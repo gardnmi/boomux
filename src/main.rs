@@ -50,6 +50,9 @@ enum Commands {
         #[arg(long)]
         takeover: bool,
     },
+    /// Print the current Boomux workspace and shell name for prompt integrations
+    #[command(hide = true)]
+    Prompt,
 }
 
 fn main() -> ExitCode {
@@ -76,6 +79,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             title,
             takeover,
         }) => open_terminal(&terminal_id, title.as_deref(), takeover),
+        Some(Commands::Prompt) => print_prompt_label(),
         None => picker(),
     }
 }
@@ -130,9 +134,12 @@ struct Workspace {
 #[derive(Deserialize)]
 struct Pane {
     pane_id: String,
+    tab_id: String,
     terminal_id: String,
     workspace_id: String,
     cwd: String,
+    #[serde(default)]
+    label: Option<String>,
     #[serde(default)]
     agent: Option<String>,
     agent_status: String,
@@ -163,33 +170,48 @@ fn dashboard() -> Result<(), Box<dyn Error>> {
     let views = dashboard_snapshot()?;
     tui::run(
         views,
-        |workspace_id| {
-            let panes = available_panes().map_err(|error| error.to_string())?;
-            let workspaces = load_workspaces().map_err(|error| error.to_string())?;
-            let workspace = workspaces
-                .iter()
-                .find(|workspace| workspace.workspace_id == workspace_id)
-                .ok_or_else(|| "selected workspace no longer exists".to_owned())?;
-            let shell_count = workspace_panes(&workspace.workspace_id, &panes).count();
-            open_workspace(workspace, &panes).map_err(|error| error.to_string())?;
-            Ok(format!(
-                "Restored {shell_count} shell(s) for {}",
-                workspace.label
-            ))
+        tui::Actions {
+            on_restore: |workspace_id: &str| {
+                let panes = load_panes().map_err(|error| error.to_string())?;
+                let workspaces = load_workspaces().map_err(|error| error.to_string())?;
+                let workspace = workspaces
+                    .iter()
+                    .find(|workspace| workspace.workspace_id == workspace_id)
+                    .ok_or_else(|| "selected workspace no longer exists".to_owned())?;
+                let shell_count = workspace_panes(&workspace.workspace_id, &panes).count();
+                open_workspace(workspace, &panes).map_err(|error| error.to_string())?;
+                Ok(format!(
+                    "Restored {shell_count} shell(s) for {}",
+                    workspace.label
+                ))
+            },
+            on_open: |terminal_id: &str| {
+                open_dashboard_terminal(terminal_id).map_err(|error| error.to_string())
+            },
+            on_close: |workspace_id: &str| {
+                let workspaces = load_workspaces().map_err(|error| error.to_string())?;
+                let Some(workspace) = workspaces
+                    .iter()
+                    .find(|workspace| workspace.workspace_id == workspace_id)
+                else {
+                    return Ok("Workspace was already closed".to_owned());
+                };
+                let label = workspace.label.clone();
+                close_workspace(workspace_id).map_err(|error| error.to_string())?;
+                Ok(format!("Closed {label} and all of its shells"))
+            },
+            on_create_workspace: |name: &str| {
+                create_dashboard_workspace(name).map_err(|error| error.to_string())
+            },
+            on_create_shell: |workspace_id: &str| {
+                create_dashboard_shell(workspace_id).map_err(|error| error.to_string())
+            },
+            on_rename: |pane_id: &str, name: &str| {
+                rename_pane(pane_id, name).map_err(|error| error.to_string())?;
+                Ok(format!("Renamed shell to {name}"))
+            },
+            on_refresh: || dashboard_snapshot().map_err(|error| error.to_string()),
         },
-        |workspace_id| {
-            let workspaces = load_workspaces().map_err(|error| error.to_string())?;
-            let Some(workspace) = workspaces
-                .iter()
-                .find(|workspace| workspace.workspace_id == workspace_id)
-            else {
-                return Ok("Workspace was already closed".to_owned());
-            };
-            let label = workspace.label.clone();
-            close_workspace(workspace_id).map_err(|error| error.to_string())?;
-            Ok(format!("Closed {label} and all of its shells"))
-        },
-        || dashboard_snapshot().map_err(|error| error.to_string()),
     )?;
     Ok(())
 }
@@ -210,6 +232,8 @@ fn dashboard_views(workspaces: &[Workspace], panes: &[Pane]) -> Vec<tui::Workspa
                 .into_iter()
                 .map(|pane| tui::TerminalView {
                     id: pane.terminal_id.clone(),
+                    pane_id: pane.pane_id.clone(),
+                    name: pane_name(pane).to_owned(),
                     kind: pane.agent.clone().unwrap_or_else(|| "shell".into()),
                     status: pane.agent_status.clone(),
                     directory: pane.cwd.clone(),
@@ -240,28 +264,45 @@ fn open_directory(
         .filter(|name| !name.is_empty())
         .map(str::to_owned)
         .unwrap_or_else(|| default_workspace_name(&directory));
-    let (terminal_id, shell_number) =
-        if let Some(workspace) = find_workspace(&workspaces, &panes, &directory, &name) {
-            let shell_number = workspace_panes(&workspace.workspace_id, &panes).count() + 1;
-            (
-                create_tab_terminal(&workspace.workspace_id, &directory)?.terminal_id,
-                shell_number,
-            )
+    let (pane, shell_name, created_workspace) = if let Some(workspace) =
+        find_workspace(&workspaces, &panes, &directory, &name)
+    {
+        let workspace_panes: Vec<_> = workspace_panes(&workspace.workspace_id, &panes).collect();
+        let shell_name = unique_shell_name("shell", &workspace_panes);
+        (
+            create_tab_terminal(
+                &workspace.workspace_id,
+                &directory,
+                &workspace.label,
+                &shell_name,
+            )?,
+            shell_name,
+            false,
+        )
+    } else {
+        (
+            create_workspace(&directory, &name)?.root_pane,
+            "shell-1".into(),
+            true,
+        )
+    };
+    if let Err(error) = rename_pane(&pane.pane_id, &shell_name) {
+        let cleanup = if created_workspace {
+            close_workspace(&pane.workspace_id)
         } else {
-            (
-                create_workspace(&directory, &name)?.root_pane.terminal_id,
-                1,
-            )
+            close_tab(&pane.tab_id)
         };
+        return Err(with_cleanup_error(error, cleanup));
+    }
 
     if open_in_new_window {
         open_terminal(
-            &terminal_id,
-            Some(&format!("{name} [{shell_number}]")),
+            &pane.terminal_id,
+            Some(&format!("{name} - {shell_name}")),
             true,
         )?;
-    } else if !attach_terminal(&terminal_id)? {
-        return Err(format!("could not attach to Herdr terminal {terminal_id}").into());
+    } else if !attach_terminal(&pane.terminal_id)? {
+        return Err(format!("could not attach to Herdr terminal {}", pane.terminal_id).into());
     }
     Ok(())
 }
@@ -381,12 +422,12 @@ fn choose_workspace(
 }
 
 fn create_workspace(cwd: &Path, name: &str) -> Result<WorkspaceCreateResult, Box<dyn Error>> {
-    println!("Creating workspace {name} in {}", cwd.display());
-
     let output = Command::new("herdr")
         .args(["workspace", "create", "--cwd"])
         .arg(cwd)
         .args(["--label", name])
+        .args(["--env", &format!("BOOMUX_WORKSPACE={name}")])
+        .args(["--env", "BOOMUX_SHELL_NAME=shell-1"])
         .arg("--focus")
         .output()?;
     if !output.status.success() {
@@ -398,10 +439,18 @@ fn create_workspace(cwd: &Path, name: &str) -> Result<WorkspaceCreateResult, Box
     Ok(response.result)
 }
 
-fn create_tab_terminal(workspace_id: &str, cwd: &Path) -> Result<Pane, Box<dyn Error>> {
+fn create_tab_terminal(
+    workspace_id: &str,
+    cwd: &Path,
+    workspace_name: &str,
+    shell_name: &str,
+) -> Result<Pane, Box<dyn Error>> {
     let output = Command::new("herdr")
         .args(["tab", "create", "--workspace", workspace_id, "--cwd"])
         .arg(cwd)
+        .args(["--label", shell_name])
+        .args(["--env", &format!("BOOMUX_WORKSPACE={workspace_name}")])
+        .args(["--env", &format!("BOOMUX_SHELL_NAME={shell_name}")])
         .arg("--focus")
         .output()?;
     if !output.status.success() {
@@ -413,6 +462,120 @@ fn create_tab_terminal(workspace_id: &str, cwd: &Path) -> Result<Pane, Box<dyn E
     Ok(response.result.root_pane)
 }
 
+fn create_dashboard_workspace(name: &str) -> Result<String, Box<dyn Error>> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("workspace name cannot be empty".into());
+    }
+    let cwd = env::current_dir()?.canonicalize()?;
+    let panes = load_panes()?;
+    let workspaces = load_workspaces()?;
+    if find_workspace(&workspaces, &panes, &cwd, name).is_some() {
+        return Err(format!("workspace {name} already exists in {}", cwd.display()).into());
+    }
+
+    let pane = create_workspace(&cwd, name)?.root_pane;
+    if let Err(error) = rename_pane(&pane.pane_id, "shell-1") {
+        return Err(with_cleanup_error(
+            error,
+            close_workspace(&pane.workspace_id),
+        ));
+    }
+    Ok(format!("Created workspace {name} with shell-1"))
+}
+
+fn create_dashboard_shell(workspace_id: &str) -> Result<String, Box<dyn Error>> {
+    let panes = load_panes()?;
+    let workspaces = load_workspaces()?;
+    let workspace = workspaces
+        .iter()
+        .find(|workspace| workspace.workspace_id == workspace_id)
+        .ok_or("selected workspace no longer exists")?;
+    let workspace_panes: Vec<_> = workspace_panes(workspace_id, &panes).collect();
+    let cwd = workspace_panes
+        .first()
+        .ok_or("selected workspace has no terminals")?
+        .cwd
+        .as_str();
+    let shell_name = unique_shell_name("shell", &workspace_panes);
+    let pane = create_tab_terminal(workspace_id, Path::new(cwd), &workspace.label, &shell_name)?;
+    if let Err(error) = rename_pane(&pane.pane_id, &shell_name) {
+        return Err(with_cleanup_error(error, close_tab(&pane.tab_id)));
+    }
+
+    Ok(format!("Created {shell_name} in {}", workspace.label))
+}
+
+fn unique_shell_name(base_name: &str, panes: &[&Pane]) -> String {
+    let highest_suffix = panes
+        .iter()
+        .filter_map(|pane| pane.label.as_deref())
+        .filter_map(|label| {
+            if label == base_name {
+                Some(1)
+            } else {
+                label
+                    .strip_prefix(base_name)
+                    .and_then(|suffix| suffix.strip_prefix('-'))
+                    .and_then(|suffix| suffix.parse::<usize>().ok())
+            }
+        })
+        .max();
+
+    highest_suffix.map_or_else(
+        || base_name.to_owned(),
+        |suffix| format!("{base_name}-{}", suffix + 1),
+    )
+}
+
+fn rename_pane(pane_id: &str, name: &str) -> Result<(), Box<dyn Error>> {
+    let output = Command::new("herdr")
+        .args(["pane", "rename", pane_id, name])
+        .output()?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let message = String::from_utf8_lossy(&output.stderr);
+        Err(format!("could not rename Herdr pane: {}", message.trim()).into())
+    }
+}
+
+fn pane_name(pane: &Pane) -> &str {
+    pane.label
+        .as_deref()
+        .or(pane.agent.as_deref())
+        .unwrap_or("shell")
+}
+
+fn with_cleanup_error(
+    error: Box<dyn Error>,
+    cleanup: Result<(), Box<dyn Error>>,
+) -> Box<dyn Error> {
+    match cleanup {
+        Ok(()) => error,
+        Err(cleanup_error) => format!("{error}; cleanup also failed: {cleanup_error}").into(),
+    }
+}
+
+fn open_dashboard_terminal(terminal_id: &str) -> Result<String, Box<dyn Error>> {
+    let panes = load_panes()?;
+    let pane = panes
+        .iter()
+        .find(|pane| pane.terminal_id == terminal_id)
+        .ok_or("selected terminal no longer exists")?;
+    let workspace = load_workspaces()?
+        .into_iter()
+        .find(|workspace| workspace.workspace_id == pane.workspace_id)
+        .ok_or("selected workspace no longer exists")?;
+    let shell_name = pane_name(pane);
+    open_terminal(
+        terminal_id,
+        Some(&format!("{} - {shell_name}", workspace.label)),
+        true,
+    )?;
+    Ok(format!("Opened {shell_name} from {}", workspace.label))
+}
+
 fn open_workspace(workspace: &Workspace, panes: &[Pane]) -> Result<(), Box<dyn Error>> {
     let workspace_panes: Vec<_> = workspace_panes(&workspace.workspace_id, panes).collect();
     if workspace_panes.is_empty() {
@@ -420,13 +583,40 @@ fn open_workspace(workspace: &Workspace, panes: &[Pane]) -> Result<(), Box<dyn E
     }
 
     for (index, pane) in workspace_panes.iter().enumerate() {
+        let shell_name = pane
+            .label
+            .as_deref()
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("shell-{}", index + 1));
         open_terminal(
             &pane.terminal_id,
-            Some(&format!("{} [{}]", workspace.label, index + 1)),
+            Some(&format!("{} - {shell_name}", workspace.label)),
             true,
         )?;
     }
 
+    Ok(())
+}
+
+fn print_prompt_label() -> Result<(), Box<dyn Error>> {
+    let Some(pane_id) = env::var_os("HERDR_PANE_ID").and_then(|value| value.into_string().ok())
+    else {
+        return Ok(());
+    };
+    let panes = load_panes()?;
+    let Some(pane) = panes.iter().find(|pane| pane.pane_id == pane_id) else {
+        return Ok(());
+    };
+    let workspace_name = load_workspaces()?
+        .into_iter()
+        .find(|workspace| workspace.workspace_id == pane.workspace_id)
+        .map(|workspace| workspace.label);
+    let shell_name = pane_name(pane);
+    if let Some(workspace_name) = workspace_name {
+        println!("{workspace_name}/{shell_name}");
+    } else {
+        println!("{shell_name}");
+    }
     Ok(())
 }
 
@@ -439,6 +629,18 @@ fn close_workspace(workspace_id: &str) -> Result<(), Box<dyn Error>> {
     } else {
         let message = String::from_utf8_lossy(&output.stderr);
         Err(format!("could not close Herdr workspace: {}", message.trim()).into())
+    }
+}
+
+fn close_tab(tab_id: &str) -> Result<(), Box<dyn Error>> {
+    let output = Command::new("herdr")
+        .args(["tab", "close", tab_id])
+        .output()?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let message = String::from_utf8_lossy(&output.stderr);
+        Err(format!("could not close Herdr tab: {}", message.trim()).into())
     }
 }
 
@@ -528,6 +730,7 @@ fn open_terminal(
     command
         .arg("+new-window")
         .arg(format!("--title={title}"))
+        .arg("--shell-integration-features=no-title")
         .args(["-e", "herdr", "terminal", "attach", terminal_id]);
 
     if takeover {
@@ -588,6 +791,9 @@ mod tests {
 
         assert!(cli.path.is_none());
         assert!(matches!(cli.command, Some(Commands::Doctor)));
+
+        let cli = Cli::try_parse_from(["boomux", "prompt"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Prompt)));
     }
 
     #[test]
@@ -608,9 +814,11 @@ mod tests {
         }];
         let panes = vec![Pane {
             pane_id: "w1:p1".into(),
+            tab_id: "w1:t1".into(),
             terminal_id: "term_123".into(),
             workspace_id: "w1".into(),
             cwd: directory.display().to_string(),
+            label: Some("shell-1".into()),
             agent: None,
             agent_status: "unknown".into(),
         }];
@@ -626,9 +834,11 @@ mod tests {
                 "result": {
                     "panes": [{
                         "pane_id": "w1:p1",
+                        "tab_id": "w1:t1",
                         "terminal_id": "term_123",
                         "workspace_id": "w1",
                         "cwd": "/tmp/project",
+                        "label": "api",
                         "agent_status": "working"
                     }]
                 }
@@ -639,6 +849,46 @@ mod tests {
         assert_eq!(response.result.panes.len(), 1);
         assert_eq!(response.result.panes[0].pane_id, "w1:p1");
         assert_eq!(response.result.panes[0].terminal_id, "term_123");
+        assert_eq!(response.result.panes[0].label.as_deref(), Some("api"));
+    }
+
+    #[test]
+    fn generates_unique_shell_names() {
+        let panes = [
+            Pane {
+                pane_id: "w1:p1".into(),
+                tab_id: "w1:t1".into(),
+                terminal_id: "term_1".into(),
+                workspace_id: "w1".into(),
+                cwd: "/tmp".into(),
+                label: Some("shell-1".into()),
+                agent: None,
+                agent_status: "unknown".into(),
+            },
+            Pane {
+                pane_id: "w1:p2".into(),
+                tab_id: "w1:t2".into(),
+                terminal_id: "term_2".into(),
+                workspace_id: "w1".into(),
+                cwd: "/tmp".into(),
+                label: Some("api".into()),
+                agent: None,
+                agent_status: "idle".into(),
+            },
+        ];
+
+        assert_eq!(
+            unique_shell_name("shell", &panes.iter().collect::<Vec<_>>()),
+            "shell-2"
+        );
+        assert_eq!(
+            unique_shell_name("api", &panes.iter().collect::<Vec<_>>()),
+            "api-2"
+        );
+        assert_eq!(
+            unique_shell_name("logs", &panes.iter().collect::<Vec<_>>()),
+            "logs"
+        );
     }
 
     #[test]
@@ -654,6 +904,7 @@ mod tests {
                 "result": {
                     "root_pane": {
                         "pane_id": "w1:p1",
+                        "tab_id": "w1:t1",
                         "terminal_id": "term_456",
                         "workspace_id": "w1",
                         "cwd": "/tmp/project",

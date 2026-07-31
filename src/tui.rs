@@ -29,16 +29,43 @@ pub(crate) struct WorkspaceView {
 
 pub(crate) struct TerminalView {
     pub(crate) id: String,
+    pub(crate) pane_id: String,
+    pub(crate) name: String,
     pub(crate) kind: String,
     pub(crate) status: String,
     pub(crate) directory: String,
 }
 
+pub(crate) struct Actions<R, O, C, W, N, E, F> {
+    pub(crate) on_restore: R,
+    pub(crate) on_open: O,
+    pub(crate) on_close: C,
+    pub(crate) on_create_workspace: W,
+    pub(crate) on_create_shell: N,
+    pub(crate) on_rename: E,
+    pub(crate) on_refresh: F,
+}
+
 struct App {
     workspaces: Vec<WorkspaceView>,
     workspace_state: TableState,
+    terminal_state: TableState,
+    focus: Focus,
+    mode: Mode,
     message: Option<Message>,
     pending_close: Option<PendingClose>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Focus {
+    Workspaces,
+    Terminals,
+}
+
+enum Mode {
+    Normal,
+    CreateWorkspace(String),
+    Rename { pane_id: String, input: String },
 }
 
 struct Message {
@@ -55,12 +82,19 @@ struct PendingClose {
 impl App {
     fn new(workspaces: Vec<WorkspaceView>) -> Self {
         let mut workspace_state = TableState::default();
+        let mut terminal_state = TableState::default();
         if !workspaces.is_empty() {
             workspace_state.select(Some(0));
+            if !workspaces[0].terminals.is_empty() {
+                terminal_state.select(Some(0));
+            }
         }
         Self {
             workspaces,
             workspace_state,
+            terminal_state,
+            focus: Focus::Workspaces,
+            mode: Mode::Normal,
             message: None,
             pending_close: None,
         }
@@ -75,28 +109,151 @@ impl App {
             .and_then(|index| self.workspaces.get(index))
     }
 
+    fn selected_terminal(&self) -> Option<&TerminalView> {
+        self.selected().and_then(|workspace| {
+            self.terminal_state
+                .selected()
+                .and_then(|index| workspace.terminals.get(index))
+        })
+    }
+
     fn next(&mut self) {
-        if self.workspaces.is_empty() {
-            return;
+        match self.focus {
+            Focus::Workspaces => {
+                if self.workspaces.is_empty() {
+                    return;
+                }
+                let next = self
+                    .selected_index()
+                    .map_or(0, |index| (index + 1) % self.workspaces.len());
+                self.workspace_state.select(Some(next));
+                self.select_first_terminal();
+            }
+            Focus::Terminals => {
+                let terminal_count = self
+                    .selected()
+                    .map_or(0, |workspace| workspace.terminals.len());
+                if terminal_count == 0 {
+                    return;
+                }
+                let next = self
+                    .terminal_state
+                    .selected()
+                    .map_or(0, |index| (index + 1) % terminal_count);
+                self.terminal_state.select(Some(next));
+            }
         }
-        let next = self
-            .selected_index()
-            .map_or(0, |index| (index + 1) % self.workspaces.len());
-        self.workspace_state.select(Some(next));
+        self.message = None;
     }
 
     fn previous(&mut self) {
-        if self.workspaces.is_empty() {
-            return;
-        }
-        let previous = self.selected_index().map_or(0, |index| {
-            if index == 0 {
-                self.workspaces.len() - 1
-            } else {
-                index - 1
+        match self.focus {
+            Focus::Workspaces => {
+                if self.workspaces.is_empty() {
+                    return;
+                }
+                let previous = self.selected_index().map_or(0, |index| {
+                    if index == 0 {
+                        self.workspaces.len() - 1
+                    } else {
+                        index - 1
+                    }
+                });
+                self.workspace_state.select(Some(previous));
+                self.select_first_terminal();
             }
+            Focus::Terminals => {
+                let terminal_count = self
+                    .selected()
+                    .map_or(0, |workspace| workspace.terminals.len());
+                if terminal_count == 0 {
+                    return;
+                }
+                let previous = self.terminal_state.selected().map_or(0, |index| {
+                    if index == 0 {
+                        terminal_count - 1
+                    } else {
+                        index - 1
+                    }
+                });
+                self.terminal_state.select(Some(previous));
+            }
+        }
+        self.message = None;
+    }
+
+    fn toggle_focus(&mut self) {
+        self.focus = match self.focus {
+            Focus::Workspaces => Focus::Terminals,
+            Focus::Terminals => Focus::Workspaces,
+        };
+        self.message = None;
+    }
+
+    fn select_first_terminal(&mut self) {
+        self.terminal_state.select(
+            self.selected()
+                .is_some_and(|workspace| !workspace.terminals.is_empty())
+                .then_some(0),
+        );
+    }
+
+    fn request_rename(&mut self) {
+        if self.focus == Focus::Terminals
+            && let Some(terminal) = self.selected_terminal()
+        {
+            self.mode = Mode::Rename {
+                pane_id: terminal.pane_id.clone(),
+                input: String::new(),
+            };
+            self.message = None;
+        }
+    }
+
+    fn request_add<F>(&mut self, on_create_shell: &mut F) -> bool
+    where
+        F: FnMut(&str) -> Result<String, String>,
+    {
+        match self.focus {
+            Focus::Workspaces => {
+                self.mode = Mode::CreateWorkspace(String::new());
+                self.message = None;
+                false
+            }
+            Focus::Terminals => {
+                let Some(workspace_id) = self.selected().map(|workspace| workspace.id.clone())
+                else {
+                    return false;
+                };
+                self.message = Some(match on_create_shell(&workspace_id) {
+                    Ok(text) => Message { text, error: false },
+                    Err(text) => Message { text, error: true },
+                });
+                true
+            }
+        }
+    }
+
+    fn create_workspace<F>(&mut self, name: &str, on_create_workspace: &mut F)
+    where
+        F: FnMut(&str) -> Result<String, String>,
+    {
+        self.mode = Mode::Normal;
+        self.message = Some(match on_create_workspace(name) {
+            Ok(text) => Message { text, error: false },
+            Err(text) => Message { text, error: true },
         });
-        self.workspace_state.select(Some(previous));
+    }
+
+    fn rename_shell<F>(&mut self, pane_id: &str, name: &str, on_rename: &mut F)
+    where
+        F: FnMut(&str, &str) -> Result<String, String>,
+    {
+        self.mode = Mode::Normal;
+        self.message = Some(match on_rename(pane_id, name) {
+            Ok(text) => Message { text, error: false },
+            Err(text) => Message { text, error: true },
+        });
     }
 
     fn restore_selected<F>(&mut self, on_restore: &mut F)
@@ -107,6 +264,19 @@ impl App {
             return;
         };
         self.message = Some(match on_restore(&workspace_id) {
+            Ok(text) => Message { text, error: false },
+            Err(text) => Message { text, error: true },
+        });
+    }
+
+    fn open_selected_terminal<F>(&mut self, on_open: &mut F)
+    where
+        F: FnMut(&str) -> Result<String, String>,
+    {
+        let Some(terminal_id) = self.selected_terminal().map(|terminal| terminal.id.clone()) else {
+            return;
+        };
+        self.message = Some(match on_open(&terminal_id) {
             Ok(text) => Message { text, error: false },
             Err(text) => Message { text, error: true },
         });
@@ -149,6 +319,7 @@ impl App {
 
     fn replace_workspaces(&mut self, workspaces: Vec<WorkspaceView>) {
         let selected_id = self.selected().map(|workspace| workspace.id.clone());
+        let selected_terminal_id = self.selected_terminal().map(|terminal| terminal.id.clone());
         let previous_index = self.selected_index().unwrap_or(0);
         let selected_index = selected_id
             .and_then(|id| workspaces.iter().position(|workspace| workspace.id == id))
@@ -156,48 +327,60 @@ impl App {
 
         self.workspaces = workspaces;
         self.workspace_state.select(selected_index);
+        let terminal_index = self.selected().and_then(|workspace| {
+            selected_terminal_id
+                .and_then(|id| {
+                    workspace
+                        .terminals
+                        .iter()
+                        .position(|terminal| terminal.id == id)
+                })
+                .or_else(|| (!workspace.terminals.is_empty()).then_some(0))
+        });
+        self.terminal_state.select(terminal_index);
+        if self.focus == Focus::Terminals && terminal_index.is_none() {
+            self.focus = Focus::Workspaces;
+        }
     }
 }
 
-pub(crate) fn run<R, C, F>(
+pub(crate) fn run<R, O, C, W, N, E, F>(
     workspaces: Vec<WorkspaceView>,
-    on_restore: R,
-    on_close: C,
-    on_refresh: F,
+    actions: Actions<R, O, C, W, N, E, F>,
 ) -> io::Result<()>
 where
     R: FnMut(&str) -> Result<String, String>,
+    O: FnMut(&str) -> Result<String, String>,
     C: FnMut(&str) -> Result<String, String>,
+    W: FnMut(&str) -> Result<String, String>,
+    N: FnMut(&str) -> Result<String, String>,
+    E: FnMut(&str, &str) -> Result<String, String>,
     F: FnMut() -> Result<Vec<WorkspaceView>, String>,
 {
     let mut terminal = ratatui::init();
-    let result = run_loop(
-        &mut terminal,
-        App::new(workspaces),
-        on_restore,
-        on_close,
-        on_refresh,
-    );
+    let result = run_loop(&mut terminal, App::new(workspaces), actions);
     ratatui::restore();
     result
 }
 
-fn run_loop<R, C, F>(
+fn run_loop<R, O, C, W, N, E, F>(
     terminal: &mut ratatui::DefaultTerminal,
     mut app: App,
-    mut on_restore: R,
-    mut on_close: C,
-    mut on_refresh: F,
+    mut actions: Actions<R, O, C, W, N, E, F>,
 ) -> io::Result<()>
 where
     R: FnMut(&str) -> Result<String, String>,
+    O: FnMut(&str) -> Result<String, String>,
     C: FnMut(&str) -> Result<String, String>,
+    W: FnMut(&str) -> Result<String, String>,
+    N: FnMut(&str) -> Result<String, String>,
+    E: FnMut(&str, &str) -> Result<String, String>,
     F: FnMut() -> Result<Vec<WorkspaceView>, String>,
 {
     let mut last_refresh = Instant::now();
     loop {
         if last_refresh.elapsed() >= REFRESH_INTERVAL {
-            app.refresh(&mut on_refresh);
+            app.refresh(&mut actions.on_refresh);
             last_refresh = Instant::now();
         }
         terminal.draw(|frame| render(frame, &mut app))?;
@@ -215,12 +398,25 @@ where
         if app.pending_close.is_some() {
             match key.code {
                 KeyCode::Char('y') => {
-                    app.confirm_close(&mut on_close);
-                    app.refresh(&mut on_refresh);
+                    app.confirm_close(&mut actions.on_close);
+                    app.refresh(&mut actions.on_refresh);
                     last_refresh = Instant::now();
                 }
                 KeyCode::Char('n') | KeyCode::Esc => app.cancel_close(),
                 _ => {}
+            }
+            continue;
+        }
+
+        if !matches!(app.mode, Mode::Normal) {
+            if handle_mode_key(
+                &mut app,
+                key.code,
+                &mut actions.on_create_workspace,
+                &mut actions.on_rename,
+            ) {
+                app.refresh(&mut actions.on_refresh);
+                last_refresh = Instant::now();
             }
             continue;
         }
@@ -230,17 +426,88 @@ where
             KeyCode::Down | KeyCode::Char('j') => app.next(),
             KeyCode::Up | KeyCode::Char('k') => app.previous(),
             KeyCode::Enter => {
-                app.restore_selected(&mut on_restore);
-                app.refresh(&mut on_refresh);
+                match app.focus {
+                    Focus::Workspaces => app.restore_selected(&mut actions.on_restore),
+                    Focus::Terminals => app.open_selected_terminal(&mut actions.on_open),
+                }
+                app.refresh(&mut actions.on_refresh);
                 last_refresh = Instant::now();
             }
             KeyCode::Char('r') => {
-                app.refresh(&mut on_refresh);
+                app.refresh(&mut actions.on_refresh);
                 last_refresh = Instant::now();
             }
             KeyCode::Char('x') => app.request_close(),
+            KeyCode::Char('a') => {
+                if app.request_add(&mut actions.on_create_shell) {
+                    app.refresh(&mut actions.on_refresh);
+                    last_refresh = Instant::now();
+                }
+            }
+            KeyCode::Char('e') => app.request_rename(),
+            KeyCode::Tab => app.toggle_focus(),
             _ => {}
         }
+    }
+}
+
+fn handle_mode_key<W, E>(
+    app: &mut App,
+    key: KeyCode,
+    on_create_workspace: &mut W,
+    on_rename: &mut E,
+) -> bool
+where
+    W: FnMut(&str) -> Result<String, String>,
+    E: FnMut(&str, &str) -> Result<String, String>,
+{
+    let mode = std::mem::replace(&mut app.mode, Mode::Normal);
+    match mode {
+        Mode::Normal => false,
+        Mode::CreateWorkspace(mut input) => match key {
+            KeyCode::Enter if !input.trim().is_empty() => {
+                let name = input.trim().to_owned();
+                app.create_workspace(&name, on_create_workspace);
+                true
+            }
+            KeyCode::Esc => false,
+            KeyCode::Backspace => {
+                input.pop();
+                app.mode = Mode::CreateWorkspace(input);
+                false
+            }
+            KeyCode::Char(character) => {
+                input.push(character);
+                app.mode = Mode::CreateWorkspace(input);
+                false
+            }
+            _ => {
+                app.mode = Mode::CreateWorkspace(input);
+                false
+            }
+        },
+        Mode::Rename { pane_id, mut input } => match key {
+            KeyCode::Enter if !input.trim().is_empty() => {
+                let name = input.trim().to_owned();
+                app.rename_shell(&pane_id, &name, on_rename);
+                true
+            }
+            KeyCode::Esc => false,
+            KeyCode::Backspace => {
+                input.pop();
+                app.mode = Mode::Rename { pane_id, input };
+                false
+            }
+            KeyCode::Char(character) => {
+                input.push(character);
+                app.mode = Mode::Rename { pane_id, input };
+                false
+            }
+            _ => {
+                app.mode = Mode::Rename { pane_id, input };
+                false
+            }
+        },
     }
 }
 
@@ -287,10 +554,7 @@ fn render_header(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
         ),
         Span::styled("  |  ", Style::new().fg(OVERLAY)),
         Span::styled(format!("{shell_count} shells"), Style::new().fg(BLUE)),
-        Span::styled(
-            "    Enter restores selected workspace",
-            Style::new().fg(SUBTEXT),
-        ),
+        Span::styled("    Tab switches tables", Style::new().fg(SUBTEXT)),
     ]);
     frame.render_widget(
         Paragraph::new(line).block(
@@ -331,7 +595,11 @@ fn render_workspaces(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut A
     .block(
         Block::bordered()
             .title(" Workspaces ")
-            .border_style(Style::new().fg(OVERLAY)),
+            .border_style(Style::new().fg(if app.focus == Focus::Workspaces {
+                TEAL
+            } else {
+                OVERLAY
+            })),
     )
     .row_highlight_style(
         Style::new()
@@ -343,10 +611,10 @@ fn render_workspaces(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut A
     frame.render_stateful_widget(table, area, &mut app.workspace_state);
 }
 
-fn render_terminals(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
-    let header = Row::new(["#", "TYPE", "STATUS", "DIRECTORY", "TERMINAL ID"])
+fn render_terminals(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
+    let header = Row::new(["#", "NAME", "TYPE", "STATUS", "DIRECTORY", "TERMINAL ID"])
         .style(Style::new().fg(BLUE).add_modifier(Modifier::BOLD));
-    let rows = app
+    let rows: Vec<_> = app
         .selected()
         .into_iter()
         .flat_map(|workspace| workspace.terminals.iter())
@@ -354,12 +622,17 @@ fn render_terminals(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
         .map(|(index, terminal)| {
             Row::new(vec![
                 Cell::from((index + 1).to_string()),
-                Cell::from(terminal.kind.as_str()),
-                Cell::from(status_span(&terminal.status)),
-                Cell::from(terminal.directory.as_str()),
-                Cell::from(terminal.id.as_str()),
+                Cell::from(terminal.name.clone()),
+                Cell::from(terminal.kind.clone()),
+                Cell::from(Span::styled(
+                    status_label(&terminal.status).to_owned(),
+                    Style::new().fg(status_color(&terminal.status)),
+                )),
+                Cell::from(terminal.directory.clone()),
+                Cell::from(terminal.id.clone()),
             ])
-        });
+        })
+        .collect();
     let title = app.selected().map_or_else(
         || " Terminals ".to_owned(),
         |workspace| format!(" Terminals: {} ", workspace.name),
@@ -369,6 +642,7 @@ fn render_terminals(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
         [
             Constraint::Length(4),
             Constraint::Length(18),
+            Constraint::Length(18),
             Constraint::Length(12),
             Constraint::Min(24),
             Constraint::Length(24),
@@ -376,12 +650,20 @@ fn render_terminals(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     )
     .header(header)
     .column_spacing(1)
-    .block(
-        Block::bordered()
-            .title(title)
-            .border_style(Style::new().fg(OVERLAY)),
-    );
-    frame.render_widget(table, area);
+    .block(Block::bordered().title(title).border_style(Style::new().fg(
+        if app.focus == Focus::Terminals {
+            TEAL
+        } else {
+            OVERLAY
+        },
+    )))
+    .row_highlight_style(
+        Style::new()
+            .fg(TEXT)
+            .add_modifier(Modifier::BOLD | Modifier::REVERSED),
+    )
+    .highlight_symbol("> ");
+    frame.render_stateful_widget(table, area, &mut app.terminal_state);
 }
 
 fn render_metrics(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
@@ -458,24 +740,67 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
             Span::styled("n/esc", Style::new().fg(GREEN)),
             Span::styled(" cancel", Style::new().fg(SUBTEXT)),
         ])
+    } else if let Mode::CreateWorkspace(input) = &app.mode {
+        Line::from(vec![
+            Span::styled(" Workspace name: ", Style::new().fg(YELLOW)),
+            Span::styled(format!("{input}_"), Style::new().fg(TEXT)),
+            Span::styled("  enter", Style::new().fg(GREEN)),
+            Span::raw(" create  "),
+            Span::styled("esc", Style::new().fg(RED)),
+            Span::raw(" cancel"),
+        ])
+    } else if let Mode::Rename { input, .. } = &app.mode {
+        Line::from(vec![
+            Span::styled(" New shell name: ", Style::new().fg(YELLOW)),
+            Span::styled(format!("{input}_"), Style::new().fg(TEXT)),
+            Span::styled("  enter", Style::new().fg(GREEN)),
+            Span::raw(" rename  "),
+            Span::styled("esc", Style::new().fg(RED)),
+            Span::raw(" cancel"),
+        ])
     } else if let Some(message) = &app.message {
         Line::from(Span::styled(
             format!(" {}", message.text),
             Style::new().fg(if message.error { RED } else { GREEN }),
         ))
     } else {
-        Line::from(vec![
+        let mut spans = vec![
             Span::styled(" j/k", Style::new().fg(TEAL)),
-            Span::styled(" or arrows navigate  ", Style::new().fg(SUBTEXT)),
+            Span::styled(" navigate  tab focus  ", Style::new().fg(SUBTEXT)),
+            Span::styled("a", Style::new().fg(GREEN)),
+            Span::styled(
+                if app.focus == Focus::Workspaces {
+                    " add workspace  "
+                } else {
+                    " add shell  "
+                },
+                Style::new().fg(SUBTEXT),
+            ),
+        ];
+        if app.focus == Focus::Terminals {
+            spans.extend([
+                Span::styled("e", Style::new().fg(YELLOW)),
+                Span::styled(" rename  ", Style::new().fg(SUBTEXT)),
+            ]);
+        }
+        spans.extend([
             Span::styled("enter", Style::new().fg(GREEN)),
-            Span::styled(" restore workspace  ", Style::new().fg(SUBTEXT)),
+            Span::styled(
+                if app.focus == Focus::Workspaces {
+                    " restore workspace  "
+                } else {
+                    " open shell  "
+                },
+                Style::new().fg(SUBTEXT),
+            ),
             Span::styled("r", Style::new().fg(BLUE)),
             Span::styled(" refresh  ", Style::new().fg(SUBTEXT)),
             Span::styled("x", Style::new().fg(RED)),
-            Span::styled(" close  ", Style::new().fg(SUBTEXT)),
+            Span::styled(" close workspace  ", Style::new().fg(SUBTEXT)),
             Span::styled("q", Style::new().fg(RED)),
             Span::styled(" quit", Style::new().fg(SUBTEXT)),
-        ])
+        ]);
+        Line::from(spans)
     };
     frame.render_widget(Paragraph::new(line), area);
 }
@@ -516,6 +841,8 @@ mod tests {
             directory: "/tmp/boomux".into(),
             terminals: vec![TerminalView {
                 id: "term_1".into(),
+                pane_id: "w1:p1".into(),
+                name: "agent".into(),
                 kind: "opencode".into(),
                 status: "working".into(),
                 directory: "/tmp/boomux".into(),
@@ -531,6 +858,121 @@ mod tests {
         assert_eq!(app.selected_index(), Some(0));
         app.previous();
         assert_eq!(app.selected_index(), Some(0));
+    }
+
+    #[test]
+    fn terminal_navigation_uses_the_focused_table() {
+        let mut app = app();
+
+        app.toggle_focus();
+        assert_eq!(app.focus, Focus::Terminals);
+        app.next();
+
+        assert_eq!(app.terminal_state.selected(), Some(0));
+        assert_eq!(
+            app.selected_terminal()
+                .map(|terminal| terminal.name.as_str()),
+            Some("agent")
+        );
+    }
+
+    #[test]
+    fn add_creates_a_workspace_from_workspace_focus() {
+        let mut app = app();
+        let mut created = None;
+
+        assert!(!app.request_add(&mut |_| Ok(String::new())));
+        assert!(matches!(app.mode, Mode::CreateWorkspace(_)));
+        for character in "feature".chars() {
+            handle_mode_key(
+                &mut app,
+                KeyCode::Char(character),
+                &mut |_| Ok(String::new()),
+                &mut |_, _| Ok(String::new()),
+            );
+        }
+        let changed = handle_mode_key(
+            &mut app,
+            KeyCode::Enter,
+            &mut |name| {
+                created = Some(name.to_owned());
+                Ok("Created workspace".into())
+            },
+            &mut |_, _| Ok(String::new()),
+        );
+
+        assert!(changed);
+        assert_eq!(created.as_deref(), Some("feature"));
+        assert!(matches!(app.mode, Mode::Normal));
+    }
+
+    #[test]
+    fn add_creates_a_shell_from_terminal_focus() {
+        let mut app = app();
+        let mut workspace_id = None;
+        app.toggle_focus();
+
+        let changed = app.request_add(&mut |selected_workspace_id| {
+            workspace_id = Some(selected_workspace_id.to_owned());
+            Ok("Created shell".into())
+        });
+
+        assert!(changed);
+        assert_eq!(workspace_id.as_deref(), Some("w1"));
+        assert!(matches!(app.mode, Mode::Normal));
+    }
+
+    #[test]
+    fn enter_on_terminal_opens_only_the_selected_shell() {
+        let mut app = app();
+        let mut opened = None;
+        app.toggle_focus();
+
+        app.open_selected_terminal(&mut |terminal_id| {
+            opened = Some(terminal_id.to_owned());
+            Ok("Opened shell".into())
+        });
+
+        assert_eq!(opened.as_deref(), Some("term_1"));
+    }
+
+    #[test]
+    fn rename_mode_dispatches_the_selected_pane_and_name() {
+        let mut app = app();
+        let mut renamed = None;
+        app.toggle_focus();
+        app.request_rename();
+
+        for character in ['a', 'p', 'i'] {
+            handle_mode_key(
+                &mut app,
+                KeyCode::Char(character),
+                &mut |_| Ok(String::new()),
+                &mut |_, _| Ok(String::new()),
+            );
+        }
+        let changed = handle_mode_key(
+            &mut app,
+            KeyCode::Enter,
+            &mut |_| Ok(String::new()),
+            &mut |pane_id, name| {
+                renamed = Some((pane_id.to_owned(), name.to_owned()));
+                Ok("Renamed shell".into())
+            },
+        );
+
+        assert!(changed);
+        assert_eq!(renamed, Some(("w1:p1".into(), "api".into())));
+        assert!(matches!(app.mode, Mode::Normal));
+    }
+
+    #[test]
+    fn rename_requires_terminal_focus() {
+        let mut app = app();
+
+        app.request_rename();
+
+        assert!(matches!(app.mode, Mode::Normal));
     }
 
     #[test]

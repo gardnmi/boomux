@@ -66,13 +66,34 @@ For a full workspace overview, open the Ratatui dashboard:
 boomux ui
 ```
 
-The first dashboard pass provides workspace and terminal tables, aggregate
-status cards, `j`/`k` and arrow-key navigation, `Enter` to restore the selected
-workspace without closing the dashboard, `r` to refresh immediately, and `q` or
-`Esc` to quit. Press `x` and then `y` to close the selected workspace and
-terminate all of its shells; `n` or `Esc` cancels the confirmation. The
-dashboard automatically refreshes its Herdr workspace and terminal snapshot
-four times per second.
+The dashboard provides workspace and terminal tables, aggregate status cards,
+and live Herdr state refreshed four times per second. Use `Tab` to switch focus
+between workspaces and terminals, then `j`/`k` or the arrow keys to navigate.
+
+- `Enter` restores the selected workspace or opens only the selected terminal,
+  depending on which table is focused.
+- `a` creates a workspace with one shell from workspace focus, or adds one plain
+  shell from terminal focus. New workspaces use the directory where the
+  dashboard was launched.
+- `e` renames the selected terminal when the terminal table is focused.
+- `x`, then `y`, closes the selected workspace and all of its shells.
+- `r` refreshes immediately; `q` or `Esc` quits.
+
+Shell names are stored as Herdr pane labels and appear in the dashboard and
+restored Ghostty window titles. New shells receive `BOOMUX_WORKSPACE` and
+`BOOMUX_SHELL_NAME` environment variables.
+
+For a dynamic Starship segment that follows later renames, add the hidden prompt
+command to your Starship format and configuration:
+
+```toml
+format = """...${custom.boomux}..."""
+
+[custom.boomux]
+command = "boomux prompt"
+when = 'test -n "$HERDR_PANE_ID"'
+format = '[ 󰊠](bg:blue fg:yellow)[ $output](bg:blue fg:crust)'
+```
 
 The dashboard uses the terminal's ANSI palette rather than a hardcoded color
 scheme. On Omarchy, Ghostty maps those colors through the active theme, so the
@@ -147,9 +168,11 @@ this machine's `PATH`. Run `boomux` from any directory.
 
 ## Roadmap
 
-1. Add workspace and terminal creation controls to the dashboard.
-2. Add workspace and terminal rename/close operations.
-3. Add live agent-state refresh and notifications.
+See [`docs/roadmap.md`](docs/roadmap.md) for the broader product idea backlog.
+
+1. Aggregate multiple agent states and add attention notifications.
+2. Add terminal close and workspace rename operations.
+3. Add configurable shell and agent recipes.
 4. Use the public socket API only when the CLI stops meeting an actual need.
 5. After explicit user approval, add optional desktop keybinding and launcher
    integration outside the core.

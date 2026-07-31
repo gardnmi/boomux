@@ -56,7 +56,9 @@ dashboard remains open after restoration so it can continue managing other
 workspaces. It refreshes from Herdr four times per second and validates the
 selected workspace against a fresh snapshot before launching Ghostty windows.
 Closing a workspace uses Herdr's atomic workspace close command after explicit
-confirmation, terminating every shell in that workspace.
+confirmation, terminating every shell in that workspace. Shell creation uses
+Herdr tabs, and pane labels provide durable shell names for the dashboard,
+Ghostty titles, and prompt integrations.
 
 Dashboard colors use semantic ANSI roles and the terminal's default foreground
 and background. This keeps the TUI portable while allowing terminal-level theme
