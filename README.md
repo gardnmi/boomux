@@ -72,12 +72,22 @@ between workspaces and terminals, then `j`/`k` or the arrow keys to navigate.
 
 - `Enter` restores the selected workspace or opens only the selected terminal,
   depending on which table is focused.
-- `a` creates a workspace with one shell from workspace focus, or adds one plain
-  shell from terminal focus. New workspaces use the directory where the
-  dashboard was launched.
+- `a` opens a directory picker from workspace focus, or adds one plain shell
+  from terminal focus.
 - `e` renames the selected terminal when the terminal table is focused.
 - `x`, then `y`, closes the selected workspace and all of its shells.
 - `r` refreshes immediately; `q` or `Esc` quits.
+
+The workspace directory picker starts with the dashboard launch directory, the
+selected workspace directory, and recently used Boomux directories. Press
+`l`/Right to browse the selected location's immediate children, `h`/Left to
+move to its parent, and `Enter` to create the workspace. Its name defaults to
+the selected directory's basename and it starts with `shell-1`. Recent paths
+are stored under `$XDG_STATE_HOME/boomux` (or `~/.local/state/boomux`).
+
+The picker only reads the filesystem on the host where Boomux is running, so it
+also works in a remote terminal when Boomux and Herdr run there. Restoring native
+Ghostty windows still requires a local graphical Ghostty session.
 
 Shell names are stored as Herdr pane labels and appear in the dashboard and
 restored Ghostty window titles. New shells receive `BOOMUX_WORKSPACE` and

@@ -1,12 +1,17 @@
+use std::env;
+use std::fs;
 use std::io;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Cell, Paragraph, Row, Table, TableState};
+use ratatui::widgets::{
+    Block, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState,
+};
 
 const BASE: Color = Color::Reset;
 const OVERLAY: Color = Color::DarkGray;
@@ -18,6 +23,8 @@ const GREEN: Color = Color::Green;
 const YELLOW: Color = Color::Yellow;
 const RED: Color = Color::Red;
 const REFRESH_INTERVAL: Duration = Duration::from_millis(250);
+const MAX_DIRECTORY_ENTRIES: usize = 500;
+const MAX_RECENT_DIRECTORIES: usize = 10;
 
 pub(crate) struct WorkspaceView {
     pub(crate) id: String,
@@ -25,6 +32,11 @@ pub(crate) struct WorkspaceView {
     pub(crate) status: String,
     pub(crate) directory: String,
     pub(crate) terminals: Vec<TerminalView>,
+}
+
+pub(crate) struct DirectoryContext {
+    pub(crate) launch_directory: PathBuf,
+    pub(crate) recent_directories: Vec<PathBuf>,
 }
 
 pub(crate) struct TerminalView {
@@ -54,6 +66,7 @@ struct App {
     mode: Mode,
     message: Option<Message>,
     pending_close: Option<PendingClose>,
+    directory_context: DirectoryContext,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,8 +77,20 @@ enum Focus {
 
 enum Mode {
     Normal,
-    CreateWorkspace(String),
+    PickDirectory(DirectoryPicker),
     Rename { pane_id: String, input: String },
+}
+
+struct DirectoryPicker {
+    entries: Vec<DirectoryEntry>,
+    state: ListState,
+    browsing: Option<PathBuf>,
+    error: Option<String>,
+}
+
+struct DirectoryEntry {
+    label: String,
+    path: PathBuf,
 }
 
 struct Message {
@@ -79,8 +104,134 @@ struct PendingClose {
     shell_count: usize,
 }
 
+impl DirectoryPicker {
+    fn new(context: &DirectoryContext, selected_directory: Option<&str>) -> Self {
+        let mut entries = Vec::new();
+        push_directory_entry(&mut entries, "current", context.launch_directory.clone());
+        if let Some(directory) = selected_directory {
+            push_directory_entry(&mut entries, "selected workspace", PathBuf::from(directory));
+        }
+        for directory in &context.recent_directories {
+            push_directory_entry(&mut entries, "recent", directory.clone());
+        }
+        let mut state = ListState::default();
+        if !entries.is_empty() {
+            state.select(Some(0));
+        }
+        Self {
+            entries,
+            state,
+            browsing: None,
+            error: None,
+        }
+    }
+
+    fn selected_path(&self) -> Option<&Path> {
+        self.state
+            .selected()
+            .and_then(|index| self.entries.get(index))
+            .map(|entry| entry.path.as_path())
+    }
+
+    fn next(&mut self) {
+        if self.entries.is_empty() {
+            return;
+        }
+        let next = self
+            .state
+            .selected()
+            .map_or(0, |index| (index + 1) % self.entries.len());
+        self.state.select(Some(next));
+    }
+
+    fn previous(&mut self) {
+        if self.entries.is_empty() {
+            return;
+        }
+        let previous = self.state.selected().map_or(0, |index| {
+            if index == 0 {
+                self.entries.len() - 1
+            } else {
+                index - 1
+            }
+        });
+        self.state.select(Some(previous));
+    }
+
+    fn browse_selected(&mut self) {
+        let Some(directory) = self.selected_path().map(Path::to_owned) else {
+            return;
+        };
+        self.show_directory(directory);
+    }
+
+    fn browse_parent(&mut self) {
+        let Some(parent) = self
+            .browsing
+            .as_deref()
+            .or_else(|| self.selected_path())
+            .and_then(Path::parent)
+            .map(Path::to_owned)
+        else {
+            return;
+        };
+        self.show_directory(parent);
+    }
+
+    fn show_directory(&mut self, directory: PathBuf) {
+        match child_directories(&directory) {
+            Ok(children) => {
+                let mut entries = vec![DirectoryEntry {
+                    label: "use this directory".into(),
+                    path: directory.clone(),
+                }];
+                entries.extend(children.into_iter().map(|path| {
+                    DirectoryEntry {
+                        label: path
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or("directory")
+                            .to_owned(),
+                        path,
+                    }
+                }));
+                self.entries = entries;
+                self.state.select(Some(0));
+                self.browsing = Some(directory);
+                self.error = None;
+            }
+            Err(error) => self.error = Some(error.to_string()),
+        }
+    }
+}
+
+fn child_directories(directory: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut children: Vec<_> = fs::read_dir(directory)?
+        .take(MAX_DIRECTORY_ENTRIES)
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect();
+    children.sort_by_cached_key(|path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_lowercase()
+    });
+    Ok(children)
+}
+
+fn push_directory_entry(entries: &mut Vec<DirectoryEntry>, label: &str, path: PathBuf) {
+    if path.is_dir() && !entries.iter().any(|entry| entry.path == path) {
+        entries.push(DirectoryEntry {
+            label: label.to_owned(),
+            path,
+        });
+    }
+}
+
 impl App {
-    fn new(workspaces: Vec<WorkspaceView>) -> Self {
+    fn new(workspaces: Vec<WorkspaceView>, directory_context: DirectoryContext) -> Self {
         let mut workspace_state = TableState::default();
         let mut terminal_state = TableState::default();
         if !workspaces.is_empty() {
@@ -97,6 +248,7 @@ impl App {
             mode: Mode::Normal,
             message: None,
             pending_close: None,
+            directory_context,
         }
     }
 
@@ -115,6 +267,18 @@ impl App {
                 .selected()
                 .and_then(|index| workspace.terminals.get(index))
         })
+    }
+
+    fn remember_directory(&mut self, directory: &Path) {
+        self.directory_context
+            .recent_directories
+            .retain(|recent| recent != directory);
+        self.directory_context
+            .recent_directories
+            .insert(0, directory.to_owned());
+        self.directory_context
+            .recent_directories
+            .truncate(MAX_RECENT_DIRECTORIES);
     }
 
     fn next(&mut self) {
@@ -216,7 +380,12 @@ impl App {
     {
         match self.focus {
             Focus::Workspaces => {
-                self.mode = Mode::CreateWorkspace(String::new());
+                let selected_directory =
+                    self.selected().map(|workspace| workspace.directory.clone());
+                self.mode = Mode::PickDirectory(DirectoryPicker::new(
+                    &self.directory_context,
+                    selected_directory.as_deref(),
+                ));
                 self.message = None;
                 false
             }
@@ -234,13 +403,16 @@ impl App {
         }
     }
 
-    fn create_workspace<F>(&mut self, name: &str, on_create_workspace: &mut F)
+    fn create_workspace<F>(&mut self, directory: &Path, on_create_workspace: &mut F)
     where
-        F: FnMut(&str) -> Result<String, String>,
+        F: FnMut(&Path) -> Result<String, String>,
     {
         self.mode = Mode::Normal;
-        self.message = Some(match on_create_workspace(name) {
-            Ok(text) => Message { text, error: false },
+        self.message = Some(match on_create_workspace(directory) {
+            Ok(text) => {
+                self.remember_directory(directory);
+                Message { text, error: false }
+            }
             Err(text) => Message { text, error: true },
         });
     }
@@ -260,11 +432,17 @@ impl App {
     where
         F: FnMut(&str) -> Result<String, String>,
     {
-        let Some(workspace_id) = self.selected().map(|workspace| workspace.id.clone()) else {
+        let Some((workspace_id, directory)) = self
+            .selected()
+            .map(|workspace| (workspace.id.clone(), workspace.directory.clone()))
+        else {
             return;
         };
         self.message = Some(match on_restore(&workspace_id) {
-            Ok(text) => Message { text, error: false },
+            Ok(text) => {
+                self.remember_directory(Path::new(&directory));
+                Message { text, error: false }
+            }
             Err(text) => Message { text, error: true },
         });
     }
@@ -273,11 +451,17 @@ impl App {
     where
         F: FnMut(&str) -> Result<String, String>,
     {
-        let Some(terminal_id) = self.selected_terminal().map(|terminal| terminal.id.clone()) else {
+        let Some((terminal_id, directory)) = self
+            .selected_terminal()
+            .map(|terminal| (terminal.id.clone(), terminal.directory.clone()))
+        else {
             return;
         };
         self.message = Some(match on_open(&terminal_id) {
-            Ok(text) => Message { text, error: false },
+            Ok(text) => {
+                self.remember_directory(Path::new(&directory));
+                Message { text, error: false }
+            }
             Err(text) => Message { text, error: true },
         });
     }
@@ -346,19 +530,24 @@ impl App {
 
 pub(crate) fn run<R, O, C, W, N, E, F>(
     workspaces: Vec<WorkspaceView>,
+    directory_context: DirectoryContext,
     actions: Actions<R, O, C, W, N, E, F>,
 ) -> io::Result<()>
 where
     R: FnMut(&str) -> Result<String, String>,
     O: FnMut(&str) -> Result<String, String>,
     C: FnMut(&str) -> Result<String, String>,
-    W: FnMut(&str) -> Result<String, String>,
+    W: FnMut(&Path) -> Result<String, String>,
     N: FnMut(&str) -> Result<String, String>,
     E: FnMut(&str, &str) -> Result<String, String>,
     F: FnMut() -> Result<Vec<WorkspaceView>, String>,
 {
     let mut terminal = ratatui::init();
-    let result = run_loop(&mut terminal, App::new(workspaces), actions);
+    let result = run_loop(
+        &mut terminal,
+        App::new(workspaces, directory_context),
+        actions,
+    );
     ratatui::restore();
     result
 }
@@ -372,7 +561,7 @@ where
     R: FnMut(&str) -> Result<String, String>,
     O: FnMut(&str) -> Result<String, String>,
     C: FnMut(&str) -> Result<String, String>,
-    W: FnMut(&str) -> Result<String, String>,
+    W: FnMut(&Path) -> Result<String, String>,
     N: FnMut(&str) -> Result<String, String>,
     E: FnMut(&str, &str) -> Result<String, String>,
     F: FnMut() -> Result<Vec<WorkspaceView>, String>,
@@ -458,31 +647,44 @@ fn handle_mode_key<W, E>(
     on_rename: &mut E,
 ) -> bool
 where
-    W: FnMut(&str) -> Result<String, String>,
+    W: FnMut(&Path) -> Result<String, String>,
     E: FnMut(&str, &str) -> Result<String, String>,
 {
     let mode = std::mem::replace(&mut app.mode, Mode::Normal);
     match mode {
         Mode::Normal => false,
-        Mode::CreateWorkspace(mut input) => match key {
-            KeyCode::Enter if !input.trim().is_empty() => {
-                let name = input.trim().to_owned();
-                app.create_workspace(&name, on_create_workspace);
+        Mode::PickDirectory(mut picker) => match key {
+            KeyCode::Enter if picker.selected_path().is_some() => {
+                let directory = picker
+                    .selected_path()
+                    .expect("selected directory")
+                    .to_owned();
+                app.create_workspace(&directory, on_create_workspace);
                 true
             }
             KeyCode::Esc => false,
-            KeyCode::Backspace => {
-                input.pop();
-                app.mode = Mode::CreateWorkspace(input);
+            KeyCode::Down | KeyCode::Char('j') => {
+                picker.next();
+                app.mode = Mode::PickDirectory(picker);
                 false
             }
-            KeyCode::Char(character) => {
-                input.push(character);
-                app.mode = Mode::CreateWorkspace(input);
+            KeyCode::Up | KeyCode::Char('k') => {
+                picker.previous();
+                app.mode = Mode::PickDirectory(picker);
+                false
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                picker.browse_selected();
+                app.mode = Mode::PickDirectory(picker);
+                false
+            }
+            KeyCode::Left | KeyCode::Char('h') | KeyCode::Backspace => {
+                picker.browse_parent();
+                app.mode = Mode::PickDirectory(picker);
                 false
             }
             _ => {
-                app.mode = Mode::CreateWorkspace(input);
+                app.mode = Mode::PickDirectory(picker);
                 false
             }
         },
@@ -535,6 +737,79 @@ fn render(frame: &mut Frame, app: &mut App) {
     render_terminals(frame, terminal_area, app);
     render_metrics(frame, metrics_area, app);
     render_footer(frame, footer_area, app);
+    if let Mode::PickDirectory(picker) = &mut app.mode {
+        render_directory_picker(frame, area, picker);
+    }
+}
+
+fn render_directory_picker(frame: &mut Frame, area: Rect, picker: &mut DirectoryPicker) {
+    let popup_area = centered_rect(area, 80, 72);
+    frame.render_widget(Clear, popup_area);
+    frame.render_widget(Block::new().style(Style::new().bg(BASE)), popup_area);
+    let [list_area, help_area] =
+        Layout::vertical([Constraint::Fill(1), Constraint::Length(2)]).areas(popup_area);
+    let items = picker.entries.iter().map(|entry| {
+        ListItem::new(Line::from(vec![
+            Span::styled(format!("{:<20}", entry.label), Style::new().fg(TEAL)),
+            Span::styled(display_path(&entry.path), Style::new().fg(TEXT)),
+        ]))
+    });
+    let title = picker.browsing.as_ref().map_or_else(
+        || " Create workspace: quick locations ".to_owned(),
+        |directory| format!(" Browse: {} ", display_path(directory)),
+    );
+    let list = List::new(items)
+        .block(
+            Block::bordered()
+                .title(title)
+                .border_style(Style::new().fg(TEAL)),
+        )
+        .highlight_symbol("> ")
+        .highlight_style(
+            Style::new()
+                .fg(TEXT)
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED),
+        );
+    frame.render_stateful_widget(list, list_area, &mut picker.state);
+
+    let help = if let Some(error) = &picker.error {
+        Line::from(Span::styled(format!(" {error}"), Style::new().fg(RED)))
+    } else {
+        Line::from(vec![
+            Span::styled(" enter", Style::new().fg(GREEN)),
+            Span::raw(" create  "),
+            Span::styled("l/right", Style::new().fg(BLUE)),
+            Span::raw(" browse  "),
+            Span::styled("h/left", Style::new().fg(YELLOW)),
+            Span::raw(" parent  "),
+            Span::styled("esc", Style::new().fg(RED)),
+            Span::raw(" cancel"),
+        ])
+    };
+    frame.render_widget(Paragraph::new(help).style(Style::new().bg(BASE)), help_area);
+}
+
+fn centered_rect(area: Rect, width_percent: u16, height_percent: u16) -> Rect {
+    let [vertical] = Layout::vertical([Constraint::Percentage(height_percent)])
+        .flex(ratatui::layout::Flex::Center)
+        .areas(area);
+    let [horizontal] = Layout::horizontal([Constraint::Percentage(width_percent)])
+        .flex(ratatui::layout::Flex::Center)
+        .areas(vertical);
+    horizontal
+}
+
+fn display_path(path: &Path) -> String {
+    let Some(home) = env::var_os("HOME").map(PathBuf::from) else {
+        return path.display().to_string();
+    };
+    if path == home {
+        "~".into()
+    } else if let Ok(relative) = path.strip_prefix(&home) {
+        format!("~/{}", relative.display())
+    } else {
+        path.display().to_string()
+    }
 }
 
 fn render_header(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
@@ -740,15 +1015,6 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
             Span::styled("n/esc", Style::new().fg(GREEN)),
             Span::styled(" cancel", Style::new().fg(SUBTEXT)),
         ])
-    } else if let Mode::CreateWorkspace(input) = &app.mode {
-        Line::from(vec![
-            Span::styled(" Workspace name: ", Style::new().fg(YELLOW)),
-            Span::styled(format!("{input}_"), Style::new().fg(TEXT)),
-            Span::styled("  enter", Style::new().fg(GREEN)),
-            Span::raw(" create  "),
-            Span::styled("esc", Style::new().fg(RED)),
-            Span::raw(" cancel"),
-        ])
     } else if let Mode::Rename { input, .. } = &app.mode {
         Line::from(vec![
             Span::styled(" New shell name: ", Style::new().fg(YELLOW)),
@@ -830,7 +1096,14 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     fn app() -> App {
-        App::new(vec![workspace("w1", "boomux")])
+        App::new(vec![workspace("w1", "boomux")], directory_context())
+    }
+
+    fn directory_context() -> DirectoryContext {
+        DirectoryContext {
+            launch_directory: "/tmp".into(),
+            recent_directories: Vec::new(),
+        }
     }
 
     fn workspace(id: &str, name: &str) -> WorkspaceView {
@@ -882,28 +1155,54 @@ mod tests {
         let mut created = None;
 
         assert!(!app.request_add(&mut |_| Ok(String::new())));
-        assert!(matches!(app.mode, Mode::CreateWorkspace(_)));
-        for character in "feature".chars() {
-            handle_mode_key(
-                &mut app,
-                KeyCode::Char(character),
-                &mut |_| Ok(String::new()),
-                &mut |_, _| Ok(String::new()),
-            );
-        }
+        assert!(matches!(app.mode, Mode::PickDirectory(_)));
         let changed = handle_mode_key(
             &mut app,
             KeyCode::Enter,
-            &mut |name| {
-                created = Some(name.to_owned());
+            &mut |directory| {
+                created = Some(directory.to_owned());
                 Ok("Created workspace".into())
             },
             &mut |_, _| Ok(String::new()),
         );
 
         assert!(changed);
-        assert_eq!(created.as_deref(), Some("feature"));
+        assert_eq!(created.as_deref(), Some(Path::new("/tmp")));
         assert!(matches!(app.mode, Mode::Normal));
+    }
+
+    #[test]
+    fn created_workspace_is_available_as_a_recent_directory() {
+        let mut app = app();
+
+        app.create_workspace(Path::new("/"), &mut |_| Ok("Created workspace".into()));
+        assert!(!app.request_add(&mut |_| Ok(String::new())));
+
+        let Mode::PickDirectory(picker) = &app.mode else {
+            panic!("expected directory picker");
+        };
+        assert!(
+            picker
+                .entries
+                .iter()
+                .any(|entry| entry.label == "recent" && entry.path == Path::new("/"))
+        );
+    }
+
+    #[test]
+    fn directory_picker_browses_children_and_parent_lazily() {
+        let mut picker = DirectoryPicker::new(&directory_context(), None);
+
+        picker.browse_parent();
+        assert_eq!(picker.browsing.as_deref(), Some(Path::new("/")));
+
+        let mut picker = DirectoryPicker::new(&directory_context(), None);
+        picker.browse_selected();
+        assert_eq!(picker.browsing.as_deref(), Some(Path::new("/tmp")));
+        assert_eq!(picker.selected_path(), Some(Path::new("/tmp")));
+
+        picker.browse_parent();
+        assert_eq!(picker.browsing.as_deref(), Some(Path::new("/")));
     }
 
     #[test]
@@ -934,6 +1233,10 @@ mod tests {
         });
 
         assert_eq!(opened.as_deref(), Some("term_1"));
+        assert_eq!(
+            app.directory_context.recent_directories.first(),
+            Some(&PathBuf::from("/tmp/boomux"))
+        );
     }
 
     #[test]
@@ -986,6 +1289,10 @@ mod tests {
         });
 
         assert_eq!(restored.as_deref(), Some("w1"));
+        assert_eq!(
+            app.directory_context.recent_directories.first(),
+            Some(&PathBuf::from("/tmp/boomux"))
+        );
         let message = app.message.expect("restore message");
         assert_eq!(message.text, "Restored workspace");
         assert!(!message.error);
@@ -1018,7 +1325,10 @@ mod tests {
 
     #[test]
     fn refresh_preserves_the_selected_workspace() {
-        let mut app = App::new(vec![workspace("w1", "one"), workspace("w2", "two")]);
+        let mut app = App::new(
+            vec![workspace("w1", "one"), workspace("w2", "two")],
+            directory_context(),
+        );
         app.next();
 
         app.replace_workspaces(vec![workspace("w2", "two"), workspace("w3", "three")]);
@@ -1031,7 +1341,10 @@ mod tests {
 
     #[test]
     fn refresh_removes_stale_workspaces_and_repairs_selection() {
-        let mut app = App::new(vec![workspace("w1", "one"), workspace("w2", "two")]);
+        let mut app = App::new(
+            vec![workspace("w1", "one"), workspace("w2", "two")],
+            directory_context(),
+        );
         app.next();
 
         app.replace_workspaces(vec![workspace("w1", "one")]);

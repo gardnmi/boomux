@@ -1,10 +1,11 @@
 use std::env;
 use std::error::Error;
+use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 
 use clap::{Parser, Subcommand};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 mod tui;
 
@@ -150,6 +151,13 @@ struct Choice {
     workspace_id: String,
 }
 
+#[derive(Default, Deserialize, Serialize)]
+struct BoomuxState {
+    recent_directories: Vec<PathBuf>,
+}
+
+const MAX_RECENT_DIRECTORIES: usize = 10;
+
 fn picker() -> Result<(), Box<dyn Error>> {
     ensure_host_terminal()?;
     let panes = available_panes()?;
@@ -162,14 +170,23 @@ fn picker() -> Result<(), Box<dyn Error>> {
         .find(|workspace| workspace.workspace_id == workspace_id)
         .ok_or("selected workspace no longer exists")?;
 
-    open_workspace(workspace, &panes)
+    open_workspace(workspace, &panes)?;
+    if let Some(pane) = workspace_panes(&workspace.workspace_id, &panes).next() {
+        remember_directory(Path::new(&pane.cwd));
+    }
+    Ok(())
 }
 
 fn dashboard() -> Result<(), Box<dyn Error>> {
     ensure_host_terminal()?;
     let views = dashboard_snapshot()?;
+    let directory_context = tui::DirectoryContext {
+        launch_directory: env::current_dir()?.canonicalize()?,
+        recent_directories: load_recent_directories(),
+    };
     tui::run(
         views,
+        directory_context,
         tui::Actions {
             on_restore: |workspace_id: &str| {
                 let panes = load_panes().map_err(|error| error.to_string())?;
@@ -180,6 +197,9 @@ fn dashboard() -> Result<(), Box<dyn Error>> {
                     .ok_or_else(|| "selected workspace no longer exists".to_owned())?;
                 let shell_count = workspace_panes(&workspace.workspace_id, &panes).count();
                 open_workspace(workspace, &panes).map_err(|error| error.to_string())?;
+                if let Some(pane) = workspace_panes(&workspace.workspace_id, &panes).next() {
+                    remember_directory(Path::new(&pane.cwd));
+                }
                 Ok(format!(
                     "Restored {shell_count} shell(s) for {}",
                     workspace.label
@@ -200,8 +220,8 @@ fn dashboard() -> Result<(), Box<dyn Error>> {
                 close_workspace(workspace_id).map_err(|error| error.to_string())?;
                 Ok(format!("Closed {label} and all of its shells"))
             },
-            on_create_workspace: |name: &str| {
-                create_dashboard_workspace(name).map_err(|error| error.to_string())
+            on_create_workspace: |directory: &Path| {
+                create_dashboard_workspace(directory).map_err(|error| error.to_string())
             },
             on_create_shell: |workspace_id: &str| {
                 create_dashboard_shell(workspace_id).map_err(|error| error.to_string())
@@ -294,6 +314,7 @@ fn open_directory(
         };
         return Err(with_cleanup_error(error, cleanup));
     }
+    remember_directory(&directory);
 
     if open_in_new_window {
         open_terminal(
@@ -314,6 +335,78 @@ fn default_workspace_name(directory: &Path) -> String {
         .filter(|name| !name.is_empty())
         .unwrap_or("default")
         .to_owned()
+}
+
+fn load_recent_directories() -> Vec<PathBuf> {
+    let Some(path) = state_file_path() else {
+        return Vec::new();
+    };
+    fs::read(path)
+        .ok()
+        .and_then(|contents| serde_json::from_slice::<BoomuxState>(&contents).ok())
+        .map(|state| {
+            state
+                .recent_directories
+                .into_iter()
+                .filter(|directory| directory.is_dir())
+                .take(MAX_RECENT_DIRECTORIES)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn remember_directory(directory: &Path) {
+    let Some(path) = state_file_path() else {
+        return;
+    };
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let Ok(lock) = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path.with_extension("lock"))
+    else {
+        return;
+    };
+    if lock.lock().is_err() {
+        return;
+    }
+
+    let mut recent_directories = load_recent_directories();
+    update_recent_directories(&mut recent_directories, directory);
+    let state = BoomuxState { recent_directories };
+    let Ok(contents) = serde_json::to_vec_pretty(&state) else {
+        return;
+    };
+    let temporary_path = path.with_extension(format!("tmp-{}", std::process::id()));
+    if fs::write(&temporary_path, contents).is_ok() && fs::rename(&temporary_path, path).is_err() {
+        let _ = fs::remove_file(temporary_path);
+    }
+}
+
+fn update_recent_directories(recent_directories: &mut Vec<PathBuf>, directory: &Path) {
+    recent_directories.retain(|recent| recent != directory);
+    recent_directories.insert(0, directory.to_owned());
+    recent_directories.truncate(MAX_RECENT_DIRECTORIES);
+}
+
+fn state_file_path() -> Option<PathBuf> {
+    env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| {
+            env::var_os("HOME")
+                .map(PathBuf::from)
+                .filter(|path| path.is_absolute())
+                .map(|home| home.join(".local/state"))
+        })
+        .map(|state_home| state_home.join("boomux/state.json"))
 }
 
 fn ensure_host_terminal() -> Result<(), Box<dyn Error>> {
@@ -462,25 +555,23 @@ fn create_tab_terminal(
     Ok(response.result.root_pane)
 }
 
-fn create_dashboard_workspace(name: &str) -> Result<String, Box<dyn Error>> {
-    let name = name.trim();
-    if name.is_empty() {
-        return Err("workspace name cannot be empty".into());
-    }
-    let cwd = env::current_dir()?.canonicalize()?;
+fn create_dashboard_workspace(directory: &Path) -> Result<String, Box<dyn Error>> {
+    let name = default_workspace_name(directory);
+    let cwd = resolve_directory(directory)?;
     let panes = load_panes()?;
     let workspaces = load_workspaces()?;
-    if find_workspace(&workspaces, &panes, &cwd, name).is_some() {
+    if find_workspace(&workspaces, &panes, &cwd, &name).is_some() {
         return Err(format!("workspace {name} already exists in {}", cwd.display()).into());
     }
 
-    let pane = create_workspace(&cwd, name)?.root_pane;
+    let pane = create_workspace(&cwd, &name)?.root_pane;
     if let Err(error) = rename_pane(&pane.pane_id, "shell-1") {
         return Err(with_cleanup_error(
             error,
             close_workspace(&pane.workspace_id),
         ));
     }
+    remember_directory(&cwd);
     Ok(format!("Created workspace {name} with shell-1"))
 }
 
@@ -568,6 +659,7 @@ fn open_dashboard_terminal(terminal_id: &str) -> Result<String, Box<dyn Error>> 
         .find(|workspace| workspace.workspace_id == pane.workspace_id)
         .ok_or("selected workspace no longer exists")?;
     let shell_name = pane_name(pane);
+    remember_directory(Path::new(&pane.cwd));
     open_terminal(
         terminal_id,
         Some(&format!("{} - {shell_name}", workspace.label)),
@@ -802,6 +894,21 @@ mod tests {
 
         assert_eq!(resolve_directory(manifest_dir).unwrap(), manifest_dir);
         assert!(resolve_directory(&manifest_dir.join("Cargo.toml")).is_err());
+    }
+
+    #[test]
+    fn recent_directories_are_deduplicated_and_bounded() {
+        let mut recent: Vec<_> = (0..MAX_RECENT_DIRECTORIES)
+            .map(|index| PathBuf::from(format!("/tmp/project-{index}")))
+            .collect();
+
+        update_recent_directories(&mut recent, Path::new("/tmp/project-4"));
+        assert_eq!(recent[0], PathBuf::from("/tmp/project-4"));
+        assert_eq!(recent.len(), MAX_RECENT_DIRECTORIES);
+
+        update_recent_directories(&mut recent, Path::new("/tmp/new-project"));
+        assert_eq!(recent[0], PathBuf::from("/tmp/new-project"));
+        assert_eq!(recent.len(), MAX_RECENT_DIRECTORIES);
     }
 
     #[test]

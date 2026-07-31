@@ -60,6 +60,12 @@ confirmation, terminating every shell in that workspace. Shell creation uses
 Herdr tabs, and pane labels provide durable shell names for the dashboard,
 Ghostty titles, and prompt integrations.
 
+Workspace creation uses a terminal-native directory picker. Quick locations
+come from the launch directory, selected workspace, and a bounded recent-path
+list in the user's XDG state directory. Filesystem browsing is lazy and reads
+only one directory level at a time; the selected directory basename becomes
+the default workspace name.
+
 Dashboard colors use semantic ANSI roles and the terminal's default foreground
 and background. This keeps the TUI portable while allowing terminal-level theme
 systems such as Omarchy to supply the concrete palette.
