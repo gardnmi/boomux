@@ -170,41 +170,48 @@ fn dashboard() -> Result<(), Box<dyn Error>> {
     let views = dashboard_snapshot()?;
     tui::run(
         views,
-        |workspace_id| {
-            let panes = available_panes().map_err(|error| error.to_string())?;
-            let workspaces = load_workspaces().map_err(|error| error.to_string())?;
-            let workspace = workspaces
-                .iter()
-                .find(|workspace| workspace.workspace_id == workspace_id)
-                .ok_or_else(|| "selected workspace no longer exists".to_owned())?;
-            let shell_count = workspace_panes(&workspace.workspace_id, &panes).count();
-            open_workspace(workspace, &panes).map_err(|error| error.to_string())?;
-            Ok(format!(
-                "Restored {shell_count} shell(s) for {}",
-                workspace.label
-            ))
+        tui::Actions {
+            on_restore: |workspace_id: &str| {
+                let panes = load_panes().map_err(|error| error.to_string())?;
+                let workspaces = load_workspaces().map_err(|error| error.to_string())?;
+                let workspace = workspaces
+                    .iter()
+                    .find(|workspace| workspace.workspace_id == workspace_id)
+                    .ok_or_else(|| "selected workspace no longer exists".to_owned())?;
+                let shell_count = workspace_panes(&workspace.workspace_id, &panes).count();
+                open_workspace(workspace, &panes).map_err(|error| error.to_string())?;
+                Ok(format!(
+                    "Restored {shell_count} shell(s) for {}",
+                    workspace.label
+                ))
+            },
+            on_open: |terminal_id: &str| {
+                open_dashboard_terminal(terminal_id).map_err(|error| error.to_string())
+            },
+            on_close: |workspace_id: &str| {
+                let workspaces = load_workspaces().map_err(|error| error.to_string())?;
+                let Some(workspace) = workspaces
+                    .iter()
+                    .find(|workspace| workspace.workspace_id == workspace_id)
+                else {
+                    return Ok("Workspace was already closed".to_owned());
+                };
+                let label = workspace.label.clone();
+                close_workspace(workspace_id).map_err(|error| error.to_string())?;
+                Ok(format!("Closed {label} and all of its shells"))
+            },
+            on_create_workspace: |name: &str| {
+                create_dashboard_workspace(name).map_err(|error| error.to_string())
+            },
+            on_create_shell: |workspace_id: &str| {
+                create_dashboard_shell(workspace_id).map_err(|error| error.to_string())
+            },
+            on_rename: |pane_id: &str, name: &str| {
+                rename_pane(pane_id, name).map_err(|error| error.to_string())?;
+                Ok(format!("Renamed shell to {name}"))
+            },
+            on_refresh: || dashboard_snapshot().map_err(|error| error.to_string()),
         },
-        |workspace_id| {
-            let workspaces = load_workspaces().map_err(|error| error.to_string())?;
-            let Some(workspace) = workspaces
-                .iter()
-                .find(|workspace| workspace.workspace_id == workspace_id)
-            else {
-                return Ok("Workspace was already closed".to_owned());
-            };
-            let label = workspace.label.clone();
-            close_workspace(workspace_id).map_err(|error| error.to_string())?;
-            Ok(format!("Closed {label} and all of its shells"))
-        },
-        |workspace_id, base_name, command| {
-            create_dashboard_shell(workspace_id, base_name, command)
-                .map_err(|error| error.to_string())
-        },
-        |pane_id, name| {
-            rename_pane(pane_id, name).map_err(|error| error.to_string())?;
-            Ok(format!("Renamed shell to {name}"))
-        },
-        || dashboard_snapshot().map_err(|error| error.to_string()),
     )?;
     Ok(())
 }
@@ -280,12 +287,12 @@ fn open_directory(
         )
     };
     if let Err(error) = rename_pane(&pane.pane_id, &shell_name) {
-        if created_workspace {
-            let _ = close_workspace(&pane.workspace_id);
+        let cleanup = if created_workspace {
+            close_workspace(&pane.workspace_id)
         } else {
-            let _ = close_tab(&pane.tab_id);
-        }
-        return Err(error);
+            close_tab(&pane.tab_id)
+        };
+        return Err(with_cleanup_error(error, cleanup));
     }
 
     if open_in_new_window {
@@ -415,8 +422,6 @@ fn choose_workspace(
 }
 
 fn create_workspace(cwd: &Path, name: &str) -> Result<WorkspaceCreateResult, Box<dyn Error>> {
-    println!("Creating workspace {name} in {}", cwd.display());
-
     let output = Command::new("herdr")
         .args(["workspace", "create", "--cwd"])
         .arg(cwd)
@@ -457,11 +462,29 @@ fn create_tab_terminal(
     Ok(response.result.root_pane)
 }
 
-fn create_dashboard_shell(
-    workspace_id: &str,
-    base_name: &str,
-    command: Option<&str>,
-) -> Result<String, Box<dyn Error>> {
+fn create_dashboard_workspace(name: &str) -> Result<String, Box<dyn Error>> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("workspace name cannot be empty".into());
+    }
+    let cwd = env::current_dir()?.canonicalize()?;
+    let panes = load_panes()?;
+    let workspaces = load_workspaces()?;
+    if find_workspace(&workspaces, &panes, &cwd, name).is_some() {
+        return Err(format!("workspace {name} already exists in {}", cwd.display()).into());
+    }
+
+    let pane = create_workspace(&cwd, name)?.root_pane;
+    if let Err(error) = rename_pane(&pane.pane_id, "shell-1") {
+        return Err(with_cleanup_error(
+            error,
+            close_workspace(&pane.workspace_id),
+        ));
+    }
+    Ok(format!("Created workspace {name} with shell-1"))
+}
+
+fn create_dashboard_shell(workspace_id: &str) -> Result<String, Box<dyn Error>> {
     let panes = load_panes()?;
     let workspaces = load_workspaces()?;
     let workspace = workspaces
@@ -474,17 +497,10 @@ fn create_dashboard_shell(
         .ok_or("selected workspace has no terminals")?
         .cwd
         .as_str();
-    let shell_name = unique_shell_name(base_name, &workspace_panes);
+    let shell_name = unique_shell_name("shell", &workspace_panes);
     let pane = create_tab_terminal(workspace_id, Path::new(cwd), &workspace.label, &shell_name)?;
     if let Err(error) = rename_pane(&pane.pane_id, &shell_name) {
-        let _ = close_tab(&pane.tab_id);
-        return Err(error);
-    }
-    if let Some(command) = command
-        && let Err(error) = run_pane_command(&pane.pane_id, command)
-    {
-        let _ = close_tab(&pane.tab_id);
-        return Err(error);
+        return Err(with_cleanup_error(error, close_tab(&pane.tab_id)));
     }
 
     Ok(format!("Created {shell_name} in {}", workspace.label))
@@ -524,23 +540,40 @@ fn rename_pane(pane_id: &str, name: &str) -> Result<(), Box<dyn Error>> {
     }
 }
 
-fn run_pane_command(pane_id: &str, command: &str) -> Result<(), Box<dyn Error>> {
-    let output = Command::new("herdr")
-        .args(["pane", "run", pane_id, command])
-        .output()?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        let message = String::from_utf8_lossy(&output.stderr);
-        Err(format!("could not run command in Herdr pane: {}", message.trim()).into())
-    }
-}
-
 fn pane_name(pane: &Pane) -> &str {
     pane.label
         .as_deref()
         .or(pane.agent.as_deref())
         .unwrap_or("shell")
+}
+
+fn with_cleanup_error(
+    error: Box<dyn Error>,
+    cleanup: Result<(), Box<dyn Error>>,
+) -> Box<dyn Error> {
+    match cleanup {
+        Ok(()) => error,
+        Err(cleanup_error) => format!("{error}; cleanup also failed: {cleanup_error}").into(),
+    }
+}
+
+fn open_dashboard_terminal(terminal_id: &str) -> Result<String, Box<dyn Error>> {
+    let panes = load_panes()?;
+    let pane = panes
+        .iter()
+        .find(|pane| pane.terminal_id == terminal_id)
+        .ok_or("selected terminal no longer exists")?;
+    let workspace = load_workspaces()?
+        .into_iter()
+        .find(|workspace| workspace.workspace_id == pane.workspace_id)
+        .ok_or("selected workspace no longer exists")?;
+    let shell_name = pane_name(pane);
+    open_terminal(
+        terminal_id,
+        Some(&format!("{} - {shell_name}", workspace.label)),
+        true,
+    )?;
+    Ok(format!("Opened {shell_name} from {}", workspace.label))
 }
 
 fn open_workspace(workspace: &Workspace, panes: &[Pane]) -> Result<(), Box<dyn Error>> {
@@ -838,8 +871,8 @@ mod tests {
                 terminal_id: "term_2".into(),
                 workspace_id: "w1".into(),
                 cwd: "/tmp".into(),
-                label: Some("opencode".into()),
-                agent: Some("opencode".into()),
+                label: Some("api".into()),
+                agent: None,
                 agent_status: "idle".into(),
             },
         ];
@@ -849,12 +882,12 @@ mod tests {
             "shell-2"
         );
         assert_eq!(
-            unique_shell_name("opencode", &panes.iter().collect::<Vec<_>>()),
-            "opencode-2"
+            unique_shell_name("api", &panes.iter().collect::<Vec<_>>()),
+            "api-2"
         );
         assert_eq!(
-            unique_shell_name("lazygit", &panes.iter().collect::<Vec<_>>()),
-            "lazygit"
+            unique_shell_name("logs", &panes.iter().collect::<Vec<_>>()),
+            "logs"
         );
     }
 

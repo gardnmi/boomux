@@ -70,8 +70,11 @@ The dashboard provides workspace and terminal tables, aggregate status cards,
 and live Herdr state refreshed four times per second. Use `Tab` to switch focus
 between workspaces and terminals, then `j`/`k` or the arrow keys to navigate.
 
-- `Enter` restores every shell in the selected workspace.
-- `a` creates a shell, OpenCode, LazyGit, or a custom command.
+- `Enter` restores the selected workspace or opens only the selected terminal,
+  depending on which table is focused.
+- `a` creates a workspace with one shell from workspace focus, or adds one plain
+  shell from terminal focus. New workspaces use the directory where the
+  dashboard was launched.
 - `e` renames the selected terminal when the terminal table is focused.
 - `x`, then `y`, closes the selected workspace and all of its shells.
 - `r` refreshes immediately; `q` or `Esc` quits.
