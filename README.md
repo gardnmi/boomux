@@ -92,7 +92,7 @@ format = """...${custom.boomux}..."""
 [custom.boomux]
 command = "boomux prompt"
 when = 'test -n "$HERDR_PANE_ID"'
-format = '[ 󰊠 $output](bg:blue fg:yellow)'
+format = '[ 󰊠](bg:blue fg:yellow)[ $output](bg:blue fg:crust)'
 ```
 
 The dashboard uses the terminal's ANSI palette rather than a hardcoded color
