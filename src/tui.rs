@@ -1,12 +1,15 @@
 use std::io;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Cell, Paragraph, Row, Table, TableState};
+use ratatui::widgets::{
+    Block, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState,
+};
 
 const BASE: Color = Color::Reset;
 const OVERLAY: Color = Color::DarkGray;
@@ -25,6 +28,21 @@ pub(crate) struct WorkspaceView {
     pub(crate) status: String,
     pub(crate) directory: String,
     pub(crate) terminals: Vec<TerminalView>,
+}
+
+#[derive(Clone)]
+pub(crate) struct ProjectView {
+    pub(crate) name: String,
+    pub(crate) path: PathBuf,
+    pub(crate) group: String,
+    pub(crate) group_order: usize,
+}
+
+pub(crate) struct ProjectContext {
+    pub(crate) projects: Vec<ProjectView>,
+    pub(crate) config_path: Option<PathBuf>,
+    pub(crate) warning: Option<String>,
+    pub(crate) roots_configured: bool,
 }
 
 pub(crate) struct TerminalView {
@@ -54,6 +72,7 @@ struct App {
     mode: Mode,
     message: Option<Message>,
     pending_close: Option<PendingClose>,
+    project_context: ProjectContext,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,8 +83,18 @@ enum Focus {
 
 enum Mode {
     Normal,
-    CreateWorkspace(String),
+    PickProject(ProjectPicker),
     Rename { pane_id: String, input: String },
+}
+
+struct ProjectPicker {
+    projects: Vec<ProjectView>,
+    matches: Vec<usize>,
+    state: ListState,
+    query: String,
+    config_path: Option<PathBuf>,
+    warning: Option<String>,
+    roots_configured: bool,
 }
 
 struct Message {
@@ -79,8 +108,106 @@ struct PendingClose {
     shell_count: usize,
 }
 
+impl ProjectPicker {
+    fn new(context: &ProjectContext) -> Self {
+        let mut picker = Self {
+            projects: context.projects.clone(),
+            matches: Vec::new(),
+            state: ListState::default(),
+            query: String::new(),
+            config_path: context.config_path.clone(),
+            warning: context.warning.clone(),
+            roots_configured: context.roots_configured,
+        };
+        picker.update_matches();
+        picker
+    }
+
+    fn update_matches(&mut self) {
+        let query = self.query.to_lowercase();
+        let mut matches: Vec<_> = self
+            .projects
+            .iter()
+            .enumerate()
+            .filter_map(|(index, project)| {
+                project_match_score(project, &query).map(|score| (index, score))
+            })
+            .collect();
+        matches.sort_by_key(|(index, score)| (self.projects[*index].group_order, *score));
+        self.matches = matches.into_iter().map(|(index, _)| index).collect();
+        self.state.select((!self.matches.is_empty()).then_some(0));
+    }
+
+    fn selected(&self) -> Option<&ProjectView> {
+        self.state
+            .selected()
+            .and_then(|index| self.matches.get(index))
+            .and_then(|index| self.projects.get(*index))
+    }
+
+    fn next(&mut self) {
+        if self.matches.is_empty() {
+            return;
+        }
+        let next = self
+            .state
+            .selected()
+            .map_or(0, |index| (index + 1) % self.matches.len());
+        self.state.select(Some(next));
+    }
+
+    fn previous(&mut self) {
+        if self.matches.is_empty() {
+            return;
+        }
+        let previous = self.state.selected().map_or(0, |index| {
+            if index == 0 {
+                self.matches.len() - 1
+            } else {
+                index - 1
+            }
+        });
+        self.state.select(Some(previous));
+    }
+}
+
+fn project_match_score(project: &ProjectView, query: &str) -> Option<(u8, usize)> {
+    if query.is_empty() {
+        return Some((0, 0));
+    }
+    let name = project.name.to_lowercase();
+    let path = project.path.to_string_lossy().to_lowercase();
+    if name.starts_with(query) {
+        Some((0, name.len()))
+    } else if let Some(index) = name.find(query) {
+        Some((1, index))
+    } else if let Some(index) = path.find(query) {
+        Some((2, index))
+    } else if is_subsequence(query, &name) {
+        Some((3, name.len()))
+    } else if is_subsequence(query, &path) {
+        Some((4, path.len()))
+    } else {
+        None
+    }
+}
+
+fn is_subsequence(query: &str, candidate: &str) -> bool {
+    let mut query = query.chars();
+    let mut expected = query.next();
+    for character in candidate.chars() {
+        if expected == Some(character) {
+            expected = query.next();
+            if expected.is_none() {
+                return true;
+            }
+        }
+    }
+    expected.is_none()
+}
+
 impl App {
-    fn new(workspaces: Vec<WorkspaceView>) -> Self {
+    fn new(workspaces: Vec<WorkspaceView>, project_context: ProjectContext) -> Self {
         let mut workspace_state = TableState::default();
         let mut terminal_state = TableState::default();
         if !workspaces.is_empty() {
@@ -97,6 +224,7 @@ impl App {
             mode: Mode::Normal,
             message: None,
             pending_close: None,
+            project_context,
         }
     }
 
@@ -216,7 +344,7 @@ impl App {
     {
         match self.focus {
             Focus::Workspaces => {
-                self.mode = Mode::CreateWorkspace(String::new());
+                self.mode = Mode::PickProject(ProjectPicker::new(&self.project_context));
                 self.message = None;
                 false
             }
@@ -234,12 +362,12 @@ impl App {
         }
     }
 
-    fn create_workspace<F>(&mut self, name: &str, on_create_workspace: &mut F)
+    fn create_workspace<F>(&mut self, directory: &Path, on_create_workspace: &mut F)
     where
-        F: FnMut(&str) -> Result<String, String>,
+        F: FnMut(&Path) -> Result<String, String>,
     {
         self.mode = Mode::Normal;
-        self.message = Some(match on_create_workspace(name) {
+        self.message = Some(match on_create_workspace(directory) {
             Ok(text) => Message { text, error: false },
             Err(text) => Message { text, error: true },
         });
@@ -346,19 +474,24 @@ impl App {
 
 pub(crate) fn run<R, O, C, W, N, E, F>(
     workspaces: Vec<WorkspaceView>,
+    project_context: ProjectContext,
     actions: Actions<R, O, C, W, N, E, F>,
 ) -> io::Result<()>
 where
     R: FnMut(&str) -> Result<String, String>,
     O: FnMut(&str) -> Result<String, String>,
     C: FnMut(&str) -> Result<String, String>,
-    W: FnMut(&str) -> Result<String, String>,
+    W: FnMut(&Path) -> Result<String, String>,
     N: FnMut(&str) -> Result<String, String>,
     E: FnMut(&str, &str) -> Result<String, String>,
     F: FnMut() -> Result<Vec<WorkspaceView>, String>,
 {
     let mut terminal = ratatui::init();
-    let result = run_loop(&mut terminal, App::new(workspaces), actions);
+    let result = run_loop(
+        &mut terminal,
+        App::new(workspaces, project_context),
+        actions,
+    );
     ratatui::restore();
     result
 }
@@ -372,7 +505,7 @@ where
     R: FnMut(&str) -> Result<String, String>,
     O: FnMut(&str) -> Result<String, String>,
     C: FnMut(&str) -> Result<String, String>,
-    W: FnMut(&str) -> Result<String, String>,
+    W: FnMut(&Path) -> Result<String, String>,
     N: FnMut(&str) -> Result<String, String>,
     E: FnMut(&str, &str) -> Result<String, String>,
     F: FnMut() -> Result<Vec<WorkspaceView>, String>,
@@ -394,8 +527,14 @@ where
         if key.kind != KeyEventKind::Press {
             continue;
         }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            return Ok(());
+        }
 
         if app.pending_close.is_some() {
+            if !key.modifiers.is_empty() {
+                continue;
+            }
             match key.code {
                 KeyCode::Char('y') => {
                     app.confirm_close(&mut actions.on_close);
@@ -412,12 +551,16 @@ where
             if handle_mode_key(
                 &mut app,
                 key.code,
+                key.modifiers,
                 &mut actions.on_create_workspace,
                 &mut actions.on_rename,
             ) {
                 app.refresh(&mut actions.on_refresh);
                 last_refresh = Instant::now();
             }
+            continue;
+        }
+        if !key.modifiers.is_empty() {
             continue;
         }
 
@@ -454,35 +597,52 @@ where
 fn handle_mode_key<W, E>(
     app: &mut App,
     key: KeyCode,
+    modifiers: KeyModifiers,
     on_create_workspace: &mut W,
     on_rename: &mut E,
 ) -> bool
 where
-    W: FnMut(&str) -> Result<String, String>,
+    W: FnMut(&Path) -> Result<String, String>,
     E: FnMut(&str, &str) -> Result<String, String>,
 {
     let mode = std::mem::replace(&mut app.mode, Mode::Normal);
+    if !modifiers.difference(KeyModifiers::SHIFT).is_empty() {
+        app.mode = mode;
+        return false;
+    }
     match mode {
         Mode::Normal => false,
-        Mode::CreateWorkspace(mut input) => match key {
-            KeyCode::Enter if !input.trim().is_empty() => {
-                let name = input.trim().to_owned();
-                app.create_workspace(&name, on_create_workspace);
+        Mode::PickProject(mut picker) => match key {
+            KeyCode::Enter if picker.selected().is_some() => {
+                let directory = picker.selected().expect("selected project").path.clone();
+                app.create_workspace(&directory, on_create_workspace);
                 true
             }
             KeyCode::Esc => false,
+            KeyCode::Down => {
+                picker.next();
+                app.mode = Mode::PickProject(picker);
+                false
+            }
+            KeyCode::Up => {
+                picker.previous();
+                app.mode = Mode::PickProject(picker);
+                false
+            }
             KeyCode::Backspace => {
-                input.pop();
-                app.mode = Mode::CreateWorkspace(input);
+                picker.query.pop();
+                picker.update_matches();
+                app.mode = Mode::PickProject(picker);
                 false
             }
             KeyCode::Char(character) => {
-                input.push(character);
-                app.mode = Mode::CreateWorkspace(input);
+                picker.query.push(character);
+                picker.update_matches();
+                app.mode = Mode::PickProject(picker);
                 false
             }
             _ => {
-                app.mode = Mode::CreateWorkspace(input);
+                app.mode = Mode::PickProject(picker);
                 false
             }
         },
@@ -535,6 +695,108 @@ fn render(frame: &mut Frame, app: &mut App) {
     render_terminals(frame, terminal_area, app);
     render_metrics(frame, metrics_area, app);
     render_footer(frame, footer_area, app);
+    if let Mode::PickProject(picker) = &mut app.mode {
+        render_project_picker(frame, area, picker);
+    }
+}
+
+fn render_project_picker(frame: &mut Frame, area: Rect, picker: &mut ProjectPicker) {
+    let popup_area = centered_rect(area, 76, 65);
+    frame.render_widget(Clear, popup_area);
+    frame.render_widget(Block::new().style(Style::new().bg(BASE)), popup_area);
+    let [search_area, list_area, help_area] = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Fill(1),
+        Constraint::Length(2),
+    ])
+    .areas(popup_area);
+
+    let search = Paragraph::new(format!("> {}_", picker.query)).block(
+        Block::bordered()
+            .title(" Create workspace from project ")
+            .border_style(Style::new().fg(TEAL)),
+    );
+    frame.render_widget(search, search_area);
+
+    let items: Vec<_> = if picker.matches.is_empty() {
+        let message = if !picker.roots_configured {
+            let path = picker.config_path.as_deref().map_or_else(
+                || "config.toml".to_owned(),
+                |path| path.display().to_string(),
+            );
+            format!("No projects configured. Add [projects] roots to {path}")
+        } else if picker.query.is_empty() {
+            "No Git projects discovered in configured roots".to_owned()
+        } else {
+            "No matching projects".to_owned()
+        };
+        vec![ListItem::new(Span::styled(
+            message,
+            Style::new().fg(SUBTEXT),
+        ))]
+    } else {
+        let mut previous_group = None;
+        picker
+            .matches
+            .iter()
+            .filter_map(|index| picker.projects.get(*index))
+            .map(|project| {
+                let group = if previous_group.as_deref() == Some(project.group.as_str()) {
+                    String::new()
+                } else {
+                    previous_group = Some(project.group.clone());
+                    project.group.clone()
+                };
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        format!("{group:<14}"),
+                        Style::new().fg(TEAL).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!("{:<24}", project.name),
+                        Style::new().fg(TEXT).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(project.path.display().to_string(), Style::new().fg(SUBTEXT)),
+                ]))
+            })
+            .collect()
+    };
+    let list = List::new(items)
+        .block(
+            Block::bordered()
+                .title(format!(" {} projects ", picker.matches.len()))
+                .border_style(Style::new().fg(OVERLAY)),
+        )
+        .highlight_symbol("> ")
+        .highlight_style(Style::new().fg(TEXT).add_modifier(Modifier::REVERSED));
+    frame.render_stateful_widget(list, list_area, &mut picker.state);
+
+    let help = picker.warning.as_ref().map_or_else(
+        || {
+            Line::from(vec![
+                Span::styled(" type", Style::new().fg(TEAL)),
+                Span::raw(" filter  "),
+                Span::styled("up/down", Style::new().fg(BLUE)),
+                Span::raw(" select  "),
+                Span::styled("enter", Style::new().fg(GREEN)),
+                Span::raw(" create  "),
+                Span::styled("esc", Style::new().fg(RED)),
+                Span::raw(" cancel"),
+            ])
+        },
+        |warning| Line::from(Span::styled(format!(" {warning}"), Style::new().fg(YELLOW))),
+    );
+    frame.render_widget(Paragraph::new(help).style(Style::new().bg(BASE)), help_area);
+}
+
+fn centered_rect(area: Rect, width_percent: u16, height_percent: u16) -> Rect {
+    let [vertical] = Layout::vertical([Constraint::Percentage(height_percent)])
+        .flex(ratatui::layout::Flex::Center)
+        .areas(area);
+    let [horizontal] = Layout::horizontal([Constraint::Percentage(width_percent)])
+        .flex(ratatui::layout::Flex::Center)
+        .areas(vertical);
+    horizontal
 }
 
 fn render_header(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
@@ -740,15 +1002,6 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
             Span::styled("n/esc", Style::new().fg(GREEN)),
             Span::styled(" cancel", Style::new().fg(SUBTEXT)),
         ])
-    } else if let Mode::CreateWorkspace(input) = &app.mode {
-        Line::from(vec![
-            Span::styled(" Workspace name: ", Style::new().fg(YELLOW)),
-            Span::styled(format!("{input}_"), Style::new().fg(TEXT)),
-            Span::styled("  enter", Style::new().fg(GREEN)),
-            Span::raw(" create  "),
-            Span::styled("esc", Style::new().fg(RED)),
-            Span::raw(" cancel"),
-        ])
     } else if let Mode::Rename { input, .. } = &app.mode {
         Line::from(vec![
             Span::styled(" New shell name: ", Style::new().fg(YELLOW)),
@@ -770,7 +1023,7 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
             Span::styled("a", Style::new().fg(GREEN)),
             Span::styled(
                 if app.focus == Focus::Workspaces {
-                    " add workspace  "
+                    " find project  "
                 } else {
                     " add shell  "
                 },
@@ -830,7 +1083,29 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     fn app() -> App {
-        App::new(vec![workspace("w1", "boomux")])
+        App::new(vec![workspace("w1", "boomux")], project_context())
+    }
+
+    fn project_context() -> ProjectContext {
+        ProjectContext {
+            projects: vec![
+                ProjectView {
+                    name: "alpha".into(),
+                    path: "/tmp/alpha".into(),
+                    group: "Projects".into(),
+                    group_order: 0,
+                },
+                ProjectView {
+                    name: "boomux".into(),
+                    path: "/tmp/boomux".into(),
+                    group: "Work".into(),
+                    group_order: 1,
+                },
+            ],
+            config_path: Some("/tmp/config.toml".into()),
+            warning: None,
+            roots_configured: true,
+        }
     }
 
     fn workspace(id: &str, name: &str) -> WorkspaceView {
@@ -882,11 +1157,12 @@ mod tests {
         let mut created = None;
 
         assert!(!app.request_add(&mut |_| Ok(String::new())));
-        assert!(matches!(app.mode, Mode::CreateWorkspace(_)));
-        for character in "feature".chars() {
+        assert!(matches!(app.mode, Mode::PickProject(_)));
+        for character in "alp".chars() {
             handle_mode_key(
                 &mut app,
                 KeyCode::Char(character),
+                KeyModifiers::NONE,
                 &mut |_| Ok(String::new()),
                 &mut |_, _| Ok(String::new()),
             );
@@ -894,16 +1170,82 @@ mod tests {
         let changed = handle_mode_key(
             &mut app,
             KeyCode::Enter,
-            &mut |name| {
-                created = Some(name.to_owned());
+            KeyModifiers::NONE,
+            &mut |directory| {
+                created = Some(directory.to_owned());
                 Ok("Created workspace".into())
             },
             &mut |_, _| Ok(String::new()),
         );
 
         assert!(changed);
-        assert_eq!(created.as_deref(), Some("feature"));
+        assert_eq!(created.as_deref(), Some(Path::new("/tmp/alpha")));
         assert!(matches!(app.mode, Mode::Normal));
+    }
+
+    #[test]
+    fn project_search_matches_subsequences() {
+        let mut picker = ProjectPicker::new(&project_context());
+        picker.query = "bmx".into();
+        picker.update_matches();
+
+        assert_eq!(picker.matches.len(), 1);
+        assert_eq!(
+            picker.selected().map(|project| project.name.as_str()),
+            Some("boomux")
+        );
+    }
+
+    #[test]
+    fn project_search_preserves_root_groups() {
+        let mut picker = ProjectPicker::new(&project_context());
+        picker.query = "tmp".into();
+        picker.update_matches();
+
+        let groups: Vec<_> = picker
+            .matches
+            .iter()
+            .map(|index| picker.projects[*index].group.as_str())
+            .collect();
+        assert_eq!(groups, ["Projects", "Work"]);
+    }
+
+    #[test]
+    fn project_search_ignores_modified_characters() {
+        let mut app = app();
+        app.request_add(&mut |_| Ok(String::new()));
+
+        handle_mode_key(
+            &mut app,
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+            &mut |_| Ok(String::new()),
+            &mut |_, _| Ok(String::new()),
+        );
+
+        let Mode::PickProject(picker) = &app.mode else {
+            panic!("expected project picker");
+        };
+        assert!(picker.query.is_empty());
+    }
+
+    #[test]
+    fn project_search_accepts_shifted_characters() {
+        let mut app = app();
+        app.request_add(&mut |_| Ok(String::new()));
+
+        handle_mode_key(
+            &mut app,
+            KeyCode::Char('_'),
+            KeyModifiers::SHIFT,
+            &mut |_| Ok(String::new()),
+            &mut |_, _| Ok(String::new()),
+        );
+
+        let Mode::PickProject(picker) = &app.mode else {
+            panic!("expected project picker");
+        };
+        assert_eq!(picker.query, "_");
     }
 
     #[test]
@@ -947,6 +1289,7 @@ mod tests {
             handle_mode_key(
                 &mut app,
                 KeyCode::Char(character),
+                KeyModifiers::NONE,
                 &mut |_| Ok(String::new()),
                 &mut |_, _| Ok(String::new()),
             );
@@ -954,6 +1297,7 @@ mod tests {
         let changed = handle_mode_key(
             &mut app,
             KeyCode::Enter,
+            KeyModifiers::NONE,
             &mut |_| Ok(String::new()),
             &mut |pane_id, name| {
                 renamed = Some((pane_id.to_owned(), name.to_owned()));
@@ -1018,7 +1362,10 @@ mod tests {
 
     #[test]
     fn refresh_preserves_the_selected_workspace() {
-        let mut app = App::new(vec![workspace("w1", "one"), workspace("w2", "two")]);
+        let mut app = App::new(
+            vec![workspace("w1", "one"), workspace("w2", "two")],
+            project_context(),
+        );
         app.next();
 
         app.replace_workspaces(vec![workspace("w2", "two"), workspace("w3", "three")]);
@@ -1031,7 +1378,10 @@ mod tests {
 
     #[test]
     fn refresh_removes_stale_workspaces_and_repairs_selection() {
-        let mut app = App::new(vec![workspace("w1", "one"), workspace("w2", "two")]);
+        let mut app = App::new(
+            vec![workspace("w1", "one"), workspace("w2", "two")],
+            project_context(),
+        );
         app.next();
 
         app.replace_workspaces(vec![workspace("w1", "one")]);
@@ -1049,6 +1399,16 @@ mod tests {
         let backend = TestBackend::new(120, 34);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = app();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    }
+
+    #[test]
+    fn project_launcher_renders_to_test_backend() {
+        let backend = TestBackend::new(120, 34);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = app();
+        app.request_add(&mut |_| Ok(String::new()));
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
     }

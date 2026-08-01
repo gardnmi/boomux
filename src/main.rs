@@ -6,6 +6,8 @@ use std::process::{Command, ExitCode, Stdio};
 use clap::{Parser, Subcommand};
 use serde::Deserialize;
 
+mod config;
+mod projects;
 mod tui;
 
 #[derive(Parser)]
@@ -168,8 +170,28 @@ fn picker() -> Result<(), Box<dyn Error>> {
 fn dashboard() -> Result<(), Box<dyn Error>> {
     ensure_host_terminal()?;
     let views = dashboard_snapshot()?;
+    let config = config::load()?;
+    let roots_configured = !config.projects.roots.is_empty();
+    let discovery = projects::discover(&config.projects);
+    let project_views = discovery
+        .projects
+        .into_iter()
+        .map(|project| tui::ProjectView {
+            name: project.name,
+            path: project.path,
+            group: project.group,
+            group_order: project.group_order,
+        })
+        .collect();
+    let project_context = tui::ProjectContext {
+        projects: project_views,
+        config_path: config.path.or_else(config::global_config_path),
+        warning: (!discovery.warnings.is_empty()).then(|| discovery.warnings.join("; ")),
+        roots_configured,
+    };
     tui::run(
         views,
+        project_context,
         tui::Actions {
             on_restore: |workspace_id: &str| {
                 let panes = load_panes().map_err(|error| error.to_string())?;
@@ -200,8 +222,8 @@ fn dashboard() -> Result<(), Box<dyn Error>> {
                 close_workspace(workspace_id).map_err(|error| error.to_string())?;
                 Ok(format!("Closed {label} and all of its shells"))
             },
-            on_create_workspace: |name: &str| {
-                create_dashboard_workspace(name).map_err(|error| error.to_string())
+            on_create_workspace: |directory: &Path| {
+                create_dashboard_workspace(directory).map_err(|error| error.to_string())
             },
             on_create_shell: |workspace_id: &str| {
                 create_dashboard_shell(workspace_id).map_err(|error| error.to_string())
@@ -310,10 +332,9 @@ fn open_directory(
 fn default_workspace_name(directory: &Path) -> String {
     directory
         .file_name()
-        .and_then(|name| name.to_str())
+        .map(|name| name.to_string_lossy().into_owned())
         .filter(|name| !name.is_empty())
-        .unwrap_or("default")
-        .to_owned()
+        .unwrap_or_else(|| "default".into())
 }
 
 fn ensure_host_terminal() -> Result<(), Box<dyn Error>> {
@@ -462,19 +483,16 @@ fn create_tab_terminal(
     Ok(response.result.root_pane)
 }
 
-fn create_dashboard_workspace(name: &str) -> Result<String, Box<dyn Error>> {
-    let name = name.trim();
-    if name.is_empty() {
-        return Err("workspace name cannot be empty".into());
-    }
-    let cwd = env::current_dir()?.canonicalize()?;
+fn create_dashboard_workspace(directory: &Path) -> Result<String, Box<dyn Error>> {
+    let cwd = resolve_directory(directory)?;
+    let name = default_workspace_name(&cwd);
     let panes = load_panes()?;
     let workspaces = load_workspaces()?;
-    if find_workspace(&workspaces, &panes, &cwd, name).is_some() {
+    if find_workspace(&workspaces, &panes, &cwd, &name).is_some() {
         return Err(format!("workspace {name} already exists in {}", cwd.display()).into());
     }
 
-    let pane = create_workspace(&cwd, name)?.root_pane;
+    let pane = create_workspace(&cwd, &name)?.root_pane;
     if let Err(error) = rename_pane(&pane.pane_id, "shell-1") {
         return Err(with_cleanup_error(
             error,
@@ -711,10 +729,33 @@ fn doctor() -> Result<(), Box<dyn Error>> {
         }
     }
 
+    match config::load() {
+        Ok(config) => {
+            let discovery = projects::discover(&config.projects);
+            let count = discovery.projects.len();
+            let source = config
+                .path
+                .map_or_else(|| "defaults".to_owned(), |path| path.display().to_string());
+            if discovery.warnings.is_empty() {
+                println!("ok  config: {source} ({count} projects)");
+            } else {
+                healthy = false;
+                eprintln!("err config: {source} ({count} projects)");
+                for warning in discovery.warnings {
+                    eprintln!("    {warning}");
+                }
+            }
+        }
+        Err(error) => {
+            healthy = false;
+            eprintln!("err config: {error}");
+        }
+    }
+
     if healthy {
         Ok(())
     } else {
-        Err("one or more dependencies are unavailable".into())
+        Err("one or more dependency or configuration checks failed".into())
     }
 }
 
@@ -766,6 +807,19 @@ mod tests {
         assert!(cli.name.is_none());
         assert!(!cli.new_window);
         assert!(cli.command.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn derives_a_visible_name_from_non_utf8_directories() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let directory = PathBuf::from(OsString::from_vec(b"/tmp/project-\x80".to_vec()));
+        let name = default_workspace_name(&directory);
+
+        assert!(name.starts_with("project-"));
+        assert_ne!(name, "default");
     }
 
     #[test]

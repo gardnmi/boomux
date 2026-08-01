@@ -72,9 +72,10 @@ between workspaces and terminals, then `j`/`k` or the arrow keys to navigate.
 
 - `Enter` restores the selected workspace or opens only the selected terminal,
   depending on which table is focused.
-- `a` creates a workspace with one shell from workspace focus, or adds one plain
-  shell from terminal focus. New workspaces use the directory where the
-  dashboard was launched.
+- `a` opens the project launcher from workspace focus, or adds one plain shell
+  from terminal focus. Type to filter configured Git projects, use Up/Down to
+  select one, and press Enter to create a basename-named workspace with
+  `shell-1`.
 - `e` renames the selected terminal when the terminal table is focused.
 - `x`, then `y`, closes the selected workspace and all of its shells.
 - `r` refreshes immediately; `q` or `Esc` quits.
@@ -102,6 +103,27 @@ dashboard follows theme changes in the same way as LazyGit.
 Restored terminals take over stale writable attachments while keeping their
 shell or agent processes running. Closing every Ghostty window leaves the
 Herdr-owned workspace and terminals alive for later restoration.
+
+## Configuration
+
+Boomux reads optional user configuration from
+`$XDG_CONFIG_HOME/boomux/config.toml`, falling back to
+`~/.config/boomux/config.toml`. Set `BOOMUX_CONFIG` to load another file after
+the global file; fields present in the override take precedence.
+
+```toml
+[projects]
+roots = ["~/Projects", "~/Work"]
+max_depth = 3
+```
+
+Project roots must be absolute or start with `~`. Boomux recursively discovers
+Git repositories up to `max_depth`, skips hidden and common generated
+directories, and stops descending after it finds a repository. Launcher results
+are visually grouped by each configured root's directory name while sharing one
+search query. No directories are scanned unless roots are explicitly configured.
+`boomux doctor` validates the configuration and reports how many projects were
+discovered.
 
 Boomux must be launched from a fresh terminal rather than from inside a
 Herdr-managed pane. The picker also hides panes whose foreground process is
@@ -133,7 +155,7 @@ server-owned terminal and its child processes continue running in Herdr.
 - Rust 2024 for a small native executable and alignment with Herdr's ecosystem
 - Clap for the CLI
 - Ratatui with the Crossterm backend for the dashboard
-- Serde for Herdr CLI responses
+- Serde and TOML for Herdr responses and layered user configuration
 - Gum for the interactive session chooser
 - Ghostty and Herdr as external runtime dependencies
 
