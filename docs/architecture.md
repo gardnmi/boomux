@@ -64,6 +64,21 @@ Dashboard colors use semantic ANSI roles and the terminal's default foreground
 and background. This keeps the TUI portable while allowing terminal-level theme
 systems such as Omarchy to supply the concrete palette.
 
+## Project Discovery
+
+The dashboard loads global TOML configuration from the XDG config directory and
+then merges an optional `BOOMUX_CONFIG` file over it. Project discovery walks
+only explicitly configured roots to a bounded depth, recognizes Git worktrees
+as well as ordinary repositories through their `.git` marker, and does not
+descend into repositories after discovering them.
+
+The resulting canonical paths and source-root labels are passed to the dashboard
+as a sorted snapshot. Workspace creation uses a grouped type-to-filter launcher
+over that snapshot; all groups share one query, and the selected project's
+basename becomes the workspace name. Configuration loading and filesystem
+discovery remain outside the TUI so input and rendering do not perform filesystem
+scans.
+
 ### Ghostty Launcher
 
 Creates native windows with stable human-readable titles. Boomux does not rely
