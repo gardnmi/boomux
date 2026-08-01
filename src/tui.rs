@@ -6,7 +6,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
     Block, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState,
 };
@@ -25,8 +25,11 @@ const REFRESH_INTERVAL: Duration = Duration::from_millis(250);
 pub(crate) struct WorkspaceView {
     pub(crate) id: String,
     pub(crate) name: String,
-    pub(crate) status: String,
     pub(crate) directory: String,
+    pub(crate) repository: String,
+    pub(crate) branch: String,
+    pub(crate) git_state: String,
+    pub(crate) worktree: String,
     pub(crate) terminals: Vec<TerminalView>,
 }
 
@@ -675,17 +678,10 @@ fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
     frame.render_widget(Block::new().style(Style::new().bg(BASE)), area);
 
-    let [
-        header_area,
-        workspace_area,
-        terminal_area,
-        metrics_area,
-        footer_area,
-    ] = Layout::vertical([
+    let [header_area, workspace_area, terminal_area, footer_area] = Layout::vertical([
         Constraint::Length(3),
         Constraint::Percentage(38),
         Constraint::Fill(1),
-        Constraint::Length(5),
         Constraint::Length(1),
     ])
     .areas(area);
@@ -693,7 +689,6 @@ fn render(frame: &mut Frame, app: &mut App) {
     render_header(frame, header_area, app);
     render_workspaces(frame, workspace_area, app);
     render_terminals(frame, terminal_area, app);
-    render_metrics(frame, metrics_area, app);
     render_footer(frame, footer_area, app);
     if let Mode::PickProject(picker) = &mut app.mode {
         render_project_picker(frame, area, picker);
@@ -829,48 +824,163 @@ fn render_header(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
 }
 
 fn render_workspaces(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
-    let header = Row::new(["#", "NAME", "STATUS", "SHELLS", "DIRECTORY", "ID"])
-        .style(Style::new().fg(BLUE).add_modifier(Modifier::BOLD));
-    let rows = app.workspaces.iter().enumerate().map(|(index, workspace)| {
-        Row::new(vec![
-            Cell::from((index + 1).to_string()),
-            Cell::from(workspace.name.as_str()),
-            Cell::from(status_span(&workspace.status)),
-            Cell::from(workspace.terminals.len().to_string()),
-            Cell::from(workspace.directory.as_str()),
-            Cell::from(workspace.id.as_str()),
-        ])
-    });
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(4),
-            Constraint::Length(20),
-            Constraint::Length(12),
-            Constraint::Length(8),
-            Constraint::Min(24),
-            Constraint::Length(12),
-        ],
-    )
-    .header(header)
-    .column_spacing(1)
-    .block(
-        Block::bordered()
-            .title(" Workspaces ")
-            .border_style(Style::new().fg(if app.focus == Focus::Workspaces {
-                TEAL
-            } else {
-                OVERLAY
-            })),
-    )
-    .row_highlight_style(
-        Style::new()
-            .fg(TEXT)
-            .add_modifier(Modifier::BOLD | Modifier::REVERSED),
-    )
-    .highlight_symbol("> ");
+    let (header, rows, widths) = if area.width >= 140 {
+        let rows: Vec<_> = app
+            .workspaces
+            .iter()
+            .enumerate()
+            .map(|(index, workspace)| {
+                Row::new(vec![
+                    Cell::from((index + 1).to_string()),
+                    Cell::from(workspace.name.as_str()),
+                    Cell::from(workspace.repository.as_str()),
+                    Cell::from(workspace.branch.as_str()),
+                    git_state_cell(&workspace.git_state),
+                    Cell::from(workspace.worktree.as_str()),
+                    Cell::from(workspace.terminals.len().to_string()),
+                    Cell::from(workspace.directory.as_str()),
+                ])
+            })
+            .collect();
+        (
+            Row::new([
+                "#",
+                "NAME",
+                "REPOSITORY",
+                "BRANCH",
+                "DIRTY",
+                "WORKTREE",
+                "SHELLS",
+                "DIRECTORY",
+            ]),
+            rows,
+            vec![
+                Constraint::Length(4),
+                Constraint::Length(18),
+                Constraint::Length(18),
+                Constraint::Length(22),
+                Constraint::Length(12),
+                Constraint::Length(18),
+                Constraint::Length(8),
+                Constraint::Min(24),
+            ],
+        )
+    } else if area.width >= 100 {
+        let rows: Vec<_> = app
+            .workspaces
+            .iter()
+            .enumerate()
+            .map(|(index, workspace)| {
+                let name = if workspace.repository == "-" || workspace.repository == workspace.name
+                {
+                    workspace.name.clone()
+                } else {
+                    format!("{} / {}", workspace.name, workspace.repository)
+                };
+                Row::new(vec![
+                    Cell::from((index + 1).to_string()),
+                    Cell::from(name),
+                    Cell::from(workspace.branch.as_str()),
+                    git_state_cell(&workspace.git_state),
+                    Cell::from(workspace.worktree.as_str()),
+                    Cell::from(workspace.terminals.len().to_string()),
+                ])
+            })
+            .collect();
+        (
+            Row::new([
+                "#",
+                "WORKSPACE / REPOSITORY",
+                "BRANCH",
+                "DIRTY",
+                "WORKTREE",
+                "SHELLS",
+            ]),
+            rows,
+            vec![
+                Constraint::Length(4),
+                Constraint::Min(20),
+                Constraint::Length(18),
+                Constraint::Length(12),
+                Constraint::Length(18),
+                Constraint::Length(7),
+            ],
+        )
+    } else {
+        let rows: Vec<_> = app
+            .workspaces
+            .iter()
+            .enumerate()
+            .map(|(index, workspace)| {
+                let name = if workspace.repository == "-" || workspace.repository == workspace.name
+                {
+                    workspace.name.clone()
+                } else {
+                    format!("{} / {}", workspace.name, workspace.repository)
+                };
+                Row::new(vec![
+                    Cell::from((index + 1).to_string()),
+                    Cell::from(Text::from(vec![
+                        Line::from(name),
+                        Line::from(format!(
+                            "{} shell{}",
+                            workspace.terminals.len(),
+                            if workspace.terminals.len() == 1 {
+                                ""
+                            } else {
+                                "s"
+                            }
+                        )),
+                    ])),
+                    Cell::from(Text::from(vec![
+                        Line::from(workspace.branch.as_str()),
+                        Line::from(vec![
+                            Span::styled(
+                                workspace.git_state.as_str(),
+                                Style::new().fg(git_state_color(&workspace.git_state)),
+                            ),
+                            Span::raw(" | "),
+                            Span::raw(workspace.worktree.as_str()),
+                        ]),
+                    ])),
+                ])
+                .height(2)
+            })
+            .collect();
+        (
+            Row::new(["#", "WORKSPACE / REPOSITORY", "GIT DETAILS"]),
+            rows,
+            vec![
+                Constraint::Length(4),
+                Constraint::Min(24),
+                Constraint::Length(34),
+            ],
+        )
+    };
+    let table = Table::new(rows, widths)
+        .header(header.style(Style::new().fg(BLUE).add_modifier(Modifier::BOLD)))
+        .column_spacing(1)
+        .block(
+            Block::bordered()
+                .title(" Workspaces ")
+                .border_style(Style::new().fg(if app.focus == Focus::Workspaces {
+                    TEAL
+                } else {
+                    OVERLAY
+                })),
+        )
+        .row_highlight_style(
+            Style::new()
+                .fg(TEXT)
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED),
+        )
+        .highlight_symbol("> ");
 
     frame.render_stateful_widget(table, area, &mut app.workspace_state);
+}
+
+fn git_state_cell(state: &str) -> Cell<'_> {
+    Cell::from(Span::styled(state, Style::new().fg(git_state_color(state))))
 }
 
 fn render_terminals(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
@@ -926,65 +1036,6 @@ fn render_terminals(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut Ap
     )
     .highlight_symbol("> ");
     frame.render_stateful_widget(table, area, &mut app.terminal_state);
-}
-
-fn render_metrics(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
-    let [name_area, id_area, shells_area, status_area] = Layout::horizontal([
-        Constraint::Ratio(1, 4),
-        Constraint::Ratio(1, 4),
-        Constraint::Ratio(1, 4),
-        Constraint::Ratio(1, 4),
-    ])
-    .areas(area);
-    let selected = app.selected();
-
-    render_metric(
-        frame,
-        name_area,
-        "Workspace",
-        selected.map_or("-", |workspace| workspace.name.as_str()),
-        TEXT,
-    );
-    render_metric(
-        frame,
-        id_area,
-        "Herdr ID",
-        selected.map_or("-", |workspace| workspace.id.as_str()),
-        BLUE,
-    );
-    let shell_count = selected
-        .map(|workspace| workspace.terminals.len().to_string())
-        .unwrap_or_else(|| "0".into());
-    render_metric(frame, shells_area, "Shells", &shell_count, GREEN);
-    let status = selected.map_or("-", |workspace| workspace.status.as_str());
-    render_metric(
-        frame,
-        status_area,
-        "Agent State",
-        status,
-        status_color(status),
-    );
-}
-
-fn render_metric(
-    frame: &mut Frame,
-    area: ratatui::layout::Rect,
-    title: &str,
-    value: &str,
-    color: Color,
-) {
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            format!(" {value}"),
-            Style::new().fg(color).add_modifier(Modifier::BOLD),
-        )))
-        .block(
-            Block::bordered()
-                .title(format!(" {title} "))
-                .border_style(Style::new().fg(OVERLAY)),
-        ),
-        area,
-    );
 }
 
 fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
@@ -1058,10 +1109,6 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     frame.render_widget(Paragraph::new(line), area);
 }
 
-fn status_span(status: &str) -> Span<'_> {
-    Span::styled(status_label(status), Style::new().fg(status_color(status)))
-}
-
 fn status_label(status: &str) -> &str {
     if status == "unknown" { "-" } else { status }
 }
@@ -1073,6 +1120,18 @@ fn status_color(status: &str) -> Color {
         "idle" => GREEN,
         "unknown" | "-" => SUBTEXT,
         _ => TEAL,
+    }
+}
+
+fn git_state_color(state: &str) -> Color {
+    if state == "clean" {
+        GREEN
+    } else if state.contains("conflict") {
+        RED
+    } else if state == "-" || state == "unknown" {
+        SUBTEXT
+    } else {
+        YELLOW
     }
 }
 
@@ -1112,8 +1171,11 @@ mod tests {
         WorkspaceView {
             id: id.into(),
             name: name.into(),
-            status: "working".into(),
             directory: "/tmp/boomux".into(),
+            repository: "boomux".into(),
+            branch: "main".into(),
+            git_state: "clean".into(),
+            worktree: "primary".into(),
             terminals: vec![TerminalView {
                 id: "term_1".into(),
                 pane_id: "w1:p1".into(),
@@ -1133,6 +1195,14 @@ mod tests {
         assert_eq!(app.selected_index(), Some(0));
         app.previous();
         assert_eq!(app.selected_index(), Some(0));
+    }
+
+    #[test]
+    fn git_states_use_semantic_colors() {
+        assert_eq!(git_state_color("clean"), GREEN);
+        assert_eq!(git_state_color("3 changed"), YELLOW);
+        assert_eq!(git_state_color("1 conflict"), RED);
+        assert_eq!(git_state_color("-"), SUBTEXT);
     }
 
     #[test]
@@ -1401,6 +1471,58 @@ mod tests {
         let mut app = app();
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("BRANCH"));
+        assert!(text.contains("DIRTY"));
+        assert!(text.contains("WORKTREE"));
+        assert!(text.contains("SHELLS"));
+        assert!(text.contains("primary"));
+    }
+
+    #[test]
+    fn wide_dashboard_renders_repository_and_directory_columns() {
+        let backend = TestBackend::new(180, 34);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = app();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("REPOSITORY"));
+        assert!(text.contains("DIRECTORY"));
+    }
+
+    #[test]
+    fn narrow_dashboard_keeps_workspace_and_git_details_visible() {
+        let backend = TestBackend::new(80, 34);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = app();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("WORKSPACE / REPOSITORY"));
+        assert!(text.contains("GIT DETAILS"));
+        assert!(text.contains("main"));
+        assert!(text.contains("clean"));
+        assert!(text.contains("primary"));
+        assert!(text.contains("1 shell"));
     }
 
     #[test]
