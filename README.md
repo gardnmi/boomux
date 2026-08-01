@@ -66,9 +66,11 @@ For a full workspace overview, open the Ratatui dashboard:
 boomux ui
 ```
 
-The dashboard provides workspace and terminal tables, aggregate status cards,
-and live Herdr state refreshed four times per second. Use `Tab` to switch focus
-between workspaces and terminals, then `j`/`k` or the arrow keys to navigate.
+The dashboard provides workspace and terminal tables with live Herdr state
+refreshed four times per second. Workspace rows include the Git repository,
+branch, clean or changed state, and primary or linked worktree. Use `Tab` to
+switch focus between workspaces and terminals, then `j`/`k` or the arrow keys to
+navigate.
 
 - `Enter` restores the selected workspace or opens only the selected terminal,
   depending on which table is focused.
@@ -157,7 +159,7 @@ server-owned terminal and its child processes continue running in Herdr.
 - Ratatui with the Crossterm backend for the dashboard
 - Serde and TOML for Herdr responses and layered user configuration
 - Gum for the interactive session chooser
-- Ghostty and Herdr as external runtime dependencies
+- Git, Ghostty, and Herdr as external runtime dependencies
 
 The MVP uses Gum rather than maintaining its own TUI framework, and the Herdr
 CLI rather than a custom socket client. Dependencies are added only when a

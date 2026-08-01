@@ -49,12 +49,16 @@ launches a Ghostty window for every terminal belonging to that Herdr workspace.
 
 ### Dashboard
 
-Provides a Ratatui overview of workspaces, terminals, directories, and agent
-state. It is a control plane only: restoring a workspace still launches native
-Ghostty windows rather than embedding terminal sessions in the dashboard. The
-dashboard remains open after restoration so it can continue managing other
-workspaces. It refreshes from Herdr four times per second and validates the
-selected workspace against a fresh snapshot before launching Ghostty windows.
+Provides a Ratatui overview of workspaces, terminals, directories, Git state,
+and per-terminal agent state. It is a control plane only: restoring a workspace
+still launches native Ghostty windows rather than embedding terminal sessions in
+the dashboard. The dashboard remains open after restoration so it can continue
+managing other workspaces. It refreshes from Herdr four times per second and
+validates the selected workspace against a fresh snapshot before launching
+Ghostty windows.
+Repository name, branch, dirty state, and primary or linked worktree information
+come from the Git CLI and are cached for two seconds so the faster Herdr refresh
+does not repeatedly spawn Git processes.
 Closing a workspace uses Herdr's atomic workspace close command after explicit
 confirmation, terminating every shell in that workspace. Shell creation uses
 Herdr tabs, and pane labels provide durable shell names for the dashboard,

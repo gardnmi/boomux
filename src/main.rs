@@ -7,6 +7,7 @@ use clap::{Parser, Subcommand};
 use serde::Deserialize;
 
 mod config;
+mod git;
 mod projects;
 mod tui;
 
@@ -169,7 +170,8 @@ fn picker() -> Result<(), Box<dyn Error>> {
 
 fn dashboard() -> Result<(), Box<dyn Error>> {
     ensure_host_terminal()?;
-    let views = dashboard_snapshot()?;
+    let mut git_cache = git::Cache::default();
+    let views = dashboard_snapshot(&mut git_cache)?;
     let config = config::load()?;
     let roots_configured = !config.projects.roots.is_empty();
     let discovery = projects::discover(&config.projects);
@@ -232,24 +234,31 @@ fn dashboard() -> Result<(), Box<dyn Error>> {
                 rename_pane(pane_id, name).map_err(|error| error.to_string())?;
                 Ok(format!("Renamed shell to {name}"))
             },
-            on_refresh: || dashboard_snapshot().map_err(|error| error.to_string()),
+            on_refresh: || dashboard_snapshot(&mut git_cache).map_err(|error| error.to_string()),
         },
     )?;
     Ok(())
 }
 
-fn dashboard_snapshot() -> Result<Vec<tui::WorkspaceView>, Box<dyn Error>> {
+fn dashboard_snapshot(
+    git_cache: &mut git::Cache,
+) -> Result<Vec<tui::WorkspaceView>, Box<dyn Error>> {
     let panes = load_panes()?;
     let workspaces = load_workspaces()?;
-    Ok(dashboard_views(&workspaces, &panes))
+    Ok(dashboard_views(&workspaces, &panes, git_cache))
 }
 
-fn dashboard_views(workspaces: &[Workspace], panes: &[Pane]) -> Vec<tui::WorkspaceView> {
+fn dashboard_views(
+    workspaces: &[Workspace],
+    panes: &[Pane],
+    git_cache: &mut git::Cache,
+) -> Vec<tui::WorkspaceView> {
     workspaces
         .iter()
         .filter_map(|workspace| {
             let workspace_panes: Vec<_> = workspace_panes(&workspace.workspace_id, panes).collect();
             let directory = workspace_panes.first()?.cwd.clone();
+            let git = git_cache.inspect(Path::new(&directory));
             let terminals = workspace_panes
                 .into_iter()
                 .map(|pane| tui::TerminalView {
@@ -264,8 +273,11 @@ fn dashboard_views(workspaces: &[Workspace], panes: &[Pane]) -> Vec<tui::Workspa
             Some(tui::WorkspaceView {
                 id: workspace.workspace_id.clone(),
                 name: workspace.label.clone(),
-                status: workspace.agent_status.clone(),
                 directory,
+                repository: git.repository,
+                branch: git.branch,
+                git_state: git.state,
+                worktree: git.worktree,
                 terminals,
             })
         })
@@ -712,7 +724,7 @@ fn load_workspaces() -> Result<Vec<Workspace>, Box<dyn Error>> {
 fn doctor() -> Result<(), Box<dyn Error>> {
     let mut healthy = true;
 
-    for command in ["ghostty", "herdr", "gum"] {
+    for command in ["ghostty", "herdr", "gum", "git"] {
         match Command::new(command).arg("--version").output() {
             Ok(output) if output.status.success() => {
                 let version = String::from_utf8_lossy(&output.stdout);

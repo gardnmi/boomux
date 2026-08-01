@@ -1,7 +1,27 @@
-# Product Ideas
+# Roadmap
 
-Boomux is under active development. This document collects possible directions
-for exploration; it is not a release commitment.
+Boomux is under active development. This document tracks shipped capabilities
+and possible directions for exploration; future ideas are not release
+commitments.
+
+## Completed
+
+- [x] Manage persistent Herdr workspaces and shells from a live Ratatui
+  dashboard.
+- [x] Restore a whole workspace into native Ghostty windows or open only one
+  selected terminal.
+- [x] Create workspaces from a searchable Git project launcher grouped by
+  configured roots.
+- [x] Load layered TOML configuration from the XDG config directory and an
+  optional `BOOMUX_CONFIG` override.
+- [x] Add plain shells, assign durable shell names, and carry those names into
+  the dashboard, Ghostty titles, and dynamic Starship prompts.
+- [x] Close a workspace and all of its shells through an explicit confirmation.
+- [x] Follow the active terminal theme through semantic ANSI colors.
+- [x] Display repository, branch, dirty state, and primary or linked worktree
+  information for each workspace.
+- [x] Validate runtime dependencies, configuration, and project discovery with
+  `boomux doctor`.
 
 ## Workspace Control
 
@@ -9,10 +29,8 @@ for exploration; it is not a release commitment.
   value.
 - Notify when an agent becomes blocked, finishes, or needs input.
 - Create shells, OpenCode, LazyGit, and custom commands from the dashboard.
-- Name individual shells and carry those names into Ghostty titles and prompts.
 - Show an opt-in, read-only preview of the selected terminal.
 - Search workspaces and actions from a command palette.
-- Display repository, branch, dirty state, and worktree information.
 - Launch workspace templates such as editor, agent, tests, and LazyGit.
 - Duplicate a workspace structure for another branch or worktree.
 - Archive inactive workspaces without terminating their shells.
