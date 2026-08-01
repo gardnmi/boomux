@@ -173,6 +173,7 @@ fn dashboard() -> Result<(), Box<dyn Error>> {
     let mut git_cache = git::Cache::default();
     let views = dashboard_snapshot(&mut git_cache)?;
     let config = config::load()?;
+    let recipes = config.recipes.clone();
     let roots_configured = !config.projects.roots.is_empty();
     let discovery = projects::discover(&config.projects);
     let project_views = discovery
@@ -187,6 +188,18 @@ fn dashboard() -> Result<(), Box<dyn Error>> {
         .collect();
     let project_context = tui::ProjectContext {
         projects: project_views,
+        recipes: recipes
+            .iter()
+            .map(|recipe| tui::RecipeView {
+                id: recipe.id.clone(),
+                label: recipe.label.clone(),
+                terminals: recipe
+                    .terminals
+                    .iter()
+                    .map(|terminal| terminal.name.clone())
+                    .collect(),
+            })
+            .collect(),
         config_path: config.path.or_else(config::global_config_path),
         warning: (!discovery.warnings.is_empty()).then(|| discovery.warnings.join("; ")),
         roots_configured,
@@ -224,8 +237,9 @@ fn dashboard() -> Result<(), Box<dyn Error>> {
                 close_workspace(workspace_id).map_err(|error| error.to_string())?;
                 Ok(format!("Closed {label} and all of its shells"))
             },
-            on_create_workspace: |directory: &Path| {
-                create_dashboard_workspace(directory).map_err(|error| error.to_string())
+            on_create_workspace: |directory: &Path, recipe_id: Option<&str>| {
+                create_dashboard_workspace(directory, recipe_id, &recipes)
+                    .map_err(|error| error.to_string())
             },
             on_create_shell: |workspace_id: &str| {
                 create_dashboard_shell(workspace_id).map_err(|error| error.to_string())
@@ -315,7 +329,7 @@ fn open_directory(
         )
     } else {
         (
-            create_workspace(&directory, &name)?.root_pane,
+            create_workspace(&directory, &name, "shell-1")?.root_pane,
             "shell-1".into(),
             true,
         )
@@ -454,15 +468,12 @@ fn choose_workspace(
         .map(|choice| choice.workspace_id))
 }
 
-fn create_workspace(cwd: &Path, name: &str) -> Result<WorkspaceCreateResult, Box<dyn Error>> {
-    let output = Command::new("herdr")
-        .args(["workspace", "create", "--cwd"])
-        .arg(cwd)
-        .args(["--label", name])
-        .args(["--env", &format!("BOOMUX_WORKSPACE={name}")])
-        .args(["--env", "BOOMUX_SHELL_NAME=shell-1"])
-        .arg("--focus")
-        .output()?;
+fn create_workspace(
+    cwd: &Path,
+    name: &str,
+    shell_name: &str,
+) -> Result<WorkspaceCreateResult, Box<dyn Error>> {
+    let output = workspace_create_command(cwd, name, shell_name).output()?;
     if !output.status.success() {
         let message = String::from_utf8_lossy(&output.stderr);
         return Err(format!("could not create Herdr terminal: {}", message.trim()).into());
@@ -472,20 +483,25 @@ fn create_workspace(cwd: &Path, name: &str) -> Result<WorkspaceCreateResult, Box
     Ok(response.result)
 }
 
+fn workspace_create_command(cwd: &Path, name: &str, shell_name: &str) -> Command {
+    let mut command = Command::new("herdr");
+    command
+        .args(["workspace", "create", "--cwd"])
+        .arg(cwd)
+        .args(["--label", name])
+        .args(["--env", &format!("BOOMUX_WORKSPACE={name}")])
+        .args(["--env", &format!("BOOMUX_SHELL_NAME={shell_name}")])
+        .arg("--focus");
+    command
+}
+
 fn create_tab_terminal(
     workspace_id: &str,
     cwd: &Path,
     workspace_name: &str,
     shell_name: &str,
 ) -> Result<Pane, Box<dyn Error>> {
-    let output = Command::new("herdr")
-        .args(["tab", "create", "--workspace", workspace_id, "--cwd"])
-        .arg(cwd)
-        .args(["--label", shell_name])
-        .args(["--env", &format!("BOOMUX_WORKSPACE={workspace_name}")])
-        .args(["--env", &format!("BOOMUX_SHELL_NAME={shell_name}")])
-        .arg("--focus")
-        .output()?;
+    let output = tab_create_command(workspace_id, cwd, workspace_name, shell_name).output()?;
     if !output.status.success() {
         let message = String::from_utf8_lossy(&output.stderr);
         return Err(format!("could not create Herdr terminal: {}", message.trim()).into());
@@ -495,7 +511,28 @@ fn create_tab_terminal(
     Ok(response.result.root_pane)
 }
 
-fn create_dashboard_workspace(directory: &Path) -> Result<String, Box<dyn Error>> {
+fn tab_create_command(
+    workspace_id: &str,
+    cwd: &Path,
+    workspace_name: &str,
+    shell_name: &str,
+) -> Command {
+    let mut command = Command::new("herdr");
+    command
+        .args(["tab", "create", "--workspace", workspace_id, "--cwd"])
+        .arg(cwd)
+        .args(["--label", shell_name])
+        .args(["--env", &format!("BOOMUX_WORKSPACE={workspace_name}")])
+        .args(["--env", &format!("BOOMUX_SHELL_NAME={shell_name}")])
+        .arg("--focus");
+    command
+}
+
+fn create_dashboard_workspace(
+    directory: &Path,
+    recipe_id: Option<&str>,
+    recipes: &[config::RecipeConfig],
+) -> Result<String, Box<dyn Error>> {
     let cwd = resolve_directory(directory)?;
     let name = default_workspace_name(&cwd);
     let panes = load_panes()?;
@@ -504,14 +541,102 @@ fn create_dashboard_workspace(directory: &Path) -> Result<String, Box<dyn Error>
         return Err(format!("workspace {name} already exists in {}", cwd.display()).into());
     }
 
-    let pane = create_workspace(&cwd, &name)?.root_pane;
-    if let Err(error) = rename_pane(&pane.pane_id, "shell-1") {
-        return Err(with_cleanup_error(
-            error,
-            close_workspace(&pane.workspace_id),
-        ));
+    let (recipe_label, terminals) = if let Some(recipe_id) = recipe_id {
+        let recipe = recipes
+            .iter()
+            .find(|recipe| recipe.id == recipe_id)
+            .ok_or_else(|| format!("recipe {recipe_id} no longer exists"))?;
+        (recipe.label.clone(), recipe.terminals.clone())
+    } else {
+        (
+            "Default".into(),
+            vec![config::RecipeTerminalConfig {
+                name: "shell-1".into(),
+                command: None,
+            }],
+        )
+    };
+
+    provision_recipe(
+        &terminals,
+        |terminal| Ok(create_workspace(&cwd, &name, &terminal.name)?.root_pane),
+        |workspace_id, terminal| create_tab_terminal(workspace_id, &cwd, &name, &terminal.name),
+        |pane, terminal| {
+            configure_recipe_terminal(pane, &terminal.name, terminal.command.as_deref())
+        },
+        close_workspace,
+    )?;
+    Ok(format!(
+        "Created workspace {name} with {recipe_label} ({} terminal{})",
+        terminals.len(),
+        if terminals.len() == 1 { "" } else { "s" }
+    ))
+}
+
+fn provision_recipe<R, T, C, X>(
+    terminals: &[config::RecipeTerminalConfig],
+    mut create_root: R,
+    mut create_tab: T,
+    mut configure: C,
+    mut cleanup: X,
+) -> Result<(), Box<dyn Error>>
+where
+    R: FnMut(&config::RecipeTerminalConfig) -> Result<Pane, Box<dyn Error>>,
+    T: FnMut(&str, &config::RecipeTerminalConfig) -> Result<Pane, Box<dyn Error>>,
+    C: FnMut(&Pane, &config::RecipeTerminalConfig) -> Result<(), Box<dyn Error>>,
+    X: FnMut(&str) -> Result<(), Box<dyn Error>>,
+{
+    let first = terminals.first().ok_or("recipe has no terminals")?;
+    let root = create_root(first)?;
+    let result = (|| {
+        configure(&root, first)?;
+        for terminal in terminals.iter().skip(1) {
+            let pane = create_tab(&root.workspace_id, terminal)?;
+            configure(&pane, terminal)?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        return Err(with_cleanup_error(error, cleanup(&root.workspace_id)));
     }
-    Ok(format!("Created workspace {name} with shell-1"))
+    Ok(())
+}
+
+fn configure_recipe_terminal(
+    pane: &Pane,
+    name: &str,
+    command: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
+    rename_tab(&pane.tab_id, name)?;
+    rename_pane(&pane.pane_id, name)?;
+    let Some(command) = command else {
+        return Ok(());
+    };
+    let output = Command::new("herdr")
+        .args(["pane", "run", &pane.pane_id, command])
+        .output()?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let message = String::from_utf8_lossy(&output.stderr);
+        Err(format!(
+            "could not deliver startup command to {name}: {}",
+            message.trim()
+        )
+        .into())
+    }
+}
+
+fn rename_tab(tab_id: &str, name: &str) -> Result<(), Box<dyn Error>> {
+    let output = Command::new("herdr")
+        .args(["tab", "rename", tab_id, name])
+        .output()?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let message = String::from_utf8_lossy(&output.stderr);
+        Err(format!("could not rename Herdr tab: {}", message.trim()).into())
+    }
 }
 
 fn create_dashboard_shell(workspace_id: &str) -> Result<String, Box<dyn Error>> {
@@ -809,7 +934,29 @@ fn run_foreground(program: &str, args: &[&str]) -> Result<(), Box<dyn Error>> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+
     use super::*;
+
+    fn test_pane(pane_id: &str, tab_id: &str) -> Pane {
+        Pane {
+            pane_id: pane_id.into(),
+            tab_id: tab_id.into(),
+            terminal_id: format!("term-{pane_id}"),
+            workspace_id: "w1".into(),
+            cwd: "/tmp/project".into(),
+            label: None,
+            agent: None,
+            agent_status: "unknown".into(),
+        }
+    }
+
+    fn command_args(command: &Command) -> Vec<String> {
+        command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect()
+    }
 
     #[test]
     fn parses_path_like_familiar_project_launchers() {
@@ -982,5 +1129,160 @@ mod tests {
         .unwrap();
 
         assert_eq!(response.result.root_pane.terminal_id, "term_456");
+    }
+
+    #[test]
+    fn recipe_provisioning_creates_and_configures_terminals_in_order() {
+        let terminals = vec![
+            config::RecipeTerminalConfig {
+                name: "opencode".into(),
+                command: Some("opencode".into()),
+            },
+            config::RecipeTerminalConfig {
+                name: "lazygit".into(),
+                command: Some("lazygit".into()),
+            },
+        ];
+        let events = RefCell::new(Vec::new());
+
+        provision_recipe(
+            &terminals,
+            |terminal| {
+                events.borrow_mut().push(format!("root:{}", terminal.name));
+                Ok(test_pane("p1", "t1"))
+            },
+            |workspace_id, terminal| {
+                events
+                    .borrow_mut()
+                    .push(format!("tab:{workspace_id}:{}", terminal.name));
+                Ok(test_pane("p2", "t2"))
+            },
+            |pane, terminal| {
+                events
+                    .borrow_mut()
+                    .push(format!("configure:{}:{}", pane.pane_id, terminal.name));
+                Ok(())
+            },
+            |workspace_id| {
+                events.borrow_mut().push(format!("cleanup:{workspace_id}"));
+                Ok(())
+            },
+        )
+        .expect("provisioned recipe");
+
+        assert_eq!(
+            events.into_inner(),
+            [
+                "root:opencode",
+                "configure:p1:opencode",
+                "tab:w1:lazygit",
+                "configure:p2:lazygit",
+            ]
+        );
+    }
+
+    #[test]
+    fn recipe_provisioning_closes_partial_workspace_after_failure() {
+        let terminals = vec![
+            config::RecipeTerminalConfig {
+                name: "shell".into(),
+                command: None,
+            },
+            config::RecipeTerminalConfig {
+                name: "agent".into(),
+                command: Some("missing-agent".into()),
+            },
+        ];
+        let cleaned = RefCell::new(Vec::new());
+
+        let error = provision_recipe(
+            &terminals,
+            |_| Ok(test_pane("p1", "t1")),
+            |_, _| Ok(test_pane("p2", "t2")),
+            |_, terminal| {
+                if terminal.name == "agent" {
+                    Err("command delivery failed".into())
+                } else {
+                    Ok(())
+                }
+            },
+            |workspace_id| {
+                cleaned.borrow_mut().push(workspace_id.to_owned());
+                Ok(())
+            },
+        )
+        .expect_err("provisioning should fail");
+
+        assert!(error.to_string().contains("command delivery failed"));
+        assert_eq!(cleaned.into_inner(), ["w1"]);
+    }
+
+    #[test]
+    fn recipe_creation_commands_include_labels_and_environment() {
+        assert_eq!(
+            command_args(&workspace_create_command(
+                Path::new("/tmp/project"),
+                "project",
+                "opencode",
+            )),
+            [
+                "workspace",
+                "create",
+                "--cwd",
+                "/tmp/project",
+                "--label",
+                "project",
+                "--env",
+                "BOOMUX_WORKSPACE=project",
+                "--env",
+                "BOOMUX_SHELL_NAME=opencode",
+                "--focus",
+            ]
+        );
+        assert_eq!(
+            command_args(&tab_create_command(
+                "w1",
+                Path::new("/tmp/project"),
+                "project",
+                "lazygit",
+            )),
+            [
+                "tab",
+                "create",
+                "--workspace",
+                "w1",
+                "--cwd",
+                "/tmp/project",
+                "--label",
+                "lazygit",
+                "--env",
+                "BOOMUX_WORKSPACE=project",
+                "--env",
+                "BOOMUX_SHELL_NAME=lazygit",
+                "--focus",
+            ]
+        );
+    }
+
+    #[test]
+    fn recipe_provisioning_reports_cleanup_failures() {
+        let terminals = vec![config::RecipeTerminalConfig {
+            name: "agent".into(),
+            command: Some("opencode".into()),
+        }];
+
+        let error = provision_recipe(
+            &terminals,
+            |_| Ok(test_pane("p1", "t1")),
+            |_, _| unreachable!("no additional terminal"),
+            |_, _| Err("command delivery failed".into()),
+            |_| Err("workspace close failed".into()),
+        )
+        .expect_err("provisioning should fail");
+
+        assert_eq!(
+            error.to_string(),
+            "command delivery failed; cleanup also failed: workspace close failed"
+        );
     }
 }

@@ -43,9 +43,17 @@ pub(crate) struct ProjectView {
 
 pub(crate) struct ProjectContext {
     pub(crate) projects: Vec<ProjectView>,
+    pub(crate) recipes: Vec<RecipeView>,
     pub(crate) config_path: Option<PathBuf>,
     pub(crate) warning: Option<String>,
     pub(crate) roots_configured: bool,
+}
+
+#[derive(Clone)]
+pub(crate) struct RecipeView {
+    pub(crate) id: String,
+    pub(crate) label: String,
+    pub(crate) terminals: Vec<String>,
 }
 
 pub(crate) struct TerminalView {
@@ -87,7 +95,15 @@ enum Focus {
 enum Mode {
     Normal,
     PickProject(ProjectPicker),
-    Rename { pane_id: String, input: String },
+    PickRecipe {
+        directory: PathBuf,
+        project_name: String,
+        picker: RecipePicker,
+    },
+    Rename {
+        pane_id: String,
+        input: String,
+    },
 }
 
 struct ProjectPicker {
@@ -98,6 +114,17 @@ struct ProjectPicker {
     config_path: Option<PathBuf>,
     warning: Option<String>,
     roots_configured: bool,
+}
+
+struct RecipePicker {
+    choices: Vec<RecipeChoice>,
+    state: ListState,
+}
+
+struct RecipeChoice {
+    id: Option<String>,
+    label: String,
+    terminals: Vec<String>,
 }
 
 struct Message {
@@ -166,6 +193,49 @@ impl ProjectPicker {
         let previous = self.state.selected().map_or(0, |index| {
             if index == 0 {
                 self.matches.len() - 1
+            } else {
+                index - 1
+            }
+        });
+        self.state.select(Some(previous));
+    }
+}
+
+impl RecipePicker {
+    fn new(recipes: &[RecipeView]) -> Self {
+        let mut choices = vec![RecipeChoice {
+            id: None,
+            label: "Default".into(),
+            terminals: vec!["shell-1".into()],
+        }];
+        choices.extend(recipes.iter().map(|recipe| RecipeChoice {
+            id: Some(recipe.id.clone()),
+            label: recipe.label.clone(),
+            terminals: recipe.terminals.clone(),
+        }));
+        let mut state = ListState::default();
+        state.select(Some(0));
+        Self { choices, state }
+    }
+
+    fn selected(&self) -> Option<&RecipeChoice> {
+        self.state
+            .selected()
+            .and_then(|index| self.choices.get(index))
+    }
+
+    fn next(&mut self) {
+        let next = self
+            .state
+            .selected()
+            .map_or(0, |index| (index + 1) % self.choices.len());
+        self.state.select(Some(next));
+    }
+
+    fn previous(&mut self) {
+        let previous = self.state.selected().map_or(0, |index| {
+            if index == 0 {
+                self.choices.len() - 1
             } else {
                 index - 1
             }
@@ -365,12 +435,16 @@ impl App {
         }
     }
 
-    fn create_workspace<F>(&mut self, directory: &Path, on_create_workspace: &mut F)
-    where
-        F: FnMut(&Path) -> Result<String, String>,
+    fn create_workspace<F>(
+        &mut self,
+        directory: &Path,
+        recipe_id: Option<&str>,
+        on_create_workspace: &mut F,
+    ) where
+        F: FnMut(&Path, Option<&str>) -> Result<String, String>,
     {
         self.mode = Mode::Normal;
-        self.message = Some(match on_create_workspace(directory) {
+        self.message = Some(match on_create_workspace(directory, recipe_id) {
             Ok(text) => Message { text, error: false },
             Err(text) => Message { text, error: true },
         });
@@ -484,7 +558,7 @@ where
     R: FnMut(&str) -> Result<String, String>,
     O: FnMut(&str) -> Result<String, String>,
     C: FnMut(&str) -> Result<String, String>,
-    W: FnMut(&Path) -> Result<String, String>,
+    W: FnMut(&Path, Option<&str>) -> Result<String, String>,
     N: FnMut(&str) -> Result<String, String>,
     E: FnMut(&str, &str) -> Result<String, String>,
     F: FnMut() -> Result<Vec<WorkspaceView>, String>,
@@ -508,7 +582,7 @@ where
     R: FnMut(&str) -> Result<String, String>,
     O: FnMut(&str) -> Result<String, String>,
     C: FnMut(&str) -> Result<String, String>,
-    W: FnMut(&Path) -> Result<String, String>,
+    W: FnMut(&Path, Option<&str>) -> Result<String, String>,
     N: FnMut(&str) -> Result<String, String>,
     E: FnMut(&str, &str) -> Result<String, String>,
     F: FnMut() -> Result<Vec<WorkspaceView>, String>,
@@ -605,7 +679,7 @@ fn handle_mode_key<W, E>(
     on_rename: &mut E,
 ) -> bool
 where
-    W: FnMut(&Path) -> Result<String, String>,
+    W: FnMut(&Path, Option<&str>) -> Result<String, String>,
     E: FnMut(&str, &str) -> Result<String, String>,
 {
     let mode = std::mem::replace(&mut app.mode, Mode::Normal);
@@ -617,9 +691,13 @@ where
         Mode::Normal => false,
         Mode::PickProject(mut picker) => match key {
             KeyCode::Enter if picker.selected().is_some() => {
-                let directory = picker.selected().expect("selected project").path.clone();
-                app.create_workspace(&directory, on_create_workspace);
-                true
+                let project = picker.selected().expect("selected project");
+                app.mode = Mode::PickRecipe {
+                    directory: project.path.clone(),
+                    project_name: project.name.clone(),
+                    picker: RecipePicker::new(&app.project_context.recipes),
+                };
+                false
             }
             KeyCode::Esc => false,
             KeyCode::Down => {
@@ -646,6 +724,44 @@ where
             }
             _ => {
                 app.mode = Mode::PickProject(picker);
+                false
+            }
+        },
+        Mode::PickRecipe {
+            directory,
+            project_name,
+            mut picker,
+        } => match key {
+            KeyCode::Enter => {
+                let recipe_id = picker.selected().expect("selected recipe").id.as_deref();
+                app.create_workspace(&directory, recipe_id, on_create_workspace);
+                true
+            }
+            KeyCode::Esc => false,
+            KeyCode::Down | KeyCode::Char('j') => {
+                picker.next();
+                app.mode = Mode::PickRecipe {
+                    directory,
+                    project_name,
+                    picker,
+                };
+                false
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                picker.previous();
+                app.mode = Mode::PickRecipe {
+                    directory,
+                    project_name,
+                    picker,
+                };
+                false
+            }
+            _ => {
+                app.mode = Mode::PickRecipe {
+                    directory,
+                    project_name,
+                    picker,
+                };
                 false
             }
         },
@@ -690,9 +806,55 @@ fn render(frame: &mut Frame, app: &mut App) {
     render_workspaces(frame, workspace_area, app);
     render_terminals(frame, terminal_area, app);
     render_footer(frame, footer_area, app);
-    if let Mode::PickProject(picker) = &mut app.mode {
-        render_project_picker(frame, area, picker);
+    match &mut app.mode {
+        Mode::PickProject(picker) => render_project_picker(frame, area, picker),
+        Mode::PickRecipe {
+            project_name,
+            picker,
+            ..
+        } => render_recipe_picker(frame, area, project_name, picker),
+        _ => {}
     }
+}
+
+fn render_recipe_picker(
+    frame: &mut Frame,
+    area: Rect,
+    project_name: &str,
+    picker: &mut RecipePicker,
+) {
+    let popup_area = centered_rect(area, 64, 52);
+    frame.render_widget(Clear, popup_area);
+    frame.render_widget(Block::new().style(Style::new().bg(BASE)), popup_area);
+    let [list_area, help_area] =
+        Layout::vertical([Constraint::Fill(1), Constraint::Length(2)]).areas(popup_area);
+    let items = picker.choices.iter().map(|choice| {
+        ListItem::new(Line::from(vec![
+            Span::styled(
+                format!("{:<22}", choice.label),
+                Style::new().fg(TEXT).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(choice.terminals.join(" · "), Style::new().fg(SUBTEXT)),
+        ]))
+    });
+    let list = List::new(items)
+        .block(
+            Block::bordered()
+                .title(format!(" Recipe for {project_name} "))
+                .border_style(Style::new().fg(TEAL)),
+        )
+        .highlight_symbol("> ")
+        .highlight_style(Style::new().fg(TEXT).add_modifier(Modifier::REVERSED));
+    frame.render_stateful_widget(list, list_area, &mut picker.state);
+    let help = Line::from(vec![
+        Span::styled(" j/k", Style::new().fg(BLUE)),
+        Span::raw(" select  "),
+        Span::styled("enter", Style::new().fg(GREEN)),
+        Span::raw(" create  "),
+        Span::styled("esc", Style::new().fg(RED)),
+        Span::raw(" cancel"),
+    ]);
+    frame.render_widget(Paragraph::new(help).style(Style::new().bg(BASE)), help_area);
 }
 
 fn render_project_picker(frame: &mut Frame, area: Rect, picker: &mut ProjectPicker) {
@@ -1161,6 +1323,11 @@ mod tests {
                     group_order: 1,
                 },
             ],
+            recipes: vec![RecipeView {
+                id: "full-dev".into(),
+                label: "Full Dev".into(),
+                terminals: vec!["opencode".into(), "lazygit".into(), "lazyvim".into()],
+            }],
             config_path: Some("/tmp/config.toml".into()),
             warning: None,
             roots_configured: true,
@@ -1233,7 +1400,7 @@ mod tests {
                 &mut app,
                 KeyCode::Char(character),
                 KeyModifiers::NONE,
-                &mut |_| Ok(String::new()),
+                &mut |_, _| Ok(String::new()),
                 &mut |_, _| Ok(String::new()),
             );
         }
@@ -1241,8 +1408,19 @@ mod tests {
             &mut app,
             KeyCode::Enter,
             KeyModifiers::NONE,
-            &mut |directory| {
+            &mut |_, _| Ok(String::new()),
+            &mut |_, _| Ok(String::new()),
+        );
+        assert!(!changed);
+        assert!(matches!(app.mode, Mode::PickRecipe { .. }));
+
+        let changed = handle_mode_key(
+            &mut app,
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+            &mut |directory, recipe_id| {
                 created = Some(directory.to_owned());
+                assert_eq!(recipe_id, None);
                 Ok("Created workspace".into())
             },
             &mut |_, _| Ok(String::new()),
@@ -1251,6 +1429,41 @@ mod tests {
         assert!(changed);
         assert_eq!(created.as_deref(), Some(Path::new("/tmp/alpha")));
         assert!(matches!(app.mode, Mode::Normal));
+    }
+
+    #[test]
+    fn recipe_picker_dispatches_the_selected_recipe() {
+        let mut app = app();
+        let mut selected_recipe = None;
+        app.request_add(&mut |_| Ok(String::new()));
+
+        handle_mode_key(
+            &mut app,
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+            &mut |_, _| Ok(String::new()),
+            &mut |_, _| Ok(String::new()),
+        );
+        handle_mode_key(
+            &mut app,
+            KeyCode::Down,
+            KeyModifiers::NONE,
+            &mut |_, _| Ok(String::new()),
+            &mut |_, _| Ok(String::new()),
+        );
+        let changed = handle_mode_key(
+            &mut app,
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+            &mut |_, recipe_id| {
+                selected_recipe = recipe_id.map(str::to_owned);
+                Ok("Created workspace".into())
+            },
+            &mut |_, _| Ok(String::new()),
+        );
+
+        assert!(changed);
+        assert_eq!(selected_recipe.as_deref(), Some("full-dev"));
     }
 
     #[test]
@@ -1289,7 +1502,7 @@ mod tests {
             &mut app,
             KeyCode::Char('c'),
             KeyModifiers::CONTROL,
-            &mut |_| Ok(String::new()),
+            &mut |_, _| Ok(String::new()),
             &mut |_, _| Ok(String::new()),
         );
 
@@ -1308,7 +1521,7 @@ mod tests {
             &mut app,
             KeyCode::Char('_'),
             KeyModifiers::SHIFT,
-            &mut |_| Ok(String::new()),
+            &mut |_, _| Ok(String::new()),
             &mut |_, _| Ok(String::new()),
         );
 
@@ -1360,7 +1573,7 @@ mod tests {
                 &mut app,
                 KeyCode::Char(character),
                 KeyModifiers::NONE,
-                &mut |_| Ok(String::new()),
+                &mut |_, _| Ok(String::new()),
                 &mut |_, _| Ok(String::new()),
             );
         }
@@ -1368,7 +1581,7 @@ mod tests {
             &mut app,
             KeyCode::Enter,
             KeyModifiers::NONE,
-            &mut |_| Ok(String::new()),
+            &mut |_, _| Ok(String::new()),
             &mut |pane_id, name| {
                 renamed = Some((pane_id.to_owned(), name.to_owned()));
                 Ok("Renamed shell".into())
@@ -1533,5 +1746,33 @@ mod tests {
         app.request_add(&mut |_| Ok(String::new()));
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    }
+
+    #[test]
+    fn recipe_launcher_renders_default_and_configured_recipes() {
+        let backend = TestBackend::new(120, 34);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = app();
+        app.request_add(&mut |_| Ok(String::new()));
+        handle_mode_key(
+            &mut app,
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+            &mut |_, _| Ok(String::new()),
+            &mut |_, _| Ok(String::new()),
+        );
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("Recipe for alpha"));
+        assert!(text.contains("Default"));
+        assert!(text.contains("Full Dev"));
+        assert!(text.contains("opencode · lazygit · lazyvim"));
     }
 }

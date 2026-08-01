@@ -76,8 +76,8 @@ navigate.
   depending on which table is focused.
 - `a` opens the project launcher from workspace focus, or adds one plain shell
   from terminal focus. Type to filter configured Git projects, use Up/Down to
-  select one, and press Enter to create a basename-named workspace with
-  `shell-1`.
+  select one, and press Enter to choose a terminal recipe. The preselected
+  `Default` recipe creates a basename-named workspace with `shell-1`.
 - `e` renames the selected terminal when the terminal table is focused.
 - `x`, then `y`, closes the selected workspace and all of its shells.
 - `r` refreshes immediately; `q` or `Esc` quits.
@@ -117,6 +117,14 @@ the global file; fields present in the override take precedence.
 [projects]
 roots = ["~/Projects", "~/Work"]
 max_depth = 3
+
+[recipes.full-dev]
+label = "Full Dev"
+terminals = [
+  { name = "opencode", command = "opencode" },
+  { name = "lazygit", command = "lazygit" },
+  { name = "lazyvim", command = "nvim" },
+]
 ```
 
 Project roots must be absolute or start with `~`. Boomux recursively discovers
@@ -126,6 +134,15 @@ are visually grouped by each configured root's directory name while sharing one
 search query. No directories are scanned unless roots are explicitly configured.
 `boomux doctor` validates the configuration and reports how many projects were
 discovered.
+
+Recipe terminals become independently persistent Herdr tabs in the selected
+project directory. `name` becomes the durable tab and shell label; an omitted or
+empty `command` creates a plain shell. Recipe provisioning is all-or-nothing:
+after Herdr returns the root workspace identity, Boomux closes the new workspace
+if a later terminal cannot be created, labeled, or sent its startup command.
+Herdr confirms command delivery but does not confirm that the invoked process
+remains running. The built-in `Default` recipe is always available and cannot be
+overridden.
 
 Boomux must be launched from a fresh terminal rather than from inside a
 Herdr-managed pane. The picker also hides panes whose foreground process is

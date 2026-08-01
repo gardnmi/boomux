@@ -20,6 +20,8 @@ commitments.
 - [x] Follow the active terminal theme through semantic ANSI colors.
 - [x] Display repository, branch, dirty state, and primary or linked worktree
   information for each workspace.
+- [x] Create workspaces from configurable multi-terminal recipes with a built-in
+  single-shell default.
 - [x] Validate runtime dependencies, configuration, and project discovery with
   `boomux doctor`.
 
@@ -28,7 +30,6 @@ commitments.
 - Aggregate multiple agent states as counts instead of one workspace-level
   value.
 - Notify when an agent becomes blocked, finishes, or needs input.
-- Create shells, OpenCode, LazyGit, and custom commands from the dashboard.
 - Show an opt-in, read-only preview of the selected terminal.
 - Search workspaces and actions from a command palette.
 - Launch workspace templates such as editor, agent, tests, and LazyGit.
@@ -48,13 +49,12 @@ commitments.
 - Record state transitions and show when an agent last changed state.
 - Provide an attention queue for blocked and completed agents.
 - Send common responses or commands to a selected pane.
-- Define recipes for OpenCode, Claude, Codex, and custom agents.
 - Run hooks, tests, notifications, or focus actions when an agent finishes.
 
 ## Distribution And Polish
 
 - Make the Ratatui interface the default and remove the Gum dependency.
 - Add a LazyGit-style interactive keybinding panel.
-- Support configuration for recipes, refresh rate, and notifications.
+- Support configuration for refresh rate and notifications.
 - Package Herdr and Boomux for Arch and Omarchy users.
 - Validate compatible Herdr and Ghostty versions in `boomux doctor`.

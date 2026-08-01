@@ -83,6 +83,23 @@ basename becomes the workspace name. Configuration loading and filesystem
 discovery remain outside the TUI so input and rendering do not perform filesystem
 scans.
 
+## Workspace Recipes
+
+After project selection, the dashboard presents the built-in single-shell
+default followed by validated recipes from Boomux's layered TOML configuration.
+Each recipe defines one or more durable terminal names and optional startup
+commands.
+
+The first recipe terminal reuses the workspace root pane; later terminals use
+Herdr tabs. Boomux labels every tab and pane, applies the existing workspace and
+shell environment variables, and delivers configured startup commands through
+`herdr pane run`. Herdr acknowledges command delivery rather than process
+liveness. After Herdr returns the root workspace identity, provisioning is
+transactional at the workspace boundary: later creation, labeling, or delivery
+failures close the new Herdr workspace rather than leaving a partial recipe. A
+successful mutation followed by an undecodable root response cannot be safely
+rolled back because Boomux has no reliable workspace identity.
+
 ### Ghostty Launcher
 
 Creates native windows with stable human-readable titles. Boomux does not rely
