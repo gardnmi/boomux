@@ -4,14 +4,14 @@
 
 Boomux is a session experience, not a terminal emulator or process
 multiplexer. It maps one Herdr workspace to a named Boomux workspace and each
-durable Herdr terminal to one native Ghostty window.
+durable Herdr terminal to one native terminal window.
 
 ```text
 Herdr server
 └── workspace: project/feature
-    ├── terminal A <-> herdr terminal attach <-> Ghostty window A
-    ├── terminal B <-> herdr terminal attach <-> Ghostty window B
-    └── terminal C <-> herdr terminal attach <-> Ghostty window C
+    ├── terminal A <-> herdr terminal attach <-> terminal window A
+    ├── terminal B <-> herdr terminal attach <-> terminal window B
+    └── terminal C <-> herdr terminal attach <-> terminal window C
 ```
 
 ## Why Compose First
@@ -21,10 +21,11 @@ the current rendered state and live ANSI frames, accepts terminal input, and
 propagates terminal resize events. Disconnecting removes the controller without
 terminating the server-owned process.
 
-Ghostty's Linux `+new-window` action creates an independent top-level GTK
-window and can execute `herdr terminal attach <terminal-id>` as that surface's
-command. Closing the surface terminates the attachment command while leaving
-the Herdr server and terminal alive.
+Omarchy's `xdg-terminal-exec` integration resolves the default or explicitly
+selected terminal desktop entry and translates common capabilities such as
+command execution and titles into that emulator's arguments. Closing the
+surface terminates the attachment command while leaving the Herdr server and
+terminal alive.
 
 These contracts provide the MVP without source-level integration.
 
@@ -45,24 +46,24 @@ private and versioned.
 ### Picker
 
 Runs in a normal terminal surface and lists named workspaces. Selecting one
-launches a Ghostty window for every terminal belonging to that Herdr workspace.
+launches a native window for every terminal belonging to that Herdr workspace.
 
 ### Dashboard
 
 Provides a Ratatui overview of workspaces, terminals, directories, Git state,
 and per-terminal agent state. It is a control plane only: restoring a workspace
-still launches native Ghostty windows rather than embedding terminal sessions in
+still launches native terminal windows rather than embedding terminal sessions in
 the dashboard. The dashboard remains open after restoration so it can continue
 managing other workspaces. It refreshes from Herdr four times per second and
 validates the selected workspace against a fresh snapshot before launching
-Ghostty windows.
+terminal windows.
 Repository name, branch, dirty state, and primary or linked worktree information
 come from the Git CLI and are cached for two seconds so the faster Herdr refresh
 does not repeatedly spawn Git processes.
 Closing a workspace uses Herdr's atomic workspace close command after explicit
 confirmation, terminating every shell in that workspace. Shell creation uses
 Herdr tabs, and pane labels provide durable shell names for the dashboard,
-Ghostty titles, and prompt integrations.
+window titles, and prompt integrations.
 
 Dashboard colors use semantic ANSI roles and the terminal's default foreground
 and background. This keeps the TUI portable while allowing terminal-level theme
@@ -100,18 +101,19 @@ failures close the new Herdr workspace rather than leaving a partial recipe. A
 successful mutation followed by an undecodable root response cannot be safely
 rolled back because Boomux has no reliable workspace identity.
 
-### Ghostty Launcher
+### Terminal Launcher
 
-Creates native windows with stable human-readable titles. Boomux does not rely
-on compositor-specific window IDs or control APIs.
+Resolves Omarchy's default terminal or a Boomux-specific XDG desktop entry and
+creates native windows with human-readable titles when supported. Boomux does
+not rely on compositor-specific window IDs or control APIs.
 
 ## Known Constraints
 
 - Herdr permits one writable controller per terminal; `--takeover` is explicit.
 - Direct interactive attachment is currently Unix-only.
-- Ghostty `+new-window` requires its Linux GTK build and session D-Bus.
-- Ghostty windows commonly share one application process, although each is an
-  independent top-level window.
+- Window launching requires Omarchy's `xdg-terminal-exec` and an installed
+  terminal with compatible XDG desktop-entry metadata.
+- Terminal capabilities such as stable titles vary by emulator.
 - Window titles identify sessions for humans but are not durable machine IDs.
 - Herdr sends rendered ANSI frames, not the original raw PTY output stream.
 

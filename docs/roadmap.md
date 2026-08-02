@@ -8,14 +8,14 @@ commitments.
 
 - [x] Manage persistent Herdr workspaces and shells from a live Ratatui
   dashboard.
-- [x] Restore a whole workspace into native Ghostty windows or open only one
+- [x] Restore a whole workspace into native terminal windows or open only one
   selected terminal.
 - [x] Create workspaces from a searchable Git project launcher grouped by
   configured roots.
 - [x] Load layered TOML configuration from the XDG config directory and an
   optional `BOOMUX_CONFIG` override.
 - [x] Add plain shells, assign durable shell names, and carry those names into
-  the dashboard, Ghostty titles, and dynamic Starship prompts.
+  the dashboard, window titles, and dynamic Starship prompts.
 - [x] Close a workspace and all of its shells through an explicit confirmation.
 - [x] Follow the active terminal theme through semantic ANSI colors.
 - [x] Display repository, branch, dirty state, and primary or linked worktree
@@ -24,6 +24,8 @@ commitments.
   single-shell default.
 - [x] Validate runtime dependencies, configuration, and project discovery with
   `boomux doctor`.
+- [x] Follow Omarchy's default terminal with persistent and per-invocation XDG
+  desktop-entry overrides.
 
 ## Workspace Control
 
@@ -41,7 +43,7 @@ commitments.
 - Restore shells into optional Hyprland layout presets.
 - Place workspace groups on selected Hyprland workspaces or monitors.
 - Give each Boomux workspace a consistent border color.
-- Focus an existing Ghostty attachment instead of opening another window.
+- Focus an existing terminal attachment instead of opening another window.
 - Offer the dashboard as an optional Hyprland special workspace.
 
 ## Agent Workflows
@@ -57,4 +59,4 @@ commitments.
 - Add a LazyGit-style interactive keybinding panel.
 - Support configuration for refresh rate and notifications.
 - Package Herdr and Boomux for Arch and Omarchy users.
-- Validate compatible Herdr and Ghostty versions in `boomux doctor`.
+- Validate compatible Herdr and `xdg-terminal-exec` versions in `boomux doctor`.

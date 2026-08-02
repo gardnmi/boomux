@@ -8,14 +8,14 @@
 > **Boomux is under active development.** It is usable today, but installation,
 > commands, and workspace behavior may change as the project takes shape.
 
-Boomux presents persistent Herdr terminals as ordinary Ghostty windows. Herdr
-owns processes and agent state, Ghostty renders terminals, and the desktop's
-existing window manager remains responsible for layout.
+Boomux presents persistent Herdr terminals as ordinary native terminal windows.
+Herdr owns processes and agent state, Omarchy's selected terminal renders them,
+and the desktop's existing window manager remains responsible for layout.
 
 ## Status
 
-Boomux is an early integration spike. It deliberately composes the public
-interfaces of Ghostty and Herdr instead of forking either project.
+Boomux is an early integration spike. It deliberately composes Omarchy's
+`xdg-terminal-exec` integration with Herdr instead of embedding either concern.
 
 During development, launch Boomux manually. It will not install or modify any
 desktop keybindings; `Super+Enter` remains unchanged unless the user explicitly
@@ -40,11 +40,12 @@ boomux ~/Projects/another-project
 
 By default, Boomux attaches the new persistent shell in the invoking terminal.
 Use `--new` to leave the invoking shell available and open the persistent shell
-in a new native Ghostty window instead:
+in a new native terminal window instead:
 
 ```console
 boomux . --new
 boomux . --name feature-x --new
+boomux . --terminal Alacritty.desktop
 ```
 
 Paths must exist and refer to directories. The default workspace name is the
@@ -58,7 +59,7 @@ boomux
 
 The Gum picker lists workspace names, Herdr IDs, directories, agent status,
 and terminal counts. Selecting a workspace opens every terminal in its own
-native Ghostty window.
+native terminal window.
 
 For a full workspace overview, open the Ratatui dashboard:
 
@@ -83,8 +84,8 @@ navigate.
 - `r` refreshes immediately; `q` or `Esc` quits.
 
 Shell names are stored as Herdr pane labels and appear in the dashboard and
-restored Ghostty window titles. New shells receive `BOOMUX_WORKSPACE` and
-`BOOMUX_SHELL_NAME` environment variables.
+restored terminal window titles when supported. New shells receive
+`BOOMUX_WORKSPACE` and `BOOMUX_SHELL_NAME` environment variables.
 
 For a dynamic Starship segment that follows later renames, add the hidden prompt
 command to your Starship format and configuration:
@@ -99,11 +100,10 @@ format = '[ 󰊠](bg:blue fg:yellow)[ $output](bg:blue fg:crust)'
 ```
 
 The dashboard uses the terminal's ANSI palette rather than a hardcoded color
-scheme. On Omarchy, Ghostty maps those colors through the active theme, so the
-dashboard follows theme changes in the same way as LazyGit.
+scheme, so it follows the active terminal theme in the same way as LazyGit.
 
 Restored terminals take over stale writable attachments while keeping their
-shell or agent processes running. Closing every Ghostty window leaves the
+shell or agent processes running. Closing every terminal window leaves the
 Herdr-owned workspace and terminals alive for later restoration.
 
 ## Configuration
@@ -114,6 +114,8 @@ Boomux reads optional user configuration from
 the global file; fields present in the override take precedence.
 
 ```toml
+terminal = "Alacritty.desktop"
+
 [projects]
 roots = ["~/Projects", "~/Work"]
 max_depth = 3
@@ -126,6 +128,11 @@ terminals = [
   { name = "lazyvim", command = "nvim" },
 ]
 ```
+
+New windows use Omarchy's default terminal unless `terminal` names an installed
+XDG desktop entry. `--terminal <desktop-entry>` overrides both for one
+invocation; when used with a path it implies `--new`. Selection precedence is
+the CLI override, Boomux configuration, then Omarchy's default.
 
 Project roots must be absolute or start with `~`. Boomux recursively discovers
 Git repositories up to `max_depth`, skips hidden and common generated
@@ -163,10 +170,10 @@ boomux open <terminal-id> [--title <title>] [--takeover]
 Boomux workspace
 ├── Herdr workspace: durable group identity
 ├── Herdr tabs/panes: independent persistent terminals
-└── Ghostty windows: temporary native clients
+└── Terminal windows: temporary native clients selected through Omarchy
 ```
 
-Closing a Ghostty window ends only its `herdr terminal attach` process. The
+Closing a terminal window ends only its `herdr terminal attach` process. The
 server-owned terminal and its child processes continue running in Herdr.
 
 ## Technology
@@ -176,11 +183,13 @@ server-owned terminal and its child processes continue running in Herdr.
 - Ratatui with the Crossterm backend for the dashboard
 - Serde and TOML for Herdr responses and layered user configuration
 - Gum for the interactive session chooser
-- Git, Ghostty, and Herdr as external runtime dependencies
+- Git, `xdg-terminal-exec`, an XDG-compatible terminal, and Herdr as external
+  runtime dependencies
 
-The MVP uses Gum rather than maintaining its own TUI framework, and the Herdr
-CLI rather than a custom socket client. Dependencies are added only when a
-tested interaction requires them.
+The MVP uses Gum rather than maintaining its own TUI framework, the Herdr CLI
+rather than a custom socket client, and Omarchy's default-terminal metadata
+rather than per-emulator adapters. Dependencies are added only when a tested
+interaction requires them.
 
 ## Development
 
@@ -218,10 +227,9 @@ See [`docs/roadmap.md`](docs/roadmap.md) for the broader product idea backlog.
 5. After explicit user approval, add optional desktop keybinding and launcher
    integration outside the core.
 
-## Fork Policy
+## Integration Policy
 
-Do not fork Ghostty or Herdr unless the prototype identifies a missing
-capability that cannot be supported through their public interfaces. Boomux
-already has the required one-terminal attachment and native-window launch
-boundaries. Keeping both projects upstream makes updates and distribution much
-simpler.
+Do not fork Herdr or maintain terminal-specific adapters unless the prototype
+identifies a missing capability that cannot be supported through their public
+interfaces. Boomux already has the required one-terminal attachment and
+XDG-native-window launch boundaries.

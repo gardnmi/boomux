@@ -9,13 +9,13 @@ use serde::Deserialize;
 mod config;
 mod git;
 mod projects;
+mod terminal;
 mod tui;
 
 #[derive(Parser)]
 #[command(
     version,
-    about = "Native Ghostty windows for persistent Herdr terminals",
-    args_conflicts_with_subcommands = true
+    about = "Native terminal windows for persistent Herdr terminals"
 )]
 struct Cli {
     /// Open or create a persistent terminal in this directory
@@ -26,9 +26,13 @@ struct Cli {
     #[arg(short, long, requires = "path")]
     name: Option<String>,
 
-    /// Open the terminal in a new Ghostty window instead of attaching here
+    /// Open the terminal in a new window instead of attaching here
     #[arg(long = "new", requires = "path")]
     new_window: bool,
+
+    /// XDG desktop entry to use for windows opened by this invocation
+    #[arg(long, global = true, value_name = "DESKTOP_ENTRY")]
+    terminal: Option<String>,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -42,11 +46,11 @@ enum Commands {
     Doctor,
     /// List panes managed by Herdr
     List,
-    /// Open a Herdr terminal in a new Ghostty window
+    /// Open a Herdr terminal in a new terminal window
     Open {
         /// Herdr terminal ID, available from `boomux list`
         terminal_id: String,
-        /// Stable title shown on the Ghostty window
+        /// Stable title shown on the terminal window when supported
         #[arg(long)]
         title: Option<String>,
         /// Replace another client currently controlling this terminal
@@ -69,22 +73,57 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
+    if let Some(desktop_entry) = cli.terminal.as_deref() {
+        terminal::validate_desktop_entry(desktop_entry)?;
+    }
     if let Some(path) = cli.path {
-        return open_directory(&path, cli.name.as_deref(), cli.new_window);
+        let open_in_new_window = should_open_new_window(cli.new_window, cli.terminal.as_deref());
+        let terminal = open_in_new_window
+            .then(|| effective_terminal(cli.terminal.as_deref()))
+            .transpose()?
+            .flatten();
+        return open_directory(
+            &path,
+            cli.name.as_deref(),
+            open_in_new_window,
+            terminal.as_deref(),
+        );
     }
 
     match cli.command {
-        Some(Commands::Ui) => dashboard(),
-        Some(Commands::Doctor) => doctor(),
+        Some(Commands::Ui) => dashboard(cli.terminal.as_deref()),
+        Some(Commands::Doctor) => doctor(cli.terminal.as_deref()),
         Some(Commands::List) => run_foreground("herdr", &["pane", "list"]),
         Some(Commands::Open {
             terminal_id,
             title,
             takeover,
-        }) => open_terminal(&terminal_id, title.as_deref(), takeover),
+        }) => {
+            let terminal = effective_terminal(cli.terminal.as_deref())?;
+            open_terminal(
+                &terminal_id,
+                title.as_deref(),
+                takeover,
+                terminal.as_deref(),
+            )
+        }
         Some(Commands::Prompt) => print_prompt_label(),
-        None => picker(),
+        None => {
+            let terminal = effective_terminal(cli.terminal.as_deref())?;
+            picker(terminal.as_deref())
+        }
     }
+}
+
+fn should_open_new_window(new_window: bool, terminal: Option<&str>) -> bool {
+    new_window || terminal.is_some()
+}
+
+fn effective_terminal(override_entry: Option<&str>) -> Result<Option<String>, Box<dyn Error>> {
+    if let Some(entry) = override_entry {
+        return Ok(Some(entry.to_owned()));
+    }
+    Ok(config::load()?.terminal)
 }
 
 #[derive(Deserialize)]
@@ -153,7 +192,7 @@ struct Choice {
     workspace_id: String,
 }
 
-fn picker() -> Result<(), Box<dyn Error>> {
+fn picker(terminal: Option<&str>) -> Result<(), Box<dyn Error>> {
     ensure_host_terminal()?;
     let panes = available_panes()?;
     let workspaces = load_workspaces()?;
@@ -165,14 +204,17 @@ fn picker() -> Result<(), Box<dyn Error>> {
         .find(|workspace| workspace.workspace_id == workspace_id)
         .ok_or("selected workspace no longer exists")?;
 
-    open_workspace(workspace, &panes)
+    open_workspace(workspace, &panes, terminal)
 }
 
-fn dashboard() -> Result<(), Box<dyn Error>> {
+fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
     ensure_host_terminal()?;
     let mut git_cache = git::Cache::default();
     let views = dashboard_snapshot(&mut git_cache)?;
     let config = config::load()?;
+    let terminal = terminal_override
+        .map(str::to_owned)
+        .or_else(|| config.terminal.clone());
     let recipes = config.recipes.clone();
     let roots_configured = !config.projects.roots.is_empty();
     let discovery = projects::discover(&config.projects);
@@ -216,14 +258,16 @@ fn dashboard() -> Result<(), Box<dyn Error>> {
                     .find(|workspace| workspace.workspace_id == workspace_id)
                     .ok_or_else(|| "selected workspace no longer exists".to_owned())?;
                 let shell_count = workspace_panes(&workspace.workspace_id, &panes).count();
-                open_workspace(workspace, &panes).map_err(|error| error.to_string())?;
+                open_workspace(workspace, &panes, terminal.as_deref())
+                    .map_err(|error| error.to_string())?;
                 Ok(format!(
                     "Restored {shell_count} shell(s) for {}",
                     workspace.label
                 ))
             },
             on_open: |terminal_id: &str| {
-                open_dashboard_terminal(terminal_id).map_err(|error| error.to_string())
+                open_dashboard_terminal(terminal_id, terminal.as_deref())
+                    .map_err(|error| error.to_string())
             },
             on_close: |workspace_id: &str| {
                 let workspaces = load_workspaces().map_err(|error| error.to_string())?;
@@ -302,6 +346,7 @@ fn open_directory(
     path: &Path,
     requested_name: Option<&str>,
     open_in_new_window: bool,
+    terminal: Option<&str>,
 ) -> Result<(), Box<dyn Error>> {
     ensure_host_terminal()?;
     let directory = resolve_directory(path)?;
@@ -348,6 +393,7 @@ fn open_directory(
             &pane.terminal_id,
             Some(&format!("{name} - {shell_name}")),
             true,
+            terminal,
         )?;
     } else if !attach_terminal(&pane.terminal_id)? {
         return Err(format!("could not attach to Herdr terminal {}", pane.terminal_id).into());
@@ -712,7 +758,10 @@ fn with_cleanup_error(
     }
 }
 
-fn open_dashboard_terminal(terminal_id: &str) -> Result<String, Box<dyn Error>> {
+fn open_dashboard_terminal(
+    terminal_id: &str,
+    terminal: Option<&str>,
+) -> Result<String, Box<dyn Error>> {
     let panes = load_panes()?;
     let pane = panes
         .iter()
@@ -727,11 +776,16 @@ fn open_dashboard_terminal(terminal_id: &str) -> Result<String, Box<dyn Error>> 
         terminal_id,
         Some(&format!("{} - {shell_name}", workspace.label)),
         true,
+        terminal,
     )?;
     Ok(format!("Opened {shell_name} from {}", workspace.label))
 }
 
-fn open_workspace(workspace: &Workspace, panes: &[Pane]) -> Result<(), Box<dyn Error>> {
+fn open_workspace(
+    workspace: &Workspace,
+    panes: &[Pane],
+    terminal: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
     let workspace_panes: Vec<_> = workspace_panes(&workspace.workspace_id, panes).collect();
     if workspace_panes.is_empty() {
         return Err(format!("workspace {} has no terminals", workspace.label).into());
@@ -747,6 +801,7 @@ fn open_workspace(workspace: &Workspace, panes: &[Pane]) -> Result<(), Box<dyn E
             &pane.terminal_id,
             Some(&format!("{} - {shell_name}", workspace.label)),
             true,
+            terminal,
         )?;
     }
 
@@ -846,10 +901,10 @@ fn load_workspaces() -> Result<Vec<Workspace>, Box<dyn Error>> {
     Ok(response.result.workspaces)
 }
 
-fn doctor() -> Result<(), Box<dyn Error>> {
+fn doctor(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
     let mut healthy = true;
 
-    for command in ["ghostty", "herdr", "gum", "git"] {
+    for command in ["herdr", "gum", "git"] {
         match Command::new(command).arg("--version").output() {
             Ok(output) if output.status.success() => {
                 let version = String::from_utf8_lossy(&output.stdout);
@@ -882,6 +937,14 @@ fn doctor() -> Result<(), Box<dyn Error>> {
                     eprintln!("    {warning}");
                 }
             }
+            let terminal = terminal_override.or(config.terminal.as_deref());
+            match terminal::selected(terminal) {
+                Ok(selected) => println!("ok  terminal: {selected}"),
+                Err(error) => {
+                    healthy = false;
+                    eprintln!("err terminal: {error}");
+                }
+            }
         }
         Err(error) => {
             healthy = false;
@@ -900,27 +963,12 @@ fn open_terminal(
     terminal_id: &str,
     title: Option<&str>,
     takeover: bool,
+    terminal: Option<&str>,
 ) -> Result<(), Box<dyn Error>> {
     let title = title
         .map(str::to_owned)
         .unwrap_or_else(|| format!("Boomux: {terminal_id}"));
-    let mut command = Command::new("ghostty");
-    command
-        .arg("+new-window")
-        .arg(format!("--title={title}"))
-        .arg("--shell-integration-features=no-title")
-        .args(["-e", "herdr", "terminal", "attach", terminal_id]);
-
-    if takeover {
-        command.arg("--takeover");
-    }
-
-    let status = command.status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("Ghostty failed with {status}").into())
-    }
+    terminal::open(terminal, terminal_id, &title, takeover)
 }
 
 fn run_foreground(program: &str, args: &[&str]) -> Result<(), Box<dyn Error>> {
@@ -996,6 +1044,32 @@ mod tests {
         assert!(cli.new_window);
         assert!(Cli::try_parse_from(["boomux", "--new"]).is_err());
         assert!(Cli::try_parse_from(["boomux", ".", "--current"]).is_err());
+    }
+
+    #[test]
+    fn accepts_a_terminal_override_for_window_launches() {
+        let cli = Cli::try_parse_from(["boomux", ".", "--terminal", "Alacritty.desktop"]).unwrap();
+
+        assert_eq!(cli.terminal.as_deref(), Some("Alacritty.desktop"));
+        assert!(should_open_new_window(
+            cli.new_window,
+            cli.terminal.as_deref()
+        ));
+
+        let cli = Cli::try_parse_from([
+            "boomux",
+            "open",
+            "term_123",
+            "--terminal",
+            "Alacritty.desktop",
+        ])
+        .unwrap();
+        assert_eq!(cli.terminal.as_deref(), Some("Alacritty.desktop"));
+
+        let cli =
+            Cli::try_parse_from(["boomux", "--terminal", "Alacritty.desktop", "doctor"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Doctor)));
+        assert_eq!(cli.terminal.as_deref(), Some("Alacritty.desktop"));
     }
 
     #[test]

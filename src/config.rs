@@ -15,6 +15,7 @@ const MAX_RECIPE_NAME_LENGTH: usize = 64;
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct RawConfig {
+    terminal: Option<String>,
     projects: Option<RawProjectsConfig>,
     recipes: Option<BTreeMap<String, RawRecipeConfig>>,
 }
@@ -42,6 +43,7 @@ struct RawRecipeTerminal {
 
 #[derive(Debug)]
 pub(crate) struct Config {
+    pub(crate) terminal: Option<String>,
     pub(crate) projects: ProjectsConfig,
     pub(crate) recipes: Vec<RecipeConfig>,
     pub(crate) path: Option<PathBuf>,
@@ -122,6 +124,9 @@ fn read(path: &Path) -> Result<RawConfig, Box<dyn Error>> {
 }
 
 fn merge(base: &mut RawConfig, next: RawConfig) {
+    if next.terminal.is_some() {
+        base.terminal = next.terminal;
+    }
     if let Some(next_projects) = next.projects {
         let projects = base.projects.get_or_insert_default();
         if next_projects.roots.is_some() {
@@ -137,6 +142,14 @@ fn merge(base: &mut RawConfig, next: RawConfig) {
 }
 
 fn resolve(raw: RawConfig, path: Option<PathBuf>) -> Result<Config, Box<dyn Error>> {
+    let terminal = raw
+        .terminal
+        .map(|terminal| terminal.trim().to_owned())
+        .map(|terminal| {
+            crate::terminal::validate_desktop_entry(&terminal)?;
+            Ok::<_, Box<dyn Error>>(terminal)
+        })
+        .transpose()?;
     let projects = raw.projects.unwrap_or_default();
     let max_depth = projects.max_depth.unwrap_or(DEFAULT_PROJECT_SEARCH_DEPTH);
     if !(1..=MAX_PROJECT_SEARCH_DEPTH).contains(&max_depth) {
@@ -155,6 +168,7 @@ fn resolve(raw: RawConfig, path: Option<PathBuf>) -> Result<Config, Box<dyn Erro
     let recipes = resolve_recipes(raw.recipes.unwrap_or_default())?;
 
     Ok(Config {
+        terminal,
         projects: ProjectsConfig { roots, max_depth },
         recipes,
         path,
@@ -281,6 +295,42 @@ mod tests {
 
         assert_eq!(config.projects.roots, [PathBuf::from("/tmp/projects")]);
         assert_eq!(config.projects.max_depth, 4);
+    }
+
+    #[test]
+    fn parses_terminal_preference() {
+        let raw: RawConfig =
+            toml::from_str(r#"terminal = "Alacritty.desktop""#).expect("valid config");
+
+        let config = resolve(raw, None).expect("resolved config");
+
+        assert_eq!(config.terminal.as_deref(), Some("Alacritty.desktop"));
+    }
+
+    #[test]
+    fn terminal_preference_can_be_overridden() {
+        let mut base: RawConfig =
+            toml::from_str(r#"terminal = "Alacritty.desktop""#).expect("valid base");
+        let next: RawConfig = toml::from_str(r#"terminal = "com.mitchellh.ghostty.desktop""#)
+            .expect("valid override");
+
+        merge(&mut base, next);
+        let config = resolve(base, None).expect("resolved config");
+
+        assert_eq!(
+            config.terminal.as_deref(),
+            Some("com.mitchellh.ghostty.desktop")
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_terminal_desktop_entries() {
+        for terminal in ["", "Alacritty", "-Alacritty.desktop", "bad\n.desktop"] {
+            let raw: RawConfig =
+                toml::from_str(&format!("terminal = {terminal:?}")).expect("valid TOML");
+
+            assert!(resolve(raw, None).is_err());
+        }
     }
 
     #[test]

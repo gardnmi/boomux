@@ -1,0 +1,190 @@
+use std::env;
+use std::error::Error;
+use std::ffi::OsString;
+use std::fs;
+use std::path::PathBuf;
+use std::process::{self, Command};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static TEMPORARY_DIRECTORY_ID: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn validate_desktop_entry(entry: &str) -> Result<(), Box<dyn Error>> {
+    let (desktop_entry, action) = entry
+        .split_once(':')
+        .map_or((entry, None), |(entry, action)| (entry, Some(action)));
+    let invalid = entry.trim() != entry
+        || desktop_entry.is_empty()
+        || !desktop_entry.ends_with(".desktop")
+        || desktop_entry.starts_with('-')
+        || desktop_entry.contains(['/', '\\'])
+        || entry.chars().any(char::is_whitespace)
+        || action.is_some_and(|action| action.is_empty() || action.contains(':'));
+    if invalid {
+        Err(format!("invalid terminal desktop entry {entry:?}").into())
+    } else {
+        Ok(())
+    }
+}
+
+pub(crate) fn selected(desktop_entry: Option<&str>) -> Result<String, Box<dyn Error>> {
+    let preference = desktop_entry.map(TemporaryPreference::new).transpose()?;
+    selected_with_preference(desktop_entry, preference.as_ref())
+}
+
+pub(crate) fn open(
+    desktop_entry: Option<&str>,
+    terminal_id: &str,
+    title: &str,
+    takeover: bool,
+) -> Result<(), Box<dyn Error>> {
+    let preference = desktop_entry.map(TemporaryPreference::new).transpose()?;
+    let selected = selected_with_preference(desktop_entry, preference.as_ref())?;
+    let mut resolver = configured_command(preference.as_ref());
+    resolver
+        .arg(r"--print-cmd=\0")
+        .arg(format!("--title={title}"))
+        .arg("--")
+        .args(["herdr", "terminal", "attach", terminal_id]);
+    if takeover {
+        resolver.arg("--takeover");
+    }
+    let output = resolver.output()?;
+    if !output.status.success() {
+        let message = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("could not prepare {selected}: {}", message.trim()).into());
+    }
+    let arguments = parse_nul_arguments(&output.stdout)?;
+    let (program, arguments) = arguments
+        .split_first()
+        .ok_or("xdg-terminal-exec returned an empty terminal command")?;
+    Command::new(program)
+        .args(arguments)
+        .spawn()
+        .map_err(|error| format!("could not launch {selected}: {error}"))?;
+    Ok(())
+}
+
+fn selected_with_preference(
+    requested: Option<&str>,
+    preference: Option<&TemporaryPreference>,
+) -> Result<String, Box<dyn Error>> {
+    if let Some(entry) = requested {
+        validate_desktop_entry(entry)?;
+    }
+    let output = configured_command(preference)
+        .arg("--print-id")
+        .output()
+        .map_err(|error| format!("could not run xdg-terminal-exec: {error}"))?;
+    if !output.status.success() {
+        let message = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("could not resolve an Omarchy terminal: {}", message.trim()).into());
+    }
+    let selected = String::from_utf8(output.stdout)?.trim().to_owned();
+    if selected.is_empty() {
+        return Err("xdg-terminal-exec did not select a terminal".into());
+    }
+    if let Some(requested) = requested
+        && selected != requested
+    {
+        return Err(format!(
+            "terminal desktop entry {requested:?} is unavailable (xdg-terminal-exec selected {selected:?} instead)"
+        )
+        .into());
+    }
+    Ok(selected)
+}
+
+fn configured_command(preference: Option<&TemporaryPreference>) -> Command {
+    let mut command = Command::new("xdg-terminal-exec");
+    if let Some(preference) = preference {
+        command
+            .env("XDG_CONFIG_HOME", &preference.directory)
+            .env("XTE_CACHE_ENABLED", "false");
+    }
+    command
+}
+
+fn parse_nul_arguments(output: &[u8]) -> Result<Vec<OsString>, Box<dyn Error>> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+
+        let arguments = output
+            .split(|byte| *byte == 0)
+            .filter(|argument| !argument.is_empty())
+            .map(|argument| OsString::from_vec(argument.to_vec()))
+            .collect::<Vec<_>>();
+        if arguments.is_empty() {
+            Err("xdg-terminal-exec returned an empty terminal command".into())
+        } else {
+            Ok(arguments)
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = output;
+        Err("terminal launching is supported only on Unix".into())
+    }
+}
+
+struct TemporaryPreference {
+    directory: PathBuf,
+}
+
+impl TemporaryPreference {
+    fn new(entry: &str) -> Result<Self, Box<dyn Error>> {
+        validate_desktop_entry(entry)?;
+        let parent = env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .unwrap_or_else(env::temp_dir);
+        let id = TEMPORARY_DIRECTORY_ID.fetch_add(1, Ordering::Relaxed);
+        let directory = parent.join(format!("boomux-{}-{id}", process::id()));
+        fs::create_dir(&directory)?;
+        if let Err(error) = fs::write(directory.join("xdg-terminals.list"), format!("{entry}\n")) {
+            let _ = fs::remove_dir(&directory);
+            return Err(error.into());
+        }
+        Ok(Self { directory })
+    }
+}
+
+impl Drop for TemporaryPreference {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.directory);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn validates_desktop_entry_ids_and_actions() {
+        assert!(validate_desktop_entry("Alacritty.desktop").is_ok());
+        assert!(validate_desktop_entry("terminal.desktop:new-window").is_ok());
+
+        for invalid in [
+            "",
+            "Alacritty",
+            "-bad.desktop",
+            "bad/name.desktop",
+            "bad.desktop:",
+        ] {
+            assert!(validate_desktop_entry(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn parses_nul_delimited_commands() {
+        let arguments = parse_nul_arguments(b"alacritty\0-e\0herdr\0terminal\0").unwrap();
+
+        assert_eq!(
+            arguments,
+            ["alacritty", "-e", "herdr", "terminal"]
+                .map(OsStr::new)
+                .map(OsStr::to_owned)
+        );
+    }
+}
