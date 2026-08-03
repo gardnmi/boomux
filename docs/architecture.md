@@ -23,7 +23,7 @@ persistence across attachment disconnects, naming, grouping, and orchestration.
 
 ### Application
 
-`src/main.rs` owns the CLI, project launcher, recipes, dashboard actions, shell
+`src/main.rs` owns the CLI, project-name suggestions, dashboard actions, shell
 name resolution, and conversion from daemon snapshots into TUI view models.
 
 ### Protocol
@@ -34,8 +34,10 @@ frames for input, output, resize, and detach events.
 
 The domain has only two durable identities:
 
-- A workspace groups shells under a name and working directory.
-- A shell owns one PTY, child process, name, and workspace ID.
+- A workspace is a globally named shell container with a UUID. It has no path
+  or working directory.
+- A shell owns one PTY, child process, name, explicit working directory, and
+  workspace ID.
 
 There are no separate tab, pane, and terminal identity layers.
 
@@ -54,7 +56,9 @@ is restricted to the current user and the socket mode is `0600`.
 
 The daemon supports:
 
-- Atomic multi-shell workspace creation
+- Empty or explicitly populated workspace creation
+- Atomic shell creation with an implicit `workspace-N` container when no
+  workspace is selected
 - Additional shell creation
 - Workspace and shell snapshots
 - Shell and workspace rename operations
@@ -63,8 +67,15 @@ The daemon supports:
 - One writable attachment with explicit takeover
 - PTY input and resize forwarding
 
-Workspace creation stages every child before publishing any of them to the
-registry. A failed spawn kills the staged children.
+An empty shell specification list remains empty. When an explicit populated
+creation is requested, the daemon stages every child before publishing any of
+them; a failed spawn kills the staged children. Workspace names are checked for
+global uniqueness at publication while the registry is locked.
+
+Shell creation may omit a workspace ID. The daemon then selects the lowest
+available `workspace-N` name and publishes the generated workspace and shell as
+one operation. Concurrent requests retry name allocation rather than exposing
+an ungrouped shell.
 
 ### Attachment
 
@@ -91,7 +102,10 @@ No emulator-specific adapter or compositor window ID is required.
 `src/tui.rs` remains a control plane. It receives backend-neutral view models
 and callback functions rather than opening sockets itself. One daemon snapshot
 contains each workspace and its shells, avoiding races between separate list
-operations. Git information is still collected independently and cached.
+operations. Configured project roots provide workspace-name suggestions only.
+Git information is collected independently from shell directories and cached;
+empty or mixed-directory workspaces have no workspace-level directory or Git
+identity.
 
 ### Agent Skill
 
@@ -117,9 +131,13 @@ restart or crash.
 
 ## Next Technical Steps
 
-1. Track terminal state with a VT parser and emit a sanitized reconnect snapshot.
-2. Negotiate terminal capabilities when the first native attachment creates a
+The detailed design, acceptance criteria, and manual test matrix are tracked in
+[`native-terminal-follow-up.md`](native-terminal-follow-up.md).
+
+1. Negotiate terminal capabilities when the first native attachment creates a
    shell.
-3. Persist reproducible workspace metadata atomically under `$XDG_STATE_HOME`.
+2. Track terminal state with a VT parser and emit a sanitized reconnect snapshot.
+3. Persist reproducible workspace and shell metadata atomically under
+   `$XDG_STATE_HOME`, keeping working directories on shells only.
 4. Add graceful daemon restart or live PTY handoff only after the base lifecycle
    is reliable.

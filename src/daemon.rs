@@ -161,7 +161,6 @@ struct RegistryState {
 struct Workspace {
     id: String,
     name: Mutex<String>,
-    cwd: PathBuf,
     shell_ids: Mutex<Vec<String>>,
 }
 
@@ -198,14 +197,17 @@ impl Registry {
             Request::GetShell { shell_id } => Ok(Response::Shell {
                 shell: self.shell(&shell_id)?.snapshot()?,
             }),
-            Request::CreateWorkspace { name, cwd, shells } => Ok(Response::Workspace {
-                workspace: self.create_workspace(name, cwd, shells)?,
+            Request::CreateWorkspace { name, shells } => Ok(Response::Workspace {
+                workspace: self.create_workspace(name, shells)?,
             }),
             Request::CreateShell {
                 workspace_id,
                 shell,
             } => Ok(Response::Shell {
-                shell: self.create_shell(&workspace_id, shell)?,
+                shell: match workspace_id {
+                    Some(workspace_id) => self.create_shell(&workspace_id, shell)?,
+                    None => self.create_shell_with_workspace(shell)?,
+                },
             }),
             Request::ReadShell {
                 shell_id,
@@ -215,7 +217,17 @@ impl Registry {
             }),
             Request::RenameWorkspace { workspace_id, name } => {
                 validate_name(&name)?;
-                *lock(&self.workspace(&workspace_id)?.name)? = name;
+                let workspace = self.workspace(&workspace_id)?;
+                let state = lock(&self.state)?;
+                for current in state.workspaces.values() {
+                    if !Arc::ptr_eq(current, &workspace) && *lock(&current.name)? == name {
+                        return Err(io::Error::new(
+                            io::ErrorKind::AlreadyExists,
+                            format!("workspace name already exists: {name}"),
+                        ));
+                    }
+                }
+                *lock(&workspace.name)? = name;
                 Ok(Response::Ok)
             }
             Request::RenameShell { shell_id, name } => {
@@ -285,22 +297,15 @@ impl Registry {
     fn create_workspace(
         &self,
         name: String,
-        cwd: PathBuf,
         specs: Vec<ShellSpec>,
     ) -> io::Result<WorkspaceSnapshot> {
         validate_name(&name)?;
-        validate_cwd(&cwd)?;
         let workspace_id = Uuid::new_v4().to_string();
-        let specs = if specs.is_empty() {
-            vec![ShellSpec::login("shell")]
-        } else {
-            specs
-        };
         validate_shell_specs(&specs)?;
 
         let mut shells = Vec::with_capacity(specs.len());
         for spec in specs {
-            match spawn_shell(&workspace_id, &name, &cwd, spec) {
+            match spawn_shell(&workspace_id, &name, spec) {
                 Ok(shell) => shells.push(shell),
                 Err(error) => {
                     for shell in shells {
@@ -315,27 +320,21 @@ impl Registry {
         let workspace = Arc::new(Workspace {
             id: workspace_id.clone(),
             name: Mutex::new(name),
-            cwd,
             shell_ids: Mutex::new(shells.iter().map(|shell| shell.id.clone()).collect()),
         });
         {
             let mut state = lock(&self.state)?;
-            let mut duplicate = false;
             for current in state.workspaces.values() {
-                if current.cwd == workspace.cwd && *lock(&current.name)? == workspace_name {
-                    duplicate = true;
-                    break;
+                if *lock(&current.name)? == workspace_name {
+                    drop(state);
+                    for shell in shells {
+                        let _ = shell.kill();
+                    }
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        format!("workspace name already exists: {workspace_name}"),
+                    ));
                 }
-            }
-            if duplicate {
-                drop(state);
-                for shell in shells {
-                    let _ = shell.kill();
-                }
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    "workspace name and directory already exist",
-                ));
             }
             for shell in &shells {
                 state.shells.insert(shell.id.clone(), Arc::clone(shell));
@@ -349,12 +348,7 @@ impl Registry {
 
     fn create_shell(&self, workspace_id: &str, spec: ShellSpec) -> io::Result<ShellSnapshot> {
         let workspace = self.workspace(workspace_id)?;
-        let shell = spawn_shell(
-            workspace_id,
-            &lock(&workspace.name)?.clone(),
-            &workspace.cwd,
-            spec,
-        )?;
+        let shell = spawn_shell(workspace_id, &lock(&workspace.name)?.clone(), spec)?;
         let snapshot = shell.snapshot()?;
         let mut state = lock(&self.state)?;
         let Some(current) = state.workspaces.get(workspace_id) else {
@@ -386,6 +380,41 @@ impl Registry {
         state.shells.insert(shell.id.clone(), Arc::clone(&shell));
         shell_ids.push(shell.id.clone());
         Ok(snapshot)
+    }
+
+    fn create_shell_with_workspace(&self, spec: ShellSpec) -> io::Result<ShellSnapshot> {
+        loop {
+            let name = self.next_workspace_name()?;
+            match self.create_workspace(name, vec![spec.clone()]) {
+                Ok(workspace) => {
+                    return workspace
+                        .shells
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| io::Error::other("implicit workspace has no shell"));
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn next_workspace_name(&self) -> io::Result<String> {
+        let state = lock(&self.state)?;
+        let mut suffix = 1_u64;
+        loop {
+            let candidate = format!("workspace-{suffix}");
+            let exists = state
+                .workspaces
+                .values()
+                .any(|workspace| workspace.name.lock().is_ok_and(|name| *name == candidate));
+            if !exists {
+                return Ok(candidate);
+            }
+            suffix = suffix
+                .checked_add(1)
+                .ok_or_else(|| io::Error::other("workspace name space exhausted"))?;
+        }
     }
 
     fn rename_shell(&self, shell_id: &str, name: String) -> io::Result<()> {
@@ -468,7 +497,6 @@ impl Workspace {
         Ok(WorkspaceSnapshot {
             id: self.id.clone(),
             name: lock(&self.name)?.clone(),
-            cwd: self.cwd.clone(),
             shells,
         })
     }
@@ -541,11 +569,10 @@ impl Shell {
 fn spawn_shell(
     workspace_id: &str,
     workspace_name: &str,
-    workspace_cwd: &Path,
     spec: ShellSpec,
 ) -> io::Result<Arc<Shell>> {
     validate_name(&spec.name)?;
-    let cwd = spec.cwd.unwrap_or_else(|| workspace_cwd.to_path_buf());
+    let cwd = spec.cwd;
     validate_cwd(&cwd)?;
     let shell_id = Uuid::new_v4().to_string();
     let pty = native_pty_system()
@@ -831,6 +858,7 @@ fn lock<T>(mutex: &Mutex<T>) -> io::Result<MutexGuard<'_, T>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Barrier;
 
     #[test]
     fn empty_registry_has_empty_snapshot() {
@@ -855,11 +883,77 @@ mod tests {
 
     #[test]
     fn rejects_duplicate_shell_names_before_spawning() {
-        let specs = vec![ShellSpec::login("shell"), ShellSpec::login("shell")];
+        let cwd = env::temp_dir();
+        let specs = vec![
+            ShellSpec::login("shell", &cwd),
+            ShellSpec::login("shell", &cwd),
+        ];
 
         let error = validate_shell_specs(&specs).unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn empty_workspace_snapshot_has_no_cwd_and_no_shells() {
+        let registry = Registry::default();
+
+        let workspace = registry
+            .create_workspace("empty".into(), Vec::new())
+            .unwrap();
+        let value = serde_json::to_value(&workspace).unwrap();
+
+        assert!(workspace.shells.is_empty());
+        assert!(value.get("cwd").is_none());
+    }
+
+    #[test]
+    fn concurrent_duplicate_workspace_names_publish_only_once() {
+        let registry = Arc::new(Registry::default());
+        let barrier = Arc::new(Barrier::new(3));
+        let threads = (0..2)
+            .map(|_| {
+                let registry = Arc::clone(&registry);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    registry.create_workspace("same".into(), Vec::new())
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        let results = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert!(results.iter().any(|result| {
+            result
+                .as_ref()
+                .is_err_and(|error| error.kind() == io::ErrorKind::AlreadyExists)
+        }));
+        assert_eq!(registry.snapshot().unwrap().workspaces.len(), 1);
+    }
+
+    #[test]
+    fn shell_without_workspace_gets_the_next_generated_workspace_name() {
+        let registry = Registry::default();
+        registry
+            .create_workspace("workspace-1".into(), Vec::new())
+            .unwrap();
+
+        let shell = registry
+            .create_shell_with_workspace(ShellSpec {
+                name: "shell-1".into(),
+                command: vec!["/bin/sh".into(), "-c".into(), "sleep 5".into()],
+                cwd: env::temp_dir(),
+            })
+            .unwrap();
+        let workspace = registry.workspace(&shell.workspace_id).unwrap();
+
+        assert_eq!(&*lock(&workspace.name).unwrap(), "workspace-2");
+        registry.shutdown().unwrap();
     }
 
     #[test]
@@ -881,11 +975,10 @@ mod tests {
         let workspace = registry
             .create_workspace(
                 "test".into(),
-                env::temp_dir(),
                 vec![ShellSpec {
                     name: "one".into(),
                     command: vec!["/bin/sh".into(), "-c".into(), "sleep 5".into()],
-                    cwd: None,
+                    cwd: env::temp_dir(),
                 }],
             )
             .unwrap();

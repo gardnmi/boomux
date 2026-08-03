@@ -141,12 +141,10 @@ impl Client {
     pub fn create_workspace(
         &self,
         name: impl Into<String>,
-        cwd: PathBuf,
         shells: Vec<ShellSpec>,
     ) -> io::Result<WorkspaceSnapshot> {
         match self.request(Request::CreateWorkspace {
             name: name.into(),
-            cwd,
             shells,
         })? {
             Response::Workspace { workspace } => Ok(workspace),
@@ -160,7 +158,17 @@ impl Client {
         shell: ShellSpec,
     ) -> io::Result<ShellSnapshot> {
         match self.request(Request::CreateShell {
-            workspace_id: workspace_id.into(),
+            workspace_id: Some(workspace_id.into()),
+            shell,
+        })? {
+            Response::Shell { shell } => Ok(shell),
+            other => unexpected(other),
+        }
+    }
+
+    pub fn create_shell_with_workspace(&self, shell: ShellSpec) -> io::Result<ShellSnapshot> {
+        match self.request(Request::CreateShell {
+            workspace_id: None,
             shell,
         })? {
             Response::Shell { shell } => Ok(shell),

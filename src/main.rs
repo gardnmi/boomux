@@ -211,6 +211,7 @@ fn picker(terminal: Option<&str>) -> Result<(), Box<dyn Error>> {
 
 fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
     ensure_host_terminal()?;
+    let launch_cwd = resolve_directory(Path::new("."))?;
     let client = client::connect_or_start()?;
     let mut git_cache = git::Cache::default();
     let views = dashboard_views(&client.snapshot()?.workspaces, &mut git_cache);
@@ -218,7 +219,6 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
     let terminal = terminal_override
         .map(str::to_owned)
         .or_else(|| config.terminal.clone());
-    let recipes = config.recipes.clone();
     let roots_configured = !config.projects.roots.is_empty();
     let discovery = projects::discover(&config.projects);
     let project_context = tui::ProjectContext {
@@ -230,18 +230,6 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
                 path: project.path,
                 group: project.group,
                 group_order: project.group_order,
-            })
-            .collect(),
-        recipes: recipes
-            .iter()
-            .map(|recipe| tui::RecipeView {
-                id: recipe.id.clone(),
-                label: recipe.label.clone(),
-                terminals: recipe
-                    .terminals
-                    .iter()
-                    .map(|terminal| terminal.name.clone())
-                    .collect(),
             })
             .collect(),
         config_path: config.path.or_else(config::global_config_path),
@@ -276,18 +264,26 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
                     .map_err(|error| error.to_string())?;
                 Ok(format!("Closed {name} and all of its shells"))
             },
-            on_create_workspace: |directory: &Path, recipe_id: Option<&str>| {
-                create_dashboard_workspace(&client, directory, recipe_id, &recipes)
-                    .map_err(|error| error.to_string())
+            on_create_workspace: |name: &str| {
+                create_dashboard_workspace(&client, name).map_err(|error| error.to_string())
             },
             on_create_shell: |workspace_id: &str| {
-                create_dashboard_shell(&client, workspace_id).map_err(|error| error.to_string())
+                create_dashboard_shell(&client, workspace_id, &launch_cwd)
+                    .map_err(|error| error.to_string())
             },
-            on_rename: |shell_id: &str, name: &str| {
-                client
-                    .rename_shell(shell_id, name)
-                    .map_err(|error| error.to_string())?;
-                Ok(format!("Renamed shell to {name}"))
+            on_rename: |target: &tui::RenameTarget, name: &str| match target {
+                tui::RenameTarget::Workspace(workspace_id) => {
+                    client
+                        .rename_workspace(workspace_id, name)
+                        .map_err(|error| error.to_string())?;
+                    Ok(format!("Renamed workspace to {name}"))
+                }
+                tui::RenameTarget::Shell(shell_id) => {
+                    client
+                        .rename_shell(shell_id, name)
+                        .map_err(|error| error.to_string())?;
+                    Ok(format!("Renamed shell to {name}"))
+                }
             },
             on_refresh: || {
                 let snapshot = client.snapshot().map_err(|error| error.to_string())?;
@@ -305,7 +301,10 @@ fn dashboard_views(
     workspaces
         .iter()
         .map(|workspace| {
-            let git = git_cache.inspect(&workspace.cwd);
+            let directory = common_shell_cwd(workspace);
+            let git = directory
+                .map(|directory| git_cache.inspect(directory))
+                .unwrap_or_default();
             let terminals = workspace
                 .shells
                 .iter()
@@ -321,7 +320,9 @@ fn dashboard_views(
             tui::WorkspaceView {
                 id: workspace.id.clone(),
                 name: workspace.name.clone(),
-                directory: workspace.cwd.display().to_string(),
+                directory: directory
+                    .map(|directory| directory.display().to_string())
+                    .unwrap_or_else(|| "-".into()),
                 repository: git.repository,
                 branch: git.branch,
                 git_state: git.state,
@@ -332,6 +333,15 @@ fn dashboard_views(
         .collect()
 }
 
+fn common_shell_cwd(workspace: &WorkspaceSnapshot) -> Option<&Path> {
+    let first = workspace.shells.first()?.cwd.as_path();
+    workspace
+        .shells
+        .iter()
+        .all(|shell| shell.cwd == first)
+        .then_some(first)
+}
+
 fn open_directory(
     path: &Path,
     requested_name: Option<&str>,
@@ -340,43 +350,41 @@ fn open_directory(
 ) -> Result<(), Box<dyn Error>> {
     ensure_host_terminal()?;
     let directory = resolve_directory(path)?;
-    let name = requested_name
+    let requested_name = requested_name
         .map(str::trim)
         .filter(|name| !name.is_empty())
-        .map(str::to_owned)
-        .unwrap_or_else(|| default_workspace_name(&directory));
+        .map(str::to_owned);
     let client = client::connect_or_start()?;
     let snapshot = client.snapshot()?;
-    let shell = if let Some(workspace) = find_workspace(&snapshot.workspaces, &directory, &name) {
-        let shell_name = unique_shell_name("shell", &workspace.shells);
-        client.create_shell(&workspace.id, ShellSpec::login(shell_name))?
+    let (shell, workspace_name) = if let Some(name) = requested_name {
+        let shell = if let Some(workspace) = find_workspace(&snapshot.workspaces, &name) {
+            let shell_name = unique_shell_name("shell", &workspace.shells);
+            client.create_shell(&workspace.id, ShellSpec::login(shell_name, &directory))?
+        } else {
+            client
+                .create_workspace(&name, vec![ShellSpec::login("shell-1", &directory)])?
+                .shells
+                .into_iter()
+                .next()
+                .ok_or("new workspace has no shell")?
+        };
+        (shell, name)
     } else {
-        client
-            .create_workspace(&name, directory, vec![ShellSpec::login("shell-1")])?
-            .shells
-            .into_iter()
-            .next()
-            .ok_or("new workspace has no shell")?
+        let shell = client.create_shell_with_workspace(ShellSpec::login("shell-1", &directory))?;
+        let workspace_name = client.get_workspace(&shell.workspace_id)?.name;
+        (shell, workspace_name)
     };
 
     if open_in_new_window {
         open_terminal(
             &shell.id,
-            Some(&format!("{name} - {}", shell.name)),
+            Some(&format!("{workspace_name} - {}", shell.name)),
             true,
             terminal,
         )
     } else {
         Ok(attach::run(&shell.id, true)?)
     }
-}
-
-fn default_workspace_name(directory: &Path) -> String {
-    directory
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| "default".into())
 }
 
 fn ensure_host_terminal() -> Result<(), Box<dyn Error>> {
@@ -404,12 +412,9 @@ fn resolve_directory(path: &Path) -> Result<PathBuf, Box<dyn Error>> {
 
 fn find_workspace<'a>(
     workspaces: &'a [WorkspaceSnapshot],
-    directory: &Path,
     name: &str,
 ) -> Option<&'a WorkspaceSnapshot> {
-    workspaces
-        .iter()
-        .find(|workspace| workspace.name == name && workspace.cwd == directory)
+    workspaces.iter().find(|workspace| workspace.name == name)
 }
 
 fn choose_workspace(workspaces: &[WorkspaceSnapshot]) -> Result<Option<String>, Box<dyn Error>> {
@@ -425,11 +430,10 @@ fn choose_workspace(workspaces: &[WorkspaceSnapshot]) -> Result<Option<String>, 
                 "shells"
             };
             let label = format!(
-                "{:<18} {:>2} {:<6} {}  ({})",
+                "{:<18} {:>2} {:<6} ({})",
                 workspace.name,
                 workspace.shells.len(),
                 shell_word,
-                workspace.cwd.display(),
                 workspace.id
             );
             (label, workspace.id.clone())
@@ -453,58 +457,29 @@ fn choose_workspace(workspaces: &[WorkspaceSnapshot]) -> Result<Option<String>, 
 
 fn create_dashboard_workspace(
     client: &client::Client,
-    directory: &Path,
-    recipe_id: Option<&str>,
-    recipes: &[config::RecipeConfig],
+    name: &str,
 ) -> Result<String, Box<dyn Error>> {
-    let cwd = resolve_directory(directory)?;
-    let name = default_workspace_name(&cwd);
-    if find_workspace(&client.snapshot()?.workspaces, &cwd, &name).is_some() {
-        return Err(format!("workspace {name} already exists in {}", cwd.display()).into());
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("workspace name cannot be empty".into());
     }
-    let (label, specs) = if let Some(recipe_id) = recipe_id {
-        let recipe = recipes
-            .iter()
-            .find(|recipe| recipe.id == recipe_id)
-            .ok_or_else(|| format!("recipe {recipe_id} no longer exists"))?;
-        (
-            recipe.label.clone(),
-            recipe.terminals.iter().map(recipe_shell_spec).collect(),
-        )
-    } else {
-        ("Default".into(), vec![ShellSpec::login("shell-1")])
-    };
-    let count = specs.len();
-    client.create_workspace(&name, cwd, specs)?;
-    Ok(format!(
-        "Created workspace {name} with {label} ({count} terminal{})",
-        if count == 1 { "" } else { "s" }
-    ))
-}
-
-fn recipe_shell_spec(terminal: &config::RecipeTerminalConfig) -> ShellSpec {
-    let command = terminal.command.as_ref().map_or_else(Vec::new, |command| {
-        vec![
-            env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()),
-            "-lc".into(),
-            command.clone(),
-        ]
-    });
-    ShellSpec {
-        name: terminal.name.clone(),
-        command,
-        cwd: None,
-    }
+    client.create_workspace(name, Vec::new())?;
+    Ok(format!("Created empty workspace {name}"))
 }
 
 fn create_dashboard_shell(
     client: &client::Client,
     workspace_id: &str,
+    launch_cwd: &Path,
 ) -> Result<String, Box<dyn Error>> {
     let workspace = client.get_workspace(workspace_id)?;
     let name = unique_shell_name("shell", &workspace.shells);
-    client.create_shell(workspace_id, ShellSpec::login(&name))?;
+    client.create_shell(workspace_id, dashboard_shell_spec(&name, launch_cwd))?;
     Ok(format!("Created {name} in {}", workspace.name))
+}
+
+fn dashboard_shell_spec(name: &str, launch_cwd: &Path) -> ShellSpec {
+    ShellSpec::login(name, launch_cwd)
 }
 
 fn unique_shell_name(base_name: &str, shells: &[ShellSnapshot]) -> String {
@@ -842,7 +817,6 @@ mod tests {
         WorkspaceSnapshot {
             id: id.into(),
             name: name.into(),
-            cwd: PathBuf::from("/tmp/project"),
             shells,
         }
     }
@@ -873,9 +847,9 @@ mod tests {
     }
 
     #[test]
-    fn matches_native_workspace_by_name_and_directory() {
+    fn matches_native_workspace_by_name_only() {
         let workspace = workspace("w1", "project", vec![]);
-        assert!(find_workspace(&[workspace], Path::new("/tmp/project"), "project").is_some());
+        assert!(find_workspace(&[workspace], "project").is_some());
     }
 
     #[test]
@@ -908,13 +882,31 @@ mod tests {
     }
 
     #[test]
-    fn recipe_commands_use_a_login_shell() {
-        let spec = recipe_shell_spec(&config::RecipeTerminalConfig {
-            name: "agent".into(),
-            command: Some("opencode --continue".into()),
-        });
-        assert_eq!(spec.name, "agent");
-        assert_eq!(&spec.command[1..], ["-lc", "opencode --continue"]);
+    fn dashboard_shell_uses_launch_cwd() {
+        let spec = dashboard_shell_spec("shell", Path::new("/tmp/dashboard-launch"));
+
+        assert_eq!(spec.cwd, Path::new("/tmp/dashboard-launch"));
+    }
+
+    #[test]
+    fn empty_workspace_view_has_no_directory_or_git_values() {
+        let views = dashboard_views(
+            &[workspace("w1", "empty", Vec::new())],
+            &mut git::Cache::default(),
+        );
+
+        assert_eq!(views[0].directory, "-");
+        assert_eq!(views[0].repository, "-");
+        assert_eq!(views[0].branch, "-");
+        assert_eq!(views[0].git_state, "-");
+        assert_eq!(views[0].worktree, "-");
+    }
+
+    #[test]
+    fn restoring_empty_workspace_returns_actionable_error() {
+        let error = open_workspace(&workspace("w1", "empty", Vec::new()), None).unwrap_err();
+
+        assert!(error.to_string().contains("workspace empty has no shells"));
     }
 
     #[test]

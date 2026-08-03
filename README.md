@@ -16,14 +16,18 @@ transport.
 
 ## Usage
 
-Create a workspace from the current directory and attach in place:
+Create a shell whose working directory is the requested path and attach in
+place. When no workspace name is supplied, Boomux creates the next available
+`workspace-N` container automatically:
 
 ```console
 boomux .
 ```
 
-Repeated invocations create additional shells in the same workspace. Use a
-name to maintain independent groups for one directory:
+Each unnamed invocation creates a new generated workspace. A workspace is only
+a named shell container with a UUID; each shell independently owns its working
+directory. Use `--name` to add the shell to an existing named workspace or
+create that explicitly named container:
 
 ```console
 boomux . --name feature-x
@@ -57,8 +61,10 @@ Dashboard controls:
 - `Tab` switches between workspace and shell tables.
 - `j`, `k`, and the arrow keys navigate.
 - `Enter` restores a workspace or opens the selected shell.
-- `a` opens the project launcher or adds a shell.
-- `e` renames the selected shell.
+- `a` creates an empty workspace or adds a shell, depending on the focused
+  table. New dashboard shells start in the directory where `boomux ui` was
+  launched.
+- `e` renames the selected workspace or shell, depending on focus.
 - `x`, then `y`, closes a workspace and all of its processes.
 - `r` refreshes immediately.
 - `q` or `Esc` quits.
@@ -100,19 +106,14 @@ terminal = "Alacritty.desktop"
 roots = ["~/Projects", "~/Work"]
 max_depth = 3
 
-[recipes.full-dev]
-label = "Full Dev"
-terminals = [
-  { name = "opencode", command = "opencode" },
-  { name = "lazygit", command = "lazygit" },
-  { name = "lazyvim", command = "nvim" },
-]
 ```
 
-Project discovery scans only configured roots, recognizes ordinary and linked
-Git worktrees, and stops descending after finding a repository. Recipe shells
-are staged before the workspace is published, so a spawn failure does not leave
-a partial workspace. Commands currently run as `$SHELL -lc <command>`.
+Directory discovery scans only configured project roots, recognizes ordinary
+and linked Git worktrees, and stops descending after finding a repository. The
+dashboard uses discovered projects only as quick suggestions for workspace
+names. Selecting one does not store or associate its path. Arbitrary text can
+also be entered as a workspace name, and every newly created workspace starts
+empty.
 
 ## Shell Context
 
@@ -160,6 +161,8 @@ Ghostty, Alacritty, or another XDG terminal
 Live PTY bytes pass through unchanged. The attachment client only enables raw
 mode, forwards input and resize events, writes output, and restores terminal
 mode on exit. See [`docs/architecture.md`](docs/architecture.md) for details.
+The remaining terminal handshake and reconnect work is tracked in
+[`docs/native-terminal-follow-up.md`](docs/native-terminal-follow-up.md).
 
 ## POC Limitations
 

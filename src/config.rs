@@ -45,6 +45,7 @@ struct RawRecipeTerminal {
 pub(crate) struct Config {
     pub(crate) terminal: Option<String>,
     pub(crate) projects: ProjectsConfig,
+    #[allow(dead_code)] // Reserved for a future explicit shell-creation flow.
     pub(crate) recipes: Vec<RecipeConfig>,
     pub(crate) path: Option<PathBuf>,
 }

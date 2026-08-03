@@ -93,7 +93,7 @@ fn native_daemon_lifecycle() {
         .output()
         .unwrap();
     assert!(status.status.success());
-    assert!(String::from_utf8_lossy(&status.stdout).contains("running (protocol 1"));
+    assert!(String::from_utf8_lossy(&status.stdout).contains("running (protocol 2"));
 
     let mut duplicate = daemon
         .command()
@@ -109,12 +109,29 @@ fn native_daemon_lifecycle() {
     );
     assert!(!duplicate.wait().unwrap().success());
 
+    let generated_shell = daemon
+        .client
+        .create_shell_with_workspace(ShellSpec {
+            name: "shell-1".into(),
+            command: vec!["/bin/sh".into(), "-c".into(), "sleep 5".into()],
+            cwd: std::env::temp_dir(),
+        })
+        .unwrap();
+    let generated_workspace = daemon
+        .client
+        .get_workspace(&generated_shell.workspace_id)
+        .unwrap();
+    assert_eq!(generated_workspace.name, "workspace-1");
+    daemon
+        .client
+        .close_workspace(&generated_workspace.id)
+        .unwrap();
+
     let workspace = daemon
         .client
         .create_workspace(
             "integration",
-            std::env::temp_dir(),
-            vec![ShellSpec::login("shell-1")],
+            vec![ShellSpec::login("shell-1", std::env::temp_dir())],
         )
         .unwrap();
     let shell = workspace.shells.first().unwrap();

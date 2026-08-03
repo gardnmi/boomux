@@ -10,18 +10,19 @@ commitments.
   dashboard.
 - [x] Restore a whole workspace into native terminal windows or open only one
   selected terminal.
-- [x] Create workspaces from a searchable Git project launcher grouped by
-  configured roots.
+- [x] Create empty named workspaces from free text or searchable project-name
+  suggestions grouped by configured roots, without associating project paths.
+- [x] Assign shells created without a workspace to the next available
+  `workspace-N` container.
 - [x] Load layered TOML configuration from the XDG config directory and an
   optional `BOOMUX_CONFIG` override.
 - [x] Add plain shells, assign durable shell names, and carry those names into
   the dashboard, window titles, and dynamic Starship prompts.
+- [x] Rename focused workspaces and shells from the dashboard.
 - [x] Close a workspace and all of its shells through an explicit confirmation.
 - [x] Follow the active terminal theme through semantic ANSI colors.
 - [x] Display repository, branch, dirty state, and primary or linked worktree
-  information for each workspace.
-- [x] Create workspaces from configurable multi-terminal recipes with a built-in
-  single-shell default.
+  information when a workspace's shells share a directory.
 - [x] Validate runtime dependencies, configuration, and project discovery with
   `boomux doctor`.
 - [x] Follow Omarchy's default terminal with persistent and per-invocation XDG
@@ -35,9 +36,13 @@ commitments.
 
 ## Workspace Control
 
-- Reconstruct reconnect state with a VT parser instead of replaying raw bytes.
-- Persist reproducible workspace metadata under `$XDG_STATE_HOME`.
+See [`native-terminal-follow-up.md`](native-terminal-follow-up.md) for the
+terminal handshake, VT reconstruction, and restart-persistence plan.
+
 - Negotiate terminal capabilities when a shell receives its first attachment.
+- Reconstruct reconnect state with a VT parser instead of replaying raw bytes.
+- Persist reproducible workspace and shell metadata under `$XDG_STATE_HOME`,
+  keeping working directories on shells only.
 - Add graceful daemon restart or live PTY handoff.
 - Aggregate multiple agent states as counts instead of one workspace-level
   value.
@@ -45,6 +50,7 @@ commitments.
 - Show an opt-in, read-only preview of the selected terminal.
 - Search workspaces and actions from a command palette.
 - Launch workspace templates such as editor, agent, tests, and LazyGit.
+- Apply configurable shell recipes through an explicit shell-creation flow.
 - Duplicate a workspace structure for another branch or worktree.
 - Archive inactive workspaces without terminating their shells.
 

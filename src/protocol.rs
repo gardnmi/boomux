@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 pub const MAX_CONTROL_FRAME: usize = 8 * 1024 * 1024;
 pub const MAX_ATTACH_FRAME: usize = 1024 * 1024;
 
@@ -32,7 +32,6 @@ pub struct Snapshot {
 pub struct WorkspaceSnapshot {
     pub id: String,
     pub name: String,
-    pub cwd: PathBuf,
     pub shells: Vec<ShellSnapshot>,
 }
 
@@ -57,16 +56,15 @@ pub struct ShellSpec {
     pub name: String,
     #[serde(default)]
     pub command: Vec<String>,
-    #[serde(default)]
-    pub cwd: Option<PathBuf>,
+    pub cwd: PathBuf,
 }
 
 impl ShellSpec {
-    pub fn login(name: impl Into<String>) -> Self {
+    pub fn login(name: impl Into<String>, cwd: impl Into<PathBuf>) -> Self {
         Self {
             name: name.into(),
             command: Vec::new(),
-            cwd: None,
+            cwd: cwd.into(),
         }
     }
 }
@@ -85,11 +83,11 @@ pub enum Request {
     },
     CreateWorkspace {
         name: String,
-        cwd: PathBuf,
         shells: Vec<ShellSpec>,
     },
     CreateShell {
-        workspace_id: String,
+        #[serde(default)]
+        workspace_id: Option<String>,
         shell: ShellSpec,
     },
     ReadShell {
@@ -238,6 +236,13 @@ mod tests {
             read_message::<Envelope<Request>>(&mut bytes.as_slice()).unwrap(),
             value
         );
+    }
+
+    #[test]
+    fn shell_spec_requires_cwd_on_the_wire() {
+        let request = r#"{"request":"create_shell","workspace_id":"w1","shell":{"name":"shell","command":[]}}"#;
+
+        assert!(serde_json::from_str::<Request>(request).is_err());
     }
 
     #[test]
