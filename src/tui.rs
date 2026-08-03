@@ -88,6 +88,12 @@ pub(crate) enum RenameTarget {
     Shell(String),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CloseTarget {
+    Workspace(String),
+    Shell(String),
+}
+
 impl RenameTarget {
     fn label(&self) -> &'static str {
         match self {
@@ -128,7 +134,7 @@ impl Message {
 }
 
 struct PendingClose {
-    id: String,
+    target: CloseTarget,
     name: String,
     shell_count: usize,
 }
@@ -427,11 +433,18 @@ impl App {
     }
 
     fn request_close(&mut self) {
-        self.pending_close = self.selected().map(|workspace| PendingClose {
-            id: workspace.id.clone(),
-            name: workspace.name.clone(),
-            shell_count: workspace.terminals.len(),
-        });
+        self.pending_close = match self.focus {
+            Focus::Workspaces => self.selected().map(|workspace| PendingClose {
+                target: CloseTarget::Workspace(workspace.id.clone()),
+                name: workspace.name.clone(),
+                shell_count: workspace.terminals.len(),
+            }),
+            Focus::Terminals => self.selected_terminal().map(|terminal| PendingClose {
+                target: CloseTarget::Shell(terminal.id.clone()),
+                name: terminal.name.clone(),
+                shell_count: 1,
+            }),
+        };
     }
 
     fn cancel_close(&mut self) {
@@ -440,12 +453,12 @@ impl App {
 
     fn confirm_close<F>(&mut self, on_close: &mut F)
     where
-        F: FnMut(&str) -> Result<String, String>,
+        F: FnMut(&CloseTarget) -> Result<String, String>,
     {
         let Some(pending) = self.pending_close.take() else {
             return;
         };
-        self.message = Some(Message::from_result(on_close(&pending.id)));
+        self.message = Some(Message::from_result(on_close(&pending.target)));
     }
 
     fn refresh<F>(&mut self, on_refresh: &mut F)
@@ -493,7 +506,7 @@ pub(crate) fn run<R, O, C, W, N, E, F>(
 where
     R: FnMut(&str) -> Result<String, String>,
     O: FnMut(&str) -> Result<String, String>,
-    C: FnMut(&str) -> Result<String, String>,
+    C: FnMut(&CloseTarget) -> Result<String, String>,
     W: FnMut(&str) -> Result<String, String>,
     N: FnMut(&str) -> Result<String, String>,
     E: FnMut(&RenameTarget, &str) -> Result<String, String>,
@@ -517,7 +530,7 @@ fn run_loop<R, O, C, W, N, E, F>(
 where
     R: FnMut(&str) -> Result<String, String>,
     O: FnMut(&str) -> Result<String, String>,
-    C: FnMut(&str) -> Result<String, String>,
+    C: FnMut(&CloseTarget) -> Result<String, String>,
     W: FnMut(&str) -> Result<String, String>,
     N: FnMut(&str) -> Result<String, String>,
     E: FnMut(&RenameTarget, &str) -> Result<String, String>,
@@ -1060,14 +1073,20 @@ fn render_terminals(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut Ap
 
 fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     let line = if let Some(pending) = &app.pending_close {
-        Line::from(vec![
-            Span::styled(
-                format!(
-                    " Close '{}' and terminate {} shell(s)?  ",
-                    pending.name, pending.shell_count
-                ),
-                Style::new().fg(YELLOW).add_modifier(Modifier::BOLD),
+        let prompt = match pending.target {
+            CloseTarget::Workspace(_) => format!(
+                " Close workspace '{}' and terminate {} shell(s)?  ",
+                pending.name, pending.shell_count
             ),
+            CloseTarget::Shell(_) => {
+                format!(
+                    " Close shell '{}' and terminate its process?  ",
+                    pending.name
+                )
+            }
+        };
+        Line::from(vec![
+            Span::styled(prompt, Style::new().fg(YELLOW).add_modifier(Modifier::BOLD)),
             Span::styled("y", Style::new().fg(RED)),
             Span::styled(" confirm  ", Style::new().fg(SUBTEXT)),
             Span::styled("n/esc", Style::new().fg(GREEN)),
@@ -1128,7 +1147,14 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
             Span::styled("r", Style::new().fg(BLUE)),
             Span::styled(" refresh  ", Style::new().fg(SUBTEXT)),
             Span::styled("x", Style::new().fg(RED)),
-            Span::styled(" close workspace  ", Style::new().fg(SUBTEXT)),
+            Span::styled(
+                if app.focus == Focus::Workspaces {
+                    " close workspace  "
+                } else {
+                    " close shell  "
+                },
+                Style::new().fg(SUBTEXT),
+            ),
             Span::styled("q", Style::new().fg(RED)),
             Span::styled(" quit", Style::new().fg(SUBTEXT)),
         ]);
@@ -1521,22 +1547,42 @@ mod tests {
 
         app.request_close();
         let pending = app.pending_close.as_ref().expect("pending close");
-        assert_eq!(pending.id, "w1");
+        assert_eq!(pending.target, CloseTarget::Workspace("w1".into()));
         assert_eq!(pending.shell_count, 1);
 
         app.cancel_close();
         assert!(app.pending_close.is_none());
         app.request_close();
-        app.confirm_close(&mut |workspace_id| {
-            closed = Some(workspace_id.to_owned());
+        app.confirm_close(&mut |target| {
+            closed = Some(target.clone());
             Ok("Closed workspace".into())
         });
 
-        assert_eq!(closed.as_deref(), Some("w1"));
+        assert_eq!(closed, Some(CloseTarget::Workspace("w1".into())));
         assert!(app.pending_close.is_none());
         let message = app.message.expect("close message");
         assert_eq!(message.text, "Closed workspace");
         assert!(!message.error);
+    }
+
+    #[test]
+    fn closing_a_shell_uses_terminal_focus() {
+        let mut app = app();
+        let mut closed = None;
+        app.toggle_focus();
+
+        app.request_close();
+        let pending = app.pending_close.as_ref().expect("pending close");
+        assert_eq!(pending.target, CloseTarget::Shell("term_1".into()));
+        assert_eq!(pending.name, "agent");
+
+        app.confirm_close(&mut |target| {
+            closed = Some(target.clone());
+            Ok("Closed shell".into())
+        });
+
+        assert_eq!(closed, Some(CloseTarget::Shell("term_1".into())));
+        assert!(app.pending_close.is_none());
     }
 
     #[test]
