@@ -52,7 +52,6 @@ terminal handshake, VT reconstruction, and restart-persistence plan.
 - Show an opt-in, read-only preview of the selected terminal.
 - Search workspaces and actions from a command palette.
 - Launch workspace templates such as editor, agent, tests, and LazyGit.
-- Apply configurable shell recipes through an explicit shell-creation flow.
 - Duplicate a workspace structure for another branch or worktree.
 - Archive inactive workspaces without terminating their shells.
 
