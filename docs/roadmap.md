@@ -35,6 +35,7 @@ commitments.
   startup locking, and graceful shutdown through an isolated binary-level test.
 - [x] Make the Ratatui dashboard the default interface and remove the external
   picker dependency.
+- [x] Run an explicit one-off command when creating a shell from a path.
 
 ## Workspace Control
 
