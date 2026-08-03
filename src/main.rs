@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 
 use clap::{Parser, Subcommand};
-use serde::Deserialize;
+
+use boomux::protocol::{ShellSnapshot, ShellSpec, ShellStatus, Snapshot, WorkspaceSnapshot};
+use boomux::{attach, client, daemon, protocol};
 
 mod config;
 mod git;
@@ -14,13 +16,10 @@ mod terminal;
 mod tui;
 
 const BOOMUX_SHELLS_SKILL: &str = include_str!("../.agents/skills/boomux-shells/SKILL.md");
-const SUPPORTED_HERDR_VERSION: &str = "0.7.5";
+const REPLAY_BYTES: usize = 1024 * 1024;
 
 #[derive(Parser)]
-#[command(
-    version,
-    about = "Native terminal windows for persistent Herdr terminals"
-)]
+#[command(version, about = "Native persistent terminal workspaces")]
 struct Cli {
     /// Open or create a persistent terminal in this directory
     #[arg(value_name = "PATH")]
@@ -46,17 +45,15 @@ struct Cli {
 enum Commands {
     /// Open the interactive workspace dashboard
     Ui,
-    /// Check that Boomux's external dependencies are available
+    /// Check that Boomux's dependencies and daemon are available
     Doctor,
-    /// List panes managed by Herdr
+    /// List all managed shells
     List,
     /// List shells in the current Boomux workspace
     Shells,
-    /// Read retained output from a shell name or Herdr terminal ID
+    /// Read retained output from a shell name or shell ID
     Read {
-        /// Shell name in the current workspace or an exact terminal ID
         target: String,
-        /// Number of recent output lines to return
         #[arg(long, default_value_t = 200, value_parser = clap::value_parser!(u32).range(1..))]
         lines: u32,
     },
@@ -65,30 +62,48 @@ enum Commands {
         #[command(subcommand)]
         command: SkillCommands,
     },
-    /// Open a Herdr terminal in a new terminal window
+    /// Open a shell in a new terminal window
     Open {
-        /// Herdr terminal ID, available from `boomux list`
-        terminal_id: String,
-        /// Stable title shown on the terminal window when supported
+        shell_id: String,
         #[arg(long)]
         title: Option<String>,
-        /// Replace another client currently controlling this terminal
         #[arg(long)]
         takeover: bool,
     },
     /// Print the current Boomux workspace and shell name for prompt integrations
     #[command(hide = true)]
     Prompt,
+    /// Manage the background PTY daemon
+    Daemon {
+        #[command(subcommand)]
+        command: DaemonCommands,
+    },
+    #[command(name = "__attach", hide = true)]
+    Attach {
+        shell_id: String,
+        #[arg(long)]
+        takeover: bool,
+    },
 }
 
 #[derive(Subcommand)]
 enum SkillCommands {
     /// Install the Boomux shell-reading skill under ~/.agents/skills
     Install {
-        /// Replace an existing skill with the bundled version
         #[arg(long)]
         force: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum DaemonCommands {
+    /// Start the daemon in the foreground
+    #[command(hide = true)]
+    Run,
+    /// Report whether the daemon is accepting requests
+    Status,
+    /// Stop the daemon and its managed shells
+    Stop,
 }
 
 fn main() -> ExitCode {
@@ -102,57 +117,70 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
-    if !matches!(
-        cli.command.as_ref(),
-        Some(Commands::Doctor | Commands::Skill { .. })
-    ) {
-        ensure_supported_herdr_version()?;
+    match cli.command.as_ref() {
+        Some(Commands::Daemon {
+            command: DaemonCommands::Run,
+        }) => return Ok(daemon::run()?),
+        Some(Commands::Attach { shell_id, takeover }) => {
+            return Ok(attach::run(shell_id, *takeover)?);
+        }
+        _ => {}
     }
+
     if let Some(desktop_entry) = cli.terminal.as_deref() {
         terminal::validate_desktop_entry(desktop_entry)?;
     }
     if let Some(path) = cli.path {
-        let open_in_new_window = should_open_new_window(cli.new_window, cli.terminal.as_deref());
-        let terminal = open_in_new_window
+        let new_window = should_open_new_window(cli.new_window, cli.terminal.as_deref());
+        let terminal = new_window
             .then(|| effective_terminal(cli.terminal.as_deref()))
             .transpose()?
             .flatten();
-        return open_directory(
-            &path,
-            cli.name.as_deref(),
-            open_in_new_window,
-            terminal.as_deref(),
-        );
+        return open_directory(&path, cli.name.as_deref(), new_window, terminal.as_deref());
     }
 
     match cli.command {
         Some(Commands::Ui) => dashboard(cli.terminal.as_deref()),
         Some(Commands::Doctor) => doctor(cli.terminal.as_deref()),
-        Some(Commands::List) => run_foreground("herdr", &["pane", "list"]),
+        Some(Commands::List) => list_shells(),
         Some(Commands::Shells) => list_workspace_shells(),
         Some(Commands::Read { target, lines }) => read_shell(&target, lines),
         Some(Commands::Skill {
             command: SkillCommands::Install { force },
         }) => install_skill(force),
         Some(Commands::Open {
-            terminal_id,
+            shell_id,
             title,
             takeover,
         }) => {
             let terminal = effective_terminal(cli.terminal.as_deref())?;
-            open_terminal(
-                &terminal_id,
-                title.as_deref(),
-                takeover,
-                terminal.as_deref(),
-            )
+            open_shell(&shell_id, title.as_deref(), takeover, terminal.as_deref())
         }
         Some(Commands::Prompt) => print_prompt_label(),
+        Some(Commands::Daemon { command }) => daemon_control(command),
+        Some(Commands::Attach { .. }) => unreachable!(),
         None => {
             let terminal = effective_terminal(cli.terminal.as_deref())?;
             picker(terminal.as_deref())
         }
     }
+}
+
+fn daemon_control(command: DaemonCommands) -> Result<(), Box<dyn Error>> {
+    let client = client::connect()?;
+    match command {
+        DaemonCommands::Status => println!(
+            "running (protocol {}, {})",
+            protocol::PROTOCOL_VERSION,
+            client.socket_path().display()
+        ),
+        DaemonCommands::Stop => {
+            client.shutdown()?;
+            println!("Stopped Boomux daemon");
+        }
+        DaemonCommands::Run => unreachable!(),
+    }
+    Ok(())
 }
 
 fn should_open_new_window(new_window: bool, terminal: Option<&str>) -> bool {
@@ -166,230 +194,152 @@ fn effective_terminal(override_entry: Option<&str>) -> Result<Option<String>, Bo
     Ok(config::load()?.terminal)
 }
 
-#[derive(Deserialize)]
-struct PaneListResponse {
-    result: PaneListResult,
-}
-
-#[derive(Deserialize)]
-struct PaneListResult {
-    panes: Vec<Pane>,
-}
-
-#[derive(Deserialize)]
-struct PaneGetResponse {
-    result: PaneGetResult,
-}
-
-#[derive(Deserialize)]
-struct PaneGetResult {
-    pane: Pane,
-}
-
-#[derive(Deserialize)]
-struct WorkspaceListResponse {
-    result: WorkspaceListResult,
-}
-
-#[derive(Deserialize)]
-struct WorkspaceListResult {
-    workspaces: Vec<Workspace>,
-}
-
-#[derive(Deserialize)]
-struct WorkspaceCreateResponse {
-    result: WorkspaceCreateResult,
-}
-
-#[derive(Deserialize)]
-struct WorkspaceCreateResult {
-    root_pane: Pane,
-}
-
-#[derive(Deserialize)]
-struct TabCreateResponse {
-    result: TabCreateResult,
-}
-
-#[derive(Deserialize)]
-struct TabCreateResult {
-    root_pane: Pane,
-}
-
-#[derive(Deserialize)]
-struct Workspace {
-    workspace_id: String,
-    label: String,
-    agent_status: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct Pane {
-    pane_id: String,
-    tab_id: String,
-    terminal_id: String,
-    workspace_id: String,
-    cwd: String,
-    #[serde(default)]
-    label: Option<String>,
-    #[serde(default)]
-    agent: Option<String>,
-    agent_status: String,
-}
-
-struct Choice {
-    label: String,
-    workspace_id: String,
-}
-
 fn picker(terminal: Option<&str>) -> Result<(), Box<dyn Error>> {
     ensure_host_terminal()?;
-    let panes = available_panes()?;
-    let workspaces = load_workspaces()?;
-    let Some(workspace_id) = choose_workspace(&workspaces, &panes)? else {
+    let client = client::connect_or_start()?;
+    let snapshot = client.snapshot()?;
+    let Some(workspace_id) = choose_workspace(&snapshot.workspaces)? else {
         return Ok(());
     };
-    let workspace = workspaces
+    let workspace = snapshot
+        .workspaces
         .iter()
-        .find(|workspace| workspace.workspace_id == workspace_id)
+        .find(|workspace| workspace.id == workspace_id)
         .ok_or("selected workspace no longer exists")?;
-
-    open_workspace(workspace, &panes, terminal)
+    open_workspace(workspace, terminal)
 }
 
 fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
     ensure_host_terminal()?;
+    let launch_cwd = resolve_directory(Path::new("."))?;
+    let client = client::connect_or_start()?;
     let mut git_cache = git::Cache::default();
-    let views = dashboard_snapshot(&mut git_cache)?;
+    let views = dashboard_views(&client.snapshot()?.workspaces, &mut git_cache);
     let config = config::load()?;
     let terminal = terminal_override
         .map(str::to_owned)
         .or_else(|| config.terminal.clone());
-    let recipes = config.recipes.clone();
     let roots_configured = !config.projects.roots.is_empty();
     let discovery = projects::discover(&config.projects);
-    let project_views = discovery
-        .projects
-        .into_iter()
-        .map(|project| tui::ProjectView {
-            name: project.name,
-            path: project.path,
-            group: project.group,
-            group_order: project.group_order,
-        })
-        .collect();
     let project_context = tui::ProjectContext {
-        projects: project_views,
-        recipes: recipes
-            .iter()
-            .map(|recipe| tui::RecipeView {
-                id: recipe.id.clone(),
-                label: recipe.label.clone(),
-                terminals: recipe
-                    .terminals
-                    .iter()
-                    .map(|terminal| terminal.name.clone())
-                    .collect(),
+        projects: discovery
+            .projects
+            .into_iter()
+            .map(|project| tui::ProjectView {
+                name: project.name,
+                path: project.path,
+                group: project.group,
+                group_order: project.group_order,
             })
             .collect(),
         config_path: config.path.or_else(config::global_config_path),
         warning: (!discovery.warnings.is_empty()).then(|| discovery.warnings.join("; ")),
         roots_configured,
     };
+
     tui::run(
         views,
         project_context,
         tui::Actions {
             on_restore: |workspace_id: &str| {
-                let panes = load_panes().map_err(|error| error.to_string())?;
-                let workspaces = load_workspaces().map_err(|error| error.to_string())?;
-                let workspace = workspaces
-                    .iter()
-                    .find(|workspace| workspace.workspace_id == workspace_id)
-                    .ok_or_else(|| "selected workspace no longer exists".to_owned())?;
-                let shell_count = workspace_panes(&workspace.workspace_id, &panes).count();
-                open_workspace(workspace, &panes, terminal.as_deref())
+                let workspace = client
+                    .get_workspace(workspace_id)
                     .map_err(|error| error.to_string())?;
-                Ok(format!(
-                    "Restored {shell_count} shell(s) for {}",
-                    workspace.label
-                ))
+                let count = workspace.shells.len();
+                open_workspace(&workspace, terminal.as_deref())
+                    .map_err(|error| error.to_string())?;
+                Ok(format!("Restored {count} shell(s) for {}", workspace.name))
             },
-            on_open: |terminal_id: &str| {
-                open_dashboard_terminal(terminal_id, terminal.as_deref())
+            on_open: |shell_id: &str| {
+                open_dashboard_shell(&client, shell_id, terminal.as_deref())
                     .map_err(|error| error.to_string())
             },
             on_close: |workspace_id: &str| {
-                let workspaces = load_workspaces().map_err(|error| error.to_string())?;
-                let Some(workspace) = workspaces
-                    .iter()
-                    .find(|workspace| workspace.workspace_id == workspace_id)
-                else {
-                    return Ok("Workspace was already closed".to_owned());
-                };
-                let label = workspace.label.clone();
-                close_workspace(workspace_id).map_err(|error| error.to_string())?;
-                Ok(format!("Closed {label} and all of its shells"))
+                let name = client
+                    .get_workspace(workspace_id)
+                    .map(|workspace| workspace.name)
+                    .unwrap_or_else(|_| "workspace".into());
+                client
+                    .close_workspace(workspace_id)
+                    .map_err(|error| error.to_string())?;
+                Ok(format!("Closed {name} and all of its shells"))
             },
-            on_create_workspace: |directory: &Path, recipe_id: Option<&str>| {
-                create_dashboard_workspace(directory, recipe_id, &recipes)
-                    .map_err(|error| error.to_string())
+            on_create_workspace: |name: &str| {
+                create_dashboard_workspace(&client, name).map_err(|error| error.to_string())
             },
             on_create_shell: |workspace_id: &str| {
-                create_dashboard_shell(workspace_id).map_err(|error| error.to_string())
+                create_dashboard_shell(&client, workspace_id, &launch_cwd)
+                    .map_err(|error| error.to_string())
             },
-            on_rename: |pane_id: &str, name: &str| {
-                rename_pane(pane_id, name).map_err(|error| error.to_string())?;
-                Ok(format!("Renamed shell to {name}"))
+            on_rename: |target: &tui::RenameTarget, name: &str| match target {
+                tui::RenameTarget::Workspace(workspace_id) => {
+                    client
+                        .rename_workspace(workspace_id, name)
+                        .map_err(|error| error.to_string())?;
+                    Ok(format!("Renamed workspace to {name}"))
+                }
+                tui::RenameTarget::Shell(shell_id) => {
+                    client
+                        .rename_shell(shell_id, name)
+                        .map_err(|error| error.to_string())?;
+                    Ok(format!("Renamed shell to {name}"))
+                }
             },
-            on_refresh: || dashboard_snapshot(&mut git_cache).map_err(|error| error.to_string()),
+            on_refresh: || {
+                let snapshot = client.snapshot().map_err(|error| error.to_string())?;
+                Ok(dashboard_views(&snapshot.workspaces, &mut git_cache))
+            },
         },
     )?;
     Ok(())
 }
 
-fn dashboard_snapshot(
-    git_cache: &mut git::Cache,
-) -> Result<Vec<tui::WorkspaceView>, Box<dyn Error>> {
-    let panes = load_panes()?;
-    let workspaces = load_workspaces()?;
-    Ok(dashboard_views(&workspaces, &panes, git_cache))
-}
-
 fn dashboard_views(
-    workspaces: &[Workspace],
-    panes: &[Pane],
+    workspaces: &[WorkspaceSnapshot],
     git_cache: &mut git::Cache,
 ) -> Vec<tui::WorkspaceView> {
     workspaces
         .iter()
-        .filter_map(|workspace| {
-            let workspace_panes: Vec<_> = workspace_panes(&workspace.workspace_id, panes).collect();
-            let directory = workspace_panes.first()?.cwd.clone();
-            let git = git_cache.inspect(Path::new(&directory));
-            let terminals = workspace_panes
-                .into_iter()
-                .map(|pane| tui::TerminalView {
-                    id: pane.terminal_id.clone(),
-                    pane_id: pane.pane_id.clone(),
-                    name: pane_name(pane).to_owned(),
-                    kind: pane.agent.clone().unwrap_or_else(|| "shell".into()),
-                    status: pane.agent_status.clone(),
-                    directory: pane.cwd.clone(),
+        .map(|workspace| {
+            let directory = common_shell_cwd(workspace);
+            let git = directory
+                .map(|directory| git_cache.inspect(directory))
+                .unwrap_or_default();
+            let terminals = workspace
+                .shells
+                .iter()
+                .map(|shell| tui::TerminalView {
+                    id: shell.id.clone(),
+                    pane_id: shell.id.clone(),
+                    name: shell.name.clone(),
+                    kind: "shell".into(),
+                    status: shell_status(&shell.status).into(),
+                    directory: shell.cwd.display().to_string(),
                 })
                 .collect();
-            Some(tui::WorkspaceView {
-                id: workspace.workspace_id.clone(),
-                name: workspace.label.clone(),
-                directory,
+            tui::WorkspaceView {
+                id: workspace.id.clone(),
+                name: workspace.name.clone(),
+                directory: directory
+                    .map(|directory| directory.display().to_string())
+                    .unwrap_or_else(|| "-".into()),
                 repository: git.repository,
                 branch: git.branch,
                 git_state: git.state,
                 worktree: git.worktree,
                 terminals,
-            })
+            }
         })
         .collect()
+}
+
+fn common_shell_cwd(workspace: &WorkspaceSnapshot) -> Option<&Path> {
+    let first = workspace.shells.first()?.cwd.as_path();
+    workspace
+        .shells
+        .iter()
+        .all(|shell| shell.cwd == first)
+        .then_some(first)
 }
 
 fn open_directory(
@@ -400,68 +350,46 @@ fn open_directory(
 ) -> Result<(), Box<dyn Error>> {
     ensure_host_terminal()?;
     let directory = resolve_directory(path)?;
-    let panes = available_panes()?;
-    let workspaces = load_workspaces()?;
-    let name = requested_name
+    let requested_name = requested_name
         .map(str::trim)
         .filter(|name| !name.is_empty())
-        .map(str::to_owned)
-        .unwrap_or_else(|| default_workspace_name(&directory));
-    let (pane, shell_name, created_workspace) = if let Some(workspace) =
-        find_workspace(&workspaces, &panes, &directory, &name)
-    {
-        let workspace_panes: Vec<_> = workspace_panes(&workspace.workspace_id, &panes).collect();
-        let shell_name = unique_shell_name("shell", &workspace_panes);
-        (
-            create_tab_terminal(
-                &workspace.workspace_id,
-                &directory,
-                &workspace.label,
-                &shell_name,
-            )?,
-            shell_name,
-            false,
-        )
-    } else {
-        (
-            create_workspace(&directory, &name, "shell-1")?.root_pane,
-            "shell-1".into(),
-            true,
-        )
-    };
-    if let Err(error) = rename_pane(&pane.pane_id, &shell_name) {
-        let cleanup = if created_workspace {
-            close_workspace(&pane.workspace_id)
+        .map(str::to_owned);
+    let client = client::connect_or_start()?;
+    let snapshot = client.snapshot()?;
+    let (shell, workspace_name) = if let Some(name) = requested_name {
+        let shell = if let Some(workspace) = find_workspace(&snapshot.workspaces, &name) {
+            let shell_name = unique_shell_name("shell", &workspace.shells);
+            client.create_shell(&workspace.id, ShellSpec::login(shell_name, &directory))?
         } else {
-            close_tab(&pane.tab_id)
+            client
+                .create_workspace(&name, vec![ShellSpec::login("shell-1", &directory)])?
+                .shells
+                .into_iter()
+                .next()
+                .ok_or("new workspace has no shell")?
         };
-        return Err(with_cleanup_error(error, cleanup));
-    }
+        (shell, name)
+    } else {
+        let shell = client.create_shell_with_workspace(ShellSpec::login("shell-1", &directory))?;
+        let workspace_name = client.get_workspace(&shell.workspace_id)?.name;
+        (shell, workspace_name)
+    };
 
     if open_in_new_window {
         open_terminal(
-            &pane.terminal_id,
-            Some(&format!("{name} - {shell_name}")),
+            &shell.id,
+            Some(&format!("{workspace_name} - {}", shell.name)),
             true,
             terminal,
-        )?;
-    } else if !attach_terminal(&pane.terminal_id)? {
-        return Err(format!("could not attach to Herdr terminal {}", pane.terminal_id).into());
+        )
+    } else {
+        Ok(attach::run(&shell.id, true)?)
     }
-    Ok(())
-}
-
-fn default_workspace_name(directory: &Path) -> String {
-    directory
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| "default".into())
 }
 
 fn ensure_host_terminal() -> Result<(), Box<dyn Error>> {
-    if env::var_os("HERDR_PANE_ID").is_some() {
-        Err("already inside a Herdr terminal; launch Boomux from a fresh terminal".into())
+    if env::var_os("BOOMUX_SHELL_ID").is_some() {
+        Err("already inside a Boomux shell; launch Boomux from a fresh terminal".into())
     } else {
         Ok(())
     }
@@ -479,395 +407,181 @@ fn resolve_directory(path: &Path) -> Result<PathBuf, Box<dyn Error>> {
     if !resolved.is_dir() {
         return Err(format!("{} is not a directory", path.display()).into());
     }
-
     Ok(resolved)
 }
 
-fn available_panes() -> Result<Vec<Pane>, Box<dyn Error>> {
-    Ok(load_panes()?
-        .into_iter()
-        .filter(|pane| !pane_runs_boomux(&pane.pane_id))
-        .collect())
-}
-
 fn find_workspace<'a>(
-    workspaces: &'a [Workspace],
-    panes: &[Pane],
-    directory: &Path,
+    workspaces: &'a [WorkspaceSnapshot],
     name: &str,
-) -> Option<&'a Workspace> {
-    workspaces.iter().find(|workspace| {
-        workspace.label == name
-            && workspace_panes(&workspace.workspace_id, panes)
-                .any(|pane| pane_is_in_directory(pane, directory))
-    })
+) -> Option<&'a WorkspaceSnapshot> {
+    workspaces.iter().find(|workspace| workspace.name == name)
 }
 
-fn workspace_panes<'a>(workspace_id: &'a str, panes: &'a [Pane]) -> impl Iterator<Item = &'a Pane> {
-    panes
+fn choose_workspace(workspaces: &[WorkspaceSnapshot]) -> Result<Option<String>, Box<dyn Error>> {
+    if workspaces.is_empty() {
+        return Err("no saved workspaces; run `boomux PATH` to create one".into());
+    }
+    let choices = workspaces
         .iter()
-        .filter(move |pane| pane.workspace_id == workspace_id)
-}
-
-fn pane_is_in_directory(pane: &Pane, directory: &Path) -> bool {
-    Path::new(&pane.cwd)
-        .canonicalize()
-        .is_ok_and(|cwd| cwd == directory)
-}
-
-fn choose_workspace(
-    workspaces: &[Workspace],
-    panes: &[Pane],
-) -> Result<Option<String>, Box<dyn Error>> {
-    let choices: Vec<_> = workspaces
-        .iter()
-        .filter_map(|workspace| {
-            let workspace_panes: Vec<_> = workspace_panes(&workspace.workspace_id, panes).collect();
-            let directory = workspace_panes.first()?.cwd.as_str();
-            let shell_word = if workspace_panes.len() == 1 {
+        .map(|workspace| {
+            let shell_word = if workspace.shells.len() == 1 {
                 "shell"
             } else {
                 "shells"
             };
-            Some(Choice {
-                label: format!(
-                    "{:<18} {:<8} {:>2} {:<6} {}  ({})",
-                    workspace.label,
-                    display_agent_status(&workspace.agent_status),
-                    workspace_panes.len(),
-                    shell_word,
-                    directory,
-                    workspace.workspace_id
-                ),
-                workspace_id: workspace.workspace_id.clone(),
-            })
+            let label = format!(
+                "{:<18} {:>2} {:<6} ({})",
+                workspace.name,
+                workspace.shells.len(),
+                shell_word,
+                workspace.id
+            );
+            (label, workspace.id.clone())
         })
-        .collect();
-    if choices.is_empty() {
-        return Err("no saved workspaces; run `boomux PATH` to create one".into());
-    }
-
+        .collect::<Vec<_>>();
     let output = Command::new("gum")
         .args(["choose", "--header", "Restore a Boomux workspace"])
-        .args(choices.iter().map(|choice| choice.label.as_str()))
+        .args(choices.iter().map(|(label, _)| label))
         .stdin(Stdio::inherit())
         .stderr(Stdio::inherit())
         .output()?;
     if !output.status.success() {
         return Ok(None);
     }
-
     let selected = String::from_utf8(output.stdout)?;
     Ok(choices
         .into_iter()
-        .find(|choice| choice.label == selected.trim_end())
-        .map(|choice| choice.workspace_id))
-}
-
-fn create_workspace(
-    cwd: &Path,
-    name: &str,
-    shell_name: &str,
-) -> Result<WorkspaceCreateResult, Box<dyn Error>> {
-    let output = workspace_create_command(cwd, name, shell_name).output()?;
-    if !output.status.success() {
-        let message = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("could not create Herdr terminal: {}", message.trim()).into());
-    }
-
-    let response: WorkspaceCreateResponse = serde_json::from_slice(&output.stdout)?;
-    Ok(response.result)
-}
-
-fn workspace_create_command(cwd: &Path, name: &str, shell_name: &str) -> Command {
-    let mut command = Command::new("herdr");
-    command
-        .args(["workspace", "create", "--cwd"])
-        .arg(cwd)
-        .args(["--label", name])
-        .args(["--env", &format!("BOOMUX_WORKSPACE={name}")])
-        .args(["--env", &format!("BOOMUX_SHELL_NAME={shell_name}")])
-        .arg("--focus");
-    command
-}
-
-fn create_tab_terminal(
-    workspace_id: &str,
-    cwd: &Path,
-    workspace_name: &str,
-    shell_name: &str,
-) -> Result<Pane, Box<dyn Error>> {
-    let output = tab_create_command(workspace_id, cwd, workspace_name, shell_name).output()?;
-    if !output.status.success() {
-        let message = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("could not create Herdr terminal: {}", message.trim()).into());
-    }
-
-    let response: TabCreateResponse = serde_json::from_slice(&output.stdout)?;
-    Ok(response.result.root_pane)
-}
-
-fn tab_create_command(
-    workspace_id: &str,
-    cwd: &Path,
-    workspace_name: &str,
-    shell_name: &str,
-) -> Command {
-    let mut command = Command::new("herdr");
-    command
-        .args(["tab", "create", "--workspace", workspace_id, "--cwd"])
-        .arg(cwd)
-        .args(["--label", shell_name])
-        .args(["--env", &format!("BOOMUX_WORKSPACE={workspace_name}")])
-        .args(["--env", &format!("BOOMUX_SHELL_NAME={shell_name}")])
-        .arg("--focus");
-    command
+        .find(|(label, _)| label == selected.trim_end())
+        .map(|(_, id)| id))
 }
 
 fn create_dashboard_workspace(
-    directory: &Path,
-    recipe_id: Option<&str>,
-    recipes: &[config::RecipeConfig],
-) -> Result<String, Box<dyn Error>> {
-    let cwd = resolve_directory(directory)?;
-    let name = default_workspace_name(&cwd);
-    let panes = load_panes()?;
-    let workspaces = load_workspaces()?;
-    if find_workspace(&workspaces, &panes, &cwd, &name).is_some() {
-        return Err(format!("workspace {name} already exists in {}", cwd.display()).into());
-    }
-
-    let (recipe_label, terminals) = if let Some(recipe_id) = recipe_id {
-        let recipe = recipes
-            .iter()
-            .find(|recipe| recipe.id == recipe_id)
-            .ok_or_else(|| format!("recipe {recipe_id} no longer exists"))?;
-        (recipe.label.clone(), recipe.terminals.clone())
-    } else {
-        (
-            "Default".into(),
-            vec![config::RecipeTerminalConfig {
-                name: "shell-1".into(),
-                command: None,
-            }],
-        )
-    };
-
-    provision_recipe(
-        &terminals,
-        |terminal| Ok(create_workspace(&cwd, &name, &terminal.name)?.root_pane),
-        |workspace_id, terminal| create_tab_terminal(workspace_id, &cwd, &name, &terminal.name),
-        |pane, terminal| {
-            configure_recipe_terminal(pane, &terminal.name, terminal.command.as_deref())
-        },
-        close_workspace,
-    )?;
-    Ok(format!(
-        "Created workspace {name} with {recipe_label} ({} terminal{})",
-        terminals.len(),
-        if terminals.len() == 1 { "" } else { "s" }
-    ))
-}
-
-fn provision_recipe<R, T, C, X>(
-    terminals: &[config::RecipeTerminalConfig],
-    mut create_root: R,
-    mut create_tab: T,
-    mut configure: C,
-    mut cleanup: X,
-) -> Result<(), Box<dyn Error>>
-where
-    R: FnMut(&config::RecipeTerminalConfig) -> Result<Pane, Box<dyn Error>>,
-    T: FnMut(&str, &config::RecipeTerminalConfig) -> Result<Pane, Box<dyn Error>>,
-    C: FnMut(&Pane, &config::RecipeTerminalConfig) -> Result<(), Box<dyn Error>>,
-    X: FnMut(&str) -> Result<(), Box<dyn Error>>,
-{
-    let first = terminals.first().ok_or("recipe has no terminals")?;
-    let root = create_root(first)?;
-    let result = (|| {
-        configure(&root, first)?;
-        for terminal in terminals.iter().skip(1) {
-            let pane = create_tab(&root.workspace_id, terminal)?;
-            configure(&pane, terminal)?;
-        }
-        Ok(())
-    })();
-    if let Err(error) = result {
-        return Err(with_cleanup_error(error, cleanup(&root.workspace_id)));
-    }
-    Ok(())
-}
-
-fn configure_recipe_terminal(
-    pane: &Pane,
+    client: &client::Client,
     name: &str,
-    command: Option<&str>,
-) -> Result<(), Box<dyn Error>> {
-    rename_tab(&pane.tab_id, name)?;
-    rename_pane(&pane.pane_id, name)?;
-    let Some(command) = command else {
-        return Ok(());
-    };
-    let output = Command::new("herdr")
-        .args(["pane", "run", &pane.pane_id, command])
-        .output()?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        let message = String::from_utf8_lossy(&output.stderr);
-        Err(format!(
-            "could not deliver startup command to {name}: {}",
-            message.trim()
-        )
-        .into())
+) -> Result<String, Box<dyn Error>> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("workspace name cannot be empty".into());
     }
+    client.create_workspace(name, Vec::new())?;
+    Ok(format!("Created empty workspace {name}"))
 }
 
-fn rename_tab(tab_id: &str, name: &str) -> Result<(), Box<dyn Error>> {
-    let output = Command::new("herdr")
-        .args(["tab", "rename", tab_id, name])
-        .output()?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        let message = String::from_utf8_lossy(&output.stderr);
-        Err(format!("could not rename Herdr tab: {}", message.trim()).into())
-    }
+fn create_dashboard_shell(
+    client: &client::Client,
+    workspace_id: &str,
+    launch_cwd: &Path,
+) -> Result<String, Box<dyn Error>> {
+    let workspace = client.get_workspace(workspace_id)?;
+    let name = unique_shell_name("shell", &workspace.shells);
+    client.create_shell(workspace_id, dashboard_shell_spec(&name, launch_cwd))?;
+    Ok(format!("Created {name} in {}", workspace.name))
 }
 
-fn create_dashboard_shell(workspace_id: &str) -> Result<String, Box<dyn Error>> {
-    let panes = load_panes()?;
-    let workspaces = load_workspaces()?;
-    let workspace = workspaces
+fn dashboard_shell_spec(name: &str, launch_cwd: &Path) -> ShellSpec {
+    ShellSpec::login(name, launch_cwd)
+}
+
+fn unique_shell_name(base_name: &str, shells: &[ShellSnapshot]) -> String {
+    let highest_suffix = shells
         .iter()
-        .find(|workspace| workspace.workspace_id == workspace_id)
-        .ok_or("selected workspace no longer exists")?;
-    let workspace_panes: Vec<_> = workspace_panes(workspace_id, &panes).collect();
-    let cwd = workspace_panes
-        .first()
-        .ok_or("selected workspace has no terminals")?
-        .cwd
-        .as_str();
-    let shell_name = unique_shell_name("shell", &workspace_panes);
-    let pane = create_tab_terminal(workspace_id, Path::new(cwd), &workspace.label, &shell_name)?;
-    if let Err(error) = rename_pane(&pane.pane_id, &shell_name) {
-        return Err(with_cleanup_error(error, close_tab(&pane.tab_id)));
-    }
-
-    Ok(format!("Created {shell_name} in {}", workspace.label))
-}
-
-fn unique_shell_name(base_name: &str, panes: &[&Pane]) -> String {
-    let highest_suffix = panes
-        .iter()
-        .filter_map(|pane| pane.label.as_deref())
-        .filter_map(|label| {
-            if label == base_name {
+        .filter_map(|shell| {
+            if shell.name == base_name {
                 Some(1)
             } else {
-                label
+                shell
+                    .name
                     .strip_prefix(base_name)
                     .and_then(|suffix| suffix.strip_prefix('-'))
                     .and_then(|suffix| suffix.parse::<usize>().ok())
             }
         })
         .max();
-
     highest_suffix.map_or_else(
         || base_name.to_owned(),
         |suffix| format!("{base_name}-{}", suffix + 1),
     )
 }
 
-fn rename_pane(pane_id: &str, name: &str) -> Result<(), Box<dyn Error>> {
-    let output = Command::new("herdr")
-        .args(["pane", "rename", pane_id, name])
-        .output()?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        let message = String::from_utf8_lossy(&output.stderr);
-        Err(format!("could not rename Herdr pane: {}", message.trim()).into())
+fn list_shells() -> Result<(), Box<dyn Error>> {
+    let snapshot = client::connect_or_start()?.snapshot()?;
+    println!("WORKSPACE\tNAME\tSHELL ID\tSTATUS");
+    for workspace in snapshot.workspaces {
+        for shell in workspace.shells {
+            println!(
+                "{}\t{}\t{}\t{}",
+                workspace.name,
+                shell.name,
+                shell.id,
+                shell_status(&shell.status)
+            );
+        }
     }
-}
-
-fn pane_name(pane: &Pane) -> &str {
-    pane.label
-        .as_deref()
-        .or(pane.agent.as_deref())
-        .unwrap_or("shell")
+    Ok(())
 }
 
 fn list_workspace_shells() -> Result<(), Box<dyn Error>> {
-    let panes = load_panes()?;
-    let current_pane_id = current_pane_id()?;
-    let current = load_pane(&current_pane_id)?;
-
-    println!("NAME\tTERMINAL ID\tSTATUS");
-    for pane in workspace_panes(&current.workspace_id, &panes) {
+    let client = client::connect_or_start()?;
+    let shell = current_shell(&client)?;
+    let workspace = client.get_workspace(&shell.workspace_id)?;
+    println!("NAME\tSHELL ID\tSTATUS");
+    for shell in workspace.shells {
         println!(
             "{}\t{}\t{}",
-            pane_name(pane),
-            pane.terminal_id,
-            display_agent_status(&pane.agent_status)
+            shell.name,
+            shell.id,
+            shell_status(&shell.status)
         );
     }
     Ok(())
 }
 
 fn read_shell(target: &str, lines: u32) -> Result<(), Box<dyn Error>> {
-    let panes = load_panes()?;
-    let current_workspace_id = env::var("HERDR_PANE_ID")
+    let client = client::connect_or_start()?;
+    let snapshot = client.snapshot()?;
+    let current_workspace_id = env::var("BOOMUX_SHELL_ID")
         .ok()
-        .map(|pane_id| load_pane(&pane_id).map(|pane| pane.workspace_id))
-        .transpose()?;
-    let pane = resolve_shell_target(&panes, current_workspace_id.as_deref(), target)?;
-    let lines = lines.to_string();
-    let status = Command::new("herdr")
-        .args([
-            "pane",
-            "read",
-            &pane.pane_id,
-            "--source",
-            "recent-unwrapped",
-            "--lines",
-            &lines,
-            "--format",
-            "text",
-        ])
-        .status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("could not read shell {target:?}: herdr failed with {status}").into())
+        .and_then(|id| find_shell(&snapshot, &id).map(|shell| shell.workspace_id.clone()));
+    let shell = resolve_shell_target(&snapshot, current_workspace_id.as_deref(), target)?;
+    let bytes = client.read_shell(&shell.id, REPLAY_BYTES)?;
+    let output = recent_lines(&String::from_utf8_lossy(&bytes), lines as usize);
+    print!("{output}");
+    if !output.is_empty() && !output.ends_with('\n') {
+        println!();
     }
+    Ok(())
 }
 
 fn resolve_shell_target<'a>(
-    panes: &'a [Pane],
+    snapshot: &'a Snapshot,
     current_workspace_id: Option<&str>,
     target: &str,
-) -> Result<&'a Pane, Box<dyn Error>> {
-    if let Some(pane) = panes.iter().find(|pane| pane.terminal_id == target) {
-        return Ok(pane);
+) -> Result<&'a ShellSnapshot, Box<dyn Error>> {
+    if let Some(shell) = find_shell(snapshot, target) {
+        return Ok(shell);
     }
-    let current_workspace_id = current_workspace_id.ok_or_else(|| {
+    let workspace_id = current_workspace_id.ok_or_else(|| {
         format!(
-            "shell name {target:?} requires a Boomux-managed pane; use an exact terminal ID outside Boomux"
+            "shell name {target:?} requires a Boomux shell; use an exact shell ID outside Boomux"
         )
     })?;
-    let matches = panes
+    let workspace = snapshot
+        .workspaces
         .iter()
-        .filter(|pane| pane.workspace_id == current_workspace_id)
-        .filter(|pane| pane_name(pane) == target)
+        .find(|workspace| workspace.id == workspace_id)
+        .ok_or("current workspace no longer exists")?;
+    let matches = workspace
+        .shells
+        .iter()
+        .filter(|shell| shell.name == target)
         .collect::<Vec<_>>();
     match matches.as_slice() {
-        [pane] => Ok(pane),
+        [shell] => Ok(shell),
         [] => {
-            let available = panes
+            let available = workspace
+                .shells
                 .iter()
-                .filter(|pane| pane.workspace_id == current_workspace_id)
-                .map(pane_name)
+                .map(|shell| shell.name.as_str())
                 .collect::<Vec<_>>()
                 .join(", ");
             Err(format!(
@@ -879,9 +593,108 @@ fn resolve_shell_target<'a>(
     }
 }
 
-fn current_pane_id() -> Result<String, Box<dyn Error>> {
-    env::var("HERDR_PANE_ID")
-        .map_err(|_| "this command must run inside a Boomux-managed Herdr pane".into())
+fn recent_lines(text: &str, count: usize) -> String {
+    let lines = text.split_inclusive('\n').collect::<Vec<_>>();
+    lines[lines.len().saturating_sub(count)..].concat()
+}
+
+fn find_shell<'a>(snapshot: &'a Snapshot, id: &str) -> Option<&'a ShellSnapshot> {
+    snapshot
+        .workspaces
+        .iter()
+        .flat_map(|workspace| &workspace.shells)
+        .find(|shell| shell.id == id)
+}
+
+fn current_shell(client: &client::Client) -> Result<ShellSnapshot, Box<dyn Error>> {
+    let shell_id = env::var("BOOMUX_SHELL_ID")
+        .map_err(|_| "this command must run inside a Boomux-managed shell")?;
+    Ok(client.get_shell(shell_id)?)
+}
+
+fn shell_status(status: &ShellStatus) -> &'static str {
+    match status {
+        ShellStatus::Running => "running",
+        ShellStatus::Exited { .. } => "exited",
+    }
+}
+
+fn open_dashboard_shell(
+    client: &client::Client,
+    shell_id: &str,
+    terminal: Option<&str>,
+) -> Result<String, Box<dyn Error>> {
+    let shell = client.get_shell(shell_id)?;
+    let workspace = client.get_workspace(&shell.workspace_id)?;
+    open_terminal(
+        shell_id,
+        Some(&format!("{} - {}", workspace.name, shell.name)),
+        true,
+        terminal,
+    )?;
+    Ok(format!("Opened {} from {}", shell.name, workspace.name))
+}
+
+fn open_workspace(
+    workspace: &WorkspaceSnapshot,
+    terminal: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
+    if workspace.shells.is_empty() {
+        return Err(format!("workspace {} has no shells", workspace.name).into());
+    }
+    for shell in &workspace.shells {
+        open_terminal(
+            &shell.id,
+            Some(&format!("{} - {}", workspace.name, shell.name)),
+            true,
+            terminal,
+        )?;
+    }
+    Ok(())
+}
+
+fn open_shell(
+    shell_id: &str,
+    title: Option<&str>,
+    takeover: bool,
+    terminal: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
+    let client = client::connect_or_start()?;
+    let shell = client.get_shell(shell_id)?;
+    let title = title.map(str::to_owned).unwrap_or_else(|| {
+        client
+            .get_workspace(&shell.workspace_id)
+            .map(|workspace| format!("{} - {}", workspace.name, shell.name))
+            .unwrap_or_else(|_| format!("Boomux: {}", shell.name))
+    });
+    open_terminal(shell_id, Some(&title), takeover, terminal)
+}
+
+fn open_terminal(
+    shell_id: &str,
+    title: Option<&str>,
+    takeover: bool,
+    terminal: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
+    let title = title
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("Boomux: {shell_id}"));
+    terminal::open(terminal, shell_id, &title, takeover)
+}
+
+fn print_prompt_label() -> Result<(), Box<dyn Error>> {
+    let Some(shell_id) = env::var_os("BOOMUX_SHELL_ID").and_then(|value| value.into_string().ok())
+    else {
+        return Ok(());
+    };
+    let client = client::connect_or_start()?;
+    let shell = client.get_shell(shell_id)?;
+    if let Ok(workspace) = client.get_workspace(&shell.workspace_id) {
+        println!("{}/{}", workspace.name, shell.name);
+    } else {
+        println!("{}", shell.name);
+    }
+    Ok(())
 }
 
 fn install_skill(force: bool) -> Result<(), Box<dyn Error>> {
@@ -918,188 +731,26 @@ fn skill_install_path(home: &Path) -> PathBuf {
     home.join(".agents/skills/boomux-shells/SKILL.md")
 }
 
-fn with_cleanup_error(
-    error: Box<dyn Error>,
-    cleanup: Result<(), Box<dyn Error>>,
-) -> Box<dyn Error> {
-    match cleanup {
-        Ok(()) => error,
-        Err(cleanup_error) => format!("{error}; cleanup also failed: {cleanup_error}").into(),
-    }
-}
-
-fn open_dashboard_terminal(
-    terminal_id: &str,
-    terminal: Option<&str>,
-) -> Result<String, Box<dyn Error>> {
-    let panes = load_panes()?;
-    let pane = panes
-        .iter()
-        .find(|pane| pane.terminal_id == terminal_id)
-        .ok_or("selected terminal no longer exists")?;
-    let workspace = load_workspaces()?
-        .into_iter()
-        .find(|workspace| workspace.workspace_id == pane.workspace_id)
-        .ok_or("selected workspace no longer exists")?;
-    let shell_name = pane_name(pane);
-    open_terminal(
-        terminal_id,
-        Some(&format!("{} - {shell_name}", workspace.label)),
-        true,
-        terminal,
-    )?;
-    Ok(format!("Opened {shell_name} from {}", workspace.label))
-}
-
-fn open_workspace(
-    workspace: &Workspace,
-    panes: &[Pane],
-    terminal: Option<&str>,
-) -> Result<(), Box<dyn Error>> {
-    let workspace_panes: Vec<_> = workspace_panes(&workspace.workspace_id, panes).collect();
-    if workspace_panes.is_empty() {
-        return Err(format!("workspace {} has no terminals", workspace.label).into());
-    }
-
-    for (index, pane) in workspace_panes.iter().enumerate() {
-        let shell_name = pane
-            .label
-            .as_deref()
-            .map(str::to_owned)
-            .unwrap_or_else(|| format!("shell-{}", index + 1));
-        open_terminal(
-            &pane.terminal_id,
-            Some(&format!("{} - {shell_name}", workspace.label)),
-            true,
-            terminal,
-        )?;
-    }
-
-    Ok(())
-}
-
-fn print_prompt_label() -> Result<(), Box<dyn Error>> {
-    let Some(pane_id) = env::var_os("HERDR_PANE_ID").and_then(|value| value.into_string().ok())
-    else {
-        return Ok(());
-    };
-    let panes = load_panes()?;
-    let Some(pane) = panes.iter().find(|pane| pane.pane_id == pane_id) else {
-        return Ok(());
-    };
-    let workspace_name = load_workspaces()?
-        .into_iter()
-        .find(|workspace| workspace.workspace_id == pane.workspace_id)
-        .map(|workspace| workspace.label);
-    let shell_name = pane_name(pane);
-    if let Some(workspace_name) = workspace_name {
-        println!("{workspace_name}/{shell_name}");
-    } else {
-        println!("{shell_name}");
-    }
-    Ok(())
-}
-
-fn close_workspace(workspace_id: &str) -> Result<(), Box<dyn Error>> {
-    let output = Command::new("herdr")
-        .args(["workspace", "close", workspace_id])
-        .output()?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        let message = String::from_utf8_lossy(&output.stderr);
-        Err(format!("could not close Herdr workspace: {}", message.trim()).into())
-    }
-}
-
-fn close_tab(tab_id: &str) -> Result<(), Box<dyn Error>> {
-    let output = Command::new("herdr")
-        .args(["tab", "close", tab_id])
-        .output()?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        let message = String::from_utf8_lossy(&output.stderr);
-        Err(format!("could not close Herdr tab: {}", message.trim()).into())
-    }
-}
-
-fn pane_runs_boomux(pane_id: &str) -> bool {
-    let Ok(output) = Command::new("herdr")
-        .args(["pane", "process-info", "--pane", pane_id])
-        .output()
-    else {
-        return false;
-    };
-
-    output.status.success()
-        && String::from_utf8_lossy(&output.stdout).contains(r#""name":"boomux""#)
-}
-
-fn attach_terminal(terminal_id: &str) -> Result<bool, Box<dyn Error>> {
-    let status = Command::new("herdr")
-        .args(["terminal", "attach", terminal_id, "--takeover"])
-        .stderr(Stdio::null())
-        .status()?;
-
-    Ok(status.success())
-}
-
-fn display_agent_status(status: &str) -> &str {
-    if status == "unknown" { "-" } else { status }
-}
-
-fn load_panes() -> Result<Vec<Pane>, Box<dyn Error>> {
-    let output = Command::new("herdr").args(["pane", "list"]).output()?;
-    if !output.status.success() {
-        let message = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("could not list Herdr terminals: {}", message.trim()).into());
-    }
-
-    let response: PaneListResponse = serde_json::from_slice(&output.stdout)?;
-    Ok(response.result.panes)
-}
-
-fn load_pane(pane_id: &str) -> Result<Pane, Box<dyn Error>> {
-    let output = Command::new("herdr")
-        .args(["pane", "get", pane_id])
-        .output()?;
-    if !output.status.success() {
-        let message = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("could not resolve current Herdr pane: {}", message.trim()).into());
-    }
-
-    let response: PaneGetResponse = serde_json::from_slice(&output.stdout)?;
-    Ok(response.result.pane)
-}
-
-fn load_workspaces() -> Result<Vec<Workspace>, Box<dyn Error>> {
-    let output = Command::new("herdr").args(["workspace", "list"]).output()?;
-    if !output.status.success() {
-        let message = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("could not list Herdr workspaces: {}", message.trim()).into());
-    }
-
-    let response: WorkspaceListResponse = serde_json::from_slice(&output.stdout)?;
-    Ok(response.result.workspaces)
-}
-
 fn doctor(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
     let mut healthy = true;
-
-    match validate_herdr_version() {
-        Ok(message) => println!("ok  herdr: {message}"),
+    match client::connect_or_start() {
+        Ok(client) => println!(
+            "ok  daemon: protocol {} ({})",
+            protocol::PROTOCOL_VERSION,
+            client.socket_path().display()
+        ),
         Err(error) => {
             healthy = false;
-            eprintln!("err herdr: {error}");
+            eprintln!("err daemon: {error}");
         }
     }
-
     for command in ["gum", "git"] {
         match Command::new(command).arg("--version").output() {
             Ok(output) if output.status.success() => {
-                let version = String::from_utf8_lossy(&output.stdout);
-                println!("ok  {command}: {}", version.trim());
+                println!(
+                    "ok  {command}: {}",
+                    String::from_utf8_lossy(&output.stdout).trim()
+                );
             }
             Ok(output) => {
                 healthy = false;
@@ -1111,7 +762,6 @@ fn doctor(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
             }
         }
     }
-
     match config::load() {
         Ok(config) => {
             let discovery = projects::discover(&config.projects);
@@ -1142,7 +792,6 @@ fn doctor(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
             eprintln!("err config: {error}");
         }
     }
-
     if healthy {
         Ok(())
     } else {
@@ -1150,569 +799,127 @@ fn doctor(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
     }
 }
 
-fn ensure_supported_herdr_version() -> Result<(), Box<dyn Error>> {
-    validate_herdr_version().map(|_| ())
-}
-
-fn validate_herdr_version() -> Result<String, Box<dyn Error>> {
-    let client_version = installed_herdr_version()?;
-    if client_version != SUPPORTED_HERDR_VERSION {
-        Err(format!(
-            "client {client_version} is installed, but Boomux requires {SUPPORTED_HERDR_VERSION}; run `herdr update` or install the version pinned in mise.toml"
-        )
-        .into())
-    } else {
-        let output = Command::new("herdr").args(["status", "server"]).output()?;
-        if !output.status.success() {
-            return Err(format!("herdr status server failed with {}", output.status).into());
-        }
-        let output = String::from_utf8(output.stdout)?;
-        let Some((server_version, compatible)) = parse_herdr_server_status(&output) else {
-            return Err("server is not running; start Herdr before launching Boomux".into());
-        };
-        if server_version != SUPPORTED_HERDR_VERSION || !compatible {
-            return Err(format!(
-                "client {client_version} is installed, but the running server is {server_version}; restart or hand off Herdr at {SUPPORTED_HERDR_VERSION}"
-            )
-            .into());
-        }
-        Ok(format!("herdr {client_version} (server compatible)"))
-    }
-}
-
-fn installed_herdr_version() -> Result<String, Box<dyn Error>> {
-    let output = Command::new("herdr").arg("--version").output()?;
-    if !output.status.success() {
-        return Err(format!("herdr --version failed with {}", output.status).into());
-    }
-    let output = String::from_utf8(output.stdout)?;
-    parse_herdr_version(&output)
-        .map(str::to_owned)
-        .ok_or_else(|| format!("could not parse version from {output:?}").into())
-}
-
-fn parse_herdr_version(output: &str) -> Option<&str> {
-    output.trim().strip_prefix("herdr ")
-}
-
-fn parse_herdr_server_status(output: &str) -> Option<(&str, bool)> {
-    let version = output
-        .lines()
-        .find_map(|line| line.trim().strip_prefix("version: "))?;
-    let compatible = output
-        .lines()
-        .find_map(|line| line.trim().strip_prefix("compatible: "))
-        .is_some_and(|value| value == "yes");
-    Some((version, compatible))
-}
-
-fn open_terminal(
-    terminal_id: &str,
-    title: Option<&str>,
-    takeover: bool,
-    terminal: Option<&str>,
-) -> Result<(), Box<dyn Error>> {
-    let title = title
-        .map(str::to_owned)
-        .unwrap_or_else(|| format!("Boomux: {terminal_id}"));
-    terminal::open(terminal, terminal_id, &title, takeover)
-}
-
-fn run_foreground(program: &str, args: &[&str]) -> Result<(), Box<dyn Error>> {
-    let status = Command::new(program).args(args).status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("{program} failed with {status}").into())
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
-
     use super::*;
 
-    fn test_pane(pane_id: &str, tab_id: &str) -> Pane {
-        Pane {
-            pane_id: pane_id.into(),
-            tab_id: tab_id.into(),
-            terminal_id: format!("term-{pane_id}"),
-            workspace_id: "w1".into(),
-            cwd: "/tmp/project".into(),
-            label: None,
-            agent: None,
-            agent_status: "unknown".into(),
+    fn shell(id: &str, workspace_id: &str, name: &str) -> ShellSnapshot {
+        ShellSnapshot {
+            id: id.into(),
+            workspace_id: workspace_id.into(),
+            name: name.into(),
+            cwd: PathBuf::from("/tmp/project"),
+            status: ShellStatus::Running,
         }
     }
 
-    fn command_args(command: &Command) -> Vec<String> {
-        command
-            .get_args()
-            .map(|argument| argument.to_string_lossy().into_owned())
-            .collect()
+    fn workspace(id: &str, name: &str, shells: Vec<ShellSnapshot>) -> WorkspaceSnapshot {
+        WorkspaceSnapshot {
+            id: id.into(),
+            name: name.into(),
+            shells,
+        }
     }
 
     #[test]
-    fn parses_path_like_familiar_project_launchers() {
+    fn parses_paths_and_native_hidden_commands() {
         let cli = Cli::try_parse_from(["boomux", "."]).unwrap();
-
         assert_eq!(cli.path, Some(PathBuf::from(".")));
-        assert!(cli.name.is_none());
-        assert!(!cli.new_window);
-        assert!(cli.command.is_none());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn derives_a_visible_name_from_non_utf8_directories() {
-        use std::ffi::OsString;
-        use std::os::unix::ffi::OsStringExt;
-
-        let directory = PathBuf::from(OsString::from_vec(b"/tmp/project-\x80".to_vec()));
-        let name = default_workspace_name(&directory);
-
-        assert!(name.starts_with("project-"));
-        assert_ne!(name, "default");
-    }
-
-    #[test]
-    fn accepts_workspace_name_only_with_a_path() {
-        let cli = Cli::try_parse_from(["boomux", ".", "--name", "feature-x"]).unwrap();
-
-        assert_eq!(cli.name.as_deref(), Some("feature-x"));
-        assert!(Cli::try_parse_from(["boomux", "--name", "feature-x"]).is_err());
-    }
-
-    #[test]
-    fn accepts_new_window_only_with_a_path() {
-        let cli = Cli::try_parse_from(["boomux", ".", "--new"]).unwrap();
-
-        assert!(cli.new_window);
-        assert!(Cli::try_parse_from(["boomux", "--new"]).is_err());
-        assert!(Cli::try_parse_from(["boomux", ".", "--current"]).is_err());
-    }
-
-    #[test]
-    fn accepts_a_terminal_override_for_window_launches() {
-        let cli = Cli::try_parse_from(["boomux", ".", "--terminal", "Alacritty.desktop"]).unwrap();
-
-        assert_eq!(cli.terminal.as_deref(), Some("Alacritty.desktop"));
-        assert!(should_open_new_window(
-            cli.new_window,
-            cli.terminal.as_deref()
-        ));
-
-        let cli = Cli::try_parse_from([
-            "boomux",
-            "open",
-            "term_123",
-            "--terminal",
-            "Alacritty.desktop",
-        ])
-        .unwrap();
-        assert_eq!(cli.terminal.as_deref(), Some("Alacritty.desktop"));
-
-        let cli =
-            Cli::try_parse_from(["boomux", "--terminal", "Alacritty.desktop", "doctor"]).unwrap();
-        assert!(matches!(cli.command, Some(Commands::Doctor)));
-        assert_eq!(cli.terminal.as_deref(), Some("Alacritty.desktop"));
-    }
-
-    #[test]
-    fn parses_shell_read_and_skill_commands() {
-        let cli = Cli::try_parse_from(["boomux", "shells"]).unwrap();
-        assert!(matches!(cli.command, Some(Commands::Shells)));
-
-        let cli = Cli::try_parse_from(["boomux", "read", "tests", "--lines", "50"]).unwrap();
-        let Some(Commands::Read { target, lines }) = cli.command else {
-            panic!("expected read command");
-        };
-        assert_eq!(target, "tests");
-        assert_eq!(lines, 50);
-
-        let cli = Cli::try_parse_from(["boomux", "skill", "install", "--force"]).unwrap();
+        assert!(Cli::try_parse_from(["boomux", "daemon", "run"]).is_ok());
+        assert!(Cli::try_parse_from(["boomux", "daemon", "stop"]).is_ok());
+        let cli = Cli::try_parse_from(["boomux", "__attach", "s1", "--takeover"]).unwrap();
         assert!(matches!(
             cli.command,
-            Some(Commands::Skill {
-                command: SkillCommands::Install { force: true }
-            })
+            Some(Commands::Attach { takeover: true, .. })
         ));
     }
 
     #[test]
-    fn resolves_terminal_ids_directly_and_names_within_the_current_workspace() {
-        let mut current = test_pane("current", "w1:t1");
-        current.terminal_id = "term_current".into();
-        current.label = Some("agent".into());
-        let mut tests = test_pane("tests", "w1:t2");
-        tests.terminal_id = "term_tests".into();
-        tests.label = Some("shell2".into());
-        let mut other = test_pane("other", "w2:t1");
-        other.workspace_id = "w2".into();
-        other.terminal_id = "term_other".into();
-        other.label = Some("shell2".into());
-        let panes = [current, tests, other];
-
-        assert_eq!(
-            resolve_shell_target(&panes, Some("w1"), "shell2")
-                .unwrap()
-                .pane_id,
-            "tests"
-        );
-        assert_eq!(
-            resolve_shell_target(&panes, None, "term_other")
-                .unwrap()
-                .pane_id,
-            "other"
-        );
-        assert!(resolve_shell_target(&panes, None, "shell2").is_err());
+    fn accepts_path_options_and_named_subcommands() {
+        let cli = Cli::try_parse_from(["boomux", ".", "--name", "feature", "--new"]).unwrap();
+        assert_eq!(cli.name.as_deref(), Some("feature"));
+        assert!(cli.new_window);
+        assert!(Cli::try_parse_from(["boomux", "--name", "feature"]).is_err());
+        assert!(matches!(
+            Cli::try_parse_from(["boomux", "doctor"]).unwrap().command,
+            Some(Commands::Doctor)
+        ));
     }
 
     #[test]
-    fn rejects_ambiguous_shell_names() {
-        let current = test_pane("current", "w1:t1");
-        let mut first = test_pane("first", "w1:t2");
-        first.label = Some("tests".into());
-        let mut second = test_pane("second", "w1:t3");
-        second.label = Some("tests".into());
-
-        let error =
-            resolve_shell_target(&[current, first, second], Some("w1"), "tests").unwrap_err();
-
-        assert!(error.to_string().contains("ambiguous"));
+    fn matches_native_workspace_by_name_only() {
+        let workspace = workspace("w1", "project", vec![]);
+        assert!(find_workspace(&[workspace], "project").is_some());
     }
 
     #[test]
-    fn installs_the_skill_under_the_vendor_neutral_agents_directory() {
+    fn resolves_shell_ids_and_contextual_names() {
+        let snapshot = Snapshot {
+            workspaces: vec![
+                workspace("w1", "one", vec![shell("s1", "w1", "tests")]),
+                workspace("w2", "two", vec![shell("s2", "w2", "tests")]),
+            ],
+        };
+        assert_eq!(
+            resolve_shell_target(&snapshot, None, "s2").unwrap().id,
+            "s2"
+        );
+        assert_eq!(
+            resolve_shell_target(&snapshot, Some("w1"), "tests")
+                .unwrap()
+                .id,
+            "s1"
+        );
+        assert!(resolve_shell_target(&snapshot, None, "tests").is_err());
+    }
+
+    #[test]
+    fn generates_unique_native_shell_names() {
+        let shells = vec![shell("s1", "w1", "shell-1"), shell("s2", "w1", "api")];
+        assert_eq!(unique_shell_name("shell", &shells), "shell-2");
+        assert_eq!(unique_shell_name("api", &shells), "api-2");
+        assert_eq!(unique_shell_name("logs", &shells), "logs");
+    }
+
+    #[test]
+    fn dashboard_shell_uses_launch_cwd() {
+        let spec = dashboard_shell_spec("shell", Path::new("/tmp/dashboard-launch"));
+
+        assert_eq!(spec.cwd, Path::new("/tmp/dashboard-launch"));
+    }
+
+    #[test]
+    fn empty_workspace_view_has_no_directory_or_git_values() {
+        let views = dashboard_views(
+            &[workspace("w1", "empty", Vec::new())],
+            &mut git::Cache::default(),
+        );
+
+        assert_eq!(views[0].directory, "-");
+        assert_eq!(views[0].repository, "-");
+        assert_eq!(views[0].branch, "-");
+        assert_eq!(views[0].git_state, "-");
+        assert_eq!(views[0].worktree, "-");
+    }
+
+    #[test]
+    fn restoring_empty_workspace_returns_actionable_error() {
+        let error = open_workspace(&workspace("w1", "empty", Vec::new()), None).unwrap_err();
+
+        assert!(error.to_string().contains("workspace empty has no shells"));
+    }
+
+    #[test]
+    fn selects_recent_lossy_replay_lines() {
+        assert_eq!(recent_lines("one\ntwo\nthree\n", 2), "two\nthree\n");
+        assert_eq!(recent_lines("one\ntwo", 1), "two");
+    }
+
+    #[test]
+    fn installs_skill_under_vendor_neutral_directory() {
         assert_eq!(
             skill_install_path(Path::new("/home/example")),
             PathBuf::from("/home/example/.agents/skills/boomux-shells/SKILL.md")
-        );
-    }
-
-    #[test]
-    fn parses_runtime_pane_lookup_into_canonical_workspace_metadata() {
-        let response: PaneGetResponse = serde_json::from_str(
-            r#"{
-                "result": {
-                    "pane": {
-                        "pane_id": "w1-3",
-                        "tab_id": "w1:t1",
-                        "terminal_id": "term_agent",
-                        "workspace_id": "w1",
-                        "cwd": "/tmp/project",
-                        "agent_status": "idle"
-                    }
-                }
-            }"#,
-        )
-        .expect("valid pane response");
-
-        assert_eq!(response.result.pane.pane_id, "w1-3");
-        assert_eq!(response.result.pane.workspace_id, "w1");
-    }
-
-    #[test]
-    fn still_prioritizes_named_subcommands() {
-        let cli = Cli::try_parse_from(["boomux", "doctor"]).unwrap();
-
-        assert!(cli.path.is_none());
-        assert!(matches!(cli.command, Some(Commands::Doctor)));
-
-        let cli = Cli::try_parse_from(["boomux", "prompt"]).unwrap();
-        assert!(matches!(cli.command, Some(Commands::Prompt)));
-    }
-
-    #[test]
-    fn resolves_directories_and_rejects_files() {
-        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-
-        assert_eq!(resolve_directory(manifest_dir).unwrap(), manifest_dir);
-        assert!(resolve_directory(&manifest_dir.join("Cargo.toml")).is_err());
-    }
-
-    #[test]
-    fn matches_workspace_by_name_and_directory() {
-        let directory = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let workspaces = vec![Workspace {
-            workspace_id: "w1".into(),
-            label: "default".into(),
-            agent_status: "unknown".into(),
-        }];
-        let panes = vec![Pane {
-            pane_id: "w1:p1".into(),
-            tab_id: "w1:t1".into(),
-            terminal_id: "term_123".into(),
-            workspace_id: "w1".into(),
-            cwd: directory.display().to_string(),
-            label: Some("shell-1".into()),
-            agent: None,
-            agent_status: "unknown".into(),
-        }];
-
-        assert!(find_workspace(&workspaces, &panes, directory, "default").is_some());
-        assert!(find_workspace(&workspaces, &panes, directory, "other").is_none());
-    }
-
-    #[test]
-    fn parses_herdr_pane_list() {
-        let response: PaneListResponse = serde_json::from_str(
-            r#"{
-                "result": {
-                    "panes": [{
-                        "pane_id": "w1:p1",
-                        "tab_id": "w1:t1",
-                        "terminal_id": "term_123",
-                        "workspace_id": "w1",
-                        "cwd": "/tmp/project",
-                        "label": "api",
-                        "agent_status": "working"
-                    }]
-                }
-            }"#,
-        )
-        .unwrap();
-
-        assert_eq!(response.result.panes.len(), 1);
-        assert_eq!(response.result.panes[0].pane_id, "w1:p1");
-        assert_eq!(response.result.panes[0].terminal_id, "term_123");
-        assert_eq!(response.result.panes[0].label.as_deref(), Some("api"));
-    }
-
-    #[test]
-    fn generates_unique_shell_names() {
-        let panes = [
-            Pane {
-                pane_id: "w1:p1".into(),
-                tab_id: "w1:t1".into(),
-                terminal_id: "term_1".into(),
-                workspace_id: "w1".into(),
-                cwd: "/tmp".into(),
-                label: Some("shell-1".into()),
-                agent: None,
-                agent_status: "unknown".into(),
-            },
-            Pane {
-                pane_id: "w1:p2".into(),
-                tab_id: "w1:t2".into(),
-                terminal_id: "term_2".into(),
-                workspace_id: "w1".into(),
-                cwd: "/tmp".into(),
-                label: Some("api".into()),
-                agent: None,
-                agent_status: "idle".into(),
-            },
-        ];
-
-        assert_eq!(
-            unique_shell_name("shell", &panes.iter().collect::<Vec<_>>()),
-            "shell-2"
-        );
-        assert_eq!(
-            unique_shell_name("api", &panes.iter().collect::<Vec<_>>()),
-            "api-2"
-        );
-        assert_eq!(
-            unique_shell_name("logs", &panes.iter().collect::<Vec<_>>()),
-            "logs"
-        );
-    }
-
-    #[test]
-    fn hides_unreported_agent_status() {
-        assert_eq!(display_agent_status("unknown"), "-");
-        assert_eq!(display_agent_status("working"), "working");
-    }
-
-    #[test]
-    fn parses_created_workspace_root_terminal() {
-        let response: WorkspaceCreateResponse = serde_json::from_str(
-            r#"{
-                "result": {
-                    "root_pane": {
-                        "pane_id": "w1:p1",
-                        "tab_id": "w1:t1",
-                        "terminal_id": "term_456",
-                        "workspace_id": "w1",
-                        "cwd": "/tmp/project",
-                        "agent_status": "unknown"
-                    }
-                }
-            }"#,
-        )
-        .unwrap();
-
-        assert_eq!(response.result.root_pane.terminal_id, "term_456");
-    }
-
-    #[test]
-    fn recipe_provisioning_creates_and_configures_terminals_in_order() {
-        let terminals = vec![
-            config::RecipeTerminalConfig {
-                name: "opencode".into(),
-                command: Some("opencode".into()),
-            },
-            config::RecipeTerminalConfig {
-                name: "lazygit".into(),
-                command: Some("lazygit".into()),
-            },
-        ];
-        let events = RefCell::new(Vec::new());
-
-        provision_recipe(
-            &terminals,
-            |terminal| {
-                events.borrow_mut().push(format!("root:{}", terminal.name));
-                Ok(test_pane("p1", "t1"))
-            },
-            |workspace_id, terminal| {
-                events
-                    .borrow_mut()
-                    .push(format!("tab:{workspace_id}:{}", terminal.name));
-                Ok(test_pane("p2", "t2"))
-            },
-            |pane, terminal| {
-                events
-                    .borrow_mut()
-                    .push(format!("configure:{}:{}", pane.pane_id, terminal.name));
-                Ok(())
-            },
-            |workspace_id| {
-                events.borrow_mut().push(format!("cleanup:{workspace_id}"));
-                Ok(())
-            },
-        )
-        .expect("provisioned recipe");
-
-        assert_eq!(
-            events.into_inner(),
-            [
-                "root:opencode",
-                "configure:p1:opencode",
-                "tab:w1:lazygit",
-                "configure:p2:lazygit",
-            ]
-        );
-    }
-
-    #[test]
-    fn recipe_provisioning_closes_partial_workspace_after_failure() {
-        let terminals = vec![
-            config::RecipeTerminalConfig {
-                name: "shell".into(),
-                command: None,
-            },
-            config::RecipeTerminalConfig {
-                name: "agent".into(),
-                command: Some("missing-agent".into()),
-            },
-        ];
-        let cleaned = RefCell::new(Vec::new());
-
-        let error = provision_recipe(
-            &terminals,
-            |_| Ok(test_pane("p1", "t1")),
-            |_, _| Ok(test_pane("p2", "t2")),
-            |_, terminal| {
-                if terminal.name == "agent" {
-                    Err("command delivery failed".into())
-                } else {
-                    Ok(())
-                }
-            },
-            |workspace_id| {
-                cleaned.borrow_mut().push(workspace_id.to_owned());
-                Ok(())
-            },
-        )
-        .expect_err("provisioning should fail");
-
-        assert!(error.to_string().contains("command delivery failed"));
-        assert_eq!(cleaned.into_inner(), ["w1"]);
-    }
-
-    #[test]
-    fn herdr_creation_commands_match_the_pinned_cli() {
-        assert_eq!(
-            command_args(&workspace_create_command(
-                Path::new("/tmp/project"),
-                "project",
-                "opencode",
-            )),
-            [
-                "workspace",
-                "create",
-                "--cwd",
-                "/tmp/project",
-                "--label",
-                "project",
-                "--env",
-                "BOOMUX_WORKSPACE=project",
-                "--env",
-                "BOOMUX_SHELL_NAME=opencode",
-                "--focus",
-            ]
-        );
-        assert_eq!(
-            command_args(&tab_create_command(
-                "w1",
-                Path::new("/tmp/project"),
-                "project",
-                "lazygit",
-            )),
-            [
-                "tab",
-                "create",
-                "--workspace",
-                "w1",
-                "--cwd",
-                "/tmp/project",
-                "--label",
-                "lazygit",
-                "--env",
-                "BOOMUX_WORKSPACE=project",
-                "--env",
-                "BOOMUX_SHELL_NAME=lazygit",
-                "--focus",
-            ]
-        );
-    }
-
-    #[test]
-    fn parses_only_the_pinned_herdr_version() {
-        assert_eq!(parse_herdr_version("herdr 0.7.5\n"), Some("0.7.5"));
-        assert_eq!(parse_herdr_version("herdr 0.6.8"), Some("0.6.8"));
-        assert_eq!(parse_herdr_version("unexpected"), None);
-        assert_eq!(SUPPORTED_HERDR_VERSION, "0.7.5");
-        assert_eq!(
-            parse_herdr_server_status(
-                "status: running\nversion: 0.7.5\nprotocol: 17\ncompatible: yes\n"
-            ),
-            Some(("0.7.5", true))
-        );
-        assert_eq!(parse_herdr_server_status("status: not running\n"), None);
-    }
-
-    #[test]
-    fn recipe_provisioning_reports_cleanup_failures() {
-        let terminals = vec![config::RecipeTerminalConfig {
-            name: "agent".into(),
-            command: Some("opencode".into()),
-        }];
-
-        let error = provision_recipe(
-            &terminals,
-            |_| Ok(test_pane("p1", "t1")),
-            |_, _| unreachable!("no additional terminal"),
-            |_, _| Err("command delivery failed".into()),
-            |_| Err("workspace close failed".into()),
-        )
-        .expect_err("provisioning should fail");
-
-        assert_eq!(
-            error.to_string(),
-            "command delivery failed; cleanup also failed: workspace close failed"
         );
     }
 }

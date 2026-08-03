@@ -1,5 +1,5 @@
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -43,17 +43,9 @@ pub(crate) struct ProjectView {
 
 pub(crate) struct ProjectContext {
     pub(crate) projects: Vec<ProjectView>,
-    pub(crate) recipes: Vec<RecipeView>,
     pub(crate) config_path: Option<PathBuf>,
     pub(crate) warning: Option<String>,
     pub(crate) roots_configured: bool,
-}
-
-#[derive(Clone)]
-pub(crate) struct RecipeView {
-    pub(crate) id: String,
-    pub(crate) label: String,
-    pub(crate) terminals: Vec<String>,
 }
 
 pub(crate) struct TerminalView {
@@ -92,18 +84,25 @@ enum Focus {
     Terminals,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RenameTarget {
+    Workspace(String),
+    Shell(String),
+}
+
+impl RenameTarget {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Workspace(_) => "workspace",
+            Self::Shell(_) => "shell",
+        }
+    }
+}
+
 enum Mode {
     Normal,
     PickProject(ProjectPicker),
-    PickRecipe {
-        directory: PathBuf,
-        project_name: String,
-        picker: RecipePicker,
-    },
-    Rename {
-        pane_id: String,
-        input: String,
-    },
+    Rename { target: RenameTarget, input: String },
 }
 
 struct ProjectPicker {
@@ -114,17 +113,6 @@ struct ProjectPicker {
     config_path: Option<PathBuf>,
     warning: Option<String>,
     roots_configured: bool,
-}
-
-struct RecipePicker {
-    choices: Vec<RecipeChoice>,
-    state: ListState,
-}
-
-struct RecipeChoice {
-    id: Option<String>,
-    label: String,
-    terminals: Vec<String>,
 }
 
 struct Message {
@@ -193,49 +181,6 @@ impl ProjectPicker {
         let previous = self.state.selected().map_or(0, |index| {
             if index == 0 {
                 self.matches.len() - 1
-            } else {
-                index - 1
-            }
-        });
-        self.state.select(Some(previous));
-    }
-}
-
-impl RecipePicker {
-    fn new(recipes: &[RecipeView]) -> Self {
-        let mut choices = vec![RecipeChoice {
-            id: None,
-            label: "Default".into(),
-            terminals: vec!["shell-1".into()],
-        }];
-        choices.extend(recipes.iter().map(|recipe| RecipeChoice {
-            id: Some(recipe.id.clone()),
-            label: recipe.label.clone(),
-            terminals: recipe.terminals.clone(),
-        }));
-        let mut state = ListState::default();
-        state.select(Some(0));
-        Self { choices, state }
-    }
-
-    fn selected(&self) -> Option<&RecipeChoice> {
-        self.state
-            .selected()
-            .and_then(|index| self.choices.get(index))
-    }
-
-    fn next(&mut self) {
-        let next = self
-            .state
-            .selected()
-            .map_or(0, |index| (index + 1) % self.choices.len());
-        self.state.select(Some(next));
-    }
-
-    fn previous(&mut self) {
-        let previous = self.state.selected().map_or(0, |index| {
-            if index == 0 {
-                self.choices.len() - 1
             } else {
                 index - 1
             }
@@ -400,11 +345,17 @@ impl App {
     }
 
     fn request_rename(&mut self) {
-        if self.focus == Focus::Terminals
-            && let Some(terminal) = self.selected_terminal()
-        {
+        let target = match self.focus {
+            Focus::Workspaces => self
+                .selected()
+                .map(|workspace| RenameTarget::Workspace(workspace.id.clone())),
+            Focus::Terminals => self
+                .selected_terminal()
+                .map(|terminal| RenameTarget::Shell(terminal.pane_id.clone())),
+        };
+        if let Some(target) = target {
             self.mode = Mode::Rename {
-                pane_id: terminal.pane_id.clone(),
+                target,
                 input: String::new(),
             };
             self.message = None;
@@ -435,27 +386,23 @@ impl App {
         }
     }
 
-    fn create_workspace<F>(
-        &mut self,
-        directory: &Path,
-        recipe_id: Option<&str>,
-        on_create_workspace: &mut F,
-    ) where
-        F: FnMut(&Path, Option<&str>) -> Result<String, String>,
+    fn create_workspace<F>(&mut self, name: &str, on_create_workspace: &mut F)
+    where
+        F: FnMut(&str) -> Result<String, String>,
     {
         self.mode = Mode::Normal;
-        self.message = Some(match on_create_workspace(directory, recipe_id) {
+        self.message = Some(match on_create_workspace(name) {
             Ok(text) => Message { text, error: false },
             Err(text) => Message { text, error: true },
         });
     }
 
-    fn rename_shell<F>(&mut self, pane_id: &str, name: &str, on_rename: &mut F)
+    fn rename<F>(&mut self, target: &RenameTarget, name: &str, on_rename: &mut F)
     where
-        F: FnMut(&str, &str) -> Result<String, String>,
+        F: FnMut(&RenameTarget, &str) -> Result<String, String>,
     {
         self.mode = Mode::Normal;
-        self.message = Some(match on_rename(pane_id, name) {
+        self.message = Some(match on_rename(target, name) {
             Ok(text) => Message { text, error: false },
             Err(text) => Message { text, error: true },
         });
@@ -543,7 +490,7 @@ impl App {
                 .or_else(|| (!workspace.terminals.is_empty()).then_some(0))
         });
         self.terminal_state.select(terminal_index);
-        if self.focus == Focus::Terminals && terminal_index.is_none() {
+        if self.focus == Focus::Terminals && self.workspaces.is_empty() {
             self.focus = Focus::Workspaces;
         }
     }
@@ -558,9 +505,9 @@ where
     R: FnMut(&str) -> Result<String, String>,
     O: FnMut(&str) -> Result<String, String>,
     C: FnMut(&str) -> Result<String, String>,
-    W: FnMut(&Path, Option<&str>) -> Result<String, String>,
+    W: FnMut(&str) -> Result<String, String>,
     N: FnMut(&str) -> Result<String, String>,
-    E: FnMut(&str, &str) -> Result<String, String>,
+    E: FnMut(&RenameTarget, &str) -> Result<String, String>,
     F: FnMut() -> Result<Vec<WorkspaceView>, String>,
 {
     let mut terminal = ratatui::init();
@@ -582,9 +529,9 @@ where
     R: FnMut(&str) -> Result<String, String>,
     O: FnMut(&str) -> Result<String, String>,
     C: FnMut(&str) -> Result<String, String>,
-    W: FnMut(&Path, Option<&str>) -> Result<String, String>,
+    W: FnMut(&str) -> Result<String, String>,
     N: FnMut(&str) -> Result<String, String>,
-    E: FnMut(&str, &str) -> Result<String, String>,
+    E: FnMut(&RenameTarget, &str) -> Result<String, String>,
     F: FnMut() -> Result<Vec<WorkspaceView>, String>,
 {
     let mut last_refresh = Instant::now();
@@ -679,8 +626,8 @@ fn handle_mode_key<W, E>(
     on_rename: &mut E,
 ) -> bool
 where
-    W: FnMut(&Path, Option<&str>) -> Result<String, String>,
-    E: FnMut(&str, &str) -> Result<String, String>,
+    W: FnMut(&str) -> Result<String, String>,
+    E: FnMut(&RenameTarget, &str) -> Result<String, String>,
 {
     let mode = std::mem::replace(&mut app.mode, Mode::Normal);
     if !modifiers.difference(KeyModifiers::SHIFT).is_empty() {
@@ -691,12 +638,17 @@ where
         Mode::Normal => false,
         Mode::PickProject(mut picker) => match key {
             KeyCode::Enter if picker.selected().is_some() => {
-                let project = picker.selected().expect("selected project");
-                app.mode = Mode::PickRecipe {
-                    directory: project.path.clone(),
-                    project_name: project.name.clone(),
-                    picker: RecipePicker::new(&app.project_context.recipes),
-                };
+                let name = picker.selected().expect("selected project").name.clone();
+                app.create_workspace(&name, on_create_workspace);
+                true
+            }
+            KeyCode::Enter if !picker.query.trim().is_empty() => {
+                let name = picker.query.trim().to_owned();
+                app.create_workspace(&name, on_create_workspace);
+                true
+            }
+            KeyCode::Enter => {
+                app.mode = Mode::PickProject(picker);
                 false
             }
             KeyCode::Esc => false,
@@ -727,63 +679,25 @@ where
                 false
             }
         },
-        Mode::PickRecipe {
-            directory,
-            project_name,
-            mut picker,
-        } => match key {
-            KeyCode::Enter => {
-                let recipe_id = picker.selected().expect("selected recipe").id.as_deref();
-                app.create_workspace(&directory, recipe_id, on_create_workspace);
-                true
-            }
-            KeyCode::Esc => false,
-            KeyCode::Down | KeyCode::Char('j') => {
-                picker.next();
-                app.mode = Mode::PickRecipe {
-                    directory,
-                    project_name,
-                    picker,
-                };
-                false
-            }
-            KeyCode::Up | KeyCode::Char('k') => {
-                picker.previous();
-                app.mode = Mode::PickRecipe {
-                    directory,
-                    project_name,
-                    picker,
-                };
-                false
-            }
-            _ => {
-                app.mode = Mode::PickRecipe {
-                    directory,
-                    project_name,
-                    picker,
-                };
-                false
-            }
-        },
-        Mode::Rename { pane_id, mut input } => match key {
+        Mode::Rename { target, mut input } => match key {
             KeyCode::Enter if !input.trim().is_empty() => {
                 let name = input.trim().to_owned();
-                app.rename_shell(&pane_id, &name, on_rename);
+                app.rename(&target, &name, on_rename);
                 true
             }
             KeyCode::Esc => false,
             KeyCode::Backspace => {
                 input.pop();
-                app.mode = Mode::Rename { pane_id, input };
+                app.mode = Mode::Rename { target, input };
                 false
             }
             KeyCode::Char(character) => {
                 input.push(character);
-                app.mode = Mode::Rename { pane_id, input };
+                app.mode = Mode::Rename { target, input };
                 false
             }
             _ => {
-                app.mode = Mode::Rename { pane_id, input };
+                app.mode = Mode::Rename { target, input };
                 false
             }
         },
@@ -806,55 +720,9 @@ fn render(frame: &mut Frame, app: &mut App) {
     render_workspaces(frame, workspace_area, app);
     render_terminals(frame, terminal_area, app);
     render_footer(frame, footer_area, app);
-    match &mut app.mode {
-        Mode::PickProject(picker) => render_project_picker(frame, area, picker),
-        Mode::PickRecipe {
-            project_name,
-            picker,
-            ..
-        } => render_recipe_picker(frame, area, project_name, picker),
-        _ => {}
+    if let Mode::PickProject(picker) = &mut app.mode {
+        render_project_picker(frame, area, picker);
     }
-}
-
-fn render_recipe_picker(
-    frame: &mut Frame,
-    area: Rect,
-    project_name: &str,
-    picker: &mut RecipePicker,
-) {
-    let popup_area = centered_rect(area, 64, 52);
-    frame.render_widget(Clear, popup_area);
-    frame.render_widget(Block::new().style(Style::new().bg(BASE)), popup_area);
-    let [list_area, help_area] =
-        Layout::vertical([Constraint::Fill(1), Constraint::Length(2)]).areas(popup_area);
-    let items = picker.choices.iter().map(|choice| {
-        ListItem::new(Line::from(vec![
-            Span::styled(
-                format!("{:<22}", choice.label),
-                Style::new().fg(TEXT).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(choice.terminals.join(" · "), Style::new().fg(SUBTEXT)),
-        ]))
-    });
-    let list = List::new(items)
-        .block(
-            Block::bordered()
-                .title(format!(" Recipe for {project_name} "))
-                .border_style(Style::new().fg(TEAL)),
-        )
-        .highlight_symbol("> ")
-        .highlight_style(Style::new().fg(TEXT).add_modifier(Modifier::REVERSED));
-    frame.render_stateful_widget(list, list_area, &mut picker.state);
-    let help = Line::from(vec![
-        Span::styled(" j/k", Style::new().fg(BLUE)),
-        Span::raw(" select  "),
-        Span::styled("enter", Style::new().fg(GREEN)),
-        Span::raw(" create  "),
-        Span::styled("esc", Style::new().fg(RED)),
-        Span::raw(" cancel"),
-    ]);
-    frame.render_widget(Paragraph::new(help).style(Style::new().bg(BASE)), help_area);
 }
 
 fn render_project_picker(frame: &mut Frame, area: Rect, picker: &mut ProjectPicker) {
@@ -870,7 +738,7 @@ fn render_project_picker(frame: &mut Frame, area: Rect, picker: &mut ProjectPick
 
     let search = Paragraph::new(format!("> {}_", picker.query)).block(
         Block::bordered()
-            .title(" Create workspace from project ")
+            .title(" Create workspace ")
             .border_style(Style::new().fg(TEAL)),
     );
     frame.render_widget(search, search_area);
@@ -881,11 +749,11 @@ fn render_project_picker(frame: &mut Frame, area: Rect, picker: &mut ProjectPick
                 || "config.toml".to_owned(),
                 |path| path.display().to_string(),
             );
-            format!("No projects configured. Add [projects] roots to {path}")
+            format!("No project suggestions. Add [projects] roots to {path}")
         } else if picker.query.is_empty() {
-            "No Git projects discovered in configured roots".to_owned()
+            "No project suggestions discovered".to_owned()
         } else {
-            "No matching projects".to_owned()
+            "No matching suggestion; Enter creates this workspace name".to_owned()
         };
         vec![ListItem::new(Span::styled(
             message,
@@ -921,7 +789,7 @@ fn render_project_picker(frame: &mut Frame, area: Rect, picker: &mut ProjectPick
     let list = List::new(items)
         .block(
             Block::bordered()
-                .title(format!(" {} projects ", picker.matches.len()))
+                .title(format!(" {} project suggestions ", picker.matches.len()))
                 .border_style(Style::new().fg(OVERLAY)),
         )
         .highlight_symbol("> ")
@@ -932,7 +800,7 @@ fn render_project_picker(frame: &mut Frame, area: Rect, picker: &mut ProjectPick
         || {
             Line::from(vec![
                 Span::styled(" type", Style::new().fg(TEAL)),
-                Span::raw(" filter  "),
+                Span::raw(" name or filter  "),
                 Span::styled("up/down", Style::new().fg(BLUE)),
                 Span::raw(" select  "),
                 Span::styled("enter", Style::new().fg(GREEN)),
@@ -1215,9 +1083,12 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
             Span::styled("n/esc", Style::new().fg(GREEN)),
             Span::styled(" cancel", Style::new().fg(SUBTEXT)),
         ])
-    } else if let Mode::Rename { input, .. } = &app.mode {
+    } else if let Mode::Rename { target, input } = &app.mode {
         Line::from(vec![
-            Span::styled(" New shell name: ", Style::new().fg(YELLOW)),
+            Span::styled(
+                format!(" New {} name: ", target.label()),
+                Style::new().fg(YELLOW),
+            ),
             Span::styled(format!("{input}_"), Style::new().fg(TEXT)),
             Span::styled("  enter", Style::new().fg(GREEN)),
             Span::raw(" rename  "),
@@ -1236,19 +1107,24 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
             Span::styled("a", Style::new().fg(GREEN)),
             Span::styled(
                 if app.focus == Focus::Workspaces {
-                    " find project  "
+                    " create workspace  "
                 } else {
                     " add shell  "
                 },
                 Style::new().fg(SUBTEXT),
             ),
         ];
-        if app.focus == Focus::Terminals {
-            spans.extend([
-                Span::styled("e", Style::new().fg(YELLOW)),
-                Span::styled(" rename  ", Style::new().fg(SUBTEXT)),
-            ]);
-        }
+        spans.extend([
+            Span::styled("e", Style::new().fg(YELLOW)),
+            Span::styled(
+                if app.focus == Focus::Workspaces {
+                    " rename workspace  "
+                } else {
+                    " rename shell  "
+                },
+                Style::new().fg(SUBTEXT),
+            ),
+        ]);
         spans.extend([
             Span::styled("enter", Style::new().fg(GREEN)),
             Span::styled(
@@ -1323,11 +1199,6 @@ mod tests {
                     group_order: 1,
                 },
             ],
-            recipes: vec![RecipeView {
-                id: "full-dev".into(),
-                label: "Full Dev".into(),
-                terminals: vec!["opencode".into(), "lazygit".into(), "lazyvim".into()],
-            }],
             config_path: Some("/tmp/config.toml".into()),
             warning: None,
             roots_configured: true,
@@ -1389,18 +1260,49 @@ mod tests {
     }
 
     #[test]
-    fn add_creates_a_workspace_from_workspace_focus() {
+    fn refresh_keeps_terminal_focus_for_an_empty_workspace() {
+        let mut empty = workspace("w1", "empty");
+        empty.terminals.clear();
+        let mut app = App::new(vec![empty], project_context());
+        app.toggle_focus();
+
+        let mut refreshed = workspace("w1", "empty");
+        refreshed.terminals.clear();
+        app.replace_workspaces(vec![refreshed]);
+
+        assert_eq!(app.focus, Focus::Terminals);
+        assert!(app.terminal_state.selected().is_none());
+    }
+
+    #[test]
+    fn empty_terminal_focus_can_create_the_first_shell() {
+        let mut empty = workspace("w1", "empty");
+        empty.terminals.clear();
+        let mut app = App::new(vec![empty], project_context());
+        app.toggle_focus();
+        let mut selected_workspace = None;
+
+        let changed = app.request_add(&mut |workspace_id| {
+            selected_workspace = Some(workspace_id.to_owned());
+            Ok("Created shell".into())
+        });
+
+        assert!(changed);
+        assert_eq!(selected_workspace.as_deref(), Some("w1"));
+    }
+
+    #[test]
+    fn project_suggestion_creates_workspace_by_name_only() {
         let mut app = app();
         let mut created = None;
 
         assert!(!app.request_add(&mut |_| Ok(String::new())));
-        assert!(matches!(app.mode, Mode::PickProject(_)));
         for character in "alp".chars() {
             handle_mode_key(
                 &mut app,
                 KeyCode::Char(character),
                 KeyModifiers::NONE,
-                &mut |_, _| Ok(String::new()),
+                &mut |_| Ok(String::new()),
                 &mut |_, _| Ok(String::new()),
             );
         }
@@ -1408,62 +1310,41 @@ mod tests {
             &mut app,
             KeyCode::Enter,
             KeyModifiers::NONE,
-            &mut |_, _| Ok(String::new()),
-            &mut |_, _| Ok(String::new()),
-        );
-        assert!(!changed);
-        assert!(matches!(app.mode, Mode::PickRecipe { .. }));
-
-        let changed = handle_mode_key(
-            &mut app,
-            KeyCode::Enter,
-            KeyModifiers::NONE,
-            &mut |directory, recipe_id| {
-                created = Some(directory.to_owned());
-                assert_eq!(recipe_id, None);
+            &mut |name| {
+                created = Some(name.to_owned());
                 Ok("Created workspace".into())
             },
             &mut |_, _| Ok(String::new()),
         );
 
         assert!(changed);
-        assert_eq!(created.as_deref(), Some(Path::new("/tmp/alpha")));
+        assert_eq!(created.as_deref(), Some("alpha"));
         assert!(matches!(app.mode, Mode::Normal));
     }
 
     #[test]
-    fn recipe_picker_dispatches_the_selected_recipe() {
+    fn arbitrary_text_creates_trimmed_workspace_name() {
         let mut app = app();
-        let mut selected_recipe = None;
+        let mut created = None;
         app.request_add(&mut |_| Ok(String::new()));
-
-        handle_mode_key(
-            &mut app,
-            KeyCode::Enter,
-            KeyModifiers::NONE,
-            &mut |_, _| Ok(String::new()),
-            &mut |_, _| Ok(String::new()),
-        );
-        handle_mode_key(
-            &mut app,
-            KeyCode::Down,
-            KeyModifiers::NONE,
-            &mut |_, _| Ok(String::new()),
-            &mut |_, _| Ok(String::new()),
-        );
+        if let Mode::PickProject(picker) = &mut app.mode {
+            picker.query = "  custom workspace  ".into();
+            picker.update_matches();
+            assert!(picker.selected().is_none());
+        }
         let changed = handle_mode_key(
             &mut app,
             KeyCode::Enter,
             KeyModifiers::NONE,
-            &mut |_, recipe_id| {
-                selected_recipe = recipe_id.map(str::to_owned);
+            &mut |name| {
+                created = Some(name.to_owned());
                 Ok("Created workspace".into())
             },
             &mut |_, _| Ok(String::new()),
         );
 
         assert!(changed);
-        assert_eq!(selected_recipe.as_deref(), Some("full-dev"));
+        assert_eq!(created.as_deref(), Some("custom workspace"));
     }
 
     #[test]
@@ -1502,7 +1383,7 @@ mod tests {
             &mut app,
             KeyCode::Char('c'),
             KeyModifiers::CONTROL,
-            &mut |_, _| Ok(String::new()),
+            &mut |_| Ok(String::new()),
             &mut |_, _| Ok(String::new()),
         );
 
@@ -1521,7 +1402,7 @@ mod tests {
             &mut app,
             KeyCode::Char('_'),
             KeyModifiers::SHIFT,
-            &mut |_, _| Ok(String::new()),
+            &mut |_| Ok(String::new()),
             &mut |_, _| Ok(String::new()),
         );
 
@@ -1562,7 +1443,7 @@ mod tests {
     }
 
     #[test]
-    fn rename_mode_dispatches_the_selected_pane_and_name() {
+    fn rename_mode_dispatches_the_selected_shell_and_name() {
         let mut app = app();
         let mut renamed = None;
         app.toggle_focus();
@@ -1573,7 +1454,7 @@ mod tests {
                 &mut app,
                 KeyCode::Char(character),
                 KeyModifiers::NONE,
-                &mut |_, _| Ok(String::new()),
+                &mut |_| Ok(String::new()),
                 &mut |_, _| Ok(String::new()),
             );
         }
@@ -1581,25 +1462,59 @@ mod tests {
             &mut app,
             KeyCode::Enter,
             KeyModifiers::NONE,
-            &mut |_, _| Ok(String::new()),
-            &mut |pane_id, name| {
-                renamed = Some((pane_id.to_owned(), name.to_owned()));
+            &mut |_| Ok(String::new()),
+            &mut |target, name| {
+                renamed = Some((target.clone(), name.to_owned()));
                 Ok("Renamed shell".into())
             },
         );
 
         assert!(changed);
-        assert_eq!(renamed, Some(("w1:p1".into(), "api".into())));
+        assert_eq!(
+            renamed,
+            Some((RenameTarget::Shell("w1:p1".into()), "api".into()))
+        );
         assert!(matches!(app.mode, Mode::Normal));
     }
 
     #[test]
-    fn rename_requires_terminal_focus() {
+    fn rename_mode_dispatches_the_selected_workspace_and_name() {
         let mut app = app();
+        let mut renamed = None;
 
         app.request_rename();
+        assert!(matches!(
+            app.mode,
+            Mode::Rename {
+                target: RenameTarget::Workspace(ref id),
+                ..
+            } if id == "w1"
+        ));
+        for character in "renamed".chars() {
+            handle_mode_key(
+                &mut app,
+                KeyCode::Char(character),
+                KeyModifiers::NONE,
+                &mut |_| Ok(String::new()),
+                &mut |_, _| Ok(String::new()),
+            );
+        }
+        let changed = handle_mode_key(
+            &mut app,
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+            &mut |_| Ok(String::new()),
+            &mut |target, name| {
+                renamed = Some((target.clone(), name.to_owned()));
+                Ok("Renamed workspace".into())
+            },
+        );
 
-        assert!(matches!(app.mode, Mode::Normal));
+        assert!(changed);
+        assert_eq!(
+            renamed,
+            Some((RenameTarget::Workspace("w1".into()), "renamed".into()))
+        );
     }
 
     #[test]
@@ -1746,33 +1661,5 @@ mod tests {
         app.request_add(&mut |_| Ok(String::new()));
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
-    }
-
-    #[test]
-    fn recipe_launcher_renders_default_and_configured_recipes() {
-        let backend = TestBackend::new(120, 34);
-        let mut terminal = Terminal::new(backend).unwrap();
-        let mut app = app();
-        app.request_add(&mut |_| Ok(String::new()));
-        handle_mode_key(
-            &mut app,
-            KeyCode::Enter,
-            KeyModifiers::NONE,
-            &mut |_, _| Ok(String::new()),
-            &mut |_, _| Ok(String::new()),
-        );
-
-        terminal.draw(|frame| render(frame, &mut app)).unwrap();
-        let text: String = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect();
-        assert!(text.contains("Recipe for alpha"));
-        assert!(text.contains("Default"));
-        assert!(text.contains("Full Dev"));
-        assert!(text.contains("opencode · lazygit · lazyvim"));
     }
 }
