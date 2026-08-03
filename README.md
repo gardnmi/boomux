@@ -33,6 +33,18 @@ create that explicitly named container:
 boomux . --name feature-x
 ```
 
+Run a one-off command instead of the login shell by placing its exact arguments
+after `--`:
+
+```console
+boomux . -- cargo watch -x test
+boomux . --name feature-x --new -- lazygit
+```
+
+Boomux executes the command directly without shell parsing. Use an explicit
+shell such as `sh -lc` when pipelines, redirects, or variable expansion are
+required.
+
 Open the shell in Omarchy's selected terminal instead of attaching in place:
 
 ```console

@@ -19,7 +19,11 @@ const BOOMUX_SHELLS_SKILL: &str = include_str!("../.agents/skills/boomux-shells/
 const REPLAY_BYTES: usize = 1024 * 1024;
 
 #[derive(Parser)]
-#[command(version, about = "Native persistent terminal workspaces")]
+#[command(
+    version,
+    about = "Native persistent terminal workspaces",
+    subcommand_value_name = "SUBCOMMAND"
+)]
 struct Cli {
     /// Open or create a persistent terminal in this directory
     #[arg(value_name = "PATH")]
@@ -36,6 +40,10 @@ struct Cli {
     /// XDG desktop entry to use for windows opened by this invocation
     #[arg(long, global = true, value_name = "DESKTOP_ENTRY")]
     terminal: Option<String>,
+
+    /// Command and arguments to run instead of the login shell
+    #[arg(last = true, num_args = 1.., requires = "path", value_name = "COMMAND")]
+    startup_command: Vec<String>,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -138,7 +146,13 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             .then(|| effective_terminal(cli.terminal.as_deref()))
             .transpose()?
             .flatten();
-        return open_directory(&path, cli.name.as_deref(), new_window, terminal.as_deref());
+        return open_directory(
+            &path,
+            cli.name.as_deref(),
+            &cli.startup_command,
+            new_window,
+            terminal.as_deref(),
+        );
     }
 
     match cli.command {
@@ -340,6 +354,7 @@ fn common_shell_cwd(workspace: &WorkspaceSnapshot) -> Option<&Path> {
 fn open_directory(
     path: &Path,
     requested_name: Option<&str>,
+    startup_command: &[String],
     open_in_new_window: bool,
     terminal: Option<&str>,
 ) -> Result<(), Box<dyn Error>> {
@@ -354,10 +369,16 @@ fn open_directory(
     let (shell, workspace_name) = if let Some(name) = requested_name {
         let shell = if let Some(workspace) = find_workspace(&snapshot.workspaces, &name) {
             let shell_name = unique_shell_name("shell", &workspace.shells);
-            client.create_shell(&workspace.id, ShellSpec::login(shell_name, &directory))?
+            client.create_shell(
+                &workspace.id,
+                shell_spec(shell_name, &directory, startup_command),
+            )?
         } else {
             client
-                .create_workspace(&name, vec![ShellSpec::login("shell-1", &directory)])?
+                .create_workspace(
+                    &name,
+                    vec![shell_spec("shell-1", &directory, startup_command)],
+                )?
                 .shells
                 .into_iter()
                 .next()
@@ -365,7 +386,11 @@ fn open_directory(
         };
         (shell, name)
     } else {
-        let shell = client.create_shell_with_workspace(ShellSpec::login("shell-1", &directory))?;
+        let shell = client.create_shell_with_workspace(shell_spec(
+            "shell-1",
+            &directory,
+            startup_command,
+        ))?;
         let workspace_name = client.get_workspace(&shell.workspace_id)?.name;
         (shell, workspace_name)
     };
@@ -379,6 +404,14 @@ fn open_directory(
         )
     } else {
         Ok(attach::run(&shell.id, true)?)
+    }
+}
+
+fn shell_spec(name: impl Into<String>, cwd: &Path, command: &[String]) -> ShellSpec {
+    ShellSpec {
+        name: name.into(),
+        command: command.to_vec(),
+        cwd: cwd.to_owned(),
     }
 }
 
@@ -814,6 +847,7 @@ mod tests {
         let cli = Cli::try_parse_from(["boomux", ".", "--name", "feature", "--new"]).unwrap();
         assert_eq!(cli.name.as_deref(), Some("feature"));
         assert!(cli.new_window);
+        assert!(cli.startup_command.is_empty());
         assert!(Cli::try_parse_from(["boomux", "--name", "feature"]).is_err());
         assert!(matches!(
             Cli::try_parse_from(["boomux", "doctor"]).unwrap().command,
@@ -825,6 +859,19 @@ mod tests {
                 .command,
             Some(Commands::Close { target }) if target == "tests"
         ));
+    }
+
+    #[test]
+    fn parses_exact_startup_command_after_separator() {
+        let cli = Cli::try_parse_from([
+            "boomux", "--name", "feature", ".", "--", "cargo", "watch", "-x", "test",
+        ])
+        .unwrap();
+
+        assert_eq!(cli.path, Some(PathBuf::from(".")));
+        assert_eq!(cli.startup_command, ["cargo", "watch", "-x", "test"]);
+        assert!(cli.command.is_none());
+        assert!(Cli::try_parse_from(["boomux", "--", "cargo", "watch"]).is_err());
     }
 
     #[test]
@@ -860,6 +907,17 @@ mod tests {
         assert_eq!(unique_shell_name("shell", &shells), "shell-2");
         assert_eq!(unique_shell_name("api", &shells), "api-2");
         assert_eq!(unique_shell_name("logs", &shells), "logs");
+    }
+
+    #[test]
+    fn builds_shell_spec_with_exact_startup_arguments() {
+        let command = vec!["sh".into(), "-lc".into(), "printf '%s' test".into()];
+
+        let spec = shell_spec("checks", Path::new("/tmp/project"), &command);
+
+        assert_eq!(spec.name, "checks");
+        assert_eq!(spec.cwd, Path::new("/tmp/project"));
+        assert_eq!(spec.command, command);
     }
 
     #[test]
