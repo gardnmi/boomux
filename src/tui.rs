@@ -50,9 +50,7 @@ pub(crate) struct ProjectContext {
 
 pub(crate) struct TerminalView {
     pub(crate) id: String,
-    pub(crate) pane_id: String,
     pub(crate) name: String,
-    pub(crate) kind: String,
     pub(crate) status: String,
     pub(crate) directory: String,
 }
@@ -118,6 +116,15 @@ struct ProjectPicker {
 struct Message {
     text: String,
     error: bool,
+}
+
+impl Message {
+    fn from_result(result: Result<String, String>) -> Self {
+        match result {
+            Ok(text) => Self { text, error: false },
+            Err(text) => Self { text, error: true },
+        }
+    }
 }
 
 struct PendingClose {
@@ -351,7 +358,7 @@ impl App {
                 .map(|workspace| RenameTarget::Workspace(workspace.id.clone())),
             Focus::Terminals => self
                 .selected_terminal()
-                .map(|terminal| RenameTarget::Shell(terminal.pane_id.clone())),
+                .map(|terminal| RenameTarget::Shell(terminal.id.clone())),
         };
         if let Some(target) = target {
             self.mode = Mode::Rename {
@@ -377,10 +384,7 @@ impl App {
                 else {
                     return false;
                 };
-                self.message = Some(match on_create_shell(&workspace_id) {
-                    Ok(text) => Message { text, error: false },
-                    Err(text) => Message { text, error: true },
-                });
+                self.message = Some(Message::from_result(on_create_shell(&workspace_id)));
                 true
             }
         }
@@ -391,10 +395,7 @@ impl App {
         F: FnMut(&str) -> Result<String, String>,
     {
         self.mode = Mode::Normal;
-        self.message = Some(match on_create_workspace(name) {
-            Ok(text) => Message { text, error: false },
-            Err(text) => Message { text, error: true },
-        });
+        self.message = Some(Message::from_result(on_create_workspace(name)));
     }
 
     fn rename<F>(&mut self, target: &RenameTarget, name: &str, on_rename: &mut F)
@@ -402,10 +403,7 @@ impl App {
         F: FnMut(&RenameTarget, &str) -> Result<String, String>,
     {
         self.mode = Mode::Normal;
-        self.message = Some(match on_rename(target, name) {
-            Ok(text) => Message { text, error: false },
-            Err(text) => Message { text, error: true },
-        });
+        self.message = Some(Message::from_result(on_rename(target, name)));
     }
 
     fn restore_selected<F>(&mut self, on_restore: &mut F)
@@ -415,10 +413,7 @@ impl App {
         let Some(workspace_id) = self.selected().map(|workspace| workspace.id.clone()) else {
             return;
         };
-        self.message = Some(match on_restore(&workspace_id) {
-            Ok(text) => Message { text, error: false },
-            Err(text) => Message { text, error: true },
-        });
+        self.message = Some(Message::from_result(on_restore(&workspace_id)));
     }
 
     fn open_selected_terminal<F>(&mut self, on_open: &mut F)
@@ -428,10 +423,7 @@ impl App {
         let Some(terminal_id) = self.selected_terminal().map(|terminal| terminal.id.clone()) else {
             return;
         };
-        self.message = Some(match on_open(&terminal_id) {
-            Ok(text) => Message { text, error: false },
-            Err(text) => Message { text, error: true },
-        });
+        self.message = Some(Message::from_result(on_open(&terminal_id)));
     }
 
     fn request_close(&mut self) {
@@ -453,10 +445,7 @@ impl App {
         let Some(pending) = self.pending_close.take() else {
             return;
         };
-        self.message = Some(match on_close(&pending.id) {
-            Ok(text) => Message { text, error: false },
-            Err(text) => Message { text, error: true },
-        });
+        self.message = Some(Message::from_result(on_close(&pending.id)));
     }
 
     fn refresh<F>(&mut self, on_refresh: &mut F)
@@ -1014,28 +1003,30 @@ fn git_state_cell(state: &str) -> Cell<'_> {
 }
 
 fn render_terminals(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
-    let header = Row::new(["#", "NAME", "TYPE", "STATUS", "DIRECTORY", "TERMINAL ID"])
+    let header = Row::new(["#", "NAME", "STATUS", "DIRECTORY", "SHELL ID"])
         .style(Style::new().fg(BLUE).add_modifier(Modifier::BOLD));
-    let rows: Vec<_> = app
+    let selected = app
+        .workspace_state
         .selected()
+        .and_then(|index| app.workspaces.get(index));
+    let rows: Vec<_> = selected
         .into_iter()
         .flat_map(|workspace| workspace.terminals.iter())
         .enumerate()
         .map(|(index, terminal)| {
             Row::new(vec![
                 Cell::from((index + 1).to_string()),
-                Cell::from(terminal.name.clone()),
-                Cell::from(terminal.kind.clone()),
+                Cell::from(terminal.name.as_str()),
                 Cell::from(Span::styled(
-                    status_label(&terminal.status).to_owned(),
+                    terminal.status.as_str(),
                     Style::new().fg(status_color(&terminal.status)),
                 )),
-                Cell::from(terminal.directory.clone()),
-                Cell::from(terminal.id.clone()),
+                Cell::from(terminal.directory.as_str()),
+                Cell::from(terminal.id.as_str()),
             ])
         })
         .collect();
-    let title = app.selected().map_or_else(
+    let title = selected.map_or_else(
         || " Terminals ".to_owned(),
         |workspace| format!(" Terminals: {} ", workspace.name),
     );
@@ -1043,7 +1034,6 @@ fn render_terminals(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut Ap
         rows,
         [
             Constraint::Length(4),
-            Constraint::Length(18),
             Constraint::Length(18),
             Constraint::Length(12),
             Constraint::Min(24),
@@ -1147,16 +1137,9 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     frame.render_widget(Paragraph::new(line), area);
 }
 
-fn status_label(status: &str) -> &str {
-    if status == "unknown" { "-" } else { status }
-}
-
 fn status_color(status: &str) -> Color {
     match status {
-        "working" => YELLOW,
-        "blocked" => RED,
-        "idle" => GREEN,
-        "unknown" | "-" => SUBTEXT,
+        "exited" => SUBTEXT,
         _ => TEAL,
     }
 }
@@ -1216,10 +1199,8 @@ mod tests {
             worktree: "primary".into(),
             terminals: vec![TerminalView {
                 id: "term_1".into(),
-                pane_id: "w1:p1".into(),
                 name: "agent".into(),
-                kind: "opencode".into(),
-                status: "working".into(),
+                status: "running".into(),
                 directory: "/tmp/boomux".into(),
             }],
         }
@@ -1472,7 +1453,7 @@ mod tests {
         assert!(changed);
         assert_eq!(
             renamed,
-            Some((RenameTarget::Shell("w1:p1".into()), "api".into()))
+            Some((RenameTarget::Shell("term_1".into()), "api".into()))
         );
         assert!(matches!(app.mode, Mode::Normal));
     }

@@ -614,7 +614,7 @@ fn spawn_shell(
 
 fn start_pty_reader(shell: Arc<Shell>, mut reader: Box<dyn Read + Send>) {
     thread::spawn(move || {
-        let mut buffer = vec![0; 16 * 1024];
+        let mut buffer = [0; 16 * 1024];
         loop {
             match reader.read(&mut buffer) {
                 Ok(0) => break,
@@ -809,12 +809,12 @@ fn signal_session(session_id: libc::pid_t, signal: libc::c_int) {
 }
 
 fn proc_session_id(stat: &str) -> Option<libc::pid_t> {
-    let fields = stat
-        .rsplit_once(')')?
+    stat.rsplit_once(')')?
         .1
         .split_whitespace()
-        .collect::<Vec<_>>();
-    fields.get(3)?.parse().ok()
+        .nth(3)?
+        .parse()
+        .ok()
 }
 
 fn validate_shell_specs(specs: &[ShellSpec]) -> io::Result<()> {

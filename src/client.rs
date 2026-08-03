@@ -90,6 +90,10 @@ impl Client {
     }
 
     pub fn request(&self, request: Request) -> io::Result<Response> {
+        self.send(request).map(|(_, response)| response)
+    }
+
+    fn send(&self, request: Request) -> io::Result<(UnixStream, Response)> {
         let mut stream = UnixStream::connect(&self.socket_path)?;
         protocol::write_message(&mut stream, &Envelope::new(request))?;
         let response: Envelope<Response> = protocol::read_message(&mut stream)?;
@@ -101,7 +105,7 @@ impl Client {
         }
         match response.message {
             Response::Error { message } => Err(io::Error::other(message)),
-            response => Ok(response),
+            response => Ok((stream, response)),
         }
     }
 
@@ -186,7 +190,6 @@ impl Client {
         }
     }
 
-    #[allow(dead_code)]
     pub fn rename_workspace(
         &self,
         workspace_id: impl Into<String>,
@@ -224,7 +227,6 @@ impl Client {
         )
     }
 
-    #[allow(dead_code)]
     pub fn close_shell(&self, shell_id: impl Into<String>) -> io::Result<()> {
         expect_ok(
             self.request(Request::CloseShell {
@@ -239,24 +241,12 @@ impl Client {
         shell_id: impl Into<String>,
         takeover: bool,
     ) -> io::Result<(UnixStream, String, Vec<u8>)> {
-        let mut stream = UnixStream::connect(&self.socket_path)?;
-        protocol::write_message(
-            &mut stream,
-            &Envelope::new(Request::Attach {
-                shell_id: shell_id.into(),
-                takeover,
-            }),
-        )?;
-        let response: Envelope<Response> = protocol::read_message(&mut stream)?;
-        if response.version != protocol::PROTOCOL_VERSION {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "protocol version mismatch",
-            ));
-        }
-        match response.message {
+        let (stream, response) = self.send(Request::Attach {
+            shell_id: shell_id.into(),
+            takeover,
+        })?;
+        match response {
             Response::Attached { token, replay } => Ok((stream, token, replay)),
-            Response::Error { message } => Err(io::Error::other(message)),
             other => unexpected(other),
         }
     }

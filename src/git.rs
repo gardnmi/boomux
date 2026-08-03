@@ -114,8 +114,10 @@ fn inspect(directory: &Path) -> Option<Metadata> {
     }
 
     let output = String::from_utf8_lossy(&output.stdout);
-    let lines: Vec<_> = output.lines().map(str::to_owned).collect();
-    let [root, git_directory, common_directory] = lines.as_slice() else {
+    let mut lines = output.lines();
+    let (Some(root), Some(git_directory), Some(common_directory), None) =
+        (lines.next(), lines.next(), lines.next(), lines.next())
+    else {
         return None;
     };
     let root = Path::new(root);

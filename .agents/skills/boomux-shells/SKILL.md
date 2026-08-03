@@ -17,7 +17,7 @@ user to copy terminal contents.
 When the user provides a shell name or shell ID, run:
 
 ```console
-boomux read "<name-or-terminal-id>" --lines 200
+boomux read "<name-or-shell-id>" --lines 200
 ```
 
 Use the returned text to answer the user's question. Increase `--lines` when
