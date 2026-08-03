@@ -306,15 +306,14 @@ stty size
 
 ## Implementation Order
 
-1. Review and merge `feat/native-pty-backend`.
-2. Create `feat/terminal-handshake`.
-3. Add `TerminalProfile` and `Pending` to the shell protocol and domain model.
-4. Move PTY spawn from shell metadata creation to first attachment.
-5. Add emulator mismatch diagnostics and acceptance tests.
-6. Dogfood Alacritty and Ghostty with the manual matrix.
-7. Create a separate VT reconstruction branch.
-8. Replace raw `boomux read` extraction with parser-backed logical lines.
-9. Add metadata persistence only after terminal behavior is stable.
+1. Create `feat/terminal-handshake`.
+2. Add `TerminalProfile` and `Pending` to the shell protocol and domain model.
+3. Move PTY spawn from shell metadata creation to first attachment.
+4. Add emulator mismatch diagnostics and acceptance tests.
+5. Dogfood Alacritty and Ghostty with the manual matrix.
+6. Create a separate VT reconstruction branch.
+7. Replace raw `boomux read` extraction with parser-backed logical lines.
+8. Add metadata persistence only after terminal behavior is stable.
 
 ## Definition Of Done
 

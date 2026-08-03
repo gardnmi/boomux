@@ -292,9 +292,7 @@ fn dashboard_views(
                 .iter()
                 .map(|shell| tui::TerminalView {
                     id: shell.id.clone(),
-                    pane_id: shell.id.clone(),
                     name: shell.name.clone(),
-                    kind: "shell".into(),
                     status: shell_status(&shell.status).into(),
                     directory: shell.cwd.display().to_string(),
                 })
@@ -360,7 +358,7 @@ fn open_directory(
     if open_in_new_window {
         open_terminal(
             &shell.id,
-            Some(&format!("{workspace_name} - {}", shell.name)),
+            &format!("{workspace_name} - {}", shell.name),
             true,
             terminal,
         )
@@ -418,12 +416,8 @@ fn create_dashboard_shell(
 ) -> Result<String, Box<dyn Error>> {
     let workspace = client.get_workspace(workspace_id)?;
     let name = unique_shell_name("shell", &workspace.shells);
-    client.create_shell(workspace_id, dashboard_shell_spec(&name, launch_cwd))?;
+    client.create_shell(workspace_id, ShellSpec::login(&name, launch_cwd))?;
     Ok(format!("Created {name} in {}", workspace.name))
-}
-
-fn dashboard_shell_spec(name: &str, launch_cwd: &Path) -> ShellSpec {
-    ShellSpec::login(name, launch_cwd)
 }
 
 fn unique_shell_name(base_name: &str, shells: &[ShellSnapshot]) -> String {
@@ -572,7 +566,7 @@ fn open_dashboard_shell(
     let workspace = client.get_workspace(&shell.workspace_id)?;
     open_terminal(
         shell_id,
-        Some(&format!("{} - {}", workspace.name, shell.name)),
+        &format!("{} - {}", workspace.name, shell.name),
         true,
         terminal,
     )?;
@@ -589,7 +583,7 @@ fn open_workspace(
     for shell in &workspace.shells {
         open_terminal(
             &shell.id,
-            Some(&format!("{} - {}", workspace.name, shell.name)),
+            &format!("{} - {}", workspace.name, shell.name),
             true,
             terminal,
         )?;
@@ -611,19 +605,16 @@ fn open_shell(
             .map(|workspace| format!("{} - {}", workspace.name, shell.name))
             .unwrap_or_else(|_| format!("Boomux: {}", shell.name))
     });
-    open_terminal(shell_id, Some(&title), takeover, terminal)
+    open_terminal(shell_id, &title, takeover, terminal)
 }
 
 fn open_terminal(
     shell_id: &str,
-    title: Option<&str>,
+    title: &str,
     takeover: bool,
     terminal: Option<&str>,
 ) -> Result<(), Box<dyn Error>> {
-    let title = title
-        .map(str::to_owned)
-        .unwrap_or_else(|| format!("Boomux: {shell_id}"));
-    terminal::open(terminal, shell_id, &title, takeover)
+    terminal::open(terminal, shell_id, title, takeover)
 }
 
 fn print_prompt_label() -> Result<(), Box<dyn Error>> {
@@ -823,13 +814,6 @@ mod tests {
         assert_eq!(unique_shell_name("shell", &shells), "shell-2");
         assert_eq!(unique_shell_name("api", &shells), "api-2");
         assert_eq!(unique_shell_name("logs", &shells), "logs");
-    }
-
-    #[test]
-    fn dashboard_shell_uses_launch_cwd() {
-        let spec = dashboard_shell_spec("shell", Path::new("/tmp/dashboard-launch"));
-
-        assert_eq!(spec.cwd, Path::new("/tmp/dashboard-launch"));
     }
 
     #[test]
