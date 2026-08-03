@@ -270,7 +270,7 @@ Persist only reproducible metadata under `$XDG_STATE_HOME/boomux`:
 - Workspace and shell IDs
 - Workspace and shell names and grouping
 - Shell working directories; workspaces have no path
-- Explicit shell startup commands and recipes
+- Explicit shell startup commands
 - Last terminal profile when useful for diagnostics
 
 Do not claim that arbitrary process state can be serialized. After an ordinary
