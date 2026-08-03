@@ -113,6 +113,86 @@ fn native_daemon_lifecycle() {
     );
     assert!(!duplicate.wait().unwrap().success());
 
+    let output = daemon
+        .command()
+        .args(["workspace", "create", "cli-test"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let output = daemon
+        .command()
+        .args(["workspace", "inspect", "cli-test"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("NAME\tcli-test"));
+    let output = daemon
+        .command()
+        .args(["workspace", "rename", "cli-test", "cli-renamed"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let output = daemon
+        .command()
+        .args([
+            "shell",
+            "create",
+            "cli-renamed",
+            "--name",
+            "checks",
+            "--cwd",
+        ])
+        .arg(std::env::temp_dir())
+        .args(["--", "/bin/sh", "-c", "printf lifecycle"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "shell create failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let cli_workspace = daemon
+        .client
+        .snapshot()
+        .unwrap()
+        .workspaces
+        .into_iter()
+        .find(|workspace| workspace.name == "cli-renamed")
+        .unwrap();
+    assert_eq!(cli_workspace.shells[0].status, ShellStatus::Pending);
+    let output = daemon
+        .command()
+        .args(["shell", "inspect", "checks", "--workspace", "cli-renamed"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("STATUS\tpending"));
+    let output = daemon
+        .command()
+        .args([
+            "shell",
+            "rename",
+            "checks",
+            "tests",
+            "--workspace",
+            "cli-renamed",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let output = daemon
+        .command()
+        .args(["shell", "close", "tests", "--workspace", "cli-renamed"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let output = daemon
+        .command()
+        .args(["workspace", "close", "cli-renamed"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
     let generated_shell = daemon
         .client
         .create_shell_with_workspace(ShellSpec {

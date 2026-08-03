@@ -38,6 +38,8 @@ commitments.
 - [x] Run an explicit one-off command when creating a shell from a path.
 - [x] Start pending shells on first attachment using its terminal environment,
   cell dimensions, and pixel dimensions.
+- [x] Expose workspace and shell create, inspect, rename, and close operations
+  through explicit CLI command groups.
 
 ## Workspace Control
 

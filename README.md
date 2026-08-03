@@ -94,6 +94,15 @@ boomux shells
 boomux read <shell-name-or-shell-id> [--lines <count>]
 boomux close <shell-name-or-shell-id>
 boomux open <shell-id> [--title <title>] [--takeover]
+boomux workspace list
+boomux workspace create <name>
+boomux workspace inspect <name-or-id>
+boomux workspace rename <name-or-id> <new-name>
+boomux workspace close <name-or-id>
+boomux shell create <workspace-name-or-id> [--name <name>] [--cwd <path>] [-- <command>...]
+boomux shell inspect <shell-name-or-id> [--workspace <name-or-id>]
+boomux shell rename <shell-name-or-id> <new-name> [--workspace <name-or-id>]
+boomux shell close <shell-name-or-id> [--workspace <name-or-id>]
 boomux daemon status
 boomux daemon stop
 boomux skill install
@@ -102,6 +111,11 @@ boomux skill install
 `boomux shells` lists shells in the current workspace. `boomux read` and
 `boomux close` resolve shell names within that workspace; exact shell IDs work
 from anywhere. A shell cannot close itself through the CLI.
+
+The `workspace` and `shell` command groups expose explicit lifecycle operations
+for scripts and integrations. `shell create` records a pending shell; its PTY
+and process start when the shell is first opened. Shell names require current
+workspace context or `--workspace`; IDs remain globally addressable.
 
 `boomux read` reads from the daemon's bounded raw output replay. The current
 proof of concept decodes bytes lossily and selects recent newline-delimited

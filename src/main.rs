@@ -67,6 +67,16 @@ enum Commands {
     },
     /// Close a shell by name or shell ID
     Close { target: String },
+    /// Manage workspaces
+    Workspace {
+        #[command(subcommand)]
+        command: WorkspaceCommands,
+    },
+    /// Manage shells
+    Shell {
+        #[command(subcommand)]
+        command: ShellCommands,
+    },
     /// Manage the vendor-neutral Boomux Agent Skill
     Skill {
         #[command(subcommand)]
@@ -93,6 +103,53 @@ enum Commands {
         shell_id: String,
         #[arg(long)]
         takeover: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum WorkspaceCommands {
+    /// List workspaces
+    List,
+    /// Create an empty workspace
+    Create { name: String },
+    /// Show a workspace and its shells
+    Inspect { target: String },
+    /// Rename a workspace
+    Rename { target: String, name: String },
+    /// Close a workspace and all of its shells
+    Close { target: String },
+}
+
+#[derive(Subcommand)]
+enum ShellCommands {
+    /// Create a pending shell in a workspace
+    Create {
+        workspace: String,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long, default_value = ".")]
+        cwd: PathBuf,
+        #[arg(last = true, num_args = 1.., value_name = "COMMAND")]
+        command: Vec<String>,
+    },
+    /// Show shell details
+    Inspect {
+        target: String,
+        #[arg(long, value_name = "NAME_OR_ID")]
+        workspace: Option<String>,
+    },
+    /// Rename a shell
+    Rename {
+        target: String,
+        name: String,
+        #[arg(long, value_name = "NAME_OR_ID")]
+        workspace: Option<String>,
+    },
+    /// Close a shell
+    Close {
+        target: String,
+        #[arg(long, value_name = "NAME_OR_ID")]
+        workspace: Option<String>,
     },
 }
 
@@ -162,6 +219,8 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         Some(Commands::Shells) => list_workspace_shells(),
         Some(Commands::Read { target, lines }) => read_shell(&target, lines),
         Some(Commands::Close { target }) => close_shell(&target),
+        Some(Commands::Workspace { command }) => workspace_command(command),
+        Some(Commands::Shell { command }) => shell_command(command),
         Some(Commands::Skill {
             command: SkillCommands::Install { force },
         }) => install_skill(force),
@@ -438,11 +497,29 @@ fn resolve_directory(path: &Path) -> Result<PathBuf, Box<dyn Error>> {
     Ok(resolved)
 }
 
+fn cli_name(name: String, kind: &str) -> Result<String, Box<dyn Error>> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(format!("{kind} name cannot be empty").into());
+    }
+    Ok(name.to_owned())
+}
+
 fn find_workspace<'a>(
     workspaces: &'a [WorkspaceSnapshot],
     name: &str,
 ) -> Option<&'a WorkspaceSnapshot> {
     workspaces.iter().find(|workspace| workspace.name == name)
+}
+
+fn resolve_workspace_target<'a>(
+    workspaces: &'a [WorkspaceSnapshot],
+    target: &str,
+) -> Result<&'a WorkspaceSnapshot, Box<dyn Error>> {
+    workspaces
+        .iter()
+        .find(|workspace| workspace.id == target || workspace.name == target)
+        .ok_or_else(|| format!("workspace not found: {target}").into())
 }
 
 fn create_dashboard_workspace(
@@ -506,6 +583,121 @@ fn list_shells() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn workspace_command(command: WorkspaceCommands) -> Result<(), Box<dyn Error>> {
+    let client = client::connect_or_start()?;
+    match command {
+        WorkspaceCommands::List => {
+            println!("NAME\tWORKSPACE ID\tSHELLS");
+            for workspace in client.snapshot()?.workspaces {
+                println!(
+                    "{}\t{}\t{}",
+                    workspace.name,
+                    workspace.id,
+                    workspace.shells.len()
+                );
+            }
+        }
+        WorkspaceCommands::Create { name } => {
+            let name = cli_name(name, "workspace")?;
+            let workspace = client.create_workspace(name, Vec::new())?;
+            println!("Created workspace {} ({})", workspace.name, workspace.id);
+        }
+        WorkspaceCommands::Inspect { target } => {
+            let snapshot = client.snapshot()?;
+            let workspace = resolve_workspace_target(&snapshot.workspaces, &target)?;
+            println!("ID\t{}", workspace.id);
+            println!("NAME\t{}", workspace.name);
+            println!("SHELLS\t{}", workspace.shells.len());
+            if !workspace.shells.is_empty() {
+                println!("\nNAME\tSHELL ID\tSTATUS\tCWD");
+                for shell in &workspace.shells {
+                    println!(
+                        "{}\t{}\t{}\t{}",
+                        shell.name,
+                        shell.id,
+                        shell_status(&shell.status),
+                        shell.cwd.display()
+                    );
+                }
+            }
+        }
+        WorkspaceCommands::Rename { target, name } => {
+            let name = cli_name(name, "workspace")?;
+            let snapshot = client.snapshot()?;
+            let workspace = resolve_workspace_target(&snapshot.workspaces, &target)?;
+            client.rename_workspace(&workspace.id, &name)?;
+            println!("Renamed workspace {} to {name}", workspace.name);
+        }
+        WorkspaceCommands::Close { target } => {
+            let snapshot = client.snapshot()?;
+            let workspace = resolve_workspace_target(&snapshot.workspaces, &target)?;
+            if env::var("BOOMUX_SHELL_ID")
+                .ok()
+                .is_some_and(|shell_id| workspace.shells.iter().any(|shell| shell.id == shell_id))
+            {
+                return Err(
+                    "cannot close the current workspace from inside it; use the dashboard or another shell"
+                        .into(),
+                );
+            }
+            client.close_workspace(&workspace.id)?;
+            println!("Closed workspace {}", workspace.name);
+        }
+    }
+    Ok(())
+}
+
+fn shell_command(command: ShellCommands) -> Result<(), Box<dyn Error>> {
+    let client = client::connect_or_start()?;
+    match command {
+        ShellCommands::Create {
+            workspace,
+            name,
+            cwd,
+            command,
+        } => {
+            let snapshot = client.snapshot()?;
+            let workspace = resolve_workspace_target(&snapshot.workspaces, &workspace)?;
+            let name = name
+                .map(|name| cli_name(name, "shell"))
+                .transpose()?
+                .unwrap_or_else(|| unique_shell_name("shell", &workspace.shells));
+            let cwd = resolve_directory(&cwd)?;
+            let shell = client.create_shell(&workspace.id, shell_spec(name, &cwd, &command))?;
+            println!("Created pending shell {} ({})", shell.name, shell.id);
+        }
+        ShellCommands::Inspect { target, workspace } => {
+            let snapshot = client.snapshot()?;
+            let shell = resolve_cli_shell(&snapshot, &target, workspace.as_deref())?;
+            let workspace = snapshot
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.id == shell.workspace_id)
+                .ok_or("shell workspace no longer exists")?;
+            println!("ID\t{}", shell.id);
+            println!("NAME\t{}", shell.name);
+            println!("WORKSPACE\t{}", workspace.name);
+            println!("STATUS\t{}", shell_status(&shell.status));
+            println!("CWD\t{}", shell.cwd.display());
+        }
+        ShellCommands::Rename {
+            target,
+            name,
+            workspace,
+        } => {
+            let name = cli_name(name, "shell")?;
+            let snapshot = client.snapshot()?;
+            let shell = resolve_cli_shell(&snapshot, &target, workspace.as_deref())?;
+            client.rename_shell(&shell.id, &name)?;
+            println!("Renamed shell {} to {name}", shell.name);
+        }
+        ShellCommands::Close { target, workspace } => {
+            close_shell_with_workspace(&client, &target, workspace.as_deref())?;
+        }
+    }
+    Ok(())
+}
+
 fn list_workspace_shells() -> Result<(), Box<dyn Error>> {
     let client = client::connect_or_start()?;
     let shell = current_shell(&client)?;
@@ -540,12 +732,17 @@ fn read_shell(target: &str, lines: u32) -> Result<(), Box<dyn Error>> {
 
 fn close_shell(target: &str) -> Result<(), Box<dyn Error>> {
     let client = client::connect_or_start()?;
+    close_shell_with_workspace(&client, target, None)
+}
+
+fn close_shell_with_workspace(
+    client: &client::Client,
+    target: &str,
+    workspace: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
     let snapshot = client.snapshot()?;
     let current_shell_id = env::var("BOOMUX_SHELL_ID").ok();
-    let current_workspace_id = current_shell_id
-        .as_deref()
-        .and_then(|id| find_shell(&snapshot, id).map(|shell| shell.workspace_id.as_str()));
-    let shell = resolve_shell_target(&snapshot, current_workspace_id, target)?;
+    let shell = resolve_cli_shell(&snapshot, target, workspace)?;
     if current_shell_id.as_deref() == Some(shell.id.as_str()) {
         return Err(
             "cannot close the current shell from inside it; use the dashboard or another shell"
@@ -561,6 +758,29 @@ fn close_shell(target: &str) -> Result<(), Box<dyn Error>> {
     client.close_shell(&shell.id)?;
     println!("Closed shell {} from {workspace_name}", shell.name);
     Ok(())
+}
+
+fn resolve_cli_shell<'a>(
+    snapshot: &'a Snapshot,
+    target: &str,
+    workspace: Option<&str>,
+) -> Result<&'a ShellSnapshot, Box<dyn Error>> {
+    if let Some(shell) = find_shell(snapshot, target) {
+        return Ok(shell);
+    }
+    let workspace_id = if let Some(workspace) = workspace {
+        resolve_workspace_target(&snapshot.workspaces, workspace)?
+            .id
+            .as_str()
+    } else {
+        let current_shell_id = env::var("BOOMUX_SHELL_ID").map_err(|_| {
+            format!("shell name {target:?} requires --workspace outside a Boomux-managed shell")
+        })?;
+        find_shell(snapshot, &current_shell_id)
+            .map(|shell| shell.workspace_id.as_str())
+            .ok_or("current Boomux shell no longer exists")?
+    };
+    resolve_shell_target(snapshot, Some(workspace_id), target)
 }
 
 fn resolve_shell_target<'a>(
@@ -873,6 +1093,58 @@ mod tests {
         assert_eq!(cli.startup_command, ["cargo", "watch", "-x", "test"]);
         assert!(cli.command.is_none());
         assert!(Cli::try_parse_from(["boomux", "--", "cargo", "watch"]).is_err());
+    }
+
+    #[test]
+    fn parses_workspace_and_shell_lifecycle_commands() {
+        assert!(matches!(
+            Cli::try_parse_from(["boomux", "workspace", "create", "project"])
+                .unwrap()
+                .command,
+            Some(Commands::Workspace {
+                command: WorkspaceCommands::Create { name }
+            }) if name == "project"
+        ));
+        let cli = Cli::try_parse_from([
+            "boomux", "shell", "create", "project", "--name", "tests", "--cwd", "/tmp", "--",
+            "cargo", "test",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Shell {
+                command: ShellCommands::Create {
+                    workspace,
+                    name: Some(name),
+                    cwd,
+                    command,
+                }
+            }) if workspace == "project"
+                && name == "tests"
+                && cwd == Path::new("/tmp")
+                && command == ["cargo", "test"]
+        ));
+    }
+
+    #[test]
+    fn resolves_workspaces_and_shell_names_for_cli_commands() {
+        let snapshot = Snapshot {
+            workspaces: vec![workspace("w1", "project", vec![shell("s1", "w1", "tests")])],
+        };
+
+        assert_eq!(
+            resolve_workspace_target(&snapshot.workspaces, "project")
+                .unwrap()
+                .id,
+            "w1"
+        );
+        assert_eq!(
+            resolve_cli_shell(&snapshot, "tests", Some("project"))
+                .unwrap()
+                .id,
+            "s1"
+        );
+        assert!(resolve_workspace_target(&snapshot.workspaces, "missing").is_err());
     }
 
     #[test]
