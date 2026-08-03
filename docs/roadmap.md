@@ -30,6 +30,8 @@ commitments.
   vendor-neutral Agent Skill and Boomux CLI commands.
 - [x] Replace the external session backend with a Boomux-owned Unix daemon,
   socket protocol, PTY lifecycle, and transparent attachment client.
+- [x] Exercise native PTY transport, detach, takeover, resize, process cleanup,
+  startup locking, and graceful shutdown through an isolated binary-level test.
 
 ## Workspace Control
 

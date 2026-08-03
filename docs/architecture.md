@@ -44,6 +44,8 @@ There are no separate tab, pane, and terminal identity layers.
 `src/client.rs` resolves the socket at
 `$XDG_RUNTIME_DIR/boomux/daemon.sock`. It starts a detached daemon on demand,
 waits for the protocol ping to succeed, and exposes typed management requests.
+An owner-held file lock prevents concurrent daemons from unlinking each other's
+sockets or splitting the registry.
 
 ### Daemon
 
@@ -105,6 +107,9 @@ receives retained raw output followed by live output.
 
 Closing a shell terminates its child and disconnects its controller. Closing a
 workspace removes all its shells from the registry before terminating them.
+On Linux, cleanup signals every process still belonging to the shell's session
+before reaping the session leader. `boomux daemon stop` applies the same cleanup
+to the complete registry and removes the runtime socket.
 
 Current persistence is deliberately limited to daemon lifetime. Boomux does not
 yet write registry metadata or claim that arbitrary processes survive daemon
@@ -112,10 +117,9 @@ restart or crash.
 
 ## Next Technical Steps
 
-1. Add integration tests around real PTY attach, resize, takeover, and teardown.
-2. Track terminal state with a VT parser and emit a sanitized reconnect snapshot.
-3. Negotiate terminal capabilities when the first native attachment creates a
+1. Track terminal state with a VT parser and emit a sanitized reconnect snapshot.
+2. Negotiate terminal capabilities when the first native attachment creates a
    shell.
-4. Persist reproducible workspace metadata atomically under `$XDG_STATE_HOME`.
-5. Add graceful daemon restart or live PTY handoff only after the base lifecycle
+3. Persist reproducible workspace metadata atomically under `$XDG_STATE_HOME`.
+4. Add graceful daemon restart or live PTY handoff only after the base lifecycle
    is reliable.

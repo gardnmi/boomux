@@ -8,9 +8,11 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
+use std::time::Duration;
 
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use uuid::Uuid;
@@ -23,6 +25,7 @@ use crate::protocol::{
 
 const REPLAY_LIMIT: usize = 1024 * 1024;
 const CONTROLLER_QUEUE: usize = 64;
+const SHUTDOWN_GRACE: Duration = Duration::from_millis(50);
 
 pub fn run() -> io::Result<()> {
     let socket_path = client::socket_path()?;
@@ -37,22 +40,37 @@ pub fn run() -> io::Result<()> {
     }
 
     let listener = UnixListener::bind(&socket_path)?;
+    let _socket_cleanup = SocketCleanup(socket_path.clone());
     fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))?;
+    listener.set_nonblocking(true)?;
     let registry = Arc::new(Registry::default());
+    let shutdown = Arc::new(AtomicBool::new(false));
 
-    for connection in listener.incoming() {
-        match connection {
-            Ok(stream) => {
+    while !shutdown.load(Ordering::Acquire) {
+        match listener.accept() {
+            Ok((stream, _)) => {
                 let registry = Arc::clone(&registry);
+                let shutdown = Arc::clone(&shutdown);
                 thread::spawn(move || {
-                    let _ = handle_connection(stream, registry);
+                    let _ = handle_connection(stream, registry, shutdown);
                 });
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(25));
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) => return Err(error),
         }
     }
-    Ok(())
+    registry.shutdown()
+}
+
+struct SocketCleanup(PathBuf);
+
+impl Drop for SocketCleanup {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
 }
 
 fn secure_runtime_dir(path: &Path) -> io::Result<()> {
@@ -89,7 +107,11 @@ fn acquire_daemon_lock(runtime_dir: &Path) -> io::Result<File> {
     Ok(lock_file)
 }
 
-fn handle_connection(mut stream: UnixStream, registry: Arc<Registry>) -> io::Result<()> {
+fn handle_connection(
+    mut stream: UnixStream,
+    registry: Arc<Registry>,
+    shutdown: Arc<AtomicBool>,
+) -> io::Result<()> {
     let request: Envelope<Request> = protocol::read_message(&mut stream)?;
     if request.version != protocol::PROTOCOL_VERSION {
         return send_response(
@@ -106,6 +128,11 @@ fn handle_connection(mut stream: UnixStream, registry: Arc<Registry>) -> io::Res
 
     if let Request::Attach { shell_id, takeover } = request.message {
         return handle_attach(stream, &registry, &shell_id, takeover);
+    }
+    if matches!(request.message, Request::Shutdown) {
+        send_response(&mut stream, Response::Ok)?;
+        shutdown.store(true, Ordering::Release);
+        return Ok(());
     }
 
     let response = registry
@@ -161,6 +188,7 @@ impl Registry {
     fn dispatch(&self, request: Request) -> io::Result<Response> {
         match request {
             Request::Ping => Ok(Response::Pong),
+            Request::Shutdown => unreachable!("shutdown is handled before dispatch"),
             Request::Snapshot => Ok(Response::Snapshot {
                 snapshot: self.snapshot()?,
             }),
@@ -215,6 +243,27 @@ impl Registry {
                 .map(|workspace| workspace.snapshot(self))
                 .collect::<io::Result<_>>()?,
         })
+    }
+
+    fn shutdown(&self) -> io::Result<()> {
+        let shells = {
+            let mut state = lock(&self.state)?;
+            state.workspaces.clear();
+            state
+                .shells
+                .drain()
+                .map(|(_, shell)| shell)
+                .collect::<Vec<_>>()
+        };
+        let mut first_error = None;
+        for shell in shells {
+            if let Err(error) = shell.kill()
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
 
     fn workspace(&self, id: &str) -> io::Result<Arc<Workspace>> {
@@ -446,12 +495,23 @@ impl Shell {
             return Ok(());
         }
         let child_pid = child.process_id().map(|pid| pid as libc::pid_t);
+        if let Some(session_id) = child_pid {
+            signal_session(session_id, libc::SIGHUP);
+        }
         for process_group in [foreground_group, child_pid].into_iter().flatten() {
             // Negative PIDs address a process group. portable-pty starts the
             // child as a session and process-group leader on Unix.
             let _ = unsafe { libc::kill(-process_group, libc::SIGHUP) };
         }
+        thread::sleep(SHUTDOWN_GRACE);
+        if let Some(session_id) = child_pid {
+            signal_session(session_id, libc::SIGTERM);
+        }
         let kill_result = child.kill();
+        thread::sleep(SHUTDOWN_GRACE);
+        if let Some(session_id) = child_pid {
+            signal_session(session_id, libc::SIGKILL);
+        }
         let wait_result = child.wait();
         match (kill_result, wait_result) {
             (_, Ok(_)) => Ok(()),
@@ -697,6 +757,37 @@ fn validate_name(name: &str) -> io::Result<()> {
     } else {
         Ok(())
     }
+}
+
+fn signal_session(session_id: libc::pid_t, signal: libc::c_int) {
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<libc::pid_t>().ok())
+        else {
+            continue;
+        };
+        let Ok(stat) = fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        if proc_session_id(&stat) == Some(session_id) {
+            // PIDs came from procfs and the signal carries no pointer data.
+            let _ = unsafe { libc::kill(pid, signal) };
+        }
+    }
+}
+
+fn proc_session_id(stat: &str) -> Option<libc::pid_t> {
+    let fields = stat
+        .rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    fields.get(3)?.parse().ok()
 }
 
 fn validate_shell_specs(specs: &[ShellSpec]) -> io::Result<()> {

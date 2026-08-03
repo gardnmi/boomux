@@ -75,6 +75,7 @@ impl ShellSpec {
 #[serde(tag = "request", rename_all = "snake_case")]
 pub enum Request {
     Ping,
+    Shutdown,
     Snapshot,
     GetWorkspace {
         workspace_id: String,

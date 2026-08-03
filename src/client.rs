@@ -33,16 +33,14 @@ pub fn socket_path() -> io::Result<PathBuf> {
 }
 
 pub fn connect_or_start() -> io::Result<Client> {
-    let client = Client {
-        socket_path: socket_path()?,
-    };
+    let client = connect_client()?;
     if client.ping().is_ok() {
         return Ok(client);
     }
 
     let mut command = Command::new(env::current_exe()?);
     command
-        .arg("daemon")
+        .args(["daemon", "run"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -70,7 +68,23 @@ pub fn connect_or_start() -> io::Result<Client> {
     Err(last_error.unwrap_or_else(|| io::Error::other("daemon did not start")))
 }
 
+pub fn connect() -> io::Result<Client> {
+    let client = connect_client()?;
+    client.ping()?;
+    Ok(client)
+}
+
+fn connect_client() -> io::Result<Client> {
+    Ok(Client {
+        socket_path: socket_path()?,
+    })
+}
+
 impl Client {
+    pub fn from_socket_path(socket_path: PathBuf) -> Self {
+        Self { socket_path }
+    }
+
     pub fn socket_path(&self) -> &Path {
         &self.socket_path
     }
@@ -93,6 +107,10 @@ impl Client {
 
     pub fn ping(&self) -> io::Result<()> {
         expect_ok(self.request(Request::Ping)?, Response::Pong)
+    }
+
+    pub fn shutdown(&self) -> io::Result<()> {
+        expect_ok(self.request(Request::Shutdown)?, Response::Ok)
     }
 
     pub fn snapshot(&self) -> io::Result<Snapshot> {

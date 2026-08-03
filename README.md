@@ -76,6 +76,8 @@ boomux list
 boomux shells
 boomux read <shell-name-or-shell-id> [--lines <count>]
 boomux open <shell-id> [--title <title>] [--takeover]
+boomux daemon status
+boomux daemon stop
 boomux skill install
 ```
 
@@ -190,8 +192,9 @@ cargo install --path . --root ~/.local --force
 ```
 
 The daemon auto-starts on the first command that needs it. During development,
-stop an older daemon before testing a rebuilt binary because both may use the
-same protocol version while containing different code.
+run `boomux daemon stop` before testing a rebuilt binary because both may use
+the same protocol version while containing different code. Stopping the daemon
+also terminates every shell it owns.
 
 ## Roadmap
 

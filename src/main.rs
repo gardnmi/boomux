@@ -6,15 +6,12 @@ use std::process::{Command, ExitCode, Stdio};
 
 use clap::{Parser, Subcommand};
 
-use protocol::{ShellSnapshot, ShellSpec, ShellStatus, Snapshot, WorkspaceSnapshot};
+use boomux::protocol::{ShellSnapshot, ShellSpec, ShellStatus, Snapshot, WorkspaceSnapshot};
+use boomux::{attach, client, daemon, protocol};
 
-mod attach;
-mod client;
 mod config;
-mod daemon;
 mod git;
 mod projects;
-mod protocol;
 mod terminal;
 mod tui;
 
@@ -76,8 +73,11 @@ enum Commands {
     /// Print the current Boomux workspace and shell name for prompt integrations
     #[command(hide = true)]
     Prompt,
-    #[command(hide = true)]
-    Daemon,
+    /// Manage the background PTY daemon
+    Daemon {
+        #[command(subcommand)]
+        command: DaemonCommands,
+    },
     #[command(name = "__attach", hide = true)]
     Attach {
         shell_id: String,
@@ -95,6 +95,17 @@ enum SkillCommands {
     },
 }
 
+#[derive(Subcommand)]
+enum DaemonCommands {
+    /// Start the daemon in the foreground
+    #[command(hide = true)]
+    Run,
+    /// Report whether the daemon is accepting requests
+    Status,
+    /// Stop the daemon and its managed shells
+    Stop,
+}
+
 fn main() -> ExitCode {
     match run(Cli::parse()) {
         Ok(()) => ExitCode::SUCCESS,
@@ -107,7 +118,9 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
     match cli.command.as_ref() {
-        Some(Commands::Daemon) => return Ok(daemon::run()?),
+        Some(Commands::Daemon {
+            command: DaemonCommands::Run,
+        }) => return Ok(daemon::run()?),
         Some(Commands::Attach { shell_id, takeover }) => {
             return Ok(attach::run(shell_id, *takeover)?);
         }
@@ -144,12 +157,30 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             open_shell(&shell_id, title.as_deref(), takeover, terminal.as_deref())
         }
         Some(Commands::Prompt) => print_prompt_label(),
-        Some(Commands::Daemon | Commands::Attach { .. }) => unreachable!(),
+        Some(Commands::Daemon { command }) => daemon_control(command),
+        Some(Commands::Attach { .. }) => unreachable!(),
         None => {
             let terminal = effective_terminal(cli.terminal.as_deref())?;
             picker(terminal.as_deref())
         }
     }
+}
+
+fn daemon_control(command: DaemonCommands) -> Result<(), Box<dyn Error>> {
+    let client = client::connect()?;
+    match command {
+        DaemonCommands::Status => println!(
+            "running (protocol {}, {})",
+            protocol::PROTOCOL_VERSION,
+            client.socket_path().display()
+        ),
+        DaemonCommands::Stop => {
+            client.shutdown()?;
+            println!("Stopped Boomux daemon");
+        }
+        DaemonCommands::Run => unreachable!(),
+    }
+    Ok(())
 }
 
 fn should_open_new_window(new_window: bool, terminal: Option<&str>) -> bool {
@@ -820,7 +851,8 @@ mod tests {
     fn parses_paths_and_native_hidden_commands() {
         let cli = Cli::try_parse_from(["boomux", "."]).unwrap();
         assert_eq!(cli.path, Some(PathBuf::from(".")));
-        assert!(Cli::try_parse_from(["boomux", "daemon"]).is_ok());
+        assert!(Cli::try_parse_from(["boomux", "daemon", "run"]).is_ok());
+        assert!(Cli::try_parse_from(["boomux", "daemon", "stop"]).is_ok());
         let cli = Cli::try_parse_from(["boomux", "__attach", "s1", "--takeover"]).unwrap();
         assert!(matches!(
             cli.command,
