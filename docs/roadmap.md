@@ -36,13 +36,14 @@ commitments.
 - [x] Make the Ratatui dashboard the default interface and remove the external
   picker dependency.
 - [x] Run an explicit one-off command when creating a shell from a path.
+- [x] Start pending shells on first attachment using its terminal environment,
+  cell dimensions, and pixel dimensions.
 
 ## Workspace Control
 
 See [`native-terminal-follow-up.md`](native-terminal-follow-up.md) for the
 terminal handshake, VT reconstruction, and restart-persistence plan.
 
-- Negotiate terminal capabilities when a shell receives its first attachment.
 - Reconstruct reconnect state with a VT parser instead of replaying raw bytes.
 - Persist reproducible workspace and shell metadata under `$XDG_STATE_HOME`,
   keeping working directories on shells only.

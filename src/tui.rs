@@ -1165,6 +1165,7 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
 
 fn status_color(status: &str) -> Color {
     match status {
+        "pending" => YELLOW,
         "exited" => SUBTEXT,
         _ => TEAL,
     }
@@ -1248,6 +1249,13 @@ mod tests {
         assert_eq!(git_state_color("3 changed"), YELLOW);
         assert_eq!(git_state_color("1 conflict"), RED);
         assert_eq!(git_state_color("-"), SUBTEXT);
+    }
+
+    #[test]
+    fn pending_shells_use_attention_color() {
+        assert_eq!(status_color("pending"), YELLOW);
+        assert_eq!(status_color("running"), TEAL);
+        assert_eq!(status_color("exited"), SUBTEXT);
     }
 
     #[test]

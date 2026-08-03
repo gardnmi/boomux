@@ -174,7 +174,9 @@ Ghostty, Alacritty, or another XDG terminal
 Live PTY bytes pass through unchanged. The attachment client only enables raw
 mode, forwards input and resize events, writes output, and restores terminal
 mode on exit. See [`docs/architecture.md`](docs/architecture.md) for details.
-The remaining terminal handshake and reconnect work is tracked in
+Shells remain pending until their first attachment reports terminal environment
+and dimensions; that profile initializes the PTY and child process. The
+remaining reconnect and persistence work is tracked in
 [`docs/native-terminal-follow-up.md`](docs/native-terminal-follow-up.md).
 
 ## POC Limitations
@@ -186,8 +188,8 @@ The remaining terminal handshake and reconnect work is tracked in
   imperfectly.
 - One writable controller is supported per shell; takeover replaces it.
 - Slow controllers can lose live output chunks rather than block the child.
-- Terminal capabilities are inherited when the daemon starts rather than
-  negotiated independently for every attachment.
+- A running shell keeps its first attachment's terminal environment. A later
+  attachment with a different `TERM` receives a compatibility warning.
 - The native backend currently targets Unix/Linux and Omarchy.
 
 ## Development

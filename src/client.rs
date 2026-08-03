@@ -8,7 +8,8 @@ use std::thread;
 use std::time::Duration;
 
 use crate::protocol::{
-    self, Envelope, Request, Response, ShellSnapshot, ShellSpec, Snapshot, WorkspaceSnapshot,
+    self, Envelope, Request, Response, ShellSnapshot, ShellSpec, Snapshot, TerminalProfile,
+    WorkspaceSnapshot,
 };
 
 const CONNECT_ATTEMPTS: usize = 40;
@@ -17,6 +18,14 @@ const CONNECT_DELAY: Duration = Duration::from_millis(25);
 #[derive(Debug, Clone)]
 pub struct Client {
     socket_path: PathBuf,
+}
+
+#[derive(Debug)]
+pub struct Attachment {
+    pub stream: UnixStream,
+    pub token: String,
+    pub replay: Vec<u8>,
+    pub warning: Option<String>,
 }
 
 pub fn socket_path() -> io::Result<PathBuf> {
@@ -240,13 +249,24 @@ impl Client {
         &self,
         shell_id: impl Into<String>,
         takeover: bool,
-    ) -> io::Result<(UnixStream, String, Vec<u8>)> {
+        profile: TerminalProfile,
+    ) -> io::Result<Attachment> {
         let (stream, response) = self.send(Request::Attach {
             shell_id: shell_id.into(),
             takeover,
+            profile,
         })?;
         match response {
-            Response::Attached { token, replay } => Ok((stream, token, replay)),
+            Response::Attached {
+                token,
+                replay,
+                warning,
+            } => Ok(Attachment {
+                stream,
+                token,
+                replay,
+                warning,
+            }),
             other => unexpected(other),
         }
     }

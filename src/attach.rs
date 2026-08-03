@@ -1,10 +1,11 @@
+use std::env;
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 
 use crossterm::terminal;
 
 use crate::client;
-use crate::protocol::AttachFrame;
+use crate::protocol::{AttachFrame, TerminalProfile};
 
 const POLL_INTERVAL_MS: i32 = 100;
 
@@ -24,16 +25,25 @@ impl Drop for RawMode {
 }
 
 pub fn run(shell_id: &str, takeover: bool) -> io::Result<()> {
+    let profile = terminal_profile()?;
+    let mut size = (
+        profile.rows,
+        profile.cols,
+        profile.pixel_width,
+        profile.pixel_height,
+    );
     let client = client::connect_or_start()?;
-    let (mut stream, _token, replay) = client.attach(shell_id, takeover)?;
+    let attachment = client.attach(shell_id, takeover, profile)?;
+    if let Some(warning) = attachment.warning {
+        eprintln!("boomux: warning: {warning}");
+    }
+    let mut stream = attachment.stream;
     let _raw_mode = RawMode::enter()?;
     let mut stdin = io::stdin().lock();
     let mut stdout = io::stdout().lock();
-    stdout.write_all(&replay)?;
+    stdout.write_all(&attachment.replay)?;
     stdout.flush()?;
 
-    let (mut cols, mut rows) = terminal::size()?;
-    AttachFrame::Resize { rows, cols }.write_to(&mut stream)?;
     let mut input = [0; 16 * 1024];
 
     loop {
@@ -90,12 +100,55 @@ pub fn run(shell_id: &str, takeover: bool) -> io::Result<()> {
             }
         }
 
-        if let Ok((new_cols, new_rows)) = terminal::size()
-            && (new_cols, new_rows) != (cols, rows)
+        if let Ok(new_size) = dimensions()
+            && new_size != size
         {
-            cols = new_cols;
-            rows = new_rows;
-            AttachFrame::Resize { rows, cols }.write_to(&mut stream)?;
+            size = new_size;
+            AttachFrame::Resize {
+                rows: size.0,
+                cols: size.1,
+                pixel_width: size.2,
+                pixel_height: size.3,
+            }
+            .write_to(&mut stream)?;
         }
     }
+}
+
+fn terminal_profile() -> io::Result<TerminalProfile> {
+    let (rows, cols, pixel_width, pixel_height) = dimensions()?;
+    Ok(TerminalProfile {
+        term: terminal_variable("TERM"),
+        colorterm: terminal_variable("COLORTERM"),
+        term_program: terminal_variable("TERM_PROGRAM"),
+        term_program_version: terminal_variable("TERM_PROGRAM_VERSION"),
+        rows,
+        cols,
+        pixel_width,
+        pixel_height,
+    })
+}
+
+fn terminal_variable(name: &str) -> Option<String> {
+    env::var(name).ok().filter(|value| !value.is_empty())
+}
+
+fn dimensions() -> io::Result<(u16, u16, u16, u16)> {
+    let mut size = libc::winsize {
+        ws_row: 0,
+        ws_col: 0,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // stdout remains open while the attachment is active and ioctl only writes `size`.
+    if unsafe { libc::ioctl(io::stdout().as_raw_fd(), libc::TIOCGWINSZ, &mut size) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    if size.ws_row == 0 || size.ws_col == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "terminal reported zero rows or columns",
+        ));
+    }
+    Ok((size.ws_row, size.ws_col, size.ws_xpixel, size.ws_ypixel))
 }

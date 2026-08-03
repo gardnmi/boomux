@@ -66,13 +66,18 @@ The daemon supports:
 - Bounded output replay
 - One writable attachment with explicit takeover
 - PTY input and resize forwarding
+- Pending shell metadata and first-attachment terminal negotiation
 
 An empty shell specification list remains empty. When an explicit populated
 creation is requested, the daemon stages every child before publishing any of
 them; a failed spawn kills the staged children. Workspace names are checked for
 global uniqueness at publication while the registry is locked.
 
-Shell creation may omit a workspace ID. The daemon then selects the lowest
+Shell creation records metadata without immediately starting a process. The
+first attachment supplies `TERM`, `COLORTERM`, terminal program identity, and
+cell/pixel dimensions; the daemon then creates the PTY and child. Failed startup
+leaves the shell pending and retryable. Shell creation may omit a workspace ID.
+The daemon then selects the lowest
 available `workspace-N` name and publishes the generated workspace and shell as
 one operation. Concurrent requests retry name allocation rather than exposing
 an ungrouped shell.
@@ -119,7 +124,8 @@ Closing a terminal window closes only its socket attachment. The daemon retains
 the PTY master and child. Reopening a window acquires the controller and first
 receives retained raw output followed by live output.
 
-Closing a shell terminates its child and disconnects its controller. Closing a
+Closing a pending shell removes only metadata. Closing a running shell terminates
+its child and disconnects its controller. Closing a
 workspace removes all its shells from the registry before terminating them.
 On Linux, cleanup signals every process still belonging to the shell's session
 before reaping the session leader. `boomux daemon stop` applies the same cleanup
@@ -134,10 +140,8 @@ restart or crash.
 The detailed design, acceptance criteria, and manual test matrix are tracked in
 [`native-terminal-follow-up.md`](native-terminal-follow-up.md).
 
-1. Negotiate terminal capabilities when the first native attachment creates a
-   shell.
-2. Track terminal state with a VT parser and emit a sanitized reconnect snapshot.
-3. Persist reproducible workspace and shell metadata atomically under
+1. Track terminal state with a VT parser and emit a sanitized reconnect snapshot.
+2. Persist reproducible workspace and shell metadata atomically under
    `$XDG_STATE_HOME`, keeping working directories on shells only.
-4. Add graceful daemon restart or live PTY handoff only after the base lifecycle
+3. Add graceful daemon restart or live PTY handoff only after the base lifecycle
    is reliable.

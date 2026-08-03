@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 pub const MAX_CONTROL_FRAME: usize = 8 * 1024 * 1024;
 pub const MAX_ATTACH_FRAME: usize = 1024 * 1024;
 
@@ -47,8 +47,21 @@ pub struct ShellSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ShellStatus {
+    Pending,
     Running,
     Exited { code: Option<u32> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalProfile {
+    pub term: Option<String>,
+    pub colorterm: Option<String>,
+    pub term_program: Option<String>,
+    pub term_program_version: Option<String>,
+    pub rows: u16,
+    pub cols: u16,
+    pub pixel_width: u16,
+    pub pixel_height: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,6 +124,7 @@ pub enum Request {
     Attach {
         shell_id: String,
         takeover: bool,
+        profile: TerminalProfile,
     },
 }
 
@@ -118,20 +132,39 @@ pub enum Request {
 #[serde(tag = "response", rename_all = "snake_case")]
 pub enum Response {
     Pong,
-    Snapshot { snapshot: Snapshot },
-    Workspace { workspace: WorkspaceSnapshot },
-    Shell { shell: ShellSnapshot },
-    Output { bytes: Vec<u8> },
-    Attached { token: String, replay: Vec<u8> },
+    Snapshot {
+        snapshot: Snapshot,
+    },
+    Workspace {
+        workspace: WorkspaceSnapshot,
+    },
+    Shell {
+        shell: ShellSnapshot,
+    },
+    Output {
+        bytes: Vec<u8>,
+    },
+    Attached {
+        token: String,
+        replay: Vec<u8>,
+        warning: Option<String>,
+    },
     Ok,
-    Error { message: String },
+    Error {
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AttachFrame {
     Input(Vec<u8>),
     Output(Vec<u8>),
-    Resize { rows: u16, cols: u16 },
+    Resize {
+        rows: u16,
+        cols: u16,
+        pixel_width: u16,
+        pixel_height: u16,
+    },
     Detached,
 }
 
@@ -145,11 +178,18 @@ impl AttachFrame {
         let (kind, payload): (u8, &[u8]) = match self {
             Self::Input(bytes) => (Self::INPUT, bytes),
             Self::Output(bytes) => (Self::OUTPUT, bytes),
-            Self::Resize { rows, cols } => {
+            Self::Resize {
+                rows,
+                cols,
+                pixel_width,
+                pixel_height,
+            } => {
                 writer.write_all(&[Self::RESIZE])?;
-                writer.write_all(&4_u32.to_be_bytes())?;
+                writer.write_all(&8_u32.to_be_bytes())?;
                 writer.write_all(&rows.to_be_bytes())?;
-                return writer.write_all(&cols.to_be_bytes());
+                writer.write_all(&cols.to_be_bytes())?;
+                writer.write_all(&pixel_width.to_be_bytes())?;
+                return writer.write_all(&pixel_height.to_be_bytes());
             }
             Self::Detached => (Self::DETACHED, &[]),
         };
@@ -181,9 +221,11 @@ impl AttachFrame {
         match kind[0] {
             Self::INPUT => Ok(Self::Input(payload)),
             Self::OUTPUT => Ok(Self::Output(payload)),
-            Self::RESIZE if payload.len() == 4 => Ok(Self::Resize {
+            Self::RESIZE if payload.len() == 8 => Ok(Self::Resize {
                 rows: u16::from_be_bytes([payload[0], payload[1]]),
                 cols: u16::from_be_bytes([payload[2], payload[3]]),
+                pixel_width: u16::from_be_bytes([payload[4], payload[5]]),
+                pixel_height: u16::from_be_bytes([payload[6], payload[7]]),
             }),
             Self::DETACHED if payload.is_empty() => Ok(Self::Detached),
             _ => Err(io::Error::new(
@@ -227,8 +269,19 @@ mod tests {
 
     #[test]
     fn control_frame_round_trips() {
-        let value = Envelope::new(Request::GetShell {
+        let value = Envelope::new(Request::Attach {
             shell_id: "s1".into(),
+            takeover: false,
+            profile: TerminalProfile {
+                term: Some("xterm-256color".into()),
+                colorterm: Some("truecolor".into()),
+                term_program: Some("test".into()),
+                term_program_version: Some("1".into()),
+                rows: 24,
+                cols: 80,
+                pixel_width: 800,
+                pixel_height: 600,
+            },
         });
         let mut bytes = Vec::new();
         write_message(&mut bytes, &value).unwrap();
@@ -249,7 +302,12 @@ mod tests {
     fn attach_frames_round_trip() {
         let frames = [
             AttachFrame::Input(vec![0, 1, 255]),
-            AttachFrame::Resize { rows: 24, cols: 80 },
+            AttachFrame::Resize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 1920,
+                pixel_height: 1080,
+            },
             AttachFrame::Detached,
         ];
         for frame in frames {
@@ -260,5 +318,12 @@ mod tests {
                 frame
             );
         }
+    }
+
+    #[test]
+    fn rejects_protocol_two_resize_frame() {
+        let bytes = [AttachFrame::RESIZE, 0, 0, 0, 4, 0, 24, 0, 80];
+
+        assert!(AttachFrame::read_from(&mut bytes.as_slice()).is_err());
     }
 }

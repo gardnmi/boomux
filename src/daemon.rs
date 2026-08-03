@@ -20,12 +20,15 @@ use uuid::Uuid;
 use crate::client;
 use crate::protocol::{
     self, AttachFrame, Envelope, Request, Response, ShellSnapshot, ShellSpec, ShellStatus,
-    Snapshot, WorkspaceSnapshot,
+    Snapshot, TerminalProfile, WorkspaceSnapshot,
 };
 
 const REPLAY_LIMIT: usize = 1024 * 1024;
 const CONTROLLER_QUEUE: usize = 64;
 const SHUTDOWN_GRACE: Duration = Duration::from_millis(50);
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
+const IO_RETRY_DELAY: Duration = Duration::from_millis(2);
+const MAX_TERMINAL_ENV_VALUE: usize = 256;
 
 pub fn run() -> io::Result<()> {
     let socket_path = client::socket_path()?;
@@ -126,8 +129,13 @@ fn handle_connection(
         );
     }
 
-    if let Request::Attach { shell_id, takeover } = request.message {
-        return handle_attach(stream, &registry, &shell_id, takeover);
+    if let Request::Attach {
+        shell_id,
+        takeover,
+        profile,
+    } = request.message
+    {
+        return handle_attach(stream, &registry, &shell_id, takeover, profile);
     }
     if matches!(request.message, Request::Shutdown) {
         send_response(&mut stream, Response::Ok)?;
@@ -169,7 +177,26 @@ struct Shell {
     workspace_id: String,
     name: Mutex<String>,
     cwd: PathBuf,
-    status: Mutex<ShellStatus>,
+    command: Vec<String>,
+    lifecycle: Mutex<ShellLifecycle>,
+}
+
+enum ShellLifecycle {
+    Pending,
+    Running {
+        profile: TerminalProfile,
+        runtime: Arc<ShellRuntime>,
+    },
+    Exited {
+        code: Option<u32>,
+        profile: TerminalProfile,
+        runtime: Arc<ShellRuntime>,
+    },
+    Closed,
+}
+
+struct ShellRuntime {
+    control: Mutex<()>,
     master: Mutex<Box<dyn MasterPty + Send>>,
     writer: Mutex<Box<dyn Write + Send>>,
     child: Mutex<Box<dyn Child + Send + Sync>>,
@@ -294,6 +321,13 @@ impl Registry {
             .ok_or_else(|| not_found("shell", id))
     }
 
+    fn contains_shell(&self, shell: &Arc<Shell>) -> io::Result<bool> {
+        Ok(lock(&self.state)?
+            .shells
+            .get(&shell.id)
+            .is_some_and(|current| Arc::ptr_eq(current, shell)))
+    }
+
     fn create_workspace(
         &self,
         name: String,
@@ -305,7 +339,7 @@ impl Registry {
 
         let mut shells = Vec::with_capacity(specs.len());
         for spec in specs {
-            match spawn_shell(&workspace_id, &name, spec) {
+            match create_pending_shell(&workspace_id, spec) {
                 Ok(shell) => shells.push(shell),
                 Err(error) => {
                     for shell in shells {
@@ -348,7 +382,7 @@ impl Registry {
 
     fn create_shell(&self, workspace_id: &str, spec: ShellSpec) -> io::Result<ShellSnapshot> {
         let workspace = self.workspace(workspace_id)?;
-        let shell = spawn_shell(workspace_id, &lock(&workspace.name)?.clone(), spec)?;
+        let shell = create_pending_shell(workspace_id, spec)?;
         let snapshot = shell.snapshot()?;
         let mut state = lock(&self.state)?;
         let Some(current) = state.workspaces.get(workspace_id) else {
@@ -445,7 +479,16 @@ impl Registry {
 
     fn read_shell(&self, shell_id: &str, max_bytes: usize) -> io::Result<Vec<u8>> {
         let shell = self.shell(shell_id)?;
-        let replay = lock(&shell.replay)?;
+        let lifecycle = lock(&shell.lifecycle)?;
+        let runtime = match &*lifecycle {
+            ShellLifecycle::Pending => return Ok(Vec::new()),
+            ShellLifecycle::Running { runtime, .. } | ShellLifecycle::Exited { runtime, .. } => {
+                Arc::clone(runtime)
+            }
+            ShellLifecycle::Closed => return Err(not_found("shell", shell_id)),
+        };
+        drop(lifecycle);
+        let replay = lock(&runtime.replay)?;
         let count = max_bytes.min(replay.len());
         Ok(replay.iter().skip(replay.len() - count).copied().collect())
     }
@@ -487,11 +530,15 @@ impl Registry {
 
 impl Workspace {
     fn snapshot(&self, registry: &Registry) -> io::Result<WorkspaceSnapshot> {
-        let state = lock(&registry.state)?;
         let ids = lock(&self.shell_ids)?.clone();
-        let shells = ids
+        let shells = {
+            let state = lock(&registry.state)?;
+            ids.iter()
+                .filter_map(|id| state.shells.get(id).cloned())
+                .collect::<Vec<_>>()
+        };
+        let shells = shells
             .iter()
-            .filter_map(|id| state.shells.get(id))
             .map(|shell| shell.snapshot())
             .collect::<io::Result<_>>()?;
         Ok(WorkspaceSnapshot {
@@ -509,16 +556,27 @@ impl Shell {
             workspace_id: self.workspace_id.clone(),
             name: lock(&self.name)?.clone(),
             cwd: self.cwd.clone(),
-            status: lock(&self.status)?.clone(),
+            status: match &*lock(&self.lifecycle)? {
+                ShellLifecycle::Pending => ShellStatus::Pending,
+                ShellLifecycle::Running { .. } => ShellStatus::Running,
+                ShellLifecycle::Exited { code, .. } => ShellStatus::Exited { code: *code },
+                ShellLifecycle::Closed => return Err(not_found("shell", &self.id)),
+            },
         })
     }
 
     fn kill(&self) -> io::Result<()> {
-        if let Some(controller) = lock(&self.controller)?.take() {
+        let runtime =
+            match std::mem::replace(&mut *lock(&self.lifecycle)?, ShellLifecycle::Closed) {
+                ShellLifecycle::Pending | ShellLifecycle::Closed => return Ok(()),
+                ShellLifecycle::Running { runtime, .. }
+                | ShellLifecycle::Exited { runtime, .. } => runtime,
+            };
+        if let Some(controller) = lock(&runtime.controller)?.take() {
             let _ = controller.connection.shutdown(std::net::Shutdown::Both);
         }
-        let foreground_group = lock(&self.master)?.process_group_leader();
-        let mut child = lock(&self.child)?;
+        let foreground_group = lock(&runtime.master)?.process_group_leader();
+        let mut child = lock(&runtime.child)?;
         if child.try_wait()?.is_some() {
             return Ok(());
         }
@@ -547,13 +605,9 @@ impl Shell {
             (Ok(()), Err(error)) => Err(error),
         }
     }
+}
 
-    fn is_controller(&self, token: &str) -> io::Result<bool> {
-        Ok(lock(&self.controller)?
-            .as_ref()
-            .is_some_and(|controller| controller.token == token))
-    }
-
+impl ShellRuntime {
     fn release_controller(&self, token: &str) -> io::Result<()> {
         let mut controller = lock(&self.controller)?;
         if controller
@@ -566,53 +620,86 @@ impl Shell {
     }
 }
 
-fn spawn_shell(
-    workspace_id: &str,
-    workspace_name: &str,
-    spec: ShellSpec,
-) -> io::Result<Arc<Shell>> {
+fn create_pending_shell(workspace_id: &str, spec: ShellSpec) -> io::Result<Arc<Shell>> {
     validate_name(&spec.name)?;
-    let cwd = spec.cwd;
-    validate_cwd(&cwd)?;
-    let shell_id = Uuid::new_v4().to_string();
+    validate_cwd(&spec.cwd)?;
+    Ok(Arc::new(Shell {
+        id: Uuid::new_v4().to_string(),
+        workspace_id: workspace_id.to_owned(),
+        name: Mutex::new(spec.name),
+        cwd: spec.cwd,
+        command: spec.command,
+        lifecycle: Mutex::new(ShellLifecycle::Pending),
+    }))
+}
+
+fn spawn_runtime(
+    shell: &Arc<Shell>,
+    workspace_name: &str,
+    shell_name: &str,
+    profile: &TerminalProfile,
+) -> io::Result<(Arc<ShellRuntime>, Box<dyn Read + Send>)> {
     let pty = native_pty_system()
-        .openpty(PtySize::default())
+        .openpty(PtySize {
+            rows: profile.rows,
+            cols: profile.cols,
+            pixel_width: profile.pixel_width,
+            pixel_height: profile.pixel_height,
+        })
         .map_err(io::Error::other)?;
+    set_nonblocking(pty.master.as_ref())?;
     let writer = pty.master.take_writer().map_err(io::Error::other)?;
     let reader = pty.master.try_clone_reader().map_err(io::Error::other)?;
 
-    let mut command = if spec.command.is_empty() {
+    let mut command = if shell.command.is_empty() {
         CommandBuilder::new(env::var_os("SHELL").unwrap_or_else(|| "/bin/sh".into()))
     } else {
-        let mut command = CommandBuilder::new(&spec.command[0]);
-        command.args(&spec.command[1..]);
+        let mut command = CommandBuilder::new(&shell.command[0]);
+        command.args(&shell.command[1..]);
         command
     };
-    command.cwd(&cwd);
-    command.env("BOOMUX_WORKSPACE_ID", workspace_id);
+    command.cwd(&shell.cwd);
+    for name in ["TERM", "COLORTERM", "TERM_PROGRAM", "TERM_PROGRAM_VERSION"] {
+        command.env_remove(name);
+    }
+    for (name, value) in [
+        ("TERM", profile.term.as_deref()),
+        ("COLORTERM", profile.colorterm.as_deref()),
+        ("TERM_PROGRAM", profile.term_program.as_deref()),
+        (
+            "TERM_PROGRAM_VERSION",
+            profile.term_program_version.as_deref(),
+        ),
+    ] {
+        if let Some(value) = value {
+            command.env(name, value);
+        }
+    }
+    command.env("BOOMUX_WORKSPACE_ID", &shell.workspace_id);
     command.env("BOOMUX_WORKSPACE", workspace_name);
-    command.env("BOOMUX_SHELL_ID", &shell_id);
-    command.env("BOOMUX_SHELL_NAME", &spec.name);
+    command.env("BOOMUX_SHELL_ID", &shell.id);
+    command.env("BOOMUX_SHELL_NAME", shell_name);
     let child = pty.slave.spawn_command(command).map_err(io::Error::other)?;
     drop(pty.slave);
 
-    let shell = Arc::new(Shell {
-        id: shell_id,
-        workspace_id: workspace_id.to_owned(),
-        name: Mutex::new(spec.name),
-        cwd,
-        status: Mutex::new(ShellStatus::Running),
-        master: Mutex::new(pty.master),
-        writer: Mutex::new(writer),
-        child: Mutex::new(child),
-        replay: Mutex::new(VecDeque::with_capacity(REPLAY_LIMIT)),
-        controller: Mutex::new(None),
-    });
-    start_pty_reader(Arc::clone(&shell), reader);
-    Ok(shell)
+    Ok((
+        Arc::new(ShellRuntime {
+            control: Mutex::new(()),
+            master: Mutex::new(pty.master),
+            writer: Mutex::new(writer),
+            child: Mutex::new(child),
+            replay: Mutex::new(VecDeque::with_capacity(REPLAY_LIMIT)),
+            controller: Mutex::new(None),
+        }),
+        reader,
+    ))
 }
 
-fn start_pty_reader(shell: Arc<Shell>, mut reader: Box<dyn Read + Send>) {
+fn start_pty_reader(
+    shell: Arc<Shell>,
+    runtime: Arc<ShellRuntime>,
+    mut reader: Box<dyn Read + Send>,
+) {
     thread::spawn(move || {
         let mut buffer = [0; 16 * 1024];
         loop {
@@ -620,9 +707,9 @@ fn start_pty_reader(shell: Arc<Shell>, mut reader: Box<dyn Read + Send>) {
                 Ok(0) => break,
                 Ok(count) => {
                     let bytes = &buffer[..count];
-                    if let Ok(mut replay) = shell.replay.lock() {
+                    if let Ok(mut replay) = runtime.replay.lock() {
                         append_replay(&mut replay, bytes);
-                        if let Ok(mut controller) = shell.controller.lock() {
+                        if let Ok(mut controller) = runtime.controller.lock() {
                             let disconnect = controller.as_ref().is_some_and(|current| {
                                 matches!(
                                     current.output.try_send(bytes.to_vec()),
@@ -635,20 +722,40 @@ fn start_pty_reader(shell: Arc<Shell>, mut reader: Box<dyn Read + Send>) {
                         }
                     }
                 }
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    if error.kind() == io::ErrorKind::WouldBlock {
+                        thread::sleep(IO_RETRY_DELAY);
+                    }
+                    continue;
+                }
                 Err(_) => break,
             }
         }
-        let code = shell
+        let code = runtime
             .child
             .lock()
             .ok()
             .and_then(|mut child| child.try_wait().ok().flatten())
             .map(|status| status.exit_code());
-        if let Ok(mut status) = shell.status.lock() {
-            *status = ShellStatus::Exited { code };
+        if let Ok(mut lifecycle) = shell.lifecycle.lock()
+            && let ShellLifecycle::Running {
+                profile,
+                runtime: current,
+            } = &*lifecycle
+            && Arc::ptr_eq(current, &runtime)
+        {
+            *lifecycle = ShellLifecycle::Exited {
+                code,
+                profile: profile.clone(),
+                runtime: Arc::clone(&runtime),
+            };
         }
-        let _ = shell
+        let _ = runtime
             .controller
             .lock()
             .map(|mut controller| controller.take());
@@ -674,7 +781,16 @@ fn handle_attach(
     registry: &Registry,
     shell_id: &str,
     takeover: bool,
+    profile: TerminalProfile,
 ) -> io::Result<()> {
+    if let Err(error) = validate_terminal_profile(&profile) {
+        return send_response(
+            &mut stream,
+            Response::Error {
+                message: error.to_string(),
+            },
+        );
+    }
     let shell = match registry.shell(shell_id) {
         Ok(shell) => shell,
         Err(error) => {
@@ -688,14 +804,70 @@ fn handle_attach(
     };
     let token = Uuid::new_v4().to_string();
     let (output, receiver) = mpsc::sync_channel(CONTROLLER_QUEUE);
-    let replay = {
-        // Match the reader's replay-then-controller lock order so replay ends
-        // exactly where delivery to this controller begins.
-        let replay = lock(&shell.replay)?;
-        let mut controller = lock(&shell.controller)?;
+    let connection = stream.try_clone()?;
+    let (runtime, startup_profile, running) = {
+        let mut lifecycle = lock(&shell.lifecycle)?;
+        if !registry.contains_shell(&shell)? {
+            return send_response(
+                &mut stream,
+                Response::Error {
+                    message: format!("shell not found: {shell_id}"),
+                },
+            );
+        }
+        if matches!(*lifecycle, ShellLifecycle::Pending) {
+            let workspace = registry.workspace(&shell.workspace_id)?;
+            let workspace_name = lock(&workspace.name)?.clone();
+            let shell_name = lock(&shell.name)?.clone();
+            let (runtime, reader) =
+                match spawn_runtime(&shell, &workspace_name, &shell_name, &profile) {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        return send_response(
+                            &mut stream,
+                            Response::Error {
+                                message: format!("could not start shell: {error}"),
+                            },
+                        );
+                    }
+                };
+            *lifecycle = ShellLifecycle::Running {
+                profile: profile.clone(),
+                runtime: Arc::clone(&runtime),
+            };
+            start_pty_reader(Arc::clone(&shell), runtime, reader);
+        }
+        match &*lifecycle {
+            ShellLifecycle::Running { profile, runtime } => {
+                (Arc::clone(runtime), profile.clone(), true)
+            }
+            ShellLifecycle::Exited {
+                profile, runtime, ..
+            } => (Arc::clone(runtime), profile.clone(), false),
+            ShellLifecycle::Pending => unreachable!(),
+            ShellLifecycle::Closed => {
+                return send_response(
+                    &mut stream,
+                    Response::Error {
+                        message: format!("shell not found: {shell_id}"),
+                    },
+                );
+            }
+        }
+    };
+    let warning = term_mismatch_warning(startup_profile.term.as_deref(), profile.term.as_deref());
+    let control = lock(&runtime.control)?;
+    if !registry.contains_shell(&shell)? {
+        return send_response(
+            &mut stream,
+            Response::Error {
+                message: format!("shell not found: {shell_id}"),
+            },
+        );
+    }
+    {
+        let controller = lock(&runtime.controller)?;
         if controller.is_some() && !takeover {
-            drop(controller);
-            drop(replay);
             return send_response(
                 &mut stream,
                 Response::Error {
@@ -703,30 +875,53 @@ fn handle_attach(
                 },
             );
         }
+    }
+    if running {
+        lock(&runtime.master)?
+            .resize(profile_size(&profile))
+            .map_err(io::Error::other)?;
+    }
+    // Keep replay locked until the controller is installed so retained output
+    // ends exactly where live delivery begins.
+    let replay = lock(&runtime.replay)?;
+    stream.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
+    send_response(
+        &mut stream,
+        Response::Attached {
+            token: token.clone(),
+            replay: replay.iter().copied().collect(),
+            warning,
+        },
+    )?;
+    stream.set_write_timeout(None)?;
+    if !running {
+        return AttachFrame::Detached.write_to(&mut stream);
+    }
+    let lifecycle = lock(&shell.lifecycle)?;
+    let still_running = registry.contains_shell(&shell)?
+        && matches!(
+            &*lifecycle,
+            ShellLifecycle::Running {
+                runtime: current,
+                ..
+            } if Arc::ptr_eq(current, &runtime)
+        );
+    if !still_running {
+        return AttachFrame::Detached.write_to(&mut stream);
+    }
+    {
+        let mut controller = lock(&runtime.controller)?;
         if let Some(previous) = controller.take() {
             let _ = previous.connection.shutdown(std::net::Shutdown::Both);
         }
         *controller = Some(Controller {
             token: token.clone(),
             output,
-            connection: stream.try_clone()?,
+            connection,
         });
-        replay.iter().copied().collect()
-    };
-
-    if let Err(error) = send_response(
-        &mut stream,
-        Response::Attached {
-            token: token.clone(),
-            replay,
-        },
-    ) {
-        shell.release_controller(&token)?;
-        return Err(error);
     }
-
     let mut output_stream = stream.try_clone()?;
-    let output_shell = Arc::clone(&shell);
+    let output_runtime = Arc::clone(&runtime);
     let output_token = token.clone();
     thread::spawn(move || {
         for bytes in receiver {
@@ -738,41 +933,147 @@ fn handle_attach(
             }
         }
         let _ = AttachFrame::Detached.write_to(&mut output_stream);
-        let _ = output_shell.release_controller(&output_token);
+        let _ = output_runtime.release_controller(&output_token);
     });
+    drop(lifecycle);
+    drop(replay);
+    drop(control);
 
     loop {
         let frame = match AttachFrame::read_from(&mut stream) {
             Ok(frame) => frame,
             Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
             Err(error) => {
-                shell.release_controller(&token)?;
+                runtime.release_controller(&token)?;
                 return Err(error);
             }
         };
-        if !shell.is_controller(&token)? {
+        if let AttachFrame::Input(bytes) = frame {
+            if !write_controller_input(&runtime, &token, &bytes)? {
+                break;
+            }
+            continue;
+        }
+        let control = lock(&runtime.control)?;
+        let authorized = lock(&runtime.controller)?
+            .as_ref()
+            .is_some_and(|controller| controller.token == token);
+        if !authorized {
             break;
         }
-        match frame {
-            AttachFrame::Input(bytes) => lock(&shell.writer)?.write_all(&bytes)?,
-            AttachFrame::Resize { rows, cols } => lock(&shell.master)?
+        let result = match frame {
+            AttachFrame::Input(_) => unreachable!(),
+            AttachFrame::Resize {
+                rows,
+                cols,
+                pixel_width,
+                pixel_height,
+            } => lock(&runtime.master)?
                 .resize(PtySize {
                     rows,
                     cols,
-                    pixel_width: 0,
-                    pixel_height: 0,
+                    pixel_width,
+                    pixel_height,
                 })
-                .map_err(io::Error::other)?,
-            AttachFrame::Detached => break,
-            AttachFrame::Output(_) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "client sent output frame",
-                ));
+                .map_err(io::Error::other),
+            AttachFrame::Detached => {
+                drop(control);
+                break;
             }
+            AttachFrame::Output(_) => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "client sent output frame",
+            )),
+        };
+        if let Err(error) = result {
+            runtime.release_controller(&token)?;
+            return Err(error);
         }
     }
-    shell.release_controller(&token)
+    runtime.release_controller(&token)
+}
+
+fn set_nonblocking(master: &dyn MasterPty) -> io::Result<()> {
+    let fd = master
+        .as_raw_fd()
+        .ok_or_else(|| io::Error::other("PTY master does not expose a file descriptor"))?;
+    // `fd` belongs to the live PTY master and fcntl only reads/updates its status flags.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn write_controller_input(runtime: &ShellRuntime, token: &str, bytes: &[u8]) -> io::Result<bool> {
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let control = lock(&runtime.control)?;
+        let authorized = lock(&runtime.controller)?
+            .as_ref()
+            .is_some_and(|controller| controller.token == token);
+        if !authorized {
+            return Ok(false);
+        }
+        let result = lock(&runtime.writer)?.write(&bytes[offset..]);
+        drop(control);
+        match result {
+            Ok(0) => return Err(io::Error::new(io::ErrorKind::WriteZero, "PTY input closed")),
+            Ok(count) => offset += count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(IO_RETRY_DELAY);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(true)
+}
+
+fn profile_size(profile: &TerminalProfile) -> PtySize {
+    PtySize {
+        rows: profile.rows,
+        cols: profile.cols,
+        pixel_width: profile.pixel_width,
+        pixel_height: profile.pixel_height,
+    }
+}
+
+fn validate_terminal_profile(profile: &TerminalProfile) -> io::Result<()> {
+    if profile.rows == 0 || profile.cols == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "terminal profile rows and columns must be nonzero",
+        ));
+    }
+    for value in [
+        &profile.term,
+        &profile.colorterm,
+        &profile.term_program,
+        &profile.term_program_version,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if value.is_empty()
+            || value.len() > MAX_TERMINAL_ENV_VALUE
+            || value.chars().any(char::is_control)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "terminal profile contains an invalid environment value",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn term_mismatch_warning(started: Option<&str>, attached: Option<&str>) -> Option<String> {
+    (started != attached).then(|| {
+        format!(
+            "shell started with TERM={started:?}; attachment reports TERM={attached:?}; process environment is unchanged"
+        )
+    })
 }
 
 fn validate_name(name: &str) -> io::Result<()> {
@@ -860,6 +1161,19 @@ mod tests {
     use super::*;
     use std::sync::Barrier;
 
+    fn profile() -> TerminalProfile {
+        TerminalProfile {
+            term: Some("xterm-256color".into()),
+            colorterm: Some("truecolor".into()),
+            term_program: Some("test".into()),
+            term_program_version: Some("1".into()),
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        }
+    }
+
     #[test]
     fn empty_registry_has_empty_snapshot() {
         assert!(
@@ -892,6 +1206,30 @@ mod tests {
         let error = validate_shell_specs(&specs).unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn validates_terminal_profile_bounds() {
+        assert!(validate_terminal_profile(&profile()).is_ok());
+
+        let mut invalid = profile();
+        invalid.rows = 0;
+        assert!(validate_terminal_profile(&invalid).is_err());
+
+        let mut invalid = profile();
+        invalid.term = Some("bad\nterm".into());
+        assert!(validate_terminal_profile(&invalid).is_err());
+
+        let mut invalid = profile();
+        invalid.term = Some("x".repeat(MAX_TERMINAL_ENV_VALUE + 1));
+        assert!(validate_terminal_profile(&invalid).is_err());
+    }
+
+    #[test]
+    fn reports_only_term_mismatches() {
+        assert_eq!(term_mismatch_warning(Some("xterm"), Some("xterm")), None);
+        assert!(term_mismatch_warning(Some("xterm"), Some("alacritty")).is_some());
+        assert!(term_mismatch_warning(None, Some("xterm")).is_some());
     }
 
     #[test]
