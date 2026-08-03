@@ -33,6 +33,8 @@ commitments.
   socket protocol, PTY lifecycle, and transparent attachment client.
 - [x] Exercise native PTY transport, detach, takeover, resize, process cleanup,
   startup locking, and graceful shutdown through an isolated binary-level test.
+- [x] Make the Ratatui dashboard the default interface and remove the external
+  picker dependency.
 
 ## Workspace Control
 
@@ -71,7 +73,6 @@ terminal handshake, VT reconstruction, and restart-persistence plan.
 
 ## Distribution And Polish
 
-- Make the Ratatui interface the default and remove the Gum dependency.
 - Add a LazyGit-style interactive keybinding panel.
 - Support configuration for refresh rate and notifications.
 - Package Boomux and its daemon lifecycle for Arch and Omarchy users.

@@ -43,14 +43,13 @@ boomux . --terminal Alacritty.desktop
 `--terminal` implies `--new`. Selection precedence is the CLI override, Boomux
 configuration, then Omarchy's default terminal.
 
-Run Boomux without a path to select a workspace with Gum and open every shell
-in its own native terminal window:
+Run Boomux without a path to open the Ratatui dashboard:
 
 ```console
 boomux
 ```
 
-Open the full Ratatui dashboard with:
+The explicit dashboard command remains available as an alias:
 
 ```console
 boomux ui
@@ -62,7 +61,7 @@ Dashboard controls:
 - `j`, `k`, and the arrow keys navigate.
 - `Enter` restores a workspace or opens the selected shell.
 - `a` creates an empty workspace or adds a shell, depending on the focused
-  table. New dashboard shells start in the directory where `boomux ui` was
+  table. New dashboard shells start in the directory where the dashboard was
   launched.
 - `e` renames the selected workspace or shell, depending on focus.
 - `x`, then `y`, closes a workspace and all of its processes.

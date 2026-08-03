@@ -2,7 +2,7 @@ use std::env;
 use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode, Stdio};
+use std::process::{Command, ExitCode};
 
 use clap::{Parser, Subcommand};
 
@@ -159,10 +159,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         Some(Commands::Prompt) => print_prompt_label(),
         Some(Commands::Daemon { command }) => daemon_control(command),
         Some(Commands::Attach { .. }) => unreachable!(),
-        None => {
-            let terminal = effective_terminal(cli.terminal.as_deref())?;
-            picker(terminal.as_deref())
-        }
+        None => dashboard(cli.terminal.as_deref()),
     }
 }
 
@@ -192,21 +189,6 @@ fn effective_terminal(override_entry: Option<&str>) -> Result<Option<String>, Bo
         return Ok(Some(entry.to_owned()));
     }
     Ok(config::load()?.terminal)
-}
-
-fn picker(terminal: Option<&str>) -> Result<(), Box<dyn Error>> {
-    ensure_host_terminal()?;
-    let client = client::connect_or_start()?;
-    let snapshot = client.snapshot()?;
-    let Some(workspace_id) = choose_workspace(&snapshot.workspaces)? else {
-        return Ok(());
-    };
-    let workspace = snapshot
-        .workspaces
-        .iter()
-        .find(|workspace| workspace.id == workspace_id)
-        .ok_or("selected workspace no longer exists")?;
-    open_workspace(workspace, terminal)
 }
 
 fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
@@ -415,44 +397,6 @@ fn find_workspace<'a>(
     name: &str,
 ) -> Option<&'a WorkspaceSnapshot> {
     workspaces.iter().find(|workspace| workspace.name == name)
-}
-
-fn choose_workspace(workspaces: &[WorkspaceSnapshot]) -> Result<Option<String>, Box<dyn Error>> {
-    if workspaces.is_empty() {
-        return Err("no saved workspaces; run `boomux PATH` to create one".into());
-    }
-    let choices = workspaces
-        .iter()
-        .map(|workspace| {
-            let shell_word = if workspace.shells.len() == 1 {
-                "shell"
-            } else {
-                "shells"
-            };
-            let label = format!(
-                "{:<18} {:>2} {:<6} ({})",
-                workspace.name,
-                workspace.shells.len(),
-                shell_word,
-                workspace.id
-            );
-            (label, workspace.id.clone())
-        })
-        .collect::<Vec<_>>();
-    let output = Command::new("gum")
-        .args(["choose", "--header", "Restore a Boomux workspace"])
-        .args(choices.iter().map(|(label, _)| label))
-        .stdin(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .output()?;
-    if !output.status.success() {
-        return Ok(None);
-    }
-    let selected = String::from_utf8(output.stdout)?;
-    Ok(choices
-        .into_iter()
-        .find(|(label, _)| label == selected.trim_end())
-        .map(|(_, id)| id))
 }
 
 fn create_dashboard_workspace(
@@ -744,7 +688,7 @@ fn doctor(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
             eprintln!("err daemon: {error}");
         }
     }
-    for command in ["gum", "git"] {
+    for command in ["git"] {
         match Command::new(command).arg("--version").output() {
             Ok(output) if output.status.success() => {
                 println!(
