@@ -2,130 +2,120 @@
 
 ## Product Boundary
 
-Boomux is a session experience, not a terminal emulator or process
-multiplexer. It maps one Herdr workspace to a named Boomux workspace and each
-durable Herdr terminal to one native terminal window.
+Boomux is a native-terminal session manager, not a terminal emulator or an
+embedded multiplexer UI. Each Boomux shell is rendered by one ordinary terminal
+window selected through `xdg-terminal-exec`.
 
 ```text
-Herdr server
-└── workspace: project/feature
-    ├── terminal A <-> herdr terminal attach <-> terminal window A
-    ├── terminal B <-> herdr terminal attach <-> terminal window B
-    └── terminal C <-> herdr terminal attach <-> terminal window C
+terminal emulator
+  -> boomux attachment client
+  -> Unix socket
+  -> Boomux daemon
+  -> PTY
+  -> child process
 ```
 
-## Why Compose First
-
-Herdr owns PTYs in its background server. Its direct terminal attachment sends
-the current rendered state and live ANSI frames, accepts terminal input, and
-propagates terminal resize events. Disconnecting removes the controller without
-terminating the server-owned process.
-
-Omarchy's `xdg-terminal-exec` integration resolves the default or explicitly
-selected terminal desktop entry and translates common capabilities such as
-command execution and titles into that emulator's arguments. Closing the
-surface terminates the attachment command while leaving the Herdr server and
-terminal alive.
-
-These contracts provide the MVP without source-level integration.
+The terminal emulator remains responsible for rendering, fonts, themes,
+selection, clipboard integration, and window behavior. Boomux provides process
+persistence across attachment disconnects, naming, grouping, and orchestration.
 
 ## Components
 
-### CLI
+### Application
 
-Provides diagnostics, creates named workspaces and terminals, and restores all
-terminals belonging to a selected workspace.
+`src/main.rs` owns the CLI, project launcher, recipes, dashboard actions, shell
+name resolution, and conversion from daemon snapshots into TUI view models.
 
-### Herdr Client
+### Protocol
 
-Uses Herdr's JSON-producing CLI commands for workspace and terminal lifecycle.
-Interactive terminal transport remains delegated to the official
-`herdr terminal attach` command because Herdr's binary client protocol is
-private and versioned.
+`src/protocol.rs` defines the versioned wire model. Control messages are JSON
+with a four-byte big-endian length prefix. Attachment traffic uses small binary
+frames for input, output, resize, and detach events.
 
-### Picker
+The domain has only two durable identities:
 
-Runs in a normal terminal surface and lists named workspaces. Selecting one
-launches a native window for every terminal belonging to that Herdr workspace.
+- A workspace groups shells under a name and working directory.
+- A shell owns one PTY, child process, name, and workspace ID.
 
-### Dashboard
+There are no separate tab, pane, and terminal identity layers.
 
-Provides a Ratatui overview of workspaces, terminals, directories, Git state,
-and per-terminal agent state. It is a control plane only: restoring a workspace
-still launches native terminal windows rather than embedding terminal sessions in
-the dashboard. The dashboard remains open after restoration so it can continue
-managing other workspaces. It refreshes from Herdr four times per second and
-validates the selected workspace against a fresh snapshot before launching
-terminal windows.
-Repository name, branch, dirty state, and primary or linked worktree information
-come from the Git CLI and are cached for two seconds so the faster Herdr refresh
-does not repeatedly spawn Git processes.
-Closing a workspace uses Herdr's atomic workspace close command after explicit
-confirmation, terminating every shell in that workspace. Shell creation uses
-Herdr tabs, and pane labels provide durable shell names for the dashboard,
-window titles, and prompt integrations.
+### Client
 
-Dashboard colors use semantic ANSI roles and the terminal's default foreground
-and background. This keeps the TUI portable while allowing terminal-level theme
-systems such as Omarchy to supply the concrete palette.
+`src/client.rs` resolves the socket at
+`$XDG_RUNTIME_DIR/boomux/daemon.sock`. It starts a detached daemon on demand,
+waits for the protocol ping to succeed, and exposes typed management requests.
 
-## Project Discovery
+### Daemon
 
-The dashboard loads global TOML configuration from the XDG config directory and
-then merges an optional `BOOMUX_CONFIG` file over it. Project discovery walks
-only explicitly configured roots to a bounded depth, recognizes Git worktrees
-as well as ordinary repositories through their `.git` marker, and does not
-descend into repositories after discovering them.
+`src/daemon.rs` owns all PTY masters and child processes. Its runtime directory
+is restricted to the current user and the socket mode is `0600`.
 
-The resulting canonical paths and source-root labels are passed to the dashboard
-as a sorted snapshot. Workspace creation uses a grouped type-to-filter launcher
-over that snapshot; all groups share one query, and the selected project's
-basename becomes the workspace name. Configuration loading and filesystem
-discovery remain outside the TUI so input and rendering do not perform filesystem
-scans.
+The daemon supports:
 
-## Workspace Recipes
+- Atomic multi-shell workspace creation
+- Additional shell creation
+- Workspace and shell snapshots
+- Shell and workspace rename operations
+- Shell and workspace closure
+- Bounded output replay
+- One writable attachment with explicit takeover
+- PTY input and resize forwarding
 
-After project selection, the dashboard presents the built-in single-shell
-default followed by validated recipes from Boomux's layered TOML configuration.
-Each recipe defines one or more durable terminal names and optional startup
-commands.
+Workspace creation stages every child before publishing any of them to the
+registry. A failed spawn kills the staged children.
 
-The first recipe terminal reuses the workspace root pane; later terminals use
-Herdr tabs. Boomux labels every tab and pane, applies the workspace and shell
-environment variables, and delivers configured startup commands through
-`herdr pane run`. Herdr acknowledges command delivery rather than process
-liveness. After Herdr returns the root workspace identity, provisioning is
-transactional at the workspace boundary: later creation, labeling, or delivery
-failures close the new Herdr workspace rather than leaving a partial recipe. A
-successful mutation followed by an undecodable root response cannot be safely
-rolled back because Boomux has no reliable workspace identity.
+### Attachment
+
+`src/attach.rs` runs inside the selected terminal emulator. It enables raw mode,
+reports dimensions, and copies bytes in both directions without interpreting
+keys or transforming live PTY output. An RAII guard restores terminal mode when
+the attachment exits.
+
+The daemon keeps a bounded output queue per active controller. A slow client
+drops output rather than blocking the PTY reader and child process.
 
 ### Terminal Launcher
 
-Resolves Omarchy's default terminal or a Boomux-specific XDG desktop entry and
-creates native windows with human-readable titles when supported. Boomux does
-not rely on compositor-specific window IDs or control APIs.
+`src/terminal.rs` uses Omarchy's `xdg-terminal-exec` metadata to launch:
+
+```console
+boomux __attach <shell-id> --takeover
+```
+
+No emulator-specific adapter or compositor window ID is required.
+
+### Dashboard
+
+`src/tui.rs` remains a control plane. It receives backend-neutral view models
+and callback functions rather than opening sockets itself. One daemon snapshot
+contains each workspace and its shells, avoiding races between separate list
+operations. Git information is still collected independently and cached.
 
 ### Agent Skill
 
-The repository contains a vendor-neutral Agent Skill that teaches compatible
-agents to list workspace shells and read retained output through Boomux. The
-binary embeds the same skill source and installs it only after an explicit user
-command under `~/.agents/skills`. Name resolution uses the invoking Herdr pane
-to stay within its Boomux workspace, while exact terminal IDs remain globally
-addressable. Boomux delegates scrollback retrieval to `herdr pane read`.
+The optional vendor-neutral Agent Skill teaches compatible clients to call
+`boomux shells` and `boomux read`. `BOOMUX_SHELL_ID` provides current-shell
+context while exact shell IDs remain globally addressable within the daemon.
 
-## Known Constraints
+## Runtime Semantics
 
-- Boomux tracks the exact latest stable Herdr release pinned in `mise.toml`
-  until its initial release; other versions are rejected before use.
-- Herdr permits one writable controller per terminal; `--takeover` is explicit.
-- Direct interactive attachment is currently Unix-only.
-- Window launching requires Omarchy's `xdg-terminal-exec` and an installed
-  terminal with compatible XDG desktop-entry metadata.
-- Terminal capabilities such as stable titles vary by emulator.
-- Window titles identify sessions for humans but are not durable machine IDs.
-- Herdr sends rendered ANSI frames, not the original raw PTY output stream.
+Closing a terminal window closes only its socket attachment. The daemon retains
+the PTY master and child. Reopening a window acquires the controller and first
+receives retained raw output followed by live output.
 
-None of these constraints blocks the proposed user experience.
+Closing a shell terminates its child and disconnects its controller. Closing a
+workspace removes all its shells from the registry before terminating them.
+
+Current persistence is deliberately limited to daemon lifetime. Boomux does not
+yet write registry metadata or claim that arbitrary processes survive daemon
+restart or crash.
+
+## Next Technical Steps
+
+1. Add integration tests around real PTY attach, resize, takeover, and teardown.
+2. Track terminal state with a VT parser and emit a sanitized reconnect snapshot.
+3. Negotiate terminal capabilities when the first native attachment creates a
+   shell.
+4. Persist reproducible workspace metadata atomically under `$XDG_STATE_HOME`.
+5. Add graceful daemon restart or live PTY handoff only after the base lifecycle
+   is reliable.

@@ -5,6 +5,9 @@ topic: omarchy-terminal-selection
 
 # Omarchy Terminal Selection
 
+> Historical context: this brainstorm predates Boomux's native PTY backend.
+> References to Herdr describe the implementation that existed on this date.
+
 ## Summary
 
 Boomux will open new windows through Omarchy's default-terminal mechanism while

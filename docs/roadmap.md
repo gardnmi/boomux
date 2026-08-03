@@ -6,7 +6,7 @@ commitments.
 
 ## Completed
 
-- [x] Manage persistent Herdr workspaces and shells from a live Ratatui
+- [x] Manage daemon-owned workspaces and PTY shells from a live Ratatui
   dashboard.
 - [x] Restore a whole workspace into native terminal windows or open only one
   selected terminal.
@@ -28,11 +28,15 @@ commitments.
   desktop-entry overrides.
 - [x] Let agents discover workspace shells and read retained output through a
   vendor-neutral Agent Skill and Boomux CLI commands.
-- [x] Pin and enforce the latest stable Herdr version during pre-release
-  development.
+- [x] Replace the external session backend with a Boomux-owned Unix daemon,
+  socket protocol, PTY lifecycle, and transparent attachment client.
 
 ## Workspace Control
 
+- Reconstruct reconnect state with a VT parser instead of replaying raw bytes.
+- Persist reproducible workspace metadata under `$XDG_STATE_HOME`.
+- Negotiate terminal capabilities when a shell receives its first attachment.
+- Add graceful daemon restart or live PTY handoff.
 - Aggregate multiple agent states as counts instead of one workspace-level
   value.
 - Notify when an agent becomes blocked, finishes, or needs input.
@@ -62,5 +66,5 @@ commitments.
 - Make the Ratatui interface the default and remove the Gum dependency.
 - Add a LazyGit-style interactive keybinding panel.
 - Support configuration for refresh rate and notifications.
-- Package Herdr and Boomux for Arch and Omarchy users.
+- Package Boomux and its daemon lifecycle for Arch and Omarchy users.
 - Validate compatible `xdg-terminal-exec` versions in `boomux doctor`.

@@ -33,7 +33,7 @@ pub(crate) fn selected(desktop_entry: Option<&str>) -> Result<String, Box<dyn Er
 
 pub(crate) fn open(
     desktop_entry: Option<&str>,
-    terminal_id: &str,
+    shell_id: &str,
     title: &str,
     takeover: bool,
 ) -> Result<(), Box<dyn Error>> {
@@ -44,7 +44,8 @@ pub(crate) fn open(
         .arg(r"--print-cmd=\0")
         .arg(format!("--title={title}"))
         .arg("--")
-        .args(["herdr", "terminal", "attach", terminal_id]);
+        .arg(env::current_exe()?)
+        .args(["__attach", shell_id]);
     if takeover {
         resolver.arg("--takeover");
     }
@@ -178,11 +179,11 @@ mod tests {
 
     #[test]
     fn parses_nul_delimited_commands() {
-        let arguments = parse_nul_arguments(b"alacritty\0-e\0herdr\0terminal\0").unwrap();
+        let arguments = parse_nul_arguments(b"alacritty\0-e\0boomux\0__attach\0").unwrap();
 
         assert_eq!(
             arguments,
-            ["alacritty", "-e", "herdr", "terminal"]
+            ["alacritty", "-e", "boomux", "__attach"]
                 .map(OsStr::new)
                 .map(OsStr::to_owned)
         );
