@@ -6,8 +6,8 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use boomux::client::Client;
-use boomux::protocol::{AttachFrame, ShellSpec, ShellStatus};
+use boomux::client::{Attachment, Client};
+use boomux::protocol::{AttachFrame, ShellSpec, ShellStatus, TerminalProfile};
 use uuid::Uuid;
 
 const TIMEOUT: Duration = Duration::from_secs(5);
@@ -32,6 +32,10 @@ impl TestDaemon {
             .args(["daemon", "run"])
             .env("XDG_RUNTIME_DIR", &runtime_dir)
             .env("SHELL", "/bin/sh")
+            .env("TERM", "daemon-term")
+            .env("COLORTERM", "daemon-color")
+            .env("TERM_PROGRAM", "daemon-program")
+            .env("TERM_PROGRAM_VERSION", "daemon-version")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -93,7 +97,7 @@ fn native_daemon_lifecycle() {
         .output()
         .unwrap();
     assert!(status.status.success());
-    assert!(String::from_utf8_lossy(&status.stdout).contains("running (protocol 2"));
+    assert!(String::from_utf8_lossy(&status.stdout).contains("running (protocol 3"));
 
     let mut duplicate = daemon
         .command()
@@ -122,6 +126,34 @@ fn native_daemon_lifecycle() {
         .get_workspace(&generated_shell.workspace_id)
         .unwrap();
     assert_eq!(generated_workspace.name, "workspace-1");
+    assert_eq!(generated_shell.status, ShellStatus::Pending);
+    assert!(
+        daemon
+            .client
+            .read_shell(&generated_shell.id, 1024)
+            .unwrap()
+            .is_empty()
+    );
+    let failed_shell = daemon
+        .client
+        .create_shell(
+            &generated_workspace.id,
+            ShellSpec {
+                name: "failed".into(),
+                command: vec!["/definitely/missing/boomux-command".into()],
+                cwd: std::env::temp_dir(),
+            },
+        )
+        .unwrap();
+    let error = daemon
+        .client
+        .attach(&failed_shell.id, false, profile())
+        .unwrap_err();
+    assert!(error.to_string().contains("could not start shell"));
+    assert_eq!(
+        daemon.client.get_shell(&failed_shell.id).unwrap().status,
+        ShellStatus::Pending
+    );
     daemon
         .client
         .close_workspace(&generated_workspace.id)
@@ -137,15 +169,27 @@ fn native_daemon_lifecycle() {
     let shell = workspace.shells.first().unwrap();
     let shell_id = shell.id.clone();
 
-    let (mut first, _, replay) = daemon.client.attach(&shell_id, false).unwrap();
-    assert!(replay.len() <= 1024 * 1024);
-    AttachFrame::Resize { rows: 24, cols: 80 }
-        .write_to(&mut first)
-        .unwrap();
+    assert_eq!(shell.status, ShellStatus::Pending);
+    let attachment = daemon.client.attach(&shell_id, false, profile()).unwrap();
+    assert!(attachment.replay.len() <= 1024 * 1024);
+    assert!(attachment.warning.is_none());
+    let mut first = attachment.stream;
     AttachFrame::Input(b"stty -echo\n".to_vec())
         .write_to(&mut first)
         .unwrap();
     thread::sleep(Duration::from_millis(100));
+    AttachFrame::Input(b"stty size\n".to_vec())
+        .write_to(&mut first)
+        .unwrap();
+    assert!(contains(&read_until(&mut first, b"24 80"), b"24 80"));
+    AttachFrame::Input(
+        b"printf 'env=%s|%s|%s|%s\n' \"$TERM\" \"$COLORTERM\" \"$TERM_PROGRAM\" \"$TERM_PROGRAM_VERSION\"\n"
+            .to_vec(),
+    )
+    .write_to(&mut first)
+    .unwrap();
+    let expected = b"env=attachment-term|truecolor|integration-terminal|1.0";
+    assert!(contains(&read_until(&mut first, expected), expected));
     AttachFrame::Input(b"printf 'transport-ok\\n'\n".to_vec())
         .write_to(&mut first)
         .unwrap();
@@ -163,10 +207,19 @@ fn native_daemon_lifecycle() {
         "shell stopped after its attachment disconnected",
     );
 
-    let (mut second, _, _) = wait_for_attach(&daemon.client, &shell_id);
-    let error = daemon.client.attach(&shell_id, false).unwrap_err();
+    let mut second = wait_for_attach(&daemon.client, &shell_id).stream;
+    let error = daemon
+        .client
+        .attach(&shell_id, false, profile())
+        .unwrap_err();
     assert!(error.to_string().contains("active controller"));
-    let (mut takeover, _, _) = daemon.client.attach(&shell_id, true).unwrap();
+    let mut mismatched = profile();
+    mismatched.term = Some("alacritty".into());
+    let takeover = daemon.client.attach(&shell_id, true, mismatched).unwrap();
+    assert!(takeover.warning.as_deref().is_some_and(|warning| {
+        warning.contains("attachment-term") && warning.contains("alacritty")
+    }));
+    let mut takeover = takeover.stream;
     second
         .set_read_timeout(Some(Duration::from_secs(1)))
         .unwrap();
@@ -175,6 +228,8 @@ fn native_daemon_lifecycle() {
     AttachFrame::Resize {
         rows: 40,
         cols: 100,
+        pixel_width: 1200,
+        pixel_height: 800,
     }
     .write_to(&mut takeover)
     .unwrap();
@@ -205,10 +260,10 @@ fn native_daemon_lifecycle() {
     daemon.stop_with_cli();
 }
 
-fn wait_for_attach(client: &Client, shell_id: &str) -> (UnixStream, String, Vec<u8>) {
+fn wait_for_attach(client: &Client, shell_id: &str) -> Attachment {
     let deadline = Instant::now() + TIMEOUT;
     loop {
-        match client.attach(shell_id, false) {
+        match client.attach(shell_id, false, profile()) {
             Ok(attachment) => return attachment,
             Err(error) if error.to_string().contains("active controller") => {
                 assert!(Instant::now() < deadline, "old attachment was not released");
@@ -216,6 +271,19 @@ fn wait_for_attach(client: &Client, shell_id: &str) -> (UnixStream, String, Vec<
             }
             Err(error) => panic!("could not attach: {error}"),
         }
+    }
+}
+
+fn profile() -> TerminalProfile {
+    TerminalProfile {
+        term: Some("attachment-term".into()),
+        colorterm: Some("truecolor".into()),
+        term_program: Some("integration-terminal".into()),
+        term_program_version: Some("1.0".into()),
+        rows: 24,
+        cols: 80,
+        pixel_width: 800,
+        pixel_height: 600,
     }
 }
 

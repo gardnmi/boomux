@@ -625,6 +625,7 @@ fn current_shell(client: &client::Client) -> Result<ShellSnapshot, Box<dyn Error
 
 fn shell_status(status: &ShellStatus) -> &'static str {
     match status {
+        ShellStatus::Pending => "pending",
         ShellStatus::Running => "running",
         ShellStatus::Exited { .. } => "exited",
     }

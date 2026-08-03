@@ -23,9 +23,9 @@ consistently in Ghostty, Alacritty, Kitty, and other XDG terminal emulators.
 | Single-controller takeover | Working |
 | Workspace and shell lifecycle | Working |
 | Graceful daemon stop and process cleanup | Working |
-| First-attachment terminal negotiation | Missing |
-| Correct terminal environment at child startup | Missing |
-| Initial pixel dimensions | Missing |
+| First-attachment terminal negotiation | Working |
+| Correct terminal environment at child startup | Working |
+| Initial pixel dimensions | Working when reported by the terminal |
 | Reconstructed terminal state on reconnect | Missing |
 | ANSI-aware logical output for `boomux read` | Missing |
 | Metadata recovery after daemon restart | Missing |
@@ -40,19 +40,18 @@ atomically creates the next available `workspace-N` container.
 
 ## Current Creation Sequence
 
-Workspace creation itself is empty. The daemon currently starts a process when
-an explicit shell is created, before a native terminal attaches:
+Workspace creation itself is empty. Explicit shell creation records pending
+metadata and waits for a native terminal attachment:
 
 ```text
-create shell with explicit working directory
-  -> daemon allocates PTY
-  -> daemon starts child
+create pending shell with explicit working directory
   -> native terminal opens
-  -> attachment sends rows and columns
+  -> attachment sends terminal profile and dimensions
+  -> daemon allocates the correctly sized PTY
+  -> daemon starts the child with the reported environment
 ```
 
-The child inherits these variables from the process that originally started the
-daemon:
+The attachment explicitly supplies these variables:
 
 ```text
 TERM
@@ -61,18 +60,17 @@ TERM_PROGRAM
 TERM_PROGRAM_VERSION
 ```
 
-Those values may not describe the terminal that eventually renders the shell.
-For example, an Alacritty window may start the daemon and a later Ghostty window
-may attach to a child that still identifies its terminal as Alacritty.
+Missing values remain unset rather than inheriting the daemon's terminal
+environment. A later attachment does not mutate a running child and receives a
+warning when its `TERM` differs from the startup profile.
 
 This can affect terminfo selection, true-color detection, keyboard protocols,
 shell integration, terminal-specific workarounds, and whether an application
 attempts graphics protocols. Direct byte pass-through preserves an extension
 only after the application decides to emit it.
 
-The PTY also begins with a default size. The attachment corrects rows and
-columns afterward, but startup output may already have rendered at the wrong
-dimensions. Pixel width and height are currently sent as zero.
+The PTY begins with the first attachment's rows, columns, pixel width, and pixel
+height. Pixel dimensions may remain zero when the terminal does not report them.
 
 ## Phase 1: Terminal Handshake
 
@@ -159,13 +157,13 @@ testing shows that warnings are insufficient.
 - Reattaching through a mismatched emulator follows the documented warning
   policy.
 
-### Open Product Decision
+### Product Decision
 
 Workspace creation must remain empty. A future explicit shell creation or first
 attachment can create pending shell metadata and delay the command until a
 terminal profile is available.
 
-Choose one behavior before implementation:
+Boomux uses option 2:
 
 1. Open the explicitly requested shell window immediately so it receives a real
    profile.
@@ -173,8 +171,8 @@ Choose one behavior before implementation:
 3. Permit explicit headless shell startup with a documented conservative
    profile.
 
-Option 1 best matches the native-terminal goal. Option 2 is the smallest model.
-Option 3 should be added only for a concrete headless workflow.
+Pending shells remain visible and retryable until opened. Headless startup is
+not supported without a concrete terminal profile.
 
 ## Phase 2: VT Reconnection State
 
@@ -306,14 +304,10 @@ stty size
 
 ## Implementation Order
 
-1. Create `feat/terminal-handshake`.
-2. Add `TerminalProfile` and `Pending` to the shell protocol and domain model.
-3. Move PTY spawn from shell metadata creation to first attachment.
-4. Add emulator mismatch diagnostics and acceptance tests.
-5. Dogfood Alacritty and Ghostty with the manual matrix.
-6. Create a separate VT reconstruction branch.
-7. Replace raw `boomux read` extraction with parser-backed logical lines.
-8. Add metadata persistence only after terminal behavior is stable.
+1. Dogfood Alacritty and Ghostty with the manual matrix.
+2. Create a separate VT reconstruction branch.
+3. Replace raw `boomux read` extraction with parser-backed logical lines.
+4. Add metadata persistence only after terminal behavior is stable.
 
 ## Definition Of Done
 
