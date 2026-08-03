@@ -970,7 +970,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_creates_and_closes_workspace_shells() {
+    fn registry_closes_shell_without_removing_workspace() {
         let registry = Registry::default();
         let workspace = registry
             .create_workspace(
@@ -984,6 +984,11 @@ mod tests {
             .unwrap();
         assert_eq!(workspace.shells.len(), 1);
         assert_eq!(registry.snapshot().unwrap().workspaces.len(), 1);
+
+        registry.close_shell(&workspace.shells[0].id).unwrap();
+        let snapshot = registry.snapshot().unwrap();
+        assert_eq!(snapshot.workspaces.len(), 1);
+        assert!(snapshot.workspaces[0].shells.is_empty());
 
         registry.close_workspace(&workspace.id).unwrap();
         assert!(registry.snapshot().unwrap().workspaces.is_empty());

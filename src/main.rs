@@ -57,6 +57,8 @@ enum Commands {
         #[arg(long, default_value_t = 200, value_parser = clap::value_parser!(u32).range(1..))]
         lines: u32,
     },
+    /// Close a shell by name or shell ID
+    Close { target: String },
     /// Manage the vendor-neutral Boomux Agent Skill
     Skill {
         #[command(subcommand)]
@@ -145,6 +147,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         Some(Commands::List) => list_shells(),
         Some(Commands::Shells) => list_workspace_shells(),
         Some(Commands::Read { target, lines }) => read_shell(&target, lines),
+        Some(Commands::Close { target }) => close_shell(&target),
         Some(Commands::Skill {
             command: SkillCommands::Install { force },
         }) => install_skill(force),
@@ -236,15 +239,27 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
                 open_dashboard_shell(&client, shell_id, terminal.as_deref())
                     .map_err(|error| error.to_string())
             },
-            on_close: |workspace_id: &str| {
-                let name = client
-                    .get_workspace(workspace_id)
-                    .map(|workspace| workspace.name)
-                    .unwrap_or_else(|_| "workspace".into());
-                client
-                    .close_workspace(workspace_id)
-                    .map_err(|error| error.to_string())?;
-                Ok(format!("Closed {name} and all of its shells"))
+            on_close: |target: &tui::CloseTarget| match target {
+                tui::CloseTarget::Workspace(workspace_id) => {
+                    let name = client
+                        .get_workspace(workspace_id)
+                        .map(|workspace| workspace.name)
+                        .unwrap_or_else(|_| "workspace".into());
+                    client
+                        .close_workspace(workspace_id)
+                        .map_err(|error| error.to_string())?;
+                    Ok(format!("Closed {name} and all of its shells"))
+                }
+                tui::CloseTarget::Shell(shell_id) => {
+                    let name = client
+                        .get_shell(shell_id)
+                        .map(|shell| shell.name)
+                        .unwrap_or_else(|_| "shell".into());
+                    client
+                        .close_shell(shell_id)
+                        .map_err(|error| error.to_string())?;
+                    Ok(format!("Closed shell {name}"))
+                }
             },
             on_create_workspace: |name: &str| {
                 create_dashboard_workspace(&client, name).map_err(|error| error.to_string())
@@ -487,6 +502,31 @@ fn read_shell(target: &str, lines: u32) -> Result<(), Box<dyn Error>> {
     if !output.is_empty() && !output.ends_with('\n') {
         println!();
     }
+    Ok(())
+}
+
+fn close_shell(target: &str) -> Result<(), Box<dyn Error>> {
+    let client = client::connect_or_start()?;
+    let snapshot = client.snapshot()?;
+    let current_shell_id = env::var("BOOMUX_SHELL_ID").ok();
+    let current_workspace_id = current_shell_id
+        .as_deref()
+        .and_then(|id| find_shell(&snapshot, id).map(|shell| shell.workspace_id.as_str()));
+    let shell = resolve_shell_target(&snapshot, current_workspace_id, target)?;
+    if current_shell_id.as_deref() == Some(shell.id.as_str()) {
+        return Err(
+            "cannot close the current shell from inside it; use the dashboard or another shell"
+                .into(),
+        );
+    }
+    let workspace_name = snapshot
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.id == shell.workspace_id)
+        .map(|workspace| workspace.name.as_str())
+        .unwrap_or("workspace");
+    client.close_shell(&shell.id)?;
+    println!("Closed shell {} from {workspace_name}", shell.name);
     Ok(())
 }
 
@@ -778,6 +818,12 @@ mod tests {
         assert!(matches!(
             Cli::try_parse_from(["boomux", "doctor"]).unwrap().command,
             Some(Commands::Doctor)
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["boomux", "close", "tests"])
+                .unwrap()
+                .command,
+            Some(Commands::Close { target }) if target == "tests"
         ));
     }
 

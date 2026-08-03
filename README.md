@@ -64,7 +64,7 @@ Dashboard controls:
   table. New dashboard shells start in the directory where the dashboard was
   launched.
 - `e` renames the selected workspace or shell, depending on focus.
-- `x`, then `y`, closes a workspace and all of its processes.
+- `x`, then `y`, closes the selected workspace or shell, depending on focus.
 - `r` refreshes immediately.
 - `q` or `Esc` quits.
 
@@ -80,14 +80,16 @@ boomux doctor
 boomux list
 boomux shells
 boomux read <shell-name-or-shell-id> [--lines <count>]
+boomux close <shell-name-or-shell-id>
 boomux open <shell-id> [--title <title>] [--takeover]
 boomux daemon status
 boomux daemon stop
 boomux skill install
 ```
 
-`boomux shells` lists shells in the current workspace. Shell names are resolved
-within that workspace; exact shell IDs work from anywhere.
+`boomux shells` lists shells in the current workspace. `boomux read` and
+`boomux close` resolve shell names within that workspace; exact shell IDs work
+from anywhere. A shell cannot close itself through the CLI.
 
 `boomux read` reads from the daemon's bounded raw output replay. The current
 proof of concept decodes bytes lossily and selects recent newline-delimited
