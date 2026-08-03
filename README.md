@@ -161,8 +161,29 @@ Supporting commands:
 boomux ui
 boomux doctor
 boomux list
+boomux shells
+boomux read <shell-name-or-terminal-id> [--lines <count>]
 boomux open <terminal-id> [--title <title>] [--takeover]
+boomux skill install
 ```
+
+`boomux shells` lists the named shells in the current Boomux workspace.
+`boomux read` prints retained Herdr scrollback as plain, unwrapped text. Shell
+names are resolved within the current workspace; exact terminal IDs work from
+anywhere.
+
+For natural agent requests such as "read the logs in shell2," install Boomux's
+optional vendor-neutral [Agent Skill](https://agentskills.io):
+
+```console
+boomux skill install
+```
+
+The command writes the bundled skill to
+`~/.agents/skills/boomux-shells/SKILL.md`. Restart the agent client after the
+first installation so it discovers the new skill. The skill teaches compatible
+agents to discover shells and invoke `boomux read`; it contains no
+vendor-specific integration.
 
 ## Architecture
 
@@ -183,8 +204,8 @@ server-owned terminal and its child processes continue running in Herdr.
 - Ratatui with the Crossterm backend for the dashboard
 - Serde and TOML for Herdr responses and layered user configuration
 - Gum for the interactive session chooser
-- Git, `xdg-terminal-exec`, an XDG-compatible terminal, and Herdr as external
-  runtime dependencies
+- Git, `xdg-terminal-exec`, an XDG-compatible terminal, and Herdr 0.7.5 as
+  external runtime dependencies
 
 The MVP uses Gum rather than maintaining its own TUI framework, the Herdr CLI
 rather than a custom socket client, and Omarchy's default-terminal metadata
@@ -192,6 +213,14 @@ rather than per-emulator adapters. Dependencies are added only when a tested
 interaction requires them.
 
 ## Development
+
+Until Boomux's initial release, development tracks the latest stable Herdr
+release. `mise.toml` pins the exact version currently supported; bump that pin
+deliberately when adopting a new Herdr release. Install the pinned tool with:
+
+```console
+mise install
+```
 
 ```console
 cargo run
@@ -201,7 +230,10 @@ cargo run -- . --new
 cargo run -- ui
 cargo run -- doctor
 cargo run -- list
+cargo run -- shells
+cargo run -- read <shell-name-or-terminal-id>
 cargo run -- open <terminal-id>
+cargo run -- skill install
 cargo test
 ```
 
@@ -214,7 +246,13 @@ cargo install --path . --root ~/.local --force
 ```
 
 Cargo installs Boomux directly to `~/.local/bin/boomux`, which is already on
-this machine's `PATH`. Run `boomux` from any directory.
+this machine's `PATH`. Run `boomux` from any directory. Optionally run
+`boomux skill install` after installation to make workspace shell reading
+discoverable to Agent Skills-compatible clients.
+
+Boomux rejects Herdr versions other than the one pinned in `mise.toml`. Direct
+Herdr installations can update with `herdr update`; mise-managed installations
+use `mise install` after pulling the latest Boomux changes.
 
 ## Roadmap
 

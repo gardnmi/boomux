@@ -1,5 +1,6 @@
 use std::env;
 use std::error::Error;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 
@@ -11,6 +12,9 @@ mod git;
 mod projects;
 mod terminal;
 mod tui;
+
+const BOOMUX_SHELLS_SKILL: &str = include_str!("../.agents/skills/boomux-shells/SKILL.md");
+const SUPPORTED_HERDR_VERSION: &str = "0.7.5";
 
 #[derive(Parser)]
 #[command(
@@ -46,6 +50,21 @@ enum Commands {
     Doctor,
     /// List panes managed by Herdr
     List,
+    /// List shells in the current Boomux workspace
+    Shells,
+    /// Read retained output from a shell name or Herdr terminal ID
+    Read {
+        /// Shell name in the current workspace or an exact terminal ID
+        target: String,
+        /// Number of recent output lines to return
+        #[arg(long, default_value_t = 200, value_parser = clap::value_parser!(u32).range(1..))]
+        lines: u32,
+    },
+    /// Manage the vendor-neutral Boomux Agent Skill
+    Skill {
+        #[command(subcommand)]
+        command: SkillCommands,
+    },
     /// Open a Herdr terminal in a new terminal window
     Open {
         /// Herdr terminal ID, available from `boomux list`
@@ -62,6 +81,16 @@ enum Commands {
     Prompt,
 }
 
+#[derive(Subcommand)]
+enum SkillCommands {
+    /// Install the Boomux shell-reading skill under ~/.agents/skills
+    Install {
+        /// Replace an existing skill with the bundled version
+        #[arg(long)]
+        force: bool,
+    },
+}
+
 fn main() -> ExitCode {
     match run(Cli::parse()) {
         Ok(()) => ExitCode::SUCCESS,
@@ -73,6 +102,12 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
+    if !matches!(
+        cli.command.as_ref(),
+        Some(Commands::Doctor | Commands::Skill { .. })
+    ) {
+        ensure_supported_herdr_version()?;
+    }
     if let Some(desktop_entry) = cli.terminal.as_deref() {
         terminal::validate_desktop_entry(desktop_entry)?;
     }
@@ -94,6 +129,11 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         Some(Commands::Ui) => dashboard(cli.terminal.as_deref()),
         Some(Commands::Doctor) => doctor(cli.terminal.as_deref()),
         Some(Commands::List) => run_foreground("herdr", &["pane", "list"]),
+        Some(Commands::Shells) => list_workspace_shells(),
+        Some(Commands::Read { target, lines }) => read_shell(&target, lines),
+        Some(Commands::Skill {
+            command: SkillCommands::Install { force },
+        }) => install_skill(force),
         Some(Commands::Open {
             terminal_id,
             title,
@@ -137,6 +177,16 @@ struct PaneListResult {
 }
 
 #[derive(Deserialize)]
+struct PaneGetResponse {
+    result: PaneGetResult,
+}
+
+#[derive(Deserialize)]
+struct PaneGetResult {
+    pane: Pane,
+}
+
+#[derive(Deserialize)]
 struct WorkspaceListResponse {
     result: WorkspaceListResult,
 }
@@ -173,7 +223,7 @@ struct Workspace {
     agent_status: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 struct Pane {
     pane_id: String,
     tab_id: String,
@@ -748,6 +798,126 @@ fn pane_name(pane: &Pane) -> &str {
         .unwrap_or("shell")
 }
 
+fn list_workspace_shells() -> Result<(), Box<dyn Error>> {
+    let panes = load_panes()?;
+    let current_pane_id = current_pane_id()?;
+    let current = load_pane(&current_pane_id)?;
+
+    println!("NAME\tTERMINAL ID\tSTATUS");
+    for pane in workspace_panes(&current.workspace_id, &panes) {
+        println!(
+            "{}\t{}\t{}",
+            pane_name(pane),
+            pane.terminal_id,
+            display_agent_status(&pane.agent_status)
+        );
+    }
+    Ok(())
+}
+
+fn read_shell(target: &str, lines: u32) -> Result<(), Box<dyn Error>> {
+    let panes = load_panes()?;
+    let current_workspace_id = env::var("HERDR_PANE_ID")
+        .ok()
+        .map(|pane_id| load_pane(&pane_id).map(|pane| pane.workspace_id))
+        .transpose()?;
+    let pane = resolve_shell_target(&panes, current_workspace_id.as_deref(), target)?;
+    let lines = lines.to_string();
+    let status = Command::new("herdr")
+        .args([
+            "pane",
+            "read",
+            &pane.pane_id,
+            "--source",
+            "recent-unwrapped",
+            "--lines",
+            &lines,
+            "--format",
+            "text",
+        ])
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("could not read shell {target:?}: herdr failed with {status}").into())
+    }
+}
+
+fn resolve_shell_target<'a>(
+    panes: &'a [Pane],
+    current_workspace_id: Option<&str>,
+    target: &str,
+) -> Result<&'a Pane, Box<dyn Error>> {
+    if let Some(pane) = panes.iter().find(|pane| pane.terminal_id == target) {
+        return Ok(pane);
+    }
+    let current_workspace_id = current_workspace_id.ok_or_else(|| {
+        format!(
+            "shell name {target:?} requires a Boomux-managed pane; use an exact terminal ID outside Boomux"
+        )
+    })?;
+    let matches = panes
+        .iter()
+        .filter(|pane| pane.workspace_id == current_workspace_id)
+        .filter(|pane| pane_name(pane) == target)
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [pane] => Ok(pane),
+        [] => {
+            let available = panes
+                .iter()
+                .filter(|pane| pane.workspace_id == current_workspace_id)
+                .map(pane_name)
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(format!(
+                "shell {target:?} was not found in this workspace; available shells: {available}"
+            )
+            .into())
+        }
+        _ => Err(format!("shell name {target:?} is ambiguous in this workspace").into()),
+    }
+}
+
+fn current_pane_id() -> Result<String, Box<dyn Error>> {
+    env::var("HERDR_PANE_ID")
+        .map_err(|_| "this command must run inside a Boomux-managed Herdr pane".into())
+}
+
+fn install_skill(force: bool) -> Result<(), Box<dyn Error>> {
+    let home = env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .ok_or("HOME must be an absolute path to install the Boomux skill")?;
+    let path = skill_install_path(&home);
+    if path.is_file() {
+        let existing = fs::read_to_string(&path)?;
+        if existing == BOOMUX_SHELLS_SKILL {
+            println!(
+                "Boomux shell skill is already installed at {}",
+                path.display()
+            );
+            return Ok(());
+        }
+        if !force {
+            return Err(format!(
+                "{} already exists; rerun with --force to replace it",
+                path.display()
+            )
+            .into());
+        }
+    }
+    let directory = path.parent().ok_or("invalid skill installation path")?;
+    fs::create_dir_all(directory)?;
+    fs::write(&path, BOOMUX_SHELLS_SKILL)?;
+    println!("Installed Boomux shell skill at {}", path.display());
+    Ok(())
+}
+
+fn skill_install_path(home: &Path) -> PathBuf {
+    home.join(".agents/skills/boomux-shells/SKILL.md")
+}
+
 fn with_cleanup_error(
     error: Box<dyn Error>,
     cleanup: Result<(), Box<dyn Error>>,
@@ -890,6 +1060,19 @@ fn load_panes() -> Result<Vec<Pane>, Box<dyn Error>> {
     Ok(response.result.panes)
 }
 
+fn load_pane(pane_id: &str) -> Result<Pane, Box<dyn Error>> {
+    let output = Command::new("herdr")
+        .args(["pane", "get", pane_id])
+        .output()?;
+    if !output.status.success() {
+        let message = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("could not resolve current Herdr pane: {}", message.trim()).into());
+    }
+
+    let response: PaneGetResponse = serde_json::from_slice(&output.stdout)?;
+    Ok(response.result.pane)
+}
+
 fn load_workspaces() -> Result<Vec<Workspace>, Box<dyn Error>> {
     let output = Command::new("herdr").args(["workspace", "list"]).output()?;
     if !output.status.success() {
@@ -904,7 +1087,15 @@ fn load_workspaces() -> Result<Vec<Workspace>, Box<dyn Error>> {
 fn doctor(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
     let mut healthy = true;
 
-    for command in ["herdr", "gum", "git"] {
+    match validate_herdr_version() {
+        Ok(message) => println!("ok  herdr: {message}"),
+        Err(error) => {
+            healthy = false;
+            eprintln!("err herdr: {error}");
+        }
+    }
+
+    for command in ["gum", "git"] {
         match Command::new(command).arg("--version").output() {
             Ok(output) if output.status.success() => {
                 let version = String::from_utf8_lossy(&output.stdout);
@@ -957,6 +1148,62 @@ fn doctor(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
     } else {
         Err("one or more dependency or configuration checks failed".into())
     }
+}
+
+fn ensure_supported_herdr_version() -> Result<(), Box<dyn Error>> {
+    validate_herdr_version().map(|_| ())
+}
+
+fn validate_herdr_version() -> Result<String, Box<dyn Error>> {
+    let client_version = installed_herdr_version()?;
+    if client_version != SUPPORTED_HERDR_VERSION {
+        Err(format!(
+            "client {client_version} is installed, but Boomux requires {SUPPORTED_HERDR_VERSION}; run `herdr update` or install the version pinned in mise.toml"
+        )
+        .into())
+    } else {
+        let output = Command::new("herdr").args(["status", "server"]).output()?;
+        if !output.status.success() {
+            return Err(format!("herdr status server failed with {}", output.status).into());
+        }
+        let output = String::from_utf8(output.stdout)?;
+        let Some((server_version, compatible)) = parse_herdr_server_status(&output) else {
+            return Err("server is not running; start Herdr before launching Boomux".into());
+        };
+        if server_version != SUPPORTED_HERDR_VERSION || !compatible {
+            return Err(format!(
+                "client {client_version} is installed, but the running server is {server_version}; restart or hand off Herdr at {SUPPORTED_HERDR_VERSION}"
+            )
+            .into());
+        }
+        Ok(format!("herdr {client_version} (server compatible)"))
+    }
+}
+
+fn installed_herdr_version() -> Result<String, Box<dyn Error>> {
+    let output = Command::new("herdr").arg("--version").output()?;
+    if !output.status.success() {
+        return Err(format!("herdr --version failed with {}", output.status).into());
+    }
+    let output = String::from_utf8(output.stdout)?;
+    parse_herdr_version(&output)
+        .map(str::to_owned)
+        .ok_or_else(|| format!("could not parse version from {output:?}").into())
+}
+
+fn parse_herdr_version(output: &str) -> Option<&str> {
+    output.trim().strip_prefix("herdr ")
+}
+
+fn parse_herdr_server_status(output: &str) -> Option<(&str, bool)> {
+    let version = output
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("version: "))?;
+    let compatible = output
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("compatible: "))
+        .is_some_and(|value| value == "yes");
+    Some((version, compatible))
 }
 
 fn open_terminal(
@@ -1070,6 +1317,100 @@ mod tests {
             Cli::try_parse_from(["boomux", "--terminal", "Alacritty.desktop", "doctor"]).unwrap();
         assert!(matches!(cli.command, Some(Commands::Doctor)));
         assert_eq!(cli.terminal.as_deref(), Some("Alacritty.desktop"));
+    }
+
+    #[test]
+    fn parses_shell_read_and_skill_commands() {
+        let cli = Cli::try_parse_from(["boomux", "shells"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Shells)));
+
+        let cli = Cli::try_parse_from(["boomux", "read", "tests", "--lines", "50"]).unwrap();
+        let Some(Commands::Read { target, lines }) = cli.command else {
+            panic!("expected read command");
+        };
+        assert_eq!(target, "tests");
+        assert_eq!(lines, 50);
+
+        let cli = Cli::try_parse_from(["boomux", "skill", "install", "--force"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Skill {
+                command: SkillCommands::Install { force: true }
+            })
+        ));
+    }
+
+    #[test]
+    fn resolves_terminal_ids_directly_and_names_within_the_current_workspace() {
+        let mut current = test_pane("current", "w1:t1");
+        current.terminal_id = "term_current".into();
+        current.label = Some("agent".into());
+        let mut tests = test_pane("tests", "w1:t2");
+        tests.terminal_id = "term_tests".into();
+        tests.label = Some("shell2".into());
+        let mut other = test_pane("other", "w2:t1");
+        other.workspace_id = "w2".into();
+        other.terminal_id = "term_other".into();
+        other.label = Some("shell2".into());
+        let panes = [current, tests, other];
+
+        assert_eq!(
+            resolve_shell_target(&panes, Some("w1"), "shell2")
+                .unwrap()
+                .pane_id,
+            "tests"
+        );
+        assert_eq!(
+            resolve_shell_target(&panes, None, "term_other")
+                .unwrap()
+                .pane_id,
+            "other"
+        );
+        assert!(resolve_shell_target(&panes, None, "shell2").is_err());
+    }
+
+    #[test]
+    fn rejects_ambiguous_shell_names() {
+        let current = test_pane("current", "w1:t1");
+        let mut first = test_pane("first", "w1:t2");
+        first.label = Some("tests".into());
+        let mut second = test_pane("second", "w1:t3");
+        second.label = Some("tests".into());
+
+        let error =
+            resolve_shell_target(&[current, first, second], Some("w1"), "tests").unwrap_err();
+
+        assert!(error.to_string().contains("ambiguous"));
+    }
+
+    #[test]
+    fn installs_the_skill_under_the_vendor_neutral_agents_directory() {
+        assert_eq!(
+            skill_install_path(Path::new("/home/example")),
+            PathBuf::from("/home/example/.agents/skills/boomux-shells/SKILL.md")
+        );
+    }
+
+    #[test]
+    fn parses_runtime_pane_lookup_into_canonical_workspace_metadata() {
+        let response: PaneGetResponse = serde_json::from_str(
+            r#"{
+                "result": {
+                    "pane": {
+                        "pane_id": "w1-3",
+                        "tab_id": "w1:t1",
+                        "terminal_id": "term_agent",
+                        "workspace_id": "w1",
+                        "cwd": "/tmp/project",
+                        "agent_status": "idle"
+                    }
+                }
+            }"#,
+        )
+        .expect("valid pane response");
+
+        assert_eq!(response.result.pane.pane_id, "w1-3");
+        assert_eq!(response.result.pane.workspace_id, "w1");
     }
 
     #[test]
@@ -1292,7 +1633,7 @@ mod tests {
     }
 
     #[test]
-    fn recipe_creation_commands_include_labels_and_environment() {
+    fn herdr_creation_commands_match_the_pinned_cli() {
         assert_eq!(
             command_args(&workspace_create_command(
                 Path::new("/tmp/project"),
@@ -1336,6 +1677,21 @@ mod tests {
                 "--focus",
             ]
         );
+    }
+
+    #[test]
+    fn parses_only_the_pinned_herdr_version() {
+        assert_eq!(parse_herdr_version("herdr 0.7.5\n"), Some("0.7.5"));
+        assert_eq!(parse_herdr_version("herdr 0.6.8"), Some("0.6.8"));
+        assert_eq!(parse_herdr_version("unexpected"), None);
+        assert_eq!(SUPPORTED_HERDR_VERSION, "0.7.5");
+        assert_eq!(
+            parse_herdr_server_status(
+                "status: running\nversion: 0.7.5\nprotocol: 17\ncompatible: yes\n"
+            ),
+            Some(("0.7.5", true))
+        );
+        assert_eq!(parse_herdr_server_status("status: not running\n"), None);
     }
 
     #[test]

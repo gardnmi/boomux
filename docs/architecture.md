@@ -92,8 +92,8 @@ Each recipe defines one or more durable terminal names and optional startup
 commands.
 
 The first recipe terminal reuses the workspace root pane; later terminals use
-Herdr tabs. Boomux labels every tab and pane, applies the existing workspace and
-shell environment variables, and delivers configured startup commands through
+Herdr tabs. Boomux labels every tab and pane, applies the workspace and shell
+environment variables, and delivers configured startup commands through
 `herdr pane run`. Herdr acknowledges command delivery rather than process
 liveness. After Herdr returns the root workspace identity, provisioning is
 transactional at the workspace boundary: later creation, labeling, or delivery
@@ -107,8 +107,19 @@ Resolves Omarchy's default terminal or a Boomux-specific XDG desktop entry and
 creates native windows with human-readable titles when supported. Boomux does
 not rely on compositor-specific window IDs or control APIs.
 
+### Agent Skill
+
+The repository contains a vendor-neutral Agent Skill that teaches compatible
+agents to list workspace shells and read retained output through Boomux. The
+binary embeds the same skill source and installs it only after an explicit user
+command under `~/.agents/skills`. Name resolution uses the invoking Herdr pane
+to stay within its Boomux workspace, while exact terminal IDs remain globally
+addressable. Boomux delegates scrollback retrieval to `herdr pane read`.
+
 ## Known Constraints
 
+- Boomux tracks the exact latest stable Herdr release pinned in `mise.toml`
+  until its initial release; other versions are rejected before use.
 - Herdr permits one writable controller per terminal; `--takeover` is explicit.
 - Direct interactive attachment is currently Unix-only.
 - Window launching requires Omarchy's `xdg-terminal-exec` and an installed

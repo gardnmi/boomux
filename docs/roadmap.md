@@ -26,6 +26,10 @@ commitments.
   `boomux doctor`.
 - [x] Follow Omarchy's default terminal with persistent and per-invocation XDG
   desktop-entry overrides.
+- [x] Let agents discover workspace shells and read retained output through a
+  vendor-neutral Agent Skill and Boomux CLI commands.
+- [x] Pin and enforce the latest stable Herdr version during pre-release
+  development.
 
 ## Workspace Control
 
@@ -59,4 +63,4 @@ commitments.
 - Add a LazyGit-style interactive keybinding panel.
 - Support configuration for refresh rate and notifications.
 - Package Herdr and Boomux for Arch and Omarchy users.
-- Validate compatible Herdr and `xdg-terminal-exec` versions in `boomux doctor`.
+- Validate compatible `xdg-terminal-exec` versions in `boomux doctor`.
