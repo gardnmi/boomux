@@ -31,6 +31,7 @@ impl TestDaemon {
         let child = Command::new(&executable)
             .args(["daemon", "run"])
             .env("XDG_RUNTIME_DIR", &runtime_dir)
+            .env("XDG_STATE_HOME", runtime_dir.join("state"))
             .env("SHELL", "/bin/sh")
             .env("TERM", "daemon-term")
             .env("COLORTERM", "daemon-color")
@@ -54,7 +55,26 @@ impl TestDaemon {
     fn command(&self) -> Command {
         let mut command = Command::new(&self.executable);
         command.env("XDG_RUNTIME_DIR", &self.runtime_dir);
+        command.env("XDG_STATE_HOME", self.runtime_dir.join("state"));
         command
+    }
+
+    fn restart(&mut self) {
+        assert!(self.child.is_none());
+        let child = self
+            .command()
+            .args(["daemon", "run"])
+            .env("SHELL", "/bin/sh")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        self.child = Some(child);
+        wait_until(
+            || self.client.ping().is_ok(),
+            "restarted daemon did not accept requests",
+        );
     }
 
     fn stop_with_cli(&mut self) {
@@ -88,6 +108,76 @@ impl Drop for TestDaemon {
 }
 
 #[test]
+fn native_daemon_recovers_reproducible_metadata_after_restart() {
+    let mut daemon = TestDaemon::start();
+    let workspace = daemon
+        .client
+        .create_workspace(
+            "persistent",
+            vec![ShellSpec {
+                name: "restored".into(),
+                command: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "printf 'restored-command\\n'; sleep 30".into(),
+                ],
+                cwd: std::env::temp_dir(),
+            }],
+        )
+        .unwrap();
+    let shell = workspace.shells.first().unwrap();
+    let workspace_id = workspace.id.clone();
+    let shell_id = shell.id.clone();
+    let mut first = daemon
+        .client
+        .attach(&shell_id, false, profile())
+        .unwrap()
+        .stream;
+    assert!(contains(
+        &read_until(&mut first, b"restored-command"),
+        b"restored-command"
+    ));
+    drop(first);
+    daemon
+        .client
+        .rename_workspace(&workspace_id, "persistent-renamed")
+        .unwrap();
+    daemon
+        .client
+        .rename_shell(&shell_id, "restored-renamed")
+        .unwrap();
+    let persisted: serde_json::Value = serde_json::from_slice(
+        &fs::read(daemon.runtime_dir.join("state/boomux/state.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        persisted["workspaces"][0]["shells"][0]["last_profile"]["term"],
+        "attachment-term"
+    );
+
+    daemon.stop_with_cli();
+    daemon.restart();
+
+    let restored = daemon.client.get_workspace(&workspace_id).unwrap();
+    assert_eq!(restored.name, "persistent-renamed");
+    assert_eq!(restored.shells.len(), 1);
+    assert_eq!(restored.shells[0].id, shell_id);
+    assert_eq!(restored.shells[0].name, "restored-renamed");
+    assert_eq!(restored.shells[0].status, ShellStatus::Pending);
+    let mut second = daemon
+        .client
+        .attach(&shell_id, false, profile())
+        .unwrap()
+        .stream;
+    assert!(contains(
+        &read_until(&mut second, b"restored-command"),
+        b"restored-command"
+    ));
+    drop(second);
+    daemon.stop_with_cli();
+}
+
+#[test]
 fn native_daemon_lifecycle() {
     let mut daemon = TestDaemon::start();
 
@@ -97,7 +187,7 @@ fn native_daemon_lifecycle() {
         .output()
         .unwrap();
     assert!(status.status.success());
-    assert!(String::from_utf8_lossy(&status.stdout).contains("running (protocol 3"));
+    assert!(String::from_utf8_lossy(&status.stdout).contains("running (protocol 4"));
 
     let mut duplicate = daemon
         .command()
@@ -112,6 +202,23 @@ fn native_daemon_lifecycle() {
         "second daemon did not reject the held startup lock",
     );
     assert!(!duplicate.wait().unwrap().success());
+
+    let second_runtime = daemon.runtime_dir.join("second-runtime");
+    fs::create_dir(&second_runtime).unwrap();
+    let mut duplicate_state = Command::new(&daemon.executable)
+        .args(["daemon", "run"])
+        .env("XDG_RUNTIME_DIR", &second_runtime)
+        .env("XDG_STATE_HOME", daemon.runtime_dir.join("state"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_until(
+        || duplicate_state.try_wait().unwrap().is_some(),
+        "second daemon did not reject the held state lock",
+    );
+    assert!(!duplicate_state.wait().unwrap().success());
 
     let output = daemon
         .command()
@@ -251,7 +358,7 @@ fn native_daemon_lifecycle() {
 
     assert_eq!(shell.status, ShellStatus::Pending);
     let attachment = daemon.client.attach(&shell_id, false, profile()).unwrap();
-    assert!(attachment.replay.len() <= 1024 * 1024);
+    assert!(attachment.reconstruction.len() <= 1024 * 1024);
     assert!(attachment.warning.is_none());
     let mut first = attachment.stream;
     AttachFrame::Input(b"stty -echo\n".to_vec())
@@ -275,6 +382,21 @@ fn native_daemon_lifecycle() {
         .unwrap();
     let output = read_until(&mut first, b"transport-ok");
     assert!(contains(&output, b"transport-ok"));
+    AttachFrame::Input(
+        b"printf 'G101MjtjO1kyeHBjR0p2WVhKawc=' | base64 -d; printf 'progress\rsettled\n'\n"
+            .to_vec(),
+    )
+    .write_to(&mut first)
+    .unwrap();
+    let output = read_until(&mut first, b"settled");
+    assert!(
+        contains(&output, b"\x1b]52;c;Y2xpcGJvYXJk\x07"),
+        "{output:?}"
+    );
+    let rendered = daemon.client.read_shell(&shell_id, 1024).unwrap();
+    assert!(contains(&rendered, b"settled"));
+    assert!(!rendered.contains(&b'\x1b'));
+    assert!(!contains(&rendered, b"Y2xpcGJvYXJk"));
 
     drop(first);
     wait_until(
@@ -287,7 +409,17 @@ fn native_daemon_lifecycle() {
         "shell stopped after its attachment disconnected",
     );
 
-    let mut second = wait_for_attach(&daemon.client, &shell_id).stream;
+    let second_attachment = wait_for_attach(&daemon.client, &shell_id);
+    assert!(!contains(
+        &second_attachment.reconstruction,
+        b"\x1b]52;c;Y2xpcGJvYXJk\x07"
+    ));
+    assert!(!contains(
+        &second_attachment.reconstruction,
+        b"Y2xpcGJvYXJk"
+    ));
+    assert!(contains(&second_attachment.reconstruction, b"settled"));
+    let mut second = second_attachment.stream;
     let error = daemon
         .client
         .attach(&shell_id, false, profile())

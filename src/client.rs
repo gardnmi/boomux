@@ -14,6 +14,7 @@ use crate::protocol::{
 
 const CONNECT_ATTEMPTS: usize = 40;
 const CONNECT_DELAY: Duration = Duration::from_millis(25);
+const SHUTDOWN_ATTEMPTS: usize = 200;
 
 #[derive(Debug, Clone)]
 pub struct Client {
@@ -24,7 +25,7 @@ pub struct Client {
 pub struct Attachment {
     pub stream: UnixStream,
     pub token: String,
-    pub replay: Vec<u8>,
+    pub reconstruction: Vec<u8>,
     pub warning: Option<String>,
 }
 
@@ -123,7 +124,17 @@ impl Client {
     }
 
     pub fn shutdown(&self) -> io::Result<()> {
-        expect_ok(self.request(Request::Shutdown)?, Response::Ok)
+        expect_ok(self.request(Request::Shutdown)?, Response::Ok)?;
+        for _ in 0..SHUTDOWN_ATTEMPTS {
+            if !self.socket_path.exists() {
+                return Ok(());
+            }
+            thread::sleep(CONNECT_DELAY);
+        }
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "Boomux daemon did not finish shutting down",
+        ))
     }
 
     pub fn snapshot(&self) -> io::Result<Snapshot> {
@@ -259,12 +270,12 @@ impl Client {
         match response {
             Response::Attached {
                 token,
-                replay,
+                reconstruction,
                 warning,
             } => Ok(Attachment {
                 stream,
                 token,
-                replay,
+                reconstruction,
                 warning,
             }),
             other => unexpected(other),

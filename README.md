@@ -117,9 +117,9 @@ for scripts and integrations. `shell create` records a pending shell; its PTY
 and process start when the shell is first opened. Shell names require current
 workspace context or `--workspace`; IDs remain globally addressable.
 
-`boomux read` reads from the daemon's bounded raw output replay. The current
-proof of concept decodes bytes lossily and selects recent newline-delimited
-lines. It does not yet interpret ANSI state or terminal soft wrapping.
+`boomux read` reads plain rendered text from the daemon's shadow VT state. It
+understands cursor rewrites and terminal soft wrapping, retains up to 2,000
+scrollback rows per shell, and never returns ANSI control sequences.
 
 ## Configuration
 
@@ -189,17 +189,20 @@ Live PTY bytes pass through unchanged. The attachment client only enables raw
 mode, forwards input and resize events, writes output, and restores terminal
 mode on exit. See [`docs/architecture.md`](docs/architecture.md) for details.
 Shells remain pending until their first attachment reports terminal environment
-and dimensions; that profile initializes the PTY and child process. The
-remaining reconnect and persistence work is tracked in
+and dimensions; that profile initializes the PTY and child process. Reproducible
+workspace and shell metadata is restored after daemon restart. Remaining live
+PTY handoff work is tracked in
 [`docs/native-terminal-follow-up.md`](docs/native-terminal-follow-up.md).
 
 ## POC Limitations
 
-- State and PTYs exist only for the daemon's lifetime.
-- Restarting or crashing the daemon loses all running shells.
-- Reconnection replays at most 1 MiB of raw output, not a reconstructed screen.
-- Alternate-screen applications and truncated escape sequences may replay
-  imperfectly.
+- PTYs and processes exist only for the daemon's lifetime. After restart,
+  persisted shells return as pending and start fresh processes when reopened.
+- Mutated process environment and in-memory application state are not persisted.
+- Reconnection emits at most 1 MiB of sanitized VT reconstruction rather than
+  replaying historical PTY bytes. Graphics are omitted from reconstruction.
+- Alternate-screen applications restore their current screen, but not their
+  alternate-screen history.
 - One writable controller is supported per shell; takeover replaces it.
 - Slow controllers can lose live output chunks rather than block the child.
 - A running shell keeps its first attachment's terminal environment. A later

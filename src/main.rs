@@ -16,7 +16,7 @@ mod terminal;
 mod tui;
 
 const BOOMUX_SHELLS_SKILL: &str = include_str!("../.agents/skills/boomux-shells/SKILL.md");
-const REPLAY_BYTES: usize = 1024 * 1024;
+const READ_BYTES: usize = 1024 * 1024;
 
 #[derive(Parser)]
 #[command(
@@ -721,7 +721,7 @@ fn read_shell(target: &str, lines: u32) -> Result<(), Box<dyn Error>> {
         .ok()
         .and_then(|id| find_shell(&snapshot, &id).map(|shell| shell.workspace_id.clone()));
     let shell = resolve_shell_target(&snapshot, current_workspace_id.as_deref(), target)?;
-    let bytes = client.read_shell(&shell.id, REPLAY_BYTES)?;
+    let bytes = client.read_shell(&shell.id, READ_BYTES)?;
     let output = recent_lines(&String::from_utf8_lossy(&bytes), lines as usize);
     print!("{output}");
     if !output.is_empty() && !output.ends_with('\n') {
@@ -1215,7 +1215,7 @@ mod tests {
     }
 
     #[test]
-    fn selects_recent_lossy_replay_lines() {
+    fn selects_recent_rendered_lines() {
         assert_eq!(recent_lines("one\ntwo\nthree\n", 2), "two\nthree\n");
         assert_eq!(recent_lines("one\ntwo", 1), "two");
     }

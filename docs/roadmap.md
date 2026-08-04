@@ -40,15 +40,16 @@ commitments.
   cell dimensions, and pixel dimensions.
 - [x] Expose workspace and shell create, inspect, rename, and close operations
   through explicit CLI command groups.
+- [x] Reconstruct reconnect state with a shadow VT parser and expose plain
+  rendered scrollback through `boomux read`.
+- [x] Persist reproducible workspace and shell metadata atomically under
+  `$XDG_STATE_HOME`; restore shells as pending after daemon restart.
 
 ## Workspace Control
 
 See [`native-terminal-follow-up.md`](native-terminal-follow-up.md) for the
 terminal handshake, VT reconstruction, and restart-persistence plan.
 
-- Reconstruct reconnect state with a VT parser instead of replaying raw bytes.
-- Persist reproducible workspace and shell metadata under `$XDG_STATE_HOME`,
-  keeping working directories on shells only.
 - Add graceful daemon restart or live PTY handoff.
 - Aggregate multiple agent states as counts instead of one workspace-level
   value.
