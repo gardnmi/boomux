@@ -14,8 +14,7 @@ acknowledged upgrade path.
 - The listener socket and both daemon lock file descriptions keep their existing
   ownership across the transition.
 - A failed replacement resumes the old daemon without killing shells.
-- The first implementation rejects active controllers rather than disconnecting
-  an attached terminal without consent.
+- Active controllers acknowledge a reconnect boundary before PTY transfer.
 - Received descriptors are close-on-exec, strictly typed by marker, and closed
   on every malformed transfer.
 
@@ -34,26 +33,36 @@ transferred separately. The replacement cannot inherit Unix parenthood; process
 monitoring and cleanup therefore need an imported-process representation, with
 a Linux pidfd where available.
 
-Bootstrap starts with the `BOOMUXH1` version header and has bounded read/write
+Bootstrap starts with the `BOOMUXH2` version header and has bounded read/write
 deadlines. The receiver validates the listener path/type, forces nonblocking
 mode, matches both lock-file inodes, and establishes exclusive flock ownership
 before acknowledging readiness. Explicit abort closes every received duplicate
 without affecting descriptors retained by the old daemon.
+
+For each detached running shell, the old reader pauses before the manifest is
+captured. The replacement validates the session leader and pidfd, reconstructs
+terminal state, and waits at `PREPARED`; it does not begin reading the PTY until
+`FINALIZE`, so rollback cannot consume output belonging to the old daemon.
+PTY/session identity is cross-checked with `TIOCGSID`, terminal reconstructions
+use separate bounded frames, and imported process/session cleanup uses pidfds to
+avoid signaling a reused numeric PID.
 
 ## Delivery Slices
 
 1. [Complete] Implement and test strict single-descriptor `SCM_RIGHTS` transport.
 2. [Complete] Replace erased PTY reader/writer ownership with a Boomux-owned Unix
    runtime and a pauseable, joinable reader task.
-3. [Complete for pending shells] Add replacement-daemon bootstrap over a private
+3. [Complete] Add replacement-daemon bootstrap over a private
    socketpair and transfer the listener and lock descriptors with readiness
    acknowledgement.
    `boomux daemon restart` now uses prepare/finalize commit semantics, preserves
    the socket pathname, and rolls back to the old daemon before finalization.
-4. Transfer detached shell runtimes and prove PID, input, output, resize, and
-   later cleanup survive replacement.
-5. Add cooperative attachment reconnection before allowing handoff with active
-   controllers.
+4. [Complete] Transfer detached shell runtimes and prove PID, input, output,
+   resize, repeated replacement, rollback, and later cleanup survive.
+5. [Complete] Add cooperative attachment reconnection with ordered
+   `Reconnect`/`ReconnectAck` framing. Input sent before the ACK is processed by
+   the old daemon; later terminal input remains queued while the client retries
+   the replacement in raw mode.
 
 ## First Acceptance Test
 

@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::PermissionsExt;
@@ -51,6 +51,7 @@ pub fn receive_handoff(channel: i32) -> io::Result<()> {
             listener,
             runtime_lock,
             state_lock,
+            runtimes,
         } => {
             let store = StateStore::from_transferred_lock(state_lock)?;
             let socket_path = client::socket_path()?;
@@ -59,6 +60,7 @@ pub fn receive_handoff(channel: i32) -> io::Result<()> {
                 File::from(runtime_lock),
                 SocketCleanup::disarmed(socket_path),
                 store,
+                runtimes,
                 Some(&mut channel),
             )
         }
@@ -86,6 +88,7 @@ pub fn run() -> io::Result<()> {
         daemon_lock,
         socket_cleanup,
         StateStore::from_environment()?,
+        Vec::new(),
         None,
     )
 }
@@ -95,9 +98,11 @@ fn run_daemon(
     daemon_lock: File,
     mut socket_cleanup: SocketCleanup,
     store: StateStore,
+    transferred_runtimes: Vec<handoff::TransferredRuntime>,
     committed: Option<&mut UnixStream>,
 ) -> io::Result<()> {
     let registry = Arc::new(Registry::restore(store)?);
+    let gated_readers = registry.import_runtimes(transferred_runtimes)?;
     if let Some(channel) = committed {
         channel.write_all(&[handoff::PREPARED])?;
         let mut decision = [0];
@@ -106,6 +111,9 @@ fn run_daemon(
             handoff::ABORT => return Ok(()),
             handoff::FINALIZE => {
                 socket_cleanup.arm();
+                for runtime in gated_readers {
+                    runtime.resume_reader()?;
+                }
                 // FINALIZE is the irreversible ownership boundary. Failure to
                 // report COMMITTED must not make the old daemon resume.
                 let _ = channel.write_all(&[handoff::COMMITTED]);
@@ -117,6 +125,11 @@ fn run_daemon(
                 ));
             }
         }
+    } else if !gated_readers.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "transferred runtimes require a handoff commit channel",
+        ));
     }
     let shutdown = Arc::new(AtomicBool::new(false));
     let transition = Arc::new(AtomicU8::new(TRANSITION_IDLE));
@@ -252,25 +265,55 @@ fn launch_replacement(
 ) -> io::Result<()> {
     let _mutation = lock(&registry.mutation_lock)?;
     registry.ensure_running()?;
-    {
-        let state = lock(&registry.state)?;
-        for shell in state.shells.values() {
-            if !matches!(*lock(&shell.lifecycle)?, ShellLifecycle::Pending) {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "live daemon restart currently requires every shell to be pending",
-                ));
-            }
-        }
-    }
     registry.stopping.store(true, Ordering::Release);
-    let result = launch_replacement_process(
-        listener.as_fd(),
-        daemon_lock.as_fd(),
-        registry.state_lock_descriptor()?,
-    );
+    let mut paused = Vec::new();
+    let result = (|| {
+        registry.quiesce_controllers()?;
+        let state = lock(&registry.state)?;
+        let mut transfers = Vec::new();
+        for shell in state.shells.values() {
+            let (profile, runtime) = match &*lock(&shell.lifecycle)? {
+                ShellLifecycle::Pending => continue,
+                ShellLifecycle::Running { profile, runtime } => {
+                    (profile.clone(), Arc::clone(runtime))
+                }
+                ShellLifecycle::Exited { .. } => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "exited shell runtime transfer is not supported",
+                    ));
+                }
+                ShellLifecycle::Closed => return Err(not_found("shell", &shell.id)),
+            };
+            runtime.pause_reader()?;
+            paused.push(Arc::clone(&runtime));
+            let (pid, pidfd) = lock(&runtime.process)?.transfer_identity()?;
+            let reconstruction = lock(&runtime.terminal)?.reconstruction();
+            transfers.push(OutgoingRuntime {
+                manifest: handoff::RuntimeManifest {
+                    shell_id: shell.id.clone(),
+                    profile,
+                    pid,
+                },
+                runtime,
+                pidfd,
+                reconstruction,
+            });
+        }
+        drop(state);
+        let state_lock = registry.state_lock_descriptor()?;
+        launch_replacement_process(
+            listener.as_fd(),
+            daemon_lock.as_fd(),
+            state_lock,
+            &transfers,
+        )
+    })();
     if result.is_err() {
         registry.stopping.store(false, Ordering::Release);
+        for runtime in paused {
+            let _ = runtime.resume_reader();
+        }
     }
     result
 }
@@ -279,6 +322,7 @@ fn launch_replacement_process(
     listener: BorrowedFd<'_>,
     runtime_lock: BorrowedFd<'_>,
     state_lock: BorrowedFd<'_>,
+    runtimes: &[OutgoingRuntime],
 ) -> io::Result<()> {
     let (mut channel, child_channel) = UnixStream::pair()?;
     let child_channel_fd = child_channel.as_raw_fd();
@@ -311,9 +355,24 @@ fn launch_replacement_process(
 
     let result = (|| {
         channel.write_all(handoff::HEADER)?;
+        protocol::write_message(
+            &mut channel,
+            &handoff::Manifest {
+                runtimes: runtimes
+                    .iter()
+                    .map(|runtime| runtime.manifest.clone())
+                    .collect(),
+            },
+        )?;
         send_descriptor(&channel, listener, handoff::LISTENER_MARKER)?;
         send_descriptor(&channel, runtime_lock, handoff::RUNTIME_LOCK_MARKER)?;
         send_descriptor(&channel, state_lock, handoff::STATE_LOCK_MARKER)?;
+        for runtime in runtimes {
+            let master = lock(&runtime.runtime.master)?;
+            send_descriptor(&channel, master.descriptor.as_fd(), handoff::PTY_MARKER)?;
+            send_descriptor(&channel, runtime.pidfd.as_fd(), handoff::PIDFD_MARKER)?;
+            protocol::write_message(&mut channel, &runtime.reconstruction)?;
+        }
         let mut acknowledgement = [0];
         channel.read_exact(&mut acknowledgement)?;
         if acknowledgement[0] != handoff::READY {
@@ -527,16 +586,39 @@ enum ShellLifecycle {
 struct ShellRuntime {
     control: Mutex<()>,
     master: Mutex<PtyMaster>,
-    child: Mutex<Box<dyn Child + Send + Sync>>,
+    process: Mutex<ManagedProcess>,
     terminal: Mutex<TerminalState>,
     controller: Mutex<Option<Controller>>,
     reader: Mutex<Option<ReaderTask>>,
 }
 
+enum ManagedProcess {
+    Owned(Box<dyn Child + Send + Sync>),
+    Imported(ImportedProcess),
+}
+
+struct ImportedProcess {
+    pid: u32,
+    pidfd: OwnedFd,
+}
+
+struct OutgoingRuntime {
+    manifest: handoff::RuntimeManifest,
+    runtime: Arc<ShellRuntime>,
+    pidfd: OwnedFd,
+    reconstruction: Vec<u8>,
+}
+
 struct Controller {
     token: String,
-    output: SyncSender<Vec<u8>>,
+    output: SyncSender<ControllerOutput>,
     connection: UnixStream,
+    reconnect_ack: Option<SyncSender<()>>,
+}
+
+enum ControllerOutput {
+    Data(Vec<u8>),
+    Reconnect(SyncSender<bool>),
 }
 
 struct PtyMaster {
@@ -559,6 +641,122 @@ enum ReaderCommand {
     },
     Resume,
     Stop,
+}
+
+impl ManagedProcess {
+    fn try_wait_code(&mut self) -> io::Result<Option<Option<u32>>> {
+        match self {
+            Self::Owned(child) => Ok(child.try_wait()?.map(|status| Some(status.exit_code()))),
+            Self::Imported(process) => process.has_exited().map(|exited| exited.then_some(None)),
+        }
+    }
+
+    fn process_id(&self) -> Option<u32> {
+        match self {
+            Self::Owned(child) => child.process_id(),
+            Self::Imported(process) => Some(process.pid),
+        }
+    }
+
+    fn kill(&mut self) -> io::Result<()> {
+        match self {
+            Self::Owned(child) => child.kill(),
+            Self::Imported(process) => process.send_signal(libc::SIGKILL),
+        }
+    }
+
+    fn wait(&mut self) -> io::Result<()> {
+        match self {
+            Self::Owned(child) => child.wait().map(|_| ()),
+            Self::Imported(process) => process.wait(),
+        }
+    }
+
+    fn transfer_identity(&mut self) -> io::Result<(u32, OwnedFd)> {
+        if self.try_wait_code()?.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "exited shell cannot be transferred as a live runtime",
+            ));
+        }
+        match self {
+            Self::Owned(child) => {
+                let pid = child
+                    .process_id()
+                    .ok_or_else(|| io::Error::other("shell process has no PID"))?;
+                Ok((pid, open_pidfd(pid)?))
+            }
+            Self::Imported(process) => Ok((process.pid, process.pidfd.try_clone()?)),
+        }
+    }
+}
+
+fn open_pidfd(pid: u32) -> io::Result<OwnedFd> {
+    // pidfd_open creates a stable kernel reference to the live process.
+    let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    if descriptor == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // pidfd_open returned a new descriptor with ownership transferred here.
+    Ok(unsafe { OwnedFd::from_raw_fd(descriptor as RawFd) })
+}
+
+impl ImportedProcess {
+    fn has_exited(&self) -> io::Result<bool> {
+        let mut descriptor = libc::pollfd {
+            fd: self.pidfd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // The pollfd points to initialized writable memory for one descriptor.
+        let result = unsafe { libc::poll(&mut descriptor, 1, 0) };
+        if result == -1 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(result > 0 && descriptor.revents & libc::POLLIN != 0)
+        }
+    }
+
+    fn send_signal(&self, signal: libc::c_int) -> io::Result<()> {
+        send_pidfd_signal(self.pidfd.as_fd(), signal)
+    }
+
+    fn wait(&self) -> io::Result<()> {
+        let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+        while Instant::now() < deadline {
+            if self.has_exited()? {
+                return Ok(());
+            }
+            thread::sleep(IO_RETRY_DELAY);
+        }
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("process {} did not exit", self.pid),
+        ))
+    }
+}
+
+fn send_pidfd_signal(pidfd: BorrowedFd<'_>, signal: libc::c_int) -> io::Result<()> {
+    // pidfd_send_signal uses the stable process reference held by pidfd.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pidfd.as_raw_fd(),
+            signal,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        )
+    };
+    if result == -1 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            Ok(())
+        } else {
+            Err(error)
+        }
+    } else {
+        Ok(())
+    }
 }
 
 impl PtyMaster {
@@ -601,14 +799,6 @@ impl PtyMaster {
             return Err(io::Error::last_os_error());
         }
         Ok(())
-    }
-
-    fn process_group_leader(&self) -> Option<libc::pid_t> {
-        // The descriptor is a live Unix PTY master.
-        match unsafe { libc::tcgetpgrp(self.descriptor.as_raw_fd()) } {
-            pid if pid > 0 => Some(pid),
-            _ => None,
-        }
     }
 
     fn write(&self, bytes: &[u8]) -> io::Result<usize> {
@@ -859,6 +1049,72 @@ impl Registry {
         })
     }
 
+    fn import_runtimes(
+        &self,
+        transferred: Vec<handoff::TransferredRuntime>,
+    ) -> io::Result<Vec<Arc<ShellRuntime>>> {
+        let state = lock(&self.state)?;
+        let mut prepared = Vec::with_capacity(transferred.len());
+        for transferred in transferred {
+            let manifest = transferred.manifest;
+            validate_terminal_profile(&manifest.profile)?;
+            let shell = state
+                .shells
+                .get(&manifest.shell_id)
+                .cloned()
+                .ok_or_else(|| not_found("persisted shell", &manifest.shell_id))?;
+            if !matches!(*lock(&shell.lifecycle)?, ShellLifecycle::Pending) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "transferred shell is not pending in restored metadata",
+                ));
+            }
+            let stat = fs::read_to_string(format!("/proc/{}/stat", manifest.pid))?;
+            if proc_session_id(&stat) != Some(manifest.pid as libc::pid_t) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "transferred process is not its session leader",
+                ));
+            }
+            let process = ImportedProcess {
+                pid: manifest.pid,
+                pidfd: transferred.pidfd,
+            };
+            if process.has_exited()? {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "transferred process exited before import",
+                ));
+            }
+            let master = PtyMaster::from_descriptor(transferred.pty)?;
+            let reader = master.try_clone_reader()?;
+            let mut terminal = TerminalState::new(manifest.profile.rows, manifest.profile.cols);
+            terminal.process(&transferred.reconstruction);
+            let runtime = Arc::new(ShellRuntime {
+                control: Mutex::new(()),
+                master: Mutex::new(master),
+                process: Mutex::new(ManagedProcess::Imported(process)),
+                terminal: Mutex::new(terminal),
+                controller: Mutex::new(None),
+                reader: Mutex::new(None),
+            });
+            prepared.push((shell, manifest.profile, runtime, reader));
+        }
+        drop(state);
+
+        let mut readers = Vec::with_capacity(prepared.len());
+        for (shell, profile, runtime, reader) in prepared {
+            *lock(&shell.last_profile)? = Some(profile.clone());
+            *lock(&shell.lifecycle)? = ShellLifecycle::Running {
+                profile,
+                runtime: Arc::clone(&runtime),
+            };
+            start_pty_reader(shell, Arc::clone(&runtime), reader, true)?;
+            readers.push(runtime);
+        }
+        Ok(readers)
+    }
+
     fn durable_mutation<T>(&self, operation: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
         let _mutation = lock(&self.mutation_lock)?;
         self.ensure_running()?;
@@ -887,6 +1143,77 @@ impl Registry {
         } else {
             Ok(())
         }
+    }
+
+    fn quiesce_controllers(&self) -> io::Result<()> {
+        let runtimes = {
+            let state = lock(&self.state)?;
+            let mut runtimes = Vec::new();
+            for shell in state.shells.values() {
+                if let ShellLifecycle::Running { runtime, .. } = &*lock(&shell.lifecycle)? {
+                    runtimes.push(Arc::clone(runtime));
+                }
+            }
+            runtimes
+        };
+        let mut acknowledgements = Vec::new();
+        for runtime in &runtimes {
+            let mut controller = lock(&runtime.controller)?;
+            let Some(current) = controller.as_mut() else {
+                continue;
+            };
+            let (written, write_acknowledged) = mpsc::sync_channel(1);
+            let (client_acknowledge, client_acknowledged) = mpsc::sync_channel(1);
+            current.reconnect_ack = Some(client_acknowledge);
+            match current
+                .output
+                .try_send(ControllerOutput::Reconnect(written))
+            {
+                Ok(()) => acknowledgements.push((write_acknowledged, client_acknowledged)),
+                Err(TrySendError::Disconnected(_)) => {
+                    if let Some(current) = controller.take() {
+                        let _ = current.connection.shutdown(std::net::Shutdown::Both);
+                    }
+                }
+                Err(TrySendError::Full(_)) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "active controller output queue is full",
+                    ));
+                }
+            }
+        }
+
+        for (written, client_acknowledged) in acknowledgements {
+            if !written.recv_timeout(HANDSHAKE_TIMEOUT).unwrap_or(false) {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "active controller did not receive reconnect request",
+                ));
+            }
+            if client_acknowledged.recv_timeout(HANDSHAKE_TIMEOUT).is_err() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "active controller did not acknowledge reconnect request",
+                ));
+            }
+        }
+
+        let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+        while Instant::now() < deadline {
+            let mut active = false;
+            for runtime in &runtimes {
+                active |= lock(&runtime.controller)?.is_some();
+            }
+            if !active {
+                return Ok(());
+            }
+            thread::sleep(IO_RETRY_DELAY);
+        }
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "active controllers did not reconnect",
+        ))
     }
 
     fn state_lock_descriptor(&self) -> io::Result<BorrowedFd<'_>> {
@@ -1336,35 +1663,31 @@ impl Shell {
         }
         runtime.pause_reader()?;
         let result = (|| {
-            let foreground_group = lock(&runtime.master)?.process_group_leader();
-            let mut child = lock(&runtime.child)?;
-            if child.try_wait()?.is_some() {
-                return Ok(());
-            }
-            let child_pid = child.process_id().map(|pid| pid as libc::pid_t);
+            let mut process = lock(&runtime.process)?;
+            let exited = process.try_wait_code()?.is_some();
+            let child_pid = process.process_id().map(|pid| pid as libc::pid_t);
             if let Some(session_id) = child_pid {
                 signal_session(session_id, libc::SIGHUP);
-            }
-            for process_group in [foreground_group, child_pid].into_iter().flatten() {
-                // Negative PIDs address a process group. portable-pty starts the
-                // child as a session and process-group leader on Unix.
-                let _ = unsafe { libc::kill(-process_group, libc::SIGHUP) };
             }
             thread::sleep(SHUTDOWN_GRACE);
             if let Some(session_id) = child_pid {
                 signal_session(session_id, libc::SIGTERM);
             }
-            let kill_result = child.kill();
+            let kill_result = if exited { Ok(()) } else { process.kill() };
             thread::sleep(SHUTDOWN_GRACE);
             if let Some(session_id) = child_pid {
                 signal_session(session_id, libc::SIGKILL);
             }
-            let wait_result = child.wait();
-            match (kill_result, wait_result) {
-                (_, Ok(_)) => Ok(()),
+            let wait_result = if exited { Ok(()) } else { process.wait() };
+            let result = match (kill_result, wait_result) {
+                (_, Ok(())) => Ok(()),
                 (Err(error), Err(_)) => Err(error),
                 (Ok(()), Err(error)) => Err(error),
+            };
+            if let Some(session_id) = child_pid {
+                wait_for_session_descendants(session_id)?;
             }
+            result
         })();
         if let Err(error) = result {
             runtime.resume_reader()?;
@@ -1496,7 +1819,7 @@ fn spawn_runtime(
         Arc::new(ShellRuntime {
             control: Mutex::new(()),
             master: Mutex::new(master),
-            child: Mutex::new(child),
+            process: Mutex::new(ManagedProcess::Owned(child)),
             terminal: Mutex::new(TerminalState::new(profile.rows, profile.cols)),
             controller: Mutex::new(None),
             reader: Mutex::new(None),
@@ -1509,128 +1832,135 @@ fn start_pty_reader(
     shell: Arc<Shell>,
     runtime: Arc<ShellRuntime>,
     mut reader: PtyReader,
+    start_paused: bool,
 ) -> io::Result<()> {
     let (commands, command_receiver) = mpsc::channel();
     let reader_runtime = Arc::clone(&runtime);
-    let handle = thread::spawn(move || {
-        let mut buffer = [0; 16 * 1024];
-        let mut stopped = false;
-        let mut paused = false;
-        let mut pause_cancellation: Option<Arc<AtomicBool>> = None;
-        loop {
-            if paused {
-                if pause_cancellation
-                    .as_ref()
-                    .is_some_and(|cancelled| cancelled.load(Ordering::Acquire))
-                {
-                    paused = false;
-                    pause_cancellation = None;
+    let handle = thread::Builder::new()
+        .name(format!("boomux-pty-{}", shell.id))
+        .spawn(move || {
+            let mut buffer = [0; 16 * 1024];
+            let mut stopped = false;
+            let mut paused = start_paused;
+            let mut pause_cancellation: Option<Arc<AtomicBool>> = None;
+            loop {
+                if paused {
+                    if pause_cancellation
+                        .as_ref()
+                        .is_some_and(|cancelled| cancelled.load(Ordering::Acquire))
+                    {
+                        paused = false;
+                        pause_cancellation = None;
+                        continue;
+                    }
+                    match command_receiver.recv_timeout(IO_RETRY_DELAY) {
+                        Ok(ReaderCommand::Pause {
+                            acknowledge,
+                            cancelled,
+                        }) => {
+                            if !cancelled.load(Ordering::Acquire) {
+                                let _ = acknowledge.send(());
+                            }
+                        }
+                        Ok(ReaderCommand::Resume) => {
+                            paused = false;
+                            pause_cancellation = None;
+                        }
+                        Ok(ReaderCommand::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            stopped = true;
+                            break;
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    }
                     continue;
                 }
-                match command_receiver.recv_timeout(IO_RETRY_DELAY) {
+                match command_receiver.try_recv() {
                     Ok(ReaderCommand::Pause {
                         acknowledge,
                         cancelled,
                     }) => {
-                        if !cancelled.load(Ordering::Acquire) {
-                            let _ = acknowledge.send(());
+                        if cancelled.load(Ordering::Acquire) {
+                            continue;
                         }
+                        paused = true;
+                        pause_cancellation = Some(Arc::clone(&cancelled));
+                        if acknowledge.send(()).is_err() || cancelled.load(Ordering::Acquire) {
+                            paused = false;
+                            pause_cancellation = None;
+                        }
+                        continue;
                     }
-                    Ok(ReaderCommand::Resume) => {
-                        paused = false;
-                        pause_cancellation = None;
-                    }
-                    Ok(ReaderCommand::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    Ok(ReaderCommand::Resume) => continue,
+                    Ok(ReaderCommand::Stop) | Err(mpsc::TryRecvError::Disconnected) => {
                         stopped = true;
                         break;
                     }
-                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::TryRecvError::Empty) => {}
                 }
-                continue;
-            }
-            match command_receiver.try_recv() {
-                Ok(ReaderCommand::Pause {
-                    acknowledge,
-                    cancelled,
-                }) => {
-                    if cancelled.load(Ordering::Acquire) {
-                        continue;
-                    }
-                    paused = true;
-                    pause_cancellation = Some(Arc::clone(&cancelled));
-                    if acknowledge.send(()).is_err() || cancelled.load(Ordering::Acquire) {
-                        paused = false;
-                        pause_cancellation = None;
-                    }
-                    continue;
-                }
-                Ok(ReaderCommand::Resume) => continue,
-                Ok(ReaderCommand::Stop) | Err(mpsc::TryRecvError::Disconnected) => {
-                    stopped = true;
-                    break;
-                }
-                Err(mpsc::TryRecvError::Empty) => {}
-            }
-            match reader.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(count) => {
-                    let bytes = &buffer[..count];
-                    if let Ok(mut terminal) = reader_runtime.terminal.lock() {
-                        terminal.process(bytes);
-                        if let Ok(mut controller) = reader_runtime.controller.lock() {
-                            let disconnect = controller.as_ref().is_some_and(|current| {
-                                matches!(
-                                    current.output.try_send(bytes.to_vec()),
-                                    Err(TrySendError::Full(_) | TrySendError::Disconnected(_))
-                                )
-                            });
-                            if disconnect && let Some(current) = controller.take() {
-                                let _ = current.connection.shutdown(std::net::Shutdown::Both);
+                match reader.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(count) => {
+                        let bytes = &buffer[..count];
+                        if let Ok(mut terminal) = reader_runtime.terminal.lock() {
+                            terminal.process(bytes);
+                            if let Ok(mut controller) = reader_runtime.controller.lock() {
+                                let disconnect = controller.as_ref().is_some_and(|current| {
+                                    matches!(
+                                        current
+                                            .output
+                                            .try_send(ControllerOutput::Data(bytes.to_vec())),
+                                        Err(TrySendError::Full(_) | TrySendError::Disconnected(_))
+                                    )
+                                });
+                                if disconnect && let Some(current) = controller.take() {
+                                    let _ = current.connection.shutdown(std::net::Shutdown::Both);
+                                }
                             }
                         }
                     }
-                }
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
-                    ) =>
-                {
-                    if error.kind() == io::ErrorKind::WouldBlock {
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        let process_exited = reader_runtime
+                            .process
+                            .lock()
+                            .ok()
+                            .and_then(|mut process| process.try_wait_code().ok())
+                            .flatten()
+                            .is_some();
+                        if process_exited {
+                            break;
+                        }
                         thread::sleep(IO_RETRY_DELAY);
                     }
-                    continue;
+                    Err(_) => break,
                 }
-                Err(_) => break,
             }
-        }
-        if stopped {
-            return;
-        }
-        let code = reader_runtime
-            .child
-            .lock()
-            .ok()
-            .and_then(|mut child| child.try_wait().ok().flatten())
-            .map(|status| status.exit_code());
-        if let Ok(mut lifecycle) = shell.lifecycle.lock()
-            && let ShellLifecycle::Running {
-                profile,
-                runtime: current,
-            } = &*lifecycle
-            && Arc::ptr_eq(current, &reader_runtime)
-        {
-            *lifecycle = ShellLifecycle::Exited {
-                code,
-                profile: profile.clone(),
-                runtime: Arc::clone(&reader_runtime),
-            };
-        }
-        let _ = reader_runtime
-            .controller
-            .lock()
-            .map(|mut controller| controller.take());
-    });
+            if stopped {
+                return;
+            }
+            let code = reader_runtime
+                .process
+                .lock()
+                .ok()
+                .and_then(|mut process| process.try_wait_code().ok().flatten().flatten());
+            if let Ok(mut lifecycle) = shell.lifecycle.lock()
+                && let ShellLifecycle::Running {
+                    profile,
+                    runtime: current,
+                } = &*lifecycle
+                && Arc::ptr_eq(current, &reader_runtime)
+            {
+                *lifecycle = ShellLifecycle::Exited {
+                    code,
+                    profile: profile.clone(),
+                    runtime: Arc::clone(&reader_runtime),
+                };
+            }
+            let _ = reader_runtime
+                .controller
+                .lock()
+                .map(|mut controller| controller.take());
+        })?;
     *lock(&runtime.reader)? = Some(ReaderTask { commands, handle });
     Ok(())
 }
@@ -1715,7 +2045,7 @@ fn handle_attach(
             };
             *lock(&shell.last_profile)? = Some(profile.clone());
             started = true;
-            start_pty_reader(Arc::clone(&shell), runtime, reader)?;
+            start_pty_reader(Arc::clone(&shell), runtime, reader, false)?;
         }
         match &*lifecycle {
             ShellLifecycle::Running { profile, runtime } => {
@@ -1779,6 +2109,7 @@ fn handle_attach(
     }
     if running {
         lock(&runtime.master)?.resize(profile_size(&profile))?;
+        update_runtime_dimensions(&shell, &runtime, profile_size(&profile))?;
     }
     lock(&runtime.terminal)?.resize(profile.rows, profile.cols);
     // Keep terminal state locked until the controller is installed so the
@@ -1818,21 +2149,40 @@ fn handle_attach(
             token: token.clone(),
             output,
             connection,
+            reconnect_ack: None,
         });
     }
     let mut output_stream = stream.try_clone()?;
     let output_runtime = Arc::clone(&runtime);
     let output_token = token.clone();
     thread::spawn(move || {
-        for bytes in receiver {
-            if AttachFrame::Output(bytes)
-                .write_to(&mut output_stream)
-                .is_err()
-            {
-                break;
+        let mut reconnect = false;
+        while let Ok(output) = receiver.recv() {
+            match output {
+                ControllerOutput::Data(bytes) => {
+                    if AttachFrame::Output(bytes)
+                        .write_to(&mut output_stream)
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                ControllerOutput::Reconnect(acknowledge) => {
+                    reconnect = true;
+                    let result = AttachFrame::Reconnect.write_to(&mut output_stream);
+                    let _ = acknowledge.send(result.is_ok());
+                    if result.is_ok() {
+                        while receiver.recv().is_ok() {}
+                    }
+                    break;
+                }
             }
         }
-        let _ = AttachFrame::Detached.write_to(&mut output_stream);
+        if reconnect {
+            let _ = output_stream.shutdown(std::net::Shutdown::Both);
+        } else {
+            let _ = AttachFrame::Detached.write_to(&mut output_stream);
+        }
         let _ = output_runtime.release_controller(&output_token);
     });
     drop(lifecycle);
@@ -1848,6 +2198,19 @@ fn handle_attach(
                 return Err(error);
             }
         };
+        if matches!(frame, AttachFrame::ReconnectAck) {
+            let acknowledge = {
+                let mut controller = lock(&runtime.controller)?;
+                controller
+                    .as_mut()
+                    .filter(|controller| controller.token == token)
+                    .and_then(|controller| controller.reconnect_ack.take())
+            };
+            if let Some(acknowledge) = acknowledge {
+                let _ = acknowledge.send(());
+            }
+            break;
+        }
         if let AttachFrame::Input(bytes) = frame {
             if !write_controller_input(&runtime, &token, &bytes)? {
                 break;
@@ -1872,13 +2235,15 @@ fn handle_attach(
                 if let Err(error) = validate_terminal_dimensions(rows, cols) {
                     Err(error)
                 } else {
-                    lock(&runtime.master)?.resize(PtySize {
+                    let size = PtySize {
                         rows,
                         cols,
                         pixel_width,
                         pixel_height,
-                    })?;
+                    };
+                    lock(&runtime.master)?.resize(size)?;
                     lock(&runtime.terminal)?.resize(rows, cols);
+                    update_runtime_dimensions(&shell, &runtime, size)?;
                     Ok(())
                 }
             }
@@ -1886,10 +2251,12 @@ fn handle_attach(
                 drop(control);
                 break;
             }
-            AttachFrame::Output(_) => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "client sent output frame",
-            )),
+            AttachFrame::Output(_) | AttachFrame::Reconnect | AttachFrame::ReconnectAck => {
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "client sent a daemon-only attach frame",
+                ))
+            }
         };
         if let Err(error) = result {
             runtime.release_controller(&token)?;
@@ -1931,6 +2298,31 @@ fn profile_size(profile: &TerminalProfile) -> PtySize {
         pixel_width: profile.pixel_width,
         pixel_height: profile.pixel_height,
     }
+}
+
+fn update_runtime_dimensions(
+    shell: &Shell,
+    runtime: &Arc<ShellRuntime>,
+    size: PtySize,
+) -> io::Result<()> {
+    let mut lifecycle = lock(&shell.lifecycle)?;
+    let profile = match &mut *lifecycle {
+        ShellLifecycle::Running {
+            profile,
+            runtime: current,
+        }
+        | ShellLifecycle::Exited {
+            profile,
+            runtime: current,
+            ..
+        } if Arc::ptr_eq(current, runtime) => profile,
+        _ => return Ok(()),
+    };
+    profile.rows = size.rows;
+    profile.cols = size.cols;
+    profile.pixel_width = size.pixel_width;
+    profile.pixel_height = size.pixel_height;
+    Ok(())
 }
 
 fn validate_terminal_profile(profile: &TerminalProfile) -> io::Result<()> {
@@ -1994,9 +2386,24 @@ fn validate_name(name: &str) -> io::Result<()> {
 }
 
 fn signal_session(session_id: libc::pid_t, signal: libc::c_int) {
+    for pid in session_processes(session_id) {
+        let Ok(pidfd) = open_pidfd(pid as u32) else {
+            continue;
+        };
+        let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            continue;
+        };
+        if proc_session_id(&stat) == Some(session_id) {
+            let _ = send_pidfd_signal(pidfd.as_fd(), signal);
+        }
+    }
+}
+
+fn session_processes(session_id: libc::pid_t) -> Vec<libc::pid_t> {
     let Ok(entries) = fs::read_dir("/proc") else {
-        return;
+        return Vec::new();
     };
+    let mut processes = Vec::new();
     for entry in entries.flatten() {
         let Some(pid) = entry
             .file_name()
@@ -2009,10 +2416,30 @@ fn signal_session(session_id: libc::pid_t, signal: libc::c_int) {
             continue;
         };
         if proc_session_id(&stat) == Some(session_id) {
-            // PIDs came from procfs and the signal carries no pointer data.
-            let _ = unsafe { libc::kill(pid, signal) };
+            processes.push(pid);
         }
     }
+    processes
+}
+
+fn wait_for_session_descendants(session_id: libc::pid_t) -> io::Result<()> {
+    let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+    while Instant::now() < deadline {
+        let has_descendants = session_processes(session_id)
+            .into_iter()
+            .any(|pid| pid != session_id);
+        if !has_descendants {
+            return Ok(());
+        }
+        // Repeat the final pass so descendants forked during an earlier scan
+        // cannot escape session cleanup.
+        signal_session(session_id, libc::SIGKILL);
+        thread::sleep(IO_RETRY_DELAY);
+    }
+    Err(io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!("session {session_id} still has descendant processes"),
+    ))
 }
 
 fn proc_session_id(stat: &str) -> Option<libc::pid_t> {
@@ -2196,7 +2623,7 @@ mod tests {
             profile: terminal_profile,
             runtime: Arc::clone(&runtime),
         };
-        start_pty_reader(Arc::clone(&shell), Arc::clone(&runtime), reader).unwrap();
+        start_pty_reader(Arc::clone(&shell), Arc::clone(&runtime), reader, false).unwrap();
 
         runtime.pause_reader().unwrap();
         lock(&runtime.master).unwrap().write(b"paused\n").unwrap();

@@ -1,6 +1,8 @@
 use std::env;
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
+use std::thread;
+use std::time::Duration;
 
 use crossterm::terminal;
 
@@ -8,6 +10,8 @@ use crate::client;
 use crate::protocol::{AttachFrame, TerminalProfile};
 
 const POLL_INTERVAL_MS: i32 = 100;
+const RECONNECT_ATTEMPTS: usize = 600;
+const RECONNECT_DELAY: Duration = Duration::from_millis(25);
 
 struct RawMode;
 
@@ -25,7 +29,7 @@ impl Drop for RawMode {
 }
 
 pub fn run(shell_id: &str, takeover: bool) -> io::Result<()> {
-    let profile = terminal_profile()?;
+    let mut profile = terminal_profile()?;
     let mut size = (
         profile.rows,
         profile.cols,
@@ -33,19 +37,58 @@ pub fn run(shell_id: &str, takeover: bool) -> io::Result<()> {
         profile.pixel_height,
     );
     let client = client::connect_or_start()?;
-    let attachment = client.attach(shell_id, takeover, profile)?;
-    if let Some(warning) = attachment.warning {
-        eprintln!("boomux: warning: {warning}");
-    }
-    let mut stream = attachment.stream;
+    let mut attachment = client.attach(shell_id, takeover, profile.clone())?;
     let _raw_mode = RawMode::enter()?;
     let mut stdin = io::stdin().lock();
     let mut stdout = io::stdout().lock();
-    stdout.write_all(&attachment.reconstruction)?;
-    stdout.flush()?;
-
     let mut input = [0; 16 * 1024];
 
+    loop {
+        if let Some(warning) = attachment.warning.take() {
+            eprintln!("boomux: warning: {warning}");
+        }
+        stdout.write_all(&attachment.reconstruction)?;
+        stdout.flush()?;
+        let mut stream = attachment.stream;
+
+        if !pump_attachment(&mut stream, &mut stdin, &mut stdout, &mut input, &mut size)? {
+            return Ok(());
+        }
+        if let Ok((rows, cols, pixel_width, pixel_height)) = dimensions() {
+            size = (rows, cols, pixel_width, pixel_height);
+            profile.rows = rows;
+            profile.cols = cols;
+            profile.pixel_width = pixel_width;
+            profile.pixel_height = pixel_height;
+        }
+        attachment = reconnect(&client, shell_id, takeover, &profile)?;
+    }
+}
+
+fn reconnect(
+    client: &client::Client,
+    shell_id: &str,
+    takeover: bool,
+    profile: &TerminalProfile,
+) -> io::Result<client::Attachment> {
+    let mut last_error = None;
+    for _ in 0..RECONNECT_ATTEMPTS {
+        match client.attach(shell_id, takeover, profile.clone()) {
+            Ok(attachment) => return Ok(attachment),
+            Err(error) => last_error = Some(error),
+        }
+        thread::sleep(RECONNECT_DELAY);
+    }
+    Err(last_error.unwrap_or_else(|| io::Error::other("daemon attachment did not reconnect")))
+}
+
+fn pump_attachment(
+    stream: &mut std::os::unix::net::UnixStream,
+    stdin: &mut (impl Read + AsRawFd),
+    stdout: &mut impl Write,
+    input: &mut [u8],
+    size: &mut (u16, u16, u16, u16),
+) -> io::Result<bool> {
     loop {
         let mut descriptors = [
             libc::pollfd {
@@ -74,43 +117,47 @@ pub fn run(shell_id: &str, takeover: bool) -> io::Result<()> {
             }
         }
 
-        if descriptors[0].revents & libc::POLLIN != 0 {
-            let count = stdin.read(&mut input)?;
-            if count == 0 {
-                AttachFrame::Detached.write_to(&mut stream)?;
-                return Ok(());
-            }
-            AttachFrame::Input(input[..count].to_vec()).write_to(&mut stream)?;
-        }
         if descriptors[1].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
-            match AttachFrame::read_from(&mut stream) {
+            match AttachFrame::read_from(stream) {
                 Ok(AttachFrame::Output(bytes)) => {
                     stdout.write_all(&bytes)?;
                     stdout.flush()?;
                 }
-                Ok(AttachFrame::Detached) => return Ok(()),
+                Ok(AttachFrame::Detached) => return Ok(false),
+                Ok(AttachFrame::Reconnect) => {
+                    let _ = AttachFrame::ReconnectAck.write_to(stream);
+                    return Ok(true);
+                }
                 Ok(_) => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "daemon sent an invalid attach frame",
                     ));
                 }
-                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(false),
                 Err(error) => return Err(error),
             }
         }
+        if descriptors[0].revents & libc::POLLIN != 0 {
+            let count = stdin.read(input)?;
+            if count == 0 {
+                AttachFrame::Detached.write_to(stream)?;
+                return Ok(false);
+            }
+            AttachFrame::Input(input[..count].to_vec()).write_to(stream)?;
+        }
 
         if let Ok(new_size) = dimensions()
-            && new_size != size
+            && new_size != *size
         {
-            size = new_size;
+            *size = new_size;
             AttachFrame::Resize {
                 rows: size.0,
                 cols: size.1,
                 pixel_width: size.2,
                 pixel_height: size.3,
             }
-            .write_to(&mut stream)?;
+            .write_to(stream)?;
         }
     }
 }
@@ -151,4 +198,48 @@ fn dimensions() -> io::Result<(u16, u16, u16, u16)> {
         ));
     }
     Ok((size.ws_row, size.ws_col, size.ws_xpixel, size.ws_ypixel))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::net::UnixStream;
+
+    use super::*;
+
+    #[test]
+    fn reconnect_frame_finishes_current_pump_after_flushing_output() {
+        let (mut daemon, mut attachment) = UnixStream::pair().unwrap();
+        let (mut fake_stdin, mut stdin_writer) = UnixStream::pair().unwrap();
+        let sender = thread::spawn(move || {
+            AttachFrame::Output(b"before-reconnect".to_vec())
+                .write_to(&mut daemon)
+                .unwrap();
+            AttachFrame::Reconnect.write_to(&mut daemon).unwrap();
+            assert_eq!(
+                AttachFrame::read_from(&mut daemon).unwrap(),
+                AttachFrame::Input(b"queued-input".to_vec())
+            );
+            assert_eq!(
+                AttachFrame::read_from(&mut daemon).unwrap(),
+                AttachFrame::ReconnectAck
+            );
+        });
+        stdin_writer.write_all(b"queued-input").unwrap();
+        let mut stdout = Vec::new();
+        let mut input = [0; 128];
+        let mut size = (24, 80, 0, 0);
+
+        let reconnect = pump_attachment(
+            &mut attachment,
+            &mut fake_stdin,
+            &mut stdout,
+            &mut input,
+            &mut size,
+        )
+        .unwrap();
+
+        sender.join().unwrap();
+        assert!(reconnect);
+        assert_eq!(stdout, b"before-reconnect");
+    }
 }

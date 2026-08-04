@@ -199,8 +199,8 @@ PTY handoff work is tracked in
 
 - PTYs and processes exist only for the daemon's lifetime. After restart,
   persisted shells return as pending and start fresh processes when reopened.
-- Live daemon restart currently requires every shell to be pending; started
-  shell runtime transfer is the next handoff phase.
+- Live daemon restart preserves pending and running shells. Active attachment
+  clients reconnect cooperatively; exited shells use metadata recovery.
 - Mutated process environment and in-memory application state are not persisted.
 - Reconnection emits at most 1 MiB of sanitized VT reconstruction rather than
   replaying historical PTY bytes. Graphics are omitted from reconstruction.

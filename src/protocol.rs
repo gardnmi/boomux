@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 pub const MAX_CONTROL_FRAME: usize = 8 * 1024 * 1024;
 pub const MAX_ATTACH_FRAME: usize = 1024 * 1024;
 
@@ -167,6 +167,8 @@ pub enum AttachFrame {
         pixel_height: u16,
     },
     Detached,
+    Reconnect,
+    ReconnectAck,
 }
 
 impl AttachFrame {
@@ -174,6 +176,8 @@ impl AttachFrame {
     const OUTPUT: u8 = 2;
     const RESIZE: u8 = 3;
     const DETACHED: u8 = 4;
+    const RECONNECT: u8 = 5;
+    const RECONNECT_ACK: u8 = 6;
 
     pub fn write_to(&self, writer: &mut impl Write) -> io::Result<()> {
         let (kind, payload): (u8, &[u8]) = match self {
@@ -193,6 +197,8 @@ impl AttachFrame {
                 return writer.write_all(&pixel_height.to_be_bytes());
             }
             Self::Detached => (Self::DETACHED, &[]),
+            Self::Reconnect => (Self::RECONNECT, &[]),
+            Self::ReconnectAck => (Self::RECONNECT_ACK, &[]),
         };
         if payload.len() > MAX_ATTACH_FRAME {
             return Err(io::Error::new(
@@ -229,6 +235,8 @@ impl AttachFrame {
                 pixel_height: u16::from_be_bytes([payload[6], payload[7]]),
             }),
             Self::DETACHED if payload.is_empty() => Ok(Self::Detached),
+            Self::RECONNECT if payload.is_empty() => Ok(Self::Reconnect),
+            Self::RECONNECT_ACK if payload.is_empty() => Ok(Self::ReconnectAck),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid attach frame",
@@ -310,6 +318,8 @@ mod tests {
                 pixel_height: 1080,
             },
             AttachFrame::Detached,
+            AttachFrame::Reconnect,
+            AttachFrame::ReconnectAck,
         ];
         for frame in frames {
             let mut bytes = Vec::new();

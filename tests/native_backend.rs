@@ -10,7 +10,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use boomux::client::{Attachment, Client};
-use boomux::protocol::{AttachFrame, ShellSpec, ShellStatus, TerminalProfile};
+use boomux::protocol::{self, AttachFrame, ShellSpec, ShellStatus, TerminalProfile};
+use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use uuid::Uuid;
 
 const TIMEOUT: Duration = Duration::from_secs(5);
@@ -175,7 +176,8 @@ fn replacement_bootstrap_receives_listener_and_lock_ownership() {
 
     parent_channel.set_read_timeout(Some(TIMEOUT)).unwrap();
     parent_channel.set_write_timeout(Some(TIMEOUT)).unwrap();
-    parent_channel.write_all(b"BOOMUXH1").unwrap();
+    parent_channel.write_all(b"BOOMUXH2").unwrap();
+    protocol::write_message(&mut parent_channel, &serde_json::json!({ "runtimes": [] })).unwrap();
     send_descriptor(&parent_channel, listener.as_raw_fd(), 1);
     send_descriptor(&parent_channel, runtime_lock.as_raw_fd(), 2);
     send_descriptor(&parent_channel, state_lock.as_raw_fd(), 3);
@@ -280,6 +282,144 @@ fn native_daemon_recovers_reproducible_metadata_after_restart() {
 }
 
 #[test]
+fn native_daemon_handoffs_multiple_detached_shells() {
+    let mut daemon = TestDaemon::start();
+    let workspace = daemon
+        .client
+        .create_workspace(
+            "multiple-live",
+            vec![
+                ShellSpec::login("first", std::env::temp_dir()),
+                ShellSpec::login("second", std::env::temp_dir()),
+            ],
+        )
+        .unwrap();
+    let mut pids = Vec::new();
+    for (index, shell) in workspace.shells.iter().enumerate() {
+        let mut attachment = daemon
+            .client
+            .attach(&shell.id, false, profile())
+            .unwrap()
+            .stream;
+        AttachFrame::Input(b"stty -echo\n".to_vec())
+            .write_to(&mut attachment)
+            .unwrap();
+        thread::sleep(Duration::from_millis(50));
+        let command = format!("printf 'pid{index}=%s:end\\n' \"$$\"\n");
+        AttachFrame::Input(command.into_bytes())
+            .write_to(&mut attachment)
+            .unwrap();
+        let output = read_until(&mut attachment, b":end");
+        pids.push(parse_pid(&output, &format!("pid{index}=")).unwrap());
+    }
+
+    let restart = daemon
+        .command()
+        .args(["daemon", "restart"])
+        .output()
+        .unwrap();
+    assert!(
+        restart.status.success(),
+        "multi-runtime restart failed: {}",
+        String::from_utf8_lossy(&restart.stderr)
+    );
+
+    for (index, shell) in workspace.shells.iter().enumerate() {
+        let mut attachment = daemon
+            .client
+            .attach(&shell.id, false, profile())
+            .unwrap()
+            .stream;
+        let command = format!("printf 'after{index}=%s:end\\n' \"$$\"\n");
+        AttachFrame::Input(command.into_bytes())
+            .write_to(&mut attachment)
+            .unwrap();
+        let output = read_until(&mut attachment, b":end");
+        assert_eq!(
+            parse_pid(&output, &format!("after{index}=")),
+            Some(pids[index])
+        );
+    }
+    daemon.client.close_workspace(&workspace.id).unwrap();
+    daemon.stop_with_cli();
+}
+
+#[test]
+fn attachment_client_reconnects_across_daemon_restart() {
+    let mut daemon = TestDaemon::start();
+    let workspace = daemon
+        .client
+        .create_workspace(
+            "attached-live",
+            vec![ShellSpec::login("attached", std::env::temp_dir())],
+        )
+        .unwrap();
+    let shell_id = workspace.shells[0].id.clone();
+    let pty = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 600,
+        })
+        .unwrap();
+    let descriptor = pty.master.as_raw_fd().unwrap();
+    let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+    assert_ne!(flags, -1);
+    assert_ne!(
+        unsafe { libc::fcntl(descriptor, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        -1
+    );
+    let mut command = CommandBuilder::new(&daemon.executable);
+    command.args(["__attach", &shell_id]);
+    command.env("XDG_RUNTIME_DIR", &daemon.runtime_dir);
+    command.env("XDG_STATE_HOME", daemon.runtime_dir.join("state"));
+    command.env("TERM", "attachment-term");
+    command.env("COLORTERM", "truecolor");
+    command.env("TERM_PROGRAM", "integration-terminal");
+    command.env("TERM_PROGRAM_VERSION", "1.0");
+    let mut attachment_process = pty.slave.spawn_command(command).unwrap();
+    drop(pty.slave);
+    let mut reader = pty.master.try_clone_reader().unwrap();
+    let mut writer = pty.master.take_writer().unwrap();
+    read_raw_until(reader.as_mut(), b"$ ");
+    writer.write_all(b"stty -echo\n").unwrap();
+    thread::sleep(Duration::from_millis(50));
+    writer
+        .write_all(b"printf 'before-live-restart\\n'\n")
+        .unwrap();
+    assert!(contains(
+        &read_raw_until(reader.as_mut(), b"before-live-restart"),
+        b"before-live-restart"
+    ));
+
+    let restart = daemon
+        .command()
+        .args(["daemon", "restart"])
+        .output()
+        .unwrap();
+    assert!(
+        restart.status.success(),
+        "attached client restart failed: {}",
+        String::from_utf8_lossy(&restart.stderr)
+    );
+    writer
+        .write_all(b"printf 'after-live-restart\\n'\n")
+        .unwrap();
+    assert!(contains(
+        &read_raw_until(reader.as_mut(), b"after-live-restart"),
+        b"after-live-restart"
+    ));
+
+    daemon.client.close_workspace(&workspace.id).unwrap();
+    wait_until(
+        || attachment_process.try_wait().unwrap().is_some(),
+        "attachment client did not exit after shell close",
+    );
+    daemon.stop_with_cli();
+}
+
+#[test]
 fn native_daemon_lifecycle() {
     let mut daemon = TestDaemon::start();
 
@@ -289,7 +429,7 @@ fn native_daemon_lifecycle() {
         .output()
         .unwrap();
     assert!(status.status.success());
-    assert!(String::from_utf8_lossy(&status.stdout).contains("running (protocol 5"));
+    assert!(String::from_utf8_lossy(&status.stdout).contains("running (protocol 6"));
 
     let mut duplicate = daemon
         .command()
@@ -532,15 +672,44 @@ fn native_daemon_lifecycle() {
         .unwrap();
     let output = read_until(&mut first, b"transport-ok");
     assert!(contains(&output, b"transport-ok"));
-    let rejected_restart = daemon
-        .command()
+    let state_path = daemon.runtime_dir.join("state/boomux/state.json");
+    let valid_state = fs::read(&state_path).unwrap();
+    fs::write(&state_path, b"invalid active replacement state").unwrap();
+    let mut failed_restart_command = daemon.command();
+    let failed_restart = failed_restart_command
         .args(["daemon", "restart"])
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .unwrap();
-    assert!(!rejected_restart.status.success());
+    acknowledge_reconnect(&mut first);
+    let failed_restart = failed_restart.wait_with_output().unwrap();
+    assert!(!failed_restart.status.success());
+    fs::write(&state_path, valid_state).unwrap();
+    let mut first = wait_for_attach_with_profile(&daemon.client, &shell_id, profile()).stream;
+    AttachFrame::Input(b"printf 'active-rollback-ok\\n'\n".to_vec())
+        .write_to(&mut first)
+        .unwrap();
+    assert!(contains(
+        &read_until(&mut first, b"active-rollback-ok"),
+        b"active-rollback-ok"
+    ));
+
+    let mut restart_command = daemon.command();
+    let restart = restart_command
+        .args(["daemon", "restart"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    acknowledge_reconnect(&mut first);
+    let reconnected = wait_for_attach_with_profile(&daemon.client, &shell_id, profile());
+    let mut first = reconnected.stream;
+    let restart = restart.wait_with_output().unwrap();
     assert!(
-        String::from_utf8_lossy(&rejected_restart.stderr)
-            .contains("requires every shell to be pending")
+        restart.status.success(),
+        "active-controller restart failed: {}",
+        String::from_utf8_lossy(&restart.stderr)
     );
     AttachFrame::Input(b"printf 'still-running\\n'\n".to_vec())
         .write_to(&mut first)
@@ -564,6 +733,24 @@ fn native_daemon_lifecycle() {
     assert!(contains(&rendered, b"settled"));
     assert!(!rendered.contains(&b'\x1b'));
     assert!(!contains(&rendered, b"Y2xpcGJvYXJk"));
+    let mut resized_profile = profile();
+    resized_profile.rows = 40;
+    resized_profile.cols = 100;
+    resized_profile.pixel_width = 1200;
+    resized_profile.pixel_height = 800;
+    AttachFrame::Resize {
+        rows: resized_profile.rows,
+        cols: resized_profile.cols,
+        pixel_width: resized_profile.pixel_width,
+        pixel_height: resized_profile.pixel_height,
+    }
+    .write_to(&mut first)
+    .unwrap();
+    AttachFrame::Input(b"printf 'shellpid=%s:end\\n' \"$$\"\n".to_vec())
+        .write_to(&mut first)
+        .unwrap();
+    let output = read_until(&mut first, b":end");
+    let shell_pid = parse_pid(&output, "shellpid=").expect("shell did not report its PID");
 
     drop(first);
     wait_until(
@@ -575,8 +762,54 @@ fn native_daemon_lifecycle() {
         },
         "shell stopped after its attachment disconnected",
     );
+    let state_path = daemon.runtime_dir.join("state/boomux/state.json");
+    let valid_state = fs::read(&state_path).unwrap();
+    fs::write(&state_path, b"invalid live replacement state").unwrap();
+    let failed_live_restart = daemon
+        .command()
+        .args(["daemon", "restart"])
+        .output()
+        .unwrap();
+    assert!(!failed_live_restart.status.success());
+    fs::write(&state_path, valid_state).unwrap();
+    let mut rollback_attachment =
+        wait_for_attach_with_profile(&daemon.client, &shell_id, resized_profile.clone()).stream;
+    AttachFrame::Input(b"printf 'rollback-ok\\n'\n".to_vec())
+        .write_to(&mut rollback_attachment)
+        .unwrap();
+    assert!(contains(
+        &read_until(&mut rollback_attachment, b"rollback-ok"),
+        b"rollback-ok"
+    ));
+    drop(rollback_attachment);
 
-    let second_attachment = wait_for_attach(&daemon.client, &shell_id);
+    let restart = daemon
+        .command()
+        .args(["daemon", "restart"])
+        .output()
+        .unwrap();
+    assert!(
+        restart.status.success(),
+        "live daemon restart failed: {}",
+        String::from_utf8_lossy(&restart.stderr)
+    );
+    assert_eq!(
+        daemon.client.get_shell(&shell_id).unwrap().status,
+        ShellStatus::Running
+    );
+    let repeated_restart = daemon
+        .command()
+        .args(["daemon", "restart"])
+        .output()
+        .unwrap();
+    assert!(
+        repeated_restart.status.success(),
+        "repeated live daemon restart failed: {}",
+        String::from_utf8_lossy(&repeated_restart.stderr)
+    );
+
+    let second_attachment =
+        wait_for_attach_with_profile(&daemon.client, &shell_id, resized_profile);
     assert!(!contains(
         &second_attachment.reconstruction,
         b"\x1b]52;c;Y2xpcGJvYXJk\x07"
@@ -587,6 +820,15 @@ fn native_daemon_lifecycle() {
     ));
     assert!(contains(&second_attachment.reconstruction, b"settled"));
     let mut second = second_attachment.stream;
+    AttachFrame::Input(b"stty size\n".to_vec())
+        .write_to(&mut second)
+        .unwrap();
+    assert!(contains(&read_until(&mut second, b"40 100"), b"40 100"));
+    AttachFrame::Input(b"printf 'shellpid2=%s:end\\n' \"$$\"\n".to_vec())
+        .write_to(&mut second)
+        .unwrap();
+    let output = read_until(&mut second, b":end");
+    assert_eq!(parse_pid(&output, "shellpid2="), Some(shell_pid));
     let error = daemon
         .client
         .attach(&shell_id, false, profile())
@@ -622,13 +864,24 @@ fn native_daemon_lifecycle() {
         String::from_utf8_lossy(&output)
     );
 
-    AttachFrame::Input(b"sleep 30 & printf 'child=%s\\n' \"$!\"\n".to_vec())
-        .write_to(&mut takeover)
-        .unwrap();
+    AttachFrame::Input(
+        b"/bin/sh -c 'trap \"\" HUP TERM; sleep 30' & printf 'child=%s\\n' \"$!\"; exit\n".to_vec(),
+    )
+    .write_to(&mut takeover)
+    .unwrap();
     let output = read_until(&mut takeover, b"child=");
     let child_pid = parse_child_pid(&output).expect("shell did not report background child PID");
 
     drop(takeover);
+    wait_until(
+        || {
+            matches!(
+                daemon.client.get_shell(&shell_id).unwrap().status,
+                ShellStatus::Exited { .. }
+            )
+        },
+        "imported shell leader exit was not detected",
+    );
     daemon.client.close_workspace(&workspace.id).unwrap();
     wait_until(
         || !process_exists(child_pid),
@@ -639,16 +892,36 @@ fn native_daemon_lifecycle() {
     daemon.stop_with_cli();
 }
 
-fn wait_for_attach(client: &Client, shell_id: &str) -> Attachment {
+fn wait_for_attach_with_profile(
+    client: &Client,
+    shell_id: &str,
+    profile: TerminalProfile,
+) -> Attachment {
     let deadline = Instant::now() + TIMEOUT;
     loop {
-        match client.attach(shell_id, false, profile()) {
+        match client.attach(shell_id, false, profile.clone()) {
             Ok(attachment) => return attachment,
-            Err(error) if error.to_string().contains("active controller") => {
-                assert!(Instant::now() < deadline, "old attachment was not released");
+            Err(error) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "attachment did not reconnect: {error}"
+                );
                 thread::sleep(Duration::from_millis(20));
             }
-            Err(error) => panic!("could not attach: {error}"),
+        }
+    }
+}
+
+fn acknowledge_reconnect(stream: &mut UnixStream) {
+    stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+    loop {
+        match AttachFrame::read_from(stream).unwrap() {
+            AttachFrame::Reconnect => {
+                AttachFrame::ReconnectAck.write_to(stream).unwrap();
+                return;
+            }
+            AttachFrame::Output(_) => {}
+            frame => panic!("expected reconnect frame, got {frame:?}"),
         }
     }
 }
@@ -748,6 +1021,37 @@ fn read_until(stream: &mut UnixStream, needle: &[u8]) -> Vec<u8> {
     );
 }
 
+fn read_raw_until(reader: &mut dyn Read, needle: &[u8]) -> Vec<u8> {
+    let deadline = Instant::now() + TIMEOUT;
+    let mut output = Vec::new();
+    let mut buffer = [0; 16 * 1024];
+    while Instant::now() < deadline {
+        match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => {
+                output.extend_from_slice(&buffer[..count]);
+                if contains(&output, needle) {
+                    return output;
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) =>
+            {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("PTY read failed: {error}"),
+        }
+    }
+    panic!(
+        "did not receive {:?}; PTY output was {:?}",
+        String::from_utf8_lossy(needle),
+        String::from_utf8_lossy(&output)
+    );
+}
+
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack
         .windows(needle.len())
@@ -755,8 +1059,12 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 }
 
 fn parse_child_pid(output: &[u8]) -> Option<libc::pid_t> {
+    parse_pid(output, "child=")
+}
+
+fn parse_pid(output: &[u8], label: &str) -> Option<libc::pid_t> {
     let output = String::from_utf8_lossy(output);
-    let value = output.rsplit_once("child=")?.1;
+    let value = output.rsplit_once(label)?.1;
     let digits = value
         .trim_start_matches(|character: char| !character.is_ascii_digit())
         .chars()

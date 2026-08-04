@@ -6,13 +6,16 @@ use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 
+use serde::{Deserialize, Serialize};
+
 use crate::client;
 use crate::fd_transfer::receive_descriptor;
+use crate::protocol::{self, TerminalProfile};
 use crate::state_store;
 
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 pub(crate) const CHANNEL_FD: RawFd = 198;
-pub(crate) const HEADER: &[u8; 8] = b"BOOMUXH1";
+pub(crate) const HEADER: &[u8; 8] = b"BOOMUXH2";
 pub(crate) const LISTENER_MARKER: u8 = 1;
 pub(crate) const RUNTIME_LOCK_MARKER: u8 = 2;
 pub(crate) const STATE_LOCK_MARKER: u8 = 3;
@@ -22,6 +25,27 @@ pub(crate) const COMMIT: u8 = 6;
 pub(crate) const PREPARED: u8 = 7;
 pub(crate) const FINALIZE: u8 = 8;
 pub(crate) const COMMITTED: u8 = 9;
+pub(crate) const PTY_MARKER: u8 = 10;
+pub(crate) const PIDFD_MARKER: u8 = 11;
+
+#[derive(Serialize, Deserialize)]
+pub(crate) struct Manifest {
+    pub(crate) runtimes: Vec<RuntimeManifest>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct RuntimeManifest {
+    pub(crate) shell_id: String,
+    pub(crate) profile: TerminalProfile,
+    pub(crate) pid: u32,
+}
+
+pub(crate) struct TransferredRuntime {
+    pub(crate) manifest: RuntimeManifest,
+    pub(crate) pty: OwnedFd,
+    pub(crate) pidfd: OwnedFd,
+    pub(crate) reconstruction: Vec<u8>,
+}
 
 pub(crate) enum Bootstrap {
     Aborted,
@@ -30,6 +54,7 @@ pub(crate) enum Bootstrap {
         listener: UnixListener,
         runtime_lock: OwnedFd,
         state_lock: OwnedFd,
+        runtimes: Vec<TransferredRuntime>,
     },
 }
 
@@ -45,9 +70,31 @@ pub(crate) fn receive_bootstrap(channel: RawFd) -> io::Result<Bootstrap> {
             "replacement bootstrap version is unsupported",
         ));
     }
+    let manifest: Manifest = protocol::read_message(&mut channel)?;
+    validate_manifest(&manifest)?;
     let listener = receive_descriptor(&channel, LISTENER_MARKER)?;
     let runtime_lock = receive_descriptor(&channel, RUNTIME_LOCK_MARKER)?;
     let state_lock = receive_descriptor(&channel, STATE_LOCK_MARKER)?;
+    let mut runtimes = Vec::with_capacity(manifest.runtimes.len());
+    for manifest in manifest.runtimes {
+        let pty = receive_descriptor(&channel, PTY_MARKER)?;
+        validate_pty(&pty, manifest.pid)?;
+        let pidfd = receive_descriptor(&channel, PIDFD_MARKER)?;
+        validate_pidfd(&pidfd, manifest.pid)?;
+        let reconstruction: Vec<u8> = protocol::read_message(&mut channel)?;
+        if reconstruction.len() > protocol::MAX_ATTACH_FRAME {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "transferred terminal reconstruction exceeds the size limit",
+            ));
+        }
+        runtimes.push(TransferredRuntime {
+            manifest,
+            pty,
+            pidfd,
+            reconstruction,
+        });
+    }
 
     let expected_socket = client::socket_path()?;
     let listener = UnixListener::from(listener);
@@ -75,12 +122,73 @@ pub(crate) fn receive_bootstrap(channel: RawFd) -> io::Result<Bootstrap> {
             listener,
             runtime_lock,
             state_lock,
+            runtimes,
         }),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "replacement bootstrap received an unsupported decision",
         )),
     }
+}
+
+fn validate_pty(descriptor: &OwnedFd, expected_session: u32) -> io::Result<()> {
+    let mut pty_number = 0_u32;
+    // TIOCGPTN succeeds only for a Unix PTY master and initializes the number.
+    if unsafe { libc::ioctl(descriptor.as_raw_fd(), libc::TIOCGPTN, &mut pty_number) } == -1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "transferred PTY descriptor is invalid: {}",
+                io::Error::last_os_error()
+            ),
+        ));
+    }
+    let mut session_id = 0 as libc::pid_t;
+    // TIOCGSID returns the controlling session associated with this PTY.
+    if unsafe { libc::ioctl(descriptor.as_raw_fd(), libc::TIOCGSID, &mut session_id) } == -1
+        || session_id != expected_session as libc::pid_t
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "transferred PTY does not match its process session",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_pidfd(descriptor: &OwnedFd, expected_pid: u32) -> io::Result<()> {
+    let contents = fs::read_to_string(format!("/proc/self/fdinfo/{}", descriptor.as_raw_fd()))?;
+    let actual_pid = contents.lines().find_map(|line| {
+        line.strip_prefix("Pid:")
+            .and_then(|value| value.trim().parse::<u32>().ok())
+    });
+    if actual_pid == Some(expected_pid) {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "transferred pidfd does not match its process",
+        ))
+    }
+}
+
+fn validate_manifest(manifest: &Manifest) -> io::Result<()> {
+    if manifest.runtimes.len() > 1_024 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "handoff manifest contains too many runtimes",
+        ));
+    }
+    let mut shell_ids = std::collections::HashSet::new();
+    for runtime in &manifest.runtimes {
+        if runtime.pid == 0 || !shell_ids.insert(&runtime.shell_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "handoff manifest contains an invalid runtime",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn adopt_channel(channel: RawFd) -> io::Result<UnixStream> {
