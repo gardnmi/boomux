@@ -1,10 +1,13 @@
 use std::env;
 use std::error::Error;
 use std::fs;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use clap::{Parser, Subcommand};
+use uuid::Uuid;
 
 use boomux::protocol::{ShellSnapshot, ShellSpec, ShellStatus, Snapshot, WorkspaceSnapshot};
 use boomux::{attach, client, daemon, protocol};
@@ -15,7 +18,48 @@ mod projects;
 mod terminal;
 mod tui;
 
-const BOOMUX_SHELLS_SKILL: &str = include_str!("../.agents/skills/boomux-shells/SKILL.md");
+const BOOMUX_SKILL: &str = include_str!("../.agents/skills/boomux/SKILL.md");
+const LEGACY_BOOMUX_SHELLS_SKILL: &str = r#"---
+name: boomux-shells
+description: Read output and logs from Boomux workspace shells. Use when asked to inspect another shell by name, read shell2, examine terminal output, check logs from another terminal, or inspect a Boomux shell ID.
+compatibility: Requires boomux on PATH. Shell-name lookup requires running inside a Boomux-managed shell.
+metadata:
+  author: boomux
+  version: "1"
+---
+
+# Boomux Shells
+
+Use Boomux to inspect output from another persistent shell without asking the
+user to copy terminal contents.
+
+## Read A Shell
+
+When the user provides a shell name or shell ID, run:
+
+```console
+boomux read "<name-or-shell-id>" --lines 200
+```
+
+Use the returned text to answer the user's question. Increase `--lines` when
+the relevant output is older. This reads Boomux's bounded, plain rendered VT
+scrollback. It does not include ANSI sequences or a process's complete
+historical log.
+
+## Discover Shells
+
+When the target is missing, unclear, or not found, run:
+
+```console
+boomux shells
+```
+
+Match the user's wording against the displayed shell names. Ask for
+clarification only when multiple shells remain plausible.
+
+Shell names are resolved within the current Boomux workspace. Exact Boomux
+shell IDs can be read directly.
+"#;
 const READ_BYTES: usize = 1024 * 1024;
 
 #[derive(Parser)]
@@ -155,7 +199,7 @@ enum ShellCommands {
 
 #[derive(Subcommand)]
 enum SkillCommands {
-    /// Install the Boomux shell-reading skill under ~/.agents/skills
+    /// Install the Boomux CLI skill under ~/.agents/skills
     Install {
         #[arg(long)]
         force: bool,
@@ -930,32 +974,134 @@ fn install_skill(force: bool) -> Result<(), Box<dyn Error>> {
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
         .ok_or("HOME must be an absolute path to install the Boomux skill")?;
-    let path = skill_install_path(&home);
-    if path.is_file() {
-        let existing = fs::read_to_string(&path)?;
-        if existing == BOOMUX_SHELLS_SKILL {
-            println!(
-                "Boomux shell skill is already installed at {}",
-                path.display()
-            );
-            return Ok(());
-        }
-        if !force {
+    install_skill_at(&home, force)
+}
+
+fn install_skill_at(home: &Path, force: bool) -> Result<(), Box<dyn Error>> {
+    let directory = ensure_skill_directory(home, "boomux")?;
+    let path = skill_install_path(home);
+    let already_installed = if let Some(existing) = read_regular_file(&path)? {
+        if existing == BOOMUX_SKILL {
+            true
+        } else if !force {
             return Err(format!(
                 "{} already exists; rerun with --force to replace it",
                 path.display()
             )
             .into());
+        } else {
+            false
         }
+    } else {
+        false
+    };
+
+    if already_installed {
+        println!("Boomux skill is already installed at {}", path.display());
+    } else {
+        write_skill_atomically(&directory, &path, BOOMUX_SKILL)?;
+        println!("Installed Boomux skill at {}", path.display());
     }
-    let directory = path.parent().ok_or("invalid skill installation path")?;
-    fs::create_dir_all(directory)?;
-    fs::write(&path, BOOMUX_SHELLS_SKILL)?;
-    println!("Installed Boomux shell skill at {}", path.display());
+    migrate_legacy_skill(home)?;
     Ok(())
 }
 
+fn migrate_legacy_skill(home: &Path) -> Result<(), Box<dyn Error>> {
+    let directory = home.join(".agents/skills/boomux-shells");
+    match fs::symlink_metadata(&directory) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => {
+            return Err(format!(
+                "legacy Boomux skill directory is not a regular directory: {}",
+                directory.display()
+            )
+            .into());
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    }
+    let path = legacy_skill_install_path(home);
+    if let Some(existing) = read_regular_file(&path)? {
+        let entries = fs::read_dir(&directory)?.collect::<Result<Vec<_>, _>>()?;
+        let untouched = existing == LEGACY_BOOMUX_SHELLS_SKILL
+            && entries.len() == 1
+            && entries[0].file_name() == "SKILL.md";
+        if untouched {
+            fs::remove_file(&path)?;
+            if let Some(directory) = path.parent() {
+                let _ = fs::remove_dir(directory);
+            }
+            println!("Removed legacy Boomux shell skill at {}", path.display());
+        } else {
+            eprintln!(
+                "warning: preserved customized legacy Boomux skill at {}; remove it to avoid duplicate guidance",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn ensure_skill_directory(home: &Path, skill: &str) -> Result<PathBuf, Box<dyn Error>> {
+    let mut directory = home.to_owned();
+    for component in [".agents", "skills", skill] {
+        directory.push(component);
+        match fs::symlink_metadata(&directory) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => {
+                return Err(format!(
+                    "skill path component is not a regular directory: {}",
+                    directory.display()
+                )
+                .into());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(&directory)?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(directory)
+}
+
+fn read_regular_file(path: &Path) -> Result<Option<String>, Box<dyn Error>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+            Ok(Some(fs::read_to_string(path)?))
+        }
+        Ok(_) => Err(format!("skill path is not a regular file: {}", path.display()).into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn write_skill_atomically(
+    directory: &Path,
+    path: &Path,
+    content: &str,
+) -> Result<(), Box<dyn Error>> {
+    let temporary = directory.join(format!(".SKILL-{}.tmp", Uuid::new_v4()));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        file.write_all(content.as_bytes())?;
+        file.sync_all()?;
+        fs::rename(&temporary, path)?;
+        Ok::<(), std::io::Error>(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result.map_err(Into::into)
+}
+
 fn skill_install_path(home: &Path) -> PathBuf {
+    home.join(".agents/skills/boomux/SKILL.md")
+}
+
+fn legacy_skill_install_path(home: &Path) -> PathBuf {
     home.join(".agents/skills/boomux-shells/SKILL.md")
 }
 
@@ -1220,7 +1366,152 @@ mod tests {
     fn installs_skill_under_vendor_neutral_directory() {
         assert_eq!(
             skill_install_path(Path::new("/home/example")),
+            PathBuf::from("/home/example/.agents/skills/boomux/SKILL.md")
+        );
+        assert_eq!(
+            legacy_skill_install_path(Path::new("/home/example")),
             PathBuf::from("/home/example/.agents/skills/boomux-shells/SKILL.md")
         );
+    }
+
+    #[test]
+    fn bundled_skill_covers_every_public_command_group() {
+        for command in [
+            "boomux ui",
+            "boomux doctor",
+            "boomux list",
+            "boomux shells",
+            "boomux read",
+            "boomux close",
+            "boomux open",
+            "boomux workspace list",
+            "boomux workspace create",
+            "boomux workspace inspect",
+            "boomux workspace rename",
+            "boomux workspace close",
+            "boomux shell create",
+            "boomux shell inspect",
+            "boomux shell rename",
+            "boomux shell close",
+            "boomux skill install",
+            "boomux daemon status",
+            "boomux daemon restart",
+            "boomux daemon stop",
+            "boomux prompt",
+        ] {
+            assert!(BOOMUX_SKILL.contains(command), "skill omits {command}");
+        }
+        assert!(BOOMUX_SKILL.contains("BOOMUX_SHELL_ID"));
+        assert!(BOOMUX_SKILL.contains("--workspace"));
+        assert!(BOOMUX_SKILL.contains("--terminal"));
+    }
+
+    #[test]
+    fn skill_install_migrates_an_untouched_legacy_skill() {
+        let home = test_skill_home("migrate");
+        let legacy = legacy_skill_install_path(&home);
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::write(&legacy, LEGACY_BOOMUX_SHELLS_SKILL).unwrap();
+
+        install_skill_at(&home, false).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(skill_install_path(&home)).unwrap(),
+            BOOMUX_SKILL
+        );
+        assert!(!legacy.exists());
+        install_skill_at(&home, false).unwrap();
+        assert_eq!(
+            fs::read_to_string(skill_install_path(&home)).unwrap(),
+            BOOMUX_SKILL
+        );
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn skill_install_requires_force_and_preserves_customized_legacy_content() {
+        let home = test_skill_home("customized");
+        let skill = skill_install_path(&home);
+        let legacy = legacy_skill_install_path(&home);
+        fs::create_dir_all(skill.parent().unwrap()).unwrap();
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::write(&skill, "older consolidated skill").unwrap();
+        fs::write(&legacy, "customized legacy skill").unwrap();
+
+        assert!(install_skill_at(&home, false).is_err());
+        assert_eq!(
+            fs::read_to_string(&skill).unwrap(),
+            "older consolidated skill"
+        );
+        assert_eq!(
+            fs::read_to_string(&legacy).unwrap(),
+            "customized legacy skill"
+        );
+        install_skill_at(&home, true).unwrap();
+
+        assert_eq!(fs::read_to_string(skill).unwrap(), BOOMUX_SKILL);
+        assert_eq!(
+            fs::read_to_string(legacy).unwrap(),
+            "customized legacy skill"
+        );
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn skill_install_preserves_legacy_skill_with_additional_files() {
+        let home = test_skill_home("legacy-resources");
+        let legacy = legacy_skill_install_path(&home);
+        let reference = legacy.parent().unwrap().join("REFERENCE.md");
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::write(&legacy, LEGACY_BOOMUX_SHELLS_SKILL).unwrap();
+        fs::write(&reference, "custom reference").unwrap();
+
+        install_skill_at(&home, false).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&legacy).unwrap(),
+            LEGACY_BOOMUX_SHELLS_SKILL
+        );
+        assert_eq!(fs::read_to_string(reference).unwrap(), "custom reference");
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn skill_install_rejects_symlinked_directories_and_files() {
+        use std::os::unix::fs::symlink;
+
+        let home = test_skill_home("symlink-directory");
+        let outside = test_skill_home("symlink-directory-target");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, home.join(".agents")).unwrap();
+
+        assert!(install_skill_at(&home, true).is_err());
+        assert!(fs::read_dir(&outside).unwrap().next().is_none());
+        fs::remove_dir_all(&home).unwrap();
+        fs::remove_dir_all(&outside).unwrap();
+
+        let home = test_skill_home("symlink-file");
+        let outside = test_skill_home("symlink-file-target");
+        let skill = skill_install_path(&home);
+        fs::create_dir_all(skill.parent().unwrap()).unwrap();
+        fs::write(&outside, "do not replace").unwrap();
+        symlink(&outside, &skill).unwrap();
+
+        assert!(install_skill_at(&home, true).is_err());
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "do not replace");
+        fs::remove_dir_all(&home).unwrap();
+        fs::remove_file(&outside).unwrap();
+    }
+
+    fn test_skill_home(label: &str) -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        env::temp_dir().join(format!(
+            "boomux-skill-{label}-{}-{unique}",
+            std::process::id()
+        ))
     }
 }

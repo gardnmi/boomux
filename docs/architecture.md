@@ -117,9 +117,12 @@ identity.
 
 ### Agent Skill
 
-The optional vendor-neutral Agent Skill teaches compatible clients to call
-`boomux shells` and `boomux read`. `BOOMUX_SHELL_ID` provides current-shell
-context while exact shell IDs remain globally addressable within the daemon.
+The optional vendor-neutral `boomux` Agent Skill documents the complete public
+CLI for compatible clients, including discovery, inspection, output reads,
+lifecycle operations, native-terminal opening, and daemon management.
+`BOOMUX_SHELL_ID` provides current-shell context while exact shell IDs remain
+globally addressable within the daemon. The installer safely removes an
+untouched legacy `boomux-shells` skill and preserves customized copies.
 
 ## Runtime Semantics
 
