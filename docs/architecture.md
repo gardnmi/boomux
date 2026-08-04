@@ -143,6 +143,33 @@ Graceful handoff version 4 transfers retained events before publishing a
 `handoff_completed` boundary and resuming PTY readers. See
 [`event-stream.md`](event-stream.md).
 
+### Transition Coordinator
+
+The daemon serializes observable runtime transitions through one coordinator. A
+coordinated transition covers the affected in-memory lifecycle, durable state,
+retained event batches, and handoff capture. This gives clients one ordering
+boundary instead of independent persistence and event locks.
+
+Coordinator paths acquire the operation or mutation lock, transition
+coordinator, persistence lock, and event state in that order. Fine-grained
+registry, lifecycle, and terminal locks are acquired only where each path needs
+them; code does not wait on blocking PTY I/O or process shutdown while holding
+the coordinator. Close and shutdown first stop runtimes, then finalize visible
+lifecycle changes inside the coordinator.
+
+Durable lifecycle events are published only after their state is persisted. A
+failed persistence attempt queues the event batch; background recovery persists
+the latest state and publishes each queued batch exactly once. If a close cannot
+commit after stopping a runtime, a running shell becomes pending with a
+terminated last run, while an already-exited shell recovers its exact exited
+lifecycle and terminal state.
+
+Baseline reads capture their snapshot and event cursor inside the same boundary,
+so the cursor describes the exact cut represented by the snapshot. PTY bytes are
+not persisted per chunk, but output revision mutation and `output_changed`
+publication cross the coordinator together. A non-blocking terminal lock keeps
+output processing from holding global locks while waiting on terminal snapshots.
+
 ## Runtime Semantics
 
 Closing a terminal window closes only its socket attachment. The daemon retains
@@ -182,5 +209,5 @@ as pending.
 The detailed design, acceptance criteria, and manual test matrix are tracked in
 [`native-terminal-follow-up.md`](native-terminal-follow-up.md).
 
-1. Route runtime transitions through one coordinator so persistence and events
-   share an ordering boundary.
+1. Model agent instances separately from shells and runs, with explicit state
+   authority, evidence, and confidence.

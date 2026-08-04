@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -129,6 +129,11 @@ fn run_daemon(
     )?);
     let gated_readers = registry.import_handoff(transferred.runtimes, transferred.exited)?;
     if let Some(channel) = committed {
+        {
+            let _transition = lock(&registry.transitions)?;
+            let events = lock(&registry.events.state)?;
+            EventLog::ensure_capacity(&events, 1)?;
+        }
         channel.write_all(&[handoff::PREPARED])?;
         let mut decision = [0];
         channel.read_exact(&mut decision)?;
@@ -136,7 +141,7 @@ fn run_daemon(
             handoff::ABORT => return Ok(()),
             handoff::FINALIZE => {
                 socket_cleanup.arm();
-                registry.events.publish(DaemonEventKind::HandoffCompleted)?;
+                registry.publish_runtime_batch(vec![DaemonEventKind::HandoffCompleted])?;
                 for runtime in gated_readers {
                     runtime.resume_reader()?;
                 }
@@ -176,7 +181,7 @@ fn run_daemon(
         if registry.persistence_dirty.load(Ordering::Acquire)
             && last_persistence_retry.elapsed() >= PERSIST_RETRY_INTERVAL
         {
-            let _ = registry.persist();
+            let _ = registry.flush_pending();
             last_persistence_retry = Instant::now();
         }
         match restart_receiver.try_recv() {
@@ -333,12 +338,8 @@ fn launch_replacement(
     daemon_lock: &File,
     registry: &Registry,
 ) -> io::Result<()> {
-    let _event_commit = lock(&registry.event_commit_lock)?;
     let _mutation = lock(&registry.mutation_lock)?;
     registry.ensure_running()?;
-    if registry.persistence_dirty.load(Ordering::Acquire) {
-        registry.persist().map_err(persistence_error)?;
-    }
     registry.stopping.store(true, Ordering::Release);
     registry.events.notify();
     let mut paused = Vec::new();
@@ -398,7 +399,20 @@ fn launch_replacement(
                 reconstruction,
             });
         }
-        let event_stream = registry.events.transfer()?;
+        let mut transition = lock(&registry.transitions)?;
+        let _persistence = lock(&registry.persist_lock)?;
+        let mut events = lock(&registry.events.state)?;
+        let published = registry.flush_pending_locked(&mut transition, &mut events)?;
+        let event_stream = handoff::EventStreamManifest {
+            stream_id: events.stream_id.clone(),
+            latest_id: events.latest_id,
+            events: events.events.iter().cloned().collect(),
+        };
+        drop(events);
+        drop(transition);
+        if published {
+            registry.events.changed.notify_all();
+        }
         let state_lock = registry.state_lock_descriptor()?;
         launch_replacement_process(
             listener.as_fd(),
@@ -642,31 +656,11 @@ fn handle_connection(
         };
     }
 
-    let event_request = request.message.clone();
-    let _event_commit = request_publishes_events(&event_request)
-        .then(|| lock(&registry.event_commit_lock))
-        .transpose()?;
     let response = match registry.dispatch(request.message) {
-        Ok(response) => {
-            registry.publish_request_events(&event_request, &response)?;
-            response
-        }
+        Ok(response) => response,
         Err(error) => error_response(error_code(&error), error.to_string()),
     };
-    drop(_event_commit);
     send_response(&mut stream, response_version, response)
-}
-
-fn request_publishes_events(request: &Request) -> bool {
-    matches!(
-        request,
-        Request::CreateWorkspace { .. }
-            | Request::CreateShell { .. }
-            | Request::RenameWorkspace { .. }
-            | Request::RenameShell { .. }
-            | Request::CloseWorkspace { .. }
-            | Request::CloseShell { .. }
-    )
 }
 
 fn send_response(stream: &mut UnixStream, version: u32, response: Response) -> io::Result<()> {
@@ -719,11 +713,16 @@ struct Registry {
     state: Mutex<RegistryState>,
     store: Option<StateStore>,
     events: EventLog,
-    event_commit_lock: Mutex<()>,
+    transitions: Mutex<TransitionState>,
     mutation_lock: Mutex<()>,
     persist_lock: Mutex<()>,
     stopping: AtomicBool,
     persistence_dirty: AtomicBool,
+}
+
+#[derive(Default)]
+struct TransitionState {
+    pending_durable_events: VecDeque<Vec<DaemonEventKind>>,
 }
 
 struct EventLog {
@@ -768,30 +767,45 @@ impl EventLog {
         }
     }
 
-    fn transfer(&self) -> io::Result<handoff::EventStreamManifest> {
-        let state = lock(&self.state)?;
-        Ok(handoff::EventStreamManifest {
-            stream_id: state.stream_id.clone(),
-            latest_id: state.latest_id,
-            events: state.events.iter().cloned().collect(),
-        })
+    fn ensure_capacity(state: &EventLogState, count: usize) -> io::Result<()> {
+        let count = u64::try_from(count).map_err(|_| io::Error::other("event batch too large"))?;
+        state
+            .latest_id
+            .checked_add(count)
+            .map(|_| ())
+            .ok_or_else(|| io::Error::other("daemon event ID exhausted"))
     }
 
+    fn append_batch_locked(
+        state: &mut EventLogState,
+        kinds: Vec<DaemonEventKind>,
+    ) -> Vec<DaemonEvent> {
+        debug_assert!(Self::ensure_capacity(state, kinds.len()).is_ok());
+        let mut appended = Vec::with_capacity(kinds.len());
+        for kind in kinds {
+            state.latest_id += 1;
+            let event = DaemonEvent {
+                id: state.latest_id,
+                at_ms: unix_time_ms(),
+                kind,
+            };
+            state.events.push_back(event.clone());
+            appended.push(event);
+        }
+        if state.events.len() > MAX_RETAINED_EVENTS {
+            let remove = state.events.len() - MAX_RETAINED_EVENTS;
+            state.events.drain(..remove);
+        }
+        appended
+    }
+
+    #[cfg(test)]
     fn publish(&self, kind: DaemonEventKind) -> io::Result<DaemonEvent> {
         let mut state = lock(&self.state)?;
-        state.latest_id = state
-            .latest_id
-            .checked_add(1)
-            .ok_or_else(|| io::Error::other("daemon event ID exhausted"))?;
-        let event = DaemonEvent {
-            id: state.latest_id,
-            at_ms: unix_time_ms(),
-            kind,
-        };
-        state.events.push_back(event.clone());
-        if state.events.len() > MAX_RETAINED_EVENTS {
-            state.events.pop_front();
-        }
+        Self::ensure_capacity(&state, 1)?;
+        let event = Self::append_batch_locked(&mut state, vec![kind])
+            .pop()
+            .expect("one event was appended");
         drop(state);
         self.changed.notify_all();
         Ok(event)
@@ -825,7 +839,7 @@ impl Default for Registry {
             state: Mutex::new(RegistryState::default()),
             store: None,
             events: EventLog::new(),
-            event_commit_lock: Mutex::new(()),
+            transitions: Mutex::new(TransitionState::default()),
             mutation_lock: Mutex::new(()),
             persist_lock: Mutex::new(()),
             stopping: AtomicBool::new(false),
@@ -865,6 +879,25 @@ enum ShellLifecycle {
         terminal: Arc<Mutex<TerminalState>>,
     },
     Closed,
+}
+
+struct StopRollback {
+    lifecycle: ShellLifecycle,
+    event: Option<DaemonEventKind>,
+}
+
+struct StopRuntimeError {
+    source: io::Error,
+    stopped: bool,
+}
+
+impl From<io::Error> for StopRuntimeError {
+    fn from(source: io::Error) -> Self {
+        Self {
+            source,
+            stopped: false,
+        }
+    }
 }
 
 struct ShellRun {
@@ -1294,6 +1327,24 @@ impl ReaderTask {
     }
 }
 
+fn workspace_created_events(workspace: &WorkspaceSnapshot) -> Vec<DaemonEventKind> {
+    let mut events = vec![DaemonEventKind::WorkspaceCreated {
+        workspace_id: workspace.id.clone(),
+        name: workspace.name.clone(),
+    }];
+    events.extend(
+        workspace
+            .shells
+            .iter()
+            .map(|shell| DaemonEventKind::ShellCreated {
+                workspace_id: workspace.id.clone(),
+                shell_id: shell.id.clone(),
+                name: shell.name.clone(),
+            }),
+    );
+    events
+}
+
 impl Registry {
     fn dispatch(&self, request: Request) -> io::Result<Response> {
         match request {
@@ -1310,20 +1361,33 @@ impl Registry {
                 shell: self.shell(&shell_id)?.snapshot()?,
             }),
             Request::CreateWorkspace { name, shells } => self.durable_mutation(|| {
-                Ok(Response::Workspace {
-                    workspace: self.create_workspace(name, shells)?,
-                })
+                let workspace = self.create_workspace(name, shells)?;
+                let events = workspace_created_events(&workspace);
+                Ok((Response::Workspace { workspace }, events))
             }),
             Request::CreateShell {
                 workspace_id,
                 shell,
             } => self.durable_mutation(|| {
-                Ok(Response::Shell {
-                    shell: match workspace_id {
-                        Some(workspace_id) => self.create_shell(&workspace_id, shell)?,
-                        None => self.create_shell_with_workspace(shell)?,
-                    },
-                })
+                let implicit_workspace = workspace_id.is_none();
+                let shell = match workspace_id {
+                    Some(workspace_id) => self.create_shell(&workspace_id, shell)?,
+                    None => self.create_shell_with_workspace(shell)?,
+                };
+                let mut events = Vec::new();
+                if implicit_workspace {
+                    let workspace = self.workspace(&shell.workspace_id)?;
+                    events.push(DaemonEventKind::WorkspaceCreated {
+                        workspace_id: workspace.id.clone(),
+                        name: lock(&workspace.name)?.clone(),
+                    });
+                }
+                events.push(DaemonEventKind::ShellCreated {
+                    workspace_id: shell.workspace_id.clone(),
+                    shell_id: shell.id.clone(),
+                    name: shell.name.clone(),
+                });
+                Ok((Response::Shell { shell }, events))
             }),
             Request::ReadShell {
                 shell_id,
@@ -1362,11 +1426,25 @@ impl Registry {
                     }
                 }
                 *lock(&workspace.name)? = name;
-                Ok(Response::Ok)
+                Ok((
+                    Response::Ok,
+                    vec![DaemonEventKind::WorkspaceRenamed {
+                        workspace_id,
+                        name: lock(&workspace.name)?.clone(),
+                    }],
+                ))
             }),
             Request::RenameShell { shell_id, name } => self.durable_mutation(|| {
-                self.rename_shell(&shell_id, name)?;
-                Ok(Response::Ok)
+                self.rename_shell(&shell_id, name.clone())?;
+                let shell = self.shell(&shell_id)?;
+                Ok((
+                    Response::Ok,
+                    vec![DaemonEventKind::ShellRenamed {
+                        workspace_id: shell.workspace_id.clone(),
+                        shell_id,
+                        name,
+                    }],
+                ))
             }),
             Request::CloseWorkspace { workspace_id } => {
                 self.close_workspace(&workspace_id)?;
@@ -1380,72 +1458,6 @@ impl Registry {
         }
     }
 
-    fn publish_request_events(&self, request: &Request, response: &Response) -> io::Result<()> {
-        let kinds =
-            match (request, response) {
-                (Request::CreateWorkspace { .. }, Response::Workspace { workspace }) => {
-                    let mut kinds = vec![DaemonEventKind::WorkspaceCreated {
-                        workspace_id: workspace.id.clone(),
-                        name: workspace.name.clone(),
-                    }];
-                    kinds.extend(workspace.shells.iter().map(|shell| {
-                        DaemonEventKind::ShellCreated {
-                            workspace_id: workspace.id.clone(),
-                            shell_id: shell.id.clone(),
-                            name: shell.name.clone(),
-                        }
-                    }));
-                    kinds
-                }
-                (Request::CreateShell { workspace_id, .. }, Response::Shell { shell }) => {
-                    let mut kinds = Vec::new();
-                    if workspace_id.is_none() {
-                        let workspace = self.workspace(&shell.workspace_id)?;
-                        kinds.push(DaemonEventKind::WorkspaceCreated {
-                            workspace_id: workspace.id.clone(),
-                            name: lock(&workspace.name)?.clone(),
-                        });
-                    }
-                    kinds.push(DaemonEventKind::ShellCreated {
-                        workspace_id: shell.workspace_id.clone(),
-                        shell_id: shell.id.clone(),
-                        name: shell.name.clone(),
-                    });
-                    kinds
-                }
-                (Request::RenameWorkspace { workspace_id, name }, Response::Ok) => {
-                    vec![DaemonEventKind::WorkspaceRenamed {
-                        workspace_id: workspace_id.clone(),
-                        name: name.clone(),
-                    }]
-                }
-                (Request::RenameShell { shell_id, name }, Response::Ok) => {
-                    let shell = self.shell(shell_id)?;
-                    vec![DaemonEventKind::ShellRenamed {
-                        workspace_id: shell.workspace_id.clone(),
-                        shell_id: shell_id.clone(),
-                        name: name.clone(),
-                    }]
-                }
-                (Request::CloseWorkspace { workspace_id }, Response::Ok) => {
-                    vec![DaemonEventKind::WorkspaceClosed {
-                        workspace_id: workspace_id.clone(),
-                    }]
-                }
-                (Request::CloseShell { shell_id }, Response::Ok) => {
-                    vec![DaemonEventKind::ShellClosed {
-                        workspace_id: None,
-                        shell_id: shell_id.clone(),
-                    }]
-                }
-                _ => Vec::new(),
-            };
-        for kind in kinds {
-            self.events.publish(kind)?;
-        }
-        Ok(())
-    }
-
     fn read_events(
         &self,
         after: Option<&EventCursor>,
@@ -1455,20 +1467,30 @@ impl Registry {
         let limit = usize::from(limit.clamp(1, MAX_EVENT_BATCH));
         let deadline =
             Instant::now() + Duration::from_millis(u64::from(wait_ms)).min(MAX_EVENT_WAIT);
-        let mut state = lock(&self.events.state)?;
         if after.is_none() {
+            let mut transition = lock(&self.transitions)?;
+            let _persistence = lock(&self.persist_lock)?;
+            let mut state = lock(&self.events.state)?;
+            let published = self.flush_pending_locked(&mut transition, &mut state)?;
             let snapshot = self.snapshot()?;
             let cursor = EventCursor {
                 stream_id: state.stream_id.clone(),
                 event_id: state.latest_id,
             };
-            return Ok(Response::Events {
+            let response = Response::Events {
                 stream_id: state.stream_id.clone(),
                 cursor,
                 snapshot: Some(snapshot),
                 events: Vec::new(),
-            });
+            };
+            drop(state);
+            drop(transition);
+            if published {
+                self.events.changed.notify_all();
+            }
+            return Ok(response);
         }
+        let mut state = lock(&self.events.state)?;
         let after = after.expect("checked above");
         loop {
             let earliest = state
@@ -1598,7 +1620,7 @@ impl Registry {
             state: Mutex::new(state),
             store: Some(store),
             events: EventLog::from_transfer(transferred_events),
-            event_commit_lock: Mutex::new(()),
+            transitions: Mutex::new(TransitionState::default()),
             mutation_lock: Mutex::new(()),
             persist_lock: Mutex::new(()),
             stopping: AtomicBool::new(false),
@@ -1783,24 +1805,113 @@ impl Registry {
         Ok(readers)
     }
 
-    fn durable_mutation<T>(&self, operation: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+    fn durable_mutation<T>(
+        &self,
+        operation: impl FnOnce() -> io::Result<(T, Vec<DaemonEventKind>)>,
+    ) -> io::Result<T> {
         let _mutation = lock(&self.mutation_lock)?;
+        let mut transition = lock(&self.transitions)?;
         let _persistence = lock(&self.persist_lock)?;
+        let mut events = lock(&self.events.state)?;
         self.ensure_running()?;
+        self.flush_pending_locked(&mut transition, &mut events)?;
         let backup = self.backup()?;
         match operation() {
-            Ok(value) => match self.persist_unlocked().map_err(persistence_error) {
-                Ok(()) => Ok(value),
-                Err(error) => {
+            Ok((value, kinds)) => {
+                if let Err(error) = EventLog::ensure_capacity(&events, kinds.len()) {
                     self.restore_backup(backup)?;
-                    Err(error)
+                    return Err(error);
                 }
-            },
+                match self.persist_unlocked().map_err(persistence_error) {
+                    Ok(()) => {
+                        EventLog::append_batch_locked(&mut events, kinds);
+                        drop(events);
+                        drop(transition);
+                        self.events.changed.notify_all();
+                        Ok(value)
+                    }
+                    Err(error) => {
+                        self.restore_backup(backup)?;
+                        self.persistence_dirty.store(false, Ordering::Release);
+                        Err(error)
+                    }
+                }
+            }
             Err(error) => {
                 self.restore_backup(backup)?;
                 Err(error)
             }
         }
+    }
+
+    fn flush_pending_locked(
+        &self,
+        transition: &mut TransitionState,
+        events: &mut EventLogState,
+    ) -> io::Result<bool> {
+        if transition.pending_durable_events.is_empty()
+            && !self.persistence_dirty.load(Ordering::Acquire)
+        {
+            return Ok(false);
+        }
+        let count = transition.pending_durable_events.iter().map(Vec::len).sum();
+        EventLog::ensure_capacity(events, count)?;
+        self.persist_unlocked().map_err(persistence_error)?;
+        while let Some(batch) = transition.pending_durable_events.pop_front() {
+            EventLog::append_batch_locked(events, batch);
+        }
+        self.events.changed.notify_all();
+        Ok(true)
+    }
+
+    fn flush_pending(&self) -> io::Result<()> {
+        let mut transition = lock(&self.transitions)?;
+        let _persistence = lock(&self.persist_lock)?;
+        let mut events = lock(&self.events.state)?;
+        let published = self.flush_pending_locked(&mut transition, &mut events)?;
+        drop(events);
+        drop(transition);
+        if published {
+            self.events.changed.notify_all();
+        }
+        Ok(())
+    }
+
+    fn compensate_stopped_locked(
+        &self,
+        shells: &[Arc<Shell>],
+        transition: &mut TransitionState,
+    ) -> io::Result<()> {
+        let batch = shells
+            .iter()
+            .map(|shell| shell.compensate_stopped())
+            .collect::<io::Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        self.queue_durable_batch_locked(batch, transition);
+        Ok(())
+    }
+
+    fn queue_durable_batch_locked(
+        &self,
+        batch: Vec<DaemonEventKind>,
+        transition: &mut TransitionState,
+    ) {
+        if !batch.is_empty() {
+            transition.pending_durable_events.push_back(batch);
+            self.persistence_dirty.store(true, Ordering::Release);
+        }
+    }
+
+    fn publish_runtime_batch(&self, kinds: Vec<DaemonEventKind>) -> io::Result<()> {
+        let _transition = lock(&self.transitions)?;
+        let mut events = lock(&self.events.state)?;
+        EventLog::ensure_capacity(&events, kinds.len())?;
+        EventLog::append_batch_locked(&mut events, kinds);
+        drop(events);
+        self.events.changed.notify_all();
+        Ok(())
     }
 
     fn ensure_running(&self) -> io::Result<()> {
@@ -1981,6 +2092,15 @@ impl Registry {
         runtime: &Arc<ShellRuntime>,
         code: Option<u32>,
     ) -> io::Result<()> {
+        let mut transition = lock(&self.transitions)?;
+        let _persistence = lock(&self.persist_lock)?;
+        let mut events = lock(&self.events.state)?;
+        let pending_count = transition
+            .pending_durable_events
+            .iter()
+            .map(Vec::len)
+            .sum::<usize>();
+        EventLog::ensure_capacity(&events, pending_count.saturating_add(1))?;
         let mut lifecycle = lock(&shell.lifecycle)?;
         let profile = match &*lifecycle {
             ShellLifecycle::Running {
@@ -2002,12 +2122,27 @@ impl Registry {
             terminal: Arc::clone(&runtime.terminal),
         };
         drop(lifecycle);
-        self.events.publish(DaemonEventKind::RunExited {
+        let batch = vec![DaemonEventKind::RunExited {
             workspace_id: shell.workspace_id.clone(),
             shell_id: shell.id.clone(),
             run: run.snapshot()?,
-        })?;
-        self.persist()
+        }];
+        match self.persist_unlocked().map_err(persistence_error) {
+            Ok(()) => {
+                while let Some(pending) = transition.pending_durable_events.pop_front() {
+                    EventLog::append_batch_locked(&mut events, pending);
+                }
+                EventLog::append_batch_locked(&mut events, batch);
+                drop(events);
+                drop(transition);
+                self.events.changed.notify_all();
+                Ok(())
+            }
+            Err(error) => {
+                transition.pending_durable_events.push_back(batch);
+                Err(error)
+            }
+        }
     }
 
     fn snapshot(&self) -> io::Result<Snapshot> {
@@ -2031,27 +2166,64 @@ impl Registry {
             let state = lock(&self.state)?;
             state.shells.values().cloned().collect::<Vec<_>>()
         };
-        let mut killed: Vec<Arc<Shell>> = Vec::new();
+        let mut stopped: Vec<Arc<Shell>> = Vec::with_capacity(shells.len());
         for shell in &shells {
-            if let Err(error) = shell.kill() {
-                for shell in killed {
-                    shell.reset_pending()?;
+            if let Err(error) = shell.stop_runtime() {
+                if error.stopped {
+                    stopped.push(Arc::clone(shell));
                 }
+                let mut transition = lock(&self.transitions)?;
+                self.compensate_stopped_locked(&stopped, &mut transition)?;
+                self.stopping.store(false, Ordering::Release);
+                return Err(error.source);
+            }
+            stopped.push(Arc::clone(shell));
+        }
+        let mut transition = lock(&self.transitions)?;
+        let _persistence = lock(&self.persist_lock)?;
+        let mut events = lock(&self.events.state)?;
+        let published = match self.flush_pending_locked(&mut transition, &mut events) {
+            Ok(published) => published,
+            Err(error) => {
+                self.compensate_stopped_locked(&stopped, &mut transition)?;
                 self.stopping.store(false, Ordering::Release);
                 return Err(error);
             }
-            killed.push(Arc::clone(shell));
-        }
-        if let Err(error) = self.persist().map_err(persistence_error) {
-            for shell in killed {
-                shell.reset_pending()?;
+        };
+        let mut rollbacks = Vec::with_capacity(shells.len());
+        for shell in &shells {
+            match shell.finalize_stop() {
+                Ok(rollback) => rollbacks.push((Arc::clone(shell), rollback)),
+                Err(error) => {
+                    for (shell, rollback) in rollbacks {
+                        shell.restore_stopped(rollback)?;
+                    }
+                    self.stopping.store(false, Ordering::Release);
+                    return Err(error);
+                }
             }
+        }
+        if let Err(error) = self.persist_unlocked().map_err(persistence_error) {
+            let batch = rollbacks
+                .iter()
+                .filter_map(|(_, rollback)| rollback.event.clone())
+                .collect();
+            for (shell, rollback) in rollbacks {
+                shell.restore_stopped(rollback)?;
+            }
+            self.queue_durable_batch_locked(batch, &mut transition);
             self.stopping.store(false, Ordering::Release);
             return Err(error);
         }
         let mut state = lock(&self.state)?;
         state.workspaces.clear();
         state.shells.clear();
+        drop(state);
+        drop(events);
+        drop(transition);
+        if published {
+            self.events.changed.notify_all();
+        }
         Ok(())
     }
 
@@ -2429,16 +2601,43 @@ impl Registry {
         self.ensure_running()?;
         let backup = self.backup()?;
         let shell = self.shell(shell_id)?;
-        shell.kill()?;
-        let killed_run = lock(&shell.last_run)?.clone();
+        if let Err(error) = shell.stop_runtime() {
+            if error.stopped {
+                let mut transition = lock(&self.transitions)?;
+                self.compensate_stopped_locked(std::slice::from_ref(&shell), &mut transition)?;
+            }
+            return Err(error.source);
+        }
+        let mut transition = lock(&self.transitions)?;
         let _persistence = lock(&self.persist_lock)?;
+        let mut events = lock(&self.events.state)?;
+        if let Err(error) = self.flush_pending_locked(&mut transition, &mut events) {
+            self.compensate_stopped_locked(std::slice::from_ref(&shell), &mut transition)?;
+            return Err(error);
+        }
+        if let Err(error) = EventLog::ensure_capacity(&events, 1) {
+            self.compensate_stopped_locked(std::slice::from_ref(&shell), &mut transition)?;
+            return Err(error);
+        }
+        let rollback = shell.finalize_stop()?;
         self.remove_shell(shell_id)?;
         if let Err(error) = self.persist_unlocked().map_err(persistence_error) {
             self.restore_backup(backup)?;
-            *lock(&shell.last_run)? = killed_run;
-            shell.reset_pending()?;
+            let event = rollback.event.clone();
+            shell.restore_stopped(rollback)?;
+            self.queue_durable_batch_locked(event.into_iter().collect(), &mut transition);
             return Err(error);
         }
+        EventLog::append_batch_locked(
+            &mut events,
+            vec![DaemonEventKind::ShellClosed {
+                workspace_id: Some(shell.workspace_id.clone()),
+                shell_id: shell_id.into(),
+            }],
+        );
+        drop(events);
+        drop(transition);
+        self.events.changed.notify_all();
         Ok(())
     }
 
@@ -2454,30 +2653,63 @@ impl Registry {
                 .filter_map(|id| state.shells.get(id).cloned())
                 .collect::<Vec<_>>()
         };
-        let mut killed: Vec<Arc<Shell>> = Vec::new();
-        let mut killed_runs = HashMap::new();
+        let mut stopped: Vec<Arc<Shell>> = Vec::with_capacity(shells.len());
         for shell in &shells {
-            if let Err(error) = shell.kill() {
-                for shell in killed {
-                    shell.reset_pending()?;
+            if let Err(error) = shell.stop_runtime() {
+                if error.stopped {
+                    stopped.push(Arc::clone(shell));
                 }
-                return Err(error);
+                let mut transition = lock(&self.transitions)?;
+                self.compensate_stopped_locked(&stopped, &mut transition)?;
+                return Err(error.source);
             }
-            killed_runs.insert(shell.id.clone(), lock(&shell.last_run)?.clone());
-            killed.push(Arc::clone(shell));
+            stopped.push(Arc::clone(shell));
         }
+        let mut transition = lock(&self.transitions)?;
         let _persistence = lock(&self.persist_lock)?;
+        let mut events = lock(&self.events.state)?;
+        if let Err(error) = self.flush_pending_locked(&mut transition, &mut events) {
+            self.compensate_stopped_locked(&stopped, &mut transition)?;
+            return Err(error);
+        }
+        if let Err(error) = EventLog::ensure_capacity(&events, 1) {
+            self.compensate_stopped_locked(&stopped, &mut transition)?;
+            return Err(error);
+        }
+        let mut rollbacks = Vec::with_capacity(shells.len());
+        for shell in &shells {
+            match shell.finalize_stop() {
+                Ok(rollback) => rollbacks.push((Arc::clone(shell), rollback)),
+                Err(error) => {
+                    for (shell, rollback) in rollbacks {
+                        shell.restore_stopped(rollback)?;
+                    }
+                    return Err(error);
+                }
+            }
+        }
         self.remove_workspace(workspace_id)?;
         if let Err(error) = self.persist_unlocked().map_err(persistence_error) {
             self.restore_backup(backup)?;
-            for shell in shells {
-                if let Some(run) = killed_runs.get(&shell.id) {
-                    *lock(&shell.last_run)? = run.clone();
-                }
-                shell.reset_pending()?;
+            let batch = rollbacks
+                .iter()
+                .filter_map(|(_, rollback)| rollback.event.clone())
+                .collect();
+            for (shell, rollback) in rollbacks {
+                shell.restore_stopped(rollback)?;
             }
+            self.queue_durable_batch_locked(batch, &mut transition);
             return Err(error);
         }
+        EventLog::append_batch_locked(
+            &mut events,
+            vec![DaemonEventKind::WorkspaceClosed {
+                workspace_id: workspace_id.into(),
+            }],
+        );
+        drop(events);
+        drop(transition);
+        self.events.changed.notify_all();
         Ok(())
     }
 }
@@ -2525,13 +2757,25 @@ impl Shell {
     }
 
     fn kill(&self) -> io::Result<()> {
-        let runtime = {
-            let mut lifecycle = lock(&self.lifecycle)?;
-            match &*lifecycle {
-                ShellLifecycle::Pending => {
-                    *lifecycle = ShellLifecycle::Closed;
-                    return Ok(());
+        match self.stop_runtime() {
+            Ok(()) => {
+                let _ = self.finalize_stop()?;
+                Ok(())
+            }
+            Err(error) => {
+                if error.stopped {
+                    let _ = self.finalize_stop()?;
                 }
+                Err(error.source)
+            }
+        }
+    }
+
+    fn stop_runtime(&self) -> Result<(), StopRuntimeError> {
+        let runtime = {
+            let lifecycle = lock(&self.lifecycle)?;
+            match &*lifecycle {
+                ShellLifecycle::Pending => return Ok(()),
                 ShellLifecycle::Running { runtime, .. } => Some(Arc::clone(runtime)),
                 ShellLifecycle::Exited { runtime, .. } => runtime.clone(),
                 ShellLifecycle::Closed => return Ok(()),
@@ -2561,48 +2805,93 @@ impl Shell {
                 signal_session(session_id, libc::SIGKILL);
             }
             let wait_result = if exited { Ok(()) } else { process.wait() };
-            let result = match (kill_result, wait_result) {
+            match (kill_result, wait_result) {
                 (_, Ok(())) => Ok(()),
                 (Err(error), Err(_)) => Err(error),
                 (Ok(()), Err(error)) => Err(error),
-            };
-            if let Some(session_id) = child_pid {
-                wait_for_session_descendants(session_id)?;
             }
-            result
         })();
         if let Err(error) = result {
             runtime.resume_reader()?;
-            return Err(error);
+            return Err(error.into());
         }
+        if let Some(session_id) = lock(&runtime.process)?.process_id()
+            && let Err(source) = wait_for_session_descendants(session_id as libc::pid_t)
+        {
+            let _ = runtime.stop_reader();
+            return Err(StopRuntimeError {
+                source,
+                stopped: true,
+            });
+        }
+        if let Err(source) = runtime.stop_reader() {
+            return Err(StopRuntimeError {
+                source,
+                stopped: true,
+            });
+        }
+        Ok(())
+    }
 
-        runtime.stop_reader()?;
+    fn finalize_stop(&self) -> io::Result<StopRollback> {
         let mut lifecycle = lock(&self.lifecycle)?;
-        match &*lifecycle {
-            ShellLifecycle::Running {
-                profile,
-                run,
-                runtime: current,
-            } if Arc::ptr_eq(current, &runtime) => {
+        let previous = std::mem::replace(&mut *lifecycle, ShellLifecycle::Closed);
+        match previous {
+            ShellLifecycle::Pending => Ok(StopRollback {
+                lifecycle: ShellLifecycle::Pending,
+                event: None,
+            }),
+            ShellLifecycle::Running { profile, run, .. } => {
                 run.finish(ShellRunExitReason::Terminated)?;
                 *lock(&self.last_run)? = Some(run.persisted(profile.clone())?);
-                *lifecycle = ShellLifecycle::Closed;
+                Ok(StopRollback {
+                    lifecycle: ShellLifecycle::Pending,
+                    event: Some(DaemonEventKind::RunExited {
+                        workspace_id: self.workspace_id.clone(),
+                        shell_id: self.id.clone(),
+                        run: run.snapshot()?,
+                    }),
+                })
             }
             ShellLifecycle::Exited {
                 profile,
                 run,
-                runtime: current,
-                ..
-            } if current
-                .as_ref()
-                .is_some_and(|current| Arc::ptr_eq(current, &runtime)) =>
-            {
+                code,
+                runtime,
+                terminal,
+            } => {
                 *lock(&self.last_run)? = Some(run.persisted(profile.clone())?);
-                *lifecycle = ShellLifecycle::Closed;
+                Ok(StopRollback {
+                    lifecycle: ShellLifecycle::Exited {
+                        code,
+                        profile,
+                        run,
+                        runtime,
+                        terminal,
+                    },
+                    event: None,
+                })
             }
-            _ => {}
+            ShellLifecycle::Closed => Ok(StopRollback {
+                lifecycle: ShellLifecycle::Closed,
+                event: None,
+            }),
+        }
+    }
+
+    fn restore_stopped(&self, rollback: StopRollback) -> io::Result<()> {
+        let mut lifecycle = lock(&self.lifecycle)?;
+        if matches!(*lifecycle, ShellLifecycle::Closed) {
+            *lifecycle = rollback.lifecycle;
         }
         Ok(())
+    }
+
+    fn compensate_stopped(&self) -> io::Result<Option<DaemonEventKind>> {
+        let rollback = self.finalize_stop()?;
+        let event = rollback.event.clone();
+        self.restore_stopped(rollback)?;
+        Ok(event)
     }
 
     fn reset_pending(&self) -> io::Result<()> {
@@ -2803,48 +3092,70 @@ fn start_pty_reader(
                     Ok(0) => break,
                     Ok(count) => {
                         let bytes = &buffer[..count];
-                        let mut output_revision = None;
-                        if let Ok(mut terminal) = reader_runtime.terminal.lock() {
-                            terminal.process(bytes);
-                            let Ok(previous_revision) = reader_run.output_revision.fetch_update(
-                                Ordering::AcqRel,
-                                Ordering::Acquire,
-                                |revision| revision.checked_add(1),
-                            ) else {
-                                break;
+                        let Some(registry) = registry.upgrade() else {
+                            break;
+                        };
+                        let (transition, mut events, mut terminal) = loop {
+                            let Ok(transition) = registry.transitions.lock() else {
+                                return;
                             };
-                            let revision = previous_revision + 1;
-                            output_revision = Some(revision);
-                            if let Ok(mut last_run) = shell.last_run.lock()
-                                && let Some(last_run) = last_run.as_mut()
-                                && last_run.id == reader_run.id
-                            {
-                                last_run.output_revision = revision;
-                            }
-                            if let Ok(mut controller) = reader_runtime.controller.lock() {
-                                let disconnect = controller.as_ref().is_some_and(|current| {
-                                    matches!(
-                                        current
-                                            .output
-                                            .try_send(ControllerOutput::Data(bytes.to_vec())),
-                                        Err(TrySendError::Full(_) | TrySendError::Disconnected(_))
-                                    )
-                                });
-                                if disconnect && let Some(current) = controller.take() {
-                                    let _ = current.connection.shutdown(std::net::Shutdown::Both);
+                            let Ok(events) = registry.events.state.lock() else {
+                                return;
+                            };
+                            match reader_runtime.terminal.try_lock() {
+                                Ok(terminal) => break (transition, events, terminal),
+                                Err(TryLockError::WouldBlock) => {
+                                    drop(events);
+                                    drop(transition);
+                                    thread::sleep(IO_RETRY_DELAY);
                                 }
+                                Err(TryLockError::Poisoned(_)) => return,
+                            }
+                        };
+                        if EventLog::ensure_capacity(&events, 1).is_err() {
+                            break;
+                        }
+                        terminal.process(bytes);
+                        let Ok(previous_revision) = reader_run.output_revision.fetch_update(
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                            |revision| revision.checked_add(1),
+                        ) else {
+                            break;
+                        };
+                        let revision = previous_revision + 1;
+                        if let Ok(mut last_run) = shell.last_run.lock()
+                            && let Some(last_run) = last_run.as_mut()
+                            && last_run.id == reader_run.id
+                        {
+                            last_run.output_revision = revision;
+                        }
+                        if let Ok(mut controller) = reader_runtime.controller.lock() {
+                            let disconnect = controller.as_ref().is_some_and(|current| {
+                                matches!(
+                                    current
+                                        .output
+                                        .try_send(ControllerOutput::Data(bytes.to_vec())),
+                                    Err(TrySendError::Full(_) | TrySendError::Disconnected(_))
+                                )
+                            });
+                            if disconnect && let Some(current) = controller.take() {
+                                let _ = current.connection.shutdown(std::net::Shutdown::Both);
                             }
                         }
-                        if let Some(output_revision) = output_revision
-                            && let Some(registry) = registry.upgrade()
-                        {
-                            let _ = registry.events.publish(DaemonEventKind::OutputChanged {
+                        EventLog::append_batch_locked(
+                            &mut events,
+                            vec![DaemonEventKind::OutputChanged {
                                 workspace_id: shell.workspace_id.clone(),
                                 shell_id: shell.id.clone(),
                                 run_id: reader_run.id.clone(),
-                                output_revision,
-                            });
-                        }
+                                output_revision: revision,
+                            }],
+                        );
+                        drop(terminal);
+                        drop(events);
+                        drop(transition);
+                        registry.events.changed.notify_all();
                     }
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -2931,6 +3242,26 @@ fn handle_attach(
     let (output, receiver) = mpsc::sync_channel(CONTROLLER_QUEUE);
     let connection = stream.try_clone()?;
     let previous_run = lock(&shell.last_run)?.clone();
+    let needs_start = matches!(*lock(&shell.lifecycle)?, ShellLifecycle::Pending);
+    let mut transition = needs_start
+        .then(|| lock(&registry.transitions))
+        .transpose()?;
+    let persistence = needs_start
+        .then(|| lock(&registry.persist_lock))
+        .transpose()?;
+    let mut events = needs_start
+        .then(|| lock(&registry.events.state))
+        .transpose()?;
+    let published_pending = if needs_start {
+        let published = registry.flush_pending_locked(
+            transition.as_mut().expect("start transition is locked"),
+            events.as_mut().expect("start event log is locked"),
+        )?;
+        EventLog::ensure_capacity(events.as_ref().expect("start event log is locked"), 1)?;
+        published
+    } else {
+        false
+    };
     let (runtime, terminal, startup_profile, running, started) = {
         let mut lifecycle = lock(&shell.lifecycle)?;
         let mut started = false;
@@ -2982,9 +3313,7 @@ fn handle_attach(
             ) {
                 drop(lifecycle);
                 let cleanup = shell.kill();
-                if cleanup.is_ok() {
-                    shell.reset_pending()?;
-                }
+                shell.reset_pending()?;
                 return send_response(
                     &mut stream,
                     response_version,
@@ -3025,11 +3354,9 @@ fn handle_attach(
             }
         }
     };
-    if started && let Err(error) = registry.persist() {
+    if started && let Err(error) = registry.persist_unlocked().map_err(persistence_error) {
         let cleanup = shell.kill();
-        if cleanup.is_ok() {
-            shell.reset_pending()?;
-        }
+        shell.reset_pending()?;
         return send_response(
             &mut stream,
             response_version,
@@ -3051,11 +3378,23 @@ fn handle_attach(
             .snapshot()?
             .run
             .ok_or_else(|| io::Error::other("started shell has no run identity"))?;
-        registry.events.publish(DaemonEventKind::RunStarted {
-            workspace_id: shell.workspace_id.clone(),
-            shell_id: shell.id.clone(),
-            run,
-        })?;
+        let events = events.as_mut().expect("start event log is locked");
+        EventLog::append_batch_locked(
+            events,
+            vec![DaemonEventKind::RunStarted {
+                workspace_id: shell.workspace_id.clone(),
+                shell_id: shell.id.clone(),
+                run,
+            }],
+        );
+    }
+    drop(events);
+    drop(persistence);
+    drop(transition);
+    if started || published_pending {
+        registry.events.changed.notify_all();
+    }
+    if started {
         runtime
             .as_ref()
             .expect("started shell has a runtime")
@@ -3679,7 +4018,52 @@ mod tests {
 
         assert!(result.is_err());
         assert!(registry.snapshot().unwrap().workspaces.is_empty());
+        assert!(lock(&registry.events.state).unwrap().events.is_empty());
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn coordinated_workspace_batch_is_included_in_baseline_cursor() {
+        let registry = Registry::default();
+        let response = registry
+            .dispatch(Request::CreateWorkspace {
+                name: "coordinated".into(),
+                shells: vec![
+                    ShellSpec::login("one", env::temp_dir()),
+                    ShellSpec::login("two", env::temp_dir()),
+                ],
+            })
+            .unwrap();
+        assert!(matches!(response, Response::Workspace { .. }));
+
+        let Response::Events {
+            cursor,
+            snapshot: Some(snapshot),
+            ..
+        } = registry.read_events(None, 256, 0).unwrap()
+        else {
+            panic!("expected coordinated baseline");
+        };
+        assert_eq!(snapshot.workspaces.len(), 1);
+        assert_eq!(snapshot.workspaces[0].shells.len(), 2);
+        assert_eq!(cursor.event_id, 3);
+        let Response::Events { events, .. } = registry.read_events(Some(&cursor), 256, 0).unwrap()
+        else {
+            panic!("expected event page");
+        };
+        assert!(events.is_empty());
+        let event_state = lock(&registry.events.state).unwrap();
+        let events = &event_state.events;
+        assert!(matches!(
+            events[0].kind,
+            DaemonEventKind::WorkspaceCreated { .. }
+        ));
+        assert!(
+            events
+                .iter()
+                .skip(1)
+                .all(|event| matches!(event.kind, DaemonEventKind::ShellCreated { .. }))
+        );
     }
 
     #[test]

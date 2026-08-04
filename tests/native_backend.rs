@@ -411,6 +411,7 @@ fn failed_start_persistence_advances_the_run_generation() {
         )
         .unwrap();
     let shell_id = workspace.shells[0].id.clone();
+    let cursor = daemon.client.events(None, 256, 0).unwrap().cursor;
     let state_directory = daemon.runtime_dir.join("state/boomux");
     let saved_directory = daemon.runtime_dir.join("saved-state");
     fs::rename(&state_directory, &saved_directory).unwrap();
@@ -425,6 +426,11 @@ fn failed_start_persistence_advances_the_run_generation() {
             .to_string()
             .contains("could not persist started shell")
     );
+    let events = daemon.client.events(Some(cursor), 256, 0).unwrap();
+    assert!(!events.events.iter().any(|event| matches!(
+        event.kind,
+        protocol::DaemonEventKind::RunStarted { .. } | protocol::DaemonEventKind::RunExited { .. }
+    )));
 
     fs::remove_file(&state_directory).unwrap();
     fs::rename(&saved_directory, &state_directory).unwrap();
@@ -453,6 +459,7 @@ fn exited_run_persistence_retries_after_storage_recovers() {
         .unwrap()
         .stream;
     let run_id = daemon.client.get_shell(&shell_id).unwrap().run.unwrap().id;
+    let cursor = daemon.client.events(None, 256, 0).unwrap().cursor;
     let state_directory = daemon.runtime_dir.join("state/boomux");
     let saved_directory = daemon.runtime_dir.join("saved-exit-state");
     fs::rename(&state_directory, &saved_directory).unwrap();
@@ -471,6 +478,28 @@ fn exited_run_persistence_retries_after_storage_recovers() {
         "shell did not exit while persistence was unavailable",
     );
     drop(attachment);
+    let while_broken = daemon.client.events(Some(cursor.clone()), 256, 0).unwrap();
+    assert!(
+        !while_broken
+            .events
+            .iter()
+            .any(|event| matches!(event.kind, protocol::DaemonEventKind::RunExited { .. }))
+    );
+    let error = daemon.client.events(None, 256, 0).unwrap_err();
+    assert_eq!(
+        error
+            .get_ref()
+            .and_then(|error| error.downcast_ref::<RemoteError>())
+            .and_then(|error| error.code),
+        Some(ErrorCode::PersistenceFailed)
+    );
+    let restart = daemon
+        .command()
+        .args(["daemon", "restart"])
+        .output()
+        .unwrap();
+    assert!(!restart.status.success());
+    assert!(daemon.client.ping().is_ok());
     fs::remove_file(&state_directory).unwrap();
     fs::rename(&saved_directory, &state_directory).unwrap();
     let state_path = state_directory.join("state.json");
@@ -483,7 +512,105 @@ fn exited_run_persistence_retries_after_storage_recovers() {
         },
         "exited run was not persisted after storage recovered",
     );
+    wait_until(
+        || {
+            daemon
+                .client
+                .events(Some(cursor.clone()), 256, 0)
+                .unwrap()
+                .events
+                .iter()
+                .any(|event| {
+                    matches!(
+                        &event.kind,
+                        protocol::DaemonEventKind::RunExited { run, .. } if run.id == run_id
+                    )
+                })
+        },
+        "exited run event was not published after storage recovered",
+    );
+    let events = daemon.client.events(Some(cursor), 256, 0).unwrap();
+    assert_eq!(
+        events
+            .events
+            .iter()
+            .filter(|event| matches!(
+                &event.kind,
+                protocol::DaemonEventKind::RunExited { run, .. } if run.id == run_id
+            ))
+            .count(),
+        1
+    );
 
+    let saved_directory = daemon.runtime_dir.join("saved-natural-exit-state");
+    fs::rename(&state_directory, &saved_directory).unwrap();
+    fs::write(&state_directory, b"not a directory").unwrap();
+    assert!(daemon.client.close_shell(&shell_id).is_err());
+    let restored = daemon.client.get_shell(&shell_id).unwrap();
+    assert!(matches!(restored.status, ShellStatus::Exited { .. }));
+    assert_eq!(restored.run.unwrap().id, run_id);
+    fs::remove_file(&state_directory).unwrap();
+    fs::rename(&saved_directory, &state_directory).unwrap();
+
+    daemon.client.close_workspace(&workspace.id).unwrap();
+    daemon.stop_with_cli();
+}
+
+#[test]
+fn failed_close_publishes_terminated_run_after_storage_recovers() {
+    let mut daemon = TestDaemon::start();
+    let workspace = daemon
+        .client
+        .create_workspace(
+            "failed-close-persistence",
+            vec![ShellSpec::login("shell", std::env::temp_dir())],
+        )
+        .unwrap();
+    let shell_id = workspace.shells[0].id.clone();
+    let attachment = daemon.client.attach(&shell_id, false, profile()).unwrap();
+    let run_id = daemon.client.get_shell(&shell_id).unwrap().run.unwrap().id;
+    let cursor = daemon.client.events(None, 256, 0).unwrap().cursor;
+    let state_directory = daemon.runtime_dir.join("state/boomux");
+    let saved_directory = daemon.runtime_dir.join("saved-close-state");
+    fs::rename(&state_directory, &saved_directory).unwrap();
+    fs::write(&state_directory, b"not a directory").unwrap();
+
+    assert!(daemon.client.close_shell(&shell_id).is_err());
+    drop(attachment);
+    let restored = daemon.client.get_shell(&shell_id).unwrap();
+    assert_eq!(restored.status, ShellStatus::Pending);
+    assert!(restored.run.is_none());
+    assert!(
+        !daemon
+            .client
+            .events(Some(cursor.clone()), 256, 0)
+            .unwrap()
+            .events
+            .iter()
+            .any(|event| matches!(event.kind, protocol::DaemonEventKind::RunExited { .. }))
+    );
+
+    fs::remove_file(&state_directory).unwrap();
+    fs::rename(&saved_directory, &state_directory).unwrap();
+    wait_until(
+        || {
+            daemon
+                .client
+                .events(Some(cursor.clone()), 256, 0)
+                .unwrap()
+                .events
+                .iter()
+                .any(|event| {
+                    matches!(
+                        &event.kind,
+                        protocol::DaemonEventKind::RunExited { run, .. }
+                            if run.id == run_id
+                                && run.exit_reason == Some(ShellRunExitReason::Terminated)
+                    )
+                })
+        },
+        "terminated run event was not published after close persistence recovered",
+    );
     daemon.client.close_workspace(&workspace.id).unwrap();
     daemon.stop_with_cli();
 }

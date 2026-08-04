@@ -38,10 +38,16 @@ Output events carry run identity and the latest output revision, not raw PTY
 bytes. Consumers use revision-aware reads to retrieve the current bounded,
 rendered terminal state.
 
-Event IDs provide one total publication order. Existing mutation paths publish
-after their current persistence or lifecycle boundary. Foundation phase 5 will
-route all transitions through one coordinator so persistence and event
-publication share a single commit boundary.
+Event IDs provide one total publication order. The daemon transition coordinator
+couples durable lifecycle mutation, persistence, and event publication. Events
+are published only after their corresponding state is persisted. If persistence
+fails, the event batch remains pending; background recovery publishes queued
+batches in transition order and exactly once.
+
+The baseline snapshot and cursor are captured under this same coordinator, so no
+transition can be published between those observations. PTY bytes are not
+persisted on every chunk, but output revision mutation and `output_changed`
+publication still cross the transition boundary together.
 
 ## Revision Reads
 
