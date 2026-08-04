@@ -44,14 +44,14 @@ commitments.
   rendered scrollback through `boomux read`.
 - [x] Persist reproducible workspace and shell metadata atomically under
   `$XDG_STATE_HOME`; restore shells as pending after daemon restart.
+- [x] Preserve running shells and reconnect active terminal clients across a
+  transactional graceful daemon restart.
 
 ## Workspace Control
 
 See [`native-terminal-follow-up.md`](native-terminal-follow-up.md) for the
 terminal handshake, VT reconstruction, and restart-persistence plan.
 
-- Add graceful daemon restart through the staged
-  [live PTY handoff design](live-pty-handoff.md).
 - Aggregate multiple agent states as counts instead of one workspace-level
   value.
 - Notify when an agent becomes blocked, finishes, or needs input.
