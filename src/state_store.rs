@@ -1,6 +1,7 @@
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -54,29 +55,18 @@ pub(crate) struct StateStore {
 
 impl StateStore {
     pub(crate) fn from_environment() -> io::Result<Self> {
-        let root = match env::var_os("XDG_STATE_HOME").filter(|path| !path.is_empty()) {
-            Some(path) => PathBuf::from(path),
-            None => PathBuf::from(
-                env::var_os("HOME")
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))?,
-            )
-            .join(".local/state"),
-        };
-        if !root.is_absolute() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "XDG_STATE_HOME must be an absolute path",
-            ));
-        }
-        let directory = root.join("boomux");
-        secure_state_dir(&directory)?;
+        let lock_path = lock_path_from_environment()?;
+        let directory = lock_path
+            .parent()
+            .ok_or_else(|| io::Error::other("state lock path has no parent"))?;
+        secure_state_dir(directory)?;
         let lock = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
             .mode(0o600)
-            .open(directory.join("daemon.lock"))?;
+            .open(&lock_path)?;
         // The descriptor remains open for the store lifetime and `flock` takes
         // only pointer-free integer arguments.
         if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == -1 {
@@ -94,6 +84,25 @@ impl StateStore {
             path: directory.join("state.json"),
             _lock: Some(lock),
         })
+    }
+
+    pub(crate) fn from_transferred_lock(lock: OwnedFd) -> io::Result<Self> {
+        let lock_path = lock_path_from_environment()?;
+        let directory = lock_path
+            .parent()
+            .ok_or_else(|| io::Error::other("state lock path has no parent"))?;
+        secure_state_dir(directory)?;
+        Ok(Self {
+            path: directory.join("state.json"),
+            _lock: Some(File::from(lock)),
+        })
+    }
+
+    pub(crate) fn lock_descriptor(&self) -> io::Result<BorrowedFd<'_>> {
+        self._lock
+            .as_ref()
+            .map(AsFd::as_fd)
+            .ok_or_else(|| io::Error::other("state store has no ownership lock"))
     }
 
     #[cfg(test)]
@@ -175,6 +184,24 @@ impl StateStore {
         }
         result
     }
+}
+
+pub(crate) fn lock_path_from_environment() -> io::Result<PathBuf> {
+    let root = match env::var_os("XDG_STATE_HOME").filter(|path| !path.is_empty()) {
+        Some(path) => PathBuf::from(path),
+        None => PathBuf::from(
+            env::var_os("HOME")
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))?,
+        )
+        .join(".local/state"),
+    };
+    if !root.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "XDG_STATE_HOME must be an absolute path",
+        ));
+    }
+    Ok(root.join("boomux/daemon.lock"))
 }
 
 fn secure_state_dir(path: &Path) -> io::Result<()> {

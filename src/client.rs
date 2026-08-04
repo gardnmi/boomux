@@ -1,5 +1,7 @@
 use std::env;
+use std::fs::OpenOptions;
 use std::io;
+use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -126,7 +128,7 @@ impl Client {
     pub fn shutdown(&self) -> io::Result<()> {
         expect_ok(self.request(Request::Shutdown)?, Response::Ok)?;
         for _ in 0..SHUTDOWN_ATTEMPTS {
-            if !self.socket_path.exists() {
+            if !self.socket_path.exists() && daemon_lock_available(&self.socket_path)? {
                 return Ok(());
             }
             thread::sleep(CONNECT_DELAY);
@@ -135,6 +137,19 @@ impl Client {
             io::ErrorKind::TimedOut,
             "Boomux daemon did not finish shutting down",
         ))
+    }
+
+    pub fn restart(&self) -> io::Result<()> {
+        expect_ok(self.request(Request::Restart)?, Response::Ok)?;
+        let mut last_error = None;
+        for _ in 0..CONNECT_ATTEMPTS {
+            match self.ping() {
+                Ok(()) => return Ok(()),
+                Err(error) => last_error = Some(error),
+            }
+            thread::sleep(CONNECT_DELAY);
+        }
+        Err(last_error.unwrap_or_else(|| io::Error::other("replacement daemon did not start")))
     }
 
     pub fn snapshot(&self) -> io::Result<Snapshot> {
@@ -280,6 +295,29 @@ impl Client {
             }),
             other => unexpected(other),
         }
+    }
+}
+
+fn daemon_lock_available(socket_path: &Path) -> io::Result<bool> {
+    let lock_path = socket_path
+        .parent()
+        .ok_or_else(|| io::Error::other("daemon socket has no parent"))?
+        .join("daemon.lock");
+    let lock = match OpenOptions::new().read(true).write(true).open(lock_path) {
+        Ok(lock) => lock,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(error),
+    };
+    // The descriptor remains live for both flock operations.
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        let _ = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) };
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+        Ok(false)
+    } else {
+        Err(error)
     }
 }
 

@@ -104,6 +104,7 @@ boomux shell inspect <shell-name-or-id> [--workspace <name-or-id>]
 boomux shell rename <shell-name-or-id> <new-name> [--workspace <name-or-id>]
 boomux shell close <shell-name-or-id> [--workspace <name-or-id>]
 boomux daemon status
+boomux daemon restart
 boomux daemon stop
 boomux skill install
 ```
@@ -198,6 +199,8 @@ PTY handoff work is tracked in
 
 - PTYs and processes exist only for the daemon's lifetime. After restart,
   persisted shells return as pending and start fresh processes when reopened.
+- Live daemon restart currently requires every shell to be pending; started
+  shell runtime transfer is the next handoff phase.
 - Mutated process environment and in-memory application state are not persisted.
 - Reconnection emits at most 1 MiB of sanitized VT reconstruction rather than
   replaying historical PTY bytes. Graphics are omitted from reconstruction.

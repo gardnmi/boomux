@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 pub const MAX_CONTROL_FRAME: usize = 8 * 1024 * 1024;
 pub const MAX_ATTACH_FRAME: usize = 1024 * 1024;
 
@@ -86,6 +86,7 @@ impl ShellSpec {
 #[serde(tag = "request", rename_all = "snake_case")]
 pub enum Request {
     Ping,
+    Restart,
     Shutdown,
     Snapshot,
     GetWorkspace {

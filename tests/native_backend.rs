@@ -1,6 +1,9 @@
-use std::fs;
-use std::io;
+use std::fs::{self, OpenOptions};
+use std::io::{self, IoSlice, Read, Write};
+use std::os::fd::{AsRawFd, RawFd};
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -11,6 +14,7 @@ use boomux::protocol::{AttachFrame, ShellSpec, ShellStatus, TerminalProfile};
 use uuid::Uuid;
 
 const TIMEOUT: Duration = Duration::from_secs(5);
+const HANDOFF_CHANNEL_FD: RawFd = 198;
 
 struct TestDaemon {
     executable: PathBuf,
@@ -99,12 +103,110 @@ impl TestDaemon {
 
 impl Drop for TestDaemon {
     fn drop(&mut self) {
+        if self.client.socket_path().exists() {
+            let _ = self.client.shutdown();
+        }
         if let Some(child) = self.child.as_mut() {
             let _ = child.kill();
             let _ = child.wait();
         }
         let _ = fs::remove_dir_all(&self.runtime_dir);
     }
+}
+
+#[test]
+fn replacement_bootstrap_rejects_invalid_inherited_descriptor() {
+    let output = Command::new(env!("CARGO_BIN_EXE_boomux"))
+        .args(["daemon", "receive-handoff", "--channel", "999999"])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Bad file descriptor"));
+}
+
+#[test]
+fn replacement_bootstrap_receives_listener_and_lock_ownership() {
+    let executable = PathBuf::from(env!("CARGO_BIN_EXE_boomux"));
+    let root = std::env::temp_dir().join(format!(
+        "boomux-handoff-{}-{}",
+        std::process::id(),
+        Uuid::new_v4()
+    ));
+    let runtime_home = root.join("runtime");
+    let state_home = root.join("state");
+    let runtime_directory = runtime_home.join("boomux");
+    let state_directory = state_home.join("boomux");
+    fs::create_dir_all(&runtime_directory).unwrap();
+    fs::create_dir_all(&state_directory).unwrap();
+    let socket_path = runtime_directory.join("daemon.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+    let runtime_lock = locked_file(&runtime_directory.join("daemon.lock"));
+    let state_lock = locked_file(&state_directory.join("daemon.lock"));
+    let (mut parent_channel, child_channel) = UnixStream::pair().unwrap();
+    let child_channel_fd = child_channel.as_raw_fd();
+    let mut command = Command::new(executable);
+    command
+        .args([
+            "daemon",
+            "receive-handoff",
+            "--channel",
+            &HANDOFF_CHANNEL_FD.to_string(),
+        ])
+        .env("XDG_RUNTIME_DIR", &runtime_home)
+        .env("XDG_STATE_HOME", &state_home)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // The child duplicates its socketpair endpoint to the explicit bootstrap fd
+    // immediately before exec and clears close-on-exec on that duplicate.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::dup2(child_channel_fd, HANDOFF_CHANNEL_FD) == -1
+                || libc::fcntl(HANDOFF_CHANNEL_FD, libc::F_SETFD, 0) == -1
+            {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut replacement = command.spawn().unwrap();
+    drop(child_channel);
+
+    parent_channel.set_read_timeout(Some(TIMEOUT)).unwrap();
+    parent_channel.set_write_timeout(Some(TIMEOUT)).unwrap();
+    parent_channel.write_all(b"BOOMUXH1").unwrap();
+    send_descriptor(&parent_channel, listener.as_raw_fd(), 1);
+    send_descriptor(&parent_channel, runtime_lock.as_raw_fd(), 2);
+    send_descriptor(&parent_channel, state_lock.as_raw_fd(), 3);
+    let mut ready = [0];
+    parent_channel.read_exact(&mut ready).unwrap();
+    assert_eq!(ready, [4]);
+
+    drop(listener);
+    drop(runtime_lock);
+    drop(state_lock);
+    let runtime_contender = open_lock(&runtime_directory.join("daemon.lock"));
+    let state_contender = open_lock(&state_directory.join("daemon.lock"));
+    assert_lock_is_held(&runtime_contender);
+    assert_lock_is_held(&state_contender);
+    UnixStream::connect(&socket_path).unwrap();
+
+    parent_channel.write_all(&[5]).unwrap();
+    wait_until(
+        || replacement.try_wait().unwrap().is_some(),
+        "replacement did not abort",
+    );
+    assert!(replacement.wait().unwrap().success());
+    assert_eq!(
+        unsafe { libc::flock(runtime_contender.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    assert_eq!(
+        unsafe { libc::flock(state_contender.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -187,7 +289,7 @@ fn native_daemon_lifecycle() {
         .output()
         .unwrap();
     assert!(status.status.success());
-    assert!(String::from_utf8_lossy(&status.stdout).contains("running (protocol 4"));
+    assert!(String::from_utf8_lossy(&status.stdout).contains("running (protocol 5"));
 
     let mut duplicate = daemon
         .command()
@@ -219,6 +321,54 @@ fn native_daemon_lifecycle() {
         "second daemon did not reject the held state lock",
     );
     assert!(!duplicate_state.wait().unwrap().success());
+
+    let pending_workspace = daemon
+        .client
+        .create_workspace(
+            "handoff-pending",
+            vec![ShellSpec::login("pending", std::env::temp_dir())],
+        )
+        .unwrap();
+    let state_path = daemon.runtime_dir.join("state/boomux/state.json");
+    let valid_state = fs::read(&state_path).unwrap();
+    fs::write(&state_path, b"invalid replacement state").unwrap();
+    let failed_restart = daemon
+        .command()
+        .args(["daemon", "restart"])
+        .output()
+        .unwrap();
+    assert!(!failed_restart.status.success());
+    assert!(daemon.client.ping().is_ok());
+    assert!(daemon.client.socket_path().exists());
+    fs::write(&state_path, valid_state).unwrap();
+
+    let old_daemon_pid = daemon.child.as_ref().unwrap().id();
+    let restart = daemon
+        .command()
+        .args(["daemon", "restart"])
+        .output()
+        .unwrap();
+    assert!(
+        restart.status.success(),
+        "daemon restart failed: {}",
+        String::from_utf8_lossy(&restart.stderr)
+    );
+    assert!(String::from_utf8_lossy(&restart.stdout).contains("Restarted Boomux daemon"));
+    wait_until(
+        || daemon.child.as_mut().unwrap().try_wait().unwrap().is_some(),
+        "old daemon did not exit after handoff",
+    );
+    assert!(!process_exists(old_daemon_pid as libc::pid_t));
+    let restored_pending = daemon.client.get_workspace(&pending_workspace.id).unwrap();
+    assert_eq!(
+        restored_pending.shells[0].id,
+        pending_workspace.shells[0].id
+    );
+    assert_eq!(restored_pending.shells[0].status, ShellStatus::Pending);
+    daemon
+        .client
+        .close_workspace(&pending_workspace.id)
+        .unwrap();
 
     let output = daemon
         .command()
@@ -382,6 +532,23 @@ fn native_daemon_lifecycle() {
         .unwrap();
     let output = read_until(&mut first, b"transport-ok");
     assert!(contains(&output, b"transport-ok"));
+    let rejected_restart = daemon
+        .command()
+        .args(["daemon", "restart"])
+        .output()
+        .unwrap();
+    assert!(!rejected_restart.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected_restart.stderr)
+            .contains("requires every shell to be pending")
+    );
+    AttachFrame::Input(b"printf 'still-running\\n'\n".to_vec())
+        .write_to(&mut first)
+        .unwrap();
+    assert!(contains(
+        &read_until(&mut first, b"still-running"),
+        b"still-running"
+    ));
     AttachFrame::Input(
         b"printf 'G101MjtjO1kyeHBjR0p2WVhKawc=' | base64 -d; printf 'progress\rsettled\n'\n"
             .to_vec(),
@@ -497,6 +664,57 @@ fn profile() -> TerminalProfile {
         pixel_width: 800,
         pixel_height: 600,
     }
+}
+
+fn open_lock(path: &std::path::Path) -> std::fs::File {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path)
+        .unwrap()
+}
+
+fn locked_file(path: &std::path::Path) -> std::fs::File {
+    let file = open_lock(path);
+    assert_eq!(
+        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    file
+}
+
+fn assert_lock_is_held(file: &std::fs::File) {
+    assert_eq!(
+        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        -1
+    );
+    assert_eq!(
+        io::Error::last_os_error().raw_os_error(),
+        Some(libc::EWOULDBLOCK)
+    );
+}
+
+fn send_descriptor(stream: &UnixStream, descriptor: RawFd, marker: u8) {
+    use nix::sys::socket::{ControlMessage, MsgFlags, sendmsg};
+
+    let marker = [marker];
+    let data = [IoSlice::new(&marker)];
+    let descriptors = [descriptor];
+    let control = [ControlMessage::ScmRights(&descriptors)];
+    assert_eq!(
+        sendmsg::<()>(
+            stream.as_raw_fd(),
+            &data,
+            &control,
+            MsgFlags::MSG_NOSIGNAL,
+            None,
+        )
+        .unwrap(),
+        1
+    );
 }
 
 fn read_until(stream: &mut UnixStream, needle: &[u8]) -> Vec<u8> {

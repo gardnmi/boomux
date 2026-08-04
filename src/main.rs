@@ -167,8 +167,16 @@ enum DaemonCommands {
     /// Start the daemon in the foreground
     #[command(hide = true)]
     Run,
+    /// Receive daemon ownership from a running Boomux process
+    #[command(hide = true)]
+    ReceiveHandoff {
+        #[arg(long)]
+        channel: i32,
+    },
     /// Report whether the daemon is accepting requests
     Status,
+    /// Replace the daemon without changing pending workspace state
+    Restart,
     /// Stop the daemon and its managed shells
     Stop,
 }
@@ -188,6 +196,9 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         Some(Commands::Daemon {
             command: DaemonCommands::Run,
         }) => return Ok(daemon::run()?),
+        Some(Commands::Daemon {
+            command: DaemonCommands::ReceiveHandoff { channel },
+        }) => return Ok(daemon::receive_handoff(*channel)?),
         Some(Commands::Attach { shell_id, takeover }) => {
             return Ok(attach::run(shell_id, *takeover)?);
         }
@@ -247,11 +258,15 @@ fn daemon_control(command: DaemonCommands) -> Result<(), Box<dyn Error>> {
             protocol::PROTOCOL_VERSION,
             client.socket_path().display()
         ),
+        DaemonCommands::Restart => {
+            client.restart()?;
+            println!("Restarted Boomux daemon");
+        }
         DaemonCommands::Stop => {
             client.shutdown()?;
             println!("Stopped Boomux daemon");
         }
-        DaemonCommands::Run => unreachable!(),
+        DaemonCommands::Run | DaemonCommands::ReceiveHandoff { .. } => unreachable!(),
     }
     Ok(())
 }
@@ -1055,6 +1070,7 @@ mod tests {
         let cli = Cli::try_parse_from(["boomux", "."]).unwrap();
         assert_eq!(cli.path, Some(PathBuf::from(".")));
         assert!(Cli::try_parse_from(["boomux", "daemon", "run"]).is_ok());
+        assert!(Cli::try_parse_from(["boomux", "daemon", "restart"]).is_ok());
         assert!(Cli::try_parse_from(["boomux", "daemon", "stop"]).is_ok());
         let cli = Cli::try_parse_from(["boomux", "__attach", "s1", "--takeover"]).unwrap();
         assert!(matches!(
