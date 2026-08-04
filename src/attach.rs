@@ -41,7 +41,7 @@ pub fn run(shell_id: &str, takeover: bool) -> io::Result<()> {
     let _raw_mode = RawMode::enter()?;
     let mut stdin = io::stdin().lock();
     let mut stdout = io::stdout().lock();
-    stdout.write_all(&attachment.replay)?;
+    stdout.write_all(&attachment.reconstruction)?;
     stdout.flush()?;
 
     let mut input = [0; 16 * 1024];

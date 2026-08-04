@@ -63,7 +63,7 @@ The daemon supports:
 - Workspace and shell snapshots
 - Shell and workspace rename operations
 - Shell and workspace closure
-- Bounded output replay
+- Bounded VT state and sanitized reconnect reconstruction
 - One writable attachment with explicit takeover
 - PTY input and resize forwarding
 - Pending shell metadata and first-attachment terminal negotiation
@@ -91,6 +91,9 @@ the attachment exits.
 
 The daemon keeps a bounded output queue per active controller. A slow client
 drops output rather than blocking the PTY reader and child process.
+It also feeds a shadow `vt100` parser while forwarding the original PTY bytes
+unchanged. Reattachment receives a bounded reconstruction of rendered state,
+not historical OSC or graphics commands.
 
 ### Terminal Launcher
 
@@ -122,7 +125,7 @@ context while exact shell IDs remain globally addressable within the daemon.
 
 Closing a terminal window closes only its socket attachment. The daemon retains
 the PTY master and child. Reopening a window acquires the controller and first
-receives retained raw output followed by live output.
+receives sanitized reconstructed terminal state followed by live output.
 
 Closing a pending shell removes only metadata. Closing a running shell terminates
 its child and disconnects its controller. Closing a
@@ -131,17 +134,17 @@ On Linux, cleanup signals every process still belonging to the shell's session
 before reaping the session leader. `boomux daemon stop` applies the same cleanup
 to the complete registry and removes the runtime socket.
 
-Current persistence is deliberately limited to daemon lifetime. Boomux does not
-yet write registry metadata or claim that arbitrary processes survive daemon
-restart or crash.
+The daemon atomically writes reproducible registry metadata to
+`$XDG_STATE_HOME/boomux/state.json`, falling back to
+`~/.local/state/boomux/state.json`. Workspace and shell IDs, names, grouping,
+shell working directories, startup commands, and last terminal profiles survive
+restart. Recovered shells are pending: Boomux does not claim that arbitrary
+processes, mutated environments, or PTYs survive daemon restart or crash.
 
 ## Next Technical Steps
 
 The detailed design, acceptance criteria, and manual test matrix are tracked in
 [`native-terminal-follow-up.md`](native-terminal-follow-up.md).
 
-1. Track terminal state with a VT parser and emit a sanitized reconnect snapshot.
-2. Persist reproducible workspace and shell metadata atomically under
-   `$XDG_STATE_HOME`, keeping working directories on shells only.
-3. Add graceful daemon restart or live PTY handoff only after the base lifecycle
+1. Add graceful daemon restart or live PTY handoff only after the base lifecycle
    is reliable.

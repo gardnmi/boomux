@@ -21,9 +21,9 @@ boomux read "<name-or-shell-id>" --lines 200
 ```
 
 Use the returned text to answer the user's question. Increase `--lines` when
-the relevant output is older. This reads Boomux's bounded raw output replay,
-which may not contain a process's complete historical log and may include ANSI
-control sequences.
+the relevant output is older. This reads Boomux's bounded, plain rendered VT
+scrollback. It does not include ANSI sequences or a process's complete
+historical log.
 
 ## Discover Shells
 

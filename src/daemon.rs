@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -22,13 +22,18 @@ use crate::protocol::{
     self, AttachFrame, Envelope, Request, Response, ShellSnapshot, ShellSpec, ShellStatus,
     Snapshot, TerminalProfile, WorkspaceSnapshot,
 };
+use crate::state_store::{PersistedShell, PersistedState, PersistedWorkspace, StateStore};
+use crate::terminal_state::TerminalState;
 
-const REPLAY_LIMIT: usize = 1024 * 1024;
 const CONTROLLER_QUEUE: usize = 64;
 const SHUTDOWN_GRACE: Duration = Duration::from_millis(50);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 const IO_RETRY_DELAY: Duration = Duration::from_millis(2);
 const MAX_TERMINAL_ENV_VALUE: usize = 256;
+const MAX_TERMINAL_ROWS: u16 = 1_000;
+const MAX_TERMINAL_COLS: u16 = 1_000;
+const MAX_TERMINAL_CELLS: usize = 1_000_000;
+const MAX_SHELL_READ_BYTES: usize = 1024 * 1024;
 
 pub fn run() -> io::Result<()> {
     let socket_path = client::socket_path()?;
@@ -46,17 +51,18 @@ pub fn run() -> io::Result<()> {
     let _socket_cleanup = SocketCleanup(socket_path.clone());
     fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))?;
     listener.set_nonblocking(true)?;
-    let registry = Arc::new(Registry::default());
+    let registry = Arc::new(Registry::restore(StateStore::from_environment()?)?);
     let shutdown = Arc::new(AtomicBool::new(false));
+    let mut handlers = Vec::new();
 
     while !shutdown.load(Ordering::Acquire) {
         match listener.accept() {
             Ok((stream, _)) => {
                 let registry = Arc::clone(&registry);
                 let shutdown = Arc::clone(&shutdown);
-                thread::spawn(move || {
+                handlers.push(thread::spawn(move || {
                     let _ = handle_connection(stream, registry, shutdown);
-                });
+                }));
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(25));
@@ -65,7 +71,15 @@ pub fn run() -> io::Result<()> {
             Err(error) => return Err(error),
         }
     }
-    registry.shutdown()
+    for handler in handlers {
+        let _ = handler.join();
+    }
+    let result = registry.shutdown();
+    drop(registry);
+    drop(listener);
+    drop(_daemon_lock);
+    drop(_socket_cleanup);
+    result
 }
 
 struct SocketCleanup(PathBuf);
@@ -115,7 +129,9 @@ fn handle_connection(
     registry: Arc<Registry>,
     shutdown: Arc<AtomicBool>,
 ) -> io::Result<()> {
+    stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
     let request: Envelope<Request> = protocol::read_message(&mut stream)?;
+    stream.set_read_timeout(None)?;
     if request.version != protocol::PROTOCOL_VERSION {
         return send_response(
             &mut stream,
@@ -138,9 +154,18 @@ fn handle_connection(
         return handle_attach(stream, &registry, &shell_id, takeover, profile);
     }
     if matches!(request.message, Request::Shutdown) {
-        send_response(&mut stream, Response::Ok)?;
-        shutdown.store(true, Ordering::Release);
-        return Ok(());
+        return match registry.shutdown() {
+            Ok(()) => {
+                shutdown.store(true, Ordering::Release);
+                send_response(&mut stream, Response::Ok)
+            }
+            Err(error) => send_response(
+                &mut stream,
+                Response::Error {
+                    message: format!("could not stop Boomux daemon: {error}"),
+                },
+            ),
+        };
     }
 
     let response = registry
@@ -155,15 +180,39 @@ fn send_response(stream: &mut UnixStream, response: Response) -> io::Result<()> 
     protocol::write_message(stream, &Envelope::new(response))
 }
 
-#[derive(Default)]
 struct Registry {
     state: Mutex<RegistryState>,
+    store: Option<StateStore>,
+    mutation_lock: Mutex<()>,
+    persist_lock: Mutex<()>,
+    stopping: AtomicBool,
 }
 
 #[derive(Default)]
 struct RegistryState {
     workspaces: HashMap<String, Arc<Workspace>>,
     shells: HashMap<String, Arc<Shell>>,
+}
+
+struct RegistryBackup {
+    workspaces: HashMap<String, Arc<Workspace>>,
+    shells: HashMap<String, Arc<Shell>>,
+    workspace_names: HashMap<String, String>,
+    workspace_shell_ids: HashMap<String, Vec<String>>,
+    shell_names: HashMap<String, String>,
+    last_profiles: HashMap<String, Option<TerminalProfile>>,
+}
+
+impl Default for Registry {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(RegistryState::default()),
+            store: None,
+            mutation_lock: Mutex::new(()),
+            persist_lock: Mutex::new(()),
+            stopping: AtomicBool::new(false),
+        }
+    }
 }
 
 struct Workspace {
@@ -178,6 +227,7 @@ struct Shell {
     name: Mutex<String>,
     cwd: PathBuf,
     command: Vec<String>,
+    last_profile: Mutex<Option<TerminalProfile>>,
     lifecycle: Mutex<ShellLifecycle>,
 }
 
@@ -200,7 +250,7 @@ struct ShellRuntime {
     master: Mutex<Box<dyn MasterPty + Send>>,
     writer: Mutex<Box<dyn Write + Send>>,
     child: Mutex<Box<dyn Child + Send + Sync>>,
-    replay: Mutex<VecDeque<u8>>,
+    terminal: Mutex<TerminalState>,
     controller: Mutex<Option<Controller>>,
 }
 
@@ -224,17 +274,21 @@ impl Registry {
             Request::GetShell { shell_id } => Ok(Response::Shell {
                 shell: self.shell(&shell_id)?.snapshot()?,
             }),
-            Request::CreateWorkspace { name, shells } => Ok(Response::Workspace {
-                workspace: self.create_workspace(name, shells)?,
+            Request::CreateWorkspace { name, shells } => self.durable_mutation(|| {
+                Ok(Response::Workspace {
+                    workspace: self.create_workspace(name, shells)?,
+                })
             }),
             Request::CreateShell {
                 workspace_id,
                 shell,
-            } => Ok(Response::Shell {
-                shell: match workspace_id {
-                    Some(workspace_id) => self.create_shell(&workspace_id, shell)?,
-                    None => self.create_shell_with_workspace(shell)?,
-                },
+            } => self.durable_mutation(|| {
+                Ok(Response::Shell {
+                    shell: match workspace_id {
+                        Some(workspace_id) => self.create_shell(&workspace_id, shell)?,
+                        None => self.create_shell_with_workspace(shell)?,
+                    },
+                })
             }),
             Request::ReadShell {
                 shell_id,
@@ -242,7 +296,7 @@ impl Registry {
             } => Ok(Response::Output {
                 bytes: self.read_shell(&shell_id, max_bytes)?,
             }),
-            Request::RenameWorkspace { workspace_id, name } => {
+            Request::RenameWorkspace { workspace_id, name } => self.durable_mutation(|| {
                 validate_name(&name)?;
                 let workspace = self.workspace(&workspace_id)?;
                 let state = lock(&self.state)?;
@@ -256,11 +310,11 @@ impl Registry {
                 }
                 *lock(&workspace.name)? = name;
                 Ok(Response::Ok)
-            }
-            Request::RenameShell { shell_id, name } => {
+            }),
+            Request::RenameShell { shell_id, name } => self.durable_mutation(|| {
                 self.rename_shell(&shell_id, name)?;
                 Ok(Response::Ok)
-            }
+            }),
             Request::CloseWorkspace { workspace_id } => {
                 self.close_workspace(&workspace_id)?;
                 Ok(Response::Ok)
@@ -271,6 +325,177 @@ impl Registry {
             }
             Request::Attach { .. } => unreachable!("attach is handled before dispatch"),
         }
+    }
+
+    fn restore(store: StateStore) -> io::Result<Self> {
+        let persisted = store.load()?.unwrap_or_default();
+        let mut state = RegistryState::default();
+        let mut workspace_names = HashSet::new();
+        for saved_workspace in persisted.workspaces {
+            validate_id("workspace", &saved_workspace.id)?;
+            validate_name(&saved_workspace.name)?;
+            if !workspace_names.insert(saved_workspace.name.clone())
+                || state.workspaces.contains_key(&saved_workspace.id)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Boomux state contains a duplicate workspace",
+                ));
+            }
+            let mut shell_names = HashSet::new();
+            let mut shell_ids = Vec::with_capacity(saved_workspace.shells.len());
+            for saved_shell in saved_workspace.shells {
+                validate_id("shell", &saved_shell.id)?;
+                validate_name(&saved_shell.name)?;
+                validate_persisted_cwd(&saved_shell.cwd)?;
+                if let Some(profile) = &saved_shell.last_profile {
+                    validate_terminal_profile(profile)?;
+                }
+                if !shell_names.insert(saved_shell.name.clone())
+                    || state.shells.contains_key(&saved_shell.id)
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Boomux state contains a duplicate shell",
+                    ));
+                }
+                let shell = Arc::new(Shell {
+                    id: saved_shell.id,
+                    workspace_id: saved_workspace.id.clone(),
+                    name: Mutex::new(saved_shell.name),
+                    cwd: saved_shell.cwd,
+                    command: saved_shell.command,
+                    last_profile: Mutex::new(saved_shell.last_profile),
+                    lifecycle: Mutex::new(ShellLifecycle::Pending),
+                });
+                shell_ids.push(shell.id.clone());
+                state.shells.insert(shell.id.clone(), shell);
+            }
+            let workspace = Arc::new(Workspace {
+                id: saved_workspace.id.clone(),
+                name: Mutex::new(saved_workspace.name),
+                shell_ids: Mutex::new(shell_ids),
+            });
+            state.workspaces.insert(saved_workspace.id, workspace);
+        }
+        Ok(Self {
+            state: Mutex::new(state),
+            store: Some(store),
+            mutation_lock: Mutex::new(()),
+            persist_lock: Mutex::new(()),
+            stopping: AtomicBool::new(false),
+        })
+    }
+
+    fn durable_mutation<T>(&self, operation: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+        let _mutation = lock(&self.mutation_lock)?;
+        self.ensure_running()?;
+        let backup = self.backup()?;
+        match operation() {
+            Ok(value) => match self.persist() {
+                Ok(()) => Ok(value),
+                Err(error) => {
+                    self.restore_backup(backup)?;
+                    Err(error)
+                }
+            },
+            Err(error) => {
+                self.restore_backup(backup)?;
+                Err(error)
+            }
+        }
+    }
+
+    fn ensure_running(&self) -> io::Result<()> {
+        if self.stopping.load(Ordering::Acquire) {
+            Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "Boomux daemon is stopping",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn backup(&self) -> io::Result<RegistryBackup> {
+        let state = lock(&self.state)?;
+        let mut workspace_names = HashMap::new();
+        let mut workspace_shell_ids = HashMap::new();
+        for workspace in state.workspaces.values() {
+            workspace_names.insert(workspace.id.clone(), lock(&workspace.name)?.clone());
+            workspace_shell_ids.insert(workspace.id.clone(), lock(&workspace.shell_ids)?.clone());
+        }
+        let mut shell_names = HashMap::new();
+        let mut last_profiles = HashMap::new();
+        for shell in state.shells.values() {
+            shell_names.insert(shell.id.clone(), lock(&shell.name)?.clone());
+            last_profiles.insert(shell.id.clone(), lock(&shell.last_profile)?.clone());
+        }
+        Ok(RegistryBackup {
+            workspaces: state.workspaces.clone(),
+            shells: state.shells.clone(),
+            workspace_names,
+            workspace_shell_ids,
+            shell_names,
+            last_profiles,
+        })
+    }
+
+    fn restore_backup(&self, backup: RegistryBackup) -> io::Result<()> {
+        let mut state = lock(&self.state)?;
+        for workspace in backup.workspaces.values() {
+            if let Some(name) = backup.workspace_names.get(&workspace.id) {
+                *lock(&workspace.name)? = name.clone();
+            }
+            if let Some(ids) = backup.workspace_shell_ids.get(&workspace.id) {
+                *lock(&workspace.shell_ids)? = ids.clone();
+            }
+        }
+        for shell in backup.shells.values() {
+            if let Some(name) = backup.shell_names.get(&shell.id) {
+                *lock(&shell.name)? = name.clone();
+            }
+            if let Some(profile) = backup.last_profiles.get(&shell.id) {
+                *lock(&shell.last_profile)? = profile.clone();
+            }
+        }
+        state.workspaces = backup.workspaces;
+        state.shells = backup.shells;
+        Ok(())
+    }
+
+    fn persist(&self) -> io::Result<()> {
+        let Some(store) = &self.store else {
+            return Ok(());
+        };
+        let _persist = lock(&self.persist_lock)?;
+        let state = lock(&self.state)?;
+        let mut workspaces = state.workspaces.values().cloned().collect::<Vec<_>>();
+        workspaces.sort_by(|left, right| left.id.cmp(&right.id));
+        let mut saved = PersistedState::default();
+        for workspace in workspaces {
+            let ids = lock(&workspace.shell_ids)?.clone();
+            let mut shells = Vec::with_capacity(ids.len());
+            for id in ids {
+                let Some(shell) = state.shells.get(&id) else {
+                    continue;
+                };
+                shells.push(PersistedShell {
+                    id: shell.id.clone(),
+                    name: lock(&shell.name)?.clone(),
+                    cwd: shell.cwd.clone(),
+                    command: shell.command.clone(),
+                    last_profile: lock(&shell.last_profile)?.clone(),
+                });
+            }
+            saved.workspaces.push(PersistedWorkspace {
+                id: workspace.id.clone(),
+                name: lock(&workspace.name)?.clone(),
+                shells,
+            });
+        }
+        drop(state);
+        store.save(&saved)
     }
 
     fn snapshot(&self) -> io::Result<Snapshot> {
@@ -285,24 +510,27 @@ impl Registry {
     }
 
     fn shutdown(&self) -> io::Result<()> {
+        let _mutation = lock(&self.mutation_lock)?;
+        self.stopping.store(true, Ordering::Release);
         let shells = {
-            let mut state = lock(&self.state)?;
-            state.workspaces.clear();
-            state
-                .shells
-                .drain()
-                .map(|(_, shell)| shell)
-                .collect::<Vec<_>>()
+            let state = lock(&self.state)?;
+            state.shells.values().cloned().collect::<Vec<_>>()
         };
-        let mut first_error = None;
-        for shell in shells {
-            if let Err(error) = shell.kill()
-                && first_error.is_none()
-            {
-                first_error = Some(error);
+        let mut killed: Vec<Arc<Shell>> = Vec::new();
+        for shell in &shells {
+            if let Err(error) = shell.kill() {
+                for shell in killed {
+                    shell.reset_pending()?;
+                }
+                self.stopping.store(false, Ordering::Release);
+                return Err(error);
             }
+            killed.push(Arc::clone(shell));
         }
-        first_error.map_or(Ok(()), Err)
+        let mut state = lock(&self.state)?;
+        state.workspaces.clear();
+        state.shells.clear();
+        Ok(())
     }
 
     fn workspace(&self, id: &str) -> io::Result<Arc<Workspace>> {
@@ -488,12 +716,13 @@ impl Registry {
             ShellLifecycle::Closed => return Err(not_found("shell", shell_id)),
         };
         drop(lifecycle);
-        let replay = lock(&runtime.replay)?;
-        let count = max_bytes.min(replay.len());
-        Ok(replay.iter().skip(replay.len() - count).copied().collect())
+        let text = lock(&runtime.terminal)?.plain_text();
+        Ok(tail_utf8(&text, max_bytes.min(MAX_SHELL_READ_BYTES))
+            .as_bytes()
+            .to_vec())
     }
 
-    fn close_shell(&self, shell_id: &str) -> io::Result<()> {
+    fn remove_shell(&self, shell_id: &str) -> io::Result<Arc<Shell>> {
         let (shell, workspace) = {
             let mut state = lock(&self.state)?;
             let shell = state
@@ -506,10 +735,10 @@ impl Registry {
         if let Some(workspace) = workspace {
             lock(&workspace.shell_ids)?.retain(|id| id != shell_id);
         }
-        shell.kill()
+        Ok(shell)
     }
 
-    fn close_workspace(&self, workspace_id: &str) -> io::Result<()> {
+    fn remove_workspace(&self, workspace_id: &str) -> io::Result<Vec<Arc<Shell>>> {
         let shells = {
             let mut state = lock(&self.state)?;
             let workspace = state
@@ -521,8 +750,53 @@ impl Registry {
                 .filter_map(|id| state.shells.remove(&id))
                 .collect::<Vec<_>>()
         };
-        for shell in shells {
-            let _ = shell.kill();
+        Ok(shells)
+    }
+
+    fn close_shell(&self, shell_id: &str) -> io::Result<()> {
+        let _mutation = lock(&self.mutation_lock)?;
+        self.ensure_running()?;
+        let backup = self.backup()?;
+        let shell = self.shell(shell_id)?;
+        shell.kill()?;
+        self.remove_shell(shell_id)?;
+        if let Err(error) = self.persist() {
+            self.restore_backup(backup)?;
+            shell.reset_pending()?;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn close_workspace(&self, workspace_id: &str) -> io::Result<()> {
+        let _mutation = lock(&self.mutation_lock)?;
+        self.ensure_running()?;
+        let backup = self.backup()?;
+        let workspace = self.workspace(workspace_id)?;
+        let shells = {
+            let state = lock(&self.state)?;
+            let ids = lock(&workspace.shell_ids)?;
+            ids.iter()
+                .filter_map(|id| state.shells.get(id).cloned())
+                .collect::<Vec<_>>()
+        };
+        let mut killed: Vec<Arc<Shell>> = Vec::new();
+        for shell in &shells {
+            if let Err(error) = shell.kill() {
+                for shell in killed {
+                    shell.reset_pending()?;
+                }
+                return Err(error);
+            }
+            killed.push(Arc::clone(shell));
+        }
+        self.remove_workspace(workspace_id)?;
+        if let Err(error) = self.persist() {
+            self.restore_backup(backup)?;
+            for shell in shells {
+                shell.reset_pending()?;
+            }
+            return Err(error);
         }
         Ok(())
     }
@@ -530,9 +804,9 @@ impl Registry {
 
 impl Workspace {
     fn snapshot(&self, registry: &Registry) -> io::Result<WorkspaceSnapshot> {
-        let ids = lock(&self.shell_ids)?.clone();
         let shells = {
             let state = lock(&registry.state)?;
+            let ids = lock(&self.shell_ids)?;
             ids.iter()
                 .filter_map(|id| state.shells.get(id).cloned())
                 .collect::<Vec<_>>()
@@ -566,44 +840,72 @@ impl Shell {
     }
 
     fn kill(&self) -> io::Result<()> {
-        let runtime =
-            match std::mem::replace(&mut *lock(&self.lifecycle)?, ShellLifecycle::Closed) {
-                ShellLifecycle::Pending | ShellLifecycle::Closed => return Ok(()),
+        let runtime = {
+            let mut lifecycle = lock(&self.lifecycle)?;
+            match &*lifecycle {
+                ShellLifecycle::Pending => {
+                    *lifecycle = ShellLifecycle::Closed;
+                    return Ok(());
+                }
                 ShellLifecycle::Running { runtime, .. }
-                | ShellLifecycle::Exited { runtime, .. } => runtime,
-            };
+                | ShellLifecycle::Exited { runtime, .. } => Arc::clone(runtime),
+                ShellLifecycle::Closed => return Ok(()),
+            }
+        };
         if let Some(controller) = lock(&runtime.controller)?.take() {
             let _ = controller.connection.shutdown(std::net::Shutdown::Both);
         }
         let foreground_group = lock(&runtime.master)?.process_group_leader();
         let mut child = lock(&runtime.child)?;
-        if child.try_wait()?.is_some() {
-            return Ok(());
+        let result = if child.try_wait()?.is_some() {
+            Ok(())
+        } else {
+            let child_pid = child.process_id().map(|pid| pid as libc::pid_t);
+            if let Some(session_id) = child_pid {
+                signal_session(session_id, libc::SIGHUP);
+            }
+            for process_group in [foreground_group, child_pid].into_iter().flatten() {
+                // Negative PIDs address a process group. portable-pty starts the
+                // child as a session and process-group leader on Unix.
+                let _ = unsafe { libc::kill(-process_group, libc::SIGHUP) };
+            }
+            thread::sleep(SHUTDOWN_GRACE);
+            if let Some(session_id) = child_pid {
+                signal_session(session_id, libc::SIGTERM);
+            }
+            let kill_result = child.kill();
+            thread::sleep(SHUTDOWN_GRACE);
+            if let Some(session_id) = child_pid {
+                signal_session(session_id, libc::SIGKILL);
+            }
+            let wait_result = child.wait();
+            match (kill_result, wait_result) {
+                (_, Ok(_)) => Ok(()),
+                (Err(error), Err(_)) => Err(error),
+                (Ok(()), Err(error)) => Err(error),
+            }
+        };
+        drop(child);
+        if result.is_ok() {
+            let mut lifecycle = lock(&self.lifecycle)?;
+            let current_runtime = match &*lifecycle {
+                ShellLifecycle::Running { runtime, .. }
+                | ShellLifecycle::Exited { runtime, .. } => Some(runtime),
+                ShellLifecycle::Pending | ShellLifecycle::Closed => None,
+            };
+            if current_runtime.is_some_and(|current| Arc::ptr_eq(current, &runtime)) {
+                *lifecycle = ShellLifecycle::Closed;
+            }
         }
-        let child_pid = child.process_id().map(|pid| pid as libc::pid_t);
-        if let Some(session_id) = child_pid {
-            signal_session(session_id, libc::SIGHUP);
+        result
+    }
+
+    fn reset_pending(&self) -> io::Result<()> {
+        let mut lifecycle = lock(&self.lifecycle)?;
+        if matches!(*lifecycle, ShellLifecycle::Closed) {
+            *lifecycle = ShellLifecycle::Pending;
         }
-        for process_group in [foreground_group, child_pid].into_iter().flatten() {
-            // Negative PIDs address a process group. portable-pty starts the
-            // child as a session and process-group leader on Unix.
-            let _ = unsafe { libc::kill(-process_group, libc::SIGHUP) };
-        }
-        thread::sleep(SHUTDOWN_GRACE);
-        if let Some(session_id) = child_pid {
-            signal_session(session_id, libc::SIGTERM);
-        }
-        let kill_result = child.kill();
-        thread::sleep(SHUTDOWN_GRACE);
-        if let Some(session_id) = child_pid {
-            signal_session(session_id, libc::SIGKILL);
-        }
-        let wait_result = child.wait();
-        match (kill_result, wait_result) {
-            (_, Ok(_)) => Ok(()),
-            (Err(error), Err(_)) => Err(error),
-            (Ok(()), Err(error)) => Err(error),
-        }
+        Ok(())
     }
 }
 
@@ -629,6 +931,7 @@ fn create_pending_shell(workspace_id: &str, spec: ShellSpec) -> io::Result<Arc<S
         name: Mutex::new(spec.name),
         cwd: spec.cwd,
         command: spec.command,
+        last_profile: Mutex::new(None),
         lifecycle: Mutex::new(ShellLifecycle::Pending),
     }))
 }
@@ -688,7 +991,7 @@ fn spawn_runtime(
             master: Mutex::new(pty.master),
             writer: Mutex::new(writer),
             child: Mutex::new(child),
-            replay: Mutex::new(VecDeque::with_capacity(REPLAY_LIMIT)),
+            terminal: Mutex::new(TerminalState::new(profile.rows, profile.cols)),
             controller: Mutex::new(None),
         }),
         reader,
@@ -707,8 +1010,8 @@ fn start_pty_reader(
                 Ok(0) => break,
                 Ok(count) => {
                     let bytes = &buffer[..count];
-                    if let Ok(mut replay) = runtime.replay.lock() {
-                        append_replay(&mut replay, bytes);
+                    if let Ok(mut terminal) = runtime.terminal.lock() {
+                        terminal.process(bytes);
                         if let Ok(mut controller) = runtime.controller.lock() {
                             let disconnect = controller.as_ref().is_some_and(|current| {
                                 matches!(
@@ -762,18 +1065,12 @@ fn start_pty_reader(
     });
 }
 
-fn append_replay(replay: &mut VecDeque<u8>, bytes: &[u8]) {
-    if bytes.len() >= REPLAY_LIMIT {
-        replay.clear();
-        replay.extend(&bytes[bytes.len() - REPLAY_LIMIT..]);
-        return;
+fn tail_utf8(text: &str, max_bytes: usize) -> &str {
+    let mut start = text.len().saturating_sub(max_bytes);
+    while !text.is_char_boundary(start) {
+        start += 1;
     }
-    let excess = replay
-        .len()
-        .saturating_add(bytes.len())
-        .saturating_sub(REPLAY_LIMIT);
-    replay.drain(..excess);
-    replay.extend(bytes);
+    &text[start..]
 }
 
 fn handle_attach(
@@ -802,11 +1099,22 @@ fn handle_attach(
             );
         }
     };
+    let mutation = lock(&registry.mutation_lock)?;
+    if registry.stopping.load(Ordering::Acquire) {
+        return send_response(
+            &mut stream,
+            Response::Error {
+                message: "Boomux daemon is stopping".into(),
+            },
+        );
+    }
     let token = Uuid::new_v4().to_string();
     let (output, receiver) = mpsc::sync_channel(CONTROLLER_QUEUE);
     let connection = stream.try_clone()?;
-    let (runtime, startup_profile, running) = {
+    let previous_profile = lock(&shell.last_profile)?.clone();
+    let (runtime, startup_profile, running, started) = {
         let mut lifecycle = lock(&shell.lifecycle)?;
+        let mut started = false;
         if !registry.contains_shell(&shell)? {
             return send_response(
                 &mut stream,
@@ -835,15 +1143,17 @@ fn handle_attach(
                 profile: profile.clone(),
                 runtime: Arc::clone(&runtime),
             };
+            *lock(&shell.last_profile)? = Some(profile.clone());
+            started = true;
             start_pty_reader(Arc::clone(&shell), runtime, reader);
         }
         match &*lifecycle {
             ShellLifecycle::Running { profile, runtime } => {
-                (Arc::clone(runtime), profile.clone(), true)
+                (Arc::clone(runtime), profile.clone(), true, started)
             }
             ShellLifecycle::Exited {
                 profile, runtime, ..
-            } => (Arc::clone(runtime), profile.clone(), false),
+            } => (Arc::clone(runtime), profile.clone(), false, started),
             ShellLifecycle::Pending => unreachable!(),
             ShellLifecycle::Closed => {
                 return send_response(
@@ -855,6 +1165,27 @@ fn handle_attach(
             }
         }
     };
+    if started && let Err(error) = registry.persist() {
+        let cleanup = shell.kill();
+        if cleanup.is_ok() {
+            shell.reset_pending()?;
+            *lock(&shell.last_profile)? = previous_profile;
+        }
+        return send_response(
+            &mut stream,
+            Response::Error {
+                message: cleanup.map_or_else(
+                    |cleanup| {
+                        format!(
+                            "could not persist started shell: {error}; process cleanup also failed: {cleanup}"
+                        )
+                    },
+                    |()| format!("could not persist started shell: {error}"),
+                ),
+            },
+        );
+    }
+    drop(mutation);
     let warning = term_mismatch_warning(startup_profile.term.as_deref(), profile.term.as_deref());
     let control = lock(&runtime.control)?;
     if !registry.contains_shell(&shell)? {
@@ -881,15 +1212,16 @@ fn handle_attach(
             .resize(profile_size(&profile))
             .map_err(io::Error::other)?;
     }
-    // Keep replay locked until the controller is installed so retained output
-    // ends exactly where live delivery begins.
-    let replay = lock(&runtime.replay)?;
+    lock(&runtime.terminal)?.resize(profile.rows, profile.cols);
+    // Keep terminal state locked until the controller is installed so the
+    // reconstruction ends exactly where live delivery begins.
+    let terminal = lock(&runtime.terminal)?;
     stream.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
     send_response(
         &mut stream,
         Response::Attached {
             token: token.clone(),
-            replay: replay.iter().copied().collect(),
+            reconstruction: terminal.reconstruction(),
             warning,
         },
     )?;
@@ -936,7 +1268,7 @@ fn handle_attach(
         let _ = output_runtime.release_controller(&output_token);
     });
     drop(lifecycle);
-    drop(replay);
+    drop(terminal);
     drop(control);
 
     loop {
@@ -968,14 +1300,22 @@ fn handle_attach(
                 cols,
                 pixel_width,
                 pixel_height,
-            } => lock(&runtime.master)?
-                .resize(PtySize {
-                    rows,
-                    cols,
-                    pixel_width,
-                    pixel_height,
-                })
-                .map_err(io::Error::other),
+            } => {
+                if let Err(error) = validate_terminal_dimensions(rows, cols) {
+                    Err(error)
+                } else {
+                    lock(&runtime.master)?
+                        .resize(PtySize {
+                            rows,
+                            cols,
+                            pixel_width,
+                            pixel_height,
+                        })
+                        .map_err(io::Error::other)?;
+                    lock(&runtime.terminal)?.resize(rows, cols);
+                    Ok(())
+                }
+            }
             AttachFrame::Detached => {
                 drop(control);
                 break;
@@ -1040,12 +1380,7 @@ fn profile_size(profile: &TerminalProfile) -> PtySize {
 }
 
 fn validate_terminal_profile(profile: &TerminalProfile) -> io::Result<()> {
-    if profile.rows == 0 || profile.cols == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "terminal profile rows and columns must be nonzero",
-        ));
-    }
+    validate_terminal_dimensions(profile.rows, profile.cols)?;
     for value in [
         &profile.term,
         &profile.colorterm,
@@ -1064,6 +1399,23 @@ fn validate_terminal_profile(profile: &TerminalProfile) -> io::Result<()> {
                 "terminal profile contains an invalid environment value",
             ));
         }
+    }
+    Ok(())
+}
+
+fn validate_terminal_dimensions(rows: u16, cols: u16) -> io::Result<()> {
+    if rows == 0
+        || cols == 0
+        || rows > MAX_TERMINAL_ROWS
+        || cols > MAX_TERMINAL_COLS
+        || usize::from(rows) * usize::from(cols) > MAX_TERMINAL_CELLS
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "terminal rows and columns must be nonzero and at most {MAX_TERMINAL_ROWS}x{MAX_TERMINAL_COLS}"
+            ),
+        ));
     }
     Ok(())
 }
@@ -1146,6 +1498,29 @@ fn validate_cwd(cwd: &Path) -> io::Result<()> {
     }
 }
 
+fn validate_persisted_cwd(cwd: &Path) -> io::Result<()> {
+    if cwd.is_absolute() {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "persisted working directory must be absolute: {}",
+                cwd.display()
+            ),
+        ))
+    }
+}
+
+fn validate_id(kind: &str, id: &str) -> io::Result<()> {
+    Uuid::parse_str(id).map(|_| ()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("persisted {kind} ID is invalid: {id}"),
+        )
+    })
+}
+
 fn not_found(kind: &str, id: &str) -> io::Error {
     io::Error::new(io::ErrorKind::NotFound, format!("{kind} not found: {id}"))
 }
@@ -1186,13 +1561,9 @@ mod tests {
     }
 
     #[test]
-    fn replay_keeps_only_the_tail() {
-        let mut replay = VecDeque::new();
-        append_replay(&mut replay, &vec![1; REPLAY_LIMIT]);
-        append_replay(&mut replay, &[2, 3]);
-        assert_eq!(replay.len(), REPLAY_LIMIT);
-        assert_eq!(replay[REPLAY_LIMIT - 2], 2);
-        assert_eq!(replay[REPLAY_LIMIT - 1], 3);
+    fn rendered_output_tail_preserves_utf8_boundaries() {
+        assert_eq!(tail_utf8("one-λ", 2), "λ");
+        assert_eq!(tail_utf8("one-λ", 3), "-λ");
     }
 
     #[test]
@@ -1217,12 +1588,35 @@ mod tests {
         assert!(validate_terminal_profile(&invalid).is_err());
 
         let mut invalid = profile();
+        invalid.cols = MAX_TERMINAL_COLS + 1;
+        assert!(validate_terminal_profile(&invalid).is_err());
+
+        let mut invalid = profile();
         invalid.term = Some("bad\nterm".into());
         assert!(validate_terminal_profile(&invalid).is_err());
 
         let mut invalid = profile();
         invalid.term = Some("x".repeat(MAX_TERMINAL_ENV_VALUE + 1));
         assert!(validate_terminal_profile(&invalid).is_err());
+    }
+
+    #[test]
+    fn failed_persistence_rolls_back_registry_mutation() {
+        let directory = env::temp_dir().join(format!("boomux-rollback-{}", Uuid::new_v4()));
+        let state_directory = directory.join("state");
+        let registry =
+            Registry::restore(StateStore::at(state_directory.join("state.json"))).unwrap();
+        fs::remove_dir(&state_directory).unwrap();
+        fs::write(&state_directory, b"not a directory").unwrap();
+
+        let result = registry.dispatch(Request::CreateWorkspace {
+            name: "rolled-back".into(),
+            shells: Vec::new(),
+        });
+
+        assert!(result.is_err());
+        assert!(registry.snapshot().unwrap().workspaces.is_empty());
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

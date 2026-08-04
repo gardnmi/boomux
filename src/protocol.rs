@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 pub const MAX_CONTROL_FRAME: usize = 8 * 1024 * 1024;
 pub const MAX_ATTACH_FRAME: usize = 1024 * 1024;
 
@@ -146,7 +146,7 @@ pub enum Response {
     },
     Attached {
         token: String,
-        replay: Vec<u8>,
+        reconstruction: Vec<u8>,
         warning: Option<String>,
     },
     Ok,

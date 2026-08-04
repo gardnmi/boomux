@@ -26,13 +26,14 @@ consistently in Ghostty, Alacritty, Kitty, and other XDG terminal emulators.
 | First-attachment terminal negotiation | Working |
 | Correct terminal environment at child startup | Working |
 | Initial pixel dimensions | Working when reported by the terminal |
-| Reconstructed terminal state on reconnect | Missing |
-| ANSI-aware logical output for `boomux read` | Missing |
-| Metadata recovery after daemon restart | Missing |
+| Reconstructed terminal state on reconnect | Working |
+| ANSI-aware logical output for `boomux read` | Working |
+| Metadata recovery after daemon restart | Working |
 | Live PTY handoff to a replacement daemon | Missing |
 
-The current backend is suitable for proof-of-concept testing. It must not yet
-claim exact screen restoration or process survival across daemon restart.
+The current backend is suitable for proof-of-concept testing. It reconstructs
+text VT state but does not claim graphics restoration or process survival across
+daemon restart.
 Workspace metadata contains only a UUID and name; working directories belong
 exclusively to shells. Dashboard project discovery supplies name suggestions
 and does not persist project paths. A shell request without a selected workspace
@@ -176,24 +177,21 @@ not supported without a concrete terminal profile.
 
 ## Phase 2: VT Reconnection State
 
-### Current Limitation
+### Implementation
 
-The daemon retains up to 1 MiB of raw PTY output and replays it into a new
-attachment. Raw output is not terminal state.
+The daemon feeds a shadow `vt100` parser with PTY output while forwarding the
+original bytes unchanged. It retains 2,000 primary-screen scrollback rows and
+emits at most 1 MiB of safe reconstruction into a new attachment.
 
-Reconnection can be incorrect after:
+Reconnection reconstructs cursor movement, in-place rewrites, screen clearing,
+styles, modes, and the current alternate screen. Known limits remain for:
 
-- Cursor movement or in-place line rewrites
-- Screen clearing
-- Alternate-screen applications such as editors and TUIs
-- Progress indicators
-- Replay truncation inside an escape sequence
-- OSC title, notification, hyperlink, or clipboard commands
 - Terminal graphics
-- Soft-wrapped lines
+- Alternate-screen history
+- Emulator-specific state outside the parser's VT model
 
-A newly attached terminal may look correct, partially correct, or remain blank
-until the application redraws.
+Historical OSC title, notification, hyperlink, and clipboard commands are
+intentionally omitted so reconnection cannot repeat their side effects.
 
 ### Target Data Flow
 
@@ -202,7 +200,7 @@ Keep the native live path unchanged and parse a shadow copy:
 ```text
 PTY output
   -> attachment output unchanged
-  -> bounded VT parser input in parallel
+  -> bounded shadow VT state alongside live delivery
 ```
 
 The parser should retain:
@@ -226,17 +224,13 @@ effects merely to reconstruct presentation.
 
 ### `boomux read`
 
-`boomux read` currently decodes raw replay bytes lossily and selects recent
-newline-delimited fragments. It does not understand cursor rewrites, ANSI state,
-or terminal wrapping.
-
-After the VT parser exists, `boomux read` should return logical rendered lines:
+`boomux read` returns parser-backed logical rendered lines:
 
 - Strip control sequences.
 - Preserve intentional hard newlines.
 - Join terminal soft wraps for the unwrapped output mode.
-- Define whether alternate-screen content is included.
-- Retain a bounded history and report truncation when useful.
+- Include the current alternate screen but not alternate-screen history.
+- Retain 2,000 primary-screen scrollback rows.
 
 ### Acceptance Criteria
 
@@ -251,17 +245,15 @@ After the VT parser exists, `boomux read` should return logical rendered lines:
 
 ### Open Engineering Decisions
 
-- Select an existing Rust VT parser rather than implementing ANSI parsing.
-- Decide how much primary-screen scrollback to retain per shell.
-- Decide whether alternate-screen history is readable or only reconstructable.
-- Decide whether graphics payloads are retained, omitted, or restored by asking
-  applications to redraw.
-- Define the safe reset and reconstruction sequence across supported emulators.
+- Decide whether graphics should remain omitted or trigger application redraw.
+- Evaluate moving shadow parsing off the PTY reader if profiling shows meaningful
+  backpressure.
 
 ## Phase 3: Restart Persistence
 
-Terminal negotiation and VT reconstruction should be reliable before adding
-disk persistence.
+The daemon atomically persists versioned JSON state at
+`$XDG_STATE_HOME/boomux/state.json`, with the XDG default
+`~/.local/state/boomux/state.json` when the environment variable is unset.
 
 Persist only reproducible metadata under `$XDG_STATE_HOME/boomux`:
 
@@ -271,9 +263,13 @@ Persist only reproducible metadata under `$XDG_STATE_HOME/boomux`:
 - Explicit shell startup commands
 - Last terminal profile when useful for diagnostics
 
+State directories are owner-only, state files are bounded and owner-validated,
+and updates use a synced temporary file followed by atomic rename. Invalid or
+unsupported state fails startup rather than silently discarding metadata.
+
 Do not claim that arbitrary process state can be serialized. After an ordinary
-daemon restart, Boomux can recreate shells from metadata but cannot recover the
-original processes or their mutated environment.
+daemon restart, Boomux restores every shell as pending and recreates it on first
+attachment, but cannot recover the original process or its mutated environment.
 
 Live process survival during an upgrade requires a separate Unix PTY handoff
 mechanism. Treat that as a later feature, not part of metadata restoration.
