@@ -141,10 +141,20 @@ shell working directories, startup commands, and last terminal profiles survive
 restart. Recovered shells are pending: Boomux does not claim that arbitrary
 processes, mutated environments, or PTYs survive daemon restart or crash.
 
+`boomux daemon restart` transfers the existing listener and both ownership locks
+to a replacement process through a private, versioned `SCM_RIGHTS` handshake.
+Prepare/finalize acknowledgement keeps rollback safe before the irreversible
+ownership boundary. Pending shells restore from metadata. Detached running
+shells transfer their PTY master, pidfd-backed process identity, terminal
+profile, and reconstructed VT state without changing the child PID. Attached
+clients receive a reconnect request, acknowledge an input-ordering boundary,
+and reconnect to the replacement while remaining in raw mode. Exited shells use
+metadata recovery.
+
 ## Next Technical Steps
 
 The detailed design, acceptance criteria, and manual test matrix are tracked in
 [`native-terminal-follow-up.md`](native-terminal-follow-up.md).
 
-1. Add graceful daemon restart or live PTY handoff only after the base lifecycle
-   is reliable.
+1. Evaluate explicit exited-shell terminal-state transfer separately from live
+   process handoff.

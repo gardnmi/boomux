@@ -7,6 +7,7 @@ edition = "2024"
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.29"
 libc = "0.2"
+nix = { version = "0.28", default-features = false, features = ["socket", "uio"] }
 portable-pty = "0.9"
 ratatui = { version = "0.30", default-features = false, features = ["crossterm", "layout-cache"] }
 serde = { version = "1", features = ["derive"] }

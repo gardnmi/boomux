@@ -50,7 +50,8 @@ commitments.
 See [`native-terminal-follow-up.md`](native-terminal-follow-up.md) for the
 terminal handshake, VT reconstruction, and restart-persistence plan.
 
-- Add graceful daemon restart or live PTY handoff.
+- Add graceful daemon restart through the staged
+  [live PTY handoff design](live-pty-handoff.md).
 - Aggregate multiple agent states as counts instead of one workspace-level
   value.
 - Notify when an agent becomes blocked, finishes, or needs input.
