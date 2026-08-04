@@ -10,9 +10,9 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -23,10 +23,12 @@ use crate::client;
 use crate::fd_transfer::send_descriptor;
 use crate::handoff;
 use crate::protocol::{
-    self, AttachFrame, Envelope, Request, Response, ShellSnapshot, ShellSpec, ShellStatus,
-    Snapshot, TerminalProfile, WorkspaceSnapshot,
+    self, AttachFrame, Envelope, Request, Response, ShellRunExitReason, ShellRunSnapshot,
+    ShellSnapshot, ShellSpec, ShellStatus, Snapshot, TerminalProfile, WorkspaceSnapshot,
 };
-use crate::state_store::{PersistedShell, PersistedState, PersistedWorkspace, StateStore};
+use crate::state_store::{
+    PersistedShell, PersistedShellRun, PersistedState, PersistedWorkspace, StateStore,
+};
 use crate::terminal_state::TerminalState;
 
 const CONTROLLER_QUEUE: usize = 64;
@@ -34,6 +36,7 @@ const SHUTDOWN_GRACE: Duration = Duration::from_millis(50);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 const RESTART_TIMEOUT: Duration = Duration::from_secs(10);
 const IO_RETRY_DELAY: Duration = Duration::from_millis(2);
+const PERSIST_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_TERMINAL_ENV_VALUE: usize = 256;
 const MAX_TERMINAL_ROWS: u16 = 1_000;
 const MAX_TERMINAL_COLS: u16 = 1_000;
@@ -101,7 +104,7 @@ fn run_daemon(
     transferred_runtimes: Vec<handoff::TransferredRuntime>,
     committed: Option<&mut UnixStream>,
 ) -> io::Result<()> {
-    let registry = Arc::new(Registry::restore(store)?);
+    let registry = Arc::new(Registry::restore(store, committed.is_some())?);
     let gated_readers = registry.import_runtimes(transferred_runtimes)?;
     if let Some(channel) = committed {
         channel.write_all(&[handoff::PREPARED])?;
@@ -136,8 +139,15 @@ fn run_daemon(
     let (restart_sender, restart_receiver) = mpsc::channel::<RestartRequest>();
     let mut handlers = Vec::new();
     let mut handed_off = false;
+    let mut last_persistence_retry = Instant::now();
 
     while !shutdown.load(Ordering::Acquire) {
+        if registry.persistence_dirty.load(Ordering::Acquire)
+            && last_persistence_retry.elapsed() >= PERSIST_RETRY_INTERVAL
+        {
+            let _ = registry.persist();
+            last_persistence_retry = Instant::now();
+        }
         match restart_receiver.try_recv() {
             Ok(request) => {
                 let result = launch_replacement(&listener, &daemon_lock, &registry);
@@ -265,6 +275,9 @@ fn launch_replacement(
 ) -> io::Result<()> {
     let _mutation = lock(&registry.mutation_lock)?;
     registry.ensure_running()?;
+    if registry.persistence_dirty.load(Ordering::Acquire) {
+        registry.persist()?;
+    }
     registry.stopping.store(true, Ordering::Release);
     let mut paused = Vec::new();
     let result = (|| {
@@ -272,11 +285,13 @@ fn launch_replacement(
         let state = lock(&registry.state)?;
         let mut transfers = Vec::new();
         for shell in state.shells.values() {
-            let (profile, runtime) = match &*lock(&shell.lifecycle)? {
+            let (profile, run, runtime) = match &*lock(&shell.lifecycle)? {
                 ShellLifecycle::Pending => continue,
-                ShellLifecycle::Running { profile, runtime } => {
-                    (profile.clone(), Arc::clone(runtime))
-                }
+                ShellLifecycle::Running {
+                    profile,
+                    run,
+                    runtime,
+                } => (profile.clone(), Arc::clone(run), Arc::clone(runtime)),
                 ShellLifecycle::Exited { .. } => {
                     return Err(io::Error::new(
                         io::ErrorKind::Unsupported,
@@ -292,6 +307,8 @@ fn launch_replacement(
             transfers.push(OutgoingRuntime {
                 manifest: handoff::RuntimeManifest {
                     shell_id: shell.id.clone(),
+                    run_id: Some(run.id.clone()),
+                    output_revision: Some(run.output_revision.load(Ordering::Acquire)),
                     profile,
                     pid,
                 },
@@ -524,6 +541,7 @@ struct Registry {
     mutation_lock: Mutex<()>,
     persist_lock: Mutex<()>,
     stopping: AtomicBool,
+    persistence_dirty: AtomicBool,
 }
 
 #[derive(Default)]
@@ -538,7 +556,6 @@ struct RegistryBackup {
     workspace_names: HashMap<String, String>,
     workspace_shell_ids: HashMap<String, Vec<String>>,
     shell_names: HashMap<String, String>,
-    last_profiles: HashMap<String, Option<TerminalProfile>>,
 }
 
 impl Default for Registry {
@@ -549,6 +566,7 @@ impl Default for Registry {
             mutation_lock: Mutex::new(()),
             persist_lock: Mutex::new(()),
             stopping: AtomicBool::new(false),
+            persistence_dirty: AtomicBool::new(false),
         }
     }
 }
@@ -565,7 +583,7 @@ struct Shell {
     name: Mutex<String>,
     cwd: PathBuf,
     command: Vec<String>,
-    last_profile: Mutex<Option<TerminalProfile>>,
+    last_run: Mutex<Option<PersistedShellRun>>,
     lifecycle: Mutex<ShellLifecycle>,
 }
 
@@ -573,14 +591,100 @@ enum ShellLifecycle {
     Pending,
     Running {
         profile: TerminalProfile,
+        run: Arc<ShellRun>,
         runtime: Arc<ShellRuntime>,
     },
     Exited {
         code: Option<u32>,
         profile: TerminalProfile,
+        run: Arc<ShellRun>,
         runtime: Arc<ShellRuntime>,
     },
     Closed,
+}
+
+struct ShellRun {
+    id: String,
+    generation: u64,
+    started_at_ms: u64,
+    ended: Mutex<Option<ShellRunEnd>>,
+    output_revision: AtomicU64,
+    environment_has_run_id: bool,
+}
+
+#[derive(Clone)]
+struct ShellRunEnd {
+    ended_at_ms: u64,
+    reason: ShellRunExitReason,
+}
+
+impl ShellRun {
+    fn new(generation: u64) -> Self {
+        Self {
+            id: Uuid::new_v4().to_string(),
+            generation,
+            started_at_ms: unix_time_ms(),
+            ended: Mutex::new(None),
+            output_revision: AtomicU64::new(0),
+            environment_has_run_id: true,
+        }
+    }
+
+    fn from_persisted(run: &PersistedShellRun) -> Self {
+        let ended = run
+            .ended_at_ms
+            .zip(run.exit_reason.clone())
+            .map(|(ended_at_ms, reason)| ShellRunEnd {
+                ended_at_ms,
+                reason,
+            });
+        Self {
+            id: run.id.clone(),
+            generation: run.generation,
+            started_at_ms: run.started_at_ms,
+            ended: Mutex::new(ended),
+            output_revision: AtomicU64::new(run.output_revision),
+            environment_has_run_id: run.environment_has_run_id,
+        }
+    }
+
+    fn finish(&self, reason: ShellRunExitReason) -> io::Result<()> {
+        let mut ended = lock(&self.ended)?;
+        if ended.is_none() {
+            *ended = Some(ShellRunEnd {
+                ended_at_ms: unix_time_ms().max(self.started_at_ms),
+                reason,
+            });
+        }
+        Ok(())
+    }
+
+    fn snapshot(&self) -> io::Result<ShellRunSnapshot> {
+        let ended = lock(&self.ended)?.clone();
+        Ok(ShellRunSnapshot {
+            id: self.id.clone(),
+            generation: self.generation,
+            started_at_ms: self.started_at_ms,
+            ended_at_ms: ended.as_ref().map(|end| end.ended_at_ms),
+            exit_reason: ended.map(|end| end.reason),
+            output_revision: self.output_revision.load(Ordering::Acquire),
+            environment_has_run_id: self.environment_has_run_id,
+        })
+    }
+
+    fn persisted(&self, profile: TerminalProfile) -> io::Result<PersistedShellRun> {
+        let snapshot = self.snapshot()?;
+        Ok(PersistedShellRun {
+            id: snapshot.id,
+            generation: snapshot.generation,
+            started_at_ms: snapshot.started_at_ms,
+            ended_at_ms: snapshot.ended_at_ms,
+            exit_reason: snapshot.exit_reason,
+            output_revision: snapshot.output_revision,
+            environment_has_run_id: snapshot.environment_has_run_id,
+            profile,
+        })
+    }
 }
 
 struct ShellRuntime {
@@ -989,10 +1093,12 @@ impl Registry {
         }
     }
 
-    fn restore(store: StateStore) -> io::Result<Self> {
+    fn restore(store: StateStore, live_handoff: bool) -> io::Result<Self> {
         let persisted = store.load()?.unwrap_or_default();
         let mut state = RegistryState::default();
         let mut workspace_names = HashSet::new();
+        let mut run_ids = HashSet::new();
+        let mut recovered_interrupted_run = false;
         for saved_workspace in persisted.workspaces {
             validate_id("workspace", &saved_workspace.id)?;
             validate_name(&saved_workspace.name)?;
@@ -1006,12 +1112,30 @@ impl Registry {
             }
             let mut shell_names = HashSet::new();
             let mut shell_ids = Vec::with_capacity(saved_workspace.shells.len());
-            for saved_shell in saved_workspace.shells {
+            for mut saved_shell in saved_workspace.shells {
                 validate_id("shell", &saved_shell.id)?;
                 validate_name(&saved_shell.name)?;
                 validate_persisted_cwd(&saved_shell.cwd)?;
-                if let Some(profile) = &saved_shell.last_profile {
-                    validate_terminal_profile(profile)?;
+                if let Some(run) = &mut saved_shell.last_run {
+                    validate_id("run", &run.id)?;
+                    validate_terminal_profile(&run.profile)?;
+                    if run.generation == 0
+                        || run.ended_at_ms.is_some() != run.exit_reason.is_some()
+                        || run
+                            .ended_at_ms
+                            .is_some_and(|ended_at_ms| ended_at_ms < run.started_at_ms)
+                        || !run_ids.insert(run.id.clone())
+                    {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "Boomux state contains an invalid shell run",
+                        ));
+                    }
+                    if !live_handoff && run.ended_at_ms.is_none() {
+                        run.ended_at_ms = Some(unix_time_ms().max(run.started_at_ms));
+                        run.exit_reason = Some(ShellRunExitReason::Interrupted);
+                        recovered_interrupted_run = true;
+                    }
                 }
                 if !shell_names.insert(saved_shell.name.clone())
                     || state.shells.contains_key(&saved_shell.id)
@@ -1027,7 +1151,7 @@ impl Registry {
                     name: Mutex::new(saved_shell.name),
                     cwd: saved_shell.cwd,
                     command: saved_shell.command,
-                    last_profile: Mutex::new(saved_shell.last_profile),
+                    last_run: Mutex::new(saved_shell.last_run),
                     lifecycle: Mutex::new(ShellLifecycle::Pending),
                 });
                 shell_ids.push(shell.id.clone());
@@ -1040,21 +1164,27 @@ impl Registry {
             });
             state.workspaces.insert(saved_workspace.id, workspace);
         }
-        Ok(Self {
+        let registry = Self {
             state: Mutex::new(state),
             store: Some(store),
             mutation_lock: Mutex::new(()),
             persist_lock: Mutex::new(()),
             stopping: AtomicBool::new(false),
-        })
+            persistence_dirty: AtomicBool::new(false),
+        };
+        if recovered_interrupted_run {
+            registry.persist()?;
+        }
+        Ok(registry)
     }
 
     fn import_runtimes(
-        &self,
+        self: &Arc<Self>,
         transferred: Vec<handoff::TransferredRuntime>,
     ) -> io::Result<Vec<Arc<ShellRuntime>>> {
         let state = lock(&self.state)?;
         let mut prepared = Vec::with_capacity(transferred.len());
+        let mut imported_shell_ids = HashSet::new();
         for transferred in transferred {
             let manifest = transferred.manifest;
             validate_terminal_profile(&manifest.profile)?;
@@ -1063,12 +1193,35 @@ impl Registry {
                 .get(&manifest.shell_id)
                 .cloned()
                 .ok_or_else(|| not_found("persisted shell", &manifest.shell_id))?;
+            imported_shell_ids.insert(shell.id.clone());
             if !matches!(*lock(&shell.lifecycle)?, ShellLifecycle::Pending) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "transferred shell is not pending in restored metadata",
                 ));
             }
+            let mut saved_run = lock(&shell.last_run)?.clone().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "transferred shell has no persisted run",
+                )
+            })?;
+            if saved_run.ended_at_ms.is_some()
+                || manifest
+                    .run_id
+                    .as_ref()
+                    .is_some_and(|run_id| run_id != &saved_run.id)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "transferred runtime does not match its persisted run",
+                ));
+            }
+            saved_run.profile = manifest.profile.clone();
+            if let Some(output_revision) = manifest.output_revision {
+                saved_run.output_revision = output_revision;
+            }
+            let run = Arc::new(ShellRun::from_persisted(&saved_run));
             let stat = fs::read_to_string(format!("/proc/{}/stat", manifest.pid))?;
             if proc_session_id(&stat) != Some(manifest.pid as libc::pid_t) {
                 return Err(io::Error::new(
@@ -1098,29 +1251,56 @@ impl Registry {
                 controller: Mutex::new(None),
                 reader: Mutex::new(None),
             });
-            prepared.push((shell, manifest.profile, runtime, reader));
+            prepared.push((shell, saved_run, run, runtime, reader));
+        }
+        let mut interrupted_untransferred_run = false;
+        for shell in state.shells.values() {
+            if imported_shell_ids.contains(&shell.id) {
+                continue;
+            }
+            let mut last_run = lock(&shell.last_run)?;
+            if let Some(last_run) = last_run.as_mut()
+                && last_run.ended_at_ms.is_none()
+            {
+                last_run.ended_at_ms = Some(unix_time_ms().max(last_run.started_at_ms));
+                last_run.exit_reason = Some(ShellRunExitReason::Interrupted);
+                interrupted_untransferred_run = true;
+            }
         }
         drop(state);
 
         let mut readers = Vec::with_capacity(prepared.len());
-        for (shell, profile, runtime, reader) in prepared {
-            *lock(&shell.last_profile)? = Some(profile.clone());
+        for (shell, saved_run, run, runtime, reader) in prepared {
+            let profile = saved_run.profile.clone();
+            *lock(&shell.last_run)? = Some(saved_run);
             *lock(&shell.lifecycle)? = ShellLifecycle::Running {
                 profile,
+                run: Arc::clone(&run),
                 runtime: Arc::clone(&runtime),
             };
-            start_pty_reader(shell, Arc::clone(&runtime), reader, true)?;
+            start_pty_reader(
+                Arc::downgrade(self),
+                shell,
+                Arc::clone(&run),
+                Arc::clone(&runtime),
+                reader,
+                true,
+            )?;
             readers.push(runtime);
+        }
+        if interrupted_untransferred_run || !readers.is_empty() {
+            self.persist()?;
         }
         Ok(readers)
     }
 
     fn durable_mutation<T>(&self, operation: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
         let _mutation = lock(&self.mutation_lock)?;
+        let _persistence = lock(&self.persist_lock)?;
         self.ensure_running()?;
         let backup = self.backup()?;
         match operation() {
-            Ok(value) => match self.persist() {
+            Ok(value) => match self.persist_unlocked() {
                 Ok(()) => Ok(value),
                 Err(error) => {
                     self.restore_backup(backup)?;
@@ -1232,10 +1412,8 @@ impl Registry {
             workspace_shell_ids.insert(workspace.id.clone(), lock(&workspace.shell_ids)?.clone());
         }
         let mut shell_names = HashMap::new();
-        let mut last_profiles = HashMap::new();
         for shell in state.shells.values() {
             shell_names.insert(shell.id.clone(), lock(&shell.name)?.clone());
-            last_profiles.insert(shell.id.clone(), lock(&shell.last_profile)?.clone());
         }
         Ok(RegistryBackup {
             workspaces: state.workspaces.clone(),
@@ -1243,7 +1421,6 @@ impl Registry {
             workspace_names,
             workspace_shell_ids,
             shell_names,
-            last_profiles,
         })
     }
 
@@ -1261,9 +1438,6 @@ impl Registry {
             if let Some(name) = backup.shell_names.get(&shell.id) {
                 *lock(&shell.name)? = name.clone();
             }
-            if let Some(profile) = backup.last_profiles.get(&shell.id) {
-                *lock(&shell.last_profile)? = profile.clone();
-            }
         }
         state.workspaces = backup.workspaces;
         state.shells = backup.shells;
@@ -1271,10 +1445,14 @@ impl Registry {
     }
 
     fn persist(&self) -> io::Result<()> {
+        let _persist = lock(&self.persist_lock)?;
+        self.persist_unlocked()
+    }
+
+    fn persist_unlocked(&self) -> io::Result<()> {
         let Some(store) = &self.store else {
             return Ok(());
         };
-        let _persist = lock(&self.persist_lock)?;
         let state = lock(&self.state)?;
         let mut workspaces = state.workspaces.values().cloned().collect::<Vec<_>>();
         workspaces.sort_by(|left, right| left.id.cmp(&right.id));
@@ -1291,7 +1469,7 @@ impl Registry {
                     name: lock(&shell.name)?.clone(),
                     cwd: shell.cwd.clone(),
                     command: shell.command.clone(),
-                    last_profile: lock(&shell.last_profile)?.clone(),
+                    last_run: lock(&shell.last_run)?.clone(),
                 });
             }
             saved.workspaces.push(PersistedWorkspace {
@@ -1301,7 +1479,40 @@ impl Registry {
             });
         }
         drop(state);
-        store.save(&saved)
+        let result = store.save(&saved);
+        self.persistence_dirty
+            .store(result.is_err(), Ordering::Release);
+        result
+    }
+
+    fn record_run_exit(
+        &self,
+        shell: &Arc<Shell>,
+        run: &Arc<ShellRun>,
+        runtime: &Arc<ShellRuntime>,
+        code: Option<u32>,
+    ) -> io::Result<()> {
+        let mut lifecycle = lock(&shell.lifecycle)?;
+        let profile = match &*lifecycle {
+            ShellLifecycle::Running {
+                profile,
+                run: current_run,
+                runtime: current_runtime,
+            } if Arc::ptr_eq(current_run, run) && Arc::ptr_eq(current_runtime, runtime) => {
+                profile.clone()
+            }
+            _ => return Ok(()),
+        };
+        run.finish(ShellRunExitReason::Exited { code })?;
+        *lock(&shell.last_run)? = Some(run.persisted(profile.clone())?);
+        *lifecycle = ShellLifecycle::Exited {
+            code,
+            profile,
+            run: Arc::clone(run),
+            runtime: Arc::clone(runtime),
+        };
+        drop(lifecycle);
+        self.persist()
     }
 
     fn snapshot(&self) -> io::Result<Snapshot> {
@@ -1317,7 +1528,9 @@ impl Registry {
 
     fn shutdown(&self) -> io::Result<()> {
         let _mutation = lock(&self.mutation_lock)?;
-        self.stopping.store(true, Ordering::Release);
+        if self.stopping.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
         let shells = {
             let state = lock(&self.state)?;
             state.shells.values().cloned().collect::<Vec<_>>()
@@ -1332,6 +1545,13 @@ impl Registry {
                 return Err(error);
             }
             killed.push(Arc::clone(shell));
+        }
+        if let Err(error) = self.persist() {
+            for shell in killed {
+                shell.reset_pending()?;
+            }
+            self.stopping.store(false, Ordering::Release);
+            return Err(error);
         }
         let mut state = lock(&self.state)?;
         state.workspaces.clear();
@@ -1565,9 +1785,12 @@ impl Registry {
         let backup = self.backup()?;
         let shell = self.shell(shell_id)?;
         shell.kill()?;
+        let killed_run = lock(&shell.last_run)?.clone();
+        let _persistence = lock(&self.persist_lock)?;
         self.remove_shell(shell_id)?;
-        if let Err(error) = self.persist() {
+        if let Err(error) = self.persist_unlocked() {
             self.restore_backup(backup)?;
+            *lock(&shell.last_run)? = killed_run;
             shell.reset_pending()?;
             return Err(error);
         }
@@ -1587,6 +1810,7 @@ impl Registry {
                 .collect::<Vec<_>>()
         };
         let mut killed: Vec<Arc<Shell>> = Vec::new();
+        let mut killed_runs = HashMap::new();
         for shell in &shells {
             if let Err(error) = shell.kill() {
                 for shell in killed {
@@ -1594,12 +1818,17 @@ impl Registry {
                 }
                 return Err(error);
             }
+            killed_runs.insert(shell.id.clone(), lock(&shell.last_run)?.clone());
             killed.push(Arc::clone(shell));
         }
+        let _persistence = lock(&self.persist_lock)?;
         self.remove_workspace(workspace_id)?;
-        if let Err(error) = self.persist() {
+        if let Err(error) = self.persist_unlocked() {
             self.restore_backup(backup)?;
             for shell in shells {
+                if let Some(run) = killed_runs.get(&shell.id) {
+                    *lock(&shell.last_run)? = run.clone();
+                }
                 shell.reset_pending()?;
             }
             return Err(error);
@@ -1631,17 +1860,22 @@ impl Workspace {
 
 impl Shell {
     fn snapshot(&self) -> io::Result<ShellSnapshot> {
+        let lifecycle = lock(&self.lifecycle)?;
+        let (status, run) = match &*lifecycle {
+            ShellLifecycle::Pending => (ShellStatus::Pending, None),
+            ShellLifecycle::Running { run, .. } => (ShellStatus::Running, Some(run.snapshot()?)),
+            ShellLifecycle::Exited { code, run, .. } => {
+                (ShellStatus::Exited { code: *code }, Some(run.snapshot()?))
+            }
+            ShellLifecycle::Closed => return Err(not_found("shell", &self.id)),
+        };
         Ok(ShellSnapshot {
             id: self.id.clone(),
             workspace_id: self.workspace_id.clone(),
             name: lock(&self.name)?.clone(),
             cwd: self.cwd.clone(),
-            status: match &*lock(&self.lifecycle)? {
-                ShellLifecycle::Pending => ShellStatus::Pending,
-                ShellLifecycle::Running { .. } => ShellStatus::Running,
-                ShellLifecycle::Exited { code, .. } => ShellStatus::Exited { code: *code },
-                ShellLifecycle::Closed => return Err(not_found("shell", &self.id)),
-            },
+            status,
+            run,
         })
     }
 
@@ -1696,14 +1930,26 @@ impl Shell {
 
         runtime.stop_reader()?;
         let mut lifecycle = lock(&self.lifecycle)?;
-        let current_runtime = match &*lifecycle {
-            ShellLifecycle::Running { runtime, .. } | ShellLifecycle::Exited { runtime, .. } => {
-                Some(runtime)
+        match &*lifecycle {
+            ShellLifecycle::Running {
+                profile,
+                run,
+                runtime: current,
+            } if Arc::ptr_eq(current, &runtime) => {
+                run.finish(ShellRunExitReason::Terminated)?;
+                *lock(&self.last_run)? = Some(run.persisted(profile.clone())?);
+                *lifecycle = ShellLifecycle::Closed;
             }
-            ShellLifecycle::Pending | ShellLifecycle::Closed => None,
-        };
-        if current_runtime.is_some_and(|current| Arc::ptr_eq(current, &runtime)) {
-            *lifecycle = ShellLifecycle::Closed;
+            ShellLifecycle::Exited {
+                profile,
+                run,
+                runtime: current,
+                ..
+            } if Arc::ptr_eq(current, &runtime) => {
+                *lock(&self.last_run)? = Some(run.persisted(profile.clone())?);
+                *lifecycle = ShellLifecycle::Closed;
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -1761,13 +2007,14 @@ fn create_pending_shell(workspace_id: &str, spec: ShellSpec) -> io::Result<Arc<S
         name: Mutex::new(spec.name),
         cwd: spec.cwd,
         command: spec.command,
-        last_profile: Mutex::new(None),
+        last_run: Mutex::new(None),
         lifecycle: Mutex::new(ShellLifecycle::Pending),
     }))
 }
 
 fn spawn_runtime(
     shell: &Arc<Shell>,
+    run: &ShellRun,
     workspace_name: &str,
     shell_name: &str,
     profile: &TerminalProfile,
@@ -1811,6 +2058,7 @@ fn spawn_runtime(
     command.env("BOOMUX_WORKSPACE", workspace_name);
     command.env("BOOMUX_SHELL_ID", &shell.id);
     command.env("BOOMUX_SHELL_NAME", shell_name);
+    command.env("BOOMUX_RUN_ID", &run.id);
     let child = pty.slave.spawn_command(command).map_err(io::Error::other)?;
     drop(pty.slave);
     drop(pty.master);
@@ -1829,13 +2077,16 @@ fn spawn_runtime(
 }
 
 fn start_pty_reader(
+    registry: Weak<Registry>,
     shell: Arc<Shell>,
+    run: Arc<ShellRun>,
     runtime: Arc<ShellRuntime>,
     mut reader: PtyReader,
     start_paused: bool,
 ) -> io::Result<()> {
     let (commands, command_receiver) = mpsc::channel();
     let reader_runtime = Arc::clone(&runtime);
+    let reader_run = Arc::clone(&run);
     let handle = thread::Builder::new()
         .name(format!("boomux-pty-{}", shell.id))
         .spawn(move || {
@@ -1903,6 +2154,19 @@ fn start_pty_reader(
                         let bytes = &buffer[..count];
                         if let Ok(mut terminal) = reader_runtime.terminal.lock() {
                             terminal.process(bytes);
+                            let revision = reader_run
+                                .output_revision
+                                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |revision| {
+                                    Some(revision.saturating_add(1))
+                                })
+                                .unwrap_or_else(|revision| revision)
+                                .saturating_add(1);
+                            if let Ok(mut last_run) = shell.last_run.lock()
+                                && let Some(last_run) = last_run.as_mut()
+                                && last_run.id == reader_run.id
+                            {
+                                last_run.output_revision = revision;
+                            }
                             if let Ok(mut controller) = reader_runtime.controller.lock() {
                                 let disconnect = controller.as_ref().is_some_and(|current| {
                                     matches!(
@@ -1943,18 +2207,11 @@ fn start_pty_reader(
                 .lock()
                 .ok()
                 .and_then(|mut process| process.try_wait_code().ok().flatten().flatten());
-            if let Ok(mut lifecycle) = shell.lifecycle.lock()
-                && let ShellLifecycle::Running {
-                    profile,
-                    runtime: current,
-                } = &*lifecycle
-                && Arc::ptr_eq(current, &reader_runtime)
+            if let Some(registry) = registry.upgrade()
+                && let Err(error) =
+                    registry.record_run_exit(&shell, &reader_run, &reader_runtime, code)
             {
-                *lifecycle = ShellLifecycle::Exited {
-                    code,
-                    profile: profile.clone(),
-                    runtime: Arc::clone(&reader_runtime),
-                };
+                eprintln!("boomux: could not persist shell run exit: {error}");
             }
             let _ = reader_runtime
                 .controller
@@ -1975,7 +2232,7 @@ fn tail_utf8(text: &str, max_bytes: usize) -> &str {
 
 fn handle_attach(
     mut stream: UnixStream,
-    registry: &Registry,
+    registry: &Arc<Registry>,
     shell_id: &str,
     takeover: bool,
     profile: TerminalProfile,
@@ -2011,7 +2268,7 @@ fn handle_attach(
     let token = Uuid::new_v4().to_string();
     let (output, receiver) = mpsc::sync_channel(CONTROLLER_QUEUE);
     let connection = stream.try_clone()?;
-    let previous_profile = lock(&shell.last_profile)?.clone();
+    let previous_run = lock(&shell.last_run)?.clone();
     let (runtime, startup_profile, running, started) = {
         let mut lifecycle = lock(&shell.lifecycle)?;
         let mut started = false;
@@ -2027,8 +2284,14 @@ fn handle_attach(
             let workspace = registry.workspace(&shell.workspace_id)?;
             let workspace_name = lock(&workspace.name)?.clone();
             let shell_name = lock(&shell.name)?.clone();
+            let generation = previous_run.as_ref().map_or(Ok(1), |run| {
+                run.generation
+                    .checked_add(1)
+                    .ok_or_else(|| io::Error::other("shell run generation exhausted"))
+            })?;
+            let run = Arc::new(ShellRun::new(generation));
             let (runtime, reader) =
-                match spawn_runtime(&shell, &workspace_name, &shell_name, &profile) {
+                match spawn_runtime(&shell, &run, &workspace_name, &shell_name, &profile) {
                     Ok(runtime) => runtime,
                     Err(error) => {
                         return send_response(
@@ -2041,16 +2304,43 @@ fn handle_attach(
                 };
             *lifecycle = ShellLifecycle::Running {
                 profile: profile.clone(),
+                run: Arc::clone(&run),
                 runtime: Arc::clone(&runtime),
             };
-            *lock(&shell.last_profile)? = Some(profile.clone());
+            *lock(&shell.last_run)? = Some(run.persisted(profile.clone())?);
             started = true;
-            start_pty_reader(Arc::clone(&shell), runtime, reader, false)?;
+            if let Err(error) = start_pty_reader(
+                Arc::downgrade(registry),
+                Arc::clone(&shell),
+                run,
+                runtime,
+                reader,
+                true,
+            ) {
+                drop(lifecycle);
+                let cleanup = shell.kill();
+                if cleanup.is_ok() {
+                    shell.reset_pending()?;
+                }
+                return send_response(
+                    &mut stream,
+                    Response::Error {
+                        message: cleanup.map_or_else(
+                            |cleanup| {
+                                format!(
+                                    "could not start shell reader: {error}; process cleanup also failed: {cleanup}"
+                                )
+                            },
+                            |()| format!("could not start shell reader: {error}"),
+                        ),
+                    },
+                );
+            }
         }
         match &*lifecycle {
-            ShellLifecycle::Running { profile, runtime } => {
-                (Arc::clone(runtime), profile.clone(), true, started)
-            }
+            ShellLifecycle::Running {
+                profile, runtime, ..
+            } => (Arc::clone(runtime), profile.clone(), true, started),
             ShellLifecycle::Exited {
                 profile, runtime, ..
             } => (Arc::clone(runtime), profile.clone(), false, started),
@@ -2069,7 +2359,6 @@ fn handle_attach(
         let cleanup = shell.kill();
         if cleanup.is_ok() {
             shell.reset_pending()?;
-            *lock(&shell.last_profile)? = previous_profile;
         }
         return send_response(
             &mut stream,
@@ -2084,6 +2373,9 @@ fn handle_attach(
                 ),
             },
         );
+    }
+    if started {
+        runtime.resume_reader()?;
     }
     drop(mutation);
     let warning = term_mismatch_warning(startup_profile.term.as_deref(), profile.term.as_deref());
@@ -2310,6 +2602,7 @@ fn update_runtime_dimensions(
         ShellLifecycle::Running {
             profile,
             runtime: current,
+            ..
         }
         | ShellLifecycle::Exited {
             profile,
@@ -2322,6 +2615,9 @@ fn update_runtime_dimensions(
     profile.cols = size.cols;
     profile.pixel_width = size.pixel_width;
     profile.pixel_height = size.pixel_height;
+    if let Some(last_run) = lock(&shell.last_run)?.as_mut() {
+        last_run.profile = profile.clone();
+    }
     Ok(())
 }
 
@@ -2383,6 +2679,15 @@ fn validate_name(name: &str) -> io::Result<()> {
     } else {
         Ok(())
     }
+}
+
+fn unix_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 fn signal_session(session_id: libc::pid_t, signal: libc::c_int) {
@@ -2586,7 +2891,7 @@ mod tests {
         let directory = env::temp_dir().join(format!("boomux-rollback-{}", Uuid::new_v4()));
         let state_directory = directory.join("state");
         let registry =
-            Registry::restore(StateStore::at(state_directory.join("state.json"))).unwrap();
+            Registry::restore(StateStore::at(state_directory.join("state.json")), false).unwrap();
         fs::remove_dir(&state_directory).unwrap();
         fs::write(&state_directory, b"not a directory").unwrap();
 
@@ -2617,13 +2922,25 @@ mod tests {
         )
         .unwrap();
         let terminal_profile = profile();
+        let run = Arc::new(ShellRun::new(1));
         let (runtime, reader) =
-            spawn_runtime(&shell, "workspace", "pause-test", &terminal_profile).unwrap();
+            spawn_runtime(&shell, &run, "workspace", "pause-test", &terminal_profile).unwrap();
+        *lock(&shell.last_run).unwrap() = Some(run.persisted(terminal_profile.clone()).unwrap());
         *lock(&shell.lifecycle).unwrap() = ShellLifecycle::Running {
             profile: terminal_profile,
+            run: Arc::clone(&run),
             runtime: Arc::clone(&runtime),
         };
-        start_pty_reader(Arc::clone(&shell), Arc::clone(&runtime), reader, false).unwrap();
+        let registry = Arc::new(Registry::default());
+        start_pty_reader(
+            Arc::downgrade(&registry),
+            Arc::clone(&shell),
+            run,
+            Arc::clone(&runtime),
+            reader,
+            false,
+        )
+        .unwrap();
 
         runtime.pause_reader().unwrap();
         lock(&runtime.master).unwrap().write(b"paused\n").unwrap();
@@ -2655,6 +2972,51 @@ mod tests {
     }
 
     #[test]
+    fn close_does_not_deadlock_with_a_naturally_exiting_reader() {
+        let registry = Arc::new(Registry::default());
+        let workspace = registry
+            .create_workspace(
+                "exit-race".into(),
+                vec![ShellSpec {
+                    name: "short-lived".into(),
+                    command: vec!["/bin/sh".into(), "-c".into(), "sleep 0.01".into()],
+                    cwd: env::temp_dir(),
+                }],
+            )
+            .unwrap();
+        let shell = registry.shell(&workspace.shells[0].id).unwrap();
+        let terminal_profile = profile();
+        let run = Arc::new(ShellRun::new(1));
+        let (runtime, reader) =
+            spawn_runtime(&shell, &run, "exit-race", "short-lived", &terminal_profile).unwrap();
+        *lock(&shell.last_run).unwrap() = Some(run.persisted(terminal_profile.clone()).unwrap());
+        *lock(&shell.lifecycle).unwrap() = ShellLifecycle::Running {
+            profile: terminal_profile,
+            run: Arc::clone(&run),
+            runtime: Arc::clone(&runtime),
+        };
+        start_pty_reader(
+            Arc::downgrade(&registry),
+            Arc::clone(&shell),
+            run,
+            runtime,
+            reader,
+            false,
+        )
+        .unwrap();
+        let shell_id = shell.id.clone();
+        let (completed, completion) = mpsc::sync_channel(1);
+        thread::spawn(move || {
+            let _ = completed.send(registry.close_shell(&shell_id));
+        });
+
+        completion
+            .recv_timeout(Duration::from_secs(3))
+            .expect("shell close deadlocked with the PTY reader")
+            .unwrap();
+    }
+
+    #[test]
     fn timed_out_reader_pause_cancels_queued_command() {
         let (commands, receiver) = mpsc::channel();
         let (observed, observation) = mpsc::sync_channel(1);
@@ -2680,6 +3042,22 @@ mod tests {
         assert_eq!(term_mismatch_warning(Some("xterm"), Some("xterm")), None);
         assert!(term_mismatch_warning(Some("xterm"), Some("alacritty")).is_some());
         assert!(term_mismatch_warning(None, Some("xterm")).is_some());
+    }
+
+    #[test]
+    fn run_completion_never_precedes_its_start_timestamp() {
+        let run = ShellRun {
+            id: Uuid::new_v4().to_string(),
+            generation: 1,
+            started_at_ms: u64::MAX,
+            ended: Mutex::new(None),
+            output_revision: AtomicU64::new(0),
+            environment_has_run_id: true,
+        };
+
+        run.finish(ShellRunExitReason::Interrupted).unwrap();
+
+        assert_eq!(run.snapshot().unwrap().ended_at_ms, Some(u64::MAX));
     }
 
     #[test]

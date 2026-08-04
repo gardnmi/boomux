@@ -42,6 +42,8 @@ pub struct ShellSnapshot {
     pub name: String,
     pub cwd: PathBuf,
     pub status: ShellStatus,
+    #[serde(default)]
+    pub run: Option<ShellRunSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,6 +52,25 @@ pub enum ShellStatus {
     Pending,
     Running,
     Exited { code: Option<u32> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShellRunSnapshot {
+    pub id: String,
+    pub generation: u64,
+    pub started_at_ms: u64,
+    pub ended_at_ms: Option<u64>,
+    pub exit_reason: Option<ShellRunExitReason>,
+    pub output_revision: u64,
+    pub environment_has_run_id: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "reason", rename_all = "snake_case")]
+pub enum ShellRunExitReason {
+    Exited { code: Option<u32> },
+    Terminated,
+    Interrupted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -276,6 +297,12 @@ pub fn read_message<T: DeserializeOwned>(reader: &mut impl Read) -> io::Result<T
 mod tests {
     use super::*;
 
+    #[derive(Deserialize)]
+    struct ProtocolSixShellSnapshot {
+        id: String,
+        status: ShellStatus,
+    }
+
     #[test]
     fn control_frame_round_trips() {
         let value = Envelope::new(Request::Attach {
@@ -305,6 +332,41 @@ mod tests {
         let request = r#"{"request":"create_shell","workspace_id":"w1","shell":{"name":"shell","command":[]}}"#;
 
         assert!(serde_json::from_str::<Request>(request).is_err());
+    }
+
+    #[test]
+    fn shell_snapshot_accepts_protocol_six_payload_without_run_identity() {
+        let snapshot = serde_json::from_str::<ShellSnapshot>(
+            r#"{"id":"s1","workspace_id":"w1","name":"shell","cwd":"/tmp","status":"running"}"#,
+        )
+        .unwrap();
+
+        assert!(snapshot.run.is_none());
+    }
+
+    #[test]
+    fn protocol_six_client_ignores_additive_run_identity() {
+        let snapshot = ShellSnapshot {
+            id: "s1".into(),
+            workspace_id: "w1".into(),
+            name: "shell".into(),
+            cwd: "/tmp".into(),
+            status: ShellStatus::Running,
+            run: Some(ShellRunSnapshot {
+                id: "r1".into(),
+                generation: 1,
+                started_at_ms: 1,
+                ended_at_ms: None,
+                exit_reason: None,
+                output_revision: 2,
+                environment_has_run_id: true,
+            }),
+        };
+
+        let legacy: ProtocolSixShellSnapshot =
+            serde_json::from_value(serde_json::to_value(snapshot).unwrap()).unwrap();
+        assert_eq!(legacy.id, "s1");
+        assert_eq!(legacy.status, ShellStatus::Running);
     }
 
     #[test]

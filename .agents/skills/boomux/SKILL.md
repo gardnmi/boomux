@@ -173,7 +173,14 @@ BOOMUX_WORKSPACE_ID
 BOOMUX_WORKSPACE
 BOOMUX_SHELL_ID
 BOOMUX_SHELL_NAME
+BOOMUX_RUN_ID
 ```
+
+`BOOMUX_RUN_ID` identifies the current process incarnation. It remains stable
+across attachment changes and graceful daemon handoff, but changes when the same
+durable shell starts a new process after recovery. A process transferred from a
+legacy daemon may have a daemon-side run identity without this environment
+variable; inspect `environment_has_run_id` before relying on it.
 
 `boomux prompt` prints `workspace/shell` inside Boomux and nothing outside it.
 It is intended for prompt integrations. Use `boomux --help` and

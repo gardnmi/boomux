@@ -10,7 +10,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use boomux::client::{Attachment, Client};
-use boomux::protocol::{self, AttachFrame, ShellSpec, ShellStatus, TerminalProfile};
+use boomux::protocol::{
+    self, AttachFrame, ShellRunExitReason, ShellSpec, ShellStatus, TerminalProfile,
+};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use uuid::Uuid;
 
@@ -99,6 +101,12 @@ impl TestDaemon {
             || !self.client.socket_path().exists(),
             "daemon socket was not removed",
         );
+    }
+
+    fn crash(&mut self) {
+        let mut child = self.child.take().unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
     }
 }
 
@@ -241,6 +249,15 @@ fn native_daemon_recovers_reproducible_metadata_after_restart() {
         &read_until(&mut first, b"restored-command"),
         b"restored-command"
     ));
+    let first_run = daemon
+        .client
+        .get_shell(&shell_id)
+        .unwrap()
+        .run
+        .expect("started shell has no run identity");
+    assert_eq!(first_run.generation, 1);
+    assert!(first_run.environment_has_run_id);
+    assert!(first_run.ended_at_ms.is_none());
     drop(first);
     daemon
         .client
@@ -255,8 +272,12 @@ fn native_daemon_recovers_reproducible_metadata_after_restart() {
     )
     .unwrap();
     assert_eq!(
-        persisted["workspaces"][0]["shells"][0]["last_profile"]["term"],
+        persisted["workspaces"][0]["shells"][0]["last_run"]["profile"]["term"],
         "attachment-term"
+    );
+    assert_eq!(
+        persisted["workspaces"][0]["shells"][0]["last_run"]["id"],
+        first_run.id
     );
 
     daemon.stop_with_cli();
@@ -268,6 +289,7 @@ fn native_daemon_recovers_reproducible_metadata_after_restart() {
     assert_eq!(restored.shells[0].id, shell_id);
     assert_eq!(restored.shells[0].name, "restored-renamed");
     assert_eq!(restored.shells[0].status, ShellStatus::Pending);
+    assert!(restored.shells[0].run.is_none());
     let mut second = daemon
         .client
         .attach(&shell_id, false, profile())
@@ -277,7 +299,141 @@ fn native_daemon_recovers_reproducible_metadata_after_restart() {
         &read_until(&mut second, b"restored-command"),
         b"restored-command"
     ));
+    let second_run = daemon
+        .client
+        .get_shell(&shell_id)
+        .unwrap()
+        .run
+        .expect("restarted shell has no run identity");
+    assert_ne!(second_run.id, first_run.id);
+    assert_eq!(second_run.generation, 2);
     drop(second);
+    daemon.stop_with_cli();
+}
+
+#[test]
+fn native_daemon_marks_a_crashed_run_interrupted() {
+    let mut daemon = TestDaemon::start();
+    let workspace = daemon
+        .client
+        .create_workspace(
+            "crash-run",
+            vec![ShellSpec::login("agent", std::env::temp_dir())],
+        )
+        .unwrap();
+    let shell_id = workspace.shells[0].id.clone();
+    let attachment = daemon.client.attach(&shell_id, false, profile()).unwrap();
+    let first_run = daemon.client.get_shell(&shell_id).unwrap().run.unwrap();
+    drop(attachment.stream);
+
+    daemon.crash();
+    daemon.restart();
+
+    let restored = daemon.client.get_shell(&shell_id).unwrap();
+    assert_eq!(restored.status, ShellStatus::Pending);
+    assert!(restored.run.is_none());
+    let persisted: serde_json::Value = serde_json::from_slice(
+        &fs::read(daemon.runtime_dir.join("state/boomux/state.json")).unwrap(),
+    )
+    .unwrap();
+    let last_run = &persisted["workspaces"][0]["shells"][0]["last_run"];
+    assert_eq!(last_run["id"], first_run.id);
+    assert_eq!(last_run["exit_reason"]["reason"], "interrupted");
+    assert!(last_run["ended_at_ms"].as_u64().is_some());
+
+    let second = daemon.client.attach(&shell_id, false, profile()).unwrap();
+    let second_run = daemon.client.get_shell(&shell_id).unwrap().run.unwrap();
+    assert_ne!(second_run.id, first_run.id);
+    assert_eq!(second_run.generation, 2);
+    drop(second.stream);
+    daemon.stop_with_cli();
+}
+
+#[test]
+fn failed_start_persistence_advances_the_run_generation() {
+    let mut daemon = TestDaemon::start();
+    let workspace = daemon
+        .client
+        .create_workspace(
+            "failed-run-persistence",
+            vec![ShellSpec::login("shell", std::env::temp_dir())],
+        )
+        .unwrap();
+    let shell_id = workspace.shells[0].id.clone();
+    let state_directory = daemon.runtime_dir.join("state/boomux");
+    let saved_directory = daemon.runtime_dir.join("saved-state");
+    fs::rename(&state_directory, &saved_directory).unwrap();
+    fs::write(&state_directory, b"not a directory").unwrap();
+
+    let error = daemon
+        .client
+        .attach(&shell_id, false, profile())
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("could not persist started shell")
+    );
+
+    fs::remove_file(&state_directory).unwrap();
+    fs::rename(&saved_directory, &state_directory).unwrap();
+    let attachment = daemon.client.attach(&shell_id, false, profile()).unwrap();
+    let run = daemon.client.get_shell(&shell_id).unwrap().run.unwrap();
+    assert_eq!(run.generation, 2);
+    drop(attachment.stream);
+    daemon.client.close_workspace(&workspace.id).unwrap();
+    daemon.stop_with_cli();
+}
+
+#[test]
+fn exited_run_persistence_retries_after_storage_recovers() {
+    let mut daemon = TestDaemon::start();
+    let workspace = daemon
+        .client
+        .create_workspace(
+            "exit-persistence-retry",
+            vec![ShellSpec::login("shell", std::env::temp_dir())],
+        )
+        .unwrap();
+    let shell_id = workspace.shells[0].id.clone();
+    let mut attachment = daemon
+        .client
+        .attach(&shell_id, false, profile())
+        .unwrap()
+        .stream;
+    let run_id = daemon.client.get_shell(&shell_id).unwrap().run.unwrap().id;
+    let state_directory = daemon.runtime_dir.join("state/boomux");
+    let saved_directory = daemon.runtime_dir.join("saved-exit-state");
+    fs::rename(&state_directory, &saved_directory).unwrap();
+    fs::write(&state_directory, b"not a directory").unwrap();
+
+    AttachFrame::Input(b"exit\n".to_vec())
+        .write_to(&mut attachment)
+        .unwrap();
+    wait_until(
+        || {
+            matches!(
+                daemon.client.get_shell(&shell_id).unwrap().status,
+                ShellStatus::Exited { .. }
+            )
+        },
+        "shell did not exit while persistence was unavailable",
+    );
+    drop(attachment);
+    fs::remove_file(&state_directory).unwrap();
+    fs::rename(&saved_directory, &state_directory).unwrap();
+    let state_path = state_directory.join("state.json");
+    wait_until(
+        || {
+            let state: serde_json::Value =
+                serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+            let run = &state["workspaces"][0]["shells"][0]["last_run"];
+            run["id"] == run_id && run["ended_at_ms"].as_u64().is_some()
+        },
+        "exited run was not persisted after storage recovered",
+    );
+
+    daemon.client.close_workspace(&workspace.id).unwrap();
     daemon.stop_with_cli();
 }
 
@@ -295,6 +451,8 @@ fn native_daemon_handoffs_multiple_detached_shells() {
         )
         .unwrap();
     let mut pids = Vec::new();
+    let mut run_ids = Vec::new();
+    let mut output_revisions = Vec::new();
     for (index, shell) in workspace.shells.iter().enumerate() {
         let mut attachment = daemon
             .client
@@ -311,6 +469,9 @@ fn native_daemon_handoffs_multiple_detached_shells() {
             .unwrap();
         let output = read_until(&mut attachment, b":end");
         pids.push(parse_pid(&output, &format!("pid{index}=")).unwrap());
+        let run = daemon.client.get_shell(&shell.id).unwrap().run.unwrap();
+        run_ids.push(run.id);
+        output_revisions.push(run.output_revision);
     }
 
     let restart = daemon
@@ -325,6 +486,9 @@ fn native_daemon_handoffs_multiple_detached_shells() {
     );
 
     for (index, shell) in workspace.shells.iter().enumerate() {
+        let transferred_run = daemon.client.get_shell(&shell.id).unwrap().run.unwrap();
+        assert_eq!(transferred_run.id, run_ids[index]);
+        assert_eq!(transferred_run.output_revision, output_revisions[index]);
         let mut attachment = daemon
             .client
             .attach(&shell.id, false, profile())
@@ -631,6 +795,14 @@ fn native_daemon_lifecycle() {
         daemon.client.get_shell(&failed_shell.id).unwrap().status,
         ShellStatus::Pending
     );
+    assert!(
+        daemon
+            .client
+            .get_shell(&failed_shell.id)
+            .unwrap()
+            .run
+            .is_none()
+    );
     daemon
         .client
         .close_workspace(&generated_workspace.id)
@@ -651,6 +823,20 @@ fn native_daemon_lifecycle() {
     assert!(attachment.reconstruction.len() <= 1024 * 1024);
     assert!(attachment.warning.is_none());
     let mut first = attachment.stream;
+    let initial_run = daemon
+        .client
+        .get_shell(&shell_id)
+        .unwrap()
+        .run
+        .expect("running shell has no run identity");
+    let inspected = daemon
+        .command()
+        .args(["shell", "inspect", &shell_id])
+        .output()
+        .unwrap();
+    assert!(inspected.status.success());
+    assert!(contains(&inspected.stdout, b"RUN ID"));
+    assert!(contains(&inspected.stdout, initial_run.id.as_bytes()));
     AttachFrame::Input(b"stty -echo\n".to_vec())
         .write_to(&mut first)
         .unwrap();
@@ -667,6 +853,15 @@ fn native_daemon_lifecycle() {
     .unwrap();
     let expected = b"env=attachment-term|truecolor|integration-terminal|1.0";
     assert!(contains(&read_until(&mut first, expected), expected));
+    let run_command = "printf 'run=%s:end\\n' \"$BOOMUX_RUN_ID\"\n".to_owned();
+    AttachFrame::Input(run_command.into_bytes())
+        .write_to(&mut first)
+        .unwrap();
+    let output = read_until(&mut first, b":end");
+    assert!(contains(
+        &output,
+        format!("run={}", initial_run.id).as_bytes()
+    ));
     AttachFrame::Input(b"printf 'transport-ok\\n'\n".to_vec())
         .write_to(&mut first)
         .unwrap();
@@ -710,6 +905,10 @@ fn native_daemon_lifecycle() {
         restart.status.success(),
         "active-controller restart failed: {}",
         String::from_utf8_lossy(&restart.stderr)
+    );
+    assert_eq!(
+        daemon.client.get_shell(&shell_id).unwrap().run.unwrap().id,
+        initial_run.id
     );
     AttachFrame::Input(b"printf 'still-running\\n'\n".to_vec())
         .write_to(&mut first)
@@ -882,6 +1081,14 @@ fn native_daemon_lifecycle() {
         },
         "imported shell leader exit was not detected",
     );
+    let exited_run = daemon.client.get_shell(&shell_id).unwrap().run.unwrap();
+    assert_eq!(exited_run.id, initial_run.id);
+    assert!(exited_run.ended_at_ms.is_some());
+    assert!(matches!(
+        exited_run.exit_reason,
+        Some(ShellRunExitReason::Exited { .. })
+    ));
+    assert!(exited_run.output_revision > initial_run.output_revision);
     daemon.client.close_workspace(&workspace.id).unwrap();
     wait_until(
         || !process_exists(child_pid),

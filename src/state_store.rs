@@ -9,9 +9,10 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::protocol::TerminalProfile;
+use crate::protocol::{ShellRunExitReason, TerminalProfile};
 
-const STATE_VERSION: u32 = 1;
+const STATE_VERSION: u32 = 2;
+const LEGACY_STATE_VERSION: u32 = 1;
 const MAX_STATE_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -45,7 +46,50 @@ pub(crate) struct PersistedShell {
     pub(crate) name: String,
     pub(crate) cwd: PathBuf,
     pub(crate) command: Vec<String>,
-    pub(crate) last_profile: Option<TerminalProfile>,
+    pub(crate) last_run: Option<PersistedShellRun>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PersistedShellRun {
+    pub(crate) id: String,
+    pub(crate) generation: u64,
+    pub(crate) started_at_ms: u64,
+    pub(crate) ended_at_ms: Option<u64>,
+    pub(crate) exit_reason: Option<ShellRunExitReason>,
+    pub(crate) output_revision: u64,
+    pub(crate) environment_has_run_id: bool,
+    pub(crate) profile: TerminalProfile,
+}
+
+#[derive(Deserialize)]
+struct StateVersion {
+    version: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyPersistedState {
+    version: u32,
+    workspaces: Vec<LegacyPersistedWorkspace>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyPersistedWorkspace {
+    id: String,
+    name: String,
+    shells: Vec<LegacyPersistedShell>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyPersistedShell {
+    id: String,
+    name: String,
+    cwd: PathBuf,
+    command: Vec<String>,
+    last_profile: Option<TerminalProfile>,
 }
 
 pub(crate) struct StateStore {
@@ -134,21 +178,27 @@ impl StateStore {
         }
         let mut bytes = Vec::with_capacity(metadata.len() as usize);
         File::open(&self.path)?.read_to_end(&mut bytes)?;
-        let state: PersistedState = serde_json::from_slice(&bytes).map_err(|error| {
+        let version: StateVersion = serde_json::from_slice(&bytes).map_err(|error| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("could not parse {}: {error}", self.path.display()),
             )
         })?;
-        if state.version != STATE_VERSION {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "unsupported Boomux state version {}; expected {STATE_VERSION}",
-                    state.version
-                ),
-            ));
-        }
+        let state = match version.version {
+            STATE_VERSION => parse_state(&bytes, &self.path)?,
+            LEGACY_STATE_VERSION => {
+                let legacy: LegacyPersistedState = parse_state(&bytes, &self.path)?;
+                let state = migrate_legacy_state(legacy);
+                self.save(&state)?;
+                state
+            }
+            version => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unsupported Boomux state version {version}; expected {STATE_VERSION}"),
+                ));
+            }
+        };
         Ok(Some(state))
     }
 
@@ -184,6 +234,60 @@ impl StateStore {
         }
         result
     }
+}
+
+fn parse_state<T: for<'de> Deserialize<'de>>(bytes: &[u8], path: &Path) -> io::Result<T> {
+    serde_json::from_slice(bytes).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("could not parse {}: {error}", path.display()),
+        )
+    })
+}
+
+fn migrate_legacy_state(legacy: LegacyPersistedState) -> PersistedState {
+    debug_assert_eq!(legacy.version, LEGACY_STATE_VERSION);
+    let migrated_at_ms = unix_time_ms();
+    PersistedState {
+        version: STATE_VERSION,
+        workspaces: legacy
+            .workspaces
+            .into_iter()
+            .map(|workspace| PersistedWorkspace {
+                id: workspace.id,
+                name: workspace.name,
+                shells: workspace
+                    .shells
+                    .into_iter()
+                    .map(|shell| PersistedShell {
+                        id: shell.id,
+                        name: shell.name,
+                        cwd: shell.cwd,
+                        command: shell.command,
+                        last_run: shell.last_profile.map(|profile| PersistedShellRun {
+                            id: Uuid::new_v4().to_string(),
+                            generation: 1,
+                            started_at_ms: migrated_at_ms,
+                            ended_at_ms: None,
+                            exit_reason: None,
+                            output_revision: 0,
+                            environment_has_run_id: false,
+                            profile,
+                        }),
+                    })
+                    .collect(),
+            })
+            .collect(),
+    }
+}
+
+fn unix_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 pub(crate) fn lock_path_from_environment() -> io::Result<PathBuf> {
@@ -264,6 +368,72 @@ mod tests {
         let error = store.load().unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn migrates_version_one_runs_once_and_preserves_the_generated_identity() {
+        let directory = env::temp_dir().join(format!("boomux-state-{}", Uuid::new_v4()));
+        let path = directory.join("boomux/state.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            br#"{
+  "version": 1,
+  "workspaces": [{
+    "id": "5bb1712a-8d4e-4998-bca2-a79aa673ca8f",
+    "name": "legacy",
+    "shells": [{
+      "id": "75dd46b5-6cd3-407a-813a-13e1b10f3614",
+      "name": "agent",
+      "cwd": "/tmp",
+      "command": ["opencode"],
+      "last_profile": {
+        "term": "xterm-256color",
+        "colorterm": null,
+        "term_program": null,
+        "term_program_version": null,
+        "rows": 24,
+        "cols": 80,
+        "pixel_width": 0,
+        "pixel_height": 0
+      }
+    }, {
+      "id": "93ffbd8b-d0e9-444e-a101-c9141abb3848",
+      "name": "pending",
+      "cwd": "/tmp",
+      "command": [],
+      "last_profile": null
+    }]
+  }]
+}"#,
+        )
+        .unwrap();
+        let store = StateStore::at(path.clone());
+
+        let migrated = store.load().unwrap().unwrap();
+        let run = migrated.workspaces[0].shells[0].last_run.as_ref().unwrap();
+        let run_id = run.id.clone();
+        assert!(Uuid::parse_str(&run_id).is_ok());
+        assert_eq!(run.generation, 1);
+        assert!(!run.environment_has_run_id);
+        assert_eq!(run.profile.term.as_deref(), Some("xterm-256color"));
+        assert!(migrated.workspaces[0].shells[1].last_run.is_none());
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .contains("\"version\": 2")
+        );
+
+        let reloaded = store.load().unwrap().unwrap();
+        assert_eq!(
+            reloaded.workspaces[0].shells[0]
+                .last_run
+                .as_ref()
+                .unwrap()
+                .id,
+            run_id
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 }
