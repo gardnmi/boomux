@@ -386,43 +386,27 @@ fn dashboard_views(
     workspaces
         .iter()
         .map(|workspace| {
-            let directory = common_shell_cwd(workspace);
-            let git = directory
-                .map(|directory| git_cache.inspect(directory))
-                .unwrap_or_default();
             let terminals = workspace
                 .shells
                 .iter()
-                .map(|shell| tui::TerminalView {
-                    id: shell.id.clone(),
-                    name: shell.name.clone(),
-                    status: shell_status(&shell.status).into(),
-                    directory: shell.cwd.display().to_string(),
+                .map(|shell| {
+                    let git = git_cache.inspect(&shell.cwd);
+                    tui::TerminalView {
+                        id: shell.id.clone(),
+                        name: shell.name.clone(),
+                        status: shell_status(&shell.status).into(),
+                        directory: shell.cwd.display().to_string(),
+                        branch: git.branch,
+                    }
                 })
                 .collect();
             tui::WorkspaceView {
                 id: workspace.id.clone(),
                 name: workspace.name.clone(),
-                directory: directory
-                    .map(|directory| directory.display().to_string())
-                    .unwrap_or_else(|| "-".into()),
-                repository: git.repository,
-                branch: git.branch,
-                git_state: git.state,
-                worktree: git.worktree,
                 terminals,
             }
         })
         .collect()
-}
-
-fn common_shell_cwd(workspace: &WorkspaceSnapshot) -> Option<&Path> {
-    let first = workspace.shells.first()?.cwd.as_path();
-    workspace
-        .shells
-        .iter()
-        .all(|shell| shell.cwd == first)
-        .then_some(first)
 }
 
 fn open_directory(
@@ -1210,17 +1194,13 @@ mod tests {
     }
 
     #[test]
-    fn empty_workspace_view_has_no_directory_or_git_values() {
+    fn empty_workspace_view_has_no_shells() {
         let views = dashboard_views(
             &[workspace("w1", "empty", Vec::new())],
             &mut git::Cache::default(),
         );
 
-        assert_eq!(views[0].directory, "-");
-        assert_eq!(views[0].repository, "-");
-        assert_eq!(views[0].branch, "-");
-        assert_eq!(views[0].git_state, "-");
-        assert_eq!(views[0].worktree, "-");
+        assert!(views[0].terminals.is_empty());
     }
 
     #[test]

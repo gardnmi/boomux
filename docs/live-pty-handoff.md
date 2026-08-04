@@ -2,9 +2,9 @@
 
 ## Goal
 
-Replace the Boomux daemon without terminating detached shell processes. A
-metadata-only restart remains the crash fallback; handoff is an explicit,
-acknowledged upgrade path.
+Replace the Boomux daemon without terminating running shell processes or ending
+active terminal sessions. Metadata-only recovery remains the crash fallback;
+handoff is an explicit, acknowledged upgrade path.
 
 ## Invariants
 
@@ -39,10 +39,11 @@ mode, matches both lock-file inodes, and establishes exclusive flock ownership
 before acknowledging readiness. Explicit abort closes every received duplicate
 without affecting descriptors retained by the old daemon.
 
-For each detached running shell, the old reader pauses before the manifest is
-captured. The replacement validates the session leader and pidfd, reconstructs
-terminal state, and waits at `PREPARED`; it does not begin reading the PTY until
-`FINALIZE`, so rollback cannot consume output belonging to the old daemon.
+For each running shell, any active controller first acknowledges its reconnect
+boundary and the old reader pauses before the manifest is captured. The
+replacement validates the session leader and pidfd, reconstructs terminal state,
+and waits at `PREPARED`; it does not begin reading the PTY until `FINALIZE`, so
+rollback cannot consume output belonging to the old daemon.
 PTY/session identity is cross-checked with `TIOCGSID`, terminal reconstructions
 use separate bounded frames, and imported process/session cleanup uses pidfds to
 avoid signaling a reused numeric PID.

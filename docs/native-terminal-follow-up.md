@@ -4,9 +4,9 @@ Date: 2026-08-03
 
 ## Purpose
 
-Boomux now owns its PTYs and shell processes, but the native terminal backend is
-not complete. Live attachment is transparent; terminal initialization and
-reconnection are still approximations.
+Boomux owns its PTYs and shell processes. Live attachment is transparent, and
+the terminal initialization, reconstruction, persistence, and graceful handoff
+phases described here are implemented.
 
 This document records the remaining work needed to make Boomux shells behave
 consistently in Ghostty, Alacritty, Kitty, and other XDG terminal emulators.
@@ -29,11 +29,11 @@ consistently in Ghostty, Alacritty, Kitty, and other XDG terminal emulators.
 | Reconstructed terminal state on reconnect | Working |
 | ANSI-aware logical output for `boomux read` | Working |
 | Metadata recovery after daemon restart | Working |
-| Live PTY handoff to a replacement daemon | Missing |
+| Live PTY handoff to a replacement daemon | Working |
 
-The current backend is suitable for proof-of-concept testing. It reconstructs
-text VT state but does not claim graphics restoration or process survival across
-daemon restart.
+The current backend reconstructs text VT state but does not claim graphics
+restoration. Running processes survive acknowledged graceful daemon restart;
+an unexpected daemon exit falls back to reproducible metadata recovery.
 Workspace metadata contains only a UUID and name; working directories belong
 exclusively to shells. Dashboard project discovery supplies name suggestions
 and does not persist project paths. A shell request without a selected workspace
@@ -267,12 +267,15 @@ State directories are owner-only, state files are bounded and owner-validated,
 and updates use a synced temporary file followed by atomic rename. Invalid or
 unsupported state fails startup rather than silently discarding metadata.
 
-Do not claim that arbitrary process state can be serialized. After an ordinary
-daemon restart, Boomux restores every shell as pending and recreates it on first
-attachment, but cannot recover the original process or its mutated environment.
+Do not claim that arbitrary process state can be serialized. After startup
+without a handoff, such as crash recovery, Boomux restores shells as pending and
+recreates them on first attachment, but cannot recover the original process or
+its mutated environment.
 
-Live process survival during an upgrade requires a separate Unix PTY handoff
-mechanism. Treat that as a later feature, not part of metadata restoration.
+An explicit `boomux daemon restart` instead uses the separate transactional Unix
+PTY handoff documented in [`live-pty-handoff.md`](live-pty-handoff.md). It
+transfers running processes and reconnects active attachment clients; this does
+not change the guarantees of metadata-only recovery.
 
 ## Manual Test Matrix
 
@@ -288,6 +291,8 @@ Run each scenario in Alacritty and Ghostty first, then Kitty if available:
 | Hyperlink and OSC title | Live behavior reaches the emulator unchanged |
 | Controller takeover | Old window disconnects; new window controls the shell |
 | Cross-emulator reattach | Compatibility warning and behavior match policy |
+| Graceful restart while detached | Process PID and subsequent input/output survive |
+| Graceful restart while attached | Client reconnects without leaving raw mode |
 | Daemon stop | All owned process sessions terminate and socket is removed |
 
 Record the terminal environment visible inside each child:
@@ -301,9 +306,11 @@ stty size
 ## Implementation Order
 
 1. Dogfood Alacritty and Ghostty with the manual matrix.
-2. Create a separate VT reconstruction branch.
-3. Replace raw `boomux read` extraction with parser-backed logical lines.
-4. Add metadata persistence only after terminal behavior is stable.
+2. [Complete] Implement VT reconstruction.
+3. [Complete] Replace raw `boomux read` extraction with parser-backed logical
+   lines.
+4. [Complete] Add atomic metadata persistence.
+5. [Complete] Add transactional live PTY handoff and active-client reconnection.
 
 ## Definition Of Done
 

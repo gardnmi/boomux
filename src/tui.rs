@@ -6,7 +6,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span, Text};
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState,
 };
@@ -25,11 +25,6 @@ const REFRESH_INTERVAL: Duration = Duration::from_millis(250);
 pub(crate) struct WorkspaceView {
     pub(crate) id: String,
     pub(crate) name: String,
-    pub(crate) directory: String,
-    pub(crate) repository: String,
-    pub(crate) branch: String,
-    pub(crate) git_state: String,
-    pub(crate) worktree: String,
     pub(crate) terminals: Vec<TerminalView>,
 }
 
@@ -53,6 +48,7 @@ pub(crate) struct TerminalView {
     pub(crate) name: String,
     pub(crate) status: String,
     pub(crate) directory: String,
+    pub(crate) branch: String,
 }
 
 pub(crate) struct Actions<R, O, C, W, N, E, F> {
@@ -349,6 +345,21 @@ impl App {
         self.message = None;
     }
 
+    fn set_focus(&mut self, focus: Focus) {
+        self.focus = focus;
+        self.message = None;
+    }
+
+    fn handle_focus_key(&mut self, key: KeyCode) -> bool {
+        let focus = match key {
+            KeyCode::Left | KeyCode::Char('h') => Focus::Workspaces,
+            KeyCode::Right | KeyCode::Char('l') => Focus::Terminals,
+            _ => return false,
+        };
+        self.set_focus(focus);
+        true
+    }
+
     fn select_first_terminal(&mut self) {
         self.terminal_state.select(
             self.selected()
@@ -615,6 +626,7 @@ where
             }
             KeyCode::Char('e') => app.request_rename(),
             KeyCode::Tab => app.toggle_focus(),
+            key if app.handle_focus_key(key) => {}
             _ => {}
         }
     }
@@ -710,17 +722,26 @@ fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
     frame.render_widget(Block::new().style(Style::new().bg(BASE)), area);
 
-    let [header_area, workspace_area, terminal_area, footer_area] = Layout::vertical([
-        Constraint::Length(3),
-        Constraint::Percentage(38),
+    let [header_area, dashboard_area, footer_area] = Layout::vertical([
+        Constraint::Length(1),
         Constraint::Fill(1),
         Constraint::Length(1),
     ])
     .areas(area);
 
     render_header(frame, header_area, app);
-    render_workspaces(frame, workspace_area, app);
-    render_terminals(frame, terminal_area, app);
+    if dashboard_area.width >= 108 {
+        let [workspace_area, terminal_area] =
+            Layout::horizontal([Constraint::Length(28), Constraint::Fill(1)]).areas(dashboard_area);
+        render_workspaces(frame, workspace_area, app);
+        render_terminals(frame, terminal_area, app);
+    } else {
+        let [workspace_area, terminal_area] =
+            Layout::vertical([Constraint::Percentage(32), Constraint::Fill(1)])
+                .areas(dashboard_area);
+        render_workspaces(frame, workspace_area, app);
+        render_terminals(frame, terminal_area, app);
+    }
     render_footer(frame, footer_area, app);
     if let Mode::PickProject(picker) = &mut app.mode {
         render_project_picker(frame, area, picker);
@@ -834,7 +855,7 @@ fn render_header(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
         .sum();
     let line = Line::from(vec![
         Span::styled(
-            " BOOMUX DASHBOARD ",
+            " BOOMUX ",
             Style::new().fg(TEAL).add_modifier(Modifier::BOLD),
         ),
         Span::styled(
@@ -843,158 +864,29 @@ fn render_header(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
         ),
         Span::styled("  |  ", Style::new().fg(OVERLAY)),
         Span::styled(format!("{shell_count} shells"), Style::new().fg(BLUE)),
-        Span::styled("    Tab switches tables", Style::new().fg(SUBTEXT)),
-    ]);
-    frame.render_widget(
-        Paragraph::new(line).block(
-            Block::bordered()
-                .border_style(Style::new().fg(TEAL))
-                .style(Style::new().bg(BASE)),
+        Span::styled(
+            "    tab/h/l/arrows switches panes",
+            Style::new().fg(SUBTEXT),
         ),
-        area,
-    );
+    ]);
+    frame.render_widget(Paragraph::new(line).style(Style::new().bg(BASE)), area);
 }
 
 fn render_workspaces(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
-    let (header, rows, widths) = if area.width >= 140 {
-        let rows: Vec<_> = app
-            .workspaces
-            .iter()
-            .enumerate()
-            .map(|(index, workspace)| {
-                Row::new(vec![
-                    Cell::from((index + 1).to_string()),
-                    Cell::from(workspace.name.as_str()),
-                    Cell::from(workspace.repository.as_str()),
-                    Cell::from(workspace.branch.as_str()),
-                    git_state_cell(&workspace.git_state),
-                    Cell::from(workspace.worktree.as_str()),
-                    Cell::from(workspace.terminals.len().to_string()),
-                    Cell::from(workspace.directory.as_str()),
-                ])
-            })
-            .collect();
-        (
-            Row::new([
-                "#",
-                "NAME",
-                "REPOSITORY",
-                "BRANCH",
-                "DIRTY",
-                "WORKTREE",
-                "SHELLS",
-                "DIRECTORY",
-            ]),
-            rows,
-            vec![
-                Constraint::Length(4),
-                Constraint::Length(18),
-                Constraint::Length(18),
-                Constraint::Length(22),
-                Constraint::Length(12),
-                Constraint::Length(18),
-                Constraint::Length(8),
-                Constraint::Min(24),
-            ],
+    let rows = app.workspaces.iter().map(|workspace| {
+        Row::new([
+            Cell::from(workspace.name.as_str()),
+            Cell::from(workspace.terminals.len().to_string()),
+        ])
+    });
+    let table = Table::new(rows, [Constraint::Min(12), Constraint::Length(6)])
+        .header(
+            Row::new(["NAME", "SHELLS"]).style(Style::new().fg(BLUE).add_modifier(Modifier::BOLD)),
         )
-    } else if area.width >= 100 {
-        let rows: Vec<_> = app
-            .workspaces
-            .iter()
-            .enumerate()
-            .map(|(index, workspace)| {
-                let name = if workspace.repository == "-" || workspace.repository == workspace.name
-                {
-                    workspace.name.clone()
-                } else {
-                    format!("{} / {}", workspace.name, workspace.repository)
-                };
-                Row::new(vec![
-                    Cell::from((index + 1).to_string()),
-                    Cell::from(name),
-                    Cell::from(workspace.branch.as_str()),
-                    git_state_cell(&workspace.git_state),
-                    Cell::from(workspace.worktree.as_str()),
-                    Cell::from(workspace.terminals.len().to_string()),
-                ])
-            })
-            .collect();
-        (
-            Row::new([
-                "#",
-                "WORKSPACE / REPOSITORY",
-                "BRANCH",
-                "DIRTY",
-                "WORKTREE",
-                "SHELLS",
-            ]),
-            rows,
-            vec![
-                Constraint::Length(4),
-                Constraint::Min(20),
-                Constraint::Length(18),
-                Constraint::Length(12),
-                Constraint::Length(18),
-                Constraint::Length(7),
-            ],
-        )
-    } else {
-        let rows: Vec<_> = app
-            .workspaces
-            .iter()
-            .enumerate()
-            .map(|(index, workspace)| {
-                let name = if workspace.repository == "-" || workspace.repository == workspace.name
-                {
-                    workspace.name.clone()
-                } else {
-                    format!("{} / {}", workspace.name, workspace.repository)
-                };
-                Row::new(vec![
-                    Cell::from((index + 1).to_string()),
-                    Cell::from(Text::from(vec![
-                        Line::from(name),
-                        Line::from(format!(
-                            "{} shell{}",
-                            workspace.terminals.len(),
-                            if workspace.terminals.len() == 1 {
-                                ""
-                            } else {
-                                "s"
-                            }
-                        )),
-                    ])),
-                    Cell::from(Text::from(vec![
-                        Line::from(workspace.branch.as_str()),
-                        Line::from(vec![
-                            Span::styled(
-                                workspace.git_state.as_str(),
-                                Style::new().fg(git_state_color(&workspace.git_state)),
-                            ),
-                            Span::raw(" | "),
-                            Span::raw(workspace.worktree.as_str()),
-                        ]),
-                    ])),
-                ])
-                .height(2)
-            })
-            .collect();
-        (
-            Row::new(["#", "WORKSPACE / REPOSITORY", "GIT DETAILS"]),
-            rows,
-            vec![
-                Constraint::Length(4),
-                Constraint::Min(24),
-                Constraint::Length(34),
-            ],
-        )
-    };
-    let table = Table::new(rows, widths)
-        .header(header.style(Style::new().fg(BLUE).add_modifier(Modifier::BOLD)))
         .column_spacing(1)
         .block(
             Block::bordered()
-                .title(" Workspaces ")
+                .title(format!(" Workspaces ({}) ", app.workspaces.len()))
                 .border_style(Style::new().fg(if app.focus == Focus::Workspaces {
                     TEAL
                 } else {
@@ -1011,64 +903,105 @@ fn render_workspaces(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut A
     frame.render_stateful_widget(table, area, &mut app.workspace_state);
 }
 
-fn git_state_cell(state: &str) -> Cell<'_> {
-    Cell::from(Span::styled(state, Style::new().fg(git_state_color(state))))
-}
-
 fn render_terminals(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
-    let header = Row::new(["#", "NAME", "STATUS", "DIRECTORY", "SHELL ID"])
+    let header = Row::new(["NAME", "STATUS", "DIRECTORY", "BRANCH", "SHELL ID"])
         .style(Style::new().fg(BLUE).add_modifier(Modifier::BOLD));
     let selected = app
         .workspace_state
         .selected()
         .and_then(|index| app.workspaces.get(index));
+    let title = selected.map_or_else(
+        || " Shells ".to_owned(),
+        |workspace| {
+            format!(
+                " Shells: {} ({}) ",
+                workspace.name,
+                workspace.terminals.len()
+            )
+        },
+    );
+    let block = Block::bordered().title(title).border_style(Style::new().fg(
+        if app.focus == Focus::Terminals {
+            TEAL
+        } else {
+            OVERLAY
+        },
+    ));
+    let inner = block.inner(area);
+    let show_full_ids = inner.width >= 150;
     let rows: Vec<_> = selected
         .into_iter()
         .flat_map(|workspace| workspace.terminals.iter())
-        .enumerate()
-        .map(|(index, terminal)| {
+        .map(|terminal| {
             Row::new(vec![
-                Cell::from((index + 1).to_string()),
                 Cell::from(terminal.name.as_str()),
                 Cell::from(Span::styled(
                     terminal.status.as_str(),
                     Style::new().fg(status_color(&terminal.status)),
                 )),
                 Cell::from(terminal.directory.as_str()),
-                Cell::from(terminal.id.as_str()),
+                Cell::from(terminal.branch.as_str()),
+                Cell::from(if show_full_ids {
+                    terminal.id.clone()
+                } else {
+                    short_id(&terminal.id)
+                }),
             ])
         })
         .collect();
-    let title = selected.map_or_else(
-        || " Terminals ".to_owned(),
-        |workspace| format!(" Terminals: {} ", workspace.name),
-    );
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(4),
-            Constraint::Length(18),
-            Constraint::Length(12),
-            Constraint::Min(24),
-            Constraint::Length(24),
-        ],
-    )
-    .header(header)
-    .column_spacing(1)
-    .block(Block::bordered().title(title).border_style(Style::new().fg(
-        if app.focus == Focus::Terminals {
-            TEAL
-        } else {
-            OVERLAY
-        },
-    )))
-    .row_highlight_style(
-        Style::new()
-            .fg(TEXT)
-            .add_modifier(Modifier::BOLD | Modifier::REVERSED),
-    )
-    .highlight_symbol("> ");
-    frame.render_stateful_widget(table, area, &mut app.terminal_state);
+    let widths = shell_column_widths(inner.width, show_full_ids);
+    frame.render_widget(block, area);
+    let table_area = if show_full_ids {
+        inner
+    } else {
+        let [detail_area, table_area] =
+            Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(inner);
+        let detail = app.selected_terminal().map_or_else(
+            || Line::from(Span::styled(" No shell selected", Style::new().fg(SUBTEXT))),
+            |terminal| {
+                Line::from(vec![
+                    Span::styled(" ID ", Style::new().fg(SUBTEXT)),
+                    Span::styled(terminal.id.as_str(), Style::new().fg(TEXT)),
+                ])
+            },
+        );
+        frame.render_widget(Paragraph::new(detail), detail_area);
+        table_area
+    };
+    let table = Table::new(rows, widths)
+        .header(header)
+        .column_spacing(1)
+        .row_highlight_style(
+            Style::new()
+                .fg(TEXT)
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED),
+        )
+        .highlight_symbol("> ");
+    frame.render_stateful_widget(table, table_area, &mut app.terminal_state);
+}
+
+fn shell_column_widths(width: u16, show_full_ids: bool) -> Vec<Constraint> {
+    let (name, status, branch, id, directory_min, directory_max) = if show_full_ids {
+        (18, 10, 30, 36, 24, 42)
+    } else {
+        (16, 10, 18, 8, 16, 36)
+    };
+    // Four column gaps and the highlight marker also consume table width.
+    let fixed = name + status + branch + id + 6;
+    let directory = width
+        .saturating_sub(fixed)
+        .clamp(directory_min, directory_max);
+    vec![
+        Constraint::Length(name),
+        Constraint::Length(status),
+        Constraint::Length(directory),
+        Constraint::Length(branch),
+        Constraint::Length(id),
+    ]
+}
+
+fn short_id(id: &str) -> String {
+    id.chars().take(8).collect()
 }
 
 fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
@@ -1112,7 +1045,10 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     } else {
         let mut spans = vec![
             Span::styled(" j/k", Style::new().fg(TEAL)),
-            Span::styled(" navigate  tab focus  ", Style::new().fg(SUBTEXT)),
+            Span::styled(
+                " navigate  tab/h/l/arrows focus  ",
+                Style::new().fg(SUBTEXT),
+            ),
             Span::styled("a", Style::new().fg(GREEN)),
             Span::styled(
                 if app.focus == Focus::Workspaces {
@@ -1171,18 +1107,6 @@ fn status_color(status: &str) -> Color {
     }
 }
 
-fn git_state_color(state: &str) -> Color {
-    if state == "clean" {
-        GREEN
-    } else if state.contains("conflict") {
-        RED
-    } else if state == "-" || state == "unknown" {
-        SUBTEXT
-    } else {
-        YELLOW
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1219,16 +1143,12 @@ mod tests {
         WorkspaceView {
             id: id.into(),
             name: name.into(),
-            directory: "/tmp/boomux".into(),
-            repository: "boomux".into(),
-            branch: "main".into(),
-            git_state: "clean".into(),
-            worktree: "primary".into(),
             terminals: vec![TerminalView {
                 id: "term_1".into(),
                 name: "agent".into(),
                 status: "running".into(),
                 directory: "/tmp/boomux".into(),
+                branch: "main".into(),
             }],
         }
     }
@@ -1244,11 +1164,23 @@ mod tests {
     }
 
     #[test]
-    fn git_states_use_semantic_colors() {
-        assert_eq!(git_state_color("clean"), GREEN);
-        assert_eq!(git_state_color("3 changed"), YELLOW);
-        assert_eq!(git_state_color("1 conflict"), RED);
-        assert_eq!(git_state_color("-"), SUBTEXT);
+    fn shell_ids_are_shortened_to_eight_characters() {
+        assert_eq!(short_id("12345678-1234-1234-1234-123456789abc"), "12345678");
+        assert_eq!(short_id("short"), "short");
+    }
+
+    #[test]
+    fn wide_shell_columns_are_bounded_instead_of_absorbing_extra_space() {
+        assert_eq!(
+            shell_column_widths(180, true),
+            vec![
+                Constraint::Length(18),
+                Constraint::Length(10),
+                Constraint::Length(42),
+                Constraint::Length(30),
+                Constraint::Length(36),
+            ]
+        );
     }
 
     #[test]
@@ -1272,6 +1204,21 @@ mod tests {
                 .map(|terminal| terminal.name.as_str()),
             Some("agent")
         );
+    }
+
+    #[test]
+    fn directional_keys_can_select_each_pane() {
+        let mut app = app();
+
+        assert!(app.handle_focus_key(KeyCode::Char('l')));
+        assert_eq!(app.focus, Focus::Terminals);
+        assert!(app.handle_focus_key(KeyCode::Left));
+        assert_eq!(app.focus, Focus::Workspaces);
+        assert!(app.handle_focus_key(KeyCode::Right));
+        assert_eq!(app.focus, Focus::Terminals);
+        assert!(app.handle_focus_key(KeyCode::Char('h')));
+        assert_eq!(app.focus, Focus::Workspaces);
+        assert!(!app.handle_focus_key(KeyCode::Char('x')));
     }
 
     #[test]
@@ -1642,14 +1589,17 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect();
         assert!(text.contains("BRANCH"));
-        assert!(text.contains("DIRTY"));
-        assert!(text.contains("WORKTREE"));
+        assert!(text.contains("DIRECTORY"));
+        assert!(text.contains("SHELL ID"));
+        assert!(text.contains("ID term_1"));
         assert!(text.contains("SHELLS"));
-        assert!(text.contains("primary"));
+        assert!(text.contains("Shells: boomux (1)"));
+        assert!(!text.contains("DIRTY"));
+        assert!(!text.contains("WORKTREE"));
     }
 
     #[test]
-    fn wide_dashboard_renders_repository_and_directory_columns() {
+    fn wide_dashboard_keeps_workspace_summary_and_shell_details() {
         let backend = TestBackend::new(180, 34);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = app();
@@ -1662,12 +1612,15 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect();
-        assert!(text.contains("REPOSITORY"));
+        assert!(text.contains("Workspaces (1)"));
+        assert!(text.contains("agent"));
         assert!(text.contains("DIRECTORY"));
+        assert!(text.contains("main"));
+        assert!(!text.contains("REPOSITORY"));
     }
 
     #[test]
-    fn narrow_dashboard_keeps_workspace_and_git_details_visible() {
+    fn narrow_dashboard_stacks_workspace_and_shell_details() {
         let backend = TestBackend::new(80, 34);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = app();
@@ -1680,12 +1633,36 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect();
-        assert!(text.contains("WORKSPACE / REPOSITORY"));
-        assert!(text.contains("GIT DETAILS"));
+        assert!(text.contains("Workspaces (1)"));
+        assert!(text.contains("Shells: boomux (1)"));
+        assert!(text.contains("DIRECTORY"));
+        assert!(text.contains("BRANCH"));
+        assert!(text.contains("SHELL ID"));
         assert!(text.contains("main"));
-        assert!(text.contains("clean"));
-        assert!(text.contains("primary"));
-        assert!(text.contains("1 shell"));
+        assert!(!text.contains("DIRTY"));
+        assert!(!text.contains("WORKTREE"));
+    }
+
+    #[test]
+    fn horizontal_breakpoint_keeps_every_shell_column_visible() {
+        let backend = TestBackend::new(108, 34);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = app();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("NAME"));
+        assert!(text.contains("STATUS"));
+        assert!(text.contains("DIRECTORY"));
+        assert!(text.contains("BRANCH"));
+        assert!(text.contains("SHELL ID"));
+        assert!(text.contains("ID term_1"));
     }
 
     #[test]

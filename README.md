@@ -191,16 +191,16 @@ mode, forwards input and resize events, writes output, and restores terminal
 mode on exit. See [`docs/architecture.md`](docs/architecture.md) for details.
 Shells remain pending until their first attachment reports terminal environment
 and dimensions; that profile initializes the PTY and child process. Reproducible
-workspace and shell metadata is restored after daemon restart. Remaining live
-PTY handoff work is tracked in
-[`docs/native-terminal-follow-up.md`](docs/native-terminal-follow-up.md).
+workspace and shell metadata provides crash recovery, while a graceful
+`boomux daemon restart` transfers running shells and reconnects active clients.
+See [`docs/live-pty-handoff.md`](docs/live-pty-handoff.md) for the handoff design.
 
 ## POC Limitations
 
-- PTYs and processes exist only for the daemon's lifetime. After restart,
-  persisted shells return as pending and start fresh processes when reopened.
 - Live daemon restart preserves pending and running shells. Active attachment
   clients reconnect cooperatively; exited shells use metadata recovery.
+- An unexpected daemon exit cannot hand off live PTYs. Persisted shell metadata
+  returns as pending and starts fresh processes when reopened.
 - Mutated process environment and in-memory application state are not persisted.
 - Reconnection emits at most 1 MiB of sanitized VT reconstruction rather than
   replaying historical PTY bytes. Graphics are omitted from reconstruction.
