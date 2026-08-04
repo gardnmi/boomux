@@ -86,8 +86,8 @@ eternal process.
    reporting for integrations.
 4. [Complete] Add a monotonic daemon event stream with reconnectable cursors and
    revision-aware output reads.
-5. Route runtime transitions through one coordinator so persistence and events
-   share an ordering boundary.
+5. [Complete] Route runtime transitions through one coordinator so persistence
+   and events share an ordering boundary.
 
 ### Agent Runtime
 
