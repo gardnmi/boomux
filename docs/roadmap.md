@@ -84,7 +84,7 @@ eternal process.
    graceful daemon restart without starting a replacement process implicitly.
 3. [Complete] Add stable versioned JSON output, typed errors, and capability
    reporting for integrations.
-4. Add a monotonic daemon event stream with reconnectable cursors and
+4. [Complete] Add a monotonic daemon event stream with reconnectable cursors and
    revision-aware output reads.
 5. Route runtime transitions through one coordinator so persistence and events
    share an ordering boundary.

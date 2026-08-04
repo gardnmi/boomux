@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -23,9 +23,9 @@ use crate::client;
 use crate::fd_transfer::send_descriptor;
 use crate::handoff;
 use crate::protocol::{
-    self, AttachFrame, Envelope, ErrorCode, Request, Response, ShellRunExitReason,
-    ShellRunSnapshot, ShellSnapshot, ShellSpec, ShellStatus, Snapshot, TerminalProfile,
-    WorkspaceSnapshot,
+    self, AttachFrame, DaemonEvent, DaemonEventKind, Envelope, ErrorCode, EventCursor, Request,
+    Response, ShellRunExitReason, ShellRunSnapshot, ShellSnapshot, ShellSpec, ShellStatus,
+    Snapshot, TerminalProfile, WorkspaceSnapshot,
 };
 use crate::state_store::{
     PersistedShell, PersistedShellRun, PersistedState, PersistedWorkspace, StateStore,
@@ -39,10 +39,14 @@ const RESTART_TIMEOUT: Duration = Duration::from_secs(10);
 const IO_RETRY_DELAY: Duration = Duration::from_millis(2);
 const PERSIST_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_TERMINAL_ENV_VALUE: usize = 256;
+const MAX_NAME_BYTES: usize = 256;
 const MAX_TERMINAL_ROWS: u16 = 1_000;
 const MAX_TERMINAL_COLS: u16 = 1_000;
 const MAX_TERMINAL_CELLS: usize = 1_000_000;
 const MAX_SHELL_READ_BYTES: usize = 1024 * 1024;
+const MAX_RETAINED_EVENTS: usize = 8_192;
+const MAX_EVENT_BATCH: u16 = 256;
+const MAX_EVENT_WAIT: Duration = Duration::from_secs(30);
 const TRANSITION_IDLE: u8 = 0;
 const TRANSITION_RESTART: u8 = 1;
 const TRANSITION_SHUTDOWN: u8 = 2;
@@ -57,6 +61,7 @@ pub fn receive_handoff(channel: i32) -> io::Result<()> {
             state_lock,
             runtimes,
             exited,
+            event_stream,
         } => {
             let store = StateStore::from_transferred_lock(state_lock)?;
             let socket_path = client::socket_path()?;
@@ -65,8 +70,11 @@ pub fn receive_handoff(channel: i32) -> io::Result<()> {
                 File::from(runtime_lock),
                 SocketCleanup::disarmed(socket_path),
                 store,
-                runtimes,
-                exited,
+                TransferredState {
+                    runtimes,
+                    exited,
+                    events: Some(event_stream),
+                },
                 Some(&mut channel),
             )
         }
@@ -94,10 +102,16 @@ pub fn run() -> io::Result<()> {
         daemon_lock,
         socket_cleanup,
         StateStore::from_environment()?,
-        Vec::new(),
-        Vec::new(),
+        TransferredState::default(),
         None,
     )
+}
+
+#[derive(Default)]
+struct TransferredState {
+    runtimes: Vec<handoff::TransferredRuntime>,
+    exited: Vec<handoff::TransferredExited>,
+    events: Option<handoff::EventStreamManifest>,
 }
 
 fn run_daemon(
@@ -105,12 +119,15 @@ fn run_daemon(
     daemon_lock: File,
     mut socket_cleanup: SocketCleanup,
     store: StateStore,
-    transferred_runtimes: Vec<handoff::TransferredRuntime>,
-    transferred_exited: Vec<handoff::TransferredExited>,
+    transferred: TransferredState,
     committed: Option<&mut UnixStream>,
 ) -> io::Result<()> {
-    let registry = Arc::new(Registry::restore(store, committed.is_some())?);
-    let gated_readers = registry.import_handoff(transferred_runtimes, transferred_exited)?;
+    let registry = Arc::new(Registry::restore(
+        store,
+        committed.is_some(),
+        transferred.events,
+    )?);
+    let gated_readers = registry.import_handoff(transferred.runtimes, transferred.exited)?;
     if let Some(channel) = committed {
         channel.write_all(&[handoff::PREPARED])?;
         let mut decision = [0];
@@ -119,6 +136,7 @@ fn run_daemon(
             handoff::ABORT => return Ok(()),
             handoff::FINALIZE => {
                 socket_cleanup.arm();
+                registry.events.publish(DaemonEventKind::HandoffCompleted)?;
                 for runtime in gated_readers {
                     runtime.resume_reader()?;
                 }
@@ -142,11 +160,19 @@ fn run_daemon(
     let shutdown = Arc::new(AtomicBool::new(false));
     let transition = Arc::new(AtomicU8::new(TRANSITION_IDLE));
     let (restart_sender, restart_receiver) = mpsc::channel::<RestartRequest>();
-    let mut handlers = Vec::new();
+    let mut handlers: Vec<thread::JoinHandle<()>> = Vec::new();
     let mut handed_off = false;
     let mut last_persistence_retry = Instant::now();
 
     while !shutdown.load(Ordering::Acquire) {
+        let mut index = 0;
+        while index < handlers.len() {
+            if handlers[index].is_finished() {
+                let _ = handlers.swap_remove(index).join();
+            } else {
+                index += 1;
+            }
+        }
         if registry.persistence_dirty.load(Ordering::Acquire)
             && last_persistence_retry.elapsed() >= PERSIST_RETRY_INTERVAL
         {
@@ -210,6 +236,20 @@ struct RestartRequest {
 
 #[derive(Debug)]
 struct PersistenceError(io::Error);
+
+#[derive(Debug)]
+struct DaemonCodeError {
+    code: ErrorCode,
+    message: String,
+}
+
+impl std::fmt::Display for DaemonCodeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for DaemonCodeError {}
 
 impl std::fmt::Display for PersistenceError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -293,12 +333,14 @@ fn launch_replacement(
     daemon_lock: &File,
     registry: &Registry,
 ) -> io::Result<()> {
+    let _event_commit = lock(&registry.event_commit_lock)?;
     let _mutation = lock(&registry.mutation_lock)?;
     registry.ensure_running()?;
     if registry.persistence_dirty.load(Ordering::Acquire) {
         registry.persist().map_err(persistence_error)?;
     }
     registry.stopping.store(true, Ordering::Release);
+    registry.events.notify();
     let mut paused = Vec::new();
     let result = (|| {
         registry.quiesce_controllers()?;
@@ -356,6 +398,7 @@ fn launch_replacement(
                 reconstruction,
             });
         }
+        let event_stream = registry.events.transfer()?;
         let state_lock = registry.state_lock_descriptor()?;
         launch_replacement_process(
             listener.as_fd(),
@@ -363,6 +406,7 @@ fn launch_replacement(
             state_lock,
             &transfers,
             &exited,
+            &event_stream,
         )
     })();
     if result.is_err() {
@@ -380,6 +424,7 @@ fn launch_replacement_process(
     state_lock: BorrowedFd<'_>,
     runtimes: &[OutgoingRuntime],
     exited: &[OutgoingExited],
+    event_stream: &handoff::EventStreamManifest,
 ) -> io::Result<()> {
     let (mut channel, child_channel) = UnixStream::pair()?;
     let child_channel_fd = child_channel.as_raw_fd();
@@ -420,6 +465,7 @@ fn launch_replacement_process(
                     .map(|runtime| runtime.manifest.clone())
                     .collect(),
                 exited: exited.iter().map(|shell| shell.manifest.clone()).collect(),
+                event_stream: event_stream.clone(),
             },
         )?;
         send_descriptor(&channel, listener, handoff::LISTENER_MARKER)?;
@@ -474,9 +520,10 @@ fn handle_connection(
     stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
     let request: Envelope<Request> = protocol::read_message(&mut stream)?;
     stream.set_read_timeout(None)?;
-    if request.version != protocol::PROTOCOL_VERSION {
+    if !(protocol::MIN_PROTOCOL_VERSION..=protocol::PROTOCOL_VERSION).contains(&request.version) {
         return send_response(
             &mut stream,
+            protocol::PROTOCOL_VERSION,
             error_response(
                 ErrorCode::UnsupportedVersion,
                 format!(
@@ -487,6 +534,22 @@ fn handle_connection(
             ),
         );
     }
+    let response_version = request.version;
+    if response_version < 7
+        && matches!(
+            request.message,
+            Request::ReadShellAt { .. } | Request::Events { .. }
+        )
+    {
+        return send_response(
+            &mut stream,
+            response_version,
+            error_response(
+                ErrorCode::UnsupportedVersion,
+                "request requires daemon protocol 7",
+            ),
+        );
+    }
 
     if let Request::Attach {
         shell_id,
@@ -494,7 +557,14 @@ fn handle_connection(
         profile,
     } = request.message
     {
-        return handle_attach(stream, &registry, &shell_id, takeover, profile);
+        return handle_attach(
+            stream,
+            response_version,
+            &registry,
+            &shell_id,
+            takeover,
+            profile,
+        );
     }
     if matches!(request.message, Request::Shutdown) {
         if transition
@@ -508,6 +578,7 @@ fn handle_connection(
         {
             return send_response(
                 &mut stream,
+                response_version,
                 error_response(
                     ErrorCode::Busy,
                     "another daemon transition is already in progress",
@@ -517,12 +588,13 @@ fn handle_connection(
         return match registry.shutdown() {
             Ok(()) => {
                 shutdown.store(true, Ordering::Release);
-                send_response(&mut stream, Response::Ok)
+                send_response(&mut stream, response_version, Response::Ok)
             }
             Err(error) => {
                 transition.store(TRANSITION_IDLE, Ordering::Release);
                 send_response(
                     &mut stream,
+                    response_version,
                     error_response(
                         error_code(&error),
                         format!("could not stop Boomux daemon: {error}"),
@@ -543,6 +615,7 @@ fn handle_connection(
         {
             return send_response(
                 &mut stream,
+                response_version,
                 error_response(ErrorCode::Busy, "daemon restart is already in progress"),
             );
         }
@@ -552,13 +625,15 @@ fn handle_connection(
             return Err(io::Error::other("daemon restart coordinator stopped"));
         }
         return match response.recv_timeout(RESTART_TIMEOUT) {
-            Ok(Ok(())) => send_response(&mut stream, Response::Ok),
+            Ok(Ok(())) => send_response(&mut stream, response_version, Response::Ok),
             Ok(Err(error)) => send_response(
                 &mut stream,
+                response_version,
                 error_response(error_code(&error), error.to_string()),
             ),
             Err(error) => send_response(
                 &mut stream,
+                response_version,
                 error_response(
                     ErrorCode::Timeout,
                     format!("daemon restart timed out: {error}"),
@@ -567,14 +642,35 @@ fn handle_connection(
         };
     }
 
-    let response = registry
-        .dispatch(request.message)
-        .unwrap_or_else(|error| error_response(error_code(&error), error.to_string()));
-    send_response(&mut stream, response)
+    let event_request = request.message.clone();
+    let _event_commit = request_publishes_events(&event_request)
+        .then(|| lock(&registry.event_commit_lock))
+        .transpose()?;
+    let response = match registry.dispatch(request.message) {
+        Ok(response) => {
+            registry.publish_request_events(&event_request, &response)?;
+            response
+        }
+        Err(error) => error_response(error_code(&error), error.to_string()),
+    };
+    drop(_event_commit);
+    send_response(&mut stream, response_version, response)
 }
 
-fn send_response(stream: &mut UnixStream, response: Response) -> io::Result<()> {
-    protocol::write_message(stream, &Envelope::new(response))
+fn request_publishes_events(request: &Request) -> bool {
+    matches!(
+        request,
+        Request::CreateWorkspace { .. }
+            | Request::CreateShell { .. }
+            | Request::RenameWorkspace { .. }
+            | Request::RenameShell { .. }
+            | Request::CloseWorkspace { .. }
+            | Request::CloseShell { .. }
+    )
+}
+
+fn send_response(stream: &mut UnixStream, version: u32, response: Response) -> io::Result<()> {
+    protocol::write_message(stream, &Envelope::with_version(version, response))
 }
 
 fn error_response(code: ErrorCode, message: impl Into<String>) -> Response {
@@ -585,6 +681,12 @@ fn error_response(code: ErrorCode, message: impl Into<String>) -> Response {
 }
 
 fn error_code(error: &io::Error) -> ErrorCode {
+    if let Some(error) = error
+        .get_ref()
+        .and_then(|error| error.downcast_ref::<DaemonCodeError>())
+    {
+        return error.code;
+    }
     if error
         .get_ref()
         .is_some_and(|error| error.downcast_ref::<PersistenceError>().is_some())
@@ -606,13 +708,101 @@ fn persistence_error(error: io::Error) -> io::Error {
     io::Error::new(error.kind(), PersistenceError(error))
 }
 
+fn coded_error(code: ErrorCode, message: impl Into<String>) -> io::Error {
+    io::Error::other(DaemonCodeError {
+        code,
+        message: message.into(),
+    })
+}
+
 struct Registry {
     state: Mutex<RegistryState>,
     store: Option<StateStore>,
+    events: EventLog,
+    event_commit_lock: Mutex<()>,
     mutation_lock: Mutex<()>,
     persist_lock: Mutex<()>,
     stopping: AtomicBool,
     persistence_dirty: AtomicBool,
+}
+
+struct EventLog {
+    state: Mutex<EventLogState>,
+    changed: Condvar,
+}
+
+struct EventLogState {
+    stream_id: String,
+    latest_id: u64,
+    events: VecDeque<DaemonEvent>,
+}
+
+impl EventLog {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(EventLogState {
+                stream_id: Uuid::new_v4().to_string(),
+                latest_id: 0,
+                events: VecDeque::new(),
+            }),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn from_transfer(transfer: Option<handoff::EventStreamManifest>) -> Self {
+        let state = transfer.map_or_else(
+            || EventLogState {
+                stream_id: Uuid::new_v4().to_string(),
+                latest_id: 0,
+                events: VecDeque::new(),
+            },
+            |transfer| EventLogState {
+                stream_id: transfer.stream_id,
+                latest_id: transfer.latest_id,
+                events: transfer.events.into(),
+            },
+        );
+        Self {
+            state: Mutex::new(state),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn transfer(&self) -> io::Result<handoff::EventStreamManifest> {
+        let state = lock(&self.state)?;
+        Ok(handoff::EventStreamManifest {
+            stream_id: state.stream_id.clone(),
+            latest_id: state.latest_id,
+            events: state.events.iter().cloned().collect(),
+        })
+    }
+
+    fn publish(&self, kind: DaemonEventKind) -> io::Result<DaemonEvent> {
+        let mut state = lock(&self.state)?;
+        state.latest_id = state
+            .latest_id
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("daemon event ID exhausted"))?;
+        let event = DaemonEvent {
+            id: state.latest_id,
+            at_ms: unix_time_ms(),
+            kind,
+        };
+        state.events.push_back(event.clone());
+        if state.events.len() > MAX_RETAINED_EVENTS {
+            state.events.pop_front();
+        }
+        drop(state);
+        self.changed.notify_all();
+        Ok(event)
+    }
+
+    fn notify(&self) {
+        if let Ok(state) = self.state.lock() {
+            self.changed.notify_all();
+            drop(state);
+        }
+    }
 }
 
 #[derive(Default)]
@@ -634,6 +824,8 @@ impl Default for Registry {
         Self {
             state: Mutex::new(RegistryState::default()),
             store: None,
+            events: EventLog::new(),
+            event_commit_lock: Mutex::new(()),
             mutation_lock: Mutex::new(()),
             persist_lock: Mutex::new(()),
             stopping: AtomicBool::new(false),
@@ -1139,6 +1331,24 @@ impl Registry {
             } => Ok(Response::Output {
                 bytes: self.read_shell(&shell_id, max_bytes)?,
             }),
+            Request::ReadShellAt {
+                shell_id,
+                max_bytes,
+                run_id,
+                after_revision,
+                wait_ms,
+            } => self.read_shell_at(
+                &shell_id,
+                max_bytes,
+                run_id.as_deref(),
+                after_revision,
+                wait_ms,
+            ),
+            Request::Events {
+                after,
+                limit,
+                wait_ms,
+            } => self.read_events(after.as_ref(), limit, wait_ms),
             Request::RenameWorkspace { workspace_id, name } => self.durable_mutation(|| {
                 validate_name(&name)?;
                 let workspace = self.workspace(&workspace_id)?;
@@ -1170,7 +1380,150 @@ impl Registry {
         }
     }
 
-    fn restore(store: StateStore, live_handoff: bool) -> io::Result<Self> {
+    fn publish_request_events(&self, request: &Request, response: &Response) -> io::Result<()> {
+        let kinds =
+            match (request, response) {
+                (Request::CreateWorkspace { .. }, Response::Workspace { workspace }) => {
+                    let mut kinds = vec![DaemonEventKind::WorkspaceCreated {
+                        workspace_id: workspace.id.clone(),
+                        name: workspace.name.clone(),
+                    }];
+                    kinds.extend(workspace.shells.iter().map(|shell| {
+                        DaemonEventKind::ShellCreated {
+                            workspace_id: workspace.id.clone(),
+                            shell_id: shell.id.clone(),
+                            name: shell.name.clone(),
+                        }
+                    }));
+                    kinds
+                }
+                (Request::CreateShell { workspace_id, .. }, Response::Shell { shell }) => {
+                    let mut kinds = Vec::new();
+                    if workspace_id.is_none() {
+                        let workspace = self.workspace(&shell.workspace_id)?;
+                        kinds.push(DaemonEventKind::WorkspaceCreated {
+                            workspace_id: workspace.id.clone(),
+                            name: lock(&workspace.name)?.clone(),
+                        });
+                    }
+                    kinds.push(DaemonEventKind::ShellCreated {
+                        workspace_id: shell.workspace_id.clone(),
+                        shell_id: shell.id.clone(),
+                        name: shell.name.clone(),
+                    });
+                    kinds
+                }
+                (Request::RenameWorkspace { workspace_id, name }, Response::Ok) => {
+                    vec![DaemonEventKind::WorkspaceRenamed {
+                        workspace_id: workspace_id.clone(),
+                        name: name.clone(),
+                    }]
+                }
+                (Request::RenameShell { shell_id, name }, Response::Ok) => {
+                    let shell = self.shell(shell_id)?;
+                    vec![DaemonEventKind::ShellRenamed {
+                        workspace_id: shell.workspace_id.clone(),
+                        shell_id: shell_id.clone(),
+                        name: name.clone(),
+                    }]
+                }
+                (Request::CloseWorkspace { workspace_id }, Response::Ok) => {
+                    vec![DaemonEventKind::WorkspaceClosed {
+                        workspace_id: workspace_id.clone(),
+                    }]
+                }
+                (Request::CloseShell { shell_id }, Response::Ok) => {
+                    vec![DaemonEventKind::ShellClosed {
+                        workspace_id: None,
+                        shell_id: shell_id.clone(),
+                    }]
+                }
+                _ => Vec::new(),
+            };
+        for kind in kinds {
+            self.events.publish(kind)?;
+        }
+        Ok(())
+    }
+
+    fn read_events(
+        &self,
+        after: Option<&EventCursor>,
+        limit: u16,
+        wait_ms: u32,
+    ) -> io::Result<Response> {
+        let limit = usize::from(limit.clamp(1, MAX_EVENT_BATCH));
+        let deadline =
+            Instant::now() + Duration::from_millis(u64::from(wait_ms)).min(MAX_EVENT_WAIT);
+        let mut state = lock(&self.events.state)?;
+        if after.is_none() {
+            let snapshot = self.snapshot()?;
+            let cursor = EventCursor {
+                stream_id: state.stream_id.clone(),
+                event_id: state.latest_id,
+            };
+            return Ok(Response::Events {
+                stream_id: state.stream_id.clone(),
+                cursor,
+                snapshot: Some(snapshot),
+                events: Vec::new(),
+            });
+        }
+        let after = after.expect("checked above");
+        loop {
+            let earliest = state
+                .events
+                .front()
+                .map_or(state.latest_id, |event| event.id.saturating_sub(1));
+            if after.stream_id != state.stream_id
+                || after.event_id < earliest
+                || after.event_id > state.latest_id
+            {
+                return Err(coded_error(
+                    ErrorCode::CursorExpired,
+                    "event cursor is no longer available",
+                ));
+            }
+            let events = state
+                .events
+                .iter()
+                .filter(|event| event.id > after.event_id)
+                .take(limit)
+                .cloned()
+                .collect::<Vec<_>>();
+            if !events.is_empty() || wait_ms == 0 || Instant::now() >= deadline {
+                let event_id = events.last().map_or(after.event_id, |event| event.id);
+                return Ok(Response::Events {
+                    stream_id: state.stream_id.clone(),
+                    cursor: EventCursor {
+                        stream_id: state.stream_id.clone(),
+                        event_id,
+                    },
+                    snapshot: None,
+                    events,
+                });
+            }
+            if self.stopping.load(Ordering::Acquire) {
+                return Err(coded_error(
+                    ErrorCode::DaemonStopping,
+                    "Boomux daemon is stopping",
+                ));
+            }
+            let timeout = deadline.saturating_duration_since(Instant::now());
+            let (next, _) = self
+                .events
+                .changed
+                .wait_timeout(state, timeout)
+                .map_err(|_| io::Error::other("daemon event lock poisoned"))?;
+            state = next;
+        }
+    }
+
+    fn restore(
+        store: StateStore,
+        live_handoff: bool,
+        transferred_events: Option<handoff::EventStreamManifest>,
+    ) -> io::Result<Self> {
         let persisted = store.load()?.unwrap_or_default();
         let mut state = RegistryState::default();
         let mut workspace_names = HashSet::new();
@@ -1178,7 +1531,7 @@ impl Registry {
         let mut recovered_interrupted_run = false;
         for saved_workspace in persisted.workspaces {
             validate_id("workspace", &saved_workspace.id)?;
-            validate_name(&saved_workspace.name)?;
+            validate_persisted_name(&saved_workspace.name)?;
             if !workspace_names.insert(saved_workspace.name.clone())
                 || state.workspaces.contains_key(&saved_workspace.id)
             {
@@ -1191,7 +1544,7 @@ impl Registry {
             let mut shell_ids = Vec::with_capacity(saved_workspace.shells.len());
             for mut saved_shell in saved_workspace.shells {
                 validate_id("shell", &saved_shell.id)?;
-                validate_name(&saved_shell.name)?;
+                validate_persisted_name(&saved_shell.name)?;
                 validate_persisted_cwd(&saved_shell.cwd)?;
                 if let Some(run) = &mut saved_shell.last_run {
                     validate_id("run", &run.id)?;
@@ -1244,6 +1597,8 @@ impl Registry {
         let registry = Self {
             state: Mutex::new(state),
             store: Some(store),
+            events: EventLog::from_transfer(transferred_events),
+            event_commit_lock: Mutex::new(()),
             mutation_lock: Mutex::new(()),
             persist_lock: Mutex::new(()),
             stopping: AtomicBool::new(false),
@@ -1647,6 +2002,11 @@ impl Registry {
             terminal: Arc::clone(&runtime.terminal),
         };
         drop(lifecycle);
+        self.events.publish(DaemonEventKind::RunExited {
+            workspace_id: shell.workspace_id.clone(),
+            shell_id: shell.id.clone(),
+            run: run.snapshot()?,
+        })?;
         self.persist()
     }
 
@@ -1666,6 +2026,7 @@ impl Registry {
         if self.stopping.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
+        self.events.notify();
         let shells = {
             let state = lock(&self.state)?;
             state.shells.values().cloned().collect::<Vec<_>>()
@@ -1880,6 +2241,156 @@ impl Registry {
         Ok(tail_utf8(&text, max_bytes.min(MAX_SHELL_READ_BYTES))
             .as_bytes()
             .to_vec())
+    }
+
+    fn read_shell_at(
+        &self,
+        shell_id: &str,
+        max_bytes: usize,
+        expected_run_id: Option<&str>,
+        after_revision: Option<u64>,
+        wait_ms: u32,
+    ) -> io::Result<Response> {
+        if expected_run_id.is_some() != after_revision.is_some() {
+            return Err(coded_error(
+                ErrorCode::InvalidArgument,
+                "run_id and after_revision must be provided together",
+            ));
+        }
+        let deadline =
+            Instant::now() + Duration::from_millis(u64::from(wait_ms)).min(MAX_EVENT_WAIT);
+        loop {
+            let observed_event_id = lock(&self.events.state)?.latest_id;
+            let shell = self.shell(shell_id)?;
+            let lifecycle = lock(&shell.lifecycle)?;
+            let (status, run, terminal) = match &*lifecycle {
+                ShellLifecycle::Pending => {
+                    if expected_run_id.is_some() {
+                        return Err(coded_error(
+                            ErrorCode::RunChanged,
+                            "shell no longer has the requested run",
+                        ));
+                    }
+                    return Ok(Response::OutputState {
+                        bytes: Vec::new(),
+                        run_id: None,
+                        output_revision: None,
+                        changed: true,
+                        status: ShellStatus::Pending,
+                    });
+                }
+                ShellLifecycle::Running { run, runtime, .. } => (
+                    ShellStatus::Running,
+                    Arc::clone(run),
+                    Arc::clone(&runtime.terminal),
+                ),
+                ShellLifecycle::Exited {
+                    code,
+                    run,
+                    terminal,
+                    ..
+                } => (
+                    ShellStatus::Exited { code: *code },
+                    Arc::clone(run),
+                    Arc::clone(terminal),
+                ),
+                ShellLifecycle::Closed => return Err(not_found("shell", shell_id)),
+            };
+            drop(lifecycle);
+            let terminal_state = lock(&terminal)?;
+            let revision = run.output_revision.load(Ordering::Acquire);
+            let changed = after_revision.is_none_or(|after| after < revision);
+            let bytes = if changed || after_revision.is_none() {
+                let text = terminal_state.plain_text();
+                tail_utf8(&text, max_bytes.min(MAX_SHELL_READ_BYTES))
+                    .as_bytes()
+                    .to_vec()
+            } else {
+                Vec::new()
+            };
+            drop(terminal_state);
+            let lifecycle = lock(&shell.lifecycle)?;
+            let observation_is_current = match (&*lifecycle, &status) {
+                (
+                    ShellLifecycle::Running {
+                        run: current_run,
+                        runtime,
+                        ..
+                    },
+                    ShellStatus::Running,
+                ) => Arc::ptr_eq(current_run, &run) && Arc::ptr_eq(&runtime.terminal, &terminal),
+                (
+                    ShellLifecycle::Exited {
+                        code,
+                        run: current_run,
+                        terminal: current_terminal,
+                        ..
+                    },
+                    ShellStatus::Exited { code: current_code },
+                ) => {
+                    code == current_code
+                        && Arc::ptr_eq(current_run, &run)
+                        && Arc::ptr_eq(current_terminal, &terminal)
+                }
+                _ => false,
+            };
+            drop(lifecycle);
+            if !observation_is_current {
+                continue;
+            }
+            if expected_run_id.is_some_and(|expected| expected != run.id) {
+                return Err(coded_error(
+                    ErrorCode::RunChanged,
+                    "shell run identity changed",
+                ));
+            }
+            if after_revision.is_some_and(|after| after > revision) {
+                return Err(coded_error(
+                    ErrorCode::RevisionAhead,
+                    "requested output revision is ahead of the current run",
+                ));
+            }
+            if changed || !matches!(status, ShellStatus::Running) || wait_ms == 0 {
+                return Ok(Response::OutputState {
+                    bytes,
+                    run_id: Some(run.id.clone()),
+                    output_revision: Some(revision),
+                    changed,
+                    status,
+                });
+            }
+            if Instant::now() >= deadline {
+                return Ok(Response::OutputState {
+                    bytes: Vec::new(),
+                    run_id: Some(run.id.clone()),
+                    output_revision: Some(revision),
+                    changed: false,
+                    status,
+                });
+            }
+            if self.stopping.load(Ordering::Acquire) {
+                return Err(coded_error(
+                    ErrorCode::DaemonStopping,
+                    "Boomux daemon is stopping",
+                ));
+            }
+            let state = lock(&self.events.state)?;
+            if self.stopping.load(Ordering::Acquire) {
+                return Err(coded_error(
+                    ErrorCode::DaemonStopping,
+                    "Boomux daemon is stopping",
+                ));
+            }
+            if state.latest_id != observed_event_id {
+                continue;
+            }
+            let timeout = deadline.saturating_duration_since(Instant::now());
+            let _ = self
+                .events
+                .changed
+                .wait_timeout(state, timeout)
+                .map_err(|_| io::Error::other("daemon event lock poisoned"))?;
+        }
     }
 
     fn remove_shell(&self, shell_id: &str) -> io::Result<Arc<Shell>> {
@@ -2292,15 +2803,18 @@ fn start_pty_reader(
                     Ok(0) => break,
                     Ok(count) => {
                         let bytes = &buffer[..count];
+                        let mut output_revision = None;
                         if let Ok(mut terminal) = reader_runtime.terminal.lock() {
                             terminal.process(bytes);
-                            let revision = reader_run
-                                .output_revision
-                                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |revision| {
-                                    Some(revision.saturating_add(1))
-                                })
-                                .unwrap_or_else(|revision| revision)
-                                .saturating_add(1);
+                            let Ok(previous_revision) = reader_run.output_revision.fetch_update(
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                                |revision| revision.checked_add(1),
+                            ) else {
+                                break;
+                            };
+                            let revision = previous_revision + 1;
+                            output_revision = Some(revision);
                             if let Ok(mut last_run) = shell.last_run.lock()
                                 && let Some(last_run) = last_run.as_mut()
                                 && last_run.id == reader_run.id
@@ -2320,6 +2834,16 @@ fn start_pty_reader(
                                     let _ = current.connection.shutdown(std::net::Shutdown::Both);
                                 }
                             }
+                        }
+                        if let Some(output_revision) = output_revision
+                            && let Some(registry) = registry.upgrade()
+                        {
+                            let _ = registry.events.publish(DaemonEventKind::OutputChanged {
+                                workspace_id: shell.workspace_id.clone(),
+                                shell_id: shell.id.clone(),
+                                run_id: reader_run.id.clone(),
+                                output_revision,
+                            });
                         }
                     }
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
@@ -2372,6 +2896,7 @@ fn tail_utf8(text: &str, max_bytes: usize) -> &str {
 
 fn handle_attach(
     mut stream: UnixStream,
+    response_version: u32,
     registry: &Arc<Registry>,
     shell_id: &str,
     takeover: bool,
@@ -2380,6 +2905,7 @@ fn handle_attach(
     if let Err(error) = validate_terminal_profile(&profile) {
         return send_response(
             &mut stream,
+            response_version,
             error_response(ErrorCode::InvalidArgument, error.to_string()),
         );
     }
@@ -2388,6 +2914,7 @@ fn handle_attach(
         Err(error) => {
             return send_response(
                 &mut stream,
+                response_version,
                 error_response(error_code(&error), error.to_string()),
             );
         }
@@ -2396,6 +2923,7 @@ fn handle_attach(
     if registry.stopping.load(Ordering::Acquire) {
         return send_response(
             &mut stream,
+            response_version,
             error_response(ErrorCode::DaemonStopping, "Boomux daemon is stopping"),
         );
     }
@@ -2409,6 +2937,7 @@ fn handle_attach(
         if !registry.contains_shell(&shell)? {
             return send_response(
                 &mut stream,
+                response_version,
                 error_response(ErrorCode::NotFound, format!("shell not found: {shell_id}")),
             );
         }
@@ -2428,6 +2957,7 @@ fn handle_attach(
                     Err(error) => {
                         return send_response(
                             &mut stream,
+                            response_version,
                             error_response(
                                 ErrorCode::ShellStartFailed,
                                 format!("could not start shell: {error}"),
@@ -2457,6 +2987,7 @@ fn handle_attach(
                 }
                 return send_response(
                     &mut stream,
+                    response_version,
                     error_response(
                         ErrorCode::ShellStartFailed,
                         cleanup.map_or_else(
@@ -2488,6 +3019,7 @@ fn handle_attach(
             ShellLifecycle::Closed => {
                 return send_response(
                     &mut stream,
+                    response_version,
                     error_response(ErrorCode::NotFound, format!("shell not found: {shell_id}")),
                 );
             }
@@ -2500,6 +3032,7 @@ fn handle_attach(
         }
         return send_response(
             &mut stream,
+            response_version,
             error_response(
                 ErrorCode::PersistenceFailed,
                 cleanup.map_or_else(
@@ -2514,6 +3047,15 @@ fn handle_attach(
         );
     }
     if started {
+        let run = shell
+            .snapshot()?
+            .run
+            .ok_or_else(|| io::Error::other("started shell has no run identity"))?;
+        registry.events.publish(DaemonEventKind::RunStarted {
+            workspace_id: shell.workspace_id.clone(),
+            shell_id: shell.id.clone(),
+            run,
+        })?;
         runtime
             .as_ref()
             .expect("started shell has a runtime")
@@ -2525,6 +3067,7 @@ fn handle_attach(
         stream.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
         send_response(
             &mut stream,
+            response_version,
             Response::Attached {
                 token,
                 reconstruction: lock(&terminal)?.reconstruction(),
@@ -2540,6 +3083,7 @@ fn handle_attach(
     if !registry.contains_shell(&shell)? {
         return send_response(
             &mut stream,
+            response_version,
             error_response(ErrorCode::NotFound, format!("shell not found: {shell_id}")),
         );
     }
@@ -2548,6 +3092,7 @@ fn handle_attach(
         if controller.is_some() && !takeover {
             return send_response(
                 &mut stream,
+                response_version,
                 error_response(
                     ErrorCode::Busy,
                     "shell already has an active controller; use takeover",
@@ -2564,6 +3109,7 @@ fn handle_attach(
     stream.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
     send_response(
         &mut stream,
+        response_version,
         Response::Attached {
             token: token.clone(),
             reconstruction: terminal.reconstruction(),
@@ -2817,10 +3363,21 @@ fn term_mismatch_warning(started: Option<&str>, attached: Option<&str>) -> Optio
 }
 
 fn validate_name(name: &str) -> io::Result<()> {
-    if name.trim().is_empty() {
+    if name.trim().is_empty() || name.len() > MAX_NAME_BYTES {
         Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "name cannot be empty",
+            format!("name must be nonempty and at most {MAX_NAME_BYTES} bytes"),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_persisted_name(name: &str) -> io::Result<()> {
+    if name.trim().is_empty() {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "persisted name cannot be empty",
         ))
     } else {
         Ok(())
@@ -2993,6 +3550,66 @@ mod tests {
     }
 
     #[test]
+    fn event_batches_are_monotonic_and_paginated() {
+        let registry = Registry::default();
+        let Response::Events {
+            cursor, snapshot, ..
+        } = registry.read_events(None, 256, 0).unwrap()
+        else {
+            panic!("expected event baseline");
+        };
+        assert!(snapshot.is_some());
+        registry
+            .events
+            .publish(DaemonEventKind::WorkspaceClosed {
+                workspace_id: "w1".into(),
+            })
+            .unwrap();
+        registry
+            .events
+            .publish(DaemonEventKind::WorkspaceClosed {
+                workspace_id: "w2".into(),
+            })
+            .unwrap();
+
+        let Response::Events {
+            cursor: first_cursor,
+            events,
+            ..
+        } = registry.read_events(Some(&cursor), 1, 0).unwrap()
+        else {
+            panic!("expected event page");
+        };
+        assert_eq!(events.len(), 1);
+        let Response::Events { events, .. } =
+            registry.read_events(Some(&first_cursor), 256, 0).unwrap()
+        else {
+            panic!("expected second event page");
+        };
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].id, first_cursor.event_id + 1);
+    }
+
+    #[test]
+    fn event_cursor_expires_after_retention() {
+        let registry = Registry::default();
+        let Response::Events { cursor, .. } = registry.read_events(None, 256, 0).unwrap() else {
+            panic!("expected event baseline");
+        };
+        for index in 0..=MAX_RETAINED_EVENTS {
+            registry
+                .events
+                .publish(DaemonEventKind::WorkspaceClosed {
+                    workspace_id: format!("w{index}"),
+                })
+                .unwrap();
+        }
+
+        let error = registry.read_events(Some(&cursor), 256, 0).unwrap_err();
+        assert_eq!(error_code(&error), ErrorCode::CursorExpired);
+    }
+
+    #[test]
     fn rendered_output_tail_preserves_utf8_boundaries() {
         assert_eq!(tail_utf8("one-λ", 2), "λ");
         assert_eq!(tail_utf8("one-λ", 3), "-λ");
@@ -3033,11 +3650,25 @@ mod tests {
     }
 
     #[test]
+    fn bounds_new_names_without_rejecting_legacy_persisted_names() {
+        let long_name = "x".repeat(MAX_NAME_BYTES + 1);
+        assert_eq!(
+            validate_name(&long_name).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert!(validate_persisted_name(&long_name).is_ok());
+    }
+
+    #[test]
     fn failed_persistence_rolls_back_registry_mutation() {
         let directory = env::temp_dir().join(format!("boomux-rollback-{}", Uuid::new_v4()));
         let state_directory = directory.join("state");
-        let registry =
-            Registry::restore(StateStore::at(state_directory.join("state.json")), false).unwrap();
+        let registry = Registry::restore(
+            StateStore::at(state_directory.join("state.json")),
+            false,
+            None,
+        )
+        .unwrap();
         fs::remove_dir(&state_directory).unwrap();
         fs::write(&state_directory, b"not a directory").unwrap();
 

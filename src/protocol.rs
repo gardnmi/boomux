@@ -4,7 +4,8 @@ use std::path::PathBuf;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 7;
+pub const MIN_PROTOCOL_VERSION: u32 = 6;
 pub const MAX_CONTROL_FRAME: usize = 8 * 1024 * 1024;
 pub const MAX_ATTACH_FRAME: usize = 1024 * 1024;
 
@@ -20,6 +21,10 @@ impl<T> Envelope<T> {
             version: PROTOCOL_VERSION,
             message,
         }
+    }
+
+    pub fn with_version(version: u32, message: T) -> Self {
+        Self { version, message }
     }
 }
 
@@ -85,9 +90,73 @@ pub enum ErrorCode {
     PersistenceFailed,
     Timeout,
     UnsupportedVersion,
+    CursorExpired,
+    RunChanged,
+    RevisionAhead,
     Internal,
     #[serde(other)]
     Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventCursor {
+    pub stream_id: String,
+    pub event_id: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonEvent {
+    pub id: u64,
+    pub at_ms: u64,
+    #[serde(flatten)]
+    pub kind: DaemonEventKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum DaemonEventKind {
+    WorkspaceCreated {
+        workspace_id: String,
+        name: String,
+    },
+    WorkspaceRenamed {
+        workspace_id: String,
+        name: String,
+    },
+    WorkspaceClosed {
+        workspace_id: String,
+    },
+    ShellCreated {
+        workspace_id: String,
+        shell_id: String,
+        name: String,
+    },
+    ShellRenamed {
+        workspace_id: String,
+        shell_id: String,
+        name: String,
+    },
+    ShellClosed {
+        workspace_id: Option<String>,
+        shell_id: String,
+    },
+    RunStarted {
+        workspace_id: String,
+        shell_id: String,
+        run: ShellRunSnapshot,
+    },
+    OutputChanged {
+        workspace_id: String,
+        shell_id: String,
+        run_id: String,
+        output_revision: u64,
+    },
+    RunExited {
+        workspace_id: String,
+        shell_id: String,
+        run: ShellRunSnapshot,
+    },
+    HandoffCompleted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -146,6 +215,24 @@ pub enum Request {
         shell_id: String,
         max_bytes: usize,
     },
+    ReadShellAt {
+        shell_id: String,
+        max_bytes: usize,
+        #[serde(default)]
+        run_id: Option<String>,
+        #[serde(default)]
+        after_revision: Option<u64>,
+        #[serde(default)]
+        wait_ms: u32,
+    },
+    Events {
+        #[serde(default)]
+        after: Option<EventCursor>,
+        #[serde(default = "default_event_limit")]
+        limit: u16,
+        #[serde(default)]
+        wait_ms: u32,
+    },
     RenameWorkspace {
         workspace_id: String,
         name: String,
@@ -183,6 +270,19 @@ pub enum Response {
     Output {
         bytes: Vec<u8>,
     },
+    OutputState {
+        bytes: Vec<u8>,
+        run_id: Option<String>,
+        output_revision: Option<u64>,
+        changed: bool,
+        status: ShellStatus,
+    },
+    Events {
+        stream_id: String,
+        cursor: EventCursor,
+        snapshot: Option<Snapshot>,
+        events: Vec<DaemonEvent>,
+    },
     Attached {
         token: String,
         reconstruction: Vec<u8>,
@@ -194,6 +294,10 @@ pub enum Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         code: Option<ErrorCode>,
     },
+}
+
+fn default_event_limit() -> u16 {
+    256
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

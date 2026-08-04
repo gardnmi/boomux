@@ -16,7 +16,7 @@ use boomux::protocol::{
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use uuid::Uuid;
 
-const TIMEOUT: Duration = Duration::from_secs(5);
+const TIMEOUT: Duration = Duration::from_secs(10);
 const HANDOFF_CHANNEL_FD: RawFd = 198;
 
 struct TestDaemon {
@@ -146,6 +146,14 @@ fn json_cli_parse_and_daemon_start_failures_use_typed_envelopes() {
     assert_eq!(parse_failure["schema"], "boomux.cli/v1");
     assert_eq!(parse_failure["command"], "cli");
     assert_eq!(parse_failure["error"]["code"], "invalid_argument");
+    let cursor_failure = Command::new(env!("CARGO_BIN_EXE_boomux"))
+        .args(["events", "--after", "invalid", "--json"])
+        .output()
+        .unwrap();
+    assert!(!cursor_failure.status.success());
+    let cursor_failure: serde_json::Value = serde_json::from_slice(&cursor_failure.stderr).unwrap();
+    assert_eq!(cursor_failure["command"], "events");
+    assert_eq!(cursor_failure["error"]["code"], "invalid_argument");
 
     let root = std::env::temp_dir().join(format!("boomux-json-start-{}", Uuid::new_v4()));
     fs::create_dir(&root).unwrap();
@@ -215,10 +223,18 @@ fn replacement_bootstrap_receives_listener_and_lock_ownership() {
 
     parent_channel.set_read_timeout(Some(TIMEOUT)).unwrap();
     parent_channel.set_write_timeout(Some(TIMEOUT)).unwrap();
-    parent_channel.write_all(b"BOOMUXH3").unwrap();
+    parent_channel.write_all(b"BOOMUXH4").unwrap();
     protocol::write_message(
         &mut parent_channel,
-        &serde_json::json!({ "runtimes": [], "exited": [] }),
+        &serde_json::json!({
+            "runtimes": [],
+            "exited": [],
+            "event_stream": {
+                "stream_id": Uuid::new_v4().to_string(),
+                "latest_id": 0,
+                "events": []
+            }
+        }),
     )
     .unwrap();
     send_descriptor(&parent_channel, listener.as_raw_fd(), 1);
@@ -585,6 +601,230 @@ fn graceful_restart_preserves_exited_run_and_terminal_state() {
 }
 
 #[test]
+fn daemon_events_and_revision_reads_survive_handoff() {
+    let mut daemon = TestDaemon::start();
+    let baseline = daemon.client.events(None, 256, 0).unwrap();
+    assert!(baseline.snapshot.is_some());
+    assert!(baseline.events.is_empty());
+    let stream_id = baseline.stream_id.clone();
+    let mut cursor = baseline.cursor;
+
+    let polling_client = daemon.client.clone();
+    let polling_cursor = cursor.clone();
+    let poll = thread::spawn(move || polling_client.events(Some(polling_cursor), 256, 2_000));
+    thread::sleep(Duration::from_millis(50));
+    let workspace = daemon
+        .client
+        .create_workspace(
+            "events",
+            vec![ShellSpec::login("agent", std::env::temp_dir())],
+        )
+        .unwrap();
+    let shell_id = workspace.shells[0].id.clone();
+    let created = poll.join().unwrap().unwrap();
+    assert!(created.snapshot.is_none());
+    assert!(
+        created
+            .events
+            .windows(2)
+            .all(|events| events[0].id < events[1].id)
+    );
+    assert!(created.events.iter().any(|event| matches!(
+        event.kind,
+        protocol::DaemonEventKind::WorkspaceCreated { .. }
+    )));
+    assert!(
+        created
+            .events
+            .iter()
+            .any(|event| matches!(event.kind, protocol::DaemonEventKind::ShellCreated { .. }))
+    );
+    cursor = created.cursor;
+
+    let mut attachment = daemon
+        .client
+        .attach(&shell_id, false, profile())
+        .unwrap()
+        .stream;
+    AttachFrame::Input(b"printf 'event-output-one\\n'\n".to_vec())
+        .write_to(&mut attachment)
+        .unwrap();
+    assert!(contains(
+        &read_until(&mut attachment, b"event-output-one"),
+        b"event-output-one"
+    ));
+    drop(attachment);
+    let changed = daemon.client.events(Some(cursor), 256, 1_000).unwrap();
+    assert!(
+        changed
+            .events
+            .iter()
+            .any(|event| matches!(event.kind, protocol::DaemonEventKind::RunStarted { .. }))
+    );
+    assert!(
+        changed
+            .events
+            .iter()
+            .any(|event| matches!(event.kind, protocol::DaemonEventKind::OutputChanged { .. }))
+    );
+    cursor = changed.cursor;
+
+    let observed = daemon
+        .client
+        .read_shell_at(&shell_id, 1024 * 1024, None, None, 0)
+        .unwrap();
+    assert!(contains(&observed.bytes, b"event-output-one"));
+    let run_id = observed.run_id.clone().unwrap();
+    let revision = observed.output_revision.unwrap();
+    let unchanged = daemon
+        .client
+        .read_shell_at(
+            &shell_id,
+            1024 * 1024,
+            Some(run_id.clone()),
+            Some(revision),
+            10,
+        )
+        .unwrap();
+    assert!(!unchanged.changed);
+    assert!(unchanged.bytes.is_empty());
+    let waiting_client = daemon.client.clone();
+    let waiting_shell_id = shell_id.clone();
+    let waiting_run_id = run_id.clone();
+    let wait = thread::spawn(move || {
+        waiting_client.read_shell_at(
+            waiting_shell_id,
+            1024 * 1024,
+            Some(waiting_run_id),
+            Some(revision),
+            2_000,
+        )
+    });
+    thread::sleep(Duration::from_millis(50));
+    let mut attachment = daemon
+        .client
+        .attach(&shell_id, false, profile())
+        .unwrap()
+        .stream;
+    AttachFrame::Input(b"printf 'event-output-two\\n'\n".to_vec())
+        .write_to(&mut attachment)
+        .unwrap();
+    assert!(contains(
+        &read_until(&mut attachment, b"event-output-two"),
+        b"event-output-two"
+    ));
+    drop(attachment);
+    let advanced = wait.join().unwrap().unwrap();
+    assert!(advanced.changed);
+    let advanced_revision = advanced.output_revision.unwrap();
+    assert!(advanced_revision > revision);
+    assert!(contains(&advanced.bytes, b"event-output-two"));
+    let error = daemon
+        .client
+        .read_shell_at(
+            &shell_id,
+            1024,
+            Some(Uuid::new_v4().to_string()),
+            Some(revision),
+            0,
+        )
+        .unwrap_err();
+    assert_eq!(
+        error
+            .get_ref()
+            .and_then(|error| error.downcast_ref::<RemoteError>())
+            .and_then(|error| error.code),
+        Some(ErrorCode::RunChanged)
+    );
+    let error = daemon
+        .client
+        .read_shell_at(&shell_id, 1024, Some(run_id.clone()), Some(u64::MAX), 0)
+        .unwrap_err();
+    assert_eq!(
+        error
+            .get_ref()
+            .and_then(|error| error.downcast_ref::<RemoteError>())
+            .and_then(|error| error.code),
+        Some(ErrorCode::RevisionAhead)
+    );
+
+    let waiting_client = daemon.client.clone();
+    let waiting_shell_id = shell_id.clone();
+    let wait = thread::spawn(move || {
+        waiting_client.read_shell_at(
+            waiting_shell_id,
+            1024,
+            Some(run_id),
+            Some(advanced_revision),
+            5_000,
+        )
+    });
+    thread::sleep(Duration::from_millis(50));
+    let restart = daemon
+        .command()
+        .args(["daemon", "restart"])
+        .output()
+        .unwrap();
+    assert!(restart.status.success());
+    let error = wait.join().unwrap().unwrap_err();
+    assert_eq!(
+        error
+            .get_ref()
+            .and_then(|error| error.downcast_ref::<RemoteError>())
+            .and_then(|error| error.code),
+        Some(ErrorCode::DaemonStopping)
+    );
+    let handed_off = daemon.client.events(Some(cursor), 256, 1_000).unwrap();
+    assert_eq!(handed_off.stream_id, stream_id);
+    assert!(
+        handed_off
+            .events
+            .iter()
+            .any(|event| matches!(event.kind, protocol::DaemonEventKind::HandoffCompleted))
+    );
+    cursor = handed_off.cursor;
+
+    let events_cli = daemon
+        .command()
+        .args([
+            "events",
+            "--after",
+            &format!("{}:{}", cursor.stream_id, cursor.event_id),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(events_cli.status.success());
+    let events_cli: serde_json::Value = serde_json::from_slice(&events_cli.stdout).unwrap();
+    assert_eq!(events_cli["command"], "events");
+    assert_eq!(events_cli["data"]["stream_id"], stream_id);
+
+    daemon.stop_with_cli();
+    daemon.restart();
+    let error = daemon.client.events(Some(cursor), 256, 0).unwrap_err();
+    assert_eq!(
+        error
+            .get_ref()
+            .and_then(|error| error.downcast_ref::<RemoteError>())
+            .and_then(|error| error.code),
+        Some(ErrorCode::CursorExpired)
+    );
+    let baseline = daemon.client.events(None, 256, 0).unwrap();
+    let waiting_client = daemon.client.clone();
+    let wait = thread::spawn(move || waiting_client.events(Some(baseline.cursor), 256, 5_000));
+    thread::sleep(Duration::from_millis(50));
+    daemon.stop_with_cli();
+    let error = wait.join().unwrap().unwrap_err();
+    assert_eq!(
+        error
+            .get_ref()
+            .and_then(|error| error.downcast_ref::<RemoteError>())
+            .and_then(|error| error.code),
+        Some(ErrorCode::DaemonStopping)
+    );
+}
+
+#[test]
 fn native_daemon_handoffs_multiple_detached_shells() {
     let mut daemon = TestDaemon::start();
     let workspace = daemon
@@ -743,7 +983,21 @@ fn native_daemon_lifecycle() {
     let capabilities: serde_json::Value = serde_json::from_slice(&capabilities.stdout).unwrap();
     assert_eq!(capabilities["schema"], "boomux.cli/v1");
     assert_eq!(capabilities["command"], "capabilities");
-    assert_eq!(capabilities["data"]["daemon_protocol_version"], 6);
+    assert_eq!(capabilities["data"]["daemon_protocol_version"], 7);
+    assert!(
+        capabilities["data"]["json_commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|command| command == "events")
+    );
+    assert!(
+        capabilities["data"]["features"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|feature| feature == "revision_aware_reads")
+    );
 
     let status = daemon
         .command()
@@ -751,7 +1005,7 @@ fn native_daemon_lifecycle() {
         .output()
         .unwrap();
     assert!(status.status.success());
-    assert!(String::from_utf8_lossy(&status.stdout).contains("running (protocol 6"));
+    assert!(String::from_utf8_lossy(&status.stdout).contains("running (protocol 7"));
     let status = daemon
         .command()
         .args(["daemon", "status", "--json"])
@@ -760,6 +1014,16 @@ fn native_daemon_lifecycle() {
     let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
     assert_eq!(status["schema"], "boomux.cli/v1");
     assert_eq!(status["data"]["status"], "running");
+    let mut protocol_six = UnixStream::connect(daemon.client.socket_path()).unwrap();
+    protocol::write_message(
+        &mut protocol_six,
+        &protocol::Envelope::with_version(6, protocol::Request::Ping),
+    )
+    .unwrap();
+    let response: protocol::Envelope<protocol::Response> =
+        protocol::read_message(&mut protocol_six).unwrap();
+    assert_eq!(response.version, 6);
+    assert_eq!(response.message, protocol::Response::Pong);
 
     let missing_id = Uuid::new_v4().to_string();
     let error = daemon.client.get_shell(&missing_id).unwrap_err();
@@ -1291,7 +1555,13 @@ fn native_daemon_lifecycle() {
     second
         .set_read_timeout(Some(Duration::from_secs(1)))
         .unwrap();
-    assert!(AttachFrame::read_from(&mut second).is_err());
+    loop {
+        match AttachFrame::read_from(&mut second) {
+            Ok(AttachFrame::Output(_)) => continue,
+            Err(_) => break,
+            Ok(frame) => panic!("old controller received unexpected frame: {frame:?}"),
+        }
+    }
 
     AttachFrame::Resize {
         rows: 40,

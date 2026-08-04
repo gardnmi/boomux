@@ -28,6 +28,7 @@ The following commands support `--json`:
 - `boomux list`
 - `boomux shells`
 - `boomux read`
+- `boomux events`
 - `boomux workspace list`
 - `boomux workspace inspect`
 - `boomux shell inspect`
@@ -48,6 +49,8 @@ Command payloads are:
   `shells`.
 - `shell.inspect`: one `shell` object.
 - `read`: shell/run identity, observed output revision, and rendered output.
+- `events`: stream identity, reconnect cursor, optional baseline snapshot, and a
+  bounded event array.
 - `daemon.status`: `status`, `protocol_version`, and `socket_path`.
 
 ## Shell Data
@@ -61,10 +64,14 @@ A run object includes `id`, `generation`, `started_at_ms`, `ended_at_ms`,
 `exit_reason`, `exit_code`, `output_revision`, and `environment_has_run_id`.
 `exit_reason` is `exited`, `terminated`, `interrupted`, or `null`.
 
-`read` returns `shell_id`, `run_id`, `output_revision`, and `output`. Output is a
-JSON string containing the same bounded plain rendered text as human mode. The
-identity and revision come from the snapshot immediately before the separate
-output read; they are observational metadata, not an atomic read cursor.
+`read` returns `shell_id`, `run_id`, `output_revision`, `changed`, `status`, and
+`output`. Output is a JSON string containing the same bounded plain rendered text
+as human mode. These fields come from one atomic daemon observation. Conditional
+reads can wait for a specific run to advance beyond a supplied revision.
+
+`events` returns an opaque `<stream-uuid>:<event-id>` cursor. See
+[`event-stream.md`](event-stream.md) for retention, graceful restart, cold
+restart, and revision semantics.
 
 ## Errors
 
@@ -85,6 +92,6 @@ Failures detected while parsing command-line arguments use `"command": "cli"`
 because no valid command was selected.
 
 The stable codes are reported by `boomux capabilities --json`. Messages remain
-human-readable context and are not stable parsing targets. Daemon protocol 6
-adds the error code as an optional field: older clients ignore it, while newer
-clients classify errors from older daemons as `unknown`.
+human-readable context and are not stable parsing targets. Daemon protocol 7
+retains the additive protocol-6 error field and adds `cursor_expired`,
+`run_changed`, and `revision_ahead`.

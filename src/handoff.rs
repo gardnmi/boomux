@@ -10,12 +10,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::client;
 use crate::fd_transfer::receive_descriptor;
-use crate::protocol::{self, TerminalProfile};
+use crate::protocol::{self, DaemonEvent, TerminalProfile};
 use crate::state_store;
 
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 pub(crate) const CHANNEL_FD: RawFd = 198;
-pub(crate) const HEADER: &[u8; 8] = b"BOOMUXH3";
+pub(crate) const HEADER: &[u8; 8] = b"BOOMUXH4";
 pub(crate) const LISTENER_MARKER: u8 = 1;
 pub(crate) const RUNTIME_LOCK_MARKER: u8 = 2;
 pub(crate) const STATE_LOCK_MARKER: u8 = 3;
@@ -32,6 +32,14 @@ pub(crate) const PIDFD_MARKER: u8 = 11;
 pub(crate) struct Manifest {
     pub(crate) runtimes: Vec<RuntimeManifest>,
     pub(crate) exited: Vec<ExitedManifest>,
+    pub(crate) event_stream: EventStreamManifest,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct EventStreamManifest {
+    pub(crate) stream_id: String,
+    pub(crate) latest_id: u64,
+    pub(crate) events: Vec<DaemonEvent>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -75,6 +83,7 @@ pub(crate) enum Bootstrap {
         state_lock: OwnedFd,
         runtimes: Vec<TransferredRuntime>,
         exited: Vec<TransferredExited>,
+        event_stream: EventStreamManifest,
     },
 }
 
@@ -92,6 +101,7 @@ pub(crate) fn receive_bootstrap(channel: RawFd) -> io::Result<Bootstrap> {
     }
     let manifest: Manifest = protocol::read_message(&mut channel)?;
     validate_manifest(&manifest)?;
+    let event_stream = manifest.event_stream.clone();
     let listener = receive_descriptor(&channel, LISTENER_MARKER)?;
     let runtime_lock = receive_descriptor(&channel, RUNTIME_LOCK_MARKER)?;
     let state_lock = receive_descriptor(&channel, STATE_LOCK_MARKER)?;
@@ -158,6 +168,7 @@ pub(crate) fn receive_bootstrap(channel: RawFd) -> io::Result<Bootstrap> {
             state_lock,
             runtimes,
             exited,
+            event_stream,
         }),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -242,6 +253,24 @@ fn validate_manifest(manifest: &Manifest) -> io::Result<()> {
                 "handoff manifest contains an invalid exited shell",
             ));
         }
+    }
+    if uuid::Uuid::parse_str(&manifest.event_stream.stream_id).is_err()
+        || manifest.event_stream.events.len() > 8_192
+        || manifest
+            .event_stream
+            .events
+            .windows(2)
+            .any(|events| events[0].id.checked_add(1) != Some(events[1].id))
+        || manifest
+            .event_stream
+            .events
+            .last()
+            .is_some_and(|event| event.id != manifest.event_stream.latest_id)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "handoff manifest contains an invalid event stream",
+        ));
     }
     Ok(())
 }
