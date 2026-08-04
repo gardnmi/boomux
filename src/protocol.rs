@@ -73,6 +73,23 @@ pub enum ShellRunExitReason {
     Interrupted,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorCode {
+    InvalidArgument,
+    NotFound,
+    AlreadyExists,
+    Busy,
+    DaemonStopping,
+    ShellStartFailed,
+    PersistenceFailed,
+    Timeout,
+    UnsupportedVersion,
+    Internal,
+    #[serde(other)]
+    Unknown,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminalProfile {
     pub term: Option<String>,
@@ -174,6 +191,8 @@ pub enum Response {
     Ok,
     Error {
         message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<ErrorCode>,
     },
 }
 
@@ -303,6 +322,12 @@ mod tests {
         status: ShellStatus,
     }
 
+    #[derive(Deserialize)]
+    #[serde(tag = "response", rename_all = "snake_case")]
+    enum LegacyResponse {
+        Error { message: String },
+    }
+
     #[test]
     fn control_frame_round_trips() {
         let value = Envelope::new(Request::Attach {
@@ -325,6 +350,38 @@ mod tests {
             read_message::<Envelope<Request>>(&mut bytes.as_slice()).unwrap(),
             value
         );
+    }
+
+    #[test]
+    fn typed_errors_are_additive_within_protocol_six() {
+        let legacy: Response =
+            serde_json::from_str(r#"{"response":"error","message":"legacy daemon"}"#).unwrap();
+        assert_eq!(
+            legacy,
+            Response::Error {
+                message: "legacy daemon".into(),
+                code: None,
+            }
+        );
+
+        let coded = Response::Error {
+            message: "missing".into(),
+            code: Some(ErrorCode::NotFound),
+        };
+        let LegacyResponse::Error { message } =
+            serde_json::from_value(serde_json::to_value(coded).unwrap()).unwrap();
+        assert_eq!(message, "missing");
+
+        let unknown: Response =
+            serde_json::from_str(r#"{"response":"error","message":"future","code":"future_code"}"#)
+                .unwrap();
+        assert!(matches!(
+            unknown,
+            Response::Error {
+                code: Some(ErrorCode::Unknown),
+                ..
+            }
+        ));
     }
 
     #[test]
