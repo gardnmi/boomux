@@ -80,8 +80,8 @@ eternal process.
 1. [Complete] Add a `ShellRun` identity beneath each durable shell, including
    generation, lifecycle timestamps, exit reason, output revision, and
    `BOOMUX_RUN_ID`.
-2. Preserve final exited-run metadata and terminal state across graceful daemon
-   restart without starting a replacement process implicitly.
+2. [Complete] Preserve final exited-run metadata and terminal state across
+   graceful daemon restart without starting a replacement process implicitly.
 3. Add stable versioned JSON output, typed errors, and capability reporting for
    integrations.
 4. Add a monotonic daemon event stream with reconnectable cursors and

@@ -158,13 +158,15 @@ shells transfer their PTY master, pidfd-backed process identity, terminal
 profile, run identity, output revision, and reconstructed VT state without
 changing the child PID. Attached clients receive a reconnect request,
 acknowledge an input-ordering boundary, and reconnect to the replacement while
-remaining in raw mode. An exited shell currently prevents graceful replacement;
-persisting its final terminal state is the next handoff milestone.
+remaining in raw mode. Exited shells transfer their final run metadata and
+bounded reconstructed terminal state without a PTY, pidfd, or replacement
+process. Cold startup and crash recovery remain metadata-only and restore shells
+as pending.
 
 ## Next Technical Steps
 
 The detailed design, acceptance criteria, and manual test matrix are tracked in
 [`native-terminal-follow-up.md`](native-terminal-follow-up.md).
 
-1. Evaluate explicit exited-shell terminal-state transfer separately from live
-   process handoff.
+1. Add stable versioned JSON output, typed errors, and capability reporting for
+   integrations.

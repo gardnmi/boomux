@@ -201,14 +201,15 @@ mode on exit. See [`docs/architecture.md`](docs/architecture.md) for details.
 Shells remain pending until their first attachment reports terminal environment
 and dimensions; that profile initializes the PTY and child process. Reproducible
 workspace and shell metadata provides crash recovery, while a graceful
-`boomux daemon restart` transfers running shells and reconnects active clients.
+`boomux daemon restart` transfers running shells, preserves exited shells and
+their final terminal state, and reconnects active clients.
 See [`docs/live-pty-handoff.md`](docs/live-pty-handoff.md) for the handoff design.
 
 ## POC Limitations
 
-- Live daemon restart preserves pending and running shells, and active attachment
-  clients reconnect cooperatively. An exited shell currently prevents graceful
-  replacement until final terminal-state transfer is implemented.
+- Live daemon restart preserves pending, running, and exited shells. Active
+  attachment clients reconnect cooperatively, while exited shells retain their
+  run metadata and bounded final terminal state without starting a new process.
 - An unexpected daemon exit cannot hand off live PTYs. Persisted shell metadata
   returns as pending and starts fresh processes when reopened.
 - Mutated process environment and in-memory application state are not persisted.

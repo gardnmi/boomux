@@ -28,13 +28,15 @@ The private handoff channel will carry a versioned manifest followed by Unix
 - One PTY master per running shell
 - Shell and run IDs, terminal profile, PID/session identity, output revision,
   and sanitized VT state
+- Exited-shell run identity, exit status, output revision, terminal profile, and
+  sanitized final VT state without process descriptors
 
 The PTY master is full duplex, so reader and writer duplicates do not need to be
 transferred separately. The replacement cannot inherit Unix parenthood; process
 monitoring and cleanup therefore need an imported-process representation, with
 a Linux pidfd where available.
 
-Bootstrap starts with the `BOOMUXH2` version header and has bounded read/write
+Bootstrap starts with the `BOOMUXH3` version header and has bounded read/write
 deadlines. The receiver validates the listener path/type, forces nonblocking
 mode, matches both lock-file inodes, and establishes exclusive flock ownership
 before acknowledging readiness. Explicit abort closes every received duplicate
@@ -48,6 +50,11 @@ rollback cannot consume output belonging to the old daemon.
 PTY/session identity is cross-checked with `TIOCGSID`, terminal reconstructions
 use separate bounded frames, and imported process/session cleanup uses pidfds to
 avoid signaling a reused numeric PID.
+
+Exited shells use a separate static transfer record and bounded reconstruction
+frame. The replacement validates that the transferred identity and exit status
+match the persisted completed run, then restores the exited lifecycle without
+opening a PTY or starting a process.
 
 ## Delivery Slices
 
@@ -65,6 +72,8 @@ avoid signaling a reused numeric PID.
    `Reconnect`/`ReconnectAck` framing. Input sent before the ACK is processed by
    the old daemon; later terminal input remains queued while the client retries
    the replacement in raw mode.
+6. [Complete] Transfer exited-run metadata and bounded final terminal state as
+   static lifecycle records alongside any live runtimes.
 
 ## First Acceptance Test
 
