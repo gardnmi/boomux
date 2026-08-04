@@ -31,6 +31,7 @@ The initial event vocabulary is:
 
 - `workspace_created`, `workspace_renamed`, `workspace_closed`
 - `shell_created`, `shell_renamed`, `shell_closed`
+- `launcher_created`, `launcher_renamed`, `launcher_removed`
 - `run_started`, `output_changed`, `run_exited`
 - `handoff_completed`
 

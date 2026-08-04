@@ -32,6 +32,8 @@ The following commands support `--json`:
 - `boomux workspace list`
 - `boomux workspace inspect`
 - `boomux shell inspect`
+- `boomux launcher list`
+- `boomux launcher inspect`
 - `boomux daemon status`
 
 Mutation commands intentionally retain human output for now. Passing `--json`
@@ -44,10 +46,13 @@ Command payloads are:
   features, and error codes.
 - `list`: a `shells` array.
 - `shells`: workspace identity plus a `shells` array.
-- `workspace.list`: a `workspaces` array of `id`, `name`, and `shell_count`.
+- `workspace.list`: a `workspaces` array of `id`, `name`, `shell_count`, and
+  `launcher_count`.
 - `workspace.inspect`: one `workspace` object containing `id`, `name`, and
-  `shells`.
+  `shells` and `launchers` arrays.
 - `shell.inspect`: one `shell` object.
+- `launcher.list`: workspace identity plus a `launchers` array.
+- `launcher.inspect`: one `launcher` object.
 - `read`: shell/run identity, observed output revision, and rendered output.
 - `events`: stream identity, reconnect cursor, optional baseline snapshot, and a
   bounded event array.
@@ -63,6 +68,9 @@ not omitted or represented as human placeholders. `status` is `pending`,
 A run object includes `id`, `generation`, `started_at_ms`, `ended_at_ms`,
 `exit_reason`, `exit_code`, `output_revision`, and `environment_has_run_id`.
 `exit_reason` is `exited`, `terminated`, `interrupted`, or `null`.
+
+Launcher objects include `id`, `workspace_id`, `workspace_name`, `name`, `cwd`,
+and `command`. `command` is the exact executable-and-arguments array.
 
 `read` returns `shell_id`, `run_id`, `output_revision`, `changed`, `status`, and
 `output`. Output is a JSON string containing the same bounded plain rendered text

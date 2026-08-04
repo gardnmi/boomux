@@ -11,7 +11,8 @@ use uuid::Uuid;
 
 use crate::protocol::{ShellRunExitReason, TerminalProfile};
 
-const STATE_VERSION: u32 = 2;
+const STATE_VERSION: u32 = 3;
+const PREVIOUS_STATE_VERSION: u32 = 2;
 const LEGACY_STATE_VERSION: u32 = 1;
 const MAX_STATE_BYTES: u64 = 8 * 1024 * 1024;
 
@@ -37,6 +38,16 @@ pub(crate) struct PersistedWorkspace {
     pub(crate) id: String,
     pub(crate) name: String,
     pub(crate) shells: Vec<PersistedShell>,
+    pub(crate) launchers: Vec<PersistedWorkspaceLauncher>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PersistedWorkspaceLauncher {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) cwd: PathBuf,
+    pub(crate) command: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -65,6 +76,21 @@ pub(crate) struct PersistedShellRun {
 #[derive(Deserialize)]
 struct StateVersion {
     version: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreviousPersistedState {
+    version: u32,
+    workspaces: Vec<PreviousPersistedWorkspace>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreviousPersistedWorkspace {
+    id: String,
+    name: String,
+    shells: Vec<PersistedShell>,
 }
 
 #[derive(Deserialize)]
@@ -186,6 +212,12 @@ impl StateStore {
         })?;
         let state = match version.version {
             STATE_VERSION => parse_state(&bytes, &self.path)?,
+            PREVIOUS_STATE_VERSION => {
+                let previous: PreviousPersistedState = parse_state(&bytes, &self.path)?;
+                let state = migrate_previous_state(previous);
+                self.save(&state)?;
+                state
+            }
             LEGACY_STATE_VERSION => {
                 let legacy: LegacyPersistedState = parse_state(&bytes, &self.path)?;
                 let state = migrate_legacy_state(legacy);
@@ -276,6 +308,24 @@ fn migrate_legacy_state(legacy: LegacyPersistedState) -> PersistedState {
                         }),
                     })
                     .collect(),
+                launchers: Vec::new(),
+            })
+            .collect(),
+    }
+}
+
+fn migrate_previous_state(previous: PreviousPersistedState) -> PersistedState {
+    debug_assert_eq!(previous.version, PREVIOUS_STATE_VERSION);
+    PersistedState {
+        version: STATE_VERSION,
+        workspaces: previous
+            .workspaces
+            .into_iter()
+            .map(|workspace| PersistedWorkspace {
+                id: workspace.id,
+                name: workspace.name,
+                shells: workspace.shells,
+                launchers: Vec::new(),
             })
             .collect(),
     }
@@ -339,6 +389,20 @@ mod tests {
                 id: Uuid::new_v4().to_string(),
                 name: "saved".into(),
                 shells: Vec::new(),
+                launchers: vec![
+                    PersistedWorkspaceLauncher {
+                        id: "launcher-1".into(),
+                        name: "editor".into(),
+                        cwd: "/tmp/project".into(),
+                        command: vec!["editor".into(), "".into(), "two words".into()],
+                    },
+                    PersistedWorkspaceLauncher {
+                        id: "launcher-2".into(),
+                        name: "server".into(),
+                        cwd: "/tmp/project/server".into(),
+                        command: vec!["server".into()],
+                    },
+                ],
             }],
         };
 
@@ -346,6 +410,21 @@ mod tests {
         let restored = store.load().unwrap().unwrap();
 
         assert_eq!(restored.workspaces[0].name, "saved");
+        assert_eq!(restored.workspaces[0].launchers[0].id, "launcher-1");
+        assert_eq!(restored.workspaces[0].launchers[0].name, "editor");
+        assert_eq!(
+            restored.workspaces[0].launchers[0].cwd,
+            Path::new("/tmp/project")
+        );
+        assert_eq!(
+            restored.workspaces[0].launchers[0].command,
+            vec![
+                String::from("editor"),
+                String::new(),
+                String::from("two words")
+            ]
+        );
+        assert_eq!(restored.workspaces[0].launchers[1].id, "launcher-2");
         assert_eq!(
             fs::metadata(directory.join("boomux/state.json"))
                 .unwrap()
@@ -422,8 +501,9 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .contains("\"version\": 2")
+                .contains("\"version\": 3")
         );
+        assert!(migrated.workspaces[0].launchers.is_empty());
 
         let reloaded = store.load().unwrap().unwrap();
         assert_eq!(
@@ -433,6 +513,44 @@ mod tests {
                 .unwrap()
                 .id,
             run_id
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn migrates_version_two_to_empty_launcher_lists() {
+        let directory = env::temp_dir().join(format!("boomux-state-{}", Uuid::new_v4()));
+        let path = directory.join("boomux/state.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            br#"{
+  "version": 2,
+  "workspaces": [{
+    "id": "5bb1712a-8d4e-4998-bca2-a79aa673ca8f",
+    "name": "version-two",
+    "shells": [{
+      "id": "75dd46b5-6cd3-407a-813a-13e1b10f3614",
+      "name": "agent",
+      "cwd": "/tmp",
+      "command": ["opencode"],
+      "last_run": null
+    }]
+  }]
+}"#,
+        )
+        .unwrap();
+        let store = StateStore::at(path.clone());
+
+        let migrated = store.load().unwrap().unwrap();
+
+        assert_eq!(migrated.workspaces[0].name, "version-two");
+        assert_eq!(migrated.workspaces[0].shells[0].name, "agent");
+        assert!(migrated.workspaces[0].launchers.is_empty());
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .contains("\"version\": 3")
         );
         fs::remove_dir_all(directory).unwrap();
     }

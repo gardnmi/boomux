@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use boomux::client::{Attachment, Client, RemoteError};
 use boomux::protocol::{
     self, AttachFrame, ErrorCode, ShellRunExitReason, ShellSpec, ShellStatus, TerminalProfile,
+    WorkspaceLauncherSpec,
 };
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use uuid::Uuid;
@@ -1098,6 +1099,169 @@ fn attachment_client_reconnects_across_daemon_restart() {
 }
 
 #[test]
+fn workspace_launchers_persist_emit_events_and_open_without_shells() {
+    let mut daemon = TestDaemon::start();
+    let workspace = daemon
+        .client
+        .create_workspace("launcher-only", Vec::new())
+        .unwrap();
+    let cursor = daemon.client.events(None, 256, 0).unwrap().cursor;
+    let output = daemon.runtime_dir.join("launcher-output");
+    let first = daemon
+        .client
+        .create_launcher(
+            &workspace.id,
+            WorkspaceLauncherSpec {
+                name: "editor".into(),
+                cwd: daemon.runtime_dir.clone(),
+                command: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "printf '%s|%s|%s|%s|%s' \"$PWD\" \"$BOOMUX_WORKSPACE_ID\" \"$BOOMUX_WORKSPACE\" \"$BOOMUX_LAUNCHER_ID\" \"$BOOMUX_LAUNCHER_NAME\" > \"$1\"".into(),
+                    "launcher".into(),
+                    output.display().to_string(),
+                ],
+            },
+        )
+        .unwrap();
+    let second = daemon
+        .client
+        .create_launcher(
+            &workspace.id,
+            WorkspaceLauncherSpec {
+                name: "browser".into(),
+                cwd: daemon.runtime_dir.clone(),
+                command: vec!["/bin/true".into()],
+            },
+        )
+        .unwrap();
+    let snapshot = daemon.client.get_workspace(&workspace.id).unwrap();
+    assert_eq!(
+        snapshot
+            .launchers
+            .iter()
+            .map(|launcher| launcher.name.as_str())
+            .collect::<Vec<_>>(),
+        ["editor", "browser"]
+    );
+    let events = daemon.client.events(Some(cursor.clone()), 256, 0).unwrap();
+    assert_eq!(
+        events
+            .events
+            .iter()
+            .filter(|event| matches!(
+                event.kind,
+                protocol::DaemonEventKind::LauncherCreated { .. }
+            ))
+            .count(),
+        2
+    );
+
+    let restart = daemon
+        .command()
+        .args(["daemon", "restart"])
+        .output()
+        .unwrap();
+    assert!(restart.status.success());
+    let restored = daemon.client.get_workspace(&workspace.id).unwrap();
+    assert_eq!(restored.launchers[0].id, first.id);
+    assert_eq!(restored.launchers[1].id, second.id);
+    let listed = daemon
+        .command()
+        .args(["launcher", "list", "--workspace", &workspace.id, "--json"])
+        .output()
+        .unwrap();
+    assert!(listed.status.success());
+    let listed: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(listed["schema"], "boomux.cli/v1");
+    assert_eq!(listed["command"], "launcher.list");
+    assert_eq!(listed["data"]["launchers"][0]["id"], first.id);
+    assert_eq!(
+        listed["data"]["launchers"][0]["command"],
+        serde_json::json!(first.command)
+    );
+
+    let opened = daemon
+        .command()
+        .args(["workspace", "open", &workspace.id])
+        .output()
+        .unwrap();
+    assert!(
+        opened.status.success(),
+        "launcher-only workspace failed to open: {}",
+        String::from_utf8_lossy(&opened.stderr)
+    );
+    wait_until(|| output.is_file(), "workspace launcher did not run");
+    assert_eq!(
+        fs::read_to_string(&output).unwrap(),
+        format!(
+            "{}|{}|{}|{}|{}",
+            daemon.runtime_dir.display(),
+            workspace.id,
+            workspace.name,
+            first.id,
+            first.name
+        )
+    );
+
+    daemon.client.rename_launcher(&first.id, "zed").unwrap();
+    assert_eq!(daemon.client.get_launcher(&first.id).unwrap().name, "zed");
+    daemon.client.remove_launcher(&second.id).unwrap();
+    assert_eq!(
+        daemon
+            .client
+            .get_workspace(&workspace.id)
+            .unwrap()
+            .launchers
+            .len(),
+        1
+    );
+    let events = daemon.client.events(Some(cursor), 256, 0).unwrap();
+    assert!(events.events.iter().any(|event| matches!(
+        event.kind,
+        protocol::DaemonEventKind::LauncherRenamed { .. }
+    )));
+    assert!(events.events.iter().any(|event| matches!(
+        event.kind,
+        protocol::DaemonEventKind::LauncherRemoved { .. }
+    )));
+    let restart = daemon
+        .command()
+        .args(["daemon", "restart"])
+        .output()
+        .unwrap();
+    assert!(restart.status.success());
+    assert_eq!(
+        daemon
+            .client
+            .get_workspace(&workspace.id)
+            .unwrap()
+            .launchers
+            .iter()
+            .map(|launcher| launcher.name.as_str())
+            .collect::<Vec<_>>(),
+        ["zed"]
+    );
+    daemon.client.close_workspace(&workspace.id).unwrap();
+    let restart = daemon
+        .command()
+        .args(["daemon", "restart"])
+        .output()
+        .unwrap();
+    assert!(restart.status.success());
+    assert!(
+        daemon
+            .client
+            .snapshot()
+            .unwrap()
+            .workspaces
+            .iter()
+            .all(|current| current.id != workspace.id)
+    );
+    daemon.stop_with_cli();
+}
+
+#[test]
 fn native_daemon_lifecycle() {
     let mut daemon = TestDaemon::start();
 
@@ -1110,7 +1274,7 @@ fn native_daemon_lifecycle() {
     let capabilities: serde_json::Value = serde_json::from_slice(&capabilities.stdout).unwrap();
     assert_eq!(capabilities["schema"], "boomux.cli/v1");
     assert_eq!(capabilities["command"], "capabilities");
-    assert_eq!(capabilities["data"]["daemon_protocol_version"], 7);
+    assert_eq!(capabilities["data"]["daemon_protocol_version"], 8);
     assert!(
         capabilities["data"]["json_commands"]
             .as_array()
@@ -1132,7 +1296,7 @@ fn native_daemon_lifecycle() {
         .output()
         .unwrap();
     assert!(status.status.success());
-    assert!(String::from_utf8_lossy(&status.stdout).contains("running (protocol 7"));
+    assert!(String::from_utf8_lossy(&status.stdout).contains("running (protocol 8"));
     let status = daemon
         .command()
         .args(["daemon", "status", "--json"])

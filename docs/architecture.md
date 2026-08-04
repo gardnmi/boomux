@@ -32,7 +32,7 @@ name resolution, and conversion from daemon snapshots into TUI view models.
 with a four-byte big-endian length prefix. Attachment traffic uses small binary
 frames for input, output, resize, and detach events.
 
-The domain has three durable identities:
+The domain has four durable identities:
 
 - A workspace is a globally named shell container with a UUID. It has no path
   or working directory.
@@ -43,6 +43,9 @@ The domain has three durable identities:
   timestamps, exit reason, and output revision.
   Runs created by Boomux export `BOOMUX_RUN_ID`; a process imported from a
   legacy daemon is marked when its existing environment lacks that variable.
+- A workspace launcher is a named, ordered, exact argument-vector command with
+  its own working directory. Its identity is durable, but each detached
+  invocation is ephemeral and has no PTY or retained runtime state.
 
 There are no separate tab, pane, and terminal identity layers.
 
@@ -53,6 +56,12 @@ There are no separate tab, pane, and terminal identity layers.
 waits for the protocol ping to succeed, and exposes typed management requests.
 An owner-held file lock prevents concurrent daemons from unlinking each other's
 sockets or splitting the registry.
+
+Explicit workspace open is client-side orchestration. The client invokes each
+workspace launcher in creation order using its own desktop environment, then
+opens native terminal windows for the workspace shells. Launcher processes are
+detached into their own sessions and reaped while the invoking client remains
+alive, but Boomux does not retain or manage their runtime lifecycle.
 
 ### Daemon
 
@@ -65,6 +74,7 @@ The daemon supports:
 - Atomic shell creation with an implicit `workspace-N` container when no
   workspace is selected
 - Additional shell creation
+- Ordered workspace launcher creation, inspection, rename, and removal
 - Workspace and shell snapshots
 - Shell and workspace rename operations
 - Shell and workspace closure
@@ -114,7 +124,7 @@ No emulator-specific adapter or compositor window ID is required.
 
 `src/tui.rs` remains a control plane. It receives backend-neutral view models
 and callback functions rather than opening sockets itself. One daemon snapshot
-contains each workspace and its shells, avoiding races between separate list
+contains each workspace, its launchers, and its shells, avoiding races between separate list
 operations. Configured project roots provide workspace-name suggestions only.
 Git information is collected independently from shell directories and cached;
 empty or mixed-directory workspaces have no workspace-level directory or Git
@@ -142,6 +152,11 @@ retention or cold-restart expiry by requesting a fresh snapshot baseline.
 Graceful handoff version 4 transfers retained events before publishing a
 `handoff_completed` boundary and resuming PTY readers. See
 [`event-stream.md`](event-stream.md).
+
+Protocol 8 adds durable workspace launcher definitions. Protocol-7 clients can
+still read workspace snapshots because launcher lists are additive; launcher
+events are filtered from protocol-7 event pages while their cursors continue to
+advance.
 
 ### Transition Coordinator
 
@@ -185,9 +200,9 @@ to the complete registry and removes the runtime socket.
 
 The daemon atomically writes reproducible registry metadata to
 `$XDG_STATE_HOME/boomux/state.json`, falling back to
-`~/.local/state/boomux/state.json`. Workspace and shell IDs, names, grouping,
-shell working directories, startup commands, and last terminal profiles survive
-restart. The last run record also preserves its identity and outcome. Recovered
+`~/.local/state/boomux/state.json`. Workspace, launcher, and shell IDs, names,
+grouping, working directories, argument vectors, and last terminal profiles
+survive restart. The last run record also preserves its identity and outcome. Recovered
 shells are pending: Boomux does not claim that arbitrary
 processes, mutated environments, or PTYs survive daemon restart or crash.
 
