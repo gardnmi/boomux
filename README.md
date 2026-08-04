@@ -106,7 +106,7 @@ boomux shell close <shell-name-or-id> [--workspace <name-or-id>]
 boomux daemon status
 boomux daemon restart
 boomux daemon stop
-boomux skill install
+boomux skill install [--force]
 ```
 
 `boomux shells` lists shells in the current workspace. `boomux read` and
@@ -172,8 +172,12 @@ Install the optional vendor-neutral [Agent Skill](https://agentskills.io) with:
 boomux skill install
 ```
 
-It is written to `~/.agents/skills/boomux-shells/SKILL.md` and teaches
-compatible agents to discover shells and invoke `boomux read`.
+It is written to `~/.agents/skills/boomux/SKILL.md` and teaches compatible
+agents to discover, inspect, read, create, open, rename, and close Boomux
+workspaces and shells through the full public CLI. Re-run with `--force` to
+replace an older customized installation. An untouched legacy `boomux-shells`
+skill is removed automatically; customized legacy content is preserved with a
+warning.
 
 ## Architecture
 
