@@ -71,10 +71,37 @@ terminal handshake, VT reconstruction, and restart-persistence plan.
 
 ## Agent Workflows
 
-- Record state transitions and show when an agent last changed state.
-- Provide an attention queue for blocked and completed agents.
-- Send common responses or commands to a selected pane.
-- Run hooks, tests, notifications, or focus actions when an agent finishes.
+Build agent orchestration on explicit process identity and observable daemon
+state rather than parsing human CLI tables or treating a durable shell as one
+eternal process.
+
+### Foundation
+
+1. [Complete] Add a `ShellRun` identity beneath each durable shell, including
+   generation, lifecycle timestamps, exit reason, output revision, and
+   `BOOMUX_RUN_ID`.
+2. Preserve final exited-run metadata and terminal state across graceful daemon
+   restart without starting a replacement process implicitly.
+3. Add stable versioned JSON output, typed errors, and capability reporting for
+   integrations.
+4. Add a monotonic daemon event stream with reconnectable cursors and
+   revision-aware output reads.
+5. Route runtime transitions through one coordinator so persistence and events
+   share an ordering boundary.
+
+### Agent Runtime
+
+1. Model agent instances separately from shells and runs, with explicit state
+   authority, evidence, and confidence.
+2. Prefer lifecycle integrations, then process adapters, then conservative
+   terminal-screen heuristics for `working`, `blocked`, `idle`, `done`, and
+   `unknown` states.
+3. Aggregate agent states as workspace counts and provide an explainable,
+   persistent attention queue for blocked and completed work.
+4. Add notifications and revision-aware `agent wait` and `agent read` commands.
+5. Add guarded prompts and common responses only after defining run-scoped
+   leases, user-controller precedence, idempotency, and audit events.
+6. Run hooks, tests, notifications, or focus actions from durable transitions.
 
 ## Distribution And Polish
 

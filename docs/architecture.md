@@ -32,12 +32,17 @@ name resolution, and conversion from daemon snapshots into TUI view models.
 with a four-byte big-endian length prefix. Attachment traffic uses small binary
 frames for input, output, resize, and detach events.
 
-The domain has only two durable identities:
+The domain has three durable identities:
 
 - A workspace is a globally named shell container with a UUID. It has no path
   or working directory.
-- A shell owns one PTY, child process, name, explicit working directory, and
-  workspace ID.
+- A shell is a durable process slot with a name, startup command, explicit
+  working directory, and workspace ID.
+- A shell run identifies one process incarnation beneath that durable shell. It
+  owns the PTY and child while live and carries a generation, lifecycle
+  timestamps, exit reason, and output revision.
+  Runs created by Boomux export `BOOMUX_RUN_ID`; a process imported from a
+  legacy daemon is marked when its existing environment lacks that variable.
 
 There are no separate tab, pane, and terminal identity layers.
 
@@ -131,8 +136,8 @@ the PTY master and child. Reopening a window acquires the controller and first
 receives sanitized reconstructed terminal state followed by live output.
 
 Closing a pending shell removes only metadata. Closing a running shell terminates
-its child and disconnects its controller. Closing a
-workspace removes all its shells from the registry before terminating them.
+its child and disconnects its controller. Closing a workspace terminates its
+shells before removing the workspace from the registry.
 On Linux, cleanup signals every process still belonging to the shell's session
 before reaping the session leader. `boomux daemon stop` applies the same cleanup
 to the complete registry and removes the runtime socket.
@@ -141,7 +146,8 @@ The daemon atomically writes reproducible registry metadata to
 `$XDG_STATE_HOME/boomux/state.json`, falling back to
 `~/.local/state/boomux/state.json`. Workspace and shell IDs, names, grouping,
 shell working directories, startup commands, and last terminal profiles survive
-restart. Recovered shells are pending: Boomux does not claim that arbitrary
+restart. The last run record also preserves its identity and outcome. Recovered
+shells are pending: Boomux does not claim that arbitrary
 processes, mutated environments, or PTYs survive daemon restart or crash.
 
 `boomux daemon restart` transfers the existing listener and both ownership locks
@@ -149,10 +155,11 @@ to a replacement process through a private, versioned `SCM_RIGHTS` handshake.
 Prepare/finalize acknowledgement keeps rollback safe before the irreversible
 ownership boundary. Pending shells restore from metadata. Detached running
 shells transfer their PTY master, pidfd-backed process identity, terminal
-profile, and reconstructed VT state without changing the child PID. Attached
-clients receive a reconnect request, acknowledge an input-ordering boundary,
-and reconnect to the replacement while remaining in raw mode. Exited shells use
-metadata recovery.
+profile, run identity, output revision, and reconstructed VT state without
+changing the child PID. Attached clients receive a reconnect request,
+acknowledge an input-ordering boundary, and reconnect to the replacement while
+remaining in raw mode. An exited shell currently prevents graceful replacement;
+persisting its final terminal state is the next handoff milestone.
 
 ## Next Technical Steps
 

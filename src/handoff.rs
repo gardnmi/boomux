@@ -36,6 +36,10 @@ pub(crate) struct Manifest {
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct RuntimeManifest {
     pub(crate) shell_id: String,
+    #[serde(default)]
+    pub(crate) run_id: Option<String>,
+    #[serde(default)]
+    pub(crate) output_revision: Option<u64>,
     pub(crate) profile: TerminalProfile,
     pub(crate) pid: u32,
 }
@@ -180,8 +184,13 @@ fn validate_manifest(manifest: &Manifest) -> io::Result<()> {
         ));
     }
     let mut shell_ids = std::collections::HashSet::new();
+    let mut run_ids = std::collections::HashSet::new();
     for runtime in &manifest.runtimes {
-        if runtime.pid == 0 || !shell_ids.insert(&runtime.shell_id) {
+        let valid_run = runtime
+            .run_id
+            .as_ref()
+            .is_none_or(|run_id| uuid::Uuid::parse_str(run_id).is_ok() && run_ids.insert(run_id));
+        if runtime.pid == 0 || !shell_ids.insert(&runtime.shell_id) || !valid_run {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "handoff manifest contains an invalid runtime",

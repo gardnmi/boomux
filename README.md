@@ -152,10 +152,15 @@ BOOMUX_WORKSPACE_ID
 BOOMUX_WORKSPACE
 BOOMUX_SHELL_ID
 BOOMUX_SHELL_NAME
+BOOMUX_RUN_ID
 ```
 
-IDs remain authoritative after a rename. A dynamic Starship segment can call
-the hidden prompt command:
+Workspace and shell IDs remain authoritative after a rename. `BOOMUX_RUN_ID`
+identifies one process incarnation and changes when a durable shell starts a
+new process after recovery. A live process transferred from a pre-run-identity
+daemon receives a daemon-side run identity, but its existing environment cannot
+be retrofitted; `shell inspect` reports that compatibility case. A dynamic
+Starship segment can call the hidden prompt command:
 
 ```toml
 [custom.boomux]
@@ -201,8 +206,9 @@ See [`docs/live-pty-handoff.md`](docs/live-pty-handoff.md) for the handoff desig
 
 ## POC Limitations
 
-- Live daemon restart preserves pending and running shells. Active attachment
-  clients reconnect cooperatively; exited shells use metadata recovery.
+- Live daemon restart preserves pending and running shells, and active attachment
+  clients reconnect cooperatively. An exited shell currently prevents graceful
+  replacement until final terminal-state transfer is implemented.
 - An unexpected daemon exit cannot hand off live PTYs. Persisted shell metadata
   returns as pending and starts fresh processes when reopened.
 - Mutated process environment and in-memory application state are not persisted.

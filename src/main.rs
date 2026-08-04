@@ -611,14 +611,15 @@ fn unique_shell_name(base_name: &str, shells: &[ShellSnapshot]) -> String {
 
 fn list_shells() -> Result<(), Box<dyn Error>> {
     let snapshot = client::connect_or_start()?.snapshot()?;
-    println!("WORKSPACE\tNAME\tSHELL ID\tSTATUS");
+    println!("WORKSPACE\tNAME\tSHELL ID\tRUN ID\tSTATUS");
     for workspace in snapshot.workspaces {
         for shell in workspace.shells {
             println!(
-                "{}\t{}\t{}\t{}",
+                "{}\t{}\t{}\t{}\t{}",
                 workspace.name,
                 shell.name,
                 shell.id,
+                shell.run.as_ref().map_or("-", |run| run.id.as_str()),
                 shell_status(&shell.status)
             );
         }
@@ -652,12 +653,13 @@ fn workspace_command(command: WorkspaceCommands) -> Result<(), Box<dyn Error>> {
             println!("NAME\t{}", workspace.name);
             println!("SHELLS\t{}", workspace.shells.len());
             if !workspace.shells.is_empty() {
-                println!("\nNAME\tSHELL ID\tSTATUS\tCWD");
+                println!("\nNAME\tSHELL ID\tRUN ID\tSTATUS\tCWD");
                 for shell in &workspace.shells {
                     println!(
-                        "{}\t{}\t{}\t{}",
+                        "{}\t{}\t{}\t{}\t{}",
                         shell.name,
                         shell.id,
+                        shell.run.as_ref().map_or("-", |run| run.id.as_str()),
                         shell_status(&shell.status),
                         shell.cwd.display()
                     );
@@ -722,6 +724,24 @@ fn shell_command(command: ShellCommands) -> Result<(), Box<dyn Error>> {
             println!("WORKSPACE\t{}", workspace.name);
             println!("STATUS\t{}", shell_status(&shell.status));
             println!("CWD\t{}", shell.cwd.display());
+            if let Some(run) = &shell.run {
+                println!("RUN ID\t{}", run.id);
+                println!("GENERATION\t{}", run.generation);
+                println!("STARTED AT MS\t{}", run.started_at_ms);
+                println!(
+                    "ENDED AT MS\t{}",
+                    run.ended_at_ms
+                        .map_or_else(|| "-".into(), |value| value.to_string())
+                );
+                println!(
+                    "EXIT REASON\t{}",
+                    run.exit_reason
+                        .as_ref()
+                        .map_or_else(|| "-".into(), shell_exit_reason)
+                );
+                println!("OUTPUT REVISION\t{}", run.output_revision);
+                println!("ENVIRONMENT HAS RUN ID\t{}", run.environment_has_run_id);
+            }
         }
         ShellCommands::Rename {
             target,
@@ -745,12 +765,13 @@ fn list_workspace_shells() -> Result<(), Box<dyn Error>> {
     let client = client::connect_or_start()?;
     let shell = current_shell(&client)?;
     let workspace = client.get_workspace(&shell.workspace_id)?;
-    println!("NAME\tSHELL ID\tSTATUS");
+    println!("NAME\tSHELL ID\tRUN ID\tSTATUS");
     for shell in workspace.shells {
         println!(
-            "{}\t{}\t{}",
+            "{}\t{}\t{}\t{}",
             shell.name,
             shell.id,
+            shell.run.as_ref().map_or("-", |run| run.id.as_str()),
             shell_status(&shell.status)
         );
     }
@@ -891,6 +912,19 @@ fn shell_status(status: &ShellStatus) -> &'static str {
         ShellStatus::Pending => "pending",
         ShellStatus::Running => "running",
         ShellStatus::Exited { .. } => "exited",
+    }
+}
+
+fn shell_exit_reason(reason: &boomux::protocol::ShellRunExitReason) -> String {
+    match reason {
+        boomux::protocol::ShellRunExitReason::Exited { code: Some(code) } => {
+            format!("exited ({code})")
+        }
+        boomux::protocol::ShellRunExitReason::Exited { code: None } => {
+            "exited (code unavailable)".into()
+        }
+        boomux::protocol::ShellRunExitReason::Terminated => "terminated".into(),
+        boomux::protocol::ShellRunExitReason::Interrupted => "interrupted".into(),
     }
 }
 
@@ -1184,6 +1218,7 @@ mod tests {
             name: name.into(),
             cwd: PathBuf::from("/tmp/project"),
             status: ShellStatus::Running,
+            run: None,
         }
     }
 
@@ -1360,6 +1395,18 @@ mod tests {
     fn selects_recent_rendered_lines() {
         assert_eq!(recent_lines("one\ntwo\nthree\n", 2), "two\nthree\n");
         assert_eq!(recent_lines("one\ntwo", 1), "two");
+    }
+
+    #[test]
+    fn formats_shell_run_exit_codes() {
+        assert_eq!(
+            shell_exit_reason(&boomux::protocol::ShellRunExitReason::Exited { code: Some(7) }),
+            "exited (7)"
+        );
+        assert_eq!(
+            shell_exit_reason(&boomux::protocol::ShellRunExitReason::Exited { code: None }),
+            "exited (code unavailable)"
+        );
     }
 
     #[test]

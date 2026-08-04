@@ -26,7 +26,8 @@ The private handoff channel will carry a versioned manifest followed by Unix
 - Existing listener socket
 - Runtime and state lock files
 - One PTY master per running shell
-- Shell ID, terminal profile, PID/session identity, and sanitized VT state
+- Shell and run IDs, terminal profile, PID/session identity, output revision,
+  and sanitized VT state
 
 The PTY master is full duplex, so reader and writer duplicates do not need to be
 transferred separately. The replacement cannot inherit Unix parenthood; process
