@@ -25,10 +25,11 @@ use crate::handoff;
 use crate::protocol::{
     self, AttachFrame, DaemonEvent, DaemonEventKind, Envelope, ErrorCode, EventCursor, Request,
     Response, ShellRunExitReason, ShellRunSnapshot, ShellSnapshot, ShellSpec, ShellStatus,
-    Snapshot, TerminalProfile, WorkspaceSnapshot,
+    Snapshot, TerminalProfile, WorkspaceLauncherSnapshot, WorkspaceLauncherSpec, WorkspaceSnapshot,
 };
 use crate::state_store::{
-    PersistedShell, PersistedShellRun, PersistedState, PersistedWorkspace, StateStore,
+    PersistedShell, PersistedShellRun, PersistedState, PersistedWorkspace,
+    PersistedWorkspaceLauncher, StateStore,
 };
 use crate::terminal_state::TerminalState;
 
@@ -564,6 +565,24 @@ fn handle_connection(
             ),
         );
     }
+    if response_version < 8
+        && matches!(
+            request.message,
+            Request::GetLauncher { .. }
+                | Request::CreateLauncher { .. }
+                | Request::RenameLauncher { .. }
+                | Request::RemoveLauncher { .. }
+        )
+    {
+        return send_response(
+            &mut stream,
+            response_version,
+            error_response(
+                ErrorCode::UnsupportedVersion,
+                "request requires daemon protocol 8",
+            ),
+        );
+    }
 
     if let Request::Attach {
         shell_id,
@@ -660,7 +679,41 @@ fn handle_connection(
         Ok(response) => response,
         Err(error) => error_response(error_code(&error), error.to_string()),
     };
-    send_response(&mut stream, response_version, response)
+    send_response(
+        &mut stream,
+        response_version,
+        response_for_version(response, response_version),
+    )
+}
+
+fn response_for_version(response: Response, version: u32) -> Response {
+    if version >= 8 {
+        return response;
+    }
+    match response {
+        Response::Events {
+            stream_id,
+            cursor,
+            snapshot,
+            mut events,
+        } => {
+            events.retain(|event| {
+                !matches!(
+                    event.kind,
+                    DaemonEventKind::LauncherCreated { .. }
+                        | DaemonEventKind::LauncherRenamed { .. }
+                        | DaemonEventKind::LauncherRemoved { .. }
+                )
+            });
+            Response::Events {
+                stream_id,
+                cursor,
+                snapshot,
+                events,
+            }
+        }
+        response => response,
+    }
 }
 
 fn send_response(stream: &mut UnixStream, version: u32, response: Response) -> io::Result<()> {
@@ -823,14 +876,18 @@ impl EventLog {
 struct RegistryState {
     workspaces: HashMap<String, Arc<Workspace>>,
     shells: HashMap<String, Arc<Shell>>,
+    launchers: HashMap<String, Arc<WorkspaceLauncher>>,
 }
 
 struct RegistryBackup {
     workspaces: HashMap<String, Arc<Workspace>>,
     shells: HashMap<String, Arc<Shell>>,
+    launchers: HashMap<String, Arc<WorkspaceLauncher>>,
     workspace_names: HashMap<String, String>,
     workspace_shell_ids: HashMap<String, Vec<String>>,
+    workspace_launcher_ids: HashMap<String, Vec<String>>,
     shell_names: HashMap<String, String>,
+    launcher_names: HashMap<String, String>,
 }
 
 impl Default for Registry {
@@ -852,6 +909,15 @@ struct Workspace {
     id: String,
     name: Mutex<String>,
     shell_ids: Mutex<Vec<String>>,
+    launcher_ids: Mutex<Vec<String>>,
+}
+
+struct WorkspaceLauncher {
+    id: String,
+    workspace_id: String,
+    name: Mutex<String>,
+    cwd: PathBuf,
+    command: Vec<String>,
 }
 
 struct Shell {
@@ -1360,6 +1426,9 @@ impl Registry {
             Request::GetShell { shell_id } => Ok(Response::Shell {
                 shell: self.shell(&shell_id)?.snapshot()?,
             }),
+            Request::GetLauncher { launcher_id } => Ok(Response::Launcher {
+                launcher: self.launcher(&launcher_id)?.snapshot()?,
+            }),
             Request::CreateWorkspace { name, shells } => self.durable_mutation(|| {
                 let workspace = self.create_workspace(name, shells)?;
                 let events = workspace_created_events(&workspace);
@@ -1388,6 +1457,15 @@ impl Registry {
                     name: shell.name.clone(),
                 });
                 Ok((Response::Shell { shell }, events))
+            }),
+            Request::CreateLauncher { workspace_id, spec } => self.durable_mutation(|| {
+                let launcher = self.create_launcher(&workspace_id, spec)?;
+                let event = DaemonEventKind::LauncherCreated {
+                    workspace_id,
+                    launcher_id: launcher.id.clone(),
+                    name: launcher.name.clone(),
+                };
+                Ok((Response::Launcher { launcher }, vec![event]))
             }),
             Request::ReadShell {
                 shell_id,
@@ -1446,6 +1524,18 @@ impl Registry {
                     }],
                 ))
             }),
+            Request::RenameLauncher { launcher_id, name } => self.durable_mutation(|| {
+                self.rename_launcher(&launcher_id, name.clone())?;
+                let launcher = self.launcher(&launcher_id)?;
+                Ok((
+                    Response::Ok,
+                    vec![DaemonEventKind::LauncherRenamed {
+                        workspace_id: launcher.workspace_id.clone(),
+                        launcher_id,
+                        name,
+                    }],
+                ))
+            }),
             Request::CloseWorkspace { workspace_id } => {
                 self.close_workspace(&workspace_id)?;
                 Ok(Response::Ok)
@@ -1454,6 +1544,16 @@ impl Registry {
                 self.close_shell(&shell_id)?;
                 Ok(Response::Ok)
             }
+            Request::RemoveLauncher { launcher_id } => self.durable_mutation(|| {
+                let launcher = self.remove_launcher(&launcher_id)?;
+                Ok((
+                    Response::Ok,
+                    vec![DaemonEventKind::LauncherRemoved {
+                        workspace_id: launcher.workspace_id.clone(),
+                        launcher_id,
+                    }],
+                ))
+            }),
             Request::Attach { .. } => unreachable!("attach is handled before dispatch"),
         }
     }
@@ -1609,10 +1709,41 @@ impl Registry {
                 shell_ids.push(shell.id.clone());
                 state.shells.insert(shell.id.clone(), shell);
             }
+            let mut launcher_names = HashSet::new();
+            let mut launcher_ids = Vec::with_capacity(saved_workspace.launchers.len());
+            for saved_launcher in saved_workspace.launchers {
+                validate_id("workspace launcher", &saved_launcher.id)?;
+                validate_persisted_name(&saved_launcher.name)?;
+                validate_persisted_cwd(&saved_launcher.cwd)?;
+                if validate_launcher_command(&saved_launcher.command).is_err() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "persisted workspace launcher command requires a non-empty executable",
+                    ));
+                }
+                if !launcher_names.insert(saved_launcher.name.clone())
+                    || state.launchers.contains_key(&saved_launcher.id)
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Boomux state contains a duplicate workspace launcher",
+                    ));
+                }
+                let launcher = Arc::new(WorkspaceLauncher {
+                    id: saved_launcher.id,
+                    workspace_id: saved_workspace.id.clone(),
+                    name: Mutex::new(saved_launcher.name),
+                    cwd: saved_launcher.cwd,
+                    command: saved_launcher.command,
+                });
+                launcher_ids.push(launcher.id.clone());
+                state.launchers.insert(launcher.id.clone(), launcher);
+            }
             let workspace = Arc::new(Workspace {
                 id: saved_workspace.id.clone(),
                 name: Mutex::new(saved_workspace.name),
                 shell_ids: Mutex::new(shell_ids),
+                launcher_ids: Mutex::new(launcher_ids),
             });
             state.workspaces.insert(saved_workspace.id, workspace);
         }
@@ -2007,20 +2138,30 @@ impl Registry {
         let state = lock(&self.state)?;
         let mut workspace_names = HashMap::new();
         let mut workspace_shell_ids = HashMap::new();
+        let mut workspace_launcher_ids = HashMap::new();
         for workspace in state.workspaces.values() {
             workspace_names.insert(workspace.id.clone(), lock(&workspace.name)?.clone());
             workspace_shell_ids.insert(workspace.id.clone(), lock(&workspace.shell_ids)?.clone());
+            workspace_launcher_ids
+                .insert(workspace.id.clone(), lock(&workspace.launcher_ids)?.clone());
         }
         let mut shell_names = HashMap::new();
         for shell in state.shells.values() {
             shell_names.insert(shell.id.clone(), lock(&shell.name)?.clone());
         }
+        let mut launcher_names = HashMap::new();
+        for launcher in state.launchers.values() {
+            launcher_names.insert(launcher.id.clone(), lock(&launcher.name)?.clone());
+        }
         Ok(RegistryBackup {
             workspaces: state.workspaces.clone(),
             shells: state.shells.clone(),
+            launchers: state.launchers.clone(),
             workspace_names,
             workspace_shell_ids,
+            workspace_launcher_ids,
             shell_names,
+            launcher_names,
         })
     }
 
@@ -2033,14 +2174,23 @@ impl Registry {
             if let Some(ids) = backup.workspace_shell_ids.get(&workspace.id) {
                 *lock(&workspace.shell_ids)? = ids.clone();
             }
+            if let Some(ids) = backup.workspace_launcher_ids.get(&workspace.id) {
+                *lock(&workspace.launcher_ids)? = ids.clone();
+            }
         }
         for shell in backup.shells.values() {
             if let Some(name) = backup.shell_names.get(&shell.id) {
                 *lock(&shell.name)? = name.clone();
             }
         }
+        for launcher in backup.launchers.values() {
+            if let Some(name) = backup.launcher_names.get(&launcher.id) {
+                *lock(&launcher.name)? = name.clone();
+            }
+        }
         state.workspaces = backup.workspaces;
         state.shells = backup.shells;
+        state.launchers = backup.launchers;
         Ok(())
     }
 
@@ -2072,10 +2222,24 @@ impl Registry {
                     last_run: lock(&shell.last_run)?.clone(),
                 });
             }
+            let ids = lock(&workspace.launcher_ids)?.clone();
+            let mut launchers = Vec::with_capacity(ids.len());
+            for id in ids {
+                let Some(launcher) = state.launchers.get(&id) else {
+                    continue;
+                };
+                launchers.push(PersistedWorkspaceLauncher {
+                    id: launcher.id.clone(),
+                    name: lock(&launcher.name)?.clone(),
+                    cwd: launcher.cwd.clone(),
+                    command: launcher.command.clone(),
+                });
+            }
             saved.workspaces.push(PersistedWorkspace {
                 id: workspace.id.clone(),
                 name: lock(&workspace.name)?.clone(),
                 shells,
+                launchers,
             });
         }
         drop(state);
@@ -2218,6 +2382,7 @@ impl Registry {
         let mut state = lock(&self.state)?;
         state.workspaces.clear();
         state.shells.clear();
+        state.launchers.clear();
         drop(state);
         drop(events);
         drop(transition);
@@ -2241,6 +2406,14 @@ impl Registry {
             .get(id)
             .cloned()
             .ok_or_else(|| not_found("shell", id))
+    }
+
+    fn launcher(&self, id: &str) -> io::Result<Arc<WorkspaceLauncher>> {
+        lock(&self.state)?
+            .launchers
+            .get(id)
+            .cloned()
+            .ok_or_else(|| not_found("workspace launcher", id))
     }
 
     fn contains_shell(&self, shell: &Arc<Shell>) -> io::Result<bool> {
@@ -2277,6 +2450,7 @@ impl Registry {
             id: workspace_id.clone(),
             name: Mutex::new(name),
             shell_ids: Mutex::new(shells.iter().map(|shell| shell.id.clone()).collect()),
+            launcher_ids: Mutex::new(Vec::new()),
         });
         {
             let mut state = lock(&self.state)?;
@@ -2353,6 +2527,92 @@ impl Registry {
                 Err(error) => return Err(error),
             }
         }
+    }
+
+    fn create_launcher(
+        &self,
+        workspace_id: &str,
+        spec: WorkspaceLauncherSpec,
+    ) -> io::Result<WorkspaceLauncherSnapshot> {
+        validate_name(&spec.name)?;
+        validate_cwd(&spec.cwd)?;
+        validate_launcher_command(&spec.command)?;
+        let workspace = self.workspace(workspace_id)?;
+        let launcher = Arc::new(WorkspaceLauncher {
+            id: Uuid::new_v4().to_string(),
+            workspace_id: workspace_id.into(),
+            name: Mutex::new(spec.name),
+            cwd: spec.cwd,
+            command: spec.command,
+        });
+        let snapshot = launcher.snapshot()?;
+        let mut state = lock(&self.state)?;
+        let Some(current) = state.workspaces.get(workspace_id) else {
+            return Err(not_found("workspace", workspace_id));
+        };
+        if !Arc::ptr_eq(current, &workspace) {
+            return Err(not_found("workspace", workspace_id));
+        }
+        let mut launcher_ids = lock(&workspace.launcher_ids)?;
+        if launcher_ids.iter().any(|id| {
+            state
+                .launchers
+                .get(id)
+                .and_then(|existing| existing.name.lock().ok())
+                .is_some_and(|name| *name == snapshot.name)
+        }) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("workspace launcher name already exists: {}", snapshot.name),
+            ));
+        }
+        state
+            .launchers
+            .insert(launcher.id.clone(), Arc::clone(&launcher));
+        launcher_ids.push(launcher.id.clone());
+        Ok(snapshot)
+    }
+
+    fn rename_launcher(&self, launcher_id: &str, name: String) -> io::Result<()> {
+        validate_name(&name)?;
+        let launcher = self.launcher(launcher_id)?;
+        let workspace = self.workspace(&launcher.workspace_id)?;
+        let state = lock(&self.state)?;
+        let launcher_ids = lock(&workspace.launcher_ids)?;
+        if launcher_ids
+            .iter()
+            .filter(|id| id.as_str() != launcher_id)
+            .any(|id| {
+                state
+                    .launchers
+                    .get(id)
+                    .and_then(|existing| existing.name.lock().ok())
+                    .is_some_and(|existing| *existing == name)
+            })
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("workspace launcher name already exists: {name}"),
+            ));
+        }
+        *lock(&launcher.name)? = name;
+        Ok(())
+    }
+
+    fn remove_launcher(&self, launcher_id: &str) -> io::Result<Arc<WorkspaceLauncher>> {
+        let (launcher, workspace) = {
+            let mut state = lock(&self.state)?;
+            let launcher = state
+                .launchers
+                .remove(launcher_id)
+                .ok_or_else(|| not_found("workspace launcher", launcher_id))?;
+            let workspace = state.workspaces.get(&launcher.workspace_id).cloned();
+            (launcher, workspace)
+        };
+        if let Some(workspace) = workspace {
+            lock(&workspace.launcher_ids)?.retain(|id| id != launcher_id);
+        }
+        Ok(launcher)
     }
 
     fn next_workspace_name(&self) -> io::Result<String> {
@@ -2588,6 +2848,9 @@ impl Registry {
                 .workspaces
                 .remove(workspace_id)
                 .ok_or_else(|| not_found("workspace", workspace_id))?;
+            for id in lock(&workspace.launcher_ids)?.iter() {
+                state.launchers.remove(id);
+            }
             let ids = lock(&workspace.shell_ids)?.clone();
             ids.into_iter()
                 .filter_map(|id| state.shells.remove(&id))
@@ -2716,21 +2979,45 @@ impl Registry {
 
 impl Workspace {
     fn snapshot(&self, registry: &Registry) -> io::Result<WorkspaceSnapshot> {
-        let shells = {
+        let (shells, launchers) = {
             let state = lock(&registry.state)?;
-            let ids = lock(&self.shell_ids)?;
-            ids.iter()
+            let shell_ids = lock(&self.shell_ids)?;
+            let shells = shell_ids
+                .iter()
                 .filter_map(|id| state.shells.get(id).cloned())
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            let launcher_ids = lock(&self.launcher_ids)?;
+            let launchers = launcher_ids
+                .iter()
+                .filter_map(|id| state.launchers.get(id).cloned())
+                .collect::<Vec<_>>();
+            (shells, launchers)
         };
         let shells = shells
             .iter()
             .map(|shell| shell.snapshot())
             .collect::<io::Result<_>>()?;
+        let launchers = launchers
+            .iter()
+            .map(|launcher| launcher.snapshot())
+            .collect::<io::Result<_>>()?;
         Ok(WorkspaceSnapshot {
             id: self.id.clone(),
             name: lock(&self.name)?.clone(),
             shells,
+            launchers,
+        })
+    }
+}
+
+impl WorkspaceLauncher {
+    fn snapshot(&self) -> io::Result<WorkspaceLauncherSnapshot> {
+        Ok(WorkspaceLauncherSnapshot {
+            id: self.id.clone(),
+            workspace_id: self.workspace_id.clone(),
+            name: lock(&self.name)?.clone(),
+            command: self.command.clone(),
+            cwd: self.cwd.clone(),
         })
     }
 }
@@ -3812,6 +4099,20 @@ fn validate_shell_specs(specs: &[ShellSpec]) -> io::Result<()> {
     Ok(())
 }
 
+fn validate_launcher_command(command: &[String]) -> io::Result<()> {
+    if command
+        .first()
+        .is_some_and(|executable| !executable.is_empty())
+    {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "workspace launcher command requires a non-empty executable",
+        ))
+    }
+}
+
 fn validate_cwd(cwd: &Path) -> io::Result<()> {
     if cwd.is_absolute() && cwd.is_dir() {
         Ok(())
@@ -4064,6 +4365,103 @@ mod tests {
                 .skip(1)
                 .all(|event| matches!(event.kind, DaemonEventKind::ShellCreated { .. }))
         );
+    }
+
+    #[test]
+    fn launcher_mutations_are_coordinated_and_names_are_unique_per_workspace() {
+        let registry = Registry::default();
+        let Response::Workspace { workspace } = registry
+            .dispatch(Request::CreateWorkspace {
+                name: "launchers".into(),
+                shells: Vec::new(),
+            })
+            .unwrap()
+        else {
+            panic!("expected workspace");
+        };
+        let spec = WorkspaceLauncherSpec {
+            name: "editor".into(),
+            command: vec!["zeditor".into(), ".".into()],
+            cwd: env::temp_dir(),
+        };
+        let Response::Launcher { launcher } = registry
+            .dispatch(Request::CreateLauncher {
+                workspace_id: workspace.id.clone(),
+                spec: spec.clone(),
+            })
+            .unwrap()
+        else {
+            panic!("expected launcher");
+        };
+        assert!(
+            registry
+                .dispatch(Request::CreateLauncher {
+                    workspace_id: workspace.id.clone(),
+                    spec,
+                })
+                .is_err()
+        );
+        let snapshot = registry
+            .workspace(&workspace.id)
+            .unwrap()
+            .snapshot(&registry)
+            .unwrap();
+        assert_eq!(snapshot.launchers, vec![launcher]);
+        assert_eq!(
+            lock(&registry.events.state)
+                .unwrap()
+                .events
+                .iter()
+                .filter(|event| matches!(event.kind, DaemonEventKind::LauncherCreated { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn protocol_seven_event_pages_hide_launcher_events() {
+        let cursor = EventCursor {
+            stream_id: "stream".into(),
+            event_id: 2,
+        };
+        let response = Response::Events {
+            stream_id: "stream".into(),
+            cursor: cursor.clone(),
+            snapshot: None,
+            events: vec![
+                DaemonEvent {
+                    id: 1,
+                    at_ms: 1,
+                    kind: DaemonEventKind::LauncherCreated {
+                        workspace_id: "workspace".into(),
+                        launcher_id: "launcher".into(),
+                        name: "editor".into(),
+                    },
+                },
+                DaemonEvent {
+                    id: 2,
+                    at_ms: 2,
+                    kind: DaemonEventKind::WorkspaceRenamed {
+                        workspace_id: "workspace".into(),
+                        name: "renamed".into(),
+                    },
+                },
+            ],
+        };
+        let Response::Events {
+            cursor: filtered_cursor,
+            events,
+            ..
+        } = response_for_version(response, 7)
+        else {
+            panic!("expected events");
+        };
+        assert_eq!(filtered_cursor, cursor);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events[0].kind,
+            DaemonEventKind::WorkspaceRenamed { .. }
+        ));
     }
 
     #[test]

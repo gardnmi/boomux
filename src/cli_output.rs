@@ -4,7 +4,9 @@ use std::io;
 use serde::Serialize;
 
 use boomux::client::RemoteError;
-use boomux::protocol::{ErrorCode, ShellRunExitReason, ShellSnapshot, ShellStatus};
+use boomux::protocol::{
+    ErrorCode, ShellRunExitReason, ShellSnapshot, ShellStatus, WorkspaceLauncherSnapshot,
+};
 
 pub(crate) const SCHEMA: &str = "boomux.cli/v1";
 
@@ -71,6 +73,17 @@ pub(crate) struct WorkspaceSummary {
     pub(crate) id: String,
     pub(crate) name: String,
     pub(crate) shell_count: usize,
+    pub(crate) launcher_count: usize,
+}
+
+#[derive(Serialize)]
+pub(crate) struct LauncherData {
+    pub(crate) id: String,
+    pub(crate) workspace_id: String,
+    pub(crate) workspace_name: Option<String>,
+    pub(crate) name: String,
+    pub(crate) cwd: String,
+    pub(crate) command: Vec<String>,
 }
 
 pub(crate) fn print<T: Serialize>(command: &str, data: T) -> Result<(), Box<dyn Error>> {
@@ -145,6 +158,20 @@ pub(crate) fn shell(shell: &ShellSnapshot, workspace_name: Option<&str>) -> Shel
                 environment_has_run_id: run.environment_has_run_id,
             }
         }),
+    }
+}
+
+pub(crate) fn launcher(
+    launcher: &WorkspaceLauncherSnapshot,
+    workspace_name: Option<&str>,
+) -> LauncherData {
+    LauncherData {
+        id: launcher.id.clone(),
+        workspace_id: launcher.workspace_id.clone(),
+        workspace_name: workspace_name.map(str::to_owned),
+        name: launcher.name.clone(),
+        cwd: launcher.cwd.display().to_string(),
+        command: launcher.command.clone(),
     }
 }
 

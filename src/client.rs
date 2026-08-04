@@ -14,7 +14,8 @@ use std::time::Duration;
 
 use crate::protocol::{
     self, DaemonEvent, Envelope, ErrorCode, EventCursor, Request, Response, ShellSnapshot,
-    ShellSpec, ShellStatus, Snapshot, TerminalProfile, WorkspaceSnapshot,
+    ShellSpec, ShellStatus, Snapshot, TerminalProfile, WorkspaceLauncherSnapshot,
+    WorkspaceLauncherSpec, WorkspaceSnapshot,
 };
 
 const CONNECT_ATTEMPTS: usize = 40;
@@ -177,23 +178,29 @@ impl Client {
     fn send(&self, request: Request) -> io::Result<(UnixStream, Response)> {
         let mut version = self.protocol_version.load(Ordering::Acquire);
         if version < request_minimum_version(&request) {
-            if !self.probe_latest()? {
+            self.probe_latest()?;
+            version = self.protocol_version.load(Ordering::Acquire);
+            if version < request_minimum_version(&request) {
                 return Err(remote_error(
                     ErrorCode::UnsupportedVersion,
                     "daemon does not support this request",
                 ));
             }
-            version = self.protocol_version.load(Ordering::Acquire);
         }
         match self.send_with_version(request.clone(), version) {
             Err(error)
                 if version > protocol::MIN_PROTOCOL_VERSION
-                    && request_minimum_version(&request) <= protocol::MIN_PROTOCOL_VERSION
                     && remote_code(&error) == Some(ErrorCode::UnsupportedVersion) =>
             {
-                self.protocol_version
-                    .store(protocol::MIN_PROTOCOL_VERSION, Ordering::Release);
-                self.send_with_version(request, protocol::MIN_PROTOCOL_VERSION)
+                self.probe_latest()?;
+                let negotiated = self.protocol_version.load(Ordering::Acquire);
+                if negotiated < request_minimum_version(&request) {
+                    return Err(remote_error(
+                        ErrorCode::UnsupportedVersion,
+                        "daemon does not support this request",
+                    ));
+                }
+                self.send_with_version(request, negotiated)
             }
             result => result,
         }
@@ -230,20 +237,21 @@ impl Client {
     }
 
     fn probe_latest(&self) -> io::Result<bool> {
-        match self.send_with_version(Request::Ping, protocol::PROTOCOL_VERSION) {
-            Ok((_, Response::Pong)) => {
-                self.protocol_version
-                    .store(protocol::PROTOCOL_VERSION, Ordering::Release);
-                Ok(true)
+        for version in (protocol::MIN_PROTOCOL_VERSION..=protocol::PROTOCOL_VERSION).rev() {
+            match self.send_with_version(Request::Ping, version) {
+                Ok((_, Response::Pong)) => {
+                    self.protocol_version.store(version, Ordering::Release);
+                    return Ok(version == protocol::PROTOCOL_VERSION);
+                }
+                Ok((_, response)) => return unexpected(response),
+                Err(error) if remote_code(&error) == Some(ErrorCode::UnsupportedVersion) => {}
+                Err(error) => return Err(error),
             }
-            Ok((_, response)) => unexpected(response),
-            Err(error) if remote_code(&error) == Some(ErrorCode::UnsupportedVersion) => {
-                self.protocol_version
-                    .store(protocol::MIN_PROTOCOL_VERSION, Ordering::Release);
-                Ok(false)
-            }
-            Err(error) => Err(error),
         }
+        Err(remote_error(
+            ErrorCode::UnsupportedVersion,
+            "daemon has no compatible protocol version",
+        ))
     }
 
     pub fn ping(&self) -> io::Result<()> {
@@ -302,6 +310,18 @@ impl Client {
         }
     }
 
+    pub fn get_launcher(
+        &self,
+        launcher_id: impl Into<String>,
+    ) -> io::Result<WorkspaceLauncherSnapshot> {
+        match self.request(Request::GetLauncher {
+            launcher_id: launcher_id.into(),
+        })? {
+            Response::Launcher { launcher } => Ok(launcher),
+            other => unexpected(other),
+        }
+    }
+
     pub fn create_workspace(
         &self,
         name: impl Into<String>,
@@ -336,6 +356,20 @@ impl Client {
             shell,
         })? {
             Response::Shell { shell } => Ok(shell),
+            other => unexpected(other),
+        }
+    }
+
+    pub fn create_launcher(
+        &self,
+        workspace_id: impl Into<String>,
+        spec: WorkspaceLauncherSpec,
+    ) -> io::Result<WorkspaceLauncherSnapshot> {
+        match self.request(Request::CreateLauncher {
+            workspace_id: workspace_id.into(),
+            spec,
+        })? {
+            Response::Launcher { launcher } => Ok(launcher),
             other => unexpected(other),
         }
     }
@@ -436,6 +470,29 @@ impl Client {
         )
     }
 
+    pub fn rename_launcher(
+        &self,
+        launcher_id: impl Into<String>,
+        name: impl Into<String>,
+    ) -> io::Result<()> {
+        expect_ok(
+            self.request(Request::RenameLauncher {
+                launcher_id: launcher_id.into(),
+                name: name.into(),
+            })?,
+            Response::Ok,
+        )
+    }
+
+    pub fn remove_launcher(&self, launcher_id: impl Into<String>) -> io::Result<()> {
+        expect_ok(
+            self.request(Request::RemoveLauncher {
+                launcher_id: launcher_id.into(),
+            })?,
+            Response::Ok,
+        )
+    }
+
     pub fn close_workspace(&self, workspace_id: impl Into<String>) -> io::Result<()> {
         expect_ok(
             self.request(Request::CloseWorkspace {
@@ -483,6 +540,10 @@ impl Client {
 
 fn request_minimum_version(request: &Request) -> u32 {
     match request {
+        Request::GetLauncher { .. }
+        | Request::CreateLauncher { .. }
+        | Request::RenameLauncher { .. }
+        | Request::RemoveLauncher { .. } => 8,
         Request::ReadShellAt { .. } | Request::Events { .. } => 7,
         _ => protocol::MIN_PROTOCOL_VERSION,
     }
@@ -554,4 +615,120 @@ fn unexpected<T>(response: Response) -> io::Result<T> {
         io::ErrorKind::InvalidData,
         format!("unexpected daemon response: {response:?}"),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::os::unix::net::UnixListener;
+
+    use uuid::Uuid;
+
+    #[test]
+    fn launcher_requests_require_protocol_eight() {
+        let requests = [
+            Request::GetLauncher {
+                launcher_id: "l1".into(),
+            },
+            Request::CreateLauncher {
+                workspace_id: "w1".into(),
+                spec: WorkspaceLauncherSpec {
+                    name: "editor".into(),
+                    command: vec!["editor".into()],
+                    cwd: "/tmp".into(),
+                },
+            },
+            Request::RenameLauncher {
+                launcher_id: "l1".into(),
+                name: "renamed".into(),
+            },
+            Request::RemoveLauncher {
+                launcher_id: "l1".into(),
+            },
+        ];
+
+        for request in requests {
+            assert_eq!(request_minimum_version(&request), 8);
+        }
+    }
+
+    #[test]
+    fn negotiates_protocol_seven_without_losing_version_seven_requests() {
+        let directory = env::temp_dir().join(format!("boomux-client-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let socket = directory.join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+            assert_eq!(request.version, 8);
+            assert!(matches!(request.message, Request::Ping));
+            protocol::write_message(
+                &mut stream,
+                &Envelope::with_version(
+                    7,
+                    Response::Error {
+                        message: "expected protocol 7".into(),
+                        code: Some(ErrorCode::UnsupportedVersion),
+                    },
+                ),
+            )
+            .unwrap();
+
+            let (mut stream, _) = listener.accept().unwrap();
+            let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+            assert_eq!(request.version, 7);
+            assert!(matches!(request.message, Request::Ping));
+            protocol::write_message(&mut stream, &Envelope::with_version(7, Response::Pong))
+                .unwrap();
+
+            let (mut stream, _) = listener.accept().unwrap();
+            let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+            assert_eq!(request.version, 7);
+            assert!(matches!(request.message, Request::Events { .. }));
+            protocol::write_message(
+                &mut stream,
+                &Envelope::with_version(
+                    7,
+                    Response::Events {
+                        stream_id: "stream".into(),
+                        cursor: EventCursor {
+                            stream_id: "stream".into(),
+                            event_id: 0,
+                        },
+                        snapshot: None,
+                        events: Vec::new(),
+                    },
+                ),
+            )
+            .unwrap();
+
+            let (mut stream, _) = listener.accept().unwrap();
+            let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+            assert_eq!(request.version, 7);
+            assert!(matches!(request.message, Request::ReadShellAt { .. }));
+            protocol::write_message(
+                &mut stream,
+                &Envelope::with_version(
+                    7,
+                    Response::OutputState {
+                        bytes: Vec::new(),
+                        run_id: None,
+                        output_revision: None,
+                        changed: true,
+                        status: ShellStatus::Pending,
+                    },
+                ),
+            )
+            .unwrap();
+        });
+
+        let client = Client::from_socket_path(socket);
+        assert_eq!(client.protocol_version().unwrap(), 7);
+        assert!(client.events(None, 1, 0).is_ok());
+        assert!(client.read_shell_at("shell", 1, None, None, 0).is_ok());
+        server.join().unwrap();
+        fs::remove_dir_all(directory).unwrap();
+    }
 }

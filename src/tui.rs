@@ -26,6 +26,7 @@ pub(crate) struct WorkspaceView {
     pub(crate) id: String,
     pub(crate) name: String,
     pub(crate) terminals: Vec<TerminalView>,
+    pub(crate) launcher_count: usize,
 }
 
 #[derive(Clone)]
@@ -133,6 +134,7 @@ struct PendingClose {
     target: CloseTarget,
     name: String,
     shell_count: usize,
+    launcher_count: usize,
 }
 
 impl ProjectPicker {
@@ -449,11 +451,13 @@ impl App {
                 target: CloseTarget::Workspace(workspace.id.clone()),
                 name: workspace.name.clone(),
                 shell_count: workspace.terminals.len(),
+                launcher_count: workspace.launcher_count,
             }),
             Focus::Terminals => self.selected_terminal().map(|terminal| PendingClose {
                 target: CloseTarget::Shell(terminal.id.clone()),
                 name: terminal.name.clone(),
                 shell_count: 1,
+                launcher_count: 0,
             }),
         };
     }
@@ -730,9 +734,9 @@ fn render(frame: &mut Frame, app: &mut App) {
     .areas(area);
 
     render_header(frame, header_area, app);
-    if dashboard_area.width >= 108 {
+    if dashboard_area.width >= 114 {
         let [workspace_area, terminal_area] =
-            Layout::horizontal([Constraint::Length(28), Constraint::Fill(1)]).areas(dashboard_area);
+            Layout::horizontal([Constraint::Length(34), Constraint::Fill(1)]).areas(dashboard_area);
         render_workspaces(frame, workspace_area, app);
         render_terminals(frame, terminal_area, app);
     } else {
@@ -853,6 +857,11 @@ fn render_header(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
         .iter()
         .map(|workspace| workspace.terminals.len())
         .sum();
+    let launcher_count: usize = app
+        .workspaces
+        .iter()
+        .map(|workspace| workspace.launcher_count)
+        .sum();
     let line = Line::from(vec![
         Span::styled(
             " BOOMUX ",
@@ -864,6 +873,11 @@ fn render_header(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
         ),
         Span::styled("  |  ", Style::new().fg(OVERLAY)),
         Span::styled(format!("{shell_count} shells"), Style::new().fg(BLUE)),
+        Span::styled("  |  ", Style::new().fg(OVERLAY)),
+        Span::styled(
+            format!("{launcher_count} launchers"),
+            Style::new().fg(YELLOW),
+        ),
         Span::styled(
             "    tab/h/l/arrows switches panes",
             Style::new().fg(SUBTEXT),
@@ -877,28 +891,37 @@ fn render_workspaces(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut A
         Row::new([
             Cell::from(workspace.name.as_str()),
             Cell::from(workspace.terminals.len().to_string()),
+            Cell::from(workspace.launcher_count.to_string()),
         ])
     });
-    let table = Table::new(rows, [Constraint::Min(12), Constraint::Length(6)])
-        .header(
-            Row::new(["NAME", "SHELLS"]).style(Style::new().fg(BLUE).add_modifier(Modifier::BOLD)),
-        )
-        .column_spacing(1)
-        .block(
-            Block::bordered()
-                .title(format!(" Workspaces ({}) ", app.workspaces.len()))
-                .border_style(Style::new().fg(if app.focus == Focus::Workspaces {
-                    TEAL
-                } else {
-                    OVERLAY
-                })),
-        )
-        .row_highlight_style(
-            Style::new()
-                .fg(TEXT)
-                .add_modifier(Modifier::BOLD | Modifier::REVERSED),
-        )
-        .highlight_symbol("> ");
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Min(8),
+            Constraint::Length(6),
+            Constraint::Length(9),
+        ],
+    )
+    .header(
+        Row::new(["NAME", "SHELLS", "LAUNCHERS"])
+            .style(Style::new().fg(BLUE).add_modifier(Modifier::BOLD)),
+    )
+    .column_spacing(1)
+    .block(
+        Block::bordered()
+            .title(format!(" Workspaces ({}) ", app.workspaces.len()))
+            .border_style(Style::new().fg(if app.focus == Focus::Workspaces {
+                TEAL
+            } else {
+                OVERLAY
+            })),
+    )
+    .row_highlight_style(
+        Style::new()
+            .fg(TEXT)
+            .add_modifier(Modifier::BOLD | Modifier::REVERSED),
+    )
+    .highlight_symbol("> ");
 
     frame.render_stateful_widget(table, area, &mut app.workspace_state);
 }
@@ -1008,8 +1031,8 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     let line = if let Some(pending) = &app.pending_close {
         let prompt = match pending.target {
             CloseTarget::Workspace(_) => format!(
-                " Close workspace '{}' and terminate {} shell(s)?  ",
-                pending.name, pending.shell_count
+                " Close workspace '{}', terminate {} shell(s), and remove {} launcher(s)?  ",
+                pending.name, pending.shell_count, pending.launcher_count
             ),
             CloseTarget::Shell(_) => {
                 format!(
@@ -1150,6 +1173,7 @@ mod tests {
                 directory: "/tmp/boomux".into(),
                 branch: "main".into(),
             }],
+            launcher_count: 0,
         }
     }
 

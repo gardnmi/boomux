@@ -1,10 +1,10 @@
 ---
 name: boomux
-description: Inspect and manage Boomux persistent terminal workspaces and shells. Use when asked to discover shells, read terminal output, create or open workspaces and shells, inspect status, rename or close targets, or manage the Boomux daemon.
+description: Inspect and manage Boomux persistent terminal workspaces, launchers, and shells. Use when asked to discover shells, read terminal output, create or open workspaces and shells, configure desktop application launchers, inspect status, rename or close targets, or manage the Boomux daemon.
 compatibility: Requires boomux on PATH. Some shell-name operations require Boomux workspace context or an explicit --workspace.
 metadata:
   author: boomux
-  version: "2"
+  version: "3"
 ---
 
 # Boomux
@@ -114,6 +114,7 @@ when `BOOMUX_SHELL_ID` is set. `boomux doctor` can run in either context.
 ```console
 boomux workspace list
 boomux workspace create "<name>"
+boomux workspace open "<name-or-id>"
 boomux workspace inspect "<name-or-id>"
 boomux workspace rename "<name-or-id>" "<new-name>"
 boomux workspace close "<name-or-id>"
@@ -122,6 +123,28 @@ boomux workspace close "<name-or-id>"
 `workspace create` creates an empty workspace. `workspace close` removes the
 workspace and terminates all of its running shell sessions. A workspace cannot
 close itself from one of its own shells.
+
+`workspace open` invokes every configured workspace launcher in creation order,
+then opens all shell terminal windows with takeover. It also supports a
+launcher-only workspace. Merely selecting a dashboard row does not invoke
+launchers.
+
+## Manage Workspace Launchers
+
+```console
+boomux launcher list --workspace "<workspace-name-or-id>"
+boomux launcher create "<name>" --workspace "<workspace-name-or-id>" --cwd "/path" -- command arg
+boomux launcher inspect "<name-or-id>" --workspace "<workspace-name-or-id>"
+boomux launcher rename "<name-or-id>" "<new-name>" --workspace "<workspace-name-or-id>"
+boomux launcher remove "<name-or-id>" --workspace "<workspace-name-or-id>"
+```
+
+Launchers are durable ordered definitions, but each invocation is a detached,
+ephemeral process without a PTY or retained output. Commands are exact argument
+vectors; use an explicit shell for pipelines or expansion. `--cwd` defaults to
+the current directory. Removing a launcher does not terminate applications from
+earlier invocations. Exact launcher IDs resolve globally; names require current
+workspace context or `--workspace`.
 
 ## Manage Shells
 
@@ -194,6 +217,10 @@ BOOMUX_SHELL_ID
 BOOMUX_SHELL_NAME
 BOOMUX_RUN_ID
 ```
+
+Detached launcher invocations inherit the invoking client's environment and
+receive `BOOMUX_WORKSPACE_ID`, `BOOMUX_WORKSPACE`, `BOOMUX_LAUNCHER_ID`, and
+`BOOMUX_LAUNCHER_NAME`. Shell and run context variables are removed.
 
 `BOOMUX_RUN_ID` identifies the current process incarnation. It remains stable
 across attachment changes and graceful daemon handoff, but changes when the same

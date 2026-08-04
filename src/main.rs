@@ -3,15 +3,18 @@ use std::error::Error;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::{self, Write};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::{Command, ExitCode, Stdio};
+use std::thread;
 
 use clap::error::ErrorKind as ClapErrorKind;
 use clap::{Parser, Subcommand};
 use uuid::Uuid;
 
 use boomux::protocol::{
-    EventCursor, ShellSnapshot, ShellSpec, ShellStatus, Snapshot, WorkspaceSnapshot,
+    EventCursor, ShellSnapshot, ShellSpec, ShellStatus, Snapshot, WorkspaceLauncherSnapshot,
+    WorkspaceLauncherSpec, WorkspaceSnapshot,
 };
 use boomux::{attach, client, daemon, protocol};
 
@@ -146,6 +149,11 @@ enum Commands {
         #[command(subcommand)]
         command: ShellCommands,
     },
+    /// Manage workspace launchers
+    Launcher {
+        #[command(subcommand)]
+        command: LauncherCommands,
+    },
     /// Manage the vendor-neutral Boomux Agent Skill
     Skill {
         #[command(subcommand)]
@@ -181,12 +189,52 @@ enum WorkspaceCommands {
     List,
     /// Create an empty workspace
     Create { name: String },
+    /// Open terminal windows and invoke launchers
+    Open { target: String },
     /// Show a workspace and its shells
     Inspect { target: String },
     /// Rename a workspace
     Rename { target: String, name: String },
     /// Close a workspace and all of its shells
     Close { target: String },
+}
+
+#[derive(Subcommand)]
+enum LauncherCommands {
+    /// List launchers in a workspace
+    List {
+        #[arg(long, value_name = "NAME_OR_ID")]
+        workspace: String,
+    },
+    /// Create a launcher in a workspace
+    Create {
+        name: String,
+        #[arg(long, value_name = "NAME_OR_ID")]
+        workspace: String,
+        #[arg(long, default_value = ".")]
+        cwd: PathBuf,
+        #[arg(last = true, num_args = 1.., required = true, value_name = "COMMAND")]
+        command: Vec<String>,
+    },
+    /// Show launcher details
+    Inspect {
+        target: String,
+        #[arg(long, value_name = "NAME_OR_ID")]
+        workspace: Option<String>,
+    },
+    /// Rename a launcher
+    Rename {
+        target: String,
+        name: String,
+        #[arg(long, value_name = "NAME_OR_ID")]
+        workspace: Option<String>,
+    },
+    /// Remove a launcher without affecting previously launched applications
+    Remove {
+        target: String,
+        #[arg(long, value_name = "NAME_OR_ID")]
+        workspace: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -357,8 +405,11 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             wait_ms,
         }) => read_events(after.as_deref(), limit, wait_ms, cli.json),
         Some(Commands::Close { target }) => close_shell(&target),
-        Some(Commands::Workspace { command }) => workspace_command(command, cli.json),
+        Some(Commands::Workspace { command }) => {
+            workspace_command(command, cli.json, cli.terminal.as_deref())
+        }
         Some(Commands::Shell { command }) => shell_command(command, cli.json),
+        Some(Commands::Launcher { command }) => launcher_command(command, cli.json),
         Some(Commands::Skill {
             command: SkillCommands::Install { force },
         }) => install_skill(force),
@@ -393,11 +444,18 @@ fn command_name(cli: &Cli) -> &'static str {
         Some(Commands::Shell {
             command: ShellCommands::Inspect { .. },
         }) => "shell.inspect",
+        Some(Commands::Launcher {
+            command: LauncherCommands::List { .. },
+        }) => "launcher.list",
+        Some(Commands::Launcher {
+            command: LauncherCommands::Inspect { .. },
+        }) => "launcher.inspect",
         Some(Commands::Daemon {
             command: DaemonCommands::Status,
         }) => "daemon.status",
         Some(Commands::Workspace { .. }) => "workspace",
         Some(Commands::Shell { .. }) => "shell",
+        Some(Commands::Launcher { .. }) => "launcher",
         Some(Commands::Daemon { .. }) => "daemon",
         Some(Commands::Ui) | None => "ui",
         Some(Commands::Doctor) => "doctor",
@@ -422,6 +480,8 @@ fn supports_json(cli: &Cli) -> bool {
             command: WorkspaceCommands::List | WorkspaceCommands::Inspect { .. }
         }) | Some(Commands::Shell {
             command: ShellCommands::Inspect { .. }
+        }) | Some(Commands::Launcher {
+            command: LauncherCommands::List { .. } | LauncherCommands::Inspect { .. }
         }) | Some(Commands::Daemon {
             command: DaemonCommands::Status
         })
@@ -507,10 +567,14 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
                 let workspace = client
                     .get_workspace(workspace_id)
                     .map_err(|error| error.to_string())?;
-                let count = workspace.shells.len();
                 open_workspace(&workspace, terminal.as_deref())
                     .map_err(|error| error.to_string())?;
-                Ok(format!("Restored {count} shell(s) for {}", workspace.name))
+                Ok(format!(
+                    "Opened {} launcher(s) and {} shell(s) for {}",
+                    workspace.launchers.len(),
+                    workspace.shells.len(),
+                    workspace.name
+                ))
             },
             on_open: |shell_id: &str| {
                 open_dashboard_shell(&client, shell_id, terminal.as_deref())
@@ -525,7 +589,9 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
                     client
                         .close_workspace(workspace_id)
                         .map_err(|error| error.to_string())?;
-                    Ok(format!("Closed {name} and all of its shells"))
+                    Ok(format!(
+                        "Closed {name}, its launchers, and all of its shells"
+                    ))
                 }
                 tui::CloseTarget::Shell(shell_id) => {
                     let name = client
@@ -593,6 +659,7 @@ fn dashboard_views(
                 id: workspace.id.clone(),
                 name: workspace.name.clone(),
                 terminals,
+                launcher_count: workspace.launchers.len(),
             }
         })
         .collect()
@@ -767,6 +834,8 @@ fn capabilities(json: bool) -> Result<(), Box<dyn Error>> {
         "workspace.list",
         "workspace.inspect",
         "shell.inspect",
+        "launcher.list",
+        "launcher.inspect",
         "daemon.status",
     ];
     let features = [
@@ -778,6 +847,7 @@ fn capabilities(json: bool) -> Result<(), Box<dyn Error>> {
         "daemon_events",
         "reconnectable_event_cursors",
         "revision_aware_reads",
+        "workspace_launchers",
     ];
     let error_codes = [
         "invalid_argument",
@@ -851,7 +921,11 @@ fn list_shells(json: bool) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn workspace_command(command: WorkspaceCommands, json: bool) -> Result<(), Box<dyn Error>> {
+fn workspace_command(
+    command: WorkspaceCommands,
+    json: bool,
+    terminal_override: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
     let client = client::connect_or_start()?;
     match command {
         WorkspaceCommands::List => {
@@ -863,6 +937,7 @@ fn workspace_command(command: WorkspaceCommands, json: bool) -> Result<(), Box<d
                         id: workspace.id.clone(),
                         name: workspace.name.clone(),
                         shell_count: workspace.shells.len(),
+                        launcher_count: workspace.launchers.len(),
                     })
                     .collect::<Vec<_>>();
                 return cli_output::print(
@@ -870,13 +945,14 @@ fn workspace_command(command: WorkspaceCommands, json: bool) -> Result<(), Box<d
                     serde_json::json!({ "workspaces": workspaces }),
                 );
             }
-            println!("NAME\tWORKSPACE ID\tSHELLS");
+            println!("NAME\tWORKSPACE ID\tSHELLS\tLAUNCHERS");
             for workspace in workspaces {
                 println!(
-                    "{}\t{}\t{}",
+                    "{}\t{}\t{}\t{}",
                     workspace.name,
                     workspace.id,
-                    workspace.shells.len()
+                    workspace.shells.len(),
+                    workspace.launchers.len()
                 );
             }
         }
@@ -884,6 +960,18 @@ fn workspace_command(command: WorkspaceCommands, json: bool) -> Result<(), Box<d
             let name = cli_name(name, "workspace")?;
             let workspace = client.create_workspace(name, Vec::new())?;
             println!("Created workspace {} ({})", workspace.name, workspace.id);
+        }
+        WorkspaceCommands::Open { target } => {
+            let snapshot = client.snapshot()?;
+            let workspace = resolve_workspace_target(&snapshot.workspaces, &target)?;
+            let terminal = effective_terminal(terminal_override)?;
+            open_workspace(workspace, terminal.as_deref())?;
+            println!(
+                "Opened {} launcher(s) and {} shell(s) for {}",
+                workspace.launchers.len(),
+                workspace.shells.len(),
+                workspace.name
+            );
         }
         WorkspaceCommands::Inspect { target } => {
             let snapshot = client.snapshot()?;
@@ -901,6 +989,9 @@ fn workspace_command(command: WorkspaceCommands, json: bool) -> Result<(), Box<d
                             "id": workspace.id,
                             "name": workspace.name,
                             "shells": shells,
+                            "launchers": workspace.launchers.iter()
+                                .map(|launcher| cli_output::launcher(launcher, Some(&workspace.name)))
+                                .collect::<Vec<_>>(),
                         }
                     }),
                 );
@@ -908,6 +999,7 @@ fn workspace_command(command: WorkspaceCommands, json: bool) -> Result<(), Box<d
             println!("ID\t{}", workspace.id);
             println!("NAME\t{}", workspace.name);
             println!("SHELLS\t{}", workspace.shells.len());
+            println!("LAUNCHERS\t{}", workspace.launchers.len());
             if !workspace.shells.is_empty() {
                 println!("\nNAME\tSHELL ID\tRUN ID\tSTATUS\tCWD");
                 for shell in &workspace.shells {
@@ -918,6 +1010,18 @@ fn workspace_command(command: WorkspaceCommands, json: bool) -> Result<(), Box<d
                         shell.run.as_ref().map_or("-", |run| run.id.as_str()),
                         shell_status(&shell.status),
                         shell.cwd.display()
+                    );
+                }
+            }
+            if !workspace.launchers.is_empty() {
+                println!("\nNAME\tLAUNCHER ID\tCWD\tCOMMAND");
+                for launcher in &workspace.launchers {
+                    println!(
+                        "{}\t{}\t{}\t{}",
+                        launcher.name,
+                        launcher.id,
+                        launcher.cwd.display(),
+                        launcher.command.join(" ")
                     );
                 }
             }
@@ -1027,6 +1131,105 @@ fn shell_command(command: ShellCommands, json: bool) -> Result<(), Box<dyn Error
     Ok(())
 }
 
+fn launcher_command(command: LauncherCommands, json: bool) -> Result<(), Box<dyn Error>> {
+    let client = client::connect_or_start()?;
+    match command {
+        LauncherCommands::List { workspace } => {
+            let snapshot = client.snapshot()?;
+            let workspace = resolve_workspace_target(&snapshot.workspaces, &workspace)?;
+            if json {
+                let launchers = workspace
+                    .launchers
+                    .iter()
+                    .map(|launcher| cli_output::launcher(launcher, Some(&workspace.name)))
+                    .collect::<Vec<_>>();
+                return cli_output::print(
+                    "launcher.list",
+                    serde_json::json!({
+                        "workspace_id": workspace.id,
+                        "workspace_name": workspace.name,
+                        "launchers": launchers,
+                    }),
+                );
+            }
+            println!("NAME\tLAUNCHER ID\tCWD\tCOMMAND");
+            for launcher in &workspace.launchers {
+                println!(
+                    "{}\t{}\t{}\t{}",
+                    launcher.name,
+                    launcher.id,
+                    launcher.cwd.display(),
+                    launcher.command.join(" ")
+                );
+            }
+        }
+        LauncherCommands::Create {
+            name,
+            workspace,
+            cwd,
+            command,
+        } => {
+            let name = cli_name(name, "workspace launcher")?;
+            let snapshot = client.snapshot()?;
+            let workspace = resolve_workspace_target(&snapshot.workspaces, &workspace)?;
+            let launcher = client.create_launcher(
+                &workspace.id,
+                WorkspaceLauncherSpec {
+                    name,
+                    cwd: resolve_directory(&cwd)?,
+                    command,
+                },
+            )?;
+            println!(
+                "Created launcher {} ({}) in {}",
+                launcher.name, launcher.id, workspace.name
+            );
+        }
+        LauncherCommands::Inspect { target, workspace } => {
+            let snapshot = client.snapshot()?;
+            let launcher = resolve_cli_launcher(&snapshot, &target, workspace.as_deref())?;
+            let workspace = snapshot
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.id == launcher.workspace_id)
+                .ok_or_else(|| {
+                    cli_output::failure("not_found", "launcher workspace no longer exists")
+                })?;
+            if json {
+                return cli_output::print(
+                    "launcher.inspect",
+                    serde_json::json!({
+                        "launcher": cli_output::launcher(launcher, Some(&workspace.name)),
+                    }),
+                );
+            }
+            println!("ID\t{}", launcher.id);
+            println!("NAME\t{}", launcher.name);
+            println!("WORKSPACE\t{}", workspace.name);
+            println!("CWD\t{}", launcher.cwd.display());
+            println!("COMMAND\t{}", launcher.command.join(" "));
+        }
+        LauncherCommands::Rename {
+            target,
+            name,
+            workspace,
+        } => {
+            let name = cli_name(name, "workspace launcher")?;
+            let snapshot = client.snapshot()?;
+            let launcher = resolve_cli_launcher(&snapshot, &target, workspace.as_deref())?;
+            client.rename_launcher(&launcher.id, &name)?;
+            println!("Renamed launcher {} to {name}", launcher.name);
+        }
+        LauncherCommands::Remove { target, workspace } => {
+            let snapshot = client.snapshot()?;
+            let launcher = resolve_cli_launcher(&snapshot, &target, workspace.as_deref())?;
+            client.remove_launcher(&launcher.id)?;
+            println!("Removed launcher {}", launcher.name);
+        }
+    }
+    Ok(())
+}
+
 fn list_workspace_shells(json: bool) -> Result<(), Box<dyn Error>> {
     let client = client::connect_or_start()?;
     let shell = current_shell(&client)?;
@@ -1129,10 +1332,16 @@ fn json_snapshot(snapshot: Snapshot) -> Result<serde_json::Value, Box<dyn Error>
                 .iter()
                 .map(|shell| cli_output::shell(shell, Some(&workspace.name)))
                 .collect::<Vec<_>>();
+            let launchers = workspace
+                .launchers
+                .iter()
+                .map(|launcher| cli_output::launcher(launcher, Some(&workspace.name)))
+                .collect::<Vec<_>>();
             serde_json::json!({
                 "id": workspace.id,
                 "name": workspace.name,
                 "shells": shells,
+                "launchers": launchers,
             })
         })
         .collect::<Vec<_>>();
@@ -1251,6 +1460,58 @@ fn resolve_cli_shell<'a>(
     resolve_shell_target(snapshot, Some(workspace_id), target)
 }
 
+fn resolve_cli_launcher<'a>(
+    snapshot: &'a Snapshot,
+    target: &str,
+    workspace: Option<&str>,
+) -> Result<&'a WorkspaceLauncherSnapshot, Box<dyn Error>> {
+    if let Some(launcher) = find_launcher(snapshot, target) {
+        return Ok(launcher);
+    }
+    let workspace_id = if let Some(workspace) = workspace {
+        resolve_workspace_target(&snapshot.workspaces, workspace)?
+            .id
+            .as_str()
+    } else {
+        let current_shell_id = env::var("BOOMUX_SHELL_ID").map_err(|_| {
+            cli_output::failure(
+                "context_required",
+                format!(
+                    "launcher name {target:?} requires --workspace outside a Boomux-managed shell"
+                ),
+            )
+        })?;
+        find_shell(snapshot, &current_shell_id)
+            .map(|shell| shell.workspace_id.as_str())
+            .ok_or_else(|| {
+                cli_output::failure("not_found", "current Boomux shell no longer exists")
+            })?
+    };
+    let workspace = snapshot
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.id == workspace_id)
+        .ok_or_else(|| cli_output::failure("not_found", "current workspace no longer exists"))?;
+    workspace
+        .launchers
+        .iter()
+        .find(|launcher| launcher.name == target)
+        .ok_or_else(|| {
+            let available = workspace
+                .launchers
+                .iter()
+                .map(|launcher| launcher.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            cli_output::failure(
+                "not_found",
+                format!(
+                    "launcher {target:?} was not found in this workspace; available launchers: {available}"
+                ),
+            )
+        })
+}
+
 fn resolve_shell_target<'a>(
     snapshot: &'a Snapshot,
     current_workspace_id: Option<&str>,
@@ -1313,6 +1574,14 @@ fn find_shell<'a>(snapshot: &'a Snapshot, id: &str) -> Option<&'a ShellSnapshot>
         .find(|shell| shell.id == id)
 }
 
+fn find_launcher<'a>(snapshot: &'a Snapshot, id: &str) -> Option<&'a WorkspaceLauncherSnapshot> {
+    snapshot
+        .workspaces
+        .iter()
+        .flat_map(|workspace| &workspace.launchers)
+        .find(|launcher| launcher.id == id)
+}
+
 fn current_shell(client: &client::Client) -> Result<ShellSnapshot, Box<dyn Error>> {
     let shell_id = env::var("BOOMUX_SHELL_ID").map_err(|_| {
         cli_output::failure(
@@ -1364,17 +1633,76 @@ fn open_workspace(
     workspace: &WorkspaceSnapshot,
     terminal: Option<&str>,
 ) -> Result<(), Box<dyn Error>> {
-    if workspace.shells.is_empty() {
-        return Err(format!("workspace {} has no shells", workspace.name).into());
+    if workspace.shells.is_empty() && workspace.launchers.is_empty() {
+        return Err(format!("workspace {} has no shells or launchers", workspace.name).into());
+    }
+    let mut failures = Vec::new();
+    for launcher in &workspace.launchers {
+        if let Err(error) = invoke_workspace_launcher(workspace, launcher) {
+            failures.push(format!("launcher {}: {error}", launcher.name));
+        }
     }
     for shell in &workspace.shells {
-        open_terminal(
+        if let Err(error) = open_terminal(
             &shell.id,
             &format!("{} - {}", workspace.name, shell.name),
             true,
             terminal,
-        )?;
+        ) {
+            failures.push(format!("shell {}: {error}", shell.name));
+        }
     }
+    if !failures.is_empty() {
+        return Err(io::Error::other(format!(
+            "workspace {} opened with failures: {}",
+            workspace.name,
+            failures.join("; ")
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+fn invoke_workspace_launcher(
+    workspace: &WorkspaceSnapshot,
+    launcher: &WorkspaceLauncherSnapshot,
+) -> io::Result<()> {
+    let (executable, arguments) = launcher
+        .command
+        .split_first()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "launcher command is empty"))?;
+    let mut command = Command::new(executable);
+    command
+        .args(arguments)
+        .current_dir(&launcher.cwd)
+        .env("BOOMUX_WORKSPACE_ID", &workspace.id)
+        .env("BOOMUX_WORKSPACE", &workspace.name)
+        .env("BOOMUX_LAUNCHER_ID", &launcher.id)
+        .env("BOOMUX_LAUNCHER_NAME", &launcher.name)
+        .env_remove("BOOMUX_SHELL_ID")
+        .env_remove("BOOMUX_SHELL_NAME")
+        .env_remove("BOOMUX_RUN_ID")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // The child has not executed user code yet; `setsid` detaches it from the
+    // invoking terminal while preserving the client's desktop environment.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    let mut child = command.spawn()?;
+    thread::Builder::new()
+        .name(format!("launcher-reaper-{}", launcher.id))
+        .spawn(move || {
+            let _ = child.wait();
+        })
+        .map_err(|error| io::Error::other(format!("could not start launcher reaper: {error}")))?;
     Ok(())
 }
 
@@ -1643,6 +1971,17 @@ mod tests {
             id: id.into(),
             name: name.into(),
             shells,
+            launchers: Vec::new(),
+        }
+    }
+
+    fn launcher(id: &str, workspace_id: &str, name: &str) -> WorkspaceLauncherSnapshot {
+        WorkspaceLauncherSnapshot {
+            id: id.into(),
+            workspace_id: workspace_id.into(),
+            name: name.into(),
+            cwd: PathBuf::from("/tmp/project"),
+            command: vec!["zeditor".into(), ".".into()],
         }
     }
 
@@ -1685,6 +2024,14 @@ mod tests {
             vec!["boomux", "--json", "capabilities"],
             vec!["boomux", "list", "--json"],
             vec!["boomux", "workspace", "list", "--json"],
+            vec![
+                "boomux",
+                "launcher",
+                "list",
+                "--workspace",
+                "project",
+                "--json",
+            ],
             vec!["boomux", "daemon", "status", "--json"],
         ] {
             let cli = Cli::try_parse_from(arguments).unwrap();
@@ -1746,6 +2093,42 @@ mod tests {
             }) if name == "project"
         ));
         let cli = Cli::try_parse_from([
+            "boomux",
+            "launcher",
+            "create",
+            "editor",
+            "--workspace",
+            "project",
+            "--cwd",
+            "/tmp",
+            "--",
+            "zeditor",
+            ".",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Launcher {
+                command: LauncherCommands::Create {
+                    name,
+                    workspace,
+                    cwd,
+                    command,
+                }
+            }) if name == "editor"
+                && workspace == "project"
+                && cwd == Path::new("/tmp")
+                && command == ["zeditor", "."]
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["boomux", "workspace", "open", "project"])
+                .unwrap()
+                .command,
+            Some(Commands::Workspace {
+                command: WorkspaceCommands::Open { target }
+            }) if target == "project"
+        ));
+        let cli = Cli::try_parse_from([
             "boomux", "shell", "create", "project", "--name", "tests", "--cwd", "/tmp", "--",
             "cargo", "test",
         ])
@@ -1768,8 +2151,10 @@ mod tests {
 
     #[test]
     fn resolves_workspaces_and_shell_names_for_cli_commands() {
+        let mut project = workspace("w1", "project", vec![shell("s1", "w1", "tests")]);
+        project.launchers.push(launcher("l1", "w1", "editor"));
         let snapshot = Snapshot {
-            workspaces: vec![workspace("w1", "project", vec![shell("s1", "w1", "tests")])],
+            workspaces: vec![project],
         };
 
         assert_eq!(
@@ -1783,6 +2168,16 @@ mod tests {
                 .unwrap()
                 .id,
             "s1"
+        );
+        assert_eq!(
+            resolve_cli_launcher(&snapshot, "editor", Some("project"))
+                .unwrap()
+                .id,
+            "l1"
+        );
+        assert_eq!(
+            resolve_cli_launcher(&snapshot, "l1", None).unwrap().name,
+            "editor"
         );
         assert!(resolve_workspace_target(&snapshot.workspaces, "missing").is_err());
     }
@@ -1848,6 +2243,45 @@ mod tests {
         let error = open_workspace(&workspace("w1", "empty", Vec::new()), None).unwrap_err();
 
         assert!(error.to_string().contains("workspace empty has no shells"));
+    }
+
+    #[test]
+    fn workspace_open_continues_after_a_launcher_spawn_failure() {
+        let marker = env::temp_dir().join(format!("boomux-launcher-{}", Uuid::new_v4()));
+        let mut workspace = workspace("w1", "launchers", Vec::new());
+        workspace.launchers = vec![
+            WorkspaceLauncherSnapshot {
+                id: "l1".into(),
+                workspace_id: "w1".into(),
+                name: "missing".into(),
+                cwd: env::temp_dir(),
+                command: vec!["/boomux-command-does-not-exist".into()],
+            },
+            WorkspaceLauncherSnapshot {
+                id: "l2".into(),
+                workspace_id: "w1".into(),
+                name: "later".into(),
+                cwd: env::temp_dir(),
+                command: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "printf launched > \"$1\"".into(),
+                    "launcher".into(),
+                    marker.display().to_string(),
+                ],
+            },
+        ];
+
+        let error = open_workspace(&workspace, None).unwrap_err();
+        assert!(error.to_string().contains("launcher missing"));
+        for _ in 0..100 {
+            if marker.is_file() {
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(fs::read_to_string(&marker).unwrap(), "launched");
+        fs::remove_file(marker).unwrap();
     }
 
     #[test]

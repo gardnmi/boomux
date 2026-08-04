@@ -24,10 +24,10 @@ place. When no workspace name is supplied, Boomux creates the next available
 boomux .
 ```
 
-Each unnamed invocation creates a new generated workspace. A workspace is only
-a named shell container with a UUID; each shell independently owns its working
-directory. Use `--name` to add the shell to an existing named workspace or
-create that explicitly named container:
+Each unnamed invocation creates a new generated workspace. A workspace is a
+named container with a UUID; each shell and launcher independently owns its
+working directory. Use `--name` to add the shell to an existing named workspace
+or create that explicitly named container:
 
 ```console
 boomux . --name feature-x
@@ -98,6 +98,7 @@ boomux close <shell-name-or-shell-id>
 boomux open <shell-id> [--title <title>] [--takeover]
 boomux workspace list
 boomux workspace create <name>
+boomux workspace open <name-or-id>
 boomux workspace inspect <name-or-id>
 boomux workspace rename <name-or-id> <new-name>
 boomux workspace close <name-or-id>
@@ -105,6 +106,11 @@ boomux shell create <workspace-name-or-id> [--name <name>] [--cwd <path>] [-- <c
 boomux shell inspect <shell-name-or-id> [--workspace <name-or-id>]
 boomux shell rename <shell-name-or-id> <new-name> [--workspace <name-or-id>]
 boomux shell close <shell-name-or-id> [--workspace <name-or-id>]
+boomux launcher list --workspace <name-or-id>
+boomux launcher create <name> --workspace <name-or-id> [--cwd <path>] -- <command>...
+boomux launcher inspect <launcher-name-or-id> [--workspace <name-or-id>]
+boomux launcher rename <launcher-name-or-id> <new-name> [--workspace <name-or-id>]
+boomux launcher remove <launcher-name-or-id> [--workspace <name-or-id>]
 boomux daemon status
 boomux daemon restart
 boomux daemon stop
@@ -121,6 +127,24 @@ and process start when the shell is first opened. Shell names require current
 workspace context or `--workspace`; IDs remain globally addressable.
 New workspace and shell names are limited to 256 UTF-8 bytes so retained event
 payloads remain bounded. Existing persisted names remain loadable.
+
+Workspace launchers are durable commands that run on every explicit workspace
+open, including dashboard `Enter` and `boomux workspace open`. They are detached
+client-side processes without PTYs, retained output, or shell-run history. A
+launcher-only workspace is valid. Commands are exact argument vectors, `--cwd`
+defaults to the current directory, and multiple launchers run in creation order
+before terminal windows open:
+
+```console
+boomux workspace create boomux
+boomux launcher create editor --workspace boomux --cwd . -- zeditor .
+boomux launcher create browser --workspace boomux -- firefox http://localhost:3000
+boomux workspace open boomux
+```
+
+Opening continues after individual launcher or terminal spawn failures and
+reports all failures at the end. Removing a launcher affects future opens only;
+Boomux does not track or terminate applications it previously launched.
 
 `boomux read` reads plain rendered text from the daemon's shadow VT state. It
 understands cursor rewrites and terminal soft wrapping, retains up to 2,000
@@ -165,6 +189,11 @@ BOOMUX_SHELL_ID
 BOOMUX_SHELL_NAME
 BOOMUX_RUN_ID
 ```
+
+Workspace launcher invocations instead receive `BOOMUX_WORKSPACE_ID`,
+`BOOMUX_WORKSPACE`, `BOOMUX_LAUNCHER_ID`, and `BOOMUX_LAUNCHER_NAME`. They
+inherit the invoking client's desktop environment, while shell/run context is
+removed.
 
 Workspace and shell IDs remain authoritative after a rename. `BOOMUX_RUN_ID`
 identifies one process incarnation and changes when a durable shell starts a

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 8;
 pub const MIN_PROTOCOL_VERSION: u32 = 6;
 pub const MAX_CONTROL_FRAME: usize = 8 * 1024 * 1024;
 pub const MAX_ATTACH_FRAME: usize = 1024 * 1024;
@@ -38,6 +38,24 @@ pub struct WorkspaceSnapshot {
     pub id: String,
     pub name: String,
     pub shells: Vec<ShellSnapshot>,
+    #[serde(default)]
+    pub launchers: Vec<WorkspaceLauncherSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceLauncherSpec {
+    pub name: String,
+    pub command: Vec<String>,
+    pub cwd: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceLauncherSnapshot {
+    pub id: String,
+    pub workspace_id: String,
+    pub name: String,
+    pub command: Vec<String>,
+    pub cwd: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -140,6 +158,20 @@ pub enum DaemonEventKind {
         workspace_id: Option<String>,
         shell_id: String,
     },
+    LauncherCreated {
+        workspace_id: String,
+        launcher_id: String,
+        name: String,
+    },
+    LauncherRenamed {
+        workspace_id: String,
+        launcher_id: String,
+        name: String,
+    },
+    LauncherRemoved {
+        workspace_id: String,
+        launcher_id: String,
+    },
     RunStarted {
         workspace_id: String,
         shell_id: String,
@@ -202,6 +234,9 @@ pub enum Request {
     GetShell {
         shell_id: String,
     },
+    GetLauncher {
+        launcher_id: String,
+    },
     CreateWorkspace {
         name: String,
         shells: Vec<ShellSpec>,
@@ -210,6 +245,10 @@ pub enum Request {
         #[serde(default)]
         workspace_id: Option<String>,
         shell: ShellSpec,
+    },
+    CreateLauncher {
+        workspace_id: String,
+        spec: WorkspaceLauncherSpec,
     },
     ReadShell {
         shell_id: String,
@@ -241,11 +280,18 @@ pub enum Request {
         shell_id: String,
         name: String,
     },
+    RenameLauncher {
+        launcher_id: String,
+        name: String,
+    },
     CloseWorkspace {
         workspace_id: String,
     },
     CloseShell {
         shell_id: String,
+    },
+    RemoveLauncher {
+        launcher_id: String,
     },
     Attach {
         shell_id: String,
@@ -266,6 +312,9 @@ pub enum Response {
     },
     Shell {
         shell: ShellSnapshot,
+    },
+    Launcher {
+        launcher: WorkspaceLauncherSnapshot,
     },
     Output {
         bytes: Vec<u8>,
@@ -503,6 +552,33 @@ mod tests {
         .unwrap();
 
         assert!(snapshot.run.is_none());
+    }
+
+    #[test]
+    fn workspace_snapshot_accepts_protocol_seven_payload_without_launchers() {
+        let snapshot = serde_json::from_str::<WorkspaceSnapshot>(
+            r#"{"id":"w1","name":"workspace","shells":[]}"#,
+        )
+        .unwrap();
+
+        assert!(snapshot.launchers.is_empty());
+    }
+
+    #[test]
+    fn launcher_request_round_trips_exact_argv() {
+        let request = Request::CreateLauncher {
+            workspace_id: "w1".into(),
+            spec: WorkspaceLauncherSpec {
+                name: "editor".into(),
+                command: vec!["editor".into(), "".into(), "two words".into()],
+                cwd: "/tmp/project".into(),
+            },
+        };
+
+        let encoded = serde_json::to_vec(&request).unwrap();
+        let decoded: Request = serde_json::from_slice(&encoded).unwrap();
+
+        assert_eq!(decoded, request);
     }
 
     #[test]
