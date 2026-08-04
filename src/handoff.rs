@@ -15,7 +15,7 @@ use crate::state_store;
 
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 pub(crate) const CHANNEL_FD: RawFd = 198;
-pub(crate) const HEADER: &[u8; 8] = b"BOOMUXH2";
+pub(crate) const HEADER: &[u8; 8] = b"BOOMUXH3";
 pub(crate) const LISTENER_MARKER: u8 = 1;
 pub(crate) const RUNTIME_LOCK_MARKER: u8 = 2;
 pub(crate) const STATE_LOCK_MARKER: u8 = 3;
@@ -31,6 +31,7 @@ pub(crate) const PIDFD_MARKER: u8 = 11;
 #[derive(Serialize, Deserialize)]
 pub(crate) struct Manifest {
     pub(crate) runtimes: Vec<RuntimeManifest>,
+    pub(crate) exited: Vec<ExitedManifest>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -44,10 +45,24 @@ pub(crate) struct RuntimeManifest {
     pub(crate) pid: u32,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct ExitedManifest {
+    pub(crate) shell_id: String,
+    pub(crate) run_id: String,
+    pub(crate) output_revision: u64,
+    pub(crate) profile: TerminalProfile,
+    pub(crate) code: Option<u32>,
+}
+
 pub(crate) struct TransferredRuntime {
     pub(crate) manifest: RuntimeManifest,
     pub(crate) pty: OwnedFd,
     pub(crate) pidfd: OwnedFd,
+    pub(crate) reconstruction: Vec<u8>,
+}
+
+pub(crate) struct TransferredExited {
+    pub(crate) manifest: ExitedManifest,
     pub(crate) reconstruction: Vec<u8>,
 }
 
@@ -59,6 +74,7 @@ pub(crate) enum Bootstrap {
         runtime_lock: OwnedFd,
         state_lock: OwnedFd,
         runtimes: Vec<TransferredRuntime>,
+        exited: Vec<TransferredExited>,
     },
 }
 
@@ -99,6 +115,20 @@ pub(crate) fn receive_bootstrap(channel: RawFd) -> io::Result<Bootstrap> {
             reconstruction,
         });
     }
+    let mut exited = Vec::with_capacity(manifest.exited.len());
+    for manifest in manifest.exited {
+        let reconstruction: Vec<u8> = protocol::read_message(&mut channel)?;
+        if reconstruction.len() > protocol::MAX_ATTACH_FRAME {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "transferred exited terminal reconstruction exceeds the size limit",
+            ));
+        }
+        exited.push(TransferredExited {
+            manifest,
+            reconstruction,
+        });
+    }
 
     let expected_socket = client::socket_path()?;
     let listener = UnixListener::from(listener);
@@ -127,6 +157,7 @@ pub(crate) fn receive_bootstrap(channel: RawFd) -> io::Result<Bootstrap> {
             runtime_lock,
             state_lock,
             runtimes,
+            exited,
         }),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -177,7 +208,12 @@ fn validate_pidfd(descriptor: &OwnedFd, expected_pid: u32) -> io::Result<()> {
 }
 
 fn validate_manifest(manifest: &Manifest) -> io::Result<()> {
-    if manifest.runtimes.len() > 1_024 {
+    if manifest
+        .runtimes
+        .len()
+        .saturating_add(manifest.exited.len())
+        > 1_024
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "handoff manifest contains too many runtimes",
@@ -194,6 +230,16 @@ fn validate_manifest(manifest: &Manifest) -> io::Result<()> {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "handoff manifest contains an invalid runtime",
+            ));
+        }
+    }
+    for exited in &manifest.exited {
+        let valid_run =
+            uuid::Uuid::parse_str(&exited.run_id).is_ok() && run_ids.insert(&exited.run_id);
+        if !shell_ids.insert(&exited.shell_id) || !valid_run {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "handoff manifest contains an invalid exited shell",
             ));
         }
     }

@@ -184,8 +184,12 @@ fn replacement_bootstrap_receives_listener_and_lock_ownership() {
 
     parent_channel.set_read_timeout(Some(TIMEOUT)).unwrap();
     parent_channel.set_write_timeout(Some(TIMEOUT)).unwrap();
-    parent_channel.write_all(b"BOOMUXH2").unwrap();
-    protocol::write_message(&mut parent_channel, &serde_json::json!({ "runtimes": [] })).unwrap();
+    parent_channel.write_all(b"BOOMUXH3").unwrap();
+    protocol::write_message(
+        &mut parent_channel,
+        &serde_json::json!({ "runtimes": [], "exited": [] }),
+    )
+    .unwrap();
     send_descriptor(&parent_channel, listener.as_raw_fd(), 1);
     send_descriptor(&parent_channel, runtime_lock.as_raw_fd(), 2);
     send_descriptor(&parent_channel, state_lock.as_raw_fd(), 3);
@@ -432,6 +436,111 @@ fn exited_run_persistence_retries_after_storage_recovers() {
         },
         "exited run was not persisted after storage recovered",
     );
+
+    daemon.client.close_workspace(&workspace.id).unwrap();
+    daemon.stop_with_cli();
+}
+
+#[test]
+fn graceful_restart_preserves_exited_run_and_terminal_state() {
+    let mut daemon = TestDaemon::start();
+    let workspace = daemon
+        .client
+        .create_workspace(
+            "exited-handoff",
+            vec![
+                ShellSpec::login("finished", std::env::temp_dir()),
+                ShellSpec::login("live", std::env::temp_dir()),
+            ],
+        )
+        .unwrap();
+    let shell_id = workspace.shells[0].id.clone();
+    let live_shell_id = workspace.shells[1].id.clone();
+    let mut live = daemon
+        .client
+        .attach(&live_shell_id, false, profile())
+        .unwrap()
+        .stream;
+    AttachFrame::Input(b"printf 'live-during-exited-handoff\\n'\n".to_vec())
+        .write_to(&mut live)
+        .unwrap();
+    assert!(contains(
+        &read_until(&mut live, b"live-during-exited-handoff"),
+        b"live-during-exited-handoff"
+    ));
+    drop(live);
+    let mut attachment = daemon
+        .client
+        .attach(&shell_id, false, profile())
+        .unwrap()
+        .stream;
+    AttachFrame::Input(b"printf 'final-exited-output\\n'; exit 7\n".to_vec())
+        .write_to(&mut attachment)
+        .unwrap();
+    assert!(contains(
+        &read_until(&mut attachment, b"final-exited-output"),
+        b"final-exited-output"
+    ));
+    drop(attachment);
+    wait_until(
+        || {
+            matches!(
+                daemon.client.get_shell(&shell_id).unwrap().status,
+                ShellStatus::Exited { code: Some(7) }
+            )
+        },
+        "shell did not record its final exit",
+    );
+    let before = daemon.client.get_shell(&shell_id).unwrap();
+    let before_run = before.run.clone().unwrap();
+    let before_output = daemon.client.read_shell(&shell_id, 1024 * 1024).unwrap();
+    assert!(contains(&before_output, b"final-exited-output"));
+
+    let restart = daemon
+        .command()
+        .args(["daemon", "restart"])
+        .output()
+        .unwrap();
+    assert!(
+        restart.status.success(),
+        "exited-shell restart failed: {}",
+        String::from_utf8_lossy(&restart.stderr)
+    );
+
+    let after = daemon.client.get_shell(&shell_id).unwrap();
+    assert_eq!(after.status, ShellStatus::Exited { code: Some(7) });
+    assert_eq!(after.run.as_ref(), Some(&before_run));
+    assert_eq!(
+        daemon.client.get_shell(&live_shell_id).unwrap().status,
+        ShellStatus::Running
+    );
+    let after_output = daemon.client.read_shell(&shell_id, 1024 * 1024).unwrap();
+    assert_eq!(after_output, before_output);
+    let mut restored = daemon.client.attach(&shell_id, false, profile()).unwrap();
+    assert!(contains(&restored.reconstruction, b"final-exited-output"));
+    assert!(matches!(
+        AttachFrame::read_from(&mut restored.stream).unwrap(),
+        AttachFrame::Detached
+    ));
+    assert_eq!(
+        daemon.client.get_shell(&shell_id).unwrap().run.unwrap().id,
+        before_run.id
+    );
+
+    let state_directory = daemon.runtime_dir.join("state/boomux");
+    let saved_directory = daemon.runtime_dir.join("saved-exited-handoff-state");
+    fs::rename(&state_directory, &saved_directory).unwrap();
+    fs::write(&state_directory, b"not a directory").unwrap();
+    assert!(daemon.client.close_shell(&shell_id).is_err());
+    let rolled_back = daemon.client.get_shell(&shell_id).unwrap();
+    assert_eq!(rolled_back.status, ShellStatus::Exited { code: Some(7) });
+    assert_eq!(rolled_back.run.as_ref(), Some(&before_run));
+    assert!(contains(
+        &daemon.client.read_shell(&shell_id, 1024 * 1024).unwrap(),
+        b"final-exited-output"
+    ));
+    fs::remove_file(&state_directory).unwrap();
+    fs::rename(&saved_directory, &state_directory).unwrap();
 
     daemon.client.close_workspace(&workspace.id).unwrap();
     daemon.stop_with_cli();

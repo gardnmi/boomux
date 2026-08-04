@@ -274,8 +274,9 @@ its mutated environment.
 
 An explicit `boomux daemon restart` instead uses the separate transactional Unix
 PTY handoff documented in [`live-pty-handoff.md`](live-pty-handoff.md). It
-transfers running processes and reconnects active attachment clients; this does
-not change the guarantees of metadata-only recovery.
+transfers running processes, preserves static exited-run terminal state, and
+reconnects active attachment clients; this does not change the guarantees of
+metadata-only recovery.
 
 ## Manual Test Matrix
 
@@ -293,6 +294,7 @@ Run each scenario in Alacritty and Ghostty first, then Kitty if available:
 | Cross-emulator reattach | Compatibility warning and behavior match policy |
 | Graceful restart while detached | Process PID and subsequent input/output survive |
 | Graceful restart while attached | Client reconnects without leaving raw mode |
+| Graceful restart after shell exit | Run identity, exit status, and final terminal state survive without a new process |
 | Daemon stop | All owned process sessions terminate and socket is removed |
 
 Record the terminal environment visible inside each child:
@@ -311,6 +313,8 @@ stty size
    lines.
 4. [Complete] Add atomic metadata persistence.
 5. [Complete] Add transactional live PTY handoff and active-client reconnection.
+6. [Complete] Preserve exited-run metadata and final terminal state during
+   graceful handoff.
 
 ## Definition Of Done
 

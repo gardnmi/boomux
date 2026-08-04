@@ -148,10 +148,11 @@ boomux daemon restart
 boomux daemon stop
 ```
 
-`restart` performs a transactional graceful handoff that preserves pending and
-running shells and reconnects active clients. `stop` terminates every managed
-process session. Confirm before either operation when the user did not request
-it explicitly.
+`restart` performs a transactional graceful handoff that preserves pending,
+running, and exited shells, including final exited terminal state, and reconnects
+active clients. It does not start a new process for an exited shell. `stop`
+terminates every managed process session. Confirm before either operation when
+the user did not request it explicitly.
 
 ## Install Or Update This Skill
 

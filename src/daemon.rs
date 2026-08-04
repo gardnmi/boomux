@@ -55,6 +55,7 @@ pub fn receive_handoff(channel: i32) -> io::Result<()> {
             runtime_lock,
             state_lock,
             runtimes,
+            exited,
         } => {
             let store = StateStore::from_transferred_lock(state_lock)?;
             let socket_path = client::socket_path()?;
@@ -64,6 +65,7 @@ pub fn receive_handoff(channel: i32) -> io::Result<()> {
                 SocketCleanup::disarmed(socket_path),
                 store,
                 runtimes,
+                exited,
                 Some(&mut channel),
             )
         }
@@ -92,6 +94,7 @@ pub fn run() -> io::Result<()> {
         socket_cleanup,
         StateStore::from_environment()?,
         Vec::new(),
+        Vec::new(),
         None,
     )
 }
@@ -102,10 +105,11 @@ fn run_daemon(
     mut socket_cleanup: SocketCleanup,
     store: StateStore,
     transferred_runtimes: Vec<handoff::TransferredRuntime>,
+    transferred_exited: Vec<handoff::TransferredExited>,
     committed: Option<&mut UnixStream>,
 ) -> io::Result<()> {
     let registry = Arc::new(Registry::restore(store, committed.is_some())?);
-    let gated_readers = registry.import_runtimes(transferred_runtimes)?;
+    let gated_readers = registry.import_handoff(transferred_runtimes, transferred_exited)?;
     if let Some(channel) = committed {
         channel.write_all(&[handoff::PREPARED])?;
         let mut decision = [0];
@@ -282,21 +286,40 @@ fn launch_replacement(
     let mut paused = Vec::new();
     let result = (|| {
         registry.quiesce_controllers()?;
-        let state = lock(&registry.state)?;
+        let shells = lock(&registry.state)?
+            .shells
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
         let mut transfers = Vec::new();
-        for shell in state.shells.values() {
-            let (profile, run, runtime) = match &*lock(&shell.lifecycle)? {
+        let mut exited = Vec::new();
+        for shell in shells {
+            let lifecycle = lock(&shell.lifecycle)?;
+            let (profile, run, runtime) = match &*lifecycle {
                 ShellLifecycle::Pending => continue,
                 ShellLifecycle::Running {
                     profile,
                     run,
                     runtime,
                 } => (profile.clone(), Arc::clone(run), Arc::clone(runtime)),
-                ShellLifecycle::Exited { .. } => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        "exited shell runtime transfer is not supported",
-                    ));
+                ShellLifecycle::Exited {
+                    code,
+                    profile,
+                    run,
+                    terminal,
+                    ..
+                } => {
+                    exited.push(OutgoingExited {
+                        manifest: handoff::ExitedManifest {
+                            shell_id: shell.id.clone(),
+                            run_id: run.id.clone(),
+                            output_revision: run.output_revision.load(Ordering::Acquire),
+                            profile: profile.clone(),
+                            code: *code,
+                        },
+                        reconstruction: lock(terminal)?.reconstruction(),
+                    });
+                    continue;
                 }
                 ShellLifecycle::Closed => return Err(not_found("shell", &shell.id)),
             };
@@ -317,13 +340,13 @@ fn launch_replacement(
                 reconstruction,
             });
         }
-        drop(state);
         let state_lock = registry.state_lock_descriptor()?;
         launch_replacement_process(
             listener.as_fd(),
             daemon_lock.as_fd(),
             state_lock,
             &transfers,
+            &exited,
         )
     })();
     if result.is_err() {
@@ -340,6 +363,7 @@ fn launch_replacement_process(
     runtime_lock: BorrowedFd<'_>,
     state_lock: BorrowedFd<'_>,
     runtimes: &[OutgoingRuntime],
+    exited: &[OutgoingExited],
 ) -> io::Result<()> {
     let (mut channel, child_channel) = UnixStream::pair()?;
     let child_channel_fd = child_channel.as_raw_fd();
@@ -379,6 +403,7 @@ fn launch_replacement_process(
                     .iter()
                     .map(|runtime| runtime.manifest.clone())
                     .collect(),
+                exited: exited.iter().map(|shell| shell.manifest.clone()).collect(),
             },
         )?;
         send_descriptor(&channel, listener, handoff::LISTENER_MARKER)?;
@@ -389,6 +414,9 @@ fn launch_replacement_process(
             send_descriptor(&channel, master.descriptor.as_fd(), handoff::PTY_MARKER)?;
             send_descriptor(&channel, runtime.pidfd.as_fd(), handoff::PIDFD_MARKER)?;
             protocol::write_message(&mut channel, &runtime.reconstruction)?;
+        }
+        for shell in exited {
+            protocol::write_message(&mut channel, &shell.reconstruction)?;
         }
         let mut acknowledgement = [0];
         channel.read_exact(&mut acknowledgement)?;
@@ -598,7 +626,8 @@ enum ShellLifecycle {
         code: Option<u32>,
         profile: TerminalProfile,
         run: Arc<ShellRun>,
-        runtime: Arc<ShellRuntime>,
+        runtime: Option<Arc<ShellRuntime>>,
+        terminal: Arc<Mutex<TerminalState>>,
     },
     Closed,
 }
@@ -691,7 +720,7 @@ struct ShellRuntime {
     control: Mutex<()>,
     master: Mutex<PtyMaster>,
     process: Mutex<ManagedProcess>,
-    terminal: Mutex<TerminalState>,
+    terminal: Arc<Mutex<TerminalState>>,
     controller: Mutex<Option<Controller>>,
     reader: Mutex<Option<ReaderTask>>,
 }
@@ -710,6 +739,11 @@ struct OutgoingRuntime {
     manifest: handoff::RuntimeManifest,
     runtime: Arc<ShellRuntime>,
     pidfd: OwnedFd,
+    reconstruction: Vec<u8>,
+}
+
+struct OutgoingExited {
+    manifest: handoff::ExitedManifest,
     reconstruction: Vec<u8>,
 }
 
@@ -1178,9 +1212,10 @@ impl Registry {
         Ok(registry)
     }
 
-    fn import_runtimes(
+    fn import_handoff(
         self: &Arc<Self>,
         transferred: Vec<handoff::TransferredRuntime>,
+        transferred_exited: Vec<handoff::TransferredExited>,
     ) -> io::Result<Vec<Arc<ShellRuntime>>> {
         let state = lock(&self.state)?;
         let mut prepared = Vec::with_capacity(transferred.len());
@@ -1247,11 +1282,57 @@ impl Registry {
                 control: Mutex::new(()),
                 master: Mutex::new(master),
                 process: Mutex::new(ManagedProcess::Imported(process)),
-                terminal: Mutex::new(terminal),
+                terminal: Arc::new(Mutex::new(terminal)),
                 controller: Mutex::new(None),
                 reader: Mutex::new(None),
             });
             prepared.push((shell, saved_run, run, runtime, reader));
+        }
+        let mut prepared_exited = Vec::with_capacity(transferred_exited.len());
+        for transferred in transferred_exited {
+            let manifest = transferred.manifest;
+            validate_terminal_profile(&manifest.profile)?;
+            let shell = state
+                .shells
+                .get(&manifest.shell_id)
+                .cloned()
+                .ok_or_else(|| not_found("persisted shell", &manifest.shell_id))?;
+            imported_shell_ids.insert(shell.id.clone());
+            if !matches!(*lock(&shell.lifecycle)?, ShellLifecycle::Pending) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "transferred exited shell is not pending in restored metadata",
+                ));
+            }
+            let mut saved_run = lock(&shell.last_run)?.clone().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "transferred exited shell has no persisted run",
+                )
+            })?;
+            if saved_run.id != manifest.run_id
+                || saved_run.exit_reason
+                    != Some(ShellRunExitReason::Exited {
+                        code: manifest.code,
+                    })
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "transferred exited shell does not match its persisted run",
+                ));
+            }
+            saved_run.profile = manifest.profile.clone();
+            saved_run.output_revision = manifest.output_revision;
+            let run = Arc::new(ShellRun::from_persisted(&saved_run));
+            let mut terminal = TerminalState::new(manifest.profile.rows, manifest.profile.cols);
+            terminal.process(&transferred.reconstruction);
+            prepared_exited.push((
+                shell,
+                saved_run,
+                run,
+                Arc::new(Mutex::new(terminal)),
+                manifest,
+            ));
         }
         let mut interrupted_untransferred_run = false;
         for shell in state.shells.values() {
@@ -1288,7 +1369,17 @@ impl Registry {
             )?;
             readers.push(runtime);
         }
-        if interrupted_untransferred_run || !readers.is_empty() {
+        for (shell, saved_run, run, terminal, manifest) in prepared_exited {
+            *lock(&shell.last_run)? = Some(saved_run);
+            *lock(&shell.lifecycle)? = ShellLifecycle::Exited {
+                code: manifest.code,
+                profile: manifest.profile,
+                run,
+                runtime: None,
+                terminal,
+            };
+        }
+        if interrupted_untransferred_run || !readers.is_empty() || !imported_shell_ids.is_empty() {
             self.persist()?;
         }
         Ok(readers)
@@ -1509,7 +1600,8 @@ impl Registry {
             code,
             profile,
             run: Arc::clone(run),
-            runtime: Arc::clone(runtime),
+            runtime: Some(Arc::clone(runtime)),
+            terminal: Arc::clone(&runtime.terminal),
         };
         drop(lifecycle);
         self.persist()
@@ -1734,15 +1826,14 @@ impl Registry {
     fn read_shell(&self, shell_id: &str, max_bytes: usize) -> io::Result<Vec<u8>> {
         let shell = self.shell(shell_id)?;
         let lifecycle = lock(&shell.lifecycle)?;
-        let runtime = match &*lifecycle {
+        let terminal = match &*lifecycle {
             ShellLifecycle::Pending => return Ok(Vec::new()),
-            ShellLifecycle::Running { runtime, .. } | ShellLifecycle::Exited { runtime, .. } => {
-                Arc::clone(runtime)
-            }
+            ShellLifecycle::Running { runtime, .. } => Arc::clone(&runtime.terminal),
+            ShellLifecycle::Exited { terminal, .. } => Arc::clone(terminal),
             ShellLifecycle::Closed => return Err(not_found("shell", shell_id)),
         };
         drop(lifecycle);
-        let text = lock(&runtime.terminal)?.plain_text();
+        let text = lock(&terminal)?.plain_text();
         Ok(tail_utf8(&text, max_bytes.min(MAX_SHELL_READ_BYTES))
             .as_bytes()
             .to_vec())
@@ -1887,10 +1978,13 @@ impl Shell {
                     *lifecycle = ShellLifecycle::Closed;
                     return Ok(());
                 }
-                ShellLifecycle::Running { runtime, .. }
-                | ShellLifecycle::Exited { runtime, .. } => Arc::clone(runtime),
+                ShellLifecycle::Running { runtime, .. } => Some(Arc::clone(runtime)),
+                ShellLifecycle::Exited { runtime, .. } => runtime.clone(),
                 ShellLifecycle::Closed => return Ok(()),
             }
+        };
+        let Some(runtime) = runtime else {
+            return Ok(());
         };
         if let Some(controller) = lock(&runtime.controller)?.take() {
             let _ = controller.connection.shutdown(std::net::Shutdown::Both);
@@ -1945,7 +2039,10 @@ impl Shell {
                 run,
                 runtime: current,
                 ..
-            } if Arc::ptr_eq(current, &runtime) => {
+            } if current
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &runtime)) =>
+            {
                 *lock(&self.last_run)? = Some(run.persisted(profile.clone())?);
                 *lifecycle = ShellLifecycle::Closed;
             }
@@ -2068,7 +2165,7 @@ fn spawn_runtime(
             control: Mutex::new(()),
             master: Mutex::new(master),
             process: Mutex::new(ManagedProcess::Owned(child)),
-            terminal: Mutex::new(TerminalState::new(profile.rows, profile.cols)),
+            terminal: Arc::new(Mutex::new(TerminalState::new(profile.rows, profile.cols))),
             controller: Mutex::new(None),
             reader: Mutex::new(None),
         }),
@@ -2269,7 +2366,7 @@ fn handle_attach(
     let (output, receiver) = mpsc::sync_channel(CONTROLLER_QUEUE);
     let connection = stream.try_clone()?;
     let previous_run = lock(&shell.last_run)?.clone();
-    let (runtime, startup_profile, running, started) = {
+    let (runtime, terminal, startup_profile, running, started) = {
         let mut lifecycle = lock(&shell.lifecycle)?;
         let mut started = false;
         if !registry.contains_shell(&shell)? {
@@ -2340,10 +2437,16 @@ fn handle_attach(
         match &*lifecycle {
             ShellLifecycle::Running {
                 profile, runtime, ..
-            } => (Arc::clone(runtime), profile.clone(), true, started),
+            } => (
+                Some(Arc::clone(runtime)),
+                Arc::clone(&runtime.terminal),
+                profile.clone(),
+                true,
+                started,
+            ),
             ShellLifecycle::Exited {
-                profile, runtime, ..
-            } => (Arc::clone(runtime), profile.clone(), false, started),
+                profile, terminal, ..
+            } => (None, Arc::clone(terminal), profile.clone(), false, started),
             ShellLifecycle::Pending => unreachable!(),
             ShellLifecycle::Closed => {
                 return send_response(
@@ -2375,10 +2478,28 @@ fn handle_attach(
         );
     }
     if started {
-        runtime.resume_reader()?;
+        runtime
+            .as_ref()
+            .expect("started shell has a runtime")
+            .resume_reader()?;
+    }
+    let warning = term_mismatch_warning(startup_profile.term.as_deref(), profile.term.as_deref());
+    if !running {
+        lock(&terminal)?.resize(profile.rows, profile.cols);
+        stream.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
+        send_response(
+            &mut stream,
+            Response::Attached {
+                token,
+                reconstruction: lock(&terminal)?.reconstruction(),
+                warning,
+            },
+        )?;
+        stream.set_write_timeout(None)?;
+        return AttachFrame::Detached.write_to(&mut stream);
     }
     drop(mutation);
-    let warning = term_mismatch_warning(startup_profile.term.as_deref(), profile.term.as_deref());
+    let runtime = runtime.expect("running shell has a runtime");
     let control = lock(&runtime.control)?;
     if !registry.contains_shell(&shell)? {
         return send_response(
@@ -2399,14 +2520,12 @@ fn handle_attach(
             );
         }
     }
-    if running {
-        lock(&runtime.master)?.resize(profile_size(&profile))?;
-        update_runtime_dimensions(&shell, &runtime, profile_size(&profile))?;
-    }
-    lock(&runtime.terminal)?.resize(profile.rows, profile.cols);
+    lock(&runtime.master)?.resize(profile_size(&profile))?;
+    update_runtime_dimensions(&shell, &runtime, profile_size(&profile))?;
+    lock(&terminal)?.resize(profile.rows, profile.cols);
     // Keep terminal state locked until the controller is installed so the
     // reconstruction ends exactly where live delivery begins.
-    let terminal = lock(&runtime.terminal)?;
+    let terminal = lock(&terminal)?;
     stream.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
     send_response(
         &mut stream,
@@ -2417,9 +2536,6 @@ fn handle_attach(
         },
     )?;
     stream.set_write_timeout(None)?;
-    if !running {
-        return AttachFrame::Detached.write_to(&mut stream);
-    }
     let lifecycle = lock(&shell.lifecycle)?;
     let still_running = registry.contains_shell(&shell)?
         && matches!(
@@ -2600,11 +2716,6 @@ fn update_runtime_dimensions(
     let mut lifecycle = lock(&shell.lifecycle)?;
     let profile = match &mut *lifecycle {
         ShellLifecycle::Running {
-            profile,
-            runtime: current,
-            ..
-        }
-        | ShellLifecycle::Exited {
             profile,
             runtime: current,
             ..
