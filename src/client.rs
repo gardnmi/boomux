@@ -7,12 +7,14 @@ use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
 use std::time::Duration;
 
 use crate::protocol::{
-    self, Envelope, ErrorCode, Request, Response, ShellSnapshot, ShellSpec, Snapshot,
-    TerminalProfile, WorkspaceSnapshot,
+    self, DaemonEvent, Envelope, ErrorCode, EventCursor, Request, Response, ShellSnapshot,
+    ShellSpec, ShellStatus, Snapshot, TerminalProfile, WorkspaceSnapshot,
 };
 
 const CONNECT_ATTEMPTS: usize = 40;
@@ -22,6 +24,7 @@ const SHUTDOWN_ATTEMPTS: usize = 200;
 #[derive(Debug, Clone)]
 pub struct Client {
     socket_path: PathBuf,
+    protocol_version: Arc<AtomicU32>,
 }
 
 #[derive(Debug)]
@@ -30,6 +33,23 @@ pub struct Attachment {
     pub token: String,
     pub reconstruction: Vec<u8>,
     pub warning: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct OutputState {
+    pub bytes: Vec<u8>,
+    pub run_id: Option<String>,
+    pub output_revision: Option<u64>,
+    pub changed: bool,
+    pub status: ShellStatus,
+}
+
+#[derive(Debug)]
+pub struct EventBatch {
+    pub stream_id: String,
+    pub cursor: EventCursor,
+    pub snapshot: Option<Snapshot>,
+    pub events: Vec<DaemonEvent>,
 }
 
 #[derive(Debug)]
@@ -129,16 +149,25 @@ pub fn connect() -> io::Result<Client> {
 fn connect_client() -> io::Result<Client> {
     Ok(Client {
         socket_path: socket_path()?,
+        protocol_version: Arc::new(AtomicU32::new(protocol::PROTOCOL_VERSION)),
     })
 }
 
 impl Client {
     pub fn from_socket_path(socket_path: PathBuf) -> Self {
-        Self { socket_path }
+        Self {
+            socket_path,
+            protocol_version: Arc::new(AtomicU32::new(protocol::PROTOCOL_VERSION)),
+        }
     }
 
     pub fn socket_path(&self) -> &Path {
         &self.socket_path
+    }
+
+    pub fn protocol_version(&self) -> io::Result<u32> {
+        let _ = self.probe_latest()?;
+        Ok(self.protocol_version.load(Ordering::Acquire))
     }
 
     pub fn request(&self, request: Request) -> io::Result<Response> {
@@ -146,22 +175,45 @@ impl Client {
     }
 
     fn send(&self, request: Request) -> io::Result<(UnixStream, Response)> {
+        let mut version = self.protocol_version.load(Ordering::Acquire);
+        if version < request_minimum_version(&request) {
+            if !self.probe_latest()? {
+                return Err(remote_error(
+                    ErrorCode::UnsupportedVersion,
+                    "daemon does not support this request",
+                ));
+            }
+            version = self.protocol_version.load(Ordering::Acquire);
+        }
+        match self.send_with_version(request.clone(), version) {
+            Err(error)
+                if version > protocol::MIN_PROTOCOL_VERSION
+                    && request_minimum_version(&request) <= protocol::MIN_PROTOCOL_VERSION
+                    && remote_code(&error) == Some(ErrorCode::UnsupportedVersion) =>
+            {
+                self.protocol_version
+                    .store(protocol::MIN_PROTOCOL_VERSION, Ordering::Release);
+                self.send_with_version(request, protocol::MIN_PROTOCOL_VERSION)
+            }
+            result => result,
+        }
+    }
+
+    fn send_with_version(
+        &self,
+        request: Request,
+        version: u32,
+    ) -> io::Result<(UnixStream, Response)> {
         let mut stream = UnixStream::connect(&self.socket_path)?;
-        protocol::write_message(&mut stream, &Envelope::new(request))?;
+        protocol::write_message(&mut stream, &Envelope::with_version(version, request))?;
         let response: Envelope<Response> = protocol::read_message(&mut stream)?;
-        if response.version != protocol::PROTOCOL_VERSION {
+        if response.version != version {
             if let Response::Error {
                 message,
                 code: Some(ErrorCode::UnsupportedVersion),
             } = response.message
             {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    RemoteError {
-                        code: Some(ErrorCode::UnsupportedVersion),
-                        message,
-                    },
-                ));
+                return Err(remote_error(ErrorCode::UnsupportedVersion, message));
             }
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -174,6 +226,23 @@ impl Client {
                 RemoteError { code, message },
             )),
             response => Ok((stream, response)),
+        }
+    }
+
+    fn probe_latest(&self) -> io::Result<bool> {
+        match self.send_with_version(Request::Ping, protocol::PROTOCOL_VERSION) {
+            Ok((_, Response::Pong)) => {
+                self.protocol_version
+                    .store(protocol::PROTOCOL_VERSION, Ordering::Release);
+                Ok(true)
+            }
+            Ok((_, response)) => unexpected(response),
+            Err(error) if remote_code(&error) == Some(ErrorCode::UnsupportedVersion) => {
+                self.protocol_version
+                    .store(protocol::MIN_PROTOCOL_VERSION, Ordering::Release);
+                Ok(false)
+            }
+            Err(error) => Err(error),
         }
     }
 
@@ -281,6 +350,64 @@ impl Client {
         }
     }
 
+    pub fn read_shell_at(
+        &self,
+        shell_id: impl Into<String>,
+        max_bytes: usize,
+        run_id: Option<String>,
+        after_revision: Option<u64>,
+        wait_ms: u32,
+    ) -> io::Result<OutputState> {
+        match self.request(Request::ReadShellAt {
+            shell_id: shell_id.into(),
+            max_bytes,
+            run_id,
+            after_revision,
+            wait_ms,
+        })? {
+            Response::OutputState {
+                bytes,
+                run_id,
+                output_revision,
+                changed,
+                status,
+            } => Ok(OutputState {
+                bytes,
+                run_id,
+                output_revision,
+                changed,
+                status,
+            }),
+            other => unexpected(other),
+        }
+    }
+
+    pub fn events(
+        &self,
+        after: Option<EventCursor>,
+        limit: u16,
+        wait_ms: u32,
+    ) -> io::Result<EventBatch> {
+        match self.request(Request::Events {
+            after,
+            limit,
+            wait_ms,
+        })? {
+            Response::Events {
+                stream_id,
+                cursor,
+                snapshot,
+                events,
+            } => Ok(EventBatch {
+                stream_id,
+                cursor,
+                snapshot,
+                events,
+            }),
+            other => unexpected(other),
+        }
+    }
+
     pub fn rename_workspace(
         &self,
         workspace_id: impl Into<String>,
@@ -352,6 +479,30 @@ impl Client {
             other => unexpected(other),
         }
     }
+}
+
+fn request_minimum_version(request: &Request) -> u32 {
+    match request {
+        Request::ReadShellAt { .. } | Request::Events { .. } => 7,
+        _ => protocol::MIN_PROTOCOL_VERSION,
+    }
+}
+
+fn remote_code(error: &io::Error) -> Option<ErrorCode> {
+    error
+        .get_ref()
+        .and_then(|error| error.downcast_ref::<RemoteError>())
+        .and_then(|error| error.code)
+}
+
+fn remote_error(code: ErrorCode, message: impl Into<String>) -> io::Error {
+    io::Error::new(
+        error_kind(Some(code)),
+        RemoteError {
+            code: Some(code),
+            message: message.into(),
+        },
+    )
 }
 
 fn error_kind(code: Option<ErrorCode>) -> io::ErrorKind {

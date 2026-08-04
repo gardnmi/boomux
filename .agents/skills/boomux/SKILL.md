@@ -51,6 +51,13 @@ boomux capabilities --json
 Parse `data` on success and `error.code` on a nonzero exit; do not parse human
 tables or `error.message`. Mutation commands do not yet support `--json`.
 
+Use `boomux events --json` for an immediate snapshot and cursor. Poll again with
+`--after CURSOR --wait-ms 30000` to observe later transitions. If
+`error.code` is `cursor_expired`, discard the cursor and request a new baseline.
+Use `boomux read TARGET --json --run-id RUN_ID --after-revision REVISION
+--wait-ms 30000` to wait for run-scoped output changes; handle `run_changed` by
+inspecting the shell again.
+
 Exact shell IDs resolve globally. Shell names resolve in the current workspace,
 or through `--workspace` for `shell inspect`, `shell rename`, and `shell close`.
 `boomux read` and top-level `boomux close` require an exact shell ID outside a

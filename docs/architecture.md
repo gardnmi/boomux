@@ -136,6 +136,13 @@ requiring a daemon. Protocol 6 error responses carry an additive optional code;
 new clients expose it through a typed `RemoteError`, while mixed-version peers
 retain message compatibility.
 
+Protocol 7 adds a bounded in-memory daemon event journal and atomic output-state
+reads. Clients reconnect through stream UUID/event-ID cursors and recover from
+retention or cold-restart expiry by requesting a fresh snapshot baseline.
+Graceful handoff version 4 transfers retained events before publishing a
+`handoff_completed` boundary and resuming PTY readers. See
+[`event-stream.md`](event-stream.md).
+
 ## Runtime Semantics
 
 Closing a terminal window closes only its socket attachment. The daemon retains
@@ -175,5 +182,5 @@ as pending.
 The detailed design, acceptance criteria, and manual test matrix are tracked in
 [`native-terminal-follow-up.md`](native-terminal-follow-up.md).
 
-1. Add a monotonic daemon event stream with reconnectable cursors and
-   revision-aware output reads.
+1. Route runtime transitions through one coordinator so persistence and events
+   share an ordering boundary.

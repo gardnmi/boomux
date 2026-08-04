@@ -199,6 +199,9 @@ fn protocol_error_code(code: ErrorCode) -> &'static str {
         ErrorCode::PersistenceFailed => "persistence_failed",
         ErrorCode::Timeout => "timeout",
         ErrorCode::UnsupportedVersion => "unsupported_version",
+        ErrorCode::CursorExpired => "cursor_expired",
+        ErrorCode::RunChanged => "run_changed",
+        ErrorCode::RevisionAhead => "revision_ahead",
         ErrorCode::Internal => "internal",
         ErrorCode::Unknown => "unknown",
     }

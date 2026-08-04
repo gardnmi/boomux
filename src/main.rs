@@ -10,7 +10,9 @@ use clap::error::ErrorKind as ClapErrorKind;
 use clap::{Parser, Subcommand};
 use uuid::Uuid;
 
-use boomux::protocol::{ShellSnapshot, ShellSpec, ShellStatus, Snapshot, WorkspaceSnapshot};
+use boomux::protocol::{
+    EventCursor, ShellSnapshot, ShellSpec, ShellStatus, Snapshot, WorkspaceSnapshot,
+};
 use boomux::{attach, client, daemon, protocol};
 
 mod cli_output;
@@ -116,6 +118,21 @@ enum Commands {
         target: String,
         #[arg(long, default_value_t = 200, value_parser = clap::value_parser!(u32).range(1..))]
         lines: u32,
+        #[arg(long, requires = "after_revision")]
+        run_id: Option<String>,
+        #[arg(long, requires = "run_id")]
+        after_revision: Option<u64>,
+        #[arg(long, default_value_t = 0, requires = "after_revision")]
+        wait_ms: u32,
+    },
+    /// Read a bounded batch of daemon events
+    Events {
+        #[arg(long)]
+        after: Option<String>,
+        #[arg(long, default_value_t = 256, value_parser = clap::value_parser!(u16).range(1..=256))]
+        limit: u16,
+        #[arg(long, default_value_t = 0)]
+        wait_ms: u32,
     },
     /// Close a shell by name or shell ID
     Close { target: String },
@@ -320,7 +337,25 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         Some(Commands::Capabilities) => capabilities(cli.json),
         Some(Commands::List) => list_shells(cli.json),
         Some(Commands::Shells) => list_workspace_shells(cli.json),
-        Some(Commands::Read { target, lines }) => read_shell(&target, lines, cli.json),
+        Some(Commands::Read {
+            target,
+            lines,
+            run_id,
+            after_revision,
+            wait_ms,
+        }) => read_shell(
+            &target,
+            lines,
+            cli.json,
+            run_id.as_deref(),
+            after_revision,
+            wait_ms,
+        ),
+        Some(Commands::Events {
+            after,
+            limit,
+            wait_ms,
+        }) => read_events(after.as_deref(), limit, wait_ms, cli.json),
         Some(Commands::Close { target }) => close_shell(&target),
         Some(Commands::Workspace { command }) => workspace_command(command, cli.json),
         Some(Commands::Shell { command }) => shell_command(command, cli.json),
@@ -348,6 +383,7 @@ fn command_name(cli: &Cli) -> &'static str {
         Some(Commands::List) => "list",
         Some(Commands::Shells) => "shells",
         Some(Commands::Read { .. }) => "read",
+        Some(Commands::Events { .. }) => "events",
         Some(Commands::Workspace {
             command: WorkspaceCommands::List,
         }) => "workspace.list",
@@ -376,33 +412,39 @@ fn command_name(cli: &Cli) -> &'static str {
 fn supports_json(cli: &Cli) -> bool {
     matches!(
         cli.command.as_ref(),
-        Some(Commands::Capabilities | Commands::List | Commands::Shells | Commands::Read { .. })
-            | Some(Commands::Workspace {
-                command: WorkspaceCommands::List | WorkspaceCommands::Inspect { .. }
-            })
-            | Some(Commands::Shell {
-                command: ShellCommands::Inspect { .. }
-            })
-            | Some(Commands::Daemon {
-                command: DaemonCommands::Status
-            })
+        Some(
+            Commands::Capabilities
+                | Commands::List
+                | Commands::Shells
+                | Commands::Read { .. }
+                | Commands::Events { .. }
+        ) | Some(Commands::Workspace {
+            command: WorkspaceCommands::List | WorkspaceCommands::Inspect { .. }
+        }) | Some(Commands::Shell {
+            command: ShellCommands::Inspect { .. }
+        }) | Some(Commands::Daemon {
+            command: DaemonCommands::Status
+        })
     )
 }
 
 fn daemon_control(command: DaemonCommands, json: bool) -> Result<(), Box<dyn Error>> {
     let client = client::connect()?;
     match command {
-        DaemonCommands::Status if json => cli_output::print(
-            "daemon.status",
-            serde_json::json!({
-                "status": "running",
-                "protocol_version": protocol::PROTOCOL_VERSION,
-                "socket_path": client.socket_path().display().to_string(),
-            }),
-        )?,
+        DaemonCommands::Status if json => {
+            let protocol_version = client.protocol_version()?;
+            cli_output::print(
+                "daemon.status",
+                serde_json::json!({
+                    "status": "running",
+                    "protocol_version": protocol_version,
+                    "socket_path": client.socket_path().display().to_string(),
+                }),
+            )?
+        }
         DaemonCommands::Status => println!(
             "running (protocol {}, {})",
-            protocol::PROTOCOL_VERSION,
+            client.protocol_version()?,
             client.socket_path().display()
         ),
         DaemonCommands::Restart => {
@@ -721,6 +763,7 @@ fn capabilities(json: bool) -> Result<(), Box<dyn Error>> {
         "list",
         "shells",
         "read",
+        "events",
         "workspace.list",
         "workspace.inspect",
         "shell.inspect",
@@ -732,6 +775,9 @@ fn capabilities(json: bool) -> Result<(), Box<dyn Error>> {
         "rendered_scrollback",
         "graceful_live_handoff",
         "graceful_exited_handoff",
+        "daemon_events",
+        "reconnectable_event_cursors",
+        "revision_aware_reads",
     ];
     let error_codes = [
         "invalid_argument",
@@ -744,6 +790,9 @@ fn capabilities(json: bool) -> Result<(), Box<dyn Error>> {
         "persistence_failed",
         "timeout",
         "unsupported_version",
+        "cursor_expired",
+        "run_changed",
+        "revision_ahead",
         "context_required",
         "ambiguous_target",
         "internal",
@@ -1010,31 +1059,136 @@ fn list_workspace_shells(json: bool) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn read_shell(target: &str, lines: u32, json: bool) -> Result<(), Box<dyn Error>> {
+fn read_events(
+    after: Option<&str>,
+    limit: u16,
+    wait_ms: u32,
+    json: bool,
+) -> Result<(), Box<dyn Error>> {
+    let after = after.map(parse_event_cursor).transpose()?;
+    let batch = client::connect_or_start()?.events(after, limit, wait_ms)?;
+    let cursor = format_event_cursor(&batch.cursor);
+    if json {
+        let snapshot = batch.snapshot.map(json_snapshot).transpose()?;
+        return cli_output::print(
+            "events",
+            serde_json::json!({
+                "stream_id": batch.stream_id,
+                "cursor": cursor,
+                "snapshot": snapshot,
+                "events": batch.events,
+            }),
+        );
+    }
+    println!("CURSOR\t{cursor}");
+    if let Some(snapshot) = batch.snapshot {
+        println!("SNAPSHOT\t{}", snapshot.workspaces.len());
+    }
+    for event in batch.events {
+        let value = serde_json::to_value(&event.kind)?;
+        println!(
+            "{}\t{}\t{}",
+            event.id,
+            event.at_ms,
+            value["event"].as_str().unwrap_or("unknown")
+        );
+    }
+    Ok(())
+}
+
+fn parse_event_cursor(value: &str) -> Result<EventCursor, Box<dyn Error>> {
+    let (stream_id, event_id) = value.split_once(':').ok_or_else(|| {
+        cli_output::failure(
+            "invalid_argument",
+            "event cursor must have the form <stream-uuid>:<event-id>",
+        )
+    })?;
+    Uuid::parse_str(stream_id).map_err(|_| {
+        cli_output::failure("invalid_argument", "event cursor stream ID is invalid")
+    })?;
+    let event_id = event_id
+        .parse::<u64>()
+        .map_err(|_| cli_output::failure("invalid_argument", "event cursor event ID is invalid"))?;
+    Ok(EventCursor {
+        stream_id: stream_id.into(),
+        event_id,
+    })
+}
+
+fn format_event_cursor(cursor: &EventCursor) -> String {
+    format!("{}:{}", cursor.stream_id, cursor.event_id)
+}
+
+fn json_snapshot(snapshot: Snapshot) -> Result<serde_json::Value, Box<dyn Error>> {
+    let workspaces = snapshot
+        .workspaces
+        .iter()
+        .map(|workspace| {
+            let shells = workspace
+                .shells
+                .iter()
+                .map(|shell| cli_output::shell(shell, Some(&workspace.name)))
+                .collect::<Vec<_>>();
+            serde_json::json!({
+                "id": workspace.id,
+                "name": workspace.name,
+                "shells": shells,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(serde_json::json!({ "workspaces": workspaces }))
+}
+
+fn read_shell(
+    target: &str,
+    lines: u32,
+    json: bool,
+    run_id: Option<&str>,
+    after_revision: Option<u64>,
+    wait_ms: u32,
+) -> Result<(), Box<dyn Error>> {
     let client = client::connect_or_start()?;
     let snapshot = client.snapshot()?;
     let current_workspace_id = env::var("BOOMUX_SHELL_ID")
         .ok()
         .and_then(|id| find_shell(&snapshot, &id).map(|shell| shell.workspace_id.clone()));
     let shell = resolve_shell_target(&snapshot, current_workspace_id.as_deref(), target)?;
+    if json || run_id.is_some() {
+        let state = client.read_shell_at(
+            &shell.id,
+            READ_BYTES,
+            run_id.map(str::to_owned),
+            after_revision,
+            wait_ms,
+        )?;
+        let output = recent_lines(&String::from_utf8_lossy(&state.bytes), lines as usize);
+        if json {
+            return cli_output::print(
+                "read",
+                serde_json::json!({
+                    "shell_id": shell.id,
+                    "run_id": state.run_id,
+                    "output_revision": state.output_revision,
+                    "changed": state.changed,
+                    "status": shell_status(&state.status),
+                    "output": output,
+                }),
+            );
+        }
+        print_output(&output);
+        return Ok(());
+    }
     let bytes = client.read_shell(&shell.id, READ_BYTES)?;
     let output = recent_lines(&String::from_utf8_lossy(&bytes), lines as usize);
-    if json {
-        return cli_output::print(
-            "read",
-            serde_json::json!({
-                "shell_id": shell.id,
-                "run_id": shell.run.as_ref().map(|run| &run.id),
-                "output_revision": shell.run.as_ref().map(|run| run.output_revision),
-                "output": output,
-            }),
-        );
-    }
+    print_output(&output);
+    Ok(())
+}
+
+fn print_output(output: &str) {
     print!("{output}");
     if !output.is_empty() && !output.ends_with('\n') {
         println!();
     }
-    Ok(())
 }
 
 fn close_shell(target: &str) -> Result<(), Box<dyn Error>> {
@@ -1539,6 +1693,33 @@ mod tests {
         }
         let cli = Cli::try_parse_from(["boomux", "workspace", "create", "test", "--json"]).unwrap();
         assert!(!supports_json(&cli));
+        assert!(
+            Cli::try_parse_from([
+                "boomux",
+                "events",
+                "--after",
+                "00000000-0000-0000-0000-000000000000:4",
+                "--wait-ms",
+                "1000",
+                "--json",
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "boomux",
+                "read",
+                "shell",
+                "--run-id",
+                "run",
+                "--after-revision",
+                "4",
+                "--wait-ms",
+                "1000",
+            ])
+            .is_ok()
+        );
+        assert!(Cli::try_parse_from(["boomux", "read", "shell", "--run-id", "run"]).is_err());
     }
 
     #[test]

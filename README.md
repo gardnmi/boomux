@@ -93,6 +93,7 @@ boomux capabilities [--json]
 boomux list
 boomux shells
 boomux read <shell-name-or-shell-id> [--lines <count>]
+boomux events [--after <cursor>] [--limit <count>] [--wait-ms <milliseconds>]
 boomux close <shell-name-or-shell-id>
 boomux open <shell-id> [--title <title>] [--takeover]
 boomux workspace list
@@ -118,6 +119,8 @@ The `workspace` and `shell` command groups expose explicit lifecycle operations
 for scripts and integrations. `shell create` records a pending shell; its PTY
 and process start when the shell is first opened. Shell names require current
 workspace context or `--workspace`; IDs remain globally addressable.
+New workspace and shell names are limited to 256 UTF-8 bytes so retained event
+payloads remain bounded. Existing persisted names remain loadable.
 
 `boomux read` reads plain rendered text from the daemon's shadow VT state. It
 understands cursor rewrites and terminal soft wrapping, retains up to 2,000
@@ -127,6 +130,8 @@ Read-only integration commands accept `--json` and emit the stable
 `boomux.cli/v1` envelope. Run `boomux capabilities --json` to discover supported
 commands, features, and typed error codes without starting the daemon. See
 [`docs/cli-json.md`](docs/cli-json.md) for the contract.
+Daemon events and revision-aware reads are documented in
+[`docs/event-stream.md`](docs/event-stream.md).
 
 ## Configuration
 

@@ -36,7 +36,7 @@ transferred separately. The replacement cannot inherit Unix parenthood; process
 monitoring and cleanup therefore need an imported-process representation, with
 a Linux pidfd where available.
 
-Bootstrap starts with the `BOOMUXH3` version header and has bounded read/write
+Bootstrap starts with the `BOOMUXH4` version header and has bounded read/write
 deadlines. The receiver validates the listener path/type, forces nonblocking
 mode, matches both lock-file inodes, and establishes exclusive flock ownership
 before acknowledging readiness. Explicit abort closes every received duplicate
@@ -55,6 +55,11 @@ Exited shells use a separate static transfer record and bounded reconstruction
 frame. The replacement validates that the transferred identity and exit status
 match the persisted completed run, then restores the exited lifecycle without
 opening a PTY or starting a process.
+
+Handoff version 4 also transfers the event stream UUID, high-water mark, and
+bounded retained events. The replacement publishes `handoff_completed` before
+resuming readers, so output revisions remain ordered after the ownership
+boundary.
 
 ## Delivery Slices
 
