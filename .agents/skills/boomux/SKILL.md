@@ -40,6 +40,17 @@ boomux workspace inspect "<workspace-name-or-id>"
 boomux shell inspect "<shell-name-or-id>" --workspace "<workspace-name-or-id>"
 ```
 
+For machine-readable inspection, add `--json`. Supported read-only commands emit
+the stable `boomux.cli/v1` envelope. Discover the exact command, feature, and
+typed-error capabilities without starting the daemon:
+
+```console
+boomux capabilities --json
+```
+
+Parse `data` on success and `error.code` on a nonzero exit; do not parse human
+tables or `error.message`. Mutation commands do not yet support `--json`.
+
 Exact shell IDs resolve globally. Shell names resolve in the current workspace,
 or through `--workspace` for `shell inspect`, `shell rename`, and `shell close`.
 `boomux read` and top-level `boomux close` require an exact shell ID outside a

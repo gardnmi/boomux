@@ -2,16 +2,18 @@ use std::env;
 use std::error::Error;
 use std::fs;
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
+use clap::error::ErrorKind as ClapErrorKind;
 use clap::{Parser, Subcommand};
 use uuid::Uuid;
 
 use boomux::protocol::{ShellSnapshot, ShellSpec, ShellStatus, Snapshot, WorkspaceSnapshot};
 use boomux::{attach, client, daemon, protocol};
 
+mod cli_output;
 mod config;
 mod git;
 mod projects;
@@ -69,6 +71,10 @@ const READ_BYTES: usize = 1024 * 1024;
     subcommand_value_name = "SUBCOMMAND"
 )]
 struct Cli {
+    /// Emit the stable boomux.cli/v1 JSON envelope
+    #[arg(long, global = true)]
+    json: bool,
+
     /// Open or create a persistent terminal in this directory
     #[arg(value_name = "PATH")]
     path: Option<PathBuf>,
@@ -99,6 +105,8 @@ enum Commands {
     Ui,
     /// Check that Boomux's dependencies and daemon are available
     Doctor,
+    /// Report stable integration capabilities without starting the daemon
+    Capabilities,
     /// List all managed shells
     List,
     /// List shells in the current Boomux workspace
@@ -226,16 +234,55 @@ enum DaemonCommands {
 }
 
 fn main() -> ExitCode {
-    match run(Cli::parse()) {
+    let json_requested = env::args_os().any(|argument| argument == "--json");
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => {
+            let exit_code = u8::try_from(error.exit_code()).unwrap_or(1);
+            if json_requested
+                && !matches!(
+                    error.kind(),
+                    ClapErrorKind::DisplayHelp | ClapErrorKind::DisplayVersion
+                )
+            {
+                cli_output::print_error_message("cli", "invalid_argument", error.to_string());
+                return ExitCode::from(exit_code);
+            }
+            let success = matches!(
+                error.kind(),
+                ClapErrorKind::DisplayHelp | ClapErrorKind::DisplayVersion
+            );
+            let _ = error.print();
+            return if success {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(exit_code)
+            };
+        }
+    };
+    let json = cli.json;
+    let command = command_name(&cli);
+    match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("boomux: {error}");
+            if json {
+                cli_output::print_error(command, error.as_ref());
+            } else {
+                eprintln!("boomux: {error}");
+            }
             ExitCode::FAILURE
         }
     }
 }
 
 fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
+    if cli.json && !supports_json(&cli) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("--json is not supported for {}", command_name(&cli)),
+        )
+        .into());
+    }
     match cli.command.as_ref() {
         Some(Commands::Daemon {
             command: DaemonCommands::Run,
@@ -270,12 +317,13 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
     match cli.command {
         Some(Commands::Ui) => dashboard(cli.terminal.as_deref()),
         Some(Commands::Doctor) => doctor(cli.terminal.as_deref()),
-        Some(Commands::List) => list_shells(),
-        Some(Commands::Shells) => list_workspace_shells(),
-        Some(Commands::Read { target, lines }) => read_shell(&target, lines),
+        Some(Commands::Capabilities) => capabilities(cli.json),
+        Some(Commands::List) => list_shells(cli.json),
+        Some(Commands::Shells) => list_workspace_shells(cli.json),
+        Some(Commands::Read { target, lines }) => read_shell(&target, lines, cli.json),
         Some(Commands::Close { target }) => close_shell(&target),
-        Some(Commands::Workspace { command }) => workspace_command(command),
-        Some(Commands::Shell { command }) => shell_command(command),
+        Some(Commands::Workspace { command }) => workspace_command(command, cli.json),
+        Some(Commands::Shell { command }) => shell_command(command, cli.json),
         Some(Commands::Skill {
             command: SkillCommands::Install { force },
         }) => install_skill(force),
@@ -288,15 +336,70 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             open_shell(&shell_id, title.as_deref(), takeover, terminal.as_deref())
         }
         Some(Commands::Prompt) => print_prompt_label(),
-        Some(Commands::Daemon { command }) => daemon_control(command),
+        Some(Commands::Daemon { command }) => daemon_control(command, cli.json),
         Some(Commands::Attach { .. }) => unreachable!(),
         None => dashboard(cli.terminal.as_deref()),
     }
 }
 
-fn daemon_control(command: DaemonCommands) -> Result<(), Box<dyn Error>> {
+fn command_name(cli: &Cli) -> &'static str {
+    match cli.command.as_ref() {
+        Some(Commands::Capabilities) => "capabilities",
+        Some(Commands::List) => "list",
+        Some(Commands::Shells) => "shells",
+        Some(Commands::Read { .. }) => "read",
+        Some(Commands::Workspace {
+            command: WorkspaceCommands::List,
+        }) => "workspace.list",
+        Some(Commands::Workspace {
+            command: WorkspaceCommands::Inspect { .. },
+        }) => "workspace.inspect",
+        Some(Commands::Shell {
+            command: ShellCommands::Inspect { .. },
+        }) => "shell.inspect",
+        Some(Commands::Daemon {
+            command: DaemonCommands::Status,
+        }) => "daemon.status",
+        Some(Commands::Workspace { .. }) => "workspace",
+        Some(Commands::Shell { .. }) => "shell",
+        Some(Commands::Daemon { .. }) => "daemon",
+        Some(Commands::Ui) | None => "ui",
+        Some(Commands::Doctor) => "doctor",
+        Some(Commands::Close { .. }) => "close",
+        Some(Commands::Skill { .. }) => "skill",
+        Some(Commands::Open { .. }) => "open",
+        Some(Commands::Prompt) => "prompt",
+        Some(Commands::Attach { .. }) => "attach",
+    }
+}
+
+fn supports_json(cli: &Cli) -> bool {
+    matches!(
+        cli.command.as_ref(),
+        Some(Commands::Capabilities | Commands::List | Commands::Shells | Commands::Read { .. })
+            | Some(Commands::Workspace {
+                command: WorkspaceCommands::List | WorkspaceCommands::Inspect { .. }
+            })
+            | Some(Commands::Shell {
+                command: ShellCommands::Inspect { .. }
+            })
+            | Some(Commands::Daemon {
+                command: DaemonCommands::Status
+            })
+    )
+}
+
+fn daemon_control(command: DaemonCommands, json: bool) -> Result<(), Box<dyn Error>> {
     let client = client::connect()?;
     match command {
+        DaemonCommands::Status if json => cli_output::print(
+            "daemon.status",
+            serde_json::json!({
+                "status": "running",
+                "protocol_version": protocol::PROTOCOL_VERSION,
+                "socket_path": client.socket_path().display().to_string(),
+            }),
+        )?,
         DaemonCommands::Status => println!(
             "running (protocol {}, {})",
             protocol::PROTOCOL_VERSION,
@@ -543,7 +646,10 @@ fn resolve_directory(path: &Path) -> Result<PathBuf, Box<dyn Error>> {
 fn cli_name(name: String, kind: &str) -> Result<String, Box<dyn Error>> {
     let name = name.trim();
     if name.is_empty() {
-        return Err(format!("{kind} name cannot be empty").into());
+        return Err(cli_output::failure(
+            "invalid_argument",
+            format!("{kind} name cannot be empty"),
+        ));
     }
     Ok(name.to_owned())
 }
@@ -562,7 +668,7 @@ fn resolve_workspace_target<'a>(
     workspaces
         .iter()
         .find(|workspace| workspace.id == target || workspace.name == target)
-        .ok_or_else(|| format!("workspace not found: {target}").into())
+        .ok_or_else(|| cli_output::failure("not_found", format!("workspace not found: {target}")))
 }
 
 fn create_dashboard_workspace(
@@ -609,8 +715,77 @@ fn unique_shell_name(base_name: &str, shells: &[ShellSnapshot]) -> String {
     )
 }
 
-fn list_shells() -> Result<(), Box<dyn Error>> {
+fn capabilities(json: bool) -> Result<(), Box<dyn Error>> {
+    let commands = [
+        "capabilities",
+        "list",
+        "shells",
+        "read",
+        "workspace.list",
+        "workspace.inspect",
+        "shell.inspect",
+        "daemon.status",
+    ];
+    let features = [
+        "typed_errors",
+        "shell_run_identity",
+        "rendered_scrollback",
+        "graceful_live_handoff",
+        "graceful_exited_handoff",
+    ];
+    let error_codes = [
+        "invalid_argument",
+        "not_found",
+        "already_exists",
+        "busy",
+        "daemon_stopping",
+        "daemon_unavailable",
+        "shell_start_failed",
+        "persistence_failed",
+        "timeout",
+        "unsupported_version",
+        "context_required",
+        "ambiguous_target",
+        "internal",
+        "unknown",
+    ];
+    if json {
+        return cli_output::print(
+            "capabilities",
+            serde_json::json!({
+                "cli_version": env!("CARGO_PKG_VERSION"),
+                "daemon_protocol_version": protocol::PROTOCOL_VERSION,
+                "json_schemas": [cli_output::SCHEMA],
+                "json_commands": commands,
+                "features": features,
+                "error_codes": error_codes,
+            }),
+        );
+    }
+    println!("CLI VERSION\t{}", env!("CARGO_PKG_VERSION"));
+    println!("DAEMON PROTOCOL\t{}", protocol::PROTOCOL_VERSION);
+    println!("JSON SCHEMAS\t{}", cli_output::SCHEMA);
+    println!("JSON COMMANDS\t{}", commands.join(","));
+    println!("FEATURES\t{}", features.join(","));
+    println!("ERROR CODES\t{}", error_codes.join(","));
+    Ok(())
+}
+
+fn list_shells(json: bool) -> Result<(), Box<dyn Error>> {
     let snapshot = client::connect_or_start()?.snapshot()?;
+    if json {
+        let shells = snapshot
+            .workspaces
+            .iter()
+            .flat_map(|workspace| {
+                workspace
+                    .shells
+                    .iter()
+                    .map(|shell| cli_output::shell(shell, Some(&workspace.name)))
+            })
+            .collect::<Vec<_>>();
+        return cli_output::print("list", serde_json::json!({ "shells": shells }));
+    }
     println!("WORKSPACE\tNAME\tSHELL ID\tRUN ID\tSTATUS");
     for workspace in snapshot.workspaces {
         for shell in workspace.shells {
@@ -627,12 +802,27 @@ fn list_shells() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn workspace_command(command: WorkspaceCommands) -> Result<(), Box<dyn Error>> {
+fn workspace_command(command: WorkspaceCommands, json: bool) -> Result<(), Box<dyn Error>> {
     let client = client::connect_or_start()?;
     match command {
         WorkspaceCommands::List => {
+            let workspaces = client.snapshot()?.workspaces;
+            if json {
+                let workspaces = workspaces
+                    .iter()
+                    .map(|workspace| cli_output::WorkspaceSummary {
+                        id: workspace.id.clone(),
+                        name: workspace.name.clone(),
+                        shell_count: workspace.shells.len(),
+                    })
+                    .collect::<Vec<_>>();
+                return cli_output::print(
+                    "workspace.list",
+                    serde_json::json!({ "workspaces": workspaces }),
+                );
+            }
             println!("NAME\tWORKSPACE ID\tSHELLS");
-            for workspace in client.snapshot()?.workspaces {
+            for workspace in workspaces {
                 println!(
                     "{}\t{}\t{}",
                     workspace.name,
@@ -649,6 +839,23 @@ fn workspace_command(command: WorkspaceCommands) -> Result<(), Box<dyn Error>> {
         WorkspaceCommands::Inspect { target } => {
             let snapshot = client.snapshot()?;
             let workspace = resolve_workspace_target(&snapshot.workspaces, &target)?;
+            if json {
+                let shells = workspace
+                    .shells
+                    .iter()
+                    .map(|shell| cli_output::shell(shell, Some(&workspace.name)))
+                    .collect::<Vec<_>>();
+                return cli_output::print(
+                    "workspace.inspect",
+                    serde_json::json!({
+                        "workspace": {
+                            "id": workspace.id,
+                            "name": workspace.name,
+                            "shells": shells,
+                        }
+                    }),
+                );
+            }
             println!("ID\t{}", workspace.id);
             println!("NAME\t{}", workspace.name);
             println!("SHELLS\t{}", workspace.shells.len());
@@ -692,7 +899,7 @@ fn workspace_command(command: WorkspaceCommands) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn shell_command(command: ShellCommands) -> Result<(), Box<dyn Error>> {
+fn shell_command(command: ShellCommands, json: bool) -> Result<(), Box<dyn Error>> {
     let client = client::connect_or_start()?;
     match command {
         ShellCommands::Create {
@@ -718,7 +925,17 @@ fn shell_command(command: ShellCommands) -> Result<(), Box<dyn Error>> {
                 .workspaces
                 .iter()
                 .find(|workspace| workspace.id == shell.workspace_id)
-                .ok_or("shell workspace no longer exists")?;
+                .ok_or_else(|| {
+                    cli_output::failure("not_found", "shell workspace no longer exists")
+                })?;
+            if json {
+                return cli_output::print(
+                    "shell.inspect",
+                    serde_json::json!({
+                        "shell": cli_output::shell(shell, Some(&workspace.name)),
+                    }),
+                );
+            }
             println!("ID\t{}", shell.id);
             println!("NAME\t{}", shell.name);
             println!("WORKSPACE\t{}", workspace.name);
@@ -761,10 +978,25 @@ fn shell_command(command: ShellCommands) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn list_workspace_shells() -> Result<(), Box<dyn Error>> {
+fn list_workspace_shells(json: bool) -> Result<(), Box<dyn Error>> {
     let client = client::connect_or_start()?;
     let shell = current_shell(&client)?;
     let workspace = client.get_workspace(&shell.workspace_id)?;
+    if json {
+        let shells = workspace
+            .shells
+            .iter()
+            .map(|shell| cli_output::shell(shell, Some(&workspace.name)))
+            .collect::<Vec<_>>();
+        return cli_output::print(
+            "shells",
+            serde_json::json!({
+                "workspace_id": workspace.id,
+                "workspace_name": workspace.name,
+                "shells": shells,
+            }),
+        );
+    }
     println!("NAME\tSHELL ID\tRUN ID\tSTATUS");
     for shell in workspace.shells {
         println!(
@@ -778,7 +1010,7 @@ fn list_workspace_shells() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn read_shell(target: &str, lines: u32) -> Result<(), Box<dyn Error>> {
+fn read_shell(target: &str, lines: u32, json: bool) -> Result<(), Box<dyn Error>> {
     let client = client::connect_or_start()?;
     let snapshot = client.snapshot()?;
     let current_workspace_id = env::var("BOOMUX_SHELL_ID")
@@ -787,6 +1019,17 @@ fn read_shell(target: &str, lines: u32) -> Result<(), Box<dyn Error>> {
     let shell = resolve_shell_target(&snapshot, current_workspace_id.as_deref(), target)?;
     let bytes = client.read_shell(&shell.id, READ_BYTES)?;
     let output = recent_lines(&String::from_utf8_lossy(&bytes), lines as usize);
+    if json {
+        return cli_output::print(
+            "read",
+            serde_json::json!({
+                "shell_id": shell.id,
+                "run_id": shell.run.as_ref().map(|run| &run.id),
+                "output_revision": shell.run.as_ref().map(|run| run.output_revision),
+                "output": output,
+            }),
+        );
+    }
     print!("{output}");
     if !output.is_empty() && !output.ends_with('\n') {
         println!();
@@ -838,11 +1081,18 @@ fn resolve_cli_shell<'a>(
             .as_str()
     } else {
         let current_shell_id = env::var("BOOMUX_SHELL_ID").map_err(|_| {
-            format!("shell name {target:?} requires --workspace outside a Boomux-managed shell")
+            cli_output::failure(
+                "context_required",
+                format!(
+                    "shell name {target:?} requires --workspace outside a Boomux-managed shell"
+                ),
+            )
         })?;
         find_shell(snapshot, &current_shell_id)
             .map(|shell| shell.workspace_id.as_str())
-            .ok_or("current Boomux shell no longer exists")?
+            .ok_or_else(|| {
+                cli_output::failure("not_found", "current Boomux shell no longer exists")
+            })?
     };
     resolve_shell_target(snapshot, Some(workspace_id), target)
 }
@@ -856,15 +1106,18 @@ fn resolve_shell_target<'a>(
         return Ok(shell);
     }
     let workspace_id = current_workspace_id.ok_or_else(|| {
-        format!(
-            "shell name {target:?} requires a Boomux shell; use an exact shell ID outside Boomux"
+        cli_output::failure(
+            "context_required",
+            format!(
+                "shell name {target:?} requires a Boomux shell; use an exact shell ID outside Boomux"
+            ),
         )
     })?;
     let workspace = snapshot
         .workspaces
         .iter()
         .find(|workspace| workspace.id == workspace_id)
-        .ok_or("current workspace no longer exists")?;
+        .ok_or_else(|| cli_output::failure("not_found", "current workspace no longer exists"))?;
     let matches = workspace
         .shells
         .iter()
@@ -879,12 +1132,17 @@ fn resolve_shell_target<'a>(
                 .map(|shell| shell.name.as_str())
                 .collect::<Vec<_>>()
                 .join(", ");
-            Err(format!(
-                "shell {target:?} was not found in this workspace; available shells: {available}"
-            )
-            .into())
+            Err(cli_output::failure(
+                "not_found",
+                format!(
+                    "shell {target:?} was not found in this workspace; available shells: {available}"
+                ),
+            ))
         }
-        _ => Err(format!("shell name {target:?} is ambiguous in this workspace").into()),
+        _ => Err(cli_output::failure(
+            "ambiguous_target",
+            format!("shell name {target:?} is ambiguous in this workspace"),
+        )),
     }
 }
 
@@ -902,8 +1160,12 @@ fn find_shell<'a>(snapshot: &'a Snapshot, id: &str) -> Option<&'a ShellSnapshot>
 }
 
 fn current_shell(client: &client::Client) -> Result<ShellSnapshot, Box<dyn Error>> {
-    let shell_id = env::var("BOOMUX_SHELL_ID")
-        .map_err(|_| "this command must run inside a Boomux-managed shell")?;
+    let shell_id = env::var("BOOMUX_SHELL_ID").map_err(|_| {
+        cli_output::failure(
+            "context_required",
+            "this command must run inside a Boomux-managed shell",
+        )
+    })?;
     Ok(client.get_shell(shell_id)?)
 }
 
@@ -1261,6 +1523,22 @@ mod tests {
                 .command,
             Some(Commands::Close { target }) if target == "tests"
         ));
+    }
+
+    #[test]
+    fn parses_global_json_for_supported_integration_commands() {
+        for arguments in [
+            vec!["boomux", "--json", "capabilities"],
+            vec!["boomux", "list", "--json"],
+            vec!["boomux", "workspace", "list", "--json"],
+            vec!["boomux", "daemon", "status", "--json"],
+        ] {
+            let cli = Cli::try_parse_from(arguments).unwrap();
+            assert!(cli.json);
+            assert!(supports_json(&cli));
+        }
+        let cli = Cli::try_parse_from(["boomux", "workspace", "create", "test", "--json"]).unwrap();
+        assert!(!supports_json(&cli));
     }
 
     #[test]

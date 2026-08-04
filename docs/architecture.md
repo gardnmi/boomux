@@ -129,6 +129,13 @@ lifecycle operations, native-terminal opening, and daemon management.
 globally addressable within the daemon. The installer safely removes an
 untouched legacy `boomux-shells` skill and preserves customized copies.
 
+Read-only CLI integrations use the separate `boomux.cli/v1` JSON envelope rather
+than serializing daemon protocol snapshots directly. `boomux capabilities`
+advertises supported commands, features, schemas, and error codes without
+requiring a daemon. Protocol 6 error responses carry an additive optional code;
+new clients expose it through a typed `RemoteError`, while mixed-version peers
+retain message compatibility.
+
 ## Runtime Semantics
 
 Closing a terminal window closes only its socket attachment. The daemon retains
@@ -168,5 +175,5 @@ as pending.
 The detailed design, acceptance criteria, and manual test matrix are tracked in
 [`native-terminal-follow-up.md`](native-terminal-follow-up.md).
 
-1. Add stable versioned JSON output, typed errors, and capability reporting for
-   integrations.
+1. Add a monotonic daemon event stream with reconnectable cursors and
+   revision-aware output reads.

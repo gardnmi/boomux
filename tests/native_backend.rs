@@ -9,9 +9,9 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use boomux::client::{Attachment, Client};
+use boomux::client::{Attachment, Client, RemoteError};
 use boomux::protocol::{
-    self, AttachFrame, ShellRunExitReason, ShellSpec, ShellStatus, TerminalProfile,
+    self, AttachFrame, ErrorCode, ShellRunExitReason, ShellSpec, ShellStatus, TerminalProfile,
 };
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use uuid::Uuid;
@@ -132,6 +132,37 @@ fn replacement_bootstrap_rejects_invalid_inherited_descriptor() {
 
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("Bad file descriptor"));
+}
+
+#[test]
+fn json_cli_parse_and_daemon_start_failures_use_typed_envelopes() {
+    let parse_failure = Command::new(env!("CARGO_BIN_EXE_boomux"))
+        .args(["--json", "read"])
+        .output()
+        .unwrap();
+    assert!(!parse_failure.status.success());
+    assert!(parse_failure.stdout.is_empty());
+    let parse_failure: serde_json::Value = serde_json::from_slice(&parse_failure.stderr).unwrap();
+    assert_eq!(parse_failure["schema"], "boomux.cli/v1");
+    assert_eq!(parse_failure["command"], "cli");
+    assert_eq!(parse_failure["error"]["code"], "invalid_argument");
+
+    let root = std::env::temp_dir().join(format!("boomux-json-start-{}", Uuid::new_v4()));
+    fs::create_dir(&root).unwrap();
+    let invalid_state_home = root.join("state-file");
+    fs::write(&invalid_state_home, b"not a directory").unwrap();
+    let unavailable = Command::new(env!("CARGO_BIN_EXE_boomux"))
+        .args(["list", "--json"])
+        .env("XDG_RUNTIME_DIR", &root)
+        .env("XDG_STATE_HOME", &invalid_state_home)
+        .output()
+        .unwrap();
+    assert!(!unavailable.status.success());
+    assert!(unavailable.stdout.is_empty());
+    let unavailable: serde_json::Value = serde_json::from_slice(&unavailable.stderr).unwrap();
+    assert_eq!(unavailable["command"], "list");
+    assert_eq!(unavailable["error"]["code"], "daemon_unavailable");
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -531,7 +562,14 @@ fn graceful_restart_preserves_exited_run_and_terminal_state() {
     let saved_directory = daemon.runtime_dir.join("saved-exited-handoff-state");
     fs::rename(&state_directory, &saved_directory).unwrap();
     fs::write(&state_directory, b"not a directory").unwrap();
-    assert!(daemon.client.close_shell(&shell_id).is_err());
+    let error = daemon.client.close_shell(&shell_id).unwrap_err();
+    assert_eq!(
+        error
+            .get_ref()
+            .and_then(|error| error.downcast_ref::<RemoteError>())
+            .and_then(|error| error.code),
+        Some(ErrorCode::PersistenceFailed)
+    );
     let rolled_back = daemon.client.get_shell(&shell_id).unwrap();
     assert_eq!(rolled_back.status, ShellStatus::Exited { code: Some(7) });
     assert_eq!(rolled_back.run.as_ref(), Some(&before_run));
@@ -696,6 +734,17 @@ fn attachment_client_reconnects_across_daemon_restart() {
 fn native_daemon_lifecycle() {
     let mut daemon = TestDaemon::start();
 
+    let capabilities = daemon
+        .command()
+        .args(["capabilities", "--json"])
+        .output()
+        .unwrap();
+    assert!(capabilities.status.success());
+    let capabilities: serde_json::Value = serde_json::from_slice(&capabilities.stdout).unwrap();
+    assert_eq!(capabilities["schema"], "boomux.cli/v1");
+    assert_eq!(capabilities["command"], "capabilities");
+    assert_eq!(capabilities["data"]["daemon_protocol_version"], 6);
+
     let status = daemon
         .command()
         .args(["daemon", "status"])
@@ -703,6 +752,51 @@ fn native_daemon_lifecycle() {
         .unwrap();
     assert!(status.status.success());
     assert!(String::from_utf8_lossy(&status.stdout).contains("running (protocol 6"));
+    let status = daemon
+        .command()
+        .args(["daemon", "status", "--json"])
+        .output()
+        .unwrap();
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["schema"], "boomux.cli/v1");
+    assert_eq!(status["data"]["status"], "running");
+
+    let missing_id = Uuid::new_v4().to_string();
+    let error = daemon.client.get_shell(&missing_id).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    let remote = error
+        .get_ref()
+        .and_then(|error| error.downcast_ref::<RemoteError>())
+        .unwrap();
+    assert_eq!(remote.code, Some(ErrorCode::NotFound));
+    let typed_failure = daemon
+        .command()
+        .args(["shells", "--json"])
+        .env("BOOMUX_SHELL_ID", &missing_id)
+        .output()
+        .unwrap();
+    assert!(!typed_failure.status.success());
+    let typed_failure: serde_json::Value = serde_json::from_slice(&typed_failure.stderr).unwrap();
+    assert_eq!(typed_failure["command"], "shells");
+    assert_eq!(typed_failure["error"]["code"], "not_found");
+    let unsupported = daemon
+        .command()
+        .args(["workspace", "create", "must-not-exist", "--json"])
+        .output()
+        .unwrap();
+    assert!(!unsupported.status.success());
+    assert!(unsupported.stdout.is_empty());
+    let unsupported_error: serde_json::Value = serde_json::from_slice(&unsupported.stderr).unwrap();
+    assert_eq!(unsupported_error["error"]["code"], "invalid_argument");
+    assert!(
+        daemon
+            .client
+            .snapshot()
+            .unwrap()
+            .workspaces
+            .iter()
+            .all(|workspace| workspace.name != "must-not-exist")
+    );
 
     let mut duplicate = daemon
         .command()
@@ -798,6 +892,14 @@ fn native_daemon_lifecycle() {
     assert!(String::from_utf8_lossy(&output.stdout).contains("NAME\tcli-test"));
     let output = daemon
         .command()
+        .args(["workspace", "inspect", "cli-test", "--json"])
+        .output()
+        .unwrap();
+    let output: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(output["command"], "workspace.inspect");
+    assert_eq!(output["data"]["workspace"]["name"], "cli-test");
+    let output = daemon
+        .command()
         .args(["workspace", "rename", "cli-test", "cli-renamed"])
         .output()
         .unwrap();
@@ -837,6 +939,22 @@ fn native_daemon_lifecycle() {
         .unwrap();
     assert!(output.status.success());
     assert!(String::from_utf8_lossy(&output.stdout).contains("STATUS\tpending"));
+    let output = daemon
+        .command()
+        .args([
+            "shell",
+            "inspect",
+            "checks",
+            "--workspace",
+            "cli-renamed",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    let output: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(output["command"], "shell.inspect");
+    assert_eq!(output["data"]["shell"]["status"], "pending");
+    assert!(output["data"]["shell"]["run"].is_null());
     let output = daemon
         .command()
         .args([
@@ -900,6 +1018,13 @@ fn native_daemon_lifecycle() {
         .attach(&failed_shell.id, false, profile())
         .unwrap_err();
     assert!(error.to_string().contains("could not start shell"));
+    assert_eq!(
+        error
+            .get_ref()
+            .and_then(|error| error.downcast_ref::<RemoteError>())
+            .and_then(|error| error.code),
+        Some(ErrorCode::ShellStartFailed)
+    );
     assert_eq!(
         daemon.client.get_shell(&failed_shell.id).unwrap().status,
         ShellStatus::Pending
@@ -976,6 +1101,20 @@ fn native_daemon_lifecycle() {
         .unwrap();
     let output = read_until(&mut first, b"transport-ok");
     assert!(contains(&output, b"transport-ok"));
+    let output = daemon
+        .command()
+        .args(["read", &shell_id, "--lines", "20", "--json"])
+        .output()
+        .unwrap();
+    let output: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(output["command"], "read");
+    assert_eq!(output["data"]["run_id"], initial_run.id);
+    assert!(
+        output["data"]["output"]
+            .as_str()
+            .unwrap()
+            .contains("transport-ok")
+    );
     let state_path = daemon.runtime_dir.join("state/boomux/state.json");
     let valid_state = fs::read(&state_path).unwrap();
     fs::write(&state_path, b"invalid active replacement state").unwrap();

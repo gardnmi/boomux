@@ -23,8 +23,9 @@ use crate::client;
 use crate::fd_transfer::send_descriptor;
 use crate::handoff;
 use crate::protocol::{
-    self, AttachFrame, Envelope, Request, Response, ShellRunExitReason, ShellRunSnapshot,
-    ShellSnapshot, ShellSpec, ShellStatus, Snapshot, TerminalProfile, WorkspaceSnapshot,
+    self, AttachFrame, Envelope, ErrorCode, Request, Response, ShellRunExitReason,
+    ShellRunSnapshot, ShellSnapshot, ShellSpec, ShellStatus, Snapshot, TerminalProfile,
+    WorkspaceSnapshot,
 };
 use crate::state_store::{
     PersistedShell, PersistedShellRun, PersistedState, PersistedWorkspace, StateStore,
@@ -207,6 +208,21 @@ struct RestartRequest {
     reply: SyncSender<io::Result<()>>,
 }
 
+#[derive(Debug)]
+struct PersistenceError(io::Error);
+
+impl std::fmt::Display for PersistenceError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl std::error::Error for PersistenceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
 struct SocketCleanup {
     path: PathBuf,
     armed: bool,
@@ -280,7 +296,7 @@ fn launch_replacement(
     let _mutation = lock(&registry.mutation_lock)?;
     registry.ensure_running()?;
     if registry.persistence_dirty.load(Ordering::Acquire) {
-        registry.persist()?;
+        registry.persist().map_err(persistence_error)?;
     }
     registry.stopping.store(true, Ordering::Release);
     let mut paused = Vec::new();
@@ -461,13 +477,14 @@ fn handle_connection(
     if request.version != protocol::PROTOCOL_VERSION {
         return send_response(
             &mut stream,
-            Response::Error {
-                message: format!(
+            error_response(
+                ErrorCode::UnsupportedVersion,
+                format!(
                     "protocol version {} is unsupported; expected {}",
                     request.version,
                     protocol::PROTOCOL_VERSION
                 ),
-            },
+            ),
         );
     }
 
@@ -491,9 +508,10 @@ fn handle_connection(
         {
             return send_response(
                 &mut stream,
-                Response::Error {
-                    message: "another daemon transition is already in progress".into(),
-                },
+                error_response(
+                    ErrorCode::Busy,
+                    "another daemon transition is already in progress",
+                ),
             );
         }
         return match registry.shutdown() {
@@ -505,9 +523,10 @@ fn handle_connection(
                 transition.store(TRANSITION_IDLE, Ordering::Release);
                 send_response(
                     &mut stream,
-                    Response::Error {
-                        message: format!("could not stop Boomux daemon: {error}"),
-                    },
+                    error_response(
+                        error_code(&error),
+                        format!("could not stop Boomux daemon: {error}"),
+                    ),
                 )
             }
         };
@@ -524,9 +543,7 @@ fn handle_connection(
         {
             return send_response(
                 &mut stream,
-                Response::Error {
-                    message: "daemon restart is already in progress".into(),
-                },
+                error_response(ErrorCode::Busy, "daemon restart is already in progress"),
             );
         }
         let (reply, response) = mpsc::sync_channel(1);
@@ -538,29 +555,55 @@ fn handle_connection(
             Ok(Ok(())) => send_response(&mut stream, Response::Ok),
             Ok(Err(error)) => send_response(
                 &mut stream,
-                Response::Error {
-                    message: error.to_string(),
-                },
+                error_response(error_code(&error), error.to_string()),
             ),
             Err(error) => send_response(
                 &mut stream,
-                Response::Error {
-                    message: format!("daemon restart timed out: {error}"),
-                },
+                error_response(
+                    ErrorCode::Timeout,
+                    format!("daemon restart timed out: {error}"),
+                ),
             ),
         };
     }
 
     let response = registry
         .dispatch(request.message)
-        .unwrap_or_else(|error| Response::Error {
-            message: error.to_string(),
-        });
+        .unwrap_or_else(|error| error_response(error_code(&error), error.to_string()));
     send_response(&mut stream, response)
 }
 
 fn send_response(stream: &mut UnixStream, response: Response) -> io::Result<()> {
     protocol::write_message(stream, &Envelope::new(response))
+}
+
+fn error_response(code: ErrorCode, message: impl Into<String>) -> Response {
+    Response::Error {
+        message: message.into(),
+        code: Some(code),
+    }
+}
+
+fn error_code(error: &io::Error) -> ErrorCode {
+    if error
+        .get_ref()
+        .is_some_and(|error| error.downcast_ref::<PersistenceError>().is_some())
+    {
+        return ErrorCode::PersistenceFailed;
+    }
+    match error.kind() {
+        io::ErrorKind::InvalidInput | io::ErrorKind::InvalidData => ErrorCode::InvalidArgument,
+        io::ErrorKind::NotFound => ErrorCode::NotFound,
+        io::ErrorKind::AlreadyExists => ErrorCode::AlreadyExists,
+        io::ErrorKind::WouldBlock | io::ErrorKind::AddrInUse => ErrorCode::Busy,
+        io::ErrorKind::ConnectionAborted => ErrorCode::DaemonStopping,
+        io::ErrorKind::TimedOut => ErrorCode::Timeout,
+        _ => ErrorCode::Internal,
+    }
+}
+
+fn persistence_error(error: io::Error) -> io::Error {
+    io::Error::new(error.kind(), PersistenceError(error))
 }
 
 struct Registry {
@@ -1391,7 +1434,7 @@ impl Registry {
         self.ensure_running()?;
         let backup = self.backup()?;
         match operation() {
-            Ok(value) => match self.persist_unlocked() {
+            Ok(value) => match self.persist_unlocked().map_err(persistence_error) {
                 Ok(()) => Ok(value),
                 Err(error) => {
                     self.restore_backup(backup)?;
@@ -1638,7 +1681,7 @@ impl Registry {
             }
             killed.push(Arc::clone(shell));
         }
-        if let Err(error) = self.persist() {
+        if let Err(error) = self.persist().map_err(persistence_error) {
             for shell in killed {
                 shell.reset_pending()?;
             }
@@ -1879,7 +1922,7 @@ impl Registry {
         let killed_run = lock(&shell.last_run)?.clone();
         let _persistence = lock(&self.persist_lock)?;
         self.remove_shell(shell_id)?;
-        if let Err(error) = self.persist_unlocked() {
+        if let Err(error) = self.persist_unlocked().map_err(persistence_error) {
             self.restore_backup(backup)?;
             *lock(&shell.last_run)? = killed_run;
             shell.reset_pending()?;
@@ -1914,7 +1957,7 @@ impl Registry {
         }
         let _persistence = lock(&self.persist_lock)?;
         self.remove_workspace(workspace_id)?;
-        if let Err(error) = self.persist_unlocked() {
+        if let Err(error) = self.persist_unlocked().map_err(persistence_error) {
             self.restore_backup(backup)?;
             for shell in shells {
                 if let Some(run) = killed_runs.get(&shell.id) {
@@ -2337,9 +2380,7 @@ fn handle_attach(
     if let Err(error) = validate_terminal_profile(&profile) {
         return send_response(
             &mut stream,
-            Response::Error {
-                message: error.to_string(),
-            },
+            error_response(ErrorCode::InvalidArgument, error.to_string()),
         );
     }
     let shell = match registry.shell(shell_id) {
@@ -2347,9 +2388,7 @@ fn handle_attach(
         Err(error) => {
             return send_response(
                 &mut stream,
-                Response::Error {
-                    message: error.to_string(),
-                },
+                error_response(error_code(&error), error.to_string()),
             );
         }
     };
@@ -2357,9 +2396,7 @@ fn handle_attach(
     if registry.stopping.load(Ordering::Acquire) {
         return send_response(
             &mut stream,
-            Response::Error {
-                message: "Boomux daemon is stopping".into(),
-            },
+            error_response(ErrorCode::DaemonStopping, "Boomux daemon is stopping"),
         );
     }
     let token = Uuid::new_v4().to_string();
@@ -2372,9 +2409,7 @@ fn handle_attach(
         if !registry.contains_shell(&shell)? {
             return send_response(
                 &mut stream,
-                Response::Error {
-                    message: format!("shell not found: {shell_id}"),
-                },
+                error_response(ErrorCode::NotFound, format!("shell not found: {shell_id}")),
             );
         }
         if matches!(*lifecycle, ShellLifecycle::Pending) {
@@ -2393,9 +2428,10 @@ fn handle_attach(
                     Err(error) => {
                         return send_response(
                             &mut stream,
-                            Response::Error {
-                                message: format!("could not start shell: {error}"),
-                            },
+                            error_response(
+                                ErrorCode::ShellStartFailed,
+                                format!("could not start shell: {error}"),
+                            ),
                         );
                     }
                 };
@@ -2421,8 +2457,9 @@ fn handle_attach(
                 }
                 return send_response(
                     &mut stream,
-                    Response::Error {
-                        message: cleanup.map_or_else(
+                    error_response(
+                        ErrorCode::ShellStartFailed,
+                        cleanup.map_or_else(
                             |cleanup| {
                                 format!(
                                     "could not start shell reader: {error}; process cleanup also failed: {cleanup}"
@@ -2430,7 +2467,7 @@ fn handle_attach(
                             },
                             |()| format!("could not start shell reader: {error}"),
                         ),
-                    },
+                    ),
                 );
             }
         }
@@ -2451,9 +2488,7 @@ fn handle_attach(
             ShellLifecycle::Closed => {
                 return send_response(
                     &mut stream,
-                    Response::Error {
-                        message: format!("shell not found: {shell_id}"),
-                    },
+                    error_response(ErrorCode::NotFound, format!("shell not found: {shell_id}")),
                 );
             }
         }
@@ -2465,8 +2500,9 @@ fn handle_attach(
         }
         return send_response(
             &mut stream,
-            Response::Error {
-                message: cleanup.map_or_else(
+            error_response(
+                ErrorCode::PersistenceFailed,
+                cleanup.map_or_else(
                     |cleanup| {
                         format!(
                             "could not persist started shell: {error}; process cleanup also failed: {cleanup}"
@@ -2474,7 +2510,7 @@ fn handle_attach(
                     },
                     |()| format!("could not persist started shell: {error}"),
                 ),
-            },
+            ),
         );
     }
     if started {
@@ -2504,9 +2540,7 @@ fn handle_attach(
     if !registry.contains_shell(&shell)? {
         return send_response(
             &mut stream,
-            Response::Error {
-                message: format!("shell not found: {shell_id}"),
-            },
+            error_response(ErrorCode::NotFound, format!("shell not found: {shell_id}")),
         );
     }
     {
@@ -2514,9 +2548,10 @@ fn handle_attach(
         if controller.is_some() && !takeover {
             return send_response(
                 &mut stream,
-                Response::Error {
-                    message: "shell already has an active controller; use takeover".into(),
-                },
+                error_response(
+                    ErrorCode::Busy,
+                    "shell already has an active controller; use takeover",
+                ),
             );
         }
     }

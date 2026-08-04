@@ -89,6 +89,7 @@ closed, or the daemon stops.
 ```console
 boomux ui
 boomux doctor
+boomux capabilities [--json]
 boomux list
 boomux shells
 boomux read <shell-name-or-shell-id> [--lines <count>]
@@ -121,6 +122,11 @@ workspace context or `--workspace`; IDs remain globally addressable.
 `boomux read` reads plain rendered text from the daemon's shadow VT state. It
 understands cursor rewrites and terminal soft wrapping, retains up to 2,000
 scrollback rows per shell, and never returns ANSI control sequences.
+
+Read-only integration commands accept `--json` and emit the stable
+`boomux.cli/v1` envelope. Run `boomux capabilities --json` to discover supported
+commands, features, and typed error codes without starting the daemon. See
+[`docs/cli-json.md`](docs/cli-json.md) for the contract.
 
 ## Configuration
 

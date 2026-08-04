@@ -1,4 +1,5 @@
 use std::env;
+use std::error::Error;
 use std::fs::OpenOptions;
 use std::io;
 use std::os::fd::AsRawFd;
@@ -10,8 +11,8 @@ use std::thread;
 use std::time::Duration;
 
 use crate::protocol::{
-    self, Envelope, Request, Response, ShellSnapshot, ShellSpec, Snapshot, TerminalProfile,
-    WorkspaceSnapshot,
+    self, Envelope, ErrorCode, Request, Response, ShellSnapshot, ShellSpec, Snapshot,
+    TerminalProfile, WorkspaceSnapshot,
 };
 
 const CONNECT_ATTEMPTS: usize = 40;
@@ -31,6 +32,20 @@ pub struct Attachment {
     pub warning: Option<String>,
 }
 
+#[derive(Debug)]
+pub struct RemoteError {
+    pub code: Option<ErrorCode>,
+    pub message: String,
+}
+
+impl std::fmt::Display for RemoteError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl Error for RemoteError {}
+
 pub fn socket_path() -> io::Result<PathBuf> {
     let runtime = env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
@@ -46,8 +61,10 @@ pub fn socket_path() -> io::Result<PathBuf> {
 
 pub fn connect_or_start() -> io::Result<Client> {
     let client = connect_client()?;
-    if client.ping().is_ok() {
-        return Ok(client);
+    match client.ping() {
+        Ok(()) => return Ok(client),
+        Err(error) if !daemon_unreachable(&error) => return Err(error),
+        Err(_) => {}
     }
 
     let mut command = Command::new(env::current_exe()?);
@@ -67,17 +84,40 @@ pub fn connect_or_start() -> io::Result<Client> {
             }
         });
     }
-    command.spawn()?;
+    command.spawn().map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            format!("daemon did not start: {error}"),
+        )
+    })?;
 
     let mut last_error = None;
     for _ in 0..CONNECT_ATTEMPTS {
         match client.ping() {
             Ok(()) => return Ok(client),
+            Err(error) if !daemon_unreachable(&error) => return Err(error),
             Err(error) => last_error = Some(error),
         }
         thread::sleep(CONNECT_DELAY);
     }
-    Err(last_error.unwrap_or_else(|| io::Error::other("daemon did not start")))
+    Err(io::Error::new(
+        io::ErrorKind::ConnectionRefused,
+        last_error.unwrap_or_else(|| io::Error::other("daemon did not start")),
+    ))
+}
+
+fn daemon_unreachable(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_none_or(|error| !error.is::<RemoteError>())
+        && matches!(
+            error.kind(),
+            io::ErrorKind::NotFound
+                | io::ErrorKind::ConnectionRefused
+                | io::ErrorKind::ConnectionReset
+                | io::ErrorKind::BrokenPipe
+                | io::ErrorKind::UnexpectedEof
+        )
 }
 
 pub fn connect() -> io::Result<Client> {
@@ -110,13 +150,29 @@ impl Client {
         protocol::write_message(&mut stream, &Envelope::new(request))?;
         let response: Envelope<Response> = protocol::read_message(&mut stream)?;
         if response.version != protocol::PROTOCOL_VERSION {
+            if let Response::Error {
+                message,
+                code: Some(ErrorCode::UnsupportedVersion),
+            } = response.message
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    RemoteError {
+                        code: Some(ErrorCode::UnsupportedVersion),
+                        message,
+                    },
+                ));
+            }
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "protocol version mismatch",
             ));
         }
         match response.message {
-            Response::Error { message } => Err(io::Error::other(message)),
+            Response::Error { message, code } => Err(io::Error::new(
+                error_kind(code),
+                RemoteError { code, message },
+            )),
             response => Ok((stream, response)),
         }
     }
@@ -295,6 +351,19 @@ impl Client {
             }),
             other => unexpected(other),
         }
+    }
+}
+
+fn error_kind(code: Option<ErrorCode>) -> io::ErrorKind {
+    match code {
+        Some(ErrorCode::InvalidArgument) => io::ErrorKind::InvalidInput,
+        Some(ErrorCode::NotFound) => io::ErrorKind::NotFound,
+        Some(ErrorCode::AlreadyExists) => io::ErrorKind::AlreadyExists,
+        Some(ErrorCode::Busy) => io::ErrorKind::WouldBlock,
+        Some(ErrorCode::DaemonStopping) => io::ErrorKind::ConnectionAborted,
+        Some(ErrorCode::Timeout) => io::ErrorKind::TimedOut,
+        Some(ErrorCode::UnsupportedVersion) => io::ErrorKind::InvalidData,
+        _ => io::ErrorKind::Other,
     }
 }
 
