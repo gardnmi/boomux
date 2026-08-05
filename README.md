@@ -124,11 +124,13 @@ boomux launcher remove <launcher-name-or-id> [--workspace <name-or-id>]
 boomux agent list [--workspace <name-or-id>]
 boomux agent inspect <agent-id>
 boomux agent register <name> --integration <integration> [--external-session-id <id>] [--shell-id <shell-id>] [--run-id <run-id>] --state <state> --authority <authority> --evidence <evidence> --confidence <0-100>
+boomux agent ensure <name> --integration <integration> --external-session-id <id> [--shell-id <shell-id>] [--run-id <run-id>] --state <state> --authority <authority> --evidence <evidence> --confidence <0-100>
 boomux agent report <agent-id> [--shell-id <shell-id>] [--run-id <run-id>] --state <state> --authority <authority> --evidence <evidence> --confidence <0-100>
 boomux daemon status
 boomux daemon restart
 boomux daemon stop
 boomux skill install [--force]
+boomux opencode install [--force]
 ```
 
 `boomux shells` lists shells in the current workspace. `boomux read` and
@@ -162,13 +164,24 @@ Boomux does not track or terminate applications it previously launched.
 
 Agent instances are durable records for external agent sessions. Each instance
 has its own exact ID and is bound to exactly one shell run, not merely to a
-durable shell. `register` and `report` require explicit `unknown`, `working`,
-`blocked`, `idle`, or `done` state plus authority, evidence, and confidence.
-The authority values are `lifecycle-integration`, `process-adapter`,
-`terminal-heuristic`, and `daemon-lifecycle`. A `done` report completes the
-instance permanently; completed instances remain inspectable across daemon
-restart. Boomux does not yet infer agent state, wait for agents, read through an
-agent API, or control agents.
+durable shell. Protocol 10 adds `agent ensure`, an idempotent registration keyed
+by integration, external session ID, shell ID, and run ID. It requires
+`--external-session-id`; an existing match is returned unchanged, including
+after an integration or daemon reload, while a different shell run creates a
+different identity. `register`, `ensure`, and `report` require explicit
+`unknown`, `working`, `blocked`, `idle`, or `done` state plus authority,
+evidence, and confidence.
+
+External reports use this precedence: `lifecycle-integration` over
+`process-adapter` over `terminal-heuristic`. A lower-authority report is a
+successful no-op. At equal authority, an exact duplicate is a no-op, while any
+changed state, evidence, or confidence replaces the observation and increments
+its revision. `daemon-lifecycle` exists in snapshots but is reserved for daemon
+observations and cannot be supplied to public mutation commands. A `done` report
+completes the instance permanently. Retrying the exact completion is an
+idempotent success; a different later report is rejected. Completed instances
+remain inspectable across daemon restart. Boomux does not yet provide process
+adapters, terminal heuristics, agent waits, agent reads, or agent control.
 
 `boomux read` reads plain rendered text from the daemon's shadow VT state. It
 understands cursor rewrites and terminal soft wrapping, retains up to 2,000
@@ -225,7 +238,7 @@ identifies one process incarnation and changes when a durable shell starts a
 new process after recovery. A live process transferred from a pre-run-identity
 daemon receives a daemon-side run identity, but its existing environment cannot
 be retrofitted; `shell inspect` reports that compatibility case as
-`environment_has_run_id: false`. Agent `register` and `report` default their
+`environment_has_run_id: false`. Agent `register`, `ensure`, and `report` default their
 shell and run arguments from `BOOMUX_SHELL_ID` and `BOOMUX_RUN_ID`.
 Integrations outside that exact environment must pass both IDs and must not
 guess a run from shell status or retained output. A dynamic
@@ -252,6 +265,37 @@ workspaces and shells, and to inspect and explicitly report run-scoped agent
 lifecycle, through the full public CLI. Re-run with `--force` to replace an
 older customized installation. An untouched legacy `boomux-shells` skill is
 removed automatically; customized legacy content is preserved with a warning.
+
+## OpenCode Integration
+
+Install the bundled config-time OpenCode lifecycle plugin with:
+
+```console
+boomux opencode install
+```
+
+The destination is `$XDG_CONFIG_HOME/opencode/plugins/boomux.js`, or
+`~/.config/opencode/plugins/boomux.js` when `XDG_CONFIG_HOME` is unset. OpenCode
+discovers files in that global plugin directory automatically; the installer
+does not edit `opencode.json` or other plugins. An identical file is left
+unchanged. Different content requires `--force`, and detected symlinked or
+non-regular path components and targets are rejected even with `--force`. Because OpenCode
+loads config-time plugins at startup, quit and restart OpenCode after installing
+or replacing the plugin.
+
+Inside a Boomux-managed shell, the plugin groups each root OpenCode session and
+all child/subagent sessions into one durable agent instance keyed by the root
+session ID. OpenCode status, chat, tool, compaction, permission/question, error,
+idle, and deletion events produce explainable `working`, `blocked`, `idle`, and
+`done` observations. Child activity contributes to the root; only root idle can
+make it idle, and only explicit deletion of the root reports `done`. Process or
+shell exit does not report completion.
+
+The plugin is fail-open: outside a managed Boomux run, when Boomux is
+unavailable, or when OpenCode session ancestry cannot be resolved, OpenCode
+continues and reporting errors are rate-limited. A `run_changed` response
+permanently disables reports for that tracked root so events cannot leak into
+another process run.
 
 ## Architecture
 

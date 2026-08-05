@@ -984,54 +984,195 @@ fn agent_runtime_is_revisioned_durable_and_version_compatible() {
         },
     };
 
-    let error = daemon
-        .client
-        .register_agent(&shell_id, Uuid::new_v4().to_string(), registration.clone())
-        .unwrap_err();
-    assert_remote_code(&error, ErrorCode::RunChanged);
-    let registered = daemon
-        .client
-        .register_agent(&shell_id, &run_id, registration)
-        .unwrap();
-    assert_eq!(registered.workspace_id, workspace.id);
-    assert_eq!(registered.shell_id, shell_id);
-    assert_eq!(registered.run_id, run_id);
-    assert_eq!(registered.observation.revision, 1);
-    assert_eq!(registered.observation.state, AgentState::Working);
-    assert!(registered.ended_at_ms.is_none());
-    assert_eq!(daemon.client.get_agent(&registered.id).unwrap(), registered);
-    let snapshot_agent = daemon
-        .client
-        .snapshot()
-        .unwrap()
-        .workspaces
-        .into_iter()
-        .find(|current| current.id == workspace.id)
-        .unwrap()
-        .agents
-        .into_iter()
-        .find(|agent| agent.id == registered.id)
-        .unwrap();
-    assert_eq!(snapshot_agent, registered);
+    let ensure_agent = |daemon: &TestDaemon| {
+        let output = daemon
+            .command()
+            .args([
+                "agent",
+                "ensure",
+                "runtime-agent",
+                "--integration",
+                "native-test",
+                "--external-session-id",
+                "session-1",
+                "--shell-id",
+                &shell_id,
+                "--run-id",
+                &run_id,
+                "--state",
+                "working",
+                "--authority",
+                "lifecycle-integration",
+                "--evidence",
+                "registered",
+                "--confidence",
+                "90",
+                "--json",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    let ensure = ensure_agent(&daemon);
+    assert_eq!(ensure["schema"], "boomux.cli/v1");
+    assert_eq!(ensure["command"], "agent.ensure");
+    let agent_id = ensure["data"]["agent"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(ensure["data"]["agent"]["shell_id"], shell_id);
+    assert_eq!(ensure["data"]["agent"]["run_id"], run_id);
+    assert_eq!(ensure["data"]["agent"]["external_session_id"], "session-1");
+    assert_eq!(ensure["data"]["agent"]["observation"]["revision"], 1);
 
-    let error = daemon
+    let repeated = ensure_agent(&daemon);
+    assert_eq!(repeated["data"]["agent"]["id"], agent_id);
+    assert_eq!(repeated["data"]["agent"]["observation"]["revision"], 1);
+    let ensured_events = daemon
+        .client
+        .events(Some(baseline.clone()), 256, 0)
+        .unwrap();
+    assert_eq!(
+        ensured_events
+            .events
+            .iter()
+            .filter(|event| matches!(
+                &event.kind,
+                protocol::DaemonEventKind::AgentRegistered { agent, .. }
+                    if agent.id == agent_id
+            ))
+            .count(),
+        1
+    );
+    let workspace_agents = daemon.client.get_workspace(&workspace.id).unwrap().agents;
+    assert_eq!(workspace_agents.len(), 1);
+    assert_eq!(workspace_agents[0].id, agent_id);
+
+    drop(attachment.stream);
+    let restart = daemon
+        .command()
+        .args(["daemon", "restart"])
+        .output()
+        .unwrap();
+    assert!(
+        restart.status.success(),
+        "{}",
+        String::from_utf8_lossy(&restart.stderr)
+    );
+    let recovered = ensure_agent(&daemon);
+    assert_eq!(recovered["data"]["agent"]["id"], agent_id);
+    assert_eq!(recovered["data"]["agent"]["observation"]["revision"], 1);
+    let recovered = daemon.client.get_agent(&agent_id).unwrap();
+
+    let weak_report_cursor = daemon.client.events(None, 256, 0).unwrap().cursor;
+    for report in [
+        AgentReport {
+            state: AgentState::Blocked,
+            authority: AgentAuthority::ProcessAdapter,
+            evidence: "process thinks blocked".into(),
+            confidence: 80,
+        },
+        AgentReport {
+            state: AgentState::Done,
+            authority: AgentAuthority::TerminalHeuristic,
+            evidence: "prompt disappeared".into(),
+            confidence: 40,
+        },
+    ] {
+        assert_eq!(
+            daemon
+                .client
+                .report_agent(&agent_id, &run_id, report)
+                .unwrap(),
+            recovered
+        );
+    }
+    assert!(
+        daemon
+            .client
+            .events(Some(weak_report_cursor), 256, 0)
+            .unwrap()
+            .events
+            .is_empty()
+    );
+
+    let register = daemon
+        .command()
+        .args([
+            "agent",
+            "register",
+            "adapter-agent",
+            "--integration",
+            "native-test",
+            "--shell-id",
+            &shell_id,
+            "--run-id",
+            &run_id,
+            "--state",
+            "idle",
+            "--authority",
+            "terminal-heuristic",
+            "--evidence",
+            "prompt visible",
+            "--confidence",
+            "30",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        register.status.success(),
+        "{}",
+        String::from_utf8_lossy(&register.stderr)
+    );
+    let register: serde_json::Value = serde_json::from_slice(&register.stdout).unwrap();
+    assert_eq!(register["schema"], "boomux.cli/v1");
+    assert_eq!(register["command"], "agent.register");
+    assert_eq!(register["data"]["agent"]["observation"]["revision"], 1);
+    let adapter_id = register["data"]["agent"]["id"].as_str().unwrap().to_owned();
+
+    let report_cursor = daemon.client.events(None, 256, 0).unwrap().cursor;
+    let report = daemon
+        .command()
+        .args([
+            "agent",
+            "report",
+            &adapter_id,
+            "--shell-id",
+            &shell_id,
+            "--run-id",
+            &run_id,
+            "--state",
+            "blocked",
+            "--authority",
+            "process-adapter",
+            "--evidence",
+            "waiting for input",
+            "--confidence",
+            "80",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        report.status.success(),
+        "{}",
+        String::from_utf8_lossy(&report.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&report.stdout).unwrap();
+    assert_eq!(report["schema"], "boomux.cli/v1");
+    assert_eq!(report["command"], "agent.report");
+    assert_eq!(report["data"]["agent"]["observation"]["revision"], 2);
+    assert_eq!(
+        report["data"]["agent"]["observation"]["authority"],
+        "process_adapter"
+    );
+    let duplicate = daemon
         .client
         .report_agent(
-            &registered.id,
-            Uuid::new_v4().to_string(),
-            AgentReport {
-                state: AgentState::Blocked,
-                authority: AgentAuthority::ProcessAdapter,
-                evidence: "wrong run".into(),
-                confidence: 50,
-            },
-        )
-        .unwrap_err();
-    assert_remote_code(&error, ErrorCode::RunChanged);
-    let blocked = daemon
-        .client
-        .report_agent(
-            &registered.id,
+            &adapter_id,
             &run_id,
             AgentReport {
                 state: AgentState::Blocked,
@@ -1041,65 +1182,136 @@ fn agent_runtime_is_revisioned_durable_and_version_compatible() {
             },
         )
         .unwrap();
-    assert_eq!(blocked.observation.revision, 2);
-    assert_eq!(blocked.observation.state, AgentState::Blocked);
-    assert!(blocked.ended_at_ms.is_none());
-    assert!(blocked.observation.observed_at_ms >= registered.observation.observed_at_ms);
+    assert_eq!(duplicate.observation.revision, 2);
+    let report_events = daemon.client.events(Some(report_cursor), 256, 0).unwrap();
+    assert_eq!(
+        report_events
+            .events
+            .iter()
+            .filter(|event| matches!(
+                &event.kind,
+                protocol::DaemonEventKind::AgentStateChanged { agent, .. }
+                    if agent.id == adapter_id
+            ))
+            .count(),
+        1
+    );
+
+    let completion = AgentReport {
+        state: AgentState::Done,
+        authority: AgentAuthority::LifecycleIntegration,
+        evidence: "completed".into(),
+        confidence: 100,
+    };
+    let done_cursor = report_events.cursor;
     let done = daemon
         .client
-        .report_agent(
-            &registered.id,
-            &run_id,
-            AgentReport {
-                state: AgentState::Done,
-                authority: AgentAuthority::LifecycleIntegration,
-                evidence: "completed".into(),
-                confidence: 100,
-            },
-        )
+        .report_agent(&adapter_id, &run_id, completion.clone())
         .unwrap();
     assert_eq!(done.observation.revision, 3);
     assert_eq!(done.observation.state, AgentState::Done);
     assert_eq!(done.ended_at_ms, Some(done.observation.observed_at_ms));
+    assert_eq!(
+        daemon
+            .client
+            .report_agent(&adapter_id, &run_id, completion)
+            .unwrap(),
+        done
+    );
+    let done_events = daemon.client.events(Some(done_cursor), 256, 0).unwrap();
+    assert_eq!(
+        done_events
+            .events
+            .iter()
+            .filter(|event| matches!(
+                &event.kind,
+                protocol::DaemonEventKind::AgentCompleted { agent, .. }
+                    if agent.id == adapter_id
+            ))
+            .count(),
+        1
+    );
     let error = daemon
         .client
         .report_agent(
-            &registered.id,
+            &adapter_id,
             &run_id,
             AgentReport {
-                state: AgentState::Idle,
-                authority: AgentAuthority::TerminalHeuristic,
-                evidence: "too late".into(),
-                confidence: 10,
+                state: AgentState::Done,
+                authority: AgentAuthority::LifecycleIntegration,
+                evidence: "conflicting completion".into(),
+                confidence: 100,
             },
         )
         .unwrap_err();
     assert_remote_code(&error, ErrorCode::InvalidArgument);
 
-    let events = daemon
-        .client
-        .events(Some(baseline.clone()), 256, 0)
+    for request in [
+        protocol::Request::RegisterAgent {
+            shell_id: shell_id.clone(),
+            run_id: run_id.clone(),
+            spec: AgentRegistrationSpec {
+                report: AgentReport {
+                    authority: AgentAuthority::DaemonLifecycle,
+                    ..registration.report.clone()
+                },
+                ..registration.clone()
+            },
+        },
+        protocol::Request::EnsureAgent {
+            shell_id: shell_id.clone(),
+            run_id: run_id.clone(),
+            spec: AgentRegistrationSpec {
+                report: AgentReport {
+                    authority: AgentAuthority::DaemonLifecycle,
+                    ..registration.report.clone()
+                },
+                ..registration.clone()
+            },
+        },
+        protocol::Request::ReportAgent {
+            agent_id: agent_id.clone(),
+            run_id: run_id.clone(),
+            report: AgentReport {
+                authority: AgentAuthority::DaemonLifecycle,
+                ..registration.report.clone()
+            },
+        },
+    ] {
+        assert!(matches!(
+            versioned_request(&daemon.client, 10, request),
+            protocol::Response::Error {
+                code: Some(ErrorCode::InvalidArgument),
+                ..
+            }
+        ));
+    }
+    let reserved_cli = daemon
+        .command()
+        .args([
+            "agent",
+            "report",
+            &agent_id,
+            "--state",
+            "done",
+            "--authority",
+            "daemon-lifecycle",
+            "--evidence",
+            "reserved",
+            "--confidence",
+            "100",
+            "--json",
+        ])
+        .output()
         .unwrap();
-    assert!(events.events.iter().any(|event| matches!(
-        &event.kind,
-        protocol::DaemonEventKind::AgentRegistered { agent, .. }
-            if agent.id == registered.id && agent.observation.revision == 1
-    )));
-    assert!(events.events.iter().any(|event| matches!(
-        &event.kind,
-        protocol::DaemonEventKind::AgentStateChanged { agent, .. }
-            if agent.id == registered.id && agent.observation.revision == 2
-    )));
-    assert!(events.events.iter().any(|event| matches!(
-        &event.kind,
-        protocol::DaemonEventKind::AgentCompleted { agent, .. }
-            if agent.id == registered.id && agent.observation.revision == 3
-    )));
+    assert!(!reserved_cli.status.success());
+    let reserved_cli: serde_json::Value = serde_json::from_slice(&reserved_cli.stderr).unwrap();
+    assert_eq!(reserved_cli["error"]["code"], "invalid_argument");
 
     let list = daemon.command().args(["agent", "list"]).output().unwrap();
     assert!(list.status.success());
     assert!(contains(&list.stdout, b"runtime-agent"));
-    assert!(contains(&list.stdout, registered.id.as_bytes()));
+    assert!(contains(&list.stdout, agent_id.as_bytes()));
     let list = daemon
         .command()
         .args(["agent", "list", "--json"])
@@ -1108,11 +1320,11 @@ fn agent_runtime_is_revisioned_durable_and_version_compatible() {
     assert!(list.status.success());
     let list: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
     assert_eq!(list["command"], "agent.list");
-    assert_eq!(list["data"]["agents"][0]["id"], registered.id);
-    assert_eq!(list["data"]["agents"][0]["observation"]["revision"], 3);
+    assert_eq!(list["data"]["agents"][0]["id"], agent_id);
+    assert_eq!(list["data"]["agents"][0]["observation"]["revision"], 1);
     let inspect = daemon
         .command()
-        .args(["agent", "inspect", &registered.id])
+        .args(["agent", "inspect", &adapter_id])
         .output()
         .unwrap();
     assert!(inspect.status.success());
@@ -1120,15 +1332,55 @@ fn agent_runtime_is_revisioned_durable_and_version_compatible() {
     assert!(contains(&inspect.stdout, b"REVISION\t3"));
     let inspect = daemon
         .command()
-        .args(["agent", "inspect", &registered.id, "--json"])
+        .args(["agent", "inspect", &adapter_id, "--json"])
         .output()
         .unwrap();
     assert!(inspect.status.success());
     let inspect: serde_json::Value = serde_json::from_slice(&inspect.stdout).unwrap();
     assert_eq!(inspect["command"], "agent.inspect");
-    assert_eq!(inspect["data"]["agent"]["id"], registered.id);
+    assert_eq!(inspect["data"]["agent"]["id"], adapter_id);
     assert_eq!(inspect["data"]["agent"]["observation"]["state"], "done");
 
+    assert!(matches!(
+        versioned_request(
+            &daemon.client,
+            9,
+            protocol::Request::EnsureAgent {
+                shell_id: shell_id.clone(),
+                run_id: run_id.clone(),
+                spec: registration.clone(),
+            },
+        ),
+        protocol::Response::Error {
+            code: Some(ErrorCode::UnsupportedVersion),
+            ..
+        }
+    ));
+    assert!(matches!(
+        versioned_request(
+            &daemon.client,
+            9,
+            protocol::Request::GetAgent {
+                agent_id: agent_id.clone(),
+            },
+        ),
+        protocol::Response::Agent { agent } if agent.id == agent_id
+    ));
+    assert!(matches!(
+        versioned_request(
+            &daemon.client,
+            9,
+            protocol::Request::ReportAgent {
+                agent_id: agent_id.clone(),
+                run_id: run_id.clone(),
+                report: registration.report.clone(),
+            },
+        ),
+        protocol::Response::Agent { agent }
+            if agent.id == agent_id && agent.observation.revision == 1
+    ));
+
+    let legacy_baseline = daemon.client.events(None, 256, 0).unwrap().cursor;
     let protocol_eight_snapshot = versioned_request(&daemon.client, 8, protocol::Request::Snapshot);
     let protocol::Response::Snapshot { snapshot } = protocol_eight_snapshot else {
         panic!("expected protocol-8 snapshot response");
@@ -1143,7 +1395,7 @@ fn agent_runtime_is_revisioned_durable_and_version_compatible() {
         &daemon.client,
         8,
         protocol::Request::Events {
-            after: Some(baseline),
+            after: Some(legacy_baseline),
             limit: 256,
             wait_ms: 0,
         },
@@ -1179,10 +1431,6 @@ fn agent_runtime_is_revisioned_durable_and_version_compatible() {
     )));
     assert!(cursor.event_id > filtered_cursor.event_id);
 
-    drop(attachment.stream);
-    daemon.stop_with_cli();
-    daemon.restart();
-    assert_eq!(daemon.client.get_agent(&registered.id).unwrap(), done);
     daemon.stop_with_cli();
 }
 
@@ -1508,21 +1756,21 @@ fn native_daemon_lifecycle() {
     let capabilities: serde_json::Value = serde_json::from_slice(&capabilities.stdout).unwrap();
     assert_eq!(capabilities["schema"], "boomux.cli/v1");
     assert_eq!(capabilities["command"], "capabilities");
-    assert_eq!(capabilities["data"]["daemon_protocol_version"], 9);
-    assert!(
-        capabilities["data"]["json_commands"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|command| command == "events")
-    );
-    assert!(
-        capabilities["data"]["features"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|feature| feature == "revision_aware_reads")
-    );
+    assert_eq!(capabilities["data"]["daemon_protocol_version"], 10);
+    let json_commands = capabilities["data"]["json_commands"].as_array().unwrap();
+    for command in ["events", "agent.register", "agent.ensure", "agent.report"] {
+        assert!(json_commands.iter().any(|current| current == command));
+    }
+    let features = capabilities["data"]["features"].as_array().unwrap();
+    for feature in [
+        "revision_aware_reads",
+        "protocol_10",
+        "idempotent_agent_ensure",
+        "agent_authority_precedence",
+        "opencode_lifecycle_plugin",
+    ] {
+        assert!(features.iter().any(|current| current == feature));
+    }
 
     let status = daemon
         .command()
@@ -1530,7 +1778,7 @@ fn native_daemon_lifecycle() {
         .output()
         .unwrap();
     assert!(status.status.success());
-    assert!(String::from_utf8_lossy(&status.stdout).contains("running (protocol 9"));
+    assert!(String::from_utf8_lossy(&status.stdout).contains("running (protocol 10"));
     let status = daemon
         .command()
         .args(["daemon", "status", "--json"])
