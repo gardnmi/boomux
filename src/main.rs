@@ -576,9 +576,28 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
                     workspace.name
                 ))
             },
-            on_open: |shell_id: &str| {
-                open_dashboard_shell(&client, shell_id, terminal.as_deref())
-                    .map_err(|error| error.to_string())
+            on_open: |target: &tui::OpenTarget| {
+                dispatch_dashboard_open(
+                    target,
+                    |shell_id| {
+                        open_dashboard_shell(&client, shell_id, terminal.as_deref())
+                            .map_err(|error| error.to_string())
+                    },
+                    |workspace_id, launcher_id| {
+                        let workspace = client
+                            .get_workspace(workspace_id)
+                            .map_err(|error| error.to_string())?;
+                        let launcher = client
+                            .get_launcher(launcher_id)
+                            .map_err(|error| error.to_string())?;
+                        invoke_workspace_launcher(&workspace, &launcher)
+                            .map_err(|error| error.to_string())?;
+                        Ok(format!(
+                            "Launched {} from {}",
+                            launcher.name, workspace.name
+                        ))
+                    },
+                )
             },
             on_close: |target: &tui::CloseTarget| match target {
                 tui::CloseTarget::Workspace(workspace_id) => {
@@ -603,6 +622,16 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
                         .map_err(|error| error.to_string())?;
                     Ok(format!("Closed shell {name}"))
                 }
+                tui::CloseTarget::Launcher(launcher_id) => {
+                    let name = client
+                        .get_launcher(launcher_id)
+                        .map(|launcher| launcher.name)
+                        .unwrap_or_else(|_| "launcher".into());
+                    client
+                        .remove_launcher(launcher_id)
+                        .map_err(|error| error.to_string())?;
+                    Ok(format!("Removed launcher {name}"))
+                }
             },
             on_create_workspace: |name: &str| {
                 create_dashboard_workspace(&client, name).map_err(|error| error.to_string())
@@ -624,6 +653,12 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
                         .map_err(|error| error.to_string())?;
                     Ok(format!("Renamed shell to {name}"))
                 }
+                tui::RenameTarget::Launcher(launcher_id) => {
+                    client
+                        .rename_launcher(launcher_id, name)
+                        .map_err(|error| error.to_string())?;
+                    Ok(format!("Renamed launcher to {name}"))
+                }
             },
             on_refresh: || {
                 let snapshot = client.snapshot().map_err(|error| error.to_string())?;
@@ -634,6 +669,24 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn dispatch_dashboard_open<S, L>(
+    target: &tui::OpenTarget,
+    mut open_shell: S,
+    mut launch: L,
+) -> Result<String, String>
+where
+    S: FnMut(&str) -> Result<String, String>,
+    L: FnMut(&str, &str) -> Result<String, String>,
+{
+    match target {
+        tui::OpenTarget::Shell(shell_id) => open_shell(shell_id),
+        tui::OpenTarget::Launcher {
+            workspace_id,
+            launcher_id,
+        } => launch(workspace_id, launcher_id),
+    }
+}
+
 fn dashboard_views(
     workspaces: &[WorkspaceSnapshot],
     git_cache: &mut git::Cache,
@@ -641,34 +694,28 @@ fn dashboard_views(
     workspaces
         .iter()
         .map(|workspace| {
-            let terminals = workspace
-                .shells
-                .iter()
-                .map(|shell| {
-                    let git = git_cache.inspect(&shell.cwd);
-                    tui::TerminalView {
-                        id: shell.id.clone(),
-                        name: shell.name.clone(),
-                        status: shell_status(&shell.status).into(),
-                        directory: shell.cwd.display().to_string(),
-                        branch: git.branch,
-                    }
+            let shells = workspace.shells.iter().map(|shell| {
+                let git = git_cache.inspect(&shell.cwd);
+                tui::WorkspaceItemView::Shell(tui::TerminalView {
+                    id: shell.id.clone(),
+                    name: shell.name.clone(),
+                    status: shell_status(&shell.status).into(),
+                    directory: shell.cwd.display().to_string(),
+                    branch: git.branch,
                 })
-                .collect();
+            });
+            let launchers = workspace.launchers.iter().map(|launcher| {
+                tui::WorkspaceItemView::Launcher(tui::LauncherView {
+                    id: launcher.id.clone(),
+                    name: launcher.name.clone(),
+                    directory: launcher.cwd.display().to_string(),
+                    command: launcher.command.join(" "),
+                })
+            });
             tui::WorkspaceView {
                 id: workspace.id.clone(),
                 name: workspace.name.clone(),
-                terminals,
-                launchers: workspace
-                    .launchers
-                    .iter()
-                    .map(|launcher| tui::LauncherView {
-                        id: launcher.id.clone(),
-                        name: launcher.name.clone(),
-                        directory: launcher.cwd.display().to_string(),
-                        command: launcher.command.join(" "),
-                    })
-                    .collect(),
+                items: shells.chain(launchers).collect(),
             }
         })
         .collect()
@@ -2244,7 +2291,7 @@ mod tests {
             &mut git::Cache::default(),
         );
 
-        assert!(views[0].terminals.is_empty());
+        assert!(views[0].items.is_empty());
     }
 
     #[test]
@@ -2254,10 +2301,39 @@ mod tests {
 
         let views = dashboard_views(&[workspace], &mut git::Cache::default());
 
-        assert_eq!(views[0].launchers.len(), 1);
-        assert_eq!(views[0].launchers[0].name, "editor");
-        assert_eq!(views[0].launchers[0].command, "zeditor .");
-        assert_eq!(views[0].launchers[0].directory, "/tmp/project");
+        let tui::WorkspaceItemView::Launcher(launcher) = &views[0].items[0] else {
+            panic!("expected launcher item");
+        };
+        assert_eq!(launcher.name, "editor");
+        assert_eq!(launcher.command, "zeditor .");
+        assert_eq!(launcher.directory, "/tmp/project");
+    }
+
+    #[test]
+    fn dashboard_open_dispatches_only_the_selected_item_type() {
+        let mut shell_calls = 0;
+        let mut launcher_calls = 0;
+        let result = dispatch_dashboard_open(
+            &tui::OpenTarget::Launcher {
+                workspace_id: "w1".into(),
+                launcher_id: "l1".into(),
+            },
+            |_| {
+                shell_calls += 1;
+                Ok("shell".into())
+            },
+            |workspace_id, launcher_id| {
+                launcher_calls += 1;
+                assert_eq!(workspace_id, "w1");
+                assert_eq!(launcher_id, "l1");
+                Ok("launcher".into())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result, "launcher");
+        assert_eq!(shell_calls, 0);
+        assert_eq!(launcher_calls, 1);
     }
 
     #[test]
