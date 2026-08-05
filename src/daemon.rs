@@ -23,12 +23,13 @@ use crate::client;
 use crate::fd_transfer::send_descriptor;
 use crate::handoff;
 use crate::protocol::{
-    self, AttachFrame, DaemonEvent, DaemonEventKind, Envelope, ErrorCode, EventCursor, Request,
-    Response, ShellRunExitReason, ShellRunSnapshot, ShellSnapshot, ShellSpec, ShellStatus,
+    self, AgentInstanceSnapshot, AgentObservationSnapshot, AgentRegistrationSpec, AgentReport,
+    AgentState, AttachFrame, DaemonEvent, DaemonEventKind, Envelope, ErrorCode, EventCursor,
+    Request, Response, ShellRunExitReason, ShellRunSnapshot, ShellSnapshot, ShellSpec, ShellStatus,
     Snapshot, TerminalProfile, WorkspaceLauncherSnapshot, WorkspaceLauncherSpec, WorkspaceSnapshot,
 };
 use crate::state_store::{
-    PersistedShell, PersistedShellRun, PersistedState, PersistedWorkspace,
+    PersistedAgentInstance, PersistedShell, PersistedShellRun, PersistedState, PersistedWorkspace,
     PersistedWorkspaceLauncher, StateStore,
 };
 use crate::terminal_state::TerminalState;
@@ -41,6 +42,7 @@ const IO_RETRY_DELAY: Duration = Duration::from_millis(2);
 const PERSIST_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_TERMINAL_ENV_VALUE: usize = 256;
 const MAX_NAME_BYTES: usize = 256;
+const MAX_AGENT_EVIDENCE_BYTES: usize = 4 * 1024;
 const MAX_TERMINAL_ROWS: u16 = 1_000;
 const MAX_TERMINAL_COLS: u16 = 1_000;
 const MAX_TERMINAL_CELLS: usize = 1_000_000;
@@ -583,6 +585,21 @@ fn handle_connection(
             ),
         );
     }
+    if response_version < 9
+        && matches!(
+            request.message,
+            Request::GetAgent { .. } | Request::RegisterAgent { .. } | Request::ReportAgent { .. }
+        )
+    {
+        return send_response(
+            &mut stream,
+            response_version,
+            error_response(
+                ErrorCode::UnsupportedVersion,
+                "request requires daemon protocol 9",
+            ),
+        );
+    }
 
     if let Request::Attach {
         shell_id,
@@ -687,24 +704,45 @@ fn handle_connection(
 }
 
 fn response_for_version(response: Response, version: u32) -> Response {
-    if version >= 8 {
+    if version >= 9 {
         return response;
     }
     match response {
+        Response::Snapshot { mut snapshot } => {
+            remove_agent_snapshots(&mut snapshot);
+            Response::Snapshot { snapshot }
+        }
+        Response::Workspace { mut workspace } => {
+            workspace.agents.clear();
+            Response::Workspace { workspace }
+        }
         Response::Events {
             stream_id,
             cursor,
-            snapshot,
+            mut snapshot,
             mut events,
         } => {
+            if let Some(snapshot) = &mut snapshot {
+                remove_agent_snapshots(snapshot);
+            }
             events.retain(|event| {
                 !matches!(
                     event.kind,
-                    DaemonEventKind::LauncherCreated { .. }
-                        | DaemonEventKind::LauncherRenamed { .. }
-                        | DaemonEventKind::LauncherRemoved { .. }
+                    DaemonEventKind::AgentRegistered { .. }
+                        | DaemonEventKind::AgentStateChanged { .. }
+                        | DaemonEventKind::AgentCompleted { .. }
                 )
             });
+            if version < 8 {
+                events.retain(|event| {
+                    !matches!(
+                        event.kind,
+                        DaemonEventKind::LauncherCreated { .. }
+                            | DaemonEventKind::LauncherRenamed { .. }
+                            | DaemonEventKind::LauncherRemoved { .. }
+                    )
+                });
+            }
             Response::Events {
                 stream_id,
                 cursor,
@@ -713,6 +751,12 @@ fn response_for_version(response: Response, version: u32) -> Response {
             }
         }
         response => response,
+    }
+}
+
+fn remove_agent_snapshots(snapshot: &mut Snapshot) {
+    for workspace in &mut snapshot.workspaces {
+        workspace.agents.clear();
     }
 }
 
@@ -877,17 +921,21 @@ struct RegistryState {
     workspaces: HashMap<String, Arc<Workspace>>,
     shells: HashMap<String, Arc<Shell>>,
     launchers: HashMap<String, Arc<WorkspaceLauncher>>,
+    agents: HashMap<String, Arc<AgentInstance>>,
 }
 
 struct RegistryBackup {
     workspaces: HashMap<String, Arc<Workspace>>,
     shells: HashMap<String, Arc<Shell>>,
     launchers: HashMap<String, Arc<WorkspaceLauncher>>,
+    agents: HashMap<String, Arc<AgentInstance>>,
     workspace_names: HashMap<String, String>,
     workspace_shell_ids: HashMap<String, Vec<String>>,
     workspace_launcher_ids: HashMap<String, Vec<String>>,
+    workspace_agent_ids: HashMap<String, Vec<String>>,
     shell_names: HashMap<String, String>,
     launcher_names: HashMap<String, String>,
+    agent_states: HashMap<String, AgentInstanceState>,
 }
 
 impl Default for Registry {
@@ -910,6 +958,25 @@ struct Workspace {
     name: Mutex<String>,
     shell_ids: Mutex<Vec<String>>,
     launcher_ids: Mutex<Vec<String>>,
+    agent_ids: Mutex<Vec<String>>,
+}
+
+struct AgentInstance {
+    id: String,
+    workspace_id: String,
+    shell_id: String,
+    run_id: String,
+    name: String,
+    integration: String,
+    external_session_id: Option<String>,
+    started_at_ms: u64,
+    state: Mutex<AgentInstanceState>,
+}
+
+#[derive(Clone)]
+struct AgentInstanceState {
+    ended_at_ms: Option<u64>,
+    observation: AgentObservationSnapshot,
 }
 
 struct WorkspaceLauncher {
@@ -1429,6 +1496,9 @@ impl Registry {
             Request::GetLauncher { launcher_id } => Ok(Response::Launcher {
                 launcher: self.launcher(&launcher_id)?.snapshot()?,
             }),
+            Request::GetAgent { agent_id } => Ok(Response::Agent {
+                agent: self.agent(&agent_id)?.snapshot()?,
+            }),
             Request::CreateWorkspace { name, shells } => self.durable_mutation(|| {
                 let workspace = self.create_workspace(name, shells)?;
                 let events = workspace_created_events(&workspace);
@@ -1466,6 +1536,47 @@ impl Registry {
                     name: launcher.name.clone(),
                 };
                 Ok((Response::Launcher { launcher }, vec![event]))
+            }),
+            Request::RegisterAgent {
+                shell_id,
+                run_id,
+                spec,
+            } => self.durable_mutation(|| {
+                let agent = self.register_agent(&shell_id, &run_id, spec)?;
+                let mut events = vec![DaemonEventKind::AgentRegistered {
+                    workspace_id: agent.workspace_id.clone(),
+                    shell_id: agent.shell_id.clone(),
+                    agent: agent.clone(),
+                }];
+                if agent.ended_at_ms.is_some() {
+                    events.push(DaemonEventKind::AgentCompleted {
+                        workspace_id: agent.workspace_id.clone(),
+                        shell_id: agent.shell_id.clone(),
+                        agent: agent.clone(),
+                    });
+                }
+                Ok((Response::Agent { agent }, events))
+            }),
+            Request::ReportAgent {
+                agent_id,
+                run_id,
+                report,
+            } => self.durable_mutation(|| {
+                let (agent, completed) = self.report_agent(&agent_id, &run_id, report)?;
+                let event = if completed {
+                    DaemonEventKind::AgentCompleted {
+                        workspace_id: agent.workspace_id.clone(),
+                        shell_id: agent.shell_id.clone(),
+                        agent: agent.clone(),
+                    }
+                } else {
+                    DaemonEventKind::AgentStateChanged {
+                        workspace_id: agent.workspace_id.clone(),
+                        shell_id: agent.shell_id.clone(),
+                        agent: agent.clone(),
+                    }
+                };
+                Ok((Response::Agent { agent }, vec![event]))
             }),
             Request::ReadShell {
                 shell_id,
@@ -1650,6 +1761,7 @@ impl Registry {
         let mut state = RegistryState::default();
         let mut workspace_names = HashSet::new();
         let mut run_ids = HashSet::new();
+        let mut agent_ids = HashSet::new();
         let mut recovered_interrupted_run = false;
         for saved_workspace in persisted.workspaces {
             validate_id("workspace", &saved_workspace.id)?;
@@ -1739,11 +1851,31 @@ impl Registry {
                 launcher_ids.push(launcher.id.clone());
                 state.launchers.insert(launcher.id.clone(), launcher);
             }
+            let mut workspace_agent_ids = Vec::with_capacity(saved_workspace.agents.len());
+            for saved_agent in saved_workspace.agents {
+                validate_id("agent", &saved_agent.id)?;
+                validate_id("agent shell", &saved_agent.shell_id)?;
+                validate_id("agent run", &saved_agent.run_id)?;
+                validate_persisted_agent(&saved_agent)?;
+                if !agent_ids.insert(saved_agent.id.clone()) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Boomux state contains a duplicate agent instance",
+                    ));
+                }
+                let agent = Arc::new(AgentInstance::from_persisted(
+                    &saved_workspace.id,
+                    saved_agent,
+                ));
+                workspace_agent_ids.push(agent.id.clone());
+                state.agents.insert(agent.id.clone(), agent);
+            }
             let workspace = Arc::new(Workspace {
                 id: saved_workspace.id.clone(),
                 name: Mutex::new(saved_workspace.name),
                 shell_ids: Mutex::new(shell_ids),
                 launcher_ids: Mutex::new(launcher_ids),
+                agent_ids: Mutex::new(workspace_agent_ids),
             });
             state.workspaces.insert(saved_workspace.id, workspace);
         }
@@ -2139,11 +2271,13 @@ impl Registry {
         let mut workspace_names = HashMap::new();
         let mut workspace_shell_ids = HashMap::new();
         let mut workspace_launcher_ids = HashMap::new();
+        let mut workspace_agent_ids = HashMap::new();
         for workspace in state.workspaces.values() {
             workspace_names.insert(workspace.id.clone(), lock(&workspace.name)?.clone());
             workspace_shell_ids.insert(workspace.id.clone(), lock(&workspace.shell_ids)?.clone());
             workspace_launcher_ids
                 .insert(workspace.id.clone(), lock(&workspace.launcher_ids)?.clone());
+            workspace_agent_ids.insert(workspace.id.clone(), lock(&workspace.agent_ids)?.clone());
         }
         let mut shell_names = HashMap::new();
         for shell in state.shells.values() {
@@ -2153,15 +2287,22 @@ impl Registry {
         for launcher in state.launchers.values() {
             launcher_names.insert(launcher.id.clone(), lock(&launcher.name)?.clone());
         }
+        let mut agent_states = HashMap::new();
+        for agent in state.agents.values() {
+            agent_states.insert(agent.id.clone(), lock(&agent.state)?.clone());
+        }
         Ok(RegistryBackup {
             workspaces: state.workspaces.clone(),
             shells: state.shells.clone(),
             launchers: state.launchers.clone(),
+            agents: state.agents.clone(),
             workspace_names,
             workspace_shell_ids,
             workspace_launcher_ids,
+            workspace_agent_ids,
             shell_names,
             launcher_names,
+            agent_states,
         })
     }
 
@@ -2177,6 +2318,9 @@ impl Registry {
             if let Some(ids) = backup.workspace_launcher_ids.get(&workspace.id) {
                 *lock(&workspace.launcher_ids)? = ids.clone();
             }
+            if let Some(ids) = backup.workspace_agent_ids.get(&workspace.id) {
+                *lock(&workspace.agent_ids)? = ids.clone();
+            }
         }
         for shell in backup.shells.values() {
             if let Some(name) = backup.shell_names.get(&shell.id) {
@@ -2188,9 +2332,15 @@ impl Registry {
                 *lock(&launcher.name)? = name.clone();
             }
         }
+        for agent in backup.agents.values() {
+            if let Some(agent_state) = backup.agent_states.get(&agent.id) {
+                *lock(&agent.state)? = agent_state.clone();
+            }
+        }
         state.workspaces = backup.workspaces;
         state.shells = backup.shells;
         state.launchers = backup.launchers;
+        state.agents = backup.agents;
         Ok(())
     }
 
@@ -2235,11 +2385,20 @@ impl Registry {
                     command: launcher.command.clone(),
                 });
             }
+            let ids = lock(&workspace.agent_ids)?.clone();
+            let mut agents = Vec::with_capacity(ids.len());
+            for id in ids {
+                let Some(agent) = state.agents.get(&id) else {
+                    continue;
+                };
+                agents.push(agent.persisted()?);
+            }
             saved.workspaces.push(PersistedWorkspace {
                 id: workspace.id.clone(),
                 name: lock(&workspace.name)?.clone(),
                 shells,
                 launchers,
+                agents,
             });
         }
         drop(state);
@@ -2383,6 +2542,7 @@ impl Registry {
         state.workspaces.clear();
         state.shells.clear();
         state.launchers.clear();
+        state.agents.clear();
         drop(state);
         drop(events);
         drop(transition);
@@ -2414,6 +2574,14 @@ impl Registry {
             .get(id)
             .cloned()
             .ok_or_else(|| not_found("workspace launcher", id))
+    }
+
+    fn agent(&self, id: &str) -> io::Result<Arc<AgentInstance>> {
+        lock(&self.state)?
+            .agents
+            .get(id)
+            .cloned()
+            .ok_or_else(|| not_found("agent instance", id))
     }
 
     fn contains_shell(&self, shell: &Arc<Shell>) -> io::Result<bool> {
@@ -2451,6 +2619,7 @@ impl Registry {
             name: Mutex::new(name),
             shell_ids: Mutex::new(shells.iter().map(|shell| shell.id.clone()).collect()),
             launcher_ids: Mutex::new(Vec::new()),
+            agent_ids: Mutex::new(Vec::new()),
         });
         {
             let mut state = lock(&self.state)?;
@@ -2571,6 +2740,113 @@ impl Registry {
             .insert(launcher.id.clone(), Arc::clone(&launcher));
         launcher_ids.push(launcher.id.clone());
         Ok(snapshot)
+    }
+
+    fn register_agent(
+        &self,
+        shell_id: &str,
+        run_id: &str,
+        spec: AgentRegistrationSpec,
+    ) -> io::Result<AgentInstanceSnapshot> {
+        validate_agent_registration(&spec)?;
+        let shell = self.shell(shell_id)?;
+        let lifecycle = lock(&shell.lifecycle)?;
+        match &*lifecycle {
+            ShellLifecycle::Running { run, .. } if run.id == run_id => {}
+            ShellLifecycle::Running { .. }
+            | ShellLifecycle::Exited { .. }
+            | ShellLifecycle::Pending => {
+                return Err(coded_error(
+                    ErrorCode::RunChanged,
+                    "shell does not have the requested active run",
+                ));
+            }
+            ShellLifecycle::Closed => return Err(not_found("shell", shell_id)),
+        }
+        let workspace = self.workspace(&shell.workspace_id)?;
+        let started_at_ms = unix_time_ms();
+        let ended_at_ms = (spec.report.state == AgentState::Done).then_some(started_at_ms);
+        let agent = Arc::new(AgentInstance {
+            id: Uuid::new_v4().to_string(),
+            workspace_id: shell.workspace_id.clone(),
+            shell_id: shell.id.clone(),
+            run_id: run_id.into(),
+            name: spec.name,
+            integration: spec.integration,
+            external_session_id: spec.external_session_id,
+            started_at_ms,
+            state: Mutex::new(AgentInstanceState {
+                ended_at_ms,
+                observation: AgentObservationSnapshot {
+                    revision: 1,
+                    state: spec.report.state,
+                    authority: spec.report.authority,
+                    evidence: spec.report.evidence,
+                    confidence: spec.report.confidence,
+                    observed_at_ms: started_at_ms,
+                },
+            }),
+        });
+        let snapshot = agent.snapshot()?;
+        let mut state = lock(&self.state)?;
+        let Some(current_shell) = state.shells.get(shell_id) else {
+            return Err(not_found("shell", shell_id));
+        };
+        let Some(current_workspace) = state.workspaces.get(&shell.workspace_id) else {
+            return Err(not_found("workspace", &shell.workspace_id));
+        };
+        if !Arc::ptr_eq(current_shell, &shell) || !Arc::ptr_eq(current_workspace, &workspace) {
+            return Err(not_found("shell", shell_id));
+        }
+        state.agents.insert(agent.id.clone(), Arc::clone(&agent));
+        lock(&workspace.agent_ids)?.push(agent.id.clone());
+        drop(lifecycle);
+        Ok(snapshot)
+    }
+
+    fn report_agent(
+        &self,
+        agent_id: &str,
+        run_id: &str,
+        report: AgentReport,
+    ) -> io::Result<(AgentInstanceSnapshot, bool)> {
+        validate_agent_report(&report)?;
+        let agent = self.agent(agent_id)?;
+        if agent.run_id != run_id {
+            return Err(coded_error(
+                ErrorCode::RunChanged,
+                "agent instance is bound to a different shell run",
+            ));
+        }
+        let mut state = lock(&agent.state)?;
+        if state.ended_at_ms.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "completed agent instance cannot be reported again",
+            ));
+        }
+        let revision = state
+            .observation
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("agent observation revision exhausted"))?;
+        let observed_at_ms = unix_time_ms()
+            .max(agent.started_at_ms)
+            .max(state.observation.observed_at_ms);
+        let completed = report.state == AgentState::Done;
+        state.observation = AgentObservationSnapshot {
+            revision,
+            state: report.state,
+            authority: report.authority,
+            evidence: report.evidence,
+            confidence: report.confidence,
+            observed_at_ms,
+        };
+        if completed {
+            state.ended_at_ms = Some(observed_at_ms);
+        }
+        drop(state);
+        Ok((agent.snapshot()?, completed))
     }
 
     fn rename_launcher(&self, launcher_id: &str, name: String) -> io::Result<()> {
@@ -2851,6 +3127,9 @@ impl Registry {
             for id in lock(&workspace.launcher_ids)?.iter() {
                 state.launchers.remove(id);
             }
+            for id in lock(&workspace.agent_ids)?.iter() {
+                state.agents.remove(id);
+            }
             let ids = lock(&workspace.shell_ids)?.clone();
             ids.into_iter()
                 .filter_map(|id| state.shells.remove(&id))
@@ -2979,7 +3258,7 @@ impl Registry {
 
 impl Workspace {
     fn snapshot(&self, registry: &Registry) -> io::Result<WorkspaceSnapshot> {
-        let (shells, launchers) = {
+        let (shells, launchers, agents) = {
             let state = lock(&registry.state)?;
             let shell_ids = lock(&self.shell_ids)?;
             let shells = shell_ids
@@ -2991,7 +3270,12 @@ impl Workspace {
                 .iter()
                 .filter_map(|id| state.launchers.get(id).cloned())
                 .collect::<Vec<_>>();
-            (shells, launchers)
+            let agent_ids = lock(&self.agent_ids)?;
+            let agents = agent_ids
+                .iter()
+                .filter_map(|id| state.agents.get(id).cloned())
+                .collect::<Vec<_>>();
+            (shells, launchers, agents)
         };
         let shells = shells
             .iter()
@@ -3001,11 +3285,16 @@ impl Workspace {
             .iter()
             .map(|launcher| launcher.snapshot())
             .collect::<io::Result<_>>()?;
+        let agents = agents
+            .iter()
+            .map(|agent| agent.snapshot())
+            .collect::<io::Result<_>>()?;
         Ok(WorkspaceSnapshot {
             id: self.id.clone(),
             name: lock(&self.name)?.clone(),
             shells,
             launchers,
+            agents,
         })
     }
 }
@@ -3018,6 +3307,56 @@ impl WorkspaceLauncher {
             name: lock(&self.name)?.clone(),
             command: self.command.clone(),
             cwd: self.cwd.clone(),
+        })
+    }
+}
+
+impl AgentInstance {
+    fn from_persisted(workspace_id: &str, saved: PersistedAgentInstance) -> Self {
+        Self {
+            id: saved.id,
+            workspace_id: workspace_id.into(),
+            shell_id: saved.shell_id,
+            run_id: saved.run_id,
+            name: saved.name,
+            integration: saved.integration,
+            external_session_id: saved.external_session_id,
+            started_at_ms: saved.started_at_ms,
+            state: Mutex::new(AgentInstanceState {
+                ended_at_ms: saved.ended_at_ms,
+                observation: saved.observation,
+            }),
+        }
+    }
+
+    fn snapshot(&self) -> io::Result<AgentInstanceSnapshot> {
+        let state = lock(&self.state)?;
+        Ok(AgentInstanceSnapshot {
+            id: self.id.clone(),
+            workspace_id: self.workspace_id.clone(),
+            shell_id: self.shell_id.clone(),
+            run_id: self.run_id.clone(),
+            name: self.name.clone(),
+            integration: self.integration.clone(),
+            external_session_id: self.external_session_id.clone(),
+            started_at_ms: self.started_at_ms,
+            ended_at_ms: state.ended_at_ms,
+            observation: state.observation.clone(),
+        })
+    }
+
+    fn persisted(&self) -> io::Result<PersistedAgentInstance> {
+        let snapshot = self.snapshot()?;
+        Ok(PersistedAgentInstance {
+            id: snapshot.id,
+            shell_id: snapshot.shell_id,
+            run_id: snapshot.run_id,
+            name: snapshot.name,
+            integration: snapshot.integration,
+            external_session_id: snapshot.external_session_id,
+            started_at_ms: snapshot.started_at_ms,
+            ended_at_ms: snapshot.ended_at_ms,
+            observation: snapshot.observation,
         })
     }
 }
@@ -4150,6 +4489,65 @@ fn validate_id(kind: &str, id: &str) -> io::Result<()> {
     })
 }
 
+fn validate_agent_registration(spec: &AgentRegistrationSpec) -> io::Result<()> {
+    validate_name(&spec.name)?;
+    validate_required_agent_string("integration", &spec.integration, MAX_NAME_BYTES)?;
+    if let Some(external_session_id) = &spec.external_session_id {
+        validate_required_agent_string("external_session_id", external_session_id, MAX_NAME_BYTES)?;
+    }
+    validate_agent_report(&spec.report)
+}
+
+fn validate_agent_report(report: &AgentReport) -> io::Result<()> {
+    validate_required_agent_string("evidence", &report.evidence, MAX_AGENT_EVIDENCE_BYTES)?;
+    if report.confidence > 100 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "agent report confidence must be between 0 and 100",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_required_agent_string(kind: &str, value: &str, max_bytes: usize) -> io::Result<()> {
+    if value.trim().is_empty() || value.len() > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("agent {kind} must be nonempty and at most {max_bytes} bytes"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_persisted_agent(agent: &PersistedAgentInstance) -> io::Result<()> {
+    validate_persisted_name(&agent.name)?;
+    validate_agent_registration(&AgentRegistrationSpec {
+        name: agent.name.clone(),
+        integration: agent.integration.clone(),
+        external_session_id: agent.external_session_id.clone(),
+        report: AgentReport {
+            state: agent.observation.state,
+            authority: agent.observation.authority,
+            evidence: agent.observation.evidence.clone(),
+            confidence: agent.observation.confidence,
+        },
+    })
+    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+    if agent.observation.revision == 0
+        || agent.observation.observed_at_ms < agent.started_at_ms
+        || agent
+            .ended_at_ms
+            .is_some_and(|ended_at_ms| ended_at_ms < agent.started_at_ms)
+        || (agent.observation.state == AgentState::Done) != agent.ended_at_ms.is_some()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Boomux state contains an invalid agent observation",
+        ));
+    }
+    Ok(())
+}
+
 fn not_found(kind: &str, id: &str) -> io::Error {
     io::Error::new(io::ErrorKind::NotFound, format!("{kind} not found: {id}"))
 }
@@ -4165,6 +4563,8 @@ mod tests {
     use super::*;
     use std::sync::Barrier;
 
+    use crate::protocol::{AgentAuthority, AgentState};
+
     fn profile() -> TerminalProfile {
         TerminalProfile {
             term: Some("xterm-256color".into()),
@@ -4176,6 +4576,44 @@ mod tests {
             pixel_width: 0,
             pixel_height: 0,
         }
+    }
+
+    fn agent_spec(state: AgentState) -> AgentRegistrationSpec {
+        AgentRegistrationSpec {
+            name: "test-agent".into(),
+            integration: "daemon-test".into(),
+            external_session_id: Some("external-1".into()),
+            report: AgentReport {
+                state,
+                authority: AgentAuthority::LifecycleIntegration,
+                evidence: "test observation".into(),
+                confidence: 90,
+            },
+        }
+    }
+
+    fn running_shell(registry: &Registry) -> (WorkspaceSnapshot, Arc<Shell>, Arc<ShellRuntime>) {
+        let workspace = registry
+            .create_workspace(
+                "agents".into(),
+                vec![ShellSpec {
+                    name: "agent-shell".into(),
+                    command: vec!["/bin/sleep".into(), "30".into()],
+                    cwd: env::temp_dir(),
+                }],
+            )
+            .unwrap();
+        let shell = registry.shell(&workspace.shells[0].id).unwrap();
+        let run = Arc::new(ShellRun::new(1));
+        let (runtime, _reader) =
+            spawn_runtime(&shell, &run, "agents", "agent-shell", &profile()).unwrap();
+        *lock(&shell.last_run).unwrap() = Some(run.persisted(profile()).unwrap());
+        *lock(&shell.lifecycle).unwrap() = ShellLifecycle::Running {
+            profile: profile(),
+            run,
+            runtime: Arc::clone(&runtime),
+        };
+        (workspace, shell, runtime)
     }
 
     #[test]
@@ -4416,6 +4854,223 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn agent_registration_and_reports_enforce_run_binding_and_complete_monotonically() {
+        let registry = Registry::default();
+        let (workspace, shell, _runtime) = running_shell(&registry);
+        let run_id = shell.snapshot().unwrap().run.unwrap().id;
+
+        let wrong_run = registry.dispatch(Request::RegisterAgent {
+            shell_id: shell.id.clone(),
+            run_id: Uuid::new_v4().to_string(),
+            spec: agent_spec(AgentState::Working),
+        });
+        assert_eq!(error_code(&wrong_run.unwrap_err()), ErrorCode::RunChanged);
+
+        let Response::Agent { agent } = registry
+            .dispatch(Request::RegisterAgent {
+                shell_id: shell.id.clone(),
+                run_id: run_id.clone(),
+                spec: agent_spec(AgentState::Working),
+            })
+            .unwrap()
+        else {
+            panic!("expected registered agent");
+        };
+        assert_eq!(agent.observation.revision, 1);
+        assert!(agent.ended_at_ms.is_none());
+        assert_eq!(
+            error_code(
+                &registry
+                    .dispatch(Request::ReportAgent {
+                        agent_id: agent.id.clone(),
+                        run_id: Uuid::new_v4().to_string(),
+                        report: agent_spec(AgentState::Idle).report,
+                    })
+                    .unwrap_err()
+            ),
+            ErrorCode::RunChanged
+        );
+
+        let Response::Agent { agent } = registry
+            .dispatch(Request::ReportAgent {
+                agent_id: agent.id.clone(),
+                run_id,
+                report: agent_spec(AgentState::Done).report,
+            })
+            .unwrap()
+        else {
+            panic!("expected completed agent");
+        };
+        assert_eq!(agent.observation.revision, 2);
+        assert_eq!(agent.observation.state, AgentState::Done);
+        assert_eq!(agent.ended_at_ms, Some(agent.observation.observed_at_ms));
+        assert_eq!(
+            registry.snapshot().unwrap().workspaces[0].agents,
+            vec![agent.clone()]
+        );
+        {
+            let event_state = lock(&registry.events.state).unwrap();
+            assert!(matches!(
+                event_state.events[0].kind,
+                DaemonEventKind::AgentRegistered { .. }
+            ));
+            assert!(matches!(
+                event_state.events[1].kind,
+                DaemonEventKind::AgentCompleted { .. }
+            ));
+        }
+        assert!(
+            registry
+                .dispatch(Request::ReportAgent {
+                    agent_id: agent.id,
+                    run_id: agent.run_id,
+                    report: agent_spec(AgentState::Idle).report,
+                })
+                .is_err()
+        );
+
+        shell.kill().unwrap();
+        registry.close_workspace(&workspace.id).unwrap();
+    }
+
+    #[test]
+    fn failed_agent_mutation_restores_observation_revision() {
+        let registry = Registry::default();
+        let (workspace, shell, _runtime) = running_shell(&registry);
+        let run_id = shell.snapshot().unwrap().run.unwrap().id;
+        let agent = registry
+            .register_agent(&shell.id, &run_id, agent_spec(AgentState::Working))
+            .unwrap();
+
+        let result: io::Result<()> = registry.durable_mutation(|| {
+            registry.report_agent(&agent.id, &run_id, agent_spec(AgentState::Blocked).report)?;
+            Err(io::Error::other("force rollback"))
+        });
+
+        assert!(result.is_err());
+        let restored = registry.agent(&agent.id).unwrap().snapshot().unwrap();
+        assert_eq!(restored.observation.revision, 1);
+        assert_eq!(restored.observation.state, AgentState::Working);
+        shell.kill().unwrap();
+        registry.close_workspace(&workspace.id).unwrap();
+    }
+
+    #[test]
+    fn agent_instances_restore_from_daemon_persistence() {
+        let directory = env::temp_dir().join(format!("boomux-agent-restore-{}", Uuid::new_v4()));
+        let path = directory.join("state/state.json");
+        let registry = Registry::restore(StateStore::at(path.clone()), false, None).unwrap();
+        let (_workspace, shell, runtime) = running_shell(&registry);
+        let run_id = shell.snapshot().unwrap().run.unwrap().id;
+        let Response::Agent { agent } = registry
+            .dispatch(Request::RegisterAgent {
+                shell_id: shell.id.clone(),
+                run_id,
+                spec: agent_spec(AgentState::Working),
+            })
+            .unwrap()
+        else {
+            panic!("expected registered agent");
+        };
+
+        shell.kill().unwrap();
+        drop(runtime);
+        drop(shell);
+        drop(registry);
+
+        let restored = Registry::restore(StateStore::at(path), false, None).unwrap();
+        assert_eq!(
+            restored.agent(&agent.id).unwrap().snapshot().unwrap(),
+            agent
+        );
+        assert_eq!(
+            restored.snapshot().unwrap().workspaces[0].agents,
+            vec![agent]
+        );
+        drop(restored);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn protocol_eight_responses_hide_agent_snapshots_and_events() {
+        let agent = AgentInstanceSnapshot {
+            id: "a1".into(),
+            workspace_id: "w1".into(),
+            shell_id: "s1".into(),
+            run_id: "r1".into(),
+            name: "agent".into(),
+            integration: "test".into(),
+            external_session_id: None,
+            started_at_ms: 1,
+            ended_at_ms: None,
+            observation: AgentObservationSnapshot {
+                revision: 1,
+                state: AgentState::Working,
+                authority: AgentAuthority::LifecycleIntegration,
+                evidence: "working".into(),
+                confidence: 90,
+                observed_at_ms: 1,
+            },
+        };
+        let workspace = WorkspaceSnapshot {
+            id: "w1".into(),
+            name: "workspace".into(),
+            shells: Vec::new(),
+            launchers: Vec::new(),
+            agents: vec![agent.clone()],
+        };
+        let response = Response::Events {
+            stream_id: "stream".into(),
+            cursor: EventCursor {
+                stream_id: "stream".into(),
+                event_id: 2,
+            },
+            snapshot: Some(Snapshot {
+                workspaces: vec![workspace],
+            }),
+            events: vec![
+                DaemonEvent {
+                    id: 1,
+                    at_ms: 1,
+                    kind: DaemonEventKind::AgentRegistered {
+                        workspace_id: "w1".into(),
+                        shell_id: "s1".into(),
+                        agent,
+                    },
+                },
+                DaemonEvent {
+                    id: 2,
+                    at_ms: 2,
+                    kind: DaemonEventKind::WorkspaceRenamed {
+                        workspace_id: "w1".into(),
+                        name: "renamed".into(),
+                    },
+                },
+            ],
+        };
+
+        let Response::Events {
+            snapshot: Some(snapshot),
+            events,
+            cursor,
+            ..
+        } = response_for_version(response, 8)
+        else {
+            panic!("expected filtered events");
+        };
+        assert!(snapshot.workspaces[0].agents.is_empty());
+        assert_eq!(events.len(), 1);
+        assert_eq!(cursor.event_id, 2);
+        assert!(matches!(
+            events[0].kind,
+            DaemonEventKind::WorkspaceRenamed { .. }
+        ));
+        let encoded =
+            serde_json::to_value(response_for_version(Response::Snapshot { snapshot }, 8)).unwrap();
+        assert!(encoded["snapshot"]["workspaces"][0].get("agents").is_none());
     }
 
     #[test]

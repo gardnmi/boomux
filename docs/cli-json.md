@@ -34,6 +34,8 @@ The following commands support `--json`:
 - `boomux shell inspect`
 - `boomux launcher list`
 - `boomux launcher inspect`
+- `boomux agent list`
+- `boomux agent inspect`
 - `boomux daemon status`
 
 Mutation commands intentionally retain human output for now. Passing `--json`
@@ -46,13 +48,15 @@ Command payloads are:
   features, and error codes.
 - `list`: a `shells` array.
 - `shells`: workspace identity plus a `shells` array.
-- `workspace.list`: a `workspaces` array of `id`, `name`, `shell_count`, and
-  `launcher_count`.
+- `workspace.list`: a `workspaces` array of `id`, `name`, `shell_count`,
+  `launcher_count`, and `agent_count`.
 - `workspace.inspect`: one `workspace` object containing `id`, `name`, and
-  `shells` and `launchers` arrays.
+  `shells`, `launchers`, and `agents` arrays.
 - `shell.inspect`: one `shell` object.
 - `launcher.list`: workspace identity plus a `launchers` array.
 - `launcher.inspect`: one `launcher` object.
+- `agent.list`: an `agents` array, optionally limited by `--workspace`.
+- `agent.inspect`: one `agent` object selected by exact agent ID.
 - `read`: shell/run identity, observed output revision, and rendered output.
 - `events`: stream identity, reconnect cursor, optional baseline snapshot, and a
   bounded event array.
@@ -71,6 +75,19 @@ A run object includes `id`, `generation`, `started_at_ms`, `ended_at_ms`,
 
 Launcher objects include `id`, `workspace_id`, `workspace_name`, `name`, `cwd`,
 and `command`. `command` is the exact executable-and-arguments array.
+
+Agent objects include stable fields `id`, `workspace_id`, `workspace_name`,
+`shell_id`, `run_id`, `name`, `integration`, `external_session_id`,
+`started_at_ms`, `ended_at_ms`, and `observation`. The observation contains
+`revision`, `state`, `authority`, `evidence`, `confidence`, and
+`observed_at_ms`. Missing optional values are JSON `null`.
+
+Agent `state` is `unknown`, `working`, `blocked`, `idle`, or `done`. `authority`
+is `lifecycle_integration`, `process_adapter`, `terminal_heuristic`, or
+`daemon_lifecycle`; CLI arguments use hyphens instead of underscores. Confidence
+is an integer from 0 through 100. Observation revisions begin at 1 and increase
+with each accepted report. `done` is terminal and has a non-null `ended_at_ms`;
+completed records remain durable and inspectable.
 
 `read` returns `shell_id`, `run_id`, `output_revision`, `changed`, `status`, and
 `output`. Output is a JSON string containing the same bounded plain rendered text
@@ -100,6 +117,6 @@ Failures detected while parsing command-line arguments use `"command": "cli"`
 because no valid command was selected.
 
 The stable codes are reported by `boomux capabilities --json`. Messages remain
-human-readable context and are not stable parsing targets. Daemon protocol 7
-retains the additive protocol-6 error field and adds `cursor_expired`,
-`run_changed`, and `revision_ahead`.
+human-readable context and are not stable parsing targets. `run_changed` means
+a supplied run ID no longer matches the run-scoped operation; integrations must
+reacquire exact context rather than substitute or guess another run.

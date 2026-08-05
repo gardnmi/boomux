@@ -1,9 +1,8 @@
 # Daemon Event Stream
 
-Boomux protocol 7 adds bounded long polling for daemon events and atomic,
-revision-aware terminal reads. Protocol-6 management clients remain compatible;
-new clients negotiate down for legacy requests and reject protocol-7-only
-requests with `unsupported_version`.
+Boomux protocol 7 added bounded long polling for daemon events and atomic,
+revision-aware terminal reads. Protocol 9 adds run-scoped agent snapshots and
+events while retaining negotiation with older management clients.
 
 ## Cursors
 
@@ -27,17 +26,30 @@ the durable registry remains the cold-recovery authority.
 
 ## Events
 
-The initial event vocabulary is:
+The event vocabulary is:
 
 - `workspace_created`, `workspace_renamed`, `workspace_closed`
 - `shell_created`, `shell_renamed`, `shell_closed`
 - `launcher_created`, `launcher_renamed`, `launcher_removed`
 - `run_started`, `output_changed`, `run_exited`
+- `agent_registered`, `agent_state_changed`, `agent_completed`
 - `handoff_completed`
 
 Output events carry run identity and the latest output revision, not raw PTY
 bytes. Consumers use revision-aware reads to retrieve the current bounded,
 rendered terminal state.
+
+Agent events carry the complete durable agent snapshot, including exact shell
+and run IDs and the latest state, authority, evidence, confidence, observation
+revision, and timestamps. Registration emits `agent_registered`; registration
+as `done` also emits `agent_completed`. Later reports emit
+`agent_state_changed`, except the terminal `done` report emits
+`agent_completed`. Completed instances reject further reports.
+
+Protocol-8 and older event clients do not receive protocol-9 agent snapshots or
+agent events. Filtering does not rewrite the journal: their returned cursor
+still advances across filtered agent events, preserving the stream's total
+publication order. Agent requests themselves require protocol 9.
 
 Event IDs provide one total publication order. The daemon transition coordinator
 couples durable lifecycle mutation, persistence, and event publication. Events
@@ -66,3 +78,7 @@ publication still cross the transition boundary together.
 Revisions are run-scoped reader-batch counters, not byte offsets. Rendered output
 can rewrite earlier cells, so successful reads return complete bounded state
 rather than byte deltas.
+
+`run_changed` is a guard against observing or reporting against another process
+incarnation. Consumers should inspect the shell and decide how to handle the new
+run; they must not silently guess or replace the requested run ID.

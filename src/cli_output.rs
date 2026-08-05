@@ -5,7 +5,8 @@ use serde::Serialize;
 
 use boomux::client::RemoteError;
 use boomux::protocol::{
-    ErrorCode, ShellRunExitReason, ShellSnapshot, ShellStatus, WorkspaceLauncherSnapshot,
+    AgentAuthority, AgentInstanceSnapshot, AgentState, ErrorCode, ShellRunExitReason,
+    ShellSnapshot, ShellStatus, WorkspaceLauncherSnapshot,
 };
 
 pub(crate) const SCHEMA: &str = "boomux.cli/v1";
@@ -74,6 +75,7 @@ pub(crate) struct WorkspaceSummary {
     pub(crate) name: String,
     pub(crate) shell_count: usize,
     pub(crate) launcher_count: usize,
+    pub(crate) agent_count: usize,
 }
 
 #[derive(Serialize)]
@@ -84,6 +86,31 @@ pub(crate) struct LauncherData {
     pub(crate) name: String,
     pub(crate) cwd: String,
     pub(crate) command: Vec<String>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct AgentData {
+    pub(crate) id: String,
+    pub(crate) workspace_id: String,
+    pub(crate) workspace_name: Option<String>,
+    pub(crate) shell_id: String,
+    pub(crate) run_id: String,
+    pub(crate) name: String,
+    pub(crate) integration: String,
+    pub(crate) external_session_id: Option<String>,
+    pub(crate) started_at_ms: u64,
+    pub(crate) ended_at_ms: Option<u64>,
+    pub(crate) observation: AgentObservationData,
+}
+
+#[derive(Serialize)]
+pub(crate) struct AgentObservationData {
+    revision: u64,
+    state: &'static str,
+    authority: &'static str,
+    evidence: String,
+    confidence: u8,
+    observed_at_ms: u64,
 }
 
 pub(crate) fn print<T: Serialize>(command: &str, data: T) -> Result<(), Box<dyn Error>> {
@@ -175,6 +202,48 @@ pub(crate) fn launcher(
     }
 }
 
+pub(crate) fn agent(agent: &AgentInstanceSnapshot, workspace_name: Option<&str>) -> AgentData {
+    AgentData {
+        id: agent.id.clone(),
+        workspace_id: agent.workspace_id.clone(),
+        workspace_name: workspace_name.map(str::to_owned),
+        shell_id: agent.shell_id.clone(),
+        run_id: agent.run_id.clone(),
+        name: agent.name.clone(),
+        integration: agent.integration.clone(),
+        external_session_id: agent.external_session_id.clone(),
+        started_at_ms: agent.started_at_ms,
+        ended_at_ms: agent.ended_at_ms,
+        observation: AgentObservationData {
+            revision: agent.observation.revision,
+            state: agent_state(agent.observation.state),
+            authority: agent_authority(agent.observation.authority),
+            evidence: agent.observation.evidence.clone(),
+            confidence: agent.observation.confidence,
+            observed_at_ms: agent.observation.observed_at_ms,
+        },
+    }
+}
+
+pub(crate) fn agent_state(state: AgentState) -> &'static str {
+    match state {
+        AgentState::Unknown => "unknown",
+        AgentState::Working => "working",
+        AgentState::Blocked => "blocked",
+        AgentState::Idle => "idle",
+        AgentState::Done => "done",
+    }
+}
+
+pub(crate) fn agent_authority(authority: AgentAuthority) -> &'static str {
+    match authority {
+        AgentAuthority::LifecycleIntegration => "lifecycle_integration",
+        AgentAuthority::ProcessAdapter => "process_adapter",
+        AgentAuthority::TerminalHeuristic => "terminal_heuristic",
+        AgentAuthority::DaemonLifecycle => "daemon_lifecycle",
+    }
+}
+
 fn classify_error(command: &str, error: &(dyn Error + 'static)) -> &'static str {
     let mut current = Some(error);
     while let Some(candidate) = current {
@@ -231,5 +300,43 @@ fn protocol_error_code(code: ErrorCode) -> &'static str {
         ErrorCode::RevisionAhead => "revision_ahead",
         ErrorCode::Internal => "internal",
         ErrorCode::Unknown => "unknown",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use boomux::protocol::AgentObservationSnapshot;
+
+    #[test]
+    fn agent_json_uses_the_stable_cli_shape() {
+        let data = agent(
+            &AgentInstanceSnapshot {
+                id: "a1".into(),
+                workspace_id: "w1".into(),
+                shell_id: "s1".into(),
+                run_id: "r1".into(),
+                name: "opencode".into(),
+                integration: "plugin".into(),
+                external_session_id: Some("external-1".into()),
+                started_at_ms: 10,
+                ended_at_ms: None,
+                observation: AgentObservationSnapshot {
+                    revision: 2,
+                    state: AgentState::Working,
+                    authority: AgentAuthority::LifecycleIntegration,
+                    evidence: "tool call".into(),
+                    confidence: 95,
+                    observed_at_ms: 11,
+                },
+            },
+            Some("project"),
+        );
+
+        let value = serde_json::to_value(data).unwrap();
+        assert_eq!(value["workspace_name"], "project");
+        assert_eq!(value["observation"]["state"], "working");
+        assert_eq!(value["observation"]["authority"], "lifecycle_integration");
+        assert_eq!(value["observation"]["confidence"], 95);
     }
 }

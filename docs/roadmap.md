@@ -91,8 +91,8 @@ eternal process.
 
 ### Agent Runtime
 
-1. Model agent instances separately from shells and runs, with explicit state
-   authority, evidence, and confidence.
+1. [Complete] Model agent instances separately from shells and runs, with
+   explicit state authority, evidence, and confidence.
 2. Prefer lifecycle integrations, then process adapters, then conservative
    terminal-screen heuristics for `working`, `blocked`, `idle`, `done`, and
    `unknown` states.
