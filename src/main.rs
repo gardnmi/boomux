@@ -659,7 +659,16 @@ fn dashboard_views(
                 id: workspace.id.clone(),
                 name: workspace.name.clone(),
                 terminals,
-                launcher_count: workspace.launchers.len(),
+                launchers: workspace
+                    .launchers
+                    .iter()
+                    .map(|launcher| tui::LauncherView {
+                        id: launcher.id.clone(),
+                        name: launcher.name.clone(),
+                        directory: launcher.cwd.display().to_string(),
+                        command: launcher.command.join(" "),
+                    })
+                    .collect(),
             }
         })
         .collect()
@@ -2236,6 +2245,19 @@ mod tests {
         );
 
         assert!(views[0].terminals.is_empty());
+    }
+
+    #[test]
+    fn workspace_view_includes_launcher_details() {
+        let mut workspace = workspace("w1", "project", Vec::new());
+        workspace.launchers.push(launcher("l1", "w1", "editor"));
+
+        let views = dashboard_views(&[workspace], &mut git::Cache::default());
+
+        assert_eq!(views[0].launchers.len(), 1);
+        assert_eq!(views[0].launchers[0].name, "editor");
+        assert_eq!(views[0].launchers[0].command, "zeditor .");
+        assert_eq!(views[0].launchers[0].directory, "/tmp/project");
     }
 
     #[test]
