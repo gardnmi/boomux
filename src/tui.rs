@@ -31,6 +31,25 @@ pub(crate) struct WorkspaceView {
 pub(crate) enum WorkspaceItemView {
     Shell(TerminalView),
     Launcher(LauncherView),
+    Agent(AgentView),
+}
+
+pub(crate) struct AgentView {
+    pub(crate) id: String,
+    pub(crate) workspace_id: String,
+    pub(crate) run_id: String,
+    pub(crate) shell_id: String,
+    pub(crate) shell_name: String,
+    pub(crate) name: String,
+    pub(crate) state: String,
+    pub(crate) integration: String,
+    pub(crate) authority: String,
+    pub(crate) confidence: u8,
+    pub(crate) evidence: String,
+    pub(crate) external_session_id: Option<String>,
+    pub(crate) started_at_ms: u64,
+    pub(crate) observed_at_ms: u64,
+    pub(crate) ended_at_ms: Option<u64>,
 }
 
 pub(crate) struct LauncherView {
@@ -77,6 +96,13 @@ impl WorkspaceView {
             .filter(|item| matches!(item, WorkspaceItemView::Launcher(_)))
             .count()
     }
+
+    fn agent_count(&self) -> usize {
+        self.items
+            .iter()
+            .filter(|item| matches!(item, WorkspaceItemView::Agent(_)))
+            .count()
+    }
 }
 
 pub(crate) struct Actions<R, O, C, W, N, E, F> {
@@ -109,6 +135,7 @@ enum Focus {
 enum ItemIdentity {
     Shell(String),
     Launcher(String),
+    Agent(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -413,11 +440,12 @@ impl App {
             Focus::Workspaces => self
                 .selected()
                 .map(|workspace| RenameTarget::Workspace(workspace.id.clone())),
-            Focus::Items => self.selected_item().map(|item| match item {
-                WorkspaceItemView::Shell(shell) => RenameTarget::Shell(shell.id.clone()),
+            Focus::Items => self.selected_item().and_then(|item| match item {
+                WorkspaceItemView::Shell(shell) => Some(RenameTarget::Shell(shell.id.clone())),
                 WorkspaceItemView::Launcher(launcher) => {
-                    RenameTarget::Launcher(launcher.id.clone())
+                    Some(RenameTarget::Launcher(launcher.id.clone()))
                 }
+                WorkspaceItemView::Agent(_) => None,
             }),
         };
         if let Some(target) = target {
@@ -476,23 +504,25 @@ impl App {
         self.message = Some(Message::from_result(on_restore(&workspace_id)));
     }
 
-    fn open_selected_item<F>(&mut self, on_open: &mut F)
+    fn open_selected_item<F>(&mut self, on_open: &mut F) -> bool
     where
         F: FnMut(&OpenTarget) -> Result<String, String>,
     {
         let Some(workspace_id) = self.selected().map(|workspace| workspace.id.clone()) else {
-            return;
+            return false;
         };
-        let Some(target) = self.selected_item().map(|item| match item {
-            WorkspaceItemView::Shell(shell) => OpenTarget::Shell(shell.id.clone()),
-            WorkspaceItemView::Launcher(launcher) => OpenTarget::Launcher {
+        let Some(target) = self.selected_item().and_then(|item| match item {
+            WorkspaceItemView::Shell(shell) => Some(OpenTarget::Shell(shell.id.clone())),
+            WorkspaceItemView::Launcher(launcher) => Some(OpenTarget::Launcher {
                 workspace_id,
                 launcher_id: launcher.id.clone(),
-            },
+            }),
+            WorkspaceItemView::Agent(_) => None,
         }) else {
-            return;
+            return false;
         };
         self.message = Some(Message::from_result(on_open(&target)));
+        true
     }
 
     fn request_close(&mut self) {
@@ -503,19 +533,20 @@ impl App {
                 shell_count: workspace.shell_count(),
                 launcher_count: workspace.launcher_count(),
             }),
-            Focus::Items => self.selected_item().map(|item| match item {
-                WorkspaceItemView::Shell(shell) => PendingClose {
+            Focus::Items => self.selected_item().and_then(|item| match item {
+                WorkspaceItemView::Shell(shell) => Some(PendingClose {
                     target: CloseTarget::Shell(shell.id.clone()),
                     name: shell.name.clone(),
                     shell_count: 1,
                     launcher_count: 0,
-                },
-                WorkspaceItemView::Launcher(launcher) => PendingClose {
+                }),
+                WorkspaceItemView::Launcher(launcher) => Some(PendingClose {
                     target: CloseTarget::Launcher(launcher.id.clone()),
                     name: launcher.name.clone(),
                     shell_count: 0,
                     launcher_count: 1,
-                },
+                }),
+                WorkspaceItemView::Agent(_) => None,
             }),
         };
     }
@@ -549,6 +580,7 @@ impl App {
         let selected_item = self.selected_item().map(|item| match item {
             WorkspaceItemView::Shell(shell) => ItemIdentity::Shell(shell.id.clone()),
             WorkspaceItemView::Launcher(launcher) => ItemIdentity::Launcher(launcher.id.clone()),
+            WorkspaceItemView::Agent(agent) => ItemIdentity::Agent(agent.id.clone()),
         });
         let previous_index = self.selected_index().unwrap_or(0);
         let selected_index = selected_id
@@ -567,6 +599,9 @@ impl App {
                     ItemIdentity::Launcher(id) => workspace.items.iter().position(|item| {
                         matches!(item, WorkspaceItemView::Launcher(launcher) if launcher.id == id)
                     }),
+                    ItemIdentity::Agent(id) => workspace.items.iter().position(
+                        |item| matches!(item, WorkspaceItemView::Agent(agent) if agent.id == id),
+                    ),
                 }
                 })
                 .or_else(|| (!workspace.items.is_empty()).then_some(0))
@@ -675,12 +710,17 @@ where
             KeyCode::Down | KeyCode::Char('j') => app.next(),
             KeyCode::Up | KeyCode::Char('k') => app.previous(),
             KeyCode::Enter => {
-                match app.focus {
-                    Focus::Workspaces => app.restore_selected(&mut actions.on_restore),
+                let dispatched = match app.focus {
+                    Focus::Workspaces => {
+                        app.restore_selected(&mut actions.on_restore);
+                        true
+                    }
                     Focus::Items => app.open_selected_item(&mut actions.on_open),
+                };
+                if dispatched {
+                    app.refresh(&mut actions.on_refresh);
+                    last_refresh = Instant::now();
                 }
-                app.refresh(&mut actions.on_refresh);
-                last_refresh = Instant::now();
             }
             KeyCode::Char('r') => {
                 app.refresh(&mut actions.on_refresh);
@@ -801,7 +841,7 @@ fn render(frame: &mut Frame, app: &mut App) {
     render_header(frame, header_area, app);
     if dashboard_area.width >= 114 {
         let [workspace_area, terminal_area] =
-            Layout::horizontal([Constraint::Length(34), Constraint::Fill(1)]).areas(dashboard_area);
+            Layout::horizontal([Constraint::Length(42), Constraint::Fill(1)]).areas(dashboard_area);
         render_workspaces(frame, workspace_area, app);
         render_items(frame, terminal_area, app);
     } else {
@@ -923,6 +963,7 @@ fn render_header(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
         .iter()
         .map(WorkspaceView::launcher_count)
         .sum();
+    let agent_count: usize = app.workspaces.iter().map(WorkspaceView::agent_count).sum();
     let line = Line::from(vec![
         Span::styled(
             " BOOMUX ",
@@ -939,6 +980,8 @@ fn render_header(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
             format!("{launcher_count} launchers"),
             Style::new().fg(YELLOW),
         ),
+        Span::styled("  |  ", Style::new().fg(OVERLAY)),
+        Span::styled(format!("{agent_count} agents"), Style::new().fg(TEAL)),
         Span::styled(
             "    tab/h/l/arrows switches panes",
             Style::new().fg(SUBTEXT),
@@ -953,6 +996,7 @@ fn render_workspaces(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut A
             Cell::from(workspace.name.as_str()),
             Cell::from(workspace.shell_count().to_string()),
             Cell::from(workspace.launcher_count().to_string()),
+            Cell::from(workspace.agent_count().to_string()),
         ])
     });
     let table = Table::new(
@@ -961,10 +1005,11 @@ fn render_workspaces(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut A
             Constraint::Min(8),
             Constraint::Length(6),
             Constraint::Length(9),
+            Constraint::Length(6),
         ],
     )
     .header(
-        Row::new(["NAME", "SHELLS", "LAUNCHERS"])
+        Row::new(["NAME", "SHELLS", "LAUNCHERS", "AGENTS"])
             .style(Style::new().fg(BLUE).add_modifier(Modifier::BOLD)),
     )
     .column_spacing(1)
@@ -995,8 +1040,8 @@ fn render_items(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
         .selected()
         .and_then(|index| app.workspaces.get(index));
     let title = selected.map_or_else(
-        || " Shells ".to_owned(),
-        |workspace| format!(" Shells: {} ({}) ", workspace.name, workspace.items.len()),
+        || " Items ".to_owned(),
+        |workspace| format!(" Items: {} ({}) ", workspace.name, workspace.items.len()),
     );
     let block = Block::bordered().title(title).border_style(Style::new().fg(
         if app.focus == Focus::Items {
@@ -1036,6 +1081,23 @@ fn render_items(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
                         short_id(&launcher.id)
                     }),
                 ]),
+                WorkspaceItemView::Agent(agent) => Row::new(vec![
+                    Cell::from(agent.name.as_str()),
+                    Cell::from(Span::styled(
+                        agent.state.as_str(),
+                        Style::new().fg(status_color(&agent.state)),
+                    )),
+                    Cell::from(agent.shell_name.as_str()),
+                    Cell::from(format!(
+                        "{} / {} {}%: {}",
+                        agent.integration, agent.authority, agent.confidence, agent.evidence
+                    )),
+                    Cell::from(if show_full_ids {
+                        agent.id.clone()
+                    } else {
+                        short_id(&agent.id)
+                    }),
+                ]),
             })
         })
         .collect();
@@ -1044,20 +1106,21 @@ fn render_items(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
     let table_area = if show_full_ids {
         inner
     } else {
+        let detail_height = if matches!(app.selected_item(), Some(WorkspaceItemView::Agent(_))) {
+            3
+        } else {
+            1
+        };
         let [detail_area, table_area] =
-            Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(inner);
+            Layout::vertical([Constraint::Length(detail_height), Constraint::Fill(1)]).areas(inner);
         let detail = app.selected_item().map_or_else(
-            || Line::from(Span::styled(" No item selected", Style::new().fg(SUBTEXT))),
-            |item| {
-                let id = match item {
-                    WorkspaceItemView::Shell(shell) => shell.id.as_str(),
-                    WorkspaceItemView::Launcher(launcher) => launcher.id.as_str(),
-                };
-                Line::from(vec![
-                    Span::styled(" ID ", Style::new().fg(SUBTEXT)),
-                    Span::styled(id, Style::new().fg(TEXT)),
-                ])
+            || {
+                vec![Line::from(Span::styled(
+                    " No item selected",
+                    Style::new().fg(SUBTEXT),
+                ))]
             },
+            item_detail_lines,
         );
         frame.render_widget(Paragraph::new(detail), detail_area);
         table_area
@@ -1072,6 +1135,42 @@ fn render_items(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
         )
         .highlight_symbol("> ");
     frame.render_stateful_widget(table, table_area, &mut app.item_state);
+}
+
+fn item_detail_lines(item: &WorkspaceItemView) -> Vec<Line<'_>> {
+    match item {
+        WorkspaceItemView::Shell(shell) => vec![Line::from(vec![
+            Span::styled(" ID ", Style::new().fg(SUBTEXT)),
+            Span::styled(shell.id.as_str(), Style::new().fg(TEXT)),
+        ])],
+        WorkspaceItemView::Launcher(launcher) => vec![Line::from(vec![
+            Span::styled(" ID ", Style::new().fg(SUBTEXT)),
+            Span::styled(launcher.id.as_str(), Style::new().fg(TEXT)),
+        ])],
+        WorkspaceItemView::Agent(agent) => vec![
+            Line::from(format!(
+                " Agent {}  Workspace {}  Run {}  Shell {} ({})",
+                agent.id, agent.workspace_id, agent.run_id, agent.shell_name, agent.shell_id
+            )),
+            Line::from(format!(
+                " {}  {}  {}  confidence {}%  external {}",
+                agent.state,
+                agent.integration,
+                agent.authority,
+                agent.confidence,
+                agent.external_session_id.as_deref().unwrap_or("-")
+            )),
+            Line::from(format!(
+                " started {}  observed {}  ended {}  {}",
+                agent.started_at_ms,
+                agent.observed_at_ms,
+                agent
+                    .ended_at_ms
+                    .map_or_else(|| "-".to_owned(), |timestamp| timestamp.to_string()),
+                agent.evidence
+            )),
+        ],
+    }
 }
 
 fn shell_column_widths(width: u16, show_full_ids: bool) -> Vec<Constraint> {
@@ -1141,6 +1240,8 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
         ))
     } else {
         let launcher_selected = matches!(app.selected_item(), Some(WorkspaceItemView::Launcher(_)));
+        let agent_selected = app.focus == Focus::Items
+            && matches!(app.selected_item(), Some(WorkspaceItemView::Agent(_)));
         let mut spans = vec![
             Span::styled(" j/k", Style::new().fg(TEAL)),
             Span::styled(
@@ -1157,44 +1258,52 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
                 Style::new().fg(SUBTEXT),
             ),
         ];
+        if !agent_selected {
+            spans.extend([
+                Span::styled("e", Style::new().fg(YELLOW)),
+                Span::styled(
+                    if app.focus == Focus::Workspaces {
+                        " rename workspace  "
+                    } else if launcher_selected {
+                        " rename launcher  "
+                    } else {
+                        " rename shell  "
+                    },
+                    Style::new().fg(SUBTEXT),
+                ),
+                Span::styled("enter", Style::new().fg(GREEN)),
+                Span::styled(
+                    if app.focus == Focus::Workspaces {
+                        " restore workspace  "
+                    } else if launcher_selected {
+                        " launch command  "
+                    } else {
+                        " open shell  "
+                    },
+                    Style::new().fg(SUBTEXT),
+                ),
+            ]);
+        }
         spans.extend([
-            Span::styled("e", Style::new().fg(YELLOW)),
-            Span::styled(
-                if app.focus == Focus::Workspaces {
-                    " rename workspace  "
-                } else if launcher_selected {
-                    " rename launcher  "
-                } else {
-                    " rename shell  "
-                },
-                Style::new().fg(SUBTEXT),
-            ),
-        ]);
-        spans.extend([
-            Span::styled("enter", Style::new().fg(GREEN)),
-            Span::styled(
-                if app.focus == Focus::Workspaces {
-                    " restore workspace  "
-                } else if launcher_selected {
-                    " launch command  "
-                } else {
-                    " open shell  "
-                },
-                Style::new().fg(SUBTEXT),
-            ),
             Span::styled("r", Style::new().fg(BLUE)),
             Span::styled(" refresh  ", Style::new().fg(SUBTEXT)),
-            Span::styled("x", Style::new().fg(RED)),
-            Span::styled(
-                if app.focus == Focus::Workspaces {
-                    " close workspace  "
-                } else if launcher_selected {
-                    " remove launcher  "
-                } else {
-                    " close shell  "
-                },
-                Style::new().fg(SUBTEXT),
-            ),
+        ]);
+        if !agent_selected {
+            spans.extend([
+                Span::styled("x", Style::new().fg(RED)),
+                Span::styled(
+                    if app.focus == Focus::Workspaces {
+                        " close workspace  "
+                    } else if launcher_selected {
+                        " remove launcher  "
+                    } else {
+                        " close shell  "
+                    },
+                    Style::new().fg(SUBTEXT),
+                ),
+            ]);
+        }
+        spans.extend([
             Span::styled("q", Style::new().fg(RED)),
             Span::styled(" quit", Style::new().fg(SUBTEXT)),
         ]);
@@ -1254,6 +1363,26 @@ mod tests {
                 directory: "/tmp/boomux".into(),
                 branch: "main".into(),
             })],
+        }
+    }
+
+    fn agent() -> AgentView {
+        AgentView {
+            id: "agent-1".into(),
+            workspace_id: "w1".into(),
+            run_id: "run-1".into(),
+            shell_id: "term_1".into(),
+            shell_name: "agent".into(),
+            name: "reviewer".into(),
+            state: "working".into(),
+            integration: "opencode".into(),
+            authority: "lifecycle_integration".into(),
+            confidence: 95,
+            evidence: "tool call in progress".into(),
+            external_session_id: Some("session-1".into()),
+            started_at_ms: 100,
+            observed_at_ms: 120,
+            ended_at_ms: None,
         }
     }
 
@@ -1380,6 +1509,33 @@ mod tests {
         assert!(matches!(
             app.selected_item(),
             Some(WorkspaceItemView::Shell(_))
+        ));
+    }
+
+    #[test]
+    fn refresh_preserves_agent_selection_by_typed_id() {
+        let mut initial = workspace("w1", "boomux");
+        initial.items.push(WorkspaceItemView::Agent(agent()));
+        let mut app = App::new(vec![initial], project_context());
+        app.toggle_focus();
+        app.next();
+
+        let mut refreshed = workspace("w1", "boomux");
+        refreshed
+            .items
+            .push(WorkspaceItemView::Launcher(LauncherView {
+                id: "agent-1".into(),
+                name: "same-id".into(),
+                directory: "/tmp/boomux".into(),
+                command: "true".into(),
+            }));
+        refreshed.items.push(WorkspaceItemView::Agent(agent()));
+        app.replace_workspaces(vec![refreshed]);
+
+        assert_eq!(app.item_state.selected(), Some(2));
+        assert!(matches!(
+            app.selected_item(),
+            Some(WorkspaceItemView::Agent(current)) if current.id == "agent-1"
         ));
     }
 
@@ -1615,6 +1771,26 @@ mod tests {
     }
 
     #[test]
+    fn agent_rows_dispatch_no_open_rename_or_close_actions() {
+        let mut app = app();
+        app.workspaces[0].items = vec![WorkspaceItemView::Agent(agent())];
+        app.toggle_focus();
+        let mut opened = false;
+
+        let dispatched = app.open_selected_item(&mut |_| {
+            opened = true;
+            Ok(String::new())
+        });
+        app.request_rename();
+        app.request_close();
+
+        assert!(!opened);
+        assert!(!dispatched);
+        assert!(matches!(app.mode, Mode::Normal));
+        assert!(app.pending_close.is_none());
+    }
+
+    #[test]
     fn rename_mode_dispatches_the_selected_shell_and_name() {
         let mut app = app();
         let mut renamed = None;
@@ -1803,7 +1979,7 @@ mod tests {
         assert!(text.contains("ID"));
         assert!(text.contains("ID term_1"));
         assert!(text.contains("SHELLS"));
-        assert!(text.contains("Shells: boomux (1)"));
+        assert!(text.contains("Items: boomux (1)"));
         assert!(!text.contains("DIRTY"));
         assert!(!text.contains("WORKTREE"));
     }
@@ -1830,7 +2006,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect();
-        assert!(text.contains("Shells: boomux (2)"));
+        assert!(text.contains("Items: boomux (2)"));
         assert!(!text.contains("Launchers: boomux"));
         assert!(text.contains("DETAIL"));
         assert!(text.contains("editor"));
@@ -1867,6 +2043,40 @@ mod tests {
             .collect();
         assert_eq!(app.item_state.selected(), Some(20));
         assert!(text.contains("command-19"));
+    }
+
+    #[test]
+    fn dashboard_renders_agent_counts_rows_details_and_read_only_footer() {
+        let backend = TestBackend::new(120, 34);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = app();
+        app.workspaces[0]
+            .items
+            .push(WorkspaceItemView::Agent(agent()));
+        app.toggle_focus();
+        app.next();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+
+        assert_eq!(app.workspaces[0].agent_count(), 1);
+        assert!(text.contains("1 agents"));
+        assert!(text.contains("AGENTS"));
+        assert!(text.contains("Items: boomux (2)"));
+        assert!(text.contains("reviewer"));
+        assert!(text.contains("working"));
+        assert!(text.contains("Agent agent-1"));
+        assert!(text.contains("lifecycle_integration"));
+        assert!(text.contains("started 100"));
+        assert!(!text.contains("rename shell"));
+        assert!(!text.contains("open shell"));
+        assert!(!text.contains("close shell"));
     }
 
     #[test]
@@ -1926,7 +2136,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect();
         assert!(text.contains("Workspaces (1)"));
-        assert!(text.contains("Shells: boomux (1)"));
+        assert!(text.contains("Items: boomux (1)"));
         assert!(text.contains("DIRECTORY"));
         assert!(text.contains("DETAIL"));
         assert!(text.contains("ID"));

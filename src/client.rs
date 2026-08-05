@@ -13,9 +13,9 @@ use std::thread;
 use std::time::Duration;
 
 use crate::protocol::{
-    self, DaemonEvent, Envelope, ErrorCode, EventCursor, Request, Response, ShellSnapshot,
-    ShellSpec, ShellStatus, Snapshot, TerminalProfile, WorkspaceLauncherSnapshot,
-    WorkspaceLauncherSpec, WorkspaceSnapshot,
+    self, AgentInstanceSnapshot, AgentRegistrationSpec, AgentReport, DaemonEvent, Envelope,
+    ErrorCode, EventCursor, Request, Response, ShellSnapshot, ShellSpec, ShellStatus, Snapshot,
+    TerminalProfile, WorkspaceLauncherSnapshot, WorkspaceLauncherSpec, WorkspaceSnapshot,
 };
 
 const CONNECT_ATTEMPTS: usize = 40;
@@ -321,6 +321,15 @@ impl Client {
         }
     }
 
+    pub fn get_agent(&self, agent_id: impl Into<String>) -> io::Result<AgentInstanceSnapshot> {
+        match self.request(Request::GetAgent {
+            agent_id: agent_id.into(),
+        })? {
+            Response::Agent { agent } => Ok(agent),
+            other => unexpected(other),
+        }
+    }
+
     pub fn create_workspace(
         &self,
         name: impl Into<String>,
@@ -369,6 +378,38 @@ impl Client {
             spec,
         })? {
             Response::Launcher { launcher } => Ok(launcher),
+            other => unexpected(other),
+        }
+    }
+
+    pub fn register_agent(
+        &self,
+        shell_id: impl Into<String>,
+        run_id: impl Into<String>,
+        spec: AgentRegistrationSpec,
+    ) -> io::Result<AgentInstanceSnapshot> {
+        match self.request(Request::RegisterAgent {
+            shell_id: shell_id.into(),
+            run_id: run_id.into(),
+            spec,
+        })? {
+            Response::Agent { agent } => Ok(agent),
+            other => unexpected(other),
+        }
+    }
+
+    pub fn report_agent(
+        &self,
+        agent_id: impl Into<String>,
+        run_id: impl Into<String>,
+        report: AgentReport,
+    ) -> io::Result<AgentInstanceSnapshot> {
+        match self.request(Request::ReportAgent {
+            agent_id: agent_id.into(),
+            run_id: run_id.into(),
+            report,
+        })? {
+            Response::Agent { agent } => Ok(agent),
             other => unexpected(other),
         }
     }
@@ -543,6 +584,7 @@ fn request_minimum_version(request: &Request) -> u32 {
         | Request::CreateLauncher { .. }
         | Request::RenameLauncher { .. }
         | Request::RemoveLauncher { .. } => 8,
+        Request::GetAgent { .. } | Request::RegisterAgent { .. } | Request::ReportAgent { .. } => 9,
         Request::ReadShellAt { .. } | Request::Events { .. } => 7,
         _ => protocol::MIN_PROTOCOL_VERSION,
     }
@@ -659,6 +701,40 @@ mod tests {
     }
 
     #[test]
+    fn agent_requests_require_protocol_nine() {
+        let report = AgentReport {
+            state: protocol::AgentState::Idle,
+            authority: protocol::AgentAuthority::TerminalHeuristic,
+            evidence: "prompt visible".into(),
+            confidence: 70,
+        };
+        let requests = [
+            Request::GetAgent {
+                agent_id: "a1".into(),
+            },
+            Request::RegisterAgent {
+                shell_id: "s1".into(),
+                run_id: "r1".into(),
+                spec: AgentRegistrationSpec {
+                    name: "agent".into(),
+                    integration: "test".into(),
+                    external_session_id: None,
+                    report: report.clone(),
+                },
+            },
+            Request::ReportAgent {
+                agent_id: "a1".into(),
+                run_id: "r1".into(),
+                report,
+            },
+        ];
+
+        for request in requests {
+            assert_eq!(request_minimum_version(&request), 9);
+        }
+    }
+
+    #[test]
     fn negotiates_protocol_seven_without_losing_version_seven_requests() {
         let directory = env::temp_dir().join(format!("boomux-client-{}", Uuid::new_v4()));
         fs::create_dir_all(&directory).unwrap();
@@ -667,15 +743,31 @@ mod tests {
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+            assert_eq!(request.version, 9);
+            assert!(matches!(request.message, Request::Ping));
+            protocol::write_message(
+                &mut stream,
+                &Envelope::with_version(
+                    9,
+                    Response::Error {
+                        message: "expected an older protocol".into(),
+                        code: Some(ErrorCode::UnsupportedVersion),
+                    },
+                ),
+            )
+            .unwrap();
+
+            let (mut stream, _) = listener.accept().unwrap();
+            let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
             assert_eq!(request.version, 8);
             assert!(matches!(request.message, Request::Ping));
             protocol::write_message(
                 &mut stream,
                 &Envelope::with_version(
-                    7,
+                    8,
                     Response::Error {
                         message: "expected protocol 7".into(),
-                        code: None,
+                        code: Some(ErrorCode::UnsupportedVersion),
                     },
                 ),
             )

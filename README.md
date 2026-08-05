@@ -86,6 +86,10 @@ The selected workspace's shell table also includes configured launchers. A
 launcher row shows its command and working directory; pressing `Enter` invokes
 only that launcher.
 
+The table also shows registered agent instances, including completed instances.
+Agent rows are read-only: they can be inspected but not opened, renamed, or
+closed from the dashboard.
+
 Closing a terminal window only disconnects its attachment. The Boomux daemon
 retains the PTY and child process until the shell exits, the workspace is
 closed, or the daemon stops.
@@ -117,6 +121,10 @@ boomux launcher create <name> --workspace <name-or-id> [--cwd <path>] -- <comman
 boomux launcher inspect <launcher-name-or-id> [--workspace <name-or-id>]
 boomux launcher rename <launcher-name-or-id> <new-name> [--workspace <name-or-id>]
 boomux launcher remove <launcher-name-or-id> [--workspace <name-or-id>]
+boomux agent list [--workspace <name-or-id>]
+boomux agent inspect <agent-id>
+boomux agent register <name> --integration <integration> [--external-session-id <id>] [--shell-id <shell-id>] [--run-id <run-id>] --state <state> --authority <authority> --evidence <evidence> --confidence <0-100>
+boomux agent report <agent-id> [--shell-id <shell-id>] [--run-id <run-id>] --state <state> --authority <authority> --evidence <evidence> --confidence <0-100>
 boomux daemon status
 boomux daemon restart
 boomux daemon stop
@@ -152,11 +160,22 @@ Opening continues after individual launcher or terminal spawn failures and
 reports all failures at the end. Removing a launcher affects future opens only;
 Boomux does not track or terminate applications it previously launched.
 
+Agent instances are durable records for external agent sessions. Each instance
+has its own exact ID and is bound to exactly one shell run, not merely to a
+durable shell. `register` and `report` require explicit `unknown`, `working`,
+`blocked`, `idle`, or `done` state plus authority, evidence, and confidence.
+The authority values are `lifecycle-integration`, `process-adapter`,
+`terminal-heuristic`, and `daemon-lifecycle`. A `done` report completes the
+instance permanently; completed instances remain inspectable across daemon
+restart. Boomux does not yet infer agent state, wait for agents, read through an
+agent API, or control agents.
+
 `boomux read` reads plain rendered text from the daemon's shadow VT state. It
 understands cursor rewrites and terminal soft wrapping, retains up to 2,000
 scrollback rows per shell, and never returns ANSI control sequences.
 
-Read-only integration commands accept `--json` and emit the stable
+Read-only integration commands, including `agent list` and `agent inspect`,
+accept `--json` and emit the stable
 `boomux.cli/v1` envelope. Run `boomux capabilities --json` to discover supported
 commands, features, and typed error codes without starting the daemon. See
 [`docs/cli-json.md`](docs/cli-json.md) for the contract.
@@ -205,7 +224,11 @@ Workspace and shell IDs remain authoritative after a rename. `BOOMUX_RUN_ID`
 identifies one process incarnation and changes when a durable shell starts a
 new process after recovery. A live process transferred from a pre-run-identity
 daemon receives a daemon-side run identity, but its existing environment cannot
-be retrofitted; `shell inspect` reports that compatibility case. A dynamic
+be retrofitted; `shell inspect` reports that compatibility case as
+`environment_has_run_id: false`. Agent `register` and `report` default their
+shell and run arguments from `BOOMUX_SHELL_ID` and `BOOMUX_RUN_ID`.
+Integrations outside that exact environment must pass both IDs and must not
+guess a run from shell status or retained output. A dynamic
 Starship segment can call the hidden prompt command:
 
 ```toml
@@ -225,10 +248,10 @@ boomux skill install
 
 It is written to `~/.agents/skills/boomux/SKILL.md` and teaches compatible
 agents to discover, inspect, read, create, open, rename, and close Boomux
-workspaces and shells through the full public CLI. Re-run with `--force` to
-replace an older customized installation. An untouched legacy `boomux-shells`
-skill is removed automatically; customized legacy content is preserved with a
-warning.
+workspaces and shells, and to inspect and explicitly report run-scoped agent
+lifecycle, through the full public CLI. Re-run with `--force` to replace an
+older customized installation. An untouched legacy `boomux-shells` skill is
+removed automatically; customized legacy content is preserved with a warning.
 
 ## Architecture
 

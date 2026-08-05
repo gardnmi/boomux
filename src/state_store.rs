@@ -9,10 +9,11 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::protocol::{ShellRunExitReason, TerminalProfile};
+use crate::protocol::{AgentObservationSnapshot, ShellRunExitReason, TerminalProfile};
 
-const STATE_VERSION: u32 = 3;
-const PREVIOUS_STATE_VERSION: u32 = 2;
+const STATE_VERSION: u32 = 4;
+const PREVIOUS_STATE_VERSION: u32 = 3;
+const VERSION_TWO_STATE_VERSION: u32 = 2;
 const LEGACY_STATE_VERSION: u32 = 1;
 const MAX_STATE_BYTES: u64 = 8 * 1024 * 1024;
 
@@ -39,6 +40,21 @@ pub(crate) struct PersistedWorkspace {
     pub(crate) name: String,
     pub(crate) shells: Vec<PersistedShell>,
     pub(crate) launchers: Vec<PersistedWorkspaceLauncher>,
+    pub(crate) agents: Vec<PersistedAgentInstance>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PersistedAgentInstance {
+    pub(crate) id: String,
+    pub(crate) shell_id: String,
+    pub(crate) run_id: String,
+    pub(crate) name: String,
+    pub(crate) integration: String,
+    pub(crate) external_session_id: Option<String>,
+    pub(crate) started_at_ms: u64,
+    pub(crate) ended_at_ms: Option<u64>,
+    pub(crate) observation: AgentObservationSnapshot,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -88,6 +104,22 @@ struct PreviousPersistedState {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PreviousPersistedWorkspace {
+    id: String,
+    name: String,
+    shells: Vec<PersistedShell>,
+    launchers: Vec<PersistedWorkspaceLauncher>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VersionTwoPersistedState {
+    version: u32,
+    workspaces: Vec<VersionTwoPersistedWorkspace>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VersionTwoPersistedWorkspace {
     id: String,
     name: String,
     shells: Vec<PersistedShell>,
@@ -218,6 +250,12 @@ impl StateStore {
                 self.save(&state)?;
                 state
             }
+            VERSION_TWO_STATE_VERSION => {
+                let previous: VersionTwoPersistedState = parse_state(&bytes, &self.path)?;
+                let state = migrate_version_two_state(previous);
+                self.save(&state)?;
+                state
+            }
             LEGACY_STATE_VERSION => {
                 let legacy: LegacyPersistedState = parse_state(&bytes, &self.path)?;
                 let state = migrate_legacy_state(legacy);
@@ -309,6 +347,7 @@ fn migrate_legacy_state(legacy: LegacyPersistedState) -> PersistedState {
                     })
                     .collect(),
                 launchers: Vec::new(),
+                agents: Vec::new(),
             })
             .collect(),
     }
@@ -325,7 +364,26 @@ fn migrate_previous_state(previous: PreviousPersistedState) -> PersistedState {
                 id: workspace.id,
                 name: workspace.name,
                 shells: workspace.shells,
+                launchers: workspace.launchers,
+                agents: Vec::new(),
+            })
+            .collect(),
+    }
+}
+
+fn migrate_version_two_state(previous: VersionTwoPersistedState) -> PersistedState {
+    debug_assert_eq!(previous.version, VERSION_TWO_STATE_VERSION);
+    PersistedState {
+        version: STATE_VERSION,
+        workspaces: previous
+            .workspaces
+            .into_iter()
+            .map(|workspace| PersistedWorkspace {
+                id: workspace.id,
+                name: workspace.name,
+                shells: workspace.shells,
                 launchers: Vec::new(),
+                agents: Vec::new(),
             })
             .collect(),
     }
@@ -378,6 +436,7 @@ fn effective_uid() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::{AgentAuthority, AgentState};
 
     #[test]
     fn atomically_round_trips_state() {
@@ -403,6 +462,44 @@ mod tests {
                         command: vec!["server".into()],
                     },
                 ],
+                agents: vec![
+                    PersistedAgentInstance {
+                        id: "agent-1".into(),
+                        shell_id: "shell-1".into(),
+                        run_id: "run-1".into(),
+                        name: "first".into(),
+                        integration: "test".into(),
+                        external_session_id: Some("external-1".into()),
+                        started_at_ms: 10,
+                        ended_at_ms: None,
+                        observation: AgentObservationSnapshot {
+                            revision: 2,
+                            state: AgentState::Working,
+                            authority: AgentAuthority::LifecycleIntegration,
+                            evidence: "active".into(),
+                            confidence: 90,
+                            observed_at_ms: 11,
+                        },
+                    },
+                    PersistedAgentInstance {
+                        id: "agent-2".into(),
+                        shell_id: "shell-2".into(),
+                        run_id: "run-2".into(),
+                        name: "second".into(),
+                        integration: "adapter".into(),
+                        external_session_id: None,
+                        started_at_ms: 20,
+                        ended_at_ms: Some(30),
+                        observation: AgentObservationSnapshot {
+                            revision: 3,
+                            state: AgentState::Done,
+                            authority: AgentAuthority::DaemonLifecycle,
+                            evidence: "run exited".into(),
+                            confidence: 100,
+                            observed_at_ms: 30,
+                        },
+                    },
+                ],
             }],
         };
 
@@ -425,6 +522,12 @@ mod tests {
             ]
         );
         assert_eq!(restored.workspaces[0].launchers[1].id, "launcher-2");
+        assert_eq!(restored.workspaces[0].agents[0].id, "agent-1");
+        assert_eq!(restored.workspaces[0].agents[1].id, "agent-2");
+        assert_eq!(
+            restored.workspaces[0].agents[1].observation.state,
+            AgentState::Done
+        );
         assert_eq!(
             fs::metadata(directory.join("boomux/state.json"))
                 .unwrap()
@@ -501,9 +604,10 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .contains("\"version\": 3")
+                .contains("\"version\": 4")
         );
         assert!(migrated.workspaces[0].launchers.is_empty());
+        assert!(migrated.workspaces[0].agents.is_empty());
 
         let reloaded = store.load().unwrap().unwrap();
         assert_eq!(
@@ -550,7 +654,45 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .contains("\"version\": 3")
+                .contains("\"version\": 4")
+        );
+        assert!(migrated.workspaces[0].agents.is_empty());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn migrates_version_three_to_empty_agent_lists_and_preserves_launchers() {
+        let directory = env::temp_dir().join(format!("boomux-state-{}", Uuid::new_v4()));
+        let path = directory.join("boomux/state.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            br#"{
+  "version": 3,
+  "workspaces": [{
+    "id": "w1",
+    "name": "version-three",
+    "shells": [],
+    "launchers": [{
+      "id": "l1",
+      "name": "editor",
+      "cwd": "/tmp/project",
+      "command": ["editor", "two words"]
+    }]
+  }]
+}"#,
+        )
+        .unwrap();
+        let store = StateStore::at(path.clone());
+
+        let migrated = store.load().unwrap().unwrap();
+
+        assert_eq!(migrated.workspaces[0].launchers[0].id, "l1");
+        assert!(migrated.workspaces[0].agents.is_empty());
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .contains("\"version\": 4")
         );
         fs::remove_dir_all(directory).unwrap();
     }

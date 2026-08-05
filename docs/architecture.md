@@ -32,7 +32,7 @@ name resolution, and conversion from daemon snapshots into TUI view models.
 with a four-byte big-endian length prefix. Attachment traffic uses small binary
 frames for input, output, resize, and detach events.
 
-The domain has four durable identities:
+The domain has five durable identities:
 
 - A workspace is a globally named shell container with a UUID. It has no path
   or working directory.
@@ -46,6 +46,10 @@ The domain has four durable identities:
 - A workspace launcher is a named, ordered, exact argument-vector command with
   its own working directory. Its identity is durable, but each detached
   invocation is ephemeral and has no PTY or retained runtime state.
+- An agent instance identifies one external agent session and is bound to
+  exactly one shell run. It owns no process or PTY. Its latest explicit
+  observation records state, reporting authority, evidence, confidence,
+  revision, and time; completion is terminal and durable.
 
 There are no separate tab, pane, and terminal identity layers.
 
@@ -82,6 +86,7 @@ The daemon supports:
 - One writable attachment with explicit takeover
 - PTY input and resize forwarding
 - Pending shell metadata and first-attachment terminal negotiation
+- Run-scoped agent registration, inspection, and explicit state reports
 
 An empty shell specification list remains empty. When an explicit populated
 creation is requested, the daemon stages every child before publishing any of
@@ -130,6 +135,10 @@ Git information is collected independently from shell directories and cached;
 empty or mixed-directory workspaces have no workspace-level directory or Git
 identity.
 
+Agent instances appear as workspace counts and read-only rows. Completed rows
+remain visible and inspectable; dashboard actions do not open, rename, close, or
+otherwise control an agent.
+
 ### Agent Skill
 
 The optional vendor-neutral `boomux` Agent Skill documents the complete public
@@ -158,6 +167,14 @@ still read workspace snapshots because launcher lists are additive; launcher
 events are filtered from protocol-7 event pages while their cursors continue to
 advance.
 
+Protocol 9 adds agent instances to workspace and event snapshots and adds exact
+ID get, register, and report requests. Protocol-8 and older responses omit agent
+snapshot fields and filter agent events while preserving the unfiltered cursor.
+The daemon owns agent IDs, observation revisions, timestamps, completion, and
+durable storage. External lifecycle integrations own the meaning and evidence
+of their reports; this slice does not discover processes, parse terminal output,
+wait for agents, or control them.
+
 ### Transition Coordinator
 
 The daemon serializes observable runtime transitions through one coordinator. A
@@ -185,6 +202,11 @@ not persisted per chunk, but output revision mutation and `output_changed`
 publication cross the coordinator together. A non-blocking terminal lock keeps
 output processing from holding global locks while waiting on terminal snapshots.
 
+Agent registration and reports use the same durable mutation coordinator.
+Persistence and `agent_registered`, `agent_state_changed`, or
+`agent_completed` publication therefore share the normal ordering boundary and
+baseline snapshots include the exact coordinated cut.
+
 ## Runtime Semantics
 
 Closing a terminal window closes only its socket attachment. The daemon retains
@@ -200,9 +222,10 @@ to the complete registry and removes the runtime socket.
 
 The daemon atomically writes reproducible registry metadata to
 `$XDG_STATE_HOME/boomux/state.json`, falling back to
-`~/.local/state/boomux/state.json`. Workspace, launcher, and shell IDs, names,
-grouping, working directories, argument vectors, and last terminal profiles
-survive restart. The last run record also preserves its identity and outcome. Recovered
+`~/.local/state/boomux/state.json`. Workspace, launcher, shell, and agent IDs;
+names and grouping; working directories; argument vectors; agent observations;
+and last terminal profiles survive restart. The last run record also preserves
+its identity and outcome. Recovered
 shells are pending: Boomux does not claim that arbitrary
 processes, mutated environments, or PTYs survive daemon restart or crash.
 
@@ -221,8 +244,6 @@ as pending.
 
 ## Next Technical Steps
 
-The detailed design, acceptance criteria, and manual test matrix are tracked in
-[`native-terminal-follow-up.md`](native-terminal-follow-up.md).
-
-1. Model agent instances separately from shells and runs, with explicit state
-   authority, evidence, and confidence.
+Future agent runtime work is tracked in [`roadmap.md`](roadmap.md). Process
+adapters, terminal heuristics, aggregation, waits, notifications, and control are
+not part of the first agent runtime slice.

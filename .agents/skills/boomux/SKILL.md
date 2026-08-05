@@ -1,10 +1,10 @@
 ---
 name: boomux
-description: Inspect and manage Boomux persistent terminal workspaces, launchers, and shells. Use when asked to discover shells, read terminal output, create or open workspaces and shells, configure desktop application launchers, inspect status, rename or close targets, or manage the Boomux daemon.
-compatibility: Requires boomux on PATH. Some shell-name operations require Boomux workspace context or an explicit --workspace.
+description: Inspect and manage Boomux persistent terminal workspaces, launchers, shells, and run-scoped agent instances. Use when asked to discover shells or agents, read terminal output, report an agent lifecycle state, create or open workspaces and shells, inspect status, rename or close targets, or manage the Boomux daemon.
+compatibility: Requires boomux on PATH. Some name operations require Boomux workspace context or an explicit --workspace; agent mutation requires exact shell-run context.
 metadata:
   author: boomux
-  version: "3"
+  version: "4"
 ---
 
 # Boomux
@@ -58,6 +58,18 @@ Use `boomux read TARGET --json --run-id RUN_ID --after-revision REVISION
 --wait-ms 30000` to wait for run-scoped output changes; handle `run_changed` by
 inspecting the shell again.
 
+Discover and inspect durable agent instances with:
+
+```console
+boomux agent list --json
+boomux agent list --workspace "<workspace-name-or-id>" --json
+boomux agent inspect "<exact-agent-id>" --json
+```
+
+Agent lookup is by exact agent ID. Never infer an agent ID or run ID from a
+name, shell status, terminal text, a recently seen row, or an external session
+ID.
+
 Exact shell IDs resolve globally. Shell names resolve in the current workspace,
 or through `--workspace` for `shell inspect`, `shell rename`, and `shell close`.
 `boomux read` and top-level `boomux close` require an exact shell ID outside a
@@ -68,6 +80,37 @@ Shell status meanings:
 - `pending`: metadata exists; the PTY and process start on first attachment.
 - `running`: the process and PTY are live, attached or detached.
 - `exited`: the process ended; bounded reconstructed terminal state remains.
+
+## Report Agent Lifecycle
+
+Use these mutation commands only for a lifecycle integration that directly
+observes the external agent session:
+
+```console
+boomux agent register "<name>" --integration "<integration>" --external-session-id "<id>" --shell-id "<shell-id>" --run-id "<run-id>" --state working --authority lifecycle-integration --evidence "<direct evidence>" --confidence 100
+boomux agent report "<exact-agent-id>" --shell-id "<same-shell-id>" --run-id "<original-run-id>" --state blocked --authority lifecycle-integration --evidence "<direct evidence>" --confidence 100
+boomux agent report "<exact-agent-id>" --shell-id "<same-shell-id>" --run-id "<original-run-id>" --state done --authority lifecycle-integration --evidence "<completion evidence>" --confidence 100
+```
+
+`--external-session-id` is optional. Inside the target managed process,
+`--shell-id` and `--run-id` default to `BOOMUX_SHELL_ID` and `BOOMUX_RUN_ID`;
+otherwise pass both explicitly. Retain the exact agent ID returned by
+`register` and use it for every later report. Also retain the original run ID:
+never replace it with a newer run from the durable shell.
+
+Every registration and report requires an explicit state (`unknown`, `working`,
+`blocked`, `idle`, or `done`), authority (`lifecycle-integration`,
+`process-adapter`, `terminal-heuristic`, or `daemon-lifecycle`), nonempty
+evidence, and confidence from 0 through 100. Report only what the stated
+authority actually observed. In particular, report `done` only after direct
+lifecycle completion evidence, never because output is quiet, a prompt appears,
+or the shell exits. `done` is terminal; the durable completed instance remains
+inspectable and rejects later reports.
+
+If `register` or `report` returns `run_changed`, stop reporting for that
+instance and reacquire exact lifecycle context. Do not guess the replacement
+run. Boomux does not yet provide agent heuristics, adapters, wait/read commands,
+notifications, or control.
 
 ## Read Shell Output
 
@@ -227,6 +270,11 @@ across attachment changes and graceful daemon handoff, but changes when the same
 durable shell starts a new process after recovery. A process transferred from a
 legacy daemon may have a daemon-side run identity without this environment
 variable; inspect `environment_has_run_id` before relying on it.
+
+For such a legacy run, do not invent `BOOMUX_RUN_ID` or select a run from
+history. Obtain the exact daemon-side run ID through `shell inspect --json` and
+pass it explicitly only when the lifecycle integration is known to belong to
+that same live process.
 
 `boomux prompt` prints `workspace/shell` inside Boomux and nothing outside it.
 It is intended for prompt integrations. Use `boomux --help` and

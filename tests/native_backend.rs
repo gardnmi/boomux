@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 
 use boomux::client::{Attachment, Client, RemoteError};
 use boomux::protocol::{
-    self, AttachFrame, ErrorCode, ShellRunExitReason, ShellSpec, ShellStatus, TerminalProfile,
-    WorkspaceLauncherSpec,
+    self, AgentAuthority, AgentRegistrationSpec, AgentReport, AgentState, AttachFrame, ErrorCode,
+    ShellRunExitReason, ShellSpec, ShellStatus, TerminalProfile, WorkspaceLauncherSpec,
 };
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use uuid::Uuid;
@@ -953,6 +953,240 @@ fn daemon_events_and_revision_reads_survive_handoff() {
 }
 
 #[test]
+fn agent_runtime_is_revisioned_durable_and_version_compatible() {
+    let mut daemon = TestDaemon::start();
+    let workspace = daemon
+        .client
+        .create_workspace(
+            "agent-runtime",
+            vec![ShellSpec::login("runtime", std::env::temp_dir())],
+        )
+        .unwrap();
+    let shell_id = workspace.shells[0].id.clone();
+    let attachment = daemon.client.attach(&shell_id, false, profile()).unwrap();
+    let run_id = daemon
+        .client
+        .get_shell(&shell_id)
+        .unwrap()
+        .run
+        .expect("started agent shell has no run identity")
+        .id;
+    let baseline = daemon.client.events(None, 256, 0).unwrap().cursor;
+    let registration = AgentRegistrationSpec {
+        name: "runtime-agent".into(),
+        integration: "native-test".into(),
+        external_session_id: Some("session-1".into()),
+        report: AgentReport {
+            state: AgentState::Working,
+            authority: AgentAuthority::LifecycleIntegration,
+            evidence: "registered".into(),
+            confidence: 90,
+        },
+    };
+
+    let error = daemon
+        .client
+        .register_agent(&shell_id, Uuid::new_v4().to_string(), registration.clone())
+        .unwrap_err();
+    assert_remote_code(&error, ErrorCode::RunChanged);
+    let registered = daemon
+        .client
+        .register_agent(&shell_id, &run_id, registration)
+        .unwrap();
+    assert_eq!(registered.workspace_id, workspace.id);
+    assert_eq!(registered.shell_id, shell_id);
+    assert_eq!(registered.run_id, run_id);
+    assert_eq!(registered.observation.revision, 1);
+    assert_eq!(registered.observation.state, AgentState::Working);
+    assert!(registered.ended_at_ms.is_none());
+    assert_eq!(daemon.client.get_agent(&registered.id).unwrap(), registered);
+    let snapshot_agent = daemon
+        .client
+        .snapshot()
+        .unwrap()
+        .workspaces
+        .into_iter()
+        .find(|current| current.id == workspace.id)
+        .unwrap()
+        .agents
+        .into_iter()
+        .find(|agent| agent.id == registered.id)
+        .unwrap();
+    assert_eq!(snapshot_agent, registered);
+
+    let error = daemon
+        .client
+        .report_agent(
+            &registered.id,
+            Uuid::new_v4().to_string(),
+            AgentReport {
+                state: AgentState::Blocked,
+                authority: AgentAuthority::ProcessAdapter,
+                evidence: "wrong run".into(),
+                confidence: 50,
+            },
+        )
+        .unwrap_err();
+    assert_remote_code(&error, ErrorCode::RunChanged);
+    let blocked = daemon
+        .client
+        .report_agent(
+            &registered.id,
+            &run_id,
+            AgentReport {
+                state: AgentState::Blocked,
+                authority: AgentAuthority::ProcessAdapter,
+                evidence: "waiting for input".into(),
+                confidence: 80,
+            },
+        )
+        .unwrap();
+    assert_eq!(blocked.observation.revision, 2);
+    assert_eq!(blocked.observation.state, AgentState::Blocked);
+    assert!(blocked.ended_at_ms.is_none());
+    assert!(blocked.observation.observed_at_ms >= registered.observation.observed_at_ms);
+    let done = daemon
+        .client
+        .report_agent(
+            &registered.id,
+            &run_id,
+            AgentReport {
+                state: AgentState::Done,
+                authority: AgentAuthority::LifecycleIntegration,
+                evidence: "completed".into(),
+                confidence: 100,
+            },
+        )
+        .unwrap();
+    assert_eq!(done.observation.revision, 3);
+    assert_eq!(done.observation.state, AgentState::Done);
+    assert_eq!(done.ended_at_ms, Some(done.observation.observed_at_ms));
+    let error = daemon
+        .client
+        .report_agent(
+            &registered.id,
+            &run_id,
+            AgentReport {
+                state: AgentState::Idle,
+                authority: AgentAuthority::TerminalHeuristic,
+                evidence: "too late".into(),
+                confidence: 10,
+            },
+        )
+        .unwrap_err();
+    assert_remote_code(&error, ErrorCode::InvalidArgument);
+
+    let events = daemon
+        .client
+        .events(Some(baseline.clone()), 256, 0)
+        .unwrap();
+    assert!(events.events.iter().any(|event| matches!(
+        &event.kind,
+        protocol::DaemonEventKind::AgentRegistered { agent, .. }
+            if agent.id == registered.id && agent.observation.revision == 1
+    )));
+    assert!(events.events.iter().any(|event| matches!(
+        &event.kind,
+        protocol::DaemonEventKind::AgentStateChanged { agent, .. }
+            if agent.id == registered.id && agent.observation.revision == 2
+    )));
+    assert!(events.events.iter().any(|event| matches!(
+        &event.kind,
+        protocol::DaemonEventKind::AgentCompleted { agent, .. }
+            if agent.id == registered.id && agent.observation.revision == 3
+    )));
+
+    let list = daemon.command().args(["agent", "list"]).output().unwrap();
+    assert!(list.status.success());
+    assert!(contains(&list.stdout, b"runtime-agent"));
+    assert!(contains(&list.stdout, registered.id.as_bytes()));
+    let list = daemon
+        .command()
+        .args(["agent", "list", "--json"])
+        .output()
+        .unwrap();
+    assert!(list.status.success());
+    let list: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
+    assert_eq!(list["command"], "agent.list");
+    assert_eq!(list["data"]["agents"][0]["id"], registered.id);
+    assert_eq!(list["data"]["agents"][0]["observation"]["revision"], 3);
+    let inspect = daemon
+        .command()
+        .args(["agent", "inspect", &registered.id])
+        .output()
+        .unwrap();
+    assert!(inspect.status.success());
+    assert!(contains(&inspect.stdout, b"STATE\tdone"));
+    assert!(contains(&inspect.stdout, b"REVISION\t3"));
+    let inspect = daemon
+        .command()
+        .args(["agent", "inspect", &registered.id, "--json"])
+        .output()
+        .unwrap();
+    assert!(inspect.status.success());
+    let inspect: serde_json::Value = serde_json::from_slice(&inspect.stdout).unwrap();
+    assert_eq!(inspect["command"], "agent.inspect");
+    assert_eq!(inspect["data"]["agent"]["id"], registered.id);
+    assert_eq!(inspect["data"]["agent"]["observation"]["state"], "done");
+
+    let protocol_eight_snapshot = versioned_request(&daemon.client, 8, protocol::Request::Snapshot);
+    let protocol::Response::Snapshot { snapshot } = protocol_eight_snapshot else {
+        panic!("expected protocol-8 snapshot response");
+    };
+    assert!(
+        snapshot
+            .workspaces
+            .iter()
+            .all(|workspace| workspace.agents.is_empty())
+    );
+    let protocol_eight_events = versioned_request(
+        &daemon.client,
+        8,
+        protocol::Request::Events {
+            after: Some(baseline),
+            limit: 256,
+            wait_ms: 0,
+        },
+    );
+    let protocol::Response::Events {
+        cursor: filtered_cursor,
+        events,
+        ..
+    } = protocol_eight_events
+    else {
+        panic!("expected protocol-8 events response");
+    };
+    assert!(events.is_empty());
+    daemon
+        .client
+        .rename_shell(&shell_id, "runtime-renamed")
+        .unwrap();
+    let protocol_eight_events = versioned_request(
+        &daemon.client,
+        8,
+        protocol::Request::Events {
+            after: Some(filtered_cursor.clone()),
+            limit: 256,
+            wait_ms: 0,
+        },
+    );
+    let protocol::Response::Events { cursor, events, .. } = protocol_eight_events else {
+        panic!("expected protocol-8 events response after rename");
+    };
+    assert!(events.iter().any(|event| matches!(
+        &event.kind,
+        protocol::DaemonEventKind::ShellRenamed { shell_id: id, .. } if id == &shell_id
+    )));
+    assert!(cursor.event_id > filtered_cursor.event_id);
+
+    drop(attachment.stream);
+    daemon.stop_with_cli();
+    daemon.restart();
+    assert_eq!(daemon.client.get_agent(&registered.id).unwrap(), done);
+    daemon.stop_with_cli();
+}
+
+#[test]
 fn native_daemon_handoffs_multiple_detached_shells() {
     let mut daemon = TestDaemon::start();
     let workspace = daemon
@@ -1274,7 +1508,7 @@ fn native_daemon_lifecycle() {
     let capabilities: serde_json::Value = serde_json::from_slice(&capabilities.stdout).unwrap();
     assert_eq!(capabilities["schema"], "boomux.cli/v1");
     assert_eq!(capabilities["command"], "capabilities");
-    assert_eq!(capabilities["data"]["daemon_protocol_version"], 8);
+    assert_eq!(capabilities["data"]["daemon_protocol_version"], 9);
     assert!(
         capabilities["data"]["json_commands"]
             .as_array()
@@ -1296,7 +1530,7 @@ fn native_daemon_lifecycle() {
         .output()
         .unwrap();
     assert!(status.status.success());
-    assert!(String::from_utf8_lossy(&status.stdout).contains("running (protocol 8"));
+    assert!(String::from_utf8_lossy(&status.stdout).contains("running (protocol 9"));
     let status = daemon
         .command()
         .args(["daemon", "status", "--json"])
@@ -2072,6 +2306,33 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack
         .windows(needle.len())
         .any(|window| window == needle)
+}
+
+fn assert_remote_code(error: &io::Error, expected: ErrorCode) {
+    assert_eq!(
+        error
+            .get_ref()
+            .and_then(|error| error.downcast_ref::<RemoteError>())
+            .and_then(|error| error.code),
+        Some(expected)
+    );
+}
+
+fn versioned_request(
+    client: &Client,
+    version: u32,
+    request: protocol::Request,
+) -> protocol::Response {
+    let mut stream = UnixStream::connect(client.socket_path()).unwrap();
+    protocol::write_message(
+        &mut stream,
+        &protocol::Envelope::with_version(version, request),
+    )
+    .unwrap();
+    let response: protocol::Envelope<protocol::Response> =
+        protocol::read_message(&mut stream).unwrap();
+    assert_eq!(response.version, version);
+    response.message
 }
 
 fn parse_child_pid(output: &[u8]) -> Option<libc::pid_t> {

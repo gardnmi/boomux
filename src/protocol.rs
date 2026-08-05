@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 8;
+pub const PROTOCOL_VERSION: u32 = 9;
 pub const MIN_PROTOCOL_VERSION: u32 = 6;
 pub const MAX_CONTROL_FRAME: usize = 8 * 1024 * 1024;
 pub const MAX_ATTACH_FRAME: usize = 1024 * 1024;
@@ -40,6 +40,67 @@ pub struct WorkspaceSnapshot {
     pub shells: Vec<ShellSnapshot>,
     #[serde(default)]
     pub launchers: Vec<WorkspaceLauncherSnapshot>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agents: Vec<AgentInstanceSnapshot>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentState {
+    Unknown,
+    Working,
+    Blocked,
+    Idle,
+    Done,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentAuthority {
+    LifecycleIntegration,
+    ProcessAdapter,
+    TerminalHeuristic,
+    DaemonLifecycle,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentReport {
+    pub state: AgentState,
+    pub authority: AgentAuthority,
+    pub evidence: String,
+    pub confidence: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentRegistrationSpec {
+    pub name: String,
+    pub integration: String,
+    pub external_session_id: Option<String>,
+    pub report: AgentReport,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentObservationSnapshot {
+    pub revision: u64,
+    pub state: AgentState,
+    pub authority: AgentAuthority,
+    pub evidence: String,
+    pub confidence: u8,
+    pub observed_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentInstanceSnapshot {
+    pub id: String,
+    pub workspace_id: String,
+    pub shell_id: String,
+    pub run_id: String,
+    pub name: String,
+    pub integration: String,
+    pub external_session_id: Option<String>,
+    pub started_at_ms: u64,
+    pub ended_at_ms: Option<u64>,
+    pub observation: AgentObservationSnapshot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -188,6 +249,21 @@ pub enum DaemonEventKind {
         shell_id: String,
         run: ShellRunSnapshot,
     },
+    AgentRegistered {
+        workspace_id: String,
+        shell_id: String,
+        agent: AgentInstanceSnapshot,
+    },
+    AgentStateChanged {
+        workspace_id: String,
+        shell_id: String,
+        agent: AgentInstanceSnapshot,
+    },
+    AgentCompleted {
+        workspace_id: String,
+        shell_id: String,
+        agent: AgentInstanceSnapshot,
+    },
     HandoffCompleted,
 }
 
@@ -237,6 +313,9 @@ pub enum Request {
     GetLauncher {
         launcher_id: String,
     },
+    GetAgent {
+        agent_id: String,
+    },
     CreateWorkspace {
         name: String,
         shells: Vec<ShellSpec>,
@@ -249,6 +328,16 @@ pub enum Request {
     CreateLauncher {
         workspace_id: String,
         spec: WorkspaceLauncherSpec,
+    },
+    RegisterAgent {
+        shell_id: String,
+        run_id: String,
+        spec: AgentRegistrationSpec,
+    },
+    ReportAgent {
+        agent_id: String,
+        run_id: String,
+        report: AgentReport,
     },
     ReadShell {
         shell_id: String,
@@ -315,6 +404,9 @@ pub enum Response {
     },
     Launcher {
         launcher: WorkspaceLauncherSnapshot,
+    },
+    Agent {
+        agent: AgentInstanceSnapshot,
     },
     Output {
         bytes: Vec<u8>,
@@ -562,6 +654,73 @@ mod tests {
         .unwrap();
 
         assert!(snapshot.launchers.is_empty());
+        assert!(snapshot.agents.is_empty());
+    }
+
+    #[test]
+    fn agent_messages_round_trip_with_snake_case_names() {
+        let report = AgentReport {
+            state: AgentState::Working,
+            authority: AgentAuthority::LifecycleIntegration,
+            evidence: "tool call in progress".into(),
+            confidence: 95,
+        };
+        let request = Request::RegisterAgent {
+            shell_id: "s1".into(),
+            run_id: "r1".into(),
+            spec: AgentRegistrationSpec {
+                name: "opencode".into(),
+                integration: "opencode-plugin".into(),
+                external_session_id: Some("external-1".into()),
+                report: report.clone(),
+            },
+        };
+
+        let encoded = serde_json::to_value(&request).unwrap();
+        assert_eq!(encoded["request"], "register_agent");
+        assert_eq!(encoded["spec"]["report"]["state"], "working");
+        assert_eq!(
+            encoded["spec"]["report"]["authority"],
+            "lifecycle_integration"
+        );
+        assert_eq!(serde_json::from_value::<Request>(encoded).unwrap(), request);
+
+        let agent = AgentInstanceSnapshot {
+            id: "a1".into(),
+            workspace_id: "w1".into(),
+            shell_id: "s1".into(),
+            run_id: "r1".into(),
+            name: "opencode".into(),
+            integration: "opencode-plugin".into(),
+            external_session_id: Some("external-1".into()),
+            started_at_ms: 10,
+            ended_at_ms: None,
+            observation: AgentObservationSnapshot {
+                revision: 1,
+                state: report.state,
+                authority: report.authority,
+                evidence: report.evidence,
+                confidence: report.confidence,
+                observed_at_ms: 11,
+            },
+        };
+        let event = DaemonEventKind::AgentStateChanged {
+            workspace_id: "w1".into(),
+            shell_id: "s1".into(),
+            agent,
+        };
+        let encoded = serde_json::to_value(&event).unwrap();
+        assert_eq!(encoded["event"], "agent_state_changed");
+        assert_eq!(
+            serde_json::from_value::<DaemonEventKind>(encoded).unwrap(),
+            event
+        );
+    }
+
+    #[test]
+    fn protocol_version_is_nine_with_minimum_six() {
+        assert_eq!(PROTOCOL_VERSION, 9);
+        assert_eq!(MIN_PROTOCOL_VERSION, 6);
     }
 
     #[test]

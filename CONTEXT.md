@@ -12,3 +12,10 @@ shell or shell run.
 
 A durable workspace slot whose process runs are retained and observable across attachments and
 daemon lifecycle transitions. A shell is distinct from a workspace launcher.
+
+## Agent Instance
+
+A durable identity for one external agent session associated with exactly one shell run. Its
+observed state records authority, evidence, confidence, and time. A completed agent instance
+remains inspectable; subagents and individual tool calls are not separate agent instances unless
+they establish independent external sessions.

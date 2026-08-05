@@ -9,10 +9,11 @@ use std::process::{Command, ExitCode, Stdio};
 use std::thread;
 
 use clap::error::ErrorKind as ClapErrorKind;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use uuid::Uuid;
 
 use boomux::protocol::{
+    AgentAuthority, AgentInstanceSnapshot, AgentRegistrationSpec, AgentReport, AgentState,
     EventCursor, ShellSnapshot, ShellSpec, ShellStatus, Snapshot, WorkspaceLauncherSnapshot,
     WorkspaceLauncherSpec, WorkspaceSnapshot,
 };
@@ -154,6 +155,11 @@ enum Commands {
         #[command(subcommand)]
         command: LauncherCommands,
     },
+    /// Inspect and report external agent runtime state
+    Agent {
+        #[command(subcommand)]
+        command: AgentCommands,
+    },
     /// Manage the vendor-neutral Boomux Agent Skill
     Skill {
         #[command(subcommand)]
@@ -268,6 +274,94 @@ enum ShellCommands {
         #[arg(long, value_name = "NAME_OR_ID")]
         workspace: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum AgentCommands {
+    /// List agent instances
+    List {
+        #[arg(long, value_name = "NAME_OR_ID")]
+        workspace: Option<String>,
+    },
+    /// Show an agent instance by exact ID
+    #[command(alias = "get")]
+    Inspect { agent_id: String },
+    /// Register an agent instance for a shell run
+    Register {
+        name: String,
+        #[arg(long)]
+        integration: String,
+        #[arg(long)]
+        external_session_id: Option<String>,
+        #[arg(long)]
+        shell_id: Option<String>,
+        #[arg(long)]
+        run_id: Option<String>,
+        #[arg(long, value_enum)]
+        state: CliAgentState,
+        #[arg(long, value_enum)]
+        authority: CliAgentAuthority,
+        #[arg(long)]
+        evidence: String,
+        #[arg(long, value_parser = clap::value_parser!(u8).range(0..=100))]
+        confidence: u8,
+    },
+    /// Report state for an agent instance by exact ID
+    Report {
+        agent_id: String,
+        #[arg(long)]
+        shell_id: Option<String>,
+        #[arg(long)]
+        run_id: Option<String>,
+        #[arg(long, value_enum)]
+        state: CliAgentState,
+        #[arg(long, value_enum)]
+        authority: CliAgentAuthority,
+        #[arg(long)]
+        evidence: String,
+        #[arg(long, value_parser = clap::value_parser!(u8).range(0..=100))]
+        confidence: u8,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum CliAgentState {
+    Unknown,
+    Working,
+    Blocked,
+    Idle,
+    Done,
+}
+
+impl From<CliAgentState> for AgentState {
+    fn from(state: CliAgentState) -> Self {
+        match state {
+            CliAgentState::Unknown => Self::Unknown,
+            CliAgentState::Working => Self::Working,
+            CliAgentState::Blocked => Self::Blocked,
+            CliAgentState::Idle => Self::Idle,
+            CliAgentState::Done => Self::Done,
+        }
+    }
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum CliAgentAuthority {
+    LifecycleIntegration,
+    ProcessAdapter,
+    TerminalHeuristic,
+    DaemonLifecycle,
+}
+
+impl From<CliAgentAuthority> for AgentAuthority {
+    fn from(authority: CliAgentAuthority) -> Self {
+        match authority {
+            CliAgentAuthority::LifecycleIntegration => Self::LifecycleIntegration,
+            CliAgentAuthority::ProcessAdapter => Self::ProcessAdapter,
+            CliAgentAuthority::TerminalHeuristic => Self::TerminalHeuristic,
+            CliAgentAuthority::DaemonLifecycle => Self::DaemonLifecycle,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -410,6 +504,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         }
         Some(Commands::Shell { command }) => shell_command(command, cli.json),
         Some(Commands::Launcher { command }) => launcher_command(command, cli.json),
+        Some(Commands::Agent { command }) => agent_command(command, cli.json),
         Some(Commands::Skill {
             command: SkillCommands::Install { force },
         }) => install_skill(force),
@@ -450,12 +545,19 @@ fn command_name(cli: &Cli) -> &'static str {
         Some(Commands::Launcher {
             command: LauncherCommands::Inspect { .. },
         }) => "launcher.inspect",
+        Some(Commands::Agent {
+            command: AgentCommands::List { .. },
+        }) => "agent.list",
+        Some(Commands::Agent {
+            command: AgentCommands::Inspect { .. },
+        }) => "agent.inspect",
         Some(Commands::Daemon {
             command: DaemonCommands::Status,
         }) => "daemon.status",
         Some(Commands::Workspace { .. }) => "workspace",
         Some(Commands::Shell { .. }) => "shell",
         Some(Commands::Launcher { .. }) => "launcher",
+        Some(Commands::Agent { .. }) => "agent",
         Some(Commands::Daemon { .. }) => "daemon",
         Some(Commands::Ui) | None => "ui",
         Some(Commands::Doctor) => "doctor",
@@ -482,6 +584,8 @@ fn supports_json(cli: &Cli) -> bool {
             command: ShellCommands::Inspect { .. }
         }) | Some(Commands::Launcher {
             command: LauncherCommands::List { .. } | LauncherCommands::Inspect { .. }
+        }) | Some(Commands::Agent {
+            command: AgentCommands::List { .. } | AgentCommands::Inspect { .. }
         }) | Some(Commands::Daemon {
             command: DaemonCommands::Status
         })
@@ -712,10 +816,34 @@ fn dashboard_views(
                     command: launcher.command.join(" "),
                 })
             });
+            let agents = workspace.agents.iter().map(|agent| {
+                let shell_name = workspace
+                    .shells
+                    .iter()
+                    .find(|shell| shell.id == agent.shell_id)
+                    .map_or("-", |shell| shell.name.as_str());
+                tui::WorkspaceItemView::Agent(tui::AgentView {
+                    id: agent.id.clone(),
+                    workspace_id: agent.workspace_id.clone(),
+                    run_id: agent.run_id.clone(),
+                    shell_id: agent.shell_id.clone(),
+                    shell_name: shell_name.into(),
+                    name: agent.name.clone(),
+                    state: cli_output::agent_state(agent.observation.state).into(),
+                    integration: agent.integration.clone(),
+                    authority: cli_output::agent_authority(agent.observation.authority).into(),
+                    confidence: agent.observation.confidence,
+                    evidence: agent.observation.evidence.clone(),
+                    external_session_id: agent.external_session_id.clone(),
+                    started_at_ms: agent.started_at_ms,
+                    observed_at_ms: agent.observation.observed_at_ms,
+                    ended_at_ms: agent.ended_at_ms,
+                })
+            });
             tui::WorkspaceView {
                 id: workspace.id.clone(),
                 name: workspace.name.clone(),
-                items: shells.chain(launchers).collect(),
+                items: shells.chain(launchers).chain(agents).collect(),
             }
         })
         .collect()
@@ -892,6 +1020,8 @@ fn capabilities(json: bool) -> Result<(), Box<dyn Error>> {
         "shell.inspect",
         "launcher.list",
         "launcher.inspect",
+        "agent.list",
+        "agent.inspect",
         "daemon.status",
     ];
     let features = [
@@ -904,6 +1034,7 @@ fn capabilities(json: bool) -> Result<(), Box<dyn Error>> {
         "reconnectable_event_cursors",
         "revision_aware_reads",
         "workspace_launchers",
+        "run_scoped_agent_instances",
     ];
     let error_codes = [
         "invalid_argument",
@@ -994,6 +1125,7 @@ fn workspace_command(
                         name: workspace.name.clone(),
                         shell_count: workspace.shells.len(),
                         launcher_count: workspace.launchers.len(),
+                        agent_count: workspace.agents.len(),
                     })
                     .collect::<Vec<_>>();
                 return cli_output::print(
@@ -1001,14 +1133,15 @@ fn workspace_command(
                     serde_json::json!({ "workspaces": workspaces }),
                 );
             }
-            println!("NAME\tWORKSPACE ID\tSHELLS\tLAUNCHERS");
+            println!("NAME\tWORKSPACE ID\tSHELLS\tLAUNCHERS\tAGENTS");
             for workspace in workspaces {
                 println!(
-                    "{}\t{}\t{}\t{}",
+                    "{}\t{}\t{}\t{}\t{}",
                     workspace.name,
                     workspace.id,
                     workspace.shells.len(),
-                    workspace.launchers.len()
+                    workspace.launchers.len(),
+                    workspace.agents.len()
                 );
             }
         }
@@ -1048,6 +1181,9 @@ fn workspace_command(
                             "launchers": workspace.launchers.iter()
                                 .map(|launcher| cli_output::launcher(launcher, Some(&workspace.name)))
                                 .collect::<Vec<_>>(),
+                            "agents": workspace.agents.iter()
+                                .map(|agent| cli_output::agent(agent, Some(&workspace.name)))
+                                .collect::<Vec<_>>(),
                         }
                     }),
                 );
@@ -1056,6 +1192,7 @@ fn workspace_command(
             println!("NAME\t{}", workspace.name);
             println!("SHELLS\t{}", workspace.shells.len());
             println!("LAUNCHERS\t{}", workspace.launchers.len());
+            println!("AGENTS\t{}", workspace.agents.len());
             if !workspace.shells.is_empty() {
                 println!("\nNAME\tSHELL ID\tRUN ID\tSTATUS\tCWD");
                 for shell in &workspace.shells {
@@ -1078,6 +1215,20 @@ fn workspace_command(
                         launcher.id,
                         launcher.cwd.display(),
                         launcher.command.join(" ")
+                    );
+                }
+            }
+            if !workspace.agents.is_empty() {
+                println!("\nNAME\tAGENT ID\tSHELL ID\tRUN ID\tSTATE\tINTEGRATION");
+                for agent in &workspace.agents {
+                    println!(
+                        "{}\t{}\t{}\t{}\t{}\t{}",
+                        agent.name,
+                        agent.id,
+                        agent.shell_id,
+                        agent.run_id,
+                        cli_output::agent_state(agent.observation.state),
+                        agent.integration
                     );
                 }
             }
@@ -1286,6 +1437,208 @@ fn launcher_command(command: LauncherCommands, json: bool) -> Result<(), Box<dyn
     Ok(())
 }
 
+fn agent_command(command: AgentCommands, json: bool) -> Result<(), Box<dyn Error>> {
+    let client = client::connect_or_start()?;
+    match command {
+        AgentCommands::List { workspace } => {
+            let snapshot = client.snapshot()?;
+            let workspaces = if let Some(target) = workspace.as_deref() {
+                vec![resolve_workspace_target(&snapshot.workspaces, target)?]
+            } else {
+                snapshot.workspaces.iter().collect()
+            };
+            if json {
+                let agents = workspaces
+                    .iter()
+                    .flat_map(|workspace| {
+                        workspace
+                            .agents
+                            .iter()
+                            .map(|agent| cli_output::agent(agent, Some(&workspace.name)))
+                    })
+                    .collect::<Vec<_>>();
+                return cli_output::print("agent.list", serde_json::json!({ "agents": agents }));
+            }
+            println!("WORKSPACE\tNAME\tAGENT ID\tSHELL ID\tRUN ID\tSTATE\tCONFIDENCE");
+            for workspace in workspaces {
+                for agent in &workspace.agents {
+                    println!(
+                        "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                        workspace.name,
+                        agent.name,
+                        agent.id,
+                        agent.shell_id,
+                        agent.run_id,
+                        cli_output::agent_state(agent.observation.state),
+                        agent.observation.confidence
+                    );
+                }
+            }
+        }
+        AgentCommands::Inspect { agent_id } => {
+            let agent = client.get_agent(agent_id)?;
+            let workspace = client.get_workspace(&agent.workspace_id)?;
+            if json {
+                return cli_output::print(
+                    "agent.inspect",
+                    serde_json::json!({
+                        "agent": cli_output::agent(&agent, Some(&workspace.name)),
+                    }),
+                );
+            }
+            print_agent(&agent, &workspace.name);
+        }
+        AgentCommands::Register {
+            name,
+            integration,
+            external_session_id,
+            shell_id,
+            run_id,
+            state,
+            authority,
+            evidence,
+            confidence,
+        } => {
+            let (shell_id, run_id) = resolve_agent_context(
+                shell_id,
+                run_id,
+                env::var("BOOMUX_SHELL_ID").ok(),
+                env::var("BOOMUX_RUN_ID").ok(),
+            )?;
+            let agent = client.register_agent(
+                shell_id,
+                run_id,
+                AgentRegistrationSpec {
+                    name: cli_name(name, "agent")?,
+                    integration,
+                    external_session_id,
+                    report: AgentReport {
+                        state: state.into(),
+                        authority: authority.into(),
+                        evidence,
+                        confidence,
+                    },
+                },
+            )?;
+            println!("Registered agent {} ({})", agent.name, agent.id);
+        }
+        AgentCommands::Report {
+            agent_id,
+            shell_id,
+            run_id,
+            state,
+            authority,
+            evidence,
+            confidence,
+        } => {
+            let (shell_id, run_id) = resolve_agent_context(
+                shell_id,
+                run_id,
+                env::var("BOOMUX_SHELL_ID").ok(),
+                env::var("BOOMUX_RUN_ID").ok(),
+            )?;
+            let existing = client.get_agent(&agent_id)?;
+            if existing.shell_id != shell_id {
+                return Err(cli_output::failure(
+                    "invalid_argument",
+                    format!("agent {agent_id} is not bound to shell {shell_id}"),
+                ));
+            }
+            if existing.run_id != run_id {
+                return Err(cli_output::failure(
+                    "run_changed",
+                    format!("agent {agent_id} is not bound to run {run_id}"),
+                ));
+            }
+            let agent = client.report_agent(
+                agent_id,
+                run_id,
+                AgentReport {
+                    state: state.into(),
+                    authority: authority.into(),
+                    evidence,
+                    confidence,
+                },
+            )?;
+            println!(
+                "Reported {} for agent {} (revision {})",
+                cli_output::agent_state(agent.observation.state),
+                agent.id,
+                agent.observation.revision
+            );
+        }
+    }
+    Ok(())
+}
+
+fn resolve_agent_context(
+    shell_id: Option<String>,
+    run_id: Option<String>,
+    environment_shell_id: Option<String>,
+    environment_run_id: Option<String>,
+) -> Result<(String, String), Box<dyn Error>> {
+    let shell_id = agent_context_value("shell ID", shell_id.or(environment_shell_id))?;
+    let run_id = agent_context_value("run ID", run_id.or(environment_run_id))?;
+    match (shell_id, run_id) {
+        (Some(shell_id), Some(run_id)) => Ok((shell_id, run_id)),
+        _ => Err(cli_output::failure(
+            "context_required",
+            "agent commands require both shell and run identity; pass --shell-id and --run-id or set BOOMUX_SHELL_ID and BOOMUX_RUN_ID",
+        )),
+    }
+}
+
+fn agent_context_value(
+    kind: &str,
+    value: Option<String>,
+) -> Result<Option<String>, Box<dyn Error>> {
+    value
+        .map(|value| {
+            let value = value.trim();
+            if value.is_empty() {
+                Err(cli_output::failure(
+                    "invalid_argument",
+                    format!("agent {kind} cannot be empty"),
+                ))
+            } else {
+                Ok(value.to_owned())
+            }
+        })
+        .transpose()
+}
+
+fn print_agent(agent: &AgentInstanceSnapshot, workspace_name: &str) {
+    println!("ID\t{}", agent.id);
+    println!("NAME\t{}", agent.name);
+    println!("WORKSPACE\t{workspace_name}");
+    println!("SHELL ID\t{}", agent.shell_id);
+    println!("RUN ID\t{}", agent.run_id);
+    println!("INTEGRATION\t{}", agent.integration);
+    println!(
+        "EXTERNAL SESSION ID\t{}",
+        agent.external_session_id.as_deref().unwrap_or("-")
+    );
+    println!("STARTED AT MS\t{}", agent.started_at_ms);
+    println!(
+        "ENDED AT MS\t{}",
+        agent
+            .ended_at_ms
+            .map_or_else(|| "-".into(), |value| value.to_string())
+    );
+    println!("REVISION\t{}", agent.observation.revision);
+    println!(
+        "STATE\t{}",
+        cli_output::agent_state(agent.observation.state)
+    );
+    println!(
+        "AUTHORITY\t{}",
+        cli_output::agent_authority(agent.observation.authority)
+    );
+    println!("EVIDENCE\t{}", agent.observation.evidence);
+    println!("CONFIDENCE\t{}", agent.observation.confidence);
+    println!("OBSERVED AT MS\t{}", agent.observation.observed_at_ms);
+}
+
 fn list_workspace_shells(json: bool) -> Result<(), Box<dyn Error>> {
     let client = client::connect_or_start()?;
     let shell = current_shell(&client)?;
@@ -1393,11 +1746,17 @@ fn json_snapshot(snapshot: Snapshot) -> Result<serde_json::Value, Box<dyn Error>
                 .iter()
                 .map(|launcher| cli_output::launcher(launcher, Some(&workspace.name)))
                 .collect::<Vec<_>>();
+            let agents = workspace
+                .agents
+                .iter()
+                .map(|agent| cli_output::agent(agent, Some(&workspace.name)))
+                .collect::<Vec<_>>();
             serde_json::json!({
                 "id": workspace.id,
                 "name": workspace.name,
                 "shells": shells,
                 "launchers": launchers,
+                "agents": agents,
             })
         })
         .collect::<Vec<_>>();
@@ -2028,6 +2387,29 @@ mod tests {
             name: name.into(),
             shells,
             launchers: Vec::new(),
+            agents: Vec::new(),
+        }
+    }
+
+    fn agent(id: &str, workspace_id: &str, shell_id: &str) -> AgentInstanceSnapshot {
+        AgentInstanceSnapshot {
+            id: id.into(),
+            workspace_id: workspace_id.into(),
+            shell_id: shell_id.into(),
+            run_id: "r1".into(),
+            name: "opencode".into(),
+            integration: "plugin".into(),
+            external_session_id: Some("external-1".into()),
+            started_at_ms: 10,
+            ended_at_ms: None,
+            observation: protocol::AgentObservationSnapshot {
+                revision: 1,
+                state: AgentState::Working,
+                authority: AgentAuthority::LifecycleIntegration,
+                evidence: "tool call".into(),
+                confidence: 95,
+                observed_at_ms: 11,
+            },
         }
     }
 
@@ -2206,6 +2588,121 @@ mod tests {
     }
 
     #[test]
+    fn parses_agent_runtime_commands_and_json_support() {
+        let cli = Cli::try_parse_from([
+            "boomux",
+            "agent",
+            "register",
+            "opencode",
+            "--integration",
+            "plugin",
+            "--shell-id",
+            "s1",
+            "--run-id",
+            "r1",
+            "--state",
+            "working",
+            "--authority",
+            "lifecycle-integration",
+            "--evidence",
+            "tool call",
+            "--confidence",
+            "95",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Agent {
+                command: AgentCommands::Register { confidence: 95, .. }
+            })
+        ));
+
+        let cli = Cli::try_parse_from([
+            "boomux",
+            "agent",
+            "list",
+            "--workspace",
+            "project",
+            "--json",
+        ])
+        .unwrap();
+        assert!(supports_json(&cli));
+        let cli = Cli::try_parse_from(["boomux", "agent", "get", "a1", "--json"]).unwrap();
+        assert_eq!(command_name(&cli), "agent.inspect");
+        assert!(supports_json(&cli));
+        let cli = Cli::try_parse_from([
+            "boomux",
+            "agent",
+            "report",
+            "a1",
+            "--state",
+            "done",
+            "--authority",
+            "lifecycle-integration",
+            "--evidence",
+            "complete",
+            "--confidence",
+            "100",
+            "--json",
+        ])
+        .unwrap();
+        assert!(!supports_json(&cli));
+        assert!(
+            Cli::try_parse_from([
+                "boomux",
+                "agent",
+                "report",
+                "a1",
+                "--state",
+                "done",
+                "--authority",
+                "lifecycle-integration",
+                "--evidence",
+                "complete",
+                "--confidence",
+                "101",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn agent_context_requires_nonempty_shell_and_run_ids() {
+        assert_eq!(
+            resolve_agent_context(
+                Some(" explicit-shell ".into()),
+                None,
+                Some("environment-shell".into()),
+                Some(" environment-run ".into()),
+            )
+            .unwrap(),
+            ("explicit-shell".into(), "environment-run".into())
+        );
+        assert!(resolve_agent_context(Some("s1".into()), None, None, None).is_err());
+        assert!(
+            resolve_agent_context(Some(" ".into()), Some("r1".into()), Some("s1".into()), None,)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn event_snapshot_json_includes_stable_agent_data() {
+        let mut project = workspace("w1", "project", vec![shell("s1", "w1", "shell")]);
+        project.agents.push(agent("a1", "w1", "s1"));
+
+        let value = json_snapshot(Snapshot {
+            workspaces: vec![project],
+        })
+        .unwrap();
+
+        assert_eq!(value["workspaces"][0]["agents"][0]["id"], "a1");
+        assert_eq!(
+            value["workspaces"][0]["agents"][0]["observation"]["authority"],
+            "lifecycle_integration"
+        );
+    }
+
+    #[test]
     fn resolves_workspaces_and_shell_names_for_cli_commands() {
         let mut project = workspace("w1", "project", vec![shell("s1", "w1", "tests")]);
         project.launchers.push(launcher("l1", "w1", "editor"));
@@ -2307,6 +2804,23 @@ mod tests {
         assert_eq!(launcher.name, "editor");
         assert_eq!(launcher.command, "zeditor .");
         assert_eq!(launcher.directory, "/tmp/project");
+    }
+
+    #[test]
+    fn workspace_view_maps_agent_runtime_details() {
+        let mut workspace = workspace("w1", "project", vec![shell("s1", "w1", "terminal")]);
+        workspace.agents.push(agent("a1", "w1", "s1"));
+
+        let views = dashboard_views(&[workspace], &mut git::Cache::default());
+
+        let tui::WorkspaceItemView::Agent(agent) = &views[0].items[1] else {
+            panic!("expected agent item");
+        };
+        assert_eq!(agent.name, "opencode");
+        assert_eq!(agent.shell_name, "terminal");
+        assert_eq!(agent.state, "working");
+        assert_eq!(agent.authority, "lifecycle_integration");
+        assert_eq!(agent.confidence, 95);
     }
 
     #[test]
