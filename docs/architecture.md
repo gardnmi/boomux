@@ -194,6 +194,45 @@ the public mutation CLI. Exact retries of an accepted `done` report return the
 completed snapshot without another revision, write, or event; conflicting
 reports after completion are rejected.
 
+### Explicit Process-Adapter Supervisor
+
+`src/process_adapter.rs` implements the first process-adapter foundation behind:
+
+```console
+boomux agent supervise <name> --integration <integration> --external-session-id <canonical-root-id> [--shell-id <shell-id>] [--run-id <run-id>] -- <exact argv>
+```
+
+Shell and run IDs default from `BOOMUX_SHELL_ID` and `BOOMUX_RUN_ID`. The
+supervisor validates the supplied identity, spawns the exact argv directly with
+inherited stdin, stdout, and stderr, and waits for that child. It returns the
+child's exit code, or `128 + signal` for signal termination. There is no PTY,
+shell interpretation, output capture, or detached process ownership in this
+adapter.
+
+After spawn, it idempotently ensures the integration, external session ID,
+shell ID, and run ID key. Both process start and process exit are observations
+with state `unknown`, authority `process_adapter`, and confidence 100; evidence
+names the child PID and the exit code or signal. A process boundary is evidence
+only of a process boundary. It never reports `done` and does not infer
+`working`, `blocked`, or `idle` from process existence or termination.
+
+Reporting is fail-open. Ensure, start-report, and exit-report failures warn but
+do not terminate the child or alter its exit result; spawn and wait failures are
+ordinary supervisor failures. A completed ensured instance receives no further
+reports. Lower process-adapter authority cannot overwrite lifecycle-integration
+state. Exact-key matching also means records with any different integration,
+external session ID, shell ID, or run ID coexist, while a supervisor supplied
+the lifecycle integration's complete key reacquires that same durable instance.
+
+This primitive intentionally does not discover an external session identity.
+For OpenCode in particular, a process, argv, local database, or API does not
+identify the canonical root session selected by the user. Automatic handling of
+fresh, continue, fork, or in-process session switching is unsafe and unsupported
+unless the caller already possesses the selected canonical root ID. Ordinary
+OpenCode should not be wrapped merely to obtain process evidence when the
+lifecycle plugin is available; that plugin resolves root ancestry and reports
+the stronger lifecycle evidence described below.
+
 ### OpenCode Lifecycle Plugin
 
 `integrations/opencode/boomux.js` is a config-time OpenCode plugin installed by
@@ -291,6 +330,7 @@ as pending.
 
 ## Next Technical Steps
 
-Future agent runtime work is tracked in [`roadmap.md`](roadmap.md). Process
-adapters, terminal heuristics, aggregation, waits, notifications, and control are
-not part of the first agent runtime slice.
+Future agent runtime work is tracked in [`roadmap.md`](roadmap.md). The explicit
+process-adapter supervisor is only a foundation; automatic and
+integration-specific adapters, terminal heuristics, aggregation, waits,
+notifications, and control remain future work.

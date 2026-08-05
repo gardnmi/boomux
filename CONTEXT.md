@@ -26,3 +26,12 @@ External observation authority descends from lifecycle integration to process ad
 heuristic. Equal authority may advance an observation; exact duplicate and lower-authority reports
 are no-ops. Daemon lifecycle authority is reserved for daemon-originated observations and is not an
 external integration authority.
+
+## Process Adapter
+
+A process-bound observer for an agent instance whose evidence is limited to process events. The
+explicit supervisor executes an exact argument vector with inherited standard streams and reports
+start and exit as Unknown at ProcessAdapter authority. Process exit is not agent completion, and a
+process adapter cannot infer Done, Working, Blocked, or Idle. It does not discover canonical
+external session identity; callers must supply the complete integration, external session, shell,
+and run key. Reporting failures are fail-open and lifecycle-integration authority wins.
