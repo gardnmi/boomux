@@ -189,8 +189,7 @@ impl Client {
         }
         match self.send_with_version(request.clone(), version) {
             Err(error)
-                if version > protocol::MIN_PROTOCOL_VERSION
-                    && remote_code(&error) == Some(ErrorCode::UnsupportedVersion) =>
+                if version > protocol::MIN_PROTOCOL_VERSION && is_protocol_rejection(&error) =>
             {
                 self.probe_latest()?;
                 let negotiated = self.protocol_version.load(Ordering::Acquire);
@@ -244,7 +243,7 @@ impl Client {
                     return Ok(version == protocol::PROTOCOL_VERSION);
                 }
                 Ok((_, response)) => return unexpected(response),
-                Err(error) if remote_code(&error) == Some(ErrorCode::UnsupportedVersion) => {}
+                Err(error) if is_protocol_rejection(&error) => {}
                 Err(error) => return Err(error),
             }
         }
@@ -556,6 +555,12 @@ fn remote_code(error: &io::Error) -> Option<ErrorCode> {
         .and_then(|error| error.code)
 }
 
+fn is_protocol_rejection(error: &io::Error) -> bool {
+    remote_code(error) == Some(ErrorCode::UnsupportedVersion)
+        || (error.kind() == io::ErrorKind::InvalidData
+            && error.to_string() == "protocol version mismatch")
+}
+
 fn remote_error(code: ErrorCode, message: impl Into<String>) -> io::Error {
     io::Error::new(
         error_kind(Some(code)),
@@ -670,7 +675,7 @@ mod tests {
                     7,
                     Response::Error {
                         message: "expected protocol 7".into(),
-                        code: Some(ErrorCode::UnsupportedVersion),
+                        code: None,
                     },
                 ),
             )
