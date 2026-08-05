@@ -25,8 +25,12 @@ const REFRESH_INTERVAL: Duration = Duration::from_millis(250);
 pub(crate) struct WorkspaceView {
     pub(crate) id: String,
     pub(crate) name: String,
-    pub(crate) terminals: Vec<TerminalView>,
-    pub(crate) launchers: Vec<LauncherView>,
+    pub(crate) items: Vec<WorkspaceItemView>,
+}
+
+pub(crate) enum WorkspaceItemView {
+    Shell(TerminalView),
+    Launcher(LauncherView),
 }
 
 pub(crate) struct LauncherView {
@@ -59,6 +63,22 @@ pub(crate) struct TerminalView {
     pub(crate) branch: String,
 }
 
+impl WorkspaceView {
+    fn shell_count(&self) -> usize {
+        self.items
+            .iter()
+            .filter(|item| matches!(item, WorkspaceItemView::Shell(_)))
+            .count()
+    }
+
+    fn launcher_count(&self) -> usize {
+        self.items
+            .iter()
+            .filter(|item| matches!(item, WorkspaceItemView::Launcher(_)))
+            .count()
+    }
+}
+
 pub(crate) struct Actions<R, O, C, W, N, E, F> {
     pub(crate) on_restore: R,
     pub(crate) on_open: O,
@@ -72,8 +92,7 @@ pub(crate) struct Actions<R, O, C, W, N, E, F> {
 struct App {
     workspaces: Vec<WorkspaceView>,
     workspace_state: TableState,
-    terminal_state: TableState,
-    launcher_state: TableState,
+    item_state: TableState,
     focus: Focus,
     mode: Mode,
     message: Option<Message>,
@@ -84,20 +103,35 @@ struct App {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Focus {
     Workspaces,
-    Terminals,
-    Launchers,
+    Items,
+}
+
+enum ItemIdentity {
+    Shell(String),
+    Launcher(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum OpenTarget {
+    Shell(String),
+    Launcher {
+        workspace_id: String,
+        launcher_id: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RenameTarget {
     Workspace(String),
     Shell(String),
+    Launcher(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum CloseTarget {
     Workspace(String),
     Shell(String),
+    Launcher(String),
 }
 
 impl RenameTarget {
@@ -105,6 +139,7 @@ impl RenameTarget {
         match self {
             Self::Workspace(_) => "workspace",
             Self::Shell(_) => "shell",
+            Self::Launcher(_) => "launcher",
         }
     }
 }
@@ -247,22 +282,17 @@ fn is_subsequence(query: &str, candidate: &str) -> bool {
 impl App {
     fn new(workspaces: Vec<WorkspaceView>, project_context: ProjectContext) -> Self {
         let mut workspace_state = TableState::default();
-        let mut terminal_state = TableState::default();
-        let mut launcher_state = TableState::default();
+        let mut item_state = TableState::default();
         if !workspaces.is_empty() {
             workspace_state.select(Some(0));
-            if !workspaces[0].terminals.is_empty() {
-                terminal_state.select(Some(0));
-            }
-            if !workspaces[0].launchers.is_empty() {
-                launcher_state.select(Some(0));
+            if !workspaces[0].items.is_empty() {
+                item_state.select(Some(0));
             }
         }
         Self {
             workspaces,
             workspace_state,
-            terminal_state,
-            launcher_state,
+            item_state,
             focus: Focus::Workspaces,
             mode: Mode::Normal,
             message: None,
@@ -280,20 +310,10 @@ impl App {
             .and_then(|index| self.workspaces.get(index))
     }
 
-    fn selected_terminal(&self) -> Option<&TerminalView> {
-        self.selected().and_then(|workspace| {
-            self.terminal_state
-                .selected()
-                .and_then(|index| workspace.terminals.get(index))
-        })
-    }
-
-    fn selected_launcher(&self) -> Option<&LauncherView> {
-        self.selected().and_then(|workspace| {
-            self.launcher_state
-                .selected()
-                .and_then(|index| workspace.launchers.get(index))
-        })
+    fn selected_item(&self) -> Option<&WorkspaceItemView> {
+        let workspace = self.selected()?;
+        let index = self.item_state.selected()?;
+        workspace.items.get(index)
     }
 
     fn next(&mut self) {
@@ -308,31 +328,16 @@ impl App {
                 self.workspace_state.select(Some(next));
                 self.select_first_details();
             }
-            Focus::Terminals => {
-                let terminal_count = self
-                    .selected()
-                    .map_or(0, |workspace| workspace.terminals.len());
-                if terminal_count == 0 {
+            Focus::Items => {
+                let item_count = self.selected().map_or(0, |workspace| workspace.items.len());
+                if item_count == 0 {
                     return;
                 }
                 let next = self
-                    .terminal_state
+                    .item_state
                     .selected()
-                    .map_or(0, |index| (index + 1) % terminal_count);
-                self.terminal_state.select(Some(next));
-            }
-            Focus::Launchers => {
-                let launcher_count = self
-                    .selected()
-                    .map_or(0, |workspace| workspace.launchers.len());
-                if launcher_count == 0 {
-                    return;
-                }
-                let next = self
-                    .launcher_state
-                    .selected()
-                    .map_or(0, |index| (index + 1) % launcher_count);
-                self.launcher_state.select(Some(next));
+                    .map_or(0, |index| (index + 1) % item_count);
+                self.item_state.select(Some(next));
             }
         }
         self.message = None;
@@ -354,37 +359,19 @@ impl App {
                 self.workspace_state.select(Some(previous));
                 self.select_first_details();
             }
-            Focus::Terminals => {
-                let terminal_count = self
-                    .selected()
-                    .map_or(0, |workspace| workspace.terminals.len());
-                if terminal_count == 0 {
+            Focus::Items => {
+                let item_count = self.selected().map_or(0, |workspace| workspace.items.len());
+                if item_count == 0 {
                     return;
                 }
-                let previous = self.terminal_state.selected().map_or(0, |index| {
+                let previous = self.item_state.selected().map_or(0, |index| {
                     if index == 0 {
-                        terminal_count - 1
+                        item_count - 1
                     } else {
                         index - 1
                     }
                 });
-                self.terminal_state.select(Some(previous));
-            }
-            Focus::Launchers => {
-                let launcher_count = self
-                    .selected()
-                    .map_or(0, |workspace| workspace.launchers.len());
-                if launcher_count == 0 {
-                    return;
-                }
-                let previous = self.launcher_state.selected().map_or(0, |index| {
-                    if index == 0 {
-                        launcher_count - 1
-                    } else {
-                        index - 1
-                    }
-                });
-                self.launcher_state.select(Some(previous));
+                self.item_state.select(Some(previous));
             }
         }
         self.message = None;
@@ -392,16 +379,8 @@ impl App {
 
     fn toggle_focus(&mut self) {
         self.focus = match self.focus {
-            Focus::Workspaces => Focus::Terminals,
-            Focus::Terminals
-                if self
-                    .selected()
-                    .is_some_and(|workspace| !workspace.launchers.is_empty()) =>
-            {
-                Focus::Launchers
-            }
-            Focus::Terminals => Focus::Workspaces,
-            Focus::Launchers => Focus::Workspaces,
+            Focus::Workspaces => Focus::Items,
+            Focus::Items => Focus::Workspaces,
         };
         self.message = None;
     }
@@ -414,7 +393,7 @@ impl App {
     fn handle_focus_key(&mut self, key: KeyCode) -> bool {
         let focus = match key {
             KeyCode::Left | KeyCode::Char('h') => Focus::Workspaces,
-            KeyCode::Right | KeyCode::Char('l') => Focus::Terminals,
+            KeyCode::Right | KeyCode::Char('l') => Focus::Items,
             _ => return false,
         };
         self.set_focus(focus);
@@ -422,14 +401,9 @@ impl App {
     }
 
     fn select_first_details(&mut self) {
-        self.terminal_state.select(
+        self.item_state.select(
             self.selected()
-                .is_some_and(|workspace| !workspace.terminals.is_empty())
-                .then_some(0),
-        );
-        self.launcher_state.select(
-            self.selected()
-                .is_some_and(|workspace| !workspace.launchers.is_empty())
+                .is_some_and(|workspace| !workspace.items.is_empty())
                 .then_some(0),
         );
     }
@@ -439,10 +413,12 @@ impl App {
             Focus::Workspaces => self
                 .selected()
                 .map(|workspace| RenameTarget::Workspace(workspace.id.clone())),
-            Focus::Terminals => self
-                .selected_terminal()
-                .map(|terminal| RenameTarget::Shell(terminal.id.clone())),
-            Focus::Launchers => None,
+            Focus::Items => self.selected_item().map(|item| match item {
+                WorkspaceItemView::Shell(shell) => RenameTarget::Shell(shell.id.clone()),
+                WorkspaceItemView::Launcher(launcher) => {
+                    RenameTarget::Launcher(launcher.id.clone())
+                }
+            }),
         };
         if let Some(target) = target {
             self.mode = Mode::Rename {
@@ -463,7 +439,7 @@ impl App {
                 self.message = None;
                 false
             }
-            Focus::Terminals => {
+            Focus::Items => {
                 let Some(workspace_id) = self.selected().map(|workspace| workspace.id.clone())
                 else {
                     return false;
@@ -471,7 +447,6 @@ impl App {
                 self.message = Some(Message::from_result(on_create_shell(&workspace_id)));
                 true
             }
-            Focus::Launchers => false,
         }
     }
 
@@ -501,14 +476,23 @@ impl App {
         self.message = Some(Message::from_result(on_restore(&workspace_id)));
     }
 
-    fn open_selected_terminal<F>(&mut self, on_open: &mut F)
+    fn open_selected_item<F>(&mut self, on_open: &mut F)
     where
-        F: FnMut(&str) -> Result<String, String>,
+        F: FnMut(&OpenTarget) -> Result<String, String>,
     {
-        let Some(terminal_id) = self.selected_terminal().map(|terminal| terminal.id.clone()) else {
+        let Some(workspace_id) = self.selected().map(|workspace| workspace.id.clone()) else {
             return;
         };
-        self.message = Some(Message::from_result(on_open(&terminal_id)));
+        let Some(target) = self.selected_item().map(|item| match item {
+            WorkspaceItemView::Shell(shell) => OpenTarget::Shell(shell.id.clone()),
+            WorkspaceItemView::Launcher(launcher) => OpenTarget::Launcher {
+                workspace_id,
+                launcher_id: launcher.id.clone(),
+            },
+        }) else {
+            return;
+        };
+        self.message = Some(Message::from_result(on_open(&target)));
     }
 
     fn request_close(&mut self) {
@@ -516,16 +500,23 @@ impl App {
             Focus::Workspaces => self.selected().map(|workspace| PendingClose {
                 target: CloseTarget::Workspace(workspace.id.clone()),
                 name: workspace.name.clone(),
-                shell_count: workspace.terminals.len(),
-                launcher_count: workspace.launchers.len(),
+                shell_count: workspace.shell_count(),
+                launcher_count: workspace.launcher_count(),
             }),
-            Focus::Terminals => self.selected_terminal().map(|terminal| PendingClose {
-                target: CloseTarget::Shell(terminal.id.clone()),
-                name: terminal.name.clone(),
-                shell_count: 1,
-                launcher_count: 0,
+            Focus::Items => self.selected_item().map(|item| match item {
+                WorkspaceItemView::Shell(shell) => PendingClose {
+                    target: CloseTarget::Shell(shell.id.clone()),
+                    name: shell.name.clone(),
+                    shell_count: 1,
+                    launcher_count: 0,
+                },
+                WorkspaceItemView::Launcher(launcher) => PendingClose {
+                    target: CloseTarget::Launcher(launcher.id.clone()),
+                    name: launcher.name.clone(),
+                    shell_count: 0,
+                    launcher_count: 1,
+                },
             }),
-            Focus::Launchers => None,
         };
     }
 
@@ -555,8 +546,10 @@ impl App {
 
     fn replace_workspaces(&mut self, workspaces: Vec<WorkspaceView>) {
         let selected_id = self.selected().map(|workspace| workspace.id.clone());
-        let selected_terminal_id = self.selected_terminal().map(|terminal| terminal.id.clone());
-        let selected_launcher_id = self.selected_launcher().map(|launcher| launcher.id.clone());
+        let selected_item = self.selected_item().map(|item| match item {
+            WorkspaceItemView::Shell(shell) => ItemIdentity::Shell(shell.id.clone()),
+            WorkspaceItemView::Launcher(launcher) => ItemIdentity::Launcher(launcher.id.clone()),
+        });
         let previous_index = self.selected_index().unwrap_or(0);
         let selected_index = selected_id
             .and_then(|id| workspaces.iter().position(|workspace| workspace.id == id))
@@ -564,31 +557,22 @@ impl App {
 
         self.workspaces = workspaces;
         self.workspace_state.select(selected_index);
-        let terminal_index = self.selected().and_then(|workspace| {
-            selected_terminal_id
-                .and_then(|id| {
-                    workspace
-                        .terminals
-                        .iter()
-                        .position(|terminal| terminal.id == id)
+        let item_index = self.selected().and_then(|workspace| {
+            selected_item
+                .and_then(|target| {
+                    match target {
+                    ItemIdentity::Shell(id) => workspace.items.iter().position(
+                        |item| matches!(item, WorkspaceItemView::Shell(shell) if shell.id == id),
+                    ),
+                    ItemIdentity::Launcher(id) => workspace.items.iter().position(|item| {
+                        matches!(item, WorkspaceItemView::Launcher(launcher) if launcher.id == id)
+                    }),
+                }
                 })
-                .or_else(|| (!workspace.terminals.is_empty()).then_some(0))
+                .or_else(|| (!workspace.items.is_empty()).then_some(0))
         });
-        self.terminal_state.select(terminal_index);
-        let launcher_index = self.selected().and_then(|workspace| {
-            selected_launcher_id
-                .and_then(|id| {
-                    workspace
-                        .launchers
-                        .iter()
-                        .position(|launcher| launcher.id == id)
-                })
-                .or_else(|| (!workspace.launchers.is_empty()).then_some(0))
-        });
-        self.launcher_state.select(launcher_index);
-        if self.workspaces.is_empty()
-            || (self.focus == Focus::Launchers && launcher_index.is_none())
-        {
+        self.item_state.select(item_index);
+        if self.workspaces.is_empty() {
             self.focus = Focus::Workspaces;
         }
     }
@@ -601,7 +585,7 @@ pub(crate) fn run<R, O, C, W, N, E, F>(
 ) -> io::Result<()>
 where
     R: FnMut(&str) -> Result<String, String>,
-    O: FnMut(&str) -> Result<String, String>,
+    O: FnMut(&OpenTarget) -> Result<String, String>,
     C: FnMut(&CloseTarget) -> Result<String, String>,
     W: FnMut(&str) -> Result<String, String>,
     N: FnMut(&str) -> Result<String, String>,
@@ -625,7 +609,7 @@ fn run_loop<R, O, C, W, N, E, F>(
 ) -> io::Result<()>
 where
     R: FnMut(&str) -> Result<String, String>,
-    O: FnMut(&str) -> Result<String, String>,
+    O: FnMut(&OpenTarget) -> Result<String, String>,
     C: FnMut(&CloseTarget) -> Result<String, String>,
     W: FnMut(&str) -> Result<String, String>,
     N: FnMut(&str) -> Result<String, String>,
@@ -693,8 +677,7 @@ where
             KeyCode::Enter => {
                 match app.focus {
                     Focus::Workspaces => app.restore_selected(&mut actions.on_restore),
-                    Focus::Terminals => app.open_selected_terminal(&mut actions.on_open),
-                    Focus::Launchers => {}
+                    Focus::Items => app.open_selected_item(&mut actions.on_open),
                 }
                 app.refresh(&mut actions.on_refresh);
                 last_refresh = Instant::now();
@@ -820,13 +803,13 @@ fn render(frame: &mut Frame, app: &mut App) {
         let [workspace_area, terminal_area] =
             Layout::horizontal([Constraint::Length(34), Constraint::Fill(1)]).areas(dashboard_area);
         render_workspaces(frame, workspace_area, app);
-        render_workspace_details(frame, terminal_area, app);
+        render_items(frame, terminal_area, app);
     } else {
         let [workspace_area, terminal_area] =
             Layout::vertical([Constraint::Percentage(32), Constraint::Fill(1)])
                 .areas(dashboard_area);
         render_workspaces(frame, workspace_area, app);
-        render_workspace_details(frame, terminal_area, app);
+        render_items(frame, terminal_area, app);
     }
     render_footer(frame, footer_area, app);
     if let Mode::PickProject(picker) = &mut app.mode {
@@ -934,15 +917,11 @@ fn centered_rect(area: Rect, width_percent: u16, height_percent: u16) -> Rect {
 }
 
 fn render_header(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
-    let shell_count: usize = app
-        .workspaces
-        .iter()
-        .map(|workspace| workspace.terminals.len())
-        .sum();
+    let shell_count: usize = app.workspaces.iter().map(WorkspaceView::shell_count).sum();
     let launcher_count: usize = app
         .workspaces
         .iter()
-        .map(|workspace| workspace.launchers.len())
+        .map(WorkspaceView::launcher_count)
         .sum();
     let line = Line::from(vec![
         Span::styled(
@@ -972,8 +951,8 @@ fn render_workspaces(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut A
     let rows = app.workspaces.iter().map(|workspace| {
         Row::new([
             Cell::from(workspace.name.as_str()),
-            Cell::from(workspace.terminals.len().to_string()),
-            Cell::from(workspace.launchers.len().to_string()),
+            Cell::from(workspace.shell_count().to_string()),
+            Cell::from(workspace.launcher_count().to_string()),
         ])
     });
     let table = Table::new(
@@ -1008,29 +987,8 @@ fn render_workspaces(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut A
     frame.render_stateful_widget(table, area, &mut app.workspace_state);
 }
 
-fn render_workspace_details(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
-    let Some(workspace) = app.selected() else {
-        render_terminals(frame, area, app);
-        return;
-    };
-    if workspace.launchers.is_empty() {
-        render_terminals(frame, area, app);
-    } else {
-        let launcher_height = u16::try_from(workspace.launchers.len())
-            .unwrap_or(u16::MAX)
-            .saturating_add(3)
-            .min(area.height / 2)
-            .max(4);
-        let [terminal_area, launcher_area] =
-            Layout::vertical([Constraint::Fill(1), Constraint::Length(launcher_height)])
-                .areas(area);
-        render_terminals(frame, terminal_area, app);
-        render_launchers(frame, launcher_area, app);
-    }
-}
-
-fn render_terminals(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
-    let header = Row::new(["NAME", "STATUS", "DIRECTORY", "BRANCH", "SHELL ID"])
+fn render_items(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
+    let header = Row::new(["NAME", "STATUS", "DIRECTORY", "DETAIL", "ID"])
         .style(Style::new().fg(BLUE).add_modifier(Modifier::BOLD));
     let selected = app
         .workspace_state
@@ -1038,16 +996,10 @@ fn render_terminals(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut Ap
         .and_then(|index| app.workspaces.get(index));
     let title = selected.map_or_else(
         || " Shells ".to_owned(),
-        |workspace| {
-            format!(
-                " Shells: {} ({}) ",
-                workspace.name,
-                workspace.terminals.len()
-            )
-        },
+        |workspace| format!(" Shells: {} ({}) ", workspace.name, workspace.items.len()),
     );
     let block = Block::bordered().title(title).border_style(Style::new().fg(
-        if app.focus == Focus::Terminals {
+        if app.focus == Focus::Items {
             TEAL
         } else {
             OVERLAY
@@ -1057,22 +1009,34 @@ fn render_terminals(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut Ap
     let show_full_ids = inner.width >= 150;
     let rows: Vec<_> = selected
         .into_iter()
-        .flat_map(|workspace| workspace.terminals.iter())
-        .map(|terminal| {
-            Row::new(vec![
-                Cell::from(terminal.name.as_str()),
-                Cell::from(Span::styled(
-                    terminal.status.as_str(),
-                    Style::new().fg(status_color(&terminal.status)),
-                )),
-                Cell::from(terminal.directory.as_str()),
-                Cell::from(terminal.branch.as_str()),
-                Cell::from(if show_full_ids {
-                    terminal.id.clone()
-                } else {
-                    short_id(&terminal.id)
-                }),
-            ])
+        .flat_map(|workspace| {
+            workspace.items.iter().map(|item| match item {
+                WorkspaceItemView::Shell(terminal) => Row::new(vec![
+                    Cell::from(terminal.name.as_str()),
+                    Cell::from(Span::styled(
+                        terminal.status.as_str(),
+                        Style::new().fg(status_color(&terminal.status)),
+                    )),
+                    Cell::from(terminal.directory.as_str()),
+                    Cell::from(terminal.branch.as_str()),
+                    Cell::from(if show_full_ids {
+                        terminal.id.clone()
+                    } else {
+                        short_id(&terminal.id)
+                    }),
+                ]),
+                WorkspaceItemView::Launcher(launcher) => Row::new(vec![
+                    Cell::from(launcher.name.as_str()),
+                    Cell::from(Span::styled("launcher", Style::new().fg(YELLOW))),
+                    Cell::from(launcher.directory.as_str()),
+                    Cell::from(launcher.command.as_str()),
+                    Cell::from(if show_full_ids {
+                        launcher.id.clone()
+                    } else {
+                        short_id(&launcher.id)
+                    }),
+                ]),
+            })
         })
         .collect();
     let widths = shell_column_widths(inner.width, show_full_ids);
@@ -1082,12 +1046,16 @@ fn render_terminals(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut Ap
     } else {
         let [detail_area, table_area] =
             Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(inner);
-        let detail = app.selected_terminal().map_or_else(
-            || Line::from(Span::styled(" No shell selected", Style::new().fg(SUBTEXT))),
-            |terminal| {
+        let detail = app.selected_item().map_or_else(
+            || Line::from(Span::styled(" No item selected", Style::new().fg(SUBTEXT))),
+            |item| {
+                let id = match item {
+                    WorkspaceItemView::Shell(shell) => shell.id.as_str(),
+                    WorkspaceItemView::Launcher(launcher) => launcher.id.as_str(),
+                };
                 Line::from(vec![
                     Span::styled(" ID ", Style::new().fg(SUBTEXT)),
-                    Span::styled(terminal.id.as_str(), Style::new().fg(TEXT)),
+                    Span::styled(id, Style::new().fg(TEXT)),
                 ])
             },
         );
@@ -1103,65 +1071,7 @@ fn render_terminals(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut Ap
                 .add_modifier(Modifier::BOLD | Modifier::REVERSED),
         )
         .highlight_symbol("> ");
-    frame.render_stateful_widget(table, table_area, &mut app.terminal_state);
-}
-
-fn render_launchers(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
-    let selected = app
-        .workspace_state
-        .selected()
-        .and_then(|index| app.workspaces.get(index));
-    let title = selected.map_or_else(
-        || " Launchers ".to_owned(),
-        |workspace| {
-            format!(
-                " Launchers: {} ({}) ",
-                workspace.name,
-                workspace.launchers.len()
-            )
-        },
-    );
-    let rows = selected
-        .into_iter()
-        .flat_map(|workspace| {
-            workspace.launchers.iter().map(|launcher| {
-                Row::new([
-                    Cell::from(launcher.name.clone()),
-                    Cell::from(launcher.directory.clone()),
-                    Cell::from(launcher.command.clone()),
-                    Cell::from(short_id(&launcher.id)),
-                ])
-            })
-        })
-        .collect::<Vec<_>>();
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(14),
-            Constraint::Percentage(35),
-            Constraint::Min(18),
-            Constraint::Length(11),
-        ],
-    )
-    .header(
-        Row::new(["NAME", "DIRECTORY", "COMMAND", "LAUNCHER ID"])
-            .style(Style::new().fg(YELLOW).add_modifier(Modifier::BOLD)),
-    )
-    .column_spacing(1)
-    .row_highlight_style(
-        Style::new()
-            .fg(TEXT)
-            .add_modifier(Modifier::BOLD | Modifier::REVERSED),
-    )
-    .highlight_symbol("> ")
-    .block(Block::bordered().title(title).border_style(Style::new().fg(
-        if app.focus == Focus::Launchers {
-            TEAL
-        } else {
-            OVERLAY
-        },
-    )));
-    frame.render_stateful_widget(table, area, &mut app.launcher_state);
+    frame.render_stateful_widget(table, table_area, &mut app.item_state);
 }
 
 fn shell_column_widths(width: u16, show_full_ids: bool) -> Vec<Constraint> {
@@ -1201,6 +1111,9 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
                     pending.name
                 )
             }
+            CloseTarget::Launcher(_) => {
+                format!(" Remove launcher '{}'?  ", pending.name)
+            }
         };
         Line::from(vec![
             Span::styled(prompt, Style::new().fg(YELLOW).add_modifier(Modifier::BOLD)),
@@ -1226,19 +1139,8 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
             format!(" {}", message.text),
             Style::new().fg(if message.error { RED } else { GREEN }),
         ))
-    } else if app.focus == Focus::Launchers {
-        Line::from(vec![
-            Span::styled(" j/k", Style::new().fg(TEAL)),
-            Span::styled(
-                " navigate launchers  tab/h/l/arrows focus  ",
-                Style::new().fg(SUBTEXT),
-            ),
-            Span::styled("r", Style::new().fg(BLUE)),
-            Span::styled(" refresh  ", Style::new().fg(SUBTEXT)),
-            Span::styled("q", Style::new().fg(RED)),
-            Span::styled(" quit", Style::new().fg(SUBTEXT)),
-        ])
     } else {
+        let launcher_selected = matches!(app.selected_item(), Some(WorkspaceItemView::Launcher(_)));
         let mut spans = vec![
             Span::styled(" j/k", Style::new().fg(TEAL)),
             Span::styled(
@@ -1260,6 +1162,8 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
             Span::styled(
                 if app.focus == Focus::Workspaces {
                     " rename workspace  "
+                } else if launcher_selected {
+                    " rename launcher  "
                 } else {
                     " rename shell  "
                 },
@@ -1271,6 +1175,8 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
             Span::styled(
                 if app.focus == Focus::Workspaces {
                     " restore workspace  "
+                } else if launcher_selected {
+                    " launch command  "
                 } else {
                     " open shell  "
                 },
@@ -1282,6 +1188,8 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
             Span::styled(
                 if app.focus == Focus::Workspaces {
                     " close workspace  "
+                } else if launcher_selected {
+                    " remove launcher  "
                 } else {
                     " close shell  "
                 },
@@ -1339,14 +1247,13 @@ mod tests {
         WorkspaceView {
             id: id.into(),
             name: name.into(),
-            terminals: vec![TerminalView {
+            items: vec![WorkspaceItemView::Shell(TerminalView {
                 id: "term_1".into(),
                 name: "agent".into(),
                 status: "running".into(),
                 directory: "/tmp/boomux".into(),
                 branch: "main".into(),
-            }],
-            launchers: Vec::new(),
+            })],
         }
     }
 
@@ -1392,15 +1299,14 @@ mod tests {
         let mut app = app();
 
         app.toggle_focus();
-        assert_eq!(app.focus, Focus::Terminals);
+        assert_eq!(app.focus, Focus::Items);
         app.next();
 
-        assert_eq!(app.terminal_state.selected(), Some(0));
-        assert_eq!(
-            app.selected_terminal()
-                .map(|terminal| terminal.name.as_str()),
-            Some("agent")
-        );
+        assert_eq!(app.item_state.selected(), Some(0));
+        assert!(matches!(
+            app.selected_item(),
+            Some(WorkspaceItemView::Shell(shell)) if shell.name == "agent"
+        ));
     }
 
     #[test]
@@ -1408,11 +1314,11 @@ mod tests {
         let mut app = app();
 
         assert!(app.handle_focus_key(KeyCode::Char('l')));
-        assert_eq!(app.focus, Focus::Terminals);
+        assert_eq!(app.focus, Focus::Items);
         assert!(app.handle_focus_key(KeyCode::Left));
         assert_eq!(app.focus, Focus::Workspaces);
         assert!(app.handle_focus_key(KeyCode::Right));
-        assert_eq!(app.focus, Focus::Terminals);
+        assert_eq!(app.focus, Focus::Items);
         assert!(app.handle_focus_key(KeyCode::Char('h')));
         assert_eq!(app.focus, Focus::Workspaces);
         assert!(!app.handle_focus_key(KeyCode::Char('x')));
@@ -1421,22 +1327,66 @@ mod tests {
     #[test]
     fn refresh_keeps_terminal_focus_for_an_empty_workspace() {
         let mut empty = workspace("w1", "empty");
-        empty.terminals.clear();
+        empty.items.clear();
         let mut app = App::new(vec![empty], project_context());
         app.toggle_focus();
 
         let mut refreshed = workspace("w1", "empty");
-        refreshed.terminals.clear();
+        refreshed.items.clear();
         app.replace_workspaces(vec![refreshed]);
 
-        assert_eq!(app.focus, Focus::Terminals);
-        assert!(app.terminal_state.selected().is_none());
+        assert_eq!(app.focus, Focus::Items);
+        assert!(app.item_state.selected().is_none());
+    }
+
+    #[test]
+    fn refresh_preserves_and_repairs_unified_item_selection() {
+        let launcher = || LauncherView {
+            id: "launcher-1".into(),
+            name: "editor".into(),
+            directory: "/tmp/boomux".into(),
+            command: "zeditor .".into(),
+        };
+        let mut initial = workspace("w1", "boomux");
+        initial.items.push(WorkspaceItemView::Launcher(launcher()));
+        let mut app = App::new(vec![initial], project_context());
+        app.toggle_focus();
+        app.next();
+        assert!(matches!(
+            app.selected_item(),
+            Some(WorkspaceItemView::Launcher(current)) if current.id == "launcher-1"
+        ));
+
+        let mut refreshed = workspace("w1", "boomux");
+        refreshed.items.push(WorkspaceItemView::Shell(TerminalView {
+            id: "term_2".into(),
+            name: "tests".into(),
+            status: "pending".into(),
+            directory: "/tmp/boomux".into(),
+            branch: "main".into(),
+        }));
+        refreshed
+            .items
+            .push(WorkspaceItemView::Launcher(launcher()));
+        app.replace_workspaces(vec![refreshed]);
+        assert_eq!(app.item_state.selected(), Some(2));
+        assert!(matches!(
+            app.selected_item(),
+            Some(WorkspaceItemView::Launcher(current)) if current.id == "launcher-1"
+        ));
+
+        app.replace_workspaces(vec![workspace("w1", "boomux")]);
+        assert_eq!(app.item_state.selected(), Some(0));
+        assert!(matches!(
+            app.selected_item(),
+            Some(WorkspaceItemView::Shell(_))
+        ));
     }
 
     #[test]
     fn empty_terminal_focus_can_create_the_first_shell() {
         let mut empty = workspace("w1", "empty");
-        empty.terminals.clear();
+        empty.items.clear();
         let mut app = App::new(vec![empty], project_context());
         app.toggle_focus();
         let mut selected_workspace = None;
@@ -1593,12 +1543,75 @@ mod tests {
         let mut opened = None;
         app.toggle_focus();
 
-        app.open_selected_terminal(&mut |terminal_id| {
-            opened = Some(terminal_id.to_owned());
+        app.open_selected_item(&mut |target| {
+            opened = Some(target.clone());
             Ok("Opened shell".into())
         });
 
-        assert_eq!(opened.as_deref(), Some("term_1"));
+        assert_eq!(opened, Some(OpenTarget::Shell("term_1".into())));
+    }
+
+    #[test]
+    fn enter_on_launcher_invokes_only_the_selected_launcher() {
+        let mut app = app();
+        app.workspaces[0]
+            .items
+            .push(WorkspaceItemView::Launcher(LauncherView {
+                id: "launcher-1".into(),
+                name: "editor".into(),
+                directory: "/tmp/boomux".into(),
+                command: "zeditor .".into(),
+            }));
+        app.toggle_focus();
+        app.next();
+        let mut opened = None;
+
+        app.open_selected_item(&mut |target| {
+            opened = Some(target.clone());
+            Ok("Launched editor".into())
+        });
+
+        assert_eq!(
+            opened,
+            Some(OpenTarget::Launcher {
+                workspace_id: "w1".into(),
+                launcher_id: "launcher-1".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn launcher_row_dispatches_rename_and_remove_targets() {
+        let launcher = LauncherView {
+            id: "launcher-1".into(),
+            name: "editor".into(),
+            directory: "/tmp/boomux".into(),
+            command: "zeditor .".into(),
+        };
+        let mut app = app();
+        app.workspaces[0]
+            .items
+            .push(WorkspaceItemView::Launcher(launcher));
+        app.toggle_focus();
+        app.next();
+
+        app.request_rename();
+        assert!(matches!(
+            app.mode,
+            Mode::Rename {
+                target: RenameTarget::Launcher(ref id),
+                ..
+            } if id == "launcher-1"
+        ));
+        app.mode = Mode::Normal;
+        app.request_close();
+        assert!(matches!(
+            app.pending_close,
+            Some(PendingClose {
+                target: CloseTarget::Launcher(ref id),
+                ..
+            }) if id == "launcher-1"
+        ));
     }
 
     #[test]
@@ -1785,9 +1798,9 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect();
-        assert!(text.contains("BRANCH"));
+        assert!(text.contains("DETAIL"));
         assert!(text.contains("DIRECTORY"));
-        assert!(text.contains("SHELL ID"));
+        assert!(text.contains("ID"));
         assert!(text.contains("ID term_1"));
         assert!(text.contains("SHELLS"));
         assert!(text.contains("Shells: boomux (1)"));
@@ -1800,12 +1813,14 @@ mod tests {
         let backend = TestBackend::new(120, 34);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = app();
-        app.workspaces[0].launchers.push(LauncherView {
-            id: "launcher-12345678".into(),
-            name: "editor".into(),
-            directory: "/tmp/boomux".into(),
-            command: "zeditor .".into(),
-        });
+        app.workspaces[0]
+            .items
+            .push(WorkspaceItemView::Launcher(LauncherView {
+                id: "launcher-12345678".into(),
+                name: "editor".into(),
+                directory: "/tmp/boomux".into(),
+                command: "zeditor .".into(),
+            }));
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let text: String = terminal
@@ -1815,8 +1830,9 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect();
-        assert!(text.contains("Launchers: boomux (1)"));
-        assert!(text.contains("LAUNCHER ID"));
+        assert!(text.contains("Shells: boomux (2)"));
+        assert!(!text.contains("Launchers: boomux"));
+        assert!(text.contains("DETAIL"));
         assert!(text.contains("editor"));
         assert!(text.contains("zeditor ."));
         assert!(text.contains("launcher"));
@@ -1827,17 +1843,16 @@ mod tests {
         let backend = TestBackend::new(120, 34);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = app();
-        app.workspaces[0].launchers = (0..20)
-            .map(|index| LauncherView {
+        app.workspaces[0].items.extend((0..20).map(|index| {
+            WorkspaceItemView::Launcher(LauncherView {
                 id: format!("launcher-{index:08}"),
                 name: format!("launcher-{index}"),
                 directory: "/tmp/boomux".into(),
                 command: format!("command-{index}"),
             })
-            .collect();
+        }));
         app.toggle_focus();
-        app.toggle_focus();
-        assert_eq!(app.focus, Focus::Launchers);
+        assert_eq!(app.focus, Focus::Items);
         for _ in 0..20 {
             app.next();
         }
@@ -1850,26 +1865,29 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect();
-        assert_eq!(app.launcher_state.selected(), Some(19));
+        assert_eq!(app.item_state.selected(), Some(20));
         assert!(text.contains("command-19"));
     }
 
     #[test]
     fn launcher_only_workspace_focuses_its_detail_pane() {
         let mut app = app();
-        app.workspaces[0].terminals.clear();
-        app.workspaces[0].launchers.push(LauncherView {
-            id: "launcher".into(),
-            name: "editor".into(),
-            directory: "/tmp/boomux".into(),
-            command: "zeditor .".into(),
-        });
+        app.workspaces[0].items.clear();
+        app.workspaces[0]
+            .items
+            .push(WorkspaceItemView::Launcher(LauncherView {
+                id: "launcher".into(),
+                name: "editor".into(),
+                directory: "/tmp/boomux".into(),
+                command: "zeditor .".into(),
+            }));
 
         app.toggle_focus();
-        assert_eq!(app.focus, Focus::Terminals);
-        app.toggle_focus();
-
-        assert_eq!(app.focus, Focus::Launchers);
+        assert_eq!(app.focus, Focus::Items);
+        assert!(matches!(
+            app.selected_item(),
+            Some(WorkspaceItemView::Launcher(launcher)) if launcher.name == "editor"
+        ));
     }
 
     #[test]
@@ -1910,8 +1928,8 @@ mod tests {
         assert!(text.contains("Workspaces (1)"));
         assert!(text.contains("Shells: boomux (1)"));
         assert!(text.contains("DIRECTORY"));
-        assert!(text.contains("BRANCH"));
-        assert!(text.contains("SHELL ID"));
+        assert!(text.contains("DETAIL"));
+        assert!(text.contains("ID"));
         assert!(text.contains("main"));
         assert!(!text.contains("DIRTY"));
         assert!(!text.contains("WORKTREE"));
@@ -1934,8 +1952,8 @@ mod tests {
         assert!(text.contains("NAME"));
         assert!(text.contains("STATUS"));
         assert!(text.contains("DIRECTORY"));
-        assert!(text.contains("BRANCH"));
-        assert!(text.contains("SHELL ID"));
+        assert!(text.contains("DETAIL"));
+        assert!(text.contains("ID"));
         assert!(text.contains("ID term_1"));
     }
 

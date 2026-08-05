@@ -71,17 +71,20 @@ Dashboard controls:
 
 - `Tab` switches between workspace and shell tables.
 - `j`, `k`, and the arrow keys navigate.
-- `Enter` restores a workspace or opens the selected shell.
+- `Enter` restores a workspace, opens the selected shell, or invokes the
+  selected launcher.
 - `a` creates an empty workspace or adds a shell, depending on the focused
   table. New dashboard shells start in the directory where the dashboard was
   launched.
-- `e` renames the selected workspace or shell, depending on focus.
-- `x`, then `y`, closes the selected workspace or shell, depending on focus.
+- `e` renames the selected workspace, shell, or launcher.
+- `x`, then `y`, closes the selected workspace or shell, or removes the selected
+  launcher.
 - `r` refreshes immediately.
 - `q` or `Esc` quits.
 
-The selected workspace detail area shows its shells and configured launchers as
-separate tables; launchers display their command and working directory.
+The selected workspace's shell table also includes configured launchers. A
+launcher row shows its command and working directory; pressing `Enter` invokes
+only that launcher.
 
 Closing a terminal window only disconnects its attachment. The Boomux daemon
 retains the PTY and child process until the shell exits, the workspace is
