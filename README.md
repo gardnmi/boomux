@@ -125,6 +125,7 @@ boomux agent list [--workspace <name-or-id>]
 boomux agent inspect <agent-id>
 boomux agent register <name> --integration <integration> [--external-session-id <id>] [--shell-id <shell-id>] [--run-id <run-id>] --state <state> --authority <authority> --evidence <evidence> --confidence <0-100>
 boomux agent ensure <name> --integration <integration> --external-session-id <id> [--shell-id <shell-id>] [--run-id <run-id>] --state <state> --authority <authority> --evidence <evidence> --confidence <0-100>
+boomux agent supervise <name> --integration <integration> --external-session-id <canonical-root-id> [--shell-id <shell-id>] [--run-id <run-id>] -- <command>...
 boomux agent report <agent-id> [--shell-id <shell-id>] [--run-id <run-id>] --state <state> --authority <authority> --evidence <evidence> --confidence <0-100>
 boomux daemon status
 boomux daemon restart
@@ -180,8 +181,32 @@ its revision. `daemon-lifecycle` exists in snapshots but is reserved for daemon
 observations and cannot be supplied to public mutation commands. A `done` report
 completes the instance permanently. Retrying the exact completion is an
 idempotent success; a different later report is rejected. Completed instances
-remain inspectable across daemon restart. Boomux does not yet provide process
-adapters, terminal heuristics, agent waits, agent reads, or agent control.
+remain inspectable across daemon restart. Boomux does not yet provide terminal
+heuristics, agent waits, agent reads, or agent control.
+
+The first explicit process-adapter supervisor runs one exact argument vector:
+
+```console
+boomux agent supervise Agent --integration example --external-session-id <canonical-root-id> -- agent-bin --flag
+```
+
+`--shell-id` and `--run-id` have the same managed-environment defaults as the
+other agent mutations. The command is executed directly, without shell parsing,
+and inherits stdin, stdout, and stderr. The supervisor propagates a normal child
+exit code and maps signal termination to `128 + signal`. It ensures the exact
+integration, external session ID, shell ID, and run ID key, then reports process
+start and exit evidence at state `unknown`, authority `process-adapter`, and
+confidence 100. Exit evidence includes the child PID and exit code or signal.
+Process existence provides no basis for `done`, `working`, `blocked`, or `idle`,
+so the supervisor never infers those states.
+
+Reporting is fail-open: ensure or report failures emit a warning but do not stop
+the child or replace its exit status. A spawn or wait failure is still a
+supervisor command failure. Lifecycle-integration observations outrank these
+process-adapter observations and therefore remain unchanged. Identity matching
+uses the complete exact key: a supervisor using the lifecycle integration's
+same key contributes to that instance, while a different integration, external
+session ID, shell ID, or run ID coexists as a distinct instance.
 
 `boomux read` reads plain rendered text from the daemon's shadow VT state. It
 understands cursor rewrites and terminal soft wrapping, retains up to 2,000
@@ -262,9 +287,10 @@ boomux skill install
 It is written to `~/.agents/skills/boomux/SKILL.md` and teaches compatible
 agents to discover, inspect, read, create, open, rename, and close Boomux
 workspaces and shells, and to inspect and explicitly report run-scoped agent
-lifecycle, through the full public CLI. Re-run with `--force` to replace an
-older customized installation. An untouched legacy `boomux-shells` skill is
-removed automatically; customized legacy content is preserved with a warning.
+lifecycle or supervise a process with caller-supplied exact identity, through
+the full public CLI. Re-run with `--force` to replace an older customized
+installation. An untouched legacy `boomux-shells` skill is removed
+automatically; customized legacy content is preserved with a warning.
 
 ## OpenCode Integration
 
@@ -296,6 +322,15 @@ unavailable, or when OpenCode session ancestry cannot be resolved, OpenCode
 continues and reporting errors are rate-limited. A `run_changed` response
 permanently disables reports for that tracked root so events cannot leak into
 another process run.
+
+Do not use automatic OpenCode process discovery to supply `agent supervise`.
+OpenCode process identity, argv, database state, and API access do not identify
+which canonical root session the user selected. Fresh sessions, continue, fork,
+and in-process session switching are unsupported by this supervisor unless the
+caller already has the selected canonical root ID and passes it explicitly as
+`--external-session-id`. This is not a reason to wrap ordinary OpenCode launches
+when the lifecycle plugin is available: the plugin resolves canonical ancestry
+and provides stronger, meaningful lifecycle observations.
 
 ## Architecture
 

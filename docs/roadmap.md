@@ -95,15 +95,22 @@ eternal process.
    explicit state authority, evidence, and confidence.
 2. [Complete] Establish authority precedence and explicit OpenCode lifecycle
    integration for `working`, `blocked`, `idle`, and explicit completion.
-3. Add process adapters beneath lifecycle-integration authority.
-4. Add conservative terminal-screen heuristics beneath process-adapter
+3. [Complete] Add an explicit-session process supervisor that preserves exact
+   argv and inherited stdio, propagates child exit, reports only `unknown`
+   process start/exit evidence, and fails open when Boomux reporting fails.
+4. [In progress] Add remaining automatic or integration-specific process
+   adapters beneath lifecycle-integration authority. OpenCode discovery must not
+   infer a selected canonical root from process identity, argv, database state,
+   or API access; fresh, continue, fork, and session switching require a caller
+   that already knows the canonical root ID.
+5. Add conservative terminal-screen heuristics beneath process-adapter
    authority, without inferring completion from quiet output or shell exit.
-5. Aggregate agent states as workspace counts and provide an explainable,
+6. Aggregate agent states as workspace counts and provide an explainable,
    persistent attention queue for blocked and completed work.
-6. Add notifications and revision-aware `agent wait` and `agent read` commands.
-7. Add guarded prompts and common responses only after defining run-scoped
+7. Add notifications and revision-aware `agent wait` and `agent read` commands.
+8. Add guarded prompts and common responses only after defining run-scoped
    leases, user-controller precedence, idempotency, and audit events.
-8. Run hooks, tests, notifications, or focus actions from durable transitions.
+9. Run hooks, tests, notifications, or focus actions from durable transitions.
 
 ## Distribution And Polish
 

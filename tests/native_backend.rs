@@ -1435,6 +1435,166 @@ fn agent_runtime_is_revisioned_durable_and_version_compatible() {
 }
 
 #[test]
+fn explicit_process_supervisor_preserves_child_io_exit_and_agent_authority() {
+    let daemon = TestDaemon::start();
+    let workspace = daemon
+        .client
+        .create_workspace(
+            "process-supervisor",
+            vec![ShellSpec {
+                name: "supervised".into(),
+                command: vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
+                cwd: std::env::temp_dir(),
+            }],
+        )
+        .unwrap();
+    let shell_id = workspace.shells[0].id.clone();
+    let _attachment = daemon.client.attach(&shell_id, false, profile()).unwrap();
+    let run_id = daemon
+        .client
+        .get_shell(&shell_id)
+        .unwrap()
+        .run
+        .expect("started supervisor shell has no run identity")
+        .id;
+    let external_session_id = "native-process-supervisor-session";
+    let baseline = daemon.client.events(None, 256, 0).unwrap().cursor;
+
+    let output = daemon
+        .command()
+        .args([
+            "agent",
+            "supervise",
+            "native-supervisor",
+            "--integration",
+            "native-test",
+            "--external-session-id",
+            external_session_id,
+            "--shell-id",
+            &shell_id,
+            "--run-id",
+            &run_id,
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf 'supervisor stdout\\n'; printf 'supervisor stderr\\n' >&2; exit 23",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(23));
+    assert_eq!(output.stdout, b"supervisor stdout\n");
+    assert_eq!(output.stderr, b"supervisor stderr\n");
+
+    let agents = daemon.client.get_workspace(&workspace.id).unwrap().agents;
+    assert_eq!(agents.len(), 1);
+    let supervised = &agents[0];
+    assert_eq!(supervised.shell_id, shell_id);
+    assert_eq!(supervised.run_id, run_id);
+    assert_eq!(
+        supervised.external_session_id.as_deref(),
+        Some(external_session_id)
+    );
+    assert_eq!(supervised.observation.revision, 2);
+    assert_eq!(supervised.observation.state, AgentState::Unknown);
+    assert_eq!(
+        supervised.observation.authority,
+        AgentAuthority::ProcessAdapter
+    );
+    assert!(
+        supervised
+            .observation
+            .evidence
+            .contains("exited with code 23")
+    );
+    assert_eq!(supervised.ended_at_ms, None);
+    let agent_id = supervised.id.clone();
+    let supervisor_events = daemon.client.events(Some(baseline), 256, 0).unwrap();
+    assert!(supervisor_events.events.iter().any(|event| matches!(
+        &event.kind,
+        protocol::DaemonEventKind::AgentRegistered { agent, .. } if agent.id == agent_id
+    )));
+    assert!(supervisor_events.events.iter().any(|event| matches!(
+        &event.kind,
+        protocol::DaemonEventKind::AgentStateChanged { agent, .. } if agent.id == agent_id
+    )));
+    assert!(!supervisor_events.events.iter().any(|event| matches!(
+        &event.kind,
+        protocol::DaemonEventKind::AgentCompleted { agent, .. } if agent.id == agent_id
+    )));
+
+    let lifecycle_report = AgentReport {
+        state: AgentState::Working,
+        authority: AgentAuthority::LifecycleIntegration,
+        evidence: "lifecycle integration owns session".into(),
+        confidence: 100,
+    };
+    let ensured = daemon
+        .client
+        .ensure_agent(
+            &shell_id,
+            &run_id,
+            AgentRegistrationSpec {
+                name: "native-supervisor".into(),
+                integration: "native-test".into(),
+                external_session_id: Some(external_session_id.into()),
+                report: lifecycle_report.clone(),
+            },
+        )
+        .unwrap();
+    assert_eq!(ensured.id, agent_id);
+    assert_eq!(ensured.observation.revision, 2);
+    let lifecycle = daemon
+        .client
+        .report_agent(&agent_id, &run_id, lifecycle_report)
+        .unwrap();
+    assert_eq!(lifecycle.id, agent_id);
+    assert_eq!(lifecycle.observation.revision, 3);
+    assert_eq!(lifecycle.observation.state, AgentState::Working);
+    assert_eq!(
+        lifecycle.observation.authority,
+        AgentAuthority::LifecycleIntegration
+    );
+
+    let lower_authority_cursor = daemon.client.events(None, 256, 0).unwrap().cursor;
+    let repeated = daemon
+        .command()
+        .args([
+            "agent",
+            "supervise",
+            "native-supervisor",
+            "--integration",
+            "native-test",
+            "--external-session-id",
+            external_session_id,
+            "--shell-id",
+            &shell_id,
+            "--run-id",
+            &run_id,
+            "--",
+            "/bin/sh",
+            "-c",
+            "exit 0",
+        ])
+        .output()
+        .unwrap();
+    assert!(repeated.status.success());
+    assert!(repeated.stdout.is_empty());
+    assert!(repeated.stderr.is_empty());
+    assert_eq!(daemon.client.get_agent(&agent_id).unwrap(), lifecycle);
+    let repeated_events = daemon
+        .client
+        .events(Some(lower_authority_cursor), 256, 0)
+        .unwrap();
+    assert!(!repeated_events.events.iter().any(|event| matches!(
+        &event.kind,
+        protocol::DaemonEventKind::AgentRegistered { agent, .. }
+            | protocol::DaemonEventKind::AgentStateChanged { agent, .. }
+            | protocol::DaemonEventKind::AgentCompleted { agent, .. }
+            if agent.id == agent_id
+    )));
+}
+
+#[test]
 fn native_daemon_handoffs_multiple_detached_shells() {
     let mut daemon = TestDaemon::start();
     let workspace = daemon
@@ -1768,6 +1928,7 @@ fn native_daemon_lifecycle() {
         "idempotent_agent_ensure",
         "agent_authority_precedence",
         "opencode_lifecycle_plugin",
+        "process_adapters",
     ] {
         assert!(features.iter().any(|current| current == feature));
     }

@@ -22,6 +22,7 @@ use boomux::{attach, client, daemon, protocol};
 mod cli_output;
 mod config;
 mod git;
+mod process_adapter;
 mod projects;
 mod terminal;
 mod tui;
@@ -61,6 +62,7 @@ const INTEGRATION_FEATURES: &[&str] = &[
     "idempotent_agent_ensure",
     "agent_authority_precedence",
     "opencode_lifecycle_plugin",
+    "process_adapters",
 ];
 const LEGACY_BOOMUX_SHELLS_SKILL: &str = r#"---
 name: boomux-shells
@@ -330,6 +332,8 @@ enum AgentCommands {
     Register(AgentRegistrationArgs),
     /// Ensure an idempotent agent instance for a shell run
     Ensure(AgentRegistrationArgs),
+    /// Supervise one exact external agent process
+    Supervise(AgentSuperviseArgs),
     /// Report state for an agent instance by exact ID
     Report {
         agent_id: String,
@@ -346,6 +350,21 @@ enum AgentCommands {
         #[arg(long, value_parser = clap::value_parser!(u8).range(0..=100))]
         confidence: u8,
     },
+}
+
+#[derive(Args)]
+struct AgentSuperviseArgs {
+    name: String,
+    #[arg(long)]
+    integration: String,
+    #[arg(long)]
+    external_session_id: String,
+    #[arg(long)]
+    shell_id: Option<String>,
+    #[arg(long)]
+    run_id: Option<String>,
+    #[arg(last = true, num_args = 1.., required = true, value_name = "COMMAND")]
+    command: Vec<String>,
 }
 
 #[derive(Args)]
@@ -444,6 +463,26 @@ enum DaemonCommands {
     Stop,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CliExit {
+    Success,
+    Child(process_adapter::ProcessExit),
+}
+
+impl CliExit {
+    fn code(self) -> ExitCode {
+        match self {
+            Self::Success | Self::Child(process_adapter::ProcessExit::Code(0)) => ExitCode::SUCCESS,
+            Self::Child(process_adapter::ProcessExit::Code(code)) => {
+                ExitCode::from(u8::try_from(code).unwrap_or(1))
+            }
+            Self::Child(process_adapter::ProcessExit::Signal(signal)) => {
+                ExitCode::from(u8::try_from(128_i32.saturating_add(signal)).unwrap_or(1))
+            }
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let json_requested = env::args_os().any(|argument| argument == "--json");
     let cli = match Cli::try_parse() {
@@ -474,7 +513,7 @@ fn main() -> ExitCode {
     let json = cli.json;
     let command = command_name(&cli);
     match run(cli) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(outcome) => outcome.code(),
         Err(error) => {
             if json {
                 cli_output::print_error(command, error.as_ref());
@@ -486,7 +525,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
+fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
     if cli.json && !supports_json(&cli) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -497,12 +536,19 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
     match cli.command.as_ref() {
         Some(Commands::Daemon {
             command: DaemonCommands::Run,
-        }) => return Ok(daemon::run()?),
+        }) => {
+            daemon::run()?;
+            return Ok(CliExit::Success);
+        }
         Some(Commands::Daemon {
             command: DaemonCommands::ReceiveHandoff { channel },
-        }) => return Ok(daemon::receive_handoff(*channel)?),
+        }) => {
+            daemon::receive_handoff(*channel)?;
+            return Ok(CliExit::Success);
+        }
         Some(Commands::Attach { shell_id, takeover }) => {
-            return Ok(attach::run(shell_id, *takeover)?);
+            attach::run(shell_id, *takeover)?;
+            return Ok(CliExit::Success);
         }
         _ => {}
     }
@@ -516,16 +562,17 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             .then(|| effective_terminal(cli.terminal.as_deref()))
             .transpose()?
             .flatten();
-        return open_directory(
+        open_directory(
             &path,
             cli.name.as_deref(),
             &cli.startup_command,
             new_window,
             terminal.as_deref(),
-        );
+        )?;
+        return Ok(CliExit::Success);
     }
 
-    match cli.command {
+    let result = match cli.command {
         Some(Commands::Ui) => dashboard(cli.terminal.as_deref()),
         Some(Commands::Doctor) => doctor(cli.terminal.as_deref()),
         Some(Commands::Capabilities) => capabilities(cli.json),
@@ -556,6 +603,9 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         }
         Some(Commands::Shell { command }) => shell_command(command, cli.json),
         Some(Commands::Launcher { command }) => launcher_command(command, cli.json),
+        Some(Commands::Agent {
+            command: AgentCommands::Supervise(arguments),
+        }) => return supervise_agent(arguments).map(CliExit::Child),
         Some(Commands::Agent { command }) => agent_command(command, cli.json),
         Some(Commands::Skill {
             command: SkillCommands::Install { force },
@@ -575,7 +625,9 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         Some(Commands::Daemon { command }) => daemon_control(command, cli.json),
         Some(Commands::Attach { .. }) => unreachable!(),
         None => dashboard(cli.terminal.as_deref()),
-    }
+    };
+    result?;
+    Ok(CliExit::Success)
 }
 
 fn command_name(cli: &Cli) -> &'static str {
@@ -612,6 +664,9 @@ fn command_name(cli: &Cli) -> &'static str {
         Some(Commands::Agent {
             command: AgentCommands::Ensure(..),
         }) => "agent.ensure",
+        Some(Commands::Agent {
+            command: AgentCommands::Supervise(..),
+        }) => "agent.supervise",
         Some(Commands::Agent {
             command: AgentCommands::Report { .. },
         }) => "agent.report",
@@ -1535,6 +1590,7 @@ fn agent_command(command: AgentCommands, json: bool) -> Result<(), Box<dyn Error
         AgentCommands::Ensure(arguments) => {
             register_or_ensure_agent(&client, arguments, json, true)?;
         }
+        AgentCommands::Supervise(_) => unreachable!(),
         AgentCommands::Report {
             agent_id,
             shell_id,
@@ -1590,6 +1646,27 @@ fn agent_command(command: AgentCommands, json: bool) -> Result<(), Box<dyn Error
         }
     }
     Ok(())
+}
+
+fn supervise_agent(
+    arguments: AgentSuperviseArgs,
+) -> Result<process_adapter::ProcessExit, Box<dyn Error>> {
+    let (shell_id, run_id) = resolve_agent_context(
+        arguments.shell_id,
+        arguments.run_id,
+        env::var("BOOMUX_SHELL_ID").ok(),
+        env::var("BOOMUX_RUN_ID").ok(),
+    )?;
+    Ok(process_adapter::supervise(
+        process_adapter::SuperviseSpec {
+            name: arguments.name,
+            integration: arguments.integration,
+            external_session_id: arguments.external_session_id,
+            shell_id,
+            run_id,
+            command: arguments.command,
+        },
+    )?)
 }
 
 fn register_or_ensure_agent(
@@ -2854,6 +2931,59 @@ mod tests {
                 "101",
             ])
             .is_err()
+        );
+
+        let supervise = Cli::try_parse_from([
+            "boomux",
+            "agent",
+            "supervise",
+            "OpenCode",
+            "--integration",
+            "opencode",
+            "--external-session-id",
+            "session-1",
+            "--shell-id",
+            "s1",
+            "--run-id",
+            "r1",
+            "--",
+            "agent-bin",
+            "literal; argument",
+        ])
+        .unwrap();
+        assert_eq!(command_name(&supervise), "agent.supervise");
+        assert!(!supports_json(&supervise));
+        assert!(matches!(
+            supervise.command,
+            Some(Commands::Agent {
+                command: AgentCommands::Supervise(AgentSuperviseArgs { command, .. })
+            }) if command == ["agent-bin", "literal; argument"]
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "boomux",
+                "agent",
+                "supervise",
+                "agent",
+                "--integration",
+                "test",
+                "--external-session-id",
+                "session-1",
+            ])
+            .is_err()
+        );
+        assert!(INTEGRATION_FEATURES.contains(&"process_adapters"));
+    }
+
+    #[test]
+    fn child_exit_outcomes_map_to_unix_cli_codes() {
+        assert_eq!(
+            CliExit::Child(process_adapter::ProcessExit::Code(23)).code(),
+            ExitCode::from(23)
+        );
+        assert_eq!(
+            CliExit::Child(process_adapter::ProcessExit::Signal(9)).code(),
+            ExitCode::from(137)
         );
     }
 

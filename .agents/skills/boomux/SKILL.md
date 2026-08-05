@@ -1,10 +1,10 @@
 ---
 name: boomux
-description: Inspect and manage Boomux persistent terminal workspaces, launchers, shells, run-scoped agent instances, and integrations. Use when asked to discover shells or agents, read terminal output, report an agent lifecycle state, install the OpenCode integration, create or open workspaces and shells, inspect status, rename or close targets, or manage the Boomux daemon.
-compatibility: Requires boomux on PATH. Some name operations require Boomux workspace context or an explicit --workspace; agent mutation requires exact shell-run context.
+description: Inspect and manage Boomux persistent terminal workspaces, launchers, shells, run-scoped agent instances, process supervision, and integrations. Use when asked to discover shells or agents, read terminal output, supervise an explicitly identified external session, report agent lifecycle state, install the OpenCode integration, create or open workspaces and shells, inspect status, rename or close targets, or manage the Boomux daemon.
+compatibility: Requires boomux on PATH. Some name operations require Boomux workspace context or an explicit --workspace; agent mutation and supervision require exact shell-run context, and supervision requires a caller-supplied canonical external session ID.
 metadata:
   author: boomux
-  version: "5"
+  version: "6"
 ---
 
 # Boomux
@@ -118,8 +118,37 @@ while conflicting later reports are rejected.
 
 If `register`, `ensure`, or `report` returns `run_changed`, stop reporting for that
 instance and reacquire exact lifecycle context. Do not guess the replacement
-run. Boomux does not yet provide agent heuristics, adapters, wait/read commands,
+run. Boomux does not yet provide terminal heuristics, agent wait/read commands,
 notifications, or control.
+
+## Supervise An Explicit Process
+
+Use the process adapter only when the caller already knows the canonical root
+external session ID:
+
+```console
+boomux agent supervise "<name>" --integration "<integration>" --external-session-id "<canonical-root-id>" --shell-id "<shell-id>" --run-id "<run-id>" -- command arg
+```
+
+Inside the target managed process, `--shell-id` and `--run-id` default to
+`BOOMUX_SHELL_ID` and `BOOMUX_RUN_ID`. Arguments after `--` are an exact argv,
+not shell syntax. The child inherits stdin, stdout, and stderr, and the
+supervisor returns its exit code or `128 + signal`.
+
+The supervisor ensures the exact integration, external session ID, shell ID,
+and run ID key. It reports child start and exit only as `unknown` with
+`process-adapter` authority and PID plus exit-code/signal evidence. It never
+infers `done`, `working`, `blocked`, or `idle`. Reporting failures warn and fail
+open so the child continues and retains its exit result; spawn and wait failures
+still fail the command. Lifecycle-integration authority wins. A different value
+in any key field creates or reacquires a distinct coexisting agent instance.
+
+Never automatically wrap OpenCode based on process discovery. Its process,
+argv, database, and API do not identify the canonical root session selected by
+the user. Fresh, continue, fork, and in-process session switching are unsupported
+unless the caller already has that canonical root ID. When the OpenCode
+lifecycle plugin is available, use ordinary OpenCode without this wrapper: the
+plugin resolves ancestry and reports stronger lifecycle evidence.
 
 ## Read Shell Output
 
