@@ -26,7 +26,14 @@ pub(crate) struct WorkspaceView {
     pub(crate) id: String,
     pub(crate) name: String,
     pub(crate) terminals: Vec<TerminalView>,
-    pub(crate) launcher_count: usize,
+    pub(crate) launchers: Vec<LauncherView>,
+}
+
+pub(crate) struct LauncherView {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) directory: String,
+    pub(crate) command: String,
 }
 
 #[derive(Clone)]
@@ -66,6 +73,7 @@ struct App {
     workspaces: Vec<WorkspaceView>,
     workspace_state: TableState,
     terminal_state: TableState,
+    launcher_state: TableState,
     focus: Focus,
     mode: Mode,
     message: Option<Message>,
@@ -77,6 +85,7 @@ struct App {
 enum Focus {
     Workspaces,
     Terminals,
+    Launchers,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -239,16 +248,21 @@ impl App {
     fn new(workspaces: Vec<WorkspaceView>, project_context: ProjectContext) -> Self {
         let mut workspace_state = TableState::default();
         let mut terminal_state = TableState::default();
+        let mut launcher_state = TableState::default();
         if !workspaces.is_empty() {
             workspace_state.select(Some(0));
             if !workspaces[0].terminals.is_empty() {
                 terminal_state.select(Some(0));
+            }
+            if !workspaces[0].launchers.is_empty() {
+                launcher_state.select(Some(0));
             }
         }
         Self {
             workspaces,
             workspace_state,
             terminal_state,
+            launcher_state,
             focus: Focus::Workspaces,
             mode: Mode::Normal,
             message: None,
@@ -274,6 +288,14 @@ impl App {
         })
     }
 
+    fn selected_launcher(&self) -> Option<&LauncherView> {
+        self.selected().and_then(|workspace| {
+            self.launcher_state
+                .selected()
+                .and_then(|index| workspace.launchers.get(index))
+        })
+    }
+
     fn next(&mut self) {
         match self.focus {
             Focus::Workspaces => {
@@ -284,7 +306,7 @@ impl App {
                     .selected_index()
                     .map_or(0, |index| (index + 1) % self.workspaces.len());
                 self.workspace_state.select(Some(next));
-                self.select_first_terminal();
+                self.select_first_details();
             }
             Focus::Terminals => {
                 let terminal_count = self
@@ -298,6 +320,19 @@ impl App {
                     .selected()
                     .map_or(0, |index| (index + 1) % terminal_count);
                 self.terminal_state.select(Some(next));
+            }
+            Focus::Launchers => {
+                let launcher_count = self
+                    .selected()
+                    .map_or(0, |workspace| workspace.launchers.len());
+                if launcher_count == 0 {
+                    return;
+                }
+                let next = self
+                    .launcher_state
+                    .selected()
+                    .map_or(0, |index| (index + 1) % launcher_count);
+                self.launcher_state.select(Some(next));
             }
         }
         self.message = None;
@@ -317,7 +352,7 @@ impl App {
                     }
                 });
                 self.workspace_state.select(Some(previous));
-                self.select_first_terminal();
+                self.select_first_details();
             }
             Focus::Terminals => {
                 let terminal_count = self
@@ -335,6 +370,22 @@ impl App {
                 });
                 self.terminal_state.select(Some(previous));
             }
+            Focus::Launchers => {
+                let launcher_count = self
+                    .selected()
+                    .map_or(0, |workspace| workspace.launchers.len());
+                if launcher_count == 0 {
+                    return;
+                }
+                let previous = self.launcher_state.selected().map_or(0, |index| {
+                    if index == 0 {
+                        launcher_count - 1
+                    } else {
+                        index - 1
+                    }
+                });
+                self.launcher_state.select(Some(previous));
+            }
         }
         self.message = None;
     }
@@ -342,7 +393,15 @@ impl App {
     fn toggle_focus(&mut self) {
         self.focus = match self.focus {
             Focus::Workspaces => Focus::Terminals,
+            Focus::Terminals
+                if self
+                    .selected()
+                    .is_some_and(|workspace| !workspace.launchers.is_empty()) =>
+            {
+                Focus::Launchers
+            }
             Focus::Terminals => Focus::Workspaces,
+            Focus::Launchers => Focus::Workspaces,
         };
         self.message = None;
     }
@@ -362,10 +421,15 @@ impl App {
         true
     }
 
-    fn select_first_terminal(&mut self) {
+    fn select_first_details(&mut self) {
         self.terminal_state.select(
             self.selected()
                 .is_some_and(|workspace| !workspace.terminals.is_empty())
+                .then_some(0),
+        );
+        self.launcher_state.select(
+            self.selected()
+                .is_some_and(|workspace| !workspace.launchers.is_empty())
                 .then_some(0),
         );
     }
@@ -378,6 +442,7 @@ impl App {
             Focus::Terminals => self
                 .selected_terminal()
                 .map(|terminal| RenameTarget::Shell(terminal.id.clone())),
+            Focus::Launchers => None,
         };
         if let Some(target) = target {
             self.mode = Mode::Rename {
@@ -406,6 +471,7 @@ impl App {
                 self.message = Some(Message::from_result(on_create_shell(&workspace_id)));
                 true
             }
+            Focus::Launchers => false,
         }
     }
 
@@ -451,7 +517,7 @@ impl App {
                 target: CloseTarget::Workspace(workspace.id.clone()),
                 name: workspace.name.clone(),
                 shell_count: workspace.terminals.len(),
-                launcher_count: workspace.launcher_count,
+                launcher_count: workspace.launchers.len(),
             }),
             Focus::Terminals => self.selected_terminal().map(|terminal| PendingClose {
                 target: CloseTarget::Shell(terminal.id.clone()),
@@ -459,6 +525,7 @@ impl App {
                 shell_count: 1,
                 launcher_count: 0,
             }),
+            Focus::Launchers => None,
         };
     }
 
@@ -489,6 +556,7 @@ impl App {
     fn replace_workspaces(&mut self, workspaces: Vec<WorkspaceView>) {
         let selected_id = self.selected().map(|workspace| workspace.id.clone());
         let selected_terminal_id = self.selected_terminal().map(|terminal| terminal.id.clone());
+        let selected_launcher_id = self.selected_launcher().map(|launcher| launcher.id.clone());
         let previous_index = self.selected_index().unwrap_or(0);
         let selected_index = selected_id
             .and_then(|id| workspaces.iter().position(|workspace| workspace.id == id))
@@ -507,7 +575,20 @@ impl App {
                 .or_else(|| (!workspace.terminals.is_empty()).then_some(0))
         });
         self.terminal_state.select(terminal_index);
-        if self.focus == Focus::Terminals && self.workspaces.is_empty() {
+        let launcher_index = self.selected().and_then(|workspace| {
+            selected_launcher_id
+                .and_then(|id| {
+                    workspace
+                        .launchers
+                        .iter()
+                        .position(|launcher| launcher.id == id)
+                })
+                .or_else(|| (!workspace.launchers.is_empty()).then_some(0))
+        });
+        self.launcher_state.select(launcher_index);
+        if self.workspaces.is_empty()
+            || (self.focus == Focus::Launchers && launcher_index.is_none())
+        {
             self.focus = Focus::Workspaces;
         }
     }
@@ -613,6 +694,7 @@ where
                 match app.focus {
                     Focus::Workspaces => app.restore_selected(&mut actions.on_restore),
                     Focus::Terminals => app.open_selected_terminal(&mut actions.on_open),
+                    Focus::Launchers => {}
                 }
                 app.refresh(&mut actions.on_refresh);
                 last_refresh = Instant::now();
@@ -738,13 +820,13 @@ fn render(frame: &mut Frame, app: &mut App) {
         let [workspace_area, terminal_area] =
             Layout::horizontal([Constraint::Length(34), Constraint::Fill(1)]).areas(dashboard_area);
         render_workspaces(frame, workspace_area, app);
-        render_terminals(frame, terminal_area, app);
+        render_workspace_details(frame, terminal_area, app);
     } else {
         let [workspace_area, terminal_area] =
             Layout::vertical([Constraint::Percentage(32), Constraint::Fill(1)])
                 .areas(dashboard_area);
         render_workspaces(frame, workspace_area, app);
-        render_terminals(frame, terminal_area, app);
+        render_workspace_details(frame, terminal_area, app);
     }
     render_footer(frame, footer_area, app);
     if let Mode::PickProject(picker) = &mut app.mode {
@@ -860,7 +942,7 @@ fn render_header(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     let launcher_count: usize = app
         .workspaces
         .iter()
-        .map(|workspace| workspace.launcher_count)
+        .map(|workspace| workspace.launchers.len())
         .sum();
     let line = Line::from(vec![
         Span::styled(
@@ -891,7 +973,7 @@ fn render_workspaces(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut A
         Row::new([
             Cell::from(workspace.name.as_str()),
             Cell::from(workspace.terminals.len().to_string()),
-            Cell::from(workspace.launcher_count.to_string()),
+            Cell::from(workspace.launchers.len().to_string()),
         ])
     });
     let table = Table::new(
@@ -924,6 +1006,27 @@ fn render_workspaces(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut A
     .highlight_symbol("> ");
 
     frame.render_stateful_widget(table, area, &mut app.workspace_state);
+}
+
+fn render_workspace_details(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
+    let Some(workspace) = app.selected() else {
+        render_terminals(frame, area, app);
+        return;
+    };
+    if workspace.launchers.is_empty() {
+        render_terminals(frame, area, app);
+    } else {
+        let launcher_height = u16::try_from(workspace.launchers.len())
+            .unwrap_or(u16::MAX)
+            .saturating_add(3)
+            .min(area.height / 2)
+            .max(4);
+        let [terminal_area, launcher_area] =
+            Layout::vertical([Constraint::Fill(1), Constraint::Length(launcher_height)])
+                .areas(area);
+        render_terminals(frame, terminal_area, app);
+        render_launchers(frame, launcher_area, app);
+    }
 }
 
 fn render_terminals(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
@@ -1003,6 +1106,64 @@ fn render_terminals(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut Ap
     frame.render_stateful_widget(table, table_area, &mut app.terminal_state);
 }
 
+fn render_launchers(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
+    let selected = app
+        .workspace_state
+        .selected()
+        .and_then(|index| app.workspaces.get(index));
+    let title = selected.map_or_else(
+        || " Launchers ".to_owned(),
+        |workspace| {
+            format!(
+                " Launchers: {} ({}) ",
+                workspace.name,
+                workspace.launchers.len()
+            )
+        },
+    );
+    let rows = selected
+        .into_iter()
+        .flat_map(|workspace| {
+            workspace.launchers.iter().map(|launcher| {
+                Row::new([
+                    Cell::from(launcher.name.clone()),
+                    Cell::from(launcher.directory.clone()),
+                    Cell::from(launcher.command.clone()),
+                    Cell::from(short_id(&launcher.id)),
+                ])
+            })
+        })
+        .collect::<Vec<_>>();
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(14),
+            Constraint::Percentage(35),
+            Constraint::Min(18),
+            Constraint::Length(11),
+        ],
+    )
+    .header(
+        Row::new(["NAME", "DIRECTORY", "COMMAND", "LAUNCHER ID"])
+            .style(Style::new().fg(YELLOW).add_modifier(Modifier::BOLD)),
+    )
+    .column_spacing(1)
+    .row_highlight_style(
+        Style::new()
+            .fg(TEXT)
+            .add_modifier(Modifier::BOLD | Modifier::REVERSED),
+    )
+    .highlight_symbol("> ")
+    .block(Block::bordered().title(title).border_style(Style::new().fg(
+        if app.focus == Focus::Launchers {
+            TEAL
+        } else {
+            OVERLAY
+        },
+    )));
+    frame.render_stateful_widget(table, area, &mut app.launcher_state);
+}
+
 fn shell_column_widths(width: u16, show_full_ids: bool) -> Vec<Constraint> {
     let (name, status, branch, id, directory_min, directory_max) = if show_full_ids {
         (18, 10, 30, 36, 24, 42)
@@ -1065,6 +1226,18 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
             format!(" {}", message.text),
             Style::new().fg(if message.error { RED } else { GREEN }),
         ))
+    } else if app.focus == Focus::Launchers {
+        Line::from(vec![
+            Span::styled(" j/k", Style::new().fg(TEAL)),
+            Span::styled(
+                " navigate launchers  tab/h/l/arrows focus  ",
+                Style::new().fg(SUBTEXT),
+            ),
+            Span::styled("r", Style::new().fg(BLUE)),
+            Span::styled(" refresh  ", Style::new().fg(SUBTEXT)),
+            Span::styled("q", Style::new().fg(RED)),
+            Span::styled(" quit", Style::new().fg(SUBTEXT)),
+        ])
     } else {
         let mut spans = vec![
             Span::styled(" j/k", Style::new().fg(TEAL)),
@@ -1173,7 +1346,7 @@ mod tests {
                 directory: "/tmp/boomux".into(),
                 branch: "main".into(),
             }],
-            launcher_count: 0,
+            launchers: Vec::new(),
         }
     }
 
@@ -1620,6 +1793,83 @@ mod tests {
         assert!(text.contains("Shells: boomux (1)"));
         assert!(!text.contains("DIRTY"));
         assert!(!text.contains("WORKTREE"));
+    }
+
+    #[test]
+    fn dashboard_renders_selected_workspace_launchers() {
+        let backend = TestBackend::new(120, 34);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = app();
+        app.workspaces[0].launchers.push(LauncherView {
+            id: "launcher-12345678".into(),
+            name: "editor".into(),
+            directory: "/tmp/boomux".into(),
+            command: "zeditor .".into(),
+        });
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("Launchers: boomux (1)"));
+        assert!(text.contains("LAUNCHER ID"));
+        assert!(text.contains("editor"));
+        assert!(text.contains("zeditor ."));
+        assert!(text.contains("launcher"));
+    }
+
+    #[test]
+    fn launcher_focus_scrolls_mixed_workspace_details() {
+        let backend = TestBackend::new(120, 34);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = app();
+        app.workspaces[0].launchers = (0..20)
+            .map(|index| LauncherView {
+                id: format!("launcher-{index:08}"),
+                name: format!("launcher-{index}"),
+                directory: "/tmp/boomux".into(),
+                command: format!("command-{index}"),
+            })
+            .collect();
+        app.toggle_focus();
+        app.toggle_focus();
+        assert_eq!(app.focus, Focus::Launchers);
+        for _ in 0..20 {
+            app.next();
+        }
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert_eq!(app.launcher_state.selected(), Some(19));
+        assert!(text.contains("command-19"));
+    }
+
+    #[test]
+    fn launcher_only_workspace_focuses_its_detail_pane() {
+        let mut app = app();
+        app.workspaces[0].terminals.clear();
+        app.workspaces[0].launchers.push(LauncherView {
+            id: "launcher".into(),
+            name: "editor".into(),
+            directory: "/tmp/boomux".into(),
+            command: "zeditor .".into(),
+        });
+
+        app.toggle_focus();
+        assert_eq!(app.focus, Focus::Terminals);
+        app.toggle_focus();
+
+        assert_eq!(app.focus, Focus::Launchers);
     }
 
     #[test]

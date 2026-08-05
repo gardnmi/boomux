@@ -80,6 +80,9 @@ Dashboard controls:
 - `r` refreshes immediately.
 - `q` or `Esc` quits.
 
+The selected workspace detail area shows its shells and configured launchers as
+separate tables; launchers display their command and working directory.
+
 Closing a terminal window only disconnects its attachment. The Boomux daemon
 retains the PTY and child process until the shell exits, the workspace is
 closed, or the daemon stops.
