@@ -398,6 +398,22 @@ impl Client {
         }
     }
 
+    pub fn ensure_agent(
+        &self,
+        shell_id: impl Into<String>,
+        run_id: impl Into<String>,
+        spec: AgentRegistrationSpec,
+    ) -> io::Result<AgentInstanceSnapshot> {
+        match self.request(Request::EnsureAgent {
+            shell_id: shell_id.into(),
+            run_id: run_id.into(),
+            spec,
+        })? {
+            Response::Agent { agent } => Ok(agent),
+            other => unexpected(other),
+        }
+    }
+
     pub fn report_agent(
         &self,
         agent_id: impl Into<String>,
@@ -585,6 +601,7 @@ fn request_minimum_version(request: &Request) -> u32 {
         | Request::RenameLauncher { .. }
         | Request::RemoveLauncher { .. } => 8,
         Request::GetAgent { .. } | Request::RegisterAgent { .. } | Request::ReportAgent { .. } => 9,
+        Request::EnsureAgent { .. } => 10,
         Request::ReadShellAt { .. } | Request::Events { .. } => 7,
         _ => protocol::MIN_PROTOCOL_VERSION,
     }
@@ -735,12 +752,50 @@ mod tests {
     }
 
     #[test]
+    fn ensure_agent_requires_protocol_ten() {
+        assert_eq!(
+            request_minimum_version(&Request::EnsureAgent {
+                shell_id: "s1".into(),
+                run_id: "r1".into(),
+                spec: AgentRegistrationSpec {
+                    name: "agent".into(),
+                    integration: "test".into(),
+                    external_session_id: Some("external-1".into()),
+                    report: AgentReport {
+                        state: protocol::AgentState::Working,
+                        authority: protocol::AgentAuthority::LifecycleIntegration,
+                        evidence: "working".into(),
+                        confidence: 90,
+                    },
+                },
+            }),
+            10
+        );
+    }
+
+    #[test]
     fn negotiates_protocol_seven_without_losing_version_seven_requests() {
         let directory = env::temp_dir().join(format!("boomux-client-{}", Uuid::new_v4()));
         fs::create_dir_all(&directory).unwrap();
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+            assert_eq!(request.version, 10);
+            assert!(matches!(request.message, Request::Ping));
+            protocol::write_message(
+                &mut stream,
+                &Envelope::with_version(
+                    10,
+                    Response::Error {
+                        message: "expected an older protocol".into(),
+                        code: Some(ErrorCode::UnsupportedVersion),
+                    },
+                ),
+            )
+            .unwrap();
+
             let (mut stream, _) = listener.accept().unwrap();
             let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
             assert_eq!(request.version, 9);
@@ -750,7 +805,7 @@ mod tests {
                 &Envelope::with_version(
                     9,
                     Response::Error {
-                        message: "expected an older protocol".into(),
+                        message: "expected protocol 7".into(),
                         code: Some(ErrorCode::UnsupportedVersion),
                     },
                 ),

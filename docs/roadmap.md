@@ -93,15 +93,17 @@ eternal process.
 
 1. [Complete] Model agent instances separately from shells and runs, with
    explicit state authority, evidence, and confidence.
-2. Prefer lifecycle integrations, then process adapters, then conservative
-   terminal-screen heuristics for `working`, `blocked`, `idle`, `done`, and
-   `unknown` states.
-3. Aggregate agent states as workspace counts and provide an explainable,
+2. [Complete] Establish authority precedence and explicit OpenCode lifecycle
+   integration for `working`, `blocked`, `idle`, and explicit completion.
+3. Add process adapters beneath lifecycle-integration authority.
+4. Add conservative terminal-screen heuristics beneath process-adapter
+   authority, without inferring completion from quiet output or shell exit.
+5. Aggregate agent states as workspace counts and provide an explainable,
    persistent attention queue for blocked and completed work.
-4. Add notifications and revision-aware `agent wait` and `agent read` commands.
-5. Add guarded prompts and common responses only after defining run-scoped
+6. Add notifications and revision-aware `agent wait` and `agent read` commands.
+7. Add guarded prompts and common responses only after defining run-scoped
    leases, user-controller precedence, idempotency, and audit events.
-6. Run hooks, tests, notifications, or focus actions from durable transitions.
+8. Run hooks, tests, notifications, or focus actions from durable transitions.
 
 ## Distribution And Polish
 

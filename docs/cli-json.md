@@ -1,7 +1,7 @@
 # CLI JSON Contract
 
-Boomux exposes a versioned JSON contract for read-only integrations. Human
-output remains the default; pass `--json` to a supported command to emit one
+Boomux exposes a versioned JSON contract for integrations. Human output remains
+the default; pass `--json` to a supported command to emit one
 JSON document on stdout:
 
 ```json
@@ -36,11 +36,15 @@ The following commands support `--json`:
 - `boomux launcher inspect`
 - `boomux agent list`
 - `boomux agent inspect`
+- `boomux agent register`
+- `boomux agent ensure`
+- `boomux agent report`
 - `boomux daemon status`
 
-Mutation commands intentionally retain human output for now. Passing `--json`
-to an unsupported command fails with `invalid_argument` before performing the
-operation.
+JSON mutations are deliberately narrow: only `agent register`, `agent ensure`,
+and `agent report` support the contract. Other mutation commands retain human
+output. Passing `--json` to an unsupported command fails with
+`invalid_argument` before performing the operation.
 
 Command payloads are:
 
@@ -57,6 +61,8 @@ Command payloads are:
 - `launcher.inspect`: one `launcher` object.
 - `agent.list`: an `agents` array, optionally limited by `--workspace`.
 - `agent.inspect`: one `agent` object selected by exact agent ID.
+- `agent.register`, `agent.ensure`, and `agent.report`: one resulting `agent`
+  object. The command field identifies the specific mutation.
 - `read`: shell/run identity, observed output revision, and rendered output.
 - `events`: stream identity, reconnect cursor, optional baseline snapshot, and a
   bounded event array.
@@ -85,9 +91,22 @@ Agent objects include stable fields `id`, `workspace_id`, `workspace_name`,
 Agent `state` is `unknown`, `working`, `blocked`, `idle`, or `done`. `authority`
 is `lifecycle_integration`, `process_adapter`, `terminal_heuristic`, or
 `daemon_lifecycle`; CLI arguments use hyphens instead of underscores. Confidence
-is an integer from 0 through 100. Observation revisions begin at 1 and increase
-with each accepted report. `done` is terminal and has a non-null `ended_at_ms`;
-completed records remain durable and inspectable.
+is an integer from 0 through 100. Public mutations accept the first three
+authorities; `daemon_lifecycle` is reserved for daemon-originated observations.
+External precedence is lifecycle integration over process adapter over terminal
+heuristic. Observation revisions begin at 1 and increase with each accepted
+changed report. Lower-authority and exact duplicate reports return success with
+the unchanged snapshot. Equal-authority changed reports update the observation.
+`done` is terminal and has a non-null `ended_at_ms`; an exact completion retry is
+an unchanged success, while conflicting later reports fail. Completed records
+remain durable and inspectable.
+
+`agent.ensure` requires `--external-session-id` and protocol 10. Its identity key
+is `integration`, `external_session_id`, `shell_id`, and `run_id`. When that key
+already identifies a unique record, ensure returns the stored snapshot without
+applying the supplied name or report. This is the intended identity-recovery
+path after an integration reload. Otherwise it creates the record with the same
+shape and validation as `agent.register`.
 
 `read` returns `shell_id`, `run_id`, `output_revision`, `changed`, `status`, and
 `output`. Output is a JSON string containing the same bounded plain rendered text

@@ -23,10 +23,11 @@ use crate::client;
 use crate::fd_transfer::send_descriptor;
 use crate::handoff;
 use crate::protocol::{
-    self, AgentInstanceSnapshot, AgentObservationSnapshot, AgentRegistrationSpec, AgentReport,
-    AgentState, AttachFrame, DaemonEvent, DaemonEventKind, Envelope, ErrorCode, EventCursor,
-    Request, Response, ShellRunExitReason, ShellRunSnapshot, ShellSnapshot, ShellSpec, ShellStatus,
-    Snapshot, TerminalProfile, WorkspaceLauncherSnapshot, WorkspaceLauncherSpec, WorkspaceSnapshot,
+    self, AgentAuthority, AgentInstanceSnapshot, AgentObservationSnapshot, AgentRegistrationSpec,
+    AgentReport, AgentState, AttachFrame, DaemonEvent, DaemonEventKind, Envelope, ErrorCode,
+    EventCursor, Request, Response, ShellRunExitReason, ShellRunSnapshot, ShellSnapshot, ShellSpec,
+    ShellStatus, Snapshot, TerminalProfile, WorkspaceLauncherSnapshot, WorkspaceLauncherSpec,
+    WorkspaceSnapshot,
 };
 use crate::state_store::{
     PersistedAgentInstance, PersistedShell, PersistedShellRun, PersistedState, PersistedWorkspace,
@@ -600,6 +601,16 @@ fn handle_connection(
             ),
         );
     }
+    if response_version < 10 && matches!(request.message, Request::EnsureAgent { .. }) {
+        return send_response(
+            &mut stream,
+            response_version,
+            error_response(
+                ErrorCode::UnsupportedVersion,
+                "request requires daemon protocol 10",
+            ),
+        );
+    }
 
     if let Request::Attach {
         shell_id,
@@ -815,6 +826,11 @@ struct Registry {
     persist_lock: Mutex<()>,
     stopping: AtomicBool,
     persistence_dirty: AtomicBool,
+}
+
+enum DurableMutation<T> {
+    Changed(T, Vec<DaemonEventKind>),
+    Unchanged(T),
 }
 
 #[derive(Default)]
@@ -1557,12 +1573,38 @@ impl Registry {
                 }
                 Ok((Response::Agent { agent }, events))
             }),
+            Request::EnsureAgent {
+                shell_id,
+                run_id,
+                spec,
+            } => self.durable_mutation_outcome(|| {
+                let (agent, created) = self.ensure_agent(&shell_id, &run_id, spec)?;
+                if !created {
+                    return Ok(DurableMutation::Unchanged(Response::Agent { agent }));
+                }
+                let mut events = vec![DaemonEventKind::AgentRegistered {
+                    workspace_id: agent.workspace_id.clone(),
+                    shell_id: agent.shell_id.clone(),
+                    agent: agent.clone(),
+                }];
+                if agent.ended_at_ms.is_some() {
+                    events.push(DaemonEventKind::AgentCompleted {
+                        workspace_id: agent.workspace_id.clone(),
+                        shell_id: agent.shell_id.clone(),
+                        agent: agent.clone(),
+                    });
+                }
+                Ok(DurableMutation::Changed(Response::Agent { agent }, events))
+            }),
             Request::ReportAgent {
                 agent_id,
                 run_id,
                 report,
-            } => self.durable_mutation(|| {
-                let (agent, completed) = self.report_agent(&agent_id, &run_id, report)?;
+            } => self.durable_mutation_outcome(|| {
+                let (agent, changed, completed) = self.report_agent(&agent_id, &run_id, report)?;
+                if !changed {
+                    return Ok(DurableMutation::Unchanged(Response::Agent { agent }));
+                }
                 let event = if completed {
                     DaemonEventKind::AgentCompleted {
                         workspace_id: agent.workspace_id.clone(),
@@ -1576,7 +1618,10 @@ impl Registry {
                         agent: agent.clone(),
                     }
                 };
-                Ok((Response::Agent { agent }, vec![event]))
+                Ok(DurableMutation::Changed(
+                    Response::Agent { agent },
+                    vec![event],
+                ))
             }),
             Request::ReadShell {
                 shell_id,
@@ -2072,6 +2117,16 @@ impl Registry {
         &self,
         operation: impl FnOnce() -> io::Result<(T, Vec<DaemonEventKind>)>,
     ) -> io::Result<T> {
+        self.durable_mutation_outcome(|| {
+            let (value, events) = operation()?;
+            Ok(DurableMutation::Changed(value, events))
+        })
+    }
+
+    fn durable_mutation_outcome<T>(
+        &self,
+        operation: impl FnOnce() -> io::Result<DurableMutation<T>>,
+    ) -> io::Result<T> {
         let _mutation = lock(&self.mutation_lock)?;
         let mut transition = lock(&self.transitions)?;
         let _persistence = lock(&self.persist_lock)?;
@@ -2080,7 +2135,8 @@ impl Registry {
         self.flush_pending_locked(&mut transition, &mut events)?;
         let backup = self.backup()?;
         match operation() {
-            Ok((value, kinds)) => {
+            Ok(DurableMutation::Unchanged(value)) => Ok(value),
+            Ok(DurableMutation::Changed(value, kinds)) => {
                 if let Err(error) = EventLog::ensure_capacity(&events, kinds.len()) {
                     self.restore_backup(backup)?;
                     return Err(error);
@@ -2749,6 +2805,7 @@ impl Registry {
         spec: AgentRegistrationSpec,
     ) -> io::Result<AgentInstanceSnapshot> {
         validate_agent_registration(&spec)?;
+        validate_external_agent_authority(spec.report.authority)?;
         let shell = self.shell(shell_id)?;
         let lifecycle = lock(&shell.lifecycle)?;
         match &*lifecycle {
@@ -2804,13 +2861,71 @@ impl Registry {
         Ok(snapshot)
     }
 
+    fn ensure_agent(
+        &self,
+        shell_id: &str,
+        run_id: &str,
+        spec: AgentRegistrationSpec,
+    ) -> io::Result<(AgentInstanceSnapshot, bool)> {
+        validate_agent_registration(&spec)?;
+        validate_external_agent_authority(spec.report.authority)?;
+        let external_session_id = spec.external_session_id.as_deref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "agent external_session_id is required for ensure",
+            )
+        })?;
+        let matches = {
+            let state = lock(&self.state)?;
+            state
+                .agents
+                .values()
+                .filter(|agent| {
+                    agent.integration == spec.integration
+                        && agent.external_session_id.as_deref() == Some(external_session_id)
+                        && agent.shell_id == shell_id
+                        && agent.run_id == run_id
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let existing = match matches.as_slice() {
+            [] => None,
+            [agent] => Some(Arc::clone(agent)),
+            agents => {
+                let mut active = Vec::new();
+                for agent in agents {
+                    if lock(&agent.state)?.ended_at_ms.is_none() {
+                        active.push(Arc::clone(agent));
+                    }
+                }
+                match active.as_slice() {
+                    [agent] => Some(Arc::clone(agent)),
+                    _ => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::AlreadyExists,
+                            "multiple agent instances match the ensured identity",
+                        ));
+                    }
+                }
+            }
+        };
+        if let Some(agent) = existing {
+            return Ok((agent.snapshot()?, false));
+        }
+
+        self.register_agent(shell_id, run_id, spec)
+            .map(|agent| (agent, true))
+    }
+
     fn report_agent(
         &self,
         agent_id: &str,
         run_id: &str,
         report: AgentReport,
-    ) -> io::Result<(AgentInstanceSnapshot, bool)> {
+    ) -> io::Result<(AgentInstanceSnapshot, bool, bool)> {
         validate_agent_report(&report)?;
+        validate_external_agent_authority(report.authority)?;
         let agent = self.agent(agent_id)?;
         if agent.run_id != run_id {
             return Err(coded_error(
@@ -2820,10 +2935,21 @@ impl Registry {
         }
         let mut state = lock(&agent.state)?;
         if state.ended_at_ms.is_some() {
+            if observation_matches_report(&state.observation, &report) {
+                drop(state);
+                return Ok((agent.snapshot()?, false, true));
+            }
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "completed agent instance cannot be reported again",
             ));
+        }
+        if observation_matches_report(&state.observation, &report)
+            || agent_authority_rank(report.authority)
+                < agent_authority_rank(state.observation.authority)
+        {
+            drop(state);
+            return Ok((agent.snapshot()?, false, false));
         }
         let revision = state
             .observation
@@ -2846,7 +2972,7 @@ impl Registry {
             state.ended_at_ms = Some(observed_at_ms);
         }
         drop(state);
-        Ok((agent.snapshot()?, completed))
+        Ok((agent.snapshot()?, true, completed))
     }
 
     fn rename_launcher(&self, launcher_id: &str, name: String) -> io::Result<()> {
@@ -4509,6 +4635,35 @@ fn validate_agent_report(report: &AgentReport) -> io::Result<()> {
     Ok(())
 }
 
+fn validate_external_agent_authority(authority: AgentAuthority) -> io::Result<()> {
+    if authority == AgentAuthority::DaemonLifecycle {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "daemon_lifecycle authority is reserved for daemon observations",
+        ));
+    }
+    Ok(())
+}
+
+fn observation_matches_report(
+    observation: &AgentObservationSnapshot,
+    report: &AgentReport,
+) -> bool {
+    observation.state == report.state
+        && observation.authority == report.authority
+        && observation.evidence == report.evidence
+        && observation.confidence == report.confidence
+}
+
+fn agent_authority_rank(authority: AgentAuthority) -> u8 {
+    match authority {
+        AgentAuthority::LifecycleIntegration => 3,
+        AgentAuthority::ProcessAdapter => 2,
+        AgentAuthority::TerminalHeuristic => 1,
+        AgentAuthority::DaemonLifecycle => 4,
+    }
+}
+
 fn validate_required_agent_string(kind: &str, value: &str, max_bytes: usize) -> io::Result<()> {
     if value.trim().is_empty() || value.len() > max_bytes {
         return Err(io::Error::new(
@@ -4589,6 +4744,15 @@ mod tests {
                 evidence: "test observation".into(),
                 confidence: 90,
             },
+        }
+    }
+
+    fn agent_report(state: AgentState, authority: AgentAuthority, evidence: &str) -> AgentReport {
+        AgentReport {
+            state,
+            authority,
+            evidence: evidence.into(),
+            confidence: 90,
         }
     }
 
@@ -4937,6 +5101,289 @@ mod tests {
     }
 
     #[test]
+    fn ensure_agent_reuses_identity_without_events_or_revision_changes() {
+        let registry = Registry::default();
+        let (workspace, shell, _runtime) = running_shell(&registry);
+        let run_id = shell.snapshot().unwrap().run.unwrap().id;
+        let spec = agent_spec(AgentState::Working);
+
+        let Response::Agent { agent: created } = registry
+            .dispatch(Request::EnsureAgent {
+                shell_id: shell.id.clone(),
+                run_id: run_id.clone(),
+                spec: spec.clone(),
+            })
+            .unwrap()
+        else {
+            panic!("expected ensured agent");
+        };
+        let event_id = lock(&registry.events.state).unwrap().latest_id;
+        let Response::Agent { agent: reused } = registry
+            .dispatch(Request::EnsureAgent {
+                shell_id: shell.id.clone(),
+                run_id,
+                spec,
+            })
+            .unwrap()
+        else {
+            panic!("expected reused agent");
+        };
+
+        assert_eq!(reused, created);
+        assert_eq!(lock(&registry.events.state).unwrap().latest_id, event_id);
+        assert_eq!(registry.snapshot().unwrap().workspaces[0].agents.len(), 1);
+        shell.kill().unwrap();
+        registry.close_workspace(&workspace.id).unwrap();
+    }
+
+    #[test]
+    fn concurrent_ensure_agent_creates_one_identity() {
+        let registry = Arc::new(Registry::default());
+        let (workspace, shell, _runtime) = running_shell(&registry);
+        let run_id = shell.snapshot().unwrap().run.unwrap().id;
+        let barrier = Arc::new(Barrier::new(3));
+        let mut threads = Vec::new();
+        for _ in 0..2 {
+            let registry = Arc::clone(&registry);
+            let shell_id = shell.id.clone();
+            let run_id = run_id.clone();
+            let barrier = Arc::clone(&barrier);
+            threads.push(thread::spawn(move || {
+                barrier.wait();
+                let Response::Agent { agent } = registry
+                    .dispatch(Request::EnsureAgent {
+                        shell_id,
+                        run_id,
+                        spec: agent_spec(AgentState::Working),
+                    })
+                    .unwrap()
+                else {
+                    panic!("expected ensured agent");
+                };
+                agent.id
+            }));
+        }
+        barrier.wait();
+        let ids = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(ids[0], ids[1]);
+        assert_eq!(registry.snapshot().unwrap().workspaces[0].agents.len(), 1);
+        shell.kill().unwrap();
+        registry.close_workspace(&workspace.id).unwrap();
+    }
+
+    #[test]
+    fn ensure_agent_resolves_only_a_unique_active_legacy_match() {
+        let registry = Registry::default();
+        let (workspace, shell, _runtime) = running_shell(&registry);
+        let run_id = shell.snapshot().unwrap().run.unwrap().id;
+        let completed = registry
+            .register_agent(&shell.id, &run_id, agent_spec(AgentState::Done))
+            .unwrap();
+        let active = registry
+            .register_agent(&shell.id, &run_id, agent_spec(AgentState::Working))
+            .unwrap();
+
+        let (ensured, created) = registry
+            .ensure_agent(&shell.id, &run_id, agent_spec(AgentState::Working))
+            .unwrap();
+        assert!(!created);
+        assert_eq!(ensured.id, active.id);
+        assert_ne!(ensured.id, completed.id);
+
+        registry
+            .register_agent(&shell.id, &run_id, agent_spec(AgentState::Working))
+            .unwrap();
+        assert_eq!(
+            registry
+                .ensure_agent(&shell.id, &run_id, agent_spec(AgentState::Working))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        shell.kill().unwrap();
+        registry.close_workspace(&workspace.id).unwrap();
+    }
+
+    #[test]
+    fn ensure_agent_requires_external_id_and_distinguishes_runs() {
+        let registry = Registry::default();
+        let (workspace, shell, runtime) = running_shell(&registry);
+        let first_run_id = shell.snapshot().unwrap().run.unwrap().id;
+        let mut missing_id = agent_spec(AgentState::Working);
+        missing_id.external_session_id = None;
+        assert_eq!(
+            registry
+                .dispatch(Request::EnsureAgent {
+                    shell_id: shell.id.clone(),
+                    run_id: first_run_id.clone(),
+                    spec: missing_id,
+                })
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        let Response::Agent { agent: first } = registry
+            .dispatch(Request::EnsureAgent {
+                shell_id: shell.id.clone(),
+                run_id: first_run_id.clone(),
+                spec: agent_spec(AgentState::Working),
+            })
+            .unwrap()
+        else {
+            panic!("expected first agent");
+        };
+
+        let second_run = Arc::new(ShellRun::new(2));
+        *lock(&shell.lifecycle).unwrap() = ShellLifecycle::Running {
+            profile: profile(),
+            run: Arc::clone(&second_run),
+            runtime: Arc::clone(&runtime),
+        };
+        let Response::Agent { agent: recovered } = registry
+            .dispatch(Request::EnsureAgent {
+                shell_id: shell.id.clone(),
+                run_id: first_run_id,
+                spec: agent_spec(AgentState::Working),
+            })
+            .unwrap()
+        else {
+            panic!("expected recovered first agent");
+        };
+        let Response::Agent { agent: second } = registry
+            .dispatch(Request::EnsureAgent {
+                shell_id: shell.id.clone(),
+                run_id: second_run.id.clone(),
+                spec: agent_spec(AgentState::Working),
+            })
+            .unwrap()
+        else {
+            panic!("expected second agent");
+        };
+
+        assert_eq!(recovered.id, first.id);
+        assert_ne!(second.id, first.id);
+        shell.kill().unwrap();
+        registry.close_workspace(&workspace.id).unwrap();
+    }
+
+    #[test]
+    fn reports_obey_authority_and_idempotent_completion_rules() {
+        let registry = Registry::default();
+        let (workspace, shell, _runtime) = running_shell(&registry);
+        let run_id = shell.snapshot().unwrap().run.unwrap().id;
+        let mut spec = agent_spec(AgentState::Working);
+        spec.report = agent_report(
+            AgentState::Working,
+            AgentAuthority::ProcessAdapter,
+            "process working",
+        );
+        let Response::Agent { agent } = registry
+            .dispatch(Request::RegisterAgent {
+                shell_id: shell.id.clone(),
+                run_id: run_id.clone(),
+                spec,
+            })
+            .unwrap()
+        else {
+            panic!("expected agent");
+        };
+        let registered_event_id = lock(&registry.events.state).unwrap().latest_id;
+
+        for report in [
+            agent_report(
+                AgentState::Done,
+                AgentAuthority::TerminalHeuristic,
+                "weak done",
+            ),
+            agent_report(
+                AgentState::Working,
+                AgentAuthority::ProcessAdapter,
+                "process working",
+            ),
+        ] {
+            let Response::Agent { agent: unchanged } = registry
+                .dispatch(Request::ReportAgent {
+                    agent_id: agent.id.clone(),
+                    run_id: run_id.clone(),
+                    report,
+                })
+                .unwrap()
+            else {
+                panic!("expected unchanged agent");
+            };
+            assert_eq!(unchanged, agent);
+        }
+        assert_eq!(
+            lock(&registry.events.state).unwrap().latest_id,
+            registered_event_id
+        );
+
+        let completion = agent_report(
+            AgentState::Done,
+            AgentAuthority::LifecycleIntegration,
+            "lifecycle done",
+        );
+        let Response::Agent { agent: completed } = registry
+            .dispatch(Request::ReportAgent {
+                agent_id: agent.id.clone(),
+                run_id: run_id.clone(),
+                report: completion.clone(),
+            })
+            .unwrap()
+        else {
+            panic!("expected completed agent");
+        };
+        let completion_event_id = lock(&registry.events.state).unwrap().latest_id;
+        let Response::Agent { agent: retried } = registry
+            .dispatch(Request::ReportAgent {
+                agent_id: agent.id.clone(),
+                run_id: run_id.clone(),
+                report: completion,
+            })
+            .unwrap()
+        else {
+            panic!("expected retried completion");
+        };
+        assert_eq!(retried, completed);
+        assert_eq!(
+            lock(&registry.events.state).unwrap().latest_id,
+            completion_event_id
+        );
+        assert!(
+            registry
+                .dispatch(Request::ReportAgent {
+                    agent_id: agent.id.clone(),
+                    run_id: run_id.clone(),
+                    report: agent_report(
+                        AgentState::Done,
+                        AgentAuthority::LifecycleIntegration,
+                        "conflicting done",
+                    ),
+                })
+                .is_err()
+        );
+        assert!(
+            registry
+                .dispatch(Request::ReportAgent {
+                    agent_id: agent.id,
+                    run_id,
+                    report: agent_report(
+                        AgentState::Done,
+                        AgentAuthority::DaemonLifecycle,
+                        "external daemon claim",
+                    ),
+                })
+                .is_err()
+        );
+        shell.kill().unwrap();
+        registry.close_workspace(&workspace.id).unwrap();
+    }
+
+    #[test]
     fn failed_agent_mutation_restores_observation_revision() {
         let registry = Registry::default();
         let (workspace, shell, _runtime) = running_shell(&registry);
@@ -4964,12 +5411,14 @@ mod tests {
         let path = directory.join("state/state.json");
         let registry = Registry::restore(StateStore::at(path.clone()), false, None).unwrap();
         let (_workspace, shell, runtime) = running_shell(&registry);
+        let shell_id = shell.id.clone();
         let run_id = shell.snapshot().unwrap().run.unwrap().id;
+        let spec = agent_spec(AgentState::Working);
         let Response::Agent { agent } = registry
-            .dispatch(Request::RegisterAgent {
-                shell_id: shell.id.clone(),
-                run_id,
-                spec: agent_spec(AgentState::Working),
+            .dispatch(Request::EnsureAgent {
+                shell_id: shell_id.clone(),
+                run_id: run_id.clone(),
+                spec: spec.clone(),
             })
             .unwrap()
         else {
@@ -4988,8 +5437,19 @@ mod tests {
         );
         assert_eq!(
             restored.snapshot().unwrap().workspaces[0].agents,
-            vec![agent]
+            vec![agent.clone()]
         );
+        let Response::Agent { agent: ensured } = restored
+            .dispatch(Request::EnsureAgent {
+                shell_id,
+                run_id,
+                spec,
+            })
+            .unwrap()
+        else {
+            panic!("expected restored ensured agent");
+        };
+        assert_eq!(ensured, agent);
         drop(restored);
         fs::remove_dir_all(directory).unwrap();
     }

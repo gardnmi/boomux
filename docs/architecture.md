@@ -86,7 +86,8 @@ The daemon supports:
 - One writable attachment with explicit takeover
 - PTY input and resize forwarding
 - Pending shell metadata and first-attachment terminal negotiation
-- Run-scoped agent registration, inspection, and explicit state reports
+- Run-scoped agent registration, idempotent ensure, inspection, and explicit
+  state reports
 
 An empty shell specification list remains empty. When an explicit populated
 creation is requested, the daemon stages every child before publishing any of
@@ -175,6 +176,52 @@ durable storage. External lifecycle integrations own the meaning and evidence
 of their reports; this slice does not discover processes, parse terminal output,
 wait for agents, or control them.
 
+Protocol 10 adds `EnsureAgent`. Its durable identity key is integration,
+external session ID, shell ID, and run ID; the external session ID is mandatory
+for ensure. A unique existing match is returned without changing its name,
+observation, revision, timestamps, persistence, or event stream. This lets an
+integration reload and reacquire the daemon-owned agent ID. A different run is a
+different identity. Multiple matching legacy records are accepted only when
+exactly one is active; otherwise ensure fails rather than guessing.
+
+External observation authority is ordered lifecycle integration, process
+adapter, then terminal heuristic. Lower-authority reports are successful no-ops.
+At equal authority an exact duplicate is also a no-op, but a changed report is
+accepted, so a source can advance its own state and evidence. Higher-authority
+reports replace lower-authority observations. `daemon_lifecycle` is a wire and
+snapshot value reserved for daemon-originated observations and is not exposed by
+the public mutation CLI. Exact retries of an accepted `done` report return the
+completed snapshot without another revision, write, or event; conflicting
+reports after completion are rejected.
+
+### OpenCode Lifecycle Plugin
+
+`integrations/opencode/boomux.js` is a config-time OpenCode plugin installed by
+`boomux opencode install [--force]`. The installer targets
+`$XDG_CONFIG_HOME/opencode/plugins/boomux.js`, falling back to
+`~/.config/opencode/plugins/boomux.js`. It creates regular directories, rejects
+detected symlinks and special targets, leaves identical content alone, and
+requires `--force` to replace different regular-file content. OpenCode discovers
+the global plugin file without a configuration edit, but must be quit and
+restarted after installation or replacement.
+
+The plugin activates only when both `BOOMUX_SHELL_ID` and `BOOMUX_RUN_ID` are
+present. It resolves every event's OpenCode ancestry and uses the root session
+ID as `external_session_id`; child and subagent events aggregate into that one
+root agent instance. Busy/active work, chat, tools, compaction, and resolved
+prompts map to `working`; outstanding permission or question requests and
+session errors map to `blocked`; only root idle maps to `idle`. Blockers are
+tracked as a set, and errors remain latched until later work is observed. Only
+explicit root `session.deleted` maps to `done`: child deletion and process or
+shell exit do not complete the instance.
+
+On first relevant event, or after plugin reload, the plugin calls `agent ensure`
+and then reports a changed derived observation when the reused durable record
+does not already match. Calls use exact argument vectors, a one-second timeout,
+bounded output, and the stable JSON envelope. Unmanaged sessions are a no-op;
+Boomux or ancestry failures are rate-limited and fail open so OpenCode continues.
+`run_changed` disables all later reports for that tracked root.
+
 ### Transition Coordinator
 
 The daemon serializes observable runtime transitions through one coordinator. A
@@ -202,7 +249,7 @@ not persisted per chunk, but output revision mutation and `output_changed`
 publication cross the coordinator together. A non-blocking terminal lock keeps
 output processing from holding global locks while waiting on terminal snapshots.
 
-Agent registration and reports use the same durable mutation coordinator.
+Agent registration, ensure, and reports use the same durable mutation coordinator.
 Persistence and `agent_registered`, `agent_state_changed`, or
 `agent_completed` publication therefore share the normal ordering boundary and
 baseline snapshots include the exact coordinated cut.

@@ -9,7 +9,7 @@ use std::process::{Command, ExitCode, Stdio};
 use std::thread;
 
 use clap::error::ErrorKind as ClapErrorKind;
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use uuid::Uuid;
 
 use boomux::protocol::{
@@ -27,6 +27,41 @@ mod terminal;
 mod tui;
 
 const BOOMUX_SKILL: &str = include_str!("../.agents/skills/boomux/SKILL.md");
+const BOOMUX_OPENCODE_PLUGIN: &str = include_str!("../integrations/opencode/boomux.js");
+const JSON_COMMANDS: &[&str] = &[
+    "capabilities",
+    "list",
+    "shells",
+    "read",
+    "events",
+    "workspace.list",
+    "workspace.inspect",
+    "shell.inspect",
+    "launcher.list",
+    "launcher.inspect",
+    "agent.list",
+    "agent.inspect",
+    "agent.register",
+    "agent.ensure",
+    "agent.report",
+    "daemon.status",
+];
+const INTEGRATION_FEATURES: &[&str] = &[
+    "typed_errors",
+    "shell_run_identity",
+    "rendered_scrollback",
+    "graceful_live_handoff",
+    "graceful_exited_handoff",
+    "daemon_events",
+    "reconnectable_event_cursors",
+    "revision_aware_reads",
+    "workspace_launchers",
+    "run_scoped_agent_instances",
+    "protocol_10",
+    "idempotent_agent_ensure",
+    "agent_authority_precedence",
+    "opencode_lifecycle_plugin",
+];
 const LEGACY_BOOMUX_SHELLS_SKILL: &str = r#"---
 name: boomux-shells
 description: Read output and logs from Boomux workspace shells. Use when asked to inspect another shell by name, read shell2, examine terminal output, check logs from another terminal, or inspect a Boomux shell ID.
@@ -165,6 +200,11 @@ enum Commands {
         #[command(subcommand)]
         command: SkillCommands,
     },
+    /// Manage the Boomux OpenCode integration
+    Opencode {
+        #[command(subcommand)]
+        command: OpenCodeCommands,
+    },
     /// Open a shell in a new terminal window
     Open {
         shell_id: String,
@@ -287,25 +327,9 @@ enum AgentCommands {
     #[command(alias = "get")]
     Inspect { agent_id: String },
     /// Register an agent instance for a shell run
-    Register {
-        name: String,
-        #[arg(long)]
-        integration: String,
-        #[arg(long)]
-        external_session_id: Option<String>,
-        #[arg(long)]
-        shell_id: Option<String>,
-        #[arg(long)]
-        run_id: Option<String>,
-        #[arg(long, value_enum)]
-        state: CliAgentState,
-        #[arg(long, value_enum)]
-        authority: CliAgentAuthority,
-        #[arg(long)]
-        evidence: String,
-        #[arg(long, value_parser = clap::value_parser!(u8).range(0..=100))]
-        confidence: u8,
-    },
+    Register(AgentRegistrationArgs),
+    /// Ensure an idempotent agent instance for a shell run
+    Ensure(AgentRegistrationArgs),
     /// Report state for an agent instance by exact ID
     Report {
         agent_id: String,
@@ -322,6 +346,27 @@ enum AgentCommands {
         #[arg(long, value_parser = clap::value_parser!(u8).range(0..=100))]
         confidence: u8,
     },
+}
+
+#[derive(Args)]
+struct AgentRegistrationArgs {
+    name: String,
+    #[arg(long)]
+    integration: String,
+    #[arg(long)]
+    external_session_id: Option<String>,
+    #[arg(long)]
+    shell_id: Option<String>,
+    #[arg(long)]
+    run_id: Option<String>,
+    #[arg(long, value_enum)]
+    state: CliAgentState,
+    #[arg(long, value_enum)]
+    authority: CliAgentAuthority,
+    #[arg(long)]
+    evidence: String,
+    #[arg(long, value_parser = clap::value_parser!(u8).range(0..=100))]
+    confidence: u8,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -350,7 +395,6 @@ enum CliAgentAuthority {
     LifecycleIntegration,
     ProcessAdapter,
     TerminalHeuristic,
-    DaemonLifecycle,
 }
 
 impl From<CliAgentAuthority> for AgentAuthority {
@@ -359,7 +403,6 @@ impl From<CliAgentAuthority> for AgentAuthority {
             CliAgentAuthority::LifecycleIntegration => Self::LifecycleIntegration,
             CliAgentAuthority::ProcessAdapter => Self::ProcessAdapter,
             CliAgentAuthority::TerminalHeuristic => Self::TerminalHeuristic,
-            CliAgentAuthority::DaemonLifecycle => Self::DaemonLifecycle,
         }
     }
 }
@@ -367,6 +410,15 @@ impl From<CliAgentAuthority> for AgentAuthority {
 #[derive(Subcommand)]
 enum SkillCommands {
     /// Install the Boomux CLI skill under ~/.agents/skills
+    Install {
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum OpenCodeCommands {
+    /// Install the Boomux plugin in the global OpenCode configuration
     Install {
         #[arg(long)]
         force: bool,
@@ -508,6 +560,9 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         Some(Commands::Skill {
             command: SkillCommands::Install { force },
         }) => install_skill(force),
+        Some(Commands::Opencode {
+            command: OpenCodeCommands::Install { force },
+        }) => install_opencode(force),
         Some(Commands::Open {
             shell_id,
             title,
@@ -551,18 +606,27 @@ fn command_name(cli: &Cli) -> &'static str {
         Some(Commands::Agent {
             command: AgentCommands::Inspect { .. },
         }) => "agent.inspect",
+        Some(Commands::Agent {
+            command: AgentCommands::Register(..),
+        }) => "agent.register",
+        Some(Commands::Agent {
+            command: AgentCommands::Ensure(..),
+        }) => "agent.ensure",
+        Some(Commands::Agent {
+            command: AgentCommands::Report { .. },
+        }) => "agent.report",
         Some(Commands::Daemon {
             command: DaemonCommands::Status,
         }) => "daemon.status",
         Some(Commands::Workspace { .. }) => "workspace",
         Some(Commands::Shell { .. }) => "shell",
         Some(Commands::Launcher { .. }) => "launcher",
-        Some(Commands::Agent { .. }) => "agent",
         Some(Commands::Daemon { .. }) => "daemon",
         Some(Commands::Ui) | None => "ui",
         Some(Commands::Doctor) => "doctor",
         Some(Commands::Close { .. }) => "close",
         Some(Commands::Skill { .. }) => "skill",
+        Some(Commands::Opencode { .. }) => "opencode",
         Some(Commands::Open { .. }) => "open",
         Some(Commands::Prompt) => "prompt",
         Some(Commands::Attach { .. }) => "attach",
@@ -585,7 +649,11 @@ fn supports_json(cli: &Cli) -> bool {
         }) | Some(Commands::Launcher {
             command: LauncherCommands::List { .. } | LauncherCommands::Inspect { .. }
         }) | Some(Commands::Agent {
-            command: AgentCommands::List { .. } | AgentCommands::Inspect { .. }
+            command: AgentCommands::List { .. }
+                | AgentCommands::Inspect { .. }
+                | AgentCommands::Register(..)
+                | AgentCommands::Ensure(..)
+                | AgentCommands::Report { .. }
         }) | Some(Commands::Daemon {
             command: DaemonCommands::Status
         })
@@ -1009,33 +1077,6 @@ fn unique_shell_name(base_name: &str, shells: &[ShellSnapshot]) -> String {
 }
 
 fn capabilities(json: bool) -> Result<(), Box<dyn Error>> {
-    let commands = [
-        "capabilities",
-        "list",
-        "shells",
-        "read",
-        "events",
-        "workspace.list",
-        "workspace.inspect",
-        "shell.inspect",
-        "launcher.list",
-        "launcher.inspect",
-        "agent.list",
-        "agent.inspect",
-        "daemon.status",
-    ];
-    let features = [
-        "typed_errors",
-        "shell_run_identity",
-        "rendered_scrollback",
-        "graceful_live_handoff",
-        "graceful_exited_handoff",
-        "daemon_events",
-        "reconnectable_event_cursors",
-        "revision_aware_reads",
-        "workspace_launchers",
-        "run_scoped_agent_instances",
-    ];
     let error_codes = [
         "invalid_argument",
         "not_found",
@@ -1062,8 +1103,8 @@ fn capabilities(json: bool) -> Result<(), Box<dyn Error>> {
                 "cli_version": env!("CARGO_PKG_VERSION"),
                 "daemon_protocol_version": protocol::PROTOCOL_VERSION,
                 "json_schemas": [cli_output::SCHEMA],
-                "json_commands": commands,
-                "features": features,
+                "json_commands": JSON_COMMANDS,
+                "features": INTEGRATION_FEATURES,
                 "error_codes": error_codes,
             }),
         );
@@ -1071,8 +1112,8 @@ fn capabilities(json: bool) -> Result<(), Box<dyn Error>> {
     println!("CLI VERSION\t{}", env!("CARGO_PKG_VERSION"));
     println!("DAEMON PROTOCOL\t{}", protocol::PROTOCOL_VERSION);
     println!("JSON SCHEMAS\t{}", cli_output::SCHEMA);
-    println!("JSON COMMANDS\t{}", commands.join(","));
-    println!("FEATURES\t{}", features.join(","));
+    println!("JSON COMMANDS\t{}", JSON_COMMANDS.join(","));
+    println!("FEATURES\t{}", INTEGRATION_FEATURES.join(","));
     println!("ERROR CODES\t{}", error_codes.join(","));
     Ok(())
 }
@@ -1488,39 +1529,11 @@ fn agent_command(command: AgentCommands, json: bool) -> Result<(), Box<dyn Error
             }
             print_agent(&agent, &workspace.name);
         }
-        AgentCommands::Register {
-            name,
-            integration,
-            external_session_id,
-            shell_id,
-            run_id,
-            state,
-            authority,
-            evidence,
-            confidence,
-        } => {
-            let (shell_id, run_id) = resolve_agent_context(
-                shell_id,
-                run_id,
-                env::var("BOOMUX_SHELL_ID").ok(),
-                env::var("BOOMUX_RUN_ID").ok(),
-            )?;
-            let agent = client.register_agent(
-                shell_id,
-                run_id,
-                AgentRegistrationSpec {
-                    name: cli_name(name, "agent")?,
-                    integration,
-                    external_session_id,
-                    report: AgentReport {
-                        state: state.into(),
-                        authority: authority.into(),
-                        evidence,
-                        confidence,
-                    },
-                },
-            )?;
-            println!("Registered agent {} ({})", agent.name, agent.id);
+        AgentCommands::Register(arguments) => {
+            register_or_ensure_agent(&client, arguments, json, false)?;
+        }
+        AgentCommands::Ensure(arguments) => {
+            register_or_ensure_agent(&client, arguments, json, true)?;
         }
         AgentCommands::Report {
             agent_id,
@@ -1560,6 +1573,14 @@ fn agent_command(command: AgentCommands, json: bool) -> Result<(), Box<dyn Error
                     confidence,
                 },
             )?;
+            if json {
+                return cli_output::print(
+                    "agent.report",
+                    serde_json::json!({
+                        "agent": cli_output::agent(&agent, None),
+                    }),
+                );
+            }
             println!(
                 "Reported {} for agent {} (revision {})",
                 cli_output::agent_state(agent.observation.state),
@@ -1568,6 +1589,55 @@ fn agent_command(command: AgentCommands, json: bool) -> Result<(), Box<dyn Error
             );
         }
     }
+    Ok(())
+}
+
+fn register_or_ensure_agent(
+    client: &client::Client,
+    arguments: AgentRegistrationArgs,
+    json: bool,
+    ensure: bool,
+) -> Result<(), Box<dyn Error>> {
+    let (shell_id, run_id) = resolve_agent_context(
+        arguments.shell_id,
+        arguments.run_id,
+        env::var("BOOMUX_SHELL_ID").ok(),
+        env::var("BOOMUX_RUN_ID").ok(),
+    )?;
+    let spec = AgentRegistrationSpec {
+        name: cli_name(arguments.name, "agent")?,
+        integration: arguments.integration,
+        external_session_id: arguments.external_session_id,
+        report: AgentReport {
+            state: arguments.state.into(),
+            authority: arguments.authority.into(),
+            evidence: arguments.evidence,
+            confidence: arguments.confidence,
+        },
+    };
+    let agent = if ensure {
+        client.ensure_agent(shell_id, run_id, spec)?
+    } else {
+        client.register_agent(shell_id, run_id, spec)?
+    };
+    if json {
+        return cli_output::print(
+            if ensure {
+                "agent.ensure"
+            } else {
+                "agent.register"
+            },
+            serde_json::json!({
+                "agent": cli_output::agent(&agent, None),
+            }),
+        );
+    }
+    println!(
+        "{} agent {} ({})",
+        if ensure { "Ensured" } else { "Registered" },
+        agent.name,
+        agent.id
+    );
     Ok(())
 }
 
@@ -2171,28 +2241,14 @@ fn install_skill(force: bool) -> Result<(), Box<dyn Error>> {
 }
 
 fn install_skill_at(home: &Path, force: bool) -> Result<(), Box<dyn Error>> {
-    let directory = ensure_skill_directory(home, "boomux")?;
+    require_absolute_root(home, "HOME")?;
+    let directory = ensure_safe_directory(&home.join(".agents/skills/boomux"))?;
     let path = skill_install_path(home);
-    let already_installed = if let Some(existing) = read_regular_file(&path)? {
-        if existing == BOOMUX_SKILL {
-            true
-        } else if !force {
-            return Err(format!(
-                "{} already exists; rerun with --force to replace it",
-                path.display()
-            )
-            .into());
-        } else {
-            false
-        }
-    } else {
-        false
-    };
+    let already_installed = install_asset_at(&directory, &path, BOOMUX_SKILL, force)?;
 
     if already_installed {
         println!("Boomux skill is already installed at {}", path.display());
     } else {
-        write_skill_atomically(&directory, &path, BOOMUX_SKILL)?;
         println!("Installed Boomux skill at {}", path.display());
     }
     migrate_legacy_skill(home)?;
@@ -2216,7 +2272,7 @@ fn migrate_legacy_skill(home: &Path) -> Result<(), Box<dyn Error>> {
     let path = legacy_skill_install_path(home);
     if let Some(existing) = read_regular_file(&path)? {
         let entries = fs::read_dir(&directory)?.collect::<Result<Vec<_>, _>>()?;
-        let untouched = existing == LEGACY_BOOMUX_SHELLS_SKILL
+        let untouched = existing == LEGACY_BOOMUX_SHELLS_SKILL.as_bytes()
             && entries.len() == 1
             && entries[0].file_name() == "SKILL.md";
         if untouched {
@@ -2235,15 +2291,57 @@ fn migrate_legacy_skill(home: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn ensure_skill_directory(home: &Path, skill: &str) -> Result<PathBuf, Box<dyn Error>> {
-    let mut directory = home.to_owned();
-    for component in [".agents", "skills", skill] {
+fn install_opencode(force: bool) -> Result<(), Box<dyn Error>> {
+    let config_root = opencode_config_root(env::var_os("XDG_CONFIG_HOME"), env::var_os("HOME"))?;
+    install_opencode_at(&config_root, force)
+}
+
+fn opencode_config_root(
+    xdg_config_home: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Result<PathBuf, Box<dyn Error>> {
+    let root = if let Some(root) = xdg_config_home {
+        PathBuf::from(root)
+    } else {
+        PathBuf::from(home.ok_or("HOME must be set to install the Boomux OpenCode plugin")?)
+            .join(".config")
+    };
+    require_absolute_root(&root, "XDG configuration root")?;
+    Ok(root)
+}
+
+fn install_opencode_at(config_root: &Path, force: bool) -> Result<(), Box<dyn Error>> {
+    require_absolute_root(config_root, "XDG configuration root")?;
+    let directory = ensure_safe_directory(&config_root.join("opencode/plugins"))?;
+    let path = opencode_install_path(config_root);
+    if install_asset_at(&directory, &path, BOOMUX_OPENCODE_PLUGIN, force)? {
+        println!(
+            "Boomux OpenCode plugin is already installed at {}",
+            path.display()
+        );
+    } else {
+        println!("Installed Boomux OpenCode plugin at {}", path.display());
+    }
+    Ok(())
+}
+
+fn require_absolute_root(root: &Path, name: &str) -> Result<(), Box<dyn Error>> {
+    if !root.is_absolute() {
+        return Err(format!("{name} must be an absolute path").into());
+    }
+    Ok(())
+}
+
+fn ensure_safe_directory(path: &Path) -> Result<PathBuf, Box<dyn Error>> {
+    require_absolute_root(path, "install directory")?;
+    let mut directory = PathBuf::new();
+    for component in path.components() {
         directory.push(component);
         match fs::symlink_metadata(&directory) {
             Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
             Ok(_) => {
                 return Err(format!(
-                    "skill path component is not a regular directory: {}",
+                    "install path component is not a regular directory: {}",
                     directory.display()
                 )
                 .into());
@@ -2257,23 +2355,45 @@ fn ensure_skill_directory(home: &Path, skill: &str) -> Result<PathBuf, Box<dyn E
     Ok(directory)
 }
 
-fn read_regular_file(path: &Path) -> Result<Option<String>, Box<dyn Error>> {
+fn read_regular_file(path: &Path) -> Result<Option<Vec<u8>>, Box<dyn Error>> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
-            Ok(Some(fs::read_to_string(path)?))
+            Ok(Some(fs::read(path)?))
         }
-        Ok(_) => Err(format!("skill path is not a regular file: {}", path.display()).into()),
+        Ok(_) => Err(format!("install path is not a regular file: {}", path.display()).into()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),
     }
 }
 
-fn write_skill_atomically(
+fn install_asset_at(
+    directory: &Path,
+    path: &Path,
+    content: &str,
+    force: bool,
+) -> Result<bool, Box<dyn Error>> {
+    if let Some(existing) = read_regular_file(path)? {
+        if existing == content.as_bytes() {
+            return Ok(true);
+        }
+        if !force {
+            return Err(format!(
+                "{} already exists; rerun with --force to replace it",
+                path.display()
+            )
+            .into());
+        }
+    }
+    write_asset_atomically(directory, path, content)?;
+    Ok(false)
+}
+
+fn write_asset_atomically(
     directory: &Path,
     path: &Path,
     content: &str,
 ) -> Result<(), Box<dyn Error>> {
-    let temporary = directory.join(format!(".SKILL-{}.tmp", Uuid::new_v4()));
+    let temporary = directory.join(format!(".boomux-install-{}.tmp", Uuid::new_v4()));
     let result = (|| {
         let mut file = OpenOptions::new()
             .write(true)
@@ -2292,6 +2412,10 @@ fn write_skill_atomically(
 
 fn skill_install_path(home: &Path) -> PathBuf {
     home.join(".agents/skills/boomux/SKILL.md")
+}
+
+fn opencode_install_path(config_root: &Path) -> PathBuf {
+    config_root.join("opencode/plugins/boomux.js")
 }
 
 fn legacy_skill_install_path(home: &Path) -> PathBuf {
@@ -2478,6 +2602,8 @@ mod tests {
         }
         let cli = Cli::try_parse_from(["boomux", "workspace", "create", "test", "--json"]).unwrap();
         assert!(!supports_json(&cli));
+        let cli = Cli::try_parse_from(["boomux", "opencode", "install", "--json"]).unwrap();
+        assert!(!supports_json(&cli));
         assert!(
             Cli::try_parse_from([
                 "boomux",
@@ -2613,9 +2739,36 @@ mod tests {
         assert!(matches!(
             cli.command,
             Some(Commands::Agent {
-                command: AgentCommands::Register { confidence: 95, .. }
+                command: AgentCommands::Register(AgentRegistrationArgs { confidence: 95, .. })
             })
         ));
+
+        let ensure = Cli::try_parse_from([
+            "boomux",
+            "agent",
+            "ensure",
+            "OpenCode",
+            "--integration",
+            "opencode",
+            "--external-session-id",
+            "session-1",
+            "--shell-id",
+            "s1",
+            "--run-id",
+            "r1",
+            "--state",
+            "working",
+            "--authority",
+            "lifecycle-integration",
+            "--evidence",
+            "tool call",
+            "--confidence",
+            "100",
+            "--json",
+        ])
+        .unwrap();
+        assert_eq!(command_name(&ensure), "agent.ensure");
+        assert!(supports_json(&ensure));
 
         let cli = Cli::try_parse_from([
             "boomux",
@@ -2646,7 +2799,45 @@ mod tests {
             "--json",
         ])
         .unwrap();
-        assert!(!supports_json(&cli));
+        assert_eq!(command_name(&cli), "agent.report");
+        assert!(supports_json(&cli));
+        let register = Cli::try_parse_from([
+            "boomux",
+            "agent",
+            "register",
+            "agent",
+            "--integration",
+            "test",
+            "--state",
+            "working",
+            "--authority",
+            "process-adapter",
+            "--evidence",
+            "running",
+            "--confidence",
+            "80",
+            "--json",
+        ])
+        .unwrap();
+        assert_eq!(command_name(&register), "agent.register");
+        assert!(supports_json(&register));
+        assert!(
+            Cli::try_parse_from([
+                "boomux",
+                "agent",
+                "report",
+                "a1",
+                "--state",
+                "done",
+                "--authority",
+                "daemon-lifecycle",
+                "--evidence",
+                "complete",
+                "--confidence",
+                "100",
+            ])
+            .is_err()
+        );
         assert!(
             Cli::try_parse_from([
                 "boomux",
@@ -2924,6 +3115,137 @@ mod tests {
             legacy_skill_install_path(Path::new("/home/example")),
             PathBuf::from("/home/example/.agents/skills/boomux-shells/SKILL.md")
         );
+    }
+
+    #[test]
+    fn parses_opencode_install_and_uses_global_plugin_path() {
+        assert!(matches!(
+            Cli::try_parse_from(["boomux", "opencode", "install", "--force"])
+                .unwrap()
+                .command,
+            Some(Commands::Opencode {
+                command: OpenCodeCommands::Install { force: true }
+            })
+        ));
+        assert_eq!(
+            opencode_install_path(Path::new("/config")),
+            PathBuf::from("/config/opencode/plugins/boomux.js")
+        );
+        assert_eq!(
+            opencode_config_root(Some("/xdg".into()), Some("/home/example".into())).unwrap(),
+            PathBuf::from("/xdg")
+        );
+        assert_eq!(
+            opencode_config_root(None, Some("/home/example".into())).unwrap(),
+            PathBuf::from("/home/example/.config")
+        );
+        assert!(opencode_config_root(Some("relative".into()), None).is_err());
+        assert!(install_opencode_at(Path::new("relative"), false).is_err());
+    }
+
+    #[test]
+    fn opencode_install_is_idempotent_and_requires_force_for_changes() {
+        let config = test_skill_home("opencode-content");
+        let plugin = opencode_install_path(&config);
+        let herdr = config.join("opencode/plugins/herdr.js");
+        let opencode_json = config.join("opencode/opencode.json");
+        fs::create_dir_all(herdr.parent().unwrap()).unwrap();
+        fs::write(&herdr, "herdr plugin").unwrap();
+        fs::write(&opencode_json, "{\"plugin\":[\"herdr\"]}").unwrap();
+
+        install_opencode_at(&config, false).unwrap();
+        assert_eq!(fs::read_to_string(&plugin).unwrap(), BOOMUX_OPENCODE_PLUGIN);
+        assert_eq!(fs::read_to_string(&herdr).unwrap(), "herdr plugin");
+        assert_eq!(
+            fs::read_to_string(&opencode_json).unwrap(),
+            "{\"plugin\":[\"herdr\"]}"
+        );
+        install_opencode_at(&config, false).unwrap();
+        fs::write(&plugin, "custom plugin").unwrap();
+        assert!(install_opencode_at(&config, false).is_err());
+        assert_eq!(fs::read_to_string(&plugin).unwrap(), "custom plugin");
+        install_opencode_at(&config, true).unwrap();
+        assert_eq!(fs::read_to_string(&plugin).unwrap(), BOOMUX_OPENCODE_PLUGIN);
+
+        fs::remove_dir_all(config).unwrap();
+    }
+
+    #[test]
+    fn capabilities_advertise_phase_two_agent_integration_surface() {
+        for command in ["agent.register", "agent.ensure", "agent.report"] {
+            assert!(JSON_COMMANDS.contains(&command));
+        }
+        for feature in [
+            "protocol_10",
+            "idempotent_agent_ensure",
+            "agent_authority_precedence",
+            "opencode_lifecycle_plugin",
+        ] {
+            assert!(INTEGRATION_FEATURES.contains(&feature));
+        }
+        assert_eq!(protocol::PROTOCOL_VERSION, 10);
+    }
+
+    #[test]
+    fn opencode_install_rejects_symlinks_and_special_targets_even_with_force() {
+        use std::os::unix::fs::symlink;
+
+        let config = test_skill_home("opencode-symlink-directory");
+        let outside = test_skill_home("opencode-symlink-directory-target");
+        fs::create_dir_all(&config).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, config.join("opencode")).unwrap();
+        assert!(install_opencode_at(&config, true).is_err());
+        assert!(fs::read_dir(&outside).unwrap().next().is_none());
+        fs::remove_dir_all(&config).unwrap();
+        fs::remove_dir_all(&outside).unwrap();
+
+        let config = test_skill_home("opencode-symlink-file");
+        let outside = test_skill_home("opencode-symlink-file-target");
+        let plugin = opencode_install_path(&config);
+        fs::create_dir_all(plugin.parent().unwrap()).unwrap();
+        fs::write(&outside, "do not replace").unwrap();
+        symlink(&outside, &plugin).unwrap();
+        assert!(install_opencode_at(&config, true).is_err());
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "do not replace");
+        fs::remove_dir_all(&config).unwrap();
+        fs::remove_file(&outside).unwrap();
+
+        let config = test_skill_home("opencode-special-file");
+        let plugin = opencode_install_path(&config);
+        fs::create_dir_all(&plugin).unwrap();
+        assert!(install_opencode_at(&config, true).is_err());
+        assert!(plugin.is_dir());
+        fs::remove_dir_all(config).unwrap();
+    }
+
+    #[test]
+    fn bundled_opencode_plugin_has_lifecycle_contract_without_shell_interpolation() {
+        for expected in [
+            "session.status",
+            "session.idle",
+            "session.error",
+            "session.deleted",
+            "permission.asked",
+            "question.asked",
+            "BOOMUX_SHELL_ID",
+            "BOOMUX_RUN_ID",
+            "agent\",\n    \"ensure",
+            "agent\",\n    \"report",
+            "--json",
+            "shell: false",
+        ] {
+            assert!(
+                BOOMUX_OPENCODE_PLUGIN.contains(expected),
+                "OpenCode plugin omits {expected}"
+            );
+        }
+        for forbidden in ["Bun.$", "exec(", "sh -c", "${BOOMUX_"] {
+            assert!(
+                !BOOMUX_OPENCODE_PLUGIN.contains(forbidden),
+                "OpenCode plugin contains shell interpolation marker {forbidden}"
+            );
+        }
     }
 
     #[test]

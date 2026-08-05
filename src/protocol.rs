@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 9;
+pub const PROTOCOL_VERSION: u32 = 10;
 pub const MIN_PROTOCOL_VERSION: u32 = 6;
 pub const MAX_CONTROL_FRAME: usize = 8 * 1024 * 1024;
 pub const MAX_ATTACH_FRAME: usize = 1024 * 1024;
@@ -330,6 +330,11 @@ pub enum Request {
         spec: WorkspaceLauncherSpec,
     },
     RegisterAgent {
+        shell_id: String,
+        run_id: String,
+        spec: AgentRegistrationSpec,
+    },
+    EnsureAgent {
         shell_id: String,
         run_id: String,
         spec: AgentRegistrationSpec,
@@ -718,9 +723,32 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_nine_with_minimum_six() {
-        assert_eq!(PROTOCOL_VERSION, 9);
+    fn protocol_version_is_ten_with_minimum_six() {
+        assert_eq!(PROTOCOL_VERSION, 10);
         assert_eq!(MIN_PROTOCOL_VERSION, 6);
+    }
+
+    #[test]
+    fn ensure_agent_uses_registration_shape() {
+        let request = Request::EnsureAgent {
+            shell_id: "s1".into(),
+            run_id: "r1".into(),
+            spec: AgentRegistrationSpec {
+                name: "agent".into(),
+                integration: "plugin".into(),
+                external_session_id: Some("session-1".into()),
+                report: AgentReport {
+                    state: AgentState::Working,
+                    authority: AgentAuthority::LifecycleIntegration,
+                    evidence: "working".into(),
+                    confidence: 90,
+                },
+            },
+        };
+
+        let encoded = serde_json::to_value(&request).unwrap();
+        assert_eq!(encoded["request"], "ensure_agent");
+        assert_eq!(serde_json::from_value::<Request>(encoded).unwrap(), request);
     }
 
     #[test]

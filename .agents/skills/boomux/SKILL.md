@@ -1,10 +1,10 @@
 ---
 name: boomux
-description: Inspect and manage Boomux persistent terminal workspaces, launchers, shells, and run-scoped agent instances. Use when asked to discover shells or agents, read terminal output, report an agent lifecycle state, create or open workspaces and shells, inspect status, rename or close targets, or manage the Boomux daemon.
+description: Inspect and manage Boomux persistent terminal workspaces, launchers, shells, run-scoped agent instances, and integrations. Use when asked to discover shells or agents, read terminal output, report an agent lifecycle state, install the OpenCode integration, create or open workspaces and shells, inspect status, rename or close targets, or manage the Boomux daemon.
 compatibility: Requires boomux on PATH. Some name operations require Boomux workspace context or an explicit --workspace; agent mutation requires exact shell-run context.
 metadata:
   author: boomux
-  version: "4"
+  version: "5"
 ---
 
 # Boomux
@@ -40,8 +40,8 @@ boomux workspace inspect "<workspace-name-or-id>"
 boomux shell inspect "<shell-name-or-id>" --workspace "<workspace-name-or-id>"
 ```
 
-For machine-readable inspection, add `--json`. Supported read-only commands emit
-the stable `boomux.cli/v1` envelope. Discover the exact command, feature, and
+For machine-readable inspection, add `--json`. Supported commands emit the
+stable `boomux.cli/v1` envelope. Discover the exact command, feature, and
 typed-error capabilities without starting the daemon:
 
 ```console
@@ -49,7 +49,8 @@ boomux capabilities --json
 ```
 
 Parse `data` on success and `error.code` on a nonzero exit; do not parse human
-tables or `error.message`. Mutation commands do not yet support `--json`.
+tables or `error.message`. JSON mutation support is limited to `agent register`,
+`agent ensure`, and `agent report`.
 
 Use `boomux events --json` for an immediate snapshot and cursor. Poll again with
 `--after CURSOR --wait-ms 30000` to observe later transitions. If
@@ -87,27 +88,35 @@ Use these mutation commands only for a lifecycle integration that directly
 observes the external agent session:
 
 ```console
-boomux agent register "<name>" --integration "<integration>" --external-session-id "<id>" --shell-id "<shell-id>" --run-id "<run-id>" --state working --authority lifecycle-integration --evidence "<direct evidence>" --confidence 100
-boomux agent report "<exact-agent-id>" --shell-id "<same-shell-id>" --run-id "<original-run-id>" --state blocked --authority lifecycle-integration --evidence "<direct evidence>" --confidence 100
-boomux agent report "<exact-agent-id>" --shell-id "<same-shell-id>" --run-id "<original-run-id>" --state done --authority lifecycle-integration --evidence "<completion evidence>" --confidence 100
+boomux agent register "<name>" --integration "<integration>" --external-session-id "<id>" --shell-id "<shell-id>" --run-id "<run-id>" --state working --authority lifecycle-integration --evidence "<direct evidence>" --confidence 100 --json
+boomux agent ensure "<name>" --integration "<integration>" --external-session-id "<id>" --shell-id "<shell-id>" --run-id "<run-id>" --state working --authority lifecycle-integration --evidence "<direct evidence>" --confidence 100 --json
+boomux agent report "<exact-agent-id>" --shell-id "<same-shell-id>" --run-id "<original-run-id>" --state blocked --authority lifecycle-integration --evidence "<direct evidence>" --confidence 100 --json
+boomux agent report "<exact-agent-id>" --shell-id "<same-shell-id>" --run-id "<original-run-id>" --state done --authority lifecycle-integration --evidence "<completion evidence>" --confidence 100 --json
 ```
 
-`--external-session-id` is optional. Inside the target managed process,
+`--external-session-id` is optional for `register` and required for `ensure`.
+Use `ensure` when an integration needs idempotent identity recovery after a
+reload. Its key is integration, external session ID, shell ID, and run ID; a
+match returns the existing durable snapshot without applying the supplied name
+or observation. Inside the target managed process,
 `--shell-id` and `--run-id` default to `BOOMUX_SHELL_ID` and `BOOMUX_RUN_ID`;
 otherwise pass both explicitly. Retain the exact agent ID returned by
-`register` and use it for every later report. Also retain the original run ID:
+`register` or `ensure` and use it for every later report. Also retain the original run ID:
 never replace it with a newer run from the durable shell.
 
-Every registration and report requires an explicit state (`unknown`, `working`,
-`blocked`, `idle`, or `done`), authority (`lifecycle-integration`,
-`process-adapter`, `terminal-heuristic`, or `daemon-lifecycle`), nonempty
-evidence, and confidence from 0 through 100. Report only what the stated
-authority actually observed. In particular, report `done` only after direct
+Every register, ensure, and report command requires an explicit state (`unknown`, `working`,
+`blocked`, `idle`, or `done`), external authority (`lifecycle-integration`,
+`process-adapter`, or `terminal-heuristic`), nonempty evidence, and confidence
+from 0 through 100. `daemon-lifecycle` is reserved and public mutations reject
+it. Authority precedence is lifecycle integration over process adapter over
+terminal heuristic. Lower-authority and exact duplicate reports are successful
+no-ops; equal-authority changed reports update the observation. Report only what
+the stated authority actually observed. In particular, report `done` only after direct
 lifecycle completion evidence, never because output is quiet, a prompt appears,
-or the shell exits. `done` is terminal; the durable completed instance remains
-inspectable and rejects later reports.
+or the shell exits. `done` is terminal; retrying the exact completion is safe,
+while conflicting later reports are rejected.
 
-If `register` or `report` returns `run_changed`, stop reporting for that
+If `register`, `ensure`, or `report` returns `run_changed`, stop reporting for that
 instance and reacquire exact lifecycle context. Do not guess the replacement
 run. Boomux does not yet provide agent heuristics, adapters, wait/read commands,
 notifications, or control.
@@ -248,6 +257,28 @@ boomux skill install --force
 The skill is installed at `~/.agents/skills/boomux/SKILL.md`. Use `--force` to
 replace different existing content. The installer removes an untouched legacy
 `boomux-shells` skill; it preserves and warns about customized legacy content.
+
+## Install The OpenCode Integration
+
+```console
+boomux opencode install
+boomux opencode install --force
+```
+
+The installer writes `$XDG_CONFIG_HOME/opencode/plugins/boomux.js`, falling back
+to `~/.config/opencode/plugins/boomux.js`. OpenCode discovers that global
+config-time plugin automatically; no `opencode.json` edit is made. Identical
+content is left alone, different content requires `--force`, and detected
+symlinks or non-regular path targets are rejected. Quit and restart OpenCode after
+installing or replacing the plugin.
+
+The plugin activates only in a managed shell run. It identifies one agent by the
+root OpenCode session and aggregates child/subagent activity. Work, tool, chat,
+and compaction events map to `working`; outstanding permission/questions and
+errors map to `blocked`; only root idle maps to `idle`; and only explicit root
+session deletion maps to `done`. Child deletion and process exit do not report
+completion. Unmanaged or unavailable Boomux is fail-open. If Boomux returns
+`run_changed`, reporting for that root is disabled rather than redirected.
 
 ## Environment And Integration
 

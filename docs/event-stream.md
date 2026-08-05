@@ -2,7 +2,8 @@
 
 Boomux protocol 7 added bounded long polling for daemon events and atomic,
 revision-aware terminal reads. Protocol 9 adds run-scoped agent snapshots and
-events while retaining negotiation with older management clients.
+events while retaining negotiation with older management clients. Protocol 10
+adds idempotent agent ensure without adding an event type.
 
 ## Cursors
 
@@ -44,12 +45,20 @@ and run IDs and the latest state, authority, evidence, confidence, observation
 revision, and timestamps. Registration emits `agent_registered`; registration
 as `done` also emits `agent_completed`. Later reports emit
 `agent_state_changed`, except the terminal `done` report emits
-`agent_completed`. Completed instances reject further reports.
+`agent_completed`.
+
+An ensure that reuses an identity emits no event and does not change its
+observation revision. Lower-authority reports and exact duplicates are also
+successful no-ops with no event. Equal-authority reports with changed content
+are updates and emit the normal state-change or completion event. Retrying the
+exact accepted `done` report is idempotent and emits no second completion event;
+other reports against a completed instance are rejected.
 
 Protocol-8 and older event clients do not receive protocol-9 agent snapshots or
 agent events. Filtering does not rewrite the journal: their returned cursor
 still advances across filtered agent events, preserving the stream's total
-publication order. Agent requests themselves require protocol 9.
+publication order. Agent get, register, and report requests require protocol 9;
+ensure requires protocol 10.
 
 Event IDs provide one total publication order. The daemon transition coordinator
 couples durable lifecycle mutation, persistence, and event publication. Events
