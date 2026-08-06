@@ -295,6 +295,9 @@ replace different existing content. The installer removes an untouched legacy
 
 ## Install The OpenCode Integration
 
+The bundled plugin is validated against `opencode-ai` `1.18.14`; this is a
+compatibility test point rather than a runtime pin.
+
 ```console
 boomux opencode install
 boomux opencode install --force
@@ -317,6 +320,10 @@ completion. Unmanaged or unavailable Boomux is fail-open. If Boomux returns
 
 ## Install The Pi Integration
 
+The bundled extension is validated against
+`@earendil-works/pi-coding-agent` `0.83.0`; this is a compatibility test point
+rather than a runtime pin.
+
 ```console
 boomux pi install
 boomux pi install --force
@@ -328,10 +335,11 @@ different content requires `--force`, and symlinks or non-regular targets are
 rejected. Restart Pi after installing or replacing the extension.
 
 The extension activates only in a managed shell run and keys the Agent instance
-by Pi's canonical project session ID. Session start and settled events report
-`idle`; agent start reports `working`; session shutdown reports `inactive`
-because Pi sessions are resumable. Inactive records remain durable but do not
-occupy dashboard agent rows. Reporting is serialized and fail-open.
+by Pi's canonical project session ID. Session start reports `idle`; agent start
+reports `working`; final assistant errors report `blocked` after the agent fully
+settles; and session shutdown reports `inactive` because Pi sessions are
+resumable. Inactive records remain durable but do not occupy dashboard agent
+rows. Reporting is serialized and fail-open.
 
 ## Environment And Integration
 
