@@ -33,7 +33,7 @@ or create that explicitly named container:
 boomux . --name feature-x
 ```
 
-Run a one-off command instead of the login shell by placing its exact arguments
+Run a command instead of the login shell by placing its exact arguments
 after `--`:
 
 ```console
@@ -43,7 +43,10 @@ boomux . --name feature-x --new -- lazygit
 
 Boomux executes the command directly without shell parsing. Use an explicit
 shell such as `sh -lc` when pipelines, redirects, or variable expansion are
-required.
+required. The dashboard labels this durable slot as `command`; the exact command
+is its primary process, so interrupting or exiting it ends the run and closes the
+attached terminal. A `shell` row instead starts a login shell, where `Ctrl-C`
+normally interrupts a child program and returns to the prompt.
 
 Open the shell in Omarchy's selected terminal instead of attaching in place:
 
@@ -82,13 +85,20 @@ Dashboard controls:
 - `r` refreshes immediately.
 - `q` or `Esc` quits.
 
-The selected workspace's shell table also includes configured launchers. A
-launcher row shows its command and working directory; pressing `Enter` invokes
-only that launcher.
+The selected workspace's item table identifies login shells, PTY-backed exact
+commands, active agent shells, and configured launchers in a `KIND` column. A
+`command` row shows its stored argv, while a launcher row shows its detached
+command and working directory. Pressing `Enter` invokes only the selected item.
 
-The table also shows registered agent instances, including completed instances.
-Agent rows are read-only: they can be inspected but not opened, renamed, or
-closed from the dashboard.
+When an active Agent instance is bound to a shell's current run, that shell row
+morphs into an agent row instead of adding a duplicate item. It keeps the
+shell's name, ID, directory, and open, rename, and close actions while showing the
+Agent's lifecycle state and evidence. Completed and historical Agent instances
+remain available through CLI inspection rather than occupying extra dashboard
+rows. A foreground `opencode` process also supplies a presentation-only agent
+hint, so the row morphs immediately before the first prompt creates a durable
+OpenCode session. The hint displays `idle` without creating a durable lifecycle
+observation; lifecycle state replaces that hint once available.
 
 Closing a terminal window only disconnects its attachment. The Boomux daemon
 retains the PTY and child process until the shell exits, the workspace is
@@ -142,6 +152,9 @@ The `workspace` and `shell` command groups expose explicit lifecycle operations
 for scripts and integrations. `shell create` records a pending shell; its PTY
 and process start when the shell is first opened. Shell names require current
 workspace context or `--workspace`; IDs remain globally addressable.
+Explicitly opening an exited shell, including through dashboard `Enter` or
+`workspace open`, starts its stored command as a new run on the same durable
+shell identity. Retained output remains readable until that reopen.
 New workspace and shell names are limited to 256 UTF-8 bytes so retained event
 payloads remain bounded. Existing persisted names remain loadable.
 
@@ -162,6 +175,9 @@ boomux workspace open boomux
 Opening continues after individual launcher or terminal spawn failures and
 reports all failures at the end. Removing a launcher affects future opens only;
 Boomux does not track or terminate applications it previously launched.
+
+Protocol 11 adds the explicit exited-shell restart used by open and restore.
+Low-level attachment can still inspect a completed run without restarting it.
 
 Agent instances are durable records for external agent sessions. Each instance
 has its own exact ID and is bound to exactly one shell run, not merely to a

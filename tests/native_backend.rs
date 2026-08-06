@@ -729,6 +729,66 @@ fn graceful_restart_preserves_exited_run_and_terminal_state() {
 }
 
 #[test]
+fn restart_on_attach_reopens_an_exited_durable_shell() {
+    let mut daemon = TestDaemon::start();
+    let workspace = daemon
+        .client
+        .create_workspace(
+            "restart-exited",
+            vec![ShellSpec {
+                name: "command".into(),
+                cwd: std::env::temp_dir(),
+                command: vec!["/bin/sh".into()],
+            }],
+        )
+        .unwrap();
+    let shell_id = workspace.shells[0].id.clone();
+    let mut first = daemon
+        .client
+        .attach(&shell_id, false, profile())
+        .unwrap()
+        .stream;
+    AttachFrame::Input(b"printf 'restartable-run\\n'; exit 0\n".to_vec())
+        .write_to(&mut first)
+        .unwrap();
+    assert!(contains(
+        &read_until(&mut first, b"restartable-run"),
+        b"restartable-run"
+    ));
+    drop(first);
+    wait_until(
+        || {
+            matches!(
+                daemon.client.get_shell(&shell_id).unwrap().status,
+                ShellStatus::Exited { .. }
+            )
+        },
+        "first shell run did not exit",
+    );
+    let first_run = daemon.client.get_shell(&shell_id).unwrap().run.unwrap();
+
+    let mut second = daemon
+        .client
+        .attach_restarting(&shell_id, false, profile())
+        .unwrap()
+        .stream;
+    AttachFrame::Input(b"printf 'restartable-run\\n'\n".to_vec())
+        .write_to(&mut second)
+        .unwrap();
+    assert!(contains(
+        &read_until(&mut second, b"restartable-run"),
+        b"restartable-run"
+    ));
+    let second_run = daemon.client.get_shell(&shell_id).unwrap().run.unwrap();
+    assert_ne!(second_run.id, first_run.id);
+    assert_eq!(second_run.generation, 2);
+
+    drop(second);
+    daemon.client.close_workspace(&workspace.id).unwrap();
+    daemon.stop_with_cli();
+}
+
+#[test]
 fn daemon_events_and_revision_reads_survive_handoff() {
     let mut daemon = TestDaemon::start();
     let baseline = daemon.client.events(None, 256, 0).unwrap();
@@ -1916,7 +1976,7 @@ fn native_daemon_lifecycle() {
     let capabilities: serde_json::Value = serde_json::from_slice(&capabilities.stdout).unwrap();
     assert_eq!(capabilities["schema"], "boomux.cli/v1");
     assert_eq!(capabilities["command"], "capabilities");
-    assert_eq!(capabilities["data"]["daemon_protocol_version"], 10);
+    assert_eq!(capabilities["data"]["daemon_protocol_version"], 11);
     let json_commands = capabilities["data"]["json_commands"].as_array().unwrap();
     for command in ["events", "agent.register", "agent.ensure", "agent.report"] {
         assert!(json_commands.iter().any(|current| current == command));
@@ -1925,6 +1985,8 @@ fn native_daemon_lifecycle() {
     for feature in [
         "revision_aware_reads",
         "protocol_10",
+        "protocol_11",
+        "restartable_exited_shells",
         "idempotent_agent_ensure",
         "agent_authority_precedence",
         "opencode_lifecycle_plugin",
@@ -1939,7 +2001,7 @@ fn native_daemon_lifecycle() {
         .output()
         .unwrap();
     assert!(status.status.success());
-    assert!(String::from_utf8_lossy(&status.stdout).contains("running (protocol 10"));
+    assert!(String::from_utf8_lossy(&status.stdout).contains("running (protocol 11"));
     let status = daemon
         .command()
         .args(["daemon", "status", "--json"])

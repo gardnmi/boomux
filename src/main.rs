@@ -59,6 +59,8 @@ const INTEGRATION_FEATURES: &[&str] = &[
     "workspace_launchers",
     "run_scoped_agent_instances",
     "protocol_10",
+    "protocol_11",
+    "restartable_exited_shells",
     "idempotent_agent_ensure",
     "agent_authority_precedence",
     "opencode_lifecycle_plugin",
@@ -228,6 +230,8 @@ enum Commands {
         shell_id: String,
         #[arg(long)]
         takeover: bool,
+        #[arg(long)]
+        restart_exited: bool,
     },
 }
 
@@ -546,8 +550,12 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
             daemon::receive_handoff(*channel)?;
             return Ok(CliExit::Success);
         }
-        Some(Commands::Attach { shell_id, takeover }) => {
-            attach::run(shell_id, *takeover)?;
+        Some(Commands::Attach {
+            shell_id,
+            takeover,
+            restart_exited,
+        }) => {
+            attach::run(shell_id, *takeover, *restart_exited)?;
             return Ok(CliExit::Success);
         }
         _ => {}
@@ -923,13 +931,57 @@ fn dashboard_views(
         .map(|workspace| {
             let shells = workspace.shells.iter().map(|shell| {
                 let git = git_cache.inspect(&shell.cwd);
-                tui::WorkspaceItemView::Shell(tui::TerminalView {
+                let shell_view = tui::TerminalView {
                     id: shell.id.clone(),
                     name: shell.name.clone(),
                     status: shell_status(&shell.status).into(),
                     directory: shell.cwd.display().to_string(),
                     branch: git.branch,
-                })
+                    command: shell.command.join(" "),
+                };
+                let agent = matches!(shell.status, ShellStatus::Running)
+                    .then(|| {
+                        shell.run.as_ref().and_then(|run| {
+                            workspace
+                                .agents
+                                .iter()
+                                .filter(|agent| {
+                                    agent.workspace_id == workspace.id
+                                        && agent.shell_id == shell.id
+                                        && agent.run_id == run.id
+                                        && agent.ended_at_ms.is_none()
+                                        && agent.observation.state != AgentState::Done
+                                })
+                                .max_by(|left, right| {
+                                    left.observation
+                                        .observed_at_ms
+                                        .cmp(&right.observation.observed_at_ms)
+                                        .then_with(|| left.id.cmp(&right.id))
+                                })
+                        })
+                    })
+                    .flatten();
+                match (agent, shell.foreground_process.as_deref()) {
+                    (Some(agent), _) => tui::WorkspaceItemView::AgentShell(tui::AgentShellView {
+                        shell: shell_view,
+                        agent: Some(tui::AgentView {
+                            id: agent.id.clone(),
+                            state: cli_output::agent_state(agent.observation.state).into(),
+                            integration: agent.integration.clone(),
+                            authority: cli_output::agent_authority(agent.observation.authority)
+                                .into(),
+                            confidence: agent.observation.confidence,
+                            evidence: agent.observation.evidence.clone(),
+                        }),
+                    }),
+                    (None, Some("opencode")) => {
+                        tui::WorkspaceItemView::AgentShell(tui::AgentShellView {
+                            shell: shell_view,
+                            agent: None,
+                        })
+                    }
+                    (None, _) => tui::WorkspaceItemView::Shell(shell_view),
+                }
             });
             let launchers = workspace.launchers.iter().map(|launcher| {
                 tui::WorkspaceItemView::Launcher(tui::LauncherView {
@@ -939,34 +991,10 @@ fn dashboard_views(
                     command: launcher.command.join(" "),
                 })
             });
-            let agents = workspace.agents.iter().map(|agent| {
-                let shell_name = workspace
-                    .shells
-                    .iter()
-                    .find(|shell| shell.id == agent.shell_id)
-                    .map_or("-", |shell| shell.name.as_str());
-                tui::WorkspaceItemView::Agent(tui::AgentView {
-                    id: agent.id.clone(),
-                    workspace_id: agent.workspace_id.clone(),
-                    run_id: agent.run_id.clone(),
-                    shell_id: agent.shell_id.clone(),
-                    shell_name: shell_name.into(),
-                    name: agent.name.clone(),
-                    state: cli_output::agent_state(agent.observation.state).into(),
-                    integration: agent.integration.clone(),
-                    authority: cli_output::agent_authority(agent.observation.authority).into(),
-                    confidence: agent.observation.confidence,
-                    evidence: agent.observation.evidence.clone(),
-                    external_session_id: agent.external_session_id.clone(),
-                    started_at_ms: agent.started_at_ms,
-                    observed_at_ms: agent.observation.observed_at_ms,
-                    ended_at_ms: agent.ended_at_ms,
-                })
-            });
             tui::WorkspaceView {
                 id: workspace.id.clone(),
                 name: workspace.name.clone(),
-                items: shells.chain(launchers).chain(agents).collect(),
+                items: shells.chain(launchers).collect(),
             }
         })
         .collect()
@@ -1024,7 +1052,7 @@ fn open_directory(
             terminal,
         )
     } else {
-        Ok(attach::run(&shell.id, true)?)
+        Ok(attach::run(&shell.id, true, false)?)
     }
 }
 
@@ -2577,8 +2605,18 @@ mod tests {
             workspace_id: workspace_id.into(),
             name: name.into(),
             cwd: PathBuf::from("/tmp/project"),
+            command: Vec::new(),
             status: ShellStatus::Running,
-            run: None,
+            run: Some(protocol::ShellRunSnapshot {
+                id: "r1".into(),
+                generation: 1,
+                started_at_ms: 1,
+                ended_at_ms: None,
+                exit_reason: None,
+                output_revision: 0,
+                environment_has_run_id: true,
+            }),
+            foreground_process: None,
         }
     }
 
@@ -2598,8 +2636,8 @@ mod tests {
             workspace_id: workspace_id.into(),
             shell_id: shell_id.into(),
             run_id: "r1".into(),
-            name: "opencode".into(),
-            integration: "plugin".into(),
+            name: "OpenCode".into(),
+            integration: "opencode".into(),
             external_session_id: Some("external-1".into()),
             started_at_ms: 10,
             ended_at_ms: None,
@@ -2631,10 +2669,16 @@ mod tests {
         assert!(Cli::try_parse_from(["boomux", "daemon", "run"]).is_ok());
         assert!(Cli::try_parse_from(["boomux", "daemon", "restart"]).is_ok());
         assert!(Cli::try_parse_from(["boomux", "daemon", "stop"]).is_ok());
-        let cli = Cli::try_parse_from(["boomux", "__attach", "s1", "--takeover"]).unwrap();
+        let cli =
+            Cli::try_parse_from(["boomux", "__attach", "s1", "--takeover", "--restart-exited"])
+                .unwrap();
         assert!(matches!(
             cli.command,
-            Some(Commands::Attach { takeover: true, .. })
+            Some(Commands::Attach {
+                takeover: true,
+                restart_exited: true,
+                ..
+            })
         ));
     }
 
@@ -3128,20 +3172,212 @@ mod tests {
     }
 
     #[test]
-    fn workspace_view_maps_agent_runtime_details() {
-        let mut workspace = workspace("w1", "project", vec![shell("s1", "w1", "terminal")]);
+    fn workspace_view_classifies_stored_argv_as_a_command() {
+        let mut command = shell("s1", "w1", "clock");
+        command.command = vec!["watch".into(), "-n".into(), "1".into(), "date".into()];
+        let workspace = workspace("w1", "project", vec![command]);
+
+        let views = dashboard_views(&[workspace], &mut git::Cache::default());
+
+        let tui::WorkspaceItemView::Shell(command) = &views[0].items[0] else {
+            panic!("expected command-backed shell item");
+        };
+        assert_eq!(command.name, "clock");
+        assert_eq!(command.command, "watch -n 1 date");
+    }
+
+    #[test]
+    fn workspace_view_morphs_shell_to_agent_shell_without_adding_a_row() {
+        let mut agent_command = shell("s1", "w1", "terminal");
+        agent_command.command = vec!["opencode".into()];
+        let mut workspace = workspace("w1", "project", vec![agent_command]);
+        workspace.launchers.push(launcher("l1", "w1", "editor"));
         workspace.agents.push(agent("a1", "w1", "s1"));
 
         let views = dashboard_views(&[workspace], &mut git::Cache::default());
 
-        let tui::WorkspaceItemView::Agent(agent) = &views[0].items[1] else {
-            panic!("expected agent item");
+        assert_eq!(views[0].items.len(), 2);
+        let tui::WorkspaceItemView::AgentShell(tui::AgentShellView { shell, agent }) =
+            &views[0].items[0]
+        else {
+            panic!("expected agent-shell item");
         };
-        assert_eq!(agent.name, "opencode");
-        assert_eq!(agent.shell_name, "terminal");
+        assert_eq!(shell.id, "s1");
+        assert_eq!(shell.name, "terminal");
+        assert_eq!(shell.status, "running");
+        assert_eq!(shell.directory, "/tmp/project");
+        assert_eq!(shell.branch, "-");
+        assert_eq!(shell.command, "opencode");
+        let agent = agent.as_ref().expect("durable agent");
         assert_eq!(agent.state, "working");
         assert_eq!(agent.authority, "lifecycle_integration");
         assert_eq!(agent.confidence, 95);
+        assert!(matches!(
+            views[0].items[1],
+            tui::WorkspaceItemView::Launcher(_)
+        ));
+    }
+
+    #[test]
+    fn workspace_view_hints_exact_opencode_foreground_process_before_first_prompt() {
+        let mut hinted = shell("s1", "w1", "terminal");
+        hinted.foreground_process = Some("opencode".into());
+        let workspace = workspace("w1", "project", vec![hinted]);
+
+        let views = dashboard_views(&[workspace], &mut git::Cache::default());
+
+        let tui::WorkspaceItemView::AgentShell(item) = &views[0].items[0] else {
+            panic!("expected hinted agent-shell item");
+        };
+        assert_eq!(item.shell.id, "s1");
+        assert_eq!(item.shell.status, "running");
+        assert_eq!(item.shell.name, "terminal");
+        assert!(item.agent.is_none());
+    }
+
+    #[test]
+    fn workspace_view_does_not_treat_arbitrary_foreground_process_as_agent() {
+        let mut ordinary = shell("s1", "w1", "terminal");
+        ordinary.foreground_process = Some("OpenCode".into());
+        let workspace = workspace("w1", "project", vec![ordinary]);
+
+        let views = dashboard_views(&[workspace], &mut git::Cache::default());
+
+        assert!(matches!(
+            views[0].items[0],
+            tui::WorkspaceItemView::Shell(_)
+        ));
+    }
+
+    #[test]
+    fn workspace_view_prefers_lifecycle_agent_over_foreground_hint() {
+        let mut hinted = shell("s1", "w1", "terminal");
+        hinted.foreground_process = Some("opencode".into());
+        let mut workspace = workspace("w1", "project", vec![hinted]);
+        let mut durable = agent("a1", "w1", "s1");
+        durable.name = "reviewer".into();
+        durable.integration = "custom".into();
+        durable.observation.state = AgentState::Blocked;
+        durable.observation.evidence = "needs approval".into();
+        workspace.agents.push(durable);
+
+        let views = dashboard_views(&[workspace], &mut git::Cache::default());
+
+        let tui::WorkspaceItemView::AgentShell(item) = &views[0].items[0] else {
+            panic!("expected durable agent-shell item");
+        };
+        assert_eq!(item.shell.name, "terminal");
+        let agent = item.agent.as_ref().expect("durable agent");
+        assert_eq!(agent.id, "a1");
+        assert_eq!(agent.state, "blocked");
+        assert_eq!(agent.evidence, "needs approval");
+    }
+
+    #[test]
+    fn workspace_view_preserves_live_four_shell_three_agent_shape() {
+        let mut hinted = shell("s1", "w1", "hinted");
+        hinted.foreground_process = Some("opencode".into());
+        let mut workspace = workspace(
+            "w1",
+            "project",
+            vec![
+                hinted,
+                shell("s2", "w1", "durable-1"),
+                shell("s3", "w1", "durable-2"),
+                shell("s4", "w1", "ordinary"),
+            ],
+        );
+        workspace.agents = vec![agent("a2", "w1", "s2"), agent("a3", "w1", "s3")];
+
+        let views = dashboard_views(&[workspace], &mut git::Cache::default());
+
+        assert_eq!(views[0].items.len(), 4);
+        assert_eq!(
+            views[0]
+                .items
+                .iter()
+                .filter(|item| matches!(item, tui::WorkspaceItemView::AgentShell(_)))
+                .count(),
+            3
+        );
+        assert_eq!(
+            views[0]
+                .items
+                .iter()
+                .filter(|item| matches!(item, tui::WorkspaceItemView::Shell(_)))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn workspace_view_selects_latest_active_agent_with_stable_id_tie_break() {
+        let mut workspace = workspace("w1", "project", vec![shell("s1", "w1", "terminal")]);
+        let mut older = agent("older", "w1", "s1");
+        older.observation.observed_at_ms = 20;
+        let mut tied_first = agent("agent-a", "w1", "s1");
+        tied_first.observation.observed_at_ms = 30;
+        tied_first.name = "first".into();
+        tied_first.integration = "other".into();
+        let mut tied_last = agent("agent-z", "w1", "s1");
+        tied_last.observation.observed_at_ms = 30;
+        tied_last.name = "latest".into();
+        tied_last.integration = "other".into();
+        workspace.agents = vec![tied_last, older, tied_first];
+
+        let views = dashboard_views(&[workspace], &mut git::Cache::default());
+
+        let tui::WorkspaceItemView::AgentShell(item) = &views[0].items[0] else {
+            panic!("expected agent-shell item");
+        };
+        assert_eq!(item.agent.as_ref().unwrap().id, "agent-z");
+    }
+
+    #[test]
+    fn workspace_view_ignores_completed_stale_wrong_run_and_orphan_agents() {
+        let mut second_shell = shell("s2", "w1", "second");
+        second_shell.run.as_mut().unwrap().id = "r2".into();
+        let mut workspace = workspace(
+            "w1",
+            "project",
+            vec![shell("s1", "w1", "first"), second_shell],
+        );
+        let mut ended = agent("ended", "w1", "s1");
+        ended.ended_at_ms = Some(12);
+        let mut done = agent("done", "w1", "s1");
+        done.observation.state = AgentState::Done;
+        let mut stale = agent("stale", "w1", "s1");
+        stale.run_id = "old-run".into();
+        let wrong_pair = agent("wrong-pair", "w1", "s2");
+        let orphan = agent("orphan", "w1", "missing");
+        let mut wrong_workspace = agent("wrong-workspace", "w2", "s1");
+        wrong_workspace.run_id = "r1".into();
+        workspace.agents = vec![ended, done, stale, wrong_pair, orphan, wrong_workspace];
+
+        let views = dashboard_views(&[workspace], &mut git::Cache::default());
+
+        assert_eq!(views[0].items.len(), 2);
+        assert!(
+            views[0]
+                .items
+                .iter()
+                .all(|item| matches!(item, tui::WorkspaceItemView::Shell(_)))
+        );
+    }
+
+    #[test]
+    fn workspace_view_does_not_present_an_exited_shell_as_an_active_agent() {
+        let mut exited = shell("s1", "w1", "agent");
+        exited.status = ShellStatus::Exited { code: Some(1) };
+        let mut workspace = workspace("w1", "project", vec![exited]);
+        workspace.agents.push(agent("a1", "w1", "s1"));
+
+        let views = dashboard_views(&[workspace], &mut git::Cache::default());
+
+        assert!(matches!(
+            views[0].items[0],
+            tui::WorkspaceItemView::Shell(_)
+        ));
     }
 
     #[test]
@@ -3313,7 +3549,7 @@ mod tests {
         ] {
             assert!(INTEGRATION_FEATURES.contains(&feature));
         }
-        assert_eq!(protocol::PROTOCOL_VERSION, 10);
+        assert_eq!(protocol::PROTOCOL_VERSION, 11);
     }
 
     #[test]

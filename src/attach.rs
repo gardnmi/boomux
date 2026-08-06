@@ -28,7 +28,7 @@ impl Drop for RawMode {
     }
 }
 
-pub fn run(shell_id: &str, takeover: bool) -> io::Result<()> {
+pub fn run(shell_id: &str, takeover: bool, restart_exited: bool) -> io::Result<()> {
     let mut profile = terminal_profile()?;
     let mut size = (
         profile.rows,
@@ -37,7 +37,11 @@ pub fn run(shell_id: &str, takeover: bool) -> io::Result<()> {
         profile.pixel_height,
     );
     let client = client::connect_or_start()?;
-    let mut attachment = client.attach(shell_id, takeover, profile.clone())?;
+    let mut attachment = if restart_exited {
+        client.attach_restarting(shell_id, takeover, profile.clone())?
+    } else {
+        client.attach(shell_id, takeover, profile.clone())?
+    };
     let _raw_mode = RawMode::enter()?;
     let mut stdin = io::stdin().lock();
     let mut stdout = io::stdout().lock();

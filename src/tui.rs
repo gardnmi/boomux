@@ -28,28 +28,33 @@ pub(crate) struct WorkspaceView {
     pub(crate) items: Vec<WorkspaceItemView>,
 }
 
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum WorkspaceItemView {
     Shell(TerminalView),
+    AgentShell(AgentShellView),
     Launcher(LauncherView),
-    Agent(AgentView),
+}
+
+pub(crate) struct AgentShellView {
+    pub(crate) shell: TerminalView,
+    pub(crate) agent: Option<AgentView>,
+}
+
+impl AgentShellView {
+    fn status(&self) -> &str {
+        self.agent
+            .as_ref()
+            .map_or("idle", |agent| agent.state.as_str())
+    }
 }
 
 pub(crate) struct AgentView {
     pub(crate) id: String,
-    pub(crate) workspace_id: String,
-    pub(crate) run_id: String,
-    pub(crate) shell_id: String,
-    pub(crate) shell_name: String,
-    pub(crate) name: String,
     pub(crate) state: String,
     pub(crate) integration: String,
     pub(crate) authority: String,
     pub(crate) confidence: u8,
     pub(crate) evidence: String,
-    pub(crate) external_session_id: Option<String>,
-    pub(crate) started_at_ms: u64,
-    pub(crate) observed_at_ms: u64,
-    pub(crate) ended_at_ms: Option<u64>,
 }
 
 pub(crate) struct LauncherView {
@@ -80,13 +85,37 @@ pub(crate) struct TerminalView {
     pub(crate) status: String,
     pub(crate) directory: String,
     pub(crate) branch: String,
+    pub(crate) command: String,
+}
+
+impl TerminalView {
+    fn kind(&self) -> &'static str {
+        if self.command.is_empty() {
+            "shell"
+        } else {
+            "command"
+        }
+    }
+
+    fn detail(&self) -> &str {
+        if self.command.is_empty() {
+            &self.branch
+        } else {
+            &self.command
+        }
+    }
 }
 
 impl WorkspaceView {
     fn shell_count(&self) -> usize {
         self.items
             .iter()
-            .filter(|item| matches!(item, WorkspaceItemView::Shell(_)))
+            .filter(|item| {
+                matches!(
+                    item,
+                    WorkspaceItemView::Shell(_) | WorkspaceItemView::AgentShell(_)
+                )
+            })
             .count()
     }
 
@@ -100,7 +129,7 @@ impl WorkspaceView {
     fn agent_count(&self) -> usize {
         self.items
             .iter()
-            .filter(|item| matches!(item, WorkspaceItemView::Agent(_)))
+            .filter(|item| matches!(item, WorkspaceItemView::AgentShell(_)))
             .count()
     }
 }
@@ -135,7 +164,6 @@ enum Focus {
 enum ItemIdentity {
     Shell(String),
     Launcher(String),
-    Agent(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -440,12 +468,14 @@ impl App {
             Focus::Workspaces => self
                 .selected()
                 .map(|workspace| RenameTarget::Workspace(workspace.id.clone())),
-            Focus::Items => self.selected_item().and_then(|item| match item {
-                WorkspaceItemView::Shell(shell) => Some(RenameTarget::Shell(shell.id.clone())),
-                WorkspaceItemView::Launcher(launcher) => {
-                    Some(RenameTarget::Launcher(launcher.id.clone()))
+            Focus::Items => self.selected_item().map(|item| match item {
+                WorkspaceItemView::Shell(shell) => RenameTarget::Shell(shell.id.clone()),
+                WorkspaceItemView::AgentShell(agent_shell) => {
+                    RenameTarget::Shell(agent_shell.shell.id.clone())
                 }
-                WorkspaceItemView::Agent(_) => None,
+                WorkspaceItemView::Launcher(launcher) => {
+                    RenameTarget::Launcher(launcher.id.clone())
+                }
             }),
         };
         if let Some(target) = target {
@@ -511,13 +541,15 @@ impl App {
         let Some(workspace_id) = self.selected().map(|workspace| workspace.id.clone()) else {
             return false;
         };
-        let Some(target) = self.selected_item().and_then(|item| match item {
-            WorkspaceItemView::Shell(shell) => Some(OpenTarget::Shell(shell.id.clone())),
-            WorkspaceItemView::Launcher(launcher) => Some(OpenTarget::Launcher {
+        let Some(target) = self.selected_item().map(|item| match item {
+            WorkspaceItemView::Shell(shell) => OpenTarget::Shell(shell.id.clone()),
+            WorkspaceItemView::AgentShell(agent_shell) => {
+                OpenTarget::Shell(agent_shell.shell.id.clone())
+            }
+            WorkspaceItemView::Launcher(launcher) => OpenTarget::Launcher {
                 workspace_id,
                 launcher_id: launcher.id.clone(),
-            }),
-            WorkspaceItemView::Agent(_) => None,
+            },
         }) else {
             return false;
         };
@@ -533,20 +565,25 @@ impl App {
                 shell_count: workspace.shell_count(),
                 launcher_count: workspace.launcher_count(),
             }),
-            Focus::Items => self.selected_item().and_then(|item| match item {
-                WorkspaceItemView::Shell(shell) => Some(PendingClose {
+            Focus::Items => self.selected_item().map(|item| match item {
+                WorkspaceItemView::Shell(shell) => PendingClose {
                     target: CloseTarget::Shell(shell.id.clone()),
                     name: shell.name.clone(),
                     shell_count: 1,
                     launcher_count: 0,
-                }),
-                WorkspaceItemView::Launcher(launcher) => Some(PendingClose {
+                },
+                WorkspaceItemView::AgentShell(agent_shell) => PendingClose {
+                    target: CloseTarget::Shell(agent_shell.shell.id.clone()),
+                    name: agent_shell.shell.name.clone(),
+                    shell_count: 1,
+                    launcher_count: 0,
+                },
+                WorkspaceItemView::Launcher(launcher) => PendingClose {
                     target: CloseTarget::Launcher(launcher.id.clone()),
                     name: launcher.name.clone(),
                     shell_count: 0,
                     launcher_count: 1,
-                }),
-                WorkspaceItemView::Agent(_) => None,
+                },
             }),
         };
     }
@@ -579,8 +616,10 @@ impl App {
         let selected_id = self.selected().map(|workspace| workspace.id.clone());
         let selected_item = self.selected_item().map(|item| match item {
             WorkspaceItemView::Shell(shell) => ItemIdentity::Shell(shell.id.clone()),
+            WorkspaceItemView::AgentShell(agent_shell) => {
+                ItemIdentity::Shell(agent_shell.shell.id.clone())
+            }
             WorkspaceItemView::Launcher(launcher) => ItemIdentity::Launcher(launcher.id.clone()),
-            WorkspaceItemView::Agent(agent) => ItemIdentity::Agent(agent.id.clone()),
         });
         let previous_index = self.selected_index().unwrap_or(0);
         let selected_index = selected_id
@@ -593,15 +632,14 @@ impl App {
             selected_item
                 .and_then(|target| {
                     match target {
-                    ItemIdentity::Shell(id) => workspace.items.iter().position(
-                        |item| matches!(item, WorkspaceItemView::Shell(shell) if shell.id == id),
-                    ),
+                    ItemIdentity::Shell(id) => workspace.items.iter().position(|item| match item {
+                        WorkspaceItemView::Shell(shell) => shell.id == id,
+                        WorkspaceItemView::AgentShell(agent_shell) => agent_shell.shell.id == id,
+                        WorkspaceItemView::Launcher(_) => false,
+                    }),
                     ItemIdentity::Launcher(id) => workspace.items.iter().position(|item| {
                         matches!(item, WorkspaceItemView::Launcher(launcher) if launcher.id == id)
                     }),
-                    ItemIdentity::Agent(id) => workspace.items.iter().position(
-                        |item| matches!(item, WorkspaceItemView::Agent(agent) if agent.id == id),
-                    ),
                 }
                 })
                 .or_else(|| (!workspace.items.is_empty()).then_some(0))
@@ -1033,7 +1071,7 @@ fn render_workspaces(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut A
 }
 
 fn render_items(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
-    let header = Row::new(["NAME", "STATUS", "DIRECTORY", "DETAIL", "ID"])
+    let header = Row::new(["KIND", "NAME", "STATUS", "DIRECTORY", "DETAIL", "ID"])
         .style(Style::new().fg(BLUE).add_modifier(Modifier::BOLD));
     let selected = app
         .workspace_state
@@ -1057,45 +1095,64 @@ fn render_items(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
         .flat_map(|workspace| {
             workspace.items.iter().map(|item| match item {
                 WorkspaceItemView::Shell(terminal) => Row::new(vec![
+                    Cell::from(Span::styled(
+                        terminal.kind(),
+                        Style::new().fg(if terminal.command.is_empty() {
+                            TEXT
+                        } else {
+                            YELLOW
+                        }),
+                    )),
                     Cell::from(terminal.name.as_str()),
                     Cell::from(Span::styled(
                         terminal.status.as_str(),
                         Style::new().fg(status_color(&terminal.status)),
                     )),
                     Cell::from(terminal.directory.as_str()),
-                    Cell::from(terminal.branch.as_str()),
+                    Cell::from(terminal.detail()),
                     Cell::from(if show_full_ids {
                         terminal.id.clone()
                     } else {
                         short_id(&terminal.id)
                     }),
                 ]),
+                WorkspaceItemView::AgentShell(agent_shell) => Row::new(vec![
+                    Cell::from(Span::styled("agent", Style::new().fg(TEAL))),
+                    Cell::from(agent_shell.shell.name.as_str()),
+                    Cell::from(Span::styled(
+                        agent_shell.status(),
+                        Style::new().fg(status_color(agent_shell.status())),
+                    )),
+                    Cell::from(agent_shell.shell.directory.as_str()),
+                    Cell::from(agent_shell.agent.as_ref().map_or_else(
+                        || format!("foreground process | {}", agent_shell.shell.branch),
+                        |agent| {
+                            format!(
+                                "{} | {} | {} / {} {}%",
+                                agent.evidence,
+                                agent_shell.shell.branch,
+                                agent.integration,
+                                agent.authority,
+                                agent.confidence
+                            )
+                        },
+                    )),
+                    Cell::from(if show_full_ids {
+                        agent_shell.shell.id.clone()
+                    } else {
+                        short_id(&agent_shell.shell.id)
+                    }),
+                ]),
                 WorkspaceItemView::Launcher(launcher) => Row::new(vec![
-                    Cell::from(launcher.name.as_str()),
                     Cell::from(Span::styled("launcher", Style::new().fg(YELLOW))),
+                    Cell::from(launcher.name.as_str()),
+                    Cell::from("-"),
                     Cell::from(launcher.directory.as_str()),
                     Cell::from(launcher.command.as_str()),
                     Cell::from(if show_full_ids {
                         launcher.id.clone()
                     } else {
                         short_id(&launcher.id)
-                    }),
-                ]),
-                WorkspaceItemView::Agent(agent) => Row::new(vec![
-                    Cell::from(agent.name.as_str()),
-                    Cell::from(Span::styled(
-                        agent.state.as_str(),
-                        Style::new().fg(status_color(&agent.state)),
-                    )),
-                    Cell::from(agent.shell_name.as_str()),
-                    Cell::from(format!(
-                        "{} / {} {}%: {}",
-                        agent.integration, agent.authority, agent.confidence, agent.evidence
-                    )),
-                    Cell::from(if show_full_ids {
-                        agent.id.clone()
-                    } else {
-                        short_id(&agent.id)
                     }),
                 ]),
             })
@@ -1106,13 +1163,8 @@ fn render_items(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
     let table_area = if show_full_ids {
         inner
     } else {
-        let detail_height = if matches!(app.selected_item(), Some(WorkspaceItemView::Agent(_))) {
-            3
-        } else {
-            1
-        };
         let [detail_area, table_area] =
-            Layout::vertical([Constraint::Length(detail_height), Constraint::Fill(1)]).areas(inner);
+            Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(inner);
         let detail = app.selected_item().map_or_else(
             || {
                 vec![Line::from(Span::styled(
@@ -1139,56 +1191,54 @@ fn render_items(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
 
 fn item_detail_lines(item: &WorkspaceItemView) -> Vec<Line<'_>> {
     match item {
-        WorkspaceItemView::Shell(shell) => vec![Line::from(vec![
-            Span::styled(" ID ", Style::new().fg(SUBTEXT)),
-            Span::styled(shell.id.as_str(), Style::new().fg(TEXT)),
-        ])],
+        WorkspaceItemView::Shell(shell) => {
+            let mut spans = vec![
+                Span::styled(" ID ", Style::new().fg(SUBTEXT)),
+                Span::styled(shell.id.as_str(), Style::new().fg(TEXT)),
+            ];
+            if !shell.command.is_empty() {
+                spans.extend([
+                    Span::styled("  Command ", Style::new().fg(SUBTEXT)),
+                    Span::styled(shell.command.as_str(), Style::new().fg(TEXT)),
+                ]);
+            }
+            vec![Line::from(spans)]
+        }
         WorkspaceItemView::Launcher(launcher) => vec![Line::from(vec![
             Span::styled(" ID ", Style::new().fg(SUBTEXT)),
             Span::styled(launcher.id.as_str(), Style::new().fg(TEXT)),
         ])],
-        WorkspaceItemView::Agent(agent) => vec![
-            Line::from(format!(
-                " Agent {}  Workspace {}  Run {}  Shell {} ({})",
-                agent.id, agent.workspace_id, agent.run_id, agent.shell_name, agent.shell_id
-            )),
-            Line::from(format!(
-                " {}  {}  {}  confidence {}%  external {}",
-                agent.state,
-                agent.integration,
-                agent.authority,
-                agent.confidence,
-                agent.external_session_id.as_deref().unwrap_or("-")
-            )),
-            Line::from(format!(
-                " started {}  observed {}  ended {}  {}",
-                agent.started_at_ms,
-                agent.observed_at_ms,
-                agent
-                    .ended_at_ms
-                    .map_or_else(|| "-".to_owned(), |timestamp| timestamp.to_string()),
-                agent.evidence
-            )),
-        ],
+        WorkspaceItemView::AgentShell(agent_shell) => vec![Line::from(match &agent_shell.agent {
+            Some(agent) => format!(
+                " Shell {}  Agent {}  Branch {}",
+                agent_shell.shell.id, agent.id, agent_shell.shell.branch
+            ),
+            None => format!(
+                " Shell {}  Branch {}",
+                agent_shell.shell.id, agent_shell.shell.branch
+            ),
+        })],
     }
 }
 
 fn shell_column_widths(width: u16, show_full_ids: bool) -> Vec<Constraint> {
-    let (name, status, branch, id, directory_min, directory_max) = if show_full_ids {
+    let (name, status, detail, id, directory_min, directory_max) = if show_full_ids {
         (18, 10, 30, 36, 24, 42)
     } else {
         (16, 10, 18, 8, 16, 36)
     };
-    // Four column gaps and the highlight marker also consume table width.
-    let fixed = name + status + branch + id + 6;
+    let kind = 8;
+    // Five column gaps and the highlight marker also consume table width.
+    let fixed = kind + name + status + detail + id + 7;
     let directory = width
         .saturating_sub(fixed)
         .clamp(directory_min, directory_max);
     vec![
+        Constraint::Length(kind),
         Constraint::Length(name),
         Constraint::Length(status),
         Constraint::Length(directory),
-        Constraint::Length(branch),
+        Constraint::Length(detail),
         Constraint::Length(id),
     ]
 }
@@ -1240,8 +1290,6 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
         ))
     } else {
         let launcher_selected = matches!(app.selected_item(), Some(WorkspaceItemView::Launcher(_)));
-        let agent_selected = app.focus == Focus::Items
-            && matches!(app.selected_item(), Some(WorkspaceItemView::Agent(_)));
         let mut spans = vec![
             Span::styled(" j/k", Style::new().fg(TEAL)),
             Span::styled(
@@ -1258,51 +1306,47 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
                 Style::new().fg(SUBTEXT),
             ),
         ];
-        if !agent_selected {
-            spans.extend([
-                Span::styled("e", Style::new().fg(YELLOW)),
-                Span::styled(
-                    if app.focus == Focus::Workspaces {
-                        " rename workspace  "
-                    } else if launcher_selected {
-                        " rename launcher  "
-                    } else {
-                        " rename shell  "
-                    },
-                    Style::new().fg(SUBTEXT),
-                ),
-                Span::styled("enter", Style::new().fg(GREEN)),
-                Span::styled(
-                    if app.focus == Focus::Workspaces {
-                        " restore workspace  "
-                    } else if launcher_selected {
-                        " launch command  "
-                    } else {
-                        " open shell  "
-                    },
-                    Style::new().fg(SUBTEXT),
-                ),
-            ]);
-        }
+        spans.extend([
+            Span::styled("e", Style::new().fg(YELLOW)),
+            Span::styled(
+                if app.focus == Focus::Workspaces {
+                    " rename workspace  "
+                } else if launcher_selected {
+                    " rename launcher  "
+                } else {
+                    " rename shell  "
+                },
+                Style::new().fg(SUBTEXT),
+            ),
+            Span::styled("enter", Style::new().fg(GREEN)),
+            Span::styled(
+                if app.focus == Focus::Workspaces {
+                    " restore workspace  "
+                } else if launcher_selected {
+                    " launch command  "
+                } else {
+                    " open shell  "
+                },
+                Style::new().fg(SUBTEXT),
+            ),
+        ]);
         spans.extend([
             Span::styled("r", Style::new().fg(BLUE)),
             Span::styled(" refresh  ", Style::new().fg(SUBTEXT)),
         ]);
-        if !agent_selected {
-            spans.extend([
-                Span::styled("x", Style::new().fg(RED)),
-                Span::styled(
-                    if app.focus == Focus::Workspaces {
-                        " close workspace  "
-                    } else if launcher_selected {
-                        " remove launcher  "
-                    } else {
-                        " close shell  "
-                    },
-                    Style::new().fg(SUBTEXT),
-                ),
-            ]);
-        }
+        spans.extend([
+            Span::styled("x", Style::new().fg(RED)),
+            Span::styled(
+                if app.focus == Focus::Workspaces {
+                    " close workspace  "
+                } else if launcher_selected {
+                    " remove launcher  "
+                } else {
+                    " close shell  "
+                },
+                Style::new().fg(SUBTEXT),
+            ),
+        ]);
         spans.extend([
             Span::styled("q", Style::new().fg(RED)),
             Span::styled(" quit", Style::new().fg(SUBTEXT)),
@@ -1362,6 +1406,7 @@ mod tests {
                 status: "running".into(),
                 directory: "/tmp/boomux".into(),
                 branch: "main".into(),
+                command: String::new(),
             })],
         }
     }
@@ -1369,20 +1414,39 @@ mod tests {
     fn agent() -> AgentView {
         AgentView {
             id: "agent-1".into(),
-            workspace_id: "w1".into(),
-            run_id: "run-1".into(),
-            shell_id: "term_1".into(),
-            shell_name: "agent".into(),
-            name: "reviewer".into(),
             state: "working".into(),
             integration: "opencode".into(),
             authority: "lifecycle_integration".into(),
             confidence: 95,
             evidence: "tool call in progress".into(),
-            external_session_id: Some("session-1".into()),
-            started_at_ms: 100,
-            observed_at_ms: 120,
-            ended_at_ms: None,
+        }
+    }
+
+    fn agent_shell() -> AgentShellView {
+        AgentShellView {
+            shell: TerminalView {
+                id: "term_1".into(),
+                name: "agent".into(),
+                status: "running".into(),
+                directory: "/tmp/boomux".into(),
+                branch: "main".into(),
+                command: String::new(),
+            },
+            agent: Some(agent()),
+        }
+    }
+
+    fn hinted_agent_shell() -> AgentShellView {
+        AgentShellView {
+            shell: TerminalView {
+                id: "term_1".into(),
+                name: "agent".into(),
+                status: "running".into(),
+                directory: "/tmp/boomux".into(),
+                branch: "main".into(),
+                command: String::new(),
+            },
+            agent: None,
         }
     }
 
@@ -1407,6 +1471,7 @@ mod tests {
         assert_eq!(
             shell_column_widths(180, true),
             vec![
+                Constraint::Length(8),
                 Constraint::Length(18),
                 Constraint::Length(10),
                 Constraint::Length(42),
@@ -1493,6 +1558,7 @@ mod tests {
             status: "pending".into(),
             directory: "/tmp/boomux".into(),
             branch: "main".into(),
+            command: String::new(),
         }));
         refreshed
             .items
@@ -1513,29 +1579,30 @@ mod tests {
     }
 
     #[test]
-    fn refresh_preserves_agent_selection_by_typed_id() {
+    fn refresh_preserves_selection_when_hint_morphs_to_durable_agent() {
         let mut initial = workspace("w1", "boomux");
-        initial.items.push(WorkspaceItemView::Agent(agent()));
+        initial.items[0] = WorkspaceItemView::AgentShell(hinted_agent_shell());
         let mut app = App::new(vec![initial], project_context());
         app.toggle_focus();
-        app.next();
 
         let mut refreshed = workspace("w1", "boomux");
-        refreshed
-            .items
-            .push(WorkspaceItemView::Launcher(LauncherView {
-                id: "agent-1".into(),
-                name: "same-id".into(),
+        refreshed.items[0] = WorkspaceItemView::AgentShell(agent_shell());
+        refreshed.items.insert(
+            0,
+            WorkspaceItemView::Launcher(LauncherView {
+                id: "launcher-1".into(),
+                name: "editor".into(),
                 directory: "/tmp/boomux".into(),
                 command: "true".into(),
-            }));
-        refreshed.items.push(WorkspaceItemView::Agent(agent()));
+            }),
+        );
         app.replace_workspaces(vec![refreshed]);
 
-        assert_eq!(app.item_state.selected(), Some(2));
+        assert_eq!(app.item_state.selected(), Some(1));
         assert!(matches!(
             app.selected_item(),
-            Some(WorkspaceItemView::Agent(current)) if current.id == "agent-1"
+            Some(WorkspaceItemView::AgentShell(current))
+                if current.shell.id == "term_1" && current.agent.is_some()
         ));
     }
 
@@ -1771,23 +1838,36 @@ mod tests {
     }
 
     #[test]
-    fn agent_rows_dispatch_no_open_rename_or_close_actions() {
+    fn agent_shell_rows_dispatch_shell_open_rename_and_close_actions() {
         let mut app = app();
-        app.workspaces[0].items = vec![WorkspaceItemView::Agent(agent())];
+        app.workspaces[0].items = vec![WorkspaceItemView::AgentShell(agent_shell())];
         app.toggle_focus();
-        let mut opened = false;
+        let mut opened = None;
 
-        let dispatched = app.open_selected_item(&mut |_| {
-            opened = true;
+        let dispatched = app.open_selected_item(&mut |target| {
+            opened = Some(target.clone());
             Ok(String::new())
         });
         app.request_rename();
+        assert!(matches!(
+            app.mode,
+            Mode::Rename {
+                target: RenameTarget::Shell(ref id),
+                ..
+            } if id == "term_1"
+        ));
+        app.mode = Mode::Normal;
         app.request_close();
 
-        assert!(!opened);
-        assert!(!dispatched);
-        assert!(matches!(app.mode, Mode::Normal));
-        assert!(app.pending_close.is_none());
+        assert!(dispatched);
+        assert_eq!(opened, Some(OpenTarget::Shell("term_1".into())));
+        assert!(matches!(
+            app.pending_close,
+            Some(PendingClose {
+                target: CloseTarget::Shell(ref id),
+                ..
+            }) if id == "term_1"
+        ));
     }
 
     #[test]
@@ -2046,15 +2126,14 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_renders_agent_counts_rows_details_and_read_only_footer() {
+    fn dashboard_renders_one_actionable_agent_shell_row_with_counts_and_details() {
         let backend = TestBackend::new(120, 34);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = app();
-        app.workspaces[0]
-            .items
-            .push(WorkspaceItemView::Agent(agent()));
+        let mut agent_shell = agent_shell();
+        agent_shell.shell.name = "keepname".into();
+        app.workspaces[0].items[0] = WorkspaceItemView::AgentShell(agent_shell);
         app.toggle_focus();
-        app.next();
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let text: String = terminal
@@ -2066,17 +2145,75 @@ mod tests {
             .collect();
 
         assert_eq!(app.workspaces[0].agent_count(), 1);
+        assert_eq!(app.workspaces[0].shell_count(), 1);
         assert!(text.contains("1 agents"));
+        assert!(text.contains("1 shells"));
         assert!(text.contains("AGENTS"));
-        assert!(text.contains("Items: boomux (2)"));
-        assert!(text.contains("reviewer"));
+        assert!(text.contains("Items: boomux (1)"));
+        assert!(text.contains("KIND"));
+        assert!(text.contains("agent"));
+        assert!(text.contains("keepname"));
         assert!(text.contains("working"));
-        assert!(text.contains("Agent agent-1"));
-        assert!(text.contains("lifecycle_integration"));
-        assert!(text.contains("started 100"));
-        assert!(!text.contains("rename shell"));
-        assert!(!text.contains("open shell"));
-        assert!(!text.contains("close shell"));
+        assert!(text.contains("Shell term_1  Agent agent-1"));
+        assert!(text.contains("tool call"));
+        assert!(text.contains("main"));
+        assert!(text.contains("rename shell"));
+        assert!(text.contains("open shell"));
+        assert!(text.contains("close shell"));
+    }
+
+    #[test]
+    fn dashboard_renders_command_kind_and_stored_argv() {
+        let backend = TestBackend::new(120, 34);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = app();
+        let WorkspaceItemView::Shell(command) = &mut app.workspaces[0].items[0] else {
+            panic!("expected shell item");
+        };
+        command.name = "clock".into();
+        command.command = "watch -n 1 date".into();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+
+        assert!(text.contains("command"));
+        assert!(text.contains("clock"));
+        assert!(text.contains("watch -n 1 date"));
+    }
+
+    #[test]
+    fn compact_dashboard_renders_hinted_agent_in_one_detail_line() {
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = app();
+        let mut agent_shell = hinted_agent_shell();
+        agent_shell.shell.name = "keepname".into();
+        app.workspaces[0].items[0] = WorkspaceItemView::AgentShell(agent_shell);
+        app.toggle_focus();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let lines: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect()
+            })
+            .collect();
+
+        assert_eq!(app.workspaces[0].agent_count(), 1);
+        assert!(lines.iter().any(|line| line.contains("Shell term_1")));
+        assert!(!lines.iter().any(|line| line.contains("Agent agent-1")));
+        assert!(lines.iter().any(|line| line.contains("foreground process")));
+        assert!(lines.iter().any(|line| line.contains("keepname")));
+        assert!(!lines.iter().any(|line| line.contains("opencode")));
+        assert!(lines.iter().any(|line| line.contains("idle")));
     }
 
     #[test]
