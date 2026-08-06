@@ -84,6 +84,9 @@ eternal process.
    revision-aware output reads.
 5. [Complete] Route runtime transitions through one coordinator so persistence
    and events share an ordering boundary.
+6. [Complete] Make installed-binary upgrades restart-safe by falling back to the
+   daemon's absolute invocation path when its replaced `/proc/.../exe` target is
+   marked deleted.
 
 ### Agent Runtime
 
@@ -108,9 +111,20 @@ eternal process.
    transitions without polling human output.
 4. Add deduplicated notifications for blocked and completed transitions after
    the attention and wait semantics are established.
-5. Make installed-binary upgrades restart-safe. Replacing a running executable
-   currently leaves the old daemon's `/proc/.../exe` path marked deleted, so a
-   graceful handoff needs a temporary alias.
+5. Add explicit cross-harness session inspection so Pi can read an OpenCode
+   session and OpenCode can read a Pi session. Do not treat bounded rendered
+   terminal output as the full session: host adapters must expose canonical
+   session identity, bounded and redacted messages and tool activity, versioned
+   capabilities, and an explicit access policy.
+6. Add contextual, categorized Agent Session browsing to selected agent rows in
+   the Boomux UI. Keep inactive and completed workspace sessions visible without
+   adding duplicate shell rows, grouped by active and recent time windows with
+   integration, canonical identity, associated shell and run, lifecycle state,
+   and timestamps. Bounded asynchronous host catalog adapters provide OpenCode
+   generated titles and Pi names or first-user-message summaries; future adapters
+   may provide transcripts and tool activity. Expose the resulting session inspection
+   surface through versioned CLI/API commands so authorized agents can discover
+   and read other sessions.
 
 ### Deferred Agent Work
 
