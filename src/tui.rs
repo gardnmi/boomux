@@ -1,6 +1,6 @@
 use std::io;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::Frame;
@@ -26,6 +26,23 @@ pub(crate) struct WorkspaceView {
     pub(crate) id: String,
     pub(crate) name: String,
     pub(crate) items: Vec<WorkspaceItemView>,
+    pub(crate) sessions: Vec<AgentSessionView>,
+}
+
+pub(crate) struct AgentSessionView {
+    pub(crate) id: String,
+    pub(crate) label: String,
+    pub(crate) integration: String,
+    pub(crate) external_session_id: Option<String>,
+    pub(crate) state: String,
+    pub(crate) state_is_current: bool,
+    pub(crate) last_at_ms: u64,
+    pub(crate) runs: Vec<AgentSessionRunView>,
+}
+
+pub(crate) struct AgentSessionRunView {
+    pub(crate) shell_name: Option<String>,
+    pub(crate) directory: Option<PathBuf>,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -131,6 +148,10 @@ impl WorkspaceView {
             .iter()
             .filter(|item| matches!(item, WorkspaceItemView::AgentShell(_)))
             .count()
+    }
+
+    fn session_count(&self) -> usize {
+        self.sessions.len()
     }
 }
 
@@ -1002,6 +1023,11 @@ fn render_header(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
         .map(WorkspaceView::launcher_count)
         .sum();
     let agent_count: usize = app.workspaces.iter().map(WorkspaceView::agent_count).sum();
+    let session_count: usize = app
+        .workspaces
+        .iter()
+        .map(WorkspaceView::session_count)
+        .sum();
     let line = Line::from(vec![
         Span::styled(
             " BOOMUX ",
@@ -1019,7 +1045,12 @@ fn render_header(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
             Style::new().fg(YELLOW),
         ),
         Span::styled("  |  ", Style::new().fg(OVERLAY)),
-        Span::styled(format!("{agent_count} agents"), Style::new().fg(TEAL)),
+        Span::styled(
+            format!("{agent_count} active agents"),
+            Style::new().fg(TEAL),
+        ),
+        Span::styled("  |  ", Style::new().fg(OVERLAY)),
+        Span::styled(format!("{session_count} sessions"), Style::new().fg(YELLOW)),
         Span::styled(
             "    tab/h/l/arrows switches panes",
             Style::new().fg(SUBTEXT),
@@ -1047,7 +1078,7 @@ fn render_workspaces(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut A
         ],
     )
     .header(
-        Row::new(["NAME", "SHELLS", "LAUNCHERS", "AGENTS"])
+        Row::new(["NAME", "SHELLS", "LAUNCHERS", "ACTIVE"])
             .style(Style::new().fg(BLUE).add_modifier(Modifier::BOLD)),
     )
     .column_spacing(1)
@@ -1089,7 +1120,18 @@ fn render_items(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
         },
     ));
     let inner = block.inner(area);
-    let show_full_ids = inner.width >= 150;
+    let contextual_panel = (inner.height >= 9)
+        .then(|| contextual_session_panel(app))
+        .flatten();
+    let (items_inner, sessions_area) = contextual_panel.as_ref().map_or((inner, None), |panel| {
+        let panel_height = (panel.content_height + 2)
+            .min(inner.height.saturating_sub(6))
+            .max(3);
+        let [items_area, sessions_area] =
+            Layout::vertical([Constraint::Fill(1), Constraint::Length(panel_height)]).areas(inner);
+        (items_area, Some(sessions_area))
+    });
+    let show_full_ids = items_inner.width >= 150;
     let rows: Vec<_> = selected
         .into_iter()
         .flat_map(|workspace| {
@@ -1158,13 +1200,13 @@ fn render_items(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
             })
         })
         .collect();
-    let widths = shell_column_widths(inner.width, show_full_ids);
+    let widths = shell_column_widths(items_inner.width, show_full_ids);
     frame.render_widget(block, area);
     let table_area = if show_full_ids {
-        inner
+        items_inner
     } else {
         let [detail_area, table_area] =
-            Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(inner);
+            Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(items_inner);
         let detail = app.selected_item().map_or_else(
             || {
                 vec![Line::from(Span::styled(
@@ -1187,6 +1229,198 @@ fn render_items(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
         )
         .highlight_symbol("> ");
     frame.render_stateful_widget(table, table_area, &mut app.item_state);
+    if let (Some(panel), Some(panel_area)) = (contextual_panel, sessions_area) {
+        render_contextual_sessions(frame, panel_area, panel);
+    }
+}
+
+struct ContextualSessionPanel {
+    title: String,
+    rows: Vec<Row<'static>>,
+    content_height: u16,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionCategory {
+    Active,
+    Last24Hours,
+    Last7Days,
+    Older,
+}
+
+impl SessionCategory {
+    const ALL: [Self; 4] = [
+        Self::Active,
+        Self::Last24Hours,
+        Self::Last7Days,
+        Self::Older,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Active => "ACTIVE",
+            Self::Last24Hours => "LAST 24 HOURS",
+            Self::Last7Days => "LAST 7 DAYS",
+            Self::Older => "OLDER",
+        }
+    }
+}
+
+fn session_category(session: &AgentSessionView, now_ms: u64) -> SessionCategory {
+    if session.state_is_current {
+        return SessionCategory::Active;
+    }
+    match now_ms.saturating_sub(session.last_at_ms) {
+        0..=86_400_000 => SessionCategory::Last24Hours,
+        86_400_001..=604_800_000 => SessionCategory::Last7Days,
+        _ => SessionCategory::Older,
+    }
+}
+
+fn contextual_session_panel(app: &App) -> Option<ContextualSessionPanel> {
+    let WorkspaceItemView::AgentShell(agent_shell) = app.selected_item()? else {
+        return None;
+    };
+    let agent = agent_shell.agent.as_ref()?;
+    let workspace = app.selected()?;
+    let sessions: Vec<_> = workspace
+        .sessions
+        .iter()
+        .filter(|session| session.integration == agent.integration)
+        .collect();
+    if sessions.is_empty() {
+        return None;
+    }
+    let now_ms = current_time_ms();
+    let mut rows = Vec::new();
+    let mut content_height = 0;
+    for category in SessionCategory::ALL {
+        let categorized: Vec<_> = sessions
+            .iter()
+            .copied()
+            .filter(|session| session_category(session, now_ms) == category)
+            .collect();
+        if categorized.is_empty() {
+            continue;
+        }
+        let categorized_count = categorized.len() as u16;
+        rows.push(
+            Row::new([
+                Cell::from(""),
+                Cell::from(category.label()),
+                Cell::from(""),
+                Cell::from(""),
+            ])
+            .style(Style::new().fg(BLUE).add_modifier(Modifier::BOLD)),
+        );
+        content_height += 1;
+        rows.extend(categorized.into_iter().map(|session| {
+            let label = best_session_label(session);
+            let external_identity = session
+                .external_session_id
+                .as_deref()
+                .map(short_id)
+                .unwrap_or_else(|| short_id(&session.id));
+            let shell = session
+                .runs
+                .last()
+                .and_then(|run| run.shell_name.as_deref())
+                .unwrap_or("removed shell");
+            let occurrences = session.runs.len();
+            let currency = if session.state_is_current {
+                "current"
+            } else {
+                "last known"
+            };
+            Row::new([
+                Cell::from(Span::styled(
+                    session_state_symbol(&session.state),
+                    Style::new().fg(session_state_color(&session.state)),
+                )),
+                Cell::from(vec![
+                    Line::from(Span::styled(
+                        label,
+                        Style::new().add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from(Span::styled(
+                        format!(
+                            "{shell}  {external_identity}  {occurrences} occurrence{}  {currency}",
+                            if occurrences == 1 { "" } else { "s" }
+                        ),
+                        Style::new().fg(SUBTEXT),
+                    )),
+                ]),
+                Cell::from(session.state.clone()),
+                Cell::from(compact_recency(session.last_at_ms)),
+            ])
+            .height(2)
+        }));
+        content_height += categorized_count * 2;
+    }
+    Some(ContextualSessionPanel {
+        title: format!(
+            " {} sessions ",
+            integration_display_name(&agent.integration)
+        ),
+        rows,
+        content_height,
+    })
+}
+
+fn best_session_label(session: &AgentSessionView) -> String {
+    let label = session.label.trim();
+    if !label.is_empty()
+        && !label.eq_ignore_ascii_case(&session.integration)
+        && !label.eq_ignore_ascii_case(integration_display_name(&session.integration))
+    {
+        return label.to_owned();
+    }
+    let identity = session
+        .external_session_id
+        .as_deref()
+        .map(short_id)
+        .unwrap_or_else(|| short_id(&session.id));
+    session
+        .runs
+        .iter()
+        .rev()
+        .find_map(|run| run.shell_name.as_deref())
+        .map_or_else(
+            || {
+                format!(
+                    "{} {identity}",
+                    integration_display_name(&session.integration)
+                )
+            },
+            |shell| format!("{shell} ({identity})"),
+        )
+}
+
+fn integration_display_name(integration: &str) -> &str {
+    match integration {
+        "opencode" => "OpenCode",
+        "pi" => "Pi",
+        other => other,
+    }
+}
+
+fn render_contextual_sessions(frame: &mut Frame, area: Rect, panel: ContextualSessionPanel) {
+    let table = Table::new(
+        panel.rows,
+        [
+            Constraint::Length(2),
+            Constraint::Fill(1),
+            Constraint::Length(10),
+            Constraint::Length(9),
+        ],
+    )
+    .column_spacing(1)
+    .block(
+        Block::bordered()
+            .title(panel.title)
+            .border_style(Style::new().fg(OVERLAY)),
+    );
+    frame.render_widget(table, area);
 }
 
 fn item_detail_lines(item: &WorkspaceItemView) -> Vec<Line<'_>> {
@@ -1245,6 +1479,45 @@ fn shell_column_widths(width: u16, show_full_ids: bool) -> Vec<Constraint> {
 
 fn short_id(id: &str) -> String {
     id.chars().take(8).collect()
+}
+
+fn compact_recency(timestamp_ms: u64) -> String {
+    let seconds = current_time_ms().saturating_sub(timestamp_ms) / 1_000;
+    match seconds {
+        0..=59 => "now".into(),
+        60..=3_599 => format!("{}m ago", seconds / 60),
+        3_600..=86_399 => format!("{}h ago", seconds / 3_600),
+        _ => format!("{}d ago", seconds / 86_400),
+    }
+}
+
+fn current_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn session_state_symbol(state: &str) -> &'static str {
+    match state {
+        "blocked" => "!",
+        "working" => ">",
+        "idle" => ".",
+        "inactive" => "-",
+        "done" => "x",
+        _ => "?",
+    }
+}
+
+fn session_state_color(state: &str) -> Color {
+    match state {
+        "blocked" => RED,
+        "working" => TEAL,
+        "idle" => GREEN,
+        "inactive" => SUBTEXT,
+        "done" => BLUE,
+        _ => YELLOW,
+    }
 }
 
 fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
@@ -1408,6 +1681,7 @@ mod tests {
                 branch: "main".into(),
                 command: String::new(),
             })],
+            sessions: Vec::new(),
         }
     }
 
@@ -1434,6 +1708,26 @@ mod tests {
             },
             agent: Some(agent()),
         }
+    }
+
+    fn session(id: &str, state: &str) -> AgentSessionView {
+        AgentSessionView {
+            id: id.into(),
+            label: "OpenCode review".into(),
+            integration: "opencode".into(),
+            external_session_id: Some(format!("external-{id}")),
+            state: state.into(),
+            state_is_current: true,
+            last_at_ms: 30,
+            runs: vec![AgentSessionRunView {
+                shell_name: Some("agent".into()),
+                directory: Some("/tmp/boomux".into()),
+            }],
+        }
+    }
+
+    fn focus_items(app: &mut App) {
+        app.set_focus(Focus::Items);
     }
 
     fn hinted_agent_shell() -> AgentShellView {
@@ -1492,7 +1786,7 @@ mod tests {
     fn terminal_navigation_uses_the_focused_table() {
         let mut app = app();
 
-        app.toggle_focus();
+        focus_items(&mut app);
         assert_eq!(app.focus, Focus::Items);
         app.next();
 
@@ -1519,11 +1813,21 @@ mod tests {
     }
 
     #[test]
+    fn tab_cycles_through_original_two_panes() {
+        let mut app = app();
+
+        app.toggle_focus();
+        assert_eq!(app.focus, Focus::Items);
+        app.toggle_focus();
+        assert_eq!(app.focus, Focus::Workspaces);
+    }
+
+    #[test]
     fn refresh_keeps_terminal_focus_for_an_empty_workspace() {
         let mut empty = workspace("w1", "empty");
         empty.items.clear();
         let mut app = App::new(vec![empty], project_context());
-        app.toggle_focus();
+        focus_items(&mut app);
 
         let mut refreshed = workspace("w1", "empty");
         refreshed.items.clear();
@@ -1544,7 +1848,7 @@ mod tests {
         let mut initial = workspace("w1", "boomux");
         initial.items.push(WorkspaceItemView::Launcher(launcher()));
         let mut app = App::new(vec![initial], project_context());
-        app.toggle_focus();
+        focus_items(&mut app);
         app.next();
         assert!(matches!(
             app.selected_item(),
@@ -1583,7 +1887,7 @@ mod tests {
         let mut initial = workspace("w1", "boomux");
         initial.items[0] = WorkspaceItemView::AgentShell(hinted_agent_shell());
         let mut app = App::new(vec![initial], project_context());
-        app.toggle_focus();
+        focus_items(&mut app);
 
         let mut refreshed = workspace("w1", "boomux");
         refreshed.items[0] = WorkspaceItemView::AgentShell(agent_shell());
@@ -1611,7 +1915,7 @@ mod tests {
         let mut empty = workspace("w1", "empty");
         empty.items.clear();
         let mut app = App::new(vec![empty], project_context());
-        app.toggle_focus();
+        focus_items(&mut app);
         let mut selected_workspace = None;
 
         let changed = app.request_add(&mut |workspace_id| {
@@ -1748,7 +2052,7 @@ mod tests {
     fn add_creates_a_shell_from_terminal_focus() {
         let mut app = app();
         let mut workspace_id = None;
-        app.toggle_focus();
+        focus_items(&mut app);
 
         let changed = app.request_add(&mut |selected_workspace_id| {
             workspace_id = Some(selected_workspace_id.to_owned());
@@ -1764,7 +2068,7 @@ mod tests {
     fn enter_on_terminal_opens_only_the_selected_shell() {
         let mut app = app();
         let mut opened = None;
-        app.toggle_focus();
+        focus_items(&mut app);
 
         app.open_selected_item(&mut |target| {
             opened = Some(target.clone());
@@ -1785,7 +2089,7 @@ mod tests {
                 directory: "/tmp/boomux".into(),
                 command: "zeditor .".into(),
             }));
-        app.toggle_focus();
+        focus_items(&mut app);
         app.next();
         let mut opened = None;
 
@@ -1815,7 +2119,7 @@ mod tests {
         app.workspaces[0]
             .items
             .push(WorkspaceItemView::Launcher(launcher));
-        app.toggle_focus();
+        focus_items(&mut app);
         app.next();
 
         app.request_rename();
@@ -1841,7 +2145,7 @@ mod tests {
     fn agent_shell_rows_dispatch_shell_open_rename_and_close_actions() {
         let mut app = app();
         app.workspaces[0].items = vec![WorkspaceItemView::AgentShell(agent_shell())];
-        app.toggle_focus();
+        focus_items(&mut app);
         let mut opened = None;
 
         let dispatched = app.open_selected_item(&mut |target| {
@@ -1874,7 +2178,7 @@ mod tests {
     fn rename_mode_dispatches_the_selected_shell_and_name() {
         let mut app = app();
         let mut renamed = None;
-        app.toggle_focus();
+        focus_items(&mut app);
         app.request_rename();
 
         for character in ['a', 'p', 'i'] {
@@ -1990,7 +2294,7 @@ mod tests {
     fn closing_a_shell_uses_terminal_focus() {
         let mut app = app();
         let mut closed = None;
-        app.toggle_focus();
+        focus_items(&mut app);
 
         app.request_close();
         let pending = app.pending_close.as_ref().expect("pending close");
@@ -2107,7 +2411,7 @@ mod tests {
                 command: format!("command-{index}"),
             })
         }));
-        app.toggle_focus();
+        focus_items(&mut app);
         assert_eq!(app.focus, Focus::Items);
         for _ in 0..20 {
             app.next();
@@ -2127,13 +2431,13 @@ mod tests {
 
     #[test]
     fn dashboard_renders_one_actionable_agent_shell_row_with_counts_and_details() {
-        let backend = TestBackend::new(120, 34);
+        let backend = TestBackend::new(180, 34);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = app();
         let mut agent_shell = agent_shell();
         agent_shell.shell.name = "keepname".into();
         app.workspaces[0].items[0] = WorkspaceItemView::AgentShell(agent_shell);
-        app.toggle_focus();
+        focus_items(&mut app);
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let text: String = terminal
@@ -2146,9 +2450,9 @@ mod tests {
 
         assert_eq!(app.workspaces[0].agent_count(), 1);
         assert_eq!(app.workspaces[0].shell_count(), 1);
-        assert!(text.contains("1 agents"));
+        assert!(text.contains("1 active agents"));
         assert!(text.contains("1 shells"));
-        assert!(text.contains("AGENTS"));
+        assert!(text.contains("ACTIVE"));
         assert!(text.contains("Items: boomux (1)"));
         assert!(text.contains("KIND"));
         assert!(text.contains("agent"));
@@ -2195,7 +2499,7 @@ mod tests {
         let mut agent_shell = hinted_agent_shell();
         agent_shell.shell.name = "keepname".into();
         app.workspaces[0].items[0] = WorkspaceItemView::AgentShell(agent_shell);
-        app.toggle_focus();
+        focus_items(&mut app);
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let buffer = terminal.backend().buffer();
@@ -2229,7 +2533,7 @@ mod tests {
                 command: "zeditor .".into(),
             }));
 
-        app.toggle_focus();
+        focus_items(&mut app);
         assert_eq!(app.focus, Focus::Items);
         assert!(matches!(
             app.selected_item(),
@@ -2256,6 +2560,142 @@ mod tests {
         assert!(text.contains("DIRECTORY"));
         assert!(text.contains("main"));
         assert!(!text.contains("REPOSITORY"));
+    }
+
+    #[test]
+    fn selected_durable_agent_renders_filtered_categorized_sessions() {
+        let backend = TestBackend::new(180, 34);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = app();
+        app.workspaces[0].items[0] = WorkspaceItemView::AgentShell(agent_shell());
+        focus_items(&mut app);
+        let now = current_time_ms();
+        let mut active = session("active", "working");
+        active.label = "Current work".into();
+        active.last_at_ms = now;
+        let mut recent = session("recent", "inactive");
+        recent.label = "Recent review".into();
+        recent.state_is_current = false;
+        recent.last_at_ms = now - 2 * 60 * 60 * 1_000;
+        let mut week = session("week", "done");
+        week.label = "Finished build".into();
+        week.state_is_current = false;
+        week.last_at_ms = now - 2 * 24 * 60 * 60 * 1_000;
+        let mut older = session("older", "inactive");
+        older.label = "Dormant review".into();
+        older.state_is_current = false;
+        older.last_at_ms = now - 8 * 24 * 60 * 60 * 1_000;
+        let mut pi = session("pi", "done");
+        pi.integration = "pi".into();
+        pi.label = "Pi session must be filtered".into();
+        app.workspaces[0].sessions = vec![active, recent, week, older, pi];
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let lines: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect()
+            })
+            .collect();
+        let text = lines.join("\n");
+
+        assert!(text.contains("OpenCode sessions"));
+        assert!(text.contains("ACTIVE"));
+        assert!(text.contains("LAST 24 HOURS"));
+        assert!(text.contains("LAST 7 DAYS"));
+        assert!(text.contains("OLDER"));
+        assert!(text.contains("Current work"));
+        assert!(text.contains("Recent review"));
+        assert!(text.contains("Dormant review"));
+        assert!(text.contains("Finished build"));
+        assert!(!text.contains("Pi session must be filtered"));
+        assert!(text.contains("Items: boomux (1)"));
+        assert!(lines.iter().any(|line| {
+            line.contains("Current work") && line.contains("working") && line.contains("now")
+        }));
+        assert!(lines.iter().any(|line| {
+            line.contains("agent")
+                && line.contains("external")
+                && line.contains("1 occurrence")
+                && line.contains("current")
+        }));
+        assert!(!text.contains("first "));
+        assert!(!text.contains("observed "));
+        assert!(!text.contains("tool call in progress"));
+    }
+
+    #[test]
+    fn ordinary_shell_and_launcher_hide_contextual_sessions() {
+        let backend = TestBackend::new(180, 34);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = app();
+        app.workspaces[0].sessions.push(session("hidden", "done"));
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let shell_text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(!shell_text.contains("OpenCode sessions"));
+
+        app.workspaces[0]
+            .items
+            .push(WorkspaceItemView::Launcher(LauncherView {
+                id: "launcher".into(),
+                name: "editor".into(),
+                directory: "/tmp/boomux".into(),
+                command: "editor .".into(),
+            }));
+        focus_items(&mut app);
+        app.next();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let launcher_text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(!launcher_text.contains("OpenCode sessions"));
+    }
+
+    #[test]
+    fn session_categories_are_non_overlapping_at_boundaries() {
+        let now = 1_000_000_000;
+        let mut view = session("category", "idle");
+        view.state_is_current = true;
+        assert_eq!(session_category(&view, now), SessionCategory::Active);
+        view.state_is_current = false;
+        view.last_at_ms = now - 86_400_000;
+        assert_eq!(session_category(&view, now), SessionCategory::Last24Hours);
+        view.last_at_ms -= 1;
+        assert_eq!(session_category(&view, now), SessionCategory::Last7Days);
+        view.last_at_ms = now - 604_800_001;
+        assert_eq!(session_category(&view, now), SessionCategory::Older);
+    }
+
+    #[test]
+    fn generic_agent_names_fall_back_to_shell_and_identity() {
+        let mut view = session("generic", "idle");
+        view.label = "opencode".into();
+        view.external_session_id = Some("ses_123456789".into());
+
+        assert_eq!(best_session_label(&view), "agent (ses_1234)");
+    }
+
+    #[test]
+    fn pi_sessions_keep_the_shell_and_identity_fallback() {
+        let mut view = session("pi-generic", "idle");
+        view.integration = "pi".into();
+        view.label = "Pi".into();
+        view.external_session_id = Some("pi_123456789".into());
+
+        assert_eq!(best_session_label(&view), "agent (pi_12345)");
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::env;
 use std::error::Error;
 use std::fs;
@@ -22,6 +23,7 @@ use boomux::{attach, client, daemon, protocol};
 mod cli_output;
 mod config;
 mod git;
+mod host_session_titles;
 mod process_adapter;
 mod projects;
 mod terminal;
@@ -797,7 +799,9 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
     let launch_cwd = resolve_directory(Path::new("."))?;
     let client = client::connect_or_start()?;
     let mut git_cache = git::Cache::default();
-    let views = dashboard_views(&client.snapshot()?.workspaces, &mut git_cache);
+    let mut title_cache = host_session_titles::Cache::default();
+    let mut views = dashboard_views(&client.snapshot()?.workspaces, &mut git_cache);
+    enrich_session_titles(&mut views, &mut title_cache);
     let config = config::load()?;
     let terminal = terminal_override
         .map(str::to_owned)
@@ -923,7 +927,9 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
             },
             on_refresh: || {
                 let snapshot = client.snapshot().map_err(|error| error.to_string())?;
-                Ok(dashboard_views(&snapshot.workspaces, &mut git_cache))
+                let mut views = dashboard_views(&snapshot.workspaces, &mut git_cache);
+                enrich_session_titles(&mut views, &mut title_cache);
+                Ok(views)
             },
         },
     )?;
@@ -955,6 +961,7 @@ fn dashboard_views(
     workspaces
         .iter()
         .map(|workspace| {
+            let sessions = workspace_session_views(workspace);
             let shells = workspace.shells.iter().map(|shell| {
                 let git = git_cache.inspect(&shell.cwd);
                 let shell_view = tui::TerminalView {
@@ -1037,9 +1044,181 @@ fn dashboard_views(
                 id: workspace.id.clone(),
                 name: workspace.name.clone(),
                 items: shells.chain(launchers).collect(),
+                sessions,
             }
         })
         .collect()
+}
+
+fn workspace_session_views(workspace: &WorkspaceSnapshot) -> Vec<tui::AgentSessionView> {
+    let shell_names: BTreeMap<_, _> = workspace
+        .shells
+        .iter()
+        .map(|shell| (shell.id.as_str(), shell.name.as_str()))
+        .collect();
+    let mut groups: BTreeMap<(String, String), Vec<&AgentInstanceSnapshot>> = BTreeMap::new();
+    for agent in &workspace.agents {
+        let key = match &agent.external_session_id {
+            Some(external_id) => (agent.integration.clone(), format!("external:{external_id}")),
+            None => (agent.integration.clone(), format!("instance:{}", agent.id)),
+        };
+        groups.entry(key).or_default().push(agent);
+    }
+
+    let mut sessions: Vec<_> = groups
+        .into_iter()
+        .map(|((integration, identity), mut agents)| {
+            agents.sort_by(|left, right| {
+                left.started_at_ms
+                    .cmp(&right.started_at_ms)
+                    .then_with(|| left.id.cmp(&right.id))
+            });
+            let first = agents[0];
+            let latest = agents
+                .iter()
+                .copied()
+                .max_by(|left, right| {
+                    left.observation
+                        .observed_at_ms
+                        .cmp(&right.observation.observed_at_ms)
+                        .then_with(|| left.started_at_ms.cmp(&right.started_at_ms))
+                        .then_with(|| left.id.cmp(&right.id))
+                })
+                .expect("session group is non-empty");
+            let active: Vec<_> = agents
+                .iter()
+                .copied()
+                .filter(|agent| {
+                    agent.workspace_id == workspace.id
+                        && agent.ended_at_ms.is_none()
+                        && !matches!(
+                            agent.observation.state,
+                            AgentState::Inactive | AgentState::Done
+                        )
+                        && workspace.shells.iter().any(|shell| {
+                            matches!(shell.status, ShellStatus::Running)
+                                && shell.id == agent.shell_id
+                                && shell.run.as_ref().is_some_and(|run| run.id == agent.run_id)
+                        })
+                })
+                .collect();
+            let (state_source, state_is_current) = if active.is_empty() {
+                (latest, false)
+            } else {
+                (
+                    active
+                        .into_iter()
+                        .min_by(|left, right| {
+                            agent_state_priority(left.observation.state)
+                                .cmp(&agent_state_priority(right.observation.state))
+                                .then_with(|| {
+                                    right
+                                        .observation
+                                        .observed_at_ms
+                                        .cmp(&left.observation.observed_at_ms)
+                                })
+                                .then_with(|| left.id.cmp(&right.id))
+                        })
+                        .expect("active session occurrence is non-empty"),
+                    true,
+                )
+            };
+            let last_at_ms = agents
+                .iter()
+                .map(|agent| {
+                    agent
+                        .ended_at_ms
+                        .unwrap_or(agent.observation.observed_at_ms)
+                        .max(agent.observation.observed_at_ms)
+                })
+                .max()
+                .unwrap_or(first.started_at_ms);
+            let runs = agents
+                .into_iter()
+                .map(|agent| tui::AgentSessionRunView {
+                    shell_name: shell_names
+                        .get(agent.shell_id.as_str())
+                        .map(|name| (*name).into()),
+                    directory: workspace
+                        .shells
+                        .iter()
+                        .find(|shell| shell.id == agent.shell_id)
+                        .map(|shell| shell.cwd.clone()),
+                })
+                .collect();
+
+            tui::AgentSessionView {
+                id: stable_session_id(&integration, &identity),
+                label: latest.name.clone(),
+                integration,
+                external_session_id: first.external_session_id.clone(),
+                state: cli_output::agent_state(state_source.observation.state).into(),
+                state_is_current,
+                last_at_ms,
+                runs,
+            }
+        })
+        .collect();
+    sessions.sort_by(|left, right| {
+        right
+            .last_at_ms
+            .cmp(&left.last_at_ms)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    sessions
+}
+
+fn enrich_session_titles(
+    workspaces: &mut [tui::WorkspaceView],
+    title_cache: &mut host_session_titles::Cache,
+) {
+    enrich_session_titles_with(workspaces, |integration, directory, external_session_id| {
+        title_cache.title(integration, directory, external_session_id)
+    });
+}
+
+fn enrich_session_titles_with<F>(workspaces: &mut [tui::WorkspaceView], mut title: F)
+where
+    F: FnMut(&str, &Path, &str) -> Option<String>,
+{
+    for session in workspaces
+        .iter_mut()
+        .flat_map(|workspace| workspace.sessions.iter_mut())
+    {
+        let Some(external_session_id) = session.external_session_id.as_deref() else {
+            continue;
+        };
+        let Some(directory) = session
+            .runs
+            .iter()
+            .rev()
+            .find_map(|run| run.directory.as_deref())
+        else {
+            continue;
+        };
+        if let Some(host_title) = title(&session.integration, directory, external_session_id) {
+            session.label = host_title;
+        }
+    }
+}
+
+fn stable_session_id(integration: &str, identity: &str) -> String {
+    format!(
+        "{}:{integration}:{}:{identity}",
+        integration.len(),
+        identity.len()
+    )
+}
+
+fn agent_state_priority(state: AgentState) -> u8 {
+    match state {
+        AgentState::Blocked => 0,
+        AgentState::Working => 1,
+        AgentState::Idle => 2,
+        AgentState::Inactive => 3,
+        AgentState::Done => 4,
+        AgentState::Unknown => 5,
+    }
 }
 
 fn open_directory(
@@ -3255,6 +3434,241 @@ mod tests {
         );
 
         assert!(views[0].items.is_empty());
+        assert!(views[0].sessions.is_empty());
+    }
+
+    #[test]
+    fn workspace_view_groups_external_session_occurrences_across_runs() {
+        let mut second_shell = shell("s2", "w1", "review");
+        second_shell.run.as_mut().unwrap().id = "r2".into();
+        let mut workspace = workspace(
+            "w1",
+            "project",
+            vec![shell("s1", "w1", "build"), second_shell],
+        );
+        let mut first = agent("agent-old", "w1", "s1");
+        first.started_at_ms = 10;
+        first.ended_at_ms = Some(20);
+        first.observation.state = AgentState::Inactive;
+        first.observation.observed_at_ms = 20;
+        let mut second = agent("agent-new", "w1", "s2");
+        second.run_id = "r2".into();
+        second.started_at_ms = 30;
+        second.observation.state = AgentState::Blocked;
+        second.observation.evidence = "approval needed".into();
+        second.observation.observed_at_ms = 40;
+        workspace.agents = vec![second, first];
+
+        let views = dashboard_views(&[workspace], &mut git::Cache::default());
+
+        assert_eq!(views[0].sessions.len(), 1);
+        let session = &views[0].sessions[0];
+        assert_eq!(
+            session.id,
+            stable_session_id("opencode", "external:external-1")
+        );
+        assert_eq!(session.state, "blocked");
+        assert!(session.state_is_current);
+        assert_eq!(session.runs.len(), 2);
+        assert_eq!(session.runs[0].shell_name.as_deref(), Some("build"));
+        assert_eq!(session.runs[1].shell_name.as_deref(), Some("review"));
+        assert_eq!(
+            session.runs[1].directory.as_deref(),
+            Some(Path::new("/tmp/project"))
+        );
+    }
+
+    #[test]
+    fn enriches_only_the_matching_integration_and_external_session() {
+        let mut workspace = workspace("w1", "project", vec![shell("s1", "w1", "agent")]);
+        workspace.agents = vec![agent("agent-1", "w1", "s1")];
+        let mut views = dashboard_views(&[workspace], &mut git::Cache::default());
+
+        enrich_session_titles_with(&mut views, |integration, directory, external_id| {
+            (integration == "opencode"
+                && directory == Path::new("/tmp/project")
+                && external_id == "external-1")
+                .then(|| "Review async title cache".into())
+        });
+
+        assert_eq!(views[0].sessions[0].label, "Review async title cache");
+    }
+
+    #[test]
+    fn enriches_from_the_newest_available_session_directory() {
+        let mut views = vec![tui::WorkspaceView {
+            id: "w1".into(),
+            name: "project".into(),
+            items: Vec::new(),
+            sessions: vec![tui::AgentSessionView {
+                id: "session".into(),
+                label: "opencode".into(),
+                integration: "opencode".into(),
+                external_session_id: Some("external-1".into()),
+                state: "inactive".into(),
+                state_is_current: false,
+                last_at_ms: 30,
+                runs: vec![
+                    tui::AgentSessionRunView {
+                        shell_name: Some("old-shell".into()),
+                        directory: Some("/tmp/project".into()),
+                    },
+                    tui::AgentSessionRunView {
+                        shell_name: None,
+                        directory: None,
+                    },
+                ],
+            }],
+        }];
+
+        enrich_session_titles_with(&mut views, |_, directory, _| {
+            (directory == Path::new("/tmp/project")).then(|| "Historical title".into())
+        });
+
+        assert_eq!(views[0].sessions[0].label, "Historical title");
+    }
+
+    #[test]
+    fn workspace_view_keeps_agents_without_external_ids_isolated() {
+        let mut workspace = workspace("w1", "project", vec![shell("s1", "w1", "agent")]);
+        let mut first = agent("agent-a", "w1", "s1");
+        first.external_session_id = None;
+        let mut second = agent("agent-b", "w1", "s1");
+        second.external_session_id = None;
+        workspace.agents = vec![first, second];
+
+        let views = dashboard_views(&[workspace], &mut git::Cache::default());
+
+        assert_eq!(views[0].sessions.len(), 2);
+        assert!(
+            views[0]
+                .sessions
+                .iter()
+                .all(|session| session.runs.len() == 1)
+        );
+    }
+
+    #[test]
+    fn workspace_session_state_prioritizes_active_blocked_occurrences() {
+        let mut workspace = workspace("w1", "project", vec![shell("s1", "w1", "agent")]);
+        let mut working = agent("working", "w1", "s1");
+        working.observation.observed_at_ms = 30;
+        let mut blocked = agent("blocked", "w1", "s1");
+        blocked.observation.state = AgentState::Blocked;
+        blocked.observation.observed_at_ms = 20;
+        workspace.agents = vec![working, blocked];
+
+        let views = dashboard_views(&[workspace], &mut git::Cache::default());
+
+        assert_eq!(views[0].sessions[0].state, "blocked");
+    }
+
+    #[test]
+    fn workspace_session_state_ignores_stale_blocked_occurrence() {
+        let mut current_shell = shell("s1", "w1", "agent");
+        current_shell.run.as_mut().unwrap().id = "current-run".into();
+        let mut workspace = workspace("w1", "project", vec![current_shell]);
+        let mut stale = agent("stale", "w1", "s1");
+        stale.run_id = "old-run".into();
+        stale.observation.state = AgentState::Blocked;
+        stale.observation.observed_at_ms = 30;
+        let mut current = agent("current", "w1", "s1");
+        current.run_id = "current-run".into();
+        current.observation.state = AgentState::Working;
+        current.observation.observed_at_ms = 20;
+        workspace.agents = vec![stale, current];
+
+        let views = dashboard_views(&[workspace], &mut git::Cache::default());
+
+        assert_eq!(views[0].sessions[0].state, "working");
+        assert!(views[0].sessions[0].state_is_current);
+    }
+
+    #[test]
+    fn workspace_session_state_marks_stale_history_as_last_known() {
+        let mut workspace = workspace("w1", "project", vec![shell("s1", "w1", "agent")]);
+        let mut stale = agent("stale", "w1", "s1");
+        stale.run_id = "old-run".into();
+        stale.observation.state = AgentState::Blocked;
+        workspace.agents = vec![stale];
+
+        let views = dashboard_views(&[workspace], &mut git::Cache::default());
+
+        assert_eq!(views[0].sessions[0].state, "blocked");
+        assert!(!views[0].sessions[0].state_is_current);
+    }
+
+    #[test]
+    fn workspace_session_id_is_stable_when_equal_timestamp_occurrence_is_added() {
+        let mut workspace = workspace("w1", "project", vec![shell("s1", "w1", "agent")]);
+        let mut first = agent("agent-z", "w1", "s1");
+        first.started_at_ms = 10;
+        workspace.agents = vec![first.clone()];
+        let initial_id = workspace_session_views(&workspace)[0].id.clone();
+
+        let mut added = agent("agent-a", "w1", "s1");
+        added.started_at_ms = 10;
+        workspace.agents.push(added);
+        let sessions = workspace_session_views(&workspace);
+
+        assert_eq!(sessions[0].id, initial_id);
+        assert_eq!(sessions[0].runs.len(), 2);
+        assert_eq!(
+            sessions[0].id,
+            stable_session_id("opencode", "external:external-1")
+        );
+    }
+
+    #[test]
+    fn workspace_session_state_priority_matches_attention_order() {
+        let states = [
+            AgentState::Blocked,
+            AgentState::Working,
+            AgentState::Idle,
+            AgentState::Inactive,
+            AgentState::Done,
+            AgentState::Unknown,
+        ];
+
+        assert_eq!(states.map(agent_state_priority), [0, 1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn workspace_session_catalog_retains_inactive_and_done_sessions() {
+        let mut workspace = workspace("w1", "project", vec![]);
+        let mut inactive = agent("inactive", "w1", "removed-a");
+        inactive.external_session_id = Some("inactive-session".into());
+        inactive.ended_at_ms = Some(20);
+        inactive.observation.state = AgentState::Inactive;
+        inactive.observation.observed_at_ms = 20;
+        let mut done = agent("done", "w1", "removed-b");
+        done.external_session_id = Some("done-session".into());
+        done.ended_at_ms = Some(30);
+        done.observation.state = AgentState::Done;
+        done.observation.observed_at_ms = 30;
+        workspace.agents = vec![inactive, done];
+
+        let views = dashboard_views(&[workspace], &mut git::Cache::default());
+
+        assert_eq!(views[0].sessions.len(), 2);
+        assert!(
+            views[0]
+                .sessions
+                .iter()
+                .any(|session| session.state == "inactive")
+        );
+        assert!(
+            views[0]
+                .sessions
+                .iter()
+                .any(|session| session.state == "done")
+        );
+        assert!(
+            views[0]
+                .sessions
+                .iter()
+                .all(|session| session.runs[0].shell_name.is_none())
+        );
     }
 
     #[test]
