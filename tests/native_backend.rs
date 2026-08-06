@@ -1976,7 +1976,7 @@ fn native_daemon_lifecycle() {
     let capabilities: serde_json::Value = serde_json::from_slice(&capabilities.stdout).unwrap();
     assert_eq!(capabilities["schema"], "boomux.cli/v1");
     assert_eq!(capabilities["command"], "capabilities");
-    assert_eq!(capabilities["data"]["daemon_protocol_version"], 11);
+    assert_eq!(capabilities["data"]["daemon_protocol_version"], 12);
     let json_commands = capabilities["data"]["json_commands"].as_array().unwrap();
     for command in ["events", "agent.register", "agent.ensure", "agent.report"] {
         assert!(json_commands.iter().any(|current| current == command));
@@ -1985,6 +1985,8 @@ fn native_daemon_lifecycle() {
     for feature in [
         "revision_aware_reads",
         "protocol_10",
+        "protocol_12",
+        "inactive_agent_state",
         "protocol_11",
         "restartable_exited_shells",
         "idempotent_agent_ensure",
@@ -2001,7 +2003,7 @@ fn native_daemon_lifecycle() {
         .output()
         .unwrap();
     assert!(status.status.success());
-    assert!(String::from_utf8_lossy(&status.stdout).contains("running (protocol 11"));
+    assert!(String::from_utf8_lossy(&status.stdout).contains("running (protocol 12"));
     let status = daemon
         .command()
         .args(["daemon", "status", "--json"])

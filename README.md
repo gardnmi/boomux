@@ -95,9 +95,9 @@ morphs into an agent row instead of adding a duplicate item. It keeps the
 shell's name, ID, directory, and open, rename, and close actions while showing the
 Agent's lifecycle state and evidence. Completed and historical Agent instances
 remain available through CLI inspection rather than occupying extra dashboard
-rows. A foreground `opencode` process also supplies a presentation-only agent
-hint, so the row morphs immediately before the first prompt creates a durable
-OpenCode session. The hint displays `idle` without creating a durable lifecycle
+rows. A foreground `opencode` or `pi` process also supplies a presentation-only agent
+hint, so the row morphs immediately while the lifecycle integration establishes
+a durable Agent session. The hint displays `idle` without creating a durable lifecycle
 observation; lifecycle state replaces that hint once available.
 
 Closing a terminal window only disconnects its attachment. The Boomux daemon
@@ -142,6 +142,7 @@ boomux daemon restart
 boomux daemon stop
 boomux skill install [--force]
 boomux opencode install [--force]
+boomux pi install [--force]
 ```
 
 `boomux shells` lists shells in the current workspace. `boomux read` and
@@ -186,7 +187,7 @@ by integration, external session ID, shell ID, and run ID. It requires
 `--external-session-id`; an existing match is returned unchanged, including
 after an integration or daemon reload, while a different shell run creates a
 different identity. `register`, `ensure`, and `report` require explicit
-`unknown`, `working`, `blocked`, `idle`, or `done` state plus authority,
+`unknown`, `working`, `blocked`, `idle`, `inactive`, or `done` state plus authority,
 evidence, and confidence.
 
 External reports use this precedence: `lifecycle-integration` over
@@ -347,6 +348,29 @@ caller already has the selected canonical root ID and passes it explicitly as
 `--external-session-id`. This is not a reason to wrap ordinary OpenCode launches
 when the lifecycle plugin is available: the plugin resolves canonical ancestry
 and provides stronger, meaningful lifecycle observations.
+
+## Pi Integration
+
+Install the bundled global Pi lifecycle extension with:
+
+```console
+boomux pi install
+```
+
+The destination is `$PI_CODING_AGENT_DIR/extensions/boomux.js`, or
+`~/.pi/agent/extensions/boomux.js` when that environment variable is unset. Pi
+discovers the extension automatically. Identical content is left unchanged;
+different content requires `--force`, and symlinked or non-regular install paths
+are rejected. Restart Pi after installing or replacing the extension.
+
+Inside a Boomux-managed shell, the extension uses Pi's canonical project session
+ID and lifecycle hooks. Session start reports `idle`, agent start reports
+`working`, and `agent_settled` reports `idle` only after retries, compaction, and
+queued continuations have finished. Session shutdown reports `inactive` rather
+than permanent completion because Pi sessions are resumable. Inactive instances
+remain durable but do not occupy agent rows until the session starts again.
+Calls use exact argument vectors, bounded JSON output, and fail open when Boomux
+is unavailable.
 
 ## Architecture
 

@@ -236,6 +236,7 @@ pub(crate) fn agent_state(state: AgentState) -> &'static str {
         AgentState::Working => "working",
         AgentState::Blocked => "blocked",
         AgentState::Idle => "idle",
+        AgentState::Inactive => "inactive",
         AgentState::Done => "done",
     }
 }

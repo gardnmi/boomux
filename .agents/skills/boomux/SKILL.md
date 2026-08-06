@@ -1,6 +1,6 @@
 ---
 name: boomux
-description: Inspect and manage Boomux persistent terminal workspaces, launchers, shells, run-scoped agent instances, process supervision, and integrations. Use when asked to discover shells or agents, read terminal output, supervise an explicitly identified external session, report agent lifecycle state, install the OpenCode integration, create or open workspaces and shells, inspect status, rename or close targets, or manage the Boomux daemon.
+description: Inspect and manage Boomux persistent terminal workspaces, launchers, shells, run-scoped agent instances, process supervision, and integrations. Use when asked to discover shells or agents, read terminal output, supervise an explicitly identified external session, report agent lifecycle state, install the OpenCode or Pi integration, create or open workspaces and shells, inspect status, rename or close targets, or manage the Boomux daemon.
 compatibility: Requires boomux on PATH. Some name operations require Boomux workspace context or an explicit --workspace; agent mutation and supervision require exact shell-run context, and supervision requires a caller-supplied canonical external session ID.
 metadata:
   author: boomux
@@ -314,6 +314,24 @@ errors map to `blocked`; only root idle maps to `idle`; and only explicit root
 session deletion maps to `done`. Child deletion and process exit do not report
 completion. Unmanaged or unavailable Boomux is fail-open. If Boomux returns
 `run_changed`, reporting for that root is disabled rather than redirected.
+
+## Install The Pi Integration
+
+```console
+boomux pi install
+boomux pi install --force
+```
+
+The installer writes `$PI_CODING_AGENT_DIR/extensions/boomux.js`, falling back
+to `~/.pi/agent/extensions/boomux.js`. Identical content is left alone,
+different content requires `--force`, and symlinks or non-regular targets are
+rejected. Restart Pi after installing or replacing the extension.
+
+The extension activates only in a managed shell run and keys the Agent instance
+by Pi's canonical project session ID. Session start and settled events report
+`idle`; agent start reports `working`; session shutdown reports `inactive`
+because Pi sessions are resumable. Inactive records remain durable but do not
+occupy dashboard agent rows. Reporting is serialized and fail-open.
 
 ## Environment And Integration
 
