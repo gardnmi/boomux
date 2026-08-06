@@ -52,8 +52,11 @@ pub(crate) struct ShellData {
     pub(crate) workspace_name: Option<String>,
     pub(crate) name: String,
     pub(crate) cwd: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) command: Vec<String>,
     pub(crate) status: &'static str,
     pub(crate) exit_code: Option<u32>,
+    pub(crate) foreground_process: Option<String>,
     pub(crate) run: Option<RunData>,
 }
 
@@ -165,8 +168,10 @@ pub(crate) fn shell(shell: &ShellSnapshot, workspace_name: Option<&str>) -> Shel
         workspace_name: workspace_name.map(str::to_owned),
         name: shell.name.clone(),
         cwd: shell.cwd.display().to_string(),
+        command: shell.command.clone(),
         status,
         exit_code,
+        foreground_process: shell.foreground_process.clone(),
         run: shell.run.as_ref().map(|run| {
             let (exit_reason, exit_code) = match run.exit_reason.as_ref() {
                 Some(ShellRunExitReason::Exited { code }) => (Some("exited"), *code),

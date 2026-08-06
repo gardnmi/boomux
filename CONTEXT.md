@@ -11,7 +11,16 @@ shell or shell run.
 ## Shell
 
 A durable workspace slot whose process runs are retained and observable across attachments and
-daemon lifecycle transitions. A shell is distinct from a workspace launcher.
+daemon lifecycle transitions. Explicitly opening an exited shell starts its stored command as a
+new run on the same shell identity. A shell is distinct from a workspace launcher.
+
+## Command
+
+The dashboard presentation of a durable shell whose stored startup argument vector is non-empty.
+Its exact command is the run's primary process, so interrupting or exiting that process ends the
+run and closes its attached terminal. A command retains shell identity and run history; it is not a
+workspace launcher. An active agent presentation takes precedence over command presentation while
+retaining the shell's durable name.
 
 ## Agent Instance
 

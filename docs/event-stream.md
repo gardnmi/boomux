@@ -3,7 +3,9 @@
 Boomux protocol 7 added bounded long polling for daemon events and atomic,
 revision-aware terminal reads. Protocol 9 adds run-scoped agent snapshots and
 events while retaining negotiation with older management clients. Protocol 10
-adds idempotent agent ensure without adding an event type.
+adds idempotent agent ensure without adding an event type. Protocol 11 adds an
+explicit exited-shell restart; the subsequent attachment emits the existing
+`run_started` event for the new generation.
 
 ## Cursors
 

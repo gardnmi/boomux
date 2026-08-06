@@ -357,7 +357,7 @@ function ensureArgv(shellID, runID, rootID, state, evidence) {
     "boomux",
     "agent",
     "ensure",
-    "OpenCode",
+    "opencode",
     "--integration",
     "opencode",
     "--external-session-id",

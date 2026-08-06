@@ -428,7 +428,7 @@ describe("Boomux commands", () => {
       "boomux",
       "agent",
       "ensure",
-      "OpenCode",
+      "opencode",
       "--integration",
       "opencode",
       "--external-session-id",
@@ -513,7 +513,7 @@ describe("Boomux commands", () => {
       "boomux",
       "agent",
       "ensure",
-      "OpenCode",
+      "opencode",
     ]);
     expect(calls[0][calls[0].indexOf("--state") + 1]).toBe("idle");
     expect(calls[1].slice(0, 4)).toEqual([

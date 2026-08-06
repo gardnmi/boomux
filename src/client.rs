@@ -567,15 +567,44 @@ impl Client {
         )
     }
 
+    pub fn restart_shell(&self, shell_id: impl Into<String>) -> io::Result<ShellSnapshot> {
+        match self.request(Request::RestartShell {
+            shell_id: shell_id.into(),
+        })? {
+            Response::Shell { shell } => Ok(shell),
+            other => unexpected(other),
+        }
+    }
+
     pub fn attach(
         &self,
         shell_id: impl Into<String>,
         takeover: bool,
         profile: TerminalProfile,
     ) -> io::Result<Attachment> {
+        self.attach_with_restart(shell_id.into(), takeover, false, profile)
+    }
+
+    pub fn attach_restarting(
+        &self,
+        shell_id: impl Into<String>,
+        takeover: bool,
+        profile: TerminalProfile,
+    ) -> io::Result<Attachment> {
+        self.attach_with_restart(shell_id.into(), takeover, true, profile)
+    }
+
+    fn attach_with_restart(
+        &self,
+        shell_id: String,
+        takeover: bool,
+        restart_exited: bool,
+        profile: TerminalProfile,
+    ) -> io::Result<Attachment> {
         let (stream, response) = self.send(Request::Attach {
-            shell_id: shell_id.into(),
+            shell_id,
             takeover,
+            restart_exited,
             profile,
         })?;
         match response {
@@ -602,6 +631,11 @@ fn request_minimum_version(request: &Request) -> u32 {
         | Request::RemoveLauncher { .. } => 8,
         Request::GetAgent { .. } | Request::RegisterAgent { .. } | Request::ReportAgent { .. } => 9,
         Request::EnsureAgent { .. } => 10,
+        Request::RestartShell { .. }
+        | Request::Attach {
+            restart_exited: true,
+            ..
+        } => 11,
         Request::ReadShellAt { .. } | Request::Events { .. } => 7,
         _ => protocol::MIN_PROTOCOL_VERSION,
     }
@@ -774,12 +808,70 @@ mod tests {
     }
 
     #[test]
+    fn restart_shell_requires_protocol_eleven() {
+        assert_eq!(
+            request_minimum_version(&Request::RestartShell {
+                shell_id: "s1".into(),
+            }),
+            11
+        );
+    }
+
+    #[test]
+    fn restarting_attach_requires_protocol_eleven() {
+        let profile = TerminalProfile {
+            term: None,
+            colorterm: None,
+            term_program: None,
+            term_program_version: None,
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        assert_eq!(
+            request_minimum_version(&Request::Attach {
+                shell_id: "s1".into(),
+                takeover: false,
+                restart_exited: true,
+                profile: profile.clone(),
+            }),
+            11
+        );
+        assert_eq!(
+            request_minimum_version(&Request::Attach {
+                shell_id: "s1".into(),
+                takeover: false,
+                restart_exited: false,
+                profile,
+            }),
+            protocol::MIN_PROTOCOL_VERSION
+        );
+    }
+
+    #[test]
     fn negotiates_protocol_seven_without_losing_version_seven_requests() {
         let directory = env::temp_dir().join(format!("boomux-client-{}", Uuid::new_v4()));
         fs::create_dir_all(&directory).unwrap();
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+            assert_eq!(request.version, 11);
+            assert!(matches!(request.message, Request::Ping));
+            protocol::write_message(
+                &mut stream,
+                &Envelope::with_version(
+                    10,
+                    Response::Error {
+                        message: "expected an older protocol".into(),
+                        code: Some(ErrorCode::UnsupportedVersion),
+                    },
+                ),
+            )
+            .unwrap();
+
             let (mut stream, _) = listener.accept().unwrap();
             let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
             assert_eq!(request.version, 10);
@@ -789,7 +881,7 @@ mod tests {
                 &Envelope::with_version(
                     10,
                     Response::Error {
-                        message: "expected an older protocol".into(),
+                        message: "expected protocol 7".into(),
                         code: Some(ErrorCode::UnsupportedVersion),
                     },
                 ),

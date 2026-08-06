@@ -52,10 +52,6 @@ commitments.
 See [`native-terminal-follow-up.md`](native-terminal-follow-up.md) for the
 terminal handshake, VT reconstruction, and restart-persistence plan.
 
-- Aggregate multiple agent states as counts instead of one workspace-level
-  value.
-- Notify when an agent becomes blocked, finishes, or needs input.
-- Show an opt-in, read-only preview of the selected terminal.
 - Search workspaces and actions from a command palette.
 - Launch workspace templates such as editor, agent, tests, and LazyGit.
 - Duplicate a workspace structure for another branch or worktree.
@@ -98,19 +94,35 @@ eternal process.
 3. [Complete] Add an explicit-session process supervisor that preserves exact
    argv and inherited stdio, propagates child exit, reports only `unknown`
    process start/exit evidence, and fails open when Boomux reporting fails.
-4. [In progress] Add remaining automatic or integration-specific process
-   adapters beneath lifecycle-integration authority. OpenCode discovery must not
-   infer a selected canonical root from process identity, argv, database state,
-   or API access; fresh, continue, fork, and session switching require a caller
-   that already knows the canonical root ID.
-5. Add conservative terminal-screen heuristics beneath process-adapter
-   authority, without inferring completion from quiet output or shell exit.
-6. Aggregate agent states as workspace counts and provide an explainable,
+
+### Near-Term Priorities
+
+1. Validate the OpenCode lifecycle plugin during normal work before expanding
+   the observation model. Confirm reload identity, root/subagent aggregation,
+   blocked prompts, idle transitions, explicit completion, and graceful daemon
+   replacement against real sessions.
+2. Aggregate agent states into workspace counts and add an explainable,
    persistent attention queue for blocked and completed work.
-7. Add notifications and revision-aware `agent wait` and `agent read` commands.
-8. Add guarded prompts and common responses only after defining run-scoped
-   leases, user-controller precedence, idempotency, and audit events.
-9. Run hooks, tests, notifications, or focus actions from durable transitions.
+3. Add revision-aware `agent wait` so scripts can await durable state
+   transitions without polling human output.
+4. Add deduplicated notifications for blocked and completed transitions after
+   the attention and wait semantics are established.
+5. Make installed-binary upgrades restart-safe. Replacing a running executable
+   currently leaves the old daemon's `/proc/.../exe` path marked deleted, so a
+   graceful handoff needs a temporary alias.
+
+### Deferred Agent Work
+
+- Defer automatic and integration-specific process discovery until a target can
+  provide canonical external-session identity without guessing from PID, argv,
+  database recency, or API activity. The explicit-session supervisor remains the
+  safe fallback.
+- Defer terminal-screen heuristics until real usage demonstrates a visibility
+  gap that lifecycle integrations and explicit process evidence do not cover.
+- Defer guarded prompts and common responses until run-scoped leases,
+  user-controller precedence, idempotency, and audit events are defined.
+- Defer hooks, tests, focus actions, and other automatic reactions until waits,
+  notification deduplication, and durable transition semantics are proven.
 
 ## Distribution And Polish
 

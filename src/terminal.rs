@@ -2,8 +2,9 @@ use std::env;
 use std::error::Error;
 use std::ffi::OsString;
 use std::fs;
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
-use std::process::{self, Command};
+use std::process::{self, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static TEMPORARY_DIRECTORY_ID: AtomicU64 = AtomicU64::new(0);
@@ -45,7 +46,7 @@ pub(crate) fn open(
         .arg(format!("--title={title}"))
         .arg("--")
         .arg(env::current_exe()?)
-        .args(["__attach", shell_id]);
+        .args(["__attach", shell_id, "--restart-exited"]);
     if takeover {
         resolver.arg("--takeover");
     }
@@ -58,8 +59,24 @@ pub(crate) fn open(
     let (program, arguments) = arguments
         .split_first()
         .ok_or("xdg-terminal-exec returned an empty terminal command")?;
-    Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(arguments)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // The child has not executed user code yet; `setsid` detaches the terminal
+    // window from the dashboard process and its controlling terminal.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    command
         .spawn()
         .map_err(|error| format!("could not launch {selected}: {error}"))?;
     Ok(())

@@ -82,6 +82,10 @@ Shell status meanings:
 - `running`: the process and PTY are live, attached or detached.
 - `exited`: the process ended; bounded reconstructed terminal state remains.
 
+The dashboard `KIND` is `shell` when the slot starts a login shell and `command`
+when it starts a stored exact argument vector. Interrupting the primary process
+of a command ends its run; an active agent presentation takes precedence.
+
 ## Report Agent Lifecycle
 
 Use these mutation commands only for a lifecycle integration that directly
@@ -260,7 +264,9 @@ boomux --terminal "kitty.desktop" open "<shell-id>"
 ```
 
 `--takeover` disconnects the current writable controller. Do not use it without
-the user's consent.
+the user's consent. Opening an exited shell explicitly restarts its stored
+command as a new run on the same durable shell identity; use `boomux read` when
+the goal is only to inspect retained output.
 
 ## Manage The Daemon
 

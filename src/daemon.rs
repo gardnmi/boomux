@@ -48,6 +48,7 @@ const MAX_TERMINAL_ROWS: u16 = 1_000;
 const MAX_TERMINAL_COLS: u16 = 1_000;
 const MAX_TERMINAL_CELLS: usize = 1_000_000;
 const MAX_SHELL_READ_BYTES: usize = 1024 * 1024;
+const MAX_FOREGROUND_PROCESS_BYTES: usize = 64;
 const MAX_RETAINED_EVENTS: usize = 8_192;
 const MAX_EVENT_BATCH: u16 = 256;
 const MAX_EVENT_WAIT: Duration = Duration::from_secs(30);
@@ -611,10 +612,30 @@ fn handle_connection(
             ),
         );
     }
+    if response_version < 11
+        && matches!(
+            request.message,
+            Request::RestartShell { .. }
+                | Request::Attach {
+                    restart_exited: true,
+                    ..
+                }
+        )
+    {
+        return send_response(
+            &mut stream,
+            response_version,
+            error_response(
+                ErrorCode::UnsupportedVersion,
+                "request requires daemon protocol 11",
+            ),
+        );
+    }
 
     if let Request::Attach {
         shell_id,
         takeover,
+        restart_exited,
         profile,
     } = request.message
     {
@@ -624,6 +645,7 @@ fn handle_connection(
             &registry,
             &shell_id,
             takeover,
+            restart_exited,
             profile,
         );
     }
@@ -1356,6 +1378,23 @@ impl PtyMaster {
         Ok(())
     }
 
+    fn foreground_process(&self) -> Option<String> {
+        let mut process_group: libc::pid_t = 0;
+        // The descriptor is a live Unix PTY master and process_group is writable.
+        if unsafe {
+            libc::ioctl(
+                self.descriptor.as_raw_fd(),
+                libc::TIOCGPGRP,
+                &mut process_group,
+            )
+        } == -1
+            || process_group <= 0
+        {
+            return None;
+        }
+        read_process_name(process_group as u32)
+    }
+
     fn write(&self, bytes: &[u8]) -> io::Result<usize> {
         // The byte slice is valid for the duration of this write.
         let result = unsafe {
@@ -1700,6 +1739,9 @@ impl Registry {
                 self.close_shell(&shell_id)?;
                 Ok(Response::Ok)
             }
+            Request::RestartShell { shell_id } => Ok(Response::Shell {
+                shell: self.restart_shell(&shell_id)?,
+            }),
             Request::RemoveLauncher { launcher_id } => self.durable_mutation(|| {
                 let launcher = self.remove_launcher(&launcher_id)?;
                 Ok((
@@ -3380,6 +3422,36 @@ impl Registry {
         self.events.changed.notify_all();
         Ok(())
     }
+
+    fn restart_shell(&self, shell_id: &str) -> io::Result<ShellSnapshot> {
+        let _mutation = lock(&self.mutation_lock)?;
+        self.ensure_running()?;
+        let shell = self.shell(shell_id)?;
+        let _transition = lock(&self.transitions)?;
+        let old_runtime = {
+            let mut lifecycle = lock(&shell.lifecycle)?;
+            let old_runtime = match &*lifecycle {
+                ShellLifecycle::Pending => {
+                    drop(lifecycle);
+                    return shell.snapshot();
+                }
+                ShellLifecycle::Running { .. } => {
+                    return Err(coded_error(
+                        ErrorCode::Busy,
+                        format!("shell is still running: {shell_id}"),
+                    ));
+                }
+                ShellLifecycle::Exited { runtime, .. } => runtime.clone(),
+                ShellLifecycle::Closed => return Err(not_found("shell", shell_id)),
+            };
+            *lifecycle = ShellLifecycle::Pending;
+            old_runtime
+        };
+        if let Some(runtime) = old_runtime {
+            runtime.stop_reader()?;
+        }
+        shell.snapshot()
+    }
 }
 
 impl Workspace {
@@ -3489,22 +3561,38 @@ impl AgentInstance {
 
 impl Shell {
     fn snapshot(&self) -> io::Result<ShellSnapshot> {
-        let lifecycle = lock(&self.lifecycle)?;
-        let (status, run) = match &*lifecycle {
-            ShellLifecycle::Pending => (ShellStatus::Pending, None),
-            ShellLifecycle::Running { run, .. } => (ShellStatus::Running, Some(run.snapshot()?)),
-            ShellLifecycle::Exited { code, run, .. } => {
-                (ShellStatus::Exited { code: *code }, Some(run.snapshot()?))
-            }
+        let (status, run, runtime) = match &*lock(&self.lifecycle)? {
+            ShellLifecycle::Pending => (ShellStatus::Pending, None, None),
+            ShellLifecycle::Running { run, runtime, .. } => (
+                ShellStatus::Running,
+                Some(run.snapshot()?),
+                Some(Arc::clone(runtime)),
+            ),
+            ShellLifecycle::Exited { code, run, .. } => (
+                ShellStatus::Exited { code: *code },
+                Some(run.snapshot()?),
+                None,
+            ),
             ShellLifecycle::Closed => return Err(not_found("shell", &self.id)),
         };
+        let foreground_process = runtime.and_then(|runtime| {
+            lock(&runtime.master)
+                .ok()
+                .and_then(|master| master.foreground_process())
+                .or_else(|| {
+                    let pid = lock(&runtime.process).ok()?.process_id()?;
+                    foreground_process_for_session_leader(pid)
+                })
+        });
         Ok(ShellSnapshot {
             id: self.id.clone(),
             workspace_id: self.workspace_id.clone(),
             name: lock(&self.name)?.clone(),
             cwd: self.cwd.clone(),
+            command: self.command.clone(),
             status,
             run,
+            foreground_process,
         })
     }
 
@@ -3963,6 +4051,7 @@ fn handle_attach(
     registry: &Arc<Registry>,
     shell_id: &str,
     takeover: bool,
+    restart_exited: bool,
     profile: TerminalProfile,
 ) -> io::Result<()> {
     if let Err(error) = validate_terminal_profile(&profile) {
@@ -3993,11 +4082,27 @@ fn handle_attach(
     let token = Uuid::new_v4().to_string();
     let (output, receiver) = mpsc::sync_channel(CONTROLLER_QUEUE);
     let connection = stream.try_clone()?;
-    let previous_run = lock(&shell.last_run)?.clone();
-    let needs_start = matches!(*lock(&shell.lifecycle)?, ShellLifecycle::Pending);
-    let mut transition = needs_start
+    let mut transition = restart_exited
         .then(|| lock(&registry.transitions))
         .transpose()?;
+    if restart_exited {
+        let old_runtime = match &*lock(&shell.lifecycle)? {
+            ShellLifecycle::Exited { runtime, .. } => runtime.clone(),
+            _ => None,
+        };
+        if let Some(runtime) = old_runtime {
+            runtime.stop_reader()?;
+        }
+        let mut lifecycle = lock(&shell.lifecycle)?;
+        if matches!(*lifecycle, ShellLifecycle::Exited { .. }) {
+            *lifecycle = ShellLifecycle::Pending;
+        }
+    }
+    let previous_run = lock(&shell.last_run)?.clone();
+    let needs_start = matches!(*lock(&shell.lifecycle)?, ShellLifecycle::Pending);
+    if needs_start && transition.is_none() {
+        transition = Some(lock(&registry.transitions)?);
+    }
     let persistence = needs_start
         .then(|| lock(&registry.persist_lock))
         .transpose()?;
@@ -4550,6 +4655,32 @@ fn proc_session_id(stat: &str) -> Option<libc::pid_t> {
         .ok()
 }
 
+fn proc_foreground_process_group(stat: &str) -> Option<libc::pid_t> {
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(5)?
+        .parse()
+        .ok()
+}
+
+fn foreground_process_for_session_leader(pid: u32) -> Option<String> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let process_group = proc_foreground_process_group(&stat)?;
+    (process_group > 0)
+        .then(|| read_process_name(process_group as u32))
+        .flatten()
+}
+
+fn read_process_name(pid: u32) -> Option<String> {
+    let file = File::open(format!("/proc/{pid}/comm")).ok()?;
+    let mut bytes = Vec::with_capacity(MAX_FOREGROUND_PROCESS_BYTES + 1);
+    file.take((MAX_FOREGROUND_PROCESS_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    parse_process_name(&bytes)
+}
+
 fn validate_shell_specs(specs: &[ShellSpec]) -> io::Result<()> {
     let mut names = HashSet::with_capacity(specs.len());
     for spec in specs {
@@ -4707,6 +4838,23 @@ fn not_found(kind: &str, id: &str) -> io::Error {
     io::Error::new(io::ErrorKind::NotFound, format!("{kind} not found: {id}"))
 }
 
+fn parse_process_name(bytes: &[u8]) -> Option<String> {
+    let name = String::from_utf8_lossy(bytes);
+    let mut sanitized = String::new();
+    for character in name.trim().chars() {
+        let character = if character.is_control() {
+            '?'
+        } else {
+            character
+        };
+        if sanitized.len() + character.len_utf8() > MAX_FOREGROUND_PROCESS_BYTES {
+            break;
+        }
+        sanitized.push(character);
+    }
+    (!sanitized.is_empty()).then_some(sanitized)
+}
+
 fn lock<T>(mutex: &Mutex<T>) -> io::Result<MutexGuard<'_, T>> {
     mutex
         .lock()
@@ -4855,6 +5003,63 @@ mod tests {
     fn rendered_output_tail_preserves_utf8_boundaries() {
         assert_eq!(tail_utf8("one-λ", 2), "λ");
         assert_eq!(tail_utf8("one-λ", 3), "-λ");
+    }
+
+    #[test]
+    fn process_name_is_trimmed_sanitized_and_bounded() {
+        assert_eq!(parse_process_name(b"  sleep\n"), Some("sleep".into()));
+        assert_eq!(parse_process_name(b" \n\t "), None);
+        assert_eq!(parse_process_name(b"bad\0name\n"), Some("bad?name".into()));
+        assert_eq!(
+            parse_process_name(&[b'x'; MAX_FOREGROUND_PROCESS_BYTES + 1]),
+            Some("x".repeat(MAX_FOREGROUND_PROCESS_BYTES))
+        );
+        assert_eq!(
+            proc_foreground_process_group("123 (shell name) S 1 123 123 34826 456 0"),
+            Some(456)
+        );
+    }
+
+    #[test]
+    fn pending_and_exited_shell_snapshots_have_no_foreground_process() {
+        let shell = create_pending_shell(
+            "workspace-id",
+            ShellSpec::login("snapshot-test", env::temp_dir()),
+        )
+        .unwrap();
+        assert!(shell.snapshot().unwrap().foreground_process.is_none());
+
+        let run = Arc::new(ShellRun::new(1));
+        run.finish(ShellRunExitReason::Exited { code: Some(0) })
+            .unwrap();
+        *lock(&shell.lifecycle).unwrap() = ShellLifecycle::Exited {
+            code: Some(0),
+            profile: profile(),
+            run,
+            runtime: None,
+            terminal: Arc::new(Mutex::new(TerminalState::new(24, 80))),
+        };
+        assert!(shell.snapshot().unwrap().foreground_process.is_none());
+    }
+
+    #[test]
+    fn running_shell_snapshot_reports_real_pty_foreground_process() {
+        let registry = Registry::default();
+        let (_workspace, shell, _runtime) = running_shell(&registry);
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let foreground_process = shell.snapshot().unwrap().foreground_process;
+            if foreground_process.as_deref() == Some("sleep") {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "sleep did not become the foreground process; last observed {foreground_process:?}"
+            );
+            thread::sleep(IO_RETRY_DELAY);
+        }
+        shell.kill().unwrap();
     }
 
     #[test]

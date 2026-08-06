@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 10;
+pub const PROTOCOL_VERSION: u32 = 11;
 pub const MIN_PROTOCOL_VERSION: u32 = 6;
 pub const MAX_CONTROL_FRAME: usize = 8 * 1024 * 1024;
 pub const MAX_ATTACH_FRAME: usize = 1024 * 1024;
@@ -125,9 +125,13 @@ pub struct ShellSnapshot {
     pub workspace_id: String,
     pub name: String,
     pub cwd: PathBuf,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub command: Vec<String>,
     pub status: ShellStatus,
     #[serde(default)]
     pub run: Option<ShellRunSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub foreground_process: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -384,12 +388,17 @@ pub enum Request {
     CloseShell {
         shell_id: String,
     },
+    RestartShell {
+        shell_id: String,
+    },
     RemoveLauncher {
         launcher_id: String,
     },
     Attach {
         shell_id: String,
         takeover: bool,
+        #[serde(default)]
+        restart_exited: bool,
         profile: TerminalProfile,
     },
 }
@@ -583,6 +592,7 @@ mod tests {
         let value = Envelope::new(Request::Attach {
             shell_id: "s1".into(),
             takeover: false,
+            restart_exited: true,
             profile: TerminalProfile {
                 term: Some("xterm-256color".into()),
                 colorterm: Some("truecolor".into()),
@@ -642,13 +652,21 @@ mod tests {
     }
 
     #[test]
-    fn shell_snapshot_accepts_protocol_six_payload_without_run_identity() {
+    fn shell_snapshot_defaults_fields_omitted_by_old_daemons() {
         let snapshot = serde_json::from_str::<ShellSnapshot>(
             r#"{"id":"s1","workspace_id":"w1","name":"shell","cwd":"/tmp","status":"running"}"#,
         )
         .unwrap();
 
+        assert!(snapshot.command.is_empty());
         assert!(snapshot.run.is_none());
+        assert!(snapshot.foreground_process.is_none());
+        assert!(
+            serde_json::to_value(snapshot)
+                .unwrap()
+                .get("foreground_process")
+                .is_none()
+        );
     }
 
     #[test]
@@ -723,8 +741,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_ten_with_minimum_six() {
-        assert_eq!(PROTOCOL_VERSION, 10);
+    fn protocol_version_is_eleven_with_minimum_six() {
+        assert_eq!(PROTOCOL_VERSION, 11);
         assert_eq!(MIN_PROTOCOL_VERSION, 6);
     }
 
@@ -769,12 +787,13 @@ mod tests {
     }
 
     #[test]
-    fn protocol_six_client_ignores_additive_run_identity() {
+    fn protocol_six_client_ignores_additive_shell_snapshot_fields() {
         let snapshot = ShellSnapshot {
             id: "s1".into(),
             workspace_id: "w1".into(),
             name: "shell".into(),
             cwd: "/tmp".into(),
+            command: vec!["sleep".into(), "1".into()],
             status: ShellStatus::Running,
             run: Some(ShellRunSnapshot {
                 id: "r1".into(),
@@ -785,6 +804,7 @@ mod tests {
                 output_revision: 2,
                 environment_has_run_id: true,
             }),
+            foreground_process: Some("sleep".into()),
         };
 
         let legacy: ProtocolSixShellSnapshot =

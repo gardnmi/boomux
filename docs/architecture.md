@@ -121,10 +121,14 @@ not historical OSC or graphics commands.
 `src/terminal.rs` uses Omarchy's `xdg-terminal-exec` metadata to launch:
 
 ```console
-boomux __attach <shell-id> --takeover
+boomux __attach <shell-id> --takeover --restart-exited
 ```
 
 No emulator-specific adapter or compositor window ID is required.
+Spawned terminal windows start in independent process sessions with null
+standard streams, so exiting the dashboard cannot close their attachments.
+The internal attachment process restarts an exited shell only after the terminal
+window has spawned, preserving retained output when terminal preparation fails.
 
 ### Dashboard
 
@@ -136,9 +140,25 @@ Git information is collected independently from shell directories and cached;
 empty or mixed-directory workspaces have no workspace-level directory or Git
 identity.
 
-Agent instances appear as workspace counts and read-only rows. Completed rows
-remain visible and inspectable; dashboard actions do not open, rename, close, or
-otherwise control an agent.
+Shell snapshots include their additive stored startup argument vector. The
+dashboard presents an empty vector as `shell` and a non-empty vector as
+`command`, making primary-process exit behavior visible without splitting the
+durable shell model. Command rows show the stored argv in their detail column.
+Agent presentation takes precedence when the current run has an active Agent or
+an exact `opencode` foreground hint.
+
+An active Agent instance bound to a shell's exact current run decorates that
+shell as an agent-shell row rather than adding a second item. The row retains
+the shell's durable identity, name, directory, Git context, and open, rename, and
+close actions while displaying Agent lifecycle state and evidence. If multiple
+active instances match one run, the most recently observed instance is shown
+with an Agent-ID tie-break. Completed, stale-run, and orphaned Agent records
+remain available through CLI inspection but do not occupy dashboard rows. A
+running shell snapshot may also expose its PTY foreground process name. The
+dashboard recognizes exact `opencode` as a presentation-only agent-shell hint
+before a canonical OpenCode session exists; this hint creates no AgentInstance,
+durable state observation, persistence, or events. It displays `idle` until
+lifecycle data exists, then yields to that authoritative observation.
 
 ### Agent Skill
 
@@ -183,6 +203,12 @@ observation, revision, timestamps, persistence, or event stream. This lets an
 integration reload and reacquire the daemon-owned agent ID. A different run is a
 different identity. Multiple matching legacy records are accepted only when
 exactly one is active; otherwise ensure fails rather than guessing.
+
+Protocol 11 adds an explicit exited-shell restart request. Opening one shell or
+restoring a workspace first moves each exited durable shell back to pending, so
+its stored argument vector starts as a new run on attachment while preserving
+the shell identity and incrementing the run generation. Plain attachment to an
+exited run remains non-mutating and can replay its retained terminal state.
 
 External observation authority is ordered lifecycle integration, process
 adapter, then terminal heuristic. Lower-authority reports are successful no-ops.
