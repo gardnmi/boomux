@@ -18,6 +18,40 @@ function boundedEvidence(value) {
   return (clean || "Pi lifecycle event").slice(0, MAX_EVIDENCE);
 }
 
+function agentErrorEvidence(messages) {
+  if (!Array.isArray(messages)) return undefined;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message?.role !== "assistant") continue;
+    if (message.stopReason !== "error") return undefined;
+    return boundedEvidence(
+      `Pi error: ${text(message.errorMessage) ?? "assistant request failed"}`,
+    );
+  }
+  return undefined;
+}
+
+function createOutcomeTracker() {
+  const errors = new Map();
+  return {
+    clear(sessionID) {
+      if (text(sessionID)) errors.delete(sessionID);
+    },
+    record(sessionID, messages) {
+      if (!text(sessionID)) return;
+      const evidence = agentErrorEvidence(messages);
+      if (evidence) errors.set(sessionID, evidence);
+      else errors.delete(sessionID);
+    },
+    settled(sessionID) {
+      const evidence = errors.get(sessionID);
+      return evidence
+        ? { state: "blocked", evidence }
+        : { state: "idle", evidence: "Pi agent settled" };
+    },
+  };
+}
+
 function parseJSON(value) {
   if (typeof value !== "string" || value.trim() === "") {
     throw new Error("boomux returned empty JSON output");
@@ -234,9 +268,25 @@ function createLifecycle({ env, run, log = console.error, now }) {
     }
   }
 
-  function enqueue(nextSessionID, state, evidence) {
+  async function sendWithAttempts(nextSessionID, state, evidence, attempts) {
+    let lastError;
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      try {
+        await send(nextSessionID, state, evidence);
+        return;
+      } catch (error) {
+        lastError = error;
+        if (disabled || error?.code === "run_changed") break;
+      }
+    }
+    throw lastError;
+  }
+
+  function enqueue(nextSessionID, state, evidence, attempts = 1) {
     if (!text(nextSessionID)) return Promise.resolve();
-    const pending = queue.then(() => send(nextSessionID, state, evidence));
+    const pending = queue.then(() =>
+      sendWithAttempts(nextSessionID, state, evidence, attempts),
+    );
     queue = pending.catch(reportError);
     return queue;
   }
@@ -254,27 +304,42 @@ export default function BoomuxPiExtension(pi) {
     run: createProcessRunner(),
   });
   if (!lifecycle) return;
+  const outcomes = createOutcomeTracker();
 
   const report = (ctx, state, evidence) =>
     lifecycle.enqueue(currentSessionID(ctx), state, evidence);
 
-  pi.on("session_start", (_event, ctx) =>
-    report(ctx, "idle", "Pi session idle"),
-  );
-  pi.on("agent_start", (_event, ctx) =>
-    report(ctx, "working", "Pi agent working"),
-  );
-  pi.on("agent_settled", (_event, ctx) =>
-    report(ctx, "idle", "Pi agent settled"),
-  );
-  pi.on("session_shutdown", (_event, ctx) =>
-    report(ctx, "inactive", "Pi session inactive"),
-  );
+  pi.on("session_start", (_event, ctx) => {
+    outcomes.clear(currentSessionID(ctx));
+    return report(ctx, "idle", "Pi session idle");
+  });
+  pi.on("agent_start", (_event, ctx) => {
+    outcomes.clear(currentSessionID(ctx));
+    return report(ctx, "working", "Pi agent working");
+  });
+  pi.on("agent_end", (event, ctx) => {
+    outcomes.record(currentSessionID(ctx), event?.messages);
+  });
+  pi.on("agent_settled", (_event, ctx) => {
+    const outcome = outcomes.settled(currentSessionID(ctx));
+    return report(ctx, outcome.state, outcome.evidence);
+  });
+  pi.on("session_shutdown", (_event, ctx) => {
+    outcomes.clear(currentSessionID(ctx));
+    return lifecycle.enqueue(
+      currentSessionID(ctx),
+      "inactive",
+      "Pi session inactive",
+      2,
+    );
+  });
 }
 
 export const __internal = Object.freeze({
+  agentErrorEvidence,
   boundedEvidence,
   createLifecycle,
+  createOutcomeTracker,
   createProcessRunner,
   ensureArgv,
   reportArgv,

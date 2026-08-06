@@ -309,6 +309,20 @@ the full public CLI. Re-run with `--force` to replace an older customized
 installation. An untouched legacy `boomux-shells` skill is removed
 automatically; customized legacy content is preserved with a warning.
 
+## Integration Compatibility
+
+Boomux currently validates its bundled integrations against these host releases:
+
+| Integration | Package | Validated version |
+| --- | --- | --- |
+| OpenCode | `opencode-ai` | `1.18.14` |
+| Pi | `@earendil-works/pi-coding-agent` | `0.83.0` |
+
+These versions are compatibility test points, not runtime pins. Older or newer
+releases may work when their plugin APIs remain compatible, but are not claimed
+as supported until validated. `boomux capabilities --json` exposes the same
+matrix under `integration_hosts`.
+
 ## OpenCode Integration
 
 Install the bundled config-time OpenCode lifecycle plugin with:
@@ -365,12 +379,15 @@ are rejected. Restart Pi after installing or replacing the extension.
 
 Inside a Boomux-managed shell, the extension uses Pi's canonical project session
 ID and lifecycle hooks. Session start reports `idle`, agent start reports
-`working`, and `agent_settled` reports `idle` only after retries, compaction, and
-queued continuations have finished. Session shutdown reports `inactive` rather
-than permanent completion because Pi sessions are resumable. Inactive instances
+`working`, and `agent_end` records a final assistant error when present.
+`agent_settled` reports that terminal error as `blocked`, or `idle` only after
+retries, compaction, and queued continuations have finished. A new agent run
+clears the latched error. Session shutdown reports `inactive` rather than
+permanent completion because Pi sessions are resumable. Inactive instances
 remain durable but do not occupy agent rows until the session starts again.
 Calls use exact argument vectors, bounded JSON output, and fail open when Boomux
-is unavailable.
+is unavailable. Session shutdown retries its `inactive` report once after a
+transient failure.
 
 ## Architecture
 

@@ -52,9 +52,40 @@ describe("Pi lifecycle", () => {
     expect([...handlers.keys()]).toEqual([
       "session_start",
       "agent_start",
+      "agent_end",
       "agent_settled",
       "session_shutdown",
     ]);
+  });
+
+  test("reports only final assistant errors as blocked", () => {
+    const outcomes = __internal.createOutcomeTracker();
+    outcomes.record("session-1", [
+      { role: "toolResult", isError: true },
+      {
+        role: "assistant",
+        stopReason: "error",
+        errorMessage: "provider unavailable",
+      },
+    ]);
+    expect(outcomes.settled("session-1")).toEqual({
+      state: "blocked",
+      evidence: "Pi error: provider unavailable",
+    });
+
+    outcomes.clear("session-1");
+    outcomes.record("session-1", [
+      {
+        role: "assistant",
+        stopReason: "error",
+        errorMessage: "recovered",
+      },
+      { role: "assistant", stopReason: "stop" },
+    ]);
+    expect(outcomes.settled("session-1")).toEqual({
+      state: "idle",
+      evidence: "Pi agent settled",
+    });
   });
 
   test("reports idle working settled and inactive states", async () => {
@@ -111,6 +142,37 @@ describe("Pi lifecycle", () => {
 
     expect(calls).toHaveLength(2);
     expect(calls.map((argv) => argv[7])).toEqual(["session-1", "session-2"]);
+  });
+
+  test("retries an inactive report without creating another identity", async () => {
+    const calls = [];
+    let inactiveAttempts = 0;
+    const lifecycle = __internal.createLifecycle({
+      env: { BOOMUX_SHELL_ID: "shell-1", BOOMUX_RUN_ID: "run-1" },
+      run: async (argv) => {
+        calls.push(argv);
+        if (argv[2] === "ensure") {
+          return agent("agent-1", "idle", "Pi session idle");
+        }
+        if (argv[argv.indexOf("--state") + 1] === "inactive") {
+          inactiveAttempts += 1;
+          if (inactiveAttempts === 1) throw new Error("temporary failure");
+        }
+        return { data: { ok: true } };
+      },
+      log: () => {},
+    });
+
+    await lifecycle.enqueue("session-1", "idle", "Pi session idle");
+    await lifecycle.enqueue(
+      "session-1",
+      "inactive",
+      "Pi session inactive",
+      2,
+    );
+
+    expect(inactiveAttempts).toBe(2);
+    expect(calls.filter((argv) => argv[2] === "ensure")).toHaveLength(1);
   });
 
   test("bounds lifecycle evidence", () => {

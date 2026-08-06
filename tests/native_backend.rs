@@ -1977,6 +1977,22 @@ fn native_daemon_lifecycle() {
     assert_eq!(capabilities["schema"], "boomux.cli/v1");
     assert_eq!(capabilities["command"], "capabilities");
     assert_eq!(capabilities["data"]["daemon_protocol_version"], 12);
+    assert_eq!(
+        capabilities["data"]["integration_hosts"]["opencode"]["validated_version"],
+        "1.18.14"
+    );
+    assert_eq!(
+        capabilities["data"]["integration_hosts"]["opencode"]["package"],
+        "opencode-ai"
+    );
+    assert_eq!(
+        capabilities["data"]["integration_hosts"]["pi"]["validated_version"],
+        "0.83.0"
+    );
+    assert_eq!(
+        capabilities["data"]["integration_hosts"]["pi"]["package"],
+        "@earendil-works/pi-coding-agent"
+    );
     let json_commands = capabilities["data"]["json_commands"].as_array().unwrap();
     for command in ["events", "agent.register", "agent.ensure", "agent.report"] {
         assert!(json_commands.iter().any(|current| current == command));

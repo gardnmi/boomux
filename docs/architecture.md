@@ -261,6 +261,9 @@ the stronger lifecycle evidence described below.
 
 ### OpenCode Lifecycle Plugin
 
+The bundled plugin is validated against `opencode-ai` `1.18.14`. This is a
+compatibility test point rather than a runtime version pin.
+
 `integrations/opencode/boomux.js` is a config-time OpenCode plugin installed by
 `boomux opencode install [--force]`. The installer targets
 `$XDG_CONFIG_HOME/opencode/plugins/boomux.js`, falling back to
@@ -289,6 +292,10 @@ Boomux or ancestry failures are rate-limited and fail open so OpenCode continues
 
 ### Pi Lifecycle Extension
 
+The bundled extension is validated against
+`@earendil-works/pi-coding-agent` `0.83.0`. This is a compatibility test point
+rather than a runtime version pin.
+
 `integrations/pi/boomux.js` is a global Pi extension installed by
 `boomux pi install [--force]`. The installer targets
 `$PI_CODING_AGENT_DIR/extensions/boomux.js`, falling back to
@@ -297,14 +304,18 @@ replacement, and `--force` rules as other bundled integrations.
 
 The extension activates only when `BOOMUX_SHELL_ID` and `BOOMUX_RUN_ID` are
 present and uses `sessionManager.getSessionId()` as canonical external identity.
-`session_start` reports `idle`, `agent_start` reports `working`, and
-`agent_settled` reports `idle` after automatic retries, compaction, and queued
-continuations have drained. `session_shutdown` reports `inactive` rather than
-`done` because Pi sessions can be resumed. Inactive records remain durable but
-do not decorate dashboard shells. Session switches reset the local agent ID and
-ensure the new canonical session identity. Reports are serialized, use exact
-argument vectors and bounded JSON output, and fail open with rate-limited
-diagnostics.
+`session_start` reports `idle` and `agent_start` reports `working`. `agent_end`
+records an error only when the final assistant message has `stopReason: "error"`;
+recoverable tool errors and earlier failed attempts do not become blockers.
+After automatic retries, compaction, and queued continuations have drained,
+`agent_settled` reports the final error as `blocked` or reports `idle`. A later
+agent start clears the latched error. `session_shutdown` reports `inactive`
+rather than `done` because Pi sessions can be resumed. Inactive records remain
+durable but do not decorate dashboard shells. Session switches reset the local
+agent ID and ensure the new canonical session identity. Reports are serialized,
+use exact argument vectors and bounded JSON output, and fail open with
+rate-limited diagnostics. Session shutdown makes one bounded retry so a
+transient reporting failure is less likely to leave the old session active.
 
 Protocol 12 adds `inactive`. Protocol-9 through protocol-11 clients receive that
 observation as `unknown`, while protocol-12 clients can distinguish a resumable

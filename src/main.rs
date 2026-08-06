@@ -30,6 +30,8 @@ mod tui;
 const BOOMUX_SKILL: &str = include_str!("../.agents/skills/boomux/SKILL.md");
 const BOOMUX_OPENCODE_PLUGIN: &str = include_str!("../integrations/opencode/boomux.js");
 const BOOMUX_PI_EXTENSION: &str = include_str!("../integrations/pi/boomux.js");
+const VALIDATED_OPENCODE_VERSION: &str = "1.18.14";
+const VALIDATED_PI_VERSION: &str = "0.83.0";
 const JSON_COMMANDS: &[&str] = &[
     "capabilities",
     "list",
@@ -1228,6 +1230,16 @@ fn capabilities(json: bool) -> Result<(), Box<dyn Error>> {
                 "json_schemas": [cli_output::SCHEMA],
                 "json_commands": JSON_COMMANDS,
                 "features": INTEGRATION_FEATURES,
+                "integration_hosts": {
+                    "opencode": {
+                        "package": "opencode-ai",
+                        "validated_version": VALIDATED_OPENCODE_VERSION,
+                    },
+                    "pi": {
+                        "package": "@earendil-works/pi-coding-agent",
+                        "validated_version": VALIDATED_PI_VERSION,
+                    },
+                },
                 "error_codes": error_codes,
             }),
         );
@@ -1237,6 +1249,7 @@ fn capabilities(json: bool) -> Result<(), Box<dyn Error>> {
     println!("JSON SCHEMAS\t{}", cli_output::SCHEMA);
     println!("JSON COMMANDS\t{}", JSON_COMMANDS.join(","));
     println!("FEATURES\t{}", INTEGRATION_FEATURES.join(","));
+    println!("INTEGRATION HOSTS\topencode={VALIDATED_OPENCODE_VERSION},pi={VALIDATED_PI_VERSION}");
     println!("ERROR CODES\t{}", error_codes.join(","));
     Ok(())
 }
@@ -3752,6 +3765,8 @@ mod tests {
         ] {
             assert!(INTEGRATION_FEATURES.contains(&feature));
         }
+        assert_eq!(VALIDATED_OPENCODE_VERSION, "1.18.14");
+        assert_eq!(VALIDATED_PI_VERSION, "0.83.0");
         assert_eq!(protocol::PROTOCOL_VERSION, 12);
     }
 
@@ -3822,8 +3837,10 @@ mod tests {
         for expected in [
             "session_start",
             "agent_start",
+            "agent_end",
             "agent_settled",
             "session_shutdown",
+            "stopReason",
             "getSessionId",
             "BOOMUX_SHELL_ID",
             "BOOMUX_RUN_ID",

@@ -20,7 +20,9 @@ Future incompatible output will use a different schema value.
 
 `boomux capabilities --json` does not start or contact the daemon. It reports
 the CLI version, daemon protocol version, supported JSON schemas and commands,
-stable error codes, and feature names.
+stable error codes, feature names, and the package and validated version for
+each bundled integration host under `integration_hosts`. Validated versions are
+compatibility test points, not runtime pins or minimum-version guarantees.
 
 The following commands support `--json`:
 
@@ -48,8 +50,8 @@ output. Passing `--json` to an unsupported command fails with
 
 Command payloads are:
 
-- `capabilities`: CLI/protocol versions plus arrays of schemas, commands,
-  features, and error codes.
+- `capabilities`: CLI/protocol versions, integration host compatibility, plus
+  arrays of schemas, commands, features, and error codes.
 - `list`: a `shells` array.
 - `shells`: workspace identity plus a `shells` array.
 - `workspace.list`: a `workspaces` array of `id`, `name`, `shell_count`,
