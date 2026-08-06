@@ -145,7 +145,7 @@ dashboard presents an empty vector as `shell` and a non-empty vector as
 `command`, making primary-process exit behavior visible without splitting the
 durable shell model. Command rows show the stored argv in their detail column.
 Agent presentation takes precedence when the current run has an active Agent or
-an exact `opencode` foreground hint.
+an exact `opencode` or `pi` foreground hint.
 
 An active Agent instance bound to a shell's exact current run decorates that
 shell as an agent-shell row rather than adding a second item. The row retains
@@ -155,8 +155,8 @@ active instances match one run, the most recently observed instance is shown
 with an Agent-ID tie-break. Completed, stale-run, and orphaned Agent records
 remain available through CLI inspection but do not occupy dashboard rows. A
 running shell snapshot may also expose its PTY foreground process name. The
-dashboard recognizes exact `opencode` as a presentation-only agent-shell hint
-before a canonical OpenCode session exists; this hint creates no AgentInstance,
+dashboard recognizes exact `opencode` and `pi` as presentation-only agent-shell hints
+before a canonical Agent session exists; this hint creates no AgentInstance,
 durable state observation, persistence, or events. It displays `idle` until
 lifecycle data exists, then yields to that authoritative observation.
 
@@ -286,6 +286,29 @@ does not already match. Calls use exact argument vectors, a one-second timeout,
 bounded output, and the stable JSON envelope. Unmanaged sessions are a no-op;
 Boomux or ancestry failures are rate-limited and fail open so OpenCode continues.
 `run_changed` disables all later reports for that tracked root.
+
+### Pi Lifecycle Extension
+
+`integrations/pi/boomux.js` is a global Pi extension installed by
+`boomux pi install [--force]`. The installer targets
+`$PI_CODING_AGENT_DIR/extensions/boomux.js`, falling back to
+`~/.pi/agent/extensions/boomux.js`, with the same regular-file, symlink, atomic
+replacement, and `--force` rules as other bundled integrations.
+
+The extension activates only when `BOOMUX_SHELL_ID` and `BOOMUX_RUN_ID` are
+present and uses `sessionManager.getSessionId()` as canonical external identity.
+`session_start` reports `idle`, `agent_start` reports `working`, and
+`agent_settled` reports `idle` after automatic retries, compaction, and queued
+continuations have drained. `session_shutdown` reports `inactive` rather than
+`done` because Pi sessions can be resumed. Inactive records remain durable but
+do not decorate dashboard shells. Session switches reset the local agent ID and
+ensure the new canonical session identity. Reports are serialized, use exact
+argument vectors and bounded JSON output, and fail open with rate-limited
+diagnostics.
+
+Protocol 12 adds `inactive`. Protocol-9 through protocol-11 clients receive that
+observation as `unknown`, while protocol-12 clients can distinguish a resumable
+session that is not currently active from permanent `done` completion.
 
 ### Transition Coordinator
 

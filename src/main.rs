@@ -29,6 +29,7 @@ mod tui;
 
 const BOOMUX_SKILL: &str = include_str!("../.agents/skills/boomux/SKILL.md");
 const BOOMUX_OPENCODE_PLUGIN: &str = include_str!("../integrations/opencode/boomux.js");
+const BOOMUX_PI_EXTENSION: &str = include_str!("../integrations/pi/boomux.js");
 const JSON_COMMANDS: &[&str] = &[
     "capabilities",
     "list",
@@ -60,10 +61,13 @@ const INTEGRATION_FEATURES: &[&str] = &[
     "run_scoped_agent_instances",
     "protocol_10",
     "protocol_11",
+    "protocol_12",
     "restartable_exited_shells",
+    "inactive_agent_state",
     "idempotent_agent_ensure",
     "agent_authority_precedence",
     "opencode_lifecycle_plugin",
+    "pi_lifecycle_extension",
     "process_adapters",
 ];
 const LEGACY_BOOMUX_SHELLS_SKILL: &str = r#"---
@@ -208,6 +212,11 @@ enum Commands {
     Opencode {
         #[command(subcommand)]
         command: OpenCodeCommands,
+    },
+    /// Manage the Boomux Pi integration
+    Pi {
+        #[command(subcommand)]
+        command: PiCommands,
     },
     /// Open a shell in a new terminal window
     Open {
@@ -398,6 +407,7 @@ enum CliAgentState {
     Working,
     Blocked,
     Idle,
+    Inactive,
     Done,
 }
 
@@ -408,6 +418,7 @@ impl From<CliAgentState> for AgentState {
             CliAgentState::Working => Self::Working,
             CliAgentState::Blocked => Self::Blocked,
             CliAgentState::Idle => Self::Idle,
+            CliAgentState::Inactive => Self::Inactive,
             CliAgentState::Done => Self::Done,
         }
     }
@@ -442,6 +453,15 @@ enum SkillCommands {
 #[derive(Subcommand)]
 enum OpenCodeCommands {
     /// Install the Boomux plugin in the global OpenCode configuration
+    Install {
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum PiCommands {
+    /// Install the Boomux extension in the global Pi configuration
     Install {
         #[arg(long)]
         force: bool,
@@ -621,6 +641,9 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
         Some(Commands::Opencode {
             command: OpenCodeCommands::Install { force },
         }) => install_opencode(force),
+        Some(Commands::Pi {
+            command: PiCommands::Install { force },
+        }) => install_pi(force),
         Some(Commands::Open {
             shell_id,
             title,
@@ -690,6 +713,7 @@ fn command_name(cli: &Cli) -> &'static str {
         Some(Commands::Close { .. }) => "close",
         Some(Commands::Skill { .. }) => "skill",
         Some(Commands::Opencode { .. }) => "opencode",
+        Some(Commands::Pi { .. }) => "pi",
         Some(Commands::Open { .. }) => "open",
         Some(Commands::Prompt) => "prompt",
         Some(Commands::Attach { .. }) => "attach",
@@ -950,7 +974,10 @@ fn dashboard_views(
                                         && agent.shell_id == shell.id
                                         && agent.run_id == run.id
                                         && agent.ended_at_ms.is_none()
-                                        && agent.observation.state != AgentState::Done
+                                        && !matches!(
+                                            agent.observation.state,
+                                            AgentState::Inactive | AgentState::Done
+                                        )
                                 })
                                 .max_by(|left, right| {
                                     left.observation
@@ -961,6 +988,19 @@ fn dashboard_views(
                         })
                     })
                     .flatten();
+                let suppress_foreground_hint = shell.run.as_ref().is_some_and(|run| {
+                    workspace.agents.iter().any(|agent| {
+                        agent.shell_id == shell.id
+                            && agent.run_id == run.id
+                            && shell.foreground_process.as_deref()
+                                == Some(agent.integration.as_str())
+                            && (agent.ended_at_ms.is_some()
+                                || matches!(
+                                    agent.observation.state,
+                                    AgentState::Inactive | AgentState::Done
+                                ))
+                    })
+                });
                 match (agent, shell.foreground_process.as_deref()) {
                     (Some(agent), _) => tui::WorkspaceItemView::AgentShell(tui::AgentShellView {
                         shell: shell_view,
@@ -974,7 +1014,7 @@ fn dashboard_views(
                             evidence: agent.observation.evidence.clone(),
                         }),
                     }),
-                    (None, Some("opencode")) => {
+                    (None, Some("opencode" | "pi")) if !suppress_foreground_hint => {
                         tui::WorkspaceItemView::AgentShell(tui::AgentShellView {
                             shell: shell_view,
                             agent: None,
@@ -2430,6 +2470,50 @@ fn install_opencode_at(config_root: &Path, force: bool) -> Result<(), Box<dyn Er
     Ok(())
 }
 
+fn install_pi(force: bool) -> Result<(), Box<dyn Error>> {
+    let config_root = pi_config_root(env::var_os("PI_CODING_AGENT_DIR"), env::var_os("HOME"))?;
+    install_pi_at(&config_root, force)
+}
+
+fn pi_config_root(
+    pi_coding_agent_dir: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Result<PathBuf, Box<dyn Error>> {
+    let home = || -> Result<PathBuf, Box<dyn Error>> {
+        home.clone()
+            .map(PathBuf::from)
+            .ok_or_else(|| "HOME must be set to install the Boomux Pi extension".into())
+    };
+    let root = match pi_coding_agent_dir.filter(|value| !value.is_empty()) {
+        Some(root) => {
+            let root = PathBuf::from(root);
+            if let Ok(suffix) = root.strip_prefix("~") {
+                home()?.join(suffix)
+            } else {
+                root
+            }
+        }
+        None => home()?.join(".pi/agent"),
+    };
+    require_absolute_root(&root, "Pi configuration root")?;
+    Ok(root)
+}
+
+fn install_pi_at(config_root: &Path, force: bool) -> Result<(), Box<dyn Error>> {
+    require_absolute_root(config_root, "Pi configuration root")?;
+    let directory = ensure_safe_directory(&config_root.join("extensions"))?;
+    let path = pi_install_path(config_root);
+    if install_asset_at(&directory, &path, BOOMUX_PI_EXTENSION, force)? {
+        println!(
+            "Boomux Pi extension is already installed at {}",
+            path.display()
+        );
+    } else {
+        println!("Installed Boomux Pi extension at {}", path.display());
+    }
+    Ok(())
+}
+
 fn require_absolute_root(root: &Path, name: &str) -> Result<(), Box<dyn Error>> {
     if !root.is_absolute() {
         return Err(format!("{name} must be an absolute path").into());
@@ -2521,6 +2605,10 @@ fn skill_install_path(home: &Path) -> PathBuf {
 
 fn opencode_install_path(config_root: &Path) -> PathBuf {
     config_root.join("opencode/plugins/boomux.js")
+}
+
+fn pi_install_path(config_root: &Path) -> PathBuf {
+    config_root.join("extensions/boomux.js")
 }
 
 fn legacy_skill_install_path(home: &Path) -> PathBuf {
@@ -3236,6 +3324,40 @@ mod tests {
     }
 
     #[test]
+    fn workspace_view_hints_exact_pi_foreground_process_before_first_prompt() {
+        let mut hinted = shell("s1", "w1", "terminal");
+        hinted.foreground_process = Some("pi".into());
+        let workspace = workspace("w1", "project", vec![hinted]);
+
+        let views = dashboard_views(&[workspace], &mut git::Cache::default());
+
+        let tui::WorkspaceItemView::AgentShell(item) = &views[0].items[0] else {
+            panic!("expected hinted agent-shell item");
+        };
+        assert_eq!(item.shell.name, "terminal");
+        assert!(item.agent.is_none());
+    }
+
+    #[test]
+    fn workspace_view_does_not_hint_an_inactive_pi_session() {
+        let mut hinted = shell("s1", "w1", "terminal");
+        hinted.foreground_process = Some("pi".into());
+        let mut workspace = workspace("w1", "project", vec![hinted]);
+        let mut inactive = agent("inactive", "w1", "s1");
+        inactive.name = "Pi".into();
+        inactive.integration = "pi".into();
+        inactive.observation.state = AgentState::Inactive;
+        workspace.agents.push(inactive);
+
+        let views = dashboard_views(&[workspace], &mut git::Cache::default());
+
+        assert!(matches!(
+            views[0].items[0],
+            tui::WorkspaceItemView::Shell(_)
+        ));
+    }
+
+    #[test]
     fn workspace_view_does_not_treat_arbitrary_foreground_process_as_agent() {
         let mut ordinary = shell("s1", "w1", "terminal");
         ordinary.foreground_process = Some("OpenCode".into());
@@ -3346,13 +3468,23 @@ mod tests {
         ended.ended_at_ms = Some(12);
         let mut done = agent("done", "w1", "s1");
         done.observation.state = AgentState::Done;
+        let mut inactive = agent("inactive", "w1", "s1");
+        inactive.observation.state = AgentState::Inactive;
         let mut stale = agent("stale", "w1", "s1");
         stale.run_id = "old-run".into();
         let wrong_pair = agent("wrong-pair", "w1", "s2");
         let orphan = agent("orphan", "w1", "missing");
         let mut wrong_workspace = agent("wrong-workspace", "w2", "s1");
         wrong_workspace.run_id = "r1".into();
-        workspace.agents = vec![ended, done, stale, wrong_pair, orphan, wrong_workspace];
+        workspace.agents = vec![
+            ended,
+            done,
+            inactive,
+            stale,
+            wrong_pair,
+            orphan,
+            wrong_workspace,
+        ];
 
         let views = dashboard_views(&[workspace], &mut git::Cache::default());
 
@@ -3537,19 +3669,90 @@ mod tests {
     }
 
     #[test]
+    fn parses_pi_install_and_uses_global_extension_path() {
+        assert!(matches!(
+            Cli::try_parse_from(["boomux", "pi", "install", "--force"])
+                .unwrap()
+                .command,
+            Some(Commands::Pi {
+                command: PiCommands::Install { force: true }
+            })
+        ));
+        assert_eq!(
+            pi_install_path(Path::new("/pi-agent")),
+            PathBuf::from("/pi-agent/extensions/boomux.js")
+        );
+        assert_eq!(
+            pi_config_root(Some("/custom/pi".into()), Some("/home/example".into())).unwrap(),
+            PathBuf::from("/custom/pi")
+        );
+        assert_eq!(
+            pi_config_root(None, Some("/home/example".into())).unwrap(),
+            PathBuf::from("/home/example/.pi/agent")
+        );
+        assert_eq!(
+            pi_config_root(Some("".into()), Some("/home/example".into())).unwrap(),
+            PathBuf::from("/home/example/.pi/agent")
+        );
+        assert_eq!(
+            pi_config_root(Some("~/.config/pi".into()), Some("/home/example".into())).unwrap(),
+            PathBuf::from("/home/example/.config/pi")
+        );
+        assert!(pi_config_root(Some("relative".into()), None).is_err());
+        assert!(install_pi_at(Path::new("relative"), false).is_err());
+    }
+
+    #[test]
+    fn pi_install_is_idempotent_and_requires_force_for_changes() {
+        let config = test_skill_home("pi-content");
+        let extension = pi_install_path(&config);
+
+        install_pi_at(&config, false).unwrap();
+        assert_eq!(fs::read_to_string(&extension).unwrap(), BOOMUX_PI_EXTENSION);
+        install_pi_at(&config, false).unwrap();
+        fs::write(&extension, "custom extension").unwrap();
+        assert!(install_pi_at(&config, false).is_err());
+        assert_eq!(fs::read_to_string(&extension).unwrap(), "custom extension");
+        install_pi_at(&config, true).unwrap();
+        assert_eq!(fs::read_to_string(&extension).unwrap(), BOOMUX_PI_EXTENSION);
+
+        fs::remove_dir_all(config).unwrap();
+    }
+
+    #[test]
+    fn pi_install_rejects_symlinked_extension_directory() {
+        use std::os::unix::fs::symlink;
+
+        let config = test_skill_home("pi-symlink-directory");
+        let outside = test_skill_home("pi-symlink-directory-target");
+        fs::create_dir_all(&config).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, config.join("extensions")).unwrap();
+
+        assert!(install_pi_at(&config, true).is_err());
+        assert!(fs::read_dir(&outside).unwrap().next().is_none());
+
+        fs::remove_dir_all(config).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
     fn capabilities_advertise_phase_two_agent_integration_surface() {
         for command in ["agent.register", "agent.ensure", "agent.report"] {
             assert!(JSON_COMMANDS.contains(&command));
         }
         for feature in [
             "protocol_10",
+            "protocol_12",
+            "inactive_agent_state",
             "idempotent_agent_ensure",
             "agent_authority_precedence",
             "opencode_lifecycle_plugin",
+            "pi_lifecycle_extension",
         ] {
             assert!(INTEGRATION_FEATURES.contains(&feature));
         }
-        assert_eq!(protocol::PROTOCOL_VERSION, 11);
+        assert_eq!(protocol::PROTOCOL_VERSION, 12);
     }
 
     #[test]
@@ -3615,6 +3818,34 @@ mod tests {
     }
 
     #[test]
+    fn bundled_pi_extension_has_lifecycle_contract_without_shell_interpolation() {
+        for expected in [
+            "session_start",
+            "agent_start",
+            "agent_settled",
+            "session_shutdown",
+            "getSessionId",
+            "BOOMUX_SHELL_ID",
+            "BOOMUX_RUN_ID",
+            "agent\",\n    \"ensure",
+            "agent\",\n    \"report",
+            "--json",
+            "shell: false",
+        ] {
+            assert!(
+                BOOMUX_PI_EXTENSION.contains(expected),
+                "Pi extension omits {expected}"
+            );
+        }
+        for forbidden in ["exec(", "sh -c", "${BOOMUX_"] {
+            assert!(
+                !BOOMUX_PI_EXTENSION.contains(forbidden),
+                "Pi extension contains shell interpolation marker {forbidden}"
+            );
+        }
+    }
+
+    #[test]
     fn bundled_skill_covers_every_public_command_group() {
         for command in [
             "boomux ui",
@@ -3634,6 +3865,8 @@ mod tests {
             "boomux shell rename",
             "boomux shell close",
             "boomux skill install",
+            "boomux opencode install",
+            "boomux pi install",
             "boomux daemon status",
             "boomux daemon restart",
             "boomux daemon stop",

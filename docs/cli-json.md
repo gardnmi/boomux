@@ -88,7 +88,7 @@ Agent objects include stable fields `id`, `workspace_id`, `workspace_name`,
 `revision`, `state`, `authority`, `evidence`, `confidence`, and
 `observed_at_ms`. Missing optional values are JSON `null`.
 
-Agent `state` is `unknown`, `working`, `blocked`, `idle`, or `done`. `authority`
+Agent `state` is `unknown`, `working`, `blocked`, `idle`, `inactive`, or `done`. `authority`
 is `lifecycle_integration`, `process_adapter`, `terminal_heuristic`, or
 `daemon_lifecycle`; CLI arguments use hyphens instead of underscores. Confidence
 is an integer from 0 through 100. Public mutations accept the first three

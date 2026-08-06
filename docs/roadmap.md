@@ -97,10 +97,11 @@ eternal process.
 
 ### Near-Term Priorities
 
-1. Validate the OpenCode lifecycle plugin during normal work before expanding
-   the observation model. Confirm reload identity, root/subagent aggregation,
-   blocked prompts, idle transitions, explicit completion, and graceful daemon
-   replacement against real sessions.
+1. Validate the OpenCode and Pi lifecycle integrations during normal work before
+   expanding the observation model. Confirm reload identity, session switching,
+   root/subagent aggregation where available, blocked prompts, idle transitions,
+   explicit completion semantics, and graceful daemon replacement against real
+   sessions.
 2. Aggregate agent states into workspace counts and add an explainable,
    persistent attention queue for blocked and completed work.
 3. Add revision-aware `agent wait` so scripts can await durable state

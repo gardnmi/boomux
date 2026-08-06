@@ -625,6 +625,12 @@ impl Client {
 
 fn request_minimum_version(request: &Request) -> u32 {
     match request {
+        Request::RegisterAgent { spec, .. } | Request::EnsureAgent { spec, .. }
+            if spec.report.state == protocol::AgentState::Inactive =>
+        {
+            12
+        }
+        Request::ReportAgent { report, .. } if report.state == protocol::AgentState::Inactive => 12,
         Request::GetLauncher { .. }
         | Request::CreateLauncher { .. }
         | Request::RenameLauncher { .. }
@@ -850,6 +856,23 @@ mod tests {
     }
 
     #[test]
+    fn inactive_agent_reports_require_protocol_twelve() {
+        assert_eq!(
+            request_minimum_version(&Request::ReportAgent {
+                agent_id: "a1".into(),
+                run_id: "r1".into(),
+                report: AgentReport {
+                    state: protocol::AgentState::Inactive,
+                    authority: protocol::AgentAuthority::LifecycleIntegration,
+                    evidence: "inactive".into(),
+                    confidence: 100,
+                },
+            }),
+            12
+        );
+    }
+
+    #[test]
     fn negotiates_protocol_seven_without_losing_version_seven_requests() {
         let directory = env::temp_dir().join(format!("boomux-client-{}", Uuid::new_v4()));
         fs::create_dir_all(&directory).unwrap();
@@ -858,14 +881,30 @@ mod tests {
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+            assert_eq!(request.version, 12);
+            assert!(matches!(request.message, Request::Ping));
+            protocol::write_message(
+                &mut stream,
+                &Envelope::with_version(
+                    11,
+                    Response::Error {
+                        message: "expected an older protocol".into(),
+                        code: Some(ErrorCode::UnsupportedVersion),
+                    },
+                ),
+            )
+            .unwrap();
+
+            let (mut stream, _) = listener.accept().unwrap();
+            let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
             assert_eq!(request.version, 11);
             assert!(matches!(request.message, Request::Ping));
             protocol::write_message(
                 &mut stream,
                 &Envelope::with_version(
-                    10,
+                    11,
                     Response::Error {
-                        message: "expected an older protocol".into(),
+                        message: "expected protocol 7".into(),
                         code: Some(ErrorCode::UnsupportedVersion),
                     },
                 ),

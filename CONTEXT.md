@@ -36,6 +36,9 @@ heuristic. Equal authority may advance an observation; exact duplicate and lower
 are no-ops. Daemon lifecycle authority is reserved for daemon-originated observations and is not an
 external integration authority.
 
+Inactive means a resumable external session is not currently active. It remains durable and can
+return to idle or working, but does not decorate a dashboard shell. Done is permanent completion.
+
 ## Process Adapter
 
 A process-bound observer for an agent instance whose evidence is limited to process events. The

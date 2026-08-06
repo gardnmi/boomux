@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 11;
+pub const PROTOCOL_VERSION: u32 = 12;
 pub const MIN_PROTOCOL_VERSION: u32 = 6;
 pub const MAX_CONTROL_FRAME: usize = 8 * 1024 * 1024;
 pub const MAX_ATTACH_FRAME: usize = 1024 * 1024;
@@ -51,6 +51,7 @@ pub enum AgentState {
     Working,
     Blocked,
     Idle,
+    Inactive,
     Done,
 }
 
@@ -741,8 +742,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_eleven_with_minimum_six() {
-        assert_eq!(PROTOCOL_VERSION, 11);
+    fn protocol_version_is_twelve_with_minimum_six() {
+        assert_eq!(PROTOCOL_VERSION, 12);
         assert_eq!(MIN_PROTOCOL_VERSION, 6);
     }
 

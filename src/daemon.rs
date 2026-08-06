@@ -447,7 +447,7 @@ fn launch_replacement_process(
 ) -> io::Result<()> {
     let (mut channel, child_channel) = UnixStream::pair()?;
     let child_channel_fd = child_channel.as_raw_fd();
-    let mut command = Command::new(env::current_exe()?);
+    let mut command = Command::new(replacement_executable()?);
     command
         .args([
             "daemon",
@@ -527,6 +527,38 @@ fn launch_replacement_process(
         let _ = replacement.wait();
     }
     result
+}
+
+fn replacement_executable() -> io::Result<PathBuf> {
+    let current = env::current_exe()?;
+    Ok(select_replacement_executable(
+        current,
+        env::args_os().next().map(PathBuf::from),
+    ))
+}
+
+fn select_replacement_executable(current: PathBuf, argument_zero: Option<PathBuf>) -> PathBuf {
+    if current.exists() {
+        return current;
+    }
+    if let Some(argument_zero) = argument_zero
+        && argument_zero.is_absolute()
+        && argument_zero.exists()
+    {
+        return argument_zero;
+    }
+    current
+}
+
+fn request_requires_protocol_twelve(request: &Request) -> bool {
+    matches!(
+        request,
+        Request::RegisterAgent { spec, .. } | Request::EnsureAgent { spec, .. }
+            if spec.report.state == AgentState::Inactive
+    ) || matches!(
+        request,
+        Request::ReportAgent { report, .. } if report.state == AgentState::Inactive
+    )
 }
 
 fn handle_connection(
@@ -628,6 +660,16 @@ fn handle_connection(
             error_response(
                 ErrorCode::UnsupportedVersion,
                 "request requires daemon protocol 11",
+            ),
+        );
+    }
+    if response_version < 12 && request_requires_protocol_twelve(&request.message) {
+        return send_response(
+            &mut stream,
+            response_version,
+            error_response(
+                ErrorCode::UnsupportedVersion,
+                "inactive agent state requires daemon protocol 12",
             ),
         );
     }
@@ -737,6 +779,10 @@ fn handle_connection(
 }
 
 fn response_for_version(response: Response, version: u32) -> Response {
+    let mut response = response;
+    if version < 12 {
+        downgrade_inactive_agent_states(&mut response);
+    }
     if version >= 9 {
         return response;
     }
@@ -784,6 +830,50 @@ fn response_for_version(response: Response, version: u32) -> Response {
             }
         }
         response => response,
+    }
+}
+
+fn downgrade_inactive_agent_states(response: &mut Response) {
+    fn downgrade(agent: &mut AgentInstanceSnapshot) {
+        if agent.observation.state == AgentState::Inactive {
+            agent.observation.state = AgentState::Unknown;
+        }
+    }
+
+    match response {
+        Response::Snapshot { snapshot } => {
+            for workspace in &mut snapshot.workspaces {
+                for agent in &mut workspace.agents {
+                    downgrade(agent);
+                }
+            }
+        }
+        Response::Workspace { workspace } => {
+            for agent in &mut workspace.agents {
+                downgrade(agent);
+            }
+        }
+        Response::Agent { agent } => downgrade(agent),
+        Response::Events {
+            snapshot, events, ..
+        } => {
+            if let Some(snapshot) = snapshot {
+                for workspace in &mut snapshot.workspaces {
+                    for agent in &mut workspace.agents {
+                        downgrade(agent);
+                    }
+                }
+            }
+            for event in events {
+                match &mut event.kind {
+                    DaemonEventKind::AgentRegistered { agent, .. }
+                    | DaemonEventKind::AgentStateChanged { agent, .. }
+                    | DaemonEventKind::AgentCompleted { agent, .. } => downgrade(agent),
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -4940,6 +5030,24 @@ mod tests {
     }
 
     #[test]
+    fn replacement_uses_absolute_argument_zero_after_binary_replacement() {
+        let directory = env::temp_dir().join(format!("boomux-replacement-{}", Uuid::new_v4()));
+        let installed = directory.join("boomux");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(&installed, b"replacement").unwrap();
+
+        assert_eq!(
+            select_replacement_executable(
+                directory.join("boomux (deleted)"),
+                Some(installed.clone())
+            ),
+            installed
+        );
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn event_batches_are_monotonic_and_paginated() {
         let registry = Registry::default();
         let Response::Events {
@@ -5619,7 +5727,7 @@ mod tests {
         let shell_id = shell.id.clone();
         let run_id = shell.snapshot().unwrap().run.unwrap().id;
         let spec = agent_spec(AgentState::Working);
-        let Response::Agent { agent } = registry
+        let Response::Agent { agent: registered } = registry
             .dispatch(Request::EnsureAgent {
                 shell_id: shell_id.clone(),
                 run_id: run_id.clone(),
@@ -5629,6 +5737,18 @@ mod tests {
         else {
             panic!("expected registered agent");
         };
+        let Response::Agent { agent } = registry
+            .dispatch(Request::ReportAgent {
+                agent_id: registered.id,
+                run_id: run_id.clone(),
+                report: agent_spec(AgentState::Inactive).report,
+            })
+            .unwrap()
+        else {
+            panic!("expected inactive agent");
+        };
+        assert_eq!(agent.observation.state, AgentState::Inactive);
+        assert_eq!(agent.ended_at_ms, None);
 
         shell.kill().unwrap();
         drop(runtime);
@@ -5655,6 +5775,20 @@ mod tests {
             panic!("expected restored ensured agent");
         };
         assert_eq!(ensured, agent);
+        let Response::Agent { agent: reactivated } = restored
+            .dispatch(Request::ReportAgent {
+                agent_id: ensured.id,
+                run_id: ensured.run_id,
+                report: agent_spec(AgentState::Idle).report,
+            })
+            .unwrap()
+        else {
+            panic!("expected reactivated agent");
+        };
+        assert_eq!(reactivated.id, agent.id);
+        assert_eq!(reactivated.observation.state, AgentState::Idle);
+        assert_eq!(reactivated.ended_at_ms, None);
+        assert_eq!(restored.snapshot().unwrap().workspaces[0].agents.len(), 1);
         drop(restored);
         fs::remove_dir_all(directory).unwrap();
     }
@@ -5736,6 +5870,134 @@ mod tests {
         let encoded =
             serde_json::to_value(response_for_version(Response::Snapshot { snapshot }, 8)).unwrap();
         assert!(encoded["snapshot"]["workspaces"][0].get("agents").is_none());
+    }
+
+    #[test]
+    fn protocol_eleven_responses_downgrade_inactive_agent_state() {
+        let agent = AgentInstanceSnapshot {
+            id: "a1".into(),
+            workspace_id: "w1".into(),
+            shell_id: "s1".into(),
+            run_id: "r1".into(),
+            name: "pi".into(),
+            integration: "pi".into(),
+            external_session_id: Some("session-1".into()),
+            started_at_ms: 1,
+            ended_at_ms: None,
+            observation: AgentObservationSnapshot {
+                revision: 2,
+                state: AgentState::Inactive,
+                authority: AgentAuthority::LifecycleIntegration,
+                evidence: "Pi session inactive".into(),
+                confidence: 100,
+                observed_at_ms: 2,
+            },
+        };
+
+        let Response::Agent { agent: downgraded } = response_for_version(
+            Response::Agent {
+                agent: agent.clone(),
+            },
+            11,
+        ) else {
+            panic!("expected agent response");
+        };
+        assert_eq!(downgraded.observation.state, AgentState::Unknown);
+
+        let Response::Agent { agent: current } = response_for_version(
+            Response::Agent {
+                agent: agent.clone(),
+            },
+            12,
+        ) else {
+            panic!("expected agent response");
+        };
+        assert_eq!(current.observation.state, AgentState::Inactive);
+
+        let workspace = WorkspaceSnapshot {
+            id: "w1".into(),
+            name: "workspace".into(),
+            shells: Vec::new(),
+            launchers: Vec::new(),
+            agents: vec![agent.clone()],
+        };
+        let Response::Workspace {
+            workspace: downgraded_workspace,
+        } = response_for_version(
+            Response::Workspace {
+                workspace: workspace.clone(),
+            },
+            11,
+        )
+        else {
+            panic!("expected workspace response");
+        };
+        assert_eq!(
+            downgraded_workspace.agents[0].observation.state,
+            AgentState::Unknown
+        );
+
+        let Response::Events {
+            snapshot: Some(snapshot),
+            events,
+            ..
+        } = response_for_version(
+            Response::Events {
+                stream_id: "stream".into(),
+                cursor: EventCursor {
+                    stream_id: "stream".into(),
+                    event_id: 1,
+                },
+                snapshot: Some(Snapshot {
+                    workspaces: vec![workspace],
+                }),
+                events: vec![DaemonEvent {
+                    id: 1,
+                    at_ms: 1,
+                    kind: DaemonEventKind::AgentStateChanged {
+                        workspace_id: "w1".into(),
+                        shell_id: "s1".into(),
+                        agent,
+                    },
+                }],
+            },
+            11,
+        )
+        else {
+            panic!("expected events response");
+        };
+        assert_eq!(
+            snapshot.workspaces[0].agents[0].observation.state,
+            AgentState::Unknown
+        );
+        let DaemonEventKind::AgentStateChanged { agent, .. } = &events[0].kind else {
+            panic!("expected agent state event");
+        };
+        assert_eq!(agent.observation.state, AgentState::Unknown);
+    }
+
+    #[test]
+    fn inactive_agent_mutations_require_protocol_twelve() {
+        assert!(request_requires_protocol_twelve(&Request::EnsureAgent {
+            shell_id: "s1".into(),
+            run_id: "r1".into(),
+            spec: agent_spec(AgentState::Inactive),
+        }));
+        assert!(request_requires_protocol_twelve(&Request::RegisterAgent {
+            shell_id: "s1".into(),
+            run_id: "r1".into(),
+            spec: agent_spec(AgentState::Inactive),
+        }));
+        assert!(request_requires_protocol_twelve(&Request::ReportAgent {
+            agent_id: "a1".into(),
+            run_id: "r1".into(),
+            report: agent_spec(AgentState::Inactive).report,
+        }));
+        assert!(!request_requires_protocol_twelve(&Request::EnsureAgent {
+            shell_id: "s1".into(),
+            run_id: "r1".into(),
+            spec: agent_spec(AgentState::Idle),
+        }));
     }
 
     #[test]
