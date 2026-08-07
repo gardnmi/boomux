@@ -100,6 +100,7 @@ boomux session list --json
 boomux session list --workspace "<workspace-name-or-id>" --json
 boomux session inspect "<exact-session-id>" --json
 boomux session read "<exact-session-id>" --limit 100 --max-bytes 1048576 --json
+boomux session read "<exact-session-id>" --before "<next-cursor>" --limit 100 --max-bytes 1048576 --json
 ```
 
 Use the exact opaque session ID returned by `session list`. Never guess or
@@ -114,6 +115,10 @@ follow its active branch. Inspect `truncated`, `truncated_by`, and per-entry
 redact host content, so use it only when the user's request authorizes reading
 that exact session. Protocol-13 sessions retain a `source_cwd` for transcript
 lookup after shell removal; this does not preserve deleted harness data itself.
+When `has_more` is true, prepend older pages by passing the exact opaque
+`next_cursor` as `--before`; bounds may change between requests. Discard the
+cursor and start a fresh read on `cursor_expired`. Do not decode, edit, or reuse
+a cursor for another projected session.
 
 Exact shell IDs resolve globally. Shell names resolve in the current workspace,
 or through `--workspace` for `shell inspect`, `shell rename`, and `shell close`.

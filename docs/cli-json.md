@@ -195,8 +195,9 @@ leaf parent chain and excludes abandoned branches. Tool-result messages are
 combined with their tool calls.
 
 The transcript contains `session_id`, `integration`, `external_session_id`,
-`entries`, `returned_entries`, `total_entries`, `content_bytes`, `truncated`, and
-`truncated_by`. Entries are a newest suffix returned in chronological order.
+`entries`, `returned_entries`, `total_entries`, `content_bytes`, `truncated`,
+`truncated_by`, `has_more`, and `next_cursor`. Entries are a newest suffix
+returned in chronological order.
 Their `type` is `message`, `reasoning`, or `tool`; common fields are `source_id`,
 `timestamp_ms`, and `truncated`. Message and reasoning entries add `role` and
 `text`. Tool entries add `tool_name`, `tool_call_id`, `status`, `input`, and
@@ -210,6 +211,18 @@ bytes in returned text, input, and output fields. `truncated_by` contains `limit
 and/or `max_bytes`; a partially clipped entry also has `truncated: true`. Boomux
 does not redact canonical host content. Raw host source inspection is separately
 capped at 16 MiB.
+
+When `has_more` is true, `next_cursor` is a non-null opaque string for
+`session read --before <cursor>`; otherwise it is JSON `null`. Continuation moves
+toward older logical entries, and bounds may change between requests. The cursor
+binds the projected session, adapter normalization, retained source context, and
+initial normalized transcript. Entries appended after the first page are ignored
+only when the normalized baseline remains an exact prefix. Existing-entry edits,
+tool-result updates, removals, reordering, Pi branch changes, source-context
+changes, and adapter-normalization changes return
+`cursor_expired`; callers discard the cursor and request a fresh newest page.
+Malformed, oversized, or cross-session cursors return `invalid_argument`.
+Pagination remains client-side and does not create daemon cursor state.
 
 `read` returns `shell_id`, `run_id`, `output_revision`, `changed`, `status`, and
 `output`. Output is a JSON string containing the same bounded plain rendered text

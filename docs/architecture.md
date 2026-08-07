@@ -385,11 +385,25 @@ limits, marks partial entries and truncation causes, caps canonical source input
 at 16 MiB, and times out OpenCode export. Unsupported hosts and unavailable,
 invalid, or oversized sources return stable typed errors.
 
+Older-page reads use a stateless opaque cursor bound to the projected session,
+adapter normalization revision, retained source context, initial normalized
+entry count, and a SHA-256 fingerprint of that baseline. Each continuation
+re-reads the bounded canonical source. Appends that leave the normalized
+baseline prefix unchanged are ignored for the established sequence, while
+baseline mutation, removal, reordering, Pi branch changes, source-context
+changes, or normalization changes expire the cursor.
+Page selection and byte clipping remain shared and advance by whole normalized
+entries; cursors create no daemon identity, persistence, or retained state.
+Cursor data is untrusted consistency metadata rather than authorization; exact
+projected-session resolution and canonical source access remain the security
+boundary.
+
 The transcript layer is an adapter registry keyed by the Agent integration
 name. An adapter receives only the canonical external session ID and retained
 working directory and returns host-neutral transcript entries. Exact projected
-session resolution, access preconditions, newest-suffix selection, byte and
-entry bounds, truncation, typed errors, human output, and `boomux.cli/v1` JSON
+session resolution, access preconditions, newest-suffix pagination, byte and
+entry bounds, cursor validation, truncation, typed errors, human output, and
+`boomux.cli/v1` JSON
 remain shared. Adding Claude Code, Codex, or another harness therefore requires
 one canonical source adapter and one registry entry, not another CLI path.
 `boomux capabilities --json` derives `session_transcript_integrations` from this

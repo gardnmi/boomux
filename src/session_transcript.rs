@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::fs::OpenOptions;
 use std::io::{self, Read};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -9,8 +10,11 @@ use std::sync::mpsc::{self, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use serde::Serialize;
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::host_session_titles::{
     PiEnvironment, PiSessionFileError, normalize_absolute, pi_session_file,
@@ -19,9 +23,13 @@ use crate::session_projection::SessionProjection;
 
 const SOURCE_LIMIT_BYTES: u64 = 16 * 1024 * 1024;
 const OPENCODE_TIMEOUT: Duration = Duration::from_secs(30);
+const CURSOR_PREFIX: &str = "v1.";
+const CURSOR_MAX_BYTES: usize = 4096;
 
 trait TranscriptAdapter: Sync {
     fn integration(&self) -> &'static str;
+
+    fn normalization_revision(&self) -> u32;
 
     fn read(&self, request: TranscriptRequest<'_>)
     -> Result<Vec<TranscriptEntry>, TranscriptError>;
@@ -97,14 +105,39 @@ pub(crate) struct Transcript {
     pub(crate) content_bytes: usize,
     pub(crate) truncated: bool,
     pub(crate) truncated_by: Vec<&'static str>,
+    pub(crate) has_more: bool,
+    pub(crate) next_cursor: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Cursor {
+    v: u32,
+    n: u32,
+    s: String,
+    i: String,
+    x: String,
+    c: u64,
+    h: String,
+    e: u64,
+}
+
+struct PageBounds {
+    normalization_revision: u32,
+    source_fingerprint: String,
+    baseline_count: usize,
+    baseline_fingerprint: String,
+    end: usize,
+    limit: usize,
+    max_bytes: usize,
 }
 
 pub(crate) fn read(
     session: &SessionProjection,
+    before: Option<&str>,
     limit: usize,
     max_bytes: usize,
 ) -> Result<Transcript, TranscriptError> {
-    read_with_adapters(session, limit, max_bytes, ADAPTERS)
+    read_with_adapters(session, before, limit, max_bytes, ADAPTERS)
 }
 
 pub(crate) fn supported_integrations() -> Vec<&'static str> {
@@ -116,6 +149,7 @@ pub(crate) fn supported_integrations() -> Vec<&'static str> {
 
 fn read_with_adapters(
     session: &SessionProjection,
+    before: Option<&str>,
     limit: usize,
     max_bytes: usize,
     adapters: &[&dyn TranscriptAdapter],
@@ -150,22 +184,66 @@ fn read_with_adapters(
                 ),
             )
         })?;
+    let source_fingerprint =
+        source_context_fingerprint(&session.integration, external_session_id, directory)?;
+    let cursor = before.map(decode_cursor).transpose()?;
+    if let Some(cursor) = cursor.as_ref() {
+        if cursor.s != session.id || cursor.i != session.integration {
+            return Err(invalid_cursor("cursor belongs to a different session"));
+        }
+        if cursor.n != adapter.normalization_revision() || cursor.x != source_fingerprint {
+            return Err(expired_cursor());
+        }
+        if cursor.e > cursor.c {
+            return Err(invalid_cursor("cursor entry index is out of range"));
+        }
+    }
     let entries = adapter.read(TranscriptRequest {
         directory,
         external_session_id,
     })?;
+    let (baseline_count, baseline_fingerprint, end) = if let Some(cursor) = cursor {
+        let baseline_count = usize::try_from(cursor.c)
+            .map_err(|_| invalid_cursor("cursor entry count is out of range"))?;
+        let end = usize::try_from(cursor.e)
+            .map_err(|_| invalid_cursor("cursor entry index is out of range"))?;
+        if entries.len() < baseline_count
+            || normalized_prefix_fingerprint(&entries[..baseline_count]) != cursor.h
+        {
+            return Err(expired_cursor());
+        }
+        (baseline_count, cursor.h, end)
+    } else {
+        let baseline_count = entries.len();
+        (
+            baseline_count,
+            normalized_prefix_fingerprint(&entries),
+            baseline_count,
+        )
+    };
     Ok(bound_entries(
         session,
         external_session_id,
         entries,
-        limit,
-        max_bytes,
+        PageBounds {
+            normalization_revision: adapter.normalization_revision(),
+            source_fingerprint,
+            baseline_count,
+            baseline_fingerprint,
+            end,
+            limit,
+            max_bytes,
+        },
     ))
 }
 
 impl TranscriptAdapter for OpenCodeAdapter {
     fn integration(&self) -> &'static str {
         "opencode"
+    }
+
+    fn normalization_revision(&self) -> u32 {
+        1
     }
 
     fn read(
@@ -180,6 +258,10 @@ impl TranscriptAdapter for OpenCodeAdapter {
 impl TranscriptAdapter for PiAdapter {
     fn integration(&self) -> &'static str {
         "pi"
+    }
+
+    fn normalization_revision(&self) -> u32 {
+        1
     }
 
     fn read(
@@ -734,40 +816,132 @@ fn value_text(value: &Value) -> String {
         .map_or_else(|| compact_json(value), str::to_owned)
 }
 
+fn source_context_fingerprint(
+    integration: &str,
+    external_session_id: &str,
+    directory: &Path,
+) -> Result<String, TranscriptError> {
+    let directory = normalize_absolute(directory).ok_or_else(|| {
+        TranscriptError::new(
+            "session_source_unavailable",
+            "session retained working directory is not absolute",
+        )
+    })?;
+    Ok(hash_fields([
+        integration.as_bytes(),
+        external_session_id.as_bytes(),
+        directory.as_os_str().as_bytes(),
+    ]))
+}
+
+fn normalized_prefix_fingerprint(entries: &[TranscriptEntry]) -> String {
+    let mut hasher = Sha256::new();
+    for entry in entries {
+        let serialized = serde_json::to_vec(entry).expect("transcript entries serialize");
+        hash_field(&mut hasher, &serialized);
+    }
+    URL_SAFE_NO_PAD.encode(hasher.finalize())
+}
+
+fn hash_fields<'a>(fields: impl IntoIterator<Item = &'a [u8]>) -> String {
+    let mut hasher = Sha256::new();
+    for field in fields {
+        hash_field(&mut hasher, field);
+    }
+    URL_SAFE_NO_PAD.encode(hasher.finalize())
+}
+
+fn hash_field(hasher: &mut Sha256, field: &[u8]) {
+    hasher.update((field.len() as u64).to_be_bytes());
+    hasher.update(field);
+}
+
+fn decode_cursor(encoded: &str) -> Result<Cursor, TranscriptError> {
+    if encoded.len() > CURSOR_MAX_BYTES {
+        return Err(invalid_cursor("cursor is too long"));
+    }
+    let payload = encoded
+        .strip_prefix(CURSOR_PREFIX)
+        .ok_or_else(|| invalid_cursor("cursor has an unknown schema"))?;
+    let bytes = URL_SAFE_NO_PAD
+        .decode(payload)
+        .map_err(|_| invalid_cursor("cursor is malformed"))?;
+    let cursor: Cursor =
+        serde_json::from_slice(&bytes).map_err(|_| invalid_cursor("cursor is malformed"))?;
+    if cursor.v != 1 {
+        return Err(invalid_cursor("cursor has an unknown schema"));
+    }
+    Ok(cursor)
+}
+
+fn encode_cursor(cursor: &Cursor) -> String {
+    let payload = serde_json::to_vec(cursor).expect("cursor serializes");
+    format!("{CURSOR_PREFIX}{}", URL_SAFE_NO_PAD.encode(payload))
+}
+
+fn invalid_cursor(message: &'static str) -> TranscriptError {
+    TranscriptError::new("invalid_argument", message)
+}
+
+fn expired_cursor() -> TranscriptError {
+    TranscriptError::new("cursor_expired", "transcript cursor has expired")
+}
+
 fn bound_entries(
     session: &SessionProjection,
     external_session_id: &str,
     entries: Vec<TranscriptEntry>,
-    limit: usize,
-    max_bytes: usize,
+    page: PageBounds,
 ) -> Transcript {
-    let total_entries = entries.len();
-    let entry_start = total_entries.saturating_sub(limit);
+    let PageBounds {
+        normalization_revision,
+        source_fingerprint,
+        baseline_count,
+        baseline_fingerprint,
+        end,
+        limit,
+        max_bytes,
+    } = page;
+    let total_entries = baseline_count;
+    let entry_start = end.saturating_sub(limit);
     let limit_truncated = entry_start > 0;
-    let selected = entries.into_iter().skip(entry_start).collect::<Vec<_>>();
+    let selected = entries
+        .into_iter()
+        .take(end)
+        .skip(entry_start)
+        .enumerate()
+        .map(|(offset, entry)| (entry_start + offset, entry))
+        .collect::<Vec<_>>();
     let selected_entries = selected.len();
     let mut remaining = max_bytes;
     let mut bounded = Vec::new();
     let mut byte_truncated = false;
-    for mut entry in selected.into_iter().rev() {
+    let mut oldest_index = end;
+    for (index, mut entry) in selected.into_iter().rev() {
         let bytes = entry.content_bytes();
         if bytes > remaining {
             byte_truncated = true;
-            if remaining == 0 {
+            if remaining == 0 && !bounded.is_empty() {
                 break;
             }
             entry.truncate_to(remaining);
-            bounded.push(entry);
+            oldest_index = index;
+            bounded.push((index, entry));
             break;
         }
         remaining -= bytes;
-        bounded.push(entry);
+        oldest_index = index;
+        bounded.push((index, entry));
     }
     if bounded.len() < selected_entries {
         byte_truncated = true;
     }
     bounded.reverse();
-    let content_bytes = bounded.iter().map(TranscriptEntry::content_bytes).sum();
+    let entries = bounded
+        .into_iter()
+        .map(|(_, entry)| entry)
+        .collect::<Vec<_>>();
+    let content_bytes = entries.iter().map(TranscriptEntry::content_bytes).sum();
     let mut truncated_by = Vec::new();
     if limit_truncated {
         truncated_by.push("limit");
@@ -775,16 +949,32 @@ fn bound_entries(
     if byte_truncated {
         truncated_by.push("max_bytes");
     }
+    let next_end = oldest_index;
+    let has_more = next_end > 0;
+    let next_cursor = has_more.then(|| {
+        encode_cursor(&Cursor {
+            v: 1,
+            n: normalization_revision,
+            s: session.id.clone(),
+            i: session.integration.clone(),
+            x: source_fingerprint,
+            c: baseline_count as u64,
+            h: baseline_fingerprint,
+            e: next_end as u64,
+        })
+    });
     Transcript {
         session_id: session.id.clone(),
         integration: session.integration.clone(),
         external_session_id: external_session_id.to_owned(),
-        returned_entries: bounded.len(),
+        returned_entries: entries.len(),
         total_entries,
         content_bytes,
-        entries: bounded,
+        entries,
         truncated: !truncated_by.is_empty(),
         truncated_by,
+        has_more,
+        next_cursor,
     }
 }
 
@@ -827,6 +1017,8 @@ fn truncate_utf8(value: &mut String, max_bytes: usize) {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     use boomux::protocol::{AgentAuthority, AgentObservationSnapshot, AgentState};
 
@@ -838,6 +1030,10 @@ mod tests {
     impl TranscriptAdapter for FutureHarnessAdapter {
         fn integration(&self) -> &'static str {
             "future-harness"
+        }
+
+        fn normalization_revision(&self) -> u32 {
+            1
         }
 
         fn read(
@@ -854,6 +1050,59 @@ mod tests {
                 "adapter output",
             )])
         }
+    }
+
+    struct MutableAdapter {
+        entries: Mutex<Vec<TranscriptEntry>>,
+        revision: AtomicU32,
+    }
+
+    impl MutableAdapter {
+        fn new(entries: Vec<TranscriptEntry>) -> Self {
+            Self {
+                entries: Mutex::new(entries),
+                revision: AtomicU32::new(1),
+            }
+        }
+    }
+
+    impl TranscriptAdapter for MutableAdapter {
+        fn integration(&self) -> &'static str {
+            "mutable"
+        }
+
+        fn normalization_revision(&self) -> u32 {
+            self.revision.load(Ordering::Relaxed)
+        }
+
+        fn read(
+            &self,
+            _request: TranscriptRequest<'_>,
+        ) -> Result<Vec<TranscriptEntry>, TranscriptError> {
+            Ok(self.entries.lock().unwrap().clone())
+        }
+    }
+
+    fn entries(ids: &[&str]) -> Vec<TranscriptEntry> {
+        ids.iter()
+            .map(|id| message_entry("message", Some((*id).into()), None, Some("user"), id))
+            .collect()
+    }
+
+    fn read_mutable(
+        session: &SessionProjection,
+        adapter: &MutableAdapter,
+        before: Option<&str>,
+        limit: usize,
+        max_bytes: usize,
+    ) -> Result<Transcript, TranscriptError> {
+        read_with_adapters(
+            session,
+            before,
+            limit,
+            max_bytes,
+            &[adapter as &dyn TranscriptAdapter],
+        )
     }
 
     fn session(integration: &str) -> SessionProjection {
@@ -963,7 +1212,20 @@ mod tests {
             ),
         ];
 
-        let transcript = bound_entries(&session("pi"), "external", entries, 2, 8);
+        let transcript = bound_entries(
+            &session("pi"),
+            "external",
+            entries,
+            PageBounds {
+                normalization_revision: 1,
+                source_fingerprint: "source".into(),
+                baseline_count: 3,
+                baseline_fingerprint: "baseline".into(),
+                end: 3,
+                limit: 2,
+                max_bytes: 8,
+            },
+        );
 
         assert_eq!(transcript.total_entries, 3);
         assert_eq!(transcript.returned_entries, 1);
@@ -978,6 +1240,7 @@ mod tests {
         let adapter = FutureHarnessAdapter;
         let transcript = read_with_adapters(
             &session("future-harness"),
+            None,
             10,
             7,
             &[&adapter as &dyn TranscriptAdapter],
@@ -987,6 +1250,243 @@ mod tests {
         assert_eq!(transcript.integration, "future-harness");
         assert_eq!(transcript.entries[0].text.as_deref(), Some("adapter"));
         assert_eq!(transcript.truncated_by, ["max_bytes"]);
+    }
+
+    #[test]
+    fn cursor_roundtrips_and_rejects_bad_representations() {
+        let cursor = Cursor {
+            v: 1,
+            n: 2,
+            s: "session".into(),
+            i: "integration".into(),
+            x: "source".into(),
+            c: 10,
+            h: "baseline".into(),
+            e: 4,
+        };
+        let encoded = encode_cursor(&cursor);
+        let decoded = decode_cursor(&encoded).unwrap();
+        assert_eq!(decoded.s, "session");
+        assert_eq!(decoded.e, 4);
+
+        for bad in ["garbage", "v1.not-base64", "v2.e30"] {
+            assert_eq!(decode_cursor(bad).unwrap_err().code, "invalid_argument");
+        }
+        let unknown =
+            URL_SAFE_NO_PAD.encode(br#"{"v":2,"n":1,"s":"s","i":"i","x":"x","c":0,"h":"h","e":0}"#);
+        assert_eq!(
+            decode_cursor(&format!("v1.{unknown}")).unwrap_err().code,
+            "invalid_argument"
+        );
+        assert_eq!(
+            decode_cursor(&"x".repeat(CURSOR_MAX_BYTES + 1))
+                .unwrap_err()
+                .code,
+            "invalid_argument"
+        );
+    }
+
+    #[test]
+    fn paginates_exactly_in_chronological_pages_with_changed_bounds() {
+        let adapter = MutableAdapter::new(entries(&["1", "2", "3", "4", "5"]));
+        let session = session("mutable");
+
+        let first = read_mutable(&session, &adapter, None, 2, usize::MAX).unwrap();
+        assert_eq!(source_ids(&first), ["4", "5"]);
+        assert_eq!(first.total_entries, 5);
+        assert_eq!(first.truncated_by, ["limit"]);
+
+        let second = read_mutable(
+            &session,
+            &adapter,
+            first.next_cursor.as_deref(),
+            1,
+            usize::MAX,
+        )
+        .unwrap();
+        assert_eq!(source_ids(&second), ["3"]);
+        assert_eq!(second.total_entries, 5);
+        assert_eq!(second.truncated_by, ["limit"]);
+
+        let third = read_mutable(
+            &session,
+            &adapter,
+            second.next_cursor.as_deref(),
+            10,
+            usize::MAX,
+        )
+        .unwrap();
+        assert_eq!(source_ids(&third), ["1", "2"]);
+        assert!(!third.has_more);
+        assert!(third.next_cursor.is_none());
+        assert!(third.truncated_by.is_empty());
+    }
+
+    #[test]
+    fn append_is_ignored_but_prefix_mutation_or_removal_expires_cursor() {
+        let adapter = MutableAdapter::new(entries(&["1", "2", "3"]));
+        let session = session("mutable");
+        let first = read_mutable(&session, &adapter, None, 1, usize::MAX).unwrap();
+        let cursor = first.next_cursor.unwrap();
+
+        adapter
+            .entries
+            .lock()
+            .unwrap()
+            .push(entries(&["4"]).remove(0));
+        let continued = read_mutable(&session, &adapter, Some(&cursor), 10, usize::MAX).unwrap();
+        assert_eq!(source_ids(&continued), ["1", "2"]);
+        assert_eq!(continued.total_entries, 3);
+
+        adapter.entries.lock().unwrap()[0].text = Some("changed".into());
+        assert_eq!(
+            read_mutable(&session, &adapter, Some(&cursor), 10, usize::MAX)
+                .unwrap_err()
+                .code,
+            "cursor_expired"
+        );
+        *adapter.entries.lock().unwrap() = entries(&["1", "2"]);
+        assert_eq!(
+            read_mutable(&session, &adapter, Some(&cursor), 10, usize::MAX)
+                .unwrap_err()
+                .code,
+            "cursor_expired"
+        );
+    }
+
+    #[test]
+    fn pi_tool_results_and_branch_changes_expire_the_baseline() {
+        let pending = br#"{"type":"session","version":3,"id":"external","cwd":"/repo"}
+{"type":"message","id":"user","parentId":null,"message":{"role":"user","content":"start","timestamp":1}}
+{"type":"message","id":"call","parentId":"user","message":{"role":"assistant","content":[{"type":"toolCall","id":"tc1","name":"read","arguments":{"path":"a"}}],"timestamp":2}}
+"#;
+        let completed = br#"{"type":"session","version":3,"id":"external","cwd":"/repo"}
+{"type":"message","id":"user","parentId":null,"message":{"role":"user","content":"start","timestamp":1}}
+{"type":"message","id":"call","parentId":"user","message":{"role":"assistant","content":[{"type":"toolCall","id":"tc1","name":"read","arguments":{"path":"a"}}],"timestamp":2}}
+{"type":"message","id":"result","parentId":"call","message":{"role":"toolResult","toolCallId":"tc1","content":"data","isError":false,"timestamp":3}}
+"#;
+        let adapter =
+            MutableAdapter::new(parse_pi(pending, "external", Path::new("/repo")).unwrap());
+        let session = session("mutable");
+        let first = read_mutable(&session, &adapter, None, 1, usize::MAX).unwrap();
+        let cursor = first.next_cursor.unwrap();
+        *adapter.entries.lock().unwrap() =
+            parse_pi(completed, "external", Path::new("/repo")).unwrap();
+        assert_eq!(
+            read_mutable(&session, &adapter, Some(&cursor), 1, usize::MAX)
+                .unwrap_err()
+                .code,
+            "cursor_expired"
+        );
+
+        *adapter.entries.lock().unwrap() = entries(&["root", "old-leaf"]);
+        let first = read_mutable(&session, &adapter, None, 1, usize::MAX).unwrap();
+        *adapter.entries.lock().unwrap() = entries(&["root", "new-leaf"]);
+        assert_eq!(
+            read_mutable(
+                &session,
+                &adapter,
+                first.next_cursor.as_deref(),
+                1,
+                usize::MAX,
+            )
+            .unwrap_err()
+            .code,
+            "cursor_expired"
+        );
+    }
+
+    #[test]
+    fn cursor_rejects_wrong_identity_and_expires_for_source_or_normalization() {
+        let adapter = MutableAdapter::new(entries(&["1", "2"]));
+        let original = session("mutable");
+        let first = read_mutable(&original, &adapter, None, 1, usize::MAX).unwrap();
+        let cursor = first.next_cursor.unwrap();
+
+        let mut out_of_range = decode_cursor(&cursor).unwrap();
+        out_of_range.e = out_of_range.c + 1;
+        assert_eq!(
+            read_mutable(
+                &original,
+                &adapter,
+                Some(&encode_cursor(&out_of_range)),
+                1,
+                usize::MAX,
+            )
+            .unwrap_err()
+            .code,
+            "invalid_argument"
+        );
+
+        let mut wrong = original.clone();
+        wrong.id = "other".into();
+        assert_eq!(
+            read_mutable(&wrong, &adapter, Some(&cursor), 1, usize::MAX)
+                .unwrap_err()
+                .code,
+            "invalid_argument"
+        );
+
+        let mut moved = original.clone();
+        moved.occurrences[0].source_cwd = Some(PathBuf::from("/other"));
+        assert_eq!(
+            read_mutable(&moved, &adapter, Some(&cursor), 1, usize::MAX)
+                .unwrap_err()
+                .code,
+            "cursor_expired"
+        );
+
+        adapter.revision.store(2, Ordering::Relaxed);
+        assert_eq!(
+            read_mutable(&original, &adapter, Some(&cursor), 1, usize::MAX)
+                .unwrap_err()
+                .code,
+            "cursor_expired"
+        );
+    }
+
+    #[test]
+    fn byte_clipping_consumes_a_logical_entry_even_at_zero_utf8_bytes() {
+        let adapter = MutableAdapter::new(vec![
+            message_entry("message", Some("old".into()), None, Some("user"), "old"),
+            message_entry("message", Some("emoji".into()), None, Some("user"), "😀"),
+        ]);
+        let session = session("mutable");
+
+        let first = read_mutable(&session, &adapter, None, 10, 1).unwrap();
+        assert_eq!(source_ids(&first), ["emoji"]);
+        assert_eq!(first.entries[0].text.as_deref(), Some(""));
+        assert_eq!(first.content_bytes, 0);
+        assert_eq!(first.truncated_by, ["max_bytes"]);
+
+        let second = read_mutable(
+            &session,
+            &adapter,
+            first.next_cursor.as_deref(),
+            10,
+            usize::MAX,
+        )
+        .unwrap();
+        assert_eq!(source_ids(&second), ["old"]);
+        assert!(!second.has_more);
+    }
+
+    #[test]
+    fn empty_source_has_no_cursor() {
+        let adapter = MutableAdapter::new(Vec::new());
+        let transcript = read_mutable(&session("mutable"), &adapter, None, 10, 10).unwrap();
+        assert_eq!(transcript.total_entries, 0);
+        assert_eq!(transcript.returned_entries, 0);
+        assert!(!transcript.has_more);
+        assert!(transcript.next_cursor.is_none());
+    }
+
+    fn source_ids(transcript: &Transcript) -> Vec<&str> {
+        transcript
+            .entries
+            .iter()
+            .map(|entry| entry.source_id.as_deref().unwrap())
+            .collect()
     }
 
     #[test]
