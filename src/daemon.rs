@@ -780,6 +780,9 @@ fn handle_connection(
 
 fn response_for_version(response: Response, version: u32) -> Response {
     let mut response = response;
+    if version < 13 {
+        remove_agent_cwds(&mut response);
+    }
     if version < 12 {
         downgrade_inactive_agent_states(&mut response);
     }
@@ -833,34 +836,43 @@ fn response_for_version(response: Response, version: u32) -> Response {
     }
 }
 
+fn remove_agent_cwds(response: &mut Response) {
+    visit_response_agents(response, &mut |agent| agent.cwd = None);
+}
+
 fn downgrade_inactive_agent_states(response: &mut Response) {
-    fn downgrade(agent: &mut AgentInstanceSnapshot) {
+    visit_response_agents(response, &mut |agent| {
         if agent.observation.state == AgentState::Inactive {
             agent.observation.state = AgentState::Unknown;
         }
-    }
+    });
+}
 
+fn visit_response_agents(
+    response: &mut Response,
+    visitor: &mut impl FnMut(&mut AgentInstanceSnapshot),
+) {
     match response {
         Response::Snapshot { snapshot } => {
             for workspace in &mut snapshot.workspaces {
                 for agent in &mut workspace.agents {
-                    downgrade(agent);
+                    visitor(agent);
                 }
             }
         }
         Response::Workspace { workspace } => {
             for agent in &mut workspace.agents {
-                downgrade(agent);
+                visitor(agent);
             }
         }
-        Response::Agent { agent } => downgrade(agent),
+        Response::Agent { agent } => visitor(agent),
         Response::Events {
             snapshot, events, ..
         } => {
             if let Some(snapshot) = snapshot {
                 for workspace in &mut snapshot.workspaces {
                     for agent in &mut workspace.agents {
-                        downgrade(agent);
+                        visitor(agent);
                     }
                 }
             }
@@ -868,7 +880,7 @@ fn downgrade_inactive_agent_states(response: &mut Response) {
                 match &mut event.kind {
                     DaemonEventKind::AgentRegistered { agent, .. }
                     | DaemonEventKind::AgentStateChanged { agent, .. }
-                    | DaemonEventKind::AgentCompleted { agent, .. } => downgrade(agent),
+                    | DaemonEventKind::AgentCompleted { agent, .. } => visitor(agent),
                     _ => {}
                 }
             }
@@ -1097,6 +1109,7 @@ struct AgentInstance {
     name: String,
     integration: String,
     external_session_id: Option<String>,
+    cwd: Option<PathBuf>,
     started_at_ms: u64,
     state: Mutex<AgentInstanceState>,
 }
@@ -2963,6 +2976,7 @@ impl Registry {
             name: spec.name,
             integration: spec.integration,
             external_session_id: spec.external_session_id,
+            cwd: Some(shell.cwd.clone()),
             started_at_ms,
             state: Mutex::new(AgentInstanceState {
                 ended_at_ms,
@@ -3609,6 +3623,7 @@ impl AgentInstance {
             name: saved.name,
             integration: saved.integration,
             external_session_id: saved.external_session_id,
+            cwd: saved.cwd,
             started_at_ms: saved.started_at_ms,
             state: Mutex::new(AgentInstanceState {
                 ended_at_ms: saved.ended_at_ms,
@@ -3627,6 +3642,7 @@ impl AgentInstance {
             name: self.name.clone(),
             integration: self.integration.clone(),
             external_session_id: self.external_session_id.clone(),
+            cwd: self.cwd.clone(),
             started_at_ms: self.started_at_ms,
             ended_at_ms: state.ended_at_ms,
             observation: state.observation.clone(),
@@ -3642,6 +3658,7 @@ impl AgentInstance {
             name: snapshot.name,
             integration: snapshot.integration,
             external_session_id: snapshot.external_session_id,
+            cwd: snapshot.cwd,
             started_at_ms: snapshot.started_at_ms,
             ended_at_ms: snapshot.ended_at_ms,
             observation: snapshot.observation,
@@ -4909,6 +4926,9 @@ fn validate_persisted_agent(agent: &PersistedAgentInstance) -> io::Result<()> {
         },
     })
     .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+    if let Some(cwd) = &agent.cwd {
+        validate_persisted_cwd(cwd)?;
+    }
     if agent.observation.revision == 0
         || agent.observation.observed_at_ms < agent.started_at_ms
         || agent
@@ -5356,6 +5376,7 @@ mod tests {
         else {
             panic!("expected registered agent");
         };
+        assert_eq!(agent.cwd.as_deref(), Some(shell.cwd.as_path()));
         assert_eq!(agent.observation.revision, 1);
         assert!(agent.ended_at_ms.is_none());
         assert_eq!(
@@ -5803,6 +5824,7 @@ mod tests {
             name: "agent".into(),
             integration: "test".into(),
             external_session_id: None,
+            cwd: Some("/tmp/project".into()),
             started_at_ms: 1,
             ended_at_ms: None,
             observation: AgentObservationSnapshot {
@@ -5873,7 +5895,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_eleven_responses_downgrade_inactive_agent_state() {
+    fn older_protocol_responses_downgrade_agent_fields() {
         let agent = AgentInstanceSnapshot {
             id: "a1".into(),
             workspace_id: "w1".into(),
@@ -5882,6 +5904,7 @@ mod tests {
             name: "pi".into(),
             integration: "pi".into(),
             external_session_id: Some("session-1".into()),
+            cwd: Some("/tmp/project".into()),
             started_at_ms: 1,
             ended_at_ms: None,
             observation: AgentObservationSnapshot {
@@ -5903,6 +5926,7 @@ mod tests {
             panic!("expected agent response");
         };
         assert_eq!(downgraded.observation.state, AgentState::Unknown);
+        assert!(downgraded.cwd.is_none());
 
         let Response::Agent { agent: current } = response_for_version(
             Response::Agent {
@@ -5913,6 +5937,17 @@ mod tests {
             panic!("expected agent response");
         };
         assert_eq!(current.observation.state, AgentState::Inactive);
+        assert!(current.cwd.is_none());
+
+        let Response::Agent { agent: current } = response_for_version(
+            Response::Agent {
+                agent: agent.clone(),
+            },
+            13,
+        ) else {
+            panic!("expected agent response");
+        };
+        assert_eq!(current.cwd.as_deref(), Some(Path::new("/tmp/project")));
 
         let workspace = WorkspaceSnapshot {
             id: "w1".into(),

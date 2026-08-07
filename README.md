@@ -231,6 +231,11 @@ never guess one from an external session ID, description, shell, or Agent ID.
 Session projection is client-side metadata over daemon protocol 12 snapshots,
 not another persisted daemon entity.
 
+Protocol 13 captures each Agent instance's working directory from its exact
+bound shell at registration. Projected occurrences expose this as `source_cwd`,
+so canonical transcript lookup can survive shell removal and daemon restart.
+The underlying directory and harness transcript data must still exist.
+
 `session read` loads canonical host data for OpenCode and Pi, never terminal
 scrollback. It returns the newest bounded suffix of messages, reasoning, and tool
 activity in chronological order. Pi reads only the current leaf branch and

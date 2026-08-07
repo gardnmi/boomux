@@ -146,6 +146,7 @@ pub(crate) struct SessionOccurrenceData {
     pub(crate) shell_id: String,
     pub(crate) retained_shell_name: Option<String>,
     pub(crate) retained_shell_cwd: Option<String>,
+    pub(crate) source_cwd: Option<String>,
     pub(crate) run_id: String,
     pub(crate) started_at_ms: u64,
     pub(crate) ended_at_ms: Option<u64>,
@@ -292,6 +293,10 @@ fn session_occurrence(occurrence: &SessionOccurrence) -> SessionOccurrenceData {
             .retained_shell_cwd
             .as_ref()
             .map(|cwd| cwd.display().to_string()),
+        source_cwd: occurrence
+            .source_cwd
+            .as_ref()
+            .map(|cwd| cwd.display().to_string()),
         run_id: occurrence.run_id.clone(),
         started_at_ms: occurrence.started_at_ms,
         ended_at_ms: occurrence.ended_at_ms,
@@ -411,6 +416,7 @@ mod tests {
                 name: "opencode".into(),
                 integration: "plugin".into(),
                 external_session_id: Some("external-1".into()),
+                cwd: Some("/tmp/project".into()),
                 started_at_ms: 10,
                 ended_at_ms: None,
                 observation: AgentObservationSnapshot {
@@ -462,6 +468,7 @@ mod tests {
                 is_current: false,
                 retained_shell_name: None,
                 retained_shell_cwd: None,
+                source_cwd: Some("/tmp/project".into()),
             }],
         });
 
@@ -469,6 +476,7 @@ mod tests {
         assert!(value["external_session_id"].is_null());
         assert!(value["occurrences"][0]["retained_shell_name"].is_null());
         assert!(value["occurrences"][0]["retained_shell_cwd"].is_null());
+        assert_eq!(value["occurrences"][0]["source_cwd"], "/tmp/project");
         assert!(value["occurrences"][0]["ended_at_ms"].is_null());
         assert_eq!(value["occurrences"][0]["shell_id"], "removed-shell");
         assert_eq!(value["occurrences"][0]["observation"]["state"], "inactive");

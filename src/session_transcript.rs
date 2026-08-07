@@ -130,7 +130,7 @@ fn read_with_adapters(
         .occurrences
         .iter()
         .rev()
-        .find_map(|occurrence| occurrence.retained_shell_cwd.as_deref())
+        .find_map(|occurrence| occurrence.source_cwd.as_deref())
         .ok_or_else(|| {
             TranscriptError::new(
                 "session_source_unavailable",
@@ -885,6 +885,7 @@ mod tests {
                 is_current: true,
                 retained_shell_name: Some("agent".into()),
                 retained_shell_cwd: Some(PathBuf::from("/repo")),
+                source_cwd: Some(PathBuf::from("/repo")),
             }],
         }
     }

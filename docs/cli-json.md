@@ -131,9 +131,12 @@ title. Missing optional values are JSON `null`.
 
 Inspect includes all summary fields plus ordered `occurrences`. Each occurrence
 contains `agent_id`, the original `shell_id` even if that shell was removed,
-`retained_shell_name`, `retained_shell_cwd`, `run_id`, `started_at_ms`,
-`ended_at_ms`, `is_current`, and the full stable Agent `observation` shape.
-Retained shell fields are null after shell removal. State and authority use the
+`retained_shell_name`, `retained_shell_cwd`, `source_cwd`, `run_id`,
+`started_at_ms`, `ended_at_ms`, `is_current`, and the full stable Agent
+`observation` shape. Retained shell fields are null after shell removal.
+`source_cwd` is the registration-time Agent working directory under protocol 13
+and can remain available for canonical transcript lookup. Protocol-12 snapshots
+fall back to a currently retained shell directory. State and authority use the
 same spellings documented for Agent observations.
 
 Projection groups Agent instances only when workspace, integration, and external

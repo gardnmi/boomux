@@ -1652,6 +1652,98 @@ fn agent_runtime_is_revisioned_durable_and_version_compatible() {
 }
 
 #[test]
+fn session_source_context_survives_shell_removal_and_cold_restart() {
+    let mut daemon = TestDaemon::start();
+    let project = daemon.runtime_dir.join("durable-source-project");
+    fs::create_dir(&project).unwrap();
+    let workspace = daemon
+        .client
+        .create_workspace(
+            "durable-source",
+            vec![ShellSpec::login("agent", project.clone())],
+        )
+        .unwrap();
+    let shell_id = workspace.shells[0].id.clone();
+    let attachment = daemon.client.attach(&shell_id, false, profile()).unwrap();
+    let run_id = daemon.client.get_shell(&shell_id).unwrap().run.unwrap().id;
+    let agent = daemon
+        .client
+        .ensure_agent(
+            &shell_id,
+            &run_id,
+            AgentRegistrationSpec {
+                name: "pi".into(),
+                integration: "pi".into(),
+                external_session_id: Some("durable-pi-session".into()),
+                report: AgentReport {
+                    state: AgentState::Idle,
+                    authority: AgentAuthority::LifecycleIntegration,
+                    evidence: "fixture idle".into(),
+                    confidence: 100,
+                },
+            },
+        )
+        .unwrap();
+    assert_eq!(agent.cwd.as_deref(), Some(project.as_path()));
+
+    let pi_directory = daemon.runtime_dir.join("durable-pi-sessions");
+    fs::create_dir(&pi_directory).unwrap();
+    fs::write(
+        pi_directory.join("custom.jsonl"),
+        format!(
+            "{{\"type\":\"session\",\"version\":3,\"id\":\"durable-pi-session\",\"cwd\":\"{}\"}}\n\
+             {{\"type\":\"message\",\"id\":\"user\",\"parentId\":null,\"timestamp\":\"x\",\"message\":{{\"role\":\"user\",\"content\":\"survives cleanup\",\"timestamp\":10}}}}\n\
+             {{\"type\":\"message\",\"id\":\"assistant\",\"parentId\":\"user\",\"timestamp\":\"x\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"still readable\"}}],\"timestamp\":11}}}}\n",
+            project.display()
+        ),
+    )
+    .unwrap();
+
+    daemon.client.close_shell(&shell_id).unwrap();
+    drop(attachment);
+    assert!(daemon.client.get_shell(&shell_id).is_err());
+    daemon.stop_with_cli();
+    daemon.restart();
+
+    let sessions = daemon
+        .command()
+        .args(["session", "list", "--workspace", &workspace.id, "--json"])
+        .output()
+        .unwrap();
+    assert!(sessions.status.success());
+    let sessions: serde_json::Value = serde_json::from_slice(&sessions.stdout).unwrap();
+    let session_id = sessions["data"]["sessions"][0]["id"].as_str().unwrap();
+    let inspect = daemon
+        .command()
+        .args(["session", "inspect", session_id, "--json"])
+        .output()
+        .unwrap();
+    assert!(inspect.status.success());
+    let inspect: serde_json::Value = serde_json::from_slice(&inspect.stdout).unwrap();
+    let occurrence = &inspect["data"]["session"]["occurrences"][0];
+    assert!(occurrence["retained_shell_name"].is_null());
+    assert!(occurrence["retained_shell_cwd"].is_null());
+    assert_eq!(occurrence["source_cwd"], project.display().to_string());
+
+    let read = daemon
+        .command()
+        .args(["session", "read", session_id, "--json"])
+        .env("PI_CODING_AGENT_SESSION_DIR", &pi_directory)
+        .output()
+        .unwrap();
+    assert!(
+        read.status.success(),
+        "{}",
+        String::from_utf8_lossy(&read.stderr)
+    );
+    let read: serde_json::Value = serde_json::from_slice(&read.stdout).unwrap();
+    assert_eq!(
+        read["data"]["transcript"]["entries"][1]["text"],
+        "still readable"
+    );
+}
+
+#[test]
 fn explicit_process_supervisor_preserves_child_io_exit_and_agent_authority() {
     let daemon = TestDaemon::start();
     let workspace = daemon
@@ -2133,7 +2225,7 @@ fn native_daemon_lifecycle() {
     let capabilities: serde_json::Value = serde_json::from_slice(&capabilities.stdout).unwrap();
     assert_eq!(capabilities["schema"], "boomux.cli/v1");
     assert_eq!(capabilities["command"], "capabilities");
-    assert_eq!(capabilities["data"]["daemon_protocol_version"], 12);
+    assert_eq!(capabilities["data"]["daemon_protocol_version"], 13);
     assert_eq!(
         capabilities["data"]["session_transcript_integrations"],
         serde_json::json!(["opencode", "pi"])
@@ -2163,6 +2255,7 @@ fn native_daemon_lifecycle() {
         "revision_aware_reads",
         "protocol_10",
         "protocol_12",
+        "protocol_13",
         "inactive_agent_state",
         "protocol_11",
         "restartable_exited_shells",
@@ -2180,7 +2273,7 @@ fn native_daemon_lifecycle() {
         .output()
         .unwrap();
     assert!(status.status.success());
-    assert!(String::from_utf8_lossy(&status.stdout).contains("running (protocol 12"));
+    assert!(String::from_utf8_lossy(&status.stdout).contains("running (protocol 13"));
     let status = daemon
         .command()
         .args(["daemon", "status", "--json"])

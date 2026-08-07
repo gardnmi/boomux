@@ -347,6 +347,7 @@ mod tests {
             name: "agent".into(),
             integration: "test".into(),
             external_session_id: Some("session-1".into()),
+            cwd: Some("/tmp/project".into()),
             started_at_ms: 1,
             ended_at_ms: completed.then_some(2),
             observation: AgentObservationSnapshot {

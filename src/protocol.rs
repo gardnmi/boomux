@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 12;
+pub const PROTOCOL_VERSION: u32 = 13;
 pub const MIN_PROTOCOL_VERSION: u32 = 6;
 pub const MAX_CONTROL_FRAME: usize = 8 * 1024 * 1024;
 pub const MAX_ATTACH_FRAME: usize = 1024 * 1024;
@@ -99,6 +99,8 @@ pub struct AgentInstanceSnapshot {
     pub name: String,
     pub integration: String,
     pub external_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<PathBuf>,
     pub started_at_ms: u64,
     pub ended_at_ms: Option<u64>,
     pub observation: AgentObservationSnapshot,
@@ -717,6 +719,7 @@ mod tests {
             name: "opencode".into(),
             integration: "opencode-plugin".into(),
             external_session_id: Some("external-1".into()),
+            cwd: Some("/tmp/project".into()),
             started_at_ms: 10,
             ended_at_ms: None,
             observation: AgentObservationSnapshot {
@@ -742,9 +745,36 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_twelve_with_minimum_six() {
-        assert_eq!(PROTOCOL_VERSION, 12);
+    fn protocol_version_is_thirteen_with_minimum_six() {
+        assert_eq!(PROTOCOL_VERSION, 13);
         assert_eq!(MIN_PROTOCOL_VERSION, 6);
+    }
+
+    #[test]
+    fn agent_snapshot_defaults_cwd_omitted_by_old_daemons() {
+        let agent: AgentInstanceSnapshot = serde_json::from_value(serde_json::json!({
+            "id": "a1",
+            "workspace_id": "w1",
+            "shell_id": "s1",
+            "run_id": "r1",
+            "name": "agent",
+            "integration": "test",
+            "external_session_id": "external",
+            "started_at_ms": 1,
+            "ended_at_ms": null,
+            "observation": {
+                "revision": 1,
+                "state": "working",
+                "authority": "lifecycle_integration",
+                "evidence": "working",
+                "confidence": 100,
+                "observed_at_ms": 1
+            }
+        }))
+        .unwrap();
+
+        assert!(agent.cwd.is_none());
+        assert!(serde_json::to_value(agent).unwrap().get("cwd").is_none());
     }
 
     #[test]
