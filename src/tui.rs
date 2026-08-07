@@ -1261,38 +1261,58 @@ fn centered_rect(area: Rect, width_percent: u16, height_percent: u16) -> Rect {
 }
 
 fn render_tabs(frame: &mut Frame, area: Rect, app: &App) {
-    let mut spans = vec![Span::styled(
-        " BOOMUX  ",
-        Style::new().fg(TEAL).add_modifier(Modifier::BOLD),
-    )];
-    spans.extend(PrimaryTab::ALL.iter().enumerate().flat_map(|(index, tab)| {
-        let selected = *tab == app.primary_tab;
-        let count = match tab {
-            PrimaryTab::Workspaces => app.workspaces.len(),
-            PrimaryTab::Agents => app.workspaces.iter().map(WorkspaceView::agent_count).sum(),
-            PrimaryTab::Launchers => app
-                .workspaces
-                .iter()
-                .map(WorkspaceView::launcher_count)
-                .sum(),
-            PrimaryTab::Shells => app.workspaces.iter().map(WorkspaceView::shell_count).sum(),
-            PrimaryTab::Commands => app
-                .workspaces
-                .iter()
-                .map(WorkspaceView::command_count)
-                .sum(),
-        };
-        let style = if selected {
-            Style::new().fg(BASE).bg(TEAL).add_modifier(Modifier::BOLD)
-        } else {
-            Style::new().fg(TEXT)
-        };
-        [
-            Span::styled(format!(" {} ", index + 1), Style::new().fg(SUBTEXT)),
-            Span::styled(format!("{} {count}", tab.label()), style),
-            Span::raw("  "),
-        ]
-    }));
+    let workspace_style = if app.primary_tab == PrimaryTab::Workspaces {
+        Style::new().fg(BASE).bg(TEAL).add_modifier(Modifier::BOLD)
+    } else {
+        Style::new().fg(TEAL).add_modifier(Modifier::BOLD)
+    };
+    let mut spans = vec![
+        Span::styled(
+            " BOOMUX  ",
+            Style::new().fg(TEAL).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(" 1 WORKSPACES {} ", app.workspaces.len()),
+            workspace_style,
+        ),
+        Span::styled("      ALL: ", Style::new().fg(SUBTEXT)),
+    ];
+    spans.extend(
+        PrimaryTab::ALL
+            .iter()
+            .enumerate()
+            .skip(1)
+            .flat_map(|(index, tab)| {
+                let count: usize = match tab {
+                    PrimaryTab::Agents => {
+                        app.workspaces.iter().map(WorkspaceView::agent_count).sum()
+                    }
+                    PrimaryTab::Launchers => app
+                        .workspaces
+                        .iter()
+                        .map(WorkspaceView::launcher_count)
+                        .sum(),
+                    PrimaryTab::Shells => {
+                        app.workspaces.iter().map(WorkspaceView::shell_count).sum()
+                    }
+                    PrimaryTab::Commands => app
+                        .workspaces
+                        .iter()
+                        .map(WorkspaceView::command_count)
+                        .sum(),
+                    PrimaryTab::Workspaces => unreachable!("workspace tab is rendered separately"),
+                };
+                let style = if *tab == app.primary_tab {
+                    Style::new().fg(BASE).bg(BLUE).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::new().fg(SUBTEXT)
+                };
+                [
+                    Span::styled(format!("{} {} {count}", index + 1, tab.label()), style),
+                    Span::raw("  "),
+                ]
+            }),
+    );
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
@@ -2345,6 +2365,10 @@ mod tests {
         assert!(text.contains("COMMANDS 1"));
         assert!(!text.contains("active agents"));
         assert!(text.contains("SHELLS CMDS LNCH AGENTS"));
+        let workspace_tab = text.find("WORKSPACES 1").expect("workspace tab");
+        let aggregate_label = text.find("ALL:").expect("aggregate label");
+        let agent_tab = text.find("AGENTS 1").expect("agent tab");
+        assert!(workspace_tab < aggregate_label && aggregate_label < agent_tab);
         assert!(
             lines
                 .iter()
