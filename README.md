@@ -1,18 +1,19 @@
 # Boomux
 
 <p align="center">
-  <img src="assets/boomux-cover.png" alt="Boomux: Persistent AI terminals. Native Hyprland windows." width="100%">
+  <img src="assets/dashboard-workspaces.png" alt="Boomux workspace dashboard with global agent, session, launcher, shell, and command views" width="100%">
 </p>
 
 > [!WARNING]
 > Boomux is an early proof of concept. Commands, storage, and session behavior
 > may change without migration support.
 
-Boomux keeps shells alive in a small background daemon while displaying each
-shell in an ordinary native terminal window. The selected terminal emulator
-still owns rendering, fonts, selection, clipboard behavior, and window chrome.
-Boomux only owns the PTY, process lifetime, workspace grouping, and attachment
-transport.
+Boomux keeps shells alive in a small background daemon, groups them into durable
+workspaces, and tracks external agent lifecycle and session history. Each shell
+still opens in an ordinary native terminal window whose emulator owns rendering,
+fonts, selection, clipboard behavior, and window chrome. Boomux owns the PTY,
+process lifetime, workspace grouping, attachment transport, and durable runtime
+metadata.
 
 ## Usage
 
@@ -72,33 +73,43 @@ boomux ui
 
 Dashboard controls:
 
-- `Tab` switches between workspace and shell tables.
+- `Tab` and `Shift-Tab` cycle the Workspaces, Agents, Sessions, Launchers,
+  Shells, and Commands views. Number keys `1` through `6` select them directly.
+- In the primary Workspaces view, `h`, `l`, and the left/right arrows switch
+  between the workspace and item tables.
 - `j`, `k`, and the arrow keys navigate.
-- `Enter` restores a workspace, opens the selected shell, or invokes the
-  selected launcher.
+- `Enter` restores a workspace, opens a shell, invokes a launcher, or opens the
+  newest still-existing shell associated with a selected session.
 - `a` creates an empty workspace or adds a shell, depending on the focused
-  table. New dashboard shells start in the directory where the dashboard was
-  launched.
+  table in the Workspaces view. New dashboard shells start in the directory
+  where the dashboard was launched.
 - `e` renames the selected workspace, shell, or launcher.
 - `x`, then `y`, closes the selected workspace or shell, or removes the selected
   launcher.
 - `r` refreshes immediately.
 - `q` or `Esc` quits.
 
-The selected workspace's item table identifies login shells, PTY-backed exact
-commands, active agent shells, and configured launchers in a `KIND` column. A
-`command` row shows its stored argv, while a launcher row shows its detached
-command and working directory. Pressing `Enter` invokes only the selected item.
+Workspaces remain the primary dashboard view. The selected workspace's item
+table identifies login shells, PTY-backed exact commands, agent shells, and
+configured launchers in a `KIND` column. The secondary `ALL:` views aggregate
+each kind across every workspace while retaining the owning workspace and exact
+item actions. Counts are exclusive by visible presentation: an agent row is not
+also counted as a shell or command.
 
 When an active Agent instance is bound to a shell's current run, that shell row
 morphs into an agent row instead of adding a duplicate item. It keeps the
 shell's name, ID, directory, and open, rename, and close actions while showing the
-Agent's lifecycle state and evidence. Completed and historical Agent instances
-remain available through CLI inspection rather than occupying extra dashboard
-rows. A foreground `opencode` or `pi` process also supplies a presentation-only agent
-hint, so the row morphs immediately while the lifecycle integration establishes
-a durable Agent session. The hint displays `idle` without creating a durable lifecycle
-observation; lifecycle state replaces that hint once available.
+Agent's lifecycle state and evidence. The Agents view stays focused on those
+current presentations. The Sessions view independently retains Boomux-observed
+active and historical sessions, grouped by activity window with workspace,
+integration, state, host-provided description, associated shell, recency, and
+canonical identity. A foreground `opencode` or `pi` process also supplies a
+presentation-only agent hint while the lifecycle integration establishes a
+durable Agent session.
+
+<p align="center">
+  <img src="assets/dashboard-sessions.png" alt="Boomux global session history grouped by activity window" width="100%">
+</p>
 
 Closing a terminal window only disconnects its attachment. The Boomux daemon
 retains the PTY and child process until the shell exits, the workspace is
