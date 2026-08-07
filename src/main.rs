@@ -70,6 +70,7 @@ const INTEGRATION_FEATURES: &[&str] = &[
     "protocol_10",
     "protocol_11",
     "protocol_12",
+    "protocol_13",
     "restartable_exited_shells",
     "inactive_agent_state",
     "idempotent_agent_ensure",
@@ -79,6 +80,7 @@ const INTEGRATION_FEATURES: &[&str] = &[
     "process_adapters",
     "projected_agent_sessions",
     "canonical_session_transcripts",
+    "durable_session_source_context",
 ];
 const LEGACY_BOOMUX_SHELLS_SKILL: &str = r#"---
 name: boomux-shells
@@ -1108,7 +1110,7 @@ fn workspace_session_views(workspace: &WorkspaceSnapshot) -> Vec<tui::AgentSessi
                         .as_ref()
                         .map(|_| occurrence.shell_id),
                     shell_name: occurrence.retained_shell_name,
-                    directory: occurrence.retained_shell_cwd,
+                    directory: occurrence.source_cwd,
                 })
                 .collect();
             tui::AgentSessionView {
@@ -2006,6 +2008,13 @@ fn print_session(session: &session_projection::SessionProjection) {
             "RETAINED SHELL CWD\t{}",
             occurrence
                 .retained_shell_cwd
+                .as_ref()
+                .map_or_else(|| "-".into(), |cwd| cwd.display().to_string())
+        );
+        println!(
+            "SOURCE CWD\t{}",
+            occurrence
+                .source_cwd
                 .as_ref()
                 .map_or_else(|| "-".into(), |cwd| cwd.display().to_string())
         );
@@ -3099,6 +3108,7 @@ mod tests {
             name: "OpenCode".into(),
             integration: "opencode".into(),
             external_session_id: Some("external-1".into()),
+            cwd: Some("/tmp/project".into()),
             started_at_ms: 10,
             ended_at_ms: None,
             observation: protocol::AgentObservationSnapshot {
@@ -4419,7 +4429,7 @@ mod tests {
             session_transcript::supported_integrations(),
             ["opencode", "pi"]
         );
-        assert_eq!(protocol::PROTOCOL_VERSION, 12);
+        assert_eq!(protocol::PROTOCOL_VERSION, 13);
     }
 
     #[test]

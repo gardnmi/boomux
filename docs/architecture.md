@@ -161,8 +161,12 @@ enrich labels asynchronously from bounded host catalogs; CLI descriptions remain
 the latest stored Agent registration name and do not invoke host adapters.
 
 Session list/inspect requires a negotiated protocol-12 snapshot because the
-projection depends on that complete Agent state model. It adds no protocol
-request, wire field, persistence record, event, or protocol-version bump.
+projection depends on that complete Agent state model. Protocol 13 adds an
+optional Agent `cwd` snapshot field, captured authoritatively from the bound
+shell during registration and persisted with the Agent. Projection exposes it as
+`source_cwd` separately from retained-shell metadata, allowing transcript lookup
+after shell removal without claiming that the shell remains openable. Protocol
+12 remains usable while a matching shell is retained.
 
 An active Agent instance bound to a shell's exact current run decorates that
 shell as an agent-shell row rather than adding a second item. The row retains
@@ -276,6 +280,24 @@ OpenCode should not be wrapped merely to obtain process evidence when the
 lifecycle plugin is available; that plugin resolves root ancestry and reports
 the stronger lifecycle evidence described below.
 
+### Integration Setup Policy
+
+Boomux prefers authoritative harness integrations over process or rendered-screen
+inference for canonical session identity and lifecycle state. This preserves the
+distinction between direct harness evidence, process existence, and terminal
+heuristics instead of making convenient setup silently weaken session semantics.
+Process adapters and any future screen detectors remain explicitly lower
+authority and cannot substitute for integration evidence.
+
+The resulting installation cost must be handled as a product workflow rather
+than left as manual plugin-file management. A future unified setup command will
+discover supported installed harnesses, describe the access and guarantees each
+integration provides, preview configuration changes, require consent, install
+or update atomically, identify required harness reloads, and verify canonical
+identity and lifecycle reports against a managed shell run. The same workflow
+will expose status, validated host versions, actionable diagnostics, repair, and
+uninstall. Individual host installers remain the underlying safe primitives.
+
 ### OpenCode Lifecycle Plugin
 
 The bundled plugin is validated against `opencode-ai` `1.18.15`. This is a
@@ -343,6 +365,12 @@ from its project-scoped JSONL file with no-follow regular-file checks. Pi's
 append-only tree is reduced to the latest leaf's parent chain so abandoned
 branches are not presented as the active transcript.
 
+Transcript lookup uses the newest occurrence `source_cwd`. For protocol-13 Agent
+records this directory survives shell removal and cold daemon restart; migrated
+protocol-12-era records recover it from a retained shell where possible. The
+source directory is a locator rather than copied transcript storage, so removing
+the directory or harness data still makes the transcript unavailable.
+
 Adapters normalize host text, reasoning, tool calls, inputs, results, status,
 source identity, and timestamps. Boomux does not redact this content because
 the harness is the content trust boundary. Reads remain explicit and bounded:
@@ -363,7 +391,9 @@ registry so integrations can discover support without hard-coded host lists.
 
 Protocol 12 adds `inactive`. Protocol-9 through protocol-11 clients receive that
 observation as `unknown`, while protocol-12 clients can distinguish a resumable
-session that is not currently active from permanent `done` completion.
+session that is not currently active from permanent `done` completion. Protocol
+13 adds durable Agent working-directory context; older clients receive Agent
+snapshots without that additive field.
 
 ### Transition Coordinator
 

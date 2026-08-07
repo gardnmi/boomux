@@ -99,6 +99,9 @@ eternal process.
    process start/exit evidence, and fails open when Boomux reporting fails.
 4. [Complete] Project run-scoped Agent instances into globally discoverable
    session metadata with stable list/inspect JSON and human CLI commands.
+5. [Complete] Capture and persist each Agent's registration-time working
+   directory so canonical transcript lookup survives shell removal and cold
+   daemon restart while retained-shell metadata remains semantically accurate.
 
 ### Near-Term Priorities
 
@@ -107,13 +110,20 @@ eternal process.
    root/subagent aggregation where available, blocked prompts, idle transitions,
    explicit completion semantics, and graceful daemon replacement against real
    sessions.
-2. Aggregate agent states into workspace counts and add an explainable,
+2. Build a first-class integration setup workflow that discovers supported
+   installed harnesses, explains why authoritative lifecycle access is required,
+   previews and obtains consent for configuration changes, installs or updates
+   each integration safely, prompts for required harness reloads, and verifies
+   canonical identity plus lifecycle reporting end to end. Include status,
+   version compatibility, diagnostics, repair, and uninstall paths so stronger
+   guarantees do not require users to manage plugin files manually.
+3. Aggregate agent states into workspace counts and add an explainable,
    persistent attention queue for blocked and completed work.
-3. Add revision-aware `agent wait` so scripts can await durable state
+4. Add revision-aware `agent wait` so scripts can await durable state
    transitions without polling human output.
-4. Add deduplicated notifications for blocked and completed transitions after
+5. Add deduplicated notifications for blocked and completed transitions after
    the attention and wait semantics are established.
-5. [Complete] Add explicit cross-harness transcript and tool inspection so Pi can read an OpenCode
+6. [Complete] Add explicit cross-harness transcript and tool inspection so Pi can read an OpenCode
    session and OpenCode can read a Pi session. Do not treat bounded rendered
    terminal output as the full session: host adapters must expose canonical
    session identity, bounded messages and tool activity, versioned
@@ -122,14 +132,14 @@ eternal process.
    canonical lookup and normalization live behind a shared adapter registry so
    future Claude Code, Codex, and other harness support reuses the same identity,
    bounds, errors, and output contract.
-6. [Complete] Add contextual, categorized Agent Session browsing to selected agent rows in
+7. [Complete] Add contextual, categorized Agent Session browsing to selected agent rows in
    the Boomux UI. Keep inactive and completed workspace sessions visible without
    adding duplicate shell rows, grouped by active and recent time windows with
    integration, canonical identity, associated shell and run, lifecycle state,
    and timestamps. Bounded asynchronous host catalog adapters provide OpenCode
    generated titles and Pi names or first-user-message summaries; future adapters
-    also provide canonical transcripts and tool activity through bounded,
-    versioned CLI output.
+   also provide canonical transcripts and tool activity through bounded,
+   versioned CLI output.
 
 ### Deferred Agent Work
 
@@ -139,6 +149,8 @@ eternal process.
   safe fallback.
 - Defer terminal-screen heuristics until real usage demonstrates a visibility
   gap that lifecycle integrations and explicit process evidence do not cover.
+  Heuristics must remain lower-authority, visibly identified observations rather
+  than silently replacing setup for canonical identity and lifecycle evidence.
 - Defer guarded prompts and common responses until run-scoped leases,
   user-controller precedence, idempotency, and audit events are defined.
 - Defer hooks, tests, focus actions, and other automatic reactions until waits,

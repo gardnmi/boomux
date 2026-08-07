@@ -90,7 +90,8 @@ messages, reasoning, and tool activity, not terminal scrollback. Pi results
 follow its active branch. Inspect `truncated`, `truncated_by`, and per-entry
 `truncated` before deciding whether to request larger bounds. Boomux does not
 redact host content, so use it only when the user's request authorizes reading
-that exact session.
+that exact session. Protocol-13 sessions retain a `source_cwd` for transcript
+lookup after shell removal; this does not preserve deleted harness data itself.
 
 Exact shell IDs resolve globally. Shell names resolve in the current workspace,
 or through `--workspace` for `shell inspect`, `shell rename`, and `shell close`.

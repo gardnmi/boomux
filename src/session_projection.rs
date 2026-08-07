@@ -37,6 +37,7 @@ pub(crate) struct SessionOccurrence {
     pub(crate) is_current: bool,
     pub(crate) retained_shell_name: Option<String>,
     pub(crate) retained_shell_cwd: Option<PathBuf>,
+    pub(crate) source_cwd: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -155,6 +156,10 @@ fn project_workspace(workspace: &WorkspaceSnapshot) -> Vec<SessionProjection> {
                         is_current: occurrence_is_current(workspace, agent),
                         retained_shell_name: retained_shell.map(|shell| shell.name.clone()),
                         retained_shell_cwd: retained_shell.map(|shell| shell.cwd.clone()),
+                        source_cwd: agent
+                            .cwd
+                            .clone()
+                            .or_else(|| retained_shell.map(|shell| shell.cwd.clone())),
                     }
                 })
                 .collect();
@@ -213,6 +218,8 @@ fn state_priority(state: AgentState) -> u8 {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
     use boomux::protocol::{AgentAuthority, ShellRunSnapshot};
 
@@ -251,6 +258,7 @@ mod tests {
                     name: format!("Agent {index}"),
                     integration: "opencode".into(),
                     external_session_id: Some("external".into()),
+                    cwd: Some("/tmp/project".into()),
                     started_at_ms: 10 + index as u64,
                     ended_at_ms: None,
                     observation: AgentObservationSnapshot {
@@ -327,5 +335,35 @@ mod tests {
             AgentState::Unknown,
         ];
         assert_eq!(states.map(state_priority), [0, 1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn source_cwd_survives_shell_removal_without_making_occurrence_current() {
+        let mut workspace = workspace("w1", &["a1"]);
+        workspace.shells.clear();
+
+        let sessions = project_workspaces(&[workspace]);
+        let occurrence = &sessions[0].occurrences[0];
+
+        assert!(!occurrence.is_current);
+        assert!(occurrence.retained_shell_name.is_none());
+        assert!(occurrence.retained_shell_cwd.is_none());
+        assert_eq!(
+            occurrence.source_cwd.as_deref(),
+            Some(Path::new("/tmp/project"))
+        );
+    }
+
+    #[test]
+    fn retained_shell_cwd_is_a_compatibility_fallback_for_old_daemons() {
+        let mut workspace = workspace("w1", &["a1"]);
+        workspace.agents[0].cwd = None;
+
+        let sessions = project_workspaces(&[workspace]);
+
+        assert_eq!(
+            sessions[0].occurrences[0].source_cwd.as_deref(),
+            Some(Path::new("/tmp/project"))
+        );
     }
 }

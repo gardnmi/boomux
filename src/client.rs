@@ -881,6 +881,22 @@ mod tests {
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+            assert_eq!(request.version, 13);
+            assert!(matches!(request.message, Request::Ping));
+            protocol::write_message(
+                &mut stream,
+                &Envelope::with_version(
+                    12,
+                    Response::Error {
+                        message: "expected an older protocol".into(),
+                        code: Some(ErrorCode::UnsupportedVersion),
+                    },
+                ),
+            )
+            .unwrap();
+
+            let (mut stream, _) = listener.accept().unwrap();
+            let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
             assert_eq!(request.version, 12);
             assert!(matches!(request.message, Request::Ping));
             protocol::write_message(
@@ -888,7 +904,7 @@ mod tests {
                 &Envelope::with_version(
                     11,
                     Response::Error {
-                        message: "expected an older protocol".into(),
+                        message: "expected protocol 7".into(),
                         code: Some(ErrorCode::UnsupportedVersion),
                     },
                 ),

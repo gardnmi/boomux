@@ -7,7 +7,9 @@ adds idempotent agent ensure without adding an event type. Protocol 11 adds an
 explicit exited-shell restart; the subsequent attachment emits the existing
 `run_started` event for the new generation. Protocol 12 adds resumable
 `inactive` Agent observations; older Agent-capable clients receive them as
-`unknown`.
+`unknown`. Protocol 13 adds the registration-time Agent working directory to
+snapshots and Agent events; protocol-12 clients receive the same records without
+that additive source context.
 
 ## Cursors
 
