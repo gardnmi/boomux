@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 14;
+pub const PROTOCOL_VERSION: u32 = 15;
 pub const MIN_PROTOCOL_VERSION: u32 = 6;
 pub const MAX_CONTROL_FRAME: usize = 8 * 1024 * 1024;
 pub const MAX_ATTACH_FRAME: usize = 1024 * 1024;
@@ -90,6 +90,19 @@ pub struct AgentObservationSnapshot {
     pub observed_at_ms: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentAttentionReason {
+    Blocked,
+    Completed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentAttentionSnapshot {
+    pub reason: AgentAttentionReason,
+    pub observation: AgentObservationSnapshot,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentInstanceSnapshot {
     pub id: String,
@@ -104,6 +117,8 @@ pub struct AgentInstanceSnapshot {
     pub started_at_ms: u64,
     pub ended_at_ms: Option<u64>,
     pub observation: AgentObservationSnapshot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention: Option<AgentAttentionSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -271,6 +286,11 @@ pub enum DaemonEventKind {
         shell_id: String,
         agent: AgentInstanceSnapshot,
     },
+    AgentAttentionAcknowledged {
+        workspace_id: String,
+        shell_id: String,
+        agent: AgentInstanceSnapshot,
+    },
     HandoffCompleted,
 }
 
@@ -357,6 +377,10 @@ pub enum Request {
         run_id: String,
         report: AgentReport,
     },
+    AcknowledgeAgentAttention {
+        agent_id: String,
+        observation_revision: u64,
+    },
     ReadShell {
         shell_id: String,
         max_bytes: usize,
@@ -432,6 +456,10 @@ pub enum Response {
         agent: AgentInstanceSnapshot,
     },
     AgentWait {
+        agent: AgentInstanceSnapshot,
+        changed: bool,
+    },
+    AgentAttentionAcknowledged {
         agent: AgentInstanceSnapshot,
         changed: bool,
     },
@@ -740,6 +768,7 @@ mod tests {
                 confidence: report.confidence,
                 observed_at_ms: 11,
             },
+            attention: None,
         };
         let event = DaemonEventKind::AgentStateChanged {
             workspace_id: "w1".into(),
@@ -755,8 +784,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_fourteen_with_minimum_six() {
-        assert_eq!(PROTOCOL_VERSION, 14);
+    fn protocol_version_is_fifteen_with_minimum_six() {
+        assert_eq!(PROTOCOL_VERSION, 15);
         assert_eq!(MIN_PROTOCOL_VERSION, 6);
     }
 
@@ -791,6 +820,7 @@ mod tests {
                     confidence: 100,
                     observed_at_ms: 2,
                 },
+                attention: None,
             },
             changed: true,
         };
@@ -826,7 +856,80 @@ mod tests {
         .unwrap();
 
         assert!(agent.cwd.is_none());
+        assert!(agent.attention.is_none());
         assert!(serde_json::to_value(agent).unwrap().get("cwd").is_none());
+    }
+
+    #[test]
+    fn agent_attention_messages_use_snake_case_and_omit_absent_attention() {
+        let observation = AgentObservationSnapshot {
+            revision: 3,
+            state: AgentState::Blocked,
+            authority: AgentAuthority::LifecycleIntegration,
+            evidence: "needs input".into(),
+            confidence: 100,
+            observed_at_ms: 4,
+        };
+        let attention = AgentAttentionSnapshot {
+            reason: AgentAttentionReason::Blocked,
+            observation: observation.clone(),
+        };
+        let encoded = serde_json::to_value(&attention).unwrap();
+        assert_eq!(encoded["reason"], "blocked");
+        assert_eq!(
+            serde_json::to_value(AgentAttentionReason::Completed).unwrap(),
+            "completed"
+        );
+
+        let request = Request::AcknowledgeAgentAttention {
+            agent_id: "a1".into(),
+            observation_revision: 3,
+        };
+        assert_eq!(
+            serde_json::to_value(&request).unwrap()["request"],
+            "acknowledge_agent_attention"
+        );
+        assert_eq!(
+            serde_json::from_value::<Request>(serde_json::to_value(request.clone()).unwrap())
+                .unwrap(),
+            request
+        );
+
+        let mut agent: AgentInstanceSnapshot = serde_json::from_value(serde_json::json!({
+            "id": "a1", "workspace_id": "w1", "shell_id": "s1", "run_id": "r1",
+            "name": "agent", "integration": "test", "external_session_id": null,
+            "started_at_ms": 1, "ended_at_ms": null, "observation": observation
+        }))
+        .unwrap();
+        assert!(agent.attention.is_none());
+        assert!(
+            serde_json::to_value(&agent)
+                .unwrap()
+                .get("attention")
+                .is_none()
+        );
+        agent.attention = Some(attention);
+        assert_eq!(
+            serde_json::to_value(&agent).unwrap()["attention"]["reason"],
+            "blocked"
+        );
+        let response = Response::AgentAttentionAcknowledged {
+            agent: agent.clone(),
+            changed: true,
+        };
+        assert_eq!(
+            serde_json::to_value(response).unwrap()["response"],
+            "agent_attention_acknowledged"
+        );
+        let event = DaemonEventKind::AgentAttentionAcknowledged {
+            workspace_id: "w1".into(),
+            shell_id: "s1".into(),
+            agent,
+        };
+        assert_eq!(
+            serde_json::to_value(event).unwrap()["event"],
+            "agent_attention_acknowledged"
+        );
     }
 
     #[test]

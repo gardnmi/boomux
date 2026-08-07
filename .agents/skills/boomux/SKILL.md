@@ -78,6 +78,21 @@ the returned newer revision. `revision_ahead` means the caller's context is
 invalid and must be reacquired. `daemon_stopping` means reconnect and retry.
 Duplicate or lower-authority reports do not satisfy a wait.
 
+Inspect outstanding blocked and completed work with:
+
+```console
+boomux attention list --json
+boomux attention list --workspace "<workspace-name-or-id>" --json
+boomux attention acknowledge "<exact-agent-id>" --observation-revision <revision> --json
+```
+
+The queue is durable and ordered blocked before completed, then newest first.
+Use the exact Agent ID and raising observation revision returned by `attention
+list`; never acknowledge by name or by a later lifecycle revision. A stale
+revision fails with `revision_ahead`, while an already empty item returns
+`changed: false`. Acknowledgment does not advance lifecycle state or satisfy an
+`agent wait`.
+
 Discover projected session metadata with:
 
 ```console

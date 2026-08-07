@@ -1314,6 +1314,10 @@ fn agent_runtime_is_revisioned_durable_and_version_compatible() {
     assert_eq!(done.observation.state, AgentState::Done);
     assert_eq!(done.ended_at_ms, Some(done.observation.observed_at_ms));
     assert_eq!(
+        done.attention.as_ref().map(|attention| attention.reason),
+        Some(protocol::AgentAttentionReason::Completed)
+    );
+    assert_eq!(
         daemon
             .client
             .report_agent(&adapter_id, &run_id, completion)
@@ -1333,6 +1337,77 @@ fn agent_runtime_is_revisioned_durable_and_version_compatible() {
             .count(),
         1
     );
+    let attention = daemon
+        .command()
+        .args(["attention", "list", "--workspace", &workspace.id, "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        attention.status.success(),
+        "{}",
+        String::from_utf8_lossy(&attention.stderr)
+    );
+    let attention: serde_json::Value = serde_json::from_slice(&attention.stdout).unwrap();
+    assert_eq!(attention["command"], "attention.list");
+    assert_eq!(attention["data"]["attention"][0]["agent"]["id"], adapter_id);
+    assert_eq!(attention["data"]["attention"][0]["reason"], "completed");
+    assert_eq!(
+        attention["data"]["attention"][0]["observation"]["revision"],
+        3
+    );
+
+    let restart = daemon
+        .command()
+        .args(["daemon", "restart"])
+        .output()
+        .unwrap();
+    assert!(restart.status.success());
+    assert_eq!(
+        daemon
+            .client
+            .get_agent(&adapter_id)
+            .unwrap()
+            .attention
+            .as_ref()
+            .map(|attention| attention.observation.revision),
+        Some(3)
+    );
+    let acknowledgment_cursor = daemon.client.events(None, 256, 0).unwrap().cursor;
+    let acknowledgment = daemon
+        .command()
+        .args([
+            "attention",
+            "acknowledge",
+            &adapter_id,
+            "--observation-revision",
+            "3",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(acknowledgment.status.success());
+    let acknowledgment: serde_json::Value = serde_json::from_slice(&acknowledgment.stdout).unwrap();
+    assert_eq!(acknowledgment["command"], "attention.acknowledge");
+    assert_eq!(acknowledgment["data"]["changed"], true);
+    assert!(acknowledgment["data"]["agent"]["attention"].is_null());
+    assert!(
+        daemon
+            .client
+            .events(Some(acknowledgment_cursor), 256, 0)
+            .unwrap()
+            .events
+            .iter()
+            .any(|event| matches!(
+                &event.kind,
+                protocol::DaemonEventKind::AgentAttentionAcknowledged { agent, .. }
+                    if agent.id == adapter_id && agent.attention.is_none()
+            ))
+    );
+    let repeated = daemon
+        .client
+        .acknowledge_agent_attention(&adapter_id, 3)
+        .unwrap();
+    assert!(!repeated.changed);
     let error = daemon
         .client
         .report_agent(
@@ -2282,7 +2357,7 @@ fn native_daemon_lifecycle() {
     let capabilities: serde_json::Value = serde_json::from_slice(&capabilities.stdout).unwrap();
     assert_eq!(capabilities["schema"], "boomux.cli/v1");
     assert_eq!(capabilities["command"], "capabilities");
-    assert_eq!(capabilities["data"]["daemon_protocol_version"], 14);
+    assert_eq!(capabilities["data"]["daemon_protocol_version"], 15);
     assert_eq!(
         capabilities["data"]["session_transcript_integrations"],
         serde_json::json!(["opencode", "pi"])
@@ -2310,6 +2385,8 @@ fn native_daemon_lifecycle() {
         "agent.ensure",
         "agent.report",
         "agent.wait",
+        "attention.list",
+        "attention.acknowledge",
     ] {
         assert!(json_commands.iter().any(|current| current == command));
     }
@@ -2320,6 +2397,7 @@ fn native_daemon_lifecycle() {
         "protocol_12",
         "protocol_13",
         "protocol_14",
+        "protocol_15",
         "inactive_agent_state",
         "protocol_11",
         "restartable_exited_shells",
@@ -2327,6 +2405,7 @@ fn native_daemon_lifecycle() {
         "agent_authority_precedence",
         "opencode_lifecycle_plugin",
         "process_adapters",
+        "persistent_agent_attention",
     ] {
         assert!(features.iter().any(|current| current == feature));
     }
@@ -2337,7 +2416,7 @@ fn native_daemon_lifecycle() {
         .output()
         .unwrap();
     assert!(status.status.success());
-    assert!(String::from_utf8_lossy(&status.stdout).contains("running (protocol 14"));
+    assert!(String::from_utf8_lossy(&status.stdout).contains("running (protocol 15"));
     let status = daemon
         .command()
         .args(["daemon", "status", "--json"])

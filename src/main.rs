@@ -19,6 +19,7 @@ use boomux::protocol::{
 };
 use boomux::{attach, client, daemon, protocol};
 
+mod agent_attention_projection;
 mod cli_output;
 mod config;
 mod git;
@@ -52,6 +53,8 @@ const JSON_COMMANDS: &[&str] = &[
     "agent.ensure",
     "agent.report",
     "agent.wait",
+    "attention.list",
+    "attention.acknowledge",
     "session.list",
     "session.inspect",
     "session.read",
@@ -73,6 +76,7 @@ const INTEGRATION_FEATURES: &[&str] = &[
     "protocol_12",
     "protocol_13",
     "protocol_14",
+    "protocol_15",
     "restartable_exited_shells",
     "inactive_agent_state",
     "idempotent_agent_ensure",
@@ -84,6 +88,7 @@ const INTEGRATION_FEATURES: &[&str] = &[
     "canonical_session_transcripts",
     "durable_session_source_context",
     "revision_aware_agent_wait",
+    "persistent_agent_attention",
 ];
 const LEGACY_BOOMUX_SHELLS_SKILL: &str = r#"---
 name: boomux-shells
@@ -217,6 +222,11 @@ enum Commands {
     Agent {
         #[command(subcommand)]
         command: AgentCommands,
+    },
+    /// Inspect and acknowledge blocked or completed Agent work
+    Attention {
+        #[command(subcommand)]
+        command: AttentionCommands,
     },
     /// Discover projected agent sessions
     Session {
@@ -390,6 +400,21 @@ enum AgentCommands {
         evidence: String,
         #[arg(long, value_parser = clap::value_parser!(u8).range(0..=100))]
         confidence: u8,
+    },
+}
+
+#[derive(Subcommand)]
+enum AttentionCommands {
+    /// List outstanding attention in priority order
+    List {
+        #[arg(long, value_name = "NAME_OR_ID")]
+        workspace: Option<String>,
+    },
+    /// Acknowledge one exact attention-raising observation
+    Acknowledge {
+        agent_id: String,
+        #[arg(long)]
+        observation_revision: u64,
     },
 }
 
@@ -683,6 +708,7 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
             command: AgentCommands::Supervise(arguments),
         }) => return supervise_agent(arguments).map(CliExit::Child),
         Some(Commands::Agent { command }) => agent_command(command, cli.json),
+        Some(Commands::Attention { command }) => attention_command(command, cli.json),
         Some(Commands::Session { command }) => session_command(command, cli.json),
         Some(Commands::Skill {
             command: SkillCommands::Install { force },
@@ -753,6 +779,12 @@ fn command_name(cli: &Cli) -> &'static str {
         Some(Commands::Agent {
             command: AgentCommands::Report { .. },
         }) => "agent.report",
+        Some(Commands::Attention {
+            command: AttentionCommands::List { .. },
+        }) => "attention.list",
+        Some(Commands::Attention {
+            command: AttentionCommands::Acknowledge { .. },
+        }) => "attention.acknowledge",
         Some(Commands::Session {
             command: SessionCommands::List { .. },
         }) => "session.list",
@@ -805,6 +837,8 @@ fn supports_json(cli: &Cli) -> bool {
                 | AgentCommands::Report { .. }
         }) | Some(Commands::Daemon {
             command: DaemonCommands::Status
+        }) | Some(Commands::Attention {
+            command: AttentionCommands::List { .. } | AttentionCommands::Acknowledge { .. }
         }) | Some(Commands::Session {
             command: SessionCommands::List { .. }
                 | SessionCommands::Inspect { .. }
@@ -1024,6 +1058,7 @@ fn dashboard_views(
         .iter()
         .map(|workspace| {
             let sessions = workspace_session_views(workspace);
+            let agent_summary = agent_attention_projection::summarize_workspace(workspace);
             let shells = workspace.shells.iter().map(|shell| {
                 let git = git_cache.inspect(&shell.cwd);
                 let shell_view = tui::TerminalView {
@@ -1107,6 +1142,8 @@ fn dashboard_views(
                 name: workspace.name.clone(),
                 items: shells.chain(launchers).collect(),
                 sessions,
+                agent_state_counts: agent_summary.states,
+                attention_count: agent_summary.attention_count,
             }
         })
         .collect()
@@ -1440,12 +1477,17 @@ fn workspace_command(
             if json {
                 let workspaces = workspaces
                     .iter()
-                    .map(|workspace| cli_output::WorkspaceSummary {
-                        id: workspace.id.clone(),
-                        name: workspace.name.clone(),
-                        shell_count: workspace.shells.len(),
-                        launcher_count: workspace.launchers.len(),
-                        agent_count: workspace.agents.len(),
+                    .map(|workspace| {
+                        let summary = agent_attention_projection::summarize_workspace(workspace);
+                        cli_output::WorkspaceSummary {
+                            id: workspace.id.clone(),
+                            name: workspace.name.clone(),
+                            shell_count: workspace.shells.len(),
+                            launcher_count: workspace.launchers.len(),
+                            agent_count: workspace.agents.len(),
+                            agent_state_counts: summary.states,
+                            attention_count: summary.attention_count,
+                        }
                     })
                     .collect::<Vec<_>>();
                 return cli_output::print(
@@ -1453,15 +1495,19 @@ fn workspace_command(
                     serde_json::json!({ "workspaces": workspaces }),
                 );
             }
-            println!("NAME\tWORKSPACE ID\tSHELLS\tLAUNCHERS\tAGENTS");
+            println!("NAME\tWORKSPACE ID\tSHELLS\tLAUNCHERS\tAGENTS\tBLOCKED\tDONE\tATTENTION");
             for workspace in workspaces {
+                let summary = agent_attention_projection::summarize_workspace(&workspace);
                 println!(
-                    "{}\t{}\t{}\t{}\t{}",
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                     workspace.name,
                     workspace.id,
                     workspace.shells.len(),
                     workspace.launchers.len(),
-                    workspace.agents.len()
+                    workspace.agents.len(),
+                    summary.states.blocked,
+                    summary.states.done,
+                    summary.attention_count,
                 );
             }
         }
@@ -1485,6 +1531,7 @@ fn workspace_command(
         WorkspaceCommands::Inspect { target } => {
             let snapshot = client.snapshot()?;
             let workspace = resolve_workspace_target(&snapshot.workspaces, &target)?;
+            let agent_summary = agent_attention_projection::summarize_workspace(workspace);
             if json {
                 let shells = workspace
                     .shells
@@ -1504,6 +1551,8 @@ fn workspace_command(
                             "agents": workspace.agents.iter()
                                 .map(|agent| cli_output::agent(agent, Some(&workspace.name)))
                                 .collect::<Vec<_>>(),
+                            "agent_state_counts": agent_summary.states,
+                            "attention_count": agent_summary.attention_count,
                         }
                     }),
                 );
@@ -1513,6 +1562,9 @@ fn workspace_command(
             println!("SHELLS\t{}", workspace.shells.len());
             println!("LAUNCHERS\t{}", workspace.launchers.len());
             println!("AGENTS\t{}", workspace.agents.len());
+            println!("BLOCKED AGENTS\t{}", agent_summary.states.blocked);
+            println!("COMPLETED AGENTS\t{}", agent_summary.states.done);
+            println!("ATTENTION\t{}", agent_summary.attention_count);
             if !workspace.shells.is_empty() {
                 println!("\nNAME\tSHELL ID\tRUN ID\tSTATUS\tCWD");
                 for shell in &workspace.shells {
@@ -1895,6 +1947,93 @@ fn agent_command(command: AgentCommands, json: bool) -> Result<(), Box<dyn Error
     Ok(())
 }
 
+fn attention_command(command: AttentionCommands, json: bool) -> Result<(), Box<dyn Error>> {
+    let client = client::connect_or_start()?;
+    validate_attention_protocol(client.protocol_version()?)?;
+    match command {
+        AttentionCommands::List { workspace } => {
+            let snapshot = client.snapshot()?;
+            let workspace_id = workspace
+                .as_deref()
+                .map(|target| resolve_workspace_target(&snapshot.workspaces, target))
+                .transpose()?
+                .map(|workspace| workspace.id.as_str());
+            let items = agent_attention_projection::project_attention(&snapshot.workspaces)
+                .into_iter()
+                .filter(|item| workspace_id.is_none_or(|id| item.workspace_id == id))
+                .collect::<Vec<_>>();
+            if json {
+                let attention = items
+                    .iter()
+                    .map(|item| {
+                        serde_json::json!({
+                            "workspace_id": item.workspace_id,
+                            "workspace_name": item.workspace_name,
+                            "reason": agent_attention_projection::attention_reason(item.attention.reason),
+                            "observation": {
+                                "revision": item.attention.observation.revision,
+                                "state": cli_output::agent_state(item.attention.observation.state),
+                                "authority": cli_output::agent_authority(item.attention.observation.authority),
+                                "evidence": item.attention.observation.evidence,
+                                "confidence": item.attention.observation.confidence,
+                                "observed_at_ms": item.attention.observation.observed_at_ms,
+                            },
+                            "observation_is_current": item.observation_is_current,
+                            "shell_is_retained": item.shell_is_retained,
+                            "agent": cli_output::agent(&item.agent, Some(&item.workspace_name)),
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                return cli_output::print(
+                    "attention.list",
+                    serde_json::json!({ "attention": attention }),
+                );
+            }
+            println!(
+                "WORKSPACE\tREASON\tAGENT\tAGENT ID\tREVISION\tCURRENT\tSHELL\tAUTHORITY\tEVIDENCE"
+            );
+            for item in items {
+                println!(
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    sanitize_table_cell(&item.workspace_name),
+                    agent_attention_projection::attention_reason(item.attention.reason),
+                    sanitize_table_cell(&item.agent.name),
+                    item.agent.id,
+                    item.attention.observation.revision,
+                    item.observation_is_current,
+                    if item.shell_is_retained {
+                        "retained"
+                    } else {
+                        "removed"
+                    },
+                    cli_output::agent_authority(item.attention.observation.authority),
+                    sanitize_table_cell(&item.attention.observation.evidence),
+                );
+            }
+        }
+        AttentionCommands::Acknowledge {
+            agent_id,
+            observation_revision,
+        } => {
+            let acknowledged =
+                client.acknowledge_agent_attention(agent_id, observation_revision)?;
+            if json {
+                return cli_output::print(
+                    "attention.acknowledge",
+                    serde_json::json!({
+                        "changed": acknowledged.changed,
+                        "agent": cli_output::agent(&acknowledged.agent, None),
+                    }),
+                );
+            }
+            println!("CHANGED\t{}", acknowledged.changed);
+            println!("AGENT ID\t{}", acknowledged.agent.id);
+            println!("OBSERVATION REVISION\t{observation_revision}");
+        }
+    }
+    Ok(())
+}
+
 fn session_command(command: SessionCommands, json: bool) -> Result<(), Box<dyn Error>> {
     let client = client::connect_or_start()?;
     validate_session_protocol(client.protocol_version()?)?;
@@ -2000,6 +2139,28 @@ fn session_command(command: SessionCommands, json: bool) -> Result<(), Box<dyn E
         }
     }
     Ok(())
+}
+
+fn validate_attention_protocol(negotiated: u32) -> Result<(), Box<dyn Error>> {
+    (negotiated >= 15).then_some(()).ok_or_else(|| {
+        cli_output::failure(
+            "unsupported_version",
+            format!("Agent attention requires daemon protocol 15; negotiated {negotiated}"),
+        )
+    })
+}
+
+fn sanitize_table_cell(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect()
 }
 
 fn validate_session_protocol(negotiated: u32) -> Result<(), Box<dyn Error>> {
@@ -3149,6 +3310,7 @@ mod tests {
             cwd: Some("/tmp/project".into()),
             started_at_ms: 10,
             ended_at_ms: None,
+            attention: None,
             observation: protocol::AgentObservationSnapshot {
                 revision: 1,
                 state: AgentState::Working,
@@ -3552,6 +3714,38 @@ mod tests {
     }
 
     #[test]
+    fn parses_attention_queue_commands_and_json_support() {
+        let list = Cli::try_parse_from([
+            "boomux",
+            "attention",
+            "list",
+            "--workspace",
+            "project",
+            "--json",
+        ])
+        .unwrap();
+        assert_eq!(command_name(&list), "attention.list");
+        assert!(supports_json(&list));
+
+        let acknowledge = Cli::try_parse_from([
+            "boomux",
+            "attention",
+            "acknowledge",
+            "a1",
+            "--observation-revision",
+            "7",
+            "--json",
+        ])
+        .unwrap();
+        assert_eq!(command_name(&acknowledge), "attention.acknowledge");
+        assert!(supports_json(&acknowledge));
+        assert_eq!(
+            sanitize_table_cell("approval\tneeded\nnow\u{7}"),
+            "approval needed now "
+        );
+    }
+
+    #[test]
     fn child_exit_outcomes_map_to_unix_cli_codes() {
         assert_eq!(
             CliExit::Child(process_adapter::ProcessExit::Code(23)).code(),
@@ -3817,6 +4011,8 @@ mod tests {
             id: "w1".into(),
             name: "project".into(),
             items: Vec::new(),
+            agent_state_counts: agent_attention_projection::AgentStateCounts::default(),
+            attention_count: 0,
             sessions: vec![tui::AgentSessionView {
                 id: "session".into(),
                 label: "opencode".into(),
@@ -4472,6 +4668,8 @@ mod tests {
             "agent.ensure",
             "agent.report",
             "agent.wait",
+            "attention.list",
+            "attention.acknowledge",
         ] {
             assert!(JSON_COMMANDS.contains(&command));
         }
@@ -4487,6 +4685,8 @@ mod tests {
             "opencode_lifecycle_plugin",
             "pi_lifecycle_extension",
             "canonical_session_transcripts",
+            "protocol_15",
+            "persistent_agent_attention",
         ] {
             assert!(INTEGRATION_FEATURES.contains(&feature));
         }
@@ -4496,7 +4696,7 @@ mod tests {
             session_transcript::supported_integrations(),
             ["opencode", "pi"]
         );
-        assert_eq!(protocol::PROTOCOL_VERSION, 14);
+        assert_eq!(protocol::PROTOCOL_VERSION, 15);
     }
 
     #[test]

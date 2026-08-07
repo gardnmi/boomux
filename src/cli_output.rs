@@ -5,10 +5,12 @@ use serde::Serialize;
 
 use boomux::client::RemoteError;
 use boomux::protocol::{
-    AgentAuthority, AgentInstanceSnapshot, AgentObservationSnapshot, AgentState, ErrorCode,
-    ShellRunExitReason, ShellSnapshot, ShellStatus, WorkspaceLauncherSnapshot,
+    AgentAttentionReason, AgentAuthority, AgentInstanceSnapshot, AgentObservationSnapshot,
+    AgentState, ErrorCode, ShellRunExitReason, ShellSnapshot, ShellStatus,
+    WorkspaceLauncherSnapshot,
 };
 
+use crate::agent_attention_projection::AgentStateCounts;
 use crate::session_projection::{SessionOccurrence, SessionProjection};
 
 pub(crate) const SCHEMA: &str = "boomux.cli/v1";
@@ -81,6 +83,8 @@ pub(crate) struct WorkspaceSummary {
     pub(crate) shell_count: usize,
     pub(crate) launcher_count: usize,
     pub(crate) agent_count: usize,
+    pub(crate) agent_state_counts: AgentStateCounts,
+    pub(crate) attention_count: usize,
 }
 
 #[derive(Serialize)]
@@ -105,7 +109,14 @@ pub(crate) struct AgentData {
     pub(crate) external_session_id: Option<String>,
     pub(crate) started_at_ms: u64,
     pub(crate) ended_at_ms: Option<u64>,
+    pub(crate) attention: Option<AgentAttentionData>,
     pub(crate) observation: AgentObservationData,
+}
+
+#[derive(Serialize)]
+pub(crate) struct AgentAttentionData {
+    reason: &'static str,
+    observation: AgentObservationData,
 }
 
 #[derive(Serialize)]
@@ -257,6 +268,13 @@ pub(crate) fn agent(agent: &AgentInstanceSnapshot, workspace_name: Option<&str>)
         external_session_id: agent.external_session_id.clone(),
         started_at_ms: agent.started_at_ms,
         ended_at_ms: agent.ended_at_ms,
+        attention: agent
+            .attention
+            .as_ref()
+            .map(|attention| AgentAttentionData {
+                reason: agent_attention_reason(attention.reason),
+                observation: agent_observation(&attention.observation),
+            }),
         observation: agent_observation(&agent.observation),
     }
 }
@@ -324,6 +342,13 @@ pub(crate) fn agent_state(state: AgentState) -> &'static str {
         AgentState::Idle => "idle",
         AgentState::Inactive => "inactive",
         AgentState::Done => "done",
+    }
+}
+
+pub(crate) fn agent_attention_reason(reason: AgentAttentionReason) -> &'static str {
+    match reason {
+        AgentAttentionReason::Blocked => "blocked",
+        AgentAttentionReason::Completed => "completed",
     }
 }
 
@@ -419,6 +444,17 @@ mod tests {
                 cwd: Some("/tmp/project".into()),
                 started_at_ms: 10,
                 ended_at_ms: None,
+                attention: Some(boomux::protocol::AgentAttentionSnapshot {
+                    reason: AgentAttentionReason::Blocked,
+                    observation: AgentObservationSnapshot {
+                        revision: 1,
+                        state: AgentState::Blocked,
+                        authority: AgentAuthority::LifecycleIntegration,
+                        evidence: "approval needed".into(),
+                        confidence: 100,
+                        observed_at_ms: 10,
+                    },
+                }),
                 observation: AgentObservationSnapshot {
                     revision: 2,
                     state: AgentState::Working,
@@ -436,6 +472,8 @@ mod tests {
         assert_eq!(value["observation"]["state"], "working");
         assert_eq!(value["observation"]["authority"], "lifecycle_integration");
         assert_eq!(value["observation"]["confidence"], 95);
+        assert_eq!(value["attention"]["reason"], "blocked");
+        assert_eq!(value["attention"]["observation"]["revision"], 1);
     }
 
     #[test]

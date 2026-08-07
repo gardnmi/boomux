@@ -23,11 +23,11 @@ use crate::client;
 use crate::fd_transfer::send_descriptor;
 use crate::handoff;
 use crate::protocol::{
-    self, AgentAuthority, AgentInstanceSnapshot, AgentObservationSnapshot, AgentRegistrationSpec,
-    AgentReport, AgentState, AttachFrame, DaemonEvent, DaemonEventKind, Envelope, ErrorCode,
-    EventCursor, Request, Response, ShellRunExitReason, ShellRunSnapshot, ShellSnapshot, ShellSpec,
-    ShellStatus, Snapshot, TerminalProfile, WorkspaceLauncherSnapshot, WorkspaceLauncherSpec,
-    WorkspaceSnapshot,
+    self, AgentAttentionReason, AgentAttentionSnapshot, AgentAuthority, AgentInstanceSnapshot,
+    AgentObservationSnapshot, AgentRegistrationSpec, AgentReport, AgentState, AttachFrame,
+    DaemonEvent, DaemonEventKind, Envelope, ErrorCode, EventCursor, Request, Response,
+    ShellRunExitReason, ShellRunSnapshot, ShellSnapshot, ShellSpec, ShellStatus, Snapshot,
+    TerminalProfile, WorkspaceLauncherSnapshot, WorkspaceLauncherSpec, WorkspaceSnapshot,
 };
 use crate::state_store::{
     PersistedAgentInstance, PersistedShell, PersistedShellRun, PersistedState, PersistedWorkspace,
@@ -683,6 +683,17 @@ fn handle_connection(
             ),
         );
     }
+    if response_version < 15 && matches!(request.message, Request::AcknowledgeAgentAttention { .. })
+    {
+        return send_response(
+            &mut stream,
+            response_version,
+            error_response(
+                ErrorCode::UnsupportedVersion,
+                "agent attention acknowledgment requires daemon protocol 15",
+            ),
+        );
+    }
 
     if let Request::Attach {
         shell_id,
@@ -790,6 +801,17 @@ fn handle_connection(
 
 fn response_for_version(response: Response, version: u32) -> Response {
     let mut response = response;
+    if version < 15 {
+        remove_agent_attention(&mut response);
+        if let Response::Events { events, .. } = &mut response {
+            events.retain(|event| {
+                !matches!(
+                    event.kind,
+                    DaemonEventKind::AgentAttentionAcknowledged { .. }
+                )
+            });
+        }
+    }
     if version < 13 {
         remove_agent_cwds(&mut response);
     }
@@ -850,6 +872,10 @@ fn remove_agent_cwds(response: &mut Response) {
     visit_response_agents(response, &mut |agent| agent.cwd = None);
 }
 
+fn remove_agent_attention(response: &mut Response) {
+    visit_response_agents(response, &mut |agent| agent.attention = None);
+}
+
 fn downgrade_inactive_agent_states(response: &mut Response) {
     visit_response_agents(response, &mut |agent| {
         if agent.observation.state == AgentState::Inactive {
@@ -875,7 +901,9 @@ fn visit_response_agents(
                 visitor(agent);
             }
         }
-        Response::Agent { agent } | Response::AgentWait { agent, .. } => visitor(agent),
+        Response::Agent { agent }
+        | Response::AgentWait { agent, .. }
+        | Response::AgentAttentionAcknowledged { agent, .. } => visitor(agent),
         Response::Events {
             snapshot, events, ..
         } => {
@@ -890,7 +918,8 @@ fn visit_response_agents(
                 match &mut event.kind {
                     DaemonEventKind::AgentRegistered { agent, .. }
                     | DaemonEventKind::AgentStateChanged { agent, .. }
-                    | DaemonEventKind::AgentCompleted { agent, .. } => visitor(agent),
+                    | DaemonEventKind::AgentCompleted { agent, .. }
+                    | DaemonEventKind::AgentAttentionAcknowledged { agent, .. } => visitor(agent),
                     _ => {}
                 }
             }
@@ -1128,6 +1157,7 @@ struct AgentInstance {
 struct AgentInstanceState {
     ended_at_ms: Option<u64>,
     observation: AgentObservationSnapshot,
+    attention: Option<AgentAttentionSnapshot>,
 }
 
 struct WorkspaceLauncher {
@@ -1672,6 +1702,27 @@ impl Registry {
                 after_revision,
                 wait_ms,
             } => self.wait_agent(&agent_id, after_revision, wait_ms),
+            Request::AcknowledgeAgentAttention {
+                agent_id,
+                observation_revision,
+            } => self.durable_mutation_outcome(|| {
+                let (agent, changed) =
+                    self.acknowledge_agent_attention(&agent_id, observation_revision)?;
+                if !changed {
+                    return Ok(DurableMutation::Unchanged(
+                        Response::AgentAttentionAcknowledged { agent, changed },
+                    ));
+                }
+                let event = DaemonEventKind::AgentAttentionAcknowledged {
+                    workspace_id: agent.workspace_id.clone(),
+                    shell_id: agent.shell_id.clone(),
+                    agent: agent.clone(),
+                };
+                Ok(DurableMutation::Changed(
+                    Response::AgentAttentionAcknowledged { agent, changed },
+                    vec![event],
+                ))
+            }),
             Request::CreateWorkspace { name, shells } => self.durable_mutation(|| {
                 let workspace = self.create_workspace(name, shells)?;
                 let events = workspace_created_events(&workspace);
@@ -3003,8 +3054,13 @@ impl Registry {
                     confidence: spec.report.confidence,
                     observed_at_ms: started_at_ms,
                 },
+                attention: None,
             }),
         });
+        {
+            let mut state = lock(&agent.state)?;
+            state.attention = attention_for_observation(&state.observation);
+        }
         let snapshot = agent.snapshot()?;
         let mut state = lock(&self.state)?;
         let Some(current_shell) = state.shells.get(shell_id) else {
@@ -3129,11 +3185,39 @@ impl Registry {
             confidence: report.confidence,
             observed_at_ms,
         };
+        if let Some(attention) = attention_for_observation(&state.observation) {
+            state.attention = Some(attention);
+        }
         if completed {
             state.ended_at_ms = Some(observed_at_ms);
         }
         drop(state);
         Ok((agent.snapshot()?, true, completed))
+    }
+
+    fn acknowledge_agent_attention(
+        &self,
+        agent_id: &str,
+        observation_revision: u64,
+    ) -> io::Result<(AgentInstanceSnapshot, bool)> {
+        let agent = self.agent(agent_id)?;
+        let mut state = lock(&agent.state)?;
+        let Some(attention) = &state.attention else {
+            drop(state);
+            return Ok((agent.snapshot()?, false));
+        };
+        if attention.observation.revision != observation_revision {
+            return Err(coded_error(
+                ErrorCode::RevisionAhead,
+                format!(
+                    "agent attention observation revision is {}; acknowledgment supplied {}",
+                    attention.observation.revision, observation_revision
+                ),
+            ));
+        }
+        state.attention = None;
+        drop(state);
+        Ok((agent.snapshot()?, true))
     }
 
     fn rename_launcher(&self, launcher_id: &str, name: String) -> io::Result<()> {
@@ -3692,6 +3776,7 @@ impl AgentInstance {
             state: Mutex::new(AgentInstanceState {
                 ended_at_ms: saved.ended_at_ms,
                 observation: saved.observation,
+                attention: saved.attention,
             }),
         }
     }
@@ -3710,6 +3795,7 @@ impl AgentInstance {
             started_at_ms: self.started_at_ms,
             ended_at_ms: state.ended_at_ms,
             observation: state.observation.clone(),
+            attention: state.attention.clone(),
         })
     }
 
@@ -3726,6 +3812,7 @@ impl AgentInstance {
             started_at_ms: snapshot.started_at_ms,
             ended_at_ms: snapshot.ended_at_ms,
             observation: snapshot.observation,
+            attention: snapshot.attention,
         })
     }
 }
@@ -4957,6 +5044,20 @@ fn observation_matches_report(
         && observation.confidence == report.confidence
 }
 
+fn attention_for_observation(
+    observation: &AgentObservationSnapshot,
+) -> Option<AgentAttentionSnapshot> {
+    let reason = match observation.state {
+        AgentState::Blocked => AgentAttentionReason::Blocked,
+        AgentState::Done => AgentAttentionReason::Completed,
+        _ => return None,
+    };
+    Some(AgentAttentionSnapshot {
+        reason,
+        observation: observation.clone(),
+    })
+}
+
 fn agent_authority_rank(authority: AgentAuthority) -> u8 {
     match authority {
         AgentAuthority::LifecycleIntegration => 3,
@@ -5004,6 +5105,40 @@ fn validate_persisted_agent(agent: &PersistedAgentInstance) -> io::Result<()> {
             io::ErrorKind::InvalidData,
             "Boomux state contains an invalid agent observation",
         ));
+    }
+    if let Some(attention) = &agent.attention {
+        validate_agent_report(&AgentReport {
+            state: attention.observation.state,
+            authority: attention.observation.authority,
+            evidence: attention.observation.evidence.clone(),
+            confidence: attention.observation.confidence,
+        })
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+        let expected_reason = match attention.observation.state {
+            AgentState::Blocked => AgentAttentionReason::Blocked,
+            AgentState::Done => AgentAttentionReason::Completed,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Boomux state contains attention for a non-attention agent state",
+                ));
+            }
+        };
+        if attention.reason != expected_reason
+            || attention.observation.revision == 0
+            || attention.observation.revision > agent.observation.revision
+            || attention.observation.observed_at_ms < agent.started_at_ms
+            || attention.observation.observed_at_ms > agent.observation.observed_at_ms
+            || (attention.observation.revision == agent.observation.revision
+                && attention.observation != agent.observation)
+            || (attention.reason == AgentAttentionReason::Completed
+                && attention.observation != agent.observation)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Boomux state contains invalid agent attention",
+            ));
+        }
     }
     Ok(())
 }
@@ -5468,6 +5603,14 @@ mod tests {
         };
         assert_eq!(agent.observation.revision, 2);
         assert_eq!(agent.observation.state, AgentState::Done);
+        assert_eq!(
+            agent.attention.as_ref().map(|attention| attention.reason),
+            Some(AgentAttentionReason::Completed)
+        );
+        assert_eq!(
+            agent.attention.as_ref().unwrap().observation,
+            agent.observation
+        );
         assert_eq!(agent.ended_at_ms, Some(agent.observation.observed_at_ms));
         assert_eq!(
             registry.snapshot().unwrap().workspaces[0].agents,
@@ -5799,6 +5942,179 @@ mod tests {
         let restored = registry.agent(&agent.id).unwrap().snapshot().unwrap();
         assert_eq!(restored.observation.revision, 1);
         assert_eq!(restored.observation.state, AgentState::Working);
+        assert!(restored.attention.is_none());
+        shell.kill().unwrap();
+        registry.close_workspace(&workspace.id).unwrap();
+    }
+
+    #[test]
+    fn agent_attention_is_raised_preserved_and_superseded_by_completion() {
+        let registry = Registry::default();
+        let (workspace, shell, _runtime) = running_shell(&registry);
+        let run_id = shell.snapshot().unwrap().run.unwrap().id;
+        let registered = registry
+            .register_agent(&shell.id, &run_id, agent_spec(AgentState::Blocked))
+            .unwrap();
+        let registered_id = registered.id.clone();
+        let blocked = registered.attention.clone().unwrap();
+        assert_eq!(blocked.reason, AgentAttentionReason::Blocked);
+        assert_eq!(blocked.observation, registered.observation);
+
+        let (unchanged, changed, _) = registry
+            .report_agent(
+                &registered_id,
+                &run_id,
+                agent_report(
+                    AgentState::Working,
+                    AgentAuthority::TerminalHeuristic,
+                    "weak working",
+                ),
+            )
+            .unwrap();
+        assert!(!changed);
+        assert_eq!(unchanged.attention.as_ref(), Some(&blocked));
+
+        let (idle, changed, _) = registry
+            .report_agent(&registered_id, &run_id, agent_spec(AgentState::Idle).report)
+            .unwrap();
+        assert!(changed);
+        assert_eq!(idle.attention.as_ref(), Some(&blocked));
+
+        let duplicate = agent_spec(AgentState::Idle).report;
+        let (idle_again, changed, _) = registry.report_agent(&idle.id, &run_id, duplicate).unwrap();
+        assert!(!changed);
+        assert_eq!(idle_again.attention.as_ref(), Some(&blocked));
+
+        let (done, changed, completed) = registry
+            .report_agent(&idle.id, &run_id, agent_spec(AgentState::Done).report)
+            .unwrap();
+        assert!(changed && completed);
+        let attention = done.attention.unwrap();
+        assert_eq!(attention.reason, AgentAttentionReason::Completed);
+        assert_eq!(attention.observation, done.observation);
+        shell.kill().unwrap();
+        registry.close_workspace(&workspace.id).unwrap();
+    }
+
+    #[test]
+    fn failed_attention_acknowledgment_persistence_restores_attention() {
+        let directory = env::temp_dir().join(format!("boomux-attention-{}", Uuid::new_v4()));
+        let state_directory = directory.join("state");
+        let registry = Registry::restore(
+            StateStore::at(state_directory.join("state.json")),
+            false,
+            None,
+        )
+        .unwrap();
+        let (_workspace, shell, _runtime) = running_shell(&registry);
+        let run_id = shell.snapshot().unwrap().run.unwrap().id;
+        let Response::Agent { agent } = registry
+            .dispatch(Request::RegisterAgent {
+                shell_id: shell.id.clone(),
+                run_id,
+                spec: agent_spec(AgentState::Blocked),
+            })
+            .unwrap()
+        else {
+            panic!("expected registered agent");
+        };
+        let event_id = lock(&registry.events.state).unwrap().latest_id;
+        fs::remove_dir_all(&state_directory).unwrap();
+        fs::write(&state_directory, b"not a directory").unwrap();
+
+        let error = registry
+            .dispatch(Request::AcknowledgeAgentAttention {
+                agent_id: agent.id.clone(),
+                observation_revision: agent.observation.revision,
+            })
+            .unwrap_err();
+
+        assert_eq!(error_code(&error), ErrorCode::PersistenceFailed);
+        assert!(
+            registry
+                .agent(&agent.id)
+                .unwrap()
+                .snapshot()
+                .unwrap()
+                .attention
+                .is_some()
+        );
+        assert_eq!(lock(&registry.events.state).unwrap().latest_id, event_id);
+        shell.kill().unwrap();
+        drop(registry);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn agent_attention_acknowledgment_is_conditional_idempotent_and_rollback_safe() {
+        let registry = Registry::default();
+        let (workspace, shell, _runtime) = running_shell(&registry);
+        let run_id = shell.snapshot().unwrap().run.unwrap().id;
+        let agent = registry
+            .register_agent(&shell.id, &run_id, agent_spec(AgentState::Blocked))
+            .unwrap();
+        let revision = agent.observation.revision;
+
+        let mismatch = registry.acknowledge_agent_attention(&agent.id, revision + 1);
+        assert_eq!(error_code(&mismatch.unwrap_err()), ErrorCode::RevisionAhead);
+        assert!(
+            registry
+                .agent(&agent.id)
+                .unwrap()
+                .snapshot()
+                .unwrap()
+                .attention
+                .is_some()
+        );
+
+        let result: io::Result<()> = registry.durable_mutation(|| {
+            registry.acknowledge_agent_attention(&agent.id, revision)?;
+            Err(io::Error::other("force rollback"))
+        });
+        assert!(result.is_err());
+        assert!(
+            registry
+                .agent(&agent.id)
+                .unwrap()
+                .snapshot()
+                .unwrap()
+                .attention
+                .is_some()
+        );
+
+        let event_id = lock(&registry.events.state).unwrap().latest_id;
+        let Response::AgentAttentionAcknowledged { agent, changed } = registry
+            .dispatch(Request::AcknowledgeAgentAttention {
+                agent_id: agent.id.clone(),
+                observation_revision: revision,
+            })
+            .unwrap()
+        else {
+            panic!("expected attention acknowledgment");
+        };
+        assert!(changed);
+        assert!(agent.attention.is_none());
+        assert_eq!(agent.observation.revision, revision);
+        assert_eq!(
+            lock(&registry.events.state).unwrap().latest_id,
+            event_id + 1
+        );
+
+        let Response::AgentAttentionAcknowledged { agent, changed } = registry
+            .dispatch(Request::AcknowledgeAgentAttention {
+                agent_id: agent.id,
+                observation_revision: revision + 100,
+            })
+            .unwrap()
+        else {
+            panic!("expected idempotent acknowledgment");
+        };
+        assert!(!changed);
+        assert_eq!(agent.observation.revision, revision);
+        assert_eq!(
+            lock(&registry.events.state).unwrap().latest_id,
+            event_id + 1
+        );
         shell.kill().unwrap();
         registry.close_workspace(&workspace.id).unwrap();
     }
@@ -6011,6 +6327,7 @@ mod tests {
                 confidence: 90,
                 observed_at_ms: 1,
             },
+            attention: None,
         };
         let workspace = WorkspaceSnapshot {
             id: "w1".into(),
@@ -6091,6 +6408,7 @@ mod tests {
                 confidence: 100,
                 observed_at_ms: 2,
             },
+            attention: None,
         };
 
         let Response::Agent { agent: downgraded } = response_for_version(
@@ -6185,6 +6503,74 @@ mod tests {
             panic!("expected agent state event");
         };
         assert_eq!(agent.observation.state, AgentState::Unknown);
+    }
+
+    #[test]
+    fn protocol_fourteen_omits_attention_and_filters_acknowledgment_events() {
+        let observation = AgentObservationSnapshot {
+            revision: 2,
+            state: AgentState::Blocked,
+            authority: AgentAuthority::LifecycleIntegration,
+            evidence: "blocked".into(),
+            confidence: 100,
+            observed_at_ms: 2,
+        };
+        let agent = AgentInstanceSnapshot {
+            id: "a1".into(),
+            workspace_id: "w1".into(),
+            shell_id: "s1".into(),
+            run_id: "r1".into(),
+            name: "agent".into(),
+            integration: "test".into(),
+            external_session_id: None,
+            cwd: None,
+            started_at_ms: 1,
+            ended_at_ms: None,
+            observation: observation.clone(),
+            attention: Some(AgentAttentionSnapshot {
+                reason: AgentAttentionReason::Blocked,
+                observation,
+            }),
+        };
+        let cursor = EventCursor {
+            stream_id: "stream".into(),
+            event_id: 2,
+        };
+        let response = Response::Events {
+            stream_id: "stream".into(),
+            cursor: cursor.clone(),
+            snapshot: Some(Snapshot {
+                workspaces: vec![WorkspaceSnapshot {
+                    id: "w1".into(),
+                    name: "workspace".into(),
+                    shells: Vec::new(),
+                    launchers: Vec::new(),
+                    agents: vec![agent.clone()],
+                }],
+            }),
+            events: vec![DaemonEvent {
+                id: 2,
+                at_ms: 3,
+                kind: DaemonEventKind::AgentAttentionAcknowledged {
+                    workspace_id: "w1".into(),
+                    shell_id: "s1".into(),
+                    agent,
+                },
+            }],
+        };
+
+        let Response::Events {
+            cursor: filtered_cursor,
+            snapshot: Some(snapshot),
+            events,
+            ..
+        } = response_for_version(response, 14)
+        else {
+            panic!("expected events response");
+        };
+        assert_eq!(filtered_cursor, cursor);
+        assert!(events.is_empty());
+        assert!(snapshot.workspaces[0].agents[0].attention.is_none());
     }
 
     #[test]
@@ -6510,5 +6896,64 @@ mod tests {
 
         registry.close_workspace(&workspace.id).unwrap();
         assert!(registry.snapshot().unwrap().workspaces.is_empty());
+    }
+
+    #[test]
+    fn persisted_attention_rejects_impossible_observation_history() {
+        let persisted = |attention: AgentAttentionSnapshot| PersistedAgentInstance {
+            id: Uuid::new_v4().to_string(),
+            shell_id: Uuid::new_v4().to_string(),
+            run_id: Uuid::new_v4().to_string(),
+            name: "agent".into(),
+            integration: "test".into(),
+            external_session_id: Some("session".into()),
+            cwd: Some(env::temp_dir()),
+            started_at_ms: 10,
+            ended_at_ms: None,
+            observation: AgentObservationSnapshot {
+                revision: 2,
+                state: AgentState::Working,
+                authority: AgentAuthority::LifecycleIntegration,
+                evidence: "working".into(),
+                confidence: 100,
+                observed_at_ms: 20,
+            },
+            attention: Some(attention),
+        };
+        let completed = AgentAttentionSnapshot {
+            reason: AgentAttentionReason::Completed,
+            observation: AgentObservationSnapshot {
+                revision: 1,
+                state: AgentState::Done,
+                authority: AgentAuthority::LifecycleIntegration,
+                evidence: "done".into(),
+                confidence: 100,
+                observed_at_ms: 15,
+            },
+        };
+        assert_eq!(
+            validate_persisted_agent(&persisted(completed))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        let mismatched_current = AgentAttentionSnapshot {
+            reason: AgentAttentionReason::Blocked,
+            observation: AgentObservationSnapshot {
+                revision: 2,
+                state: AgentState::Blocked,
+                authority: AgentAuthority::LifecycleIntegration,
+                evidence: "different revision contents".into(),
+                confidence: 100,
+                observed_at_ms: 20,
+            },
+        };
+        assert_eq!(
+            validate_persisted_agent(&persisted(mismatched_current))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 }

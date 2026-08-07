@@ -117,7 +117,7 @@ eternal process.
    canonical identity plus lifecycle reporting end to end. Include status,
    version compatibility, diagnostics, repair, and uninstall paths so stronger
    guarantees do not require users to manage plugin files manually.
-3. Aggregate agent states into workspace counts and add an explainable,
+3. [Complete] Aggregate agent states into workspace counts and add an explainable,
    persistent attention queue for blocked and completed work.
 4. [Complete] Add revision-aware `agent wait` so scripts can await durable state
    transitions without polling human output.
