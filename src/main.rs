@@ -26,14 +26,15 @@ mod host_session_titles;
 mod process_adapter;
 mod projects;
 mod session_projection;
+mod session_transcript;
 mod terminal;
 mod tui;
 
 const BOOMUX_SKILL: &str = include_str!("../.agents/skills/boomux/SKILL.md");
 const BOOMUX_OPENCODE_PLUGIN: &str = include_str!("../integrations/opencode/boomux.js");
 const BOOMUX_PI_EXTENSION: &str = include_str!("../integrations/pi/boomux.js");
-const VALIDATED_OPENCODE_VERSION: &str = "1.18.14";
-const VALIDATED_PI_VERSION: &str = "0.83.0";
+const VALIDATED_OPENCODE_VERSION: &str = "1.18.15";
+const VALIDATED_PI_VERSION: &str = "0.84.1";
 const JSON_COMMANDS: &[&str] = &[
     "capabilities",
     "list",
@@ -52,6 +53,7 @@ const JSON_COMMANDS: &[&str] = &[
     "agent.report",
     "session.list",
     "session.inspect",
+    "session.read",
     "daemon.status",
 ];
 const INTEGRATION_FEATURES: &[&str] = &[
@@ -76,6 +78,7 @@ const INTEGRATION_FEATURES: &[&str] = &[
     "pi_lifecycle_extension",
     "process_adapters",
     "projected_agent_sessions",
+    "canonical_session_transcripts",
 ];
 const LEGACY_BOOMUX_SHELLS_SKILL: &str = r#"---
 name: boomux-shells
@@ -387,6 +390,14 @@ enum SessionCommands {
     /// Show a projected session by exact opaque ID
     #[command(alias = "get")]
     Inspect { session_id: String },
+    /// Read canonical messages and tool activity by exact opaque ID
+    Read {
+        session_id: String,
+        #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u16).range(1..=1000))]
+        limit: u16,
+        #[arg(long, default_value_t = 1024 * 1024, value_parser = clap::value_parser!(u32).range(1..=4 * 1024 * 1024))]
+        max_bytes: u32,
+    },
 }
 
 #[derive(Args)]
@@ -732,6 +743,9 @@ fn command_name(cli: &Cli) -> &'static str {
         Some(Commands::Session {
             command: SessionCommands::Inspect { .. },
         }) => "session.inspect",
+        Some(Commands::Session {
+            command: SessionCommands::Read { .. },
+        }) => "session.read",
         Some(Commands::Daemon {
             command: DaemonCommands::Status,
         }) => "daemon.status",
@@ -775,7 +789,9 @@ fn supports_json(cli: &Cli) -> bool {
         }) | Some(Commands::Daemon {
             command: DaemonCommands::Status
         }) | Some(Commands::Session {
-            command: SessionCommands::List { .. } | SessionCommands::Inspect { .. }
+            command: SessionCommands::List { .. }
+                | SessionCommands::Inspect { .. }
+                | SessionCommands::Read { .. }
         })
     )
 }
@@ -1319,6 +1335,10 @@ fn capabilities(json: bool) -> Result<(), Box<dyn Error>> {
         "revision_ahead",
         "context_required",
         "ambiguous_target",
+        "unsupported_integration",
+        "session_source_unavailable",
+        "session_source_invalid",
+        "session_source_too_large",
         "internal",
         "unknown",
     ];
@@ -1331,6 +1351,7 @@ fn capabilities(json: bool) -> Result<(), Box<dyn Error>> {
                 "json_schemas": [cli_output::SCHEMA],
                 "json_commands": JSON_COMMANDS,
                 "features": INTEGRATION_FEATURES,
+                "session_transcript_integrations": session_transcript::supported_integrations(),
                 "integration_hosts": {
                     "opencode": {
                         "package": "opencode-ai",
@@ -1350,6 +1371,10 @@ fn capabilities(json: bool) -> Result<(), Box<dyn Error>> {
     println!("JSON SCHEMAS\t{}", cli_output::SCHEMA);
     println!("JSON COMMANDS\t{}", JSON_COMMANDS.join(","));
     println!("FEATURES\t{}", INTEGRATION_FEATURES.join(","));
+    println!(
+        "SESSION TRANSCRIPT INTEGRATIONS\t{}",
+        session_transcript::supported_integrations().join(",")
+    );
     println!("INTEGRATION HOSTS\topencode={VALIDATED_OPENCODE_VERSION},pi={VALIDATED_PI_VERSION}");
     println!("ERROR CODES\t{}", error_codes.join(","));
     Ok(())
@@ -1903,6 +1928,36 @@ fn session_command(command: SessionCommands, json: bool) -> Result<(), Box<dyn E
             }
             print_session(session);
         }
+        SessionCommands::Read {
+            session_id,
+            limit,
+            max_bytes,
+        } => {
+            let session = match session_projection::resolve_exact(&sessions, &session_id) {
+                Ok(session) => session,
+                Err(session_projection::ResolveError::NotFound) => {
+                    return Err(cli_output::failure(
+                        "not_found",
+                        format!("session not found: {session_id}"),
+                    ));
+                }
+                Err(session_projection::ResolveError::DuplicateId) => {
+                    return Err(cli_output::failure(
+                        "internal",
+                        format!("duplicate projected session ID: {session_id}"),
+                    ));
+                }
+            };
+            let transcript = session_transcript::read(session, limit.into(), max_bytes as usize)
+                .map_err(|error| cli_output::failure(error.code, error.to_string()))?;
+            if json {
+                return cli_output::print(
+                    "session.read",
+                    serde_json::json!({ "transcript": transcript }),
+                );
+            }
+            print_transcript(&transcript);
+        }
     }
     Ok(())
 }
@@ -1978,6 +2033,58 @@ fn print_session(session: &session_projection::SessionProjection) {
             occurrence.observation.confidence
         );
         println!("OBSERVED AT MS\t{}", occurrence.observation.observed_at_ms);
+    }
+}
+
+fn print_transcript(transcript: &session_transcript::Transcript) {
+    println!("SESSION ID\t{}", transcript.session_id);
+    println!("INTEGRATION\t{}", transcript.integration);
+    println!("EXTERNAL SESSION ID\t{}", transcript.external_session_id);
+    println!(
+        "ENTRIES\t{} of {}",
+        transcript.returned_entries, transcript.total_entries
+    );
+    println!("CONTENT BYTES\t{}", transcript.content_bytes);
+    println!(
+        "TRUNCATED\t{}",
+        if transcript.truncated {
+            transcript.truncated_by.join(",")
+        } else {
+            "no".to_owned()
+        }
+    );
+    for entry in &transcript.entries {
+        println!();
+        match entry.kind {
+            "tool" => println!(
+                "TOOL\t{}\t{}",
+                entry.tool_name.as_deref().unwrap_or("unknown"),
+                entry.status.as_deref().unwrap_or("unknown")
+            ),
+            _ => println!(
+                "{}\t{}",
+                entry.kind.to_uppercase(),
+                entry.role.as_deref().unwrap_or("unknown")
+            ),
+        }
+        if let Some(timestamp_ms) = entry.timestamp_ms {
+            println!("TIMESTAMP MS\t{timestamp_ms}");
+        }
+        if let Some(call_id) = entry.tool_call_id.as_deref() {
+            println!("CALL ID\t{call_id}");
+        }
+        if let Some(text) = entry.text.as_deref() {
+            println!("{text}");
+        }
+        if let Some(input) = entry.input.as_deref() {
+            println!("INPUT\t{input}");
+        }
+        if let Some(output) = entry.output.as_deref() {
+            println!("OUTPUT\t{output}");
+        }
+        if entry.truncated {
+            println!("ENTRY TRUNCATED\ttrue");
+        }
     }
 }
 
@@ -3410,6 +3517,34 @@ mod tests {
             Cli::try_parse_from(["boomux", "session", "get", "opaque", "--json"]).unwrap();
         assert_eq!(command_name(&inspect), "session.inspect");
         assert!(supports_json(&inspect));
+
+        let read = Cli::try_parse_from([
+            "boomux",
+            "session",
+            "read",
+            "opaque",
+            "--limit",
+            "25",
+            "--max-bytes",
+            "4096",
+            "--json",
+        ])
+        .unwrap();
+        assert_eq!(command_name(&read), "session.read");
+        assert!(supports_json(&read));
+        assert!(matches!(
+            read.command,
+            Some(Commands::Session {
+                command: SessionCommands::Read {
+                    session_id,
+                    limit: 25,
+                    max_bytes: 4096,
+                }
+            }) if session_id == "opaque"
+        ));
+        assert!(
+            Cli::try_parse_from(["boomux", "session", "read", "opaque", "--limit", "0"]).is_err()
+        );
     }
 
     #[test]
@@ -4263,7 +4398,7 @@ mod tests {
         for command in ["agent.register", "agent.ensure", "agent.report"] {
             assert!(JSON_COMMANDS.contains(&command));
         }
-        for command in ["session.list", "session.inspect"] {
+        for command in ["session.list", "session.inspect", "session.read"] {
             assert!(JSON_COMMANDS.contains(&command));
         }
         for feature in [
@@ -4274,11 +4409,16 @@ mod tests {
             "agent_authority_precedence",
             "opencode_lifecycle_plugin",
             "pi_lifecycle_extension",
+            "canonical_session_transcripts",
         ] {
             assert!(INTEGRATION_FEATURES.contains(&feature));
         }
-        assert_eq!(VALIDATED_OPENCODE_VERSION, "1.18.14");
-        assert_eq!(VALIDATED_PI_VERSION, "0.83.0");
+        assert_eq!(VALIDATED_OPENCODE_VERSION, "1.18.15");
+        assert_eq!(VALIDATED_PI_VERSION, "0.84.1");
+        assert_eq!(
+            session_transcript::supported_integrations(),
+            ["opencode", "pi"]
+        );
         assert_eq!(protocol::PROTOCOL_VERSION, 12);
     }
 
@@ -4395,6 +4535,7 @@ mod tests {
             "boomux shell close",
             "boomux session list",
             "boomux session inspect",
+            "boomux session read",
             "boomux skill install",
             "boomux opencode install",
             "boomux pi install",

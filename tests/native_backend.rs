@@ -1428,6 +1428,107 @@ fn agent_runtime_is_revisioned_durable_and_version_compatible() {
         shell_id
     );
 
+    let unsupported_read = daemon
+        .command()
+        .args(["session", "read", session_id, "--json"])
+        .output()
+        .unwrap();
+    assert!(!unsupported_read.status.success());
+    let unsupported_read: serde_json::Value =
+        serde_json::from_slice(&unsupported_read.stderr).unwrap();
+    assert_eq!(unsupported_read["command"], "session.read");
+    assert_eq!(unsupported_read["error"]["code"], "unsupported_integration");
+
+    let pi_ensure = daemon
+        .command()
+        .args([
+            "agent",
+            "ensure",
+            "pi-agent",
+            "--integration",
+            "pi",
+            "--external-session-id",
+            "pi-session",
+            "--shell-id",
+            &shell_id,
+            "--run-id",
+            &run_id,
+            "--state",
+            "idle",
+            "--authority",
+            "lifecycle-integration",
+            "--evidence",
+            "pi fixture",
+            "--confidence",
+            "100",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(pi_ensure.status.success());
+    let pi_directory = daemon.runtime_dir.join("pi-sessions");
+    fs::create_dir(&pi_directory).unwrap();
+    fs::write(
+        pi_directory.join("pi-session.jsonl"),
+        format!(
+            "{{\"type\":\"session\",\"version\":3,\"id\":\"pi-session\",\"cwd\":\"{}\"}}\n\
+             {{\"type\":\"message\",\"id\":\"user\",\"parentId\":null,\"timestamp\":\"x\",\"message\":{{\"role\":\"user\",\"content\":\"inspect this\",\"timestamp\":10}}}}\n\
+             {{\"type\":\"message\",\"id\":\"call\",\"parentId\":\"user\",\"timestamp\":\"x\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"toolCall\",\"id\":\"tc1\",\"name\":\"read\",\"arguments\":{{\"path\":\"README.md\"}}}}],\"timestamp\":11}}}}\n\
+             {{\"type\":\"message\",\"id\":\"result\",\"parentId\":\"call\",\"timestamp\":\"x\",\"message\":{{\"role\":\"toolResult\",\"toolCallId\":\"tc1\",\"toolName\":\"read\",\"content\":[{{\"type\":\"text\",\"text\":\"fixture output\"}}],\"isError\":false,\"timestamp\":12}}}}\n",
+            std::env::temp_dir().display()
+        ),
+    )
+    .unwrap();
+    let pi_sessions = daemon
+        .command()
+        .args(["session", "list", "--json"])
+        .output()
+        .unwrap();
+    let pi_sessions: serde_json::Value = serde_json::from_slice(&pi_sessions.stdout).unwrap();
+    let pi_session_id = pi_sessions["data"]["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["external_session_id"] == "pi-session")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+    let pi_read = daemon
+        .command()
+        .args([
+            "session",
+            "read",
+            pi_session_id,
+            "--limit",
+            "10",
+            "--max-bytes",
+            "4096",
+            "--json",
+        ])
+        .env("PI_CODING_AGENT_SESSION_DIR", &pi_directory)
+        .output()
+        .unwrap();
+    assert!(
+        pi_read.status.success(),
+        "{}",
+        String::from_utf8_lossy(&pi_read.stderr)
+    );
+    let pi_read: serde_json::Value = serde_json::from_slice(&pi_read.stdout).unwrap();
+    assert_eq!(pi_read["command"], "session.read");
+    assert_eq!(pi_read["data"]["transcript"]["total_entries"], 2);
+    assert_eq!(
+        pi_read["data"]["transcript"]["entries"][0]["text"],
+        "inspect this"
+    );
+    assert_eq!(
+        pi_read["data"]["transcript"]["entries"][1]["tool_name"],
+        "read"
+    );
+    assert_eq!(
+        pi_read["data"]["transcript"]["entries"][1]["output"],
+        "fixture output"
+    );
+
     let missing_session = daemon
         .command()
         .args(["session", "inspect", "session-1", "--json"])
@@ -2034,8 +2135,12 @@ fn native_daemon_lifecycle() {
     assert_eq!(capabilities["command"], "capabilities");
     assert_eq!(capabilities["data"]["daemon_protocol_version"], 12);
     assert_eq!(
+        capabilities["data"]["session_transcript_integrations"],
+        serde_json::json!(["opencode", "pi"])
+    );
+    assert_eq!(
         capabilities["data"]["integration_hosts"]["opencode"]["validated_version"],
-        "1.18.14"
+        "1.18.15"
     );
     assert_eq!(
         capabilities["data"]["integration_hosts"]["opencode"]["package"],
@@ -2043,7 +2148,7 @@ fn native_daemon_lifecycle() {
     );
     assert_eq!(
         capabilities["data"]["integration_hosts"]["pi"]["validated_version"],
-        "0.83.0"
+        "0.84.1"
     );
     assert_eq!(
         capabilities["data"]["integration_hosts"]["pi"]["package"],
