@@ -25,6 +25,8 @@ persistence across attachment disconnects, naming, grouping, and orchestration.
 
 `src/main.rs` owns the CLI, project-name suggestions, dashboard actions, shell
 name resolution, and conversion from daemon snapshots into TUI view models.
+`src/session_projection.rs` is the shared binary projection used by the CLI and
+dashboard to derive session history from one daemon snapshot.
 
 ### Protocol
 
@@ -146,6 +148,21 @@ dashboard presents an empty vector as `shell` and a non-empty vector as
 durable shell model. Command rows show the stored argv in their detail column.
 Agent presentation takes precedence when the current run has an active Agent or
 an exact `opencode` or `pi` foreground hint.
+
+Agent sessions are a client-side projection, not a sixth durable daemon
+identity. The projection groups stored Agent instances by workspace,
+integration, and external session ID, while isolating instances without an
+external ID. It retains original shell/run identity and observations even when a
+shell no longer exists. UUID v5 IDs use a fixed namespace and a versioned,
+length-prefixed encoding of workspace ID, integration, and the external-or-agent
+grouping identity. IDs are globally unique and deterministic but opaque to
+consumers. The dashboard maps retained shells to openable run views and may
+enrich labels asynchronously from bounded host catalogs; CLI descriptions remain
+the latest stored Agent registration name and do not invoke host adapters.
+
+Session list/inspect requires a negotiated protocol-12 snapshot because the
+projection depends on that complete Agent state model. It adds no protocol
+request, wire field, persistence record, event, or protocol-version bump.
 
 An active Agent instance bound to a shell's exact current run decorates that
 shell as an agent-shell row rather than adding a second item. The row retains

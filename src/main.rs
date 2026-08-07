@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::env;
 use std::error::Error;
 use std::fs;
@@ -26,6 +25,7 @@ mod git;
 mod host_session_titles;
 mod process_adapter;
 mod projects;
+mod session_projection;
 mod terminal;
 mod tui;
 
@@ -50,6 +50,8 @@ const JSON_COMMANDS: &[&str] = &[
     "agent.register",
     "agent.ensure",
     "agent.report",
+    "session.list",
+    "session.inspect",
     "daemon.status",
 ];
 const INTEGRATION_FEATURES: &[&str] = &[
@@ -73,6 +75,7 @@ const INTEGRATION_FEATURES: &[&str] = &[
     "opencode_lifecycle_plugin",
     "pi_lifecycle_extension",
     "process_adapters",
+    "projected_agent_sessions",
 ];
 const LEGACY_BOOMUX_SHELLS_SKILL: &str = r#"---
 name: boomux-shells
@@ -206,6 +209,11 @@ enum Commands {
     Agent {
         #[command(subcommand)]
         command: AgentCommands,
+    },
+    /// Discover projected agent sessions
+    Session {
+        #[command(subcommand)]
+        command: SessionCommands,
     },
     /// Manage the vendor-neutral Boomux Agent Skill
     Skill {
@@ -367,6 +375,18 @@ enum AgentCommands {
         #[arg(long, value_parser = clap::value_parser!(u8).range(0..=100))]
         confidence: u8,
     },
+}
+
+#[derive(Subcommand)]
+enum SessionCommands {
+    /// List projected agent sessions
+    List {
+        #[arg(long, value_name = "NAME_OR_ID")]
+        workspace: Option<String>,
+    },
+    /// Show a projected session by exact opaque ID
+    #[command(alias = "get")]
+    Inspect { session_id: String },
 }
 
 #[derive(Args)]
@@ -639,6 +659,7 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
             command: AgentCommands::Supervise(arguments),
         }) => return supervise_agent(arguments).map(CliExit::Child),
         Some(Commands::Agent { command }) => agent_command(command, cli.json),
+        Some(Commands::Session { command }) => session_command(command, cli.json),
         Some(Commands::Skill {
             command: SkillCommands::Install { force },
         }) => install_skill(force),
@@ -705,6 +726,12 @@ fn command_name(cli: &Cli) -> &'static str {
         Some(Commands::Agent {
             command: AgentCommands::Report { .. },
         }) => "agent.report",
+        Some(Commands::Session {
+            command: SessionCommands::List { .. },
+        }) => "session.list",
+        Some(Commands::Session {
+            command: SessionCommands::Inspect { .. },
+        }) => "session.inspect",
         Some(Commands::Daemon {
             command: DaemonCommands::Status,
         }) => "daemon.status",
@@ -747,6 +774,8 @@ fn supports_json(cli: &Cli) -> bool {
                 | AgentCommands::Report { .. }
         }) | Some(Commands::Daemon {
             command: DaemonCommands::Status
+        }) | Some(Commands::Session {
+            command: SessionCommands::List { .. } | SessionCommands::Inspect { .. }
         })
     )
 }
@@ -1051,126 +1080,33 @@ fn dashboard_views(
 }
 
 fn workspace_session_views(workspace: &WorkspaceSnapshot) -> Vec<tui::AgentSessionView> {
-    let shell_names: BTreeMap<_, _> = workspace
-        .shells
-        .iter()
-        .map(|shell| (shell.id.as_str(), shell.name.as_str()))
-        .collect();
-    let mut groups: BTreeMap<(String, String), Vec<&AgentInstanceSnapshot>> = BTreeMap::new();
-    for agent in &workspace.agents {
-        let key = match &agent.external_session_id {
-            Some(external_id) => (agent.integration.clone(), format!("external:{external_id}")),
-            None => (agent.integration.clone(), format!("instance:{}", agent.id)),
-        };
-        groups.entry(key).or_default().push(agent);
-    }
-
-    let mut sessions: Vec<_> = groups
+    session_projection::project_workspaces(std::slice::from_ref(workspace))
         .into_iter()
-        .map(|((integration, identity), mut agents)| {
-            agents.sort_by(|left, right| {
-                left.started_at_ms
-                    .cmp(&right.started_at_ms)
-                    .then_with(|| left.id.cmp(&right.id))
-            });
-            let first = agents[0];
-            let latest = agents
-                .iter()
-                .copied()
-                .max_by(|left, right| {
-                    left.observation
-                        .observed_at_ms
-                        .cmp(&right.observation.observed_at_ms)
-                        .then_with(|| left.started_at_ms.cmp(&right.started_at_ms))
-                        .then_with(|| left.id.cmp(&right.id))
-                })
-                .expect("session group is non-empty");
-            let active: Vec<_> = agents
-                .iter()
-                .copied()
-                .filter(|agent| {
-                    agent.workspace_id == workspace.id
-                        && agent.ended_at_ms.is_none()
-                        && !matches!(
-                            agent.observation.state,
-                            AgentState::Inactive | AgentState::Done
-                        )
-                        && workspace.shells.iter().any(|shell| {
-                            matches!(shell.status, ShellStatus::Running)
-                                && shell.id == agent.shell_id
-                                && shell.run.as_ref().is_some_and(|run| run.id == agent.run_id)
-                        })
-                })
-                .collect();
-            let (state_source, state_is_current) = if active.is_empty() {
-                (latest, false)
-            } else {
-                (
-                    active
-                        .into_iter()
-                        .min_by(|left, right| {
-                            agent_state_priority(left.observation.state)
-                                .cmp(&agent_state_priority(right.observation.state))
-                                .then_with(|| {
-                                    right
-                                        .observation
-                                        .observed_at_ms
-                                        .cmp(&left.observation.observed_at_ms)
-                                })
-                                .then_with(|| left.id.cmp(&right.id))
-                        })
-                        .expect("active session occurrence is non-empty"),
-                    true,
-                )
-            };
-            let last_at_ms = agents
-                .iter()
-                .map(|agent| {
-                    agent
-                        .ended_at_ms
-                        .unwrap_or(agent.observation.observed_at_ms)
-                        .max(agent.observation.observed_at_ms)
-                })
-                .max()
-                .unwrap_or(first.started_at_ms);
-            let runs = agents
+        .map(|session| {
+            let runs = session
+                .occurrences
                 .into_iter()
-                .map(|agent| tui::AgentSessionRunView {
-                    shell_id: workspace
-                        .shells
-                        .iter()
-                        .find(|shell| shell.id == agent.shell_id)
-                        .map(|shell| shell.id.clone()),
-                    shell_name: shell_names
-                        .get(agent.shell_id.as_str())
-                        .map(|name| (*name).into()),
-                    directory: workspace
-                        .shells
-                        .iter()
-                        .find(|shell| shell.id == agent.shell_id)
-                        .map(|shell| shell.cwd.clone()),
+                .map(|occurrence| tui::AgentSessionRunView {
+                    shell_id: occurrence
+                        .retained_shell_name
+                        .as_ref()
+                        .map(|_| occurrence.shell_id),
+                    shell_name: occurrence.retained_shell_name,
+                    directory: occurrence.retained_shell_cwd,
                 })
                 .collect();
-
             tui::AgentSessionView {
-                id: stable_session_id(&integration, &identity),
-                label: latest.name.clone(),
-                integration,
-                external_session_id: first.external_session_id.clone(),
-                state: cli_output::agent_state(state_source.observation.state).into(),
-                state_is_current,
-                last_at_ms,
+                id: session.id,
+                label: session.description,
+                integration: session.integration,
+                external_session_id: session.external_session_id,
+                state: cli_output::agent_state(session.state).into(),
+                state_is_current: session.state_is_current,
+                last_at_ms: session.last_at_ms,
                 runs,
             }
         })
-        .collect();
-    sessions.sort_by(|left, right| {
-        right
-            .last_at_ms
-            .cmp(&left.last_at_ms)
-            .then_with(|| left.id.cmp(&right.id))
-    });
-    sessions
+        .collect()
 }
 
 fn enrich_session_titles(
@@ -1204,25 +1140,6 @@ where
         if let Some(host_title) = title(&session.integration, directory, external_session_id) {
             session.label = host_title;
         }
-    }
-}
-
-fn stable_session_id(integration: &str, identity: &str) -> String {
-    format!(
-        "{}:{integration}:{}:{identity}",
-        integration.len(),
-        identity.len()
-    )
-}
-
-fn agent_state_priority(state: AgentState) -> u8 {
-    match state {
-        AgentState::Blocked => 0,
-        AgentState::Working => 1,
-        AgentState::Idle => 2,
-        AgentState::Inactive => 3,
-        AgentState::Done => 4,
-        AgentState::Unknown => 5,
     }
 }
 
@@ -1911,6 +1828,157 @@ fn agent_command(command: AgentCommands, json: bool) -> Result<(), Box<dyn Error
         }
     }
     Ok(())
+}
+
+fn session_command(command: SessionCommands, json: bool) -> Result<(), Box<dyn Error>> {
+    let client = client::connect_or_start()?;
+    validate_session_protocol(client.protocol_version()?)?;
+    let snapshot = client.snapshot()?;
+    let sessions = session_projection::project_snapshot(&snapshot);
+    match command {
+        SessionCommands::List { workspace } => {
+            let workspace_id = workspace
+                .as_deref()
+                .map(|target| resolve_workspace_target(&snapshot.workspaces, target))
+                .transpose()?
+                .map(|workspace| workspace.id.as_str());
+            let sessions = sessions
+                .iter()
+                .filter(|session| {
+                    workspace_id.is_none_or(|workspace_id| session.workspace_id == workspace_id)
+                })
+                .collect::<Vec<_>>();
+            if json {
+                let sessions = sessions
+                    .iter()
+                    .map(|session| cli_output::session_summary(session))
+                    .collect::<Vec<_>>();
+                return cli_output::print(
+                    "session.list",
+                    serde_json::json!({ "sessions": sessions }),
+                );
+            }
+            println!(
+                "WORKSPACE\tDESCRIPTION\tSESSION ID\tINTEGRATION\tSTATE\tLAST ACTIVITY MS\tOCCURRENCES"
+            );
+            for session in sessions {
+                println!(
+                    "{}\t{}\t{}\t{}\t{} ({})\t{}\t{}",
+                    session.workspace_name,
+                    session.description,
+                    session.id,
+                    session.integration,
+                    cli_output::agent_state(session.state),
+                    if session.state_is_current {
+                        "current"
+                    } else {
+                        "last-known"
+                    },
+                    session.last_at_ms,
+                    session.occurrences.len()
+                );
+            }
+        }
+        SessionCommands::Inspect { session_id } => {
+            let session = match session_projection::resolve_exact(&sessions, &session_id) {
+                Ok(session) => session,
+                Err(session_projection::ResolveError::NotFound) => {
+                    return Err(cli_output::failure(
+                        "not_found",
+                        format!("session not found: {session_id}"),
+                    ));
+                }
+                Err(session_projection::ResolveError::DuplicateId) => {
+                    return Err(cli_output::failure(
+                        "internal",
+                        format!("duplicate projected session ID: {session_id}"),
+                    ));
+                }
+            };
+            if json {
+                return cli_output::print(
+                    "session.inspect",
+                    serde_json::json!({ "session": cli_output::session(session) }),
+                );
+            }
+            print_session(session);
+        }
+    }
+    Ok(())
+}
+
+fn validate_session_protocol(negotiated: u32) -> Result<(), Box<dyn Error>> {
+    (negotiated >= 12).then_some(()).ok_or_else(|| {
+        cli_output::failure(
+            "unsupported_version",
+            format!("session projection requires daemon protocol 12; negotiated {negotiated}"),
+        )
+    })
+}
+
+fn print_session(session: &session_projection::SessionProjection) {
+    println!("ID\t{}", session.id);
+    println!("WORKSPACE ID\t{}", session.workspace_id);
+    println!("WORKSPACE\t{}", session.workspace_name);
+    println!("DESCRIPTION\t{}", session.description);
+    println!("INTEGRATION\t{}", session.integration);
+    println!(
+        "EXTERNAL SESSION ID\t{}",
+        session.external_session_id.as_deref().unwrap_or("-")
+    );
+    println!(
+        "STATE\t{} ({})",
+        cli_output::agent_state(session.state),
+        if session.state_is_current {
+            "current"
+        } else {
+            "last-known"
+        }
+    );
+    println!("STARTED AT MS\t{}", session.started_at_ms);
+    println!("LAST ACTIVITY MS\t{}", session.last_at_ms);
+    println!("OCCURRENCES\t{}", session.occurrences.len());
+    for (index, occurrence) in session.occurrences.iter().enumerate() {
+        println!();
+        println!("OCCURRENCE {}", index + 1);
+        println!("AGENT ID\t{}", occurrence.agent_id);
+        println!("SHELL ID\t{}", occurrence.shell_id);
+        println!(
+            "RETAINED SHELL NAME\t{}",
+            occurrence.retained_shell_name.as_deref().unwrap_or("-")
+        );
+        println!(
+            "RETAINED SHELL CWD\t{}",
+            occurrence
+                .retained_shell_cwd
+                .as_ref()
+                .map_or_else(|| "-".into(), |cwd| cwd.display().to_string())
+        );
+        println!("RUN ID\t{}", occurrence.run_id);
+        println!("STARTED AT MS\t{}", occurrence.started_at_ms);
+        println!(
+            "ENDED AT MS\t{}",
+            occurrence
+                .ended_at_ms
+                .map_or_else(|| "-".into(), |ended| ended.to_string())
+        );
+        println!("CURRENT\t{}", occurrence.is_current);
+        println!("OBSERVATION REVISION\t{}", occurrence.observation.revision);
+        println!(
+            "OBSERVATION STATE\t{}",
+            cli_output::agent_state(occurrence.observation.state)
+        );
+        println!(
+            "OBSERVATION AUTHORITY\t{}",
+            cli_output::agent_authority(occurrence.observation.authority)
+        );
+        println!("OBSERVATION EVIDENCE\t{}", occurrence.observation.evidence);
+        println!(
+            "OBSERVATION CONFIDENCE\t{}",
+            occurrence.observation.confidence
+        );
+        println!("OBSERVED AT MS\t{}", occurrence.observation.observed_at_ms);
+    }
 }
 
 fn supervise_agent(
@@ -3317,6 +3385,44 @@ mod tests {
     }
 
     #[test]
+    fn parses_session_discovery_commands_and_json_support() {
+        let list = Cli::try_parse_from([
+            "boomux",
+            "session",
+            "list",
+            "--workspace",
+            "project",
+            "--json",
+        ])
+        .unwrap();
+        assert_eq!(command_name(&list), "session.list");
+        assert!(supports_json(&list));
+        assert!(matches!(
+            list.command,
+            Some(Commands::Session {
+                command: SessionCommands::List {
+                    workspace: Some(workspace)
+                }
+            }) if workspace == "project"
+        ));
+
+        let inspect =
+            Cli::try_parse_from(["boomux", "session", "get", "opaque", "--json"]).unwrap();
+        assert_eq!(command_name(&inspect), "session.inspect");
+        assert!(supports_json(&inspect));
+    }
+
+    #[test]
+    fn session_commands_require_protocol_twelve() {
+        let error = validate_session_protocol(11).unwrap_err();
+        assert_eq!(
+            cli_output::classify_for_test("session.list", error.as_ref()),
+            "unsupported_version"
+        );
+        assert!(validate_session_protocol(12).is_ok());
+    }
+
+    #[test]
     fn agent_context_requires_nonempty_shell_and_run_ids() {
         assert_eq!(
             resolve_agent_context(
@@ -3468,10 +3574,7 @@ mod tests {
 
         assert_eq!(views[0].sessions.len(), 1);
         let session = &views[0].sessions[0];
-        assert_eq!(
-            session.id,
-            stable_session_id("opencode", "external:external-1")
-        );
+        assert!(Uuid::parse_str(&session.id).is_ok());
         assert_eq!(session.state, "blocked");
         assert!(session.state_is_current);
         assert_eq!(session.runs.len(), 2);
@@ -3622,24 +3725,7 @@ mod tests {
 
         assert_eq!(sessions[0].id, initial_id);
         assert_eq!(sessions[0].runs.len(), 2);
-        assert_eq!(
-            sessions[0].id,
-            stable_session_id("opencode", "external:external-1")
-        );
-    }
-
-    #[test]
-    fn workspace_session_state_priority_matches_attention_order() {
-        let states = [
-            AgentState::Blocked,
-            AgentState::Working,
-            AgentState::Idle,
-            AgentState::Inactive,
-            AgentState::Done,
-            AgentState::Unknown,
-        ];
-
-        assert_eq!(states.map(agent_state_priority), [0, 1, 2, 3, 4, 5]);
+        assert!(Uuid::parse_str(&sessions[0].id).is_ok());
     }
 
     #[test]
@@ -4177,6 +4263,9 @@ mod tests {
         for command in ["agent.register", "agent.ensure", "agent.report"] {
             assert!(JSON_COMMANDS.contains(&command));
         }
+        for command in ["session.list", "session.inspect"] {
+            assert!(JSON_COMMANDS.contains(&command));
+        }
         for feature in [
             "protocol_10",
             "protocol_12",
@@ -4304,6 +4393,8 @@ mod tests {
             "boomux shell inspect",
             "boomux shell rename",
             "boomux shell close",
+            "boomux session list",
+            "boomux session inspect",
             "boomux skill install",
             "boomux opencode install",
             "boomux pi install",

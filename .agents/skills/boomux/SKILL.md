@@ -1,10 +1,10 @@
 ---
 name: boomux
-description: Inspect and manage Boomux persistent terminal workspaces, launchers, shells, run-scoped agent instances, process supervision, and integrations. Use when asked to discover shells or agents, read terminal output, supervise an explicitly identified external session, report agent lifecycle state, install the OpenCode or Pi integration, create or open workspaces and shells, inspect status, rename or close targets, or manage the Boomux daemon.
+description: Inspect and manage Boomux persistent terminal workspaces, launchers, shells, run-scoped agent instances, projected sessions, process supervision, and integrations. Use when asked to discover shells, agents, or sessions, read terminal output, supervise an explicitly identified external session, report agent lifecycle state, install the OpenCode or Pi integration, create or open workspaces and shells, inspect status, rename or close targets, or manage the Boomux daemon.
 compatibility: Requires boomux on PATH. Some name operations require Boomux workspace context or an explicit --workspace; agent mutation and supervision require exact shell-run context, and supervision requires a caller-supplied canonical external session ID.
 metadata:
   author: boomux
-  version: "6"
+  version: "7"
 ---
 
 # Boomux
@@ -70,6 +70,22 @@ boomux agent inspect "<exact-agent-id>" --json
 Agent lookup is by exact agent ID. Never infer an agent ID or run ID from a
 name, shell status, terminal text, a recently seen row, or an external session
 ID.
+
+Discover projected session metadata with:
+
+```console
+boomux session list --json
+boomux session list --workspace "<workspace-name-or-id>" --json
+boomux session inspect "<exact-session-id>" --json
+```
+
+Use the exact opaque session ID returned by `session list`. Never guess or
+resolve it from an external session ID, description, shell ID, or Agent ID.
+Session state is marked current only when an occurrence is active on the current
+run of a running retained shell; otherwise it is last-known. `description` is
+the latest stored Boomux Agent registration name, not a host-enriched title.
+These commands expose metadata only; transcript and tool reading is not yet
+available.
 
 Exact shell IDs resolve globally. Shell names resolve in the current workspace,
 or through `--workspace` for `shell inspect`, `shell rename`, and `shell close`.

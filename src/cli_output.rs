@@ -5,9 +5,11 @@ use serde::Serialize;
 
 use boomux::client::RemoteError;
 use boomux::protocol::{
-    AgentAuthority, AgentInstanceSnapshot, AgentState, ErrorCode, ShellRunExitReason,
-    ShellSnapshot, ShellStatus, WorkspaceLauncherSnapshot,
+    AgentAuthority, AgentInstanceSnapshot, AgentObservationSnapshot, AgentState, ErrorCode,
+    ShellRunExitReason, ShellSnapshot, ShellStatus, WorkspaceLauncherSnapshot,
 };
+
+use crate::session_projection::{SessionOccurrence, SessionProjection};
 
 pub(crate) const SCHEMA: &str = "boomux.cli/v1";
 
@@ -116,6 +118,41 @@ pub(crate) struct AgentObservationData {
     observed_at_ms: u64,
 }
 
+#[derive(Serialize)]
+pub(crate) struct SessionSummaryData {
+    pub(crate) id: String,
+    pub(crate) workspace_id: String,
+    pub(crate) workspace_name: String,
+    pub(crate) description: String,
+    pub(crate) integration: String,
+    pub(crate) external_session_id: Option<String>,
+    pub(crate) state: &'static str,
+    pub(crate) state_is_current: bool,
+    pub(crate) started_at_ms: u64,
+    pub(crate) last_at_ms: u64,
+    pub(crate) occurrence_count: usize,
+}
+
+#[derive(Serialize)]
+pub(crate) struct SessionData {
+    #[serde(flatten)]
+    pub(crate) summary: SessionSummaryData,
+    pub(crate) occurrences: Vec<SessionOccurrenceData>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct SessionOccurrenceData {
+    pub(crate) agent_id: String,
+    pub(crate) shell_id: String,
+    pub(crate) retained_shell_name: Option<String>,
+    pub(crate) retained_shell_cwd: Option<String>,
+    pub(crate) run_id: String,
+    pub(crate) started_at_ms: u64,
+    pub(crate) ended_at_ms: Option<u64>,
+    pub(crate) is_current: bool,
+    pub(crate) observation: AgentObservationData,
+}
+
 pub(crate) fn print<T: Serialize>(command: &str, data: T) -> Result<(), Box<dyn Error>> {
     println!(
         "{}",
@@ -219,14 +256,58 @@ pub(crate) fn agent(agent: &AgentInstanceSnapshot, workspace_name: Option<&str>)
         external_session_id: agent.external_session_id.clone(),
         started_at_ms: agent.started_at_ms,
         ended_at_ms: agent.ended_at_ms,
-        observation: AgentObservationData {
-            revision: agent.observation.revision,
-            state: agent_state(agent.observation.state),
-            authority: agent_authority(agent.observation.authority),
-            evidence: agent.observation.evidence.clone(),
-            confidence: agent.observation.confidence,
-            observed_at_ms: agent.observation.observed_at_ms,
-        },
+        observation: agent_observation(&agent.observation),
+    }
+}
+
+pub(crate) fn session_summary(session: &SessionProjection) -> SessionSummaryData {
+    SessionSummaryData {
+        id: session.id.clone(),
+        workspace_id: session.workspace_id.clone(),
+        workspace_name: session.workspace_name.clone(),
+        description: session.description.clone(),
+        integration: session.integration.clone(),
+        external_session_id: session.external_session_id.clone(),
+        state: agent_state(session.state),
+        state_is_current: session.state_is_current,
+        started_at_ms: session.started_at_ms,
+        last_at_ms: session.last_at_ms,
+        occurrence_count: session.occurrences.len(),
+    }
+}
+
+pub(crate) fn session(session: &SessionProjection) -> SessionData {
+    SessionData {
+        summary: session_summary(session),
+        occurrences: session.occurrences.iter().map(session_occurrence).collect(),
+    }
+}
+
+fn session_occurrence(occurrence: &SessionOccurrence) -> SessionOccurrenceData {
+    SessionOccurrenceData {
+        agent_id: occurrence.agent_id.clone(),
+        shell_id: occurrence.shell_id.clone(),
+        retained_shell_name: occurrence.retained_shell_name.clone(),
+        retained_shell_cwd: occurrence
+            .retained_shell_cwd
+            .as_ref()
+            .map(|cwd| cwd.display().to_string()),
+        run_id: occurrence.run_id.clone(),
+        started_at_ms: occurrence.started_at_ms,
+        ended_at_ms: occurrence.ended_at_ms,
+        is_current: occurrence.is_current,
+        observation: agent_observation(&occurrence.observation),
+    }
+}
+
+fn agent_observation(observation: &AgentObservationSnapshot) -> AgentObservationData {
+    AgentObservationData {
+        revision: observation.revision,
+        state: agent_state(observation.state),
+        authority: agent_authority(observation.authority),
+        evidence: observation.evidence.clone(),
+        confidence: observation.confidence,
+        observed_at_ms: observation.observed_at_ms,
     }
 }
 
@@ -290,6 +371,11 @@ fn classify_error(command: &str, error: &(dyn Error + 'static)) -> &'static str 
     "internal"
 }
 
+#[cfg(test)]
+pub(crate) fn classify_for_test(command: &str, error: &(dyn Error + 'static)) -> &'static str {
+    classify_error(command, error)
+}
+
 fn protocol_error_code(code: ErrorCode) -> &'static str {
     match code {
         ErrorCode::InvalidArgument => "invalid_argument",
@@ -344,5 +430,47 @@ mod tests {
         assert_eq!(value["observation"]["state"], "working");
         assert_eq!(value["observation"]["authority"], "lifecycle_integration");
         assert_eq!(value["observation"]["confidence"], 95);
+    }
+
+    #[test]
+    fn session_json_uses_null_for_missing_optional_metadata() {
+        let data = session(&SessionProjection {
+            id: "projected-session".into(),
+            workspace_id: "w1".into(),
+            workspace_name: "project".into(),
+            integration: "plugin".into(),
+            external_session_id: None,
+            description: "Agent".into(),
+            state: AgentState::Inactive,
+            state_is_current: false,
+            started_at_ms: 10,
+            last_at_ms: 11,
+            occurrences: vec![SessionOccurrence {
+                agent_id: "a1".into(),
+                shell_id: "removed-shell".into(),
+                run_id: "r1".into(),
+                started_at_ms: 10,
+                ended_at_ms: None,
+                observation: AgentObservationSnapshot {
+                    revision: 2,
+                    state: AgentState::Inactive,
+                    authority: AgentAuthority::DaemonLifecycle,
+                    evidence: "shell exited".into(),
+                    confidence: 100,
+                    observed_at_ms: 11,
+                },
+                is_current: false,
+                retained_shell_name: None,
+                retained_shell_cwd: None,
+            }],
+        });
+
+        let value = serde_json::to_value(data).unwrap();
+        assert!(value["external_session_id"].is_null());
+        assert!(value["occurrences"][0]["retained_shell_name"].is_null());
+        assert!(value["occurrences"][0]["retained_shell_cwd"].is_null());
+        assert!(value["occurrences"][0]["ended_at_ms"].is_null());
+        assert_eq!(value["occurrences"][0]["shell_id"], "removed-shell");
+        assert_eq!(value["occurrences"][0]["observation"]["state"], "inactive");
     }
 }
