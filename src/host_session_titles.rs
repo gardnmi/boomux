@@ -16,6 +16,8 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_OPENCODE_STDOUT_BYTES: u64 = 1024 * 1024;
 const MAX_PI_FILE_BYTES: u64 = 256 * 1024;
 const MAX_PI_CATALOG_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_PI_TRANSCRIPT_SCAN_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_PI_TRANSCRIPT_SCAN_FILES: usize = 4096;
 const MAX_SESSIONS: usize = 100;
 const MAX_TITLE_CHARS: usize = 160;
 
@@ -217,14 +219,14 @@ fn parse_opencode_titles(output: &[u8]) -> Option<Titles> {
 }
 
 #[derive(Clone, Debug, Default)]
-struct PiEnvironment {
+pub(crate) struct PiEnvironment {
     coding_agent_dir: Option<OsString>,
     session_dir: Option<OsString>,
     home: Option<OsString>,
 }
 
 impl PiEnvironment {
-    fn from_process() -> Self {
+    pub(crate) fn from_process() -> Self {
         Self {
             coding_agent_dir: std::env::var_os("PI_CODING_AGENT_DIR"),
             session_dir: std::env::var_os("PI_CODING_AGENT_SESSION_DIR"),
@@ -256,7 +258,10 @@ fn inspect_pi(directory: &Path, environment: &PiEnvironment) -> Option<Titles> {
     Some(titles)
 }
 
-fn pi_session_directory(directory: &Path, environment: &PiEnvironment) -> Option<PathBuf> {
+pub(crate) fn pi_session_directory(
+    directory: &Path,
+    environment: &PiEnvironment,
+) -> Option<PathBuf> {
     if let Some(session_directory) = nonempty(environment.session_dir.as_ref()) {
         return expand_home(session_directory, environment.home.as_ref());
     }
@@ -299,7 +304,7 @@ fn pi_encoded_session_directory(directory: &Path) -> String {
     format!("--{encoded}--")
 }
 
-fn normalize_absolute(path: &Path) -> Option<PathBuf> {
+pub(crate) fn normalize_absolute(path: &Path) -> Option<PathBuf> {
     if !path.is_absolute() {
         return None;
     }
@@ -342,6 +347,89 @@ fn pi_catalog_files(directory: &Path) -> Option<Vec<PathBuf>> {
     });
     files.truncate(MAX_SESSIONS);
     Some(files.into_iter().map(|(path, _)| path).collect())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PiSessionFileError {
+    Unavailable,
+    ScanLimit,
+}
+
+pub(crate) fn pi_session_file(
+    directory: &Path,
+    external_session_id: &str,
+    environment: &PiEnvironment,
+) -> Result<PathBuf, PiSessionFileError> {
+    let normalized_directory =
+        normalize_absolute(directory).ok_or(PiSessionFileError::Unavailable)?;
+    let catalog_directory = pi_session_directory(&normalized_directory, environment)
+        .ok_or(PiSessionFileError::Unavailable)?;
+    let mut remaining_bytes = MAX_PI_TRANSCRIPT_SCAN_BYTES;
+    let mut remaining_files = MAX_PI_TRANSCRIPT_SCAN_FILES;
+    for filename_match in [true, false] {
+        let entries =
+            fs::read_dir(&catalog_directory).map_err(|_| PiSessionFileError::Unavailable)?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if pi_session_filename_matches(&path, external_session_id) != filename_match
+                || path
+                    .extension()
+                    .is_none_or(|extension| extension != "jsonl")
+                || !fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_file())
+            {
+                continue;
+            }
+            if remaining_bytes == 0 || remaining_files == 0 {
+                return Err(PiSessionFileError::ScanLimit);
+            }
+            remaining_files -= 1;
+            let Some(prefix) =
+                read_regular_file_prefix(&path, remaining_bytes.min(MAX_PI_FILE_BYTES))
+            else {
+                continue;
+            };
+            remaining_bytes = remaining_bytes.saturating_sub(prefix.scanned_bytes);
+            if pi_header_matches(&prefix.bytes, external_session_id, &normalized_directory) {
+                return Ok(path);
+            }
+        }
+    }
+    Err(PiSessionFileError::Unavailable)
+}
+
+fn pi_header_matches(output: &[u8], external_session_id: &str, directory: &Path) -> bool {
+    let Some(header) = output
+        .split(|byte| *byte == b'\n')
+        .filter_map(|line| serde_json::from_slice::<serde_json::Value>(line).ok())
+        .next()
+    else {
+        return false;
+    };
+    header.get("type").and_then(serde_json::Value::as_str) == Some("session")
+        && header.get("id").and_then(serde_json::Value::as_str) == Some(external_session_id)
+        && header
+            .get("cwd")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|cwd| normalize_absolute(Path::new(cwd)))
+            .is_some_and(|cwd| cwd == directory)
+}
+
+fn pi_session_filename_matches(path: &Path, external_session_id: &str) -> bool {
+    if external_session_id.is_empty()
+        || path
+            .extension()
+            .is_none_or(|extension| extension != "jsonl")
+    {
+        return false;
+    }
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| {
+            stem == external_session_id
+                || stem
+                    .strip_suffix(external_session_id)
+                    .is_some_and(|prefix| prefix.ends_with('_'))
+        })
 }
 
 struct FilePrefix {
@@ -771,6 +859,40 @@ mod tests {
         assert_eq!(titles.len(), MAX_SESSIONS);
         assert!(titles.contains_key("pi-100"));
         assert!(!titles.contains_key("pi-000"));
+    }
+
+    #[test]
+    fn exact_pi_file_lookup_is_not_limited_to_the_newest_catalog_entries() {
+        let test = TestDirectory::new();
+        let exact = test.write(
+            "2026-01-01_external.jsonl",
+            &format!("{}\n", pi_header("external", "/repo")),
+        );
+        for index in 0..MAX_SESSIONS + 1 {
+            test.write(
+                &format!("2026-02-{index:03}_other-{index}.jsonl"),
+                &format!("{}\n", pi_header(&format!("other-{index}"), "/repo")),
+            );
+        }
+
+        assert_eq!(
+            pi_session_file(Path::new("/repo"), "external", &test.environment()),
+            Ok(exact)
+        );
+    }
+
+    #[test]
+    fn exact_pi_file_lookup_accepts_noncanonical_filenames_by_header_identity() {
+        let test = TestDirectory::new();
+        let exact = test.write(
+            "custom.jsonl",
+            &format!("{}\n", pi_header("external", "/repo")),
+        );
+
+        assert_eq!(
+            pi_session_file(Path::new("/repo"), "external", &test.environment()),
+            Ok(exact)
+        );
     }
 
     #[test]

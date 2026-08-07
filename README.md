@@ -150,6 +150,7 @@ boomux agent supervise <name> --integration <integration> --external-session-id 
 boomux agent report <agent-id> [--shell-id <shell-id>] [--run-id <run-id>] --state <state> --authority <authority> --evidence <evidence> --confidence <0-100>
 boomux session list [--workspace <name-or-id>]
 boomux session inspect <session-id>
+boomux session read <session-id> [--limit <entries>] [--max-bytes <bytes>]
 boomux daemon status
 boomux daemon restart
 boomux daemon stop
@@ -224,10 +225,22 @@ registration name. The dashboard may separately enrich its display title from
 bounded host catalogs; the CLI never synchronously calls those adapters.
 
 Projected session IDs are deterministic, globally unique UUIDs, but are opaque.
-Obtain an ID from `session list` and pass that exact value to `session inspect`;
+Obtain an ID from `session list` and pass that exact value to `session inspect`
+or `session read`;
 never guess one from an external session ID, description, shell, or Agent ID.
 Session projection is client-side metadata over daemon protocol 12 snapshots,
 not another persisted daemon entity.
+
+`session read` loads canonical host data for OpenCode and Pi, never terminal
+scrollback. It returns the newest bounded suffix of messages, reasoning, and tool
+activity in chronological order. Pi reads only the current leaf branch and
+combines tool calls with their results. Boomux does not redact host content;
+`--limit` and `--max-bytes` explicitly bound the response and report truncation.
+Transcript hosts are registered behind one adapter contract, so future harnesses
+such as Claude Code or Codex can supply canonical lookup and normalization while
+reusing exact Boomux identity, bounds, errors, and output semantics. Discover the
+currently bundled adapters through `session_transcript_integrations` in
+`boomux capabilities --json`.
 
 The first explicit process-adapter supervisor runs one exact argument vector:
 
@@ -258,7 +271,7 @@ understands cursor rewrites and terminal soft wrapping, retains up to 2,000
 scrollback rows per shell, and never returns ANSI control sequences.
 
 Read-only integration commands, including `agent list`, `agent inspect`,
-`session list`, and `session inspect`, accept `--json` and emit the stable
+`session list`, `session inspect`, and `session read` accept `--json` and emit the stable
 `boomux.cli/v1` envelope. Run `boomux capabilities --json` to discover supported
 commands, features, and typed error codes without starting the daemon. See
 [`docs/cli-json.md`](docs/cli-json.md) for the contract.
@@ -343,8 +356,8 @@ Boomux currently validates its bundled integrations against these host releases:
 
 | Integration | Package | Validated version |
 | --- | --- | --- |
-| OpenCode | `opencode-ai` | `1.18.14` |
-| Pi | `@earendil-works/pi-coding-agent` | `0.83.0` |
+| OpenCode | `opencode-ai` | `1.18.15` |
+| Pi | `@earendil-works/pi-coding-agent` | `0.84.1` |
 
 These versions are compatibility test points, not runtime pins. Older or newer
 releases may work when their plugin APIs remain compatible, but are not claimed

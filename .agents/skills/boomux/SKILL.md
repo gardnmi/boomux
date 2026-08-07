@@ -77,6 +77,7 @@ Discover projected session metadata with:
 boomux session list --json
 boomux session list --workspace "<workspace-name-or-id>" --json
 boomux session inspect "<exact-session-id>" --json
+boomux session read "<exact-session-id>" --limit 100 --max-bytes 1048576 --json
 ```
 
 Use the exact opaque session ID returned by `session list`. Never guess or
@@ -84,8 +85,12 @@ resolve it from an external session ID, description, shell ID, or Agent ID.
 Session state is marked current only when an occurrence is active on the current
 run of a running retained shell; otherwise it is last-known. `description` is
 the latest stored Boomux Agent registration name, not a host-enriched title.
-These commands expose metadata only; transcript and tool reading is not yet
-available.
+`session read` returns the newest bounded suffix of canonical OpenCode or Pi
+messages, reasoning, and tool activity, not terminal scrollback. Pi results
+follow its active branch. Inspect `truncated`, `truncated_by`, and per-entry
+`truncated` before deciding whether to request larger bounds. Boomux does not
+redact host content, so use it only when the user's request authorizes reading
+that exact session.
 
 Exact shell IDs resolve globally. Shell names resolve in the current workspace,
 or through `--workspace` for `shell inspect`, `shell rename`, and `shell close`.
@@ -311,7 +316,7 @@ replace different existing content. The installer removes an untouched legacy
 
 ## Install The OpenCode Integration
 
-The bundled plugin is validated against `opencode-ai` `1.18.14`; this is a
+The bundled plugin is validated against `opencode-ai` `1.18.15`; this is a
 compatibility test point rather than a runtime pin.
 
 ```console
@@ -337,7 +342,7 @@ completion. Unmanaged or unavailable Boomux is fail-open. If Boomux returns
 ## Install The Pi Integration
 
 The bundled extension is validated against
-`@earendil-works/pi-coding-agent` `0.83.0`; this is a compatibility test point
+`@earendil-works/pi-coding-agent` `0.84.1`; this is a compatibility test point
 rather than a runtime pin.
 
 ```console

@@ -23,6 +23,8 @@ the CLI version, daemon protocol version, supported JSON schemas and commands,
 stable error codes, feature names, and the package and validated version for
 each bundled integration host under `integration_hosts`. Validated versions are
 compatibility test points, not runtime pins or minimum-version guarantees.
+`session_transcript_integrations` lists the integration keys with registered
+canonical transcript adapters.
 
 The following commands support `--json`:
 
@@ -43,6 +45,7 @@ The following commands support `--json`:
 - `boomux agent report`
 - `boomux session list`
 - `boomux session inspect`
+- `boomux session read`
 - `boomux daemon status`
 
 JSON mutations are deliberately narrow: only `agent register`, `agent ensure`,
@@ -70,6 +73,8 @@ Command payloads are:
 - `session.list`: a globally newest-first `sessions` array, optionally limited
   by exact workspace name or ID.
 - `session.inspect`: one projected `session` object selected only by exact
+  opaque session ID.
+- `session.read`: one bounded canonical `transcript` selected only by exact
   opaque session ID.
 - `read`: shell/run identity, observed output revision, and rendered output.
 - `events`: stream identity, reconnect cursor, optional baseline snapshot, and a
@@ -144,9 +149,32 @@ versioned, length-prefixed encoding of workspace ID, integration, and grouping
 identity (`external:<id>` or `instance:<agent-id>`). This algorithm is frozen to
 keep emitted IDs stable, not exposed for callers to reproduce or guess. Only an
 exact ID returned by `session.list` resolves; external IDs, descriptions, shell
-IDs, and Agent IDs never resolve through `session.inspect`. Both session commands
-require a negotiated daemon protocol of at least 12 and return
+IDs, and Agent IDs never resolve through `session.inspect` or `session.read`.
+All session commands require a negotiated daemon protocol of at least 12 and return
 `unsupported_version` before projection against an older daemon.
+
+`session.read` supports OpenCode and Pi sessions with a canonical external
+session ID and a retained working directory. It reads OpenCode's export and Pi's
+project JSONL rather than terminal scrollback. Pi projection follows the current
+leaf parent chain and excludes abandoned branches. Tool-result messages are
+combined with their tool calls.
+
+The transcript contains `session_id`, `integration`, `external_session_id`,
+`entries`, `returned_entries`, `total_entries`, `content_bytes`, `truncated`, and
+`truncated_by`. Entries are a newest suffix returned in chronological order.
+Their `type` is `message`, `reasoning`, or `tool`; common fields are `source_id`,
+`timestamp_ms`, and `truncated`. Message and reasoning entries add `role` and
+`text`. Tool entries add `tool_name`, `tool_call_id`, `status`, `input`, and
+`output`; input is compact host JSON encoded as a string. Inapplicable fields are
+omitted except `source_id` and `timestamp_ms`, which are JSON `null` when the host
+does not provide them.
+
+`--limit` defaults to 100 and accepts 1 through 1,000 entries. `--max-bytes`
+defaults to 1 MiB and accepts 1 byte through 4 MiB. `content_bytes` counts UTF-8
+bytes in returned text, input, and output fields. `truncated_by` contains `limit`
+and/or `max_bytes`; a partially clipped entry also has `truncated: true`. Boomux
+does not redact canonical host content. Raw host source inspection is separately
+capped at 16 MiB.
 
 `read` returns `shell_id`, `run_id`, `output_revision`, `changed`, `status`, and
 `output`. Output is a JSON string containing the same bounded plain rendered text

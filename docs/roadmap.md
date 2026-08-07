@@ -113,20 +113,23 @@ eternal process.
    transitions without polling human output.
 4. Add deduplicated notifications for blocked and completed transitions after
    the attention and wait semantics are established.
-5. Add explicit cross-harness transcript and tool inspection so Pi can read an OpenCode
+5. [Complete] Add explicit cross-harness transcript and tool inspection so Pi can read an OpenCode
    session and OpenCode can read a Pi session. Do not treat bounded rendered
    terminal output as the full session: host adapters must expose canonical
-   session identity, bounded and redacted messages and tool activity, versioned
-   capabilities, and an explicit access policy.
+   session identity, bounded messages and tool activity, versioned
+   capabilities, and an explicit access policy. Boomux trusts the harness as the
+   content boundary and does not apply another redaction pass. Host-specific
+   canonical lookup and normalization live behind a shared adapter registry so
+   future Claude Code, Codex, and other harness support reuses the same identity,
+   bounds, errors, and output contract.
 6. [Complete] Add contextual, categorized Agent Session browsing to selected agent rows in
    the Boomux UI. Keep inactive and completed workspace sessions visible without
    adding duplicate shell rows, grouped by active and recent time windows with
    integration, canonical identity, associated shell and run, lifecycle state,
    and timestamps. Bounded asynchronous host catalog adapters provide OpenCode
    generated titles and Pi names or first-user-message summaries; future adapters
-   may provide transcripts and tool activity. Session metadata discovery is
-   exposed through versioned CLI commands; transcript and tool reading remains
-   future work.
+    also provide canonical transcripts and tool activity through bounded,
+    versioned CLI output.
 
 ### Deferred Agent Work
 

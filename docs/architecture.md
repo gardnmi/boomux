@@ -278,7 +278,7 @@ the stronger lifecycle evidence described below.
 
 ### OpenCode Lifecycle Plugin
 
-The bundled plugin is validated against `opencode-ai` `1.18.14`. This is a
+The bundled plugin is validated against `opencode-ai` `1.18.15`. This is a
 compatibility test point rather than a runtime version pin.
 
 `integrations/opencode/boomux.js` is a config-time OpenCode plugin installed by
@@ -310,7 +310,7 @@ Boomux or ancestry failures are rate-limited and fail open so OpenCode continues
 ### Pi Lifecycle Extension
 
 The bundled extension is validated against
-`@earendil-works/pi-coding-agent` `0.83.0`. This is a compatibility test point
+`@earendil-works/pi-coding-agent` `0.84.1`. This is a compatibility test point
 rather than a runtime version pin.
 
 `integrations/pi/boomux.js` is a global Pi extension installed by
@@ -333,6 +333,33 @@ agent ID and ensure the new canonical session identity. Reports are serialized,
 use exact argument vectors and bounded JSON output, and fail open with
 rate-limited diagnostics. Session shutdown makes one bounded retry so a
 transient reporting failure is less likely to leave the old session active.
+
+### Canonical Session Transcripts
+
+`boomux session read` resolves only an exact projected session ID, then uses the
+canonical external ID and a retained occurrence working directory to invoke the
+matching host adapter. OpenCode is read through `opencode export`; Pi is read
+from its project-scoped JSONL file with no-follow regular-file checks. Pi's
+append-only tree is reduced to the latest leaf's parent chain so abandoned
+branches are not presented as the active transcript.
+
+Adapters normalize host text, reasoning, tool calls, inputs, results, status,
+source identity, and timestamps. Boomux does not redact this content because
+the harness is the content trust boundary. Reads remain explicit and bounded:
+the CLI returns a newest chronological suffix with entry and UTF-8 content-byte
+limits, marks partial entries and truncation causes, caps canonical source input
+at 16 MiB, and times out OpenCode export. Unsupported hosts and unavailable,
+invalid, or oversized sources return stable typed errors.
+
+The transcript layer is an adapter registry keyed by the Agent integration
+name. An adapter receives only the canonical external session ID and retained
+working directory and returns host-neutral transcript entries. Exact projected
+session resolution, access preconditions, newest-suffix selection, byte and
+entry bounds, truncation, typed errors, human output, and `boomux.cli/v1` JSON
+remain shared. Adding Claude Code, Codex, or another harness therefore requires
+one canonical source adapter and one registry entry, not another CLI path.
+`boomux capabilities --json` derives `session_transcript_integrations` from this
+registry so integrations can discover support without hard-coded host lists.
 
 Protocol 12 adds `inactive`. Protocol-9 through protocol-11 clients receive that
 observation as `unknown`, while protocol-12 clients can distinguish a resumable
