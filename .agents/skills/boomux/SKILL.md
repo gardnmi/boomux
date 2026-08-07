@@ -65,11 +65,18 @@ Discover and inspect durable agent instances with:
 boomux agent list --json
 boomux agent list --workspace "<workspace-name-or-id>" --json
 boomux agent inspect "<exact-agent-id>" --json
+boomux agent wait "<exact-agent-id>" --after-revision <revision> --wait-ms 30000 --json
 ```
 
 Agent lookup is by exact agent ID. Never infer an agent ID or run ID from a
 name, shell status, terminal text, a recently seen row, or an external session
 ID.
+
+Use `agent wait` after inspecting an exact Agent and retaining its observation
+revision. If `changed` is false, repeat with the same revision; if true, retain
+the returned newer revision. `revision_ahead` means the caller's context is
+invalid and must be reacquired. `daemon_stopping` means reconnect and retry.
+Duplicate or lower-authority reports do not satisfy a wait.
 
 Discover projected session metadata with:
 
@@ -144,7 +151,7 @@ while conflicting later reports are rejected.
 
 If `register`, `ensure`, or `report` returns `run_changed`, stop reporting for that
 instance and reacquire exact lifecycle context. Do not guess the replacement
-run. Boomux does not yet provide terminal heuristics, agent wait/read commands,
+run. Boomux does not yet provide terminal heuristics, agent read commands,
 notifications, or control.
 
 ## Supervise An Explicit Process

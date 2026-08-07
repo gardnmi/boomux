@@ -144,6 +144,7 @@ boomux launcher rename <launcher-name-or-id> <new-name> [--workspace <name-or-id
 boomux launcher remove <launcher-name-or-id> [--workspace <name-or-id>]
 boomux agent list [--workspace <name-or-id>]
 boomux agent inspect <agent-id>
+boomux agent wait <agent-id> --after-revision <revision> [--wait-ms <milliseconds>]
 boomux agent register <name> --integration <integration> [--external-session-id <id>] [--shell-id <shell-id>] [--run-id <run-id>] --state <state> --authority <authority> --evidence <evidence> --confidence <0-100>
 boomux agent ensure <name> --integration <integration> --external-session-id <id> [--shell-id <shell-id>] [--run-id <run-id>] --state <state> --authority <authority> --evidence <evidence> --confidence <0-100>
 boomux agent supervise <name> --integration <integration> --external-session-id <canonical-root-id> [--shell-id <shell-id>] [--run-id <run-id>] -- <command>...
@@ -212,8 +213,10 @@ its revision. `daemon-lifecycle` exists in snapshots but is reserved for daemon
 observations and cannot be supplied to public mutation commands. A `done` report
 completes the instance permanently. Retrying the exact completion is an
 idempotent success; a different later report is rejected. Completed instances
-remain inspectable across daemon restart. Boomux does not yet provide terminal
-heuristics, agent waits, agent reads, or agent control.
+remain inspectable across daemon restart. Protocol 14 adds `agent wait`: callers
+supply the last observed revision and can block until a newer durable observation
+is accepted without polling. Boomux does not yet provide terminal heuristics,
+agent reads, or agent control.
 
 `boomux session list` and `boomux session inspect` project durable Agent
 instances into workspace session history. Instances are grouped within one

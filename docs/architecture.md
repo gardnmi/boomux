@@ -395,6 +395,15 @@ session that is not currently active from permanent `done` completion. Protocol
 13 adds durable Agent working-directory context; older clients receive Agent
 snapshots without that additive field.
 
+Protocol 14 adds an exact revision-conditional Agent read. `agent wait` holds the
+event coordination boundary while sampling the durable Agent observation, then
+uses the event condition variable only as a wake-up signal. Accepted reports are
+persisted before publication, so a waiter sees either the old revision or the
+complete committed replacement. Unrelated events cause harmless rechecks;
+duplicate and lower-authority reports do not advance the revision. Waiters are
+not persisted and reconnect with the same durable revision after daemon
+replacement.
+
 ### Transition Coordinator
 
 The daemon serializes observable runtime transitions through one coordinator. A

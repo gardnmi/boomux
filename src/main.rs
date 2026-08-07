@@ -51,6 +51,7 @@ const JSON_COMMANDS: &[&str] = &[
     "agent.register",
     "agent.ensure",
     "agent.report",
+    "agent.wait",
     "session.list",
     "session.inspect",
     "session.read",
@@ -71,6 +72,7 @@ const INTEGRATION_FEATURES: &[&str] = &[
     "protocol_11",
     "protocol_12",
     "protocol_13",
+    "protocol_14",
     "restartable_exited_shells",
     "inactive_agent_state",
     "idempotent_agent_ensure",
@@ -81,6 +83,7 @@ const INTEGRATION_FEATURES: &[&str] = &[
     "projected_agent_sessions",
     "canonical_session_transcripts",
     "durable_session_source_context",
+    "revision_aware_agent_wait",
 ];
 const LEGACY_BOOMUX_SHELLS_SKILL: &str = r#"---
 name: boomux-shells
@@ -358,6 +361,14 @@ enum AgentCommands {
     /// Show an agent instance by exact ID
     #[command(alias = "get")]
     Inspect { agent_id: String },
+    /// Wait for an exact Agent observation revision to advance
+    Wait {
+        agent_id: String,
+        #[arg(long)]
+        after_revision: u64,
+        #[arg(long, default_value_t = 30_000)]
+        wait_ms: u32,
+    },
     /// Register an agent instance for a shell run
     Register(AgentRegistrationArgs),
     /// Ensure an idempotent agent instance for a shell run
@@ -728,6 +739,9 @@ fn command_name(cli: &Cli) -> &'static str {
             command: AgentCommands::Inspect { .. },
         }) => "agent.inspect",
         Some(Commands::Agent {
+            command: AgentCommands::Wait { .. },
+        }) => "agent.wait",
+        Some(Commands::Agent {
             command: AgentCommands::Register(..),
         }) => "agent.register",
         Some(Commands::Agent {
@@ -785,6 +799,7 @@ fn supports_json(cli: &Cli) -> bool {
         }) | Some(Commands::Agent {
             command: AgentCommands::List { .. }
                 | AgentCommands::Inspect { .. }
+                | AgentCommands::Wait { .. }
                 | AgentCommands::Register(..)
                 | AgentCommands::Ensure(..)
                 | AgentCommands::Report { .. }
@@ -1792,6 +1807,29 @@ fn agent_command(command: AgentCommands, json: bool) -> Result<(), Box<dyn Error
                 );
             }
             print_agent(&agent, &workspace.name);
+        }
+        AgentCommands::Wait {
+            agent_id,
+            after_revision,
+            wait_ms,
+        } => {
+            let waited = client.wait_agent(agent_id, after_revision, wait_ms)?;
+            if json {
+                return cli_output::print(
+                    "agent.wait",
+                    serde_json::json!({
+                        "changed": waited.changed,
+                        "agent": cli_output::agent(&waited.agent, None),
+                    }),
+                );
+            }
+            println!("CHANGED\t{}", waited.changed);
+            println!("ID\t{}", waited.agent.id);
+            println!(
+                "STATE\t{}",
+                cli_output::agent_state(waited.agent.observation.state)
+            );
+            println!("REVISION\t{}", waited.agent.observation.revision);
         }
         AgentCommands::Register(arguments) => {
             register_or_ensure_agent(&client, arguments, json, false)?;
@@ -3377,6 +3415,30 @@ mod tests {
         let cli = Cli::try_parse_from([
             "boomux",
             "agent",
+            "wait",
+            "a1",
+            "--after-revision",
+            "3",
+            "--wait-ms",
+            "5000",
+            "--json",
+        ])
+        .unwrap();
+        assert_eq!(command_name(&cli), "agent.wait");
+        assert!(supports_json(&cli));
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Agent {
+                command: AgentCommands::Wait {
+                    agent_id,
+                    after_revision: 3,
+                    wait_ms: 5000,
+                }
+            }) if agent_id == "a1"
+        ));
+        let cli = Cli::try_parse_from([
+            "boomux",
+            "agent",
             "report",
             "a1",
             "--state",
@@ -4405,7 +4467,12 @@ mod tests {
 
     #[test]
     fn capabilities_advertise_phase_two_agent_integration_surface() {
-        for command in ["agent.register", "agent.ensure", "agent.report"] {
+        for command in [
+            "agent.register",
+            "agent.ensure",
+            "agent.report",
+            "agent.wait",
+        ] {
             assert!(JSON_COMMANDS.contains(&command));
         }
         for command in ["session.list", "session.inspect", "session.read"] {
@@ -4429,7 +4496,7 @@ mod tests {
             session_transcript::supported_integrations(),
             ["opencode", "pi"]
         );
-        assert_eq!(protocol::PROTOCOL_VERSION, 13);
+        assert_eq!(protocol::PROTOCOL_VERSION, 14);
     }
 
     #[test]

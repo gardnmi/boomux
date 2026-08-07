@@ -9,7 +9,15 @@ explicit exited-shell restart; the subsequent attachment emits the existing
 `inactive` Agent observations; older Agent-capable clients receive them as
 `unknown`. Protocol 13 adds the registration-time Agent working directory to
 snapshots and Agent events; protocol-12 clients receive the same records without
-that additive source context.
+that additive source context. Protocol 14 adds revision-conditional Agent reads
+that reuse the event condition variable for wakeups without consuming or
+depending on the retained global event cursor.
+
+`boomux agent wait <id> --after-revision <revision>` is the preferred way to
+await one Agent. It returns on a newer accepted durable observation, returns
+unchanged on timeout, rejects future revisions, and wakes with
+`daemon_stopping` during replacement. Callers reconnect and repeat with the same
+revision; no waiter state is persisted.
 
 ## Cursors
 

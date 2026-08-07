@@ -40,6 +40,7 @@ The following commands support `--json`:
 - `boomux launcher inspect`
 - `boomux agent list`
 - `boomux agent inspect`
+- `boomux agent wait`
 - `boomux agent register`
 - `boomux agent ensure`
 - `boomux agent report`
@@ -68,6 +69,8 @@ Command payloads are:
 - `launcher.inspect`: one `launcher` object.
 - `agent.list`: an `agents` array, optionally limited by `--workspace`.
 - `agent.inspect`: one `agent` object selected by exact agent ID.
+- `agent.wait`: `changed` plus one exact `agent` object after a revision-aware
+  conditional read.
 - `agent.register`, `agent.ensure`, and `agent.report`: one resulting `agent`
   object. The command field identifies the specific mutation.
 - `session.list`: a globally newest-first `sessions` array, optionally limited
@@ -120,6 +123,16 @@ already identifies a unique record, ensure returns the stored snapshot without
 applying the supplied name or report. This is the intended identity-recovery
 path after an integration reload. Otherwise it creates the record with the same
 shape and validation as `agent.register`.
+
+`agent.wait` requires protocol 14, an exact Agent ID, and
+`--after-revision`. A current revision greater than the supplied revision returns
+immediately with `changed: true`; an equal revision waits for at most `--wait-ms`
+and returns `changed: false` on timeout. Revision zero therefore returns any
+existing Agent immediately. A supplied future revision fails with
+`revision_ahead`. A terminal `done` observation at the equal revision returns
+unchanged immediately. Inactive sessions remain resumable and may advance later.
+No-op ensure calls, duplicate reports, and lower-authority reports do not advance
+the revision or satisfy a wait.
 
 ## Session Data
 

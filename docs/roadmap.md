@@ -119,7 +119,7 @@ eternal process.
    guarantees do not require users to manage plugin files manually.
 3. Aggregate agent states into workspace counts and add an explainable,
    persistent attention queue for blocked and completed work.
-4. Add revision-aware `agent wait` so scripts can await durable state
+4. [Complete] Add revision-aware `agent wait` so scripts can await durable state
    transitions without polling human output.
 5. Add deduplicated notifications for blocked and completed transitions after
    the attention and wait semantics are established.
