@@ -298,12 +298,7 @@ function currentSessionID(ctx) {
   return text(ctx?.sessionManager?.getSessionId?.());
 }
 
-export default function BoomuxPiExtension(pi) {
-  const lifecycle = createLifecycle({
-    env: globalThis.process?.env ?? {},
-    run: createProcessRunner(),
-  });
-  if (!lifecycle) return;
+function registerLifecycleHandlers(pi, lifecycle) {
   const outcomes = createOutcomeTracker();
 
   const report = (ctx, state, evidence) =>
@@ -335,6 +330,15 @@ export default function BoomuxPiExtension(pi) {
   });
 }
 
+export default function BoomuxPiExtension(pi) {
+  const lifecycle = createLifecycle({
+    env: globalThis.process?.env ?? {},
+    run: createProcessRunner(),
+  });
+  if (!lifecycle) return;
+  registerLifecycleHandlers(pi, lifecycle);
+}
+
 export const __internal = Object.freeze({
   agentErrorEvidence,
   boundedEvidence,
@@ -343,4 +347,5 @@ export const __internal = Object.freeze({
   createProcessRunner,
   ensureArgv,
   reportArgv,
+  registerLifecycleHandlers,
 });

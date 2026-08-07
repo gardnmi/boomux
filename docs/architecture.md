@@ -298,6 +298,12 @@ identity and lifecycle reports against a managed shell run. The same workflow
 will expose status, validated host versions, actionable diagnostics, repair, and
 uninstall. Individual host installers remain the underlying safe primitives.
 
+Observed host compatibility and provider-dependent gaps are recorded in
+[`lifecycle-validation.md`](lifecycle-validation.md). Focused unit fixtures
+exercise only the host fields and ordering Boomux consumes; the record
+deliberately distinguishes those tests from transitions observed in real
+managed sessions.
+
 ### OpenCode Lifecycle Plugin
 
 The bundled plugin is validated against `opencode-ai` `1.18.15`. This is a

@@ -124,6 +124,71 @@ describe("Pi lifecycle", () => {
     expect(calls.every((argv) => argv.includes("--json"))).toBe(true);
   });
 
+  test("maps the Pi 0.84.1 hook ordering consumed by Boomux", async () => {
+    const handlers = new Map();
+    const calls = [];
+    const lifecycle = {
+      enqueue: async (...values) => calls.push(values),
+    };
+    __internal.registerLifecycleHandlers(
+      { on: (event, handler) => handlers.set(event, handler) },
+      lifecycle,
+    );
+    const first = context("session-1");
+    const second = context("session-2");
+
+    await handlers.get("session_start")(
+      { type: "session_start", reason: "startup" },
+      first,
+    );
+    await handlers.get("agent_start")({ type: "agent_start" }, first);
+    handlers.get("agent_end")(
+      {
+        type: "agent_end",
+        messages: [
+          {
+            role: "assistant",
+            stopReason: "error",
+            errorMessage: "provider unavailable",
+          },
+        ],
+      },
+      first,
+    );
+    await handlers.get("agent_settled")({ type: "agent_settled" }, first);
+    await handlers.get("session_shutdown")(
+      { type: "session_shutdown", reason: "reload" },
+      first,
+    );
+    await handlers.get("session_start")(
+      { type: "session_start", reason: "reload" },
+      first,
+    );
+    await handlers.get("session_shutdown")(
+      { type: "session_shutdown", reason: "resume" },
+      first,
+    );
+    await handlers.get("session_start")(
+      { type: "session_start", reason: "resume" },
+      second,
+    );
+    await handlers.get("session_shutdown")(
+      { type: "session_shutdown", reason: "quit" },
+      second,
+    );
+
+    expect(calls).toEqual([
+      ["session-1", "idle", "Pi session idle"],
+      ["session-1", "working", "Pi agent working"],
+      ["session-1", "blocked", "Pi error: provider unavailable"],
+      ["session-1", "inactive", "Pi session inactive", 2],
+      ["session-1", "idle", "Pi session idle"],
+      ["session-1", "inactive", "Pi session inactive", 2],
+      ["session-2", "idle", "Pi session idle"],
+      ["session-2", "inactive", "Pi session inactive", 2],
+    ]);
+  });
+
   test("ensures a new identity when Pi switches sessions", async () => {
     const calls = [];
     let next = 0;
