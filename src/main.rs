@@ -1136,6 +1136,11 @@ fn workspace_session_views(workspace: &WorkspaceSnapshot) -> Vec<tui::AgentSessi
             let runs = agents
                 .into_iter()
                 .map(|agent| tui::AgentSessionRunView {
+                    shell_id: workspace
+                        .shells
+                        .iter()
+                        .find(|shell| shell.id == agent.shell_id)
+                        .map(|shell| shell.id.clone()),
                     shell_name: shell_names
                         .get(agent.shell_id.as_str())
                         .map(|name| (*name).into()),
@@ -3470,6 +3475,8 @@ mod tests {
         assert_eq!(session.state, "blocked");
         assert!(session.state_is_current);
         assert_eq!(session.runs.len(), 2);
+        assert_eq!(session.runs[0].shell_id.as_deref(), Some("s1"));
+        assert_eq!(session.runs[1].shell_id.as_deref(), Some("s2"));
         assert_eq!(session.runs[0].shell_name.as_deref(), Some("build"));
         assert_eq!(session.runs[1].shell_name.as_deref(), Some("review"));
         assert_eq!(
@@ -3510,10 +3517,12 @@ mod tests {
                 last_at_ms: 30,
                 runs: vec![
                     tui::AgentSessionRunView {
+                        shell_id: Some("old-shell-id".into()),
                         shell_name: Some("old-shell".into()),
                         directory: Some("/tmp/project".into()),
                     },
                     tui::AgentSessionRunView {
+                        shell_id: None,
                         shell_name: None,
                         directory: None,
                     },

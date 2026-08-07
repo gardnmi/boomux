@@ -41,6 +41,7 @@ pub(crate) struct AgentSessionView {
 }
 
 pub(crate) struct AgentSessionRunView {
+    pub(crate) shell_id: Option<String>,
     pub(crate) shell_name: Option<String>,
     pub(crate) directory: Option<PathBuf>,
 }
@@ -198,6 +199,7 @@ struct App {
     workspace_state: TableState,
     item_state: TableState,
     global_state: TableState,
+    session_state: TableState,
     primary_tab: PrimaryTab,
     focus: Focus,
     mode: Mode,
@@ -216,15 +218,17 @@ enum Focus {
 enum PrimaryTab {
     Workspaces,
     Agents,
+    Sessions,
     Launchers,
     Shells,
     Commands,
 }
 
 impl PrimaryTab {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::Workspaces,
         Self::Agents,
+        Self::Sessions,
         Self::Launchers,
         Self::Shells,
         Self::Commands,
@@ -234,6 +238,7 @@ impl PrimaryTab {
         match self {
             Self::Workspaces => None,
             Self::Agents => Some(ItemKind::Agent),
+            Self::Sessions => None,
             Self::Launchers => Some(ItemKind::Launcher),
             Self::Shells => Some(ItemKind::Shell),
             Self::Commands => Some(ItemKind::Command),
@@ -244,6 +249,7 @@ impl PrimaryTab {
         match self {
             Self::Workspaces => "WORKSPACES",
             Self::Agents => "AGENTS",
+            Self::Sessions => "SESSIONS",
             Self::Launchers => "LAUNCHERS",
             Self::Shells => "SHELLS",
             Self::Commands => "COMMANDS",
@@ -251,11 +257,23 @@ impl PrimaryTab {
     }
 }
 
+fn shortcut_tab(key: char) -> Option<PrimaryTab> {
+    PrimaryTab::ALL
+        .get(key.to_digit(10)?.checked_sub(1)? as usize)
+        .copied()
+}
+
 #[derive(Clone)]
 struct ItemIdentity {
     workspace_id: String,
     item_id: String,
     launcher: bool,
+}
+
+#[derive(Clone)]
+struct SessionIdentity {
+    workspace_id: String,
+    session_id: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -441,6 +459,7 @@ impl App {
             workspace_state,
             item_state,
             global_state: TableState::default(),
+            session_state: TableState::default(),
             primary_tab: PrimaryTab::Workspaces,
             focus: Focus::Workspaces,
             mode: Mode::Normal,
@@ -495,6 +514,67 @@ impl App {
             .nth(ordinal)
     }
 
+    fn global_session_locations(&self) -> Vec<(usize, usize)> {
+        let now_ms = current_time_ms();
+        let mut locations: Vec<_> = self
+            .workspaces
+            .iter()
+            .enumerate()
+            .flat_map(|(workspace_index, workspace)| {
+                workspace
+                    .sessions
+                    .iter()
+                    .enumerate()
+                    .map(move |(session_index, session)| {
+                        (
+                            workspace_index,
+                            session_index,
+                            session_category(session, now_ms),
+                        )
+                    })
+            })
+            .collect();
+        locations.sort_by(
+            |(left_workspace, left_session, left_category),
+             (right_workspace, right_session, right_category)| {
+                let left = &self.workspaces[*left_workspace].sessions[*left_session];
+                let right = &self.workspaces[*right_workspace].sessions[*right_session];
+                session_category_order(*left_category)
+                    .cmp(&session_category_order(*right_category))
+                    .then_with(|| right.last_at_ms.cmp(&left.last_at_ms))
+                    .then_with(|| {
+                        self.workspaces[*left_workspace]
+                            .id
+                            .cmp(&self.workspaces[*right_workspace].id)
+                    })
+                    .then_with(|| left.id.cmp(&right.id))
+            },
+        );
+        locations
+            .into_iter()
+            .map(|(workspace, session, _)| (workspace, session))
+            .collect()
+    }
+
+    fn global_session_location(&self, ordinal: usize) -> Option<(usize, usize)> {
+        self.global_session_locations().get(ordinal).copied()
+    }
+
+    fn selected_session(&self) -> Option<(&WorkspaceView, &AgentSessionView)> {
+        let (workspace, session) = self.global_session_location(self.session_state.selected()?)?;
+        Some((
+            self.workspaces.get(workspace)?,
+            self.workspaces.get(workspace)?.sessions.get(session)?,
+        ))
+    }
+
+    fn global_session_count(&self) -> usize {
+        self.workspaces
+            .iter()
+            .map(WorkspaceView::session_count)
+            .sum()
+    }
+
     fn global_item_count(&self) -> usize {
         let Some(kind) = self.primary_tab.kind() else {
             return 0;
@@ -512,8 +592,13 @@ impl App {
             return;
         }
         self.focus = Focus::Items;
-        self.global_state
-            .select((self.global_item_count() > 0).then_some(0));
+        if tab == PrimaryTab::Sessions {
+            self.session_state
+                .select((self.global_session_count() > 0).then_some(0));
+        } else {
+            self.global_state
+                .select((self.global_item_count() > 0).then_some(0));
+        }
         self.message = None;
     }
 
@@ -532,13 +617,20 @@ impl App {
 
     fn next(&mut self) {
         if self.primary_tab != PrimaryTab::Workspaces {
-            let item_count = self.global_item_count();
+            let sessions = self.primary_tab == PrimaryTab::Sessions;
+            let item_count = if sessions {
+                self.global_session_count()
+            } else {
+                self.global_item_count()
+            };
             if item_count > 0 {
-                let next = self
-                    .global_state
-                    .selected()
-                    .map_or(0, |index| (index + 1) % item_count);
-                self.global_state.select(Some(next));
+                let state = if sessions {
+                    &mut self.session_state
+                } else {
+                    &mut self.global_state
+                };
+                let next = state.selected().map_or(0, |index| (index + 1) % item_count);
+                state.select(Some(next));
             }
             self.message = None;
             return;
@@ -571,16 +663,26 @@ impl App {
 
     fn previous(&mut self) {
         if self.primary_tab != PrimaryTab::Workspaces {
-            let item_count = self.global_item_count();
+            let sessions = self.primary_tab == PrimaryTab::Sessions;
+            let item_count = if sessions {
+                self.global_session_count()
+            } else {
+                self.global_item_count()
+            };
             if item_count > 0 {
-                let previous = self.global_state.selected().map_or(0, |index| {
+                let state = if sessions {
+                    &mut self.session_state
+                } else {
+                    &mut self.global_state
+                };
+                let previous = state.selected().map_or(0, |index| {
                     if index == 0 {
                         item_count - 1
                     } else {
                         index - 1
                     }
                 });
-                self.global_state.select(Some(previous));
+                state.select(Some(previous));
             }
             self.message = None;
             return;
@@ -645,6 +747,9 @@ impl App {
     }
 
     fn request_rename(&mut self) {
+        if self.primary_tab == PrimaryTab::Sessions {
+            return;
+        }
         let target = if self.primary_tab != PrimaryTab::Workspaces {
             self.selected_item().map(item_rename_target)
         } else {
@@ -743,7 +848,25 @@ impl App {
         true
     }
 
+    fn open_selected_session<F>(&mut self, on_open: &mut F) -> bool
+    where
+        F: FnMut(&OpenTarget) -> Result<String, String>,
+    {
+        let Some(shell_id) = self.selected_session().and_then(|(_, session)| {
+            latest_existing_session_run(session)
+                .and_then(|run| run.shell_id.as_deref())
+                .map(str::to_owned)
+        }) else {
+            return false;
+        };
+        self.message = Some(Message::from_result(on_open(&OpenTarget::Shell(shell_id))));
+        true
+    }
+
     fn request_close(&mut self) {
+        if self.primary_tab == PrimaryTab::Sessions {
+            return;
+        }
         self.pending_close = if self.primary_tab != PrimaryTab::Workspaces {
             self.selected_item().map(item_pending_close)
         } else {
@@ -787,6 +910,7 @@ impl App {
         let selected_id = self.selected().map(|workspace| workspace.id.clone());
         let selected_item = self.workspace_item_identity();
         let selected_global_item = self.global_item_identity();
+        let selected_global_session = self.global_session_identity();
         let previous_index = self.selected_index().unwrap_or(0);
         let selected_index = selected_id
             .and_then(|id| workspaces.iter().position(|workspace| workspace.id == id))
@@ -805,7 +929,12 @@ impl App {
                 .or_else(|| (!workspace.items.is_empty()).then_some(0))
         });
         self.item_state.select(item_index);
-        if self.primary_tab != PrimaryTab::Workspaces {
+        if self.primary_tab == PrimaryTab::Sessions {
+            let session_index = selected_global_session
+                .and_then(|target| self.global_session_position(&target))
+                .or_else(|| (self.global_session_count() > 0).then_some(0));
+            self.session_state.select(session_index);
+        } else if self.primary_tab != PrimaryTab::Workspaces {
             let global_index = selected_global_item
                 .and_then(|target| self.global_item_position(&target))
                 .or_else(|| (self.global_item_count() > 0).then_some(0));
@@ -823,7 +952,10 @@ impl App {
     }
 
     fn global_item_identity(&self) -> Option<ItemIdentity> {
-        if self.primary_tab == PrimaryTab::Workspaces {
+        if matches!(
+            self.primary_tab,
+            PrimaryTab::Workspaces | PrimaryTab::Sessions
+        ) {
             return None;
         }
         let (workspace, item) = self.selected_item_location()?;
@@ -831,6 +963,26 @@ impl App {
             &self.workspaces[workspace],
             &self.workspaces[workspace].items[item],
         ))
+    }
+
+    fn global_session_identity(&self) -> Option<SessionIdentity> {
+        if self.primary_tab != PrimaryTab::Sessions {
+            return None;
+        }
+        let (workspace, session) = self.global_session_location(self.session_state.selected()?)?;
+        Some(SessionIdentity {
+            workspace_id: self.workspaces[workspace].id.clone(),
+            session_id: self.workspaces[workspace].sessions[session].id.clone(),
+        })
+    }
+
+    fn global_session_position(&self, identity: &SessionIdentity) -> Option<usize> {
+        self.global_session_locations()
+            .iter()
+            .position(|(workspace, session)| {
+                self.workspaces[*workspace].id == identity.workspace_id
+                    && self.workspaces[*workspace].sessions[*session].id == identity.session_id
+            })
     }
 
     fn global_item_position(&self, identity: &ItemIdentity) -> Option<usize> {
@@ -998,7 +1150,9 @@ where
             KeyCode::Down | KeyCode::Char('j') => app.next(),
             KeyCode::Up | KeyCode::Char('k') => app.previous(),
             KeyCode::Enter => {
-                let dispatched = if app.primary_tab != PrimaryTab::Workspaces {
+                let dispatched = if app.primary_tab == PrimaryTab::Sessions {
+                    app.open_selected_session(&mut actions.on_open)
+                } else if app.primary_tab != PrimaryTab::Workspaces {
                     app.open_selected_item(&mut actions.on_open)
                 } else {
                     match app.focus {
@@ -1028,11 +1182,9 @@ where
             KeyCode::Char('e') => app.request_rename(),
             KeyCode::Tab => app.cycle_tab(false),
             KeyCode::BackTab => app.cycle_tab(true),
-            KeyCode::Char('1') => app.select_tab(PrimaryTab::Workspaces),
-            KeyCode::Char('2') => app.select_tab(PrimaryTab::Agents),
-            KeyCode::Char('3') => app.select_tab(PrimaryTab::Launchers),
-            KeyCode::Char('4') => app.select_tab(PrimaryTab::Shells),
-            KeyCode::Char('5') => app.select_tab(PrimaryTab::Commands),
+            KeyCode::Char(key) if shortcut_tab(key).is_some() => {
+                app.select_tab(shortcut_tab(key).expect("validated tab shortcut"));
+            }
             key if app.handle_focus_key(key) => {}
             _ => {}
         }
@@ -1141,7 +1293,9 @@ fn render(frame: &mut Frame, app: &mut App) {
     .areas(area);
 
     render_tabs(frame, tabs_area, app);
-    if app.primary_tab != PrimaryTab::Workspaces {
+    if app.primary_tab == PrimaryTab::Sessions {
+        render_global_sessions(frame, dashboard_area, app);
+    } else if app.primary_tab != PrimaryTab::Workspaces {
         render_global_items(frame, dashboard_area, app);
     } else if dashboard_area.width >= 114 {
         let [workspace_area, terminal_area] =
@@ -1287,6 +1441,11 @@ fn render_tabs(frame: &mut Frame, area: Rect, app: &App) {
                     PrimaryTab::Agents => {
                         app.workspaces.iter().map(WorkspaceView::agent_count).sum()
                     }
+                    PrimaryTab::Sessions => app
+                        .workspaces
+                        .iter()
+                        .map(WorkspaceView::session_count)
+                        .sum(),
                     PrimaryTab::Launchers => app
                         .workspaces
                         .iter()
@@ -1361,24 +1520,11 @@ fn render_workspaces(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut A
 }
 
 fn render_global_items(frame: &mut Frame, area: Rect, app: &mut App) {
-    let title = if app.primary_tab == PrimaryTab::Agents {
-        let sessions: usize = app
-            .workspaces
-            .iter()
-            .map(WorkspaceView::session_count)
-            .sum();
-        format!(
-            " {} ({}) | {sessions} SESSIONS ",
-            app.primary_tab.label(),
-            app.global_item_count()
-        )
-    } else {
-        format!(
-            " {} ({}) ",
-            app.primary_tab.label(),
-            app.global_item_count()
-        )
-    };
+    let title = format!(
+        " {} ({}) ",
+        app.primary_tab.label(),
+        app.global_item_count()
+    );
     let block = Block::bordered()
         .title(title)
         .border_style(Style::new().fg(TEAL));
@@ -1498,6 +1644,122 @@ fn render_global_items(frame: &mut Frame, area: Rect, app: &mut App) {
     if let (Some(panel), Some(panel_area)) = (contextual_panel, sessions_area) {
         render_contextual_sessions(frame, panel_area, panel);
     }
+}
+
+fn render_global_sessions(frame: &mut Frame, area: Rect, app: &mut App) {
+    let now_ms = current_time_ms();
+    let locations = app.global_session_locations();
+    let compact = area.width < 120;
+    let mut previous_category = None;
+    let rows = locations.iter().map(|(workspace_index, session_index)| {
+        let workspace = &app.workspaces[*workspace_index];
+        let session = &workspace.sessions[*session_index];
+        let category = session_category(session, now_ms);
+        let category_label = if previous_category == Some(category) {
+            ""
+        } else {
+            previous_category = Some(category);
+            category.label()
+        };
+        let latest_shell = latest_existing_session_run(session)
+            .and_then(|run| run.shell_name.as_deref())
+            .unwrap_or("removed shell");
+        let identity = session
+            .external_session_id
+            .as_deref()
+            .map(short_id)
+            .unwrap_or_else(|| short_id(&session.id));
+        let state = Cell::from(Line::from(vec![
+            Span::styled(
+                session_state_symbol(&session.state),
+                Style::new().fg(session_state_color(&session.state)),
+            ),
+            Span::raw(format!(" {}", session.state)),
+        ]));
+        if compact {
+            Row::new(vec![
+                Cell::from(category_label),
+                Cell::from(workspace.name.clone()),
+                Cell::from(best_session_label(session)),
+                state,
+                Cell::from(latest_shell.to_owned()),
+                Cell::from(compact_recency(session.last_at_ms)),
+            ])
+        } else {
+            Row::new(vec![
+                Cell::from(category_label),
+                Cell::from(workspace.name.clone()),
+                Cell::from(best_session_label(session)),
+                Cell::from(integration_display_name(&session.integration).to_owned()),
+                state,
+                Cell::from(latest_shell.to_owned()),
+                Cell::from(compact_recency(session.last_at_ms)),
+                Cell::from(identity),
+            ])
+        }
+    });
+    let (header, widths) = if compact {
+        (
+            Row::new([
+                "ACTIVITY",
+                "WORKSPACE",
+                "DESCRIPTION",
+                "STATE",
+                "SHELL",
+                "LAST",
+            ]),
+            vec![
+                Constraint::Length(8),
+                Constraint::Length(11),
+                Constraint::Fill(1),
+                Constraint::Length(10),
+                Constraint::Length(13),
+                Constraint::Length(7),
+            ],
+        )
+    } else {
+        (
+            Row::new([
+                "ACTIVITY",
+                "WORKSPACE",
+                "DESCRIPTION",
+                "INTEGRATION",
+                "STATE",
+                "LATEST SHELL",
+                "RECENCY",
+                "ID",
+            ]),
+            vec![
+                Constraint::Length(13),
+                Constraint::Length(16),
+                Constraint::Fill(1),
+                Constraint::Length(10),
+                Constraint::Length(11),
+                Constraint::Length(18),
+                Constraint::Length(9),
+                Constraint::Length(8),
+            ],
+        )
+    };
+    let table = Table::new(rows, widths)
+        .header(header.style(Style::new().fg(BLUE).add_modifier(Modifier::BOLD)))
+        .column_spacing(1)
+        .block(
+            Block::bordered()
+                .title(format!(" SESSIONS ({}) ", locations.len()))
+                .border_style(Style::new().fg(TEAL)),
+        )
+        .row_highlight_style(
+            Style::new()
+                .fg(TEXT)
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED),
+        )
+        .highlight_symbol("> ");
+    frame.render_stateful_widget(table, area, &mut app.session_state);
+}
+
+fn latest_existing_session_run(session: &AgentSessionView) -> Option<&AgentSessionRunView> {
+    session.runs.iter().rev().find(|run| run.shell_id.is_some())
 }
 
 fn render_items(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
@@ -1662,6 +1924,15 @@ impl SessionCategory {
             Self::Last7Days => "LAST 7 DAYS",
             Self::Older => "OLDER",
         }
+    }
+}
+
+fn session_category_order(category: SessionCategory) -> u8 {
+    match category {
+        SessionCategory::Active => 0,
+        SessionCategory::Last24Hours => 1,
+        SessionCategory::Last7Days => 2,
+        SessionCategory::Older => 3,
     }
 }
 
@@ -1982,6 +2253,33 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
             Style::new().fg(if message.error { RED } else { GREEN }),
         ))
     } else {
+        if app.primary_tab == PrimaryTab::Sessions {
+            let shell_available = app.selected_session().is_some_and(|(_, session)| {
+                session.runs.iter().rev().any(|run| run.shell_id.is_some())
+            });
+            let open_help = if app.session_state.selected().is_none() {
+                " no session selected  "
+            } else if shell_available {
+                " open latest shell  "
+            } else {
+                " unavailable (no shell)  "
+            };
+            let line = Line::from(vec![
+                Span::styled(" j/k", Style::new().fg(TEAL)),
+                Span::styled(
+                    " navigate  tab/shift-tab views  1-6 select view  ",
+                    Style::new().fg(SUBTEXT),
+                ),
+                Span::styled("enter", Style::new().fg(GREEN)),
+                Span::styled(open_help, Style::new().fg(SUBTEXT)),
+                Span::styled("r", Style::new().fg(BLUE)),
+                Span::styled(" refresh  ", Style::new().fg(SUBTEXT)),
+                Span::styled("q", Style::new().fg(RED)),
+                Span::styled(" quit", Style::new().fg(SUBTEXT)),
+            ]);
+            frame.render_widget(Paragraph::new(line), area);
+            return;
+        }
         let launcher_selected = matches!(app.selected_item(), Some(WorkspaceItemView::Launcher(_)));
         let mut spans = vec![
             Span::styled(" j/k", Style::new().fg(TEAL)),
@@ -1989,7 +2287,7 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
                 if app.primary_tab == PrimaryTab::Workspaces {
                     " navigate  tab/shift-tab views  h/l panes  "
                 } else {
-                    " navigate  tab/shift-tab views  1-5 select view  "
+                    " navigate  tab/shift-tab views  1-6 select view  "
                 },
                 Style::new().fg(SUBTEXT),
             ),
@@ -2148,6 +2446,7 @@ mod tests {
             state_is_current: true,
             last_at_ms: 30,
             runs: vec![AgentSessionRunView {
+                shell_id: Some("term_1".into()),
                 shell_name: Some("agent".into()),
                 directory: Some("/tmp/boomux".into()),
             }],
@@ -2267,11 +2566,25 @@ mod tests {
         app.cycle_tab(false);
         assert_eq!(app.primary_tab, PrimaryTab::Agents);
         app.cycle_tab(false);
+        assert_eq!(app.primary_tab, PrimaryTab::Sessions);
+        app.cycle_tab(false);
         assert_eq!(app.primary_tab, PrimaryTab::Launchers);
+        app.cycle_tab(true);
+        assert_eq!(app.primary_tab, PrimaryTab::Sessions);
         app.cycle_tab(true);
         assert_eq!(app.primary_tab, PrimaryTab::Agents);
         app.cycle_tab(true);
         assert_eq!(app.primary_tab, PrimaryTab::Workspaces);
+    }
+
+    #[test]
+    fn numeric_shortcuts_match_primary_tab_order() {
+        assert_eq!(
+            ('1'..='6').filter_map(shortcut_tab).collect::<Vec<_>>(),
+            PrimaryTab::ALL
+        );
+        assert_eq!(shortcut_tab('0'), None);
+        assert_eq!(shortcut_tab('7'), None);
     }
 
     #[test]
@@ -2360,6 +2673,7 @@ mod tests {
 
         assert!(text.contains("WORKSPACES 1"));
         assert!(text.contains("AGENTS 1"));
+        assert!(text.contains("SESSIONS 1"));
         assert!(text.contains("LAUNCHERS 1"));
         assert!(text.contains("SHELLS 1"));
         assert!(text.contains("COMMANDS 1"));
@@ -2386,7 +2700,8 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect();
-        assert!(agent_text.contains("AGENTS (1) | 1 SESSIONS"));
+        assert!(agent_text.contains("AGENTS (1)"));
+        assert!(!agent_text.contains("| 1 SESSIONS"));
     }
 
     #[test]
@@ -3221,6 +3536,208 @@ mod tests {
         assert!(text.contains("beta-shell"));
         assert!(text.contains("one"));
         assert!(text.contains("two"));
+    }
+
+    #[test]
+    fn global_sessions_render_grouped_and_sorted_across_workspaces() {
+        let backend = TestBackend::new(180, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let now = current_time_ms();
+        let mut one = workspace("w1", "one");
+        let mut older_active = session("active-old", "idle");
+        older_active.label = "Active old".into();
+        older_active.last_at_ms = now - 2_000;
+        let mut recent = session("recent", "inactive");
+        recent.label = "Recent session".into();
+        recent.state_is_current = false;
+        recent.last_at_ms = now - 60_000;
+        one.sessions = vec![recent, older_active];
+        let mut two = workspace("w2", "two");
+        let mut newer_active = session("active-new", "working");
+        newer_active.label = "Active new".into();
+        newer_active.last_at_ms = now - 1_000;
+        let mut weekly = session("weekly", "done");
+        weekly.label = "Weekly session".into();
+        weekly.state_is_current = false;
+        weekly.last_at_ms = now - 2 * 86_400_000;
+        two.sessions = vec![weekly, newer_active];
+        let mut app = App::new(vec![one, two], project_context());
+        app.select_tab(PrimaryTab::Sessions);
+
+        let labels: Vec<_> = app
+            .global_session_locations()
+            .into_iter()
+            .map(|(workspace, session)| app.workspaces[workspace].sessions[session].label.as_str())
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "Active new",
+                "Active old",
+                "Recent session",
+                "Weekly session"
+            ]
+        );
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+
+        assert!(text.contains("SESSIONS (4)"));
+        assert!(text.contains("ACTIVITY"));
+        assert!(text.contains("WORKSPACE"));
+        assert!(text.contains("DESCRIPTION"));
+        assert!(text.contains("LATEST SHELL"));
+        assert_eq!(text.matches("ACTIVE").count(), 1);
+        assert_eq!(text.matches("LAST 24 HOURS").count(), 1);
+        assert_eq!(text.matches("LAST 7 DAYS").count(), 1);
+        assert!(text.find("Active new").unwrap() < text.find("Active old").unwrap());
+    }
+
+    #[test]
+    fn narrow_global_sessions_keep_core_context_visible() {
+        let backend = TestBackend::new(100, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut workspace = workspace("w1", "project");
+        let mut view = session("session", "idle");
+        view.label = "Review narrow layout".into();
+        workspace.sessions.push(view);
+        let mut app = App::new(vec![workspace], project_context());
+        app.select_tab(PrimaryTab::Sessions);
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+
+        assert!(text.contains("ACTIVITY"));
+        assert!(text.contains("WORKSPACE"));
+        assert!(text.contains("DESCRIPTION"));
+        assert!(text.contains("STATE"));
+        assert!(text.contains("SHELL"));
+        assert!(text.contains("LAST"));
+        assert!(text.contains("Review narrow layout"));
+        assert!(text.contains("project"));
+        assert!(text.contains("agent"));
+    }
+
+    #[test]
+    fn global_session_navigation_and_refresh_preserve_session_identity() {
+        let mut one = workspace("w1", "one");
+        one.sessions = vec![session("one", "working")];
+        let mut two = workspace("w2", "two");
+        two.sessions = vec![session("two", "working")];
+        let mut app = App::new(vec![one, two], project_context());
+        app.select_tab(PrimaryTab::Sessions);
+        assert_eq!(app.session_state.selected(), Some(0));
+        app.next();
+        assert_eq!(
+            app.selected_session()
+                .map(|(_, session)| session.id.as_str()),
+            Some("two")
+        );
+        app.previous();
+        assert_eq!(
+            app.selected_session()
+                .map(|(_, session)| session.id.as_str()),
+            Some("one")
+        );
+        app.next();
+
+        let mut refreshed_two = workspace("w2", "two");
+        refreshed_two.sessions = vec![session("new", "working"), session("two", "working")];
+        let mut refreshed_one = workspace("w1", "one");
+        refreshed_one.sessions = vec![session("one", "working")];
+        app.replace_workspaces(vec![refreshed_two, refreshed_one]);
+
+        assert_eq!(
+            app.selected_session()
+                .map(|(workspace, _)| workspace.id.as_str()),
+            Some("w2")
+        );
+        assert_eq!(
+            app.selected_session()
+                .map(|(_, session)| session.id.as_str()),
+            Some("two")
+        );
+    }
+
+    #[test]
+    fn session_open_uses_newest_still_existing_shell() {
+        let mut workspace = workspace("w1", "one");
+        let mut view = session("session", "inactive");
+        view.runs = vec![
+            AgentSessionRunView {
+                shell_id: Some("old-shell".into()),
+                shell_name: Some("old".into()),
+                directory: None,
+            },
+            AgentSessionRunView {
+                shell_id: Some("new-shell".into()),
+                shell_name: Some("new".into()),
+                directory: None,
+            },
+            AgentSessionRunView {
+                shell_id: None,
+                shell_name: None,
+                directory: None,
+            },
+        ];
+        workspace.sessions.push(view);
+        let mut app = App::new(vec![workspace], project_context());
+        app.select_tab(PrimaryTab::Sessions);
+        let mut opened = None;
+
+        assert!(app.open_selected_session(&mut |target| {
+            opened = Some(target.clone());
+            Ok(String::new())
+        }));
+        assert_eq!(opened, Some(OpenTarget::Shell("new-shell".into())));
+    }
+
+    #[test]
+    fn unavailable_session_has_no_open_or_mutation_actions() {
+        let backend = TestBackend::new(140, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut workspace = workspace("w1", "one");
+        let mut view = session("removed", "inactive");
+        view.runs[0].shell_id = None;
+        view.runs[0].shell_name = None;
+        workspace.sessions.push(view);
+        let mut app = App::new(vec![workspace], project_context());
+        app.select_tab(PrimaryTab::Sessions);
+        let mut opened = false;
+
+        assert!(!app.open_selected_session(&mut |_| {
+            opened = true;
+            Ok(String::new())
+        }));
+        app.request_rename();
+        app.request_close();
+        assert!(!app.request_add(&mut |_| Ok(String::new())));
+        assert!(!opened);
+        assert!(matches!(app.mode, Mode::Normal));
+        assert!(app.pending_close.is_none());
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("unavailable (no shell)"), "{text:?}");
+        assert!(!text.contains("rename shell"));
+        assert!(!text.contains("close shell"));
     }
 
     #[test]
