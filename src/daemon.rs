@@ -673,6 +673,16 @@ fn handle_connection(
             ),
         );
     }
+    if response_version < 14 && matches!(request.message, Request::WaitAgent { .. }) {
+        return send_response(
+            &mut stream,
+            response_version,
+            error_response(
+                ErrorCode::UnsupportedVersion,
+                "agent wait requires daemon protocol 14",
+            ),
+        );
+    }
 
     if let Request::Attach {
         shell_id,
@@ -865,7 +875,7 @@ fn visit_response_agents(
                 visitor(agent);
             }
         }
-        Response::Agent { agent } => visitor(agent),
+        Response::Agent { agent } | Response::AgentWait { agent, .. } => visitor(agent),
         Response::Events {
             snapshot, events, ..
         } => {
@@ -1657,6 +1667,11 @@ impl Registry {
             Request::GetAgent { agent_id } => Ok(Response::Agent {
                 agent: self.agent(&agent_id)?.snapshot()?,
             }),
+            Request::WaitAgent {
+                agent_id,
+                after_revision,
+                wait_ms,
+            } => self.wait_agent(&agent_id, after_revision, wait_ms),
             Request::CreateWorkspace { name, shells } => self.durable_mutation(|| {
                 let workspace = self.create_workspace(name, shells)?;
                 let events = workspace_created_events(&workspace);
@@ -3221,6 +3236,55 @@ impl Registry {
         Ok(tail_utf8(&text, max_bytes.min(MAX_SHELL_READ_BYTES))
             .as_bytes()
             .to_vec())
+    }
+
+    fn wait_agent(
+        &self,
+        agent_id: &str,
+        after_revision: u64,
+        wait_ms: u32,
+    ) -> io::Result<Response> {
+        let deadline =
+            Instant::now() + Duration::from_millis(u64::from(wait_ms)).min(MAX_EVENT_WAIT);
+        let mut events = lock(&self.events.state)?;
+        loop {
+            if self.stopping.load(Ordering::Acquire) {
+                return Err(coded_error(
+                    ErrorCode::DaemonStopping,
+                    "Boomux daemon is stopping",
+                ));
+            }
+            let agent = self.agent(agent_id)?.snapshot()?;
+            let revision = agent.observation.revision;
+            if after_revision < revision {
+                return Ok(Response::AgentWait {
+                    agent,
+                    changed: true,
+                });
+            }
+            if after_revision > revision {
+                return Err(coded_error(
+                    ErrorCode::RevisionAhead,
+                    "requested Agent revision is ahead of the current observation",
+                ));
+            }
+            if agent.observation.state == AgentState::Done
+                || wait_ms == 0
+                || Instant::now() >= deadline
+            {
+                return Ok(Response::AgentWait {
+                    agent,
+                    changed: false,
+                });
+            }
+            let timeout = deadline.saturating_duration_since(Instant::now());
+            let (next, _) = self
+                .events
+                .changed
+                .wait_timeout(events, timeout)
+                .map_err(|_| io::Error::other("event wait lock poisoned"))?;
+            events = next;
+        }
     }
 
     fn read_shell_at(
@@ -5735,6 +5799,118 @@ mod tests {
         let restored = registry.agent(&agent.id).unwrap().snapshot().unwrap();
         assert_eq!(restored.observation.revision, 1);
         assert_eq!(restored.observation.state, AgentState::Working);
+        shell.kill().unwrap();
+        registry.close_workspace(&workspace.id).unwrap();
+    }
+
+    #[test]
+    fn agent_wait_is_revision_conditional_and_wakes_after_durable_change() {
+        let registry = Arc::new(Registry::default());
+        let (workspace, shell, _runtime) = running_shell(&registry);
+        let run_id = shell.snapshot().unwrap().run.unwrap().id;
+        let Response::Agent { agent } = registry
+            .dispatch(Request::RegisterAgent {
+                shell_id: shell.id.clone(),
+                run_id: run_id.clone(),
+                spec: agent_spec(AgentState::Working),
+            })
+            .unwrap()
+        else {
+            panic!("expected registered agent");
+        };
+
+        let Response::AgentWait { changed, .. } = registry.wait_agent(&agent.id, 0, 0).unwrap()
+        else {
+            panic!("expected immediate Agent wait");
+        };
+        assert!(changed);
+        let Response::AgentWait { changed, .. } = registry.wait_agent(&agent.id, 1, 0).unwrap()
+        else {
+            panic!("expected unchanged Agent wait");
+        };
+        assert!(!changed);
+        assert_eq!(
+            error_code(&registry.wait_agent(&agent.id, 2, 0).unwrap_err()),
+            ErrorCode::RevisionAhead
+        );
+
+        let waiting_registry = Arc::clone(&registry);
+        let waiting_agent_id = agent.id.clone();
+        let waiter =
+            thread::spawn(move || waiting_registry.wait_agent(&waiting_agent_id, 1, 2_000));
+        thread::sleep(Duration::from_millis(20));
+        let Response::Agent { agent: blocked } = registry
+            .dispatch(Request::ReportAgent {
+                agent_id: agent.id.clone(),
+                run_id: run_id.clone(),
+                report: agent_spec(AgentState::Blocked).report,
+            })
+            .unwrap()
+        else {
+            panic!("expected changed Agent");
+        };
+        let Response::AgentWait {
+            agent: waited,
+            changed,
+        } = waiter.join().unwrap().unwrap()
+        else {
+            panic!("expected changed Agent wait");
+        };
+        assert!(changed);
+        assert_eq!(waited, blocked);
+        assert_eq!(waited.observation.revision, 2);
+
+        let Response::Agent { agent: done } = registry
+            .dispatch(Request::ReportAgent {
+                agent_id: agent.id.clone(),
+                run_id,
+                report: agent_spec(AgentState::Done).report,
+            })
+            .unwrap()
+        else {
+            panic!("expected completed Agent");
+        };
+        let start = Instant::now();
+        let Response::AgentWait { changed, .. } = registry
+            .wait_agent(&done.id, done.observation.revision, 2_000)
+            .unwrap()
+        else {
+            panic!("expected terminal Agent wait");
+        };
+        assert!(!changed);
+        assert!(start.elapsed() < Duration::from_secs(1));
+
+        shell.kill().unwrap();
+        registry.close_workspace(&workspace.id).unwrap();
+    }
+
+    #[test]
+    fn agent_wait_wakes_with_daemon_stopping_before_registry_cleanup() {
+        let registry = Arc::new(Registry::default());
+        let (workspace, shell, _runtime) = running_shell(&registry);
+        let run_id = shell.snapshot().unwrap().run.unwrap().id;
+        let Response::Agent { agent } = registry
+            .dispatch(Request::RegisterAgent {
+                shell_id: shell.id.clone(),
+                run_id,
+                spec: agent_spec(AgentState::Working),
+            })
+            .unwrap()
+        else {
+            panic!("expected registered agent");
+        };
+        let waiting_registry = Arc::clone(&registry);
+        let waiter = thread::spawn(move || waiting_registry.wait_agent(&agent.id, 1, 2_000));
+        thread::sleep(Duration::from_millis(20));
+
+        registry.stopping.store(true, Ordering::Release);
+        registry.events.notify();
+
+        assert_eq!(
+            error_code(&waiter.join().unwrap().unwrap_err()),
+            ErrorCode::DaemonStopping
+        );
+        registry.stopping.store(false, Ordering::Release);
         shell.kill().unwrap();
         registry.close_workspace(&workspace.id).unwrap();
     }

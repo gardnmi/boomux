@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 13;
+pub const PROTOCOL_VERSION: u32 = 14;
 pub const MIN_PROTOCOL_VERSION: u32 = 6;
 pub const MAX_CONTROL_FRAME: usize = 8 * 1024 * 1024;
 pub const MAX_ATTACH_FRAME: usize = 1024 * 1024;
@@ -323,6 +323,12 @@ pub enum Request {
     GetAgent {
         agent_id: String,
     },
+    WaitAgent {
+        agent_id: String,
+        after_revision: u64,
+        #[serde(default)]
+        wait_ms: u32,
+    },
     CreateWorkspace {
         name: String,
         shells: Vec<ShellSpec>,
@@ -424,6 +430,10 @@ pub enum Response {
     },
     Agent {
         agent: AgentInstanceSnapshot,
+    },
+    AgentWait {
+        agent: AgentInstanceSnapshot,
+        changed: bool,
     },
     Output {
         bytes: Vec<u8>,
@@ -745,9 +755,51 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_thirteen_with_minimum_six() {
-        assert_eq!(PROTOCOL_VERSION, 13);
+    fn protocol_version_is_fourteen_with_minimum_six() {
+        assert_eq!(PROTOCOL_VERSION, 14);
         assert_eq!(MIN_PROTOCOL_VERSION, 6);
+    }
+
+    #[test]
+    fn agent_wait_messages_round_trip() {
+        let request = Request::WaitAgent {
+            agent_id: "a1".into(),
+            after_revision: 3,
+            wait_ms: 30_000,
+        };
+        let encoded = serde_json::to_value(&request).unwrap();
+        assert_eq!(encoded["request"], "wait_agent");
+        assert_eq!(serde_json::from_value::<Request>(encoded).unwrap(), request);
+
+        let response = Response::AgentWait {
+            agent: AgentInstanceSnapshot {
+                id: "a1".into(),
+                workspace_id: "w1".into(),
+                shell_id: "s1".into(),
+                run_id: "r1".into(),
+                name: "agent".into(),
+                integration: "test".into(),
+                external_session_id: Some("external".into()),
+                cwd: Some("/tmp/project".into()),
+                started_at_ms: 1,
+                ended_at_ms: None,
+                observation: AgentObservationSnapshot {
+                    revision: 4,
+                    state: AgentState::Idle,
+                    authority: AgentAuthority::LifecycleIntegration,
+                    evidence: "idle".into(),
+                    confidence: 100,
+                    observed_at_ms: 2,
+                },
+            },
+            changed: true,
+        };
+        let encoded = serde_json::to_value(&response).unwrap();
+        assert_eq!(encoded["response"], "agent_wait");
+        assert_eq!(
+            serde_json::from_value::<Response>(encoded).unwrap(),
+            response
+        );
     }
 
     #[test]

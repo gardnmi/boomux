@@ -54,6 +54,12 @@ pub struct EventBatch {
 }
 
 #[derive(Debug)]
+pub struct AgentWait {
+    pub agent: AgentInstanceSnapshot,
+    pub changed: bool,
+}
+
+#[derive(Debug)]
 pub struct RemoteError {
     pub code: Option<ErrorCode>,
     pub message: String,
@@ -430,6 +436,28 @@ impl Client {
         }
     }
 
+    pub fn wait_agent(
+        &self,
+        agent_id: impl Into<String>,
+        after_revision: u64,
+        wait_ms: u32,
+    ) -> io::Result<AgentWait> {
+        if self.protocol_version()? < 14 {
+            return Err(remote_error(
+                ErrorCode::UnsupportedVersion,
+                "daemon does not support Agent wait",
+            ));
+        }
+        match self.request(Request::WaitAgent {
+            agent_id: agent_id.into(),
+            after_revision,
+            wait_ms,
+        })? {
+            Response::AgentWait { agent, changed } => Ok(AgentWait { agent, changed }),
+            other => unexpected(other),
+        }
+    }
+
     pub fn read_shell(&self, shell_id: impl Into<String>, max_bytes: usize) -> io::Result<Vec<u8>> {
         match self.request(Request::ReadShell {
             shell_id: shell_id.into(),
@@ -625,6 +653,7 @@ impl Client {
 
 fn request_minimum_version(request: &Request) -> u32 {
     match request {
+        Request::WaitAgent { .. } => 14,
         Request::RegisterAgent { spec, .. } | Request::EnsureAgent { spec, .. }
             if spec.report.state == protocol::AgentState::Inactive =>
         {
@@ -814,6 +843,57 @@ mod tests {
     }
 
     #[test]
+    fn agent_wait_requires_protocol_fourteen() {
+        assert_eq!(
+            request_minimum_version(&Request::WaitAgent {
+                agent_id: "a1".into(),
+                after_revision: 1,
+                wait_ms: 30_000,
+            }),
+            14
+        );
+    }
+
+    #[test]
+    fn direct_client_negotiates_before_sending_agent_wait() {
+        let directory = env::temp_dir().join(format!("boomux-client-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let socket = directory.join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+            assert_eq!(request.version, 14);
+            assert!(matches!(request.message, Request::Ping));
+            protocol::write_message(
+                &mut stream,
+                &Envelope::with_version(
+                    13,
+                    Response::Error {
+                        message: "protocol 14 unsupported".into(),
+                        code: Some(ErrorCode::UnsupportedVersion),
+                    },
+                ),
+            )
+            .unwrap();
+
+            let (mut stream, _) = listener.accept().unwrap();
+            let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+            assert_eq!(request.version, 13);
+            assert!(matches!(request.message, Request::Ping));
+            protocol::write_message(&mut stream, &Envelope::with_version(13, Response::Pong))
+                .unwrap();
+        });
+        let client = Client::from_socket_path(socket);
+
+        let error = client.wait_agent("a1", 1, 0).unwrap_err();
+
+        assert_eq!(remote_code(&error), Some(ErrorCode::UnsupportedVersion));
+        server.join().unwrap();
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn restart_shell_requires_protocol_eleven() {
         assert_eq!(
             request_minimum_version(&Request::RestartShell {
@@ -879,6 +959,22 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+            assert_eq!(request.version, 14);
+            assert!(matches!(request.message, Request::Ping));
+            protocol::write_message(
+                &mut stream,
+                &Envelope::with_version(
+                    13,
+                    Response::Error {
+                        message: "expected an older protocol".into(),
+                        code: Some(ErrorCode::UnsupportedVersion),
+                    },
+                ),
+            )
+            .unwrap();
+
             let (mut stream, _) = listener.accept().unwrap();
             let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
             assert_eq!(request.version, 13);

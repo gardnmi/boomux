@@ -1193,6 +1193,20 @@ fn agent_runtime_is_revisioned_durable_and_version_compatible() {
     assert_eq!(register["data"]["agent"]["observation"]["revision"], 1);
     let adapter_id = register["data"]["agent"]["id"].as_str().unwrap().to_owned();
 
+    let mut wait_command = daemon.command();
+    wait_command.args([
+        "agent",
+        "wait",
+        &adapter_id,
+        "--after-revision",
+        "1",
+        "--wait-ms",
+        "5000",
+        "--json",
+    ]);
+    let wait = thread::spawn(move || wait_command.output().unwrap());
+    thread::sleep(Duration::from_millis(50));
+
     let report_cursor = daemon.client.events(None, 256, 0).unwrap().cursor;
     let report = daemon
         .command()
@@ -1229,6 +1243,17 @@ fn agent_runtime_is_revisioned_durable_and_version_compatible() {
         report["data"]["agent"]["observation"]["authority"],
         "process_adapter"
     );
+    let waited = wait.join().unwrap();
+    assert!(
+        waited.status.success(),
+        "{}",
+        String::from_utf8_lossy(&waited.stderr)
+    );
+    let waited: serde_json::Value = serde_json::from_slice(&waited.stdout).unwrap();
+    assert_eq!(waited["command"], "agent.wait");
+    assert_eq!(waited["data"]["changed"], true);
+    assert_eq!(waited["data"]["agent"]["id"], adapter_id);
+    assert_eq!(waited["data"]["agent"]["observation"]["revision"], 2);
     let duplicate = daemon
         .client
         .report_agent(
@@ -1243,6 +1268,23 @@ fn agent_runtime_is_revisioned_durable_and_version_compatible() {
         )
         .unwrap();
     assert_eq!(duplicate.observation.revision, 2);
+    let unchanged = daemon
+        .command()
+        .args([
+            "agent",
+            "wait",
+            &adapter_id,
+            "--after-revision",
+            "2",
+            "--wait-ms",
+            "10",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(unchanged.status.success());
+    let unchanged: serde_json::Value = serde_json::from_slice(&unchanged.stdout).unwrap();
+    assert_eq!(unchanged["data"]["changed"], false);
     let report_events = daemon.client.events(Some(report_cursor), 256, 0).unwrap();
     assert_eq!(
         report_events
@@ -1566,6 +1608,21 @@ fn agent_runtime_is_revisioned_durable_and_version_compatible() {
                 shell_id: shell_id.clone(),
                 run_id: run_id.clone(),
                 spec: registration.clone(),
+            },
+        ),
+        protocol::Response::Error {
+            code: Some(ErrorCode::UnsupportedVersion),
+            ..
+        }
+    ));
+    assert!(matches!(
+        versioned_request(
+            &daemon.client,
+            13,
+            protocol::Request::WaitAgent {
+                agent_id: agent_id.clone(),
+                after_revision: 1,
+                wait_ms: 0,
             },
         ),
         protocol::Response::Error {
@@ -2225,7 +2282,7 @@ fn native_daemon_lifecycle() {
     let capabilities: serde_json::Value = serde_json::from_slice(&capabilities.stdout).unwrap();
     assert_eq!(capabilities["schema"], "boomux.cli/v1");
     assert_eq!(capabilities["command"], "capabilities");
-    assert_eq!(capabilities["data"]["daemon_protocol_version"], 13);
+    assert_eq!(capabilities["data"]["daemon_protocol_version"], 14);
     assert_eq!(
         capabilities["data"]["session_transcript_integrations"],
         serde_json::json!(["opencode", "pi"])
@@ -2247,7 +2304,13 @@ fn native_daemon_lifecycle() {
         "@earendil-works/pi-coding-agent"
     );
     let json_commands = capabilities["data"]["json_commands"].as_array().unwrap();
-    for command in ["events", "agent.register", "agent.ensure", "agent.report"] {
+    for command in [
+        "events",
+        "agent.register",
+        "agent.ensure",
+        "agent.report",
+        "agent.wait",
+    ] {
         assert!(json_commands.iter().any(|current| current == command));
     }
     let features = capabilities["data"]["features"].as_array().unwrap();
@@ -2256,6 +2319,7 @@ fn native_daemon_lifecycle() {
         "protocol_10",
         "protocol_12",
         "protocol_13",
+        "protocol_14",
         "inactive_agent_state",
         "protocol_11",
         "restartable_exited_shells",
@@ -2273,7 +2337,7 @@ fn native_daemon_lifecycle() {
         .output()
         .unwrap();
     assert!(status.status.success());
-    assert!(String::from_utf8_lossy(&status.stdout).contains("running (protocol 13"));
+    assert!(String::from_utf8_lossy(&status.stdout).contains("running (protocol 14"));
     let status = daemon
         .command()
         .args(["daemon", "status", "--json"])
