@@ -350,6 +350,7 @@ mod tests {
             cwd: Some("/tmp/project".into()),
             started_at_ms: 1,
             ended_at_ms: completed.then_some(2),
+            attention: None,
             observation: AgentObservationSnapshot {
                 revision: 1,
                 state: AgentState::Working,

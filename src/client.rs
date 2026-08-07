@@ -60,6 +60,12 @@ pub struct AgentWait {
 }
 
 #[derive(Debug)]
+pub struct AgentAttentionAcknowledgement {
+    pub agent: AgentInstanceSnapshot,
+    pub changed: bool,
+}
+
+#[derive(Debug)]
 pub struct RemoteError {
     pub code: Option<ErrorCode>,
     pub message: String,
@@ -458,6 +464,22 @@ impl Client {
         }
     }
 
+    pub fn acknowledge_agent_attention(
+        &self,
+        agent_id: impl Into<String>,
+        observation_revision: u64,
+    ) -> io::Result<AgentAttentionAcknowledgement> {
+        match self.request(Request::AcknowledgeAgentAttention {
+            agent_id: agent_id.into(),
+            observation_revision,
+        })? {
+            Response::AgentAttentionAcknowledged { agent, changed } => {
+                Ok(AgentAttentionAcknowledgement { agent, changed })
+            }
+            other => unexpected(other),
+        }
+    }
+
     pub fn read_shell(&self, shell_id: impl Into<String>, max_bytes: usize) -> io::Result<Vec<u8>> {
         match self.request(Request::ReadShell {
             shell_id: shell_id.into(),
@@ -653,6 +675,7 @@ impl Client {
 
 fn request_minimum_version(request: &Request) -> u32 {
     match request {
+        Request::AcknowledgeAgentAttention { .. } => 15,
         Request::WaitAgent { .. } => 14,
         Request::RegisterAgent { spec, .. } | Request::EnsureAgent { spec, .. }
             if spec.report.state == protocol::AgentState::Inactive =>
@@ -855,12 +878,39 @@ mod tests {
     }
 
     #[test]
+    fn agent_attention_acknowledgment_requires_protocol_fifteen() {
+        assert_eq!(
+            request_minimum_version(&Request::AcknowledgeAgentAttention {
+                agent_id: "a1".into(),
+                observation_revision: 2,
+            }),
+            15
+        );
+    }
+
+    #[test]
     fn direct_client_negotiates_before_sending_agent_wait() {
         let directory = env::temp_dir().join(format!("boomux-client-{}", Uuid::new_v4()));
         fs::create_dir_all(&directory).unwrap();
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+            assert_eq!(request.version, 15);
+            assert!(matches!(request.message, Request::Ping));
+            protocol::write_message(
+                &mut stream,
+                &Envelope::with_version(
+                    14,
+                    Response::Error {
+                        message: "protocol 15 unsupported".into(),
+                        code: Some(ErrorCode::UnsupportedVersion),
+                    },
+                ),
+            )
+            .unwrap();
+
             let (mut stream, _) = listener.accept().unwrap();
             let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
             assert_eq!(request.version, 14);
@@ -959,6 +1009,22 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+            assert_eq!(request.version, 15);
+            assert!(matches!(request.message, Request::Ping));
+            protocol::write_message(
+                &mut stream,
+                &Envelope::with_version(
+                    14,
+                    Response::Error {
+                        message: "expected an older protocol".into(),
+                        code: Some(ErrorCode::UnsupportedVersion),
+                    },
+                ),
+            )
+            .unwrap();
+
             let (mut stream, _) = listener.accept().unwrap();
             let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
             assert_eq!(request.version, 14);

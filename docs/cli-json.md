@@ -44,14 +44,16 @@ The following commands support `--json`:
 - `boomux agent register`
 - `boomux agent ensure`
 - `boomux agent report`
+- `boomux attention list`
+- `boomux attention acknowledge`
 - `boomux session list`
 - `boomux session inspect`
 - `boomux session read`
 - `boomux daemon status`
 
 JSON mutations are deliberately narrow: only `agent register`, `agent ensure`,
-and `agent report` support the contract. Other mutation commands retain human
-output. Passing `--json` to an unsupported command fails with
+`agent report`, and `attention acknowledge` support the contract. Other mutation
+commands retain human output. Passing `--json` to an unsupported command fails with
 `invalid_argument` before performing the operation.
 
 Command payloads are:
@@ -61,7 +63,8 @@ Command payloads are:
 - `list`: a `shells` array.
 - `shells`: workspace identity plus a `shells` array.
 - `workspace.list`: a `workspaces` array of `id`, `name`, `shell_count`,
-  `launcher_count`, and `agent_count`.
+  `launcher_count`, `agent_count`, fixed `agent_state_counts`, and
+  `attention_count`.
 - `workspace.inspect`: one `workspace` object containing `id`, `name`, and
   `shells`, `launchers`, and `agents` arrays.
 - `shell.inspect`: one `shell` object.
@@ -73,6 +76,9 @@ Command payloads are:
   conditional read.
 - `agent.register`, `agent.ensure`, and `agent.report`: one resulting `agent`
   object. The command field identifies the specific mutation.
+- `attention.list`: an `attention` array ordered blocked before completed, then
+  newest observation first; `--workspace` limits it to one workspace.
+- `attention.acknowledge`: `changed` plus the resulting `agent` object.
 - `session.list`: a globally newest-first `sessions` array, optionally limited
   by exact workspace name or ID.
 - `session.inspect`: one projected `session` object selected only by exact
@@ -100,7 +106,7 @@ and `command`. `command` is the exact executable-and-arguments array.
 
 Agent objects include stable fields `id`, `workspace_id`, `workspace_name`,
 `shell_id`, `run_id`, `name`, `integration`, `external_session_id`,
-`started_at_ms`, `ended_at_ms`, and `observation`. The observation contains
+`started_at_ms`, `ended_at_ms`, `attention`, and `observation`. The observation contains
 `revision`, `state`, `authority`, `evidence`, `confidence`, and
 `observed_at_ms`. Missing optional values are JSON `null`.
 
@@ -116,6 +122,19 @@ the unchanged snapshot. Equal-authority changed reports update the observation.
 `done` is terminal and has a non-null `ended_at_ms`; an exact completion retry is
 an unchanged success, while conflicting later reports fail. Completed records
 remain durable and inspectable.
+
+Protocol 15 raises one durable outstanding attention item for every accepted
+`blocked` or `done` observation. The item records `reason` (`blocked` or
+`completed`) and a copy of the exact raising observation, so later working or
+idle reports do not erase an unseen blocker. A newer blocked observation or
+terminal completion replaces the older item. Existing records migrated from an
+older daemon start acknowledged and do not flood the queue.
+
+`attention acknowledge <agent-id> --observation-revision <revision>` removes
+only the item raised by that exact revision. A different outstanding revision
+fails with `revision_ahead`; an already empty item is an idempotent unchanged
+success. Acknowledgment does not alter the Agent lifecycle observation or
+satisfy `agent wait`.
 
 `agent.ensure` requires `--external-session-id` and protocol 10. Its identity key
 is `integration`, `external_session_id`, `shell_id`, and `run_id`. When that key

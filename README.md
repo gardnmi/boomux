@@ -149,6 +149,8 @@ boomux agent register <name> --integration <integration> [--external-session-id 
 boomux agent ensure <name> --integration <integration> --external-session-id <id> [--shell-id <shell-id>] [--run-id <run-id>] --state <state> --authority <authority> --evidence <evidence> --confidence <0-100>
 boomux agent supervise <name> --integration <integration> --external-session-id <canonical-root-id> [--shell-id <shell-id>] [--run-id <run-id>] -- <command>...
 boomux agent report <agent-id> [--shell-id <shell-id>] [--run-id <run-id>] --state <state> --authority <authority> --evidence <evidence> --confidence <0-100>
+boomux attention list [--workspace <name-or-id>]
+boomux attention acknowledge <agent-id> --observation-revision <revision>
 boomux session list [--workspace <name-or-id>]
 boomux session inspect <session-id>
 boomux session read <session-id> [--limit <entries>] [--max-bytes <bytes>]
@@ -215,7 +217,12 @@ completes the instance permanently. Retrying the exact completion is an
 idempotent success; a different later report is rejected. Completed instances
 remain inspectable across daemon restart. Protocol 14 adds `agent wait`: callers
 supply the last observed revision and can block until a newer durable observation
-is accepted without polling. Boomux does not yet provide terminal heuristics,
+is accepted without polling. Protocol 15 records accepted blocked and completed
+observations in a durable, blocked-first attention queue. Each item retains the
+exact raising evidence, authority, confidence, revision, and timestamp until it
+is conditionally acknowledged; later working or idle activity does not erase
+unseen work. Workspace output includes fixed Agent state counts and the
+outstanding attention count. Boomux does not yet provide terminal heuristics,
 agent reads, or agent control.
 
 `boomux session list` and `boomux session inspect` project durable Agent

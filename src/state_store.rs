@@ -9,10 +9,13 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::protocol::{AgentObservationSnapshot, ShellRunExitReason, TerminalProfile};
+use crate::protocol::{
+    AgentAttentionSnapshot, AgentObservationSnapshot, ShellRunExitReason, TerminalProfile,
+};
 
-const STATE_VERSION: u32 = 5;
-const PREVIOUS_STATE_VERSION: u32 = 4;
+const STATE_VERSION: u32 = 6;
+const PREVIOUS_STATE_VERSION: u32 = 5;
+const VERSION_FOUR_STATE_VERSION: u32 = 4;
 const VERSION_THREE_STATE_VERSION: u32 = 3;
 const VERSION_TWO_STATE_VERSION: u32 = 2;
 const LEGACY_STATE_VERSION: u32 = 1;
@@ -57,6 +60,7 @@ pub(crate) struct PersistedAgentInstance {
     pub(crate) started_at_ms: u64,
     pub(crate) ended_at_ms: Option<u64>,
     pub(crate) observation: AgentObservationSnapshot,
+    pub(crate) attention: Option<AgentAttentionSnapshot>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -116,6 +120,38 @@ struct PreviousPersistedWorkspace {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PreviousPersistedAgentInstance {
+    id: String,
+    shell_id: String,
+    run_id: String,
+    name: String,
+    integration: String,
+    external_session_id: Option<String>,
+    cwd: Option<PathBuf>,
+    started_at_ms: u64,
+    ended_at_ms: Option<u64>,
+    observation: AgentObservationSnapshot,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VersionFourPersistedState {
+    version: u32,
+    workspaces: Vec<VersionFourPersistedWorkspace>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VersionFourPersistedWorkspace {
+    id: String,
+    name: String,
+    shells: Vec<PersistedShell>,
+    launchers: Vec<PersistedWorkspaceLauncher>,
+    agents: Vec<VersionFourPersistedAgentInstance>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VersionFourPersistedAgentInstance {
     id: String,
     shell_id: String,
     run_id: String,
@@ -283,6 +319,12 @@ impl StateStore {
                 self.save(&state)?;
                 state
             }
+            VERSION_FOUR_STATE_VERSION => {
+                let previous: VersionFourPersistedState = parse_state(&bytes, &self.path)?;
+                let state = migrate_version_four_state(previous);
+                self.save(&state)?;
+                state
+            }
             VERSION_THREE_STATE_VERSION => {
                 let previous: VersionThreePersistedState = parse_state(&bytes, &self.path)?;
                 let state = migrate_version_three_state(previous);
@@ -399,6 +441,40 @@ fn migrate_previous_state(previous: PreviousPersistedState) -> PersistedState {
         workspaces: previous
             .workspaces
             .into_iter()
+            .map(|workspace| PersistedWorkspace {
+                id: workspace.id,
+                name: workspace.name,
+                shells: workspace.shells,
+                launchers: workspace.launchers,
+                agents: workspace
+                    .agents
+                    .into_iter()
+                    .map(|agent| PersistedAgentInstance {
+                        cwd: agent.cwd,
+                        id: agent.id,
+                        shell_id: agent.shell_id,
+                        run_id: agent.run_id,
+                        name: agent.name,
+                        integration: agent.integration,
+                        external_session_id: agent.external_session_id,
+                        started_at_ms: agent.started_at_ms,
+                        ended_at_ms: agent.ended_at_ms,
+                        observation: agent.observation,
+                        attention: None,
+                    })
+                    .collect(),
+            })
+            .collect(),
+    }
+}
+
+fn migrate_version_four_state(previous: VersionFourPersistedState) -> PersistedState {
+    debug_assert_eq!(previous.version, VERSION_FOUR_STATE_VERSION);
+    PersistedState {
+        version: STATE_VERSION,
+        workspaces: previous
+            .workspaces
+            .into_iter()
             .map(|workspace| {
                 let shell_cwds = workspace
                     .shells
@@ -424,6 +500,7 @@ fn migrate_previous_state(previous: PreviousPersistedState) -> PersistedState {
                             started_at_ms: agent.started_at_ms,
                             ended_at_ms: agent.ended_at_ms,
                             observation: agent.observation,
+                            attention: None,
                         })
                         .collect(),
                 }
@@ -560,6 +637,7 @@ mod tests {
                             confidence: 90,
                             observed_at_ms: 11,
                         },
+                        attention: None,
                     },
                     PersistedAgentInstance {
                         id: "agent-2".into(),
@@ -579,6 +657,17 @@ mod tests {
                             confidence: 100,
                             observed_at_ms: 30,
                         },
+                        attention: Some(AgentAttentionSnapshot {
+                            reason: crate::protocol::AgentAttentionReason::Completed,
+                            observation: AgentObservationSnapshot {
+                                revision: 3,
+                                state: AgentState::Done,
+                                authority: AgentAuthority::DaemonLifecycle,
+                                evidence: "run exited".into(),
+                                confidence: 100,
+                                observed_at_ms: 30,
+                            },
+                        }),
                     },
                 ],
             }],
@@ -608,6 +697,13 @@ mod tests {
         assert_eq!(
             restored.workspaces[0].agents[1].observation.state,
             AgentState::Done
+        );
+        assert_eq!(
+            restored.workspaces[0].agents[1]
+                .attention
+                .as_ref()
+                .map(|attention| attention.reason),
+            Some(crate::protocol::AgentAttentionReason::Completed)
         );
         assert_eq!(
             fs::metadata(directory.join("boomux/state.json"))
@@ -685,7 +781,7 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .contains("\"version\": 5")
+                .contains("\"version\": 6")
         );
         assert!(migrated.workspaces[0].launchers.is_empty());
         assert!(migrated.workspaces[0].agents.is_empty());
@@ -735,7 +831,7 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .contains("\"version\": 5")
+                .contains("\"version\": 6")
         );
         assert!(migrated.workspaces[0].agents.is_empty());
         fs::remove_dir_all(directory).unwrap();
@@ -773,7 +869,7 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .contains("\"version\": 5")
+                .contains("\"version\": 6")
         );
         fs::remove_dir_all(directory).unwrap();
     }
@@ -849,8 +945,43 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .contains("\"version\": 5")
+                .contains("\"version\": 6")
         );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn migrates_version_five_agents_without_historical_attention() {
+        let directory = env::temp_dir().join(format!("boomux-state-{}", Uuid::new_v4()));
+        let path = directory.join("boomux/state.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            br#"{
+  "version": 5,
+  "workspaces": [{
+    "id": "w1", "name": "version-five", "shells": [], "launchers": [],
+    "agents": [{
+      "id": "a1", "shell_id": "s1", "run_id": "r1", "name": "agent",
+      "integration": "test", "external_session_id": null, "cwd": "/tmp/project",
+      "started_at_ms": 1, "ended_at_ms": 3,
+      "observation": {
+        "revision": 2, "state": "done", "authority": "lifecycle_integration",
+        "evidence": "completed before upgrade", "confidence": 100, "observed_at_ms": 3
+      }
+    }]
+  }]
+}"#,
+        )
+        .unwrap();
+        let store = StateStore::at(path.clone());
+
+        let migrated = store.load().unwrap().unwrap();
+
+        assert!(migrated.workspaces[0].agents[0].attention.is_none());
+        let saved = fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("\"version\": 6"));
+        assert!(saved.contains("\"attention\": null"));
         fs::remove_dir_all(directory).unwrap();
     }
 }

@@ -11,6 +11,8 @@ use ratatui::widgets::{
     Block, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState,
 };
 
+use crate::agent_attention_projection::AgentStateCounts;
+
 const BASE: Color = Color::Reset;
 const OVERLAY: Color = Color::DarkGray;
 const TEXT: Color = Color::Reset;
@@ -27,6 +29,8 @@ pub(crate) struct WorkspaceView {
     pub(crate) name: String,
     pub(crate) items: Vec<WorkspaceItemView>,
     pub(crate) sessions: Vec<AgentSessionView>,
+    pub(crate) agent_state_counts: AgentStateCounts,
+    pub(crate) attention_count: usize,
 }
 
 pub(crate) struct AgentSessionView {
@@ -1483,20 +1487,26 @@ fn render_workspaces(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut A
             Cell::from(workspace.command_count().to_string()),
             Cell::from(workspace.launcher_count().to_string()),
             Cell::from(workspace.agent_count().to_string()),
+            Cell::from(workspace.agent_state_counts.blocked.to_string()),
+            Cell::from(workspace.agent_state_counts.done.to_string()),
+            Cell::from(workspace.attention_count.to_string()),
         ])
     });
     let table = Table::new(
         rows,
         [
             Constraint::Min(8),
-            Constraint::Length(6),
-            Constraint::Length(4),
-            Constraint::Length(4),
-            Constraint::Length(6),
+            Constraint::Length(2),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(2),
+            Constraint::Length(3),
+            Constraint::Length(2),
+            Constraint::Length(1),
         ],
     )
     .header(
-        Row::new(["NAME", "SHELLS", "CMDS", "LNCH", "AGENTS"])
+        Row::new(["NAME", "SH", "CMD", "LCH", "AG", "BLK", "DN", "!"])
             .style(Style::new().fg(BLUE).add_modifier(Modifier::BOLD)),
     )
     .column_spacing(1)
@@ -2408,6 +2418,8 @@ mod tests {
                 command: String::new(),
             })],
             sessions: Vec::new(),
+            agent_state_counts: AgentStateCounts::default(),
+            attention_count: 0,
         }
     }
 
@@ -2656,6 +2668,9 @@ mod tests {
             launcher_view("launcher-1", "editor"),
         ];
         mixed.sessions.push(session("durable-1", "working"));
+        mixed.agent_state_counts.blocked = 1;
+        mixed.agent_state_counts.done = 1;
+        mixed.attention_count = 2;
         let mut app = App::new(vec![mixed], project_context());
 
         terminal_backend
@@ -2678,7 +2693,9 @@ mod tests {
         assert!(text.contains("SHELLS 1"));
         assert!(text.contains("COMMANDS 1"));
         assert!(!text.contains("active agents"));
-        assert!(text.contains("SHELLS CMDS LNCH AGENTS"));
+        for header in ["SH", "CMD", "LCH", "AG", "BLK", "DN", "!"] {
+            assert!(text.contains(header), "missing {header}");
+        }
         let workspace_tab = text.find("WORKSPACES 1").expect("workspace tab");
         let aggregate_label = text.find("ALL:").expect("aggregate label");
         let agent_tab = text.find("AGENTS 1").expect("agent tab");

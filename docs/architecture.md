@@ -404,6 +404,16 @@ duplicate and lower-authority reports do not advance the revision. Waiters are
 not persisted and reconnect with the same durable revision after daemon
 replacement.
 
+Protocol 15 adds one durable outstanding attention item per Agent. Accepted
+`blocked` and `done` observations capture their reason and full raising
+observation; unrelated later states preserve the item until acknowledgment, and
+a newer qualifying observation supersedes it. Acknowledgment is conditional on
+the captured observation revision, idempotent once empty, and does not mutate
+the lifecycle revision used by `agent wait`. Version-5 state migrates with no
+outstanding items so upgrading does not reinterpret historical work as unseen.
+The CLI projects these records into a deterministic blocked-first queue and
+reports fixed lifecycle-state and attention counts per workspace.
+
 ### Transition Coordinator
 
 The daemon serializes observable runtime transitions through one coordinator. A
@@ -431,9 +441,9 @@ not persisted per chunk, but output revision mutation and `output_changed`
 publication cross the coordinator together. A non-blocking terminal lock keeps
 output processing from holding global locks while waiting on terminal snapshots.
 
-Agent registration, ensure, and reports use the same durable mutation coordinator.
-Persistence and `agent_registered`, `agent_state_changed`, or
-`agent_completed` publication therefore share the normal ordering boundary and
+Agent registration, ensure, reports, and attention acknowledgment use the same durable mutation coordinator.
+Persistence and `agent_registered`, `agent_state_changed`, `agent_completed`, or
+`agent_attention_acknowledged` publication therefore share the normal ordering boundary and
 baseline snapshots include the exact coordinated cut.
 
 ## Runtime Semantics
@@ -452,7 +462,7 @@ to the complete registry and removes the runtime socket.
 The daemon atomically writes reproducible registry metadata to
 `$XDG_STATE_HOME/boomux/state.json`, falling back to
 `~/.local/state/boomux/state.json`. Workspace, launcher, shell, and agent IDs;
-names and grouping; working directories; argument vectors; agent observations;
+ names and grouping; working directories; argument vectors; agent observations and attention;
 and last terminal profiles survive restart. The last run record also preserves
 its identity and outcome. Recovered
 shells are pending: Boomux does not claim that arbitrary
@@ -475,5 +485,5 @@ as pending.
 
 Future agent runtime work is tracked in [`roadmap.md`](roadmap.md). The explicit
 process-adapter supervisor is only a foundation; automatic and
-integration-specific adapters, terminal heuristics, aggregation, waits,
+ integration-specific adapters, terminal heuristics,
 notifications, and control remain future work.

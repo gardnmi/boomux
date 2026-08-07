@@ -261,6 +261,7 @@ mod tests {
                     cwd: Some("/tmp/project".into()),
                     started_at_ms: 10 + index as u64,
                     ended_at_ms: None,
+                    attention: None,
                     observation: AgentObservationSnapshot {
                         revision: 1,
                         state: AgentState::Working,

@@ -12,6 +12,10 @@ snapshots and Agent events; protocol-12 clients receive the same records without
 that additive source context. Protocol 14 adds revision-conditional Agent reads
 that reuse the event condition variable for wakeups without consuming or
 depending on the retained global event cursor.
+Protocol 15 adds durable blocked/completed attention and conditional
+acknowledgment. Protocol-14 clients receive Agent snapshots without attention
+and do not receive acknowledgment events, while cursors still advance across
+those filtered events.
 
 `boomux agent wait <id> --after-revision <revision>` is the preferred way to
 await one Agent. It returns on a newer accepted durable observation, returns
@@ -47,7 +51,8 @@ The event vocabulary is:
 - `shell_created`, `shell_renamed`, `shell_closed`
 - `launcher_created`, `launcher_renamed`, `launcher_removed`
 - `run_started`, `output_changed`, `run_exited`
-- `agent_registered`, `agent_state_changed`, `agent_completed`
+- `agent_registered`, `agent_state_changed`, `agent_completed`,
+  `agent_attention_acknowledged`
 - `handoff_completed`
 
 Output events carry run identity and the latest output revision, not raw PTY
@@ -67,6 +72,12 @@ successful no-ops with no event. Equal-authority reports with changed content
 are updates and emit the normal state-change or completion event. Retrying the
 exact accepted `done` report is idempotent and emits no second completion event;
 other reports against a completed instance are rejected.
+
+Accepted blocked and completed observations also carry an outstanding attention
+item in their Agent snapshot. `agent_attention_acknowledged` contains the full
+resulting Agent snapshot after the item is removed. The acknowledgment is
+conditional on its raising observation revision, persists before publication,
+and does not increment the lifecycle observation revision.
 
 Protocol-8 and older event clients do not receive protocol-9 agent snapshots or
 agent events. Filtering does not rewrite the journal: their returned cursor
