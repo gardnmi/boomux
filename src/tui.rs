@@ -127,31 +127,59 @@ impl WorkspaceView {
     fn shell_count(&self) -> usize {
         self.items
             .iter()
-            .filter(|item| {
-                matches!(
-                    item,
-                    WorkspaceItemView::Shell(_) | WorkspaceItemView::AgentShell(_)
-                )
-            })
+            .filter(|item| item.kind() == ItemKind::Shell)
+            .count()
+    }
+
+    fn command_count(&self) -> usize {
+        self.items
+            .iter()
+            .filter(|item| item.kind() == ItemKind::Command)
             .count()
     }
 
     fn launcher_count(&self) -> usize {
         self.items
             .iter()
-            .filter(|item| matches!(item, WorkspaceItemView::Launcher(_)))
+            .filter(|item| item.kind() == ItemKind::Launcher)
             .count()
     }
 
     fn agent_count(&self) -> usize {
         self.items
             .iter()
-            .filter(|item| matches!(item, WorkspaceItemView::AgentShell(_)))
+            .filter(|item| item.kind() == ItemKind::Agent)
             .count()
     }
 
     fn session_count(&self) -> usize {
         self.sessions.len()
+    }
+
+    fn process_count(&self) -> usize {
+        self.items
+            .iter()
+            .filter(|item| !matches!(item, WorkspaceItemView::Launcher(_)))
+            .count()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ItemKind {
+    Agent,
+    Launcher,
+    Shell,
+    Command,
+}
+
+impl WorkspaceItemView {
+    fn kind(&self) -> ItemKind {
+        match self {
+            Self::AgentShell(_) => ItemKind::Agent,
+            Self::Launcher(_) => ItemKind::Launcher,
+            Self::Shell(shell) if shell.command.is_empty() => ItemKind::Shell,
+            Self::Shell(_) => ItemKind::Command,
+        }
     }
 }
 
@@ -169,6 +197,8 @@ struct App {
     workspaces: Vec<WorkspaceView>,
     workspace_state: TableState,
     item_state: TableState,
+    global_state: TableState,
+    primary_tab: PrimaryTab,
     focus: Focus,
     mode: Mode,
     message: Option<Message>,
@@ -182,9 +212,50 @@ enum Focus {
     Items,
 }
 
-enum ItemIdentity {
-    Shell(String),
-    Launcher(String),
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PrimaryTab {
+    Workspaces,
+    Agents,
+    Launchers,
+    Shells,
+    Commands,
+}
+
+impl PrimaryTab {
+    const ALL: [Self; 5] = [
+        Self::Workspaces,
+        Self::Agents,
+        Self::Launchers,
+        Self::Shells,
+        Self::Commands,
+    ];
+
+    fn kind(self) -> Option<ItemKind> {
+        match self {
+            Self::Workspaces => None,
+            Self::Agents => Some(ItemKind::Agent),
+            Self::Launchers => Some(ItemKind::Launcher),
+            Self::Shells => Some(ItemKind::Shell),
+            Self::Commands => Some(ItemKind::Command),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Workspaces => "WORKSPACES",
+            Self::Agents => "AGENTS",
+            Self::Launchers => "LAUNCHERS",
+            Self::Shells => "SHELLS",
+            Self::Commands => "COMMANDS",
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ItemIdentity {
+    workspace_id: String,
+    item_id: String,
+    launcher: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -369,6 +440,8 @@ impl App {
             workspaces,
             workspace_state,
             item_state,
+            global_state: TableState::default(),
+            primary_tab: PrimaryTab::Workspaces,
             focus: Focus::Workspaces,
             mode: Mode::Normal,
             message: None,
@@ -387,12 +460,89 @@ impl App {
     }
 
     fn selected_item(&self) -> Option<&WorkspaceItemView> {
-        let workspace = self.selected()?;
-        let index = self.item_state.selected()?;
-        workspace.items.get(index)
+        self.selected_item_location()
+            .and_then(|(workspace, item)| self.workspaces.get(workspace)?.items.get(item))
+    }
+
+    fn selected_item_location(&self) -> Option<(usize, usize)> {
+        if self.primary_tab == PrimaryTab::Workspaces {
+            return Some((
+                self.workspace_state.selected()?,
+                self.item_state.selected()?,
+            ));
+        }
+        self.global_item_location(self.global_state.selected()?)
+    }
+
+    fn selected_item_workspace(&self) -> Option<&WorkspaceView> {
+        let (workspace, _) = self.selected_item_location()?;
+        self.workspaces.get(workspace)
+    }
+
+    fn global_item_location(&self, ordinal: usize) -> Option<(usize, usize)> {
+        let kind = self.primary_tab.kind()?;
+        self.workspaces
+            .iter()
+            .enumerate()
+            .flat_map(|(workspace_index, workspace)| {
+                workspace
+                    .items
+                    .iter()
+                    .enumerate()
+                    .filter(move |(_, item)| item.kind() == kind)
+                    .map(move |(item_index, _)| (workspace_index, item_index))
+            })
+            .nth(ordinal)
+    }
+
+    fn global_item_count(&self) -> usize {
+        let Some(kind) = self.primary_tab.kind() else {
+            return 0;
+        };
+        self.workspaces
+            .iter()
+            .flat_map(|workspace| &workspace.items)
+            .filter(|item| item.kind() == kind)
+            .count()
+    }
+
+    fn select_tab(&mut self, tab: PrimaryTab) {
+        self.primary_tab = tab;
+        if tab == PrimaryTab::Workspaces {
+            return;
+        }
+        self.focus = Focus::Items;
+        self.global_state
+            .select((self.global_item_count() > 0).then_some(0));
+        self.message = None;
+    }
+
+    fn cycle_tab(&mut self, backwards: bool) {
+        let index = PrimaryTab::ALL
+            .iter()
+            .position(|tab| *tab == self.primary_tab)
+            .expect("primary tab");
+        let next = if backwards {
+            (index + PrimaryTab::ALL.len() - 1) % PrimaryTab::ALL.len()
+        } else {
+            (index + 1) % PrimaryTab::ALL.len()
+        };
+        self.select_tab(PrimaryTab::ALL[next]);
     }
 
     fn next(&mut self) {
+        if self.primary_tab != PrimaryTab::Workspaces {
+            let item_count = self.global_item_count();
+            if item_count > 0 {
+                let next = self
+                    .global_state
+                    .selected()
+                    .map_or(0, |index| (index + 1) % item_count);
+                self.global_state.select(Some(next));
+            }
+            self.message = None;
+            return;
+        }
         match self.focus {
             Focus::Workspaces => {
                 if self.workspaces.is_empty() {
@@ -420,6 +570,21 @@ impl App {
     }
 
     fn previous(&mut self) {
+        if self.primary_tab != PrimaryTab::Workspaces {
+            let item_count = self.global_item_count();
+            if item_count > 0 {
+                let previous = self.global_state.selected().map_or(0, |index| {
+                    if index == 0 {
+                        item_count - 1
+                    } else {
+                        index - 1
+                    }
+                });
+                self.global_state.select(Some(previous));
+            }
+            self.message = None;
+            return;
+        }
         match self.focus {
             Focus::Workspaces => {
                 if self.workspaces.is_empty() {
@@ -453,20 +618,15 @@ impl App {
         self.message = None;
     }
 
-    fn toggle_focus(&mut self) {
-        self.focus = match self.focus {
-            Focus::Workspaces => Focus::Items,
-            Focus::Items => Focus::Workspaces,
-        };
-        self.message = None;
-    }
-
     fn set_focus(&mut self, focus: Focus) {
         self.focus = focus;
         self.message = None;
     }
 
     fn handle_focus_key(&mut self, key: KeyCode) -> bool {
+        if self.primary_tab != PrimaryTab::Workspaces {
+            return false;
+        }
         let focus = match key {
             KeyCode::Left | KeyCode::Char('h') => Focus::Workspaces,
             KeyCode::Right | KeyCode::Char('l') => Focus::Items,
@@ -485,19 +645,15 @@ impl App {
     }
 
     fn request_rename(&mut self) {
-        let target = match self.focus {
-            Focus::Workspaces => self
-                .selected()
-                .map(|workspace| RenameTarget::Workspace(workspace.id.clone())),
-            Focus::Items => self.selected_item().map(|item| match item {
-                WorkspaceItemView::Shell(shell) => RenameTarget::Shell(shell.id.clone()),
-                WorkspaceItemView::AgentShell(agent_shell) => {
-                    RenameTarget::Shell(agent_shell.shell.id.clone())
-                }
-                WorkspaceItemView::Launcher(launcher) => {
-                    RenameTarget::Launcher(launcher.id.clone())
-                }
-            }),
+        let target = if self.primary_tab != PrimaryTab::Workspaces {
+            self.selected_item().map(item_rename_target)
+        } else {
+            match self.focus {
+                Focus::Workspaces => self
+                    .selected()
+                    .map(|workspace| RenameTarget::Workspace(workspace.id.clone())),
+                Focus::Items => self.selected_item().map(item_rename_target),
+            }
         };
         if let Some(target) = target {
             self.mode = Mode::Rename {
@@ -512,6 +668,9 @@ impl App {
     where
         F: FnMut(&str) -> Result<String, String>,
     {
+        if self.primary_tab != PrimaryTab::Workspaces {
+            return false;
+        }
         match self.focus {
             Focus::Workspaces => {
                 self.mode = Mode::PickProject(ProjectPicker::new(&self.project_context));
@@ -549,6 +708,9 @@ impl App {
     where
         F: FnMut(&str) -> Result<String, String>,
     {
+        if self.primary_tab != PrimaryTab::Workspaces {
+            return;
+        }
         let Some(workspace_id) = self.selected().map(|workspace| workspace.id.clone()) else {
             return;
         };
@@ -559,7 +721,10 @@ impl App {
     where
         F: FnMut(&OpenTarget) -> Result<String, String>,
     {
-        let Some(workspace_id) = self.selected().map(|workspace| workspace.id.clone()) else {
+        let Some(workspace_id) = self
+            .selected_item_workspace()
+            .map(|workspace| workspace.id.clone())
+        else {
             return false;
         };
         let Some(target) = self.selected_item().map(|item| match item {
@@ -579,33 +744,18 @@ impl App {
     }
 
     fn request_close(&mut self) {
-        self.pending_close = match self.focus {
-            Focus::Workspaces => self.selected().map(|workspace| PendingClose {
-                target: CloseTarget::Workspace(workspace.id.clone()),
-                name: workspace.name.clone(),
-                shell_count: workspace.shell_count(),
-                launcher_count: workspace.launcher_count(),
-            }),
-            Focus::Items => self.selected_item().map(|item| match item {
-                WorkspaceItemView::Shell(shell) => PendingClose {
-                    target: CloseTarget::Shell(shell.id.clone()),
-                    name: shell.name.clone(),
-                    shell_count: 1,
-                    launcher_count: 0,
-                },
-                WorkspaceItemView::AgentShell(agent_shell) => PendingClose {
-                    target: CloseTarget::Shell(agent_shell.shell.id.clone()),
-                    name: agent_shell.shell.name.clone(),
-                    shell_count: 1,
-                    launcher_count: 0,
-                },
-                WorkspaceItemView::Launcher(launcher) => PendingClose {
-                    target: CloseTarget::Launcher(launcher.id.clone()),
-                    name: launcher.name.clone(),
-                    shell_count: 0,
-                    launcher_count: 1,
-                },
-            }),
+        self.pending_close = if self.primary_tab != PrimaryTab::Workspaces {
+            self.selected_item().map(item_pending_close)
+        } else {
+            match self.focus {
+                Focus::Workspaces => self.selected().map(|workspace| PendingClose {
+                    target: CloseTarget::Workspace(workspace.id.clone()),
+                    name: workspace.name.clone(),
+                    shell_count: workspace.process_count(),
+                    launcher_count: workspace.launcher_count(),
+                }),
+                Focus::Items => self.selected_item().map(item_pending_close),
+            }
         };
     }
 
@@ -635,13 +785,8 @@ impl App {
 
     fn replace_workspaces(&mut self, workspaces: Vec<WorkspaceView>) {
         let selected_id = self.selected().map(|workspace| workspace.id.clone());
-        let selected_item = self.selected_item().map(|item| match item {
-            WorkspaceItemView::Shell(shell) => ItemIdentity::Shell(shell.id.clone()),
-            WorkspaceItemView::AgentShell(agent_shell) => {
-                ItemIdentity::Shell(agent_shell.shell.id.clone())
-            }
-            WorkspaceItemView::Launcher(launcher) => ItemIdentity::Launcher(launcher.id.clone()),
-        });
+        let selected_item = self.workspace_item_identity();
+        let selected_global_item = self.global_item_identity();
         let previous_index = self.selected_index().unwrap_or(0);
         let selected_index = selected_id
             .and_then(|id| workspaces.iter().position(|workspace| workspace.id == id))
@@ -652,23 +797,107 @@ impl App {
         let item_index = self.selected().and_then(|workspace| {
             selected_item
                 .and_then(|target| {
-                    match target {
-                    ItemIdentity::Shell(id) => workspace.items.iter().position(|item| match item {
-                        WorkspaceItemView::Shell(shell) => shell.id == id,
-                        WorkspaceItemView::AgentShell(agent_shell) => agent_shell.shell.id == id,
-                        WorkspaceItemView::Launcher(_) => false,
-                    }),
-                    ItemIdentity::Launcher(id) => workspace.items.iter().position(|item| {
-                        matches!(item, WorkspaceItemView::Launcher(launcher) if launcher.id == id)
-                    }),
-                }
+                    workspace
+                        .items
+                        .iter()
+                        .position(|item| item_matches(item, &target))
                 })
                 .or_else(|| (!workspace.items.is_empty()).then_some(0))
         });
         self.item_state.select(item_index);
+        if self.primary_tab != PrimaryTab::Workspaces {
+            let global_index = selected_global_item
+                .and_then(|target| self.global_item_position(&target))
+                .or_else(|| (self.global_item_count() > 0).then_some(0));
+            self.global_state.select(global_index);
+        }
         if self.workspaces.is_empty() {
             self.focus = Focus::Workspaces;
         }
+    }
+
+    fn workspace_item_identity(&self) -> Option<ItemIdentity> {
+        let workspace = self.selected()?;
+        let item = workspace.items.get(self.item_state.selected()?)?;
+        Some(item_identity(workspace, item))
+    }
+
+    fn global_item_identity(&self) -> Option<ItemIdentity> {
+        if self.primary_tab == PrimaryTab::Workspaces {
+            return None;
+        }
+        let (workspace, item) = self.selected_item_location()?;
+        Some(item_identity(
+            &self.workspaces[workspace],
+            &self.workspaces[workspace].items[item],
+        ))
+    }
+
+    fn global_item_position(&self, identity: &ItemIdentity) -> Option<usize> {
+        (0..self.global_item_count()).position(|ordinal| {
+            self.global_item_location(ordinal)
+                .is_some_and(|(workspace, item)| {
+                    let workspace = &self.workspaces[workspace];
+                    item_matches(&workspace.items[item], identity)
+                        && workspace.id == identity.workspace_id
+                })
+        })
+    }
+}
+
+fn item_identity(workspace: &WorkspaceView, item: &WorkspaceItemView) -> ItemIdentity {
+    let (item_id, launcher) = match item {
+        WorkspaceItemView::Shell(shell) => (shell.id.clone(), false),
+        WorkspaceItemView::AgentShell(agent) => (agent.shell.id.clone(), false),
+        WorkspaceItemView::Launcher(launcher) => (launcher.id.clone(), true),
+    };
+    ItemIdentity {
+        workspace_id: workspace.id.clone(),
+        item_id,
+        launcher,
+    }
+}
+
+fn item_matches(item: &WorkspaceItemView, identity: &ItemIdentity) -> bool {
+    match item {
+        WorkspaceItemView::Shell(shell) => !identity.launcher && shell.id == identity.item_id,
+        WorkspaceItemView::AgentShell(agent) => {
+            !identity.launcher && agent.shell.id == identity.item_id
+        }
+        WorkspaceItemView::Launcher(launcher) => {
+            identity.launcher && launcher.id == identity.item_id
+        }
+    }
+}
+
+fn item_rename_target(item: &WorkspaceItemView) -> RenameTarget {
+    match item {
+        WorkspaceItemView::Shell(shell) => RenameTarget::Shell(shell.id.clone()),
+        WorkspaceItemView::AgentShell(agent) => RenameTarget::Shell(agent.shell.id.clone()),
+        WorkspaceItemView::Launcher(launcher) => RenameTarget::Launcher(launcher.id.clone()),
+    }
+}
+
+fn item_pending_close(item: &WorkspaceItemView) -> PendingClose {
+    match item {
+        WorkspaceItemView::Shell(shell) => PendingClose {
+            target: CloseTarget::Shell(shell.id.clone()),
+            name: shell.name.clone(),
+            shell_count: 1,
+            launcher_count: 0,
+        },
+        WorkspaceItemView::AgentShell(agent) => PendingClose {
+            target: CloseTarget::Shell(agent.shell.id.clone()),
+            name: agent.shell.name.clone(),
+            shell_count: 1,
+            launcher_count: 0,
+        },
+        WorkspaceItemView::Launcher(launcher) => PendingClose {
+            target: CloseTarget::Launcher(launcher.id.clone()),
+            name: launcher.name.clone(),
+            shell_count: 0,
+            launcher_count: 1,
+        },
     }
 }
 
@@ -760,7 +989,7 @@ where
             }
             continue;
         }
-        if !key.modifiers.is_empty() {
+        if !normal_mode_modifiers_supported(key.code, key.modifiers) {
             continue;
         }
 
@@ -769,12 +998,16 @@ where
             KeyCode::Down | KeyCode::Char('j') => app.next(),
             KeyCode::Up | KeyCode::Char('k') => app.previous(),
             KeyCode::Enter => {
-                let dispatched = match app.focus {
-                    Focus::Workspaces => {
-                        app.restore_selected(&mut actions.on_restore);
-                        true
+                let dispatched = if app.primary_tab != PrimaryTab::Workspaces {
+                    app.open_selected_item(&mut actions.on_open)
+                } else {
+                    match app.focus {
+                        Focus::Workspaces => {
+                            app.restore_selected(&mut actions.on_restore);
+                            true
+                        }
+                        Focus::Items => app.open_selected_item(&mut actions.on_open),
                     }
-                    Focus::Items => app.open_selected_item(&mut actions.on_open),
                 };
                 if dispatched {
                     app.refresh(&mut actions.on_refresh);
@@ -793,11 +1026,21 @@ where
                 }
             }
             KeyCode::Char('e') => app.request_rename(),
-            KeyCode::Tab => app.toggle_focus(),
+            KeyCode::Tab => app.cycle_tab(false),
+            KeyCode::BackTab => app.cycle_tab(true),
+            KeyCode::Char('1') => app.select_tab(PrimaryTab::Workspaces),
+            KeyCode::Char('2') => app.select_tab(PrimaryTab::Agents),
+            KeyCode::Char('3') => app.select_tab(PrimaryTab::Launchers),
+            KeyCode::Char('4') => app.select_tab(PrimaryTab::Shells),
+            KeyCode::Char('5') => app.select_tab(PrimaryTab::Commands),
             key if app.handle_focus_key(key) => {}
             _ => {}
         }
     }
+}
+
+fn normal_mode_modifiers_supported(code: KeyCode, modifiers: KeyModifiers) -> bool {
+    modifiers.is_empty() || (code == KeyCode::BackTab && modifiers == KeyModifiers::SHIFT)
 }
 
 fn handle_mode_key<W, E>(
@@ -890,15 +1133,17 @@ fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
     frame.render_widget(Block::new().style(Style::new().bg(BASE)), area);
 
-    let [header_area, dashboard_area, footer_area] = Layout::vertical([
+    let [tabs_area, dashboard_area, footer_area] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Fill(1),
         Constraint::Length(1),
     ])
     .areas(area);
 
-    render_header(frame, header_area, app);
-    if dashboard_area.width >= 114 {
+    render_tabs(frame, tabs_area, app);
+    if app.primary_tab != PrimaryTab::Workspaces {
+        render_global_items(frame, dashboard_area, app);
+    } else if dashboard_area.width >= 114 {
         let [workspace_area, terminal_area] =
             Layout::horizontal([Constraint::Length(42), Constraint::Fill(1)]).areas(dashboard_area);
         render_workspaces(frame, workspace_area, app);
@@ -1015,48 +1260,40 @@ fn centered_rect(area: Rect, width_percent: u16, height_percent: u16) -> Rect {
     horizontal
 }
 
-fn render_header(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
-    let shell_count: usize = app.workspaces.iter().map(WorkspaceView::shell_count).sum();
-    let launcher_count: usize = app
-        .workspaces
-        .iter()
-        .map(WorkspaceView::launcher_count)
-        .sum();
-    let agent_count: usize = app.workspaces.iter().map(WorkspaceView::agent_count).sum();
-    let session_count: usize = app
-        .workspaces
-        .iter()
-        .map(WorkspaceView::session_count)
-        .sum();
-    let line = Line::from(vec![
-        Span::styled(
-            " BOOMUX ",
-            Style::new().fg(TEAL).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!("{} workspaces", app.workspaces.len()),
-            Style::new().fg(GREEN),
-        ),
-        Span::styled("  |  ", Style::new().fg(OVERLAY)),
-        Span::styled(format!("{shell_count} shells"), Style::new().fg(BLUE)),
-        Span::styled("  |  ", Style::new().fg(OVERLAY)),
-        Span::styled(
-            format!("{launcher_count} launchers"),
-            Style::new().fg(YELLOW),
-        ),
-        Span::styled("  |  ", Style::new().fg(OVERLAY)),
-        Span::styled(
-            format!("{agent_count} active agents"),
-            Style::new().fg(TEAL),
-        ),
-        Span::styled("  |  ", Style::new().fg(OVERLAY)),
-        Span::styled(format!("{session_count} sessions"), Style::new().fg(YELLOW)),
-        Span::styled(
-            "    tab/h/l/arrows switches panes",
-            Style::new().fg(SUBTEXT),
-        ),
-    ]);
-    frame.render_widget(Paragraph::new(line).style(Style::new().bg(BASE)), area);
+fn render_tabs(frame: &mut Frame, area: Rect, app: &App) {
+    let mut spans = vec![Span::styled(
+        " BOOMUX  ",
+        Style::new().fg(TEAL).add_modifier(Modifier::BOLD),
+    )];
+    spans.extend(PrimaryTab::ALL.iter().enumerate().flat_map(|(index, tab)| {
+        let selected = *tab == app.primary_tab;
+        let count = match tab {
+            PrimaryTab::Workspaces => app.workspaces.len(),
+            PrimaryTab::Agents => app.workspaces.iter().map(WorkspaceView::agent_count).sum(),
+            PrimaryTab::Launchers => app
+                .workspaces
+                .iter()
+                .map(WorkspaceView::launcher_count)
+                .sum(),
+            PrimaryTab::Shells => app.workspaces.iter().map(WorkspaceView::shell_count).sum(),
+            PrimaryTab::Commands => app
+                .workspaces
+                .iter()
+                .map(WorkspaceView::command_count)
+                .sum(),
+        };
+        let style = if selected {
+            Style::new().fg(BASE).bg(TEAL).add_modifier(Modifier::BOLD)
+        } else {
+            Style::new().fg(TEXT)
+        };
+        [
+            Span::styled(format!(" {} ", index + 1), Style::new().fg(SUBTEXT)),
+            Span::styled(format!("{} {count}", tab.label()), style),
+            Span::raw("  "),
+        ]
+    }));
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn render_workspaces(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
@@ -1064,6 +1301,7 @@ fn render_workspaces(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut A
         Row::new([
             Cell::from(workspace.name.as_str()),
             Cell::from(workspace.shell_count().to_string()),
+            Cell::from(workspace.command_count().to_string()),
             Cell::from(workspace.launcher_count().to_string()),
             Cell::from(workspace.agent_count().to_string()),
         ])
@@ -1073,12 +1311,13 @@ fn render_workspaces(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut A
         [
             Constraint::Min(8),
             Constraint::Length(6),
-            Constraint::Length(9),
+            Constraint::Length(4),
+            Constraint::Length(4),
             Constraint::Length(6),
         ],
     )
     .header(
-        Row::new(["NAME", "SHELLS", "LAUNCHERS", "ACTIVE"])
+        Row::new(["NAME", "SHELLS", "CMDS", "LNCH", "AGENTS"])
             .style(Style::new().fg(BLUE).add_modifier(Modifier::BOLD)),
     )
     .column_spacing(1)
@@ -1099,6 +1338,146 @@ fn render_workspaces(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut A
     .highlight_symbol("> ");
 
     frame.render_stateful_widget(table, area, &mut app.workspace_state);
+}
+
+fn render_global_items(frame: &mut Frame, area: Rect, app: &mut App) {
+    let title = if app.primary_tab == PrimaryTab::Agents {
+        let sessions: usize = app
+            .workspaces
+            .iter()
+            .map(WorkspaceView::session_count)
+            .sum();
+        format!(
+            " {} ({}) | {sessions} SESSIONS ",
+            app.primary_tab.label(),
+            app.global_item_count()
+        )
+    } else {
+        format!(
+            " {} ({}) ",
+            app.primary_tab.label(),
+            app.global_item_count()
+        )
+    };
+    let block = Block::bordered()
+        .title(title)
+        .border_style(Style::new().fg(TEAL));
+    let inner = block.inner(area);
+    let contextual_panel = (app.primary_tab == PrimaryTab::Agents && inner.height >= 9)
+        .then(|| contextual_session_panel(app))
+        .flatten();
+    let (items_inner, sessions_area) = contextual_panel.as_ref().map_or((inner, None), |panel| {
+        let panel_height = (panel.content_height + 2)
+            .min(inner.height.saturating_sub(6))
+            .max(3);
+        let [items_area, sessions_area] =
+            Layout::vertical([Constraint::Fill(1), Constraint::Length(panel_height)]).areas(inner);
+        (items_area, Some(sessions_area))
+    });
+    let show_full_ids = items_inner.width >= 150;
+    let kind = app.primary_tab.kind().expect("global tab kind");
+    let rows: Vec<_> = app
+        .workspaces
+        .iter()
+        .flat_map(|workspace| {
+            workspace
+                .items
+                .iter()
+                .filter(move |item| item.kind() == kind)
+                .map(move |item| {
+                    let mut cells = vec![Cell::from(workspace.name.clone())];
+                    match item {
+                        WorkspaceItemView::Shell(shell) => cells.extend([
+                            Cell::from(shell.name.clone()),
+                            Cell::from(Span::styled(
+                                shell.status.clone(),
+                                Style::new().fg(status_color(&shell.status)),
+                            )),
+                            Cell::from(shell.directory.clone()),
+                            Cell::from(shell.detail().to_owned()),
+                            Cell::from(if show_full_ids {
+                                shell.id.clone()
+                            } else {
+                                short_id(&shell.id)
+                            }),
+                        ]),
+                        WorkspaceItemView::AgentShell(agent) => cells.extend([
+                            Cell::from(agent.shell.name.clone()),
+                            Cell::from(Span::styled(
+                                agent.status().to_owned(),
+                                Style::new().fg(status_color(agent.status())),
+                            )),
+                            Cell::from(agent.shell.directory.clone()),
+                            Cell::from(agent.agent.as_ref().map_or_else(
+                                || format!("foreground process | {}", agent.shell.branch),
+                                |view| {
+                                    format!(
+                                        "{} | {} | {} / {} {}%",
+                                        view.evidence,
+                                        agent.shell.branch,
+                                        view.integration,
+                                        view.authority,
+                                        view.confidence
+                                    )
+                                },
+                            )),
+                            Cell::from(if show_full_ids {
+                                agent.shell.id.clone()
+                            } else {
+                                short_id(&agent.shell.id)
+                            }),
+                        ]),
+                        WorkspaceItemView::Launcher(launcher) => cells.extend([
+                            Cell::from(launcher.name.clone()),
+                            Cell::from("-"),
+                            Cell::from(launcher.directory.clone()),
+                            Cell::from(launcher.command.clone()),
+                            Cell::from(if show_full_ids {
+                                launcher.id.clone()
+                            } else {
+                                short_id(&launcher.id)
+                            }),
+                        ]),
+                    }
+                    Row::new(cells)
+                })
+        })
+        .collect();
+    let table_area = if show_full_ids {
+        items_inner
+    } else {
+        let [detail_area, table_area] =
+            Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(items_inner);
+        let detail = app.selected_item().map_or_else(
+            || {
+                vec![Line::from(Span::styled(
+                    " No item selected",
+                    Style::new().fg(SUBTEXT),
+                ))]
+            },
+            item_detail_lines,
+        );
+        frame.render_widget(Paragraph::new(detail), detail_area);
+        table_area
+    };
+    let widths = global_column_widths(items_inner.width, show_full_ids);
+    let table = Table::new(rows, widths)
+        .header(
+            Row::new(["WORKSPACE", "NAME", "STATUS", "DIRECTORY", "DETAIL", "ID"])
+                .style(Style::new().fg(BLUE).add_modifier(Modifier::BOLD)),
+        )
+        .column_spacing(1)
+        .row_highlight_style(
+            Style::new()
+                .fg(TEXT)
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED),
+        )
+        .highlight_symbol("> ");
+    frame.render_widget(block, area);
+    frame.render_stateful_widget(table, table_area, &mut app.global_state);
+    if let (Some(panel), Some(panel_area)) = (contextual_panel, sessions_area) {
+        render_contextual_sessions(frame, panel_area, panel);
+    }
 }
 
 fn render_items(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
@@ -1282,7 +1661,7 @@ fn contextual_session_panel(app: &App) -> Option<ContextualSessionPanel> {
         return None;
     };
     let agent = agent_shell.agent.as_ref()?;
-    let workspace = app.selected()?;
+    let workspace = app.selected_item_workspace()?;
     let sessions: Vec<_> = workspace
         .sessions
         .iter()
@@ -1477,6 +1856,27 @@ fn shell_column_widths(width: u16, show_full_ids: bool) -> Vec<Constraint> {
     ]
 }
 
+fn global_column_widths(width: u16, show_full_ids: bool) -> Vec<Constraint> {
+    let (workspace, name, status, detail, id, directory_min, directory_max) = if show_full_ids {
+        (20, 18, 10, 30, 36, 16, 42)
+    } else {
+        (12, 12, 8, 12, 8, 8, 28)
+    };
+    // Five column gaps and the highlight marker also consume table width.
+    let fixed = workspace + name + status + detail + id + 7;
+    let directory = width
+        .saturating_sub(fixed)
+        .clamp(directory_min, directory_max);
+    vec![
+        Constraint::Length(workspace),
+        Constraint::Length(name),
+        Constraint::Length(status),
+        Constraint::Length(directory),
+        Constraint::Length(detail),
+        Constraint::Length(id),
+    ]
+}
+
 fn short_id(id: &str) -> String {
     id.chars().take(8).collect()
 }
@@ -1566,23 +1966,31 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
         let mut spans = vec![
             Span::styled(" j/k", Style::new().fg(TEAL)),
             Span::styled(
-                " navigate  tab/h/l/arrows focus  ",
-                Style::new().fg(SUBTEXT),
-            ),
-            Span::styled("a", Style::new().fg(GREEN)),
-            Span::styled(
-                if app.focus == Focus::Workspaces {
-                    " create workspace  "
+                if app.primary_tab == PrimaryTab::Workspaces {
+                    " navigate  tab/shift-tab views  h/l panes  "
                 } else {
-                    " add shell  "
+                    " navigate  tab/shift-tab views  1-5 select view  "
                 },
                 Style::new().fg(SUBTEXT),
             ),
         ];
+        if app.primary_tab == PrimaryTab::Workspaces {
+            spans.extend([
+                Span::styled("a", Style::new().fg(GREEN)),
+                Span::styled(
+                    if app.focus == Focus::Workspaces {
+                        " create workspace  "
+                    } else {
+                        " add shell  "
+                    },
+                    Style::new().fg(SUBTEXT),
+                ),
+            ]);
+        }
         spans.extend([
             Span::styled("e", Style::new().fg(YELLOW)),
             Span::styled(
-                if app.focus == Focus::Workspaces {
+                if app.primary_tab == PrimaryTab::Workspaces && app.focus == Focus::Workspaces {
                     " rename workspace  "
                 } else if launcher_selected {
                     " rename launcher  "
@@ -1593,7 +2001,7 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
             ),
             Span::styled("enter", Style::new().fg(GREEN)),
             Span::styled(
-                if app.focus == Focus::Workspaces {
+                if app.primary_tab == PrimaryTab::Workspaces && app.focus == Focus::Workspaces {
                     " restore workspace  "
                 } else if launcher_selected {
                     " launch command  "
@@ -1610,7 +2018,7 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
         spans.extend([
             Span::styled("x", Style::new().fg(RED)),
             Span::styled(
-                if app.focus == Focus::Workspaces {
+                if app.primary_tab == PrimaryTab::Workspaces && app.focus == Focus::Workspaces {
                     " close workspace  "
                 } else if launcher_selected {
                     " remove launcher  "
@@ -1744,6 +2152,26 @@ mod tests {
         }
     }
 
+    fn terminal(id: &str, name: &str, command: &str) -> WorkspaceItemView {
+        WorkspaceItemView::Shell(TerminalView {
+            id: id.into(),
+            name: name.into(),
+            status: "running".into(),
+            directory: format!("/tmp/{name}"),
+            branch: "main".into(),
+            command: command.into(),
+        })
+    }
+
+    fn launcher_view(id: &str, name: &str) -> WorkspaceItemView {
+        WorkspaceItemView::Launcher(LauncherView {
+            id: id.into(),
+            name: name.into(),
+            directory: format!("/tmp/{name}"),
+            command: format!("run-{name}"),
+        })
+    }
+
     #[test]
     fn navigation_wraps() {
         let mut app = app();
@@ -1813,13 +2241,128 @@ mod tests {
     }
 
     #[test]
-    fn tab_cycles_through_original_two_panes() {
+    fn tab_and_backtab_cycle_primary_views() {
         let mut app = app();
 
-        app.toggle_focus();
-        assert_eq!(app.focus, Focus::Items);
-        app.toggle_focus();
-        assert_eq!(app.focus, Focus::Workspaces);
+        app.cycle_tab(false);
+        assert_eq!(app.primary_tab, PrimaryTab::Agents);
+        app.cycle_tab(false);
+        assert_eq!(app.primary_tab, PrimaryTab::Launchers);
+        app.cycle_tab(true);
+        assert_eq!(app.primary_tab, PrimaryTab::Agents);
+        app.cycle_tab(true);
+        assert_eq!(app.primary_tab, PrimaryTab::Workspaces);
+    }
+
+    #[test]
+    fn normal_mode_accepts_shift_backtab_but_rejects_other_modified_keys() {
+        assert!(normal_mode_modifiers_supported(
+            KeyCode::BackTab,
+            KeyModifiers::SHIFT
+        ));
+        assert!(normal_mode_modifiers_supported(
+            KeyCode::BackTab,
+            KeyModifiers::NONE
+        ));
+        assert!(!normal_mode_modifiers_supported(
+            KeyCode::Tab,
+            KeyModifiers::SHIFT
+        ));
+        assert!(!normal_mode_modifiers_supported(
+            KeyCode::Char('1'),
+            KeyModifiers::CONTROL
+        ));
+    }
+
+    #[test]
+    fn direct_tab_selection_selects_first_matching_item_or_none() {
+        let mut app = app();
+        app.workspaces[0]
+            .items
+            .push(launcher_view("launch-1", "editor"));
+
+        app.select_tab(PrimaryTab::Launchers);
+        assert_eq!(app.primary_tab, PrimaryTab::Launchers);
+        assert_eq!(app.global_state.selected(), Some(0));
+        assert!(matches!(
+            app.selected_item(),
+            Some(WorkspaceItemView::Launcher(launcher)) if launcher.id == "launch-1"
+        ));
+
+        app.select_tab(PrimaryTab::Commands);
+        assert!(app.global_state.selected().is_none());
+    }
+
+    #[test]
+    fn presentation_kind_counts_are_exclusive() {
+        let mut workspace = workspace("w1", "mixed");
+        let mut agent_with_command = agent_shell();
+        agent_with_command.shell.command = "opencode --continue".into();
+        workspace.items = vec![
+            terminal("shell-1", "shell", ""),
+            terminal("command-1", "clock", "watch date"),
+            WorkspaceItemView::AgentShell(agent_with_command),
+            launcher_view("launcher-1", "editor"),
+        ];
+
+        assert_eq!(workspace.shell_count(), 1);
+        assert_eq!(workspace.command_count(), 1);
+        assert_eq!(workspace.agent_count(), 1);
+        assert_eq!(workspace.launcher_count(), 1);
+    }
+
+    #[test]
+    fn tabs_and_workspace_table_render_exclusive_counts() {
+        let backend = TestBackend::new(180, 24);
+        let mut terminal_backend = Terminal::new(backend).unwrap();
+        let mut mixed = workspace("w1", "mixed");
+        mixed.items = vec![
+            terminal("shell-1", "shell", ""),
+            terminal("command-1", "clock", "watch date"),
+            WorkspaceItemView::AgentShell(agent_shell()),
+            launcher_view("launcher-1", "editor"),
+        ];
+        mixed.sessions.push(session("durable-1", "working"));
+        let mut app = App::new(vec![mixed], project_context());
+
+        terminal_backend
+            .draw(|frame| render(frame, &mut app))
+            .unwrap();
+        let buffer = terminal_backend.backend().buffer();
+        let lines: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect()
+            })
+            .collect();
+        let text = lines.join("\n");
+
+        assert!(text.contains("WORKSPACES 1"));
+        assert!(text.contains("AGENTS 1"));
+        assert!(text.contains("LAUNCHERS 1"));
+        assert!(text.contains("SHELLS 1"));
+        assert!(text.contains("COMMANDS 1"));
+        assert!(!text.contains("active agents"));
+        assert!(text.contains("SHELLS CMDS LNCH AGENTS"));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("mixed") && line.matches('1').count() >= 4)
+        );
+
+        app.select_tab(PrimaryTab::Agents);
+        terminal_backend
+            .draw(|frame| render(frame, &mut app))
+            .unwrap();
+        let agent_text: String = terminal_backend
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(agent_text.contains("AGENTS (1) | 1 SESSIONS"));
     }
 
     #[test]
@@ -2449,10 +2992,9 @@ mod tests {
             .collect();
 
         assert_eq!(app.workspaces[0].agent_count(), 1);
-        assert_eq!(app.workspaces[0].shell_count(), 1);
-        assert!(text.contains("1 active agents"));
-        assert!(text.contains("1 shells"));
-        assert!(text.contains("ACTIVE"));
+        assert_eq!(app.workspaces[0].shell_count(), 0);
+        assert!(text.contains("AGENTS 1"));
+        assert!(text.contains("SHELLS 0"));
         assert!(text.contains("Items: boomux (1)"));
         assert!(text.contains("KIND"));
         assert!(text.contains("agent"));
@@ -2624,6 +3166,164 @@ mod tests {
         assert!(!text.contains("first "));
         assert!(!text.contains("observed "));
         assert!(!text.contains("tool call in progress"));
+    }
+
+    #[test]
+    fn global_kind_view_aggregates_items_across_workspaces() {
+        let backend = TestBackend::new(140, 24);
+        let mut terminal_backend = Terminal::new(backend).unwrap();
+        let mut one = workspace("w1", "one");
+        one.items = vec![terminal("shell-one", "alpha-shell", "")];
+        let mut two = workspace("w2", "two");
+        two.items = vec![terminal("shell-two", "beta-shell", "")];
+        let mut app = App::new(vec![one, two], project_context());
+        app.select_tab(PrimaryTab::Shells);
+
+        terminal_backend
+            .draw(|frame| render(frame, &mut app))
+            .unwrap();
+        let text: String = terminal_backend
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+
+        assert_eq!(app.global_item_count(), 2);
+        assert!(text.contains("SHELLS (2)"));
+        assert!(text.contains("WORKSPACE"));
+        assert!(text.contains("alpha-shell"));
+        assert!(text.contains("beta-shell"));
+        assert!(text.contains("one"));
+        assert!(text.contains("two"));
+    }
+
+    #[test]
+    fn narrow_global_view_keeps_all_aggregate_columns_visible() {
+        let backend = TestBackend::new(80, 20);
+        let mut terminal_backend = Terminal::new(backend).unwrap();
+        let mut workspace = workspace("w1", "one");
+        workspace.items = vec![terminal("shell-one", "alpha", "")];
+        let mut app = App::new(vec![workspace], project_context());
+        app.select_tab(PrimaryTab::Shells);
+
+        terminal_backend
+            .draw(|frame| render(frame, &mut app))
+            .unwrap();
+        let text: String = terminal_backend
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+
+        assert!(text.contains("WORKSPACE"));
+        assert!(text.contains("DIRECTORY"));
+        assert!(text.contains("DETAIL"));
+        assert!(text.contains("ID"));
+        assert!(text.contains("shell-on"));
+    }
+
+    #[test]
+    fn global_launcher_actions_dispatch_exact_item_and_owner() {
+        let mut one = workspace("w1", "one");
+        one.items = vec![launcher_view("same-id", "first")];
+        let mut two = workspace("w2", "two");
+        two.items = vec![launcher_view("same-id", "second")];
+        let mut app = App::new(vec![one, two], project_context());
+        app.select_tab(PrimaryTab::Launchers);
+        app.next();
+        let mut opened = None;
+
+        app.open_selected_item(&mut |target| {
+            opened = Some(target.clone());
+            Ok(String::new())
+        });
+        app.request_rename();
+        assert!(matches!(
+            app.mode,
+            Mode::Rename { target: RenameTarget::Launcher(ref id), .. } if id == "same-id"
+        ));
+        app.mode = Mode::Normal;
+        app.request_close();
+
+        assert_eq!(
+            opened,
+            Some(OpenTarget::Launcher {
+                workspace_id: "w2".into(),
+                launcher_id: "same-id".into(),
+            })
+        );
+        assert!(matches!(
+            app.pending_close,
+            Some(PendingClose { target: CloseTarget::Launcher(ref id), ref name, .. })
+                if id == "same-id" && name == "second"
+        ));
+    }
+
+    #[test]
+    fn refresh_preserves_global_selection_by_workspace_and_item_identity() {
+        let mut one = workspace("w1", "one");
+        one.items = vec![launcher_view("same-id", "first")];
+        let mut two = workspace("w2", "two");
+        two.items = vec![launcher_view("same-id", "second")];
+        let mut app = App::new(vec![one, two], project_context());
+        app.select_tab(PrimaryTab::Launchers);
+        app.next();
+
+        let mut refreshed_two = workspace("w2", "two");
+        refreshed_two.items = vec![
+            launcher_view("new", "new"),
+            launcher_view("same-id", "second"),
+        ];
+        let mut refreshed_one = workspace("w1", "one");
+        refreshed_one.items = vec![launcher_view("same-id", "first")];
+        app.replace_workspaces(vec![refreshed_two, refreshed_one]);
+
+        assert_eq!(app.global_state.selected(), Some(1));
+        assert!(matches!(
+            app.selected_item(),
+            Some(WorkspaceItemView::Launcher(launcher)) if launcher.name == "second"
+        ));
+        assert_eq!(
+            app.selected_item_workspace()
+                .map(|workspace| workspace.id.as_str()),
+            Some("w2")
+        );
+    }
+
+    #[test]
+    fn global_agent_uses_owning_workspace_session_context() {
+        let backend = TestBackend::new(180, 34);
+        let mut terminal_backend = Terminal::new(backend).unwrap();
+        let mut one = workspace("w1", "one");
+        one.items.clear();
+        let mut wrong = session("wrong", "working");
+        wrong.label = "Wrong workspace session".into();
+        one.sessions.push(wrong);
+        let mut two = workspace("w2", "two");
+        two.items = vec![WorkspaceItemView::AgentShell(agent_shell())];
+        let mut right = session("right", "working");
+        right.label = "Owning workspace session".into();
+        two.sessions.push(right);
+        let mut app = App::new(vec![one, two], project_context());
+        app.select_tab(PrimaryTab::Agents);
+
+        terminal_backend
+            .draw(|frame| render(frame, &mut app))
+            .unwrap();
+        let text: String = terminal_backend
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+
+        assert!(text.contains("Owning workspace session"));
+        assert!(!text.contains("Wrong workspace session"));
     }
 
     #[test]
