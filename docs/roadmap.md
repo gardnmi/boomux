@@ -105,7 +105,7 @@ eternal process.
 
 ### Near-Term Priorities
 
-1. Validate the OpenCode and Pi lifecycle integrations during normal work before
+1. [Partially validated; see `lifecycle-validation.md`] Validate the OpenCode and Pi lifecycle integrations during normal work before
    expanding the observation model. Confirm reload identity, session switching,
    root/subagent aggregation where available, blocked prompts, idle transitions,
    explicit completion semantics, and graceful daemon replacement against real

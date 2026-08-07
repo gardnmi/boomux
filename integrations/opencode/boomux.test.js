@@ -165,6 +165,54 @@ describe("event mapping and reducer", () => {
 });
 
 describe("root aggregation", () => {
+  test("maps OpenCode 1.18.15 fields consumed for child permissions", async () => {
+    const calls = [];
+    const lifecycle = createLifecycle({
+      client: { session: { get: async () => {} } },
+      env,
+      run: async (argv) => {
+        calls.push(argv);
+        return calls.length === 1 ? successfulEnsure() : { data: {} };
+      },
+      log: () => {},
+    });
+    await lifecycle.enqueue(event("session.created", { info: { id: "root" } }));
+    await lifecycle.enqueue(
+      event("session.created", { info: { id: "child", parentID: "root" } }),
+    );
+    await lifecycle.enqueue(
+      event("session.status", {
+        sessionID: "child",
+        status: { type: "busy" },
+      }),
+    );
+    await lifecycle.enqueue(
+      event("permission.asked", {
+        id: "permission-1",
+        sessionID: "child",
+        permission: "bash",
+      }),
+    );
+    await lifecycle.enqueue(
+      event("permission.replied", {
+        requestID: "permission-1",
+        sessionID: "child",
+        reply: "reject",
+      }),
+    );
+    await lifecycle.enqueue(event("session.idle", { sessionID: "child" }));
+    await lifecycle.enqueue(event("session.idle", { sessionID: "root" }));
+
+    expect(calls.map((argv) => argv[argv.indexOf("--state") + 1])).toEqual([
+      "working",
+      "blocked",
+      "working",
+      "idle",
+    ]);
+    expect(calls[0]).toContain("root");
+    expect(calls.every((argv) => !argv.includes("child"))).toBe(true);
+  });
+
   test("resolves unknown nested ancestry through the client", async () => {
     const calls = [];
     const sessions = {

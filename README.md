@@ -378,6 +378,9 @@ These versions are compatibility test points, not runtime pins. Older or newer
 releases may work when their plugin APIs remain compatible, but are not claimed
 as supported until validated. `boomux capabilities --json` exposes the same
 matrix under `integration_hosts`.
+The scope and evidence behind each test point, including transitions that still
+require an authenticated disposable provider, are recorded in
+[`docs/lifecycle-validation.md`](docs/lifecycle-validation.md).
 
 ## OpenCode Integration
 
