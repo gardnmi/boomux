@@ -153,7 +153,7 @@ boomux attention list [--workspace <name-or-id>]
 boomux attention acknowledge <agent-id> --observation-revision <revision>
 boomux session list [--workspace <name-or-id>]
 boomux session inspect <session-id>
-boomux session read <session-id> [--limit <entries>] [--max-bytes <bytes>]
+boomux session read <session-id> [--before <cursor>] [--limit <entries>] [--max-bytes <bytes>]
 boomux daemon status
 boomux daemon restart
 boomux daemon stop
@@ -251,6 +251,10 @@ scrollback. It returns the newest bounded suffix of messages, reasoning, and too
 activity in chronological order. Pi reads only the current leaf branch and
 combines tool calls with their results. Boomux does not redact host content;
 `--limit` and `--max-bytes` explicitly bound the response and report truncation.
+When `has_more` is true, pass the opaque `next_cursor` back through `--before`
+to read older entries. Cursors preserve the initial normalized snapshot across
+appends that leave its normalized prefix unchanged, and expire if existing
+entries, the active Pi branch, source context, or adapter normalization changes.
 Transcript hosts are registered behind one adapter contract, so future harnesses
 such as Claude Code or Codex can supply canonical lookup and normalization while
 reusing exact Boomux identity, bounds, errors, and output semantics. Discover the

@@ -130,8 +130,9 @@ eternal process.
    capabilities, and an explicit access policy. Boomux trusts the harness as the
    content boundary and does not apply another redaction pass. Host-specific
    canonical lookup and normalization live behind a shared adapter registry so
-   future Claude Code, Codex, and other harness support reuses the same identity,
-   bounds, errors, and output contract.
+    future Claude Code, Codex, and other harness support reuses the same identity,
+    bounds, errors, and output contract. Opaque stateless cursors page toward
+    older entries while expiring on baseline or source-context changes.
 7. [Complete] Add contextual, categorized Agent Session browsing to selected agent rows in
    the Boomux UI. Keep inactive and completed workspace sessions visible without
    adding duplicate shell rows, grouped by active and recent time windows with

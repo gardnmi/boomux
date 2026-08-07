@@ -86,6 +86,7 @@ const INTEGRATION_FEATURES: &[&str] = &[
     "process_adapters",
     "projected_agent_sessions",
     "canonical_session_transcripts",
+    "transcript_pagination",
     "durable_session_source_context",
     "revision_aware_agent_wait",
     "persistent_agent_attention",
@@ -431,6 +432,8 @@ enum SessionCommands {
     /// Read canonical messages and tool activity by exact opaque ID
     Read {
         session_id: String,
+        #[arg(long)]
+        before: Option<String>,
         #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u16).range(1..=1000))]
         limit: u16,
         #[arg(long, default_value_t = 1024 * 1024, value_parser = clap::value_parser!(u32).range(1..=4 * 1024 * 1024))]
@@ -2109,6 +2112,7 @@ fn session_command(command: SessionCommands, json: bool) -> Result<(), Box<dyn E
         }
         SessionCommands::Read {
             session_id,
+            before,
             limit,
             max_bytes,
         } => {
@@ -2127,8 +2131,13 @@ fn session_command(command: SessionCommands, json: bool) -> Result<(), Box<dyn E
                     ));
                 }
             };
-            let transcript = session_transcript::read(session, limit.into(), max_bytes as usize)
-                .map_err(|error| cli_output::failure(error.code, error.to_string()))?;
+            let transcript = session_transcript::read(
+                session,
+                before.as_deref(),
+                limit.into(),
+                max_bytes as usize,
+            )
+            .map_err(|error| cli_output::failure(error.code, error.to_string()))?;
             if json {
                 return cli_output::print(
                     "session.read",
@@ -2253,6 +2262,11 @@ fn print_transcript(transcript: &session_transcript::Transcript) {
         transcript.returned_entries, transcript.total_entries
     );
     println!("CONTENT BYTES\t{}", transcript.content_bytes);
+    println!("HAS MORE\t{}", transcript.has_more);
+    println!(
+        "NEXT CURSOR\t{}",
+        transcript.next_cursor.as_deref().unwrap_or("-")
+    );
     println!(
         "TRUNCATED\t{}",
         if transcript.truncated {
@@ -3789,6 +3803,8 @@ mod tests {
             "session",
             "read",
             "opaque",
+            "--before",
+            "v1.cursor",
             "--limit",
             "25",
             "--max-bytes",
@@ -3803,10 +3819,11 @@ mod tests {
             Some(Commands::Session {
                 command: SessionCommands::Read {
                     session_id,
+                    before: Some(before),
                     limit: 25,
                     max_bytes: 4096,
                 }
-            }) if session_id == "opaque"
+            }) if session_id == "opaque" && before == "v1.cursor"
         ));
         assert!(
             Cli::try_parse_from(["boomux", "session", "read", "opaque", "--limit", "0"]).is_err()
@@ -4685,6 +4702,7 @@ mod tests {
             "opencode_lifecycle_plugin",
             "pi_lifecycle_extension",
             "canonical_session_transcripts",
+            "transcript_pagination",
             "protocol_15",
             "persistent_agent_attention",
         ] {

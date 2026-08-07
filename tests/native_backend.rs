@@ -1617,7 +1617,7 @@ fn agent_runtime_is_revisioned_durable_and_version_compatible() {
             "read",
             pi_session_id,
             "--limit",
-            "10",
+            "1",
             "--max-bytes",
             "4096",
             "--json",
@@ -1633,18 +1633,95 @@ fn agent_runtime_is_revisioned_durable_and_version_compatible() {
     let pi_read: serde_json::Value = serde_json::from_slice(&pi_read.stdout).unwrap();
     assert_eq!(pi_read["command"], "session.read");
     assert_eq!(pi_read["data"]["transcript"]["total_entries"], 2);
+    assert_eq!(pi_read["data"]["transcript"]["returned_entries"], 1);
+    assert_eq!(pi_read["data"]["transcript"]["has_more"], true);
+    let next_cursor = pi_read["data"]["transcript"]["next_cursor"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     assert_eq!(
         pi_read["data"]["transcript"]["entries"][0]["text"],
-        "inspect this"
+        serde_json::Value::Null
     );
     assert_eq!(
-        pi_read["data"]["transcript"]["entries"][1]["tool_name"],
-        "read"
-    );
-    assert_eq!(
-        pi_read["data"]["transcript"]["entries"][1]["output"],
+        pi_read["data"]["transcript"]["entries"][0]["output"],
         "fixture output"
     );
+    writeln!(
+        OpenOptions::new()
+            .append(true)
+            .open(pi_directory.join("pi-session.jsonl"))
+            .unwrap(),
+        "{{\"type\":\"message\",\"id\":\"later\",\"parentId\":\"result\",\"timestamp\":\"x\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"appended later\"}}],\"timestamp\":13}}}}"
+    )
+    .unwrap();
+    let older = daemon
+        .command()
+        .args([
+            "session",
+            "read",
+            pi_session_id,
+            "--before",
+            &next_cursor,
+            "--limit",
+            "1",
+            "--max-bytes",
+            "4096",
+            "--json",
+        ])
+        .env("PI_CODING_AGENT_SESSION_DIR", &pi_directory)
+        .output()
+        .unwrap();
+    assert!(older.status.success());
+    let older: serde_json::Value = serde_json::from_slice(&older.stdout).unwrap();
+    assert_eq!(older["data"]["transcript"]["total_entries"], 2);
+    assert_eq!(older["data"]["transcript"]["has_more"], false);
+    assert!(older["data"]["transcript"]["next_cursor"].is_null());
+    assert_eq!(
+        older["data"]["transcript"]["entries"][0]["text"],
+        "inspect this"
+    );
+    let malformed_cursor = daemon
+        .command()
+        .args([
+            "session",
+            "read",
+            pi_session_id,
+            "--before",
+            "not-a-cursor",
+            "--json",
+        ])
+        .env("PI_CODING_AGENT_SESSION_DIR", &pi_directory)
+        .output()
+        .unwrap();
+    assert!(!malformed_cursor.status.success());
+    let malformed_cursor: serde_json::Value =
+        serde_json::from_slice(&malformed_cursor.stderr).unwrap();
+    assert_eq!(malformed_cursor["command"], "session.read");
+    assert_eq!(malformed_cursor["error"]["code"], "invalid_argument");
+
+    let pi_path = pi_directory.join("pi-session.jsonl");
+    let changed = fs::read_to_string(&pi_path)
+        .unwrap()
+        .replace("inspect this", "changed baseline");
+    fs::write(&pi_path, changed).unwrap();
+    let expired_cursor = daemon
+        .command()
+        .args([
+            "session",
+            "read",
+            pi_session_id,
+            "--before",
+            &next_cursor,
+            "--json",
+        ])
+        .env("PI_CODING_AGENT_SESSION_DIR", &pi_directory)
+        .output()
+        .unwrap();
+    assert!(!expired_cursor.status.success());
+    let expired_cursor: serde_json::Value = serde_json::from_slice(&expired_cursor.stderr).unwrap();
+    assert_eq!(expired_cursor["command"], "session.read");
+    assert_eq!(expired_cursor["error"]["code"], "cursor_expired");
 
     let missing_session = daemon
         .command()
@@ -2406,6 +2483,7 @@ fn native_daemon_lifecycle() {
         "opencode_lifecycle_plugin",
         "process_adapters",
         "persistent_agent_attention",
+        "transcript_pagination",
     ] {
         assert!(features.iter().any(|current| current == feature));
     }
