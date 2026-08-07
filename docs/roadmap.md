@@ -97,6 +97,8 @@ eternal process.
 3. [Complete] Add an explicit-session process supervisor that preserves exact
    argv and inherited stdio, propagates child exit, reports only `unknown`
    process start/exit evidence, and fails open when Boomux reporting fails.
+4. [Complete] Project run-scoped Agent instances into globally discoverable
+   session metadata with stable list/inspect JSON and human CLI commands.
 
 ### Near-Term Priorities
 
@@ -111,20 +113,20 @@ eternal process.
    transitions without polling human output.
 4. Add deduplicated notifications for blocked and completed transitions after
    the attention and wait semantics are established.
-5. Add explicit cross-harness session inspection so Pi can read an OpenCode
+5. Add explicit cross-harness transcript and tool inspection so Pi can read an OpenCode
    session and OpenCode can read a Pi session. Do not treat bounded rendered
    terminal output as the full session: host adapters must expose canonical
    session identity, bounded and redacted messages and tool activity, versioned
    capabilities, and an explicit access policy.
-6. Add contextual, categorized Agent Session browsing to selected agent rows in
+6. [Complete] Add contextual, categorized Agent Session browsing to selected agent rows in
    the Boomux UI. Keep inactive and completed workspace sessions visible without
    adding duplicate shell rows, grouped by active and recent time windows with
    integration, canonical identity, associated shell and run, lifecycle state,
    and timestamps. Bounded asynchronous host catalog adapters provide OpenCode
    generated titles and Pi names or first-user-message summaries; future adapters
-   may provide transcripts and tool activity. Expose the resulting session inspection
-   surface through versioned CLI/API commands so authorized agents can discover
-   and read other sessions.
+   may provide transcripts and tool activity. Session metadata discovery is
+   exposed through versioned CLI commands; transcript and tool reading remains
+   future work.
 
 ### Deferred Agent Work
 

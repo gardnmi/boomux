@@ -148,6 +148,8 @@ boomux agent register <name> --integration <integration> [--external-session-id 
 boomux agent ensure <name> --integration <integration> --external-session-id <id> [--shell-id <shell-id>] [--run-id <run-id>] --state <state> --authority <authority> --evidence <evidence> --confidence <0-100>
 boomux agent supervise <name> --integration <integration> --external-session-id <canonical-root-id> [--shell-id <shell-id>] [--run-id <run-id>] -- <command>...
 boomux agent report <agent-id> [--shell-id <shell-id>] [--run-id <run-id>] --state <state> --authority <authority> --evidence <evidence> --confidence <0-100>
+boomux session list [--workspace <name-or-id>]
+boomux session inspect <session-id>
 boomux daemon status
 boomux daemon restart
 boomux daemon stop
@@ -212,6 +214,21 @@ idempotent success; a different later report is rejected. Completed instances
 remain inspectable across daemon restart. Boomux does not yet provide terminal
 heuristics, agent waits, agent reads, or agent control.
 
+`boomux session list` and `boomux session inspect` project durable Agent
+instances into workspace session history. Instances are grouped within one
+workspace and integration by external session ID; records without one remain
+isolated. A session is current only while at least one occurrence is active on
+the exact current run of a running retained shell. Otherwise its state is
+explicitly last-known. The CLI `description` is the latest stored Boomux Agent
+registration name. The dashboard may separately enrich its display title from
+bounded host catalogs; the CLI never synchronously calls those adapters.
+
+Projected session IDs are deterministic, globally unique UUIDs, but are opaque.
+Obtain an ID from `session list` and pass that exact value to `session inspect`;
+never guess one from an external session ID, description, shell, or Agent ID.
+Session projection is client-side metadata over daemon protocol 12 snapshots,
+not another persisted daemon entity.
+
 The first explicit process-adapter supervisor runs one exact argument vector:
 
 ```console
@@ -240,8 +257,8 @@ session ID, shell ID, or run ID coexists as a distinct instance.
 understands cursor rewrites and terminal soft wrapping, retains up to 2,000
 scrollback rows per shell, and never returns ANSI control sequences.
 
-Read-only integration commands, including `agent list` and `agent inspect`,
-accept `--json` and emit the stable
+Read-only integration commands, including `agent list`, `agent inspect`,
+`session list`, and `session inspect`, accept `--json` and emit the stable
 `boomux.cli/v1` envelope. Run `boomux capabilities --json` to discover supported
 commands, features, and typed error codes without starting the daemon. See
 [`docs/cli-json.md`](docs/cli-json.md) for the contract.

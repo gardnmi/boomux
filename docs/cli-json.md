@@ -41,6 +41,8 @@ The following commands support `--json`:
 - `boomux agent register`
 - `boomux agent ensure`
 - `boomux agent report`
+- `boomux session list`
+- `boomux session inspect`
 - `boomux daemon status`
 
 JSON mutations are deliberately narrow: only `agent register`, `agent ensure`,
@@ -65,6 +67,10 @@ Command payloads are:
 - `agent.inspect`: one `agent` object selected by exact agent ID.
 - `agent.register`, `agent.ensure`, and `agent.report`: one resulting `agent`
   object. The command field identifies the specific mutation.
+- `session.list`: a globally newest-first `sessions` array, optionally limited
+  by exact workspace name or ID.
+- `session.inspect`: one projected `session` object selected only by exact
+  opaque session ID.
 - `read`: shell/run identity, observed output revision, and rendered output.
 - `events`: stream identity, reconnect cursor, optional baseline snapshot, and a
   bounded event array.
@@ -109,6 +115,38 @@ already identifies a unique record, ensure returns the stored snapshot without
 applying the supplied name or report. This is the intended identity-recovery
 path after an integration reload. Otherwise it creates the record with the same
 shape and validation as `agent.register`.
+
+## Session Data
+
+Session summaries contain `id`, `workspace_id`, `workspace_name`, `description`,
+`integration`, `external_session_id`, `state`, `state_is_current`,
+`started_at_ms`, `last_at_ms`, and `occurrence_count`. `description` is the
+latest stored Boomux Agent registration name, never a synchronously fetched host
+title. Missing optional values are JSON `null`.
+
+Inspect includes all summary fields plus ordered `occurrences`. Each occurrence
+contains `agent_id`, the original `shell_id` even if that shell was removed,
+`retained_shell_name`, `retained_shell_cwd`, `run_id`, `started_at_ms`,
+`ended_at_ms`, `is_current`, and the full stable Agent `observation` shape.
+Retained shell fields are null after shell removal. State and authority use the
+same spellings documented for Agent observations.
+
+Projection groups Agent instances only when workspace, integration, and external
+session ID match. An Agent without an external session ID forms its own session.
+Current state is selected from occurrences that are incomplete, non-inactive,
+and bound to the current run of a running retained shell; otherwise state is the
+latest stored observation and `state_is_current` is false. List order is newest
+activity first, then workspace ID and session ID.
+
+Session IDs are deterministic globally unique UUID v5 values, but consumers must
+treat them as opaque. At a semantic level, Boomux hashes a frozen namespace and
+versioned, length-prefixed encoding of workspace ID, integration, and grouping
+identity (`external:<id>` or `instance:<agent-id>`). This algorithm is frozen to
+keep emitted IDs stable, not exposed for callers to reproduce or guess. Only an
+exact ID returned by `session.list` resolves; external IDs, descriptions, shell
+IDs, and Agent IDs never resolve through `session.inspect`. Both session commands
+require a negotiated daemon protocol of at least 12 and return
+`unsupported_version` before projection against an older daemon.
 
 `read` returns `shell_id`, `run_id`, `output_revision`, `changed`, `status`, and
 `output`. Output is a JSON string containing the same bounded plain rendered text

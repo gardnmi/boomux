@@ -1382,6 +1382,62 @@ fn agent_runtime_is_revisioned_durable_and_version_compatible() {
     assert_eq!(list["command"], "agent.list");
     assert_eq!(list["data"]["agents"][0]["id"], agent_id);
     assert_eq!(list["data"]["agents"][0]["observation"]["revision"], 1);
+    let session_list = daemon
+        .command()
+        .args(["session", "list", "--workspace", &workspace.id, "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        session_list.status.success(),
+        "{}",
+        String::from_utf8_lossy(&session_list.stderr)
+    );
+    let session_list: serde_json::Value = serde_json::from_slice(&session_list.stdout).unwrap();
+    assert_eq!(session_list["command"], "session.list");
+    let sessions = session_list["data"]["sessions"].as_array().unwrap();
+    assert_eq!(sessions.len(), 2);
+    assert!(
+        sessions
+            .iter()
+            .all(|session| session["workspace_id"] == workspace.id)
+    );
+    let projected = sessions
+        .iter()
+        .find(|session| session["external_session_id"] == "session-1")
+        .unwrap();
+    let session_id = projected["id"].as_str().unwrap();
+    assert_eq!(projected["description"], "runtime-agent");
+    assert_eq!(projected["occurrence_count"], 1);
+
+    let session_inspect = daemon
+        .command()
+        .args(["session", "inspect", session_id, "--json"])
+        .output()
+        .unwrap();
+    assert!(session_inspect.status.success());
+    let session_inspect: serde_json::Value =
+        serde_json::from_slice(&session_inspect.stdout).unwrap();
+    assert_eq!(session_inspect["command"], "session.inspect");
+    assert_eq!(session_inspect["data"]["session"]["id"], session_id);
+    assert_eq!(
+        session_inspect["data"]["session"]["occurrences"][0]["agent_id"],
+        agent_id
+    );
+    assert_eq!(
+        session_inspect["data"]["session"]["occurrences"][0]["shell_id"],
+        shell_id
+    );
+
+    let missing_session = daemon
+        .command()
+        .args(["session", "inspect", "session-1", "--json"])
+        .output()
+        .unwrap();
+    assert!(!missing_session.status.success());
+    let missing_session: serde_json::Value =
+        serde_json::from_slice(&missing_session.stderr).unwrap();
+    assert_eq!(missing_session["command"], "session.inspect");
+    assert_eq!(missing_session["error"]["code"], "not_found");
     let inspect = daemon
         .command()
         .args(["agent", "inspect", &adapter_id])
