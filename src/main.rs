@@ -24,6 +24,7 @@ mod agent_attention_projection;
 mod cli_output;
 mod config;
 mod git;
+mod host_session_source;
 mod host_session_titles;
 mod process_adapter;
 mod projects;

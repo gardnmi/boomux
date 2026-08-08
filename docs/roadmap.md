@@ -141,6 +141,9 @@ eternal process.
    generated titles and Pi names or first-user-message summaries; future adapters
    also provide canonical transcripts and tool activity through bounded,
    versioned CLI output.
+8. [Complete] Separate OpenCode and Pi title and transcript adapters from shared
+   cache, pagination, cursor, and output policy so future harness support can be
+   added through isolated modules and explicit capability registries.
 
 ### Deferred Agent Work
 
