@@ -1,28 +1,40 @@
 use std::collections::{HashMap, HashSet};
-use std::ffi::OsString;
-use std::fs::{self, OpenOptions};
-use std::io::Read;
-use std::os::unix::fs::OpenOptionsExt;
-use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
+
+mod opencode;
+mod pi;
+
+#[cfg(test)]
+use crate::host_session_source::pi::{
+    Environment as PiEnvironment, MAX_FILE_BYTES as MAX_PI_FILE_BYTES,
+    session_directory_for_test as pi_session_directory, session_file as pi_session_file,
+};
+#[cfg(test)]
+use opencode::{
+    MAX_STDOUT_BYTES as MAX_OPENCODE_STDOUT_BYTES, parse_titles as parse_opencode_titles,
+};
+#[cfg(test)]
+use pi::{inspect as inspect_pi, parse_session as parse_pi_session};
 
 const SUCCESS_TTL: Duration = Duration::from_secs(30);
 const FAILURE_TTL: Duration = Duration::from_secs(5);
-const COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
-const MAX_OPENCODE_STDOUT_BYTES: u64 = 1024 * 1024;
-const MAX_PI_FILE_BYTES: u64 = 256 * 1024;
-const MAX_PI_CATALOG_BYTES: u64 = 4 * 1024 * 1024;
-const MAX_PI_TRANSCRIPT_SCAN_BYTES: u64 = 16 * 1024 * 1024;
-const MAX_PI_TRANSCRIPT_SCAN_FILES: usize = 4096;
 const MAX_SESSIONS: usize = 100;
 const MAX_TITLE_CHARS: usize = 160;
 
 type Titles = HashMap<String, String>;
 type Inspector = dyn Fn(&str, &Path) -> Option<Titles> + Send + Sync;
+
+trait TitleAdapter: Sync {
+    fn integration(&self) -> &'static str;
+
+    fn inspect(&self, directory: &Path) -> Option<Titles>;
+}
+
+static ADAPTERS: &[&dyn TitleAdapter] = &[opencode::ADAPTER, pi::ADAPTER];
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct CacheKey {
@@ -114,419 +126,16 @@ impl Cache {
 }
 
 fn is_supported(integration: &str) -> bool {
-    matches!(integration, "opencode" | "pi")
+    ADAPTERS
+        .iter()
+        .any(|adapter| adapter.integration() == integration)
 }
 
 fn inspect(integration: &str, directory: &Path) -> Option<Titles> {
-    match integration {
-        "opencode" => inspect_opencode(directory),
-        "pi" => inspect_pi(directory, &PiEnvironment::from_process()),
-        _ => None,
-    }
-}
-
-fn inspect_opencode(directory: &Path) -> Option<Titles> {
-    let stdout = run_opencode(directory)?;
-    parse_opencode_titles(&stdout)
-}
-
-fn run_opencode(directory: &Path) -> Option<Vec<u8>> {
-    let mut child = Command::new("opencode")
-        .args(["session", "list", "--format", "json", "-n", "100"])
-        .current_dir(directory)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let mut stdout = child.stdout.take()?;
-    let (sender, receiver) = mpsc::channel();
-    thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let result = stdout
-            .by_ref()
-            .take(MAX_OPENCODE_STDOUT_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .map(|_| bytes);
-        let _ = sender.send(result);
-    });
-
-    let deadline = Instant::now() + COMMAND_TIMEOUT;
-    let mut output = None;
-    let mut status = None;
-    loop {
-        if output.is_none() {
-            match receiver.try_recv() {
-                Ok(Ok(bytes)) => output = Some(bytes),
-                Ok(Err(_)) | Err(TryRecvError::Disconnected) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return None;
-                }
-                Err(TryRecvError::Empty) => {}
-            }
-        }
-        if output
-            .as_ref()
-            .is_some_and(|bytes| bytes.len() as u64 > MAX_OPENCODE_STDOUT_BYTES)
-        {
-            let _ = child.kill();
-            let _ = child.wait();
-            return None;
-        }
-        if status.is_none() {
-            status = child.try_wait().ok()?;
-        }
-        if let (Some(status), Some(bytes)) = (status.as_ref(), output.as_ref()) {
-            return status.success().then(|| bytes.clone());
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return None;
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-}
-
-#[derive(serde::Deserialize)]
-struct OpenCodeSession {
-    id: String,
-    title: String,
-    #[serde(rename = "updated")]
-    _updated: serde_json::Value,
-    #[serde(rename = "created")]
-    _created: serde_json::Value,
-    #[serde(rename = "directory")]
-    _directory: String,
-}
-
-fn parse_opencode_titles(output: &[u8]) -> Option<Titles> {
-    if output.len() as u64 > MAX_OPENCODE_STDOUT_BYTES {
-        return None;
-    }
-    let sessions: Vec<OpenCodeSession> = serde_json::from_slice(output).ok()?;
-    let mut titles = HashMap::new();
-    for session in sessions.into_iter().take(MAX_SESSIONS) {
-        if session.id.is_empty() {
-            continue;
-        }
-        if let Some(title) = sanitize_title(&session.title) {
-            titles.insert(session.id, title);
-        }
-    }
-    Some(titles)
-}
-
-#[derive(Clone, Debug, Default)]
-pub(crate) struct PiEnvironment {
-    coding_agent_dir: Option<OsString>,
-    session_dir: Option<OsString>,
-    home: Option<OsString>,
-}
-
-impl PiEnvironment {
-    pub(crate) fn from_process() -> Self {
-        Self {
-            coding_agent_dir: std::env::var_os("PI_CODING_AGENT_DIR"),
-            session_dir: std::env::var_os("PI_CODING_AGENT_SESSION_DIR"),
-            home: std::env::var_os("HOME"),
-        }
-    }
-}
-
-fn inspect_pi(directory: &Path, environment: &PiEnvironment) -> Option<Titles> {
-    let normalized_directory = normalize_absolute(directory)?;
-    let catalog_directory = pi_session_directory(&normalized_directory, environment)?;
-    let files = pi_catalog_files(&catalog_directory)?;
-    let mut remaining_bytes = MAX_PI_CATALOG_BYTES;
-    let mut titles = HashMap::new();
-
-    for path in files {
-        if remaining_bytes == 0 {
-            break;
-        }
-        let limit = MAX_PI_FILE_BYTES.min(remaining_bytes);
-        let Some(prefix) = read_regular_file_prefix(&path, limit) else {
-            continue;
-        };
-        remaining_bytes = remaining_bytes.saturating_sub(prefix.scanned_bytes);
-        if let Some((id, title)) = parse_pi_session(&prefix.bytes, &normalized_directory) {
-            titles.entry(id).or_insert(title);
-        }
-    }
-    Some(titles)
-}
-
-pub(crate) fn pi_session_directory(
-    directory: &Path,
-    environment: &PiEnvironment,
-) -> Option<PathBuf> {
-    if let Some(session_directory) = nonempty(environment.session_dir.as_ref()) {
-        return expand_home(session_directory, environment.home.as_ref());
-    }
-    let root = match nonempty(environment.coding_agent_dir.as_ref()) {
-        Some(root) => expand_home(root, environment.home.as_ref())?,
-        None => PathBuf::from(nonempty(environment.home.as_ref())?).join(".pi/agent"),
-    };
-    root.is_absolute().then(|| {
-        root.join("sessions")
-            .join(pi_encoded_session_directory(directory))
-    })
-}
-
-fn nonempty(value: Option<&OsString>) -> Option<&OsString> {
-    value.filter(|value| !value.is_empty())
-}
-
-fn expand_home(value: &OsString, home: Option<&OsString>) -> Option<PathBuf> {
-    let path = PathBuf::from(value);
-    let expanded = if path == Path::new("~") {
-        PathBuf::from(nonempty(home)?)
-    } else if let Ok(suffix) = path.strip_prefix("~/") {
-        PathBuf::from(nonempty(home)?).join(suffix)
-    } else {
-        path
-    };
-    expanded.is_absolute().then_some(expanded)
-}
-
-fn pi_encoded_session_directory(directory: &Path) -> String {
-    let directory = directory.to_string_lossy();
-    let encoded: String = directory
-        .trim_start_matches('/')
-        .chars()
-        .map(|character| match character {
-            '/' | '\\' | ':' => '-',
-            other => other,
-        })
-        .collect();
-    format!("--{encoded}--")
-}
-
-pub(crate) fn normalize_absolute(path: &Path) -> Option<PathBuf> {
-    if !path.is_absolute() {
-        return None;
-    }
-    let mut normalized = PathBuf::from("/");
-    for component in path.components() {
-        match component {
-            Component::RootDir | Component::CurDir => {}
-            Component::Normal(component) => normalized.push(component),
-            Component::ParentDir => {
-                normalized.pop();
-            }
-            Component::Prefix(_) => return None,
-        }
-    }
-    Some(normalized)
-}
-
-fn pi_catalog_files(directory: &Path) -> Option<Vec<PathBuf>> {
-    let mut files = Vec::new();
-    for entry in fs::read_dir(directory).ok()?.flatten() {
-        let path = entry.path();
-        if path
-            .extension()
-            .is_none_or(|extension| extension != "jsonl")
-        {
-            continue;
-        }
-        let Ok(metadata) = fs::symlink_metadata(&path) else {
-            continue;
-        };
-        if !metadata.file_type().is_file() {
-            continue;
-        }
-        files.push((path, metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH)));
-    }
-    files.sort_by(|(left_path, left_time), (right_path, right_time)| {
-        right_time
-            .cmp(left_time)
-            .then_with(|| left_path.cmp(right_path))
-    });
-    files.truncate(MAX_SESSIONS);
-    Some(files.into_iter().map(|(path, _)| path).collect())
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PiSessionFileError {
-    Unavailable,
-    ScanLimit,
-}
-
-pub(crate) fn pi_session_file(
-    directory: &Path,
-    external_session_id: &str,
-    environment: &PiEnvironment,
-) -> Result<PathBuf, PiSessionFileError> {
-    let normalized_directory =
-        normalize_absolute(directory).ok_or(PiSessionFileError::Unavailable)?;
-    let catalog_directory = pi_session_directory(&normalized_directory, environment)
-        .ok_or(PiSessionFileError::Unavailable)?;
-    let mut remaining_bytes = MAX_PI_TRANSCRIPT_SCAN_BYTES;
-    let mut remaining_files = MAX_PI_TRANSCRIPT_SCAN_FILES;
-    for filename_match in [true, false] {
-        let entries =
-            fs::read_dir(&catalog_directory).map_err(|_| PiSessionFileError::Unavailable)?;
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if pi_session_filename_matches(&path, external_session_id) != filename_match
-                || path
-                    .extension()
-                    .is_none_or(|extension| extension != "jsonl")
-                || !fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_file())
-            {
-                continue;
-            }
-            if remaining_bytes == 0 || remaining_files == 0 {
-                return Err(PiSessionFileError::ScanLimit);
-            }
-            remaining_files -= 1;
-            let Some(prefix) =
-                read_regular_file_prefix(&path, remaining_bytes.min(MAX_PI_FILE_BYTES))
-            else {
-                continue;
-            };
-            remaining_bytes = remaining_bytes.saturating_sub(prefix.scanned_bytes);
-            if pi_header_matches(&prefix.bytes, external_session_id, &normalized_directory) {
-                return Ok(path);
-            }
-        }
-    }
-    Err(PiSessionFileError::Unavailable)
-}
-
-fn pi_header_matches(output: &[u8], external_session_id: &str, directory: &Path) -> bool {
-    let Some(header) = output
-        .split(|byte| *byte == b'\n')
-        .filter_map(|line| serde_json::from_slice::<serde_json::Value>(line).ok())
-        .next()
-    else {
-        return false;
-    };
-    header.get("type").and_then(serde_json::Value::as_str) == Some("session")
-        && header.get("id").and_then(serde_json::Value::as_str) == Some(external_session_id)
-        && header
-            .get("cwd")
-            .and_then(serde_json::Value::as_str)
-            .and_then(|cwd| normalize_absolute(Path::new(cwd)))
-            .is_some_and(|cwd| cwd == directory)
-}
-
-fn pi_session_filename_matches(path: &Path, external_session_id: &str) -> bool {
-    if external_session_id.is_empty()
-        || path
-            .extension()
-            .is_none_or(|extension| extension != "jsonl")
-    {
-        return false;
-    }
-    path.file_stem()
-        .and_then(|stem| stem.to_str())
-        .is_some_and(|stem| {
-            stem == external_session_id
-                || stem
-                    .strip_suffix(external_session_id)
-                    .is_some_and(|prefix| prefix.ends_with('_'))
-        })
-}
-
-struct FilePrefix {
-    bytes: Vec<u8>,
-    scanned_bytes: u64,
-}
-
-// Prefix-only inspection keeps I/O bounded; session_info names beyond this prefix are unavailable.
-fn read_regular_file_prefix(path: &Path, limit: u64) -> Option<FilePrefix> {
-    let mut file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)
-        .ok()?;
-    let metadata = file.metadata().ok()?;
-    if !metadata.file_type().is_file() {
-        return None;
-    }
-    let mut bytes = Vec::new();
-    file.by_ref().take(limit).read_to_end(&mut bytes).ok()?;
-    let scanned_bytes = bytes.len() as u64;
-    if metadata.len() > scanned_bytes {
-        let complete_length = bytes
-            .iter()
-            .rposition(|byte| *byte == b'\n')
-            .map_or(0, |index| index + 1);
-        bytes.truncate(complete_length);
-    }
-    Some(FilePrefix {
-        bytes,
-        scanned_bytes,
-    })
-}
-
-fn parse_pi_session(output: &[u8], requested_directory: &Path) -> Option<(String, String)> {
-    let mut entries = output
-        .split(|byte| *byte == b'\n')
-        .filter_map(|line| serde_json::from_slice::<serde_json::Value>(line).ok());
-    let header = entries.next()?;
-    if header.get("type")?.as_str()? != "session" {
-        return None;
-    }
-    let id = header.get("id")?.as_str()?;
-    if id.is_empty() {
-        return None;
-    }
-    let header_directory = normalize_absolute(Path::new(header.get("cwd")?.as_str()?))?;
-    if header_directory != requested_directory {
-        return None;
-    }
-
-    let mut explicit_name = None;
-    let mut saw_session_info = false;
-    let mut first_user_summary = None;
-    for entry in entries {
-        match entry.get("type").and_then(serde_json::Value::as_str) {
-            Some("session_info") => {
-                saw_session_info = true;
-                explicit_name = entry
-                    .get("name")
-                    .and_then(serde_json::Value::as_str)
-                    .and_then(sanitize_title);
-            }
-            Some("message") if first_user_summary.is_none() => {
-                let Some(message) = entry.get("message") else {
-                    continue;
-                };
-                if message.get("role").and_then(serde_json::Value::as_str) != Some("user") {
-                    continue;
-                }
-                first_user_summary = message
-                    .get("content")
-                    .and_then(pi_message_text)
-                    .and_then(|text| sanitize_title(&text));
-            }
-            _ => {}
-        }
-    }
-    match (saw_session_info, explicit_name) {
-        (true, Some(name)) => Some(name),
-        _ => first_user_summary,
-    }
-    .map(|title| (id.to_owned(), title))
-}
-
-fn pi_message_text(content: &serde_json::Value) -> Option<String> {
-    if let Some(text) = content.as_str() {
-        return Some(text.to_owned());
-    }
-    let blocks = content.as_array()?;
-    let text = blocks
+    ADAPTERS
         .iter()
-        .filter(|block| block.get("type").and_then(serde_json::Value::as_str) == Some("text"))
-        .filter_map(|block| block.get("text").and_then(serde_json::Value::as_str))
-        .collect::<Vec<_>>()
-        .join(" ");
-    (!text.is_empty()).then_some(text)
+        .find(|adapter| adapter.integration() == integration)?
+        .inspect(directory)
 }
 
 fn sanitize_title(title: &str) -> Option<String> {
@@ -543,7 +152,8 @@ fn sanitize_title(title: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::fs::{File, FileTimes};
+    use std::ffi::OsString;
+    use std::fs::{self, File, FileTimes};
     use std::os::unix::fs::symlink;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -565,11 +175,11 @@ mod tests {
         }
 
         fn environment(&self) -> PiEnvironment {
-            PiEnvironment {
-                session_dir: Some(self.0.clone().into_os_string()),
-                home: Some("/home/test".into()),
-                ..PiEnvironment::default()
-            }
+            PiEnvironment::for_test(
+                None,
+                Some(self.0.clone().into_os_string()),
+                Some("/home/test".into()),
+            )
         }
 
         fn write(&self, name: &str, contents: &str) -> PathBuf {
@@ -633,11 +243,8 @@ mod tests {
 
     #[test]
     fn derives_default_pi_directory_with_documented_encoding_and_home_expansion() {
-        let environment = PiEnvironment {
-            coding_agent_dir: Some("~/.local/pi".into()),
-            home: Some("/home/test".into()),
-            ..PiEnvironment::default()
-        };
+        let environment =
+            PiEnvironment::for_test(Some("~/.local/pi".into()), None, Some("/home/test".into()));
 
         assert_eq!(
             pi_session_directory(Path::new("/home/test/work:tree\\repo"), &environment),
@@ -648,11 +255,7 @@ mod tests {
         assert_eq!(
             pi_session_directory(
                 Path::new("/home/test/repo"),
-                &PiEnvironment {
-                    coding_agent_dir: Some(OsString::new()),
-                    home: Some("/home/test".into()),
-                    ..PiEnvironment::default()
-                }
+                &PiEnvironment::for_test(Some(OsString::new()), None, Some("/home/test".into()))
             ),
             Some(PathBuf::from(
                 "/home/test/.pi/agent/sessions/--home-test-repo--"
@@ -662,11 +265,11 @@ mod tests {
 
     #[test]
     fn custom_pi_session_directory_expands_home_without_recursing() {
-        let environment = PiEnvironment {
-            session_dir: Some("~/sessions/project".into()),
-            home: Some("/home/test".into()),
-            ..PiEnvironment::default()
-        };
+        let environment = PiEnvironment::for_test(
+            None,
+            Some("~/sessions/project".into()),
+            Some("/home/test".into()),
+        );
 
         assert_eq!(
             pi_session_directory(Path::new("/repo"), &environment),

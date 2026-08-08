@@ -159,6 +159,12 @@ grouping identity. IDs are globally unique and deterministic but opaque to
 consumers. The dashboard maps retained shells to openable run views and may
 enrich labels asynchronously from bounded host catalogs; CLI descriptions remain
 the latest stored Agent registration name and do not invoke host adapters.
+Title enrichment has its own adapter registry. The shared layer owns asynchronous
+cache, refresh, deduplication, sanitization, and fallback policy; OpenCode and Pi
+modules own host command execution and title extraction. Neutral host source
+modules own shared path normalization and secure source discovery. Title support
+remains independent from transcript support so a future harness may implement
+either capability without claiming the other.
 
 Session list/inspect requires a negotiated protocol-12 snapshot because the
 projection depends on that complete Agent state model. Protocol 13 adds an
@@ -408,6 +414,15 @@ remain shared. Adding Claude Code, Codex, or another harness therefore requires
 one canonical source adapter and one registry entry, not another CLI path.
 `boomux capabilities --json` derives `session_transcript_integrations` from this
 registry so integrations can discover support without hard-coded host lists.
+
+The implementation mirrors these boundaries in both adapter families:
+`host_session_titles.rs` and `session_transcript.rs` contain only shared policy,
+contracts, and registries, while their `opencode.rs` and `pi.rs` child modules
+contain host-specific parsing and normalization. Shared source lookup belongs in
+`host_session_source.rs` and its host-specific child modules rather than either
+capability adapter. Adding Claude Code, Codex, or another harness means adding
+isolated title and transcript modules as supported, then registering each
+capability explicitly; existing host parsers do not grow new conditional branches.
 
 Protocol 12 adds `inactive`. Protocol-9 through protocol-11 clients receive that
 observation as `unknown`, while protocol-12 clients can distinguish a resumable
