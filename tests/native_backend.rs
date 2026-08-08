@@ -1331,6 +1331,7 @@ fn agent_runtime_is_revisioned_durable_and_version_compatible() {
     assert_eq!(ensure["data"]["agent"]["shell_id"], shell_id);
     assert_eq!(ensure["data"]["agent"]["run_id"], run_id);
     assert_eq!(ensure["data"]["agent"]["external_session_id"], "session-1");
+    assert_eq!(ensure["data"]["agent"]["workspace_name"], "agent-runtime");
     assert_eq!(ensure["data"]["agent"]["observation"]["revision"], 1);
 
     let repeated = ensure_agent(&daemon);
@@ -1436,6 +1437,7 @@ fn agent_runtime_is_revisioned_durable_and_version_compatible() {
     let register: serde_json::Value = serde_json::from_slice(&register.stdout).unwrap();
     assert_eq!(register["schema"], "boomux.cli/v1");
     assert_eq!(register["command"], "agent.register");
+    assert_eq!(register["data"]["agent"]["workspace_name"], "agent-runtime");
     assert_eq!(register["data"]["agent"]["observation"]["revision"], 1);
     let adapter_id = register["data"]["agent"]["id"].as_str().unwrap().to_owned();
 
@@ -1484,6 +1486,7 @@ fn agent_runtime_is_revisioned_durable_and_version_compatible() {
     let report: serde_json::Value = serde_json::from_slice(&report.stdout).unwrap();
     assert_eq!(report["schema"], "boomux.cli/v1");
     assert_eq!(report["command"], "agent.report");
+    assert_eq!(report["data"]["agent"]["workspace_name"], "agent-runtime");
     assert_eq!(report["data"]["agent"]["observation"]["revision"], 2);
     assert_eq!(
         report["data"]["agent"]["observation"]["authority"],
@@ -1499,6 +1502,7 @@ fn agent_runtime_is_revisioned_durable_and_version_compatible() {
     assert_eq!(waited["command"], "agent.wait");
     assert_eq!(waited["data"]["changed"], true);
     assert_eq!(waited["data"]["agent"]["id"], adapter_id);
+    assert_eq!(waited["data"]["agent"]["workspace_name"], "agent-runtime");
     assert_eq!(waited["data"]["agent"]["observation"]["revision"], 2);
     let duplicate = daemon
         .client
@@ -1635,6 +1639,10 @@ fn agent_runtime_is_revisioned_durable_and_version_compatible() {
     let acknowledgment: serde_json::Value = serde_json::from_slice(&acknowledgment.stdout).unwrap();
     assert_eq!(acknowledgment["command"], "attention.acknowledge");
     assert_eq!(acknowledgment["data"]["changed"], true);
+    assert_eq!(
+        acknowledgment["data"]["agent"]["workspace_name"],
+        "agent-runtime"
+    );
     assert!(acknowledgment["data"]["agent"]["attention"].is_null());
     assert!(
         daemon
@@ -2665,6 +2673,44 @@ fn workspace_launchers_persist_emit_events_and_open_without_shells() {
             .all(|current| current.id != workspace.id)
     );
     daemon.stop_with_cli();
+}
+
+#[test]
+fn failed_implicit_terminal_launch_rolls_back_created_state() {
+    let daemon = TestDaemon::start();
+    let project = daemon.runtime_dir.join("project");
+    fs::create_dir(&project).unwrap();
+
+    let generated = daemon
+        .command()
+        .arg(&project)
+        .arg("--new")
+        .env("PATH", "")
+        .output()
+        .unwrap();
+    assert!(!generated.status.success());
+    assert!(daemon.client.snapshot().unwrap().workspaces.is_empty());
+
+    let workspace = daemon
+        .client
+        .create_workspace("existing", Vec::new())
+        .unwrap();
+    let existing = daemon
+        .command()
+        .arg(&project)
+        .args(["--name", "existing", "--new"])
+        .env("PATH", "")
+        .output()
+        .unwrap();
+    assert!(!existing.status.success());
+    assert!(
+        daemon
+            .client
+            .get_workspace(&workspace.id)
+            .unwrap()
+            .shells
+            .is_empty()
+    );
 }
 
 #[test]

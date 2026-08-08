@@ -1,5 +1,6 @@
 use std::env;
 use std::error::Error;
+use std::ffi::OsString;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::{self, Write};
@@ -587,7 +588,7 @@ impl CliExit {
 }
 
 fn main() -> ExitCode {
-    let json_requested = env::args_os().any(|argument| argument == "--json");
+    let json_requested = requests_json(env::args_os().skip(1));
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(error) => {
@@ -626,6 +627,13 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn requests_json(arguments: impl IntoIterator<Item = OsString>) -> bool {
+    arguments
+        .into_iter()
+        .take_while(|argument| argument != "--")
+        .any(|argument| argument == "--json")
 }
 
 fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
@@ -1237,25 +1245,32 @@ fn open_directory(
         .map(str::to_owned);
     let client = client::connect_or_start()?;
     let snapshot = client.snapshot()?;
-    let (shell, workspace_name) = if let Some(name) = requested_name {
-        let shell = if let Some(workspace) = find_workspace(&snapshot.workspaces, &name) {
-            let shell_name = unique_shell_name("shell", &workspace.shells);
-            client.create_shell(
-                &workspace.id,
-                shell_spec(shell_name, &directory, startup_command),
-            )?
-        } else {
-            client
-                .create_workspace(
-                    &name,
-                    vec![shell_spec("shell-1", &directory, startup_command)],
-                )?
-                .shells
-                .into_iter()
-                .next()
-                .ok_or("new workspace has no shell")?
-        };
-        (shell, name)
+    let (shell, workspace_name, created_workspace) = if let Some(name) = requested_name {
+        let (shell, created_workspace) =
+            if let Some(workspace) = find_workspace(&snapshot.workspaces, &name) {
+                let shell_name = unique_shell_name("shell", &workspace.shells);
+                (
+                    client.create_shell(
+                        &workspace.id,
+                        shell_spec(shell_name, &directory, startup_command),
+                    )?,
+                    false,
+                )
+            } else {
+                (
+                    client
+                        .create_workspace(
+                            &name,
+                            vec![shell_spec("shell-1", &directory, startup_command)],
+                        )?
+                        .shells
+                        .into_iter()
+                        .next()
+                        .ok_or("new workspace has no shell")?,
+                    true,
+                )
+            };
+        (shell, name, created_workspace)
     } else {
         let shell = client.create_shell_with_workspace(shell_spec(
             "shell-1",
@@ -1263,10 +1278,10 @@ fn open_directory(
             startup_command,
         ))?;
         let workspace_name = client.get_workspace(&shell.workspace_id)?.name;
-        (shell, workspace_name)
+        (shell, workspace_name, true)
     };
 
-    if open_in_new_window {
+    let open_result = if open_in_new_window {
         open_terminal(
             &shell.id,
             &format!("{workspace_name} - {}", shell.name),
@@ -1275,7 +1290,22 @@ fn open_directory(
         )
     } else {
         Ok(attach::run(&shell.id, true, false)?)
+    };
+    if let Err(open_error) = open_result {
+        let rollback = if created_workspace {
+            client.close_workspace(&shell.workspace_id)
+        } else {
+            client.close_shell(&shell.id)
+        };
+        if let Err(rollback_error) = rollback {
+            return Err(format!(
+                "{open_error}; additionally could not roll back failed launch: {rollback_error}"
+            )
+            .into());
+        }
+        return Err(open_error);
     }
+    Ok(())
 }
 
 fn shell_spec(name: impl Into<String>, cwd: &Path, command: &[String]) -> ShellSpec {
@@ -1333,7 +1363,8 @@ fn resolve_workspace_target<'a>(
 ) -> Result<&'a WorkspaceSnapshot, Box<dyn Error>> {
     workspaces
         .iter()
-        .find(|workspace| workspace.id == target || workspace.name == target)
+        .find(|workspace| workspace.id == target)
+        .or_else(|| workspaces.iter().find(|workspace| workspace.name == target))
         .ok_or_else(|| cli_output::failure("not_found", format!("workspace not found: {target}")))
 }
 
@@ -1509,7 +1540,7 @@ fn workspace_command(
                 let summary = agent_attention_projection::summarize_workspace(&workspace);
                 println!(
                     "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                    workspace.name,
+                    sanitize_table_cell(&workspace.name),
                     workspace.id,
                     workspace.shells.len(),
                     workspace.launchers.len(),
@@ -1876,11 +1907,12 @@ fn agent_command(command: AgentCommands, json: bool) -> Result<(), Box<dyn Error
         } => {
             let waited = client.wait_agent(agent_id, after_revision, wait_ms)?;
             if json {
+                let workspace = client.get_workspace(&waited.agent.workspace_id)?;
                 return cli_output::print(
                     "agent.wait",
                     serde_json::json!({
                         "changed": waited.changed,
-                        "agent": cli_output::agent(&waited.agent, None),
+                        "agent": cli_output::agent(&waited.agent, Some(&workspace.name)),
                     }),
                 );
             }
@@ -1938,10 +1970,11 @@ fn agent_command(command: AgentCommands, json: bool) -> Result<(), Box<dyn Error
                 },
             )?;
             if json {
+                let workspace = client.get_workspace(&agent.workspace_id)?;
                 return cli_output::print(
                     "agent.report",
                     serde_json::json!({
-                        "agent": cli_output::agent(&agent, None),
+                        "agent": cli_output::agent(&agent, Some(&workspace.name)),
                     }),
                 );
             }
@@ -2027,11 +2060,12 @@ fn attention_command(command: AttentionCommands, json: bool) -> Result<(), Box<d
             let acknowledged =
                 client.acknowledge_agent_attention(agent_id, observation_revision)?;
             if json {
+                let workspace = client.get_workspace(&acknowledged.agent.workspace_id)?;
                 return cli_output::print(
                     "attention.acknowledge",
                     serde_json::json!({
                         "changed": acknowledged.changed,
-                        "agent": cli_output::agent(&acknowledged.agent, None),
+                        "agent": cli_output::agent(&acknowledged.agent, Some(&workspace.name)),
                     }),
                 );
             }
@@ -2366,6 +2400,7 @@ fn register_or_ensure_agent(
         client.register_agent(shell_id, run_id, spec)?
     };
     if json {
+        let workspace = client.get_workspace(&agent.workspace_id)?;
         return cli_output::print(
             if ensure {
                 "agent.ensure"
@@ -2373,7 +2408,7 @@ fn register_or_ensure_agent(
                 "agent.register"
             },
             serde_json::json!({
-                "agent": cli_output::agent(&agent, None),
+                "agent": cli_output::agent(&agent, Some(&workspace.name)),
             }),
         );
     }
@@ -3522,6 +3557,16 @@ mod tests {
     }
 
     #[test]
+    fn detects_json_only_before_the_command_separator() {
+        assert!(requests_json(
+            ["workspace", "list", "--json"].map(OsString::from)
+        ));
+        assert!(!requests_json(
+            [".", "--", "/bin/echo", "--json"].map(OsString::from)
+        ));
+    }
+
+    #[test]
     fn parses_workspace_and_shell_lifecycle_commands() {
         assert!(matches!(
             Cli::try_parse_from(["boomux", "workspace", "create", "project"])
@@ -3951,7 +3996,7 @@ mod tests {
         let mut project = workspace("w1", "project", vec![shell("s1", "w1", "tests")]);
         project.launchers.push(launcher("l1", "w1", "editor"));
         let snapshot = Snapshot {
-            workspaces: vec![project],
+            workspaces: vec![workspace("w2", "w1", vec![]), project],
         };
 
         assert_eq!(
@@ -3959,6 +4004,12 @@ mod tests {
                 .unwrap()
                 .id,
             "w1"
+        );
+        assert_eq!(
+            resolve_workspace_target(&snapshot.workspaces, "w1")
+                .unwrap()
+                .name,
+            "project"
         );
         assert_eq!(
             resolve_cli_shell(&snapshot, "tests", Some("project"))
