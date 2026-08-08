@@ -25,6 +25,11 @@ each bundled integration host under `integration_hosts`. Validated versions are
 compatibility test points, not runtime pins or minimum-version guarantees.
 `session_transcript_integrations` lists the integration keys with registered
 canonical transcript adapters.
+The `desktop_notifications` feature means this binary supports daemon-owned
+notification delivery; it does not imply notifications are enabled or that
+`notify-send` and a desktop notification service are available. Configuration is
+sampled when the daemon starts and is intentionally outside the JSON capability
+contract.
 
 The following commands support `--json`:
 

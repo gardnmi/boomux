@@ -9,18 +9,27 @@ use serde::Deserialize;
 const DEFAULT_PROJECT_SEARCH_DEPTH: usize = 3;
 const MAX_PROJECT_SEARCH_DEPTH: usize = 10;
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct RawConfig {
     terminal: Option<String>,
     projects: Option<RawProjectsConfig>,
+    notifications: Option<RawNotificationsConfig>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct RawProjectsConfig {
     roots: Option<Vec<String>>,
     max_depth: Option<usize>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RawNotificationsConfig {
+    enabled: Option<bool>,
+    blocked: Option<bool>,
+    completed: Option<bool>,
 }
 
 #[derive(Debug)]
@@ -28,6 +37,7 @@ pub(crate) struct Config {
     pub(crate) terminal: Option<String>,
     pub(crate) projects: ProjectsConfig,
     pub(crate) path: Option<PathBuf>,
+    pub(crate) notifications: boomux::daemon::NotificationSettings,
 }
 
 #[derive(Debug)]
@@ -48,6 +58,17 @@ impl fmt::Display for ConfigError {
 impl Error for ConfigError {}
 
 pub(crate) fn load() -> Result<Config, Box<dyn Error>> {
+    let (raw, loaded_path) = load_raw()?;
+    resolve(raw, loaded_path)
+}
+
+pub(crate) fn load_notification_settings()
+-> Result<boomux::daemon::NotificationSettings, Box<dyn Error>> {
+    let (raw, _) = load_raw()?;
+    Ok(resolve_notifications(raw.notifications))
+}
+
+fn load_raw() -> Result<(RawConfig, Option<PathBuf>), Box<dyn Error>> {
     let global_path = global_config_path();
     let mut raw = RawConfig::default();
     let mut loaded_path = None;
@@ -68,7 +89,7 @@ pub(crate) fn load() -> Result<Config, Box<dyn Error>> {
         loaded_path = Some(path);
     }
 
-    resolve(raw, loaded_path)
+    Ok((raw, loaded_path))
 }
 
 pub(crate) fn global_config_path() -> Option<PathBuf> {
@@ -104,6 +125,18 @@ fn merge(base: &mut RawConfig, next: RawConfig) {
             projects.max_depth = next_projects.max_depth;
         }
     }
+    if let Some(next_notifications) = next.notifications {
+        let notifications = base.notifications.get_or_insert_default();
+        if next_notifications.enabled.is_some() {
+            notifications.enabled = next_notifications.enabled;
+        }
+        if next_notifications.blocked.is_some() {
+            notifications.blocked = next_notifications.blocked;
+        }
+        if next_notifications.completed.is_some() {
+            notifications.completed = next_notifications.completed;
+        }
+    }
 }
 
 fn resolve(raw: RawConfig, path: Option<PathBuf>) -> Result<Config, Box<dyn Error>> {
@@ -134,7 +167,19 @@ fn resolve(raw: RawConfig, path: Option<PathBuf>) -> Result<Config, Box<dyn Erro
         terminal,
         projects: ProjectsConfig { roots, max_depth },
         path,
+        notifications: resolve_notifications(raw.notifications),
     })
+}
+
+fn resolve_notifications(
+    raw: Option<RawNotificationsConfig>,
+) -> boomux::daemon::NotificationSettings {
+    let raw = raw.unwrap_or_default();
+    boomux::daemon::NotificationSettings {
+        enabled: raw.enabled.unwrap_or(false),
+        blocked: raw.blocked.unwrap_or(true),
+        completed: raw.completed.unwrap_or(true),
+    }
 }
 
 fn expand_root(root: &str) -> Result<PathBuf, Box<dyn Error>> {
@@ -267,5 +312,54 @@ mod tests {
         .expect("valid TOML");
 
         assert!(resolve(raw, None).is_err());
+    }
+
+    #[test]
+    fn notification_settings_default_and_parse() {
+        assert_eq!(
+            resolve_notifications(None),
+            boomux::daemon::NotificationSettings::default()
+        );
+        let raw: RawConfig =
+            toml::from_str("[notifications]\nenabled = true\nblocked = false\ncompleted = false")
+                .unwrap();
+        let settings = resolve_notifications(raw.notifications);
+        assert!(settings.enabled);
+        assert!(!settings.blocked);
+        assert!(!settings.completed);
+    }
+
+    #[test]
+    fn notification_overrides_merge_per_field() {
+        let mut base: RawConfig =
+            toml::from_str("[notifications]\nenabled = true\nblocked = false\ncompleted = false")
+                .unwrap();
+        let next = toml::from_str("[notifications]\ncompleted = true").unwrap();
+        merge(&mut base, next);
+
+        let settings = resolve_notifications(base.notifications);
+        assert_eq!(
+            settings,
+            boomux::daemon::NotificationSettings {
+                enabled: true,
+                blocked: false,
+                completed: true,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_notification_settings() {
+        assert!(toml::from_str::<RawConfig>("[notifications]\nunknown = true").is_err());
+    }
+
+    #[test]
+    fn notification_resolution_ignores_unrelated_semantic_errors() {
+        let raw: RawConfig = toml::from_str(
+            "terminal = \"invalid\"\n[projects]\nroots = [\"relative\"]\n[notifications]\nenabled = true",
+        )
+        .unwrap();
+        assert!(resolve(raw.clone(), None).is_err());
+        assert!(resolve_notifications(raw.notifications).enabled);
     }
 }

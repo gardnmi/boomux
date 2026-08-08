@@ -1,6 +1,7 @@
 pub mod attach;
 pub mod client;
 pub mod daemon;
+mod desktop_notifications;
 // The replacement-daemon protocol will activate this transport in the next
 // handoff slice; keeping it compiled now prevents the unsafe boundary drifting.
 #[allow(dead_code)]

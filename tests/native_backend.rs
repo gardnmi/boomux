@@ -1,7 +1,7 @@
 use std::fs::{self, OpenOptions};
 use std::io::{self, IoSlice, Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
@@ -58,6 +58,71 @@ impl TestDaemon {
             child: Some(child),
             client,
         }
+    }
+
+    fn start_with_notifications() -> (Self, PathBuf, PathBuf) {
+        let executable = PathBuf::from(env!("CARGO_BIN_EXE_boomux"));
+        let runtime_dir = std::env::temp_dir().join(format!(
+            "boomux-integration-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        fs::create_dir(&runtime_dir).unwrap();
+        let bin_dir = runtime_dir.join("bin");
+        fs::create_dir(&bin_dir).unwrap();
+        let notify_send = bin_dir.join("notify-send");
+        let capture = runtime_dir.join("notifications");
+        fs::write(
+            &notify_send,
+            "#!/bin/sh\nif [ -f \"$BOOMUX_NOTIFICATION_HANG\" ]; then\n  printf '%s\\n' \"$$\" > \"$BOOMUX_NOTIFICATION_PID\"\n  exec sleep 10\nfi\nprintf '%s\\0' \"$@\" >> \"$BOOMUX_NOTIFICATION_CAPTURE\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&notify_send, fs::Permissions::from_mode(0o755)).unwrap();
+        let config = runtime_dir.join("config.toml");
+        fs::write(
+            &config,
+            "[notifications]\nenabled = true\nblocked = true\ncompleted = true\n",
+        )
+        .unwrap();
+        let mut paths = vec![bin_dir];
+        if let Some(path) = std::env::var_os("PATH") {
+            paths.extend(std::env::split_paths(&path));
+        }
+        let path = std::env::join_paths(paths).unwrap();
+        let child = Command::new(&executable)
+            .args(["daemon", "run"])
+            .env("XDG_RUNTIME_DIR", &runtime_dir)
+            .env("XDG_STATE_HOME", runtime_dir.join("state"))
+            .env("BOOMUX_CONFIG", &config)
+            .env("BOOMUX_NOTIFICATION_CAPTURE", &capture)
+            .env(
+                "BOOMUX_NOTIFICATION_HANG",
+                runtime_dir.join("notification-hang"),
+            )
+            .env(
+                "BOOMUX_NOTIFICATION_PID",
+                runtime_dir.join("notification-pid"),
+            )
+            .env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/nonexistent")
+            .env("PATH", path)
+            .env("SHELL", "/bin/sh")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let client = Client::from_socket_path(runtime_dir.join("boomux/daemon.sock"));
+        wait_until(|| client.ping().is_ok(), "daemon did not accept requests");
+        (
+            Self {
+                executable,
+                runtime_dir,
+                child: Some(child),
+                client,
+            },
+            capture,
+            notify_send,
+        )
     }
 
     fn command(&self) -> Command {
@@ -1010,6 +1075,187 @@ fn daemon_events_and_revision_reads_survive_handoff() {
             .and_then(|error| error.code),
         Some(ErrorCode::DaemonStopping)
     );
+}
+
+#[test]
+fn desktop_notifications_are_deduplicated_private_and_survive_handoff() {
+    let (daemon, capture, notify_send) = TestDaemon::start_with_notifications();
+    let workspace = daemon
+        .client
+        .create_workspace(
+            "notification-workspace",
+            vec![ShellSpec::login("notification-shell", std::env::temp_dir())],
+        )
+        .unwrap();
+    let shell_id = workspace.shells[0].id.clone();
+    let attachment = daemon.client.attach(&shell_id, false, profile()).unwrap();
+    let run_id = daemon.client.get_shell(&shell_id).unwrap().run.unwrap().id;
+    let agent = daemon
+        .client
+        .register_agent(
+            &shell_id,
+            &run_id,
+            AgentRegistrationSpec {
+                name: "notification-agent".into(),
+                integration: "native-test".into(),
+                external_session_id: Some("PRIVATE-SESSION".into()),
+                report: AgentReport {
+                    state: AgentState::Blocked,
+                    authority: AgentAuthority::LifecycleIntegration,
+                    evidence: "PRIVATE-EVIDENCE".into(),
+                    confidence: 90,
+                },
+            },
+        )
+        .unwrap();
+    wait_until(
+        || captured_notification_count(&capture) == 1,
+        "blocked notification was not delivered",
+    );
+    let captured = fs::read(&capture).unwrap();
+    assert!(
+        !captured
+            .windows(b"PRIVATE-EVIDENCE".len())
+            .any(|value| value == b"PRIVATE-EVIDENCE")
+    );
+    assert!(
+        !captured
+            .windows(b"PRIVATE-SESSION".len())
+            .any(|value| value == b"PRIVATE-SESSION")
+    );
+
+    daemon
+        .client
+        .report_agent(
+            &agent.id,
+            &run_id,
+            AgentReport {
+                state: AgentState::Blocked,
+                authority: AgentAuthority::LifecycleIntegration,
+                evidence: "changed blocker evidence".into(),
+                confidence: 95,
+            },
+        )
+        .unwrap();
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(captured_notification_count(&capture), 1);
+
+    for (state, evidence, expected) in [
+        (AgentState::Working, "resumed", 1),
+        (AgentState::Blocked, "blocked again", 2),
+        (AgentState::Done, "completed", 3),
+    ] {
+        daemon
+            .client
+            .report_agent(
+                &agent.id,
+                &run_id,
+                AgentReport {
+                    state,
+                    authority: AgentAuthority::LifecycleIntegration,
+                    evidence: evidence.into(),
+                    confidence: 95,
+                },
+            )
+            .unwrap();
+        wait_until(
+            || captured_notification_count(&capture) == expected,
+            "notification transition was not delivered",
+        );
+    }
+
+    let hang = daemon.runtime_dir.join("notification-hang");
+    let notification_pid = daemon.runtime_dir.join("notification-pid");
+    fs::write(&hang, b"").unwrap();
+    daemon
+        .client
+        .register_agent(
+            shell_id.clone(),
+            run_id.clone(),
+            AgentRegistrationSpec {
+                name: "handoff-hanging-agent".into(),
+                integration: "native-test".into(),
+                external_session_id: Some("handoff-hanging-session".into()),
+                report: AgentReport {
+                    state: AgentState::Blocked,
+                    authority: AgentAuthority::LifecycleIntegration,
+                    evidence: "exercise notifier shutdown".into(),
+                    confidence: 90,
+                },
+            },
+        )
+        .unwrap();
+    wait_until(
+        || notification_pid.is_file(),
+        "fake notifier did not enter its hanging state",
+    );
+    let notification_pid_value = fs::read_to_string(&notification_pid)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    drop(attachment.stream);
+    let restart = daemon
+        .command()
+        .args(["daemon", "restart"])
+        .output()
+        .unwrap();
+    assert!(
+        restart.status.success(),
+        "{}",
+        String::from_utf8_lossy(&restart.stderr)
+    );
+    wait_until(
+        || !process_exists(notification_pid_value),
+        "daemon handoff did not reap the active notifier",
+    );
+    fs::remove_file(hang).unwrap();
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(captured_notification_count(&capture), 3);
+    daemon
+        .client
+        .register_agent(
+            shell_id.clone(),
+            run_id.clone(),
+            AgentRegistrationSpec {
+                name: "post-handoff-agent".into(),
+                integration: "native-test".into(),
+                external_session_id: Some("post-handoff-session".into()),
+                report: AgentReport {
+                    state: AgentState::Blocked,
+                    authority: AgentAuthority::LifecycleIntegration,
+                    evidence: "post-handoff blocker".into(),
+                    confidence: 90,
+                },
+            },
+        )
+        .unwrap();
+    wait_until(
+        || captured_notification_count(&capture) == 4,
+        "notifications stopped after daemon handoff",
+    );
+
+    fs::remove_file(notify_send).unwrap();
+    daemon
+        .client
+        .register_agent(
+            shell_id,
+            run_id,
+            AgentRegistrationSpec {
+                name: "missing-notify-send-agent".into(),
+                integration: "native-test".into(),
+                external_session_id: Some("missing-notify-send-session".into()),
+                report: AgentReport {
+                    state: AgentState::Blocked,
+                    authority: AgentAuthority::LifecycleIntegration,
+                    evidence: "delivery must fail open".into(),
+                    confidence: 90,
+                },
+            },
+        )
+        .unwrap();
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(captured_notification_count(&capture), 4);
 }
 
 #[test]
@@ -3328,4 +3574,16 @@ fn wait_until(mut condition: impl FnMut() -> bool, message: &str) {
         thread::sleep(Duration::from_millis(20));
     }
     panic!("{message}");
+}
+
+fn captured_notification_count(path: &std::path::Path) -> usize {
+    fs::read(path)
+        .map(|contents| {
+            contents
+                .split(|byte| *byte == 0)
+                .filter(|argument| !argument.is_empty())
+                .count()
+                / 4
+        })
+        .unwrap_or(0)
 }

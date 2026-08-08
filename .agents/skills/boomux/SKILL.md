@@ -93,6 +93,12 @@ revision fails with `revision_ahead`, while an already empty item returns
 `changed: false`. Acknowledgment does not advance lifecycle state or satisfy an
 `agent wait`.
 
+Desktop notifications, when the user has opted in, are only a best-effort signal
+for new transitions into blocked or done. They do not acknowledge attention,
+change an observation revision, or contain lifecycle evidence. Always inspect
+the durable queue before acting; do not infer queue state or delivery from a
+desktop notification.
+
 Discover projected session metadata with:
 
 ```console
@@ -171,8 +177,8 @@ while conflicting later reports are rejected.
 
 If `register`, `ensure`, or `report` returns `run_changed`, stop reporting for that
 instance and reacquire exact lifecycle context. Do not guess the replacement
-run. Boomux does not yet provide terminal heuristics, agent read commands,
-notifications, or control.
+run. Boomux does not yet provide terminal heuristics, agent read commands, or
+control.
 
 ## Supervise An Explicit Process
 

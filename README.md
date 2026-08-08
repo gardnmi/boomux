@@ -225,6 +225,15 @@ unseen work. Workspace output includes fixed Agent state counts and the
 outstanding attention count. Boomux does not yet provide terminal heuristics,
 agent reads, or agent control.
 
+Optional desktop notifications mirror transitions into `blocked` and `done`.
+They do not replace or acknowledge durable attention items. Delivery is an
+asynchronous, at-most-once attempt after the Agent mutation commits, and failures
+never fail the Agent request. A bounded delivery queue prevents notification
+bursts from exhausting daemon resources. Boomux does not replay restored
+attention after a daemon start or handoff, and changed evidence for an already
+blocked Agent does not generate another notification until the Agent first
+leaves that state.
+
 `boomux session list` and `boomux session inspect` project durable Agent
 instances into workspace session history. Instances are grouped within one
 workspace and integration by external session ID; records without one remain
@@ -309,7 +318,19 @@ terminal = "Alacritty.desktop"
 roots = ["~/Projects", "~/Work"]
 max_depth = 3
 
+[notifications]
+enabled = false
+blocked = true
+completed = true
 ```
+
+Notifications are disabled by default and require `notify-send` plus a desktop
+notification service. The daemon samples this configuration at startup; run
+`boomux daemon restart` after changing it. `boomux doctor` reports whether the
+configured command and a plausible desktop bus environment are present. Bodies
+contain only the sanitized Agent, workspace, and shell names, never evidence,
+working directories, command arguments, external session IDs, or transcript
+content.
 
 Directory discovery scans only configured project roots, recognizes ordinary
 and linked Git worktrees, and stops descending after finding a repository. The
