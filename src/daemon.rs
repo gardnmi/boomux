@@ -4942,10 +4942,12 @@ fn term_mismatch_warning(started: Option<&str>, attached: Option<&str>) -> Optio
 }
 
 fn validate_name(name: &str) -> io::Result<()> {
-    if name.trim().is_empty() || name.len() > MAX_NAME_BYTES {
+    if name.trim().is_empty() || name.len() > MAX_NAME_BYTES || name.chars().any(char::is_control) {
         Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("name must be nonempty and at most {MAX_NAME_BYTES} bytes"),
+            format!(
+                "name must be nonempty, contain no control characters, and be at most {MAX_NAME_BYTES} bytes"
+            ),
         ))
     } else {
         Ok(())
@@ -5579,6 +5581,11 @@ mod tests {
             io::ErrorKind::InvalidInput
         );
         assert!(validate_persisted_name(&long_name).is_ok());
+        assert_eq!(
+            validate_name("real\nforged\trow").unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert!(validate_persisted_name("real\nlegacy row").is_ok());
     }
 
     #[test]
