@@ -3,6 +3,7 @@ use std::error::Error;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::{self, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
@@ -90,6 +91,7 @@ const INTEGRATION_FEATURES: &[&str] = &[
     "durable_session_source_context",
     "revision_aware_agent_wait",
     "persistent_agent_attention",
+    "desktop_notifications",
 ];
 const LEGACY_BOOMUX_SHELLS_SKILL: &str = r#"---
 name: boomux-shells
@@ -637,13 +639,16 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
         Some(Commands::Daemon {
             command: DaemonCommands::Run,
         }) => {
-            daemon::run()?;
+            daemon::run_with_notifications(config::load_notification_settings()?)?;
             return Ok(CliExit::Success);
         }
         Some(Commands::Daemon {
             command: DaemonCommands::ReceiveHandoff { channel },
         }) => {
-            daemon::receive_handoff(*channel)?;
+            daemon::receive_handoff_with_notifications(
+                *channel,
+                config::load_notification_settings()?,
+            )?;
             return Ok(CliExit::Success);
         }
         Some(Commands::Attach {
@@ -3264,6 +3269,28 @@ fn doctor(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
                     eprintln!("err terminal: {error}");
                 }
             }
+            match notification_diagnostic(
+                config.notifications,
+                executable_on_path("notify-send"),
+                plausible_desktop_bus(),
+            ) {
+                NotificationDiagnostic::Disabled => {
+                    println!("ok  notification config: disabled (sampled at daemon start)");
+                }
+                NotificationDiagnostic::Ready => {
+                    println!(
+                        "ok  notification config: notify-send and plausible desktop bus context present; restart daemon after changes"
+                    );
+                }
+                NotificationDiagnostic::MissingExecutable => {
+                    healthy = false;
+                    eprintln!("err notifications: notify-send is not executable on PATH");
+                }
+                NotificationDiagnostic::MissingDesktopBus => {
+                    healthy = false;
+                    eprintln!("err notifications: no plausible desktop bus is available");
+                }
+            }
         }
         Err(error) => {
             healthy = false;
@@ -3275,6 +3302,48 @@ fn doctor(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
     } else {
         Err("one or more dependency or configuration checks failed".into())
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum NotificationDiagnostic {
+    Disabled,
+    Ready,
+    MissingExecutable,
+    MissingDesktopBus,
+}
+
+fn notification_diagnostic(
+    settings: daemon::NotificationSettings,
+    executable: bool,
+    desktop_bus: bool,
+) -> NotificationDiagnostic {
+    if !settings.enabled {
+        NotificationDiagnostic::Disabled
+    } else if !executable {
+        NotificationDiagnostic::MissingExecutable
+    } else if !desktop_bus {
+        NotificationDiagnostic::MissingDesktopBus
+    } else {
+        NotificationDiagnostic::Ready
+    }
+}
+
+fn executable_on_path(name: &str) -> bool {
+    env::var_os("PATH").is_some_and(|path| {
+        env::split_paths(&path).any(|directory| {
+            fs::metadata(directory.join(name)).is_ok_and(|metadata| {
+                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+            })
+        })
+    })
+}
+
+fn plausible_desktop_bus() -> bool {
+    env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some_and(|value| !value.is_empty())
+        || env::var_os("XDG_RUNTIME_DIR").is_some_and(|directory| {
+            let directory = PathBuf::from(directory);
+            directory.is_absolute() && directory.join("bus").exists()
+        })
 }
 
 #[cfg(test)]
@@ -4705,6 +4774,7 @@ mod tests {
             "transcript_pagination",
             "protocol_15",
             "persistent_agent_attention",
+            "desktop_notifications",
         ] {
             assert!(INTEGRATION_FEATURES.contains(&feature));
         }
@@ -4715,6 +4785,31 @@ mod tests {
             ["opencode", "pi"]
         );
         assert_eq!(protocol::PROTOCOL_VERSION, 15);
+    }
+
+    #[test]
+    fn notification_doctor_diagnostic_is_deterministic() {
+        let disabled = daemon::NotificationSettings::default();
+        assert_eq!(
+            notification_diagnostic(disabled, false, false),
+            NotificationDiagnostic::Disabled
+        );
+        let enabled = daemon::NotificationSettings {
+            enabled: true,
+            ..disabled
+        };
+        assert_eq!(
+            notification_diagnostic(enabled, false, true),
+            NotificationDiagnostic::MissingExecutable
+        );
+        assert_eq!(
+            notification_diagnostic(enabled, true, false),
+            NotificationDiagnostic::MissingDesktopBus
+        );
+        assert_eq!(
+            notification_diagnostic(enabled, true, true),
+            NotificationDiagnostic::Ready
+        );
     }
 
     #[test]

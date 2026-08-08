@@ -20,6 +20,10 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system}
 use uuid::Uuid;
 
 use crate::client;
+use crate::desktop_notifications::{
+    DesktopNotificationSink, DisabledNotificationSink, NotificationReason, NotificationRequest,
+    NotificationSink, category_enabled,
+};
 use crate::fd_transfer::send_descriptor;
 use crate::handoff;
 use crate::protocol::{
@@ -56,7 +60,31 @@ const TRANSITION_IDLE: u8 = 0;
 const TRANSITION_RESTART: u8 = 1;
 const TRANSITION_SHUTDOWN: u8 = 2;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NotificationSettings {
+    pub enabled: bool,
+    pub blocked: bool,
+    pub completed: bool,
+}
+
+impl Default for NotificationSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            blocked: true,
+            completed: true,
+        }
+    }
+}
+
 pub fn receive_handoff(channel: i32) -> io::Result<()> {
+    receive_handoff_with_notifications(channel, NotificationSettings::default())
+}
+
+pub fn receive_handoff_with_notifications(
+    channel: i32,
+    notification_settings: NotificationSettings,
+) -> io::Result<()> {
     match handoff::receive_bootstrap(channel)? {
         handoff::Bootstrap::Aborted => Ok(()),
         handoff::Bootstrap::Committed {
@@ -81,12 +109,17 @@ pub fn receive_handoff(channel: i32) -> io::Result<()> {
                     events: Some(event_stream),
                 },
                 Some(&mut channel),
+                notification_settings,
             )
         }
     }
 }
 
 pub fn run() -> io::Result<()> {
+    run_with_notifications(NotificationSettings::default())
+}
+
+pub fn run_with_notifications(notification_settings: NotificationSettings) -> io::Result<()> {
     let socket_path = client::socket_path()?;
     let runtime_dir = socket_path
         .parent()
@@ -109,6 +142,7 @@ pub fn run() -> io::Result<()> {
         StateStore::from_environment()?,
         TransferredState::default(),
         None,
+        notification_settings,
     )
 }
 
@@ -126,12 +160,12 @@ fn run_daemon(
     store: StateStore,
     transferred: TransferredState,
     committed: Option<&mut UnixStream>,
+    notification_settings: NotificationSettings,
 ) -> io::Result<()> {
-    let registry = Arc::new(Registry::restore(
-        store,
-        committed.is_some(),
-        transferred.events,
-    )?);
+    let mut registry = Registry::restore(store, committed.is_some(), transferred.events)?;
+    registry.notification_settings = notification_settings;
+    registry.notification_sink = Arc::new(DesktopNotificationSink::new());
+    let registry = Arc::new(registry);
     let gated_readers = registry.import_handoff(transferred.runtimes, transferred.exited)?;
     if let Some(channel) = committed {
         {
@@ -989,6 +1023,8 @@ struct Registry {
     persist_lock: Mutex<()>,
     stopping: AtomicBool,
     persistence_dirty: AtomicBool,
+    notification_settings: NotificationSettings,
+    notification_sink: Arc<dyn NotificationSink>,
 }
 
 enum DurableMutation<T> {
@@ -1128,6 +1164,8 @@ impl Default for Registry {
             persist_lock: Mutex::new(()),
             stopping: AtomicBool::new(false),
             persistence_dirty: AtomicBool::new(false),
+            notification_settings: NotificationSettings::default(),
+            notification_sink: Arc::new(DisabledNotificationSink),
         }
     }
 }
@@ -2144,6 +2182,8 @@ impl Registry {
             persist_lock: Mutex::new(()),
             stopping: AtomicBool::new(false),
             persistence_dirty: AtomicBool::new(false),
+            notification_settings: NotificationSettings::default(),
+            notification_sink: Arc::new(DisabledNotificationSink),
         };
         if recovered_interrupted_run {
             registry.persist()?;
@@ -2338,9 +2378,9 @@ impl Registry {
         &self,
         operation: impl FnOnce() -> io::Result<DurableMutation<T>>,
     ) -> io::Result<T> {
-        let _mutation = lock(&self.mutation_lock)?;
+        let mutation = lock(&self.mutation_lock)?;
         let mut transition = lock(&self.transitions)?;
-        let _persistence = lock(&self.persist_lock)?;
+        let persistence = lock(&self.persist_lock)?;
         let mut events = lock(&self.events.state)?;
         self.ensure_running()?;
         self.flush_pending_locked(&mut transition, &mut events)?;
@@ -2352,12 +2392,18 @@ impl Registry {
                     self.restore_backup(backup)?;
                     return Err(error);
                 }
+                let notifications = self.notification_requests(&kinds, &backup);
                 match self.persist_unlocked().map_err(persistence_error) {
                     Ok(()) => {
                         EventLog::append_batch_locked(&mut events, kinds);
                         drop(events);
                         drop(transition);
+                        drop(persistence);
                         self.events.changed.notify_all();
+                        drop(mutation);
+                        for notification in notifications {
+                            self.notification_sink.notify(notification);
+                        }
                         Ok(value)
                     }
                     Err(error) => {
@@ -2372,6 +2418,85 @@ impl Registry {
                 Err(error)
             }
         }
+    }
+
+    fn notification_requests(
+        &self,
+        kinds: &[DaemonEventKind],
+        previous: &RegistryBackup,
+    ) -> Vec<NotificationRequest> {
+        let mut seen = HashSet::new();
+        let mut requests = Vec::new();
+        for kind in kinds {
+            let (workspace_id, shell_id, agent) = match kind {
+                DaemonEventKind::AgentRegistered {
+                    workspace_id,
+                    shell_id,
+                    agent,
+                }
+                | DaemonEventKind::AgentStateChanged {
+                    workspace_id,
+                    shell_id,
+                    agent,
+                }
+                | DaemonEventKind::AgentCompleted {
+                    workspace_id,
+                    shell_id,
+                    agent,
+                } => (workspace_id, shell_id, agent),
+                _ => continue,
+            };
+            let Some(attention) = agent.attention.as_ref() else {
+                continue;
+            };
+            if attention.observation.revision != agent.observation.revision {
+                continue;
+            }
+            let reason = match (attention.reason, agent.observation.state) {
+                (AgentAttentionReason::Blocked, AgentState::Blocked) => NotificationReason::Blocked,
+                (AgentAttentionReason::Completed, AgentState::Done) => {
+                    NotificationReason::Completed
+                }
+                _ => continue,
+            };
+            if previous
+                .agent_states
+                .get(&agent.id)
+                .is_some_and(|state| state.observation.state == agent.observation.state)
+            {
+                continue;
+            }
+            if !category_enabled(self.notification_settings, reason)
+                || !seen.insert((agent.id.as_str(), agent.observation.revision, reason))
+            {
+                continue;
+            }
+            let (workspace, shell) = self.notification_context(workspace_id, shell_id);
+            requests.push(NotificationRequest {
+                reason,
+                agent: agent.name.clone(),
+                workspace,
+                shell,
+            });
+        }
+        requests
+    }
+
+    fn notification_context(&self, workspace_id: &str, shell_id: &str) -> (String, String) {
+        let Ok(state) = self.state.lock() else {
+            return ("unknown".into(), "removed".into());
+        };
+        let workspace = state
+            .workspaces
+            .get(workspace_id)
+            .and_then(|workspace| workspace.name.lock().ok().map(|name| name.clone()))
+            .unwrap_or_else(|| "unknown".into());
+        let shell = state
+            .shells
+            .get(shell_id)
+            .and_then(|shell| shell.name.lock().ok().map(|name| name.clone()))
+            .unwrap_or_else(|| "removed".into());
+        (workspace, shell)
     }
 
     fn flush_pending_locked(
@@ -5177,6 +5302,29 @@ mod tests {
 
     use crate::protocol::{AgentAuthority, AgentState};
 
+    #[derive(Default)]
+    struct RecordingNotificationSink {
+        requests: Mutex<Vec<NotificationRequest>>,
+    }
+
+    impl NotificationSink for RecordingNotificationSink {
+        fn notify(&self, request: NotificationRequest) {
+            self.requests.lock().unwrap().push(request);
+        }
+    }
+
+    fn notification_registry(
+        settings: NotificationSettings,
+    ) -> (Registry, Arc<RecordingNotificationSink>) {
+        let sink = Arc::new(RecordingNotificationSink::default());
+        let registry = Registry {
+            notification_settings: settings,
+            notification_sink: sink.clone(),
+            ..Registry::default()
+        };
+        (registry, sink)
+    }
+
     fn profile() -> TerminalProfile {
         TerminalProfile {
             term: Some("xterm-256color".into()),
@@ -5994,6 +6142,227 @@ mod tests {
         assert_eq!(attention.observation, done.observation);
         shell.kill().unwrap();
         registry.close_workspace(&workspace.id).unwrap();
+    }
+
+    #[test]
+    fn notifications_are_deduplicated_and_follow_current_attention() {
+        let (registry, sink) = notification_registry(NotificationSettings {
+            enabled: true,
+            blocked: true,
+            completed: true,
+        });
+        let (workspace, shell, _runtime) = running_shell(&registry);
+        let run_id = shell.snapshot().unwrap().run.unwrap().id;
+
+        let Response::Agent { agent: blocked } = registry
+            .dispatch(Request::RegisterAgent {
+                shell_id: shell.id.clone(),
+                run_id: run_id.clone(),
+                spec: agent_spec(AgentState::Blocked),
+            })
+            .unwrap()
+        else {
+            panic!("expected blocked agent");
+        };
+        assert_eq!(sink.requests.lock().unwrap().len(), 1);
+
+        registry
+            .dispatch(Request::ReportAgent {
+                agent_id: blocked.id.clone(),
+                run_id: run_id.clone(),
+                report: agent_spec(AgentState::Blocked).report,
+            })
+            .unwrap();
+        registry
+            .dispatch(Request::ReportAgent {
+                agent_id: blocked.id.clone(),
+                run_id: run_id.clone(),
+                report: agent_report(
+                    AgentState::Blocked,
+                    AgentAuthority::LifecycleIntegration,
+                    "same blocker with updated evidence",
+                ),
+            })
+            .unwrap();
+        registry
+            .dispatch(Request::ReportAgent {
+                agent_id: blocked.id.clone(),
+                run_id: run_id.clone(),
+                report: agent_report(
+                    AgentState::Working,
+                    AgentAuthority::TerminalHeuristic,
+                    "lower authority",
+                ),
+            })
+            .unwrap();
+        assert_eq!(sink.requests.lock().unwrap().len(), 1);
+
+        let Response::Agent { agent: working } = registry
+            .dispatch(Request::ReportAgent {
+                agent_id: blocked.id.clone(),
+                run_id: run_id.clone(),
+                report: agent_spec(AgentState::Working).report,
+            })
+            .unwrap()
+        else {
+            panic!("expected working agent");
+        };
+        assert!(working.attention.is_some());
+        assert_eq!(sink.requests.lock().unwrap().len(), 1);
+
+        let Response::Agent { agent: reblocked } = registry
+            .dispatch(Request::ReportAgent {
+                agent_id: blocked.id.clone(),
+                run_id: run_id.clone(),
+                report: agent_spec(AgentState::Blocked).report,
+            })
+            .unwrap()
+        else {
+            panic!("expected reblocked agent");
+        };
+        assert_eq!(sink.requests.lock().unwrap().len(), 2);
+
+        registry
+            .dispatch(Request::AcknowledgeAgentAttention {
+                agent_id: reblocked.id.clone(),
+                observation_revision: reblocked.observation.revision,
+            })
+            .unwrap();
+        assert_eq!(sink.requests.lock().unwrap().len(), 2);
+
+        registry
+            .dispatch(Request::ReportAgent {
+                agent_id: reblocked.id,
+                run_id: run_id.clone(),
+                report: agent_spec(AgentState::Done).report,
+            })
+            .unwrap();
+        assert_eq!(sink.requests.lock().unwrap().len(), 3);
+
+        registry
+            .dispatch(Request::RegisterAgent {
+                shell_id: shell.id.clone(),
+                run_id,
+                spec: agent_spec(AgentState::Done),
+            })
+            .unwrap();
+        let requests = sink.requests.lock().unwrap();
+        assert_eq!(requests.len(), 4);
+        assert_eq!(requests[0].reason, NotificationReason::Blocked);
+        assert_eq!(requests[1].reason, NotificationReason::Blocked);
+        assert_eq!(requests[2].reason, NotificationReason::Completed);
+        assert_eq!(requests[3].reason, NotificationReason::Completed);
+        assert_eq!(requests[0].workspace, "agents");
+        assert_eq!(requests[0].shell, "agent-shell");
+        drop(requests);
+
+        shell.kill().unwrap();
+        registry.close_workspace(&workspace.id).unwrap();
+    }
+
+    #[test]
+    fn disabled_notifications_do_not_reach_sink() {
+        let (registry, sink) = notification_registry(NotificationSettings::default());
+        let (workspace, shell, _runtime) = running_shell(&registry);
+        let run_id = shell.snapshot().unwrap().run.unwrap().id;
+        registry
+            .dispatch(Request::RegisterAgent {
+                shell_id: shell.id.clone(),
+                run_id,
+                spec: agent_spec(AgentState::Blocked),
+            })
+            .unwrap();
+        assert!(sink.requests.lock().unwrap().is_empty());
+        shell.kill().unwrap();
+        registry.close_workspace(&workspace.id).unwrap();
+    }
+
+    #[test]
+    fn retained_agent_notifications_explain_a_removed_shell() {
+        let (registry, sink) = notification_registry(NotificationSettings {
+            enabled: true,
+            blocked: true,
+            completed: true,
+        });
+        let (workspace, shell, _runtime) = running_shell(&registry);
+        let run_id = shell.snapshot().unwrap().run.unwrap().id;
+        let Response::Agent { agent } = registry
+            .dispatch(Request::RegisterAgent {
+                shell_id: shell.id.clone(),
+                run_id: run_id.clone(),
+                spec: agent_spec(AgentState::Working),
+            })
+            .unwrap()
+        else {
+            panic!("expected working agent");
+        };
+        registry
+            .dispatch(Request::CloseShell {
+                shell_id: shell.id.clone(),
+            })
+            .unwrap();
+        registry
+            .dispatch(Request::ReportAgent {
+                agent_id: agent.id,
+                run_id,
+                report: agent_spec(AgentState::Blocked).report,
+            })
+            .unwrap();
+
+        let requests = sink.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].workspace, "agents");
+        assert_eq!(requests[0].shell, "removed");
+        drop(requests);
+        registry.close_workspace(&workspace.id).unwrap();
+    }
+
+    #[test]
+    fn failed_persistence_does_not_notify() {
+        let directory = env::temp_dir().join(format!("boomux-notification-{}", Uuid::new_v4()));
+        let state_directory = directory.join("state");
+        let mut registry = Registry::restore(
+            StateStore::at(state_directory.join("state.json")),
+            false,
+            None,
+        )
+        .unwrap();
+        let sink = Arc::new(RecordingNotificationSink::default());
+        registry.notification_settings = NotificationSettings {
+            enabled: true,
+            blocked: true,
+            completed: true,
+        };
+        registry.notification_sink = sink.clone();
+        let (workspace, shell, _runtime) = running_shell(&registry);
+        let run_id = shell.snapshot().unwrap().run.unwrap().id;
+        let Response::Agent { agent } = registry
+            .dispatch(Request::RegisterAgent {
+                shell_id: shell.id.clone(),
+                run_id: run_id.clone(),
+                spec: agent_spec(AgentState::Working),
+            })
+            .unwrap()
+        else {
+            panic!("expected working agent");
+        };
+        fs::remove_dir_all(&state_directory).unwrap();
+        fs::write(&state_directory, b"not a directory").unwrap();
+
+        assert!(
+            registry
+                .dispatch(Request::ReportAgent {
+                    agent_id: agent.id,
+                    run_id,
+                    report: agent_spec(AgentState::Blocked).report,
+                })
+                .is_err()
+        );
+        assert!(sink.requests.lock().unwrap().is_empty());
+        shell.kill().unwrap();
+        let _ = workspace;
+        drop(registry);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

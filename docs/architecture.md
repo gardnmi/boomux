@@ -434,6 +434,21 @@ outstanding items so upgrading does not reinterpret historical work as unseen.
 The CLI projects these records into a deterministic blocked-first queue and
 reports fixed lifecycle-state and attention counts per workspace.
 
+Opt-in desktop notifications are a daemon-owned projection of committed Agent
+state transitions, not durable queue state. A transition from any other state
+into `blocked` or `done` schedules one asynchronous `notify-send` attempt after
+persistence and event publication locks are released. Same-state evidence or
+confidence revisions do not notify, and restored state is not replayed. A daemon
+handoff reloads configuration for the replacement, just like a cold daemon
+start. Delivery uses one worker and a bounded, non-blocking queue. It is
+at-most-once and fail-open: queue saturation, a missing command, desktop-bus
+failure, timeout, or non-zero exit neither retries nor changes the successful
+Agent mutation.
+Notification payloads include only sanitized Agent, workspace, and shell names;
+if retained Agent context outlives a removed shell, the shell is identified as
+removed rather than suppressing the transition. Notifications never acknowledge
+attention, advance an observation revision, or publish lifecycle events.
+
 ### Transition Coordinator
 
 The daemon serializes observable runtime transitions through one coordinator. A
@@ -461,10 +476,14 @@ not persisted per chunk, but output revision mutation and `output_changed`
 publication cross the coordinator together. A non-blocking terminal lock keeps
 output processing from holding global locks while waiting on terminal snapshots.
 
-Agent registration, ensure, reports, and attention acknowledgment use the same durable mutation coordinator.
+Agent registration, ensure, reports, and attention acknowledgment use the same
+durable mutation coordinator.
 Persistence and `agent_registered`, `agent_state_changed`, `agent_completed`, or
-`agent_attention_acknowledged` publication therefore share the normal ordering boundary and
-baseline snapshots include the exact coordinated cut.
+`agent_attention_acknowledged` publication therefore share the normal ordering
+boundary and baseline snapshots include the exact coordinated cut. Notification
+eligibility is derived from the pre-mutation and committed Agent states inside
+this boundary, but sink dispatch occurs only after all coordinator and mutation
+locks are released.
 
 ## Runtime Semantics
 
@@ -506,4 +525,4 @@ as pending.
 Future agent runtime work is tracked in [`roadmap.md`](roadmap.md). The explicit
 process-adapter supervisor is only a foundation; automatic and
  integration-specific adapters, terminal heuristics,
-notifications, and control remain future work.
+and control remain future work.
