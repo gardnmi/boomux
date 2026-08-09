@@ -1674,15 +1674,7 @@ fn verify_integration(
         _ => {
             return Err(cli_output::failure(
                 "ambiguous_target",
-                format!(
-                    "multiple running {} host shells found ({}); pass --shell <id>",
-                    spec.name,
-                    targets
-                        .iter()
-                        .map(|target| target.shell_id.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
+                format_ambiguous_verification_targets(&snapshot, integration, &targets),
             ));
         }
     };
@@ -1753,6 +1745,47 @@ fn verify_integration(
         cursor = batch.cursor;
         snapshot = client.snapshot()?;
     }
+}
+
+fn format_ambiguous_verification_targets(
+    snapshot: &Snapshot,
+    integration: integration_management::IntegrationId,
+    targets: &[integration_management::VerificationTarget],
+) -> String {
+    let spec = integration.spec();
+    let mut choices = targets
+        .iter()
+        .filter_map(|target| {
+            snapshot.workspaces.iter().find_map(|workspace| {
+                workspace
+                    .shells
+                    .iter()
+                    .find(|shell| shell.id == target.shell_id)
+                    .map(|shell| {
+                        (
+                            workspace.name.as_str(),
+                            shell.name.as_str(),
+                            target.shell_id.as_str(),
+                        )
+                    })
+            })
+        })
+        .collect::<Vec<_>>();
+    choices.sort_unstable();
+
+    let mut output = format!(
+        "multiple running {} host shells found\n\nChoose a shell:",
+        spec.display_name
+    );
+    for (workspace, shell, shell_id) in choices {
+        write!(
+            output,
+            "\n  {workspace} / {shell}\n    boomux integration verify {} --shell {shell_id}",
+            spec.name
+        )
+        .expect("writing to a string cannot fail");
+    }
+    output
 }
 
 fn list_integrations(json: bool) -> Result<(), Box<dyn Error>> {
@@ -5309,6 +5342,42 @@ mod tests {
         ));
         assert_eq!(command_name(&verify), "integration.verify");
         assert!(supports_json(&verify));
+    }
+
+    #[test]
+    fn ambiguous_verification_lists_named_shell_commands() {
+        let snapshot = Snapshot {
+            workspaces: vec![
+                workspace("w2", "Zeta", vec![shell("s2", "w2", "backend")]),
+                workspace("w1", "Alpha", vec![shell("s1", "w1", "frontend")]),
+            ],
+        };
+        let targets = vec![
+            integration_management::VerificationTarget {
+                shell_id: "s2".into(),
+                run_id: "r2".into(),
+            },
+            integration_management::VerificationTarget {
+                shell_id: "s1".into(),
+                run_id: "r1".into(),
+            },
+        ];
+
+        assert_eq!(
+            format_ambiguous_verification_targets(
+                &snapshot,
+                integration_management::IntegrationId::Opencode,
+                &targets,
+            ),
+            concat!(
+                "multiple running OpenCode host shells found\n\n",
+                "Choose a shell:\n",
+                "  Alpha / frontend\n",
+                "    boomux integration verify opencode --shell s1\n",
+                "  Zeta / backend\n",
+                "    boomux integration verify opencode --shell s2",
+            )
+        );
     }
 
     #[test]

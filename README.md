@@ -448,7 +448,8 @@ boomux integration verify opencode --shell <shell-id> --wait-ms 30000
 ```
 
 Verification never treats process or terminal evidence as lifecycle proof. When
-several matching host shells are running, pass one exact shell ID.
+several matching host shells are running, Boomux lists each workspace and shell
+name with a ready-to-run command containing the required exact shell ID.
 
 Boomux currently validates its bundled integrations against these host releases:
 
