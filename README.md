@@ -161,6 +161,7 @@ boomux integration list
 boomux integration status [opencode|pi]
 boomux integration install <opencode|pi> [--force]
 boomux integration install --all [--force]
+boomux integration verify <opencode|pi> [--shell <shell-id>] [--wait-ms <milliseconds>]
 boomux daemon status
 boomux daemon restart
 boomux daemon stop
@@ -437,6 +438,17 @@ preserved unless `--force` is supplied, and symlinked or non-regular paths are
 rejected. Successful changes print the required host restart guidance. The
 existing `boomux opencode install` and `boomux pi install` commands remain
 equivalent host-specific shortcuts.
+
+After restarting a host, verify that a running managed shell has authoritative
+lifecycle reporting:
+
+```console
+boomux integration verify opencode
+boomux integration verify opencode --shell <shell-id> --wait-ms 30000
+```
+
+Verification never treats process or terminal evidence as lifecycle proof. When
+several matching host shells are running, pass one exact shell ID.
 
 Boomux currently validates its bundled integrations against these host releases:
 

@@ -2956,6 +2956,7 @@ fn native_daemon_lifecycle() {
         "integration.list",
         "integration.status",
         "integration.install",
+        "integration.verify",
     ] {
         assert!(json_commands.iter().any(|current| current == command));
     }

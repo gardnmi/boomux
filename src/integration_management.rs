@@ -214,6 +214,93 @@ pub(crate) struct RuntimeStatus {
     pub(crate) untracked_processes: usize,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct VerificationTarget {
+    pub(crate) shell_id: String,
+    pub(crate) run_id: String,
+}
+
+#[derive(Debug)]
+pub(crate) enum VerificationCheck {
+    Verified {
+        workspace_name: String,
+        agents: Vec<boomux::protocol::AgentInstanceSnapshot>,
+    },
+    Pending,
+    Missing,
+    RunChanged,
+}
+
+pub(crate) fn verification_targets(
+    snapshot: &Snapshot,
+    id: IntegrationId,
+    shell_id: Option<&str>,
+) -> Vec<VerificationTarget> {
+    let executable = id.spec().executable;
+    let mut targets = snapshot
+        .workspaces
+        .iter()
+        .flat_map(|workspace| &workspace.shells)
+        .filter(|shell| {
+            matches!(shell.status, ShellStatus::Running)
+                && shell.foreground_process.as_deref() == Some(executable)
+                && shell_id.is_none_or(|requested| shell.id == requested)
+        })
+        .filter_map(|shell| {
+            shell.run.as_ref().map(|run| VerificationTarget {
+                shell_id: shell.id.clone(),
+                run_id: run.id.clone(),
+            })
+        })
+        .collect::<Vec<_>>();
+    targets.sort_by(|left, right| left.shell_id.cmp(&right.shell_id));
+    targets
+}
+
+pub(crate) fn check_verification_target(
+    snapshot: &Snapshot,
+    id: IntegrationId,
+    target: &VerificationTarget,
+) -> VerificationCheck {
+    let spec = id.spec();
+    for workspace in &snapshot.workspaces {
+        let Some(shell) = workspace
+            .shells
+            .iter()
+            .find(|shell| shell.id == target.shell_id)
+        else {
+            continue;
+        };
+        if !matches!(shell.status, ShellStatus::Running)
+            || shell.foreground_process.as_deref() != Some(spec.executable)
+        {
+            return VerificationCheck::Missing;
+        }
+        let Some(run) = shell.run.as_ref() else {
+            return VerificationCheck::Missing;
+        };
+        if run.id != target.run_id {
+            return VerificationCheck::RunChanged;
+        }
+        let mut agents = workspace
+            .agents
+            .iter()
+            .filter(|agent| authoritative_agent_matches(agent, spec, shell, run))
+            .cloned()
+            .collect::<Vec<_>>();
+        agents.sort_by(|left, right| left.id.cmp(&right.id));
+        return if agents.is_empty() {
+            VerificationCheck::Pending
+        } else {
+            VerificationCheck::Verified {
+                workspace_name: workspace.name.clone(),
+                agents,
+            }
+        };
+    }
+    VerificationCheck::Missing
+}
+
 #[derive(Debug, Serialize)]
 pub(crate) struct IntegrationStatus {
     pub(crate) name: &'static str,
@@ -397,17 +484,10 @@ fn inspect_runtime(spec: &IntegrationSpec, snapshot: Option<&Snapshot>) -> Runti
     for (workspace, shell) in running {
         running_processes += 1;
         if shell.run.as_ref().is_some_and(|run| {
-            workspace.agents.iter().any(|agent| {
-                agent.integration == spec.name
-                    && agent.shell_id == shell.id
-                    && agent.run_id == run.id
-                    && agent.ended_at_ms.is_none()
-                    && agent.observation.authority == AgentAuthority::LifecycleIntegration
-                    && !matches!(
-                        agent.observation.state,
-                        AgentState::Inactive | AgentState::Done
-                    )
-            })
+            workspace
+                .agents
+                .iter()
+                .any(|agent| authoritative_agent_matches(agent, spec, shell, run))
         }) {
             tracked_processes += 1;
         }
@@ -426,6 +506,23 @@ fn inspect_runtime(spec: &IntegrationSpec, snapshot: Option<&Snapshot>) -> Runti
         tracked_processes,
         untracked_processes,
     }
+}
+
+fn authoritative_agent_matches(
+    agent: &boomux::protocol::AgentInstanceSnapshot,
+    spec: &IntegrationSpec,
+    shell: &boomux::protocol::ShellSnapshot,
+    run: &boomux::protocol::ShellRunSnapshot,
+) -> bool {
+    agent.integration == spec.name
+        && agent.shell_id == shell.id
+        && agent.run_id == run.id
+        && agent.ended_at_ms.is_none()
+        && agent.observation.authority == AgentAuthority::LifecycleIntegration
+        && !matches!(
+            agent.observation.state,
+            AgentState::Inactive | AgentState::Done
+        )
 }
 
 fn executable_on_path(name: &str, path: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
@@ -1083,9 +1180,27 @@ mod tests {
             workspaces: vec![workspace.clone()],
         };
         assert_eq!(
+            verification_targets(&snapshot, IntegrationId::Opencode, None),
+            [VerificationTarget {
+                shell_id: "s1".into(),
+                run_id: "r1".into(),
+            }]
+        );
+        assert_eq!(
             inspect_runtime(IntegrationId::Opencode.spec(), Some(&snapshot)).state,
             RuntimeState::Reporting
         );
+        assert!(matches!(
+            check_verification_target(
+                &snapshot,
+                IntegrationId::Opencode,
+                &VerificationTarget {
+                    shell_id: "s1".into(),
+                    run_id: "r1".into(),
+                }
+            ),
+            VerificationCheck::Verified { agents, .. } if agents.len() == 1
+        ));
 
         workspace.agents[0].observation.authority = AgentAuthority::ProcessAdapter;
         let snapshot = Snapshot {
@@ -1095,5 +1210,16 @@ mod tests {
             inspect_runtime(IntegrationId::Opencode.spec(), Some(&snapshot)).state,
             RuntimeState::Untracked
         );
+        assert!(matches!(
+            check_verification_target(
+                &snapshot,
+                IntegrationId::Opencode,
+                &VerificationTarget {
+                    shell_id: "s1".into(),
+                    run_id: "r1".into(),
+                }
+            ),
+            VerificationCheck::Pending
+        ));
     }
 }
