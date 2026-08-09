@@ -1288,12 +1288,18 @@ fn cached_host_catalog(
     workspaces: &[WorkspaceSnapshot],
     cache: &mut host_session_titles::Cache,
 ) -> Vec<host_session_titles::HostSession> {
-    workspace_source_directories(workspaces)
+    let mut catalog = Vec::new();
+    for directory in workspace_source_directories(workspaces)
         .into_iter()
         .take(MAX_HOST_CATALOG_DIRECTORIES)
-        .filter_map(|directory| cache.catalog("opencode", &directory))
-        .flatten()
-        .collect()
+    {
+        for integration in host_session_titles::catalog_integrations() {
+            if let Some(sessions) = cache.catalog(integration, &directory) {
+                catalog.extend(sessions);
+            }
+        }
+    }
+    catalog
 }
 
 fn discover_host_catalog(
@@ -1303,10 +1309,15 @@ fn discover_host_catalog(
         .into_iter()
         .take(MAX_HOST_CATALOG_DIRECTORIES)
         .collect::<Vec<_>>();
+    let requests = directories.into_iter().flat_map(|directory| {
+        host_session_titles::catalog_integrations()
+            .map(move |integration| (integration, directory.clone()))
+    });
     thread::scope(|scope| {
-        directories
-            .into_iter()
-            .map(|directory| scope.spawn(move || host_session_titles::catalog(&directory)))
+        requests
+            .map(|(integration, directory)| {
+                scope.spawn(move || host_session_titles::catalog(integration, &directory))
+            })
             .collect::<Vec<_>>()
             .into_iter()
             .filter_map(|handle| handle.join().ok().flatten())

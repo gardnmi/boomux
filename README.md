@@ -225,8 +225,8 @@ observations in a durable, blocked-first attention queue. Each item retains the
 exact raising evidence, authority, confidence, revision, and timestamp until it
 is conditionally acknowledged; later working or idle activity does not erase
 unseen work. Workspace output includes fixed Agent state counts and the
-outstanding attention count. Boomux does not yet provide terminal heuristics,
-agent reads, or agent control.
+outstanding attention count. Boomux does not yet provide terminal heuristics or
+agent control.
 
 Optional desktop notifications mirror transitions into `blocked` and `done`.
 They do not replace or acknowledge durable attention items. Delivery is an

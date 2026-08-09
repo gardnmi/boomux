@@ -340,12 +340,9 @@ export default function BoomuxPiExtension(pi) {
 }
 
 export const __internal = Object.freeze({
-  agentErrorEvidence,
   boundedEvidence,
   createLifecycle,
   createOutcomeTracker,
   createProcessRunner,
-  ensureArgv,
-  reportArgv,
   registerLifecycleHandlers,
 });

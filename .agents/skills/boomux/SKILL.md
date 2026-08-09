@@ -165,7 +165,7 @@ otherwise pass both explicitly. Retain the exact agent ID returned by
 never replace it with a newer run from the durable shell.
 
 Every register, ensure, and report command requires an explicit state (`unknown`, `working`,
-`blocked`, `idle`, or `done`), external authority (`lifecycle-integration`,
+`blocked`, `idle`, `done`, or `inactive`), external authority (`lifecycle-integration`,
 `process-adapter`, or `terminal-heuristic`), nonempty evidence, and confidence
 from 0 through 100. `daemon-lifecycle` is reserved and public mutations reject
 it. Authority precedence is lifecycle integration over process adapter over
@@ -178,8 +178,7 @@ while conflicting later reports are rejected.
 
 If `register`, `ensure`, or `report` returns `run_changed`, stop reporting for that
 instance and reacquire exact lifecycle context. Do not guess the replacement
-run. Boomux does not yet provide terminal heuristics, agent read commands, or
-control.
+run. Boomux does not yet provide terminal heuristics or agent control.
 
 ## Supervise An Explicit Process
 

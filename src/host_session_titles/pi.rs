@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use super::{MAX_SESSIONS, TitleAdapter, Titles, sanitize_title};
+use super::{Inspection, MAX_SESSIONS, TitleAdapter, sanitize_title};
 use crate::host_session_source::{
     normalize_absolute,
     pi::{Environment, session_catalog},
@@ -16,12 +16,12 @@ impl TitleAdapter for PiAdapter {
         "pi"
     }
 
-    fn inspect(&self, directory: &Path) -> Option<Titles> {
+    fn inspect(&self, directory: &Path) -> Option<Inspection> {
         inspect(directory, &Environment::from_process())
     }
 }
 
-pub(super) fn inspect(directory: &Path, environment: &Environment) -> Option<Titles> {
+pub(super) fn inspect(directory: &Path, environment: &Environment) -> Option<Inspection> {
     let (normalized_directory, prefixes) = session_catalog(directory, environment, MAX_SESSIONS)?;
     let mut titles = HashMap::new();
 
@@ -30,7 +30,10 @@ pub(super) fn inspect(directory: &Path, environment: &Environment) -> Option<Tit
             titles.entry(id).or_insert(title);
         }
     }
-    Some(titles)
+    Some(Inspection {
+        titles,
+        catalog: Vec::new(),
+    })
 }
 
 pub(super) fn parse_session(output: &[u8], requested_directory: &Path) -> Option<(String, String)> {

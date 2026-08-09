@@ -47,7 +47,11 @@ struct Inspection {
 trait TitleAdapter: Sync {
     fn integration(&self) -> &'static str;
 
-    fn inspect(&self, directory: &Path) -> Option<Titles>;
+    fn inspect(&self, directory: &Path) -> Option<Inspection>;
+
+    fn provides_catalog(&self) -> bool {
+        false
+    }
 }
 
 static ADAPTERS: &[&dyn TitleAdapter] = &[opencode::ADAPTER, pi::ADAPTER];
@@ -119,6 +123,9 @@ impl Cache {
         integration: &str,
         directory: &Path,
     ) -> Option<Vec<HostSession>> {
+        if !adapter(integration).is_some_and(|adapter| adapter.provides_catalog()) {
+            return None;
+        }
         self.refresh(integration, directory);
         let key = CacheKey {
             integration: integration.to_owned(),
@@ -142,7 +149,7 @@ impl Cache {
             );
         }
 
-        if !is_supported(integration) {
+        if adapter(integration).is_none() {
             return;
         }
 
@@ -164,28 +171,32 @@ impl Cache {
     }
 }
 
-fn is_supported(integration: &str) -> bool {
-    ADAPTERS
-        .iter()
-        .any(|adapter| adapter.integration() == integration)
-}
-
 fn inspect(integration: &str, directory: &Path) -> Option<Inspection> {
-    if integration == "opencode" {
-        return opencode::inspect_catalog(directory);
-    }
-    ADAPTERS
-        .iter()
-        .find(|adapter| adapter.integration() == integration)?
-        .inspect(directory)
-        .map(|titles| Inspection {
-            titles,
-            catalog: Vec::new(),
-        })
+    adapter(integration)?.inspect(directory)
 }
 
-pub(crate) fn catalog(directory: &Path) -> Option<Vec<HostSession>> {
-    opencode::inspect_catalog(directory).map(|inspection| inspection.catalog)
+pub(crate) fn catalog_integrations() -> impl Iterator<Item = &'static str> {
+    ADAPTERS
+        .iter()
+        .filter(|adapter| adapter.provides_catalog())
+        .map(|adapter| adapter.integration())
+}
+
+pub(crate) fn catalog(integration: &str, directory: &Path) -> Option<Vec<HostSession>> {
+    let adapter = adapter(integration)?;
+    if !adapter.provides_catalog() {
+        return None;
+    }
+    adapter
+        .inspect(directory)
+        .map(|inspection| inspection.catalog)
+}
+
+fn adapter(integration: &str) -> Option<&'static dyn TitleAdapter> {
+    ADAPTERS
+        .iter()
+        .copied()
+        .find(|adapter| adapter.integration() == integration)
 }
 
 fn sanitize_title(title: &str) -> Option<String> {
@@ -390,7 +401,9 @@ mod tests {
             ),
         );
 
-        let titles = inspect_pi(Path::new("/repo"), &test.environment()).expect("catalog");
+        let inspection = inspect_pi(Path::new("/repo"), &test.environment()).expect("catalog");
+        assert!(inspection.catalog.is_empty());
+        let titles = inspection.titles;
 
         assert_eq!(
             titles.get("matching").map(String::as_str),
@@ -490,7 +503,8 @@ mod tests {
             ),
         );
 
-        let titles = inspect_pi(Path::new("/repo"), &test.environment()).expect("catalog");
+        let inspection = inspect_pi(Path::new("/repo"), &test.environment()).expect("catalog");
+        let titles = inspection.titles;
 
         assert_eq!(
             titles.get("pi-oversized").map(String::as_str),
@@ -524,7 +538,8 @@ mod tests {
             ),
         );
 
-        let titles = inspect_pi(Path::new("/repo"), &test.environment()).expect("catalog");
+        let inspection = inspect_pi(Path::new("/repo"), &test.environment()).expect("catalog");
+        let titles = inspection.titles;
 
         assert_eq!(titles.len(), 1);
         assert_eq!(titles.get("valid").map(String::as_str), Some("Valid title"));
@@ -550,7 +565,8 @@ mod tests {
                 .expect("set session timestamp");
         }
 
-        let titles = inspect_pi(Path::new("/repo"), &test.environment()).expect("catalog");
+        let inspection = inspect_pi(Path::new("/repo"), &test.environment()).expect("catalog");
+        let titles = inspection.titles;
 
         assert_eq!(titles.len(), MAX_SESSIONS);
         assert!(titles.contains_key("pi-100"));
@@ -589,6 +605,13 @@ mod tests {
             pi_session_file(Path::new("/repo"), "external", &test.environment()),
             Ok(exact)
         );
+    }
+
+    #[test]
+    fn adapters_declare_catalog_support() {
+        assert_eq!(catalog_integrations().collect::<Vec<_>>(), ["opencode"]);
+        assert!(catalog("pi", Path::new("/repo")).is_none());
+        assert!(adapter("missing").is_none());
     }
 
     #[test]
@@ -659,12 +682,7 @@ mod tests {
                 .root_id,
             "opencode-id"
         );
-        assert!(
-            cache
-                .catalog("pi", Path::new("/repo"))
-                .expect("cached catalog")
-                .is_empty()
-        );
+        assert!(cache.catalog("pi", Path::new("/repo")).is_none());
     }
 
     #[test]
