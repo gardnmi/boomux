@@ -1926,13 +1926,6 @@ enum SessionCategory {
 }
 
 impl SessionCategory {
-    const ALL: [Self; 4] = [
-        Self::Active,
-        Self::Last24Hours,
-        Self::Last7Days,
-        Self::Older,
-    ];
-
     fn label(self) -> &'static str {
         match self {
             Self::Active => "ACTIVE",
@@ -1970,91 +1963,68 @@ fn contextual_session_panel(app: &App) -> Option<ContextualSessionPanel> {
     let agent = agent_shell.agent.as_ref()?;
     let external_session_id = agent.external_session_id.as_deref()?;
     let workspace = app.selected_item_workspace()?;
-    let sessions: Vec<_> = workspace
+    let session = workspace
         .sessions
         .iter()
         .filter(|session| {
             session.integration == agent.integration
                 && session.external_session_id.as_deref() == Some(external_session_id)
         })
-        .collect();
-    if sessions.is_empty() {
-        return None;
-    }
-    let now_ms = current_time_ms();
-    let mut rows = Vec::new();
-    let mut content_height = 0;
-    for category in SessionCategory::ALL {
-        let categorized: Vec<_> = sessions
-            .iter()
-            .copied()
-            .filter(|session| session_category(session, now_ms) == category)
-            .collect();
-        if categorized.is_empty() {
-            continue;
-        }
-        let categorized_count = categorized.len() as u16;
-        rows.push(
-            Row::new([
-                Cell::from(""),
-                Cell::from(category.label()),
-                Cell::from(""),
-                Cell::from(""),
-            ])
-            .style(Style::new().fg(BLUE).add_modifier(Modifier::BOLD)),
-        );
-        content_height += 1;
-        rows.extend(categorized.into_iter().map(|session| {
-            let label = best_session_label(session);
-            let external_identity = session
-                .external_session_id
-                .as_deref()
-                .map(short_id)
-                .unwrap_or_else(|| short_id(&session.id));
-            let shell = session
-                .runs
-                .last()
-                .and_then(|run| run.shell_name.as_deref())
-                .unwrap_or(if session.runs.is_empty() {
-                    "catalog only"
-                } else {
-                    "removed shell"
-                });
-            let occurrences = session.runs.len();
-            let currency = if session.state_is_current {
-                "current"
-            } else {
-                "last known"
-            };
-            Row::new([
-                Cell::from(Span::styled(
-                    session_state_symbol(&session.state),
-                    Style::new().fg(session_state_color(&session.state)),
+        .max_by(|left, right| {
+            left.state_is_current
+                .cmp(&right.state_is_current)
+                .then_with(|| left.last_at_ms.cmp(&right.last_at_ms))
+                .then_with(|| left.id.cmp(&right.id))
+        })?;
+    let label = best_session_label(session);
+    let external_identity = session
+        .external_session_id
+        .as_deref()
+        .map(short_id)
+        .unwrap_or_else(|| short_id(&session.id));
+    let shell = session
+        .runs
+        .last()
+        .and_then(|run| run.shell_name.as_deref())
+        .unwrap_or(if session.runs.is_empty() {
+            "catalog only"
+        } else {
+            "removed shell"
+        });
+    let occurrences = session.runs.len();
+    let currency = if session.state_is_current {
+        "current"
+    } else {
+        "last known"
+    };
+    let rows = vec![
+        Row::new([
+            Cell::from(Span::styled(
+                session_state_symbol(&session.state),
+                Style::new().fg(session_state_color(&session.state)),
+            )),
+            Cell::from(vec![
+                Line::from(Span::styled(
+                    label,
+                    Style::new().add_modifier(Modifier::BOLD),
                 )),
-                Cell::from(vec![
-                    Line::from(Span::styled(
-                        label,
-                        Style::new().add_modifier(Modifier::BOLD),
-                    )),
-                    Line::from(Span::styled(
-                        format!(
-                            "{shell}  {external_identity}  {occurrences} occurrence{}  {currency}",
-                            if occurrences == 1 { "" } else { "s" }
-                        ),
-                        Style::new().fg(SUBTEXT),
-                    )),
-                ]),
-                Cell::from(session.state.clone()),
-                Cell::from(compact_recency(session.last_at_ms)),
-            ])
-            .height(2)
-        }));
-        content_height += categorized_count * 2;
-    }
+                Line::from(Span::styled(
+                    format!(
+                        "{shell}  {external_identity}  {occurrences} occurrence{}  {currency}",
+                        if occurrences == 1 { "" } else { "s" }
+                    ),
+                    Style::new().fg(SUBTEXT),
+                )),
+            ]),
+            Cell::from(session.state.clone()),
+            Cell::from(compact_recency(session.last_at_ms)),
+        ])
+        .height(2),
+    ];
     Some(ContextualSessionPanel {
         title: format!(" {} session ", integration_display_name(&agent.integration)),
         rows,
-        content_height,
+        content_height: 2,
     })
 }
 
@@ -3485,8 +3455,9 @@ mod tests {
         active.last_at_ms = now;
         let mut recent = session("recent", "inactive");
         recent.label = "Recent review".into();
+        recent.external_session_id = Some("external-active".into());
         recent.state_is_current = false;
-        recent.last_at_ms = now - 2 * 60 * 60 * 1_000;
+        recent.last_at_ms = now + 1;
         let mut week = session("week", "done");
         week.label = "Finished build".into();
         week.state_is_current = false;
@@ -3512,7 +3483,6 @@ mod tests {
         let text = lines.join("\n");
 
         assert!(text.contains("OpenCode session"));
-        assert!(text.contains("ACTIVE"));
         assert!(text.contains("Current work"));
         assert!(!text.contains("Recent review"));
         assert!(!text.contains("Dormant review"));
@@ -3531,6 +3501,18 @@ mod tests {
         assert!(!text.contains("first "));
         assert!(!text.contains("observed "));
         assert!(!text.contains("tool call in progress"));
+
+        app.workspaces[0].sessions[0].state_is_current = false;
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let latest_text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(latest_text.contains("Recent review"));
+        assert!(!latest_text.contains("Current work"));
     }
 
     #[test]

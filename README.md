@@ -103,7 +103,8 @@ Agent's lifecycle state and evidence. The Agents view stays focused on those
 current presentations. A process-only foreground hint is labeled `untracked`,
 never `idle`, until its lifecycle integration registers. A selected durable
 Agent may show its one matching canonical session; untracked hints never receive
-directory-wide history. Full Boomux-observed and bounded OpenCode catalog
+directory-wide history. The preview prefers the active match and otherwise uses
+the latest match. Full Boomux-observed and bounded OpenCode catalog
 history remains available through the session CLI.
 
 Closing a terminal window only disconnects its attachment. The Boomux daemon
