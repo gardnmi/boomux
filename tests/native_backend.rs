@@ -2785,6 +2785,132 @@ fn failed_implicit_terminal_launch_rolls_back_created_state() {
 }
 
 #[test]
+fn integration_management_reports_and_installs_bundled_hosts() {
+    let root = std::env::temp_dir().join(format!(
+        "boomux-integration-management-{}-{}",
+        std::process::id(),
+        Uuid::new_v4()
+    ));
+    let bin = root.join("bin");
+    let config = root.join("config");
+    let pi = root.join("pi");
+    let runtime = root.join("runtime");
+    fs::create_dir_all(&bin).unwrap();
+    fs::create_dir_all(&runtime).unwrap();
+    for (name, version) in [("opencode", "1.18.15"), ("pi", "0.84.1")] {
+        let executable = bin.join(name);
+        fs::write(
+            &executable,
+            format!("#!/bin/sh\nprintf '%s\\n' '{version}'\n"),
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let command = || {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_boomux"));
+        command
+            .env("HOME", &root)
+            .env("XDG_CONFIG_HOME", &config)
+            .env("PI_CODING_AGENT_DIR", &pi)
+            .env("XDG_RUNTIME_DIR", &runtime)
+            .env("PATH", &bin);
+        command
+    };
+
+    let listed = command()
+        .args(["integration", "list", "--json"])
+        .output()
+        .unwrap();
+    assert!(listed.status.success());
+    let listed: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(listed["schema"], "boomux.cli/v1");
+    assert_eq!(listed["command"], "integration.list");
+    assert_eq!(listed["data"]["integrations"].as_array().unwrap().len(), 2);
+
+    let missing = command()
+        .args(["integration", "status", "--json"])
+        .output()
+        .unwrap();
+    assert!(missing.status.success());
+    let missing: serde_json::Value = serde_json::from_slice(&missing.stdout).unwrap();
+    assert_eq!(missing["command"], "integration.status");
+    for integration in missing["data"]["integrations"].as_array().unwrap() {
+        assert_eq!(integration["host"]["compatibility"], "validated");
+        assert_eq!(integration["asset"]["state"], "missing");
+        assert_eq!(integration["runtime"]["state"], "not_observable");
+        assert_eq!(integration["recommended_action"], "install");
+    }
+    assert!(fs::read_dir(&runtime).unwrap().next().is_none());
+
+    fs::create_dir_all(pi.join("extensions")).unwrap();
+    fs::write(pi.join("extensions/boomux.js"), "custom extension").unwrap();
+    let preflight_refused = command()
+        .args(["integration", "install", "--all", "--json"])
+        .output()
+        .unwrap();
+    assert!(!preflight_refused.status.success());
+    assert!(!config.join("opencode/plugins/boomux.js").exists());
+    fs::remove_file(pi.join("extensions/boomux.js")).unwrap();
+
+    let installed = command()
+        .args(["integration", "install", "--all", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        installed.status.success(),
+        "integration install failed: {}",
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    let installed: serde_json::Value = serde_json::from_slice(&installed.stdout).unwrap();
+    assert_eq!(installed["command"], "integration.install");
+    for integration in installed["data"]["integrations"].as_array().unwrap() {
+        assert_eq!(integration["result"], "installed");
+        assert_eq!(integration["restart_required"], true);
+    }
+    assert!(config.join("opencode/plugins/boomux.js").is_file());
+    assert!(pi.join("extensions/boomux.js").is_file());
+
+    for arguments in [["opencode", "install"], ["pi", "install"]] {
+        let shortcut = command().args(arguments).output().unwrap();
+        assert!(shortcut.status.success());
+        assert!(String::from_utf8_lossy(&shortcut.stdout).contains("already installed"));
+    }
+
+    let current = command()
+        .args(["integration", "status", "pi", "--json"])
+        .output()
+        .unwrap();
+    let current: serde_json::Value = serde_json::from_slice(&current.stdout).unwrap();
+    assert_eq!(
+        current["data"]["integrations"][0]["asset"]["state"],
+        "current"
+    );
+
+    fs::write(pi.join("extensions/boomux.js"), "custom extension").unwrap();
+    let refused = command()
+        .args(["integration", "install", "pi", "--json"])
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    let refused: serde_json::Value = serde_json::from_slice(&refused.stderr).unwrap();
+    assert_eq!(refused["command"], "integration.install");
+    assert_eq!(refused["error"]["code"], "already_exists");
+
+    let invalid_environment = Command::new(env!("CARGO_BIN_EXE_boomux"))
+        .args(["integration", "install", "opencode", "--json"])
+        .env_remove("HOME")
+        .env_remove("XDG_CONFIG_HOME")
+        .output()
+        .unwrap();
+    assert!(!invalid_environment.status.success());
+    let invalid_environment: serde_json::Value =
+        serde_json::from_slice(&invalid_environment.stderr).unwrap();
+    assert_eq!(invalid_environment["error"]["code"], "invalid_argument");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn native_daemon_lifecycle() {
     let mut daemon = TestDaemon::start();
 
@@ -2827,6 +2953,9 @@ fn native_daemon_lifecycle() {
         "agent.wait",
         "attention.list",
         "attention.acknowledge",
+        "integration.list",
+        "integration.status",
+        "integration.install",
     ] {
         assert!(json_commands.iter().any(|current| current == command));
     }
@@ -2848,6 +2977,7 @@ fn native_daemon_lifecycle() {
         "process_adapters",
         "persistent_agent_attention",
         "transcript_pagination",
+        "integration_management",
     ] {
         assert!(features.iter().any(|current| current == feature));
     }

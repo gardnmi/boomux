@@ -2,9 +2,9 @@ use std::collections::BTreeSet;
 use std::env;
 use std::error::Error;
 use std::ffi::OsString;
+use std::fmt::Write as _;
 use std::fs;
-use std::fs::OpenOptions;
-use std::io::{self, Write};
+use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -22,12 +22,18 @@ use boomux::protocol::{
 };
 use boomux::{attach, client, daemon, protocol};
 
+use crate::integration_management::{
+    InstallOutcome, ensure_safe_directory, install_asset_at, regular_file_matches,
+    require_absolute_root,
+};
+
 mod agent_attention_projection;
 mod cli_output;
 mod config;
 mod git;
 mod host_session_source;
 mod host_session_titles;
+mod integration_management;
 mod process_adapter;
 mod projects;
 mod session_projection;
@@ -36,10 +42,10 @@ mod terminal;
 mod tui;
 
 const BOOMUX_SKILL: &str = include_str!("../.agents/skills/boomux/SKILL.md");
-const BOOMUX_OPENCODE_PLUGIN: &str = include_str!("../integrations/opencode/boomux.js");
-const BOOMUX_PI_EXTENSION: &str = include_str!("../integrations/pi/boomux.js");
-const VALIDATED_OPENCODE_VERSION: &str = "1.18.15";
-const VALIDATED_PI_VERSION: &str = "0.84.1";
+#[cfg(test)]
+const BOOMUX_OPENCODE_PLUGIN: &str = integration_management::OPENCODE_ASSET;
+#[cfg(test)]
+const BOOMUX_PI_EXTENSION: &str = integration_management::PI_ASSET;
 const MAX_HOST_CATALOG_DIRECTORIES: usize = 8;
 const JSON_COMMANDS: &[&str] = &[
     "capabilities",
@@ -60,6 +66,9 @@ const JSON_COMMANDS: &[&str] = &[
     "agent.wait",
     "attention.list",
     "attention.acknowledge",
+    "integration.list",
+    "integration.status",
+    "integration.install",
     "session.list",
     "session.inspect",
     "session.read",
@@ -97,6 +106,7 @@ const INTEGRATION_FEATURES: &[&str] = &[
     "revision_aware_agent_wait",
     "persistent_agent_attention",
     "desktop_notifications",
+    "integration_management",
 ];
 const LEGACY_BOOMUX_SHELLS_SKILL: &str = r#"---
 name: boomux-shells
@@ -240,6 +250,11 @@ enum Commands {
     Session {
         #[command(subcommand)]
         command: SessionCommands,
+    },
+    /// Inspect and install supported harness integrations
+    Integration {
+        #[command(subcommand)]
+        command: IntegrationCommands,
     },
     /// Manage the vendor-neutral Boomux Agent Skill
     Skill {
@@ -552,6 +567,26 @@ enum PiCommands {
 }
 
 #[derive(Subcommand)]
+enum IntegrationCommands {
+    /// List integrations bundled with this Boomux binary
+    List,
+    /// Inspect host, asset, and runtime reporting status
+    Status {
+        #[arg(value_enum)]
+        integration: Option<integration_management::IntegrationId>,
+    },
+    /// Install one integration or every bundled integration
+    Install {
+        #[arg(value_enum, required_unless_present = "all", conflicts_with = "all")]
+        integration: Option<integration_management::IntegrationId>,
+        #[arg(long, conflicts_with = "integration")]
+        all: bool,
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum DaemonCommands {
     /// Start the daemon in the foreground
     #[command(hide = true)]
@@ -730,6 +765,7 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
         Some(Commands::Agent { command }) => agent_command(command, cli.json),
         Some(Commands::Attention { command }) => attention_command(command, cli.json),
         Some(Commands::Session { command }) => session_command(command, cli.json),
+        Some(Commands::Integration { command }) => integration_command(command, cli.json),
         Some(Commands::Skill {
             command: SkillCommands::Install { force },
         }) => install_skill(force),
@@ -814,6 +850,15 @@ fn command_name(cli: &Cli) -> &'static str {
         Some(Commands::Session {
             command: SessionCommands::Read { .. },
         }) => "session.read",
+        Some(Commands::Integration {
+            command: IntegrationCommands::List,
+        }) => "integration.list",
+        Some(Commands::Integration {
+            command: IntegrationCommands::Status { .. },
+        }) => "integration.status",
+        Some(Commands::Integration {
+            command: IntegrationCommands::Install { .. },
+        }) => "integration.install",
         Some(Commands::Daemon {
             command: DaemonCommands::Status,
         }) => "daemon.status",
@@ -863,6 +908,10 @@ fn supports_json(cli: &Cli) -> bool {
             command: SessionCommands::List { .. }
                 | SessionCommands::Inspect { .. }
                 | SessionCommands::Read { .. }
+        }) | Some(Commands::Integration {
+            command: IntegrationCommands::List
+                | IntegrationCommands::Status { .. }
+                | IntegrationCommands::Install { .. }
         })
     )
 }
@@ -1543,6 +1592,237 @@ fn unique_shell_name(base_name: &str, shells: &[ShellSnapshot]) -> String {
     )
 }
 
+fn integration_command(command: IntegrationCommands, json: bool) -> Result<(), Box<dyn Error>> {
+    match command {
+        IntegrationCommands::List => list_integrations(json),
+        IntegrationCommands::Status { integration } => integration_status(integration, json),
+        IntegrationCommands::Install {
+            integration,
+            all,
+            force,
+        } => {
+            let integrations = if all {
+                integration_management::IntegrationId::ALL.to_vec()
+            } else {
+                vec![integration.ok_or_else(|| {
+                    cli_output::failure(
+                        "invalid_argument",
+                        "integration install requires a name or --all",
+                    )
+                })?]
+            };
+            install_integrations(&integrations, force, json)
+        }
+    }
+}
+
+fn list_integrations(json: bool) -> Result<(), Box<dyn Error>> {
+    let integrations = integration_management::IntegrationId::ALL
+        .into_iter()
+        .map(integration_management::IntegrationSummary::from)
+        .collect::<Vec<_>>();
+    if json {
+        return cli_output::print(
+            "integration.list",
+            serde_json::json!({ "integrations": integrations }),
+        );
+    }
+    print!("{}", format_integration_list(&integrations));
+    Ok(())
+}
+
+fn format_integration_list(integrations: &[integration_management::IntegrationSummary]) -> String {
+    let name_width = integrations
+        .iter()
+        .map(|integration| integration.name.len())
+        .max()
+        .unwrap_or(0)
+        .max("NAME".len());
+    let package_width = integrations
+        .iter()
+        .map(|integration| integration.package.len())
+        .max()
+        .unwrap_or(0)
+        .max("PACKAGE".len());
+    let mut output = String::new();
+    writeln!(
+        output,
+        "{:<name_width$}  {:<package_width$}  VALIDATED VERSION",
+        "NAME", "PACKAGE"
+    )
+    .expect("writing to a string cannot fail");
+    for integration in integrations {
+        writeln!(
+            output,
+            "{:<name_width$}  {:<package_width$}  {}",
+            integration.name, integration.package, integration.validated_version
+        )
+        .expect("writing to a string cannot fail");
+    }
+    output
+}
+
+fn integration_status(
+    integration: Option<integration_management::IntegrationId>,
+    json: bool,
+) -> Result<(), Box<dyn Error>> {
+    let environment = integration_management::Environment::from_process();
+    let snapshot = client::connect().and_then(|client| client.snapshot()).ok();
+    let integrations = integration.map_or_else(
+        || integration_management::IntegrationId::ALL.to_vec(),
+        |integration| vec![integration],
+    );
+    let statuses = integrations
+        .into_iter()
+        .map(|integration| {
+            integration_management::inspect(integration, &environment, snapshot.as_ref())
+        })
+        .collect::<Vec<_>>();
+    if json {
+        return cli_output::print(
+            "integration.status",
+            serde_json::json!({ "integrations": statuses }),
+        );
+    }
+    print!("{}", format_integration_statuses(&statuses));
+    for status in &statuses {
+        if let Some(error) = status.host.error.as_deref() {
+            eprintln!("warning: {} host version: {error}", status.name);
+        }
+        if let Some(error) = status.asset.error.as_deref() {
+            eprintln!("warning: {} integration asset: {error}", status.name);
+        }
+    }
+    Ok(())
+}
+
+fn format_integration_statuses(statuses: &[integration_management::IntegrationStatus]) -> String {
+    let mut output = String::new();
+    for (index, status) in statuses.iter().enumerate() {
+        if index > 0 {
+            output.push('\n');
+        }
+        writeln!(output, "{} ({})", status.display_name, status.name)
+            .expect("writing to a string cannot fail");
+        writeln!(output, "  {:<14}{}", "Host", status.host.state.as_str())
+            .expect("writing to a string cannot fail");
+        writeln!(
+            output,
+            "  {:<14}{}",
+            "Executable",
+            status.host.executable.as_deref().unwrap_or("-")
+        )
+        .expect("writing to a string cannot fail");
+        writeln!(
+            output,
+            "  {:<14}{}",
+            "Version",
+            status.host.version.as_deref().unwrap_or("-")
+        )
+        .expect("writing to a string cannot fail");
+        writeln!(
+            output,
+            "  {:<14}{}",
+            "Compatibility", status.host.compatibility
+        )
+        .expect("writing to a string cannot fail");
+        writeln!(output, "  {:<14}{}", "Asset", status.asset.state.as_str())
+            .expect("writing to a string cannot fail");
+        writeln!(
+            output,
+            "  {:<14}{}",
+            "Runtime",
+            format_runtime_status(&status.runtime)
+        )
+        .expect("writing to a string cannot fail");
+        writeln!(
+            output,
+            "  {:<14}{}",
+            "Action",
+            format_recommended_action(status.recommended_action)
+        )
+        .expect("writing to a string cannot fail");
+        writeln!(
+            output,
+            "  {:<14}{}",
+            "Path",
+            sanitize_table_cell(status.asset.path.as_deref().unwrap_or("-"))
+        )
+        .expect("writing to a string cannot fail");
+    }
+    output
+}
+
+fn format_runtime_status(status: &integration_management::RuntimeStatus) -> String {
+    if status.running_processes == 0 {
+        return status.state.as_str().replace('_', " ");
+    }
+    format!(
+        "{} ({} running, {} reporting, {} untracked)",
+        status.state.as_str().replace('_', " "),
+        status.running_processes,
+        status.tracked_processes,
+        status.untracked_processes
+    )
+}
+
+fn format_recommended_action(action: integration_management::RecommendedAction) -> &'static str {
+    match action {
+        integration_management::RecommendedAction::None => "none",
+        integration_management::RecommendedAction::Install => "install integration",
+        integration_management::RecommendedAction::Replace => "replace with --force",
+        integration_management::RecommendedAction::RestartHost => "restart host",
+        integration_management::RecommendedAction::InspectError => "inspect reported error",
+    }
+}
+
+fn install_integrations(
+    integrations: &[integration_management::IntegrationId],
+    force: bool,
+    json: bool,
+) -> Result<(), Box<dyn Error>> {
+    let environment = integration_management::Environment::from_process();
+    for integration in integrations {
+        integration_management::preflight_install(*integration, &environment, force)?;
+    }
+    let results = integrations
+        .iter()
+        .copied()
+        .map(|integration| integration_management::install(integration, &environment, force))
+        .collect::<Result<Vec<_>, _>>()?;
+    if json {
+        return cli_output::print(
+            "integration.install",
+            serde_json::json!({ "integrations": results }),
+        );
+    }
+    print_integration_install_results(&results);
+    Ok(())
+}
+
+fn print_integration_install_results(results: &[integration_management::InstallResult]) {
+    for result in results {
+        let spec = result.integration.spec();
+        match result.result {
+            integration_management::InstallOutcome::Unchanged => println!(
+                "Boomux {} {} is already installed at {}",
+                spec.display_name, spec.asset_name, result.path
+            ),
+            integration_management::InstallOutcome::Installed => println!(
+                "Installed Boomux {} {} at {}",
+                spec.display_name, spec.asset_name, result.path
+            ),
+            integration_management::InstallOutcome::Replaced => println!(
+                "Replaced Boomux {} {} at {}",
+                spec.display_name, spec.asset_name, result.path
+            ),
+        }
+        if result.restart_required {
+            println!("{}", spec.reload_message);
+        }
+    }
+}
+
 fn capabilities(json: bool) -> Result<(), Box<dyn Error>> {
     let error_codes = [
         "invalid_argument",
@@ -1567,6 +1847,19 @@ fn capabilities(json: bool) -> Result<(), Box<dyn Error>> {
         "internal",
         "unknown",
     ];
+    let integration_hosts = integration_management::IntegrationId::ALL
+        .into_iter()
+        .map(|integration| {
+            let spec = integration.spec();
+            (
+                spec.name.to_owned(),
+                serde_json::json!({
+                    "package": spec.package,
+                    "validated_version": spec.validated_version,
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
     if json {
         return cli_output::print(
             "capabilities",
@@ -1577,16 +1870,7 @@ fn capabilities(json: bool) -> Result<(), Box<dyn Error>> {
                 "json_commands": JSON_COMMANDS,
                 "features": INTEGRATION_FEATURES,
                 "session_transcript_integrations": session_transcript::supported_integrations(),
-                "integration_hosts": {
-                    "opencode": {
-                        "package": "opencode-ai",
-                        "validated_version": VALIDATED_OPENCODE_VERSION,
-                    },
-                    "pi": {
-                        "package": "@earendil-works/pi-coding-agent",
-                        "validated_version": VALIDATED_PI_VERSION,
-                    },
-                },
+                "integration_hosts": integration_hosts,
                 "error_codes": error_codes,
             }),
         );
@@ -1600,7 +1884,17 @@ fn capabilities(json: bool) -> Result<(), Box<dyn Error>> {
         "SESSION TRANSCRIPT INTEGRATIONS\t{}",
         session_transcript::supported_integrations().join(",")
     );
-    println!("INTEGRATION HOSTS\topencode={VALIDATED_OPENCODE_VERSION},pi={VALIDATED_PI_VERSION}");
+    println!(
+        "INTEGRATION HOSTS\t{}",
+        integration_management::IntegrationId::ALL
+            .into_iter()
+            .map(|integration| {
+                let spec = integration.spec();
+                format!("{}={}", spec.name, spec.validated_version)
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    );
     println!("ERROR CODES\t{}", error_codes.join(","));
     Ok(())
 }
@@ -3173,9 +3467,9 @@ fn install_skill_at(home: &Path, force: bool) -> Result<(), Box<dyn Error>> {
     require_absolute_root(home, "HOME")?;
     let directory = ensure_safe_directory(&home.join(".agents/skills/boomux"))?;
     let path = skill_install_path(home);
-    let already_installed = install_asset_at(&directory, &path, BOOMUX_SKILL, force)?;
+    let outcome = install_asset_at(&directory, &path, BOOMUX_SKILL, force)?;
 
-    if already_installed {
+    if outcome == InstallOutcome::Unchanged {
         println!("Boomux skill is already installed at {}", path.display());
     } else {
         println!("Installed Boomux skill at {}", path.display());
@@ -3199,11 +3493,10 @@ fn migrate_legacy_skill(home: &Path) -> Result<(), Box<dyn Error>> {
         Err(error) => return Err(error.into()),
     }
     let path = legacy_skill_install_path(home);
-    if let Some(existing) = read_regular_file(&path)? {
+    if let Some(content_matches) = regular_file_matches(&path, LEGACY_BOOMUX_SHELLS_SKILL)? {
         let entries = fs::read_dir(&directory)?.collect::<Result<Vec<_>, _>>()?;
-        let untouched = existing == LEGACY_BOOMUX_SHELLS_SKILL.as_bytes()
-            && entries.len() == 1
-            && entries[0].file_name() == "SKILL.md";
+        let untouched =
+            content_matches && entries.len() == 1 && entries[0].file_name() == "SKILL.md";
         if untouched {
             fs::remove_file(&path)?;
             if let Some(directory) = path.parent() {
@@ -3221,180 +3514,54 @@ fn migrate_legacy_skill(home: &Path) -> Result<(), Box<dyn Error>> {
 }
 
 fn install_opencode(force: bool) -> Result<(), Box<dyn Error>> {
-    let config_root = opencode_config_root(env::var_os("XDG_CONFIG_HOME"), env::var_os("HOME"))?;
-    install_opencode_at(&config_root, force)
+    install_integrations(
+        &[integration_management::IntegrationId::Opencode],
+        force,
+        false,
+    )
 }
 
-fn opencode_config_root(
-    xdg_config_home: Option<std::ffi::OsString>,
-    home: Option<std::ffi::OsString>,
-) -> Result<PathBuf, Box<dyn Error>> {
-    let root = if let Some(root) = xdg_config_home {
-        PathBuf::from(root)
-    } else {
-        PathBuf::from(home.ok_or("HOME must be set to install the Boomux OpenCode plugin")?)
-            .join(".config")
-    };
-    require_absolute_root(&root, "XDG configuration root")?;
-    Ok(root)
-}
-
+#[cfg(test)]
 fn install_opencode_at(config_root: &Path, force: bool) -> Result<(), Box<dyn Error>> {
-    require_absolute_root(config_root, "XDG configuration root")?;
-    let directory = ensure_safe_directory(&config_root.join("opencode/plugins"))?;
-    let path = opencode_install_path(config_root);
-    if install_asset_at(&directory, &path, BOOMUX_OPENCODE_PLUGIN, force)? {
-        println!(
-            "Boomux OpenCode plugin is already installed at {}",
-            path.display()
-        );
-    } else {
-        println!("Installed Boomux OpenCode plugin at {}", path.display());
-        println!("Restart any running OpenCode process to activate the plugin");
-    }
+    let result = integration_management::install_at(
+        integration_management::IntegrationId::Opencode,
+        config_root,
+        force,
+    )?;
+    print_integration_install_results(&[result]);
     Ok(())
 }
 
 fn install_pi(force: bool) -> Result<(), Box<dyn Error>> {
-    let config_root = pi_config_root(env::var_os("PI_CODING_AGENT_DIR"), env::var_os("HOME"))?;
-    install_pi_at(&config_root, force)
+    install_integrations(&[integration_management::IntegrationId::Pi], force, false)
 }
 
-fn pi_config_root(
-    pi_coding_agent_dir: Option<std::ffi::OsString>,
-    home: Option<std::ffi::OsString>,
-) -> Result<PathBuf, Box<dyn Error>> {
-    let home = || -> Result<PathBuf, Box<dyn Error>> {
-        home.clone()
-            .map(PathBuf::from)
-            .ok_or_else(|| "HOME must be set to install the Boomux Pi extension".into())
-    };
-    let root = match pi_coding_agent_dir.filter(|value| !value.is_empty()) {
-        Some(root) => {
-            let root = PathBuf::from(root);
-            if let Ok(suffix) = root.strip_prefix("~") {
-                home()?.join(suffix)
-            } else {
-                root
-            }
-        }
-        None => home()?.join(".pi/agent"),
-    };
-    require_absolute_root(&root, "Pi configuration root")?;
-    Ok(root)
-}
-
+#[cfg(test)]
 fn install_pi_at(config_root: &Path, force: bool) -> Result<(), Box<dyn Error>> {
-    require_absolute_root(config_root, "Pi configuration root")?;
-    let directory = ensure_safe_directory(&config_root.join("extensions"))?;
-    let path = pi_install_path(config_root);
-    if install_asset_at(&directory, &path, BOOMUX_PI_EXTENSION, force)? {
-        println!(
-            "Boomux Pi extension is already installed at {}",
-            path.display()
-        );
-    } else {
-        println!("Installed Boomux Pi extension at {}", path.display());
-        println!("Restart any running Pi process to activate the extension");
-    }
+    let result = integration_management::install_at(
+        integration_management::IntegrationId::Pi,
+        config_root,
+        force,
+    )?;
+    print_integration_install_results(&[result]);
     Ok(())
-}
-
-fn require_absolute_root(root: &Path, name: &str) -> Result<(), Box<dyn Error>> {
-    if !root.is_absolute() {
-        return Err(format!("{name} must be an absolute path").into());
-    }
-    Ok(())
-}
-
-fn ensure_safe_directory(path: &Path) -> Result<PathBuf, Box<dyn Error>> {
-    require_absolute_root(path, "install directory")?;
-    let mut directory = PathBuf::new();
-    for component in path.components() {
-        directory.push(component);
-        match fs::symlink_metadata(&directory) {
-            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
-            Ok(_) => {
-                return Err(format!(
-                    "install path component is not a regular directory: {}",
-                    directory.display()
-                )
-                .into());
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                fs::create_dir(&directory)?;
-            }
-            Err(error) => return Err(error.into()),
-        }
-    }
-    Ok(directory)
-}
-
-fn read_regular_file(path: &Path) -> Result<Option<Vec<u8>>, Box<dyn Error>> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
-            Ok(Some(fs::read(path)?))
-        }
-        Ok(_) => Err(format!("install path is not a regular file: {}", path.display()).into()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error.into()),
-    }
-}
-
-fn install_asset_at(
-    directory: &Path,
-    path: &Path,
-    content: &str,
-    force: bool,
-) -> Result<bool, Box<dyn Error>> {
-    if let Some(existing) = read_regular_file(path)? {
-        if existing == content.as_bytes() {
-            return Ok(true);
-        }
-        if !force {
-            return Err(format!(
-                "{} already exists; rerun with --force to replace it",
-                path.display()
-            )
-            .into());
-        }
-    }
-    write_asset_atomically(directory, path, content)?;
-    Ok(false)
-}
-
-fn write_asset_atomically(
-    directory: &Path,
-    path: &Path,
-    content: &str,
-) -> Result<(), Box<dyn Error>> {
-    let temporary = directory.join(format!(".boomux-install-{}.tmp", Uuid::new_v4()));
-    let result = (|| {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)?;
-        file.write_all(content.as_bytes())?;
-        file.sync_all()?;
-        fs::rename(&temporary, path)?;
-        Ok::<(), std::io::Error>(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    result.map_err(Into::into)
 }
 
 fn skill_install_path(home: &Path) -> PathBuf {
     home.join(".agents/skills/boomux/SKILL.md")
 }
 
+#[cfg(test)]
 fn opencode_install_path(config_root: &Path) -> PathBuf {
-    config_root.join("opencode/plugins/boomux.js")
+    integration_management::install_path_at(
+        integration_management::IntegrationId::Opencode,
+        config_root,
+    )
 }
 
+#[cfg(test)]
 fn pi_install_path(config_root: &Path) -> PathBuf {
-    config_root.join("extensions/boomux.js")
+    integration_management::install_path_at(integration_management::IntegrationId::Pi, config_root)
 }
 
 fn legacy_skill_install_path(home: &Path) -> PathBuf {
@@ -3495,23 +3662,14 @@ fn doctor(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
             eprintln!("err config: {error}");
         }
     }
-    if let Some(snapshot) = daemon_snapshot.as_ref() {
-        healthy &= print_integration_diagnostic(
-            "opencode",
-            "plugin",
-            opencode_config_root(env::var_os("XDG_CONFIG_HOME"), env::var_os("HOME"))
-                .map(|root| opencode_install_path(&root)),
-            BOOMUX_OPENCODE_PLUGIN,
-            snapshot,
+    let integration_environment = integration_management::Environment::from_process();
+    for integration in integration_management::IntegrationId::ALL {
+        let status = integration_management::inspect_without_host_probe(
+            integration,
+            &integration_environment,
+            daemon_snapshot.as_ref(),
         );
-        healthy &= print_integration_diagnostic(
-            "pi",
-            "extension",
-            pi_config_root(env::var_os("PI_CODING_AGENT_DIR"), env::var_os("HOME"))
-                .map(|root| pi_install_path(&root)),
-            BOOMUX_PI_EXTENSION,
-            snapshot,
-        );
+        healthy &= print_integration_diagnostic(integration, &status);
     }
     if healthy {
         Ok(())
@@ -3521,78 +3679,54 @@ fn doctor(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
 }
 
 fn print_integration_diagnostic(
-    integration: &str,
-    asset_name: &str,
-    path: Result<PathBuf, Box<dyn Error>>,
-    expected: &str,
-    snapshot: &Snapshot,
+    integration: integration_management::IntegrationId,
+    status: &integration_management::IntegrationStatus,
 ) -> bool {
-    let running = snapshot.workspaces.iter().flat_map(|workspace| {
-        workspace.shells.iter().filter_map(move |shell| {
-            (matches!(shell.status, ShellStatus::Running)
-                && shell.foreground_process.as_deref() == Some(integration))
-            .then_some((workspace, shell))
-        })
-    });
-    let running = running.collect::<Vec<_>>();
-    let untracked = running
-        .iter()
-        .filter(|(workspace, shell)| {
-            !shell.run.as_ref().is_some_and(|run| {
-                workspace.agents.iter().any(|agent| {
-                    agent.integration == integration
-                        && agent.shell_id == shell.id
-                        && agent.run_id == run.id
-                        && agent.ended_at_ms.is_none()
-                        && !matches!(
-                            agent.observation.state,
-                            AgentState::Inactive | AgentState::Done
-                        )
-                })
-            })
-        })
-        .count();
-    let path = match path {
-        Ok(path) => path,
-        Err(error) => {
-            eprintln!("err {integration} integration: cannot resolve {asset_name} path: {error}");
-            return false;
-        }
-    };
-    let state = match read_regular_file(&path) {
-        Ok(None) => "missing",
-        Ok(Some(contents)) if contents == expected.as_bytes() => "current",
-        Ok(Some(_)) => "stale",
-        Err(error) => {
-            eprintln!(
-                "err {integration} integration: invalid {asset_name} at {}: {error}",
-                path.display()
-            );
-            return false;
-        }
-    };
-    if running.is_empty() {
-        println!(
-            "ok  {integration} integration: {asset_name} {state} at {}",
-            path.display()
-        );
-        return true;
-    }
-    if state != "current" {
+    let spec = integration.spec();
+    let path = status.asset.path.as_deref().unwrap_or("unresolved path");
+    if status.asset.state == integration_management::AssetState::Unavailable {
         eprintln!(
-            "err {integration} integration: {asset_name} {state} at {}; run boomux {integration} install{}",
-            path.display(),
-            if state == "stale" { " --force" } else { "" }
+            "err {} integration: cannot inspect {} at {path}: {}",
+            spec.name,
+            spec.asset_name,
+            status.asset.error.as_deref().unwrap_or("unknown error")
         );
         return false;
     }
-    if untracked == 0 {
-        println!("ok  {integration} integration: lifecycle registration active");
+    if status.runtime.running_processes == 0 {
+        println!(
+            "ok  {} integration: {} {} at {path}",
+            spec.name,
+            spec.asset_name,
+            status.asset.state.as_str(),
+        );
+        return true;
+    }
+    if status.asset.state != integration_management::AssetState::Current {
+        eprintln!(
+            "err {} integration: {} {} at {path}; run boomux integration install {}{}",
+            spec.name,
+            spec.asset_name,
+            status.asset.state.as_str(),
+            spec.name,
+            if status.asset.state == integration_management::AssetState::Modified {
+                " --force"
+            } else {
+                ""
+            }
+        );
+        return false;
+    }
+    if status.runtime.untracked_processes == 0 {
+        println!(
+            "ok  {} integration: lifecycle registration active",
+            spec.name
+        );
         true
     } else {
         eprintln!(
-            "err {integration} integration: {untracked} foreground process(es) are untracked; restart {integration} and verify it loads {}",
-            path.display()
+            "err {} integration: {} foreground process(es) are untracked; restart {} and verify it loads {path}",
+            spec.name, status.runtime.untracked_processes, spec.display_name
         );
         false
     }
@@ -3643,6 +3777,7 @@ fn plausible_desktop_bus() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::integration_management::{opencode_config_root, pi_config_root};
 
     fn shell(id: &str, workspace_id: &str, name: &str) -> ShellSnapshot {
         ShellSnapshot {
@@ -3763,6 +3898,9 @@ mod tests {
                 "--json",
             ],
             vec!["boomux", "daemon", "status", "--json"],
+            vec!["boomux", "integration", "list", "--json"],
+            vec!["boomux", "integration", "status", "opencode", "--json"],
+            vec!["boomux", "integration", "install", "pi", "--json"],
         ] {
             let cli = Cli::try_parse_from(arguments).unwrap();
             assert!(cli.json);
@@ -4968,6 +5106,94 @@ mod tests {
     }
 
     #[test]
+    fn parses_unified_integration_management_commands() {
+        let list = Cli::try_parse_from(["boomux", "integration", "list"]).unwrap();
+        assert!(matches!(
+            list.command,
+            Some(Commands::Integration {
+                command: IntegrationCommands::List
+            })
+        ));
+        assert_eq!(command_name(&list), "integration.list");
+
+        let status = Cli::try_parse_from(["boomux", "integration", "status", "pi"]).unwrap();
+        assert!(matches!(
+            status.command,
+            Some(Commands::Integration {
+                command: IntegrationCommands::Status {
+                    integration: Some(integration_management::IntegrationId::Pi)
+                }
+            })
+        ));
+        assert_eq!(command_name(&status), "integration.status");
+
+        let install =
+            Cli::try_parse_from(["boomux", "integration", "install", "opencode", "--force"])
+                .unwrap();
+        assert!(matches!(
+            install.command,
+            Some(Commands::Integration {
+                command: IntegrationCommands::Install {
+                    integration: Some(integration_management::IntegrationId::Opencode),
+                    all: false,
+                    force: true,
+                }
+            })
+        ));
+        assert_eq!(command_name(&install), "integration.install");
+
+        assert!(Cli::try_parse_from(["boomux", "integration", "install", "--all"]).is_ok());
+        assert!(Cli::try_parse_from(["boomux", "integration", "install"]).is_err());
+        assert!(Cli::try_parse_from(["boomux", "integration", "install", "pi", "--all",]).is_err());
+    }
+
+    #[test]
+    fn formats_integration_output_without_tab_alignment() {
+        let integrations = integration_management::IntegrationId::ALL
+            .into_iter()
+            .map(integration_management::IntegrationSummary::from)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            format_integration_list(&integrations),
+            "NAME      PACKAGE                          VALIDATED VERSION\n\
+             opencode  opencode-ai                      1.18.15\n\
+             pi        @earendil-works/pi-coding-agent  0.84.1\n"
+        );
+
+        let status = integration_management::IntegrationStatus {
+            name: "opencode",
+            display_name: "OpenCode",
+            package: "opencode-ai",
+            validated_version: "1.18.15",
+            host: integration_management::HostStatus {
+                state: integration_management::HostState::Available,
+                executable: Some("/usr/bin/opencode".into()),
+                version: Some("1.18.15".into()),
+                compatibility: "validated",
+                error: None,
+            },
+            asset: integration_management::AssetStatus {
+                state: integration_management::AssetState::Current,
+                path: Some("/home/test/.config/opencode/plugins/boomux.js".into()),
+                error: None,
+            },
+            runtime: integration_management::RuntimeStatus {
+                state: integration_management::RuntimeState::Untracked,
+                running_processes: 3,
+                tracked_processes: 2,
+                untracked_processes: 1,
+            },
+            recommended_action: integration_management::RecommendedAction::RestartHost,
+        };
+        let output = format_integration_statuses(&[status]);
+        assert!(output.contains("  Host          available\n"));
+        assert!(
+            output.contains("  Runtime       untracked (3 running, 2 reporting, 1 untracked)\n")
+        );
+        assert!(output.contains("  Action        restart host\n"));
+    }
+
+    #[test]
     fn opencode_install_is_idempotent_and_requires_force_for_changes() {
         let config = test_skill_home("opencode-content");
         let plugin = opencode_install_path(&config);
@@ -5077,6 +5303,13 @@ mod tests {
         for command in ["session.list", "session.inspect", "session.read"] {
             assert!(JSON_COMMANDS.contains(&command));
         }
+        for command in [
+            "integration.list",
+            "integration.status",
+            "integration.install",
+        ] {
+            assert!(JSON_COMMANDS.contains(&command));
+        }
         for feature in [
             "protocol_10",
             "protocol_12",
@@ -5091,11 +5324,22 @@ mod tests {
             "protocol_16",
             "persistent_agent_attention",
             "desktop_notifications",
+            "integration_management",
         ] {
             assert!(INTEGRATION_FEATURES.contains(&feature));
         }
-        assert_eq!(VALIDATED_OPENCODE_VERSION, "1.18.15");
-        assert_eq!(VALIDATED_PI_VERSION, "0.84.1");
+        assert_eq!(
+            integration_management::IntegrationId::Opencode
+                .spec()
+                .validated_version,
+            "1.18.15"
+        );
+        assert_eq!(
+            integration_management::IntegrationId::Pi
+                .spec()
+                .validated_version,
+            "0.84.1"
+        );
         assert_eq!(
             session_transcript::supported_integrations(),
             ["opencode", "pi"]

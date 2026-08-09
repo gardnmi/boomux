@@ -49,8 +49,23 @@ boomux capabilities --json
 ```
 
 Parse `data` on success and `error.code` on a nonzero exit; do not parse human
-tables or `error.message`. JSON mutation support is limited to `agent register`,
-`agent ensure`, and `agent report`.
+tables or `error.message`. JSON mutation support includes explicit Agent reports,
+attention acknowledgment, and integration installation.
+
+Inspect bundled lifecycle integrations with:
+
+```console
+boomux integration list --json
+boomux integration status --json
+boomux integration status opencode --json
+```
+
+Host, asset, and runtime status are independent. `unvalidated` compatibility is
+not an incompatibility claim. Never install or replace integration files unless
+the user explicitly asks. With that authorization, use `boomux integration
+install opencode --json`, `boomux integration install pi --json`, or
+`boomux integration install --all --json`; add `--force` only when the user also
+authorizes replacing a modified asset.
 
 Use `boomux events --json` for an immediate snapshot and cursor. Poll again with
 `--after CURSOR --wait-ms 30000` to observe later transitions. If

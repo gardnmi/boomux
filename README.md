@@ -157,6 +157,10 @@ boomux attention acknowledge <agent-id> --observation-revision <revision>
 boomux session list [--workspace <name-or-id>]
 boomux session inspect <session-id>
 boomux session read <session-id> [--before <cursor>] [--limit <entries>] [--max-bytes <bytes>]
+boomux integration list
+boomux integration status [opencode|pi]
+boomux integration install <opencode|pi> [--force]
+boomux integration install --all [--force]
 boomux daemon status
 boomux daemon restart
 boomux daemon stop
@@ -402,6 +406,37 @@ installation. An untouched legacy `boomux-shells` skill is removed
 automatically; customized legacy content is preserved with a warning.
 
 ## Integration Compatibility
+
+Inspect every bundled host integration from one command group:
+
+```console
+boomux integration list
+boomux integration status
+boomux integration status opencode --json
+```
+
+Status reports host discovery and version compatibility, the installed Boomux
+asset, and current lifecycle reporting independently. Asset state is `missing`,
+`current`, `modified`, or `unavailable`. Runtime state is `not_observable` when
+the daemon cannot be contacted, `not_running` when no matching foreground host
+is present, `reporting` when every matching process has an exact current-run
+Agent registration, and `untracked` otherwise. An `unvalidated` host version is
+not known to be incompatible; it has simply not been recorded as a Boomux test
+point. The `ACTION` column recommends installation, explicit replacement, or a
+host restart without performing it.
+
+Install one integration or all bundled integrations with:
+
+```console
+boomux integration install opencode
+boomux integration install --all
+```
+
+Installation is individually atomic and idempotent. A modified target is
+preserved unless `--force` is supplied, and symlinked or non-regular paths are
+rejected. Successful changes print the required host restart guidance. The
+existing `boomux opencode install` and `boomux pi install` commands remain
+equivalent host-specific shortcuts.
 
 Boomux currently validates its bundled integrations against these host releases:
 

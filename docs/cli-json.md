@@ -54,12 +54,17 @@ The following commands support `--json`:
 - `boomux session list`
 - `boomux session inspect`
 - `boomux session read`
+- `boomux integration list`
+- `boomux integration status [opencode|pi]`
+- `boomux integration install <opencode|pi>`
+- `boomux integration install --all`
 - `boomux daemon status`
 
 JSON mutations are deliberately narrow: only `agent register`, `agent ensure`,
-`agent report`, and `attention acknowledge` support the contract. Other mutation
-commands retain human output. Passing `--json` to an unsupported command fails with
-`invalid_argument` before performing the operation.
+`agent report`, `attention acknowledge`, and `integration install` support the
+contract. Other mutation commands retain human output. Passing `--json` to an
+unsupported command fails with `invalid_argument` before performing the
+operation.
 
 Command payloads are:
 
@@ -90,10 +95,51 @@ Command payloads are:
   opaque session ID.
 - `session.read`: one bounded canonical `transcript` selected only by exact
   opaque session ID.
+- `integration.list`: an `integrations` array containing bundled integration
+  names, display names, packages, and validated host versions.
+- `integration.status`: an `integrations` array containing independent `host`,
+  `asset`, and `runtime` status objects. Status does not start the daemon or
+  mutate integration files. It executes each PATH-resolved host's `--version`
+  command with bounded output and runtime; missing or unhealthy integrations are
+  represented as data and do not make status fail.
+- `integration.install`: an `integrations` array containing `installed`,
+  `replaced`, or `unchanged` results, target paths, and whether a host restart is
+  required. Each target is changed atomically; `--all` is not a transaction
+  across hosts, but every target is preflighted before the first write.
 - `read`: shell/run identity, observed output revision, and rendered output.
 - `events`: stream identity, reconnect cursor, optional baseline snapshot, and a
   bounded event array.
 - `daemon.status`: `status`, `protocol_version`, and `socket_path`.
+
+## Integration Data
+
+Integration arrays are ordered `opencode`, then `pi`. List entries contain
+`name`, `display_name`, `package`, and `validated_version`.
+
+Status entries contain those four fields plus `host`, `asset`, `runtime`, and
+`recommended_action`.
+The `host` object contains `state`, `executable`, `version`, `compatibility`, and
+`error`. Host state is `missing`, `available`, or `probe_failed`;
+`compatibility` is `validated`, `unvalidated`, or `unknown`. Paths, versions, and
+errors that are not available are JSON `null`. A validated version is an
+observed compatibility test point, not a version requirement.
+
+The `asset` object contains `state`, `path`, and `error`. Asset state is
+`missing`, `current`, `modified`, or `unavailable`. The `runtime` object contains
+`state`, `running_processes`, `tracked_processes`, and `untracked_processes`.
+Runtime state is `not_observable`, `not_running`, `reporting`, or `untracked`.
+Reporting requires an active exact shell/run Agent observation with
+`lifecycle_integration` authority; process and terminal evidence do not satisfy
+it.
+
+`recommended_action` is `none`, `install`, `replace`, `restart_host`, or
+`inspect_error`. Replacement requires explicit `--force`; the recommendation
+does not authorize a mutation by itself.
+
+Install entries contain `name`, `result`, `path`, and `restart_required`.
+Result is `installed`, `replaced`, or `unchanged`. A modified target fails with
+`already_exists` unless `--force` is supplied. Invalid roots or unsafe paths fail
+with `invalid_argument` before mutation.
 
 ## Shell Data
 
