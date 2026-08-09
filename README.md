@@ -1,124 +1,199 @@
 # Boomux
 
+**Persistent native-terminal workspaces for organizing shells, commands, and
+coding agents across projects.**
+
 > [!WARNING]
 > Boomux is an early proof of concept. Commands, storage, and session behavior
 > may change without migration support.
 
-Boomux keeps shells alive in a small background daemon, groups them into durable
-workspaces, and tracks external agent lifecycle and session history. Each shell
-still opens in an ordinary native terminal window whose emulator owns rendering,
-fonts, selection, clipboard behavior, and window chrome. Boomux owns the PTY,
-process lifetime, workspace grouping, attachment transport, and durable runtime
-metadata.
+Boomux is a persistent workspace manager for native terminal windows. It keeps
+shells and commands alive after their windows close, groups related work into
+restorable workspaces, and shows the lifecycle of supported coding agents
+without replacing your terminal emulator.
 
-## Usage
+Your terminal still owns rendering, fonts, selection, clipboard behavior, and
+window chrome. Boomux owns the PTY, process lifetime, workspace grouping,
+attachments, and durable runtime metadata.
 
-Create a shell whose working directory is the requested path and attach in
-place. When no workspace name is supplied, Boomux creates the next available
-`workspace-N` container automatically:
+![Boomux workspace dashboard showing shell, command, agent, and launcher kinds](assets/dashboard-workspaces.png)
 
-```console
-boomux .
-```
+_The workspace view keeps every kind of work in one place. IDs remain available
+for exact CLI operations, but daily navigation uses workspace and item names._
 
-Each unnamed invocation creates a new generated workspace. A workspace is a
-named container with a UUID; each shell and launcher independently owns its
-working directory. Use `--name` to add the shell to an existing named workspace
-or create that explicitly named container:
+## Why Boomux
 
-```console
-boomux . --name feature-x
-```
+- Close a terminal window without killing its shell or foreground process.
+- Restore a project workspace instead of rebuilding a collection of windows.
+- Run login shells, long-lived commands, desktop launchers, and coding agents
+  under one durable model.
+- See whether OpenCode or Pi is working, blocked, idle, inactive, or merely an
+  untracked foreground process.
+- Keep using Ghostty, Alacritty, or another XDG terminal as an ordinary native
+  window rather than moving into a pane-based terminal UI.
 
-Run a command instead of the login shell by placing its exact arguments
-after `--`:
+## Install
 
-```console
-boomux . -- cargo watch -x test
-boomux . --name feature-x --new -- lazygit
-```
-
-Boomux executes the command directly without shell parsing. Use an explicit
-shell such as `sh -lc` when pipelines, redirects, or variable expansion are
-required. The dashboard labels this durable slot as `command`; the exact command
-is its primary process, so interrupting or exiting it ends the run and closes the
-attached terminal. A `shell` row instead starts a login shell, where `Ctrl-C`
-normally interrupts a child program and returns to the prompt.
-
-Open the shell in Omarchy's selected terminal instead of attaching in place:
+Boomux currently targets Unix/Linux and is developed on Omarchy. Install the
+Rust toolchain, then install directly from the repository:
 
 ```console
-boomux . --new
-boomux . --terminal Alacritty.desktop
+cargo install --git https://github.com/gardnmi/boomux --locked
+boomux doctor
 ```
 
-`--terminal` implies `--new`. Selection precedence is the CLI override, Boomux
-configuration, then Omarchy's default terminal.
+`boomux doctor` checks the daemon, terminal launcher, optional desktop
+notifications, and coding-agent integrations. To build a checkout instead:
 
-Run Boomux without a path to open the Ratatui dashboard:
+```console
+cargo install --path . --locked
+```
+
+## First Five Minutes
+
+From a project directory, create a named workspace and its first login shell:
+
+```console
+boomux . --name my-project
+```
+
+You are now attached to a Boomux-owned PTY. Start a program, then close the
+terminal window. The shell and program continue running in the background.
+
+From a fresh host terminal, open the dashboard:
 
 ```console
 boomux
 ```
 
-The explicit dashboard command remains available as an alias:
+Select `my-project` and press `Enter` to reopen its shell. Add another native
+terminal window without leaving the current one with:
 
 ```console
-boomux ui
+boomux . --name my-project --new
 ```
 
-Dashboard controls:
+Add a durable exact command instead of a login shell by placing its arguments
+after `--`:
 
-- `Tab` and `Shift-Tab` cycle the Workspaces, Agents, Launchers, Shells, and
-  Commands views. Number keys `1` through `5` select them directly.
-- In the primary Workspaces view, `h`, `l`, and the left/right arrows switch
-  between the workspace and item tables.
-- `j`, `k`, and the arrow keys navigate.
-- `PageUp` and `PageDown` scroll a selected shell or command preview. `Home`
-  jumps to the oldest retained preview row and `End` resumes following output.
-- `Enter` restores a workspace, opens a shell, or invokes a launcher.
-- `a` creates an empty workspace or adds a shell, depending on the focused
-  table in the Workspaces view. New dashboard shells start in the directory
-  where the dashboard was launched.
-- `e` renames the selected workspace, shell, or launcher.
-- `x`, then `y`, closes the selected workspace or shell, or removes the selected
-  launcher.
-- `r` refreshes immediately.
-- `q` or `Esc` quits.
+```console
+boomux . --name my-project --new -- cargo watch -x test
+```
 
-Workspaces remain the primary dashboard view. The selected workspace's item
-table identifies login shells, PTY-backed exact commands, agent shells, and
-configured launchers in a `KIND` column. The secondary `ALL:` views aggregate
-each kind across every workspace while retaining the owning workspace and exact
-item actions. Counts are exclusive by visible presentation: an agent row is not
-also counted as a shell or command.
+Boomux executes that argument vector directly. Use an explicit shell such as
+`sh -lc` only when you need pipes, redirects, globbing, or variable expansion.
 
-The selected kind receives a read-only preview. Workspaces show retained Agent
-state and their highest-priority attention item. Shells show run metadata plus a
-bounded 16-row terminal-output viewport, fetched only when the selected shell's
-output revision changes. The viewport is hidden when it cannot fit without
-crowding the item table, retains its position while scrolled, and follows new
-output again after `End`. Commands show exact argv and run metadata without
-terminal output. Commands and launchers preserve argument boundaries in their
-previews. Launchers explicitly show that their detached output and invocation
-history are not retained.
+## Mental Model
 
-When an active Agent instance is bound to a shell's current run, that shell row
-morphs into an agent row instead of adding a duplicate item. It keeps the
-shell's name, ID, directory, and open, rename, and close actions while showing the
-Agent's lifecycle state and evidence. The Agents view stays focused on those
-current presentations. A process-only foreground hint is labeled `untracked`,
-never `idle`, until its lifecycle integration registers. A selected durable
-Agent may show its one matching canonical session; untracked hints never receive
-directory-wide history. The preview prefers the active match and otherwise uses
-the latest match. Full Boomux-observed and bounded OpenCode catalog
-history remains available through the session CLI.
+| Term | Meaning |
+| --- | --- |
+| **Workspace** | A durable named container for related shells, commands, agents, and launchers. |
+| **Shell** | A durable terminal slot. Its PTY and process can outlive every attached window. |
+| **Run** | One process incarnation of a shell. Reopening an exited shell starts a new run on the same shell identity. |
+| **Attachment** | A native terminal window currently reading from and optionally controlling a shell. Closing it does not close the shell. |
+| **Launcher** | A stored desktop command invoked when a workspace opens. It has no PTY or retained output. |
+| **Agent** | Lifecycle information reported by an integration for an external coding-agent session bound to an exact shell run. |
+| **Session** | Projected OpenCode or Pi history that can be inspected through the CLI; it is not terminal scrollback. |
 
-Closing a terminal window only disconnects its attachment. The Boomux daemon
-retains the PTY and child process until the shell exits, the workspace is
-closed, or the daemon stops.
+### Persistence Boundaries
 
-## Commands
+| Event | Managed process | Workspace metadata |
+| --- | --- | --- |
+| Terminal window closes | Keeps running | Preserved |
+| Dashboard quits | Keeps running | Preserved |
+| `boomux daemon restart` | Handed off live | Preserved |
+| Unexpected daemon exit or host reboot | Cannot remain live | Restored as pending |
+| Workspace is explicitly closed | Terminated | Removed |
+
+### Dashboard Kinds
+
+`KIND` describes how an item behaves, not merely which process happens to be in
+the foreground:
+
+| Kind | What it represents | What happens on exit |
+| --- | --- | --- |
+| `shell` | A login shell. Programs run as children of that shell. | `Ctrl-C` normally returns to the prompt; exiting the login shell ends the run. |
+| `command` | One exact PTY-backed argument vector, such as `cargo watch`. | Interrupting or exiting the primary command ends the run. |
+| `agent` | A shell or command whose current run is presenting an active coding agent. This replaces the underlying row rather than duplicating it. | The shell keeps its identity; lifecycle state comes from the integration, not terminal text. |
+| `launcher` | A detached command such as an editor or browser, run when the workspace is explicitly opened. | Boomux does not retain its output, invocation history, or process lifetime. |
+
+Counts are exclusive by visible presentation. When an OpenCode-backed shell is
+shown as `agent`, it is not also counted as a `shell` or `command`.
+
+Shell and command status is `pending`, `running`, or `exited`. Agent status may
+be `unknown`, `working`, `blocked`, `idle`, `inactive`, or `done`. `untracked`
+means Boomux sees a supported foreground host but has not received authoritative
+lifecycle reporting; it never guesses `idle` from quiet terminal output.
+
+![Boomux agents view showing tracked and untracked coding-agent shells](assets/dashboard-agents.png)
+
+_The Agents view aggregates current agent presentations across workspaces and
+keeps untracked foreground hints visibly distinct from integrated lifecycle
+state._
+
+## Coding-Agent Setup
+
+Boomux includes guided setup for OpenCode and Pi:
+
+```console
+boomux integration setup opencode
+# or
+boomux integration setup pi
+```
+
+Setup shows host, asset, and runtime status; previews the exact file action;
+asks before changing anything; and prints restart and verification guidance.
+After restarting the host, launch it inside a Boomux-managed shell and verify
+reporting from another terminal:
+
+```console
+boomux integration verify opencode --wait-ms 30000
+```
+
+If several matching shells are running, Boomux lists each workspace and shell
+with a ready-to-run command containing its exact shell ID.
+
+## Everyday Workflows
+
+| Goal | Command |
+| --- | --- |
+| Create a generated workspace and attach | `boomux .` |
+| Create or add to a named workspace | `boomux . --name feature-x` |
+| Open in a new native terminal | `boomux . --name feature-x --new` |
+| Run one exact command | `boomux . --name feature-x --new -- lazygit` |
+| Choose a terminal explicitly | `boomux . --terminal Alacritty.desktop` |
+| Open the dashboard | `boomux` or `boomux ui` |
+
+Without `--name`, each invocation creates the next `workspace-N`. With
+`--name`, Boomux adds a shell to an existing exact-name workspace or creates
+that workspace. `--terminal` implies `--new`; terminal selection uses the CLI
+override, then Boomux configuration, then Omarchy's default.
+
+### Dashboard Controls
+
+| Key | Action |
+| --- | --- |
+| `Tab`, `Shift-Tab`, `1`-`5` | Change view. |
+| `h`, `l`, left, right | Move between workspace and item tables. |
+| `j`, `k`, up, down | Navigate rows. |
+| `Enter` | Restore a workspace, open a shell, or invoke a launcher. |
+| `a` | Create a workspace or add a shell, depending on focus. |
+| `e` | Rename the selected workspace, shell, or launcher. |
+| `x`, then `y` | Close or remove the selected item. |
+| `PageUp`, `PageDown`, `Home`, `End` | Browse retained shell preview output. |
+| `r` | Refresh immediately. |
+| `q`, `Esc` | Quit the dashboard. |
+
+The selected item receives a read-only contextual preview. Shells can show up
+to 16 retained terminal rows; commands show exact arguments and run metadata;
+launchers explain that output is not retained; and integrated agents show their
+current evidence and matching canonical session. Closing the dashboard or a
+terminal attachment does not stop managed shells. Closing a workspace does.
+
+## CLI Reference
+
+<details>
+<summary>Complete command map</summary>
 
 ```console
 boomux ui
@@ -172,6 +247,13 @@ boomux skill install [--force]
 boomux opencode install [--force]
 boomux pi install [--force]
 ```
+
+</details>
+
+## Detailed Behavior
+
+<details>
+<summary>Shell, launcher, agent, session, and JSON semantics</summary>
 
 `boomux shells` lists shells in the current workspace. `boomux read` and
 `boomux close` resolve shell names within that workspace; exact shell IDs work
@@ -318,6 +400,8 @@ commands, features, and typed error codes without starting the daemon. See
 [`docs/cli-json.md`](docs/cli-json.md) for the contract.
 Daemon events and revision-aware reads are documented in
 [`docs/event-stream.md`](docs/event-stream.md).
+
+</details>
 
 ## Configuration
 
