@@ -359,15 +359,13 @@ fn native_daemon_recovers_reproducible_metadata_after_restart() {
     let shell = workspace.shells.first().unwrap();
     let workspace_id = workspace.id.clone();
     let shell_id = shell.id.clone();
-    let mut first = daemon
-        .client
-        .attach(&shell_id, false, profile())
-        .unwrap()
-        .stream;
-    assert!(contains(
-        &read_until(&mut first, b"restored-command"),
-        b"restored-command"
-    ));
+    let mut first = daemon.client.attach(&shell_id, false, profile()).unwrap();
+    if !contains(&first.reconstruction, b"restored-command") {
+        first
+            .reconstruction
+            .extend(read_until(&mut first.stream, b"restored-command"));
+    }
+    assert!(contains(&first.reconstruction, b"restored-command"));
     let first_run = daemon
         .client
         .get_shell(&shell_id)
@@ -409,15 +407,13 @@ fn native_daemon_recovers_reproducible_metadata_after_restart() {
     assert_eq!(restored.shells[0].name, "restored-renamed");
     assert_eq!(restored.shells[0].status, ShellStatus::Pending);
     assert!(restored.shells[0].run.is_none());
-    let mut second = daemon
-        .client
-        .attach(&shell_id, false, profile())
-        .unwrap()
-        .stream;
-    assert!(contains(
-        &read_until(&mut second, b"restored-command"),
-        b"restored-command"
-    ));
+    let mut second = daemon.client.attach(&shell_id, false, profile()).unwrap();
+    if !contains(&second.reconstruction, b"restored-command") {
+        second
+            .reconstruction
+            .extend(read_until(&mut second.stream, b"restored-command"));
+    }
+    assert!(contains(&second.reconstruction, b"restored-command"));
     let second_run = daemon
         .client
         .get_shell(&shell_id)
