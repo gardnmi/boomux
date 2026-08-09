@@ -593,6 +593,7 @@ impl App {
     fn select_tab(&mut self, tab: PrimaryTab) {
         self.primary_tab = tab;
         if tab == PrimaryTab::Workspaces {
+            self.focus = Focus::Workspaces;
             return;
         }
         self.focus = Focus::Items;
@@ -2587,6 +2588,7 @@ mod tests {
         assert_eq!(app.primary_tab, PrimaryTab::Agents);
         app.cycle_tab(true);
         assert_eq!(app.primary_tab, PrimaryTab::Workspaces);
+        assert_eq!(app.focus, Focus::Workspaces);
     }
 
     #[test]

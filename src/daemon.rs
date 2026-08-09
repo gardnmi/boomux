@@ -575,6 +575,14 @@ fn select_replacement_executable(current: PathBuf, argument_zero: Option<PathBuf
     if current.exists() {
         return current;
     }
+    if let Some(installed) = current
+        .to_str()
+        .and_then(|path| path.strip_suffix(" (deleted)"))
+        .map(PathBuf::from)
+        .filter(|path| path.exists())
+    {
+        return installed;
+    }
     if let Some(argument_zero) = argument_zero
         && argument_zero.is_absolute()
         && argument_zero.exists()
@@ -4175,6 +4183,17 @@ fn create_pending_shell(workspace_id: &str, spec: ShellSpec) -> io::Result<Arc<S
     }))
 }
 
+fn initial_terminal_state(
+    rows: u16,
+    cols: u16,
+    workspace_name: &str,
+    shell_name: &str,
+) -> TerminalState {
+    let mut terminal = TerminalState::new(rows, cols);
+    terminal.process(format!("\x1b[2mBoomux: {workspace_name}/{shell_name}\x1b[0m\r\n").as_bytes());
+    terminal
+}
+
 fn spawn_runtime(
     shell: &Arc<Shell>,
     run: &ShellRun,
@@ -4226,12 +4245,14 @@ fn spawn_runtime(
     drop(pty.slave);
     drop(pty.master);
 
+    let terminal = initial_terminal_state(profile.rows, profile.cols, workspace_name, shell_name);
+
     Ok((
         Arc::new(ShellRuntime {
             control: Mutex::new(()),
             master: Mutex::new(master),
             process: Mutex::new(ManagedProcess::Owned(child)),
-            terminal: Arc::new(Mutex::new(TerminalState::new(profile.rows, profile.cols))),
+            terminal: Arc::new(Mutex::new(terminal)),
             controller: Mutex::new(None),
             reader: Mutex::new(None),
         }),
@@ -5340,6 +5361,13 @@ mod tests {
         }
     }
 
+    #[test]
+    fn new_shell_terminal_starts_with_its_workspace_and_shell_name() {
+        let terminal = initial_terminal_state(24, 80, "project", "build");
+
+        assert!(terminal.plain_text().contains("Boomux: project/build"));
+    }
+
     fn agent_spec(state: AgentState) -> AgentRegistrationSpec {
         AgentRegistrationSpec {
             name: "test-agent".into(),
@@ -5399,7 +5427,7 @@ mod tests {
     }
 
     #[test]
-    fn replacement_uses_absolute_argument_zero_after_binary_replacement() {
+    fn replacement_finds_new_binary_after_binary_replacement() {
         let directory = env::temp_dir().join(format!("boomux-replacement-{}", Uuid::new_v4()));
         let installed = directory.join("boomux");
         fs::create_dir_all(&directory).unwrap();
@@ -5408,7 +5436,7 @@ mod tests {
         assert_eq!(
             select_replacement_executable(
                 directory.join("boomux (deleted)"),
-                Some(installed.clone())
+                Some(PathBuf::from("boomux"))
             ),
             installed
         );

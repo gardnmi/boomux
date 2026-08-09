@@ -2,6 +2,7 @@ use std::env;
 use std::error::Error;
 use std::ffi::OsString;
 use std::fs;
+use std::io;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{self, Command, Stdio};
@@ -45,7 +46,7 @@ pub(crate) fn open(
         .arg(r"--print-cmd=\0")
         .arg(format!("--title={title}"))
         .arg("--")
-        .arg(env::current_exe()?)
+        .arg(attachment_executable()?)
         .args(["__attach", shell_id, "--restart-exited"]);
     if takeover {
         resolver.arg("--takeover");
@@ -80,6 +81,22 @@ pub(crate) fn open(
         .spawn()
         .map_err(|error| format!("could not launch {selected}: {error}"))?;
     Ok(())
+}
+
+fn attachment_executable() -> io::Result<PathBuf> {
+    Ok(select_attachment_executable(env::current_exe()?))
+}
+
+fn select_attachment_executable(current: PathBuf) -> PathBuf {
+    if current.exists() {
+        return current;
+    }
+    current
+        .to_str()
+        .and_then(|path| path.strip_suffix(" (deleted)"))
+        .map(PathBuf::from)
+        .filter(|path| path.exists())
+        .unwrap_or(current)
 }
 
 fn selected_with_preference(
@@ -203,6 +220,16 @@ mod tests {
             ["alacritty", "-e", "boomux", "__attach"]
                 .map(OsStr::new)
                 .map(OsStr::to_owned)
+        );
+    }
+
+    #[test]
+    fn attachment_finds_installed_binary_after_replacement() {
+        let installed = PathBuf::from("/bin/sh");
+
+        assert_eq!(
+            select_attachment_executable(PathBuf::from("/bin/sh (deleted)")),
+            installed
         );
     }
 }
