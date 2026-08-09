@@ -152,17 +152,12 @@ fn read_with_adapters(
             "session has no canonical external session ID",
         )
     })?;
-    let directory = session
-        .occurrences
-        .iter()
-        .rev()
-        .find_map(|occurrence| occurrence.source_cwd.as_deref())
-        .ok_or_else(|| {
-            TranscriptError::new(
-                "session_source_unavailable",
-                "session has no retained working directory for host lookup",
-            )
-        })?;
+    let directory = session.source_cwd.as_deref().ok_or_else(|| {
+        TranscriptError::new(
+            "session_source_unavailable",
+            "session has no retained working directory for host lookup",
+        )
+    })?;
 
     let adapter = adapters
         .iter()
@@ -562,6 +557,7 @@ mod tests {
             state_is_current: true,
             started_at_ms: 1,
             last_at_ms: 2,
+            source_cwd: Some(PathBuf::from("/repo")),
             occurrences: vec![SessionOccurrence {
                 agent_id: "agent".into(),
                 shell_id: "shell".into(),
@@ -695,6 +691,27 @@ mod tests {
         assert_eq!(transcript.integration, "future-harness");
         assert_eq!(transcript.entries[0].text.as_deref(), Some("adapter"));
         assert_eq!(transcript.truncated_by, ["max_bytes"]);
+    }
+
+    #[test]
+    fn session_level_source_reads_without_occurrences() {
+        let adapter = FutureHarnessAdapter;
+        let mut catalog_only = session("future-harness");
+        catalog_only.occurrences.clear();
+
+        let transcript = read_with_adapters(
+            &catalog_only,
+            None,
+            10,
+            usize::MAX,
+            &[&adapter as &dyn TranscriptAdapter],
+        )
+        .unwrap();
+
+        assert_eq!(
+            transcript.entries[0].text.as_deref(),
+            Some("adapter output")
+        );
     }
 
     #[test]
@@ -873,7 +890,7 @@ mod tests {
         );
 
         let mut moved = original.clone();
-        moved.occurrences[0].source_cwd = Some(PathBuf::from("/other"));
+        moved.source_cwd = Some(PathBuf::from("/other"));
         assert_eq!(
             read_mutable(&moved, &adapter, Some(&cursor), 1, usize::MAX)
                 .unwrap_err()

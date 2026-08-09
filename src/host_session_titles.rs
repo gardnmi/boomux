@@ -15,7 +15,7 @@ use crate::host_session_source::pi::{
 };
 #[cfg(test)]
 use opencode::{
-    MAX_STDOUT_BYTES as MAX_OPENCODE_STDOUT_BYTES, parse_titles as parse_opencode_titles,
+    MAX_STDOUT_BYTES as MAX_OPENCODE_STDOUT_BYTES, parse_catalog as parse_opencode_catalog,
 };
 #[cfg(test)]
 use pi::{inspect as inspect_pi, parse_session as parse_pi_session};
@@ -26,7 +26,23 @@ const MAX_SESSIONS: usize = 100;
 const MAX_TITLE_CHARS: usize = 160;
 
 type Titles = HashMap<String, String>;
-type Inspector = dyn Fn(&str, &Path) -> Option<Titles> + Send + Sync;
+type Inspector = dyn Fn(&str, &Path) -> Option<Inspection> + Send + Sync;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct HostSession {
+    pub(crate) integration: String,
+    pub(crate) root_id: String,
+    pub(crate) title: String,
+    pub(crate) directory: PathBuf,
+    pub(crate) created_at_ms: u64,
+    pub(crate) updated_at_ms: u64,
+}
+
+#[derive(Clone, Debug)]
+struct Inspection {
+    titles: Titles,
+    catalog: Vec<HostSession>,
+}
 
 trait TitleAdapter: Sync {
     fn integration(&self) -> &'static str;
@@ -42,16 +58,16 @@ struct CacheKey {
     directory: PathBuf,
 }
 
-struct CachedTitles {
-    value: Option<Titles>,
+struct CachedInspection {
+    value: Option<Inspection>,
     inspected_at: Instant,
 }
 
 pub(crate) struct Cache {
-    entries: HashMap<CacheKey, CachedTitles>,
+    entries: HashMap<CacheKey, CachedInspection>,
     pending: HashSet<CacheKey>,
     requests: Sender<CacheKey>,
-    results: Receiver<(CacheKey, Option<Titles>)>,
+    results: Receiver<(CacheKey, Option<Inspection>)>,
 }
 
 impl Default for Cache {
@@ -86,11 +102,40 @@ impl Cache {
         directory: &Path,
         external_session_id: &str,
     ) -> Option<String> {
+        self.refresh(integration, directory);
+        let key = CacheKey {
+            integration: integration.to_owned(),
+            directory: directory.to_owned(),
+        };
+        self.entries
+            .get(&key)
+            .and_then(|cached| cached.value.as_ref())
+            .and_then(|inspection| inspection.titles.get(external_session_id))
+            .cloned()
+    }
+
+    pub(crate) fn catalog(
+        &mut self,
+        integration: &str,
+        directory: &Path,
+    ) -> Option<Vec<HostSession>> {
+        self.refresh(integration, directory);
+        let key = CacheKey {
+            integration: integration.to_owned(),
+            directory: directory.to_owned(),
+        };
+        self.entries
+            .get(&key)
+            .and_then(|cached| cached.value.as_ref())
+            .map(|inspection| inspection.catalog.clone())
+    }
+
+    fn refresh(&mut self, integration: &str, directory: &Path) {
         for (key, value) in self.results.try_iter() {
             self.pending.remove(&key);
             self.entries.insert(
                 key,
-                CachedTitles {
+                CachedInspection {
                     value,
                     inspected_at: Instant::now(),
                 },
@@ -98,7 +143,7 @@ impl Cache {
         }
 
         if !is_supported(integration) {
-            return None;
+            return;
         }
 
         let key = CacheKey {
@@ -114,14 +159,8 @@ impl Cache {
                 }
         });
         if !fresh && !self.pending.contains(&key) && self.requests.send(key.clone()).is_ok() {
-            self.pending.insert(key.clone());
+            self.pending.insert(key);
         }
-
-        self.entries
-            .get(&key)
-            .and_then(|cached| cached.value.as_ref())
-            .and_then(|titles| titles.get(external_session_id))
-            .cloned()
     }
 }
 
@@ -131,11 +170,22 @@ fn is_supported(integration: &str) -> bool {
         .any(|adapter| adapter.integration() == integration)
 }
 
-fn inspect(integration: &str, directory: &Path) -> Option<Titles> {
+fn inspect(integration: &str, directory: &Path) -> Option<Inspection> {
+    if integration == "opencode" {
+        return opencode::inspect_catalog(directory);
+    }
     ADAPTERS
         .iter()
         .find(|adapter| adapter.integration() == integration)?
         .inspect(directory)
+        .map(|titles| Inspection {
+            titles,
+            catalog: Vec::new(),
+        })
+}
+
+pub(crate) fn catalog(directory: &Path) -> Option<Vec<HostSession>> {
+    opencode::inspect_catalog(directory).map(|inspection| inspection.catalog)
 }
 
 fn sanitize_title(title: &str) -> Option<String> {
@@ -201,7 +251,7 @@ mod tests {
 
     #[test]
     fn parses_opencode_catalog_by_canonical_session_id() {
-        let titles = parse_opencode_titles(
+        let inspection = parse_opencode_catalog(
             br#"[
                 {"id":"ses_one","title":"Review cache","updated":2,"created":1,"directory":"/repo"},
                 {"id":"ses_two","title":"Implement panel","updated":4,"created":3,"directory":"/repo"}
@@ -210,13 +260,17 @@ mod tests {
         .expect("valid catalog");
 
         assert_eq!(
-            titles.get("ses_one").map(String::as_str),
+            inspection.titles.get("ses_one").map(String::as_str),
             Some("Review cache")
         );
         assert_eq!(
-            titles.get("ses_two").map(String::as_str),
+            inspection.titles.get("ses_two").map(String::as_str),
             Some("Implement panel")
         );
+        assert_eq!(inspection.catalog[0].root_id, "ses_one");
+        assert_eq!(inspection.catalog[0].directory, Path::new("/repo"));
+        assert_eq!(inspection.catalog[0].created_at_ms, 1);
+        assert_eq!(inspection.catalog[0].updated_at_ms, 2);
     }
 
     #[test]
@@ -235,10 +289,49 @@ mod tests {
 
     #[test]
     fn malformed_and_oversized_opencode_catalogs_fail_open() {
-        assert!(parse_opencode_titles(b"not json").is_none());
+        assert!(parse_opencode_catalog(b"not json").is_none());
         assert!(
-            parse_opencode_titles(&vec![b'x'; MAX_OPENCODE_STDOUT_BYTES as usize + 1]).is_none()
+            parse_opencode_catalog(&vec![b'x'; MAX_OPENCODE_STDOUT_BYTES as usize + 1]).is_none()
         );
+    }
+
+    #[test]
+    fn opencode_catalog_normalizes_absolute_directories_and_skips_invalid_records() {
+        let inspection = parse_opencode_catalog(
+            br#"[
+                {"id":"normalized","title":"Title","updated":20,"created":10,"directory":"/repo/./src/.."},
+                {"id":"relative","title":"Ignored","updated":2,"created":1,"directory":"repo"},
+                {"id":"empty-title","title":"  ","updated":2,"created":1,"directory":"/repo"}
+            ]"#,
+        )
+        .expect("valid catalog");
+
+        assert_eq!(inspection.catalog.len(), 1);
+        assert_eq!(inspection.catalog[0].directory, Path::new("/repo"));
+        assert_eq!(inspection.catalog[0].integration, "opencode");
+        assert_eq!(inspection.titles.len(), 1);
+    }
+
+    #[test]
+    fn opencode_catalog_is_bounded_to_the_requested_session_limit() {
+        let sessions = (0..MAX_SESSIONS + 1)
+            .map(|index| {
+                serde_json::json!({
+                    "id": format!("session-{index}"),
+                    "title": format!("Title {index}"),
+                    "updated": index + 1,
+                    "created": index,
+                    "directory": "/repo",
+                })
+            })
+            .collect::<Vec<_>>();
+        let output = serde_json::to_vec(&sessions).expect("serialize catalog");
+
+        let inspection = parse_opencode_catalog(&output).expect("valid catalog");
+
+        assert_eq!(inspection.catalog.len(), MAX_SESSIONS);
+        assert!(inspection.titles.contains_key("session-99"));
+        assert!(!inspection.titles.contains_key("session-100"));
     }
 
     #[test]
@@ -509,10 +602,24 @@ mod tests {
                 .expect("calls lock")
                 .push((integration.to_owned(), directory.to_owned()));
             let _ = finished_sender.send(integration.to_owned());
-            Some(HashMap::from([(
-                format!("{integration}-id"),
-                format!("{integration} title"),
-            )]))
+            let catalog = (integration == "opencode")
+                .then(|| HostSession {
+                    integration: integration.to_owned(),
+                    root_id: format!("{integration}-id"),
+                    title: format!("{integration} title"),
+                    directory: directory.to_owned(),
+                    created_at_ms: 1,
+                    updated_at_ms: 2,
+                })
+                .into_iter()
+                .collect();
+            Some(Inspection {
+                titles: HashMap::from([(
+                    format!("{integration}-id"),
+                    format!("{integration} title"),
+                )]),
+                catalog,
+            })
         }));
 
         assert_eq!(
@@ -545,6 +652,19 @@ mod tests {
             thread::yield_now();
         }
         assert_eq!(calls.lock().expect("calls lock").len(), 2);
+        assert_eq!(
+            cache
+                .catalog("opencode", Path::new("/repo"))
+                .expect("cached catalog")[0]
+                .root_id,
+            "opencode-id"
+        );
+        assert!(
+            cache
+                .catalog("pi", Path::new("/repo"))
+                .expect("cached catalog")
+                .is_empty()
+        );
     }
 
     #[test]

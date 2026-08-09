@@ -37,11 +37,7 @@ pub fn run(shell_id: &str, takeover: bool, restart_exited: bool) -> io::Result<(
         profile.pixel_height,
     );
     let client = client::connect_or_start()?;
-    let mut attachment = if restart_exited {
-        client.attach_restarting(shell_id, takeover, profile.clone())?
-    } else {
-        client.attach(shell_id, takeover, profile.clone())?
-    };
+    let mut attachment = attach_once(&client, shell_id, takeover, restart_exited, &profile)?;
     let _raw_mode = RawMode::enter()?;
     let mut stdin = io::stdin().lock();
     let mut stdout = io::stdout().lock();
@@ -77,13 +73,31 @@ fn reconnect(
 ) -> io::Result<client::Attachment> {
     let mut last_error = None;
     for _ in 0..RECONNECT_ATTEMPTS {
-        match client.attach(shell_id, takeover, profile.clone()) {
+        match attach_once(client, shell_id, takeover, false, profile) {
             Ok(attachment) => return Ok(attachment),
             Err(error) => last_error = Some(error),
         }
         thread::sleep(RECONNECT_DELAY);
     }
     Err(last_error.unwrap_or_else(|| io::Error::other("daemon attachment did not reconnect")))
+}
+
+fn attach_once(
+    client: &client::Client,
+    shell_id: &str,
+    takeover: bool,
+    restart_exited: bool,
+    profile: &TerminalProfile,
+) -> io::Result<client::Attachment> {
+    let transfers_environment = client.protocol_version()? >= 16;
+    match (restart_exited, transfers_environment) {
+        (true, true) => {
+            client.attach_restarting_with_client_environment(shell_id, takeover, profile.clone())
+        }
+        (true, false) => client.attach_restarting(shell_id, takeover, profile.clone()),
+        (false, true) => client.attach_with_client_environment(shell_id, takeover, profile.clone()),
+        (false, false) => client.attach(shell_id, takeover, profile.clone()),
+    }
 }
 
 fn pump_attachment(

@@ -100,8 +100,9 @@ When an active Agent instance is bound to a shell's current run, that shell row
 morphs into an agent row instead of adding a duplicate item. It keeps the
 shell's name, ID, directory, and open, rename, and close actions while showing the
 Agent's lifecycle state and evidence. The Agents view stays focused on those
-current presentations. The Sessions view independently retains Boomux-observed
-active and historical sessions, grouped by activity window with workspace,
+current presentations. A process-only foreground hint is labeled `untracked`,
+never `idle`, until its lifecycle integration registers. The Sessions view
+combines Boomux-observed sessions with bounded OpenCode catalog history, grouped by activity window with workspace,
 integration, state, host-provided description, associated shell, recency, and
 canonical identity. A foreground `opencode` or `pi` process also supplies a
 presentation-only agent hint while the lifecycle integration establishes a
@@ -235,13 +236,15 @@ blocked Agent does not generate another notification until the Agent first
 leaves that state.
 
 `boomux session list` and `boomux session inspect` project durable Agent
-instances into workspace session history. Instances are grouped within one
+instances and bounded OpenCode root-session catalogs into workspace session
+history. Instances are grouped within one
 workspace and integration by external session ID; records without one remain
 isolated. A session is current only while at least one occurrence is active on
 the exact current run of a running retained shell. Otherwise its state is
 explicitly last-known. The CLI `description` is the latest stored Boomux Agent
-registration name. The dashboard may separately enrich its display title from
-bounded host catalogs; the CLI never synchronously calls those adapters.
+registration name. Catalog-only records use the sanitized OpenCode title, have
+state `unknown`, contain no fabricated occurrence, and remain available for
+canonical transcript reads while their source directory and host data exist.
 
 Projected session IDs are deterministic, globally unique UUIDs, but are opaque.
 Obtain an ID from `session list` and pass that exact value to `session inspect`
@@ -351,6 +354,12 @@ BOOMUX_SHELL_NAME
 BOOMUX_RUN_ID
 ```
 
+When an attachment starts a pending or exited shell run, protocol 16 forwards
+that attachment client's Unix environment directly to the child. Boomux does
+not persist it or expose it in snapshots or events. Terminal-profile values and
+the authoritative `BOOMUX_*` identity variables override conflicting client
+values. Later attachments never mutate a running process environment.
+
 Workspace launcher invocations instead receive `BOOMUX_WORKSPACE_ID`,
 `BOOMUX_WORKSPACE`, `BOOMUX_LAUNCHER_ID`, and `BOOMUX_LAUNCHER_NAME`. They
 inherit the invoking client's desktop environment, while shell/run context is
@@ -422,7 +431,9 @@ does not edit `opencode.json` or other plugins. An identical file is left
 unchanged. Different content requires `--force`, and detected symlinked or
 non-regular path components and targets are rejected even with `--force`. Because OpenCode
 loads config-time plugins at startup, quit and restart OpenCode after installing
-or replacing the plugin.
+or replacing the plugin. The installer prints this requirement, and `boomux
+doctor` reports a foreground OpenCode process without lifecycle registration as
+untracked instead of presenting it as idle.
 
 Inside a Boomux-managed shell, the plugin groups each root OpenCode session and
 all child/subagent sessions into one durable agent instance keyed by the root

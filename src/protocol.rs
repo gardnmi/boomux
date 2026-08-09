@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 15;
+pub const PROTOCOL_VERSION: u32 = 16;
 pub const MIN_PROTOCOL_VERSION: u32 = 6;
 pub const MAX_CONTROL_FRAME: usize = 8 * 1024 * 1024;
 pub const MAX_ATTACH_FRAME: usize = 1024 * 1024;
@@ -306,6 +306,35 @@ pub struct TerminalProfile {
     pub pixel_height: u16,
 }
 
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnixEnvironment {
+    pub variables: Vec<UnixEnvironmentVariable>,
+}
+
+impl std::fmt::Debug for UnixEnvironment {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("UnixEnvironment")
+            .field(
+                "variables",
+                &format_args!("<redacted: {}>", self.variables.len()),
+            )
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnixEnvironmentVariable {
+    pub name: Vec<u8>,
+    pub value: Vec<u8>,
+}
+
+impl std::fmt::Debug for UnixEnvironmentVariable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("UnixEnvironmentVariable(<redacted>)")
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShellSpec {
     pub name: String,
@@ -433,6 +462,8 @@ pub enum Request {
         #[serde(default)]
         restart_exited: bool,
         profile: TerminalProfile,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        environment: Option<UnixEnvironment>,
     },
 }
 
@@ -644,6 +675,12 @@ mod tests {
                 pixel_width: 800,
                 pixel_height: 600,
             },
+            environment: Some(UnixEnvironment {
+                variables: vec![UnixEnvironmentVariable {
+                    name: b"NON_UTF8".to_vec(),
+                    value: vec![0xff, 0xfe],
+                }],
+            }),
         });
         let mut bytes = Vec::new();
         write_message(&mut bytes, &value).unwrap();
@@ -784,9 +821,33 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_fifteen_with_minimum_six() {
-        assert_eq!(PROTOCOL_VERSION, 15);
+    fn protocol_version_is_sixteen_with_minimum_six() {
+        assert_eq!(PROTOCOL_VERSION, 16);
         assert_eq!(MIN_PROTOCOL_VERSION, 6);
+    }
+
+    #[test]
+    fn attach_environment_is_optional_and_debug_is_redacted() {
+        let legacy = r#"{"request":"attach","shell_id":"s1","takeover":false,"profile":{"term":null,"colorterm":null,"term_program":null,"term_program_version":null,"rows":24,"cols":80,"pixel_width":0,"pixel_height":0}}"#;
+        let request: Request = serde_json::from_str(legacy).unwrap();
+        assert!(matches!(
+            request,
+            Request::Attach {
+                environment: None,
+                ..
+            }
+        ));
+
+        let environment = UnixEnvironment {
+            variables: vec![UnixEnvironmentVariable {
+                name: b"SECRET_NAME".to_vec(),
+                value: b"secret-value".to_vec(),
+            }],
+        };
+        let debug = format!("{environment:?}");
+        assert!(!debug.contains("SECRET_NAME"));
+        assert!(!debug.contains("secret-value"));
+        assert!(debug.contains("redacted"));
     }
 
     #[test]

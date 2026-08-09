@@ -41,6 +41,7 @@ pub(crate) struct AgentSessionView {
     pub(crate) state: String,
     pub(crate) state_is_current: bool,
     pub(crate) last_at_ms: u64,
+    pub(crate) source_cwd: Option<PathBuf>,
     pub(crate) runs: Vec<AgentSessionRunView>,
 }
 
@@ -60,13 +61,21 @@ pub(crate) enum WorkspaceItemView {
 pub(crate) struct AgentShellView {
     pub(crate) shell: TerminalView,
     pub(crate) agent: Option<AgentView>,
+    pub(crate) hinted_integration: Option<String>,
 }
 
 impl AgentShellView {
     fn status(&self) -> &str {
         self.agent
             .as_ref()
-            .map_or("idle", |agent| agent.state.as_str())
+            .map_or("untracked", |agent| agent.state.as_str())
+    }
+
+    fn integration(&self) -> Option<&str> {
+        self.agent
+            .as_ref()
+            .map(|agent| agent.integration.as_str())
+            .or(self.hinted_integration.as_deref())
     }
 }
 
@@ -1674,7 +1683,11 @@ fn render_global_sessions(frame: &mut Frame, area: Rect, app: &mut App) {
         };
         let latest_shell = latest_existing_session_run(session)
             .and_then(|run| run.shell_name.as_deref())
-            .unwrap_or("removed shell");
+            .unwrap_or(if session.runs.is_empty() {
+                "catalog only"
+            } else {
+                "removed shell"
+            });
         let identity = session
             .external_session_id
             .as_deref()
@@ -1962,12 +1975,12 @@ fn contextual_session_panel(app: &App) -> Option<ContextualSessionPanel> {
     let WorkspaceItemView::AgentShell(agent_shell) = app.selected_item()? else {
         return None;
     };
-    let agent = agent_shell.agent.as_ref()?;
+    let integration = agent_shell.integration()?;
     let workspace = app.selected_item_workspace()?;
     let sessions: Vec<_> = workspace
         .sessions
         .iter()
-        .filter(|session| session.integration == agent.integration)
+        .filter(|session| session.integration == integration)
         .collect();
     if sessions.is_empty() {
         return None;
@@ -2006,7 +2019,11 @@ fn contextual_session_panel(app: &App) -> Option<ContextualSessionPanel> {
                 .runs
                 .last()
                 .and_then(|run| run.shell_name.as_deref())
-                .unwrap_or("removed shell");
+                .unwrap_or(if session.runs.is_empty() {
+                    "catalog only"
+                } else {
+                    "removed shell"
+                });
             let occurrences = session.runs.len();
             let currency = if session.state_is_current {
                 "current"
@@ -2039,10 +2056,7 @@ fn contextual_session_panel(app: &App) -> Option<ContextualSessionPanel> {
         content_height += categorized_count * 2;
     }
     Some(ContextualSessionPanel {
-        title: format!(
-            " {} sessions ",
-            integration_display_name(&agent.integration)
-        ),
+        title: format!(" {} sessions ", integration_display_name(integration)),
         rows,
         content_height,
     })
@@ -2368,7 +2382,7 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
 
 fn status_color(status: &str) -> Color {
     match status {
-        "pending" => YELLOW,
+        "pending" | "untracked" => YELLOW,
         "exited" => SUBTEXT,
         _ => TEAL,
     }
@@ -2446,6 +2460,7 @@ mod tests {
                 command: String::new(),
             },
             agent: Some(agent()),
+            hinted_integration: None,
         }
     }
 
@@ -2458,6 +2473,7 @@ mod tests {
             state: state.into(),
             state_is_current: true,
             last_at_ms: 30,
+            source_cwd: Some("/tmp/boomux".into()),
             runs: vec![AgentSessionRunView {
                 shell_id: Some("term_1".into()),
                 shell_name: Some("agent".into()),
@@ -2481,6 +2497,7 @@ mod tests {
                 command: String::new(),
             },
             agent: None,
+            hinted_integration: Some("opencode".into()),
         }
     }
 
@@ -3417,7 +3434,8 @@ mod tests {
         assert!(lines.iter().any(|line| line.contains("foreground process")));
         assert!(lines.iter().any(|line| line.contains("keepname")));
         assert!(!lines.iter().any(|line| line.contains("opencode")));
-        assert!(lines.iter().any(|line| line.contains("idle")));
+        assert!(lines.iter().any(|line| line.contains("untracked")));
+        assert!(!lines.iter().any(|line| line.contains("idle")));
     }
 
     #[test]

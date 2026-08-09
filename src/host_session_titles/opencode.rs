@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -6,7 +5,8 @@ use std::sync::mpsc::{self, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use super::{MAX_SESSIONS, TitleAdapter, Titles, sanitize_title};
+use super::{HostSession, Inspection, MAX_SESSIONS, TitleAdapter, sanitize_title};
+use crate::host_session_source::normalize_absolute;
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
 pub(super) const MAX_STDOUT_BYTES: u64 = 1024 * 1024;
@@ -20,15 +20,19 @@ impl TitleAdapter for OpenCodeAdapter {
         "opencode"
     }
 
-    fn inspect(&self, directory: &Path) -> Option<Titles> {
-        let stdout = run(directory)?;
-        parse_titles(&stdout)
+    fn inspect(&self, directory: &Path) -> Option<super::Titles> {
+        inspect_catalog(directory).map(|inspection| inspection.titles)
     }
+}
+
+pub(super) fn inspect_catalog(directory: &Path) -> Option<Inspection> {
+    let stdout = run(directory)?;
+    parse_catalog(&stdout)
 }
 
 fn run(directory: &Path) -> Option<Vec<u8>> {
     let mut child = Command::new("opencode")
-        .args(["session", "list", "--format", "json", "-n", "100"])
+        .args(["--pure", "session", "list", "--format", "json", "-n", "100"])
         .current_dir(directory)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -89,27 +93,39 @@ fn run(directory: &Path) -> Option<Vec<u8>> {
 struct OpenCodeSession {
     id: String,
     title: String,
-    #[serde(rename = "updated")]
-    _updated: serde_json::Value,
-    #[serde(rename = "created")]
-    _created: serde_json::Value,
-    #[serde(rename = "directory")]
-    _directory: String,
+    updated: u64,
+    created: u64,
+    directory: String,
 }
 
-pub(super) fn parse_titles(output: &[u8]) -> Option<Titles> {
+pub(super) fn parse_catalog(output: &[u8]) -> Option<Inspection> {
     if output.len() as u64 > MAX_STDOUT_BYTES {
         return None;
     }
     let sessions: Vec<OpenCodeSession> = serde_json::from_slice(output).ok()?;
-    let mut titles = HashMap::new();
+    let mut catalog = Vec::new();
     for session in sessions.into_iter().take(MAX_SESSIONS) {
         if session.id.is_empty() {
             continue;
         }
-        if let Some(title) = sanitize_title(&session.title) {
-            titles.insert(session.id, title);
-        }
+        let Some(title) = sanitize_title(&session.title) else {
+            continue;
+        };
+        let Some(directory) = normalize_absolute(Path::new(&session.directory)) else {
+            continue;
+        };
+        catalog.push(HostSession {
+            integration: "opencode".into(),
+            root_id: session.id,
+            title,
+            directory,
+            created_at_ms: session.created,
+            updated_at_ms: session.updated,
+        });
     }
-    Some(titles)
+    let titles = catalog
+        .iter()
+        .map(|session| (session.root_id.clone(), session.title.clone()))
+        .collect();
+    Some(Inspection { titles, catalog })
 }
