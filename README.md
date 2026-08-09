@@ -159,8 +159,8 @@ boomux session inspect <session-id>
 boomux session read <session-id> [--before <cursor>] [--limit <entries>] [--max-bytes <bytes>]
 boomux integration list
 boomux integration status [opencode|pi]
-boomux integration install <opencode|pi> [--force]
-boomux integration install --all [--force]
+boomux integration install <opencode|pi> [--force] [--dry-run]
+boomux integration install --all [--force] [--dry-run]
 boomux integration verify <opencode|pi> [--shell <shell-id>] [--wait-ms <milliseconds>]
 boomux daemon status
 boomux daemon restart
@@ -431,11 +431,14 @@ Install one integration or all bundled integrations with:
 ```console
 boomux integration install opencode
 boomux integration install --all
+boomux integration install --all --dry-run
 ```
 
 Installation is individually atomic and idempotent. A modified target is
 preserved unless `--force` is supplied, and symlinked or non-regular paths are
-rejected. Successful changes print the required host restart guidance. The
+rejected. `--dry-run` reports the current state and exact action for every target
+without creating directories or changing files. Successful changes print the
+required host restart guidance. The
 existing `boomux opencode install` and `boomux pi install` commands remain
 equivalent host-specific shortcuts.
 

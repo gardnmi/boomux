@@ -657,6 +657,25 @@ pub(crate) struct InstallResult {
     pub(crate) restart_required: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum InstallAction {
+    Install,
+    Replace,
+    Unchanged,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct InstallPlan {
+    #[serde(skip)]
+    pub(crate) integration: IntegrationId,
+    pub(crate) name: &'static str,
+    pub(crate) current_state: AssetState,
+    pub(crate) action: InstallAction,
+    pub(crate) path: String,
+    pub(crate) restart_required: bool,
+}
+
 pub(crate) fn install(
     id: IntegrationId,
     environment: &Environment,
@@ -675,18 +694,29 @@ pub(crate) fn install(
     })
 }
 
-pub(crate) fn preflight_install(
+pub(crate) fn plan_install(
     id: IntegrationId,
     environment: &Environment,
     force: bool,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<InstallPlan, Box<dyn Error>> {
     let spec = id.spec();
     let target = install_target(id, environment)?;
     validate_existing_directory_chain(&target.directory)?;
-    if inspect_existing_asset(&target.path, spec.content)? == ExistingAsset::Modified && !force {
-        return Err(existing_asset_error(&target.path).into());
-    }
-    Ok(())
+    let existing = inspect_existing_asset(&target.path, spec.content)?;
+    let (current_state, action) = match existing {
+        ExistingAsset::Missing => (AssetState::Missing, InstallAction::Install),
+        ExistingAsset::Current => (AssetState::Current, InstallAction::Unchanged),
+        ExistingAsset::Modified if !force => return Err(existing_asset_error(&target.path).into()),
+        ExistingAsset::Modified => (AssetState::Modified, InstallAction::Replace),
+    };
+    Ok(InstallPlan {
+        integration: id,
+        name: spec.name,
+        current_state,
+        action,
+        path: target.path.display().to_string(),
+        restart_required: action != InstallAction::Unchanged,
+    })
 }
 
 #[cfg(test)]
@@ -1083,6 +1113,31 @@ mod tests {
                 .result,
             InstallOutcome::Replaced
         );
+    }
+
+    #[test]
+    fn install_plan_reports_actions_without_mutating_the_target() {
+        let home = TestDirectory::new("install-plan");
+        let environment = environment(&home.0);
+
+        let missing = plan_install(IntegrationId::Opencode, &environment, false).unwrap();
+        assert_eq!(missing.current_state, AssetState::Missing);
+        assert_eq!(missing.action, InstallAction::Install);
+        assert!(missing.restart_required);
+        assert!(!home.0.join(".config").exists());
+
+        let installed = install(IntegrationId::Opencode, &environment, false).unwrap();
+        let current = plan_install(IntegrationId::Opencode, &environment, false).unwrap();
+        assert_eq!(current.current_state, AssetState::Current);
+        assert_eq!(current.action, InstallAction::Unchanged);
+        assert!(!current.restart_required);
+
+        fs::write(&installed.path, "custom").unwrap();
+        assert!(plan_install(IntegrationId::Opencode, &environment, false).is_err());
+        let replacement = plan_install(IntegrationId::Opencode, &environment, true).unwrap();
+        assert_eq!(replacement.current_state, AssetState::Modified);
+        assert_eq!(replacement.action, InstallAction::Replace);
+        assert_eq!(fs::read_to_string(installed.path).unwrap(), "custom");
     }
 
     #[test]
