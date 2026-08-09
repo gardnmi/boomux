@@ -36,8 +36,8 @@ commitments.
 - [x] Make the Ratatui dashboard the default interface and remove the external
   picker dependency.
 - [x] Run an explicit one-off command when creating a shell from a path.
-- [x] Start pending shells on first attachment using its terminal environment,
-  cell dimensions, and pixel dimensions.
+- [x] Start pending shells on first attachment using its ephemeral full Unix
+  environment, cell dimensions, and pixel dimensions without persisting it.
 - [x] Expose workspace and shell create, inspect, rename, and close operations
   through explicit CLI command groups.
 - [x] Reconstruct reconnect state with a shadow VT parser and expose plain
@@ -133,12 +133,13 @@ eternal process.
     future Claude Code, Codex, and other harness support reuses the same identity,
     bounds, errors, and output contract. Opaque stateless cursors page toward
     older entries while expiring on baseline or source-context changes.
-7. [Complete] Add contextual, categorized Agent Session browsing to selected agent rows in
-   the Boomux UI. Keep inactive and completed workspace sessions visible without
-   adding duplicate shell rows, grouped by active and recent time windows with
-   integration, canonical identity, associated shell and run, lifecycle state,
-   and timestamps. Bounded asynchronous host catalog adapters provide OpenCode
-   generated titles and Pi names or first-user-message summaries; future adapters
+7. [Complete] Add canonical Agent Session context to selected durable Agent rows
+   in the Boomux UI without attaching directory-wide history to untracked
+   process hints. Keep full inactive and completed workspace history available
+   through the session CLI with integration, canonical identity, associated
+   shell and run, lifecycle state, and timestamps. Bounded host catalogs also project pre-registration OpenCode
+   root-session history without fabricated Agent occurrences, while asynchronous
+   adapters provide OpenCode generated titles and Pi names or first-user-message summaries; future adapters
    also provide canonical transcripts and tool activity through bounded,
    versioned CLI output.
 8. [Complete] Separate OpenCode and Pi title and transcript adapters from shared

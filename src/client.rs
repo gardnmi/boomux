@@ -3,6 +3,7 @@ use std::error::Error;
 use std::fs::OpenOptions;
 use std::io;
 use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -15,7 +16,8 @@ use std::time::Duration;
 use crate::protocol::{
     self, AgentInstanceSnapshot, AgentRegistrationSpec, AgentReport, DaemonEvent, Envelope,
     ErrorCode, EventCursor, Request, Response, ShellSnapshot, ShellSpec, ShellStatus, Snapshot,
-    TerminalProfile, WorkspaceLauncherSnapshot, WorkspaceLauncherSpec, WorkspaceSnapshot,
+    TerminalProfile, UnixEnvironment, UnixEnvironmentVariable, WorkspaceLauncherSnapshot,
+    WorkspaceLauncherSpec, WorkspaceSnapshot,
 };
 
 const CONNECT_ATTEMPTS: usize = 40;
@@ -632,7 +634,22 @@ impl Client {
         takeover: bool,
         profile: TerminalProfile,
     ) -> io::Result<Attachment> {
-        self.attach_with_restart(shell_id.into(), takeover, false, profile)
+        self.attach_with_restart(shell_id.into(), takeover, false, profile, None)
+    }
+
+    pub fn attach_with_client_environment(
+        &self,
+        shell_id: impl Into<String>,
+        takeover: bool,
+        profile: TerminalProfile,
+    ) -> io::Result<Attachment> {
+        self.attach_with_restart(
+            shell_id.into(),
+            takeover,
+            false,
+            profile,
+            Some(current_environment()),
+        )
     }
 
     pub fn attach_restarting(
@@ -641,7 +658,22 @@ impl Client {
         takeover: bool,
         profile: TerminalProfile,
     ) -> io::Result<Attachment> {
-        self.attach_with_restart(shell_id.into(), takeover, true, profile)
+        self.attach_with_restart(shell_id.into(), takeover, true, profile, None)
+    }
+
+    pub fn attach_restarting_with_client_environment(
+        &self,
+        shell_id: impl Into<String>,
+        takeover: bool,
+        profile: TerminalProfile,
+    ) -> io::Result<Attachment> {
+        self.attach_with_restart(
+            shell_id.into(),
+            takeover,
+            true,
+            profile,
+            Some(current_environment()),
+        )
     }
 
     fn attach_with_restart(
@@ -650,12 +682,14 @@ impl Client {
         takeover: bool,
         restart_exited: bool,
         profile: TerminalProfile,
+        environment: Option<UnixEnvironment>,
     ) -> io::Result<Attachment> {
         let (stream, response) = self.send(Request::Attach {
             shell_id,
             takeover,
             restart_exited,
             profile,
+            environment,
         })?;
         match response {
             Response::Attached {
@@ -673,8 +707,23 @@ impl Client {
     }
 }
 
+fn current_environment() -> UnixEnvironment {
+    UnixEnvironment {
+        variables: env::vars_os()
+            .map(|(name, value)| UnixEnvironmentVariable {
+                name: name.as_os_str().as_bytes().to_vec(),
+                value: value.as_os_str().as_bytes().to_vec(),
+            })
+            .collect(),
+    }
+}
+
 fn request_minimum_version(request: &Request) -> u32 {
     match request {
+        Request::Attach {
+            environment: Some(_),
+            ..
+        } => 16,
         Request::AcknowledgeAgentAttention { .. } => 15,
         Request::WaitAgent { .. } => 14,
         Request::RegisterAgent { spec, .. } | Request::EnsureAgent { spec, .. }
@@ -780,6 +829,19 @@ mod tests {
     use std::os::unix::net::UnixListener;
 
     use uuid::Uuid;
+
+    fn test_profile() -> TerminalProfile {
+        TerminalProfile {
+            term: None,
+            colorterm: None,
+            term_program: None,
+            term_program_version: None,
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        }
+    }
 
     #[test]
     fn launcher_requests_require_protocol_eight() {
@@ -897,6 +959,22 @@ mod tests {
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+            assert_eq!(request.version, 16);
+            assert!(matches!(request.message, Request::Ping));
+            protocol::write_message(
+                &mut stream,
+                &Envelope::with_version(
+                    15,
+                    Response::Error {
+                        message: "protocol 16 unsupported".into(),
+                        code: Some(ErrorCode::UnsupportedVersion),
+                    },
+                ),
+            )
+            .unwrap();
+
+            let (mut stream, _) = listener.accept().unwrap();
+            let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
             assert_eq!(request.version, 15);
             assert!(matches!(request.message, Request::Ping));
             protocol::write_message(
@@ -971,6 +1049,7 @@ mod tests {
                 takeover: false,
                 restart_exited: true,
                 profile: profile.clone(),
+                environment: None,
             }),
             11
         );
@@ -980,9 +1059,90 @@ mod tests {
                 takeover: false,
                 restart_exited: false,
                 profile,
+                environment: None,
             }),
             protocol::MIN_PROTOCOL_VERSION
         );
+    }
+
+    #[test]
+    fn attach_environment_requires_protocol_sixteen() {
+        assert_eq!(
+            request_minimum_version(&Request::Attach {
+                shell_id: "s1".into(),
+                takeover: false,
+                restart_exited: false,
+                profile: TerminalProfile {
+                    term: None,
+                    colorterm: None,
+                    term_program: None,
+                    term_program_version: None,
+                    rows: 24,
+                    cols: 80,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                },
+                environment: Some(UnixEnvironment {
+                    variables: Vec::new(),
+                }),
+            }),
+            16
+        );
+    }
+
+    #[test]
+    fn attach_captures_the_full_unix_environment() {
+        let expected: std::collections::HashMap<Vec<u8>, Vec<u8>> = env::vars_os()
+            .map(|(name, value)| {
+                (
+                    name.as_os_str().as_bytes().to_vec(),
+                    value.as_os_str().as_bytes().to_vec(),
+                )
+            })
+            .collect();
+        let directory = env::temp_dir().join(format!("boomux-client-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let socket = directory.join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+            assert_eq!(request.version, 16);
+            let Request::Attach {
+                environment: Some(environment),
+                ..
+            } = request.message
+            else {
+                panic!("attach did not include an environment");
+            };
+            let actual: std::collections::HashMap<Vec<u8>, Vec<u8>> = environment
+                .variables
+                .into_iter()
+                .map(|variable| (variable.name, variable.value))
+                .collect();
+            assert_eq!(actual, expected);
+            protocol::write_message(
+                &mut stream,
+                &Envelope::with_version(
+                    16,
+                    Response::Attached {
+                        token: "token".into(),
+                        reconstruction: Vec::new(),
+                        warning: None,
+                    },
+                ),
+            )
+            .unwrap();
+        });
+        let client = Client::from_socket_path(socket);
+
+        let attachment = client
+            .attach_with_client_environment("s1", false, test_profile())
+            .unwrap();
+
+        assert_eq!(attachment.token, "token");
+        server.join().unwrap();
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -1009,6 +1169,22 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+            assert_eq!(request.version, 16);
+            assert!(matches!(request.message, Request::Ping));
+            protocol::write_message(
+                &mut stream,
+                &Envelope::with_version(
+                    15,
+                    Response::Error {
+                        message: "expected an older protocol".into(),
+                        code: Some(ErrorCode::UnsupportedVersion),
+                    },
+                ),
+            )
+            .unwrap();
+
             let (mut stream, _) = listener.accept().unwrap();
             let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
             assert_eq!(request.version, 15);

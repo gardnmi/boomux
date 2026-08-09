@@ -26,7 +26,7 @@ persistence across attachment disconnects, naming, grouping, and orchestration.
 `src/main.rs` owns the CLI, project-name suggestions, dashboard actions, shell
 name resolution, and conversion from daemon snapshots into TUI view models.
 `src/session_projection.rs` is the shared binary projection used by the CLI and
-dashboard to derive session history from one daemon snapshot.
+dashboard to combine one daemon snapshot with bounded host session catalogs.
 
 ### Protocol
 
@@ -97,8 +97,10 @@ them; a failed spawn kills the staged children. Workspace names are checked for
 global uniqueness at publication while the registry is locked.
 
 Shell creation records metadata without immediately starting a process. The
-first attachment supplies `TERM`, `COLORTERM`, terminal program identity, and
-cell/pixel dimensions; the daemon then creates the PTY and child. Failed startup
+first attachment supplies its ephemeral Unix environment, `TERM`, `COLORTERM`,
+terminal program identity, and cell/pixel dimensions; the daemon then creates
+the PTY and child. The environment is validated, never persisted or projected,
+and is overridden by authoritative terminal-profile and Boomux identity values. Failed startup
 leaves the shell pending and retryable. Shell creation may omit a workspace ID.
 The daemon then selects the lowest
 available `workspace-N` name and publishes the generated workspace and shell as
@@ -149,6 +151,12 @@ durable shell model. Command rows show the stored argv in their detail column.
 Agent presentation takes precedence when the current run has an active Agent or
 an exact `opencode` or `pi` foreground hint.
 
+Selected-kind previews remain read-only. Workspace, launcher, and run metadata
+come from the polled snapshot. Shell and command output uses a bounded plain-text
+read only when the selected shell, run ID, or output revision changes. Launcher
+previews never imply retained invocation state because launcher processes remain
+ephemeral.
+
 Agent sessions are a client-side projection, not a sixth durable daemon
 identity. The projection groups stored Agent instances by workspace,
 integration, and external session ID, while isolating instances without an
@@ -156,9 +164,13 @@ external ID. It retains original shell/run identity and observations even when a
 shell no longer exists. UUID v5 IDs use a fixed namespace and a versioned,
 length-prefixed encoding of workspace ID, integration, and the external-or-agent
 grouping identity. IDs are globally unique and deterministic but opaque to
-consumers. The dashboard maps retained shells to openable run views and may
-enrich labels asynchronously from bounded host catalogs; CLI descriptions remain
-the latest stored Agent registration name and do not invoke host adapters.
+consumers. Bounded OpenCode root-session catalogs add historical, `unknown`
+sessions without fabricating Agent occurrences and merge with a later durable
+registration under the same stable ID. Catalog records associate to each
+workspace that references their exact normalized directory. The dashboard maps
+the active or latest exact match into a durable Agent's contextual preview and
+discovers catalogs asynchronously; session CLI listing performs the same bounded
+discovery synchronously. Sessions are not a dashboard kind.
 Title enrichment has its own adapter registry. The shared layer owns asynchronous
 cache, refresh, deduplication, sanitization, and fallback policy; OpenCode and Pi
 modules own host command execution and title extraction. Neutral host source
@@ -184,8 +196,10 @@ remain available through CLI inspection but do not occupy dashboard rows. A
 running shell snapshot may also expose its PTY foreground process name. The
 dashboard recognizes exact `opencode` and `pi` as presentation-only agent-shell hints
 before a canonical Agent session exists; this hint creates no AgentInstance,
-durable state observation, persistence, or events. It displays `idle` until
-lifecycle data exists, then yields to that authoritative observation.
+durable state observation, persistence, or events. It displays `untracked` until
+lifecycle data exists, then yields to that authoritative observation. `doctor`
+checks installed integration assets and reports a running untracked host with
+explicit install or restart guidance.
 
 ### Agent Skill
 

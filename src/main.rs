@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::env;
 use std::error::Error;
 use std::ffi::OsString;
@@ -39,6 +40,7 @@ const BOOMUX_OPENCODE_PLUGIN: &str = include_str!("../integrations/opencode/boom
 const BOOMUX_PI_EXTENSION: &str = include_str!("../integrations/pi/boomux.js");
 const VALIDATED_OPENCODE_VERSION: &str = "1.18.15";
 const VALIDATED_PI_VERSION: &str = "0.84.1";
+const MAX_HOST_CATALOG_DIRECTORIES: usize = 8;
 const JSON_COMMANDS: &[&str] = &[
     "capabilities",
     "list",
@@ -80,6 +82,7 @@ const INTEGRATION_FEATURES: &[&str] = &[
     "protocol_13",
     "protocol_14",
     "protocol_15",
+    "protocol_16",
     "restartable_exited_shells",
     "inactive_agent_state",
     "idempotent_agent_ensure",
@@ -913,7 +916,11 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
     let client = client::connect_or_start()?;
     let mut git_cache = git::Cache::default();
     let mut title_cache = host_session_titles::Cache::default();
-    let mut views = dashboard_views(&client.snapshot()?.workspaces, &mut git_cache);
+    let mut views = dashboard_views_with_catalog(
+        &client.snapshot()?.workspaces,
+        &mut git_cache,
+        &mut title_cache,
+    );
     enrich_session_titles(&mut views, &mut title_cache);
     let config = config::load()?;
     let terminal = terminal_override
@@ -1040,9 +1047,19 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
             },
             on_refresh: || {
                 let snapshot = client.snapshot().map_err(|error| error.to_string())?;
-                let mut views = dashboard_views(&snapshot.workspaces, &mut git_cache);
+                let mut views = dashboard_views_with_catalog(
+                    &snapshot.workspaces,
+                    &mut git_cache,
+                    &mut title_cache,
+                );
                 enrich_session_titles(&mut views, &mut title_cache);
                 Ok(views)
+            },
+            on_terminal_preview: |shell_id: &str| {
+                let bytes = client
+                    .read_shell(shell_id, READ_BYTES)
+                    .map_err(|error| error.to_string())?;
+                Ok(recent_lines(&String::from_utf8_lossy(&bytes), 12))
             },
         },
     )?;
@@ -1067,15 +1084,51 @@ where
     }
 }
 
+#[cfg(test)]
 fn dashboard_views(
     workspaces: &[WorkspaceSnapshot],
     git_cache: &mut git::Cache,
 ) -> Vec<tui::WorkspaceView> {
+    let sessions = session_projection::project_workspaces(workspaces);
+    dashboard_views_from_sessions(workspaces, git_cache, &sessions)
+}
+
+fn dashboard_views_with_catalog(
+    workspaces: &[WorkspaceSnapshot],
+    git_cache: &mut git::Cache,
+    title_cache: &mut host_session_titles::Cache,
+) -> Vec<tui::WorkspaceView> {
+    let catalog = cached_host_catalog(workspaces, title_cache);
+    let sessions = session_projection::project_workspaces_with_catalog(workspaces, Some(&catalog));
+    dashboard_views_from_sessions(workspaces, git_cache, &sessions)
+}
+
+fn dashboard_views_from_sessions(
+    workspaces: &[WorkspaceSnapshot],
+    git_cache: &mut git::Cache,
+    sessions: &[session_projection::SessionProjection],
+) -> Vec<tui::WorkspaceView> {
     workspaces
         .iter()
         .map(|workspace| {
-            let sessions = workspace_session_views(workspace);
+            let sessions = workspace_session_views(
+                sessions
+                    .iter()
+                    .filter(|session| session.workspace_id == workspace.id),
+            );
             let agent_summary = agent_attention_projection::summarize_workspace(workspace);
+            let attention =
+                agent_attention_projection::project_attention(std::slice::from_ref(workspace))
+                    .into_iter()
+                    .next()
+                    .map(|item| tui::WorkspaceAttentionView {
+                        agent_name: item.agent.name,
+                        reason: agent_attention_projection::attention_reason(item.attention.reason)
+                            .into(),
+                        evidence: item.attention.observation.evidence,
+                        observed_at_ms: item.attention.observation.observed_at_ms,
+                        observation_is_current: item.observation_is_current,
+                    });
             let shells = workspace.shells.iter().map(|shell| {
                 let git = git_cache.inspect(&shell.cwd);
                 let shell_view = tui::TerminalView {
@@ -1085,6 +1138,15 @@ fn dashboard_views(
                     directory: shell.cwd.display().to_string(),
                     branch: git.branch,
                     command: shell.command.join(" "),
+                    argv: shell.command.clone(),
+                    run: shell.run.as_ref().map(|run| tui::TerminalRunView {
+                        id: run.id.clone(),
+                        generation: run.generation,
+                        started_at_ms: run.started_at_ms,
+                        ended_at_ms: run.ended_at_ms,
+                        exit_reason: run.exit_reason.as_ref().map(shell_exit_reason),
+                        output_revision: run.output_revision,
+                    }),
                 };
                 let agent = matches!(shell.status, ShellStatus::Running)
                     .then(|| {
@@ -1131,6 +1193,7 @@ fn dashboard_views(
                             id: agent.id.clone(),
                             state: cli_output::agent_state(agent.observation.state).into(),
                             integration: agent.integration.clone(),
+                            external_session_id: agent.external_session_id.clone(),
                             authority: cli_output::agent_authority(agent.observation.authority)
                                 .into(),
                             confidence: agent.observation.confidence,
@@ -1152,6 +1215,7 @@ fn dashboard_views(
                     name: launcher.name.clone(),
                     directory: launcher.cwd.display().to_string(),
                     command: launcher.command.join(" "),
+                    argv: launcher.command.clone(),
                 })
             });
             tui::WorkspaceView {
@@ -1161,39 +1225,94 @@ fn dashboard_views(
                 sessions,
                 agent_state_counts: agent_summary.states,
                 attention_count: agent_summary.attention_count,
+                attention,
             }
         })
         .collect()
 }
 
-fn workspace_session_views(workspace: &WorkspaceSnapshot) -> Vec<tui::AgentSessionView> {
-    session_projection::project_workspaces(std::slice::from_ref(workspace))
+fn workspace_session_views<'a>(
+    sessions: impl IntoIterator<Item = &'a session_projection::SessionProjection>,
+) -> Vec<tui::AgentSessionView> {
+    sessions
         .into_iter()
         .map(|session| {
             let runs = session
                 .occurrences
-                .into_iter()
+                .iter()
                 .map(|occurrence| tui::AgentSessionRunView {
-                    shell_id: occurrence
-                        .retained_shell_name
-                        .as_ref()
-                        .map(|_| occurrence.shell_id),
-                    shell_name: occurrence.retained_shell_name,
-                    directory: occurrence.source_cwd,
+                    shell_name: occurrence.retained_shell_name.clone(),
+                    directory: occurrence.source_cwd.clone(),
                 })
                 .collect();
             tui::AgentSessionView {
-                id: session.id,
-                label: session.description,
-                integration: session.integration,
-                external_session_id: session.external_session_id,
+                id: session.id.clone(),
+                label: session.description.clone(),
+                integration: session.integration.clone(),
+                external_session_id: session.external_session_id.clone(),
                 state: cli_output::agent_state(session.state).into(),
                 state_is_current: session.state_is_current,
                 last_at_ms: session.last_at_ms,
+                source_cwd: session.source_cwd.clone(),
                 runs,
             }
         })
         .collect()
+}
+
+fn workspace_source_directories(workspaces: &[WorkspaceSnapshot]) -> BTreeSet<PathBuf> {
+    workspaces
+        .iter()
+        .flat_map(|workspace| {
+            workspace
+                .shells
+                .iter()
+                .map(|shell| shell.cwd.clone())
+                .chain(
+                    workspace
+                        .launchers
+                        .iter()
+                        .map(|launcher| launcher.cwd.clone()),
+                )
+                .chain(
+                    workspace
+                        .agents
+                        .iter()
+                        .filter_map(|agent| agent.cwd.clone()),
+                )
+        })
+        .collect()
+}
+
+fn cached_host_catalog(
+    workspaces: &[WorkspaceSnapshot],
+    cache: &mut host_session_titles::Cache,
+) -> Vec<host_session_titles::HostSession> {
+    workspace_source_directories(workspaces)
+        .into_iter()
+        .take(MAX_HOST_CATALOG_DIRECTORIES)
+        .filter_map(|directory| cache.catalog("opencode", &directory))
+        .flatten()
+        .collect()
+}
+
+fn discover_host_catalog(
+    workspaces: &[WorkspaceSnapshot],
+) -> Vec<host_session_titles::HostSession> {
+    let directories = workspace_source_directories(workspaces)
+        .into_iter()
+        .take(MAX_HOST_CATALOG_DIRECTORIES)
+        .collect::<Vec<_>>();
+    thread::scope(|scope| {
+        directories
+            .into_iter()
+            .map(|directory| scope.spawn(move || host_session_titles::catalog(&directory)))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .filter_map(|handle| handle.join().ok().flatten())
+            .flatten()
+            .collect()
+    })
 }
 
 fn enrich_session_titles(
@@ -1221,6 +1340,7 @@ where
             .iter()
             .rev()
             .find_map(|run| run.directory.as_deref())
+            .or(session.source_cwd.as_deref())
         else {
             continue;
         };
@@ -2081,14 +2201,19 @@ fn session_command(command: SessionCommands, json: bool) -> Result<(), Box<dyn E
     let client = client::connect_or_start()?;
     validate_session_protocol(client.protocol_version()?)?;
     let snapshot = client.snapshot()?;
-    let sessions = session_projection::project_snapshot(&snapshot);
     match command {
         SessionCommands::List { workspace } => {
-            let workspace_id = workspace
+            let selected_workspace = workspace
                 .as_deref()
                 .map(|target| resolve_workspace_target(&snapshot.workspaces, target))
-                .transpose()?
-                .map(|workspace| workspace.id.as_str());
+                .transpose()?;
+            let catalog = selected_workspace.map_or_else(
+                || discover_host_catalog(&snapshot.workspaces),
+                |workspace| discover_host_catalog(std::slice::from_ref(workspace)),
+            );
+            let sessions =
+                session_projection::project_snapshot_with_catalog(&snapshot, Some(&catalog));
+            let workspace_id = selected_workspace.map(|workspace| workspace.id.as_str());
             let sessions = sessions
                 .iter()
                 .filter(|session| {
@@ -2127,6 +2252,9 @@ fn session_command(command: SessionCommands, json: bool) -> Result<(), Box<dyn E
             }
         }
         SessionCommands::Inspect { session_id } => {
+            let catalog = discover_host_catalog(&snapshot.workspaces);
+            let sessions =
+                session_projection::project_snapshot_with_catalog(&snapshot, Some(&catalog));
             let session = match session_projection::resolve_exact(&sessions, &session_id) {
                 Ok(session) => session,
                 Err(session_projection::ResolveError::NotFound) => {
@@ -2156,6 +2284,9 @@ fn session_command(command: SessionCommands, json: bool) -> Result<(), Box<dyn E
             limit,
             max_bytes,
         } => {
+            let catalog = discover_host_catalog(&snapshot.workspaces);
+            let sessions =
+                session_projection::project_snapshot_with_catalog(&snapshot, Some(&catalog));
             let session = match session_projection::resolve_exact(&sessions, &session_id) {
                 Ok(session) => session,
                 Err(session_projection::ResolveError::NotFound) => {
@@ -2242,6 +2373,13 @@ fn print_session(session: &session_projection::SessionProjection) {
     );
     println!("STARTED AT MS\t{}", session.started_at_ms);
     println!("LAST ACTIVITY MS\t{}", session.last_at_ms);
+    println!(
+        "SOURCE CWD\t{}",
+        session
+            .source_cwd
+            .as_ref()
+            .map_or_else(|| "-".into(), |cwd| cwd.display().to_string())
+    );
     println!("OCCURRENCES\t{}", session.occurrences.len());
     for (index, occurrence) in session.occurrences.iter().enumerate() {
         println!();
@@ -3101,6 +3239,7 @@ fn install_opencode_at(config_root: &Path, force: bool) -> Result<(), Box<dyn Er
         );
     } else {
         println!("Installed Boomux OpenCode plugin at {}", path.display());
+        println!("Restart any running OpenCode process to activate the plugin");
     }
     Ok(())
 }
@@ -3145,6 +3284,7 @@ fn install_pi_at(config_root: &Path, force: bool) -> Result<(), Box<dyn Error>> 
         );
     } else {
         println!("Installed Boomux Pi extension at {}", path.display());
+        println!("Restart any running Pi process to activate the extension");
     }
     Ok(())
 }
@@ -3252,17 +3392,28 @@ fn legacy_skill_install_path(home: &Path) -> PathBuf {
 
 fn doctor(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
     let mut healthy = true;
-    match client::connect_or_start() {
-        Ok(client) => println!(
-            "ok  daemon: protocol {} ({})",
-            protocol::PROTOCOL_VERSION,
-            client.socket_path().display()
-        ),
+    let daemon_snapshot = match client::connect_or_start() {
+        Ok(client) => {
+            println!(
+                "ok  daemon: protocol {} ({})",
+                client.protocol_version()?,
+                client.socket_path().display()
+            );
+            match client.snapshot() {
+                Ok(snapshot) => Some(snapshot),
+                Err(error) => {
+                    healthy = false;
+                    eprintln!("err daemon snapshot: {error}");
+                    None
+                }
+            }
+        }
         Err(error) => {
             healthy = false;
             eprintln!("err daemon: {error}");
+            None
         }
-    }
+    };
     for command in ["git"] {
         match Command::new(command).arg("--version").output() {
             Ok(output) if output.status.success() => {
@@ -3333,10 +3484,106 @@ fn doctor(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
             eprintln!("err config: {error}");
         }
     }
+    if let Some(snapshot) = daemon_snapshot.as_ref() {
+        healthy &= print_integration_diagnostic(
+            "opencode",
+            "plugin",
+            opencode_config_root(env::var_os("XDG_CONFIG_HOME"), env::var_os("HOME"))
+                .map(|root| opencode_install_path(&root)),
+            BOOMUX_OPENCODE_PLUGIN,
+            snapshot,
+        );
+        healthy &= print_integration_diagnostic(
+            "pi",
+            "extension",
+            pi_config_root(env::var_os("PI_CODING_AGENT_DIR"), env::var_os("HOME"))
+                .map(|root| pi_install_path(&root)),
+            BOOMUX_PI_EXTENSION,
+            snapshot,
+        );
+    }
     if healthy {
         Ok(())
     } else {
         Err("one or more dependency or configuration checks failed".into())
+    }
+}
+
+fn print_integration_diagnostic(
+    integration: &str,
+    asset_name: &str,
+    path: Result<PathBuf, Box<dyn Error>>,
+    expected: &str,
+    snapshot: &Snapshot,
+) -> bool {
+    let running = snapshot.workspaces.iter().flat_map(|workspace| {
+        workspace.shells.iter().filter_map(move |shell| {
+            (matches!(shell.status, ShellStatus::Running)
+                && shell.foreground_process.as_deref() == Some(integration))
+            .then_some((workspace, shell))
+        })
+    });
+    let running = running.collect::<Vec<_>>();
+    let untracked = running
+        .iter()
+        .filter(|(workspace, shell)| {
+            !shell.run.as_ref().is_some_and(|run| {
+                workspace.agents.iter().any(|agent| {
+                    agent.integration == integration
+                        && agent.shell_id == shell.id
+                        && agent.run_id == run.id
+                        && agent.ended_at_ms.is_none()
+                        && !matches!(
+                            agent.observation.state,
+                            AgentState::Inactive | AgentState::Done
+                        )
+                })
+            })
+        })
+        .count();
+    let path = match path {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("err {integration} integration: cannot resolve {asset_name} path: {error}");
+            return false;
+        }
+    };
+    let state = match read_regular_file(&path) {
+        Ok(None) => "missing",
+        Ok(Some(contents)) if contents == expected.as_bytes() => "current",
+        Ok(Some(_)) => "stale",
+        Err(error) => {
+            eprintln!(
+                "err {integration} integration: invalid {asset_name} at {}: {error}",
+                path.display()
+            );
+            return false;
+        }
+    };
+    if running.is_empty() {
+        println!(
+            "ok  {integration} integration: {asset_name} {state} at {}",
+            path.display()
+        );
+        return true;
+    }
+    if state != "current" {
+        eprintln!(
+            "err {integration} integration: {asset_name} {state} at {}; run boomux {integration} install{}",
+            path.display(),
+            if state == "stale" { " --force" } else { "" }
+        );
+        return false;
+    }
+    if untracked == 0 {
+        println!("ok  {integration} integration: lifecycle registration active");
+        true
+    } else {
+        eprintln!(
+            "err {integration} integration: {untracked} foreground process(es) are untracked; restart {integration} and verify it loads {}",
+            path.display()
+        );
+        false
     }
 }
 
@@ -4117,8 +4364,6 @@ mod tests {
         assert_eq!(session.state, "blocked");
         assert!(session.state_is_current);
         assert_eq!(session.runs.len(), 2);
-        assert_eq!(session.runs[0].shell_id.as_deref(), Some("s1"));
-        assert_eq!(session.runs[1].shell_id.as_deref(), Some("s2"));
         assert_eq!(session.runs[0].shell_name.as_deref(), Some("build"));
         assert_eq!(session.runs[1].shell_name.as_deref(), Some("review"));
         assert_eq!(
@@ -4151,6 +4396,7 @@ mod tests {
             items: Vec::new(),
             agent_state_counts: agent_attention_projection::AgentStateCounts::default(),
             attention_count: 0,
+            attention: None,
             sessions: vec![tui::AgentSessionView {
                 id: "session".into(),
                 label: "opencode".into(),
@@ -4159,14 +4405,13 @@ mod tests {
                 state: "inactive".into(),
                 state_is_current: false,
                 last_at_ms: 30,
+                source_cwd: Some("/tmp/project".into()),
                 runs: vec![
                     tui::AgentSessionRunView {
-                        shell_id: Some("old-shell-id".into()),
                         shell_name: Some("old-shell".into()),
                         directory: Some("/tmp/project".into()),
                     },
                     tui::AgentSessionRunView {
-                        shell_id: None,
                         shell_name: None,
                         directory: None,
                     },
@@ -4257,12 +4502,14 @@ mod tests {
         let mut first = agent("agent-z", "w1", "s1");
         first.started_at_ms = 10;
         workspace.agents = vec![first.clone()];
-        let initial_id = workspace_session_views(&workspace)[0].id.clone();
+        let initial = session_projection::project_workspaces(std::slice::from_ref(&workspace));
+        let initial_id = workspace_session_views(&initial)[0].id.clone();
 
         let mut added = agent("agent-a", "w1", "s1");
         added.started_at_ms = 10;
         workspace.agents.push(added);
-        let sessions = workspace_session_views(&workspace);
+        let projected = session_projection::project_workspaces(std::slice::from_ref(&workspace));
+        let sessions = workspace_session_views(&projected);
 
         assert_eq!(sessions[0].id, initial_id);
         assert_eq!(sessions[0].runs.len(), 2);
@@ -4319,6 +4566,7 @@ mod tests {
         };
         assert_eq!(launcher.name, "editor");
         assert_eq!(launcher.command, "zeditor .");
+        assert_eq!(launcher.argv, ["zeditor", "."]);
         assert_eq!(launcher.directory, "/tmp/project");
     }
 
@@ -4335,6 +4583,10 @@ mod tests {
         };
         assert_eq!(command.name, "clock");
         assert_eq!(command.command, "watch -n 1 date");
+        assert_eq!(command.argv, ["watch", "-n", "1", "date"]);
+        let run = command.run.as_ref().expect("current run metadata");
+        assert_eq!(run.id, "r1");
+        assert_eq!(run.generation, 1);
     }
 
     #[test]
@@ -4348,7 +4600,7 @@ mod tests {
         let views = dashboard_views(&[workspace], &mut git::Cache::default());
 
         assert_eq!(views[0].items.len(), 2);
-        let tui::WorkspaceItemView::AgentShell(tui::AgentShellView { shell, agent }) =
+        let tui::WorkspaceItemView::AgentShell(tui::AgentShellView { shell, agent, .. }) =
             &views[0].items[0]
         else {
             panic!("expected agent-shell item");
@@ -4825,6 +5077,7 @@ mod tests {
             "canonical_session_transcripts",
             "transcript_pagination",
             "protocol_15",
+            "protocol_16",
             "persistent_agent_attention",
             "desktop_notifications",
         ] {
@@ -4836,7 +5089,7 @@ mod tests {
             session_transcript::supported_integrations(),
             ["opencode", "pi"]
         );
-        assert_eq!(protocol::PROTOCOL_VERSION, 15);
+        assert_eq!(protocol::PROTOCOL_VERSION, 16);
     }
 
     #[test]

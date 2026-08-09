@@ -52,7 +52,8 @@ create pending shell with explicit working directory
   -> daemon starts the child with the reported environment
 ```
 
-The attachment explicitly supplies these variables:
+Protocol 16 supplies the attachment client's complete Unix environment
+ephemerally, including these terminal-profile variables:
 
 ```text
 TERM
@@ -61,8 +62,11 @@ TERM_PROGRAM
 TERM_PROGRAM_VERSION
 ```
 
-Missing values remain unset rather than inheriting the daemon's terminal
-environment. A later attachment does not mutate a running child and receives a
+The daemon validates names and values, clears its own inherited environment,
+then applies the client environment. It overrides terminal-profile fields and
+`BOOMUX_*` identity fields authoritatively. The payload is not persisted,
+included in snapshots, events, or handoff state. Missing values remain unset.
+A later attachment does not mutate a running child and receives a
 warning when its `TERM` differs from the startup profile.
 
 This can affect terminfo selection, true-color detection, keyboard protocols,
@@ -105,8 +109,9 @@ struct TerminalProfile {
 }
 ```
 
-Do not forward the attachment client's complete environment. Validate lengths,
-reject control characters, and send only known terminal capability fields.
+Forward the attachment client's environment only in the startup request that
+can create a new run. Preserve Unix bytes, reject invalid names, duplicates, and
+NUL bytes, redact the payload from debug output, and never persist it.
 
 Read cell and pixel dimensions from `TIOCGWINSZ` on Unix. Pixel dimensions may
 legitimately remain zero when the emulator or kernel does not report them.

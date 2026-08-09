@@ -3,6 +3,7 @@ use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::PermissionsExt;
@@ -31,7 +32,8 @@ use crate::protocol::{
     AgentObservationSnapshot, AgentRegistrationSpec, AgentReport, AgentState, AttachFrame,
     DaemonEvent, DaemonEventKind, Envelope, ErrorCode, EventCursor, Request, Response,
     ShellRunExitReason, ShellRunSnapshot, ShellSnapshot, ShellSpec, ShellStatus, Snapshot,
-    TerminalProfile, WorkspaceLauncherSnapshot, WorkspaceLauncherSpec, WorkspaceSnapshot,
+    TerminalProfile, UnixEnvironment, WorkspaceLauncherSnapshot, WorkspaceLauncherSpec,
+    WorkspaceSnapshot,
 };
 use crate::state_store::{
     PersistedAgentInstance, PersistedShell, PersistedShellRun, PersistedState, PersistedWorkspace,
@@ -575,6 +577,14 @@ fn select_replacement_executable(current: PathBuf, argument_zero: Option<PathBuf
     if current.exists() {
         return current;
     }
+    if let Some(installed) = current
+        .to_str()
+        .and_then(|path| path.strip_suffix(" (deleted)"))
+        .map(PathBuf::from)
+        .filter(|path| path.exists())
+    {
+        return installed;
+    }
     if let Some(argument_zero) = argument_zero
         && argument_zero.is_absolute()
         && argument_zero.exists()
@@ -728,12 +738,31 @@ fn handle_connection(
             ),
         );
     }
+    if response_version < 16
+        && matches!(
+            request.message,
+            Request::Attach {
+                environment: Some(_),
+                ..
+            }
+        )
+    {
+        return send_response(
+            &mut stream,
+            response_version,
+            error_response(
+                ErrorCode::UnsupportedVersion,
+                "client environment requires daemon protocol 16",
+            ),
+        );
+    }
 
     if let Request::Attach {
         shell_id,
         takeover,
         restart_exited,
         profile,
+        environment,
     } = request.message
     {
         return handle_attach(
@@ -741,9 +770,12 @@ fn handle_connection(
             response_version,
             &registry,
             &shell_id,
-            takeover,
-            restart_exited,
-            profile,
+            AttachRequestOptions {
+                takeover,
+                restart_exited,
+                profile,
+                environment,
+            },
         );
     }
     if matches!(request.message, Request::Shutdown) {
@@ -4175,12 +4207,24 @@ fn create_pending_shell(workspace_id: &str, spec: ShellSpec) -> io::Result<Arc<S
     }))
 }
 
+fn initial_terminal_state(
+    rows: u16,
+    cols: u16,
+    workspace_name: &str,
+    shell_name: &str,
+) -> TerminalState {
+    let mut terminal = TerminalState::new(rows, cols);
+    terminal.process(format!("\x1b[2mBoomux: {workspace_name}/{shell_name}\x1b[0m\r\n").as_bytes());
+    terminal
+}
+
 fn spawn_runtime(
     shell: &Arc<Shell>,
     run: &ShellRun,
     workspace_name: &str,
     shell_name: &str,
     profile: &TerminalProfile,
+    environment: Option<&UnixEnvironment>,
 ) -> io::Result<(Arc<ShellRuntime>, PtyReader)> {
     let pty = native_pty_system()
         .openpty(PtySize {
@@ -4193,14 +4237,38 @@ fn spawn_runtime(
     let master = PtyMaster::duplicate(pty.master.as_ref())?;
     let reader = master.try_clone_reader()?;
 
+    let client_shell = environment
+        .and_then(|environment| {
+            environment
+                .variables
+                .iter()
+                .find(|variable| variable.name == b"SHELL")
+                .map(|variable| std::ffi::OsString::from_vec(variable.value.clone()))
+        })
+        .or_else(|| {
+            environment
+                .is_none()
+                .then(|| env::var_os("SHELL"))
+                .flatten()
+        })
+        .unwrap_or_else(|| "/bin/sh".into());
     let mut command = if shell.command.is_empty() {
-        CommandBuilder::new(env::var_os("SHELL").unwrap_or_else(|| "/bin/sh".into()))
+        CommandBuilder::new(client_shell)
     } else {
         let mut command = CommandBuilder::new(&shell.command[0]);
         command.args(&shell.command[1..]);
         command
     };
     command.cwd(&shell.cwd);
+    if let Some(environment) = environment {
+        command.env_clear();
+        for variable in &environment.variables {
+            command.env(
+                std::ffi::OsString::from_vec(variable.name.clone()),
+                std::ffi::OsString::from_vec(variable.value.clone()),
+            );
+        }
+    }
     for name in ["TERM", "COLORTERM", "TERM_PROGRAM", "TERM_PROGRAM_VERSION"] {
         command.env_remove(name);
     }
@@ -4226,12 +4294,14 @@ fn spawn_runtime(
     drop(pty.slave);
     drop(pty.master);
 
+    let terminal = initial_terminal_state(profile.rows, profile.cols, workspace_name, shell_name);
+
     Ok((
         Arc::new(ShellRuntime {
             control: Mutex::new(()),
             master: Mutex::new(master),
             process: Mutex::new(ManagedProcess::Owned(child)),
-            terminal: Arc::new(Mutex::new(TerminalState::new(profile.rows, profile.cols))),
+            terminal: Arc::new(Mutex::new(terminal)),
             controller: Mutex::new(None),
             reader: Mutex::new(None),
         }),
@@ -4428,16 +4498,36 @@ fn tail_utf8(text: &str, max_bytes: usize) -> &str {
     &text[start..]
 }
 
+struct AttachRequestOptions {
+    takeover: bool,
+    restart_exited: bool,
+    profile: TerminalProfile,
+    environment: Option<UnixEnvironment>,
+}
+
 fn handle_attach(
     mut stream: UnixStream,
     response_version: u32,
     registry: &Arc<Registry>,
     shell_id: &str,
-    takeover: bool,
-    restart_exited: bool,
-    profile: TerminalProfile,
+    options: AttachRequestOptions,
 ) -> io::Result<()> {
+    let AttachRequestOptions {
+        takeover,
+        restart_exited,
+        profile,
+        environment,
+    } = options;
     if let Err(error) = validate_terminal_profile(&profile) {
+        return send_response(
+            &mut stream,
+            response_version,
+            error_response(ErrorCode::InvalidArgument, error.to_string()),
+        );
+    }
+    if let Some(environment) = &environment
+        && let Err(error) = validate_unix_environment(environment)
+    {
         return send_response(
             &mut stream,
             response_version,
@@ -4522,20 +4612,26 @@ fn handle_attach(
                     .ok_or_else(|| io::Error::other("shell run generation exhausted"))
             })?;
             let run = Arc::new(ShellRun::new(generation));
-            let (runtime, reader) =
-                match spawn_runtime(&shell, &run, &workspace_name, &shell_name, &profile) {
-                    Ok(runtime) => runtime,
-                    Err(error) => {
-                        return send_response(
-                            &mut stream,
-                            response_version,
-                            error_response(
-                                ErrorCode::ShellStartFailed,
-                                format!("could not start shell: {error}"),
-                            ),
-                        );
-                    }
-                };
+            let (runtime, reader) = match spawn_runtime(
+                &shell,
+                &run,
+                &workspace_name,
+                &shell_name,
+                &profile,
+                environment.as_ref(),
+            ) {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    return send_response(
+                        &mut stream,
+                        response_version,
+                        error_response(
+                            ErrorCode::ShellStartFailed,
+                            format!("could not start shell: {error}"),
+                        ),
+                    );
+                }
+            };
             *lifecycle = ShellLifecycle::Running {
                 profile: profile.clone(),
                 run: Arc::clone(&run),
@@ -4910,6 +5006,29 @@ fn validate_terminal_profile(profile: &TerminalProfile) -> io::Result<()> {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "terminal profile contains an invalid environment value",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_unix_environment(environment: &UnixEnvironment) -> io::Result<()> {
+    let mut names = HashSet::new();
+    for variable in &environment.variables {
+        if variable.name.is_empty()
+            || variable.name.contains(&0)
+            || variable.name.contains(&b'=')
+            || !names.insert(variable.name.as_slice())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "client environment contains an invalid variable name",
+            ));
+        }
+        if variable.value.contains(&0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "client environment contains an invalid variable value",
             ));
         }
     }
@@ -5340,6 +5459,13 @@ mod tests {
         }
     }
 
+    #[test]
+    fn new_shell_terminal_starts_with_its_workspace_and_shell_name() {
+        let terminal = initial_terminal_state(24, 80, "project", "build");
+
+        assert!(terminal.plain_text().contains("Boomux: project/build"));
+    }
+
     fn agent_spec(state: AgentState) -> AgentRegistrationSpec {
         AgentRegistrationSpec {
             name: "test-agent".into(),
@@ -5377,7 +5503,7 @@ mod tests {
         let shell = registry.shell(&workspace.shells[0].id).unwrap();
         let run = Arc::new(ShellRun::new(1));
         let (runtime, _reader) =
-            spawn_runtime(&shell, &run, "agents", "agent-shell", &profile()).unwrap();
+            spawn_runtime(&shell, &run, "agents", "agent-shell", &profile(), None).unwrap();
         *lock(&shell.last_run).unwrap() = Some(run.persisted(profile()).unwrap());
         *lock(&shell.lifecycle).unwrap() = ShellLifecycle::Running {
             profile: profile(),
@@ -5399,7 +5525,7 @@ mod tests {
     }
 
     #[test]
-    fn replacement_uses_absolute_argument_zero_after_binary_replacement() {
+    fn replacement_finds_new_binary_after_binary_replacement() {
         let directory = env::temp_dir().join(format!("boomux-replacement-{}", Uuid::new_v4()));
         let installed = directory.join("boomux");
         fs::create_dir_all(&directory).unwrap();
@@ -5408,7 +5534,7 @@ mod tests {
         assert_eq!(
             select_replacement_executable(
                 directory.join("boomux (deleted)"),
-                Some(installed.clone())
+                Some(PathBuf::from("boomux"))
             ),
             installed
         );
@@ -5571,6 +5697,35 @@ mod tests {
         let mut invalid = profile();
         invalid.term = Some("x".repeat(MAX_TERMINAL_ENV_VALUE + 1));
         assert!(validate_terminal_profile(&invalid).is_err());
+    }
+
+    #[test]
+    fn validates_unix_environment_without_echoing_payload() {
+        let invalid_name = UnixEnvironment {
+            variables: vec![protocol::UnixEnvironmentVariable {
+                name: b"SECRET=NAME".to_vec(),
+                value: b"secret-value".to_vec(),
+            }],
+        };
+        let error = validate_unix_environment(&invalid_name).unwrap_err();
+        assert!(!error.to_string().contains("SECRET"));
+        assert!(!error.to_string().contains("secret-value"));
+
+        let invalid_value = UnixEnvironment {
+            variables: vec![protocol::UnixEnvironmentVariable {
+                name: b"VALID_NAME".to_vec(),
+                value: b"secret\0value".to_vec(),
+            }],
+        };
+        assert!(validate_unix_environment(&invalid_value).is_err());
+
+        let bytes = UnixEnvironment {
+            variables: vec![protocol::UnixEnvironmentVariable {
+                name: b"NON_UTF8".to_vec(),
+                value: vec![0xff, 0xfe],
+            }],
+        };
+        assert!(validate_unix_environment(&bytes).is_ok());
     }
 
     #[test]
@@ -7037,8 +7192,15 @@ mod tests {
         .unwrap();
         let terminal_profile = profile();
         let run = Arc::new(ShellRun::new(1));
-        let (runtime, reader) =
-            spawn_runtime(&shell, &run, "workspace", "pause-test", &terminal_profile).unwrap();
+        let (runtime, reader) = spawn_runtime(
+            &shell,
+            &run,
+            "workspace",
+            "pause-test",
+            &terminal_profile,
+            None,
+        )
+        .unwrap();
         *lock(&shell.last_run).unwrap() = Some(run.persisted(terminal_profile.clone()).unwrap());
         *lock(&shell.lifecycle).unwrap() = ShellLifecycle::Running {
             profile: terminal_profile,
@@ -7101,8 +7263,15 @@ mod tests {
         let shell = registry.shell(&workspace.shells[0].id).unwrap();
         let terminal_profile = profile();
         let run = Arc::new(ShellRun::new(1));
-        let (runtime, reader) =
-            spawn_runtime(&shell, &run, "exit-race", "short-lived", &terminal_profile).unwrap();
+        let (runtime, reader) = spawn_runtime(
+            &shell,
+            &run,
+            "exit-race",
+            "short-lived",
+            &terminal_profile,
+            None,
+        )
+        .unwrap();
         *lock(&shell.last_run).unwrap() = Some(run.persisted(terminal_profile.clone()).unwrap());
         *lock(&shell.lifecycle).unwrap() = ShellLifecycle::Running {
             profile: terminal_profile,

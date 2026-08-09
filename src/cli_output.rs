@@ -148,6 +148,7 @@ pub(crate) struct SessionSummaryData {
 pub(crate) struct SessionData {
     #[serde(flatten)]
     pub(crate) summary: SessionSummaryData,
+    pub(crate) source_cwd: Option<String>,
     pub(crate) occurrences: Vec<SessionOccurrenceData>,
 }
 
@@ -298,6 +299,10 @@ pub(crate) fn session_summary(session: &SessionProjection) -> SessionSummaryData
 pub(crate) fn session(session: &SessionProjection) -> SessionData {
     SessionData {
         summary: session_summary(session),
+        source_cwd: session
+            .source_cwd
+            .as_ref()
+            .map(|cwd| cwd.display().to_string()),
         occurrences: session.occurrences.iter().map(session_occurrence).collect(),
     }
 }
@@ -489,6 +494,7 @@ mod tests {
             state_is_current: false,
             started_at_ms: 10,
             last_at_ms: 11,
+            source_cwd: Some("/tmp/project".into()),
             occurrences: vec![SessionOccurrence {
                 agent_id: "a1".into(),
                 shell_id: "removed-shell".into(),
@@ -512,6 +518,7 @@ mod tests {
 
         let value = serde_json::to_value(data).unwrap();
         assert!(value["external_session_id"].is_null());
+        assert_eq!(value["source_cwd"], "/tmp/project");
         assert!(value["occurrences"][0]["retained_shell_name"].is_null());
         assert!(value["occurrences"][0]["retained_shell_cwd"].is_null());
         assert_eq!(value["occurrences"][0]["source_cwd"], "/tmp/project");

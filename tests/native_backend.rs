@@ -12,7 +12,8 @@ use std::time::{Duration, Instant};
 use boomux::client::{Attachment, Client, RemoteError};
 use boomux::protocol::{
     self, AgentAuthority, AgentRegistrationSpec, AgentReport, AgentState, AttachFrame, ErrorCode,
-    ShellRunExitReason, ShellSpec, ShellStatus, TerminalProfile, WorkspaceLauncherSpec,
+    ShellRunExitReason, ShellSpec, ShellStatus, TerminalProfile, UnixEnvironment,
+    UnixEnvironmentVariable, WorkspaceLauncherSpec,
 };
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use uuid::Uuid;
@@ -45,6 +46,7 @@ impl TestDaemon {
             .env("COLORTERM", "daemon-color")
             .env("TERM_PROGRAM", "daemon-program")
             .env("TERM_PROGRAM_VERSION", "daemon-version")
+            .env("BOOMUX_DAEMON_ONLY", "must-not-leak")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -426,6 +428,74 @@ fn native_daemon_recovers_reproducible_metadata_after_restart() {
     assert_eq!(second_run.generation, 2);
     drop(second);
     daemon.stop_with_cli();
+}
+
+#[test]
+fn attach_environment_is_ephemeral_and_authoritative_for_initial_and_restarted_runs() {
+    let daemon = TestDaemon::start();
+    let client_shell = daemon.runtime_dir.join("client-shell");
+    fs::write(
+        &client_shell,
+        "#!/bin/sh\nbytes=$(printf '%s' \"$NON_UTF8\" | /usr/bin/od -An -tx1)\nprintf 'startup=%s|daemon=%s|term=%s|run=%s|bytes=%s\\n' \"$CLIENT_MARKER\" \"${BOOMUX_DAEMON_ONLY-unset}\" \"$TERM\" \"$BOOMUX_RUN_ID\" \"$bytes\"\nexec /bin/sh\n",
+    )
+    .unwrap();
+    fs::set_permissions(&client_shell, fs::Permissions::from_mode(0o755)).unwrap();
+    let workspace = daemon
+        .client
+        .create_workspace(
+            "ephemeral-environment",
+            vec![ShellSpec::login("shell", std::env::temp_dir())],
+        )
+        .unwrap();
+    let shell_id = workspace.shells[0].id.clone();
+    let first_secret = format!("first-secret-{}", Uuid::new_v4());
+    let mut first = attach_with_environment(
+        &daemon.client,
+        &shell_id,
+        false,
+        environment_for_shell(&client_shell, &first_secret),
+    );
+    let first_output = read_until(&mut first.stream, b"|bytes= ff fe");
+    assert!(contains(&first_output, first_secret.as_bytes()));
+    assert!(contains(&first_output, b"daemon=unset"));
+    assert!(contains(&first_output, b"term=attachment-term"));
+    assert!(!contains(&first_output, b"attacker-run-id"));
+    AttachFrame::Input(b"exit 0\n".to_vec())
+        .write_to(&mut first.stream)
+        .unwrap();
+    drop(first);
+    wait_until(
+        || {
+            matches!(
+                daemon.client.get_shell(&shell_id).unwrap().status,
+                ShellStatus::Exited { .. }
+            )
+        },
+        "first environment shell did not exit",
+    );
+
+    let second_secret = format!("second-secret-{}", Uuid::new_v4());
+    let mut second = attach_with_environment(
+        &daemon.client,
+        &shell_id,
+        true,
+        environment_for_shell(&client_shell, &second_secret),
+    );
+    let second_output = read_until(&mut second.stream, b"|bytes= ff fe");
+    assert!(contains(&second_output, second_secret.as_bytes()));
+    assert!(contains(&second_output, b"daemon=unset"));
+    assert!(contains(&second_output, b"term=attachment-term"));
+    assert!(!contains(&second_output, first_secret.as_bytes()));
+
+    let state = fs::read(daemon.runtime_dir.join("state/boomux/state.json")).unwrap();
+    let snapshot = serde_json::to_vec(&daemon.client.snapshot().unwrap()).unwrap();
+    let events = daemon.client.events(None, 256, 0).unwrap();
+    let events = serde_json::to_vec(&(events.snapshot, events.events)).unwrap();
+    for bytes in [&state, &snapshot, &events] {
+        assert!(!contains(bytes, first_secret.as_bytes()));
+        assert!(!contains(bytes, second_secret.as_bytes()));
+        assert!(!contains(bytes, b"attacker-run-id"));
+    }
 }
 
 #[test]
@@ -2471,6 +2541,7 @@ fn attachment_client_reconnects_across_daemon_restart() {
     command.env("COLORTERM", "truecolor");
     command.env("TERM_PROGRAM", "integration-terminal");
     command.env("TERM_PROGRAM_VERSION", "1.0");
+    command.env("SHELL", "/bin/sh");
     let mut attachment_process = pty.slave.spawn_command(command).unwrap();
     drop(pty.slave);
     let mut reader = pty.master.try_clone_reader().unwrap();
@@ -2726,7 +2797,7 @@ fn native_daemon_lifecycle() {
     let capabilities: serde_json::Value = serde_json::from_slice(&capabilities.stdout).unwrap();
     assert_eq!(capabilities["schema"], "boomux.cli/v1");
     assert_eq!(capabilities["command"], "capabilities");
-    assert_eq!(capabilities["data"]["daemon_protocol_version"], 15);
+    assert_eq!(capabilities["data"]["daemon_protocol_version"], 16);
     assert_eq!(
         capabilities["data"]["session_transcript_integrations"],
         serde_json::json!(["opencode", "pi"])
@@ -2767,6 +2838,7 @@ fn native_daemon_lifecycle() {
         "protocol_13",
         "protocol_14",
         "protocol_15",
+        "protocol_16",
         "inactive_agent_state",
         "protocol_11",
         "restartable_exited_shells",
@@ -2786,7 +2858,7 @@ fn native_daemon_lifecycle() {
         .output()
         .unwrap();
     assert!(status.status.success());
-    assert!(String::from_utf8_lossy(&status.stdout).contains("running (protocol 15"));
+    assert!(String::from_utf8_lossy(&status.stdout).contains("running (protocol 16"));
     let status = daemon
         .command()
         .args(["daemon", "status", "--json"])
@@ -3442,6 +3514,72 @@ fn profile() -> TerminalProfile {
         cols: 80,
         pixel_width: 800,
         pixel_height: 600,
+    }
+}
+
+fn environment_for_shell(shell: &std::path::Path, marker: &str) -> UnixEnvironment {
+    UnixEnvironment {
+        variables: vec![
+            UnixEnvironmentVariable {
+                name: b"SHELL".to_vec(),
+                value: shell.as_os_str().as_encoded_bytes().to_vec(),
+            },
+            UnixEnvironmentVariable {
+                name: b"CLIENT_MARKER".to_vec(),
+                value: marker.as_bytes().to_vec(),
+            },
+            UnixEnvironmentVariable {
+                name: b"TERM".to_vec(),
+                value: b"client-supplied-term".to_vec(),
+            },
+            UnixEnvironmentVariable {
+                name: b"BOOMUX_RUN_ID".to_vec(),
+                value: b"attacker-run-id".to_vec(),
+            },
+            UnixEnvironmentVariable {
+                name: b"NON_UTF8".to_vec(),
+                value: vec![0xff, 0xfe],
+            },
+        ],
+    }
+}
+
+fn attach_with_environment(
+    client: &Client,
+    shell_id: &str,
+    restart_exited: bool,
+    environment: UnixEnvironment,
+) -> Attachment {
+    let mut stream = UnixStream::connect(client.socket_path()).unwrap();
+    protocol::write_message(
+        &mut stream,
+        &protocol::Envelope::with_version(
+            16,
+            protocol::Request::Attach {
+                shell_id: shell_id.into(),
+                takeover: false,
+                restart_exited,
+                profile: profile(),
+                environment: Some(environment),
+            },
+        ),
+    )
+    .unwrap();
+    let response: protocol::Envelope<protocol::Response> =
+        protocol::read_message(&mut stream).unwrap();
+    assert_eq!(response.version, 16);
+    match response.message {
+        protocol::Response::Attached {
+            token,
+            reconstruction,
+            warning,
+        } => Attachment {
+            stream,
+            token,
+            reconstruction,
+            warning,
+        },
+        response => panic!("unexpected attach response: {response:?}"),
     }
 }
 

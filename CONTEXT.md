@@ -38,6 +38,9 @@ external integration authority.
 
 Inactive means a resumable external session is not currently active. It remains durable and can
 return to idle or working, but does not decorate a dashboard shell. Done is permanent completion.
+A foreground process hint is not an Agent Instance and is presented as Untracked, never Idle.
+Catalog-only OpenCode history is a client-side projected session with Unknown state and no
+fabricated Agent occurrence.
 
 ## Process Adapter
 

@@ -112,8 +112,9 @@ boomux session read "<exact-session-id>" --before "<next-cursor>" --limit 100 --
 Use the exact opaque session ID returned by `session list`. Never guess or
 resolve it from an external session ID, description, shell ID, or Agent ID.
 Session state is marked current only when an occurrence is active on the current
-run of a running retained shell; otherwise it is last-known. `description` is
-the latest stored Boomux Agent registration name, not a host-enriched title.
+run of a running retained shell; otherwise it is last-known. Catalog-only
+OpenCode history has state `unknown`, no fabricated occurrence, and a sanitized
+host title. Registered-session descriptions remain durable Agent names.
 `session read` returns the newest bounded suffix of canonical OpenCode or Pi
 messages, reasoning, and tool activity, not terminal scrollback. Pi results
 follow its active branch. Inspect `truncated`, `truncated_by`, and per-entry
@@ -407,6 +408,11 @@ BOOMUX_SHELL_ID
 BOOMUX_SHELL_NAME
 BOOMUX_RUN_ID
 ```
+
+Protocol 16 starts pending and exited shell runs with the attaching client's
+ephemeral Unix environment. Boomux does not persist or project that payload;
+terminal-profile and `BOOMUX_*` identity values are authoritative. Reattaching
+does not alter an already-running process environment.
 
 Detached launcher invocations inherit the invoking client's environment and
 receive `BOOMUX_WORKSPACE_ID`, `BOOMUX_WORKSPACE`, `BOOMUX_LAUNCHER_ID`, and

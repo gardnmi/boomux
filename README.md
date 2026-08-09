@@ -1,9 +1,5 @@
 # Boomux
 
-<p align="center">
-  <img src="assets/dashboard-workspaces.png" alt="Boomux workspace dashboard with global agent, session, launcher, shell, and command views" width="100%">
-</p>
-
 > [!WARNING]
 > Boomux is an early proof of concept. Commands, storage, and session behavior
 > may change without migration support.
@@ -73,13 +69,12 @@ boomux ui
 
 Dashboard controls:
 
-- `Tab` and `Shift-Tab` cycle the Workspaces, Agents, Sessions, Launchers,
-  Shells, and Commands views. Number keys `1` through `6` select them directly.
+- `Tab` and `Shift-Tab` cycle the Workspaces, Agents, Launchers, Shells, and
+  Commands views. Number keys `1` through `5` select them directly.
 - In the primary Workspaces view, `h`, `l`, and the left/right arrows switch
   between the workspace and item tables.
 - `j`, `k`, and the arrow keys navigate.
-- `Enter` restores a workspace, opens a shell, invokes a launcher, or opens the
-  newest still-existing shell associated with a selected session.
+- `Enter` restores a workspace, opens a shell, or invokes a launcher.
 - `a` creates an empty workspace or adds a shell, depending on the focused
   table in the Workspaces view. New dashboard shells start in the directory
   where the dashboard was launched.
@@ -96,20 +91,23 @@ each kind across every workspace while retaining the owning workspace and exact
 item actions. Counts are exclusive by visible presentation: an agent row is not
 also counted as a shell or command.
 
+The selected kind receives a read-only preview. Workspaces show retained Agent
+state and their highest-priority attention item. Shells and commands show run
+metadata plus a bounded terminal-output tail, fetched only when the selected
+shell's output revision changes. Commands and launchers preserve argument
+boundaries in their previews. Launchers explicitly show that their detached
+output and invocation history are not retained.
+
 When an active Agent instance is bound to a shell's current run, that shell row
 morphs into an agent row instead of adding a duplicate item. It keeps the
 shell's name, ID, directory, and open, rename, and close actions while showing the
 Agent's lifecycle state and evidence. The Agents view stays focused on those
-current presentations. The Sessions view independently retains Boomux-observed
-active and historical sessions, grouped by activity window with workspace,
-integration, state, host-provided description, associated shell, recency, and
-canonical identity. A foreground `opencode` or `pi` process also supplies a
-presentation-only agent hint while the lifecycle integration establishes a
-durable Agent session.
-
-<p align="center">
-  <img src="assets/dashboard-sessions.png" alt="Boomux global session history grouped by activity window" width="100%">
-</p>
+current presentations. A process-only foreground hint is labeled `untracked`,
+never `idle`, until its lifecycle integration registers. A selected durable
+Agent may show its one matching canonical session; untracked hints never receive
+directory-wide history. The preview prefers the active match and otherwise uses
+the latest match. Full Boomux-observed and bounded OpenCode catalog
+history remains available through the session CLI.
 
 Closing a terminal window only disconnects its attachment. The Boomux daemon
 retains the PTY and child process until the shell exits, the workspace is
@@ -235,13 +233,15 @@ blocked Agent does not generate another notification until the Agent first
 leaves that state.
 
 `boomux session list` and `boomux session inspect` project durable Agent
-instances into workspace session history. Instances are grouped within one
+instances and bounded OpenCode root-session catalogs into workspace session
+history. Instances are grouped within one
 workspace and integration by external session ID; records without one remain
 isolated. A session is current only while at least one occurrence is active on
 the exact current run of a running retained shell. Otherwise its state is
 explicitly last-known. The CLI `description` is the latest stored Boomux Agent
-registration name. The dashboard may separately enrich its display title from
-bounded host catalogs; the CLI never synchronously calls those adapters.
+registration name. Catalog-only records use the sanitized OpenCode title, have
+state `unknown`, contain no fabricated occurrence, and remain available for
+canonical transcript reads while their source directory and host data exist.
 
 Projected session IDs are deterministic, globally unique UUIDs, but are opaque.
 Obtain an ID from `session list` and pass that exact value to `session inspect`
@@ -351,6 +351,12 @@ BOOMUX_SHELL_NAME
 BOOMUX_RUN_ID
 ```
 
+When an attachment starts a pending or exited shell run, protocol 16 forwards
+that attachment client's Unix environment directly to the child. Boomux does
+not persist it or expose it in snapshots or events. Terminal-profile values and
+the authoritative `BOOMUX_*` identity variables override conflicting client
+values. Later attachments never mutate a running process environment.
+
 Workspace launcher invocations instead receive `BOOMUX_WORKSPACE_ID`,
 `BOOMUX_WORKSPACE`, `BOOMUX_LAUNCHER_ID`, and `BOOMUX_LAUNCHER_NAME`. They
 inherit the invoking client's desktop environment, while shell/run context is
@@ -422,11 +428,13 @@ does not edit `opencode.json` or other plugins. An identical file is left
 unchanged. Different content requires `--force`, and detected symlinked or
 non-regular path components and targets are rejected even with `--force`. Because OpenCode
 loads config-time plugins at startup, quit and restart OpenCode after installing
-or replacing the plugin.
+or replacing the plugin. The installer prints this requirement, and `boomux
+doctor` reports a foreground OpenCode process without lifecycle registration as
+untracked instead of presenting it as idle.
 
 Inside a Boomux-managed shell, the plugin groups each root OpenCode session and
 all child/subagent sessions into one durable agent instance keyed by the root
-session ID. OpenCode status, chat, tool, compaction, permission/question, error,
+session ID. OpenCode creation, status, chat, tool, compaction, permission/question, error,
 idle, and deletion events produce explainable `working`, `blocked`, `idle`, and
 `done` observations. Child activity contributes to the root; only root idle can
 make it idle, and only explicit deletion of the root reports `done`. Process or

@@ -162,11 +162,13 @@ the revision or satisfy a wait.
 
 Session summaries contain `id`, `workspace_id`, `workspace_name`, `description`,
 `integration`, `external_session_id`, `state`, `state_is_current`,
-`started_at_ms`, `last_at_ms`, and `occurrence_count`. `description` is the
-latest stored Boomux Agent registration name, never a synchronously fetched host
-title. Missing optional values are JSON `null`.
+`started_at_ms`, `last_at_ms`, and `occurrence_count`. Registered-session
+`description` is the latest stored Boomux Agent registration name. Catalog-only
+OpenCode sessions use the sanitized host title, state `unknown`, and zero
+occurrences. Missing optional values are JSON `null`.
 
-Inspect includes all summary fields plus ordered `occurrences`. Each occurrence
+Inspect includes all summary fields, session-level `source_cwd`, and ordered
+`occurrences`. Each occurrence
 contains `agent_id`, the original `shell_id` even if that shell was removed,
 `retained_shell_name`, `retained_shell_cwd`, `source_cwd`, `run_id`,
 `started_at_ms`, `ended_at_ms`, `is_current`, and the full stable Agent
@@ -178,6 +180,9 @@ same spellings documented for Agent observations.
 
 Projection groups Agent instances only when workspace, integration, and external
 session ID match. An Agent without an external session ID forms its own session.
+Bounded OpenCode catalogs add root sessions to workspaces that reference the
+same normalized directory. A matching durable Agent merges into the same stable
+ID and supplies authoritative lifecycle state and occurrences.
 Current state is selected from occurrences that are incomplete, non-inactive,
 and bound to the current run of a running retained shell; otherwise state is the
 latest stored observation and `state_is_current` is false. List order is newest

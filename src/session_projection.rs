@@ -1,5 +1,5 @@
-use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 
 use uuid::Uuid;
 
@@ -7,6 +7,9 @@ use boomux::protocol::{
     AgentInstanceSnapshot, AgentObservationSnapshot, AgentState, ShellStatus, Snapshot,
     WorkspaceSnapshot,
 };
+
+use crate::host_session_source::normalize_absolute;
+use crate::host_session_titles::HostSession;
 
 // Frozen namespace for opaque boomux projected-session IDs.
 const SESSION_ID_NAMESPACE: Uuid = Uuid::from_u128(0x8ea7578e_7532_5d53_91f6_1d210f960b48);
@@ -23,6 +26,7 @@ pub(crate) struct SessionProjection {
     pub(crate) state_is_current: bool,
     pub(crate) started_at_ms: u64,
     pub(crate) last_at_ms: u64,
+    pub(crate) source_cwd: Option<PathBuf>,
     pub(crate) occurrences: Vec<SessionOccurrence>,
 }
 
@@ -46,15 +50,29 @@ pub(crate) enum ResolveError {
     DuplicateId,
 }
 
-pub(crate) fn project_snapshot(snapshot: &Snapshot) -> Vec<SessionProjection> {
-    project_workspaces(&snapshot.workspaces)
+#[cfg(test)]
+pub(crate) fn project_workspaces(workspaces: &[WorkspaceSnapshot]) -> Vec<SessionProjection> {
+    project_workspaces_with_catalog(workspaces, None)
 }
 
-pub(crate) fn project_workspaces(workspaces: &[WorkspaceSnapshot]) -> Vec<SessionProjection> {
+pub(crate) fn project_snapshot_with_catalog(
+    snapshot: &Snapshot,
+    catalog: Option<&[HostSession]>,
+) -> Vec<SessionProjection> {
+    project_workspaces_with_catalog(&snapshot.workspaces, catalog)
+}
+
+pub(crate) fn project_workspaces_with_catalog(
+    workspaces: &[WorkspaceSnapshot],
+    catalog: Option<&[HostSession]>,
+) -> Vec<SessionProjection> {
     let mut sessions = workspaces
         .iter()
         .flat_map(project_workspace)
         .collect::<Vec<_>>();
+    if let Some(catalog) = catalog {
+        merge_catalog(workspaces, &mut sessions, catalog);
+    }
     sessions.sort_by(|left, right| {
         right
             .last_at_ms
@@ -142,7 +160,7 @@ fn project_workspace(workspace: &WorkspaceSnapshot) -> Vec<SessionProjection> {
                 })
                 .max()
                 .unwrap_or(first.started_at_ms);
-            let occurrences = agents
+            let occurrences: Vec<SessionOccurrence> = agents
                 .into_iter()
                 .map(|agent| {
                     let retained_shell = shells.get(agent.shell_id.as_str()).copied();
@@ -163,6 +181,7 @@ fn project_workspace(workspace: &WorkspaceSnapshot) -> Vec<SessionProjection> {
                     }
                 })
                 .collect();
+            let source_cwd = agents_source_cwd(&occurrences);
 
             SessionProjection {
                 id: stable_session_id(&workspace.id, &integration, &identity),
@@ -175,10 +194,102 @@ fn project_workspace(workspace: &WorkspaceSnapshot) -> Vec<SessionProjection> {
                 state_is_current,
                 started_at_ms: first.started_at_ms,
                 last_at_ms,
+                source_cwd,
                 occurrences,
             }
         })
         .collect()
+}
+
+fn agents_source_cwd(occurrences: &[SessionOccurrence]) -> Option<PathBuf> {
+    occurrences
+        .iter()
+        .rev()
+        .find_map(|occurrence| occurrence.source_cwd.clone())
+}
+
+fn merge_catalog(
+    workspaces: &[WorkspaceSnapshot],
+    sessions: &mut Vec<SessionProjection>,
+    catalog: &[HostSession],
+) {
+    let workspace_directories = workspaces
+        .iter()
+        .map(|workspace| (workspace.id.as_str(), workspace_directories(workspace)))
+        .collect::<Vec<_>>();
+
+    for record in catalog {
+        let Some(record_directory) = normalize_absolute(&record.directory) else {
+            continue;
+        };
+        let matching_workspaces = workspace_directories
+            .iter()
+            .filter(|(_, directories)| directories.contains(&record_directory))
+            .map(|(workspace_id, _)| *workspace_id)
+            .collect::<Vec<_>>();
+        if matching_workspaces.is_empty() {
+            continue;
+        }
+        for workspace_id in matching_workspaces {
+            let Some(workspace) = workspaces
+                .iter()
+                .find(|workspace| workspace.id == workspace_id)
+            else {
+                continue;
+            };
+            let identity = format!("external:{}", record.root_id);
+            if let Some(session) = sessions.iter_mut().find(|session| {
+                session.workspace_id == workspace.id
+                    && session.integration == record.integration
+                    && session.external_session_id.as_deref() == Some(record.root_id.as_str())
+            }) {
+                if session.source_cwd.is_none() {
+                    session.source_cwd = Some(record_directory.clone());
+                }
+                continue;
+            }
+
+            sessions.push(SessionProjection {
+                id: stable_session_id(&workspace.id, &record.integration, &identity),
+                workspace_id: workspace.id.clone(),
+                workspace_name: workspace.name.clone(),
+                integration: record.integration.clone(),
+                external_session_id: Some(record.root_id.clone()),
+                description: record.title.clone(),
+                state: AgentState::Unknown,
+                state_is_current: false,
+                started_at_ms: record.created_at_ms,
+                last_at_ms: record.updated_at_ms,
+                source_cwd: Some(record_directory.clone()),
+                occurrences: Vec::new(),
+            });
+        }
+    }
+}
+
+fn workspace_directories(workspace: &WorkspaceSnapshot) -> BTreeSet<PathBuf> {
+    workspace
+        .shells
+        .iter()
+        .map(|shell| shell.cwd.as_path())
+        .chain(
+            workspace
+                .launchers
+                .iter()
+                .map(|launcher| launcher.cwd.as_path()),
+        )
+        .chain(
+            workspace
+                .agents
+                .iter()
+                .filter_map(|agent| agent.cwd.as_deref()),
+        )
+        .filter_map(normalized_directory)
+        .collect()
+}
+
+fn normalized_directory(directory: &Path) -> Option<PathBuf> {
+    normalize_absolute(directory)
 }
 
 fn occurrence_is_current(workspace: &WorkspaceSnapshot, agent: &AgentInstanceSnapshot) -> bool {
@@ -222,6 +333,17 @@ mod tests {
 
     use super::*;
     use boomux::protocol::{AgentAuthority, ShellRunSnapshot};
+
+    fn catalog_session(id: &str, directory: &str) -> HostSession {
+        HostSession {
+            integration: "opencode".into(),
+            root_id: id.into(),
+            title: format!("Catalog {id}"),
+            directory: PathBuf::from(directory),
+            created_at_ms: 5,
+            updated_at_ms: 50,
+        }
+    }
 
     fn workspace(id: &str, agent_ids: &[&str]) -> WorkspaceSnapshot {
         let shell = boomux::protocol::ShellSnapshot {
@@ -364,6 +486,139 @@ mod tests {
 
         assert_eq!(
             sessions[0].occurrences[0].source_cwd.as_deref(),
+            Some(Path::new("/tmp/project"))
+        );
+        assert_eq!(
+            sessions[0].source_cwd.as_deref(),
+            Some(Path::new("/tmp/project"))
+        );
+    }
+
+    #[test]
+    fn catalog_only_session_requires_one_exact_normalized_workspace_match() {
+        let mut matching = workspace("w1", &[]);
+        matching.shells[0].cwd = "/tmp/project/./src/..".into();
+        let mut unmatched = workspace("w2", &[]);
+        unmatched.shells[0].cwd = "/other/project".into();
+        let catalog = [catalog_session("catalog-only", "/tmp/project")];
+
+        let sessions = project_workspaces_with_catalog(&[matching, unmatched], Some(&catalog));
+
+        assert_eq!(sessions.len(), 1);
+        let session = &sessions[0];
+        assert_eq!(session.workspace_id, "w1");
+        assert_eq!(session.external_session_id.as_deref(), Some("catalog-only"));
+        assert_eq!(session.description, "Catalog catalog-only");
+        assert_eq!(session.state, AgentState::Unknown);
+        assert!(!session.state_is_current);
+        assert!(session.occurrences.is_empty());
+        assert_eq!(
+            session.source_cwd.as_deref(),
+            Some(Path::new("/tmp/project"))
+        );
+        assert_eq!(session.started_at_ms, 5);
+        assert_eq!(session.last_at_ms, 50);
+    }
+
+    #[test]
+    fn catalog_association_uses_launcher_and_agent_cwds() {
+        let mut launcher_match = workspace("launcher", &[]);
+        launcher_match.shells.clear();
+        launcher_match
+            .launchers
+            .push(boomux::protocol::WorkspaceLauncherSnapshot {
+                id: "launcher".into(),
+                workspace_id: "launcher".into(),
+                name: "build".into(),
+                command: vec!["make".into()],
+                cwd: "/launcher/repo".into(),
+            });
+        let mut agent_match = workspace("agent", &["a1"]);
+        agent_match.shells.clear();
+        agent_match.agents[0].cwd = Some("/agent/repo".into());
+        let catalog = [
+            catalog_session("from-launcher", "/launcher/repo"),
+            catalog_session("from-agent", "/agent/repo"),
+        ];
+
+        let sessions =
+            project_workspaces_with_catalog(&[launcher_match, agent_match], Some(&catalog));
+
+        assert_eq!(sessions.len(), 3);
+        assert!(sessions.iter().any(|session| {
+            session.workspace_id == "launcher"
+                && session.external_session_id.as_deref() == Some("from-launcher")
+        }));
+        assert!(sessions.iter().any(|session| {
+            session.workspace_id == "agent"
+                && session.external_session_id.as_deref() == Some("from-agent")
+        }));
+    }
+
+    #[test]
+    fn shared_catalog_directories_project_into_each_matching_workspace() {
+        let first = workspace("w1", &[]);
+        let second = workspace("w2", &[]);
+        let catalog = [
+            catalog_session("ambiguous", "/tmp/project"),
+            catalog_session("unmatched", "/elsewhere"),
+        ];
+
+        let sessions = project_workspaces_with_catalog(&[first, second], Some(&catalog));
+        assert_eq!(sessions.len(), 2);
+        assert!(
+            sessions
+                .iter()
+                .all(|session| { session.external_session_id.as_deref() == Some("ambiguous") })
+        );
+    }
+
+    #[test]
+    fn catalog_merges_durable_identity_and_keeps_stable_id_and_durable_source() {
+        let durable = workspace("w1", &["a1"]);
+        let durable_only = project_workspaces(std::slice::from_ref(&durable));
+        let mut record = catalog_session("external", "/tmp/project");
+        record.created_at_ms = 1;
+        record.updated_at_ms = 100;
+
+        let merged = project_workspaces_with_catalog(&[durable], Some(&[record]));
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].id, durable_only[0].id);
+        assert_eq!(merged[0].description, durable_only[0].description);
+        assert_eq!(merged[0].state, AgentState::Working);
+        assert!(merged[0].state_is_current);
+        assert_eq!(merged[0].occurrences.len(), 1);
+        assert_eq!(merged[0].source_cwd, durable_only[0].source_cwd);
+        assert_eq!(merged[0].started_at_ms, durable_only[0].started_at_ms);
+        assert_eq!(merged[0].last_at_ms, durable_only[0].last_at_ms);
+    }
+
+    #[test]
+    fn catalog_directory_is_the_fallback_when_durable_source_is_missing() {
+        let mut durable = workspace("w1", &["a1"]);
+        durable.shells.clear();
+        durable.agents[0].cwd = None;
+        durable
+            .launchers
+            .push(boomux::protocol::WorkspaceLauncherSnapshot {
+                id: "launcher".into(),
+                workspace_id: "w1".into(),
+                name: "agent".into(),
+                command: vec!["opencode".into()],
+                cwd: "/tmp/project".into(),
+            });
+
+        let merged = project_workspaces_with_catalog(
+            &[durable],
+            Some(&[catalog_session("external", "/tmp/project")]),
+        );
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].occurrences.len(), 1);
+        assert!(merged[0].occurrences[0].source_cwd.is_none());
+        assert_eq!(
+            merged[0].source_cwd.as_deref(),
             Some(Path::new("/tmp/project"))
         );
     }
