@@ -157,8 +157,6 @@ when the selected shell, run ID, or output revision changes. Its viewport follow
 the tail by default and preserves the viewed rows when new output arrives while
 scrolled. The dashboard omits a contextual preview rather than rendering a
 partial panel when the full preview and a usable item table cannot both fit.
-As a presentation-only heuristic, a leading standalone `❯` or `>` prompt token
-is normalized to `$`; this does not claim semantic command boundaries.
 Command previews expose argv and run metadata without reading terminal output.
 Launcher previews never imply retained invocation state because launcher
 processes remain ephemeral.

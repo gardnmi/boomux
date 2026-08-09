@@ -2020,7 +2020,7 @@ struct TerminalViewport {
 fn terminal_output_lines(output: &str) -> Vec<String> {
     let mut lines: Vec<_> = output
         .lines()
-        .map(|line| normalize_shell_prompt_indicator(line.trim_end()))
+        .map(|line| line.trim_end().to_owned())
         .collect();
     let first = lines
         .iter()
@@ -2033,19 +2033,6 @@ fn terminal_output_lines(output: &str) -> Vec<String> {
     lines.drain(end..);
     lines.drain(..first);
     lines
-}
-
-fn normalize_shell_prompt_indicator(line: &str) -> String {
-    let content = line.trim_start();
-    let indentation = &line[..line.len() - content.len()];
-    for indicator in ["❯", ">"] {
-        if let Some(rest) = content.strip_prefix(indicator)
-            && rest.chars().next().is_none_or(char::is_whitespace)
-        {
-            return format!("{indentation}${rest}");
-        }
-    }
-    line.to_owned()
 }
 
 fn terminal_viewport(output: &str, height: usize, scroll_from_bottom: usize) -> TerminalViewport {
@@ -3943,24 +3930,6 @@ mod tests {
         let scrolled = terminal_viewport(output, 2, 2);
         assert_eq!(scrolled.lines, ["old", ""]);
         assert!(!scrolled.following);
-    }
-
-    #[test]
-    fn shell_preview_normalizes_only_leading_prompt_chevrons() {
-        assert_eq!(
-            normalize_shell_prompt_indicator("❯ cargo test"),
-            "$ cargo test"
-        );
-        assert_eq!(
-            normalize_shell_prompt_indicator("  > cargo test"),
-            "  $ cargo test"
-        );
-        assert_eq!(normalize_shell_prompt_indicator("❯"), "$");
-        assert_eq!(normalize_shell_prompt_indicator(">="), ">=");
-        assert_eq!(
-            normalize_shell_prompt_indicator("result > expected"),
-            "result > expected"
-        );
     }
 
     #[test]
