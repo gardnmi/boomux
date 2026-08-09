@@ -1855,19 +1855,22 @@ fn terminal_preview(app: &App, terminal: &TerminalView) -> Option<ContextualPrev
                 Style::new().fg(SUBTEXT),
             ))),
             Ok(output) => {
-                lines.push(Line::from(Span::styled(
-                    "Latest terminal output",
-                    Style::new().fg(BLUE).add_modifier(Modifier::BOLD),
-                )));
-                let output_lines: Vec<_> = output.lines().collect();
-                lines.extend(
-                    output_lines
-                        .iter()
-                        .rev()
-                        .take(3)
-                        .rev()
-                        .map(|line| Line::from(Span::raw((*line).to_owned()))),
-                );
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        "Terminal tail",
+                        Style::new().fg(BLUE).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!("  revision {}", preview.output_revision),
+                        Style::new().fg(SUBTEXT),
+                    ),
+                ]));
+                lines.extend(terminal_tail_lines(output, 5).into_iter().map(|line| {
+                    Line::from(vec![
+                        Span::styled("| ", Style::new().fg(OVERLAY)),
+                        Span::raw(line),
+                    ])
+                }));
             }
             Err(error) => lines.push(Line::from(Span::styled(
                 format!("Output unavailable: {error}"),
@@ -1877,13 +1880,34 @@ fn terminal_preview(app: &App, terminal: &TerminalView) -> Option<ContextualPrev
     }
     Some(ContextualPreview {
         title: if is_command {
-            " Command preview ".into()
+            format!(" Command preview: {} ", terminal.name)
         } else {
-            " Shell preview ".into()
+            format!(" Shell preview: {} ", terminal.name)
         },
         content_height: lines.len() as u16,
         content: PreviewContent::Lines(lines),
     })
+}
+
+fn terminal_tail_lines(output: &str, limit: usize) -> Vec<String> {
+    let mut lines: Vec<_> = output
+        .lines()
+        .map(|line| line.trim_end().to_owned())
+        .collect();
+    let first = lines
+        .iter()
+        .position(|line| !line.is_empty())
+        .unwrap_or(lines.len());
+    let end = lines
+        .iter()
+        .rposition(|line| !line.is_empty())
+        .map_or(first, |last| last + 1);
+    lines.drain(end..);
+    lines.drain(..first);
+    if lines.len() > limit {
+        lines.drain(..lines.len() - limit);
+    }
+    lines
 }
 
 fn format_argv(argv: &[String]) -> String {
@@ -3723,8 +3747,20 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect();
-        assert!(text.contains("Latest terminal output"));
+        assert!(text.contains("Terminal tail"));
+        assert!(text.contains("revision 5"));
         assert!(text.contains("latest"));
+    }
+
+    #[test]
+    fn terminal_tail_trims_edge_blanks_and_keeps_the_latest_rows() {
+        let output = "\nold\n\nrecent one  \nrecent two\n\n";
+
+        assert_eq!(
+            terminal_tail_lines(output, 3),
+            ["", "recent one", "recent two"]
+        );
+        assert!(terminal_tail_lines("\n \n", 5).is_empty());
     }
 
     #[test]

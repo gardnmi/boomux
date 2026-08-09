@@ -1059,7 +1059,7 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
                 let bytes = client
                     .read_shell(shell_id, READ_BYTES)
                     .map_err(|error| error.to_string())?;
-                Ok(recent_lines(&String::from_utf8_lossy(&bytes), 3))
+                Ok(recent_lines(&String::from_utf8_lossy(&bytes), 12))
             },
         },
     )?;
