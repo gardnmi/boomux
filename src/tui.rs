@@ -834,12 +834,14 @@ impl App {
             None
         } else {
             self.selected_item().and_then(|item| match item {
-                WorkspaceItemView::Shell(shell) => Some((
+                WorkspaceItemView::Shell(shell) if shell.command.is_empty() => Some((
                     shell.id.clone(),
                     shell.run.as_ref().map(|run| run.id.clone()),
                     shell.run.as_ref().map_or(0, |run| run.output_revision),
                 )),
-                WorkspaceItemView::AgentShell(_) | WorkspaceItemView::Launcher(_) => None,
+                WorkspaceItemView::Shell(_)
+                | WorkspaceItemView::AgentShell(_)
+                | WorkspaceItemView::Launcher(_) => None,
             })
         };
         let Some((shell_id, run_id, output_revision)) = selected else {
@@ -1938,7 +1940,7 @@ fn terminal_preview(app: &App, terminal: &TerminalView) -> Option<ContextualPrev
     if let Some(preview) = app
         .terminal_preview
         .as_ref()
-        .filter(|preview| preview.shell_id == terminal.id)
+        .filter(|preview| !is_command && preview.shell_id == terminal.id)
     {
         match &preview.output {
             Ok(output) if output.trim().is_empty() => lines.push(Line::from(vec![
@@ -3818,6 +3820,11 @@ mod tests {
         command.argv = vec!["printf".into(), "a b".into(), String::new()];
         let mut app = App::new(vec![workspace], project_context());
         app.select_tab(PrimaryTab::Commands);
+        let reads = std::cell::Cell::new(0);
+        app.refresh_terminal_preview(&mut |_| {
+            reads.set(reads.get() + 1);
+            Ok("command output".into())
+        });
 
         backend_terminal
             .draw(|frame| render(frame, &mut app))
@@ -3832,6 +3839,10 @@ mod tests {
 
         assert!(text.contains("Command: format"));
         assert!(text.contains("[\"printf\", \"a b\", \"\"]"));
+        assert!(!text.contains(" Output "));
+        assert!(!text.contains("pgup/dn"));
+        assert_eq!(reads.get(), 0);
+        assert!(app.terminal_preview.is_none());
     }
 
     #[test]

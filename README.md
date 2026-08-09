@@ -94,12 +94,13 @@ item actions. Counts are exclusive by visible presentation: an agent row is not
 also counted as a shell or command.
 
 The selected kind receives a read-only preview. Workspaces show retained Agent
-state and their highest-priority attention item. Shells and commands show run
-metadata plus a bounded terminal-output tail, fetched only when the selected
-shell's output revision changes. The output viewport retains its position while
-scrolled and follows new output again after `End`. Commands and launchers
-preserve argument boundaries in their previews. Launchers explicitly show that
-their detached output and invocation history are not retained.
+state and their highest-priority attention item. Shells show run metadata plus a
+bounded terminal-output viewport, fetched only when the selected shell's output
+revision changes. The viewport retains its position while scrolled and follows
+new output again after `End`. Commands show exact argv and run metadata without
+terminal output. Commands and launchers preserve argument boundaries in their
+previews. Launchers explicitly show that their detached output and invocation
+history are not retained.
 
 When an active Agent instance is bound to a shell's current run, that shell row
 morphs into an agent row instead of adding a duplicate item. It keeps the
