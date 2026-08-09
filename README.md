@@ -74,6 +74,8 @@ Dashboard controls:
 - In the primary Workspaces view, `h`, `l`, and the left/right arrows switch
   between the workspace and item tables.
 - `j`, `k`, and the arrow keys navigate.
+- `PageUp` and `PageDown` scroll a selected shell or command preview. `Home`
+  jumps to the oldest retained preview row and `End` resumes following output.
 - `Enter` restores a workspace, opens a shell, or invokes a launcher.
 - `a` creates an empty workspace or adds a shell, depending on the focused
   table in the Workspaces view. New dashboard shells start in the directory
@@ -92,11 +94,14 @@ item actions. Counts are exclusive by visible presentation: an agent row is not
 also counted as a shell or command.
 
 The selected kind receives a read-only preview. Workspaces show retained Agent
-state and their highest-priority attention item. Shells and commands show run
-metadata plus a bounded terminal-output tail, fetched only when the selected
-shell's output revision changes. Commands and launchers preserve argument
-boundaries in their previews. Launchers explicitly show that their detached
-output and invocation history are not retained.
+state and their highest-priority attention item. Shells show run metadata plus a
+bounded 16-row terminal-output viewport, fetched only when the selected shell's
+output revision changes. The viewport is hidden when it cannot fit without
+crowding the item table, retains its position while scrolled, and follows new
+output again after `End`. Commands show exact argv and run metadata without
+terminal output. Commands and launchers preserve argument boundaries in their
+previews. Launchers explicitly show that their detached output and invocation
+history are not retained.
 
 When an active Agent instance is bound to a shell's current run, that shell row
 morphs into an agent row instead of adding a duplicate item. It keeps the
@@ -523,9 +528,9 @@ See [`docs/live-pty-handoff.md`](docs/live-pty-handoff.md) for the handoff desig
 ## Development
 
 ```console
+cargo run
 cargo run -- .
 cargo run -- . --new
-cargo run -- ui
 cargo run -- doctor
 cargo test
 cargo clippy --all-targets -- -D warnings
