@@ -58,6 +58,7 @@ The following commands support `--json`:
 - `boomux integration status [opencode|pi]`
 - `boomux integration install <opencode|pi>`
 - `boomux integration install --all`
+- `boomux integration verify <opencode|pi>`
 - `boomux daemon status`
 
 JSON mutations are deliberately narrow: only `agent register`, `agent ensure`,
@@ -106,6 +107,9 @@ Command payloads are:
   `replaced`, or `unchanged` results, target paths, and whether a host restart is
   required. Each target is changed atomically; `--all` is not a transaction
   across hosts, but every target is preflighted before the first write.
+- `integration.verify`: `integration`, `verified`, exact `shell_id` and `run_id`,
+  plus the nonempty authoritative `agents` array. Failure uses typed
+  `not_found`, `ambiguous_target`, `run_changed`, or `timeout` errors.
 - `read`: shell/run identity, observed output revision, and rendered output.
 - `events`: stream identity, reconnect cursor, optional baseline snapshot, and a
   bounded event array.

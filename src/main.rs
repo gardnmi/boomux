@@ -69,6 +69,7 @@ const JSON_COMMANDS: &[&str] = &[
     "integration.list",
     "integration.status",
     "integration.install",
+    "integration.verify",
     "session.list",
     "session.inspect",
     "session.read",
@@ -584,6 +585,15 @@ enum IntegrationCommands {
         #[arg(long)]
         force: bool,
     },
+    /// Verify authoritative lifecycle reporting in a running host shell
+    Verify {
+        #[arg(value_enum)]
+        integration: integration_management::IntegrationId,
+        #[arg(long, value_name = "ID")]
+        shell: Option<String>,
+        #[arg(long, default_value_t = 30_000)]
+        wait_ms: u32,
+    },
 }
 
 #[derive(Subcommand)]
@@ -859,6 +869,9 @@ fn command_name(cli: &Cli) -> &'static str {
         Some(Commands::Integration {
             command: IntegrationCommands::Install { .. },
         }) => "integration.install",
+        Some(Commands::Integration {
+            command: IntegrationCommands::Verify { .. },
+        }) => "integration.verify",
         Some(Commands::Daemon {
             command: DaemonCommands::Status,
         }) => "daemon.status",
@@ -912,6 +925,7 @@ fn supports_json(cli: &Cli) -> bool {
             command: IntegrationCommands::List
                 | IntegrationCommands::Status { .. }
                 | IntegrationCommands::Install { .. }
+                | IntegrationCommands::Verify { .. }
         })
     )
 }
@@ -1613,7 +1627,165 @@ fn integration_command(command: IntegrationCommands, json: bool) -> Result<(), B
             };
             install_integrations(&integrations, force, json)
         }
+        IntegrationCommands::Verify {
+            integration,
+            shell,
+            wait_ms,
+        } => verify_integration(integration, shell.as_deref(), wait_ms, json),
     }
+}
+
+fn verify_integration(
+    integration: integration_management::IntegrationId,
+    shell_id: Option<&str>,
+    wait_ms: u32,
+    json: bool,
+) -> Result<(), Box<dyn Error>> {
+    let client = client::connect().map_err(|error| {
+        cli_output::failure(
+            "daemon_unavailable",
+            format!("cannot verify integration without the daemon: {error}"),
+        )
+    })?;
+    let baseline = client.events(None, 1, 0)?;
+    let snapshot = baseline
+        .snapshot
+        .ok_or_else(|| io::Error::other("event baseline omitted its snapshot"))?;
+    let targets = integration_management::verification_targets(&snapshot, integration, shell_id);
+    let spec = integration.spec();
+    let target = match targets.as_slice() {
+        [target] => target.clone(),
+        [] if shell_id.is_some() => {
+            return Err(cli_output::failure(
+                "not_found",
+                format!(
+                    "shell {} is not a running {} host shell",
+                    shell_id.expect("checked above"),
+                    spec.name
+                ),
+            ));
+        }
+        [] => {
+            return Err(cli_output::failure(
+                "not_found",
+                format!("no running {} host shell found", spec.name),
+            ));
+        }
+        _ => {
+            return Err(cli_output::failure(
+                "ambiguous_target",
+                format_ambiguous_verification_targets(&snapshot, integration, &targets),
+            ));
+        }
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(u64::from(wait_ms));
+    let mut cursor = baseline.cursor;
+    let mut snapshot = snapshot;
+    loop {
+        match integration_management::check_verification_target(&snapshot, integration, &target) {
+            integration_management::VerificationCheck::Verified {
+                workspace_name,
+                agents,
+            } => {
+                if json {
+                    let agents = agents
+                        .iter()
+                        .map(|agent| cli_output::agent(agent, Some(&workspace_name)))
+                        .collect::<Vec<_>>();
+                    return cli_output::print(
+                        "integration.verify",
+                        serde_json::json!({
+                            "integration": spec.name,
+                            "verified": true,
+                            "shell_id": target.shell_id,
+                            "run_id": target.run_id,
+                            "agents": agents,
+                        }),
+                    );
+                }
+                println!("Verified {} lifecycle reporting", spec.display_name);
+                println!("  {:<12}{}", "Shell", target.shell_id);
+                println!("  {:<12}{}", "Run", target.run_id);
+                println!("  {:<12}{}", "Agents", agents.len());
+                return Ok(());
+            }
+            integration_management::VerificationCheck::Missing => {
+                return Err(cli_output::failure(
+                    "not_found",
+                    format!(
+                        "shell {} is no longer a running {} host shell",
+                        target.shell_id, spec.name
+                    ),
+                ));
+            }
+            integration_management::VerificationCheck::RunChanged => {
+                return Err(cli_output::failure(
+                    "run_changed",
+                    format!("shell {} started a different run", target.shell_id),
+                ));
+            }
+            integration_management::VerificationCheck::Pending => {}
+        }
+        let now = std::time::Instant::now();
+        if wait_ms == 0 || now >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "did not observe lifecycle integration reporting for {} in shell {} within {} ms",
+                    spec.name, target.shell_id, wait_ms
+                ),
+            )
+            .into());
+        }
+        let remaining = deadline.saturating_duration_since(now).as_millis();
+        let chunk_ms = u32::try_from(remaining.min(30_000))
+            .unwrap_or(30_000)
+            .max(1);
+        let batch = client.events(Some(cursor), 1, chunk_ms)?;
+        cursor = batch.cursor;
+        snapshot = client.snapshot()?;
+    }
+}
+
+fn format_ambiguous_verification_targets(
+    snapshot: &Snapshot,
+    integration: integration_management::IntegrationId,
+    targets: &[integration_management::VerificationTarget],
+) -> String {
+    let spec = integration.spec();
+    let mut choices = targets
+        .iter()
+        .filter_map(|target| {
+            snapshot.workspaces.iter().find_map(|workspace| {
+                workspace
+                    .shells
+                    .iter()
+                    .find(|shell| shell.id == target.shell_id)
+                    .map(|shell| {
+                        (
+                            workspace.name.as_str(),
+                            shell.name.as_str(),
+                            target.shell_id.as_str(),
+                        )
+                    })
+            })
+        })
+        .collect::<Vec<_>>();
+    choices.sort_unstable();
+
+    let mut output = format!(
+        "multiple running {} host shells found\n\nChoose a shell:",
+        spec.display_name
+    );
+    for (workspace, shell, shell_id) in choices {
+        write!(
+            output,
+            "\n  {workspace} / {shell}\n    boomux integration verify {} --shell {shell_id}",
+            spec.name
+        )
+        .expect("writing to a string cannot fail");
+    }
+    output
 }
 
 fn list_integrations(json: bool) -> Result<(), Box<dyn Error>> {
@@ -5145,6 +5317,67 @@ mod tests {
         assert!(Cli::try_parse_from(["boomux", "integration", "install", "--all"]).is_ok());
         assert!(Cli::try_parse_from(["boomux", "integration", "install"]).is_err());
         assert!(Cli::try_parse_from(["boomux", "integration", "install", "pi", "--all",]).is_err());
+
+        let verify = Cli::try_parse_from([
+            "boomux",
+            "integration",
+            "verify",
+            "opencode",
+            "--shell",
+            "s1",
+            "--wait-ms",
+            "0",
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            verify.command,
+            Some(Commands::Integration {
+                command: IntegrationCommands::Verify {
+                    integration: integration_management::IntegrationId::Opencode,
+                    shell: Some(ref shell),
+                    wait_ms: 0,
+                }
+            }) if shell == "s1"
+        ));
+        assert_eq!(command_name(&verify), "integration.verify");
+        assert!(supports_json(&verify));
+    }
+
+    #[test]
+    fn ambiguous_verification_lists_named_shell_commands() {
+        let snapshot = Snapshot {
+            workspaces: vec![
+                workspace("w2", "Zeta", vec![shell("s2", "w2", "backend")]),
+                workspace("w1", "Alpha", vec![shell("s1", "w1", "frontend")]),
+            ],
+        };
+        let targets = vec![
+            integration_management::VerificationTarget {
+                shell_id: "s2".into(),
+                run_id: "r2".into(),
+            },
+            integration_management::VerificationTarget {
+                shell_id: "s1".into(),
+                run_id: "r1".into(),
+            },
+        ];
+
+        assert_eq!(
+            format_ambiguous_verification_targets(
+                &snapshot,
+                integration_management::IntegrationId::Opencode,
+                &targets,
+            ),
+            concat!(
+                "multiple running OpenCode host shells found\n\n",
+                "Choose a shell:\n",
+                "  Alpha / frontend\n",
+                "    boomux integration verify opencode --shell s1\n",
+                "  Zeta / backend\n",
+                "    boomux integration verify opencode --shell s2",
+            )
+        );
     }
 
     #[test]
@@ -5307,6 +5540,7 @@ mod tests {
             "integration.list",
             "integration.status",
             "integration.install",
+            "integration.verify",
         ] {
             assert!(JSON_COMMANDS.contains(&command));
         }

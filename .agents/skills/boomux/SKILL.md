@@ -66,6 +66,8 @@ the user explicitly asks. With that authorization, use `boomux integration
 install opencode --json`, `boomux integration install pi --json`, or
 `boomux integration install --all --json`; add `--force` only when the user also
 authorizes replacing a modified asset.
+After the user restarts a host, verify authoritative reporting with `boomux
+integration verify opencode --json` or `boomux integration verify pi --json`.
 
 Use `boomux events --json` for an immediate snapshot and cursor. Poll again with
 `--after CURSOR --wait-ms 30000` to observe later transitions. If
