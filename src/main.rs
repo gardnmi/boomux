@@ -69,6 +69,7 @@ const JSON_COMMANDS: &[&str] = &[
     "integration.list",
     "integration.status",
     "integration.install",
+    "integration.uninstall",
     "integration.verify",
     "session.list",
     "session.inspect",
@@ -587,6 +588,15 @@ enum IntegrationCommands {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Remove one integration or every bundled integration
+    Uninstall {
+        #[arg(value_enum, required_unless_present = "all", conflicts_with = "all")]
+        integration: Option<integration_management::IntegrationId>,
+        #[arg(long, conflicts_with = "integration")]
+        all: bool,
+        #[arg(long)]
+        force: bool,
+    },
     /// Verify authoritative lifecycle reporting in a running host shell
     Verify {
         #[arg(value_enum)]
@@ -872,6 +882,9 @@ fn command_name(cli: &Cli) -> &'static str {
             command: IntegrationCommands::Install { .. },
         }) => "integration.install",
         Some(Commands::Integration {
+            command: IntegrationCommands::Uninstall { .. },
+        }) => "integration.uninstall",
+        Some(Commands::Integration {
             command: IntegrationCommands::Verify { .. },
         }) => "integration.verify",
         Some(Commands::Daemon {
@@ -927,6 +940,7 @@ fn supports_json(cli: &Cli) -> bool {
             command: IntegrationCommands::List
                 | IntegrationCommands::Status { .. }
                 | IntegrationCommands::Install { .. }
+                | IntegrationCommands::Uninstall { .. }
                 | IntegrationCommands::Verify { .. }
         })
     )
@@ -1630,6 +1644,23 @@ fn integration_command(command: IntegrationCommands, json: bool) -> Result<(), B
             };
             install_integrations(&integrations, force, dry_run, json)
         }
+        IntegrationCommands::Uninstall {
+            integration,
+            all,
+            force,
+        } => {
+            let integrations = if all {
+                integration_management::IntegrationId::ALL.to_vec()
+            } else {
+                vec![integration.ok_or_else(|| {
+                    cli_output::failure(
+                        "invalid_argument",
+                        "integration uninstall requires a name or --all",
+                    )
+                })?]
+            };
+            uninstall_integrations(&integrations, force, json)
+        }
         IntegrationCommands::Verify {
             integration,
             shell,
@@ -2025,6 +2056,45 @@ fn print_integration_install_results(results: &[integration_management::InstallR
             println!("{}", spec.reload_message);
         }
     }
+}
+
+fn uninstall_integrations(
+    integrations: &[integration_management::IntegrationId],
+    force: bool,
+    json: bool,
+) -> Result<(), Box<dyn Error>> {
+    let environment = integration_management::Environment::from_process();
+    for integration in integrations {
+        integration_management::preflight_uninstall(*integration, &environment, force)?;
+    }
+    let results = integrations
+        .iter()
+        .copied()
+        .map(|integration| integration_management::uninstall(integration, &environment, force))
+        .collect::<Result<Vec<_>, _>>()?;
+    if json {
+        return cli_output::print(
+            "integration.uninstall",
+            serde_json::json!({ "integrations": results }),
+        );
+    }
+    for result in &results {
+        let spec = result.integration.spec();
+        match result.result {
+            integration_management::UninstallOutcome::Removed => println!(
+                "Removed Boomux {} {} from {}",
+                spec.display_name, spec.asset_name, result.path
+            ),
+            integration_management::UninstallOutcome::NotInstalled => println!(
+                "Boomux {} {} is not installed at {}",
+                spec.display_name, spec.asset_name, result.path
+            ),
+        }
+        if result.restart_required {
+            println!("{}", spec.reload_message);
+        }
+    }
+    Ok(())
 }
 
 fn capabilities(json: bool) -> Result<(), Box<dyn Error>> {
@@ -5375,6 +5445,28 @@ mod tests {
         ));
         assert!(supports_json(&preview));
 
+        let uninstall = Cli::try_parse_from([
+            "boomux",
+            "integration",
+            "uninstall",
+            "opencode",
+            "--force",
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            uninstall.command,
+            Some(Commands::Integration {
+                command: IntegrationCommands::Uninstall {
+                    integration: Some(integration_management::IntegrationId::Opencode),
+                    all: false,
+                    force: true,
+                }
+            })
+        ));
+        assert_eq!(command_name(&uninstall), "integration.uninstall");
+        assert!(supports_json(&uninstall));
+
         assert!(Cli::try_parse_from(["boomux", "integration", "install", "--all"]).is_ok());
         assert!(Cli::try_parse_from(["boomux", "integration", "install"]).is_err());
         assert!(Cli::try_parse_from(["boomux", "integration", "install", "pi", "--all",]).is_err());
@@ -5601,6 +5693,7 @@ mod tests {
             "integration.list",
             "integration.status",
             "integration.install",
+            "integration.uninstall",
             "integration.verify",
         ] {
             assert!(JSON_COMMANDS.contains(&command));
