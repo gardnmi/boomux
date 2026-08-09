@@ -151,6 +151,12 @@ durable shell model. Command rows show the stored argv in their detail column.
 Agent presentation takes precedence when the current run has an active Agent or
 an exact `opencode` or `pi` foreground hint.
 
+Selected-kind previews remain read-only. Workspace, launcher, and run metadata
+come from the polled snapshot. Shell and command output uses a bounded plain-text
+read only when the selected shell, run ID, or output revision changes. Launcher
+previews never imply retained invocation state because launcher processes remain
+ephemeral.
+
 Agent sessions are a client-side projection, not a sixth durable daemon
 identity. The projection groups stored Agent instances by workspace,
 integration, and external session ID, while isolating instances without an
@@ -162,8 +168,9 @@ consumers. Bounded OpenCode root-session catalogs add historical, `unknown`
 sessions without fabricating Agent occurrences and merge with a later durable
 registration under the same stable ID. Catalog records associate to each
 workspace that references their exact normalized directory. The dashboard maps
-retained shells to openable run views and discovers catalogs asynchronously;
-session CLI listing performs the same bounded discovery synchronously.
+the active or latest exact match into a durable Agent's contextual preview and
+discovers catalogs asynchronously; session CLI listing performs the same bounded
+discovery synchronously. Sessions are not a dashboard kind.
 Title enrichment has its own adapter registry. The shared layer owns asynchronous
 cache, refresh, deduplication, sanitization, and fallback policy; OpenCode and Pi
 modules own host command execution and title extraction. Neutral host source

@@ -1055,6 +1055,12 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
                 enrich_session_titles(&mut views, &mut title_cache);
                 Ok(views)
             },
+            on_terminal_preview: |shell_id: &str| {
+                let bytes = client
+                    .read_shell(shell_id, READ_BYTES)
+                    .map_err(|error| error.to_string())?;
+                Ok(recent_lines(&String::from_utf8_lossy(&bytes), 3))
+            },
         },
     )?;
     Ok(())
@@ -1111,6 +1117,18 @@ fn dashboard_views_from_sessions(
                     .filter(|session| session.workspace_id == workspace.id),
             );
             let agent_summary = agent_attention_projection::summarize_workspace(workspace);
+            let attention =
+                agent_attention_projection::project_attention(std::slice::from_ref(workspace))
+                    .into_iter()
+                    .next()
+                    .map(|item| tui::WorkspaceAttentionView {
+                        agent_name: item.agent.name,
+                        reason: agent_attention_projection::attention_reason(item.attention.reason)
+                            .into(),
+                        evidence: item.attention.observation.evidence,
+                        observed_at_ms: item.attention.observation.observed_at_ms,
+                        observation_is_current: item.observation_is_current,
+                    });
             let shells = workspace.shells.iter().map(|shell| {
                 let git = git_cache.inspect(&shell.cwd);
                 let shell_view = tui::TerminalView {
@@ -1120,6 +1138,15 @@ fn dashboard_views_from_sessions(
                     directory: shell.cwd.display().to_string(),
                     branch: git.branch,
                     command: shell.command.join(" "),
+                    argv: shell.command.clone(),
+                    run: shell.run.as_ref().map(|run| tui::TerminalRunView {
+                        id: run.id.clone(),
+                        generation: run.generation,
+                        started_at_ms: run.started_at_ms,
+                        ended_at_ms: run.ended_at_ms,
+                        exit_reason: run.exit_reason.as_ref().map(shell_exit_reason),
+                        output_revision: run.output_revision,
+                    }),
                 };
                 let agent = matches!(shell.status, ShellStatus::Running)
                     .then(|| {
@@ -1188,6 +1215,7 @@ fn dashboard_views_from_sessions(
                     name: launcher.name.clone(),
                     directory: launcher.cwd.display().to_string(),
                     command: launcher.command.join(" "),
+                    argv: launcher.command.clone(),
                 })
             });
             tui::WorkspaceView {
@@ -1197,6 +1225,7 @@ fn dashboard_views_from_sessions(
                 sessions,
                 agent_state_counts: agent_summary.states,
                 attention_count: agent_summary.attention_count,
+                attention,
             }
         })
         .collect()
@@ -1212,10 +1241,6 @@ fn workspace_session_views<'a>(
                 .occurrences
                 .iter()
                 .map(|occurrence| tui::AgentSessionRunView {
-                    shell_id: occurrence
-                        .retained_shell_name
-                        .as_ref()
-                        .map(|_| occurrence.shell_id.clone()),
                     shell_name: occurrence.retained_shell_name.clone(),
                     directory: occurrence.source_cwd.clone(),
                 })
@@ -4339,8 +4364,6 @@ mod tests {
         assert_eq!(session.state, "blocked");
         assert!(session.state_is_current);
         assert_eq!(session.runs.len(), 2);
-        assert_eq!(session.runs[0].shell_id.as_deref(), Some("s1"));
-        assert_eq!(session.runs[1].shell_id.as_deref(), Some("s2"));
         assert_eq!(session.runs[0].shell_name.as_deref(), Some("build"));
         assert_eq!(session.runs[1].shell_name.as_deref(), Some("review"));
         assert_eq!(
@@ -4373,6 +4396,7 @@ mod tests {
             items: Vec::new(),
             agent_state_counts: agent_attention_projection::AgentStateCounts::default(),
             attention_count: 0,
+            attention: None,
             sessions: vec![tui::AgentSessionView {
                 id: "session".into(),
                 label: "opencode".into(),
@@ -4384,12 +4408,10 @@ mod tests {
                 source_cwd: Some("/tmp/project".into()),
                 runs: vec![
                     tui::AgentSessionRunView {
-                        shell_id: Some("old-shell-id".into()),
                         shell_name: Some("old-shell".into()),
                         directory: Some("/tmp/project".into()),
                     },
                     tui::AgentSessionRunView {
-                        shell_id: None,
                         shell_name: None,
                         directory: None,
                     },
@@ -4544,6 +4566,7 @@ mod tests {
         };
         assert_eq!(launcher.name, "editor");
         assert_eq!(launcher.command, "zeditor .");
+        assert_eq!(launcher.argv, ["zeditor", "."]);
         assert_eq!(launcher.directory, "/tmp/project");
     }
 
@@ -4560,6 +4583,10 @@ mod tests {
         };
         assert_eq!(command.name, "clock");
         assert_eq!(command.command, "watch -n 1 date");
+        assert_eq!(command.argv, ["watch", "-n", "1", "date"]);
+        let run = command.run.as_ref().expect("current run metadata");
+        assert_eq!(run.id, "r1");
+        assert_eq!(run.generation, 1);
     }
 
     #[test]

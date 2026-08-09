@@ -1,9 +1,5 @@
 # Boomux
 
-<p align="center">
-  <img src="assets/dashboard-workspaces.png" alt="Boomux workspace dashboard with global agent, session, launcher, shell, and command views" width="100%">
-</p>
-
 > [!WARNING]
 > Boomux is an early proof of concept. Commands, storage, and session behavior
 > may change without migration support.
@@ -73,13 +69,12 @@ boomux ui
 
 Dashboard controls:
 
-- `Tab` and `Shift-Tab` cycle the Workspaces, Agents, Sessions, Launchers,
-  Shells, and Commands views. Number keys `1` through `6` select them directly.
+- `Tab` and `Shift-Tab` cycle the Workspaces, Agents, Launchers, Shells, and
+  Commands views. Number keys `1` through `5` select them directly.
 - In the primary Workspaces view, `h`, `l`, and the left/right arrows switch
   between the workspace and item tables.
 - `j`, `k`, and the arrow keys navigate.
-- `Enter` restores a workspace, opens a shell, invokes a launcher, or opens the
-  newest still-existing shell associated with a selected session.
+- `Enter` restores a workspace, opens a shell, or invokes a launcher.
 - `a` creates an empty workspace or adds a shell, depending on the focused
   table in the Workspaces view. New dashboard shells start in the directory
   where the dashboard was launched.
@@ -95,6 +90,13 @@ configured launchers in a `KIND` column. The secondary `ALL:` views aggregate
 each kind across every workspace while retaining the owning workspace and exact
 item actions. Counts are exclusive by visible presentation: an agent row is not
 also counted as a shell or command.
+
+The selected kind receives a read-only preview. Workspaces show retained Agent
+state and their highest-priority attention item. Shells and commands show run
+metadata plus a bounded terminal-output tail, fetched only when the selected
+shell's output revision changes. Commands and launchers preserve argument
+boundaries in their previews. Launchers explicitly show that their detached
+output and invocation history are not retained.
 
 When an active Agent instance is bound to a shell's current run, that shell row
 morphs into an agent row instead of adding a duplicate item. It keeps the
