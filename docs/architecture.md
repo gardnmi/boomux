@@ -314,14 +314,14 @@ heuristics instead of making convenient setup silently weaken session semantics.
 Process adapters and any future screen detectors remain explicitly lower
 authority and cannot substitute for integration evidence.
 
-The resulting installation cost must be handled as a product workflow rather
-than left as manual plugin-file management. A future unified setup command will
-discover supported installed harnesses, describe the access and guarantees each
-integration provides, preview configuration changes, require consent, install
-or update atomically, identify required harness reloads, and verify canonical
-identity and lifecycle reports against a managed shell run. The same workflow
-will expose status, validated host versions, actionable diagnostics, repair, and
-uninstall. Individual host installers remain the underlying safe primitives.
+The resulting installation cost is handled as a product workflow rather than
+left as manual plugin-file management. The unified `integration` commands list
+bundled harnesses, inspect host versions, assets, and current-run lifecycle
+reporting, and install one or all assets with each write atomic and accompanied
+by reload guidance.
+Individual host installers remain equivalent shortcuts over the same registry
+and safe primitives. Guided consent, end-to-end verification, and uninstall
+remain future workflow additions.
 
 Observed host compatibility and provider-dependent gaps are recorded in
 [`lifecycle-validation.md`](lifecycle-validation.md). Focused unit fixtures
