@@ -20,8 +20,12 @@ impl TitleAdapter for OpenCodeAdapter {
         "opencode"
     }
 
-    fn inspect(&self, directory: &Path) -> Option<super::Titles> {
-        inspect_catalog(directory).map(|inspection| inspection.titles)
+    fn inspect(&self, directory: &Path) -> Option<Inspection> {
+        inspect_catalog(directory)
+    }
+
+    fn provides_catalog(&self) -> bool {
+        true
     }
 }
 

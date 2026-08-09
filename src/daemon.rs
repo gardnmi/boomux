@@ -594,17 +594,6 @@ fn select_replacement_executable(current: PathBuf, argument_zero: Option<PathBuf
     current
 }
 
-fn request_requires_protocol_twelve(request: &Request) -> bool {
-    matches!(
-        request,
-        Request::RegisterAgent { spec, .. } | Request::EnsureAgent { spec, .. }
-            if spec.report.state == AgentState::Inactive
-    ) || matches!(
-        request,
-        Request::ReportAgent { report, .. } if report.state == AgentState::Inactive
-    )
-}
-
 fn handle_connection(
     mut stream: UnixStream,
     registry: Arc<Registry>,
@@ -630,129 +619,14 @@ fn handle_connection(
         );
     }
     let response_version = request.version;
-    if response_version < 7
-        && matches!(
-            request.message,
-            Request::ReadShellAt { .. } | Request::Events { .. }
-        )
-    {
+    let minimum_version = request.message.minimum_protocol_version();
+    if response_version < minimum_version {
         return send_response(
             &mut stream,
             response_version,
             error_response(
                 ErrorCode::UnsupportedVersion,
-                "request requires daemon protocol 7",
-            ),
-        );
-    }
-    if response_version < 8
-        && matches!(
-            request.message,
-            Request::GetLauncher { .. }
-                | Request::CreateLauncher { .. }
-                | Request::RenameLauncher { .. }
-                | Request::RemoveLauncher { .. }
-        )
-    {
-        return send_response(
-            &mut stream,
-            response_version,
-            error_response(
-                ErrorCode::UnsupportedVersion,
-                "request requires daemon protocol 8",
-            ),
-        );
-    }
-    if response_version < 9
-        && matches!(
-            request.message,
-            Request::GetAgent { .. } | Request::RegisterAgent { .. } | Request::ReportAgent { .. }
-        )
-    {
-        return send_response(
-            &mut stream,
-            response_version,
-            error_response(
-                ErrorCode::UnsupportedVersion,
-                "request requires daemon protocol 9",
-            ),
-        );
-    }
-    if response_version < 10 && matches!(request.message, Request::EnsureAgent { .. }) {
-        return send_response(
-            &mut stream,
-            response_version,
-            error_response(
-                ErrorCode::UnsupportedVersion,
-                "request requires daemon protocol 10",
-            ),
-        );
-    }
-    if response_version < 11
-        && matches!(
-            request.message,
-            Request::RestartShell { .. }
-                | Request::Attach {
-                    restart_exited: true,
-                    ..
-                }
-        )
-    {
-        return send_response(
-            &mut stream,
-            response_version,
-            error_response(
-                ErrorCode::UnsupportedVersion,
-                "request requires daemon protocol 11",
-            ),
-        );
-    }
-    if response_version < 12 && request_requires_protocol_twelve(&request.message) {
-        return send_response(
-            &mut stream,
-            response_version,
-            error_response(
-                ErrorCode::UnsupportedVersion,
-                "inactive agent state requires daemon protocol 12",
-            ),
-        );
-    }
-    if response_version < 14 && matches!(request.message, Request::WaitAgent { .. }) {
-        return send_response(
-            &mut stream,
-            response_version,
-            error_response(
-                ErrorCode::UnsupportedVersion,
-                "agent wait requires daemon protocol 14",
-            ),
-        );
-    }
-    if response_version < 15 && matches!(request.message, Request::AcknowledgeAgentAttention { .. })
-    {
-        return send_response(
-            &mut stream,
-            response_version,
-            error_response(
-                ErrorCode::UnsupportedVersion,
-                "agent attention acknowledgment requires daemon protocol 15",
-            ),
-        );
-    }
-    if response_version < 16
-        && matches!(
-            request.message,
-            Request::Attach {
-                environment: Some(_),
-                ..
-            }
-        )
-    {
-        return send_response(
-            &mut stream,
-            response_version,
-            error_response(
-                ErrorCode::UnsupportedVersion,
-                "client environment requires daemon protocol 16",
+                unsupported_request_message(&request.message, minimum_version),
             ),
         );
     }
@@ -863,6 +737,28 @@ fn handle_connection(
         response_version,
         response_for_version(response, response_version),
     )
+}
+
+fn unsupported_request_message(request: &Request, minimum_version: u32) -> String {
+    match request {
+        Request::RegisterAgent { spec, .. } | Request::EnsureAgent { spec, .. }
+            if spec.report.state == AgentState::Inactive =>
+        {
+            "inactive agent state requires daemon protocol 12".into()
+        }
+        Request::ReportAgent { report, .. } if report.state == AgentState::Inactive => {
+            "inactive agent state requires daemon protocol 12".into()
+        }
+        Request::WaitAgent { .. } => "agent wait requires daemon protocol 14".into(),
+        Request::AcknowledgeAgentAttention { .. } => {
+            "agent attention acknowledgment requires daemon protocol 15".into()
+        }
+        Request::Attach {
+            environment: Some(_),
+            ..
+        } => "client environment requires daemon protocol 16".into(),
+        _ => format!("request requires daemon protocol {minimum_version}"),
+    }
 }
 
 fn response_for_version(response: Response, version: u32) -> Response {
@@ -7102,30 +6998,6 @@ mod tests {
         assert_eq!(filtered_cursor, cursor);
         assert!(events.is_empty());
         assert!(snapshot.workspaces[0].agents[0].attention.is_none());
-    }
-
-    #[test]
-    fn inactive_agent_mutations_require_protocol_twelve() {
-        assert!(request_requires_protocol_twelve(&Request::EnsureAgent {
-            shell_id: "s1".into(),
-            run_id: "r1".into(),
-            spec: agent_spec(AgentState::Inactive),
-        }));
-        assert!(request_requires_protocol_twelve(&Request::RegisterAgent {
-            shell_id: "s1".into(),
-            run_id: "r1".into(),
-            spec: agent_spec(AgentState::Inactive),
-        }));
-        assert!(request_requires_protocol_twelve(&Request::ReportAgent {
-            agent_id: "a1".into(),
-            run_id: "r1".into(),
-            report: agent_spec(AgentState::Inactive).report,
-        }));
-        assert!(!request_requires_protocol_twelve(&Request::EnsureAgent {
-            shell_id: "s1".into(),
-            run_id: "r1".into(),
-            spec: agent_spec(AgentState::Idle),
-        }));
     }
 
     #[test]

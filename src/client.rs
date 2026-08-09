@@ -191,10 +191,10 @@ impl Client {
 
     fn send(&self, request: Request) -> io::Result<(UnixStream, Response)> {
         let mut version = self.protocol_version.load(Ordering::Acquire);
-        if version < request_minimum_version(&request) {
+        if version < request.minimum_protocol_version() {
             self.probe_latest()?;
             version = self.protocol_version.load(Ordering::Acquire);
-            if version < request_minimum_version(&request) {
+            if version < request.minimum_protocol_version() {
                 return Err(remote_error(
                     ErrorCode::UnsupportedVersion,
                     "daemon does not support this request",
@@ -207,7 +207,7 @@ impl Client {
             {
                 self.probe_latest()?;
                 let negotiated = self.protocol_version.load(Ordering::Acquire);
-                if negotiated < request_minimum_version(&request) {
+                if negotiated < request.minimum_protocol_version() {
                     return Err(remote_error(
                         ErrorCode::UnsupportedVersion,
                         "daemon does not support this request",
@@ -450,17 +450,18 @@ impl Client {
         after_revision: u64,
         wait_ms: u32,
     ) -> io::Result<AgentWait> {
-        if self.protocol_version()? < 14 {
+        let request = Request::WaitAgent {
+            agent_id: agent_id.into(),
+            after_revision,
+            wait_ms,
+        };
+        if self.protocol_version()? < request.minimum_protocol_version() {
             return Err(remote_error(
                 ErrorCode::UnsupportedVersion,
                 "daemon does not support Agent wait",
             ));
         }
-        match self.request(Request::WaitAgent {
-            agent_id: agent_id.into(),
-            after_revision,
-            wait_ms,
-        })? {
+        match self.request(request)? {
             Response::AgentWait { agent, changed } => Ok(AgentWait { agent, changed }),
             other => unexpected(other),
         }
@@ -718,36 +719,6 @@ fn current_environment() -> UnixEnvironment {
     }
 }
 
-fn request_minimum_version(request: &Request) -> u32 {
-    match request {
-        Request::Attach {
-            environment: Some(_),
-            ..
-        } => 16,
-        Request::AcknowledgeAgentAttention { .. } => 15,
-        Request::WaitAgent { .. } => 14,
-        Request::RegisterAgent { spec, .. } | Request::EnsureAgent { spec, .. }
-            if spec.report.state == protocol::AgentState::Inactive =>
-        {
-            12
-        }
-        Request::ReportAgent { report, .. } if report.state == protocol::AgentState::Inactive => 12,
-        Request::GetLauncher { .. }
-        | Request::CreateLauncher { .. }
-        | Request::RenameLauncher { .. }
-        | Request::RemoveLauncher { .. } => 8,
-        Request::GetAgent { .. } | Request::RegisterAgent { .. } | Request::ReportAgent { .. } => 9,
-        Request::EnsureAgent { .. } => 10,
-        Request::RestartShell { .. }
-        | Request::Attach {
-            restart_exited: true,
-            ..
-        } => 11,
-        Request::ReadShellAt { .. } | Request::Events { .. } => 7,
-        _ => protocol::MIN_PROTOCOL_VERSION,
-    }
-}
-
 fn remote_code(error: &io::Error) -> Option<ErrorCode> {
     error
         .get_ref()
@@ -844,113 +815,6 @@ mod tests {
     }
 
     #[test]
-    fn launcher_requests_require_protocol_eight() {
-        let requests = [
-            Request::GetLauncher {
-                launcher_id: "l1".into(),
-            },
-            Request::CreateLauncher {
-                workspace_id: "w1".into(),
-                spec: WorkspaceLauncherSpec {
-                    name: "editor".into(),
-                    command: vec!["editor".into()],
-                    cwd: "/tmp".into(),
-                },
-            },
-            Request::RenameLauncher {
-                launcher_id: "l1".into(),
-                name: "renamed".into(),
-            },
-            Request::RemoveLauncher {
-                launcher_id: "l1".into(),
-            },
-        ];
-
-        for request in requests {
-            assert_eq!(request_minimum_version(&request), 8);
-        }
-    }
-
-    #[test]
-    fn agent_requests_require_protocol_nine() {
-        let report = AgentReport {
-            state: protocol::AgentState::Idle,
-            authority: protocol::AgentAuthority::TerminalHeuristic,
-            evidence: "prompt visible".into(),
-            confidence: 70,
-        };
-        let requests = [
-            Request::GetAgent {
-                agent_id: "a1".into(),
-            },
-            Request::RegisterAgent {
-                shell_id: "s1".into(),
-                run_id: "r1".into(),
-                spec: AgentRegistrationSpec {
-                    name: "agent".into(),
-                    integration: "test".into(),
-                    external_session_id: None,
-                    report: report.clone(),
-                },
-            },
-            Request::ReportAgent {
-                agent_id: "a1".into(),
-                run_id: "r1".into(),
-                report,
-            },
-        ];
-
-        for request in requests {
-            assert_eq!(request_minimum_version(&request), 9);
-        }
-    }
-
-    #[test]
-    fn ensure_agent_requires_protocol_ten() {
-        assert_eq!(
-            request_minimum_version(&Request::EnsureAgent {
-                shell_id: "s1".into(),
-                run_id: "r1".into(),
-                spec: AgentRegistrationSpec {
-                    name: "agent".into(),
-                    integration: "test".into(),
-                    external_session_id: Some("external-1".into()),
-                    report: AgentReport {
-                        state: protocol::AgentState::Working,
-                        authority: protocol::AgentAuthority::LifecycleIntegration,
-                        evidence: "working".into(),
-                        confidence: 90,
-                    },
-                },
-            }),
-            10
-        );
-    }
-
-    #[test]
-    fn agent_wait_requires_protocol_fourteen() {
-        assert_eq!(
-            request_minimum_version(&Request::WaitAgent {
-                agent_id: "a1".into(),
-                after_revision: 1,
-                wait_ms: 30_000,
-            }),
-            14
-        );
-    }
-
-    #[test]
-    fn agent_attention_acknowledgment_requires_protocol_fifteen() {
-        assert_eq!(
-            request_minimum_version(&Request::AcknowledgeAgentAttention {
-                agent_id: "a1".into(),
-                observation_revision: 2,
-            }),
-            15
-        );
-    }
-
-    #[test]
     fn direct_client_negotiates_before_sending_agent_wait() {
         let directory = env::temp_dir().join(format!("boomux-client-{}", Uuid::new_v4()));
         fs::create_dir_all(&directory).unwrap();
@@ -1022,75 +886,6 @@ mod tests {
     }
 
     #[test]
-    fn restart_shell_requires_protocol_eleven() {
-        assert_eq!(
-            request_minimum_version(&Request::RestartShell {
-                shell_id: "s1".into(),
-            }),
-            11
-        );
-    }
-
-    #[test]
-    fn restarting_attach_requires_protocol_eleven() {
-        let profile = TerminalProfile {
-            term: None,
-            colorterm: None,
-            term_program: None,
-            term_program_version: None,
-            rows: 24,
-            cols: 80,
-            pixel_width: 0,
-            pixel_height: 0,
-        };
-        assert_eq!(
-            request_minimum_version(&Request::Attach {
-                shell_id: "s1".into(),
-                takeover: false,
-                restart_exited: true,
-                profile: profile.clone(),
-                environment: None,
-            }),
-            11
-        );
-        assert_eq!(
-            request_minimum_version(&Request::Attach {
-                shell_id: "s1".into(),
-                takeover: false,
-                restart_exited: false,
-                profile,
-                environment: None,
-            }),
-            protocol::MIN_PROTOCOL_VERSION
-        );
-    }
-
-    #[test]
-    fn attach_environment_requires_protocol_sixteen() {
-        assert_eq!(
-            request_minimum_version(&Request::Attach {
-                shell_id: "s1".into(),
-                takeover: false,
-                restart_exited: false,
-                profile: TerminalProfile {
-                    term: None,
-                    colorterm: None,
-                    term_program: None,
-                    term_program_version: None,
-                    rows: 24,
-                    cols: 80,
-                    pixel_width: 0,
-                    pixel_height: 0,
-                },
-                environment: Some(UnixEnvironment {
-                    variables: Vec::new(),
-                }),
-            }),
-            16
-        );
-    }
-
-    #[test]
     fn attach_captures_the_full_unix_environment() {
         let expected: std::collections::HashMap<Vec<u8>, Vec<u8>> = env::vars_os()
             .map(|(name, value)| {
@@ -1143,23 +938,6 @@ mod tests {
         assert_eq!(attachment.token, "token");
         server.join().unwrap();
         fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn inactive_agent_reports_require_protocol_twelve() {
-        assert_eq!(
-            request_minimum_version(&Request::ReportAgent {
-                agent_id: "a1".into(),
-                run_id: "r1".into(),
-                report: AgentReport {
-                    state: protocol::AgentState::Inactive,
-                    authority: protocol::AgentAuthority::LifecycleIntegration,
-                    evidence: "inactive".into(),
-                    confidence: 100,
-                },
-            }),
-            12
-        );
     }
 
     #[test]

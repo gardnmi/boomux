@@ -175,12 +175,13 @@ workspace that references their exact normalized directory. The dashboard maps
 the active or latest exact match into a durable Agent's contextual preview and
 discovers catalogs asynchronously; session CLI listing performs the same bounded
 discovery synchronously. Sessions are not a dashboard kind.
-Title enrichment has its own adapter registry. The shared layer owns asynchronous
-cache, refresh, deduplication, sanitization, and fallback policy; OpenCode and Pi
-modules own host command execution and title extraction. Neutral host source
-modules own shared path normalization and secure source discovery. Title support
-remains independent from transcript support so a future harness may implement
-either capability without claiming the other.
+Title enrichment has its own adapter registry. Each adapter declares whether it
+also provides a session catalog. The shared layer owns asynchronous cache,
+refresh, deduplication, sanitization, and fallback policy; OpenCode and Pi modules
+own host command execution and title extraction. Neutral host source modules own
+shared path normalization and secure source discovery. Title and catalog support
+remain independent from transcript support so a future harness may implement
+the relevant capabilities without claiming transcript support.
 
 Session list/inspect requires a negotiated protocol-12 snapshot because the
 projection depends on that complete Agent state model. Protocol 13 adds an

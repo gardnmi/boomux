@@ -467,6 +467,51 @@ pub enum Request {
     },
 }
 
+impl Request {
+    pub fn minimum_protocol_version(&self) -> u32 {
+        match self {
+            Self::Attach {
+                environment: Some(_),
+                ..
+            } => 16,
+            Self::AcknowledgeAgentAttention { .. } => 15,
+            Self::WaitAgent { .. } => 14,
+            Self::RegisterAgent { spec, .. } | Self::EnsureAgent { spec, .. }
+                if spec.report.state == AgentState::Inactive =>
+            {
+                12
+            }
+            Self::ReportAgent { report, .. } if report.state == AgentState::Inactive => 12,
+            Self::RestartShell { .. }
+            | Self::Attach {
+                restart_exited: true,
+                ..
+            } => 11,
+            Self::EnsureAgent { .. } => 10,
+            Self::GetAgent { .. } | Self::RegisterAgent { .. } | Self::ReportAgent { .. } => 9,
+            Self::GetLauncher { .. }
+            | Self::CreateLauncher { .. }
+            | Self::RenameLauncher { .. }
+            | Self::RemoveLauncher { .. } => 8,
+            Self::ReadShellAt { .. } | Self::Events { .. } => 7,
+            Self::Ping
+            | Self::Restart
+            | Self::Shutdown
+            | Self::Snapshot
+            | Self::GetWorkspace { .. }
+            | Self::GetShell { .. }
+            | Self::CreateWorkspace { .. }
+            | Self::CreateShell { .. }
+            | Self::ReadShell { .. }
+            | Self::RenameWorkspace { .. }
+            | Self::RenameShell { .. }
+            | Self::CloseWorkspace { .. }
+            | Self::CloseShell { .. }
+            | Self::Attach { .. } => MIN_PROTOCOL_VERSION,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "response", rename_all = "snake_case")]
 pub enum Response {
@@ -647,6 +692,37 @@ pub fn read_message<T: DeserializeOwned>(reader: &mut impl Read) -> io::Result<T
 mod tests {
     use super::*;
 
+    fn test_profile() -> TerminalProfile {
+        TerminalProfile {
+            term: None,
+            colorterm: None,
+            term_program: None,
+            term_program_version: None,
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        }
+    }
+
+    fn test_report(state: AgentState) -> AgentReport {
+        AgentReport {
+            state,
+            authority: AgentAuthority::LifecycleIntegration,
+            evidence: "test".into(),
+            confidence: 100,
+        }
+    }
+
+    fn test_registration(state: AgentState) -> AgentRegistrationSpec {
+        AgentRegistrationSpec {
+            name: "agent".into(),
+            integration: "test".into(),
+            external_session_id: None,
+            report: test_report(state),
+        }
+    }
+
     #[derive(Deserialize)]
     struct ProtocolSixShellSnapshot {
         id: String,
@@ -824,6 +900,198 @@ mod tests {
     fn protocol_version_is_sixteen_with_minimum_six() {
         assert_eq!(PROTOCOL_VERSION, 16);
         assert_eq!(MIN_PROTOCOL_VERSION, 6);
+    }
+
+    #[test]
+    fn request_minimum_protocol_versions_cover_all_groups() {
+        let groups = vec![
+            (
+                6,
+                vec![
+                    Request::Ping,
+                    Request::Restart,
+                    Request::Shutdown,
+                    Request::Snapshot,
+                    Request::GetWorkspace {
+                        workspace_id: "w1".into(),
+                    },
+                    Request::GetShell {
+                        shell_id: "s1".into(),
+                    },
+                    Request::CreateWorkspace {
+                        name: "workspace".into(),
+                        shells: Vec::new(),
+                    },
+                    Request::CreateShell {
+                        workspace_id: Some("w1".into()),
+                        shell: ShellSpec::login("shell", "/tmp"),
+                    },
+                    Request::ReadShell {
+                        shell_id: "s1".into(),
+                        max_bytes: 1024,
+                    },
+                    Request::RenameWorkspace {
+                        workspace_id: "w1".into(),
+                        name: "renamed".into(),
+                    },
+                    Request::RenameShell {
+                        shell_id: "s1".into(),
+                        name: "renamed".into(),
+                    },
+                    Request::CloseWorkspace {
+                        workspace_id: "w1".into(),
+                    },
+                    Request::CloseShell {
+                        shell_id: "s1".into(),
+                    },
+                    Request::Attach {
+                        shell_id: "s1".into(),
+                        takeover: false,
+                        restart_exited: false,
+                        profile: test_profile(),
+                        environment: None,
+                    },
+                ],
+            ),
+            (
+                7,
+                vec![
+                    Request::ReadShellAt {
+                        shell_id: "s1".into(),
+                        max_bytes: 1024,
+                        run_id: None,
+                        after_revision: None,
+                        wait_ms: 0,
+                    },
+                    Request::Events {
+                        after: None,
+                        limit: 1,
+                        wait_ms: 0,
+                    },
+                ],
+            ),
+            (
+                8,
+                vec![
+                    Request::GetLauncher {
+                        launcher_id: "l1".into(),
+                    },
+                    Request::CreateLauncher {
+                        workspace_id: "w1".into(),
+                        spec: WorkspaceLauncherSpec {
+                            name: "editor".into(),
+                            command: vec!["editor".into()],
+                            cwd: "/tmp".into(),
+                        },
+                    },
+                    Request::RenameLauncher {
+                        launcher_id: "l1".into(),
+                        name: "renamed".into(),
+                    },
+                    Request::RemoveLauncher {
+                        launcher_id: "l1".into(),
+                    },
+                ],
+            ),
+            (
+                9,
+                vec![
+                    Request::GetAgent {
+                        agent_id: "a1".into(),
+                    },
+                    Request::RegisterAgent {
+                        shell_id: "s1".into(),
+                        run_id: "r1".into(),
+                        spec: test_registration(AgentState::Working),
+                    },
+                    Request::ReportAgent {
+                        agent_id: "a1".into(),
+                        run_id: "r1".into(),
+                        report: test_report(AgentState::Idle),
+                    },
+                ],
+            ),
+            (
+                10,
+                vec![Request::EnsureAgent {
+                    shell_id: "s1".into(),
+                    run_id: "r1".into(),
+                    spec: test_registration(AgentState::Working),
+                }],
+            ),
+            (
+                11,
+                vec![
+                    Request::RestartShell {
+                        shell_id: "s1".into(),
+                    },
+                    Request::Attach {
+                        shell_id: "s1".into(),
+                        takeover: false,
+                        restart_exited: true,
+                        profile: test_profile(),
+                        environment: None,
+                    },
+                ],
+            ),
+            (
+                12,
+                vec![
+                    Request::RegisterAgent {
+                        shell_id: "s1".into(),
+                        run_id: "r1".into(),
+                        spec: test_registration(AgentState::Inactive),
+                    },
+                    Request::EnsureAgent {
+                        shell_id: "s1".into(),
+                        run_id: "r1".into(),
+                        spec: test_registration(AgentState::Inactive),
+                    },
+                    Request::ReportAgent {
+                        agent_id: "a1".into(),
+                        run_id: "r1".into(),
+                        report: test_report(AgentState::Inactive),
+                    },
+                ],
+            ),
+            (
+                14,
+                vec![Request::WaitAgent {
+                    agent_id: "a1".into(),
+                    after_revision: 1,
+                    wait_ms: 0,
+                }],
+            ),
+            (
+                15,
+                vec![Request::AcknowledgeAgentAttention {
+                    agent_id: "a1".into(),
+                    observation_revision: 1,
+                }],
+            ),
+            (
+                16,
+                vec![Request::Attach {
+                    shell_id: "s1".into(),
+                    takeover: false,
+                    restart_exited: true,
+                    profile: test_profile(),
+                    environment: Some(UnixEnvironment {
+                        variables: Vec::new(),
+                    }),
+                }],
+            ),
+        ];
+
+        for (expected, requests) in groups {
+            for request in requests {
+                assert_eq!(
+                    request.minimum_protocol_version(),
+                    expected,
+                    "unexpected minimum protocol version for {request:?}"
+                );
+            }
+        }
     }
 
     #[test]
