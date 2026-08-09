@@ -526,9 +526,9 @@ See [`docs/live-pty-handoff.md`](docs/live-pty-handoff.md) for the handoff desig
 ## Development
 
 ```console
+cargo run
 cargo run -- .
 cargo run -- . --new
-cargo run -- ui
 cargo run -- doctor
 cargo test
 cargo clippy --all-targets -- -D warnings
