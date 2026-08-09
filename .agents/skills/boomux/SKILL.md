@@ -65,7 +65,8 @@ not an incompatibility claim. Never install or replace integration files unless
 the user explicitly asks. With that authorization, use `boomux integration
 install opencode --json`, `boomux integration install pi --json`, or
 `boomux integration install --all --json`; add `--force` only when the user also
-authorizes replacing a modified asset.
+authorizes replacing a modified asset. Use `--dry-run` first when the user wants
+to inspect exact target paths and planned actions without changing files.
 After the user restarts a host, verify authoritative reporting with `boomux
 integration verify opencode --json` or `boomux integration verify pi --json`.
 

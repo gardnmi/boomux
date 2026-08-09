@@ -584,6 +584,8 @@ enum IntegrationCommands {
         all: bool,
         #[arg(long)]
         force: bool,
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Verify authoritative lifecycle reporting in a running host shell
     Verify {
@@ -1614,6 +1616,7 @@ fn integration_command(command: IntegrationCommands, json: bool) -> Result<(), B
             integration,
             all,
             force,
+            dry_run,
         } => {
             let integrations = if all {
                 integration_management::IntegrationId::ALL.to_vec()
@@ -1625,7 +1628,7 @@ fn integration_command(command: IntegrationCommands, json: bool) -> Result<(), B
                     )
                 })?]
             };
-            install_integrations(&integrations, force, json)
+            install_integrations(&integrations, force, dry_run, json)
         }
         IntegrationCommands::Verify {
             integration,
@@ -1951,11 +1954,40 @@ fn format_recommended_action(action: integration_management::RecommendedAction) 
 fn install_integrations(
     integrations: &[integration_management::IntegrationId],
     force: bool,
+    dry_run: bool,
     json: bool,
 ) -> Result<(), Box<dyn Error>> {
     let environment = integration_management::Environment::from_process();
-    for integration in integrations {
-        integration_management::preflight_install(*integration, &environment, force)?;
+    let plans = integrations
+        .iter()
+        .copied()
+        .map(|integration| integration_management::plan_install(integration, &environment, force))
+        .collect::<Result<Vec<_>, _>>()?;
+    if dry_run {
+        if json {
+            return cli_output::print(
+                "integration.install",
+                serde_json::json!({ "dry_run": true, "integrations": plans }),
+            );
+        }
+        for plan in &plans {
+            let spec = plan.integration.spec();
+            match plan.action {
+                integration_management::InstallAction::Install => println!(
+                    "Would install Boomux {} {} at {}",
+                    spec.display_name, spec.asset_name, plan.path
+                ),
+                integration_management::InstallAction::Replace => println!(
+                    "Would replace Boomux {} {} at {}",
+                    spec.display_name, spec.asset_name, plan.path
+                ),
+                integration_management::InstallAction::Unchanged => println!(
+                    "Boomux {} {} is already installed at {}",
+                    spec.display_name, spec.asset_name, plan.path
+                ),
+            }
+        }
+        return Ok(());
     }
     let results = integrations
         .iter()
@@ -3690,6 +3722,7 @@ fn install_opencode(force: bool) -> Result<(), Box<dyn Error>> {
         &[integration_management::IntegrationId::Opencode],
         force,
         false,
+        false,
     )
 }
 
@@ -3705,7 +3738,12 @@ fn install_opencode_at(config_root: &Path, force: bool) -> Result<(), Box<dyn Er
 }
 
 fn install_pi(force: bool) -> Result<(), Box<dyn Error>> {
-    install_integrations(&[integration_management::IntegrationId::Pi], force, false)
+    install_integrations(
+        &[integration_management::IntegrationId::Pi],
+        force,
+        false,
+        false,
+    )
 }
 
 #[cfg(test)]
@@ -5309,10 +5347,33 @@ mod tests {
                     integration: Some(integration_management::IntegrationId::Opencode),
                     all: false,
                     force: true,
+                    dry_run: false,
                 }
             })
         ));
         assert_eq!(command_name(&install), "integration.install");
+
+        let preview = Cli::try_parse_from([
+            "boomux",
+            "integration",
+            "install",
+            "pi",
+            "--dry-run",
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            preview.command,
+            Some(Commands::Integration {
+                command: IntegrationCommands::Install {
+                    integration: Some(integration_management::IntegrationId::Pi),
+                    all: false,
+                    force: false,
+                    dry_run: true,
+                }
+            })
+        ));
+        assert!(supports_json(&preview));
 
         assert!(Cli::try_parse_from(["boomux", "integration", "install", "--all"]).is_ok());
         assert!(Cli::try_parse_from(["boomux", "integration", "install"]).is_err());

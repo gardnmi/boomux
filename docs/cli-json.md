@@ -103,10 +103,13 @@ Command payloads are:
   mutate integration files. It executes each PATH-resolved host's `--version`
   command with bounded output and runtime; missing or unhealthy integrations are
   represented as data and do not make status fail.
-- `integration.install`: an `integrations` array containing `installed`,
-  `replaced`, or `unchanged` results, target paths, and whether a host restart is
-  required. Each target is changed atomically; `--all` is not a transaction
-  across hosts, but every target is preflighted before the first write.
+- `integration.install`: normally, an `integrations` array containing
+  `installed`, `replaced`, or `unchanged` results, target paths, and whether a
+  host restart is required. With `--dry-run`, `dry_run` is `true` and each entry
+  instead contains `current_state`, the planned `action`, `path`, and
+  `restart_required`. Each target is changed atomically; `--all` is not a
+  transaction across hosts, but every target is preflighted before the first
+  write.
 - `integration.verify`: `integration`, `verified`, exact `shell_id` and `run_id`,
   plus the nonempty authoritative `agents` array. Failure uses typed
   `not_found`, `ambiguous_target`, `run_changed`, or `timeout` errors.
@@ -144,6 +147,11 @@ Install entries contain `name`, `result`, `path`, and `restart_required`.
 Result is `installed`, `replaced`, or `unchanged`. A modified target fails with
 `already_exists` unless `--force` is supplied. Invalid roots or unsafe paths fail
 with `invalid_argument` before mutation.
+
+Install preview entries contain `name`, `current_state`, `action`, `path`, and
+`restart_required`. Current state is `missing`, `current`, or `modified`; action
+is `install`, `replace`, or `unchanged`. Preview performs the same path and
+replacement validation as installation but does not create or modify anything.
 
 ## Shell Data
 
