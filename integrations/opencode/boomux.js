@@ -56,6 +56,14 @@ function classifyEvent(event) {
   const id = sessionID(event);
   if (!type || !id) return undefined;
 
+  if (type === "session.created") {
+    return {
+      kind: "idle",
+      sessionID: id,
+      evidence: "OpenCode root session created",
+    };
+  }
+
   if (type === "session.status") {
     const kind = statusKind(properties.status);
     if (

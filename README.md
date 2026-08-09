@@ -437,7 +437,7 @@ untracked instead of presenting it as idle.
 
 Inside a Boomux-managed shell, the plugin groups each root OpenCode session and
 all child/subagent sessions into one durable agent instance keyed by the root
-session ID. OpenCode status, chat, tool, compaction, permission/question, error,
+session ID. OpenCode creation, status, chat, tool, compaction, permission/question, error,
 idle, and deletion events produce explainable `working`, `blocked`, `idle`, and
 `done` observations. Child activity contributes to the root; only root idle can
 make it idle, and only explicit deletion of the root reports `done`. Process or

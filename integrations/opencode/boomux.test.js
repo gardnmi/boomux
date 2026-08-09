@@ -42,6 +42,13 @@ function successfulEnsure(
 describe("event mapping and reducer", () => {
   test("maps structural status, chat, tool, compaction, waits, and errors", () => {
     expect(
+      classifyEvent(event("session.created", { info: { id: "root" } })),
+    ).toEqual({
+      kind: "idle",
+      sessionID: "root",
+      evidence: "OpenCode root session created",
+    });
+    expect(
       classifyEvent(
         event("session.status", { sessionID: "s", status: { type: "retry" } }),
       ).kind,
@@ -180,6 +187,8 @@ describe("root aggregation", () => {
     await lifecycle.enqueue(
       event("session.created", { info: { id: "child", parentID: "root" } }),
     );
+    expect(calls[0]).toContain("root");
+    calls.length = 0;
     await lifecycle.enqueue(
       event("session.status", {
         sessionID: "child",
@@ -209,7 +218,6 @@ describe("root aggregation", () => {
       "working",
       "idle",
     ]);
-    expect(calls[0]).toContain("root");
     expect(calls.every((argv) => !argv.includes("child"))).toBe(true);
   });
 
@@ -265,6 +273,7 @@ describe("root aggregation", () => {
     await lifecycle.enqueue(
       event("session.created", { info: { id: "child", parentID: "root" } }),
     );
+    calls.length = 0;
     await lifecycle.enqueue(
       event("session.deleted", { info: { id: "child", parentID: "root" } }),
     );
@@ -294,6 +303,7 @@ describe("root aggregation", () => {
     await lifecycle.enqueue(
       event("session.created", { info: { id: "child", parentID: "root" } }),
     );
+    calls.length = 0;
 
     await lifecycle.enqueue(
       event("permission.asked", { sessionID: "child", id: "permission-1" }),
@@ -331,6 +341,7 @@ describe("root aggregation", () => {
       log: () => {},
     });
     await lifecycle.enqueue(event("session.created", { info: { id: "root" } }));
+    calls.length = 0;
     for (const id of ["first", "second"]) {
       await lifecycle.enqueue(
         event("session.created", { info: { id, parentID: "root" } }),
@@ -369,6 +380,7 @@ describe("root aggregation", () => {
     await lifecycle.enqueue(
       event("session.created", { info: { id: "child", parentID: "root" } }),
     );
+    calls.length = 0;
 
     await lifecycle.enqueue(
       event("session.error", {
