@@ -161,6 +161,8 @@ boomux integration list
 boomux integration status [opencode|pi]
 boomux integration install <opencode|pi> [--force] [--dry-run]
 boomux integration install --all [--force] [--dry-run]
+boomux integration uninstall <opencode|pi> [--force]
+boomux integration uninstall --all [--force]
 boomux integration verify <opencode|pi> [--shell <shell-id>] [--wait-ms <milliseconds>]
 boomux daemon status
 boomux daemon restart
@@ -441,6 +443,12 @@ without creating directories or changing files. Successful changes print the
 required host restart guidance. The
 existing `boomux opencode install` and `boomux pi install` commands remain
 equivalent host-specific shortcuts.
+
+Remove one integration or all bundled integrations with `boomux integration
+uninstall opencode` or `boomux integration uninstall --all`. Uninstall removes
+only the bundled asset file and leaves host configuration and directories in
+place. Missing assets are accepted. Modified assets require `--force`, while
+symlinked and non-regular paths are always rejected.
 
 After restarting a host, verify that a running managed shell has authoritative
 lifecycle reporting:

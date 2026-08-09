@@ -676,6 +676,23 @@ pub(crate) struct InstallPlan {
     pub(crate) restart_required: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum UninstallOutcome {
+    Removed,
+    NotInstalled,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct UninstallResult {
+    #[serde(skip)]
+    pub(crate) integration: IntegrationId,
+    pub(crate) name: &'static str,
+    pub(crate) result: UninstallOutcome,
+    pub(crate) path: String,
+    pub(crate) restart_required: bool,
+}
+
 pub(crate) fn install(
     id: IntegrationId,
     environment: &Environment,
@@ -716,6 +733,48 @@ pub(crate) fn plan_install(
         action,
         path: target.path.display().to_string(),
         restart_required: action != InstallAction::Unchanged,
+    })
+}
+
+pub(crate) fn preflight_uninstall(
+    id: IntegrationId,
+    environment: &Environment,
+    force: bool,
+) -> Result<(), Box<dyn Error>> {
+    let spec = id.spec();
+    let target = install_target(id, environment)?;
+    validate_existing_directory_chain(&target.directory)?;
+    if inspect_existing_asset(&target.path, spec.content)? == ExistingAsset::Modified && !force {
+        return Err(modified_uninstall_error(&target.path).into());
+    }
+    Ok(())
+}
+
+pub(crate) fn uninstall(
+    id: IntegrationId,
+    environment: &Environment,
+    force: bool,
+) -> Result<UninstallResult, Box<dyn Error>> {
+    let spec = id.spec();
+    let target = install_target(id, environment)?;
+    validate_existing_directory_chain(&target.directory)?;
+    let existing = inspect_existing_asset(&target.path, spec.content)?;
+    let result = match existing {
+        ExistingAsset::Missing => UninstallOutcome::NotInstalled,
+        ExistingAsset::Modified if !force => {
+            return Err(modified_uninstall_error(&target.path).into());
+        }
+        ExistingAsset::Current | ExistingAsset::Modified => {
+            fs::remove_file(&target.path)?;
+            UninstallOutcome::Removed
+        }
+    };
+    Ok(UninstallResult {
+        integration: id,
+        name: spec.name,
+        result,
+        path: target.path.display().to_string(),
+        restart_required: result == UninstallOutcome::Removed,
     })
 }
 
@@ -968,6 +1027,16 @@ fn existing_asset_error(path: &Path) -> io::Error {
     )
 }
 
+fn modified_uninstall_error(path: &Path) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!(
+            "{} contains modified content; rerun with --force to remove it",
+            path.display()
+        ),
+    )
+}
+
 fn write_asset_atomically(directory: &Path, path: &Path, content: &str) -> io::Result<()> {
     let temporary = directory.join(format!(".boomux-install-{}.tmp", Uuid::new_v4()));
     let result = (|| {
@@ -1138,6 +1207,36 @@ mod tests {
         assert_eq!(replacement.current_state, AssetState::Modified);
         assert_eq!(replacement.action, InstallAction::Replace);
         assert_eq!(fs::read_to_string(installed.path).unwrap(), "custom");
+    }
+
+    #[test]
+    fn uninstall_is_idempotent_and_protects_modified_assets() {
+        let home = TestDirectory::new("uninstall");
+        let environment = environment(&home.0);
+        let installed = install(IntegrationId::Pi, &environment, false).unwrap();
+        let directory = Path::new(&installed.path).parent().unwrap().to_owned();
+
+        let removed = uninstall(IntegrationId::Pi, &environment, false).unwrap();
+        assert_eq!(removed.result, UninstallOutcome::Removed);
+        assert!(removed.restart_required);
+        assert!(!Path::new(&removed.path).exists());
+        assert!(directory.is_dir());
+
+        let missing = uninstall(IntegrationId::Pi, &environment, false).unwrap();
+        assert_eq!(missing.result, UninstallOutcome::NotInstalled);
+        assert!(!missing.restart_required);
+
+        install(IntegrationId::Pi, &environment, false).unwrap();
+        fs::write(&installed.path, "custom").unwrap();
+        assert!(preflight_uninstall(IntegrationId::Pi, &environment, false).is_err());
+        assert!(uninstall(IntegrationId::Pi, &environment, false).is_err());
+        assert_eq!(fs::read_to_string(&installed.path).unwrap(), "custom");
+        assert_eq!(
+            uninstall(IntegrationId::Pi, &environment, true)
+                .unwrap()
+                .result,
+            UninstallOutcome::Removed
+        );
     }
 
     #[test]

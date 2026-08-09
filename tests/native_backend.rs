@@ -2892,6 +2892,42 @@ fn integration_management_reports_and_installs_bundled_hosts() {
     assert_eq!(refused["command"], "integration.install");
     assert_eq!(refused["error"]["code"], "already_exists");
 
+    let uninstall_refused = command()
+        .args(["integration", "uninstall", "--all", "--json"])
+        .output()
+        .unwrap();
+    assert!(!uninstall_refused.status.success());
+    assert!(config.join("opencode/plugins/boomux.js").is_file());
+    assert_eq!(
+        fs::read_to_string(pi.join("extensions/boomux.js")).unwrap(),
+        "custom extension"
+    );
+
+    let uninstalled = command()
+        .args(["integration", "uninstall", "--all", "--force", "--json"])
+        .output()
+        .unwrap();
+    assert!(uninstalled.status.success());
+    let uninstalled: serde_json::Value = serde_json::from_slice(&uninstalled.stdout).unwrap();
+    assert_eq!(uninstalled["command"], "integration.uninstall");
+    for integration in uninstalled["data"]["integrations"].as_array().unwrap() {
+        assert_eq!(integration["result"], "removed");
+        assert_eq!(integration["restart_required"], true);
+    }
+    assert!(!config.join("opencode/plugins/boomux.js").exists());
+    assert!(!pi.join("extensions/boomux.js").exists());
+    assert!(config.join("opencode/plugins").is_dir());
+    assert!(pi.join("extensions").is_dir());
+
+    let absent = command()
+        .args(["integration", "uninstall", "pi", "--json"])
+        .output()
+        .unwrap();
+    assert!(absent.status.success());
+    let absent: serde_json::Value = serde_json::from_slice(&absent.stdout).unwrap();
+    assert_eq!(absent["data"]["integrations"][0]["result"], "not_installed");
+    assert_eq!(absent["data"]["integrations"][0]["restart_required"], false);
+
     let invalid_environment = Command::new(env!("CARGO_BIN_EXE_boomux"))
         .args(["integration", "install", "opencode", "--json"])
         .env_remove("HOME")

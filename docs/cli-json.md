@@ -58,14 +58,16 @@ The following commands support `--json`:
 - `boomux integration status [opencode|pi]`
 - `boomux integration install <opencode|pi>`
 - `boomux integration install --all`
+- `boomux integration uninstall <opencode|pi>`
+- `boomux integration uninstall --all`
 - `boomux integration verify <opencode|pi>`
 - `boomux daemon status`
 
 JSON mutations are deliberately narrow: only `agent register`, `agent ensure`,
-`agent report`, `attention acknowledge`, and `integration install` support the
-contract. Other mutation commands retain human output. Passing `--json` to an
-unsupported command fails with `invalid_argument` before performing the
-operation.
+`agent report`, `attention acknowledge`, `integration install`, and
+`integration uninstall` support the contract. Other mutation commands retain
+human output. Passing `--json` to an unsupported command fails with
+`invalid_argument` before performing the operation.
 
 Command payloads are:
 
@@ -110,6 +112,9 @@ Command payloads are:
   `restart_required`. Each target is changed atomically; `--all` is not a
   transaction across hosts, but every target is preflighted before the first
   write.
+- `integration.uninstall`: an `integrations` array containing `removed` or
+  `not_installed` results, target paths, and whether a host restart is required.
+  Every target is preflighted before the first removal.
 - `integration.verify`: `integration`, `verified`, exact `shell_id` and `run_id`,
   plus the nonempty authoritative `agents` array. Failure uses typed
   `not_found`, `ambiguous_target`, `run_changed`, or `timeout` errors.
@@ -152,6 +157,11 @@ Install preview entries contain `name`, `current_state`, `action`, `path`, and
 `restart_required`. Current state is `missing`, `current`, or `modified`; action
 is `install`, `replace`, or `unchanged`. Preview performs the same path and
 replacement validation as installation but does not create or modify anything.
+
+Uninstall entries contain `name`, `result`, `path`, and `restart_required`.
+Result is `removed` or `not_installed`. Only the bundled asset file is removed;
+directories and unrelated host configuration are retained. Modified content
+requires `--force`, while unsafe paths fail before any removal.
 
 ## Shell Data
 

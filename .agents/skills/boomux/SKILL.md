@@ -67,6 +67,9 @@ install opencode --json`, `boomux integration install pi --json`, or
 `boomux integration install --all --json`; add `--force` only when the user also
 authorizes replacing a modified asset. Use `--dry-run` first when the user wants
 to inspect exact target paths and planned actions without changing files.
+Use `boomux integration uninstall <name> --json` only when the user explicitly
+asks to remove an integration; add `--force` only with authorization to remove a
+modified asset.
 After the user restarts a host, verify authoritative reporting with `boomux
 integration verify opencode --json` or `boomux integration verify pi --json`.
 
