@@ -155,8 +155,10 @@ Selected-kind previews remain read-only. Workspace, launcher, and run metadata
 come from the polled snapshot. Shell output uses a bounded plain-text read only
 when the selected shell, run ID, or output revision changes. Its viewport follows
 the tail by default and preserves the viewed rows when new output arrives while
-scrolled. Command previews expose argv and run metadata without reading terminal
-output. Launcher previews never imply retained invocation state because launcher
+scrolled. The dashboard omits a contextual preview rather than rendering a
+partial panel when the full preview and a usable item table cannot both fit.
+Command previews expose argv and run metadata without reading terminal output.
+Launcher previews never imply retained invocation state because launcher
 processes remain ephemeral.
 
 Agent sessions are a client-side projection, not a sixth durable daemon

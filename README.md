@@ -95,9 +95,10 @@ also counted as a shell or command.
 
 The selected kind receives a read-only preview. Workspaces show retained Agent
 state and their highest-priority attention item. Shells show run metadata plus a
-bounded terminal-output viewport, fetched only when the selected shell's output
-revision changes. The viewport retains its position while scrolled and follows
-new output again after `End`. Commands show exact argv and run metadata without
+bounded 16-row terminal-output viewport, fetched only when the selected shell's
+output revision changes. The viewport is hidden when it cannot fit without
+crowding the item table, retains its position while scrolled, and follows new
+output again after `End`. Commands show exact argv and run metadata without
 terminal output. Commands and launchers preserve argument boundaries in their
 previews. Launchers explicitly show that their detached output and invocation
 history are not retained.

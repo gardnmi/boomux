@@ -23,8 +23,9 @@ const GREEN: Color = Color::Green;
 const YELLOW: Color = Color::Yellow;
 const RED: Color = Color::Red;
 const REFRESH_INTERVAL: Duration = Duration::from_millis(250);
-const TERMINAL_PREVIEW_ROWS: usize = 8;
-const TERMINAL_PREVIEW_SCROLL_STEP: usize = 5;
+const TERMINAL_PREVIEW_ROWS: usize = 16;
+const TERMINAL_PREVIEW_SCROLL_STEP: usize = 12;
+const PREVIEW_RESERVED_ITEM_HEIGHT: u16 = 6;
 
 pub(crate) struct WorkspaceView {
     pub(crate) id: String,
@@ -1549,13 +1550,15 @@ fn render_global_items(frame: &mut Frame, area: Rect, app: &mut App) {
         .title(title)
         .border_style(Style::new().fg(TEAL));
     let inner = block.inner(area);
-    let contextual_panel = (inner.height >= 9)
-        .then(|| selected_item_preview(app))
-        .flatten();
+    let contextual_panel = selected_item_preview(app).filter(|panel| {
+        inner.height
+            >= panel
+                .content_height
+                .saturating_add(2)
+                .saturating_add(PREVIEW_RESERVED_ITEM_HEIGHT)
+    });
     let (items_inner, preview_area) = contextual_panel.as_ref().map_or((inner, None), |panel| {
-        let panel_height = (panel.content_height + 2)
-            .min(inner.height.saturating_sub(6))
-            .max(3);
+        let panel_height = panel.content_height + 2;
         let [items_area, preview_area] =
             Layout::vertical([Constraint::Fill(1), Constraint::Length(panel_height)]).areas(inner);
         (items_area, Some(preview_area))
@@ -1685,13 +1688,18 @@ fn render_items(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
         },
     ));
     let inner = block.inner(area);
-    let contextual_panel = (app.focus == Focus::Items && inner.height >= 9)
+    let contextual_panel = (app.focus == Focus::Items)
         .then(|| selected_item_preview(app))
-        .flatten();
+        .flatten()
+        .filter(|panel| {
+            inner.height
+                >= panel
+                    .content_height
+                    .saturating_add(2)
+                    .saturating_add(PREVIEW_RESERVED_ITEM_HEIGHT)
+        });
     let (items_inner, preview_area) = contextual_panel.as_ref().map_or((inner, None), |panel| {
-        let panel_height = (panel.content_height + 2)
-            .min(inner.height.saturating_sub(6))
-            .max(3);
+        let panel_height = panel.content_height + 2;
         let [items_area, preview_area] =
             Layout::vertical([Constraint::Fill(1), Constraint::Length(panel_height)]).areas(inner);
         (items_area, Some(preview_area))
@@ -1992,7 +2000,11 @@ fn terminal_preview(app: &App, terminal: &TerminalView) -> Option<ContextualPrev
         } else {
             format!(" Shell: {} ", terminal.name)
         },
-        content_height: lines.len() as u16,
+        content_height: if is_command {
+            lines.len() as u16
+        } else {
+            (TERMINAL_PREVIEW_ROWS + 3) as u16
+        },
         content: PreviewContent::Lines(lines),
     })
 }
@@ -3942,26 +3954,83 @@ mod tests {
                 .join("\n")
         };
 
-        app.refresh_terminal_preview(&mut |_| Ok(output(20)));
+        app.refresh_terminal_preview(&mut |_| Ok(output(40)));
         app.scroll_terminal_preview_up();
-        assert_eq!(app.terminal_preview.as_ref().unwrap().scroll_from_bottom, 5);
-        app.scroll_terminal_preview_to_start();
         assert_eq!(
             app.terminal_preview.as_ref().unwrap().scroll_from_bottom,
             12
         );
+        app.scroll_terminal_preview_to_start();
+        assert_eq!(
+            app.terminal_preview.as_ref().unwrap().scroll_from_bottom,
+            24
+        );
         app.scroll_terminal_preview_down();
-        assert_eq!(app.terminal_preview.as_ref().unwrap().scroll_from_bottom, 7);
+        assert_eq!(
+            app.terminal_preview.as_ref().unwrap().scroll_from_bottom,
+            12
+        );
 
         let WorkspaceItemView::Shell(shell) = &mut app.workspaces[0].items[0] else {
             unreachable!();
         };
         shell.run.as_mut().unwrap().output_revision = 2;
-        app.refresh_terminal_preview(&mut |_| Ok(output(22)));
-        assert_eq!(app.terminal_preview.as_ref().unwrap().scroll_from_bottom, 9);
+        app.refresh_terminal_preview(&mut |_| Ok(output(42)));
+        assert_eq!(
+            app.terminal_preview.as_ref().unwrap().scroll_from_bottom,
+            14
+        );
 
         app.scroll_terminal_preview_to_end();
         assert_eq!(app.terminal_preview.as_ref().unwrap().scroll_from_bottom, 0);
+    }
+
+    #[test]
+    fn shell_preview_uses_sixteen_rows_or_hides_when_height_is_insufficient() {
+        let mut app = app();
+        focus_items(&mut app);
+        let WorkspaceItemView::Shell(shell) = &mut app.workspaces[0].items[0] else {
+            unreachable!();
+        };
+        shell.run = Some(TerminalRunView {
+            id: "run-1".into(),
+            generation: 1,
+            started_at_ms: current_time_ms(),
+            ended_at_ms: None,
+            exit_reason: None,
+            output_revision: 1,
+        });
+        let output = (1..=30)
+            .map(|line| format!("viewport line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.refresh_terminal_preview(&mut |_| Ok(output.clone()));
+
+        let mut wide = Terminal::new(TestBackend::new(180, 40)).unwrap();
+        wide.draw(|frame| render(frame, &mut app)).unwrap();
+        let wide_text: String = wide
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(wide_text.contains("Shell: agent"));
+        assert!(wide_text.contains("viewport line 15"));
+        assert!(wide_text.contains("viewport line 30"));
+        assert!(!wide_text.contains("viewport line 14"));
+
+        let mut short = Terminal::new(TestBackend::new(180, 24)).unwrap();
+        short.draw(|frame| render(frame, &mut app)).unwrap();
+        let short_text: String = short
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(!short_text.contains("Shell: agent"));
+        assert!(short_text.contains("Items: boomux"));
     }
 
     #[test]
