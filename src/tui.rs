@@ -23,6 +23,8 @@ const GREEN: Color = Color::Green;
 const YELLOW: Color = Color::Yellow;
 const RED: Color = Color::Red;
 const REFRESH_INTERVAL: Duration = Duration::from_millis(250);
+const TERMINAL_PREVIEW_ROWS: usize = 8;
+const TERMINAL_PREVIEW_SCROLL_STEP: usize = 5;
 
 pub(crate) struct WorkspaceView {
     pub(crate) id: String,
@@ -236,6 +238,7 @@ struct TerminalPreviewState {
     run_id: Option<String>,
     output_revision: u64,
     output: Result<String, String>,
+    scroll_from_bottom: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -851,12 +854,85 @@ impl App {
         }) {
             return;
         }
+        let output = on_preview(&shell_id);
+        let scroll_from_bottom = self
+            .terminal_preview
+            .as_ref()
+            .filter(|preview| {
+                preview.shell_id == shell_id
+                    && preview.run_id == run_id
+                    && preview.scroll_from_bottom > 0
+            })
+            .map_or(0, |preview| {
+                let previous_count = preview
+                    .output
+                    .as_deref()
+                    .ok()
+                    .map_or(0, |output| terminal_output_lines(output).len());
+                let next_count = output
+                    .as_deref()
+                    .ok()
+                    .map_or(0, |output| terminal_output_lines(output).len());
+                preview
+                    .scroll_from_bottom
+                    .saturating_add(next_count.saturating_sub(previous_count))
+            });
         self.terminal_preview = Some(TerminalPreviewState {
-            output: on_preview(&shell_id),
+            output,
             shell_id,
             run_id,
             output_revision,
+            scroll_from_bottom,
         });
+    }
+
+    fn scroll_terminal_preview_up(&mut self) {
+        let Some(preview) = self.terminal_preview.as_mut() else {
+            return;
+        };
+        let line_count = preview
+            .output
+            .as_deref()
+            .ok()
+            .map_or(0, |output| terminal_output_lines(output).len());
+        let max_scroll = line_count.saturating_sub(TERMINAL_PREVIEW_ROWS);
+        preview.scroll_from_bottom = preview
+            .scroll_from_bottom
+            .saturating_add(TERMINAL_PREVIEW_SCROLL_STEP)
+            .min(max_scroll);
+    }
+
+    fn scroll_terminal_preview_down(&mut self) {
+        let Some(preview) = self.terminal_preview.as_mut() else {
+            return;
+        };
+        preview.scroll_from_bottom = preview
+            .scroll_from_bottom
+            .saturating_sub(TERMINAL_PREVIEW_SCROLL_STEP);
+    }
+
+    fn scroll_terminal_preview_to_start(&mut self) {
+        let Some(preview) = self.terminal_preview.as_mut() else {
+            return;
+        };
+        let line_count = preview
+            .output
+            .as_deref()
+            .ok()
+            .map_or(0, |output| terminal_output_lines(output).len());
+        preview.scroll_from_bottom = line_count.saturating_sub(TERMINAL_PREVIEW_ROWS);
+    }
+
+    fn scroll_terminal_preview_to_end(&mut self) {
+        if let Some(preview) = self.terminal_preview.as_mut() {
+            preview.scroll_from_bottom = 0;
+        }
+    }
+
+    fn terminal_preview_is_available(&self) -> bool {
+        self.terminal_preview
+            .as_ref()
+            .is_some_and(|preview| preview.output.is_ok())
     }
 
     fn replace_workspaces(&mut self, workspaces: Vec<WorkspaceView>) {
@@ -1076,6 +1152,10 @@ where
             KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
             KeyCode::Down | KeyCode::Char('j') => app.next(),
             KeyCode::Up | KeyCode::Char('k') => app.previous(),
+            KeyCode::PageUp => app.scroll_terminal_preview_up(),
+            KeyCode::PageDown => app.scroll_terminal_preview_down(),
+            KeyCode::Home => app.scroll_terminal_preview_to_start(),
+            KeyCode::End => app.scroll_terminal_preview_to_end(),
             KeyCode::Enter => {
                 let dispatched = if app.primary_tab != PrimaryTab::Workspaces {
                     app.open_selected_item(&mut actions.on_open)
@@ -1827,22 +1907,33 @@ fn terminal_preview(app: &App, terminal: &TerminalView) -> Option<ContextualPrev
         Span::styled("  branch ", Style::new().fg(SUBTEXT)),
         Span::raw(terminal.branch.clone()),
     ]));
-    let run = terminal.run.as_ref().map_or_else(
-        || format!("{}  no run yet", terminal.status),
+    let run_detail = terminal.run.as_ref().map_or_else(
+        || "no run yet".to_owned(),
         |run| {
-            let result = run.exit_reason.as_deref().unwrap_or(&terminal.status);
+            let outcome = run
+                .exit_reason
+                .as_deref()
+                .map_or_else(String::new, |reason| format!("{reason}  "));
             let timing = run.ended_at_ms.map_or_else(
                 || format!("started {}", compact_recency(run.started_at_ms)),
                 |ended| format!("ended {}", compact_recency(ended)),
             );
             format!(
-                "{result}  run {} generation {}  {timing}",
+                "{outcome}run {}  generation {}  {timing}",
                 short_id(&run.id),
                 run.generation
             )
         },
     );
-    lines.push(Line::from(Span::styled(run, Style::new().fg(SUBTEXT))));
+    lines.push(Line::from(vec![
+        Span::styled(
+            terminal.status.clone(),
+            Style::new()
+                .fg(status_color(&terminal.status))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!("  {run_detail}"), Style::new().fg(SUBTEXT)),
+    ]));
 
     if let Some(preview) = app
         .terminal_preview
@@ -1850,27 +1941,42 @@ fn terminal_preview(app: &App, terminal: &TerminalView) -> Option<ContextualPrev
         .filter(|preview| preview.shell_id == terminal.id)
     {
         match &preview.output {
-            Ok(output) if output.trim().is_empty() => lines.push(Line::from(Span::styled(
-                "No terminal output",
-                Style::new().fg(SUBTEXT),
-            ))),
+            Ok(output) if output.trim().is_empty() => lines.push(Line::from(vec![
+                Span::styled(" Output ", Style::new().fg(BASE).bg(BLUE)),
+                Span::styled(" no terminal output", Style::new().fg(SUBTEXT)),
+            ])),
             Ok(output) => {
+                let viewport =
+                    terminal_viewport(output, TERMINAL_PREVIEW_ROWS, preview.scroll_from_bottom);
                 lines.push(Line::from(vec![
+                    Span::styled(" Output ", Style::new().fg(BASE).bg(BLUE)),
                     Span::styled(
-                        "Terminal tail",
-                        Style::new().fg(BLUE).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        format!("  revision {}", preview.output_revision),
+                        format!(
+                            " {}-{} / {}  revision {}  ",
+                            viewport.start + 1,
+                            viewport.end,
+                            viewport.total,
+                            preview.output_revision
+                        ),
                         Style::new().fg(SUBTEXT),
                     ),
+                    Span::styled(
+                        if viewport.following {
+                            "FOLLOW"
+                        } else {
+                            "SCROLLED"
+                        },
+                        Style::new()
+                            .fg(if viewport.following { GREEN } else { YELLOW })
+                            .add_modifier(Modifier::BOLD),
+                    ),
                 ]));
-                lines.extend(terminal_tail_lines(output, 5).into_iter().map(|line| {
-                    Line::from(vec![
-                        Span::styled("| ", Style::new().fg(OVERLAY)),
-                        Span::raw(line),
-                    ])
-                }));
+                lines.extend(
+                    viewport
+                        .lines
+                        .into_iter()
+                        .map(|line| Line::from(Span::raw(format!(" {line}")))),
+                );
             }
             Err(error) => lines.push(Line::from(Span::styled(
                 format!("Output unavailable: {error}"),
@@ -1880,16 +1986,24 @@ fn terminal_preview(app: &App, terminal: &TerminalView) -> Option<ContextualPrev
     }
     Some(ContextualPreview {
         title: if is_command {
-            format!(" Command preview: {} ", terminal.name)
+            format!(" Command: {} ", terminal.name)
         } else {
-            format!(" Shell preview: {} ", terminal.name)
+            format!(" Shell: {} ", terminal.name)
         },
         content_height: lines.len() as u16,
         content: PreviewContent::Lines(lines),
     })
 }
 
-fn terminal_tail_lines(output: &str, limit: usize) -> Vec<String> {
+struct TerminalViewport {
+    lines: Vec<String>,
+    start: usize,
+    end: usize,
+    total: usize,
+    following: bool,
+}
+
+fn terminal_output_lines(output: &str) -> Vec<String> {
     let mut lines: Vec<_> = output
         .lines()
         .map(|line| line.trim_end().to_owned())
@@ -1904,10 +2018,23 @@ fn terminal_tail_lines(output: &str, limit: usize) -> Vec<String> {
         .map_or(first, |last| last + 1);
     lines.drain(end..);
     lines.drain(..first);
-    if lines.len() > limit {
-        lines.drain(..lines.len() - limit);
-    }
     lines
+}
+
+fn terminal_viewport(output: &str, height: usize, scroll_from_bottom: usize) -> TerminalViewport {
+    let lines = terminal_output_lines(output);
+    let total = lines.len();
+    let latest_start = total.saturating_sub(height);
+    let scroll_from_bottom = scroll_from_bottom.min(latest_start);
+    let start = latest_start - scroll_from_bottom;
+    let end = (start + height).min(total);
+    TerminalViewport {
+        lines: lines[start..end].to_vec(),
+        start,
+        end,
+        total,
+        following: scroll_from_bottom == 0,
+    }
 }
 
 fn format_argv(argv: &[String]) -> String {
@@ -2254,6 +2381,14 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
                 Style::new().fg(SUBTEXT),
             ),
         ]);
+        if app.terminal_preview_is_available() {
+            spans.extend([
+                Span::styled("pgup/dn", Style::new().fg(TEAL)),
+                Span::styled(" output  ", Style::new().fg(SUBTEXT)),
+                Span::styled("home/end", Style::new().fg(TEAL)),
+                Span::styled(" oldest/follow  ", Style::new().fg(SUBTEXT)),
+            ]);
+        }
         spans.extend([
             Span::styled("r", Style::new().fg(BLUE)),
             Span::styled(" refresh  ", Style::new().fg(SUBTEXT)),
@@ -3642,7 +3777,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect();
-        assert!(shell_text.contains("Shell preview"));
+        assert!(shell_text.contains("Shell: agent"));
         assert!(shell_text.contains("/tmp/boomux"));
         assert!(!shell_text.contains("OpenCode session"));
 
@@ -3695,7 +3830,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect();
 
-        assert!(text.contains("Command preview"));
+        assert!(text.contains("Command: format"));
         assert!(text.contains("[\"printf\", \"a b\", \"\"]"));
     }
 
@@ -3747,20 +3882,75 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect();
-        assert!(text.contains("Terminal tail"));
+        assert!(text.contains("Output"));
         assert!(text.contains("revision 5"));
+        assert!(text.contains("FOLLOW"));
         assert!(text.contains("latest"));
+        assert!(text.contains("pgup/dn"));
     }
 
     #[test]
-    fn terminal_tail_trims_edge_blanks_and_keeps_the_latest_rows() {
+    fn terminal_viewport_trims_edges_and_scrolls_from_the_tail() {
         let output = "\nold\n\nrecent one  \nrecent two\n\n";
 
         assert_eq!(
-            terminal_tail_lines(output, 3),
-            ["", "recent one", "recent two"]
+            terminal_output_lines(output),
+            ["old", "", "recent one", "recent two"]
         );
-        assert!(terminal_tail_lines("\n \n", 5).is_empty());
+        assert!(terminal_output_lines("\n \n").is_empty());
+
+        let following = terminal_viewport(output, 3, 0);
+        assert_eq!(following.lines, ["", "recent one", "recent two"]);
+        assert_eq!((following.start, following.end, following.total), (1, 4, 4));
+        assert!(following.following);
+
+        let scrolled = terminal_viewport(output, 2, 2);
+        assert_eq!(scrolled.lines, ["old", ""]);
+        assert!(!scrolled.following);
+    }
+
+    #[test]
+    fn terminal_preview_scroll_controls_preserve_position_as_output_arrives() {
+        let mut app = app();
+        focus_items(&mut app);
+        let WorkspaceItemView::Shell(shell) = &mut app.workspaces[0].items[0] else {
+            unreachable!();
+        };
+        shell.run = Some(TerminalRunView {
+            id: "run-1".into(),
+            generation: 1,
+            started_at_ms: current_time_ms(),
+            ended_at_ms: None,
+            exit_reason: None,
+            output_revision: 1,
+        });
+        let output = |count: usize| {
+            (1..=count)
+                .map(|line| format!("line {line}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        app.refresh_terminal_preview(&mut |_| Ok(output(20)));
+        app.scroll_terminal_preview_up();
+        assert_eq!(app.terminal_preview.as_ref().unwrap().scroll_from_bottom, 5);
+        app.scroll_terminal_preview_to_start();
+        assert_eq!(
+            app.terminal_preview.as_ref().unwrap().scroll_from_bottom,
+            12
+        );
+        app.scroll_terminal_preview_down();
+        assert_eq!(app.terminal_preview.as_ref().unwrap().scroll_from_bottom, 7);
+
+        let WorkspaceItemView::Shell(shell) = &mut app.workspaces[0].items[0] else {
+            unreachable!();
+        };
+        shell.run.as_mut().unwrap().output_revision = 2;
+        app.refresh_terminal_preview(&mut |_| Ok(output(22)));
+        assert_eq!(app.terminal_preview.as_ref().unwrap().scroll_from_bottom, 9);
+
+        app.scroll_terminal_preview_to_end();
+        assert_eq!(app.terminal_preview.as_ref().unwrap().scroll_from_bottom, 0);
     }
 
     #[test]

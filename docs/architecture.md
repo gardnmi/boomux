@@ -153,9 +153,10 @@ an exact `opencode` or `pi` foreground hint.
 
 Selected-kind previews remain read-only. Workspace, launcher, and run metadata
 come from the polled snapshot. Shell and command output uses a bounded plain-text
-read only when the selected shell, run ID, or output revision changes. Launcher
-previews never imply retained invocation state because launcher processes remain
-ephemeral.
+read only when the selected shell, run ID, or output revision changes. Its
+viewport follows the tail by default and preserves the viewed rows when new
+output arrives while scrolled. Launcher previews never imply retained invocation
+state because launcher processes remain ephemeral.
 
 Agent sessions are a client-side projection, not a sixth durable daemon
 identity. The projection groups stored Agent instances by workspace,
