@@ -597,6 +597,17 @@ enum IntegrationCommands {
         #[arg(long)]
         force: bool,
     },
+    /// Inspect, install, and explain verification for one integration
+    Setup {
+        #[arg(value_enum)]
+        integration: integration_management::IntegrationId,
+        /// Accept the proposed installation without prompting
+        #[arg(long)]
+        yes: bool,
+        /// Allow replacement of a modified integration asset
+        #[arg(long)]
+        force: bool,
+    },
     /// Verify authoritative lifecycle reporting in a running host shell
     Verify {
         #[arg(value_enum)]
@@ -884,6 +895,9 @@ fn command_name(cli: &Cli) -> &'static str {
         Some(Commands::Integration {
             command: IntegrationCommands::Uninstall { .. },
         }) => "integration.uninstall",
+        Some(Commands::Integration {
+            command: IntegrationCommands::Setup { .. },
+        }) => "integration.setup",
         Some(Commands::Integration {
             command: IntegrationCommands::Verify { .. },
         }) => "integration.verify",
@@ -1661,6 +1675,11 @@ fn integration_command(command: IntegrationCommands, json: bool) -> Result<(), B
             };
             uninstall_integrations(&integrations, force, json)
         }
+        IntegrationCommands::Setup {
+            integration,
+            yes,
+            force,
+        } => setup_integration(integration, yes, force),
         IntegrationCommands::Verify {
             integration,
             shell,
@@ -2095,6 +2114,102 @@ fn uninstall_integrations(
         }
     }
     Ok(())
+}
+
+fn setup_integration(
+    integration: integration_management::IntegrationId,
+    yes: bool,
+    force: bool,
+) -> Result<(), Box<dyn Error>> {
+    let environment = integration_management::Environment::from_process();
+    let snapshot = client::connect().and_then(|client| client.snapshot()).ok();
+    let status = integration_management::inspect(integration, &environment, snapshot.as_ref());
+    print!(
+        "{}",
+        format_integration_statuses(std::slice::from_ref(&status))
+    );
+
+    let spec = integration.spec();
+    if status.asset.state == integration_management::AssetState::Current {
+        print_setup_next_step(integration, status.runtime.state);
+        return Ok(());
+    }
+    if status.asset.state == integration_management::AssetState::Unavailable {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            status
+                .asset
+                .error
+                .unwrap_or_else(|| "integration asset could not be inspected".into()),
+        )
+        .into());
+    }
+
+    let replacing = status.asset.state == integration_management::AssetState::Modified;
+    let plan = integration_management::plan_install(integration, &environment, replacing || force)?;
+    let action = match plan.action {
+        integration_management::InstallAction::Install => "install",
+        integration_management::InstallAction::Replace => "replace",
+        integration_management::InstallAction::Unchanged => "leave unchanged",
+    };
+    println!("Plan: {action} Boomux {} at {}", spec.asset_name, plan.path);
+
+    if yes && replacing && !force {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--yes requires --force to replace a modified integration asset",
+        )
+        .into());
+    }
+    if !yes {
+        let prompt = if replacing {
+            "Replace the modified asset?"
+        } else {
+            "Install this integration?"
+        };
+        if !confirm_setup(prompt)? {
+            println!("No changes made.");
+            return Ok(());
+        }
+    }
+
+    let result = integration_management::install(integration, &environment, replacing || force)?;
+    print_integration_install_results(&[result]);
+    println!(
+        "After restarting {}, run: boomux integration verify {}",
+        spec.display_name, spec.name
+    );
+    Ok(())
+}
+
+fn confirm_setup(prompt: &str) -> io::Result<bool> {
+    print!("{prompt} [y/N] ");
+    std::io::Write::flush(&mut io::stdout())?;
+    let mut response = String::new();
+    io::stdin().read_line(&mut response)?;
+    Ok(is_setup_confirmation(&response))
+}
+
+fn is_setup_confirmation(response: &str) -> bool {
+    matches!(response.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+fn print_setup_next_step(
+    integration: integration_management::IntegrationId,
+    runtime: integration_management::RuntimeState,
+) {
+    let spec = integration.spec();
+    if runtime == integration_management::RuntimeState::Reporting {
+        println!(
+            "Boomux lifecycle reporting is ready for {}.",
+            spec.display_name
+        );
+    } else {
+        println!(
+            "The asset is current. Restart {}, open it in a Boomux-managed shell, then run: boomux integration verify {}",
+            spec.display_name, spec.name
+        );
+    }
 }
 
 fn capabilities(json: bool) -> Result<(), Box<dyn Error>> {
@@ -5467,6 +5582,22 @@ mod tests {
         assert_eq!(command_name(&uninstall), "integration.uninstall");
         assert!(supports_json(&uninstall));
 
+        let setup =
+            Cli::try_parse_from(["boomux", "integration", "setup", "pi", "--yes", "--force"])
+                .unwrap();
+        assert!(matches!(
+            setup.command,
+            Some(Commands::Integration {
+                command: IntegrationCommands::Setup {
+                    integration: integration_management::IntegrationId::Pi,
+                    yes: true,
+                    force: true,
+                }
+            })
+        ));
+        assert_eq!(command_name(&setup), "integration.setup");
+        assert!(!supports_json(&setup));
+
         assert!(Cli::try_parse_from(["boomux", "integration", "install", "--all"]).is_ok());
         assert!(Cli::try_parse_from(["boomux", "integration", "install"]).is_err());
         assert!(Cli::try_parse_from(["boomux", "integration", "install", "pi", "--all",]).is_err());
@@ -5531,6 +5662,14 @@ mod tests {
                 "    boomux integration verify opencode --shell s2",
             )
         );
+    }
+
+    #[test]
+    fn setup_confirmation_requires_an_explicit_yes() {
+        assert!(is_setup_confirmation("y\n"));
+        assert!(is_setup_confirmation(" YES "));
+        assert!(!is_setup_confirmation(""));
+        assert!(!is_setup_confirmation("no"));
     }
 
     #[test]
