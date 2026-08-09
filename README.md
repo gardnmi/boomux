@@ -163,6 +163,7 @@ boomux integration install <opencode|pi> [--force] [--dry-run]
 boomux integration install --all [--force] [--dry-run]
 boomux integration uninstall <opencode|pi> [--force]
 boomux integration uninstall --all [--force]
+boomux integration setup <opencode|pi> [--yes] [--force]
 boomux integration verify <opencode|pi> [--shell <shell-id>] [--wait-ms <milliseconds>]
 boomux daemon status
 boomux daemon restart
@@ -449,6 +450,12 @@ uninstall opencode` or `boomux integration uninstall --all`. Uninstall removes
 only the bundled asset file and leaves host configuration and directories in
 place. Missing assets are accepted. Modified assets require `--force`, while
 symlinked and non-regular paths are always rejected.
+
+For an end-to-end guided path, run `boomux integration setup opencode` or
+`boomux integration setup pi`. Setup displays host, asset, and runtime status,
+previews the exact installation action, asks before changing files, and prints
+the restart and verification command. `--yes` accepts a missing-asset install
+without prompting; automated replacement requires both `--yes` and `--force`.
 
 After restarting a host, verify that a running managed shell has authoritative
 lifecycle reporting:

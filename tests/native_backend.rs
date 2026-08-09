@@ -2928,6 +2928,50 @@ fn integration_management_reports_and_installs_bundled_hosts() {
     assert_eq!(absent["data"]["integrations"][0]["result"], "not_installed");
     assert_eq!(absent["data"]["integrations"][0]["restart_required"], false);
 
+    let mut declined = command();
+    declined
+        .args(["integration", "setup", "pi"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped());
+    let mut declined = declined.spawn().unwrap();
+    declined.stdin.take().unwrap().write_all(b"n\n").unwrap();
+    let declined = declined.wait_with_output().unwrap();
+    assert!(declined.status.success());
+    assert!(String::from_utf8_lossy(&declined.stdout).contains("No changes made."));
+    assert!(!pi.join("extensions/boomux.js").exists());
+
+    let setup = command()
+        .args(["integration", "setup", "pi", "--yes"])
+        .output()
+        .unwrap();
+    assert!(setup.status.success());
+    let setup_output = String::from_utf8_lossy(&setup.stdout);
+    assert!(setup_output.contains("Plan: install"));
+    assert!(setup_output.contains("boomux integration verify pi"));
+    assert!(pi.join("extensions/boomux.js").is_file());
+
+    fs::write(pi.join("extensions/boomux.js"), "custom extension").unwrap();
+    let setup_refused = command()
+        .args(["integration", "setup", "pi", "--yes"])
+        .output()
+        .unwrap();
+    assert!(!setup_refused.status.success());
+    assert_eq!(
+        fs::read_to_string(pi.join("extensions/boomux.js")).unwrap(),
+        "custom extension"
+    );
+
+    let setup_replaced = command()
+        .args(["integration", "setup", "pi", "--yes", "--force"])
+        .output()
+        .unwrap();
+    assert!(setup_replaced.status.success());
+    assert!(String::from_utf8_lossy(&setup_replaced.stdout).contains("Plan: replace"));
+    assert_ne!(
+        fs::read_to_string(pi.join("extensions/boomux.js")).unwrap(),
+        "custom extension"
+    );
+
     let invalid_environment = Command::new(env!("CARGO_BIN_EXE_boomux"))
         .args(["integration", "install", "opencode", "--json"])
         .env_remove("HOME")

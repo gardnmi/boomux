@@ -70,6 +70,10 @@ to inspect exact target paths and planned actions without changing files.
 Use `boomux integration uninstall <name> --json` only when the user explicitly
 asks to remove an integration; add `--force` only with authorization to remove a
 modified asset.
+For an interactive end-to-end workflow, use `boomux integration setup <name>`.
+It inspects current state, previews the target action, confirms mutation, and
+prints restart and verification guidance. Do not pass `--yes` unless the user
+has authorized installation, or `--force` unless they authorized replacement.
 After the user restarts a host, verify authoritative reporting with `boomux
 integration verify opencode --json` or `boomux integration verify pi --json`.
 

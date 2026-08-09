@@ -69,6 +69,12 @@ JSON mutations are deliberately narrow: only `agent register`, `agent ensure`,
 human output. Passing `--json` to an unsupported command fails with
 `invalid_argument` before performing the operation.
 
+`boomux integration setup <opencode|pi>` is intentionally human-oriented and
+does not support `--json`. It composes status inspection, an exact install
+preview, confirmation, installation when needed, and restart/verification
+guidance. `--yes` skips confirmation for automation; replacing modified content
+also requires `--force`.
+
 Command payloads are:
 
 - `capabilities`: CLI/protocol versions, integration host compatibility, plus
