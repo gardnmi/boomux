@@ -133,11 +133,11 @@ eternal process.
     future Claude Code, Codex, and other harness support reuses the same identity,
     bounds, errors, and output contract. Opaque stateless cursors page toward
     older entries while expiring on baseline or source-context changes.
-7. [Complete] Add contextual, categorized Agent Session browsing to selected agent rows in
-   the Boomux UI. Keep inactive and completed workspace sessions visible without
-   adding duplicate shell rows, grouped by active and recent time windows with
-   integration, canonical identity, associated shell and run, lifecycle state,
-   and timestamps. Bounded host catalogs also project pre-registration OpenCode
+7. [Complete] Add canonical Agent Session context to selected durable Agent rows
+   in the Boomux UI without attaching directory-wide history to untracked
+   process hints. Keep full inactive and completed workspace history available
+   through the session CLI with integration, canonical identity, associated
+   shell and run, lifecycle state, and timestamps. Bounded host catalogs also project pre-registration OpenCode
    root-session history without fabricated Agent occurrences, while asynchronous
    adapters provide OpenCode generated titles and Pi names or first-user-message summaries; future adapters
    also provide canonical transcripts and tool activity through bounded,

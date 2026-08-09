@@ -1166,20 +1166,17 @@ fn dashboard_views_from_sessions(
                             id: agent.id.clone(),
                             state: cli_output::agent_state(agent.observation.state).into(),
                             integration: agent.integration.clone(),
+                            external_session_id: agent.external_session_id.clone(),
                             authority: cli_output::agent_authority(agent.observation.authority)
                                 .into(),
                             confidence: agent.observation.confidence,
                             evidence: agent.observation.evidence.clone(),
                         }),
-                        hinted_integration: None,
                     }),
-                    (None, Some(integration @ ("opencode" | "pi")))
-                        if !suppress_foreground_hint =>
-                    {
+                    (None, Some("opencode" | "pi")) if !suppress_foreground_hint => {
                         tui::WorkspaceItemView::AgentShell(tui::AgentShellView {
                             shell: shell_view,
                             agent: None,
-                            hinted_integration: Some(integration.to_owned()),
                         })
                     }
                     (None, _) => tui::WorkspaceItemView::Shell(shell_view),

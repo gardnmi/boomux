@@ -101,16 +101,10 @@ morphs into an agent row instead of adding a duplicate item. It keeps the
 shell's name, ID, directory, and open, rename, and close actions while showing the
 Agent's lifecycle state and evidence. The Agents view stays focused on those
 current presentations. A process-only foreground hint is labeled `untracked`,
-never `idle`, until its lifecycle integration registers. The Sessions view
-combines Boomux-observed sessions with bounded OpenCode catalog history, grouped by activity window with workspace,
-integration, state, host-provided description, associated shell, recency, and
-canonical identity. A foreground `opencode` or `pi` process also supplies a
-presentation-only agent hint while the lifecycle integration establishes a
-durable Agent session.
-
-<p align="center">
-  <img src="assets/dashboard-sessions.png" alt="Boomux global session history grouped by activity window" width="100%">
-</p>
+never `idle`, until its lifecycle integration registers. A selected durable
+Agent may show its one matching canonical session; untracked hints never receive
+directory-wide history. Full Boomux-observed and bounded OpenCode catalog
+history remains available through the session CLI.
 
 Closing a terminal window only disconnects its attachment. The Boomux daemon
 retains the PTY and child process until the shell exits, the workspace is

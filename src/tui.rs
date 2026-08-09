@@ -61,7 +61,6 @@ pub(crate) enum WorkspaceItemView {
 pub(crate) struct AgentShellView {
     pub(crate) shell: TerminalView,
     pub(crate) agent: Option<AgentView>,
-    pub(crate) hinted_integration: Option<String>,
 }
 
 impl AgentShellView {
@@ -70,19 +69,13 @@ impl AgentShellView {
             .as_ref()
             .map_or("untracked", |agent| agent.state.as_str())
     }
-
-    fn integration(&self) -> Option<&str> {
-        self.agent
-            .as_ref()
-            .map(|agent| agent.integration.as_str())
-            .or(self.hinted_integration.as_deref())
-    }
 }
 
 pub(crate) struct AgentView {
     pub(crate) id: String,
     pub(crate) state: String,
     pub(crate) integration: String,
+    pub(crate) external_session_id: Option<String>,
     pub(crate) authority: String,
     pub(crate) confidence: u8,
     pub(crate) evidence: String,
@@ -238,10 +231,9 @@ enum PrimaryTab {
 }
 
 impl PrimaryTab {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 5] = [
         Self::Workspaces,
         Self::Agents,
-        Self::Sessions,
         Self::Launchers,
         Self::Shells,
         Self::Commands,
@@ -1975,12 +1967,16 @@ fn contextual_session_panel(app: &App) -> Option<ContextualSessionPanel> {
     let WorkspaceItemView::AgentShell(agent_shell) = app.selected_item()? else {
         return None;
     };
-    let integration = agent_shell.integration()?;
+    let agent = agent_shell.agent.as_ref()?;
+    let external_session_id = agent.external_session_id.as_deref()?;
     let workspace = app.selected_item_workspace()?;
     let sessions: Vec<_> = workspace
         .sessions
         .iter()
-        .filter(|session| session.integration == integration)
+        .filter(|session| {
+            session.integration == agent.integration
+                && session.external_session_id.as_deref() == Some(external_session_id)
+        })
         .collect();
     if sessions.is_empty() {
         return None;
@@ -2056,7 +2052,7 @@ fn contextual_session_panel(app: &App) -> Option<ContextualSessionPanel> {
         content_height += categorized_count * 2;
     }
     Some(ContextualSessionPanel {
-        title: format!(" {} sessions ", integration_display_name(integration)),
+        title: format!(" {} session ", integration_display_name(&agent.integration)),
         rows,
         content_height,
     })
@@ -2292,7 +2288,7 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
             let line = Line::from(vec![
                 Span::styled(" j/k", Style::new().fg(TEAL)),
                 Span::styled(
-                    " navigate  tab/shift-tab views  1-6 select view  ",
+                    " navigate  tab/shift-tab views  1-5 select view  ",
                     Style::new().fg(SUBTEXT),
                 ),
                 Span::styled("enter", Style::new().fg(GREEN)),
@@ -2312,7 +2308,7 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
                 if app.primary_tab == PrimaryTab::Workspaces {
                     " navigate  tab/shift-tab views  h/l panes  "
                 } else {
-                    " navigate  tab/shift-tab views  1-6 select view  "
+                    " navigate  tab/shift-tab views  1-5 select view  "
                 },
                 Style::new().fg(SUBTEXT),
             ),
@@ -2443,6 +2439,7 @@ mod tests {
             id: "agent-1".into(),
             state: "working".into(),
             integration: "opencode".into(),
+            external_session_id: Some("external-active".into()),
             authority: "lifecycle_integration".into(),
             confidence: 95,
             evidence: "tool call in progress".into(),
@@ -2460,7 +2457,6 @@ mod tests {
                 command: String::new(),
             },
             agent: Some(agent()),
-            hinted_integration: None,
         }
     }
 
@@ -2497,7 +2493,6 @@ mod tests {
                 command: String::new(),
             },
             agent: None,
-            hinted_integration: Some("opencode".into()),
         }
     }
 
@@ -2596,11 +2591,7 @@ mod tests {
         app.cycle_tab(false);
         assert_eq!(app.primary_tab, PrimaryTab::Agents);
         app.cycle_tab(false);
-        assert_eq!(app.primary_tab, PrimaryTab::Sessions);
-        app.cycle_tab(false);
         assert_eq!(app.primary_tab, PrimaryTab::Launchers);
-        app.cycle_tab(true);
-        assert_eq!(app.primary_tab, PrimaryTab::Sessions);
         app.cycle_tab(true);
         assert_eq!(app.primary_tab, PrimaryTab::Agents);
         app.cycle_tab(true);
@@ -2611,11 +2602,11 @@ mod tests {
     #[test]
     fn numeric_shortcuts_match_primary_tab_order() {
         assert_eq!(
-            ('1'..='6').filter_map(shortcut_tab).collect::<Vec<_>>(),
+            ('1'..='5').filter_map(shortcut_tab).collect::<Vec<_>>(),
             PrimaryTab::ALL
         );
         assert_eq!(shortcut_tab('0'), None);
-        assert_eq!(shortcut_tab('7'), None);
+        assert_eq!(shortcut_tab('6'), None);
     }
 
     #[test]
@@ -2707,7 +2698,7 @@ mod tests {
 
         assert!(text.contains("WORKSPACES 1"));
         assert!(text.contains("AGENTS 1"));
-        assert!(text.contains("SESSIONS 1"));
+        assert!(!text.contains("SESSIONS"));
         assert!(text.contains("LAUNCHERS 1"));
         assert!(text.contains("SHELLS 1"));
         assert!(text.contains("COMMANDS 1"));
@@ -2737,7 +2728,6 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect();
         assert!(agent_text.contains("AGENTS (1)"));
-        assert!(!agent_text.contains("| 1 SESSIONS"));
     }
 
     #[test]
@@ -3416,6 +3406,7 @@ mod tests {
         let mut agent_shell = hinted_agent_shell();
         agent_shell.shell.name = "keepname".into();
         app.workspaces[0].items[0] = WorkspaceItemView::AgentShell(agent_shell);
+        app.workspaces[0].sessions = vec![session("active", "working")];
         focus_items(&mut app);
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
@@ -3436,6 +3427,7 @@ mod tests {
         assert!(!lines.iter().any(|line| line.contains("opencode")));
         assert!(lines.iter().any(|line| line.contains("untracked")));
         assert!(!lines.iter().any(|line| line.contains("idle")));
+        assert!(!lines.iter().any(|line| line.contains("OpenCode session")));
     }
 
     #[test]
@@ -3481,7 +3473,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_durable_agent_renders_filtered_categorized_sessions() {
+    fn selected_durable_agent_renders_only_its_canonical_session() {
         let backend = TestBackend::new(180, 34);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = app();
@@ -3519,15 +3511,12 @@ mod tests {
             .collect();
         let text = lines.join("\n");
 
-        assert!(text.contains("OpenCode sessions"));
+        assert!(text.contains("OpenCode session"));
         assert!(text.contains("ACTIVE"));
-        assert!(text.contains("LAST 24 HOURS"));
-        assert!(text.contains("LAST 7 DAYS"));
-        assert!(text.contains("OLDER"));
         assert!(text.contains("Current work"));
-        assert!(text.contains("Recent review"));
-        assert!(text.contains("Dormant review"));
-        assert!(text.contains("Finished build"));
+        assert!(!text.contains("Recent review"));
+        assert!(!text.contains("Dormant review"));
+        assert!(!text.contains("Finished build"));
         assert!(!text.contains("Pi session must be filtered"));
         assert!(text.contains("Items: boomux (1)"));
         assert!(lines.iter().any(|line| {
@@ -3884,6 +3873,7 @@ mod tests {
         let mut two = workspace("w2", "two");
         two.items = vec![WorkspaceItemView::AgentShell(agent_shell())];
         let mut right = session("right", "working");
+        right.external_session_id = Some("external-active".into());
         right.label = "Owning workspace session".into();
         two.sessions.push(right);
         let mut app = App::new(vec![one, two], project_context());
