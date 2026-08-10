@@ -1,10 +1,10 @@
 ---
 name: boomux
-description: Inspect and manage Boomux persistent terminal workspaces, launchers, shells, run-scoped agent instances, projected sessions, process supervision, and integrations. Use when asked to discover shells, agents, or sessions, read terminal output, supervise an explicitly identified external session, report agent lifecycle state, install the OpenCode or Pi integration, create or open workspaces and shells, inspect status, rename or close targets, or manage the Boomux daemon.
+description: Inspect and manage Boomux persistent terminal workspaces, launchers, shells, run-scoped agent instances, attention, projected sessions, notifications, process supervision, and integrations. Use when asked to discover shells, agents, or sessions, read terminal output, supervise an explicitly identified external session, report agent lifecycle state, configure or test notifications, install or remove the OpenCode or Pi integration, create or open workspaces and shells, inspect status, rename or close targets, or manage the Boomux daemon.
 compatibility: Requires boomux on PATH. Some name operations require Boomux workspace context or an explicit --workspace; agent mutation and supervision require exact shell-run context, and supervision requires a caller-supplied canonical external session ID.
 metadata:
   author: boomux
-  version: "7"
+  version: "8"
 ---
 
 # Boomux
@@ -49,8 +49,16 @@ boomux capabilities --json
 ```
 
 Parse `data` on success and `error.code` on a nonzero exit; do not parse human
-tables or `error.message`. JSON mutation support includes explicit Agent reports,
-attention acknowledgment, and integration installation.
+tables or `error.message`. JSON mutation support includes Agent register,
+ensure, and report; attention acknowledgment; and integration installation and
+uninstallation.
+
+Most daemon-backed inspection commands automatically start Boomux when it is
+not running. This includes `list`, `shells`, `read`, `events`, workspace, shell,
+and launcher inspection, Agent, attention, and session inspection, and
+`doctor`. Use `boomux daemon status` first when starting the daemon would be an
+unwanted side effect. `capabilities`, `integration list`, and `integration
+status` do not start it.
 
 Inspect bundled lifecycle integrations with:
 
@@ -60,29 +68,65 @@ boomux integration status --json
 boomux integration status opencode --json
 ```
 
+Mutation commands include:
+
+```console
+boomux integration install opencode --json
+boomux integration install --all --json
+boomux integration uninstall opencode --json
+boomux integration uninstall --all --json
+boomux integration setup opencode
+boomux integration verify opencode --json
+```
+
 Host, asset, and runtime status are independent. `unvalidated` compatibility is
-not an incompatibility claim. Never install or replace integration files unless
-the user explicitly asks. With that authorization, use `boomux integration
-install opencode --json`, `boomux integration install pi --json`, or
-`boomux integration install --all --json`; add `--force` only when the user also
-authorizes replacing a modified asset. Use `--dry-run` first when the user wants
-to inspect exact target paths and planned actions without changing files.
-Use `boomux integration uninstall <name> --json` only when the user explicitly
-asks to remove an integration; add `--force` only with authorization to remove a
-modified asset.
+not an incompatibility claim. `integration status` does not start Boomux, but it
+executes each PATH-resolved host's `--version`; avoid it when those executables
+are untrusted.
+
+Never install, replace, or remove integration files unless the user explicitly
+asks. With that authorization, use `boomux integration install opencode --json`,
+`boomux integration install pi --json`, or `boomux integration install --all
+--json`; add `--force` only when the user also authorizes replacing a modified
+asset. Use `--dry-run` to inspect exact paths and actions. Previewing replacement
+of modified content requires `--force --dry-run`, which does not write files.
+Use `boomux integration uninstall <name> --json` or `boomux integration
+uninstall --all --json` only when explicitly requested. Uninstall has no dry-run
+mode; add `--force` only with authorization to remove a modified asset.
+
+Batch install and uninstall preflight all targets before the first change but
+are not transactions across hosts; a later filesystem failure can leave earlier
+targets changed.
+
 For an interactive end-to-end workflow, use `boomux integration setup <name>`.
 It inspects current state, previews the target action, confirms mutation, and
 prints restart and verification guidance. Do not pass `--yes` unless the user
-has authorized installation, or `--force` unless they authorized replacement.
+has authorized installation. Interactive setup can replace modified content
+after an explicit yes response; noninteractive replacement requires both
+`--yes` and `--force`.
+
 After the user restarts a host, verify authoritative reporting with `boomux
 integration verify opencode --json` or `boomux integration verify pi --json`.
+Verification requires a running foreground host and current-run
+`lifecycle-integration` evidence. If multiple hosts match, pass `--shell
+"<exact-shell-id>"`; shell names are not accepted.
 
-Use `boomux events --json` for an immediate snapshot and cursor. Poll again with
-`--after CURSOR --wait-ms 30000` to observe later transitions. If
+Use this for an immediate snapshot and cursor:
+
+```console
+boomux events --json
+```
+
+Poll again with `--after CURSOR --wait-ms 30000` to observe later transitions. If
 `error.code` is `cursor_expired`, discard the cursor and request a new baseline.
 Use `boomux read TARGET --json --run-id RUN_ID --after-revision REVISION
---wait-ms 30000` to wait for run-scoped output changes; handle `run_changed` by
-inspecting the shell again.
+--wait-ms 30000` to wait for run-scoped output changes. Process `changed`,
+`status`, `run_id`, and `output_revision` before examining `output`. When
+`changed` is false, `output` is intentionally empty and does not mean retained
+output is empty; retain the previous rendered state. On `revision_ahead`,
+reacquire the shell snapshot. On `run_changed`, do not substitute a new run
+implicitly. On `daemon_stopping`, reconnect and repeat with the same run and
+revision if still relevant.
 
 Discover and inspect durable agent instances with:
 
@@ -98,10 +142,14 @@ name, shell status, terminal text, a recently seen row, or an external session
 ID.
 
 Use `agent wait` after inspecting an exact Agent and retaining its observation
-revision. If `changed` is false, repeat with the same revision; if true, retain
-the returned newer revision. `revision_ahead` means the caller's context is
-invalid and must be reacquired. `daemon_stopping` means reconnect and retry.
-Duplicate or lower-authority reports do not satisfy a wait.
+revision. If `changed` is true, retain the returned newer revision. If it is
+false after a timeout and the Agent is still nonterminal, repeat with the same
+revision only when continued waiting is desired. Stop waiting when state is
+`done`; a completed Agent at the supplied revision returns unchanged
+immediately. `inactive` is resumable and may advance later. `revision_ahead`
+means the caller's context is invalid and must be reacquired. `daemon_stopping`
+means reconnect and retry. Duplicate or lower-authority reports do not satisfy
+a wait.
 
 Inspect outstanding blocked and completed work with:
 
@@ -118,17 +166,47 @@ revision fails with `revision_ahead`, while an already empty item returns
 `changed: false`. Acknowledgment does not advance lifecycle state or satisfy an
 `agent wait`.
 
-Desktop notifications, when the user has opted in, are only a best-effort signal
+Desktop and sound notifications, when the user opts in, are best-effort signals
 for new transitions into blocked or done. They do not acknowledge attention,
 change an observation revision, or contain lifecycle evidence. Always inspect
 the durable queue before acting; do not infer queue state or delivery from a
-desktop notification.
+notification.
 
-Optional notification sounds are also a best-effort signal for those committed
-transitions. Test configured desktop and sound channels without changing Agent
-state using `boomux notification test blocked` or `boomux notification test
-completed`. Configuration is sampled at daemon startup, so restart the daemon
-after changing notification settings.
+Desktop and sound delivery are independently disabled by default. Desktop uses
+`notify-send`; sound uses `canberra-gtk-play` with configured freedesktop sound
+event IDs. The top-level blocked and completed category flags filter both.
+
+```toml
+[notifications]
+enabled = false
+blocked = true
+completed = true
+
+[notifications.sound]
+enabled = false
+blocked = "message-new-instant"
+completed = "complete"
+```
+
+`notifications.enabled` controls desktop delivery;
+`notifications.sound.enabled` controls sound. Test all currently configured,
+enabled channels without changing Agent state using:
+
+```console
+boomux notification test blocked
+boomux notification test completed
+```
+
+These commands are human-only, do not support `--json`, and fail when the
+requested category has no enabled channel. Runtime delivery uses the daemon's
+startup-sampled configuration until `boomux daemon restart`.
+
+Session discovery is not limited to daemon metadata. It may execute the
+PATH-resolved OpenCode CLI and inspect host catalogs in workspace-derived
+directories, exposing sanitized but potentially private session titles.
+`session read` additionally runs `opencode export` or reads Pi project session
+files. Require authorization appropriate to the host-history metadata or
+content before listing, inspecting, or reading sessions.
 
 Discover projected session metadata with:
 
@@ -249,7 +327,9 @@ boomux read "<shell-name-or-id>" --lines 200
 `--lines` defaults to 200 and must be at least 1. Increase it when relevant
 output is older. The result is bounded, plain rendered VT text without ANSI
 sequences. It is not a complete historical log. Primary-screen scrollback is
-limited to 2,000 rows; alternate-screen history and graphics are not retained.
+limited to 2,000 rows and reads are capped at 1 MiB. The current alternate
+screen can be reconstructed, but alternate-screen history and graphical content
+are not retained.
 
 ## Create And Enter Workspaces
 
@@ -269,6 +349,10 @@ command after `--` is an exact executable and argument vector; shell operators
 such as pipes or redirects work only when explicitly passed through a shell,
 for example `-- /bin/sh -lc 'command | command'`.
 
+`--terminal` overrides configured terminal selection and implies `--new` for
+path opening. Selection otherwise follows Boomux configuration and then normal
+`xdg-terminal-exec` policy.
+
 Open the dashboard or run diagnostics with:
 
 ```console
@@ -279,6 +363,22 @@ boomux doctor
 
 `boomux` and `boomux ui` must run from a fresh host terminal; they are rejected
 when `BOOMUX_SHELL_ID` is set. `boomux doctor` can run in either context.
+
+The dashboard has workspace, Agent, launcher, shell, and command views. `/` or
+`:` opens its action and search palette, `?` shows contextual help, `Enter`
+restores the selected workspace or opens the selected entry, and `x` followed
+by `y` confirms close or removal. Shell previews are bounded and read-only.
+Restoring a workspace has the same launcher, takeover, restart, and
+partial-success behavior as `workspace open`.
+
+## Configuration
+
+Boomux reads `$XDG_CONFIG_HOME/boomux/config.toml`, falling back to
+`~/.config/boomux/config.toml`. `BOOMUX_CONFIG` points to an additional
+field-level override loaded last. Configuration controls terminal selection,
+project discovery roots and depth, and desktop and sound notifications. Unknown
+fields are rejected. Project roots provide dashboard workspace-name suggestions
+only; they do not bind a workspace to a directory.
 
 ## Manage Workspaces
 
@@ -291,14 +391,19 @@ boomux workspace rename "<name-or-id>" "<new-name>"
 boomux workspace close "<name-or-id>"
 ```
 
-`workspace create` creates an empty workspace. `workspace close` removes the
-workspace and terminates all of its running shell sessions. A workspace cannot
-close itself from one of its own shells.
+`workspace create` creates an empty workspace. `workspace close` terminates
+every running shell process session and removes the workspace, all shell and
+launcher definitions, retained terminal state, and all durable Agent and
+attention records associated with it. Canonical OpenCode or Pi host data is not
+deleted. A workspace cannot close itself from one of its own shells. Confirm
+the exact target and full removal scope first.
 
-`workspace open` invokes every configured workspace launcher in creation order,
-then opens all shell terminal windows with takeover. It also supports a
-launcher-only workspace. Merely selecting a dashboard row does not invoke
-launchers.
+`workspace open` is an active, non-transactional restore operation. It invokes
+every launcher in creation order and attempts to open every shell even if an
+earlier item fails. Each shell opens with takeover, disconnecting its current
+writable controller, and an exited shell restarts as a new run. Obtain explicit
+authorization before running it, especially from inside that workspace. A
+launcher-only workspace is valid, but an empty workspace cannot be opened.
 
 ## Manage Workspace Launchers
 
@@ -330,7 +435,9 @@ boomux shell close "<name-or-id>" --workspace "<workspace-name-or-id>"
 
 `shell create` records a pending shell. `--cwd` defaults to the current
 directory. Omit `--name` to let Boomux generate a unique shell name. A shell
-cannot close itself through the CLI.
+cannot close itself through the CLI. Closing one shell terminates its process
+session and removes its retained terminal state, but durable Agent records
+remain in the workspace as historical occurrences.
 
 The contextual close shorthand is:
 
@@ -365,8 +472,11 @@ boomux daemon stop
 `restart` performs a transactional graceful handoff that preserves pending,
 running, and exited shells, including final exited terminal state, and reconnects
 active clients. It does not start a new process for an exited shell. `stop`
-terminates every managed process session. Confirm before either operation when
-the user did not request it explicitly.
+terminates every managed process session and stops the daemon, but durable
+definitions remain. A later daemon-backed command can start Boomux again;
+recovered shells are pending and opening them starts new processes. Process
+memory, PTYs, and mutated environments do not survive. Confirm before either
+operation when the user did not request it explicitly.
 
 ## Install Or Update This Skill
 
@@ -375,11 +485,20 @@ boomux skill install
 boomux skill install --force
 ```
 
-The skill is installed at `~/.agents/skills/boomux/SKILL.md`. Use `--force` to
-replace different existing content. The installer removes an untouched legacy
-`boomux-shells` skill; it preserves and warns about customized legacy content.
+The skill is installed at `~/.agents/skills/boomux/SKILL.md`. Installation has
+no dry-run mode. Use `--force` only with authorization to overwrite different
+existing content. After every successful install, the installer checks
+`~/.agents/skills/boomux-shells`: an exactly untouched single-file legacy skill
+is deleted automatically, while customized content or additional files are
+preserved with a warning. Obtain authorization for installation and this
+possible legacy removal.
 
-## Install The OpenCode Integration
+## Direct OpenCode Install Shortcut
+
+Prefer `boomux integration setup opencode` for guided status, preview, consent,
+restart, and verification guidance. `boomux opencode install` is an equivalent
+immediate-write shortcut; use it only after the user authorizes installation at
+the resolved global target.
 
 The bundled plugin is validated against `opencode-ai` `1.18.15`; this is a
 compatibility test point rather than a runtime pin.
@@ -404,7 +523,12 @@ session deletion maps to `done`. Child deletion and process exit do not report
 completion. Unmanaged or unavailable Boomux is fail-open. If Boomux returns
 `run_changed`, reporting for that root is disabled rather than redirected.
 
-## Install The Pi Integration
+## Direct Pi Install Shortcut
+
+Prefer `boomux integration setup pi` for guided status, preview, consent,
+restart, and verification guidance. `boomux pi install` is an equivalent
+immediate-write shortcut; use it only after the user authorizes installation at
+the resolved global target.
 
 The bundled extension is validated against
 `@earendil-works/pi-coding-agent` `0.84.1`; this is a compatibility test point
@@ -422,10 +546,11 @@ rejected. Restart Pi after installing or replacing the extension.
 
 The extension activates only in a managed shell run and keys the Agent instance
 by Pi's canonical project session ID. Session start reports `idle`; agent start
-reports `working`; final assistant errors report `blocked` after the agent fully
-settles; and session shutdown reports `inactive` because Pi sessions are
-resumable. Inactive records remain durable but do not occupy dashboard agent
-rows. Reporting is serialized and fail-open.
+reports `working`; after retries, compaction, and queued continuations settle, a
+final assistant error reports `blocked` and a successful settle reports `idle`.
+Session shutdown reports `inactive` because Pi sessions are resumable and makes
+one bounded retry. Inactive records remain durable but do not occupy dashboard
+Agent rows. Reporting is serialized and fail-open.
 
 ## Environment And Integration
 
@@ -459,8 +584,13 @@ history. Obtain the exact daemon-side run ID through `shell inspect --json` and
 pass it explicitly only when the lifecycle integration is known to belong to
 that same live process.
 
-`boomux prompt` prints `workspace/shell` inside Boomux and nothing outside it.
-It is intended for prompt integrations. Use `boomux --help` and
+This hidden command is intended only for prompt integrations:
+
+```console
+boomux prompt
+```
+
+It prints `workspace/shell` inside Boomux and nothing outside it. Use `boomux --help` and
 `boomux <command> --help` when exact syntax or newly added options are needed.
 
 Do not invoke private transport commands such as `__attach`, `daemon run`, or

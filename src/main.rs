@@ -6123,13 +6123,16 @@ mod tests {
         for command in [
             "boomux ui",
             "boomux doctor",
+            "boomux capabilities",
             "boomux list",
             "boomux shells",
             "boomux read",
+            "boomux events",
             "boomux close",
             "boomux open",
             "boomux workspace list",
             "boomux workspace create",
+            "boomux workspace open",
             "boomux workspace inspect",
             "boomux workspace rename",
             "boomux workspace close",
@@ -6137,9 +6140,30 @@ mod tests {
             "boomux shell inspect",
             "boomux shell rename",
             "boomux shell close",
+            "boomux launcher list",
+            "boomux launcher create",
+            "boomux launcher inspect",
+            "boomux launcher rename",
+            "boomux launcher remove",
+            "boomux agent list",
+            "boomux agent inspect",
+            "boomux agent wait",
+            "boomux agent register",
+            "boomux agent ensure",
+            "boomux agent report",
+            "boomux agent supervise",
+            "boomux attention list",
+            "boomux attention acknowledge",
+            "boomux notification test",
             "boomux session list",
             "boomux session inspect",
             "boomux session read",
+            "boomux integration list",
+            "boomux integration status",
+            "boomux integration install",
+            "boomux integration uninstall",
+            "boomux integration setup",
+            "boomux integration verify",
             "boomux skill install",
             "boomux opencode install",
             "boomux pi install",
@@ -6148,7 +6172,14 @@ mod tests {
             "boomux daemon stop",
             "boomux prompt",
         ] {
-            assert!(BOOMUX_SKILL.contains(command), "skill omits {command}");
+            let documented = BOOMUX_SKILL.lines().any(|line| {
+                let line = line.trim_start();
+                line.strip_prefix(command).is_some_and(|remaining| {
+                    remaining.is_empty()
+                        || remaining.chars().next().is_some_and(char::is_whitespace)
+                })
+            });
+            assert!(documented, "skill omits command line for {command}");
         }
         assert!(BOOMUX_SKILL.contains("BOOMUX_SHELL_ID"));
         assert!(BOOMUX_SKILL.contains("--workspace"));
