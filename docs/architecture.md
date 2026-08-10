@@ -36,8 +36,9 @@ frames for input, output, resize, and detach events.
 
 The domain has five durable identities:
 
-- A workspace is a globally named shell container with a UUID. It has no path
-  or working directory.
+- A workspace is a globally named shell container with a UUID and an optional
+  default working directory for newly created shells. The default is creation
+  behavior, not workspace identity; individual shells may use other paths.
 - A shell is a durable process slot with a name, startup command, explicit
   working directory, and workspace ID.
 - A shell run identifies one process incarnation beneath that durable shell. It
@@ -76,7 +77,8 @@ is restricted to the current user and the socket mode is `0600`.
 
 The daemon supports:
 
-- Empty or explicitly populated workspace creation
+- Empty or explicitly populated workspace creation with an optional shell cwd
+  default
 - Atomic shell creation with an implicit `workspace-N` container when no
   workspace is selected
 - Additional shell creation
@@ -145,10 +147,11 @@ window has spawned, preserving retained output when terminal preparation fails.
 `src/tui.rs` remains a control plane. It receives backend-neutral view models
 and callback functions rather than opening sockets itself. One daemon snapshot
 contains each workspace, its launchers, and its shells, avoiding races between separate list
-operations. Configured project roots provide workspace-name suggestions only.
-Git information is collected independently from shell directories and cached;
-empty or mixed-directory workspaces have no workspace-level directory or Git
-identity.
+operations. Configured project roots provide workspace suggestions; selecting
+one persists its canonical path as the workspace's default cwd. Git information
+is still collected independently from shell directories and cached. A default
+cwd does not create workspace-level Git identity, and mixed-directory
+workspaces remain valid.
 
 Shell snapshots include their additive stored startup argument vector. The
 dashboard presents an empty vector as `shell` and a non-empty vector as

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 18;
+pub const PROTOCOL_VERSION: u32 = 19;
 pub const MIN_PROTOCOL_VERSION: u32 = 6;
 pub const MAX_CONTROL_FRAME: usize = 8 * 1024 * 1024;
 pub const MAX_ATTACH_FRAME: usize = 1024 * 1024;
@@ -47,6 +47,8 @@ pub struct FocusedTerminalSnapshot {
 pub struct WorkspaceSnapshot {
     pub id: String,
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_cwd: Option<PathBuf>,
     pub shells: Vec<ShellSnapshot>,
     #[serde(default)]
     pub launchers: Vec<WorkspaceLauncherSnapshot>,
@@ -403,6 +405,8 @@ pub enum Request {
     },
     CreateWorkspace {
         name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        default_cwd: Option<PathBuf>,
         shells: Vec<ShellSpec>,
     },
     CreateShell {
@@ -493,6 +497,13 @@ pub enum Request {
 impl Request {
     pub fn minimum_protocol_version(&self) -> u32 {
         match self {
+            Self::CreateWorkspace {
+                default_cwd: Some(_),
+                ..
+            }
+            | Self::CreateShell {
+                workspace_id: None, ..
+            } => 19,
             Self::RestartWithNotificationConfig { .. } => 17,
             Self::Attach {
                 environment: Some(_),
@@ -852,7 +863,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_snapshot_accepts_protocol_seven_payload_without_launchers() {
+    fn workspace_snapshot_defaults_fields_omitted_by_old_daemons() {
         let snapshot = serde_json::from_str::<WorkspaceSnapshot>(
             r#"{"id":"w1","name":"workspace","shells":[]}"#,
         )
@@ -860,6 +871,23 @@ mod tests {
 
         assert!(snapshot.launchers.is_empty());
         assert!(snapshot.agents.is_empty());
+        assert!(snapshot.default_cwd.is_none());
+    }
+
+    #[test]
+    fn old_workspace_creation_defaults_to_no_cwd() {
+        let request = serde_json::from_str::<Request>(
+            r#"{"request":"create_workspace","name":"workspace","shells":[]}"#,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            request,
+            Request::CreateWorkspace {
+                default_cwd: None,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -925,8 +953,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_eighteen_with_minimum_six() {
-        assert_eq!(PROTOCOL_VERSION, 18);
+    fn protocol_version_is_nineteen_with_minimum_six() {
+        assert_eq!(PROTOCOL_VERSION, 19);
         assert_eq!(MIN_PROTOCOL_VERSION, 6);
     }
 
@@ -940,6 +968,20 @@ mod tests {
     #[test]
     fn request_minimum_protocol_versions_cover_all_groups() {
         let groups = vec![
+            (
+                19,
+                vec![
+                    Request::CreateWorkspace {
+                        name: "project".into(),
+                        default_cwd: Some("/tmp/project".into()),
+                        shells: Vec::new(),
+                    },
+                    Request::CreateShell {
+                        workspace_id: None,
+                        shell: ShellSpec::login("shell", "/tmp/project"),
+                    },
+                ],
+            ),
             (
                 17,
                 vec![Request::RestartWithNotificationConfig {
@@ -968,6 +1010,7 @@ mod tests {
                     },
                     Request::CreateWorkspace {
                         name: "workspace".into(),
+                        default_cwd: None,
                         shells: Vec::new(),
                     },
                     Request::CreateShell {

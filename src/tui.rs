@@ -30,6 +30,7 @@ const PREVIEW_RESERVED_ITEM_HEIGHT: u16 = 6;
 pub(crate) struct WorkspaceView {
     pub(crate) id: String,
     pub(crate) name: String,
+    pub(crate) default_cwd: Option<String>,
     pub(crate) items: Vec<WorkspaceItemView>,
     pub(crate) sessions: Vec<AgentSessionView>,
     pub(crate) agent_state_counts: AgentStateCounts,
@@ -1221,12 +1222,16 @@ impl App {
         }
     }
 
-    fn create_workspace<F>(&mut self, name: &str, on_create_workspace: &mut F)
-    where
-        F: FnMut(&str) -> Result<String, String>,
+    fn create_workspace<F>(
+        &mut self,
+        name: &str,
+        default_cwd: Option<&PathBuf>,
+        on_create_workspace: &mut F,
+    ) where
+        F: FnMut(&str, Option<&PathBuf>) -> Result<String, String>,
     {
         self.mode = Mode::Normal;
-        self.message = Some(Message::from_result(on_create_workspace(name)));
+        self.message = Some(Message::from_result(on_create_workspace(name, default_cwd)));
     }
 
     fn rename<F>(&mut self, target: &RenameTarget, name: &str, on_rename: &mut F)
@@ -1558,7 +1563,7 @@ where
     R: FnMut(&str) -> Result<String, String>,
     O: FnMut(&OpenTarget) -> Result<String, String>,
     C: FnMut(&CloseTarget) -> Result<String, String>,
-    W: FnMut(&str) -> Result<String, String>,
+    W: FnMut(&str, Option<&PathBuf>) -> Result<String, String>,
     N: FnMut(&str) -> Result<String, String>,
     E: FnMut(&RenameTarget, &str) -> Result<String, String>,
     F: FnMut() -> Result<DashboardState, String>,
@@ -1583,7 +1588,7 @@ where
     R: FnMut(&str) -> Result<String, String>,
     O: FnMut(&OpenTarget) -> Result<String, String>,
     C: FnMut(&CloseTarget) -> Result<String, String>,
-    W: FnMut(&str) -> Result<String, String>,
+    W: FnMut(&str, Option<&PathBuf>) -> Result<String, String>,
     N: FnMut(&str) -> Result<String, String>,
     E: FnMut(&RenameTarget, &str) -> Result<String, String>,
     F: FnMut() -> Result<DashboardState, String>,
@@ -1718,7 +1723,7 @@ where
     R: FnMut(&str) -> Result<String, String>,
     O: FnMut(&OpenTarget) -> Result<String, String>,
     C: FnMut(&CloseTarget) -> Result<String, String>,
-    W: FnMut(&str) -> Result<String, String>,
+    W: FnMut(&str, Option<&PathBuf>) -> Result<String, String>,
     N: FnMut(&str) -> Result<String, String>,
     E: FnMut(&RenameTarget, &str) -> Result<String, String>,
     F: FnMut() -> Result<DashboardState, String>,
@@ -1882,7 +1887,7 @@ fn handle_mode_key<W, E>(
     on_rename: &mut E,
 ) -> bool
 where
-    W: FnMut(&str) -> Result<String, String>,
+    W: FnMut(&str, Option<&PathBuf>) -> Result<String, String>,
     E: FnMut(&RenameTarget, &str) -> Result<String, String>,
 {
     let mode = std::mem::replace(&mut app.mode, Mode::Normal);
@@ -1895,13 +1900,13 @@ where
         Mode::Palette(_) | Mode::Help => false,
         Mode::PickProject(mut picker) => match key {
             KeyCode::Enter if picker.selected().is_some() => {
-                let name = picker.selected().expect("selected project").name.clone();
-                app.create_workspace(&name, on_create_workspace);
+                let project = picker.selected().expect("selected project").clone();
+                app.create_workspace(&project.name, Some(&project.path), on_create_workspace);
                 true
             }
             KeyCode::Enter if !picker.query.trim().is_empty() => {
                 let name = picker.query.trim().to_owned();
-                app.create_workspace(&name, on_create_workspace);
+                app.create_workspace(&name, None, on_create_workspace);
                 true
             }
             KeyCode::Enter => {
@@ -2622,7 +2627,14 @@ fn selected_item_preview(app: &App) -> Option<ContextualPreview> {
 
 fn workspace_preview(workspace: &WorkspaceView) -> ContextualPreview {
     let counts = workspace.agent_state_counts;
-    let mut lines = vec![
+    let mut lines = Vec::new();
+    if let Some(default_cwd) = &workspace.default_cwd {
+        lines.push(Line::from(vec![
+            Span::styled("default  ", Style::new().fg(SUBTEXT)),
+            Span::raw(default_cwd.clone()),
+        ]));
+    }
+    lines.extend([
         Line::from(format!(
             "{:<9}{:<3}{:<9}{}",
             "shell",
@@ -2651,7 +2663,7 @@ fn workspace_preview(workspace: &WorkspaceView) -> ContextualPreview {
             ),
             Style::new().fg(SUBTEXT),
         )),
-    ];
+    ]);
     if let Some(attention) = workspace.attention.first() {
         let currency = if attention.observation_is_current {
             "current"
@@ -3253,6 +3265,7 @@ mod tests {
         WorkspaceView {
             id: id.into(),
             name: name.into(),
+            default_cwd: None,
             items: vec![WorkspaceItemView::Shell(TerminalView {
                 id: "term_1".into(),
                 name: "agent".into(),
@@ -3327,6 +3340,10 @@ mod tests {
     }
 
     fn successful_text(_: &str) -> Result<String, String> {
+        Ok(String::new())
+    }
+
+    fn successful_workspace(_: &str, _: Option<&PathBuf>) -> Result<String, String> {
         Ok(String::new())
     }
 
@@ -3818,7 +3835,7 @@ mod tests {
     }
 
     #[test]
-    fn project_suggestion_creates_workspace_by_name_only() {
+    fn project_suggestion_creates_workspace_with_default_cwd() {
         let mut app = app();
         let mut created = None;
 
@@ -3828,7 +3845,7 @@ mod tests {
                 &mut app,
                 KeyCode::Char(character),
                 KeyModifiers::NONE,
-                &mut |_| Ok(String::new()),
+                &mut |_, _| Ok(String::new()),
                 &mut |_, _| Ok(String::new()),
             );
         }
@@ -3836,15 +3853,15 @@ mod tests {
             &mut app,
             KeyCode::Enter,
             KeyModifiers::NONE,
-            &mut |name| {
-                created = Some(name.to_owned());
+            &mut |name, default_cwd| {
+                created = Some((name.to_owned(), default_cwd.cloned()));
                 Ok("Created workspace".into())
             },
             &mut |_, _| Ok(String::new()),
         );
 
         assert!(changed);
-        assert_eq!(created.as_deref(), Some("alpha"));
+        assert_eq!(created, Some(("alpha".into(), Some("/tmp/alpha".into()))));
         assert!(matches!(app.mode, Mode::Normal));
     }
 
@@ -3862,15 +3879,15 @@ mod tests {
             &mut app,
             KeyCode::Enter,
             KeyModifiers::NONE,
-            &mut |name| {
-                created = Some(name.to_owned());
+            &mut |name, default_cwd| {
+                created = Some((name.to_owned(), default_cwd.cloned()));
                 Ok("Created workspace".into())
             },
             &mut |_, _| Ok(String::new()),
         );
 
         assert!(changed);
-        assert_eq!(created.as_deref(), Some("custom workspace"));
+        assert_eq!(created, Some(("custom workspace".into(), None)));
     }
 
     #[test]
@@ -3909,7 +3926,7 @@ mod tests {
             &mut app,
             KeyCode::Char('c'),
             KeyModifiers::CONTROL,
-            &mut |_| Ok(String::new()),
+            &mut |_, _| Ok(String::new()),
             &mut |_, _| Ok(String::new()),
         );
 
@@ -3928,7 +3945,7 @@ mod tests {
             &mut app,
             KeyCode::Char('_'),
             KeyModifiers::SHIFT,
-            &mut |_| Ok(String::new()),
+            &mut |_, _| Ok(String::new()),
             &mut |_, _| Ok(String::new()),
         );
 
@@ -4083,7 +4100,7 @@ mod tests {
                 Ok("opened".into())
             },
             on_close: successful_close,
-            on_create_workspace: successful_text,
+            on_create_workspace: successful_workspace,
             on_create_shell: successful_text,
             on_rename: successful_rename,
             on_refresh: empty_refresh,
@@ -4145,7 +4162,7 @@ mod tests {
             on_restore: successful_text,
             on_open: successful_open,
             on_close: successful_close,
-            on_create_workspace: successful_text,
+            on_create_workspace: successful_workspace,
             on_create_shell: successful_text,
             on_rename: successful_rename,
             on_refresh: empty_refresh,
@@ -4173,7 +4190,7 @@ mod tests {
             on_restore: successful_text,
             on_open: successful_open,
             on_close: successful_close,
-            on_create_workspace: successful_text,
+            on_create_workspace: successful_workspace,
             on_create_shell: successful_text,
             on_rename: successful_rename,
             on_refresh: empty_refresh,
@@ -4403,7 +4420,7 @@ mod tests {
                 &mut app,
                 KeyCode::Char(character),
                 KeyModifiers::NONE,
-                &mut |_| Ok(String::new()),
+                &mut |_, _| Ok(String::new()),
                 &mut |_, _| Ok(String::new()),
             );
         }
@@ -4411,7 +4428,7 @@ mod tests {
             &mut app,
             KeyCode::Enter,
             KeyModifiers::NONE,
-            &mut |_| Ok(String::new()),
+            &mut |_, _| Ok(String::new()),
             &mut |target, name| {
                 renamed = Some((target.clone(), name.to_owned()));
                 Ok("Renamed shell".into())
@@ -4444,7 +4461,7 @@ mod tests {
                 &mut app,
                 KeyCode::Char(character),
                 KeyModifiers::NONE,
-                &mut |_| Ok(String::new()),
+                &mut |_, _| Ok(String::new()),
                 &mut |_, _| Ok(String::new()),
             );
         }
@@ -4452,7 +4469,7 @@ mod tests {
             &mut app,
             KeyCode::Enter,
             KeyModifiers::NONE,
-            &mut |_| Ok(String::new()),
+            &mut |_, _| Ok(String::new()),
             &mut |target, name| {
                 renamed = Some((target.clone(), name.to_owned()));
                 Ok("Renamed workspace".into())

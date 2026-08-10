@@ -367,6 +367,7 @@ mod tests {
         WorkspaceSnapshot {
             id: id.into(),
             name: format!("workspace-{id}"),
+            default_cwd: None,
             shells: vec![shell],
             launchers: Vec::new(),
             agents: agent_ids

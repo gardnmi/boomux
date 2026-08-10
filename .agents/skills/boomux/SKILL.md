@@ -4,7 +4,7 @@ description: Inspect and manage Boomux persistent terminal workspaces, launchers
 compatibility: Requires boomux on PATH. Some name operations require Boomux workspace context or an explicit --workspace; agent mutation and supervision require exact shell-run context, and supervision requires a caller-supplied canonical external session ID.
 metadata:
   author: boomux
-  version: "8"
+  version: "9"
 ---
 
 # Boomux
@@ -347,11 +347,12 @@ boomux "/path/to/project" --terminal "Alacritty.desktop"
 boomux "/path/to/project" -- command arg1 arg2
 ```
 
-Without `--name`, Boomux creates the next generated workspace. With `--name`, it
-adds a shell to an existing exact-name workspace or creates that workspace. A
-command after `--` is an exact executable and argument vector; shell operators
-such as pipes or redirects work only when explicitly passed through a shell,
-for example `-- /bin/sh -lc 'command | command'`.
+Without `--name`, Boomux creates the next generated workspace and stores the
+selected path as its default cwd. With `--name`, it adds a shell to an existing
+exact-name workspace or creates that workspace with the selected path as its
+default. A command after `--` is an exact executable and argument vector; shell
+operators such as pipes or redirects work only when explicitly passed through a
+shell, for example `-- /bin/sh -lc 'command | command'`.
 
 `--terminal` overrides configured terminal selection and implies `--new` for
 path opening. Selection otherwise follows Boomux configuration and then normal
@@ -383,23 +384,27 @@ Boomux reads `$XDG_CONFIG_HOME/boomux/config.toml`, falling back to
 `~/.config/boomux/config.toml`. `BOOMUX_CONFIG` points to an additional
 field-level override loaded last. Configuration controls terminal selection,
 project discovery roots and depth, dashboard focus following, and desktop and
-sound notifications. Unknown fields are rejected. Project roots provide
-dashboard workspace-name suggestions only; they do not bind a workspace to a
-directory. Set `[dashboard] follow_focused_terminal = false` to disable the
-default focus-following behavior.
+sound notifications. Unknown fields are rejected. Selecting a discovered
+project in the dashboard persists its canonical path as the workspace default
+cwd for later shells. Set `[dashboard] follow_focused_terminal = false` to
+disable the default focus-following behavior.
 
 ## Manage Workspaces
 
 ```console
 boomux workspace list
 boomux workspace create "<name>"
+boomux workspace create "<name>" --cwd "/path/to/project"
 boomux workspace open "<name-or-id>"
 boomux workspace inspect "<name-or-id>"
 boomux workspace rename "<name-or-id>" "<new-name>"
 boomux workspace close "<name-or-id>"
 ```
 
-`workspace create` creates an empty workspace. `workspace close` terminates
+`workspace create` creates an empty workspace. `--cwd` stores an optional
+default used by dashboard shells and `shell create` when no explicit cwd is
+given. The default does not prevent individual shells from using other paths.
+`workspace close` terminates
 every running shell process session and removes the workspace, all shell and
 launcher definitions, retained terminal state, and all durable Agent and
 attention records associated with it. Canonical OpenCode or Pi host data is not
@@ -441,11 +446,13 @@ boomux shell rename "<name-or-id>" "<new-name>" --workspace "<workspace-name-or-
 boomux shell close "<name-or-id>" --workspace "<workspace-name-or-id>"
 ```
 
-`shell create` records a pending shell. `--cwd` defaults to the current
-directory. Omit `--name` to let Boomux generate a unique shell name. A shell
-cannot close itself through the CLI. Closing one shell terminates its process
-session and removes its retained terminal state, but durable Agent records
-remain in the workspace as historical occurrences.
+`shell create` records a pending shell. Without `--cwd`, it uses the workspace
+default when present and otherwise the current directory. An unavailable stored
+default is an error rather than a silent fallback. Omit `--name` to let Boomux
+generate a unique shell name. A shell cannot close itself through the CLI.
+Closing one shell terminates its process session and removes its retained
+terminal state, but durable Agent records remain in the workspace as historical
+occurrences.
 
 The contextual close shorthand is:
 

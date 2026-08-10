@@ -52,8 +52,9 @@ boomux . --name my-project
 ```
 
 `.` selects the current directory. Boomux creates the workspace and shell, then
-connects the current terminal window to that shell. The workspace is identified
-by its name; it is not permanently bound to the directory.
+connects the current terminal window to that shell. The directory becomes the
+workspace default for shells created without an explicit working directory;
+individual shells can still use other directories.
 
 Start a program, then close the terminal window. The process keeps running. From
 a fresh, regular terminal, open the dashboard:
@@ -116,14 +117,16 @@ boomux . --name my-project --new -- sh -lc 'cargo test | tee test.log'
 | --- | --- |
 | Create a generated workspace | `boomux .` |
 | Create or add to a named workspace | `boomux . --name feature-x` |
+| Create an empty workspace with a default directory | `boomux workspace create feature-x --cwd .` |
 | Open the new shell in another terminal | `boomux . --name feature-x --new` |
 | Run one command | `boomux . --name feature-x --new -- lazygit` |
 | Choose a terminal | `boomux . --terminal Alacritty.desktop` |
 | Open the dashboard | `boomux` or `boomux ui` |
 | Inspect daemon health | `boomux doctor` |
 
-Without `--name`, Boomux creates the next `workspace-N`. With `--name`, it adds
-a shell to an existing exact-name workspace or creates the workspace.
+Without `--name`, Boomux creates the next `workspace-N` and stores the selected
+path as its default for later shells. With `--name`, it adds a shell to an
+existing exact-name workspace or creates a workspace with that default.
 `--terminal` implies `--new`. Terminal selection uses the CLI override, then
 Boomux configuration, then the normal `xdg-terminal-exec` policy.
 
@@ -240,8 +243,10 @@ blocked = "message-new-instant"
 completed = "complete"
 ```
 
-Project roots provide workspace-name suggestions in the dashboard. Selecting a
-suggestion does not bind the workspace to that path.
+Project roots provide workspace suggestions in the dashboard. Selecting one
+stores its path as the workspace default for shells added later. Free-text and
+legacy workspaces without a default continue to use the directory where the
+dashboard was opened. An explicit shell cwd always takes precedence.
 
 The dashboard follows the most recently focused Boomux terminal by default,
 selecting its workspace and shell or Agent row. Manual dashboard navigation is

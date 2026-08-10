@@ -10,8 +10,9 @@ commitments.
   dashboard.
 - [x] Restore a whole workspace into native terminal windows or open only one
   selected terminal.
-- [x] Create empty named workspaces from free text or searchable project-name
-  suggestions grouped by configured roots, without associating project paths.
+- [x] Create empty named workspaces from free text or searchable project
+  suggestions grouped by configured roots, persisting a selected project's path
+  as the default cwd for later shells.
 - [x] Assign shells created without a workspace to the next available
   `workspace-N` container.
 - [x] Load layered TOML configuration from the XDG config directory and an

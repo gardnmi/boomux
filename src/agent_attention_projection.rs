@@ -162,6 +162,7 @@ mod tests {
         WorkspaceSnapshot {
             id: "w1".into(),
             name: "project".into(),
+            default_cwd: None,
             shells: vec![boomux::protocol::ShellSnapshot {
                 id: "s1".into(),
                 workspace_id: "w1".into(),
