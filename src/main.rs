@@ -96,6 +96,8 @@ const INTEGRATION_FEATURES: &[&str] = &[
     "protocol_16",
     "protocol_17",
     "protocol_18",
+    "protocol_19",
+    "workspace_default_cwd",
     "focused_terminal_following",
     "restartable_exited_shells",
     "inactive_agent_state",
@@ -313,7 +315,11 @@ enum WorkspaceCommands {
     /// List workspaces
     List,
     /// Create an empty workspace
-    Create { name: String },
+    Create {
+        name: String,
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+    },
     /// Open terminal windows and invoke launchers
     Open { target: String },
     /// Show a workspace and its shells
@@ -369,8 +375,8 @@ enum ShellCommands {
         workspace: String,
         #[arg(long)]
         name: Option<String>,
-        #[arg(long, default_value = ".")]
-        cwd: PathBuf,
+        #[arg(long)]
+        cwd: Option<PathBuf>,
         #[arg(last = true, num_args = 1.., value_name = "COMMAND")]
         command: Vec<String>,
     },
@@ -1153,8 +1159,9 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
                     Ok(format!("Removed launcher {name}"))
                 }
             },
-            on_create_workspace: |name: &str| {
-                create_dashboard_workspace(&client, name).map_err(|error| error.to_string())
+            on_create_workspace: |name: &str, default_cwd: Option<&PathBuf>| {
+                create_dashboard_workspace(&client, name, default_cwd)
+                    .map_err(|error| error.to_string())
             },
             on_create_shell: |workspace_id: &str| {
                 create_dashboard_shell(&client, workspace_id, &launch_cwd)
@@ -1367,6 +1374,10 @@ fn dashboard_views_from_sessions(
             tui::WorkspaceView {
                 id: workspace.id.clone(),
                 name: workspace.name.clone(),
+                default_cwd: workspace
+                    .default_cwd
+                    .as_ref()
+                    .map(|cwd| cwd.display().to_string()),
                 items: shells.chain(launchers).collect(),
                 sessions,
                 agent_state_counts: agent_summary.states,
@@ -1411,9 +1422,10 @@ fn workspace_source_directories(workspaces: &[WorkspaceSnapshot]) -> BTreeSet<Pa
         .iter()
         .flat_map(|workspace| {
             workspace
-                .shells
+                .default_cwd
                 .iter()
-                .map(|shell| shell.cwd.clone())
+                .cloned()
+                .chain(workspace.shells.iter().map(|shell| shell.cwd.clone()))
                 .chain(
                     workspace
                         .launchers
@@ -1536,8 +1548,9 @@ fn open_directory(
             } else {
                 (
                     client
-                        .create_workspace(
+                        .create_workspace_with_default_cwd(
                             &name,
+                            Some(directory.clone()),
                             vec![shell_spec("shell-1", &directory, startup_command)],
                         )?
                         .shells
@@ -1648,12 +1661,13 @@ fn resolve_workspace_target<'a>(
 fn create_dashboard_workspace(
     client: &client::Client,
     name: &str,
+    default_cwd: Option<&PathBuf>,
 ) -> Result<String, Box<dyn Error>> {
     let name = name.trim();
     if name.is_empty() {
         return Err("workspace name cannot be empty".into());
     }
-    client.create_workspace(name, Vec::new())?;
+    client.create_workspace_with_default_cwd(name, default_cwd.cloned(), Vec::new())?;
     Ok(format!("Created empty workspace {name}"))
 }
 
@@ -1664,8 +1678,29 @@ fn create_dashboard_shell(
 ) -> Result<String, Box<dyn Error>> {
     let workspace = client.get_workspace(workspace_id)?;
     let name = unique_shell_name("shell", &workspace.shells);
-    client.create_shell(workspace_id, ShellSpec::login(&name, launch_cwd))?;
+    let cwd = resolve_shell_cwd(workspace.default_cwd.as_deref(), None, launch_cwd)?;
+    client.create_shell(workspace_id, ShellSpec::login(&name, cwd))?;
     Ok(format!("Created {name} in {}", workspace.name))
+}
+
+fn resolve_shell_cwd(
+    default_cwd: Option<&Path>,
+    requested_cwd: Option<&Path>,
+    fallback_cwd: &Path,
+) -> Result<PathBuf, Box<dyn Error>> {
+    if let Some(cwd) = requested_cwd {
+        return resolve_directory(cwd);
+    }
+    let Some(default_cwd) = default_cwd else {
+        return resolve_directory(fallback_cwd);
+    };
+    resolve_directory(default_cwd).map_err(|error| {
+        format!(
+            "workspace default working directory is unavailable: {}: {error}",
+            default_cwd.display()
+        )
+        .into()
+    })
 }
 
 fn unique_shell_name(base_name: &str, shells: &[ShellSnapshot]) -> String {
@@ -2418,9 +2453,11 @@ fn workspace_command(
                 );
             }
         }
-        WorkspaceCommands::Create { name } => {
+        WorkspaceCommands::Create { name, cwd } => {
             let name = cli_name(name, "workspace")?;
-            let workspace = client.create_workspace(name, Vec::new())?;
+            let default_cwd = cwd.as_deref().map(resolve_directory).transpose()?;
+            let workspace =
+                client.create_workspace_with_default_cwd(name, default_cwd, Vec::new())?;
             println!("Created workspace {} ({})", workspace.name, workspace.id);
         }
         WorkspaceCommands::Open { target } => {
@@ -2451,6 +2488,7 @@ fn workspace_command(
                         "workspace": {
                             "id": workspace.id,
                             "name": workspace.name,
+                            "default_cwd": workspace.default_cwd,
                             "shells": shells,
                             "launchers": workspace.launchers.iter()
                                 .map(|launcher| cli_output::launcher(launcher, Some(&workspace.name)))
@@ -2466,6 +2504,13 @@ fn workspace_command(
             }
             println!("ID\t{}", workspace.id);
             println!("NAME\t{}", workspace.name);
+            println!(
+                "DEFAULT CWD\t{}",
+                workspace
+                    .default_cwd
+                    .as_deref()
+                    .map_or_else(|| "-".into(), |cwd| cwd.display().to_string())
+            );
             println!("SHELLS\t{}", workspace.shells.len());
             println!("LAUNCHERS\t{}", workspace.launchers.len());
             println!("AGENTS\t{}", workspace.agents.len());
@@ -2553,7 +2598,11 @@ fn shell_command(command: ShellCommands, json: bool) -> Result<(), Box<dyn Error
                 .map(|name| cli_name(name, "shell"))
                 .transpose()?
                 .unwrap_or_else(|| unique_shell_name("shell", &workspace.shells));
-            let cwd = resolve_directory(&cwd)?;
+            let cwd = resolve_shell_cwd(
+                workspace.default_cwd.as_deref(),
+                cwd.as_deref(),
+                Path::new("."),
+            )?;
             let shell = client.create_shell(&workspace.id, shell_spec(name, &cwd, &command))?;
             println!("Created pending shell {} ({})", shell.name, shell.id);
         }
@@ -4302,6 +4351,7 @@ mod tests {
         WorkspaceSnapshot {
             id: id.into(),
             name: name.into(),
+            default_cwd: None,
             shells,
             launchers: Vec::new(),
             agents: Vec::new(),
@@ -4467,8 +4517,26 @@ mod tests {
                 .unwrap()
                 .command,
             Some(Commands::Workspace {
-                command: WorkspaceCommands::Create { name }
+                command: WorkspaceCommands::Create { name, cwd: None }
             }) if name == "project"
+        ));
+        assert!(matches!(
+            Cli::try_parse_from([
+                "boomux",
+                "workspace",
+                "create",
+                "project",
+                "--cwd",
+                "/tmp"
+            ])
+            .unwrap()
+            .command,
+            Some(Commands::Workspace {
+                command: WorkspaceCommands::Create {
+                    name,
+                    cwd: Some(cwd)
+                }
+            }) if name == "project" && cwd == Path::new("/tmp")
         ));
         let cli = Cli::try_parse_from([
             "boomux",
@@ -4522,8 +4590,16 @@ mod tests {
                 }
             }) if workspace == "project"
                 && name == "tests"
-                && cwd == Path::new("/tmp")
+                && cwd.as_deref() == Some(Path::new("/tmp"))
                 && command == ["cargo", "test"]
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["boomux", "shell", "create", "project"])
+                .unwrap()
+                .command,
+            Some(Commands::Shell {
+                command: ShellCommands::Create { cwd: None, .. }
+            })
         ));
     }
 
@@ -5060,6 +5136,7 @@ mod tests {
         let mut views = vec![tui::WorkspaceView {
             id: "w1".into(),
             name: "project".into(),
+            default_cwd: None,
             items: Vec::new(),
             agent_state_counts: agent_attention_projection::AgentStateCounts::default(),
             attention_count: 0,
@@ -5996,7 +6073,7 @@ mod tests {
             session_transcript::supported_integrations(),
             ["opencode", "pi"]
         );
-        assert_eq!(protocol::PROTOCOL_VERSION, 18);
+        assert_eq!(protocol::PROTOCOL_VERSION, 19);
     }
 
     #[test]

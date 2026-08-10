@@ -1297,6 +1297,7 @@ mod tests {
         let mut workspace = WorkspaceSnapshot {
             id: "w1".into(),
             name: "workspace".into(),
+            default_cwd: None,
             shells: vec![shell],
             launchers: Vec::new(),
             agents: Vec::new(),

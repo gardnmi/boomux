@@ -34,10 +34,11 @@ consistently in Ghostty, Alacritty, Kitty, and other XDG terminal emulators.
 The current backend reconstructs text VT state but does not claim graphics
 restoration. Running processes survive acknowledged graceful daemon restart;
 an unexpected daemon exit falls back to reproducible metadata recovery.
-Workspace metadata contains only a UUID and name; working directories belong
-exclusively to shells. Dashboard project discovery supplies name suggestions
-and does not persist project paths. A shell request without a selected workspace
-atomically creates the next available `workspace-N` container.
+Workspace metadata contains a UUID, name, and optional default working directory
+for newly created shells. Every shell still stores its own authoritative cwd,
+so mixed-directory workspaces remain valid. Dashboard project discovery persists
+the selected project path as that default. A shell request without a selected
+workspace atomically creates the next available `workspace-N` container.
 
 ## Current Creation Sequence
 

@@ -87,8 +87,8 @@ Command payloads are:
 - `workspace.list`: a `workspaces` array of `id`, `name`, `shell_count`,
   `launcher_count`, `agent_count`, fixed `agent_state_counts`, and
   `attention_count`.
-- `workspace.inspect`: one `workspace` object containing `id`, `name`, and
-  `shells`, `launchers`, and `agents` arrays.
+- `workspace.inspect`: one `workspace` object containing `id`, `name`, nullable
+  `default_cwd`, and `shells`, `launchers`, and `agents` arrays.
 - `shell.inspect`: one `shell` object.
 - `launcher.list`: workspace identity plus a `launchers` array.
 - `launcher.inspect`: one `launcher` object.

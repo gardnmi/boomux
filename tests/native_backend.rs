@@ -202,6 +202,131 @@ impl Drop for TestDaemon {
 }
 
 #[test]
+fn workspace_default_cwd_is_inherited_and_survives_handoff() {
+    let mut daemon = TestDaemon::start();
+    let project = daemon.runtime_dir.join("project");
+    let other = daemon.runtime_dir.join("other");
+    fs::create_dir(&project).unwrap();
+    fs::create_dir(&other).unwrap();
+
+    let created = daemon
+        .command()
+        .args(["workspace", "create", "project", "--cwd"])
+        .arg(&project)
+        .output()
+        .unwrap();
+    assert!(
+        created.status.success(),
+        "workspace create failed: {}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let inspected = daemon
+        .command()
+        .args(["workspace", "inspect", "project", "--json"])
+        .output()
+        .unwrap();
+    let inspected: serde_json::Value = serde_json::from_slice(&inspected.stdout).unwrap();
+    assert_eq!(
+        inspected["data"]["workspace"]["default_cwd"],
+        project.display().to_string()
+    );
+
+    let first = daemon
+        .command()
+        .current_dir(&other)
+        .args(["shell", "create", "project", "--name", "first"])
+        .output()
+        .unwrap();
+    assert!(first.status.success());
+    let workspace = daemon
+        .client
+        .snapshot()
+        .unwrap()
+        .workspaces
+        .into_iter()
+        .find(|workspace| workspace.name == "project")
+        .unwrap();
+    assert_eq!(workspace.shells[0].cwd, project);
+
+    let restart = daemon
+        .command()
+        .args(["daemon", "restart"])
+        .output()
+        .unwrap();
+    assert!(restart.status.success());
+    wait_until(
+        || daemon.child.as_mut().unwrap().try_wait().unwrap().is_some(),
+        "old daemon did not exit after handoff",
+    );
+
+    let second = daemon
+        .command()
+        .current_dir(&other)
+        .args(["shell", "create", "project", "--name", "second"])
+        .output()
+        .unwrap();
+    assert!(second.status.success());
+    let explicit = daemon
+        .command()
+        .args(["shell", "create", "project", "--name", "explicit", "--cwd"])
+        .arg(&other)
+        .output()
+        .unwrap();
+    assert!(explicit.status.success());
+    let workspace = daemon
+        .client
+        .snapshot()
+        .unwrap()
+        .workspaces
+        .into_iter()
+        .find(|workspace| workspace.name == "project")
+        .unwrap();
+    assert_eq!(workspace.default_cwd.as_deref(), Some(project.as_path()));
+    assert_eq!(workspace.shells[1].cwd, project);
+    assert_eq!(workspace.shells[2].cwd, other);
+
+    daemon.stop_with_cli();
+    daemon.restart();
+    let restored = daemon
+        .client
+        .snapshot()
+        .unwrap()
+        .workspaces
+        .into_iter()
+        .find(|workspace| workspace.name == "project")
+        .unwrap();
+    assert_eq!(restored.default_cwd.as_deref(), Some(project.as_path()));
+    let after_restart = daemon
+        .command()
+        .current_dir(&other)
+        .args(["shell", "create", "project", "--name", "after-restart"])
+        .output()
+        .unwrap();
+    assert!(after_restart.status.success());
+    let restored = daemon
+        .client
+        .snapshot()
+        .unwrap()
+        .workspaces
+        .into_iter()
+        .find(|workspace| workspace.name == "project")
+        .unwrap();
+    assert_eq!(restored.shells[3].cwd, project);
+
+    fs::remove_dir_all(restored.default_cwd.unwrap()).unwrap();
+    let missing = daemon
+        .command()
+        .args(["shell", "create", "project", "--name", "missing"])
+        .output()
+        .unwrap();
+    assert!(!missing.status.success());
+    assert!(
+        String::from_utf8_lossy(&missing.stderr)
+            .contains("workspace default working directory is unavailable")
+    );
+}
+
+#[test]
 fn replacement_bootstrap_rejects_invalid_inherited_descriptor() {
     let output = Command::new(env!("CARGO_BIN_EXE_boomux"))
         .args(["daemon", "receive-handoff", "--channel", "999999"])
@@ -360,7 +485,7 @@ fn focused_attachment_is_exposed_in_daemon_snapshots() {
         .unwrap();
     let shell_id = workspace.shells[0].id.clone();
     let mut attachment = daemon.client.attach(&shell_id, false, profile()).unwrap();
-    assert_eq!(attachment.protocol_version, 18);
+    assert_eq!(attachment.protocol_version, 19);
 
     AttachFrame::FocusGained
         .write_to(&mut attachment.stream)
@@ -3213,7 +3338,7 @@ fn native_daemon_lifecycle() {
     let capabilities: serde_json::Value = serde_json::from_slice(&capabilities.stdout).unwrap();
     assert_eq!(capabilities["schema"], "boomux.cli/v1");
     assert_eq!(capabilities["command"], "capabilities");
-    assert_eq!(capabilities["data"]["daemon_protocol_version"], 18);
+    assert_eq!(capabilities["data"]["daemon_protocol_version"], 19);
     assert_eq!(
         capabilities["data"]["session_transcript_integrations"],
         serde_json::json!(["opencode", "pi"])
@@ -3261,6 +3386,8 @@ fn native_daemon_lifecycle() {
         "protocol_16",
         "protocol_17",
         "protocol_18",
+        "protocol_19",
+        "workspace_default_cwd",
         "focused_terminal_following",
         "inactive_agent_state",
         "protocol_11",
@@ -3282,7 +3409,7 @@ fn native_daemon_lifecycle() {
         .output()
         .unwrap();
     assert!(status.status.success());
-    assert!(String::from_utf8_lossy(&status.stdout).contains("running (protocol 18"));
+    assert!(String::from_utf8_lossy(&status.stdout).contains("running (protocol 19"));
     let status = daemon
         .command()
         .args(["daemon", "status", "--json"])

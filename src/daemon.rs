@@ -283,6 +283,9 @@ fn run_daemon(
             handoff::ABORT => return Ok(()),
             handoff::FINALIZE => {
                 socket_cleanup.arm();
+                if registry.persistence_dirty.load(Ordering::Acquire) {
+                    let _ = registry.persist();
+                }
                 registry.publish_runtime_batch(vec![DaemonEventKind::HandoffCompleted])?;
                 for runtime in gated_readers {
                     runtime.resume_reader()?;
@@ -303,6 +306,8 @@ fn run_daemon(
             io::ErrorKind::InvalidData,
             "transferred runtimes require a handoff commit channel",
         ));
+    } else if registry.persistence_dirty.load(Ordering::Acquire) {
+        registry.persist()?;
     }
     let shutdown = Arc::new(AtomicBool::new(false));
     let transition = Arc::new(AtomicU8::new(TRANSITION_IDLE));
@@ -901,6 +906,9 @@ fn unsupported_request_message(request: &Request, minimum_version: u32) -> Strin
 
 fn response_for_version(response: Response, version: u32) -> Response {
     let mut response = response;
+    if version < 19 {
+        remove_workspace_default_cwds(&mut response);
+    }
     if version < 18 {
         remove_focused_terminal(&mut response);
     }
@@ -968,6 +976,26 @@ fn response_for_version(response: Response, version: u32) -> Response {
             }
         }
         response => response,
+    }
+}
+
+fn remove_workspace_default_cwds(response: &mut Response) {
+    match response {
+        Response::Snapshot { snapshot } => {
+            for workspace in &mut snapshot.workspaces {
+                workspace.default_cwd = None;
+            }
+        }
+        Response::Workspace { workspace } => workspace.default_cwd = None,
+        Response::Events {
+            snapshot: Some(snapshot),
+            ..
+        } => {
+            for workspace in &mut snapshot.workspaces {
+                workspace.default_cwd = None;
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1261,6 +1289,7 @@ impl Default for Registry {
 struct Workspace {
     id: String,
     name: Mutex<String>,
+    default_cwd: Option<PathBuf>,
     shell_ids: Mutex<Vec<String>>,
     launcher_ids: Mutex<Vec<String>>,
     agent_ids: Mutex<Vec<String>>,
@@ -1851,8 +1880,13 @@ impl Registry {
                     vec![event],
                 ))
             }),
-            Request::CreateWorkspace { name, shells } => self.durable_mutation(|| {
-                let workspace = self.create_workspace(name, shells)?;
+            Request::CreateWorkspace {
+                name,
+                default_cwd,
+                shells,
+            } => self.durable_mutation(|| {
+                let workspace =
+                    self.create_workspace_with_default_cwd(name, default_cwd, shells)?;
                 let events = workspace_created_events(&workspace);
                 Ok((Response::Workspace { workspace }, events))
             }),
@@ -2141,7 +2175,8 @@ impl Registry {
         live_handoff: bool,
         transferred_events: Option<handoff::EventStreamManifest>,
     ) -> io::Result<Self> {
-        let persisted = store.load()?.unwrap_or_default();
+        let (persisted, migrated) = store.load_deferred()?;
+        let persisted = persisted.unwrap_or_default();
         let mut state = RegistryState::default();
         let mut workspace_names = HashSet::new();
         let mut run_ids = HashSet::new();
@@ -2150,6 +2185,9 @@ impl Registry {
         for saved_workspace in persisted.workspaces {
             validate_id("workspace", &saved_workspace.id)?;
             validate_persisted_name(&saved_workspace.name)?;
+            if let Some(default_cwd) = &saved_workspace.default_cwd {
+                validate_persisted_cwd(default_cwd)?;
+            }
             if !workspace_names.insert(saved_workspace.name.clone())
                 || state.workspaces.contains_key(&saved_workspace.id)
             {
@@ -2257,6 +2295,7 @@ impl Registry {
             let workspace = Arc::new(Workspace {
                 id: saved_workspace.id.clone(),
                 name: Mutex::new(saved_workspace.name),
+                default_cwd: saved_workspace.default_cwd,
                 shell_ids: Mutex::new(shell_ids),
                 launcher_ids: Mutex::new(launcher_ids),
                 agent_ids: Mutex::new(workspace_agent_ids),
@@ -2272,7 +2311,7 @@ impl Registry {
             mutation_lock: Mutex::new(()),
             persist_lock: Mutex::new(()),
             stopping: AtomicBool::new(false),
-            persistence_dirty: AtomicBool::new(false),
+            persistence_dirty: AtomicBool::new(migrated),
             notification_settings: NotificationDeliverySettings::default(),
             notification_sink: Arc::new(DisabledNotificationSink),
         };
@@ -2890,6 +2929,7 @@ impl Registry {
             saved.workspaces.push(PersistedWorkspace {
                 id: workspace.id.clone(),
                 name: lock(&workspace.name)?.clone(),
+                default_cwd: workspace.default_cwd.clone(),
                 shells,
                 launchers,
                 agents,
@@ -3190,12 +3230,25 @@ impl Registry {
             .is_some_and(|current| Arc::ptr_eq(current, shell)))
     }
 
+    #[cfg(test)]
     fn create_workspace(
         &self,
         name: String,
         specs: Vec<ShellSpec>,
     ) -> io::Result<WorkspaceSnapshot> {
+        self.create_workspace_with_default_cwd(name, None, specs)
+    }
+
+    fn create_workspace_with_default_cwd(
+        &self,
+        name: String,
+        default_cwd: Option<PathBuf>,
+        specs: Vec<ShellSpec>,
+    ) -> io::Result<WorkspaceSnapshot> {
         validate_name(&name)?;
+        if let Some(default_cwd) = &default_cwd {
+            validate_cwd(default_cwd)?;
+        }
         let workspace_id = Uuid::new_v4().to_string();
         validate_shell_specs(&specs)?;
 
@@ -3216,6 +3269,7 @@ impl Registry {
         let workspace = Arc::new(Workspace {
             id: workspace_id.clone(),
             name: Mutex::new(name),
+            default_cwd,
             shell_ids: Mutex::new(shells.iter().map(|shell| shell.id.clone()).collect()),
             launcher_ids: Mutex::new(Vec::new()),
             agent_ids: Mutex::new(Vec::new()),
@@ -3281,9 +3335,14 @@ impl Registry {
     }
 
     fn create_shell_with_workspace(&self, spec: ShellSpec) -> io::Result<ShellSnapshot> {
+        let default_cwd = spec.cwd.clone();
         loop {
             let name = self.next_workspace_name()?;
-            match self.create_workspace(name, vec![spec.clone()]) {
+            match self.create_workspace_with_default_cwd(
+                name,
+                Some(default_cwd.clone()),
+                vec![spec.clone()],
+            ) {
                 Ok(workspace) => {
                     return workspace
                         .shells
@@ -4079,6 +4138,7 @@ impl Workspace {
         Ok(WorkspaceSnapshot {
             id: self.id.clone(),
             name: lock(&self.name)?.clone(),
+            default_cwd: self.default_cwd.clone(),
             shells,
             launchers,
             agents,
@@ -6017,6 +6077,7 @@ mod tests {
 
         let result = registry.dispatch(Request::CreateWorkspace {
             name: "rolled-back".into(),
+            default_cwd: None,
             shells: Vec::new(),
         });
 
@@ -6032,6 +6093,7 @@ mod tests {
         let response = registry
             .dispatch(Request::CreateWorkspace {
                 name: "coordinated".into(),
+                default_cwd: None,
                 shells: vec![
                     ShellSpec::login("one", env::temp_dir()),
                     ShellSpec::login("two", env::temp_dir()),
@@ -6076,6 +6138,7 @@ mod tests {
         let Response::Workspace { workspace } = registry
             .dispatch(Request::CreateWorkspace {
                 name: "launchers".into(),
+                default_cwd: None,
                 shells: Vec::new(),
             })
             .unwrap()
@@ -7170,6 +7233,7 @@ mod tests {
         let workspace = WorkspaceSnapshot {
             id: "w1".into(),
             name: "workspace".into(),
+            default_cwd: None,
             shells: Vec::new(),
             launchers: Vec::new(),
             agents: vec![agent.clone()],
@@ -7305,6 +7369,7 @@ mod tests {
         let workspace = WorkspaceSnapshot {
             id: "w1".into(),
             name: "workspace".into(),
+            default_cwd: None,
             shells: Vec::new(),
             launchers: Vec::new(),
             agents: vec![agent.clone()],
@@ -7403,6 +7468,7 @@ mod tests {
                 workspaces: vec![WorkspaceSnapshot {
                     id: "w1".into(),
                     name: "workspace".into(),
+                    default_cwd: None,
                     shells: Vec::new(),
                     launchers: Vec::new(),
                     agents: vec![agent.clone()],
@@ -7650,7 +7716,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_workspace_snapshot_has_no_cwd_and_no_shells() {
+    fn pathless_workspace_snapshot_has_no_default_cwd_and_no_shells() {
         let registry = Registry::default();
 
         let workspace = registry
@@ -7659,7 +7725,79 @@ mod tests {
         let value = serde_json::to_value(&workspace).unwrap();
 
         assert!(workspace.shells.is_empty());
-        assert!(value.get("cwd").is_none());
+        assert!(workspace.default_cwd.is_none());
+        assert!(value.get("default_cwd").is_none());
+    }
+
+    #[test]
+    fn workspace_snapshot_retains_default_cwd() {
+        let registry = Registry::default();
+        let cwd = env::temp_dir();
+
+        let workspace = registry
+            .create_workspace_with_default_cwd("project".into(), Some(cwd.clone()), Vec::new())
+            .unwrap();
+
+        assert_eq!(workspace.default_cwd.as_deref(), Some(cwd.as_path()));
+    }
+
+    #[test]
+    fn protocol_eighteen_responses_hide_workspace_default_cwd() {
+        let source_workspace = WorkspaceSnapshot {
+            id: "w1".into(),
+            name: "project".into(),
+            default_cwd: Some("/tmp/project".into()),
+            shells: Vec::new(),
+            launchers: Vec::new(),
+            agents: Vec::new(),
+        };
+
+        let Response::Workspace { workspace } = response_for_version(
+            Response::Workspace {
+                workspace: source_workspace.clone(),
+            },
+            18,
+        ) else {
+            panic!("expected workspace response");
+        };
+
+        assert!(workspace.default_cwd.is_none());
+
+        let Response::Snapshot { snapshot } = response_for_version(
+            Response::Snapshot {
+                snapshot: Snapshot {
+                    workspaces: vec![source_workspace.clone()],
+                    focused_terminal: None,
+                },
+            },
+            18,
+        ) else {
+            panic!("expected snapshot response");
+        };
+        assert!(snapshot.workspaces[0].default_cwd.is_none());
+
+        let Response::Events {
+            snapshot: Some(snapshot),
+            ..
+        } = response_for_version(
+            Response::Events {
+                stream_id: "stream".into(),
+                cursor: EventCursor {
+                    stream_id: "stream".into(),
+                    event_id: 0,
+                },
+                snapshot: Some(Snapshot {
+                    workspaces: vec![source_workspace],
+                    focused_terminal: None,
+                }),
+                events: Vec::new(),
+            },
+            18,
+        )
+        else {
+            panic!("expected events response");
+        };
+        assert!(snapshot.workspaces[0].default_cwd.is_none());
     }
 
     #[test]
@@ -7708,6 +7846,10 @@ mod tests {
         let workspace = registry.workspace(&shell.workspace_id).unwrap();
 
         assert_eq!(&*lock(&workspace.name).unwrap(), "workspace-2");
+        assert_eq!(
+            workspace.default_cwd.as_deref(),
+            Some(env::temp_dir().as_path())
+        );
         registry.shutdown().unwrap();
     }
 

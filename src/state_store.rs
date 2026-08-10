@@ -13,8 +13,9 @@ use crate::protocol::{
     AgentAttentionSnapshot, AgentObservationSnapshot, ShellRunExitReason, TerminalProfile,
 };
 
-const STATE_VERSION: u32 = 6;
-const PREVIOUS_STATE_VERSION: u32 = 5;
+const STATE_VERSION: u32 = 7;
+const PREVIOUS_STATE_VERSION: u32 = 6;
+const VERSION_FIVE_STATE_VERSION: u32 = 5;
 const VERSION_FOUR_STATE_VERSION: u32 = 4;
 const VERSION_THREE_STATE_VERSION: u32 = 3;
 const VERSION_TWO_STATE_VERSION: u32 = 2;
@@ -42,6 +43,7 @@ impl Default for PersistedState {
 pub(crate) struct PersistedWorkspace {
     pub(crate) id: String,
     pub(crate) name: String,
+    pub(crate) default_cwd: Option<PathBuf>,
     pub(crate) shells: Vec<PersistedShell>,
     pub(crate) launchers: Vec<PersistedWorkspaceLauncher>,
     pub(crate) agents: Vec<PersistedAgentInstance>,
@@ -110,6 +112,23 @@ struct PreviousPersistedState {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PreviousPersistedWorkspace {
+    id: String,
+    name: String,
+    shells: Vec<PersistedShell>,
+    launchers: Vec<PersistedWorkspaceLauncher>,
+    agents: Vec<PersistedAgentInstance>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VersionFivePersistedState {
+    version: u32,
+    workspaces: Vec<VersionFivePersistedWorkspace>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VersionFivePersistedWorkspace {
     id: String,
     name: String,
     shells: Vec<PersistedShell>,
@@ -281,14 +300,23 @@ impl StateStore {
         Self { path, _lock: None }
     }
 
+    #[cfg(test)]
     pub(crate) fn load(&self) -> io::Result<Option<PersistedState>> {
+        let (state, migrated) = self.load_deferred()?;
+        if migrated && let Some(state) = &state {
+            self.save(state)?;
+        }
+        Ok(state)
+    }
+
+    pub(crate) fn load_deferred(&self) -> io::Result<(Option<PersistedState>, bool)> {
         let Some(parent) = self.path.parent() else {
             return Err(io::Error::other("state path has no parent"));
         };
         secure_state_dir(parent)?;
         let metadata = match fs::symlink_metadata(&self.path) {
             Ok(metadata) => metadata,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok((None, false)),
             Err(error) => return Err(error),
         };
         if !metadata.is_file() || metadata.uid() != effective_uid() {
@@ -311,37 +339,31 @@ impl StateStore {
                 format!("could not parse {}: {error}", self.path.display()),
             )
         })?;
-        let state = match version.version {
-            STATE_VERSION => parse_state(&bytes, &self.path)?,
+        let (state, migrated) = match version.version {
+            STATE_VERSION => (parse_state(&bytes, &self.path)?, false),
             PREVIOUS_STATE_VERSION => {
                 let previous: PreviousPersistedState = parse_state(&bytes, &self.path)?;
-                let state = migrate_previous_state(previous);
-                self.save(&state)?;
-                state
+                (migrate_previous_state(previous), true)
+            }
+            VERSION_FIVE_STATE_VERSION => {
+                let previous: VersionFivePersistedState = parse_state(&bytes, &self.path)?;
+                (migrate_version_five_state(previous), true)
             }
             VERSION_FOUR_STATE_VERSION => {
                 let previous: VersionFourPersistedState = parse_state(&bytes, &self.path)?;
-                let state = migrate_version_four_state(previous);
-                self.save(&state)?;
-                state
+                (migrate_version_four_state(previous), true)
             }
             VERSION_THREE_STATE_VERSION => {
                 let previous: VersionThreePersistedState = parse_state(&bytes, &self.path)?;
-                let state = migrate_version_three_state(previous);
-                self.save(&state)?;
-                state
+                (migrate_version_three_state(previous), true)
             }
             VERSION_TWO_STATE_VERSION => {
                 let previous: VersionTwoPersistedState = parse_state(&bytes, &self.path)?;
-                let state = migrate_version_two_state(previous);
-                self.save(&state)?;
-                state
+                (migrate_version_two_state(previous), true)
             }
             LEGACY_STATE_VERSION => {
                 let legacy: LegacyPersistedState = parse_state(&bytes, &self.path)?;
-                let state = migrate_legacy_state(legacy);
-                self.save(&state)?;
-                state
+                (migrate_legacy_state(legacy), true)
             }
             version => {
                 return Err(io::Error::new(
@@ -350,7 +372,7 @@ impl StateStore {
                 ));
             }
         };
-        Ok(Some(state))
+        Ok((Some(state), migrated))
     }
 
     pub(crate) fn save(&self, state: &PersistedState) -> io::Result<()> {
@@ -407,6 +429,7 @@ fn migrate_legacy_state(legacy: LegacyPersistedState) -> PersistedState {
             .map(|workspace| PersistedWorkspace {
                 id: workspace.id,
                 name: workspace.name,
+                default_cwd: None,
                 shells: workspace
                     .shells
                     .into_iter()
@@ -444,6 +467,26 @@ fn migrate_previous_state(previous: PreviousPersistedState) -> PersistedState {
             .map(|workspace| PersistedWorkspace {
                 id: workspace.id,
                 name: workspace.name,
+                default_cwd: None,
+                shells: workspace.shells,
+                launchers: workspace.launchers,
+                agents: workspace.agents,
+            })
+            .collect(),
+    }
+}
+
+fn migrate_version_five_state(previous: VersionFivePersistedState) -> PersistedState {
+    debug_assert_eq!(previous.version, VERSION_FIVE_STATE_VERSION);
+    PersistedState {
+        version: STATE_VERSION,
+        workspaces: previous
+            .workspaces
+            .into_iter()
+            .map(|workspace| PersistedWorkspace {
+                id: workspace.id,
+                name: workspace.name,
+                default_cwd: None,
                 shells: workspace.shells,
                 launchers: workspace.launchers,
                 agents: workspace
@@ -484,6 +527,7 @@ fn migrate_version_four_state(previous: VersionFourPersistedState) -> PersistedS
                 PersistedWorkspace {
                     id: workspace.id,
                     name: workspace.name,
+                    default_cwd: None,
                     shells: workspace.shells,
                     launchers: workspace.launchers,
                     agents: workspace
@@ -519,6 +563,7 @@ fn migrate_version_three_state(previous: VersionThreePersistedState) -> Persiste
             .map(|workspace| PersistedWorkspace {
                 id: workspace.id,
                 name: workspace.name,
+                default_cwd: None,
                 shells: workspace.shells,
                 launchers: workspace.launchers,
                 agents: Vec::new(),
@@ -537,6 +582,7 @@ fn migrate_version_two_state(previous: VersionTwoPersistedState) -> PersistedSta
             .map(|workspace| PersistedWorkspace {
                 id: workspace.id,
                 name: workspace.name,
+                default_cwd: None,
                 shells: workspace.shells,
                 launchers: Vec::new(),
                 agents: Vec::new(),
@@ -603,6 +649,7 @@ mod tests {
             workspaces: vec![PersistedWorkspace {
                 id: Uuid::new_v4().to_string(),
                 name: "saved".into(),
+                default_cwd: Some("/tmp/project".into()),
                 shells: Vec::new(),
                 launchers: vec![
                     PersistedWorkspaceLauncher {
@@ -677,6 +724,10 @@ mod tests {
         let restored = store.load().unwrap().unwrap();
 
         assert_eq!(restored.workspaces[0].name, "saved");
+        assert_eq!(
+            restored.workspaces[0].default_cwd.as_deref(),
+            Some(Path::new("/tmp/project"))
+        );
         assert_eq!(restored.workspaces[0].launchers[0].id, "launcher-1");
         assert_eq!(restored.workspaces[0].launchers[0].name, "editor");
         assert_eq!(
@@ -781,7 +832,7 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .contains("\"version\": 6")
+                .contains("\"version\": 7")
         );
         assert!(migrated.workspaces[0].launchers.is_empty());
         assert!(migrated.workspaces[0].agents.is_empty());
@@ -831,7 +882,7 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .contains("\"version\": 6")
+                .contains("\"version\": 7")
         );
         assert!(migrated.workspaces[0].agents.is_empty());
         fs::remove_dir_all(directory).unwrap();
@@ -869,7 +920,7 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .contains("\"version\": 6")
+                .contains("\"version\": 7")
         );
         fs::remove_dir_all(directory).unwrap();
     }
@@ -945,7 +996,7 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .contains("\"version\": 6")
+                .contains("\"version\": 7")
         );
         fs::remove_dir_all(directory).unwrap();
     }
@@ -980,8 +1031,40 @@ mod tests {
 
         assert!(migrated.workspaces[0].agents[0].attention.is_none());
         let saved = fs::read_to_string(&path).unwrap();
-        assert!(saved.contains("\"version\": 6"));
+        assert!(saved.contains("\"version\": 7"));
         assert!(saved.contains("\"attention\": null"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn migrates_version_six_workspaces_without_default_cwds() {
+        let directory = env::temp_dir().join(format!("boomux-state-{}", Uuid::new_v4()));
+        let path = directory.join("boomux/state.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            br#"{
+  "version": 6,
+  "workspaces": [{
+    "id": "w1", "name": "version-six", "shells": [], "launchers": [], "agents": []
+  }]
+}"#,
+        )
+        .unwrap();
+        let store = StateStore::at(path.clone());
+
+        let (migrated, deferred) = store.load_deferred().unwrap();
+        let migrated = migrated.unwrap();
+
+        assert!(deferred);
+        assert!(migrated.workspaces[0].default_cwd.is_none());
+        let original = fs::read_to_string(&path).unwrap();
+        assert!(original.contains("\"version\": 6"));
+        assert!(!original.contains("default_cwd"));
+        store.save(&migrated).unwrap();
+        let saved = fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("\"version\": 7"));
+        assert!(saved.contains("\"default_cwd\": null"));
         fs::remove_dir_all(directory).unwrap();
     }
 }

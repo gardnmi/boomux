@@ -366,8 +366,18 @@ impl Client {
         name: impl Into<String>,
         shells: Vec<ShellSpec>,
     ) -> io::Result<WorkspaceSnapshot> {
+        self.create_workspace_with_default_cwd(name, None, shells)
+    }
+
+    pub fn create_workspace_with_default_cwd(
+        &self,
+        name: impl Into<String>,
+        default_cwd: Option<PathBuf>,
+        shells: Vec<ShellSpec>,
+    ) -> io::Result<WorkspaceSnapshot> {
         match self.request(Request::CreateWorkspace {
             name: name.into(),
+            default_cwd,
             shells,
         })? {
             Response::Workspace { workspace } => Ok(workspace),
@@ -841,6 +851,22 @@ mod tests {
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+            assert_eq!(request.version, 19);
+            assert!(matches!(request.message, Request::Ping));
+            protocol::write_message(
+                &mut stream,
+                &Envelope::with_version(
+                    18,
+                    Response::Error {
+                        message: "protocol 19 unsupported".into(),
+                        code: Some(ErrorCode::UnsupportedVersion),
+                    },
+                ),
+            )
+            .unwrap();
+
+            let (mut stream, _) = listener.accept().unwrap();
+            let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
             assert_eq!(request.version, 18);
             assert!(matches!(request.message, Request::Ping));
             protocol::write_message(
@@ -952,7 +978,7 @@ mod tests {
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
-            assert_eq!(request.version, 18);
+            assert_eq!(request.version, 19);
             let Request::Attach {
                 environment: Some(environment),
                 ..
@@ -969,7 +995,7 @@ mod tests {
             protocol::write_message(
                 &mut stream,
                 &Envelope::with_version(
-                    18,
+                    19,
                     Response::Attached {
                         token: "token".into(),
                         reconstruction: Vec::new(),
@@ -999,14 +1025,30 @@ mod tests {
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
-            assert_eq!(request.version, 18);
+            assert_eq!(request.version, 19);
             assert!(matches!(request.message, Request::Attach { .. }));
+            protocol::write_message(
+                &mut stream,
+                &Envelope::with_version(
+                    19,
+                    Response::Error {
+                        message: "protocol 19 unsupported".into(),
+                        code: Some(ErrorCode::UnsupportedVersion),
+                    },
+                ),
+            )
+            .unwrap();
+
+            let (mut stream, _) = listener.accept().unwrap();
+            let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+            assert_eq!(request.version, 19);
+            assert!(matches!(request.message, Request::Ping));
             protocol::write_message(
                 &mut stream,
                 &Envelope::with_version(
                     18,
                     Response::Error {
-                        message: "protocol 18 unsupported".into(),
+                        message: "protocol 19 unsupported".into(),
                         code: Some(ErrorCode::UnsupportedVersion),
                     },
                 ),
@@ -1020,7 +1062,7 @@ mod tests {
             protocol::write_message(
                 &mut stream,
                 &Envelope::with_version(
-                    18,
+                    17,
                     Response::Error {
                         message: "protocol 18 unsupported".into(),
                         code: Some(ErrorCode::UnsupportedVersion),
@@ -1069,6 +1111,22 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+            assert_eq!(request.version, 19);
+            assert!(matches!(request.message, Request::Ping));
+            protocol::write_message(
+                &mut stream,
+                &Envelope::with_version(
+                    18,
+                    Response::Error {
+                        message: "expected an older protocol".into(),
+                        code: Some(ErrorCode::UnsupportedVersion),
+                    },
+                ),
+            )
+            .unwrap();
+
             let (mut stream, _) = listener.accept().unwrap();
             let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
             assert_eq!(request.version, 18);
