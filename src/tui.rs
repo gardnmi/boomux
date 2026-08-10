@@ -12,6 +12,7 @@ use ratatui::widgets::{
 };
 
 use crate::agent_attention_projection::AgentStateCounts;
+use crate::protocol::{TerminalColor, TerminalPreview, TerminalPreviewLine, TerminalStyle};
 
 const BASE: Color = Color::Reset;
 const OVERLAY: Color = Color::DarkGray;
@@ -288,7 +289,7 @@ struct TerminalPreviewState {
     shell_id: String,
     run_id: Option<String>,
     output_revision: u64,
-    output: Result<String, String>,
+    output: Result<TerminalPreview, String>,
     scroll_from_bottom: usize,
 }
 
@@ -1326,7 +1327,7 @@ impl App {
 
     fn refresh_terminal_preview<P>(&mut self, on_preview: &mut P)
     where
-        P: FnMut(&str) -> Result<String, String>,
+        P: FnMut(&str) -> Result<TerminalPreview, String>,
     {
         let selected = if self.primary_tab == PrimaryTab::Workspaces && self.focus != Focus::Items {
             None
@@ -1366,11 +1367,11 @@ impl App {
             .map_or(0, |preview| {
                 let previous_count = preview
                     .output
-                    .as_deref()
+                    .as_ref()
                     .ok()
                     .map_or(0, |output| terminal_output_lines(output).len());
                 let next_count = output
-                    .as_deref()
+                    .as_ref()
                     .ok()
                     .map_or(0, |output| terminal_output_lines(output).len());
                 preview
@@ -1392,7 +1393,7 @@ impl App {
         };
         let line_count = preview
             .output
-            .as_deref()
+            .as_ref()
             .ok()
             .map_or(0, |output| terminal_output_lines(output).len());
         let max_scroll = line_count.saturating_sub(TERMINAL_PREVIEW_ROWS);
@@ -1417,7 +1418,7 @@ impl App {
         };
         let line_count = preview
             .output
-            .as_deref()
+            .as_ref()
             .ok()
             .map_or(0, |output| terminal_output_lines(output).len());
         preview.scroll_from_bottom = line_count.saturating_sub(TERMINAL_PREVIEW_ROWS);
@@ -1567,7 +1568,7 @@ where
     N: FnMut(&str) -> Result<String, String>,
     E: FnMut(&RenameTarget, &str) -> Result<String, String>,
     F: FnMut() -> Result<DashboardState, String>,
-    P: FnMut(&str) -> Result<String, String>,
+    P: FnMut(&str) -> Result<TerminalPreview, String>,
 {
     let mut terminal = ratatui::init();
     let mut app = App::new(state.workspaces, project_context);
@@ -1592,7 +1593,7 @@ where
     N: FnMut(&str) -> Result<String, String>,
     E: FnMut(&RenameTarget, &str) -> Result<String, String>,
     F: FnMut() -> Result<DashboardState, String>,
-    P: FnMut(&str) -> Result<String, String>,
+    P: FnMut(&str) -> Result<TerminalPreview, String>,
 {
     let mut last_refresh = Instant::now();
     loop {
@@ -1727,7 +1728,7 @@ where
     N: FnMut(&str) -> Result<String, String>,
     E: FnMut(&RenameTarget, &str) -> Result<String, String>,
     F: FnMut() -> Result<DashboardState, String>,
-    P: FnMut(&str) -> Result<String, String>,
+    P: FnMut(&str) -> Result<TerminalPreview, String>,
 {
     match command {
         PaletteCommand::CreateWorkspace => {
@@ -2771,7 +2772,7 @@ fn terminal_preview(app: &App, terminal: &TerminalView) -> Option<ContextualPrev
         .filter(|preview| !is_command && preview.shell_id == terminal.id)
     {
         match &preview.output {
-            Ok(output) if output.trim().is_empty() => lines.push(Line::from(vec![
+            Ok(output) if terminal_preview_is_empty(output) => lines.push(Line::from(vec![
                 Span::styled(" Output ", Style::new().fg(BASE).bg(BLUE)),
                 Span::styled(" no terminal output", Style::new().fg(SUBTEXT)),
             ])),
@@ -2801,12 +2802,7 @@ fn terminal_preview(app: &App, terminal: &TerminalView) -> Option<ContextualPrev
                             .add_modifier(Modifier::BOLD),
                     ),
                 ]));
-                lines.extend(
-                    viewport
-                        .lines
-                        .into_iter()
-                        .map(|line| Line::from(Span::raw(format!(" {line}")))),
-                );
+                lines.extend(viewport.lines.into_iter().map(terminal_preview_line));
             }
             Err(error) => lines.push(Line::from(Span::styled(
                 format!("Output unavailable: {error}"),
@@ -2830,32 +2826,44 @@ fn terminal_preview(app: &App, terminal: &TerminalView) -> Option<ContextualPrev
 }
 
 struct TerminalViewport {
-    lines: Vec<String>,
+    lines: Vec<TerminalPreviewLine>,
     start: usize,
     end: usize,
     total: usize,
     following: bool,
 }
 
-fn terminal_output_lines(output: &str) -> Vec<String> {
-    let mut lines: Vec<_> = output
-        .lines()
-        .map(|line| line.trim_end().to_owned())
-        .collect();
+fn terminal_output_lines(output: &TerminalPreview) -> Vec<TerminalPreviewLine> {
+    let mut lines = output.lines.clone();
+    for line in &mut lines {
+        while let Some(span) = line.spans.last_mut() {
+            let trimmed = span.text.trim_end().len();
+            span.text.truncate(trimmed);
+            if span.text.is_empty() {
+                line.spans.pop();
+            } else {
+                break;
+            }
+        }
+    }
     let first = lines
         .iter()
-        .position(|line| !line.is_empty())
+        .position(|line| !terminal_preview_line_is_empty(line))
         .unwrap_or(lines.len());
     let end = lines
         .iter()
-        .rposition(|line| !line.is_empty())
+        .rposition(|line| !terminal_preview_line_is_empty(line))
         .map_or(first, |last| last + 1);
     lines.drain(end..);
     lines.drain(..first);
     lines
 }
 
-fn terminal_viewport(output: &str, height: usize, scroll_from_bottom: usize) -> TerminalViewport {
+fn terminal_viewport(
+    output: &TerminalPreview,
+    height: usize,
+    scroll_from_bottom: usize,
+) -> TerminalViewport {
     let lines = terminal_output_lines(output);
     let total = lines.len();
     let latest_start = total.saturating_sub(height);
@@ -2868,6 +2876,56 @@ fn terminal_viewport(output: &str, height: usize, scroll_from_bottom: usize) -> 
         end,
         total,
         following: scroll_from_bottom == 0,
+    }
+}
+
+fn terminal_preview_is_empty(preview: &TerminalPreview) -> bool {
+    preview.lines.iter().all(terminal_preview_line_is_empty)
+}
+
+fn terminal_preview_line_is_empty(line: &TerminalPreviewLine) -> bool {
+    line.spans.iter().all(|span| span.text.trim().is_empty())
+}
+
+fn terminal_preview_line(line: TerminalPreviewLine) -> Line<'static> {
+    let mut spans = Vec::with_capacity(line.spans.len() + 1);
+    spans.push(Span::raw(" "));
+    spans.extend(
+        line.spans
+            .into_iter()
+            .map(|span| Span::styled(span.text, terminal_style(span.style))),
+    );
+    Line::from(spans)
+}
+
+fn terminal_style(style: TerminalStyle) -> Style {
+    let mut modifiers = Modifier::empty();
+    if style.bold {
+        modifiers |= Modifier::BOLD;
+    }
+    if style.dim {
+        modifiers |= Modifier::DIM;
+    }
+    if style.italic {
+        modifiers |= Modifier::ITALIC;
+    }
+    if style.underline {
+        modifiers |= Modifier::UNDERLINED;
+    }
+    if style.inverse {
+        modifiers |= Modifier::REVERSED;
+    }
+    Style::new()
+        .fg(terminal_color(style.foreground))
+        .bg(terminal_color(style.background))
+        .add_modifier(modifiers)
+}
+
+fn terminal_color(color: TerminalColor) -> Color {
+    match color {
+        TerminalColor::Default => Color::Reset,
+        TerminalColor::Indexed(index) => Color::Indexed(index),
+        TerminalColor::Rgb { red, green, blue } => Color::Rgb(red, green, blue),
     }
 }
 
@@ -3341,6 +3399,28 @@ mod tests {
 
     fn successful_text(_: &str) -> Result<String, String> {
         Ok(String::new())
+    }
+
+    fn successful_preview(_: &str) -> Result<TerminalPreview, String> {
+        Ok(TerminalPreview::default())
+    }
+
+    fn text_preview(text: &str) -> TerminalPreview {
+        TerminalPreview {
+            lines: text
+                .split('\n')
+                .map(|line| TerminalPreviewLine {
+                    spans: vec![crate::protocol::TerminalPreviewSpan {
+                        text: line.to_owned(),
+                        style: TerminalStyle::default(),
+                    }],
+                })
+                .collect(),
+        }
+    }
+
+    fn preview_text(line: &TerminalPreviewLine) -> String {
+        line.spans.iter().map(|span| span.text.as_str()).collect()
     }
 
     fn successful_workspace(_: &str, _: Option<&PathBuf>) -> Result<String, String> {
@@ -4104,7 +4184,7 @@ mod tests {
             on_create_shell: successful_text,
             on_rename: successful_rename,
             on_refresh: empty_refresh,
-            on_terminal_preview: successful_text,
+            on_terminal_preview: successful_preview,
         };
 
         assert!(execute_palette_command(
@@ -4166,7 +4246,7 @@ mod tests {
             on_create_shell: successful_text,
             on_rename: successful_rename,
             on_refresh: empty_refresh,
-            on_terminal_preview: successful_text,
+            on_terminal_preview: successful_preview,
         };
 
         execute_palette_command(
@@ -4194,7 +4274,7 @@ mod tests {
             on_create_shell: successful_text,
             on_rename: successful_rename,
             on_refresh: empty_refresh,
-            on_terminal_preview: successful_text,
+            on_terminal_preview: successful_preview,
         };
 
         execute_palette_command(
@@ -5096,7 +5176,7 @@ mod tests {
         let reads = std::cell::Cell::new(0);
         app.refresh_terminal_preview(&mut |_| {
             reads.set(reads.get() + 1);
-            Ok("command output".into())
+            Ok(text_preview("command output"))
         });
 
         backend_terminal
@@ -5136,7 +5216,7 @@ mod tests {
         let calls = std::cell::Cell::new(0);
         let mut read = |_: &str| {
             calls.set(calls.get() + 1);
-            Ok("first\nlatest".into())
+            Ok(text_preview("first\nlatest"))
         };
 
         app.refresh_terminal_preview(&mut read);
@@ -5175,22 +5255,67 @@ mod tests {
 
     #[test]
     fn terminal_viewport_trims_edges_and_scrolls_from_the_tail() {
-        let output = "\nold\n\nrecent one  \nrecent two\n\n";
+        let output = text_preview("\nold\n\nrecent one  \nrecent two\n\n");
 
         assert_eq!(
-            terminal_output_lines(output),
+            terminal_output_lines(&output)
+                .iter()
+                .map(preview_text)
+                .collect::<Vec<_>>(),
             ["old", "", "recent one", "recent two"]
         );
-        assert!(terminal_output_lines("\n \n").is_empty());
+        assert!(terminal_output_lines(&text_preview("\n \n")).is_empty());
 
-        let following = terminal_viewport(output, 3, 0);
-        assert_eq!(following.lines, ["", "recent one", "recent two"]);
+        let following = terminal_viewport(&output, 3, 0);
+        assert_eq!(
+            following.lines.iter().map(preview_text).collect::<Vec<_>>(),
+            ["", "recent one", "recent two"]
+        );
         assert_eq!((following.start, following.end, following.total), (1, 4, 4));
         assert!(following.following);
 
-        let scrolled = terminal_viewport(output, 2, 2);
-        assert_eq!(scrolled.lines, ["old", ""]);
+        let scrolled = terminal_viewport(&output, 2, 2);
+        assert_eq!(
+            scrolled.lines.iter().map(preview_text).collect::<Vec<_>>(),
+            ["old", ""]
+        );
         assert!(!scrolled.following);
+    }
+
+    #[test]
+    fn terminal_preview_renders_structured_colors_and_modifiers() {
+        let mut terminal = Terminal::new(TestBackend::new(4, 1)).unwrap();
+        let line = TerminalPreviewLine {
+            spans: vec![crate::protocol::TerminalPreviewSpan {
+                text: "X".into(),
+                style: TerminalStyle {
+                    foreground: TerminalColor::Indexed(196),
+                    background: TerminalColor::Rgb {
+                        red: 1,
+                        green: 2,
+                        blue: 3,
+                    },
+                    bold: true,
+                    italic: true,
+                    inverse: true,
+                    ..TerminalStyle::default()
+                },
+            }],
+        };
+
+        terminal
+            .draw(|frame| {
+                frame.render_widget(Paragraph::new(terminal_preview_line(line)), frame.area())
+            })
+            .unwrap();
+
+        let cell = &terminal.backend().buffer()[(1, 0)];
+        assert_eq!(cell.symbol(), "X");
+        assert_eq!(cell.fg, Color::Indexed(196));
+        assert_eq!(cell.bg, Color::Rgb(1, 2, 3));
+        assert!(cell.modifier.contains(Modifier::BOLD));
+        assert!(cell.modifier.contains(Modifier::ITALIC));
+        assert!(cell.modifier.contains(Modifier::REVERSED));
     }
 
     #[test]
@@ -5209,10 +5334,12 @@ mod tests {
             output_revision: 1,
         });
         let output = |count: usize| {
-            (1..=count)
-                .map(|line| format!("line {line}"))
-                .collect::<Vec<_>>()
-                .join("\n")
+            text_preview(
+                &(1..=count)
+                    .map(|line| format!("line {line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
         };
 
         app.refresh_terminal_preview(&mut |_| Ok(output(40)));
@@ -5261,10 +5388,12 @@ mod tests {
             exit_reason: None,
             output_revision: 1,
         });
-        let output = (1..=30)
-            .map(|line| format!("viewport line {line}"))
-            .collect::<Vec<_>>()
-            .join("\n");
+        let output = text_preview(
+            &(1..=30)
+                .map(|line| format!("viewport line {line}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
         app.refresh_terminal_preview(&mut |_| Ok(output.clone()));
 
         let mut wide = Terminal::new(TestBackend::new(180, 40)).unwrap();

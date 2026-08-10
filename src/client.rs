@@ -16,8 +16,9 @@ use std::time::Duration;
 use crate::protocol::{
     self, AgentInstanceSnapshot, AgentRegistrationSpec, AgentReport, DaemonEvent, Envelope,
     ErrorCode, EventCursor, NotificationDeliveryConfig, Request, Response, ShellSnapshot,
-    ShellSpec, ShellStatus, Snapshot, TerminalProfile, UnixEnvironment, UnixEnvironmentVariable,
-    WorkspaceLauncherSnapshot, WorkspaceLauncherSpec, WorkspaceSnapshot,
+    ShellSpec, ShellStatus, Snapshot, TerminalPreview, TerminalPreviewLine, TerminalPreviewSpan,
+    TerminalProfile, UnixEnvironment, UnixEnvironmentVariable, WorkspaceLauncherSnapshot,
+    WorkspaceLauncherSpec, WorkspaceSnapshot,
 };
 
 const CONNECT_ATTEMPTS: usize = 40;
@@ -520,6 +521,40 @@ impl Client {
         }
     }
 
+    pub fn read_shell_preview(
+        &self,
+        shell_id: impl Into<String>,
+        max_bytes: usize,
+        max_lines: u16,
+    ) -> io::Result<TerminalPreview> {
+        let shell_id = shell_id.into();
+        if self.protocol_version()? < 20 {
+            let bytes = self.read_shell(shell_id, max_bytes)?;
+            let text = String::from_utf8_lossy(&bytes);
+            let lines = text.lines().collect::<Vec<_>>();
+            let start = lines.len().saturating_sub(usize::from(max_lines));
+            return Ok(TerminalPreview {
+                lines: lines[start..]
+                    .iter()
+                    .map(|line| TerminalPreviewLine {
+                        spans: vec![TerminalPreviewSpan {
+                            text: (*line).to_owned(),
+                            style: Default::default(),
+                        }],
+                    })
+                    .collect(),
+            });
+        }
+        match self.request(Request::ReadShellPreview {
+            shell_id,
+            max_bytes,
+            max_lines,
+        })? {
+            Response::ShellPreview { preview } => Ok(preview),
+            other => unexpected(other),
+        }
+    }
+
     pub fn read_shell_at(
         &self,
         shell_id: impl Into<String>,
@@ -851,6 +886,22 @@ mod tests {
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+            assert_eq!(request.version, 20);
+            assert!(matches!(request.message, Request::Ping));
+            protocol::write_message(
+                &mut stream,
+                &Envelope::with_version(
+                    19,
+                    Response::Error {
+                        message: "protocol 20 unsupported".into(),
+                        code: Some(ErrorCode::UnsupportedVersion),
+                    },
+                ),
+            )
+            .unwrap();
+
+            let (mut stream, _) = listener.accept().unwrap();
+            let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
             assert_eq!(request.version, 19);
             assert!(matches!(request.message, Request::Ping));
             protocol::write_message(
@@ -978,7 +1029,7 @@ mod tests {
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
-            assert_eq!(request.version, 19);
+            assert_eq!(request.version, 20);
             let Request::Attach {
                 environment: Some(environment),
                 ..
@@ -995,7 +1046,7 @@ mod tests {
             protocol::write_message(
                 &mut stream,
                 &Envelope::with_version(
-                    19,
+                    20,
                     Response::Attached {
                         token: "token".into(),
                         reconstruction: Vec::new(),
@@ -1025,14 +1076,30 @@ mod tests {
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
-            assert_eq!(request.version, 19);
+            assert_eq!(request.version, 20);
             assert!(matches!(request.message, Request::Attach { .. }));
+            protocol::write_message(
+                &mut stream,
+                &Envelope::with_version(
+                    20,
+                    Response::Error {
+                        message: "protocol 20 unsupported".into(),
+                        code: Some(ErrorCode::UnsupportedVersion),
+                    },
+                ),
+            )
+            .unwrap();
+
+            let (mut stream, _) = listener.accept().unwrap();
+            let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+            assert_eq!(request.version, 20);
+            assert!(matches!(request.message, Request::Ping));
             protocol::write_message(
                 &mut stream,
                 &Envelope::with_version(
                     19,
                     Response::Error {
-                        message: "protocol 19 unsupported".into(),
+                        message: "protocol 20 unsupported".into(),
                         code: Some(ErrorCode::UnsupportedVersion),
                     },
                 ),
@@ -1105,12 +1172,84 @@ mod tests {
     }
 
     #[test]
+    fn shell_preview_falls_back_to_plain_output_from_protocol_nineteen() {
+        let directory = env::temp_dir().join(format!("boomux-client-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let socket = directory.join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+            assert_eq!(request.version, 20);
+            assert!(matches!(request.message, Request::Ping));
+            protocol::write_message(
+                &mut stream,
+                &Envelope::with_version(
+                    19,
+                    Response::Error {
+                        message: "protocol 20 unsupported".into(),
+                        code: Some(ErrorCode::UnsupportedVersion),
+                    },
+                ),
+            )
+            .unwrap();
+
+            let (mut stream, _) = listener.accept().unwrap();
+            let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+            assert_eq!(request.version, 19);
+            assert!(matches!(request.message, Request::Ping));
+            protocol::write_message(&mut stream, &Envelope::with_version(19, Response::Pong))
+                .unwrap();
+
+            let (mut stream, _) = listener.accept().unwrap();
+            let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+            assert_eq!(request.version, 19);
+            assert!(matches!(request.message, Request::ReadShell { .. }));
+            protocol::write_message(
+                &mut stream,
+                &Envelope::with_version(
+                    19,
+                    Response::Output {
+                        bytes: b"old\nlatest".to_vec(),
+                    },
+                ),
+            )
+            .unwrap();
+        });
+        let client = Client::from_socket_path(socket);
+
+        let preview = client.read_shell_preview("s1", 1024, 1).unwrap();
+
+        assert_eq!(preview.lines.len(), 1);
+        assert_eq!(preview.lines[0].spans[0].text, "latest");
+        assert_eq!(preview.lines[0].spans[0].style, Default::default());
+        server.join().unwrap();
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn negotiates_protocol_seven_without_losing_version_seven_requests() {
         let directory = env::temp_dir().join(format!("boomux-client-{}", Uuid::new_v4()));
         fs::create_dir_all(&directory).unwrap();
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+            assert_eq!(request.version, 20);
+            assert!(matches!(request.message, Request::Ping));
+            protocol::write_message(
+                &mut stream,
+                &Envelope::with_version(
+                    19,
+                    Response::Error {
+                        message: "expected an older protocol".into(),
+                        code: Some(ErrorCode::UnsupportedVersion),
+                    },
+                ),
+            )
+            .unwrap();
+
             let (mut stream, _) = listener.accept().unwrap();
             let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
             assert_eq!(request.version, 19);
