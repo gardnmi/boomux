@@ -376,7 +376,9 @@ by `y` confirms close or removal. Shell previews are bounded and read-only.
 Restoring a workspace has the same launcher, takeover, restart, and
 partial-success behavior as `workspace open`. By default, a newly focused
 managed terminal selects its owning workspace and shell or Agent row once;
-manual navigation remains until another focus change.
+manual navigation remains until another focus change. Press `Space` to pin the
+current dashboard selection and pause focus following; press it again to unpin
+and catch up to the currently focused terminal.
 
 ## Configuration
 
