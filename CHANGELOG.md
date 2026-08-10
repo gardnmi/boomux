@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.3.0](https://github.com/gardnmi/boomux/compare/v0.2.0...v0.3.0) (2026-08-10)
+
+
+### Features
+
+* **tui:** add grouped command palette ([#65](https://github.com/gardnmi/boomux/issues/65)) ([51e0d0b](https://github.com/gardnmi/boomux/commit/51e0d0b9f27ad122409ce0558b5c2d174debbc70))
+
+
+### Bug Fixes
+
+* **tui:** simplify dashboard tables ([#67](https://github.com/gardnmi/boomux/issues/67)) ([1ff45e8](https://github.com/gardnmi/boomux/commit/1ff45e8937a92fe637373c6d8df2ed6165a52d03))
+
 ## [0.2.0](https://github.com/gardnmi/boomux/compare/v0.1.0...v0.2.0) (2026-08-09)
 
 
