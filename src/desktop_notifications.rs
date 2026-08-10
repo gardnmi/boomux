@@ -1,3 +1,4 @@
+use std::io;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -5,7 +6,7 @@ use std::sync::mpsc::{SyncSender, sync_channel};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crate::daemon::NotificationSettings;
+use crate::daemon::NotificationDeliverySettings;
 
 const MAX_CONTEXT_BYTES: usize = 120;
 const NOTIFICATION_TIMEOUT: Duration = Duration::from_secs(2);
@@ -38,7 +39,7 @@ pub(crate) struct DesktopNotificationSink {
 pub(crate) struct DisabledNotificationSink;
 
 impl DesktopNotificationSink {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(settings: NotificationDeliverySettings) -> Self {
         let (sender, receiver) = sync_channel(NOTIFICATION_QUEUE_CAPACITY);
         let stopping = Arc::new(AtomicBool::new(false));
         let worker_stopping = stopping.clone();
@@ -48,7 +49,7 @@ impl DesktopNotificationSink {
                 while let Ok(request) = receiver.recv()
                     && !worker_stopping.load(Ordering::Acquire)
                 {
-                    deliver(request, &worker_stopping);
+                    deliver(request, &settings, &worker_stopping);
                 }
             })
             .ok();
@@ -82,41 +83,123 @@ impl NotificationSink for DesktopNotificationSink {
     }
 }
 
-fn deliver(request: NotificationRequest, stopping: &AtomicBool) {
-    let argv = notify_send_argv(&request);
-    if let Ok(mut child) = Command::new(&argv[0])
+fn deliver(
+    request: NotificationRequest,
+    settings: &NotificationDeliverySettings,
+    stopping: &AtomicBool,
+) {
+    if settings.desktop.enabled {
+        let _ = run_bounded(notify_send_argv(&request), stopping);
+    }
+    if settings.sound.enabled && !stopping.load(Ordering::Acquire) {
+        let _ = run_bounded(sound_argv(settings, request.reason), stopping);
+    }
+}
+
+fn run_bounded(argv: Vec<String>, stopping: &AtomicBool) -> io::Result<()> {
+    if stopping.load(Ordering::Acquire) {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "notification delivery stopped",
+        ));
+    }
+    let mut child = Command::new(&argv[0])
         .args(&argv[1..])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
-    {
-        let deadline = Instant::now() + NOTIFICATION_TIMEOUT;
-        loop {
-            match child.try_wait() {
-                Ok(Some(_)) => break,
-                Ok(None) if stopping.load(Ordering::Acquire) || Instant::now() >= deadline => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    break;
-                }
-                Ok(None) => thread::sleep(Duration::from_millis(10)),
-                Err(_) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    break;
-                }
+        .spawn()?;
+    let deadline = Instant::now() + NOTIFICATION_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(status)) => {
+                return Err(io::Error::other(format!(
+                    "{} exited with {status}",
+                    argv[0]
+                )));
+            }
+            Ok(None) if stopping.load(Ordering::Acquire) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "notification delivery stopped",
+                ));
+            }
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("{} timed out", argv[0]),
+                ));
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(10)),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
             }
         }
     }
 }
 
-pub(crate) fn category_enabled(settings: NotificationSettings, reason: NotificationReason) -> bool {
-    settings.enabled
+pub(crate) fn test_delivery(
+    settings: &NotificationDeliverySettings,
+    reason: NotificationReason,
+) -> io::Result<()> {
+    if !category_enabled(settings, reason) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the requested notification category has no enabled delivery channel",
+        ));
+    }
+    let request = NotificationRequest {
+        reason,
+        agent: "Test Agent".into(),
+        workspace: "test-workspace".into(),
+        shell: "test-shell".into(),
+    };
+    let stopping = AtomicBool::new(false);
+    let mut first_error = None;
+    if settings.desktop.enabled
+        && let Err(error) = run_bounded(notify_send_argv(&request), &stopping)
+    {
+        first_error = Some(error);
+    }
+    if settings.sound.enabled
+        && let Err(error) = run_bounded(sound_argv(settings, reason), &stopping)
+        && first_error.is_none()
+    {
+        first_error = Some(error);
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+pub(crate) fn category_enabled(
+    settings: &NotificationDeliverySettings,
+    reason: NotificationReason,
+) -> bool {
+    (settings.desktop.enabled || settings.sound.enabled)
         && match reason {
-            NotificationReason::Blocked => settings.blocked,
-            NotificationReason::Completed => settings.completed,
+            NotificationReason::Blocked => settings.desktop.blocked,
+            NotificationReason::Completed => settings.desktop.completed,
         }
+}
+
+fn sound_argv(settings: &NotificationDeliverySettings, reason: NotificationReason) -> Vec<String> {
+    let event = match reason {
+        NotificationReason::Blocked => &settings.sound.blocked,
+        NotificationReason::Completed => &settings.sound.completed,
+    };
+    vec![
+        "canberra-gtk-play".into(),
+        "--id".into(),
+        event.clone(),
+        "--description".into(),
+        "Boomux Agent notification".into(),
+    ]
 }
 
 fn notify_send_argv(request: &NotificationRequest) -> Vec<String> {
@@ -228,16 +311,60 @@ mod tests {
 
     #[test]
     fn category_filtering_requires_global_and_category_flags() {
-        let enabled = NotificationSettings {
-            enabled: true,
-            blocked: true,
-            completed: false,
+        let enabled = NotificationDeliverySettings {
+            desktop: crate::daemon::NotificationSettings {
+                enabled: true,
+                blocked: true,
+                completed: false,
+            },
+            ..Default::default()
         };
-        assert!(category_enabled(enabled, NotificationReason::Blocked));
-        assert!(!category_enabled(enabled, NotificationReason::Completed));
+        assert!(category_enabled(&enabled, NotificationReason::Blocked));
+        assert!(!category_enabled(&enabled, NotificationReason::Completed));
         assert!(!category_enabled(
-            NotificationSettings::default(),
+            &NotificationDeliverySettings::default(),
             NotificationReason::Blocked
         ));
+
+        let sound_only = NotificationDeliverySettings {
+            sound: crate::daemon::NotificationSoundSettings {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(category_enabled(&sound_only, NotificationReason::Blocked));
+    }
+
+    #[test]
+    fn builds_exact_sound_arguments_for_each_reason() {
+        let settings = NotificationDeliverySettings {
+            sound: crate::daemon::NotificationSoundSettings {
+                enabled: true,
+                blocked: "dialog-warning".into(),
+                completed: "complete".into(),
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            sound_argv(&settings, NotificationReason::Blocked),
+            [
+                "canberra-gtk-play",
+                "--id",
+                "dialog-warning",
+                "--description",
+                "Boomux Agent notification",
+            ]
+        );
+        assert_eq!(
+            sound_argv(&settings, NotificationReason::Completed),
+            [
+                "canberra-gtk-play",
+                "--id",
+                "complete",
+                "--description",
+                "Boomux Agent notification",
+            ]
+        );
     }
 }

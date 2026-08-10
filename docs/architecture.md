@@ -468,20 +468,24 @@ outstanding items so upgrading does not reinterpret historical work as unseen.
 The CLI projects these records into a deterministic blocked-first queue and
 reports fixed lifecycle-state and attention counts per workspace.
 
-Opt-in desktop notifications are a daemon-owned projection of committed Agent
-state transitions, not durable queue state. A transition from any other state
-into `blocked` or `done` schedules one asynchronous `notify-send` attempt after
-persistence and event publication locks are released. Same-state evidence or
-confidence revisions do not notify, and restored state is not replayed. A daemon
-handoff reloads configuration for the replacement, just like a cold daemon
-start. Delivery uses one worker and a bounded, non-blocking queue. It is
-at-most-once and fail-open: queue saturation, a missing command, desktop-bus
-failure, timeout, or non-zero exit neither retries nor changes the successful
-Agent mutation.
+Opt-in desktop and sound notifications are a daemon-owned projection of committed
+Agent state transitions, not durable queue state. A transition from any other
+state into `blocked` or `done` schedules one asynchronous delivery request after
+persistence and event publication locks are released. Enabled desktop delivery
+invokes `notify-send`; enabled sound delivery invokes `canberra-gtk-play` with a
+configured freedesktop event ID. Same-state evidence or confidence revisions do
+not notify, and restored state is not replayed. A daemon handoff reloads
+configuration for the replacement, just like a cold daemon start. Both channels
+share one worker and a bounded, non-blocking queue. Delivery is at-most-once and
+fail-open: queue saturation, a missing command, desktop-bus or audio failure,
+timeout, or non-zero exit neither retries nor changes the successful Agent
+mutation.
 Notification payloads include only sanitized Agent, workspace, and shell names;
 if retained Agent context outlives a removed shell, the shell is identified as
 removed rather than suppressing the transition. Notifications never acknowledge
 attention, advance an observation revision, or publish lifecycle events.
+`notification test` exercises the same configured delivery commands directly
+without fabricating or persisting an Agent transition.
 
 ### Transition Coordinator
 

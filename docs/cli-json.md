@@ -30,6 +30,9 @@ notification delivery; it does not imply notifications are enabled or that
 `notify-send` and a desktop notification service are available. Configuration is
 sampled when the daemon starts and is intentionally outside the JSON capability
 contract.
+The `sound_notifications` feature similarly advertises optional direct sound
+delivery through `canberra-gtk-play`. `boomux notification test` is a human-facing
+delivery diagnostic and does not support `--json`.
 
 The following commands support `--json`:
 

@@ -425,15 +425,31 @@ max_depth = 3
 enabled = false
 blocked = true
 completed = true
+
+[notifications.sound]
+enabled = false
+blocked = "message-new-instant"
+completed = "complete"
 ```
 
-Notifications are disabled by default and require `notify-send` plus a desktop
-notification service. The daemon samples this configuration at startup; run
-`boomux daemon restart` after changing it. `boomux doctor` reports whether the
-configured command and a plausible desktop bus environment are present. Bodies
-contain only the sanitized Agent, workspace, and shell names, never evidence,
-working directories, command arguments, external session IDs, or transcript
-content.
+Desktop and sound delivery are independently disabled by default. Desktop
+delivery uses `notify-send` and a desktop notification service. Sound delivery
+uses `canberra-gtk-play`; `blocked` and `completed` are freedesktop sound event
+IDs passed as exact arguments, not shell commands. Both channels share the
+top-level category filters.
+
+Test the configured channels without creating an Agent transition:
+
+```console
+boomux notification test blocked
+boomux notification test completed
+```
+
+The daemon samples notification configuration at startup; run `boomux daemon
+restart` after changing it. `boomux doctor` diagnoses desktop and sound delivery
+separately. Desktop bodies contain only the sanitized Agent, workspace, and shell
+names, never evidence, working directories, command arguments, external session
+IDs, or transcript content.
 
 Directory discovery scans only configured project roots, recognizes ordinary
 and linked Git worktrees, and stops descending after finding a repository. The

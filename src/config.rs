@@ -30,6 +30,15 @@ struct RawNotificationsConfig {
     enabled: Option<bool>,
     blocked: Option<bool>,
     completed: Option<bool>,
+    sound: Option<RawNotificationSoundConfig>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RawNotificationSoundConfig {
+    enabled: Option<bool>,
+    blocked: Option<String>,
+    completed: Option<String>,
 }
 
 #[derive(Debug)]
@@ -37,7 +46,7 @@ pub(crate) struct Config {
     pub(crate) terminal: Option<String>,
     pub(crate) projects: ProjectsConfig,
     pub(crate) path: Option<PathBuf>,
-    pub(crate) notifications: boomux::daemon::NotificationSettings,
+    pub(crate) notifications: boomux::daemon::NotificationDeliverySettings,
 }
 
 #[derive(Debug)]
@@ -63,7 +72,7 @@ pub(crate) fn load() -> Result<Config, Box<dyn Error>> {
 }
 
 pub(crate) fn load_notification_settings()
--> Result<boomux::daemon::NotificationSettings, Box<dyn Error>> {
+-> Result<boomux::daemon::NotificationDeliverySettings, Box<dyn Error>> {
     let (raw, _) = load_raw()?;
     Ok(resolve_notifications(raw.notifications))
 }
@@ -136,6 +145,18 @@ fn merge(base: &mut RawConfig, next: RawConfig) {
         if next_notifications.completed.is_some() {
             notifications.completed = next_notifications.completed;
         }
+        if let Some(next_sound) = next_notifications.sound {
+            let sound = notifications.sound.get_or_insert_default();
+            if next_sound.enabled.is_some() {
+                sound.enabled = next_sound.enabled;
+            }
+            if next_sound.blocked.is_some() {
+                sound.blocked = next_sound.blocked;
+            }
+            if next_sound.completed.is_some() {
+                sound.completed = next_sound.completed;
+            }
+        }
     }
 }
 
@@ -173,12 +194,23 @@ fn resolve(raw: RawConfig, path: Option<PathBuf>) -> Result<Config, Box<dyn Erro
 
 fn resolve_notifications(
     raw: Option<RawNotificationsConfig>,
-) -> boomux::daemon::NotificationSettings {
+) -> boomux::daemon::NotificationDeliverySettings {
     let raw = raw.unwrap_or_default();
-    boomux::daemon::NotificationSettings {
-        enabled: raw.enabled.unwrap_or(false),
-        blocked: raw.blocked.unwrap_or(true),
-        completed: raw.completed.unwrap_or(true),
+    boomux::daemon::NotificationDeliverySettings {
+        desktop: boomux::daemon::NotificationSettings {
+            enabled: raw.enabled.unwrap_or(false),
+            blocked: raw.blocked.unwrap_or(true),
+            completed: raw.completed.unwrap_or(true),
+        },
+        sound: raw.sound.map_or_else(Default::default, |sound| {
+            boomux::daemon::NotificationSoundSettings {
+                enabled: sound.enabled.unwrap_or(false),
+                blocked: sound
+                    .blocked
+                    .unwrap_or_else(|| "message-new-instant".into()),
+                completed: sound.completed.unwrap_or_else(|| "complete".into()),
+            }
+        }),
     }
 }
 
@@ -318,15 +350,19 @@ mod tests {
     fn notification_settings_default_and_parse() {
         assert_eq!(
             resolve_notifications(None),
-            boomux::daemon::NotificationSettings::default()
+            boomux::daemon::NotificationDeliverySettings::default()
         );
-        let raw: RawConfig =
-            toml::from_str("[notifications]\nenabled = true\nblocked = false\ncompleted = false")
-                .unwrap();
+        let raw: RawConfig = toml::from_str(
+            "[notifications]\nenabled = true\nblocked = false\ncompleted = false\n[notifications.sound]\nenabled = true\nblocked = \"dialog-warning\"",
+        )
+        .unwrap();
         let settings = resolve_notifications(raw.notifications);
-        assert!(settings.enabled);
-        assert!(!settings.blocked);
-        assert!(!settings.completed);
+        assert!(settings.desktop.enabled);
+        assert!(!settings.desktop.blocked);
+        assert!(!settings.desktop.completed);
+        assert!(settings.sound.enabled);
+        assert_eq!(settings.sound.blocked, "dialog-warning");
+        assert_eq!(settings.sound.completed, "complete");
     }
 
     #[test]
@@ -334,16 +370,26 @@ mod tests {
         let mut base: RawConfig =
             toml::from_str("[notifications]\nenabled = true\nblocked = false\ncompleted = false")
                 .unwrap();
-        let next = toml::from_str("[notifications]\ncompleted = true").unwrap();
+        let next = toml::from_str(
+            "[notifications]\ncompleted = true\n[notifications.sound]\nenabled = true\ncompleted = \"service-login\"",
+        )
+        .unwrap();
         merge(&mut base, next);
 
         let settings = resolve_notifications(base.notifications);
         assert_eq!(
             settings,
-            boomux::daemon::NotificationSettings {
-                enabled: true,
-                blocked: false,
-                completed: true,
+            boomux::daemon::NotificationDeliverySettings {
+                desktop: boomux::daemon::NotificationSettings {
+                    enabled: true,
+                    blocked: false,
+                    completed: true,
+                },
+                sound: boomux::daemon::NotificationSoundSettings {
+                    enabled: true,
+                    blocked: "message-new-instant".into(),
+                    completed: "service-login".into(),
+                },
             }
         );
     }
@@ -351,6 +397,7 @@ mod tests {
     #[test]
     fn rejects_unknown_notification_settings() {
         assert!(toml::from_str::<RawConfig>("[notifications]\nunknown = true").is_err());
+        assert!(toml::from_str::<RawConfig>("[notifications.sound]\nunknown = true").is_err());
     }
 
     #[test]
@@ -360,6 +407,6 @@ mod tests {
         )
         .unwrap();
         assert!(resolve(raw.clone(), None).is_err());
-        assert!(resolve_notifications(raw.notifications).enabled);
+        assert!(resolve_notifications(raw.notifications).desktop.enabled);
     }
 }

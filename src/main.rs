@@ -108,6 +108,7 @@ const INTEGRATION_FEATURES: &[&str] = &[
     "revision_aware_agent_wait",
     "persistent_agent_attention",
     "desktop_notifications",
+    "sound_notifications",
     "integration_management",
 ];
 const LEGACY_BOOMUX_SHELLS_SKILL: &str = r#"---
@@ -247,6 +248,11 @@ enum Commands {
     Attention {
         #[command(subcommand)]
         command: AttentionCommands,
+    },
+    /// Test configured desktop and sound notification delivery
+    Notification {
+        #[command(subcommand)]
+        command: NotificationCommands,
     },
     /// Discover projected agent sessions
     Session {
@@ -441,6 +447,30 @@ enum AttentionCommands {
         #[arg(long)]
         observation_revision: u64,
     },
+}
+
+#[derive(Subcommand)]
+enum NotificationCommands {
+    /// Deliver a test notification through every configured channel
+    Test {
+        #[arg(value_enum)]
+        reason: CliNotificationReason,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum CliNotificationReason {
+    Blocked,
+    Completed,
+}
+
+impl From<CliNotificationReason> for daemon::NotificationTestReason {
+    fn from(reason: CliNotificationReason) -> Self {
+        match reason {
+            CliNotificationReason::Blocked => Self::Blocked,
+            CliNotificationReason::Completed => Self::Completed,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -719,13 +749,13 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
         Some(Commands::Daemon {
             command: DaemonCommands::Run,
         }) => {
-            daemon::run_with_notifications(config::load_notification_settings()?)?;
+            daemon::run_with_notification_delivery(config::load_notification_settings()?)?;
             return Ok(CliExit::Success);
         }
         Some(Commands::Daemon {
             command: DaemonCommands::ReceiveHandoff { channel },
         }) => {
-            daemon::receive_handoff_with_notifications(
+            daemon::receive_handoff_with_notification_delivery(
                 *channel,
                 config::load_notification_settings()?,
             )?;
@@ -797,6 +827,9 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
         }) => return supervise_agent(arguments).map(CliExit::Child),
         Some(Commands::Agent { command }) => agent_command(command, cli.json),
         Some(Commands::Attention { command }) => attention_command(command, cli.json),
+        Some(Commands::Notification {
+            command: NotificationCommands::Test { reason },
+        }) => test_notification(reason),
         Some(Commands::Session { command }) => session_command(command, cli.json),
         Some(Commands::Integration { command }) => integration_command(command, cli.json),
         Some(Commands::Skill {
@@ -874,6 +907,9 @@ fn command_name(cli: &Cli) -> &'static str {
         Some(Commands::Attention {
             command: AttentionCommands::Acknowledge { .. },
         }) => "attention.acknowledge",
+        Some(Commands::Notification {
+            command: NotificationCommands::Test { .. },
+        }) => "notification.test",
         Some(Commands::Session {
             command: SessionCommands::List { .. },
         }) => "session.list",
@@ -4030,7 +4066,7 @@ fn doctor(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
                 }
             }
             match notification_diagnostic(
-                config.notifications,
+                &config.notifications,
                 executable_on_path("notify-send"),
                 plausible_desktop_bus(),
             ) {
@@ -4049,6 +4085,25 @@ fn doctor(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
                 NotificationDiagnostic::MissingDesktopBus => {
                     healthy = false;
                     eprintln!("err notifications: no plausible desktop bus is available");
+                }
+            }
+            match sound_notification_diagnostic(
+                &config.notifications,
+                executable_on_path("canberra-gtk-play"),
+            ) {
+                SoundNotificationDiagnostic::Disabled => {
+                    println!("ok  notification sound: disabled (sampled at daemon start)");
+                }
+                SoundNotificationDiagnostic::Ready => {
+                    println!(
+                        "ok  notification sound: canberra-gtk-play is executable; restart daemon after changes"
+                    );
+                }
+                SoundNotificationDiagnostic::MissingExecutable => {
+                    healthy = false;
+                    eprintln!(
+                        "err notification sound: canberra-gtk-play is not executable on PATH"
+                    );
                 }
             }
         }
@@ -4135,12 +4190,19 @@ enum NotificationDiagnostic {
     MissingDesktopBus,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum SoundNotificationDiagnostic {
+    Disabled,
+    Ready,
+    MissingExecutable,
+}
+
 fn notification_diagnostic(
-    settings: daemon::NotificationSettings,
+    settings: &daemon::NotificationDeliverySettings,
     executable: bool,
     desktop_bus: bool,
 ) -> NotificationDiagnostic {
-    if !settings.enabled {
+    if !settings.desktop.enabled {
         NotificationDiagnostic::Disabled
     } else if !executable {
         NotificationDiagnostic::MissingExecutable
@@ -4149,6 +4211,30 @@ fn notification_diagnostic(
     } else {
         NotificationDiagnostic::Ready
     }
+}
+
+fn sound_notification_diagnostic(
+    settings: &daemon::NotificationDeliverySettings,
+    executable: bool,
+) -> SoundNotificationDiagnostic {
+    if !settings.sound.enabled {
+        SoundNotificationDiagnostic::Disabled
+    } else if !executable {
+        SoundNotificationDiagnostic::MissingExecutable
+    } else {
+        SoundNotificationDiagnostic::Ready
+    }
+}
+
+fn test_notification(reason: CliNotificationReason) -> Result<(), Box<dyn Error>> {
+    let settings = config::load_notification_settings()?;
+    daemon::test_notification_delivery(&settings, reason.into())?;
+    let reason = match reason {
+        CliNotificationReason::Blocked => "blocked",
+        CliNotificationReason::Completed => "completed",
+    };
+    println!("Delivered test {reason} notification");
+    Ok(())
 }
 
 fn executable_on_path(name: &str) -> bool {
@@ -4663,6 +4749,23 @@ mod tests {
             sanitize_table_cell("approval\tneeded\nnow\u{7}"),
             "approval needed now "
         );
+    }
+
+    #[test]
+    fn parses_notification_test_commands_without_json_support() {
+        let blocked = Cli::try_parse_from(["boomux", "notification", "test", "blocked"]).unwrap();
+        assert_eq!(command_name(&blocked), "notification.test");
+        assert!(!supports_json(&blocked));
+        assert!(matches!(
+            blocked.command,
+            Some(Commands::Notification {
+                command: NotificationCommands::Test {
+                    reason: CliNotificationReason::Blocked
+                }
+            })
+        ));
+
+        assert!(Cli::try_parse_from(["boomux", "notification", "test", "unknown"]).is_err());
     }
 
     #[test]
@@ -5851,6 +5954,7 @@ mod tests {
             "protocol_16",
             "persistent_agent_attention",
             "desktop_notifications",
+            "sound_notifications",
             "integration_management",
         ] {
             assert!(INTEGRATION_FEATURES.contains(&feature));
@@ -5876,26 +5980,49 @@ mod tests {
 
     #[test]
     fn notification_doctor_diagnostic_is_deterministic() {
-        let disabled = daemon::NotificationSettings::default();
+        let disabled = daemon::NotificationDeliverySettings::default();
         assert_eq!(
-            notification_diagnostic(disabled, false, false),
+            notification_diagnostic(&disabled, false, false),
             NotificationDiagnostic::Disabled
         );
-        let enabled = daemon::NotificationSettings {
-            enabled: true,
+        let enabled = daemon::NotificationDeliverySettings {
+            desktop: daemon::NotificationSettings {
+                enabled: true,
+                ..Default::default()
+            },
             ..disabled
         };
         assert_eq!(
-            notification_diagnostic(enabled, false, true),
+            notification_diagnostic(&enabled, false, true),
             NotificationDiagnostic::MissingExecutable
         );
         assert_eq!(
-            notification_diagnostic(enabled, true, false),
+            notification_diagnostic(&enabled, true, false),
             NotificationDiagnostic::MissingDesktopBus
         );
         assert_eq!(
-            notification_diagnostic(enabled, true, true),
+            notification_diagnostic(&enabled, true, true),
             NotificationDiagnostic::Ready
+        );
+
+        assert_eq!(
+            sound_notification_diagnostic(&enabled, false),
+            SoundNotificationDiagnostic::Disabled
+        );
+        let sound_enabled = daemon::NotificationDeliverySettings {
+            sound: daemon::NotificationSoundSettings {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            sound_notification_diagnostic(&sound_enabled, false),
+            SoundNotificationDiagnostic::MissingExecutable
+        );
+        assert_eq!(
+            sound_notification_diagnostic(&sound_enabled, true),
+            SoundNotificationDiagnostic::Ready
         );
     }
 

@@ -62,7 +62,7 @@ impl TestDaemon {
         }
     }
 
-    fn start_with_notifications() -> (Self, PathBuf, PathBuf) {
+    fn start_with_notifications() -> (Self, PathBuf, PathBuf, PathBuf) {
         let executable = PathBuf::from(env!("CARGO_BIN_EXE_boomux"));
         let runtime_dir = std::env::temp_dir().join(format!(
             "boomux-integration-{}-{}",
@@ -73,17 +73,25 @@ impl TestDaemon {
         let bin_dir = runtime_dir.join("bin");
         fs::create_dir(&bin_dir).unwrap();
         let notify_send = bin_dir.join("notify-send");
+        let sound_player = bin_dir.join("canberra-gtk-play");
         let capture = runtime_dir.join("notifications");
+        let sound_capture = runtime_dir.join("sounds");
         fs::write(
             &notify_send,
             "#!/bin/sh\nif [ -f \"$BOOMUX_NOTIFICATION_HANG\" ]; then\n  printf '%s\\n' \"$$\" > \"$BOOMUX_NOTIFICATION_PID\"\n  exec sleep 10\nfi\nprintf '%s\\0' \"$@\" >> \"$BOOMUX_NOTIFICATION_CAPTURE\"\n",
         )
         .unwrap();
         fs::set_permissions(&notify_send, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(
+            &sound_player,
+            "#!/bin/sh\nprintf '%s\\0' \"$@\" >> \"$BOOMUX_SOUND_CAPTURE\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&sound_player, fs::Permissions::from_mode(0o755)).unwrap();
         let config = runtime_dir.join("config.toml");
         fs::write(
             &config,
-            "[notifications]\nenabled = true\nblocked = true\ncompleted = true\n",
+            "[notifications]\nenabled = true\nblocked = true\ncompleted = true\n[notifications.sound]\nenabled = true\n",
         )
         .unwrap();
         let mut paths = vec![bin_dir];
@@ -97,6 +105,7 @@ impl TestDaemon {
             .env("XDG_STATE_HOME", runtime_dir.join("state"))
             .env("BOOMUX_CONFIG", &config)
             .env("BOOMUX_NOTIFICATION_CAPTURE", &capture)
+            .env("BOOMUX_SOUND_CAPTURE", &sound_capture)
             .env(
                 "BOOMUX_NOTIFICATION_HANG",
                 runtime_dir.join("notification-hang"),
@@ -124,6 +133,7 @@ impl TestDaemon {
             },
             capture,
             notify_send,
+            sound_capture,
         )
     }
 
@@ -1145,7 +1155,7 @@ fn daemon_events_and_revision_reads_survive_handoff() {
 
 #[test]
 fn desktop_notifications_are_deduplicated_private_and_survive_handoff() {
-    let (daemon, capture, notify_send) = TestDaemon::start_with_notifications();
+    let (daemon, capture, notify_send, sound_capture) = TestDaemon::start_with_notifications();
     let workspace = daemon
         .client
         .create_workspace(
@@ -1178,6 +1188,10 @@ fn desktop_notifications_are_deduplicated_private_and_survive_handoff() {
         || captured_notification_count(&capture) == 1,
         "blocked notification was not delivered",
     );
+    wait_until(
+        || captured_notification_count(&sound_capture) == 1,
+        "blocked notification sound was not delivered",
+    );
     let captured = fs::read(&capture).unwrap();
     assert!(
         !captured
@@ -1205,6 +1219,7 @@ fn desktop_notifications_are_deduplicated_private_and_survive_handoff() {
         .unwrap();
     thread::sleep(Duration::from_millis(100));
     assert_eq!(captured_notification_count(&capture), 1);
+    assert_eq!(captured_notification_count(&sound_capture), 1);
 
     for (state, evidence, expected) in [
         (AgentState::Working, "resumed", 1),
@@ -1227,6 +1242,10 @@ fn desktop_notifications_are_deduplicated_private_and_survive_handoff() {
         wait_until(
             || captured_notification_count(&capture) == expected,
             "notification transition was not delivered",
+        );
+        wait_until(
+            || captured_notification_count(&sound_capture) == expected,
+            "notification transition sound was not delivered",
         );
     }
 
@@ -1260,6 +1279,11 @@ fn desktop_notifications_are_deduplicated_private_and_survive_handoff() {
         .trim()
         .parse()
         .unwrap();
+    fs::write(
+        daemon.runtime_dir.join("config.toml"),
+        "[notifications]\nenabled = true\nblocked = true\ncompleted = true\n[notifications.sound]\nenabled = true\nblocked = \"dialog-warning\"\n",
+    )
+    .unwrap();
     drop(attachment.stream);
     let restart = daemon
         .command()
@@ -1300,8 +1324,20 @@ fn desktop_notifications_are_deduplicated_private_and_survive_handoff() {
         || captured_notification_count(&capture) == 4,
         "notifications stopped after daemon handoff",
     );
+    wait_until(
+        || captured_notification_count(&sound_capture) == 4,
+        "notification sounds stopped after daemon handoff",
+    );
+    assert!(
+        fs::read(&sound_capture)
+            .unwrap()
+            .windows(b"dialog-warning".len())
+            .any(|value| value == b"dialog-warning"),
+        "daemon handoff did not resample sound configuration"
+    );
 
     fs::remove_file(notify_send).unwrap();
+    let sound_count = captured_notification_count(&sound_capture);
     daemon
         .client
         .register_agent(
@@ -1322,6 +1358,88 @@ fn desktop_notifications_are_deduplicated_private_and_survive_handoff() {
         .unwrap();
     thread::sleep(Duration::from_millis(100));
     assert_eq!(captured_notification_count(&capture), 4);
+    wait_until(
+        || captured_notification_count(&sound_capture) == sound_count + 1,
+        "sound did not survive desktop notification failure",
+    );
+}
+
+#[test]
+fn notification_test_command_plays_the_configured_sound() {
+    let executable = PathBuf::from(env!("CARGO_BIN_EXE_boomux"));
+    let directory = std::env::temp_dir().join(format!(
+        "boomux-sound-test-{}-{}",
+        std::process::id(),
+        Uuid::new_v4()
+    ));
+    let bin = directory.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let player = bin.join("canberra-gtk-play");
+    let capture = directory.join("sound-arguments");
+    fs::write(
+        &player,
+        "#!/bin/sh\nprintf '%s\\0' \"$@\" >> \"$BOOMUX_SOUND_CAPTURE\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&player, fs::Permissions::from_mode(0o755)).unwrap();
+    let config = directory.join("config.toml");
+    fs::write(
+        &config,
+        "[notifications]\nenabled = false\nblocked = true\ncompleted = true\n[notifications.sound]\nenabled = true\nblocked = \"dialog-warning\"\ncompleted = \"complete\"\n",
+    )
+    .unwrap();
+    let mut paths = vec![bin];
+    if let Some(path) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&path));
+    }
+    let path = std::env::join_paths(paths).unwrap();
+
+    for reason in ["blocked", "completed"] {
+        let output = Command::new(&executable)
+            .args(["notification", "test", reason])
+            .env("BOOMUX_CONFIG", &config)
+            .env("BOOMUX_SOUND_CAPTURE", &capture)
+            .env("PATH", &path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains(reason));
+    }
+
+    let arguments = fs::read(&capture)
+        .unwrap()
+        .split(|byte| *byte == 0)
+        .filter(|argument| !argument.is_empty())
+        .map(|argument| String::from_utf8(argument.to_vec()).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        arguments,
+        [
+            "--id",
+            "dialog-warning",
+            "--description",
+            "Boomux Agent notification",
+            "--id",
+            "complete",
+            "--description",
+            "Boomux Agent notification",
+        ]
+    );
+
+    fs::write(&player, "#!/bin/sh\nexit 7\n").unwrap();
+    let failed = Command::new(&executable)
+        .args(["notification", "test", "blocked"])
+        .env("BOOMUX_CONFIG", &config)
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(!failed.status.success());
+    assert!(String::from_utf8_lossy(&failed.stderr).contains("canberra-gtk-play exited"));
+    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]

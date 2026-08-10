@@ -124,6 +124,12 @@ change an observation revision, or contain lifecycle evidence. Always inspect
 the durable queue before acting; do not infer queue state or delivery from a
 desktop notification.
 
+Optional notification sounds are also a best-effort signal for those committed
+transitions. Test configured desktop and sound channels without changing Agent
+state using `boomux notification test blocked` or `boomux notification test
+completed`. Configuration is sampled at daemon startup, so restart the daemon
+after changing notification settings.
+
 Discover projected session metadata with:
 
 ```console
