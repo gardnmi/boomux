@@ -1201,10 +1201,9 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
                 })
             },
             on_terminal_preview: |shell_id: &str| {
-                let bytes = client
-                    .read_shell(shell_id, READ_BYTES)
-                    .map_err(|error| error.to_string())?;
-                Ok(recent_lines(&String::from_utf8_lossy(&bytes), 500))
+                client
+                    .read_shell_preview(shell_id, READ_BYTES, 500)
+                    .map_err(|error| error.to_string())
             },
         },
     )?;
@@ -6073,7 +6072,7 @@ mod tests {
             session_transcript::supported_integrations(),
             ["opencode", "pi"]
         );
-        assert_eq!(protocol::PROTOCOL_VERSION, 19);
+        assert_eq!(protocol::PROTOCOL_VERSION, 20);
     }
 
     #[test]

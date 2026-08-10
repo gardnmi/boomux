@@ -1,3 +1,6 @@
+use crate::protocol::{
+    TerminalColor, TerminalPreview, TerminalPreviewLine, TerminalPreviewSpan, TerminalStyle,
+};
 use crate::terminal_focus::FocusMode;
 
 const SCROLLBACK_ROWS: usize = 2_000;
@@ -104,6 +107,115 @@ impl TerminalState {
             .filter(|character| !character.is_control() || matches!(character, '\n' | '\t'))
             .collect()
     }
+
+    pub(crate) fn preview(
+        &self,
+        max_bytes: usize,
+        max_lines: usize,
+        max_spans: usize,
+    ) -> TerminalPreview {
+        let screen = self.parser.screen();
+        let mut scrolled = screen.clone();
+        scrolled.set_scrollback(usize::MAX);
+        let scrollback_rows = scrolled.scrollback();
+        let mut lines = Vec::new();
+        let mut current = TerminalPreviewLine::default();
+
+        for offset in (1..=scrollback_rows).rev() {
+            scrolled.set_scrollback(offset);
+            append_preview_row(&mut lines, &mut current, &scrolled, 0);
+        }
+        scrolled.set_scrollback(0);
+        for row in 0..scrolled.size().0 {
+            append_preview_row(&mut lines, &mut current, &scrolled, row);
+        }
+        if !current.spans.is_empty() {
+            lines.push(current);
+        }
+
+        let first = lines
+            .iter()
+            .position(|line| !preview_line_is_blank(line))
+            .unwrap_or(lines.len());
+        let end = lines
+            .iter()
+            .rposition(|line| !preview_line_is_blank(line))
+            .map_or(first, |last| last + 1);
+        let lines = &lines[first..end];
+        let start = lines.len().saturating_sub(max_lines);
+        let mut selected = Vec::new();
+        let mut bytes = 0usize;
+        let mut spans = 0usize;
+        for line in lines[start..].iter().rev() {
+            let line_bytes = line.spans.iter().map(|span| span.text.len()).sum::<usize>();
+            let line_spans = line.spans.len();
+            if !selected.is_empty()
+                && (bytes.saturating_add(line_bytes) > max_bytes
+                    || spans.saturating_add(line_spans) > max_spans)
+            {
+                break;
+            }
+            bytes = bytes.saturating_add(line_bytes);
+            spans = spans.saturating_add(line_spans);
+            selected.push(line.clone());
+        }
+        selected.reverse();
+        TerminalPreview { lines: selected }
+    }
+}
+
+fn append_preview_row(
+    lines: &mut Vec<TerminalPreviewLine>,
+    current: &mut TerminalPreviewLine,
+    screen: &vt100::Screen,
+    row: u16,
+) {
+    let (_, cols) = screen.size();
+    let wrapped = screen.row_wrapped(row);
+    let last_col = if wrapped {
+        cols.checked_sub(1)
+    } else {
+        (0..cols).rfind(|col| {
+            screen.cell(row, *col).is_some_and(|cell| {
+                cell.has_contents() || CellStyle::from_cell(cell) != CellStyle::default()
+            })
+        })
+    };
+
+    if let Some(last_col) = last_col {
+        for col in 0..=last_col {
+            let Some(cell) = screen.cell(row, col) else {
+                continue;
+            };
+            if cell.is_wide_continuation() {
+                continue;
+            }
+            let text = if cell.has_contents() {
+                cell.contents()
+            } else {
+                " "
+            };
+            append_preview_span(current, text, CellStyle::from_cell(cell).into());
+        }
+    }
+    if !wrapped {
+        lines.push(std::mem::take(current));
+    }
+}
+
+fn append_preview_span(line: &mut TerminalPreviewLine, text: &str, style: TerminalStyle) {
+    if let Some(span) = line.spans.last_mut().filter(|span| span.style == style) {
+        span.text.push_str(text);
+    } else {
+        line.spans.push(TerminalPreviewSpan {
+            text: text.to_owned(),
+            style,
+        });
+    }
+}
+
+fn preview_line_is_blank(line: &TerminalPreviewLine) -> bool {
+    line.spans.iter().all(|span| span.text.trim().is_empty())
 }
 
 fn alternate_screen_start(bytes: &[u8]) -> Option<usize> {
@@ -228,6 +340,30 @@ impl CellStyle {
         write_color(output, self.foreground, true);
         write_color(output, self.background, false);
         output.push(b'm');
+    }
+}
+
+impl From<CellStyle> for TerminalStyle {
+    fn from(style: CellStyle) -> Self {
+        Self {
+            foreground: style.foreground.into(),
+            background: style.background.into(),
+            bold: style.bold,
+            dim: style.dim,
+            italic: style.italic,
+            underline: style.underline,
+            inverse: style.inverse,
+        }
+    }
+}
+
+impl From<vt100::Color> for TerminalColor {
+    fn from(color: vt100::Color) -> Self {
+        match color {
+            vt100::Color::Default => Self::Default,
+            vt100::Color::Idx(index) => Self::Indexed(index),
+            vt100::Color::Rgb(red, green, blue) => Self::Rgb { red, green, blue },
+        }
     }
 }
 
@@ -499,5 +635,63 @@ mod tests {
         let mut restored = TerminalState::new(2, 20);
         restored.process(&state.reconstruction());
         assert_eq!(restored.plain_text(), "one\ntwo\nthree");
+    }
+
+    #[test]
+    fn preview_preserves_styles_and_matches_plain_text() {
+        let mut state = TerminalState::new(3, 30);
+        state.process(b"plain \x1b[1;31mred\x1b[0m\r\n\x1b[38;2;1;2;3;48;2;4;5;6mcolor\x1b[0m");
+
+        let preview = state.preview(1024, 100, 100);
+        let text = preview
+            .lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.text.as_str())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert_eq!(text, state.plain_text());
+        assert_eq!(preview.lines[0].spans.len(), 2);
+        assert_eq!(
+            preview.lines[0].spans[1].style.foreground,
+            TerminalColor::Indexed(1)
+        );
+        assert!(preview.lines[0].spans[1].style.bold);
+        assert_eq!(
+            preview.lines[1].spans[0].style.foreground,
+            TerminalColor::Rgb {
+                red: 1,
+                green: 2,
+                blue: 3
+            }
+        );
+        assert_eq!(
+            preview.lines[1].spans[0].style.background,
+            TerminalColor::Rgb {
+                red: 4,
+                green: 5,
+                blue: 6
+            }
+        );
+    }
+
+    #[test]
+    fn preview_keeps_the_newest_complete_lines_within_bounds() {
+        let mut state = TerminalState::new(2, 20);
+        state.process(b"one\r\ntwo\r\nthree");
+
+        let preview = state.preview(1024, 2, 100);
+        let text = preview
+            .lines
+            .iter()
+            .map(|line| line.spans[0].text.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(text, ["two", "three"]);
     }
 }

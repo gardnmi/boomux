@@ -485,7 +485,7 @@ fn focused_attachment_is_exposed_in_daemon_snapshots() {
         .unwrap();
     let shell_id = workspace.shells[0].id.clone();
     let mut attachment = daemon.client.attach(&shell_id, false, profile()).unwrap();
-    assert_eq!(attachment.protocol_version, 19);
+    assert_eq!(attachment.protocol_version, 20);
 
     AttachFrame::FocusGained
         .write_to(&mut attachment.stream)
@@ -698,6 +698,50 @@ fn reattachment_reflows_retained_output_for_the_new_terminal_width() {
     );
 
     drop(second);
+    daemon.stop_with_cli();
+}
+
+#[test]
+fn structured_shell_preview_preserves_color_while_plain_read_stays_plain() {
+    let mut daemon = TestDaemon::start();
+    let workspace = daemon
+        .client
+        .create_workspace(
+            "styled-preview",
+            vec![ShellSpec::login("shell", std::env::temp_dir())],
+        )
+        .unwrap();
+    let shell_id = workspace.shells[0].id.clone();
+    let mut attachment = daemon.client.attach(&shell_id, false, profile()).unwrap();
+    AttachFrame::Input(b"printf '\\033[31mstyled-preview-marker\\033[0m\\n'\n".to_vec())
+        .write_to(&mut attachment.stream)
+        .unwrap();
+    assert!(contains(
+        &read_until(&mut attachment.stream, b"styled-preview-marker"),
+        b"styled-preview-marker"
+    ));
+
+    let preview = daemon
+        .client
+        .read_shell_preview(&shell_id, 1024 * 1024, 500)
+        .unwrap();
+    let styled = preview
+        .lines
+        .iter()
+        .flat_map(|line| &line.spans)
+        .find(|span| {
+            span.text.contains("styled-preview-marker")
+                && span.style.foreground == boomux::protocol::TerminalColor::Indexed(1)
+        });
+    assert!(
+        styled.is_some(),
+        "styled preview did not retain red output: {preview:?}"
+    );
+    let plain = daemon.client.read_shell(&shell_id, 1024 * 1024).unwrap();
+    assert!(contains(&plain, b"styled-preview-marker"));
+    assert!(!plain.contains(&b'\x1b'));
+
+    drop(attachment);
     daemon.stop_with_cli();
 }
 
@@ -3386,7 +3430,7 @@ fn native_daemon_lifecycle() {
     let capabilities: serde_json::Value = serde_json::from_slice(&capabilities.stdout).unwrap();
     assert_eq!(capabilities["schema"], "boomux.cli/v1");
     assert_eq!(capabilities["command"], "capabilities");
-    assert_eq!(capabilities["data"]["daemon_protocol_version"], 19);
+    assert_eq!(capabilities["data"]["daemon_protocol_version"], 20);
     assert_eq!(
         capabilities["data"]["session_transcript_integrations"],
         serde_json::json!(["opencode", "pi"])
@@ -3457,7 +3501,7 @@ fn native_daemon_lifecycle() {
         .output()
         .unwrap();
     assert!(status.status.success());
-    assert!(String::from_utf8_lossy(&status.stdout).contains("running (protocol 19"));
+    assert!(String::from_utf8_lossy(&status.stdout).contains("running (protocol 20"));
     let status = daemon
         .command()
         .args(["daemon", "status", "--json"])

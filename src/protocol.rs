@@ -4,10 +4,58 @@ use std::path::PathBuf;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 19;
+pub const PROTOCOL_VERSION: u32 = 20;
 pub const MIN_PROTOCOL_VERSION: u32 = 6;
 pub const MAX_CONTROL_FRAME: usize = 8 * 1024 * 1024;
 pub const MAX_ATTACH_FRAME: usize = 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalColor {
+    #[default]
+    Default,
+    Indexed(u8),
+    Rgb {
+        red: u8,
+        green: u8,
+        blue: u8,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalStyle {
+    #[serde(default)]
+    pub foreground: TerminalColor,
+    #[serde(default)]
+    pub background: TerminalColor,
+    #[serde(default)]
+    pub bold: bool,
+    #[serde(default)]
+    pub dim: bool,
+    #[serde(default)]
+    pub italic: bool,
+    #[serde(default)]
+    pub underline: bool,
+    #[serde(default)]
+    pub inverse: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalPreviewSpan {
+    pub text: String,
+    #[serde(default)]
+    pub style: TerminalStyle,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalPreviewLine {
+    pub spans: Vec<TerminalPreviewSpan>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalPreview {
+    pub lines: Vec<TerminalPreviewLine>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Envelope<T> {
@@ -441,6 +489,11 @@ pub enum Request {
         shell_id: String,
         max_bytes: usize,
     },
+    ReadShellPreview {
+        shell_id: String,
+        max_bytes: usize,
+        max_lines: u16,
+    },
     ReadShellAt {
         shell_id: String,
         max_bytes: usize,
@@ -497,6 +550,7 @@ pub enum Request {
 impl Request {
     pub fn minimum_protocol_version(&self) -> u32 {
         match self {
+            Self::ReadShellPreview { .. } => 20,
             Self::CreateWorkspace {
                 default_cwd: Some(_),
                 ..
@@ -576,6 +630,9 @@ pub enum Response {
     },
     Output {
         bytes: Vec<u8>,
+    },
+    ShellPreview {
+        preview: TerminalPreview,
     },
     OutputState {
         bytes: Vec<u8>,
@@ -953,9 +1010,43 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_nineteen_with_minimum_six() {
-        assert_eq!(PROTOCOL_VERSION, 19);
+    fn protocol_version_is_twenty_with_minimum_six() {
+        assert_eq!(PROTOCOL_VERSION, 20);
         assert_eq!(MIN_PROTOCOL_VERSION, 6);
+    }
+
+    #[test]
+    fn terminal_preview_styles_round_trip() {
+        let preview = TerminalPreview {
+            lines: vec![TerminalPreviewLine {
+                spans: vec![TerminalPreviewSpan {
+                    text: "styled".into(),
+                    style: TerminalStyle {
+                        foreground: TerminalColor::Indexed(2),
+                        background: TerminalColor::Rgb {
+                            red: 3,
+                            green: 4,
+                            blue: 5,
+                        },
+                        bold: true,
+                        dim: false,
+                        italic: true,
+                        underline: true,
+                        inverse: true,
+                    },
+                }],
+            }],
+        };
+        let response = Response::ShellPreview {
+            preview: preview.clone(),
+        };
+        let encoded = serde_json::to_value(response).unwrap();
+
+        assert_eq!(encoded["response"], "shell_preview");
+        assert_eq!(
+            serde_json::from_value::<Response>(encoded).unwrap(),
+            Response::ShellPreview { preview }
+        );
     }
 
     #[test]
@@ -968,6 +1059,14 @@ mod tests {
     #[test]
     fn request_minimum_protocol_versions_cover_all_groups() {
         let groups = vec![
+            (
+                20,
+                vec![Request::ReadShellPreview {
+                    shell_id: "s1".into(),
+                    max_bytes: 1024,
+                    max_lines: 500,
+                }],
+            ),
             (
                 19,
                 vec![

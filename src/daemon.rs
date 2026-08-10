@@ -32,8 +32,8 @@ use crate::protocol::{
     AgentObservationSnapshot, AgentRegistrationSpec, AgentReport, AgentState, AttachFrame,
     DaemonEvent, DaemonEventKind, Envelope, ErrorCode, EventCursor, FocusedTerminalSnapshot,
     NotificationDeliveryConfig, Request, Response, ShellRunExitReason, ShellRunSnapshot,
-    ShellSnapshot, ShellSpec, ShellStatus, Snapshot, TerminalProfile, UnixEnvironment,
-    WorkspaceLauncherSnapshot, WorkspaceLauncherSpec, WorkspaceSnapshot,
+    ShellSnapshot, ShellSpec, ShellStatus, Snapshot, TerminalPreview, TerminalProfile,
+    UnixEnvironment, WorkspaceLauncherSnapshot, WorkspaceLauncherSpec, WorkspaceSnapshot,
 };
 use crate::state_store::{
     PersistedAgentInstance, PersistedShell, PersistedShellRun, PersistedState, PersistedWorkspace,
@@ -52,6 +52,8 @@ const MAX_NAME_BYTES: usize = 256;
 const MAX_AGENT_EVIDENCE_BYTES: usize = 4 * 1024;
 const MAX_TERMINAL_ROWS: u16 = 1_000;
 const MAX_TERMINAL_COLS: u16 = 1_000;
+const MAX_TERMINAL_PREVIEW_LINES: usize = 500;
+const MAX_TERMINAL_PREVIEW_SPANS: usize = 20_000;
 const MAX_TERMINAL_CELLS: usize = 1_000_000;
 const MAX_SHELL_READ_BYTES: usize = 1024 * 1024;
 const MAX_FOREGROUND_PROCESS_BYTES: usize = 64;
@@ -1999,6 +2001,13 @@ impl Registry {
             } => Ok(Response::Output {
                 bytes: self.read_shell(&shell_id, max_bytes)?,
             }),
+            Request::ReadShellPreview {
+                shell_id,
+                max_bytes,
+                max_lines,
+            } => Ok(Response::ShellPreview {
+                preview: self.read_shell_preview(&shell_id, max_bytes, max_lines)?,
+            }),
             Request::ReadShellAt {
                 shell_id,
                 max_bytes,
@@ -3716,6 +3725,29 @@ impl Registry {
         Ok(tail_utf8(&text, max_bytes.min(MAX_SHELL_READ_BYTES))
             .as_bytes()
             .to_vec())
+    }
+
+    fn read_shell_preview(
+        &self,
+        shell_id: &str,
+        max_bytes: usize,
+        max_lines: u16,
+    ) -> io::Result<TerminalPreview> {
+        let shell = self.shell(shell_id)?;
+        let lifecycle = lock(&shell.lifecycle)?;
+        let terminal = match &*lifecycle {
+            ShellLifecycle::Pending => return Ok(TerminalPreview::default()),
+            ShellLifecycle::Running { runtime, .. } => Arc::clone(&runtime.terminal),
+            ShellLifecycle::Exited { terminal, .. } => Arc::clone(terminal),
+            ShellLifecycle::Closed => return Err(not_found("shell", shell_id)),
+        };
+        drop(lifecycle);
+        let preview = lock(&terminal)?.preview(
+            max_bytes.min(MAX_SHELL_READ_BYTES),
+            usize::from(max_lines).min(MAX_TERMINAL_PREVIEW_LINES),
+            MAX_TERMINAL_PREVIEW_SPANS,
+        );
+        Ok(preview)
     }
 
     fn wait_agent(
