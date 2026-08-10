@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.1](https://github.com/gardnmi/boomux/compare/v0.4.0...v0.4.1) (2026-08-10)
+
+
+### Performance Improvements
+
+* **terminal:** avoid cloning screen per output chunk ([#73](https://github.com/gardnmi/boomux/issues/73)) ([87614e2](https://github.com/gardnmi/boomux/commit/87614e25f7b5ae658c61fbd5c2db015bca082f78))
+
 ## [0.4.0](https://github.com/gardnmi/boomux/compare/v0.3.0...v0.4.0) (2026-08-10)
 
 
