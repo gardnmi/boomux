@@ -244,7 +244,9 @@ Desktop and sound notifications are independently disabled by default. Desktop
 delivery requires `notify-send` and a desktop notification service. Sound
 delivery requires `canberra-gtk-play`; its `blocked` and `completed` values are
 freedesktop sound event IDs, not shell commands. Both channels use the top-level
-category filters.
+category filters. A completed notification is sent when an Agent finishes a
+unit of work and becomes idle, as well as when the Agent reaches its terminal
+done state.
 
 Test every configured, enabled channel with:
 
@@ -253,8 +255,10 @@ boomux notification test blocked
 boomux notification test completed
 ```
 
-The daemon reads notification configuration at startup; run `boomux daemon
-restart` after changing it. `boomux doctor` diagnoses both delivery channels.
+The daemon reads notification configuration at startup. `boomux daemon restart`
+applies the invoking client's resolved notification settings to the replacement
+daemon, even when the old daemon inherited a different config environment.
+`boomux doctor` diagnoses both delivery channels.
 
 Managed shells expose `BOOMUX_WORKSPACE_ID`, `BOOMUX_WORKSPACE`,
 `BOOMUX_SHELL_ID`, `BOOMUX_SHELL_NAME`, and `BOOMUX_RUN_ID` for scripts and

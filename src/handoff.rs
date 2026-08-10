@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::client;
 use crate::fd_transfer::receive_descriptor;
-use crate::protocol::{self, DaemonEvent, TerminalProfile};
+use crate::protocol::{self, DaemonEvent, NotificationDeliveryConfig, TerminalProfile};
 use crate::state_store;
 
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
@@ -33,6 +33,8 @@ pub(crate) struct Manifest {
     pub(crate) runtimes: Vec<RuntimeManifest>,
     pub(crate) exited: Vec<ExitedManifest>,
     pub(crate) event_stream: EventStreamManifest,
+    #[serde(default)]
+    pub(crate) notifications: Option<NotificationDeliveryConfig>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -84,6 +86,7 @@ pub(crate) enum Bootstrap {
         runtimes: Vec<TransferredRuntime>,
         exited: Vec<TransferredExited>,
         event_stream: EventStreamManifest,
+        notifications: Option<NotificationDeliveryConfig>,
     },
 }
 
@@ -102,6 +105,7 @@ pub(crate) fn receive_bootstrap(channel: RawFd) -> io::Result<Bootstrap> {
     let manifest: Manifest = protocol::read_message(&mut channel)?;
     validate_manifest(&manifest)?;
     let event_stream = manifest.event_stream.clone();
+    let notifications = manifest.notifications.clone();
     let listener = receive_descriptor(&channel, LISTENER_MARKER)?;
     let runtime_lock = receive_descriptor(&channel, RUNTIME_LOCK_MARKER)?;
     let state_lock = receive_descriptor(&channel, STATE_LOCK_MARKER)?;
@@ -169,6 +173,7 @@ pub(crate) fn receive_bootstrap(channel: RawFd) -> io::Result<Bootstrap> {
             runtimes,
             exited,
             event_stream,
+            notifications,
         }),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,

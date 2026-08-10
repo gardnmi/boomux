@@ -30,9 +30,9 @@ use crate::handoff;
 use crate::protocol::{
     self, AgentAttentionReason, AgentAttentionSnapshot, AgentAuthority, AgentInstanceSnapshot,
     AgentObservationSnapshot, AgentRegistrationSpec, AgentReport, AgentState, AttachFrame,
-    DaemonEvent, DaemonEventKind, Envelope, ErrorCode, EventCursor, Request, Response,
-    ShellRunExitReason, ShellRunSnapshot, ShellSnapshot, ShellSpec, ShellStatus, Snapshot,
-    TerminalProfile, UnixEnvironment, WorkspaceLauncherSnapshot, WorkspaceLauncherSpec,
+    DaemonEvent, DaemonEventKind, Envelope, ErrorCode, EventCursor, NotificationDeliveryConfig,
+    Request, Response, ShellRunExitReason, ShellRunSnapshot, ShellSnapshot, ShellSpec, ShellStatus,
+    Snapshot, TerminalProfile, UnixEnvironment, WorkspaceLauncherSnapshot, WorkspaceLauncherSpec,
     WorkspaceSnapshot,
 };
 use crate::state_store::{
@@ -82,6 +82,36 @@ impl Default for NotificationSoundSettings {
             enabled: false,
             blocked: "message-new-instant".into(),
             completed: "complete".into(),
+        }
+    }
+}
+
+impl From<NotificationDeliveryConfig> for NotificationDeliverySettings {
+    fn from(config: NotificationDeliveryConfig) -> Self {
+        Self {
+            desktop: NotificationSettings {
+                enabled: config.desktop_enabled,
+                blocked: config.blocked,
+                completed: config.completed,
+            },
+            sound: NotificationSoundSettings {
+                enabled: config.sound_enabled,
+                blocked: config.blocked_sound,
+                completed: config.completed_sound,
+            },
+        }
+    }
+}
+
+impl From<NotificationDeliverySettings> for NotificationDeliveryConfig {
+    fn from(settings: NotificationDeliverySettings) -> Self {
+        Self {
+            desktop_enabled: settings.desktop.enabled,
+            sound_enabled: settings.sound.enabled,
+            blocked: settings.desktop.blocked,
+            completed: settings.desktop.completed,
+            blocked_sound: settings.sound.blocked,
+            completed_sound: settings.sound.completed,
         }
     }
 }
@@ -152,6 +182,7 @@ pub fn receive_handoff_with_notification_delivery(
             runtimes,
             exited,
             event_stream,
+            notifications,
         } => {
             let store = StateStore::from_transferred_lock(state_lock)?;
             let socket_path = client::socket_path()?;
@@ -166,7 +197,9 @@ pub fn receive_handoff_with_notification_delivery(
                     events: Some(event_stream),
                 },
                 Some(&mut channel),
-                notification_settings,
+                notifications
+                    .map(Into::into)
+                    .unwrap_or(notification_settings),
             )
         }
     }
@@ -291,7 +324,12 @@ fn run_daemon(
         }
         match restart_receiver.try_recv() {
             Ok(request) => {
-                let result = launch_replacement(&listener, &daemon_lock, &registry);
+                let result = launch_replacement(
+                    &listener,
+                    &daemon_lock,
+                    &registry,
+                    request.notification_settings,
+                );
                 if result.is_ok() {
                     handed_off = true;
                     shutdown.store(true, Ordering::Release);
@@ -342,6 +380,7 @@ fn run_daemon(
 
 struct RestartRequest {
     reply: SyncSender<io::Result<()>>,
+    notification_settings: Option<NotificationDeliverySettings>,
 }
 
 #[derive(Debug)]
@@ -442,6 +481,7 @@ fn launch_replacement(
     listener: &UnixListener,
     daemon_lock: &File,
     registry: &Registry,
+    notification_settings: Option<NotificationDeliverySettings>,
 ) -> io::Result<()> {
     let _mutation = lock(&registry.mutation_lock)?;
     registry.ensure_running()?;
@@ -526,6 +566,7 @@ fn launch_replacement(
             &transfers,
             &exited,
             &event_stream,
+            notification_settings,
         )
     })();
     if result.is_err() {
@@ -544,6 +585,7 @@ fn launch_replacement_process(
     runtimes: &[OutgoingRuntime],
     exited: &[OutgoingExited],
     event_stream: &handoff::EventStreamManifest,
+    notification_settings: Option<NotificationDeliverySettings>,
 ) -> io::Result<()> {
     let (mut channel, child_channel) = UnixStream::pair()?;
     let child_channel_fd = child_channel.as_raw_fd();
@@ -585,6 +627,7 @@ fn launch_replacement_process(
                     .collect(),
                 exited: exited.iter().map(|shell| shell.manifest.clone()).collect(),
                 event_stream: event_stream.clone(),
+                notifications: notification_settings.map(Into::into),
             },
         )?;
         send_descriptor(&channel, listener, handoff::LISTENER_MARKER)?;
@@ -753,7 +796,14 @@ fn handle_connection(
             }
         };
     }
-    if matches!(request.message, Request::Restart) {
+    let restart_notification_settings = match &request.message {
+        Request::Restart => Some(None),
+        Request::RestartWithNotificationConfig { notifications } => {
+            Some(Some(notifications.clone().into()))
+        }
+        _ => None,
+    };
+    if let Some(notification_settings) = restart_notification_settings {
         if transition
             .compare_exchange(
                 TRANSITION_IDLE,
@@ -770,7 +820,13 @@ fn handle_connection(
             );
         }
         let (reply, response) = mpsc::sync_channel(1);
-        if restart_sender.send(RestartRequest { reply }).is_err() {
+        if restart_sender
+            .send(RestartRequest {
+                reply,
+                notification_settings,
+            })
+            .is_err()
+        {
             transition.store(TRANSITION_IDLE, Ordering::Release);
             return Err(io::Error::other("daemon restart coordinator stopped"));
         }
@@ -1710,7 +1766,9 @@ impl Registry {
     fn dispatch(&self, request: Request) -> io::Result<Response> {
         match request {
             Request::Ping => Ok(Response::Pong),
-            Request::Restart => unreachable!("restart is handled before dispatch"),
+            Request::Restart | Request::RestartWithNotificationConfig { .. } => {
+                unreachable!("restart is handled before dispatch")
+            }
             Request::Shutdown => unreachable!("shutdown is handled before dispatch"),
             Request::Snapshot => Ok(Response::Snapshot {
                 snapshot: self.snapshot()?,
@@ -2438,26 +2496,37 @@ impl Registry {
                 } => (workspace_id, shell_id, agent),
                 _ => continue,
             };
-            let Some(attention) = agent.attention.as_ref() else {
-                continue;
-            };
-            if attention.observation.revision != agent.observation.revision {
+            let previous_state = previous
+                .agent_states
+                .get(&agent.id)
+                .map(|state| state.observation.state);
+            if previous_state == Some(agent.observation.state) {
                 continue;
             }
-            let reason = match (attention.reason, agent.observation.state) {
-                (AgentAttentionReason::Blocked, AgentState::Blocked) => NotificationReason::Blocked,
-                (AgentAttentionReason::Completed, AgentState::Done) => {
+            let current_attention = agent
+                .attention
+                .as_ref()
+                .filter(|attention| attention.observation.revision == agent.observation.revision);
+            let reason = match agent.observation.state {
+                AgentState::Blocked
+                    if current_attention.is_some_and(|attention| {
+                        attention.reason == AgentAttentionReason::Blocked
+                    }) =>
+                {
+                    NotificationReason::Blocked
+                }
+                AgentState::Done
+                    if current_attention.is_some_and(|attention| {
+                        attention.reason == AgentAttentionReason::Completed
+                    }) =>
+                {
+                    NotificationReason::Completed
+                }
+                AgentState::Idle if previous_state == Some(AgentState::Working) => {
                     NotificationReason::Completed
                 }
                 _ => continue,
             };
-            if previous
-                .agent_states
-                .get(&agent.id)
-                .is_some_and(|state| state.observation.state == agent.observation.state)
-            {
-                continue;
-            }
             if !category_enabled(&self.notification_settings, reason)
                 || !seen.insert((agent.id.as_str(), agent.observation.revision, reason))
             {
@@ -6381,6 +6450,46 @@ mod tests {
         assert_eq!(requests[0].shell, "agent-shell");
         drop(requests);
 
+        shell.kill().unwrap();
+        registry.close_workspace(&workspace.id).unwrap();
+    }
+
+    #[test]
+    fn working_to_idle_notifies_without_completed_attention() {
+        let (registry, sink) = notification_registry(NotificationSettings {
+            enabled: true,
+            blocked: true,
+            completed: true,
+        });
+        let (workspace, shell, _runtime) = running_shell(&registry);
+        let run_id = shell.snapshot().unwrap().run.unwrap().id;
+        let Response::Agent { agent } = registry
+            .dispatch(Request::RegisterAgent {
+                shell_id: shell.id.clone(),
+                run_id: run_id.clone(),
+                spec: agent_spec(AgentState::Working),
+            })
+            .unwrap()
+        else {
+            panic!("expected working agent");
+        };
+
+        let Response::Agent { agent } = registry
+            .dispatch(Request::ReportAgent {
+                agent_id: agent.id,
+                run_id,
+                report: agent_spec(AgentState::Idle).report,
+            })
+            .unwrap()
+        else {
+            panic!("expected idle agent");
+        };
+
+        assert!(agent.attention.is_none());
+        let requests = sink.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].reason, NotificationReason::Completed);
+        drop(requests);
         shell.kill().unwrap();
         registry.close_workspace(&workspace.id).unwrap();
     }

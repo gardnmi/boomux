@@ -15,9 +15,9 @@ use std::time::Duration;
 
 use crate::protocol::{
     self, AgentInstanceSnapshot, AgentRegistrationSpec, AgentReport, DaemonEvent, Envelope,
-    ErrorCode, EventCursor, Request, Response, ShellSnapshot, ShellSpec, ShellStatus, Snapshot,
-    TerminalProfile, UnixEnvironment, UnixEnvironmentVariable, WorkspaceLauncherSnapshot,
-    WorkspaceLauncherSpec, WorkspaceSnapshot,
+    ErrorCode, EventCursor, NotificationDeliveryConfig, Request, Response, ShellSnapshot,
+    ShellSpec, ShellStatus, Snapshot, TerminalProfile, UnixEnvironment, UnixEnvironmentVariable,
+    WorkspaceLauncherSnapshot, WorkspaceLauncherSpec, WorkspaceSnapshot,
 };
 
 const CONNECT_ATTEMPTS: usize = 40;
@@ -286,7 +286,21 @@ impl Client {
     }
 
     pub fn restart(&self) -> io::Result<()> {
-        expect_ok(self.request(Request::Restart)?, Response::Ok)?;
+        self.restart_request(Request::Restart)
+    }
+
+    pub fn restart_with_notification_config(
+        &self,
+        notifications: NotificationDeliveryConfig,
+    ) -> io::Result<()> {
+        if self.protocol_version()? < 17 {
+            self.restart_request(Request::Restart)?;
+        }
+        self.restart_request(Request::RestartWithNotificationConfig { notifications })
+    }
+
+    fn restart_request(&self, request: Request) -> io::Result<()> {
+        expect_ok(self.request(request)?, Response::Ok)?;
         let mut last_error = None;
         for _ in 0..CONNECT_ATTEMPTS {
             match self.ping() {
@@ -823,6 +837,22 @@ mod tests {
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+            assert_eq!(request.version, 17);
+            assert!(matches!(request.message, Request::Ping));
+            protocol::write_message(
+                &mut stream,
+                &Envelope::with_version(
+                    16,
+                    Response::Error {
+                        message: "protocol 17 unsupported".into(),
+                        code: Some(ErrorCode::UnsupportedVersion),
+                    },
+                ),
+            )
+            .unwrap();
+
+            let (mut stream, _) = listener.accept().unwrap();
+            let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
             assert_eq!(request.version, 16);
             assert!(matches!(request.message, Request::Ping));
             protocol::write_message(
@@ -902,7 +932,7 @@ mod tests {
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
-            assert_eq!(request.version, 16);
+            assert_eq!(request.version, 17);
             let Request::Attach {
                 environment: Some(environment),
                 ..
@@ -919,7 +949,7 @@ mod tests {
             protocol::write_message(
                 &mut stream,
                 &Envelope::with_version(
-                    16,
+                    17,
                     Response::Attached {
                         token: "token".into(),
                         reconstruction: Vec::new(),
@@ -947,6 +977,22 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+            assert_eq!(request.version, 17);
+            assert!(matches!(request.message, Request::Ping));
+            protocol::write_message(
+                &mut stream,
+                &Envelope::with_version(
+                    16,
+                    Response::Error {
+                        message: "expected an older protocol".into(),
+                        code: Some(ErrorCode::UnsupportedVersion),
+                    },
+                ),
+            )
+            .unwrap();
+
             let (mut stream, _) = listener.accept().unwrap();
             let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
             assert_eq!(request.version, 16);

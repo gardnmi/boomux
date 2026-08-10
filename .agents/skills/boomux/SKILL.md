@@ -167,9 +167,11 @@ revision fails with `revision_ahead`, while an already empty item returns
 `agent wait`.
 
 Desktop and sound notifications, when the user opts in, are best-effort signals
-for new transitions into blocked or done. They do not acknowledge attention,
-change an observation revision, or contain lifecycle evidence. Always inspect
-the durable queue before acting; do not infer queue state or delivery from a
+for new transitions into blocked or done, and for working Agents becoming idle
+after completing a unit of work. Idle completion notifications do not create
+durable completed attention. Notifications do not acknowledge attention, change
+an observation revision, or contain lifecycle evidence. Always inspect the
+durable queue before acting; do not infer queue state or delivery from a
 notification.
 
 Desktop and sound delivery are independently disabled by default. Desktop uses
@@ -199,7 +201,9 @@ boomux notification test completed
 
 These commands are human-only, do not support `--json`, and fail when the
 requested category has no enabled channel. Runtime delivery uses the daemon's
-startup-sampled configuration until `boomux daemon restart`.
+startup-sampled configuration until `boomux daemon restart`. Restart applies
+the invoking client's resolved notification settings, even when the old daemon
+inherited a different config environment.
 
 Session discovery is not limited to daemon metadata. It may execute the
 PATH-resolved OpenCode CLI and inspect host catalogs in workspace-derived

@@ -1223,8 +1223,10 @@ fn desktop_notifications_are_deduplicated_private_and_survive_handoff() {
 
     for (state, evidence, expected) in [
         (AgentState::Working, "resumed", 1),
-        (AgentState::Blocked, "blocked again", 2),
-        (AgentState::Done, "completed", 3),
+        (AgentState::Idle, "turn completed", 2),
+        (AgentState::Working, "next turn", 2),
+        (AgentState::Blocked, "blocked again", 3),
+        (AgentState::Done, "completed", 4),
     ] {
         daemon
             .client
@@ -1279,14 +1281,16 @@ fn desktop_notifications_are_deduplicated_private_and_survive_handoff() {
         .trim()
         .parse()
         .unwrap();
+    let replacement_config = daemon.runtime_dir.join("replacement-config.toml");
     fs::write(
-        daemon.runtime_dir.join("config.toml"),
+        &replacement_config,
         "[notifications]\nenabled = true\nblocked = true\ncompleted = true\n[notifications.sound]\nenabled = true\nblocked = \"dialog-warning\"\n",
     )
     .unwrap();
     drop(attachment.stream);
     let restart = daemon
         .command()
+        .env("BOOMUX_CONFIG", replacement_config)
         .args(["daemon", "restart"])
         .output()
         .unwrap();
@@ -1301,7 +1305,7 @@ fn desktop_notifications_are_deduplicated_private_and_survive_handoff() {
     );
     fs::remove_file(hang).unwrap();
     thread::sleep(Duration::from_millis(100));
-    assert_eq!(captured_notification_count(&capture), 3);
+    assert_eq!(captured_notification_count(&capture), 4);
     daemon
         .client
         .register_agent(
@@ -1321,11 +1325,11 @@ fn desktop_notifications_are_deduplicated_private_and_survive_handoff() {
         )
         .unwrap();
     wait_until(
-        || captured_notification_count(&capture) == 4,
+        || captured_notification_count(&capture) == 5,
         "notifications stopped after daemon handoff",
     );
     wait_until(
-        || captured_notification_count(&sound_capture) == 4,
+        || captured_notification_count(&sound_capture) == 5,
         "notification sounds stopped after daemon handoff",
     );
     assert!(
@@ -1357,7 +1361,7 @@ fn desktop_notifications_are_deduplicated_private_and_survive_handoff() {
         )
         .unwrap();
     thread::sleep(Duration::from_millis(100));
-    assert_eq!(captured_notification_count(&capture), 4);
+    assert_eq!(captured_notification_count(&capture), 5);
     wait_until(
         || captured_notification_count(&sound_capture) == sound_count + 1,
         "sound did not survive desktop notification failure",
@@ -3117,7 +3121,7 @@ fn native_daemon_lifecycle() {
     let capabilities: serde_json::Value = serde_json::from_slice(&capabilities.stdout).unwrap();
     assert_eq!(capabilities["schema"], "boomux.cli/v1");
     assert_eq!(capabilities["command"], "capabilities");
-    assert_eq!(capabilities["data"]["daemon_protocol_version"], 16);
+    assert_eq!(capabilities["data"]["daemon_protocol_version"], 17);
     assert_eq!(
         capabilities["data"]["session_transcript_integrations"],
         serde_json::json!(["opencode", "pi"])
@@ -3163,6 +3167,7 @@ fn native_daemon_lifecycle() {
         "protocol_14",
         "protocol_15",
         "protocol_16",
+        "protocol_17",
         "inactive_agent_state",
         "protocol_11",
         "restartable_exited_shells",
@@ -3183,7 +3188,7 @@ fn native_daemon_lifecycle() {
         .output()
         .unwrap();
     assert!(status.status.success());
-    assert!(String::from_utf8_lossy(&status.stdout).contains("running (protocol 16"));
+    assert!(String::from_utf8_lossy(&status.stdout).contains("running (protocol 17"));
     let status = daemon
         .command()
         .args(["daemon", "status", "--json"])
