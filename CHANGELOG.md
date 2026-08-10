@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.0](https://github.com/gardnmi/boomux/compare/v0.4.2...v0.5.0) (2026-08-10)
+
+
+### Features
+
+* **tui:** follow focused terminals ([#79](https://github.com/gardnmi/boomux/issues/79)) ([d91a070](https://github.com/gardnmi/boomux/commit/d91a070d99140827cb17fa0d404039f01d9b03d6))
+
 ## [0.4.2](https://github.com/gardnmi/boomux/compare/v0.4.1...v0.4.2) (2026-08-10)
 
 
