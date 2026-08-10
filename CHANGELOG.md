@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/gardnmi/boomux/compare/v0.3.0...v0.4.0) (2026-08-10)
+
+
+### Features
+
+* **notifications:** add sound delivery ([#68](https://github.com/gardnmi/boomux/issues/68)) ([26ebf37](https://github.com/gardnmi/boomux/commit/26ebf37f2e4741fd4712e7f68286f951134d6036))
+
 ## [0.3.0](https://github.com/gardnmi/boomux/compare/v0.2.0...v0.3.0) (2026-08-10)
 
 
