@@ -3,48 +3,49 @@ const MAX_RECONSTRUCTION_BYTES: usize = 1024 * 1024;
 
 pub(crate) struct TerminalState {
     parser: vt100::Parser,
-    primary: vt100::Screen,
+    primary_before_alternate: Option<vt100::Screen>,
 }
 
 impl TerminalState {
     pub(crate) fn new(rows: u16, cols: u16) -> Self {
         let parser = vt100::Parser::new(rows, cols, SCROLLBACK_ROWS);
         Self {
-            primary: parser.screen().clone(),
             parser,
+            primary_before_alternate: None,
         }
     }
 
     pub(crate) fn process(&mut self, bytes: &[u8]) {
-        if !self.parser.screen().alternate_screen()
-            && let Some(offset) = alternate_screen_start(bytes)
-        {
+        let was_alternate = self.parser.screen().alternate_screen();
+        if !was_alternate && let Some(offset) = alternate_screen_start(bytes) {
             self.parser.process(&bytes[..offset]);
-            self.primary = self.parser.screen().clone();
+            self.primary_before_alternate = Some(self.parser.screen().clone());
             self.parser.process(&bytes[offset..]);
+            if !self.parser.screen().alternate_screen() {
+                self.primary_before_alternate = None;
+            }
             return;
         }
         self.parser.process(bytes);
-        if !self.parser.screen().alternate_screen() {
-            self.primary = self.parser.screen().clone();
+        if was_alternate && !self.parser.screen().alternate_screen() {
+            self.primary_before_alternate = None;
         }
     }
 
     pub(crate) fn resize(&mut self, rows: u16, cols: u16) {
         self.parser.screen_mut().set_size(rows, cols);
-        if self.parser.screen().alternate_screen() {
-            self.primary.set_size(rows, cols);
-        } else {
-            self.primary = self.parser.screen().clone();
+        if let Some(primary) = self.primary_before_alternate.as_mut() {
+            primary.set_size(rows, cols);
         }
     }
 
     pub(crate) fn reconstruction(&self) -> Vec<u8> {
         let screen = self.parser.screen();
+        let primary = self.primary_before_alternate.as_ref().unwrap_or(screen);
         let mut output = b"\x1b[?1049l\x1b[0m\x1b[?25h\x1b[H\x1b[2J".to_vec();
-        append_scrollback(&mut output, &self.primary);
+        append_scrollback(&mut output, primary);
         output.extend_from_slice(b"\x1b[H\x1b[2J");
-        output.extend(self.primary.contents_formatted());
+        output.extend(primary.contents_formatted());
         if screen.alternate_screen() {
             output.extend_from_slice(b"\x1b[?1049h\x1b[H\x1b[2J");
             output.extend(screen.contents_formatted());
@@ -184,6 +185,18 @@ mod tests {
         assert_eq!(restored.plain_text(), "alt");
         restored.process(b"\x1b[?1049l");
         assert_eq!(restored.plain_text(), "primary");
+    }
+
+    #[test]
+    fn primary_screen_keeps_updating_after_alternate_screen_exits() {
+        let mut source = TerminalState::new(4, 20);
+        source.process(b"before\x1b[?1049halt\x1b[?1049l after");
+        let reconstruction = source.reconstruction();
+        let mut restored = TerminalState::new(4, 20);
+        restored.process(&reconstruction);
+
+        assert!(!restored.parser.screen().alternate_screen());
+        assert_eq!(restored.plain_text(), "before after");
     }
 
     #[test]
