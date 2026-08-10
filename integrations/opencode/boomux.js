@@ -240,8 +240,12 @@ function reduce(state, action, isRootEvent) {
   }
 
   const bounded = boundedEvidence(evidence);
-  if (next === state.lastState && bounded === state.lastEvidence)
+  if (
+    next === state.lastState &&
+    (next === "working" || bounded === state.lastEvidence)
+  ) {
     return undefined;
+  }
   state.lastEvidence = bounded;
   state.lastState = next;
   return { state: next, evidence: bounded };
@@ -421,6 +425,15 @@ function observationMatches(observation, derived) {
   );
 }
 
+function observationAlreadyWorking(observation, derived) {
+  return (
+    derived.state === "working" &&
+    observation?.state === "working" &&
+    observation?.authority === LIFECYCLE_AUTHORITY &&
+    observation?.confidence === LIFECYCLE_CONFIDENCE
+  );
+}
+
 function rateLimitedLogger(log, now = Date.now) {
   let last = -Infinity;
   let suppressed = 0;
@@ -484,7 +497,12 @@ function createLifecycle({ client, env, run, log = console.error, now }) {
           item.reducer.terminal = true;
           return;
         }
-        if (observationMatches(agent?.observation, derived)) return;
+        if (
+          observationMatches(agent?.observation, derived) ||
+          observationAlreadyWorking(agent?.observation, derived)
+        ) {
+          return;
+        }
       }
       await run(
         reportArgv(

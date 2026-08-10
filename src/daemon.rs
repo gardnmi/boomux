@@ -3347,7 +3347,12 @@ impl Registry {
                 "completed agent instance cannot be reported again",
             ));
         }
+        let repeated_working = state.observation.state == AgentState::Working
+            && report.state == AgentState::Working
+            && state.observation.authority == report.authority
+            && state.observation.confidence == report.confidence;
         if observation_matches_report(&state.observation, &report)
+            || repeated_working
             || agent_authority_rank(report.authority)
                 < agent_authority_rank(state.observation.authority)
         {
@@ -6186,6 +6191,11 @@ mod tests {
                 AgentState::Working,
                 AgentAuthority::ProcessAdapter,
                 "process working",
+            ),
+            agent_report(
+                AgentState::Working,
+                AgentAuthority::ProcessAdapter,
+                "updated working evidence",
             ),
         ] {
             let Response::Agent { agent: unchanged } = registry

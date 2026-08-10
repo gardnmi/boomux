@@ -523,9 +523,11 @@ The plugin activates only in a managed shell run. It identifies one agent by the
 root OpenCode session and aggregates child/subagent activity. Work, tool, chat,
 and compaction events map to `working`; outstanding permission/questions and
 errors map to `blocked`; only root idle maps to `idle`; and only explicit root
-session deletion maps to `done`. Child deletion and process exit do not report
-completion. Unmanaged or unavailable Boomux is fail-open. If Boomux returns
-`run_changed`, reporting for that root is disabled rather than redirected.
+session deletion maps to `done`. Repeated working activity is coalesced until a
+meaningful state transition, so tool bursts do not create evidence-only durable
+reports. Child deletion and process exit do not report completion. Unmanaged or
+unavailable Boomux is fail-open. If Boomux returns `run_changed`, reporting for
+that root is disabled rather than redirected.
 
 ## Direct Pi Install Shortcut
 

@@ -259,11 +259,14 @@ exited run remains non-mutating and can replay its retained terminal state.
 External observation authority is ordered lifecycle integration, process
 adapter, then terminal heuristic. Lower-authority reports are successful no-ops.
 At equal authority an exact duplicate is also a no-op, but a changed report is
-accepted, so a source can advance its own state and evidence. Higher-authority
+accepted, so a source can advance its own state and evidence. The exception is a
+same-authority, same-confidence `working` report: evidence-only changes are
+successful no-ops because they do not change lifecycle meaning and would put
+high-frequency tool activity on the durable persistence path. Higher-authority
 reports replace lower-authority observations. `daemon_lifecycle` is a wire and
-snapshot value reserved for daemon-originated observations and is not exposed by
-the public mutation CLI. Exact retries of an accepted `done` report return the
-completed snapshot without another revision, write, or event; conflicting
+snapshot value reserved for daemon-originated observations and is not exposed
+by the public mutation CLI. Exact retries of an accepted `done` report return
+the completed snapshot without another revision, write, or event; conflicting
 reports after completion are rejected.
 
 ### Explicit Process-Adapter Supervisor
@@ -351,14 +354,17 @@ prompts map to `working`; outstanding permission or question requests and
 session errors map to `blocked`; only root idle maps to `idle`. Blockers are
 tracked as a set, and errors remain latched until later work is observed. Only
 explicit root `session.deleted` maps to `done`: child deletion and process or
-shell exit do not complete the instance.
+shell exit do not complete the instance. Once the derived state is `working`,
+later chat, tool, and compaction evidence is coalesced until a meaningful state
+transition occurs. This keeps activity bursts off the CLI and durable fsync path.
 
 On first relevant event, or after plugin reload, the plugin calls `agent ensure`
-and then reports a changed derived observation when the reused durable record
-does not already match. Calls use exact argument vectors, a one-second timeout,
-bounded output, and the stable JSON envelope. Unmanaged sessions are a no-op;
-Boomux or ancestry failures are rate-limited and fail open so OpenCode continues.
-`run_changed` disables all later reports for that tracked root.
+and then reports a changed derived state when the reused durable record does not
+already represent `working`, or when another state or authority differs. Calls
+use exact argument vectors, a one-second timeout, bounded output, and the stable
+JSON envelope. Unmanaged sessions are a no-op; Boomux or ancestry failures are
+rate-limited and fail open so OpenCode continues. `run_changed` disables all
+later reports for that tracked root.
 
 ### Pi Lifecycle Extension
 
