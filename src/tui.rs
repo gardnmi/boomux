@@ -8,7 +8,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState,
+    Block, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState, Wrap,
 };
 
 use crate::agent_attention_projection::AgentStateCounts;
@@ -34,10 +34,11 @@ pub(crate) struct WorkspaceView {
     pub(crate) sessions: Vec<AgentSessionView>,
     pub(crate) agent_state_counts: AgentStateCounts,
     pub(crate) attention_count: usize,
-    pub(crate) attention: Option<WorkspaceAttentionView>,
+    pub(crate) attention: Vec<WorkspaceAttentionView>,
 }
 
 pub(crate) struct WorkspaceAttentionView {
+    pub(crate) shell_id: String,
     pub(crate) agent_name: String,
     pub(crate) reason: String,
     pub(crate) evidence: String,
@@ -207,6 +208,41 @@ impl WorkspaceItemView {
             Self::Shell(_) => ItemKind::Command,
         }
     }
+
+    fn name(&self) -> &str {
+        match self {
+            Self::Shell(shell) => &shell.name,
+            Self::AgentShell(agent) => &agent.shell.name,
+            Self::Launcher(launcher) => &launcher.name,
+        }
+    }
+
+    fn status(&self) -> &str {
+        match self {
+            Self::Shell(shell) => &shell.status,
+            Self::AgentShell(agent) => agent.status(),
+            Self::Launcher(_) => "launcher",
+        }
+    }
+
+    fn id(&self) -> &str {
+        match self {
+            Self::Shell(shell) => &shell.id,
+            Self::AgentShell(agent) => &agent.shell.id,
+            Self::Launcher(launcher) => &launcher.id,
+        }
+    }
+}
+
+impl ItemKind {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Agent => "agent",
+            Self::Launcher => "launcher",
+            Self::Shell => "shell",
+            Self::Command => "command",
+        }
+    }
 }
 
 pub(crate) struct Actions<R, O, C, W, N, E, F, P> {
@@ -336,6 +372,8 @@ impl RenameTarget {
 enum Mode {
     Normal,
     PickProject(ProjectPicker),
+    Palette(CommandPalette),
+    Help,
     Rename { target: RenameTarget, input: String },
 }
 
@@ -347,6 +385,109 @@ struct ProjectPicker {
     config_path: Option<PathBuf>,
     warning: Option<String>,
     roots_configured: bool,
+}
+
+struct CommandPalette {
+    entries: Vec<PaletteEntry>,
+    matches: Vec<usize>,
+    state: ListState,
+    query: String,
+}
+
+struct PaletteEntry {
+    action_group: PaletteActionGroup,
+    kind_group: PaletteKindGroup,
+    label: String,
+    detail: String,
+    keywords: String,
+    command: PaletteCommand,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum PaletteActionGroup {
+    QuickAccess,
+    GoTo,
+    Open,
+    Create,
+    Rename,
+    Close,
+    Help,
+}
+
+impl PaletteActionGroup {
+    fn label(self) -> &'static str {
+        match self {
+            Self::QuickAccess => "QUICK ACCESS",
+            Self::GoTo => "GO TO",
+            Self::Open => "OPEN",
+            Self::Create => "CREATE",
+            Self::Rename => "RENAME",
+            Self::Close => "CLOSE",
+            Self::Help => "HELP",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum PaletteKindGroup {
+    BlockedAgents,
+    Attention,
+    Workspaces,
+    Agents,
+    Shells,
+    Commands,
+    Launchers,
+    Dashboard,
+}
+
+impl PaletteKindGroup {
+    fn label(self) -> &'static str {
+        match self {
+            Self::BlockedAgents => "BLOCKED AGENTS",
+            Self::Attention => "ATTENTION",
+            Self::Workspaces => "WORKSPACES",
+            Self::Agents => "AGENTS",
+            Self::Shells => "SHELLS",
+            Self::Commands => "COMMANDS",
+            Self::Launchers => "LAUNCHERS",
+            Self::Dashboard => "DASHBOARD",
+        }
+    }
+}
+
+#[derive(Clone)]
+enum PaletteCommand {
+    CreateWorkspace,
+    ShowHelp,
+    Workspace {
+        workspace_id: String,
+        action: WorkspacePaletteAction,
+    },
+    Item {
+        identity: ItemIdentity,
+        action: ItemPaletteAction,
+    },
+    Attention {
+        workspace_id: String,
+        shell_id: String,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum WorkspacePaletteAction {
+    GoTo,
+    Restore,
+    AddShell,
+    Rename,
+    Close,
+}
+
+#[derive(Clone, Copy)]
+enum ItemPaletteAction {
+    GoTo,
+    Open,
+    Rename,
+    Close,
 }
 
 struct Message {
@@ -431,6 +572,239 @@ impl ProjectPicker {
         });
         self.state.select(Some(previous));
     }
+}
+
+impl CommandPalette {
+    fn new(workspaces: &[WorkspaceView]) -> Self {
+        let mut entries = vec![
+            PaletteEntry {
+                action_group: PaletteActionGroup::Create,
+                kind_group: PaletteKindGroup::Workspaces,
+                label: "Create workspace".into(),
+                detail: "choose a project suggestion or enter a name".into(),
+                keywords: "add new project".into(),
+                command: PaletteCommand::CreateWorkspace,
+            },
+            PaletteEntry {
+                action_group: PaletteActionGroup::Help,
+                kind_group: PaletteKindGroup::Dashboard,
+                label: "Show dashboard help".into(),
+                detail: "keys, kinds, states, and attention".into(),
+                keywords: "explain keyboard shortcuts question".into(),
+                command: PaletteCommand::ShowHelp,
+            },
+        ];
+        let mut attention_entries = Vec::new();
+        for workspace in workspaces {
+            let workspace_keywords = format!("workspace {} {}", workspace.name, workspace.id);
+            for (action, action_group) in [
+                (WorkspacePaletteAction::GoTo, PaletteActionGroup::GoTo),
+                (WorkspacePaletteAction::Restore, PaletteActionGroup::Open),
+                (WorkspacePaletteAction::AddShell, PaletteActionGroup::Create),
+                (WorkspacePaletteAction::Rename, PaletteActionGroup::Rename),
+                (WorkspacePaletteAction::Close, PaletteActionGroup::Close),
+            ] {
+                entries.push(PaletteEntry {
+                    action_group,
+                    kind_group: if matches!(action, WorkspacePaletteAction::AddShell) {
+                        PaletteKindGroup::Shells
+                    } else {
+                        PaletteKindGroup::Workspaces
+                    },
+                    label: if matches!(action, WorkspacePaletteAction::AddShell) {
+                        format!("Add shell to {}", workspace.name)
+                    } else {
+                        workspace.name.clone()
+                    },
+                    detail: format!(
+                        "{} items, {} attention",
+                        workspace.items.len(),
+                        workspace.attention_count
+                    ),
+                    keywords: workspace_keywords.clone(),
+                    command: PaletteCommand::Workspace {
+                        workspace_id: workspace.id.clone(),
+                        action,
+                    },
+                });
+            }
+
+            for item in &workspace.items {
+                let kind = item.kind();
+                let identity = ItemIdentity {
+                    workspace_id: workspace.id.clone(),
+                    item_id: item.id().to_owned(),
+                    launcher: kind == ItemKind::Launcher,
+                };
+                let keywords = format!(
+                    "{} {} {} {} {} {}",
+                    workspace.name,
+                    workspace.id,
+                    kind.label(),
+                    item.name(),
+                    item.status(),
+                    item.id()
+                );
+                let kind_group = match kind {
+                    ItemKind::Agent => PaletteKindGroup::Agents,
+                    ItemKind::Shell => PaletteKindGroup::Shells,
+                    ItemKind::Command => PaletteKindGroup::Commands,
+                    ItemKind::Launcher => PaletteKindGroup::Launchers,
+                };
+                for (action, action_group) in [
+                    (ItemPaletteAction::GoTo, PaletteActionGroup::GoTo),
+                    (ItemPaletteAction::Open, PaletteActionGroup::Open),
+                    (ItemPaletteAction::Rename, PaletteActionGroup::Rename),
+                    (ItemPaletteAction::Close, PaletteActionGroup::Close),
+                ] {
+                    entries.push(PaletteEntry {
+                        action_group,
+                        kind_group,
+                        label: format!("{} / {}", workspace.name, item.name()),
+                        detail: item.status().into(),
+                        keywords: keywords.clone(),
+                        command: PaletteCommand::Item {
+                            identity: identity.clone(),
+                            action,
+                        },
+                    });
+                }
+                if kind == ItemKind::Agent && item.status() == "blocked" {
+                    entries.push(PaletteEntry {
+                        action_group: PaletteActionGroup::QuickAccess,
+                        kind_group: PaletteKindGroup::BlockedAgents,
+                        label: format!("{} / {}", workspace.name, item.name()),
+                        detail: "blocked".into(),
+                        keywords: format!("filter current needs input {keywords}"),
+                        command: PaletteCommand::Item {
+                            identity,
+                            action: ItemPaletteAction::GoTo,
+                        },
+                    });
+                }
+            }
+
+            for attention in &workspace.attention {
+                attention_entries.push((
+                    usize::from(attention.reason != "blocked"),
+                    attention.observed_at_ms,
+                    workspace.id.clone(),
+                    attention.shell_id.clone(),
+                    PaletteEntry {
+                        action_group: PaletteActionGroup::QuickAccess,
+                        kind_group: PaletteKindGroup::Attention,
+                        label: format!("{} / {}", workspace.name, attention.agent_name),
+                        detail: format!("{}: {}", attention.reason, attention.evidence),
+                        keywords: format!(
+                            "attention unseen outstanding {} {} {} {}",
+                            attention.reason,
+                            attention.evidence,
+                            workspace.name,
+                            attention.shell_id
+                        ),
+                        command: PaletteCommand::Attention {
+                            workspace_id: workspace.id.clone(),
+                            shell_id: attention.shell_id.clone(),
+                        },
+                    },
+                ));
+            }
+        }
+        attention_entries.sort_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| right.1.cmp(&left.1))
+                .then_with(|| left.2.cmp(&right.2))
+                .then_with(|| left.3.cmp(&right.3))
+        });
+        entries.extend(attention_entries.into_iter().map(|entry| entry.4));
+
+        let mut palette = Self {
+            entries,
+            matches: Vec::new(),
+            state: ListState::default(),
+            query: String::new(),
+        };
+        palette.update_matches();
+        palette
+    }
+
+    fn update_matches(&mut self) {
+        let query = self.query.to_lowercase();
+        let mut matches = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| {
+                palette_match_score(entry, &query).map(|score| (index, score))
+            })
+            .collect::<Vec<_>>();
+        matches.sort_by_key(|(index, score)| {
+            let entry = &self.entries[*index];
+            (entry.action_group, entry.kind_group, *score, *index)
+        });
+        self.matches = matches.into_iter().map(|(index, _)| index).collect();
+        self.state.select((!self.matches.is_empty()).then_some(0));
+    }
+
+    fn selected_command(&self) -> Option<PaletteCommand> {
+        self.state
+            .selected()
+            .and_then(|selected| self.matches.get(selected))
+            .and_then(|entry| self.entries.get(*entry))
+            .map(|entry| entry.command.clone())
+    }
+
+    fn next(&mut self) {
+        if self.matches.is_empty() {
+            return;
+        }
+        let next = self
+            .state
+            .selected()
+            .map_or(0, |index| (index + 1) % self.matches.len());
+        self.state.select(Some(next));
+    }
+
+    fn previous(&mut self) {
+        if self.matches.is_empty() {
+            return;
+        }
+        let previous = self.state.selected().map_or(0, |index| {
+            if index == 0 {
+                self.matches.len() - 1
+            } else {
+                index - 1
+            }
+        });
+        self.state.select(Some(previous));
+    }
+}
+
+fn palette_match_score(entry: &PaletteEntry, query: &str) -> Option<usize> {
+    if query.is_empty() {
+        return Some(0);
+    }
+    let candidate = format!(
+        "{} {} {} {} {}",
+        entry.action_group.label(),
+        entry.kind_group.label(),
+        entry.label,
+        entry.detail,
+        entry.keywords
+    )
+    .to_lowercase();
+    query.split_whitespace().try_fold(0, |score, token| {
+        candidate
+            .find(token)
+            .map(|index| score + index)
+            .or_else(|| {
+                candidate
+                    .split_whitespace()
+                    .any(|word| is_subsequence(token, word))
+                    .then_some(score + candidate.len())
+            })
+    })
 }
 
 fn project_match_score(project: &ProjectView, query: &str) -> Option<(u8, usize)> {
@@ -665,6 +1039,61 @@ impl App {
     fn set_focus(&mut self, focus: Focus) {
         self.focus = focus;
         self.message = None;
+    }
+
+    fn open_palette(&mut self) {
+        self.mode = Mode::Palette(CommandPalette::new(&self.workspaces));
+        self.message = None;
+    }
+
+    fn select_workspace(&mut self, workspace_id: &str, focus: Focus) -> bool {
+        let Some(index) = self
+            .workspaces
+            .iter()
+            .position(|workspace| workspace.id == workspace_id)
+        else {
+            self.message = Some(Message {
+                text: "workspace is no longer available".into(),
+                error: true,
+            });
+            return false;
+        };
+        self.select_tab(PrimaryTab::Workspaces);
+        self.workspace_state.select(Some(index));
+        self.select_first_details();
+        self.set_focus(focus);
+        true
+    }
+
+    fn select_item_identity(&mut self, identity: &ItemIdentity) -> bool {
+        let Some(workspace_index) = self
+            .workspaces
+            .iter()
+            .position(|workspace| workspace.id == identity.workspace_id)
+        else {
+            self.message = Some(Message {
+                text: "item workspace is no longer available".into(),
+                error: true,
+            });
+            return false;
+        };
+        let Some(item_index) = self.workspaces[workspace_index]
+            .items
+            .iter()
+            .position(|item| item_matches(item, identity))
+        else {
+            self.select_workspace(&identity.workspace_id, Focus::Workspaces);
+            self.message = Some(Message {
+                text: "item is no longer available; selected its workspace".into(),
+                error: true,
+            });
+            return false;
+        };
+        self.select_tab(PrimaryTab::Workspaces);
+        self.workspace_state.select(Some(workspace_index));
+        self.item_state.select(Some(item_index));
+        self.set_focus(Focus::Items);
+        true
     }
 
     fn handle_focus_key(&mut self, key: KeyCode) -> bool {
@@ -1134,6 +1563,21 @@ where
             continue;
         }
 
+        if matches!(app.mode, Mode::Help) {
+            handle_help_key(&mut app, key.code, key.modifiers);
+            continue;
+        }
+
+        if matches!(app.mode, Mode::Palette(_)) {
+            if let Some(command) = handle_palette_key(&mut app, key.code, key.modifiers)
+                && execute_palette_command(&mut app, command, &mut actions)
+            {
+                app.refresh(&mut actions.on_refresh);
+                last_refresh = Instant::now();
+            }
+            continue;
+        }
+
         if !matches!(app.mode, Mode::Normal) {
             if handle_mode_key(
                 &mut app,
@@ -1188,6 +1632,8 @@ where
                 }
             }
             KeyCode::Char('e') => app.request_rename(),
+            KeyCode::Char('/' | ':') => app.open_palette(),
+            KeyCode::Char('?') => app.mode = Mode::Help,
             KeyCode::Tab => app.cycle_tab(false),
             KeyCode::BackTab => app.cycle_tab(true),
             KeyCode::Char(key) if shortcut_tab(key).is_some() => {
@@ -1199,8 +1645,169 @@ where
     }
 }
 
+fn execute_palette_command<R, O, C, W, N, E, F, P>(
+    app: &mut App,
+    command: PaletteCommand,
+    actions: &mut Actions<R, O, C, W, N, E, F, P>,
+) -> bool
+where
+    R: FnMut(&str) -> Result<String, String>,
+    O: FnMut(&OpenTarget) -> Result<String, String>,
+    C: FnMut(&CloseTarget) -> Result<String, String>,
+    W: FnMut(&str) -> Result<String, String>,
+    N: FnMut(&str) -> Result<String, String>,
+    E: FnMut(&RenameTarget, &str) -> Result<String, String>,
+    F: FnMut() -> Result<Vec<WorkspaceView>, String>,
+    P: FnMut(&str) -> Result<String, String>,
+{
+    match command {
+        PaletteCommand::CreateWorkspace => {
+            app.mode = Mode::PickProject(ProjectPicker::new(&app.project_context));
+            false
+        }
+        PaletteCommand::ShowHelp => {
+            app.mode = Mode::Help;
+            false
+        }
+        PaletteCommand::Workspace {
+            workspace_id,
+            action,
+        } => {
+            let focus = if matches!(action, WorkspacePaletteAction::AddShell) {
+                Focus::Items
+            } else {
+                Focus::Workspaces
+            };
+            if !app.select_workspace(&workspace_id, focus) {
+                return false;
+            }
+            match action {
+                WorkspacePaletteAction::GoTo => false,
+                WorkspacePaletteAction::Restore => {
+                    app.restore_selected(&mut actions.on_restore);
+                    true
+                }
+                WorkspacePaletteAction::AddShell => app.request_add(&mut actions.on_create_shell),
+                WorkspacePaletteAction::Rename => {
+                    app.request_rename();
+                    false
+                }
+                WorkspacePaletteAction::Close => {
+                    app.request_close();
+                    false
+                }
+            }
+        }
+        PaletteCommand::Item { identity, action } => {
+            if !app.select_item_identity(&identity) {
+                return false;
+            }
+            match action {
+                ItemPaletteAction::GoTo => false,
+                ItemPaletteAction::Open => app.open_selected_item(&mut actions.on_open),
+                ItemPaletteAction::Rename => {
+                    app.request_rename();
+                    false
+                }
+                ItemPaletteAction::Close => {
+                    app.request_close();
+                    false
+                }
+            }
+        }
+        PaletteCommand::Attention {
+            workspace_id,
+            shell_id,
+        } => {
+            let identity = ItemIdentity {
+                workspace_id: workspace_id.clone(),
+                item_id: shell_id,
+                launcher: false,
+            };
+            if !app.select_item_identity(&identity) {
+                if app.select_workspace(&workspace_id, Focus::Workspaces) {
+                    app.message = Some(Message {
+                        text:
+                            "attention source shell is no longer retained; selected its workspace"
+                                .into(),
+                        error: false,
+                    });
+                } else {
+                    app.message = Some(Message {
+                        text: "attention source workspace is no longer available".into(),
+                        error: true,
+                    });
+                }
+            }
+            false
+        }
+    }
+}
+
+fn handle_help_key(app: &mut App, key: KeyCode, modifiers: KeyModifiers) {
+    if modifiers.is_empty() && key == KeyCode::Char('/') {
+        app.open_palette();
+    } else if modifiers.difference(KeyModifiers::SHIFT).is_empty()
+        && matches!(key, KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q'))
+    {
+        app.mode = Mode::Normal;
+    }
+}
+
 fn normal_mode_modifiers_supported(code: KeyCode, modifiers: KeyModifiers) -> bool {
-    modifiers.is_empty() || (code == KeyCode::BackTab && modifiers == KeyModifiers::SHIFT)
+    modifiers.is_empty()
+        || (modifiers == KeyModifiers::SHIFT
+            && matches!(code, KeyCode::BackTab | KeyCode::Char('?' | ':')))
+}
+
+fn handle_palette_key(
+    app: &mut App,
+    key: KeyCode,
+    modifiers: KeyModifiers,
+) -> Option<PaletteCommand> {
+    let Mode::Palette(mut palette) = std::mem::replace(&mut app.mode, Mode::Normal) else {
+        return None;
+    };
+    if !modifiers.difference(KeyModifiers::SHIFT).is_empty() {
+        app.mode = Mode::Palette(palette);
+        return None;
+    }
+    match key {
+        KeyCode::Enter => match palette.selected_command() {
+            Some(command) => Some(command),
+            None => {
+                app.mode = Mode::Palette(palette);
+                None
+            }
+        },
+        KeyCode::Esc => None,
+        KeyCode::Down => {
+            palette.next();
+            app.mode = Mode::Palette(palette);
+            None
+        }
+        KeyCode::Up => {
+            palette.previous();
+            app.mode = Mode::Palette(palette);
+            None
+        }
+        KeyCode::Backspace => {
+            palette.query.pop();
+            palette.update_matches();
+            app.mode = Mode::Palette(palette);
+            None
+        }
+        KeyCode::Char(character) => {
+            palette.query.push(character);
+            palette.update_matches();
+            app.mode = Mode::Palette(palette);
+            None
+        }
+        _ => {
+            app.mode = Mode::Palette(palette);
+            None
+        }
+    }
 }
 
 fn handle_mode_key<W, E>(
@@ -1221,6 +1828,7 @@ where
     }
     match mode {
         Mode::Normal => false,
+        Mode::Palette(_) | Mode::Help => false,
         Mode::PickProject(mut picker) => match key {
             KeyCode::Enter if picker.selected().is_some() => {
                 let name = picker.selected().expect("selected project").name.clone();
@@ -1316,8 +1924,11 @@ fn render(frame: &mut Frame, app: &mut App) {
         render_items(frame, terminal_area, app);
     }
     render_footer(frame, footer_area, app);
-    if let Mode::PickProject(picker) = &mut app.mode {
-        render_project_picker(frame, area, picker);
+    match &mut app.mode {
+        Mode::PickProject(picker) => render_project_picker(frame, area, picker),
+        Mode::Palette(palette) => render_command_palette(frame, area, palette),
+        Mode::Help => render_help_overlay(frame, area, app),
+        Mode::Normal | Mode::Rename { .. } => {}
     }
 }
 
@@ -1408,6 +2019,215 @@ fn render_project_picker(frame: &mut Frame, area: Rect, picker: &mut ProjectPick
         |warning| Line::from(Span::styled(format!(" {warning}"), Style::new().fg(YELLOW))),
     );
     frame.render_widget(Paragraph::new(help).style(Style::new().bg(BASE)), help_area);
+}
+
+fn render_command_palette(frame: &mut Frame, area: Rect, palette: &mut CommandPalette) {
+    let popup_area = centered_rect(area, 82, 72);
+    frame.render_widget(Clear, popup_area);
+    frame.render_widget(Block::new().style(Style::new().bg(BASE)), popup_area);
+    let [search_area, list_area, help_area] = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Fill(1),
+        Constraint::Length(1),
+    ])
+    .areas(popup_area);
+
+    frame.render_widget(
+        Paragraph::new(format!("> {}_", palette.query)).block(
+            Block::bordered()
+                .title(" Command palette ")
+                .border_style(Style::new().fg(TEAL)),
+        ),
+        search_area,
+    );
+
+    let mut selected_row = None;
+    let items = if palette.matches.is_empty() {
+        vec![ListItem::new(Span::styled(
+            "No matching actions",
+            Style::new().fg(SUBTEXT),
+        ))]
+    } else {
+        let mut items = Vec::new();
+        let mut previous_action = None;
+        let mut previous_kind = None;
+        for (match_position, index) in palette.matches.iter().enumerate() {
+            let Some(entry) = palette.entries.get(*index) else {
+                continue;
+            };
+            if previous_action != Some(entry.action_group) {
+                if previous_action.is_some() {
+                    items.push(ListItem::new(""));
+                }
+                items.push(ListItem::new(Span::styled(
+                    entry.action_group.label(),
+                    Style::new().fg(TEAL).add_modifier(Modifier::BOLD),
+                )));
+                previous_action = Some(entry.action_group);
+                previous_kind = None;
+            }
+            if previous_kind != Some(entry.kind_group) {
+                items.push(ListItem::new(Span::styled(
+                    format!("  {}", entry.kind_group.label()),
+                    Style::new().fg(BLUE).add_modifier(Modifier::BOLD),
+                )));
+                previous_kind = Some(entry.kind_group);
+            }
+            if palette.state.selected() == Some(match_position) {
+                selected_row = Some(items.len());
+            }
+            items.push(ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!("    {:<42}", entry.label),
+                    Style::new().fg(TEXT).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(entry.detail.clone(), Style::new().fg(SUBTEXT)),
+            ])));
+        }
+        items
+    };
+    let list = List::new(items)
+        .block(
+            Block::bordered()
+                .title(format!(" {} actions ", palette.matches.len()))
+                .border_style(Style::new().fg(OVERLAY)),
+        )
+        .highlight_symbol("> ")
+        .highlight_style(Style::new().fg(TEXT).add_modifier(Modifier::REVERSED));
+    let mut render_state = ListState::default().with_selected(selected_row);
+    frame.render_stateful_widget(list, list_area, &mut render_state);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(" type", Style::new().fg(TEAL)),
+            Span::raw(" filter, including 'blocked' or 'attention'  "),
+            Span::styled("up/down", Style::new().fg(BLUE)),
+            Span::raw(" select  "),
+            Span::styled("enter", Style::new().fg(GREEN)),
+            Span::raw(" run  "),
+            Span::styled("esc", Style::new().fg(RED)),
+            Span::raw(" cancel"),
+        ]))
+        .style(Style::new().bg(BASE)),
+        help_area,
+    );
+}
+
+fn render_help_overlay(frame: &mut Frame, area: Rect, app: &App) {
+    let popup_area = if area.width < 100 || area.height < 30 {
+        area
+    } else {
+        centered_rect(area, 82, 78)
+    };
+    frame.render_widget(Clear, popup_area);
+    frame.render_widget(Block::new().style(Style::new().bg(BASE)), popup_area);
+    let [content_area, footer_area] =
+        Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(popup_area);
+    let lines = help_lines(app);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::bordered()
+                    .title(" Dashboard help ")
+                    .border_style(Style::new().fg(TEAL)),
+            )
+            .wrap(Wrap { trim: false }),
+        content_area,
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(" ?/q/esc", Style::new().fg(RED)),
+            Span::raw(" close help  "),
+            Span::styled("/", Style::new().fg(TEAL)),
+            Span::raw(" command palette"),
+        ]))
+        .style(Style::new().bg(BASE)),
+        footer_area,
+    );
+}
+
+fn help_lines(app: &App) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "FIND AND ACT",
+            Style::new().fg(TEAL).add_modifier(Modifier::BOLD),
+        )),
+        Line::from("  / or :   search workspaces, items, and actions"),
+        Line::from("  blocked  filter palette results to currently blocked agents"),
+        Line::from("  attention filter palette results to outstanding durable attention"),
+        Line::from("  Enter    restore a workspace, open a shell, or invoke a launcher"),
+        Line::from("  a/e/x    add, rename, or request confirmed close/remove"),
+        Line::from("  Tab/1-5 change view; h/l change pane; j/k navigate"),
+        Line::from(""),
+        Line::from(Span::styled(
+            "SELECTED CONTEXT",
+            Style::new().fg(BLUE).add_modifier(Modifier::BOLD),
+        )),
+    ];
+    if app.primary_tab == PrimaryTab::Workspaces && app.focus == Focus::Workspaces {
+        if let Some(workspace) = app.selected() {
+            lines.extend([
+                Line::from(format!("  workspace: {}", workspace.name)),
+                Line::from("  Enter restores its launchers and terminal windows."),
+                Line::from("  Closing it terminates retained shells and removes launchers."),
+            ]);
+            if workspace.attention_count > 0 {
+                lines.push(Line::from(format!(
+                    "  attention: {} unseen blocked/completed observation(s)",
+                    workspace.attention_count
+                )));
+            }
+        } else {
+            lines.push(Line::from("  No workspace selected."));
+        }
+    } else if let Some(item) = app.selected_item() {
+        let (summary, exit) = match item.kind() {
+            ItemKind::Shell => (
+                "A shell is a durable login-shell PTY slot.",
+                "Ctrl-C normally returns to its prompt; exiting the login shell ends the run.",
+            ),
+            ItemKind::Command => (
+                "A command is a durable PTY slot with one exact startup argument vector.",
+                "Interrupting or exiting its primary command ends the run.",
+            ),
+            ItemKind::Agent => (
+                "An agent is the current presentation of an underlying shell or command.",
+                "Its state comes from lifecycle integration evidence, never quiet output.",
+            ),
+            ItemKind::Launcher => (
+                "A launcher is a detached command invoked when its workspace opens.",
+                "Boomux retains no launcher output, invocation history, or process lifetime.",
+            ),
+        };
+        lines.extend([
+            Line::from(format!("  {}: {}", item.kind().label(), item.name())),
+            Line::from(format!("  status: {}", item.status())),
+            Line::from(format!("  {summary}")),
+            Line::from(format!("  {exit}")),
+        ]);
+        if item.status() == "untracked" {
+            lines.push(Line::from(
+                "  Untracked means a supported foreground host has no authoritative report.",
+            ));
+        } else if item.status() == "blocked" {
+            lines.push(Line::from(
+                "  Blocked means the current Agent observation requires user input.",
+            ));
+        }
+    } else {
+        lines.push(Line::from("  No item selected."));
+    }
+    lines.extend([
+        Line::from(""),
+        Line::from(Span::styled(
+            "STATE QUICK REFERENCE",
+            Style::new().fg(YELLOW).add_modifier(Modifier::BOLD),
+        )),
+        Line::from("  pending/running/exited describe shell process runs."),
+        Line::from("  working/blocked/idle describe authoritative active Agent state."),
+        Line::from("  inactive is resumable; done is permanent completion."),
+        Line::from("  Attention is durable unseen blocked/completed work and may be stale."),
+    ]);
+    lines
 }
 
 fn centered_rect(area: Rect, width_percent: u16, height_percent: u16) -> Rect {
@@ -1844,7 +2664,7 @@ fn workspace_preview(workspace: &WorkspaceView) -> ContextualPreview {
             Style::new().fg(SUBTEXT),
         )),
     ];
-    if let Some(attention) = &workspace.attention {
+    if let Some(attention) = workspace.attention.first() {
         let currency = if attention.observation_is_current {
             "current"
         } else {
@@ -2357,6 +3177,10 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
                 },
                 Style::new().fg(SUBTEXT),
             ),
+            Span::styled("/", Style::new().fg(TEAL)),
+            Span::styled(" palette  ", Style::new().fg(SUBTEXT)),
+            Span::styled("?", Style::new().fg(BLUE)),
+            Span::styled(" help  ", Style::new().fg(SUBTEXT)),
         ];
         if app.primary_tab == PrimaryTab::Workspaces {
             spans.extend([
@@ -2439,6 +3263,8 @@ fn status_color(status: &str) -> Color {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+
     use super::*;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -2486,7 +3312,7 @@ mod tests {
             sessions: Vec::new(),
             agent_state_counts: AgentStateCounts::default(),
             attention_count: 0,
-            attention: None,
+            attention: Vec::new(),
         }
     }
 
@@ -2537,6 +3363,26 @@ mod tests {
 
     fn focus_items(app: &mut App) {
         app.set_focus(Focus::Items);
+    }
+
+    fn successful_text(_: &str) -> Result<String, String> {
+        Ok(String::new())
+    }
+
+    fn successful_open(_: &OpenTarget) -> Result<String, String> {
+        Ok(String::new())
+    }
+
+    fn successful_close(_: &CloseTarget) -> Result<String, String> {
+        Ok(String::new())
+    }
+
+    fn successful_rename(_: &RenameTarget, _: &str) -> Result<String, String> {
+        Ok(String::new())
+    }
+
+    fn empty_refresh() -> Result<Vec<WorkspaceView>, String> {
+        Ok(Vec::new())
     }
 
     fn hinted_agent_shell() -> AgentShellView {
@@ -3020,6 +3866,331 @@ mod tests {
             panic!("expected project picker");
         };
         assert_eq!(picker.query, "_");
+    }
+
+    #[test]
+    fn command_palette_finds_blocked_agents_and_attention() {
+        let mut workspace = workspace("w1", "review");
+        let mut agent = agent_shell();
+        agent.agent.as_mut().unwrap().state = "blocked".into();
+        workspace.items[0] = WorkspaceItemView::AgentShell(agent);
+        workspace.attention = vec![WorkspaceAttentionView {
+            shell_id: "term_1".into(),
+            agent_name: "review-agent".into(),
+            reason: "blocked".into(),
+            evidence: "approval required".into(),
+            observed_at_ms: 1,
+            observation_is_current: true,
+        }];
+        workspace.attention_count = 1;
+        let mut palette = CommandPalette::new(&[workspace]);
+
+        palette.query = "blocked".into();
+        palette.update_matches();
+        let labels = palette
+            .matches
+            .iter()
+            .map(|index| palette.entries[*index].label.as_str())
+            .collect::<Vec<_>>();
+        assert!(labels.contains(&"review / agent"));
+
+        palette.query = "attention approval".into();
+        palette.update_matches();
+        assert_eq!(palette.matches.len(), 1);
+        assert!(matches!(
+            palette.selected_command(),
+            Some(PaletteCommand::Attention { ref shell_id, .. }) if shell_id == "term_1"
+        ));
+    }
+
+    #[test]
+    fn command_palette_does_not_fuzzy_match_across_words() {
+        let entry = PaletteEntry {
+            action_group: PaletteActionGroup::Help,
+            kind_group: PaletteKindGroup::Dashboard,
+            label: "l o c k e d".into(),
+            detail: String::new(),
+            keywords: String::new(),
+            command: PaletteCommand::CreateWorkspace,
+        };
+
+        assert_eq!(palette_match_score(&entry, "blocked"), None);
+    }
+
+    #[test]
+    fn command_palette_orders_attention_by_global_urgency() {
+        let mut completed = workspace("w1", "first");
+        completed.attention = vec![WorkspaceAttentionView {
+            shell_id: "completed-shell".into(),
+            agent_name: "completed-agent".into(),
+            reason: "completed".into(),
+            evidence: "finished".into(),
+            observed_at_ms: 20,
+            observation_is_current: true,
+        }];
+        let mut blocked = workspace("w2", "second");
+        blocked.attention = vec![WorkspaceAttentionView {
+            shell_id: "blocked-shell".into(),
+            agent_name: "blocked-agent".into(),
+            reason: "blocked".into(),
+            evidence: "approval required".into(),
+            observed_at_ms: 10,
+            observation_is_current: true,
+        }];
+        let mut palette = CommandPalette::new(&[completed, blocked]);
+
+        palette.query = "attention".into();
+        palette.update_matches();
+
+        assert!(matches!(
+            palette.selected_command(),
+            Some(PaletteCommand::Attention { ref workspace_id, .. }) if workspace_id == "w2"
+        ));
+    }
+
+    #[test]
+    fn command_palette_starts_at_the_first_grouped_action() {
+        let palette = CommandPalette::new(&[workspace("w1", "boomux")]);
+        let selected = palette
+            .state
+            .selected()
+            .and_then(|position| palette.matches.get(position))
+            .and_then(|index| palette.entries.get(*index))
+            .unwrap();
+
+        assert_eq!(selected.action_group, PaletteActionGroup::GoTo);
+        assert_eq!(selected.kind_group, PaletteKindGroup::Workspaces);
+        assert_eq!(selected.label, "boomux");
+    }
+
+    #[test]
+    fn command_palette_accepts_search_input_and_escape() {
+        let mut app = app();
+        app.open_palette();
+        for character in "agent".chars() {
+            assert!(
+                handle_palette_key(&mut app, KeyCode::Char(character), KeyModifiers::NONE,)
+                    .is_none()
+            );
+        }
+        let Mode::Palette(palette) = &app.mode else {
+            panic!("palette closed while entering a query");
+        };
+        assert_eq!(palette.query, "agent");
+        assert!(!palette.matches.is_empty());
+
+        assert!(handle_palette_key(&mut app, KeyCode::Esc, KeyModifiers::NONE).is_none());
+        assert!(matches!(app.mode, Mode::Normal));
+        assert!(normal_mode_modifiers_supported(
+            KeyCode::Char('?'),
+            KeyModifiers::SHIFT,
+        ));
+    }
+
+    #[test]
+    fn help_slash_opens_the_command_palette() {
+        let mut app = app();
+        app.mode = Mode::Help;
+
+        handle_help_key(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+
+        assert!(matches!(app.mode, Mode::Palette(_)));
+    }
+
+    #[test]
+    fn palette_open_reuses_typed_item_dispatch() {
+        let opened = RefCell::new(Vec::new());
+        let mut app = app();
+        let identity = ItemIdentity {
+            workspace_id: "w1".into(),
+            item_id: "term_1".into(),
+            launcher: false,
+        };
+        let mut actions = Actions {
+            on_restore: successful_text,
+            on_open: |target: &OpenTarget| {
+                opened.borrow_mut().push(target.clone());
+                Ok("opened".into())
+            },
+            on_close: successful_close,
+            on_create_workspace: successful_text,
+            on_create_shell: successful_text,
+            on_rename: successful_rename,
+            on_refresh: empty_refresh,
+            on_terminal_preview: successful_text,
+        };
+
+        assert!(execute_palette_command(
+            &mut app,
+            PaletteCommand::Item {
+                identity: identity.clone(),
+                action: ItemPaletteAction::Open,
+            },
+            &mut actions,
+        ));
+        assert_eq!(
+            opened.borrow().as_slice(),
+            &[OpenTarget::Shell("term_1".into())]
+        );
+        assert_eq!(app.focus, Focus::Items);
+
+        assert!(!execute_palette_command(
+            &mut app,
+            PaletteCommand::Item {
+                identity: identity.clone(),
+                action: ItemPaletteAction::Rename,
+            },
+            &mut actions,
+        ));
+        assert!(matches!(
+            app.mode,
+            Mode::Rename {
+                target: RenameTarget::Shell(ref id),
+                ..
+            } if id == "term_1"
+        ));
+
+        app.mode = Mode::Normal;
+        execute_palette_command(
+            &mut app,
+            PaletteCommand::Item {
+                identity,
+                action: ItemPaletteAction::Close,
+            },
+            &mut actions,
+        );
+        assert!(matches!(
+            app.pending_close,
+            Some(PendingClose {
+                target: CloseTarget::Shell(ref id),
+                ..
+            }) if id == "term_1"
+        ));
+    }
+
+    #[test]
+    fn attention_jump_falls_back_when_shell_is_not_retained() {
+        let mut app = app();
+        let mut actions = Actions {
+            on_restore: successful_text,
+            on_open: successful_open,
+            on_close: successful_close,
+            on_create_workspace: successful_text,
+            on_create_shell: successful_text,
+            on_rename: successful_rename,
+            on_refresh: empty_refresh,
+            on_terminal_preview: successful_text,
+        };
+
+        execute_palette_command(
+            &mut app,
+            PaletteCommand::Attention {
+                workspace_id: "w1".into(),
+                shell_id: "removed".into(),
+            },
+            &mut actions,
+        );
+        assert_eq!(app.focus, Focus::Workspaces);
+        assert!(app.message.as_ref().is_some_and(|message| {
+            !message.error && message.text.contains("no longer retained")
+        }));
+    }
+
+    #[test]
+    fn attention_jump_reports_when_workspace_is_not_retained() {
+        let mut app = app();
+        let mut actions = Actions {
+            on_restore: successful_text,
+            on_open: successful_open,
+            on_close: successful_close,
+            on_create_workspace: successful_text,
+            on_create_shell: successful_text,
+            on_rename: successful_rename,
+            on_refresh: empty_refresh,
+            on_terminal_preview: successful_text,
+        };
+
+        execute_palette_command(
+            &mut app,
+            PaletteCommand::Attention {
+                workspace_id: "removed".into(),
+                shell_id: "removed".into(),
+            },
+            &mut actions,
+        );
+
+        assert!(app.message.as_ref().is_some_and(|message| {
+            message.error && message.text.contains("workspace is no longer available")
+        }));
+    }
+
+    #[test]
+    fn palette_and_help_render_contextual_overlays() {
+        let backend = TestBackend::new(140, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = app();
+        app.open_palette();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let palette_text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(palette_text.contains("Command palette"));
+        assert!(palette_text.contains("Create workspace"));
+        assert!(palette_text.contains("GO TO"));
+        assert!(palette_text.contains("SHELLS"));
+        assert!(palette_text.contains("boomux / agent"));
+
+        app.mode = Mode::Help;
+        app.set_focus(Focus::Items);
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let help_text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(help_text.contains("Dashboard help"));
+        assert!(help_text.contains("shell: agent"));
+        assert!(help_text.contains("durable login-shell PTY slot"));
+        assert!(help_text.contains("attention"));
+
+        app.workspaces[0].items[0] = WorkspaceItemView::AgentShell(hinted_agent_shell());
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let untracked_help: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(untracked_help.contains("agent: agent"));
+        assert!(untracked_help.contains("no authoritative report"));
+    }
+
+    #[test]
+    fn help_renders_state_reference_at_common_terminal_size() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = app();
+        app.mode = Mode::Help;
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("STATE QUICK REFERENCE"));
+        assert!(text.contains("Attention is durable"));
+        assert!(text.contains("command palette"));
     }
 
     #[test]
@@ -4038,13 +5209,14 @@ mod tests {
         let backend = TestBackend::new(140, 34);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut workspace = workspace("w1", "review");
-        workspace.attention = Some(WorkspaceAttentionView {
+        workspace.attention = vec![WorkspaceAttentionView {
+            shell_id: "term_1".into(),
             agent_name: "review-agent".into(),
             reason: "blocked".into(),
             evidence: "approval required".into(),
             observed_at_ms: current_time_ms(),
             observation_is_current: true,
-        });
+        }];
         workspace.attention_count = 1;
         let mut app = App::new(vec![workspace], project_context());
 
