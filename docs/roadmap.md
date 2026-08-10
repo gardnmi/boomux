@@ -125,8 +125,8 @@ eternal process.
    persistent attention queue for blocked and completed work.
 4. [Complete] Add revision-aware `agent wait` so scripts can await durable state
    transitions without polling human output.
-5. [Complete] Add deduplicated notifications for blocked and completed
-   transitions after the attention and wait semantics are established.
+5. [Complete] Add deduplicated desktop and sound notifications for blocked and
+   completed transitions after the attention and wait semantics are established.
 6. [Complete] Add explicit cross-harness transcript and tool inspection so Pi can read an OpenCode
    session and OpenCode can read a Pi session. Do not treat bounded rendered
    terminal output as the full session: host adapters must expose canonical

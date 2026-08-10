@@ -23,7 +23,7 @@ use uuid::Uuid;
 use crate::client;
 use crate::desktop_notifications::{
     DesktopNotificationSink, DisabledNotificationSink, NotificationReason, NotificationRequest,
-    NotificationSink, category_enabled,
+    NotificationSink, category_enabled, test_delivery,
 };
 use crate::fd_transfer::send_descriptor;
 use crate::handoff;
@@ -69,6 +69,48 @@ pub struct NotificationSettings {
     pub completed: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NotificationSoundSettings {
+    pub enabled: bool,
+    pub blocked: String,
+    pub completed: String,
+}
+
+impl Default for NotificationSoundSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            blocked: "message-new-instant".into(),
+            completed: "complete".into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NotificationDeliverySettings {
+    pub desktop: NotificationSettings,
+    pub sound: NotificationSoundSettings,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NotificationTestReason {
+    Blocked,
+    Completed,
+}
+
+pub fn test_notification_delivery(
+    settings: &NotificationDeliverySettings,
+    reason: NotificationTestReason,
+) -> io::Result<()> {
+    test_delivery(
+        settings,
+        match reason {
+            NotificationTestReason::Blocked => NotificationReason::Blocked,
+            NotificationTestReason::Completed => NotificationReason::Completed,
+        },
+    )
+}
+
 impl Default for NotificationSettings {
     fn default() -> Self {
         Self {
@@ -86,6 +128,19 @@ pub fn receive_handoff(channel: i32) -> io::Result<()> {
 pub fn receive_handoff_with_notifications(
     channel: i32,
     notification_settings: NotificationSettings,
+) -> io::Result<()> {
+    receive_handoff_with_notification_delivery(
+        channel,
+        NotificationDeliverySettings {
+            desktop: notification_settings,
+            ..Default::default()
+        },
+    )
+}
+
+pub fn receive_handoff_with_notification_delivery(
+    channel: i32,
+    notification_settings: NotificationDeliverySettings,
 ) -> io::Result<()> {
     match handoff::receive_bootstrap(channel)? {
         handoff::Bootstrap::Aborted => Ok(()),
@@ -122,6 +177,15 @@ pub fn run() -> io::Result<()> {
 }
 
 pub fn run_with_notifications(notification_settings: NotificationSettings) -> io::Result<()> {
+    run_with_notification_delivery(NotificationDeliverySettings {
+        desktop: notification_settings,
+        ..Default::default()
+    })
+}
+
+pub fn run_with_notification_delivery(
+    notification_settings: NotificationDeliverySettings,
+) -> io::Result<()> {
     let socket_path = client::socket_path()?;
     let runtime_dir = socket_path
         .parent()
@@ -162,11 +226,11 @@ fn run_daemon(
     store: StateStore,
     transferred: TransferredState,
     committed: Option<&mut UnixStream>,
-    notification_settings: NotificationSettings,
+    notification_settings: NotificationDeliverySettings,
 ) -> io::Result<()> {
     let mut registry = Registry::restore(store, committed.is_some(), transferred.events)?;
-    registry.notification_settings = notification_settings;
-    registry.notification_sink = Arc::new(DesktopNotificationSink::new());
+    registry.notification_settings = notification_settings.clone();
+    registry.notification_sink = Arc::new(DesktopNotificationSink::new(notification_settings));
     let registry = Arc::new(registry);
     let gated_readers = registry.import_handoff(transferred.runtimes, transferred.exited)?;
     if let Some(channel) = committed {
@@ -951,7 +1015,7 @@ struct Registry {
     persist_lock: Mutex<()>,
     stopping: AtomicBool,
     persistence_dirty: AtomicBool,
-    notification_settings: NotificationSettings,
+    notification_settings: NotificationDeliverySettings,
     notification_sink: Arc<dyn NotificationSink>,
 }
 
@@ -1092,7 +1156,7 @@ impl Default for Registry {
             persist_lock: Mutex::new(()),
             stopping: AtomicBool::new(false),
             persistence_dirty: AtomicBool::new(false),
-            notification_settings: NotificationSettings::default(),
+            notification_settings: NotificationDeliverySettings::default(),
             notification_sink: Arc::new(DisabledNotificationSink),
         }
     }
@@ -2110,7 +2174,7 @@ impl Registry {
             persist_lock: Mutex::new(()),
             stopping: AtomicBool::new(false),
             persistence_dirty: AtomicBool::new(false),
-            notification_settings: NotificationSettings::default(),
+            notification_settings: NotificationDeliverySettings::default(),
             notification_sink: Arc::new(DisabledNotificationSink),
         };
         if recovered_interrupted_run {
@@ -2394,7 +2458,7 @@ impl Registry {
             {
                 continue;
             }
-            if !category_enabled(self.notification_settings, reason)
+            if !category_enabled(&self.notification_settings, reason)
                 || !seen.insert((agent.id.as_str(), agent.observation.revision, reason))
             {
                 continue;
@@ -5335,7 +5399,10 @@ mod tests {
     ) -> (Registry, Arc<RecordingNotificationSink>) {
         let sink = Arc::new(RecordingNotificationSink::default());
         let registry = Registry {
-            notification_settings: settings,
+            notification_settings: NotificationDeliverySettings {
+                desktop: settings,
+                ..Default::default()
+            },
             notification_sink: sink.clone(),
             ..Registry::default()
         };
@@ -6386,10 +6453,13 @@ mod tests {
         )
         .unwrap();
         let sink = Arc::new(RecordingNotificationSink::default());
-        registry.notification_settings = NotificationSettings {
-            enabled: true,
-            blocked: true,
-            completed: true,
+        registry.notification_settings = NotificationDeliverySettings {
+            desktop: NotificationSettings {
+                enabled: true,
+                blocked: true,
+                completed: true,
+            },
+            ..Default::default()
         };
         registry.notification_sink = sink.clone();
         let (workspace, shell, _runtime) = running_shell(&registry);
