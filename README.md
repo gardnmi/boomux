@@ -23,10 +23,10 @@ At runtime, Boomux requires:
 
 - An absolute `XDG_RUNTIME_DIR`.
 - `xdg-terminal-exec` and an available terminal desktop entry.
+- `git` for repository metadata.
 
 Installing from source also requires:
 
-- `git`.
 - A Rust toolchain.
 
 Install directly from the repository:
