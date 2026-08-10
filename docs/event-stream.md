@@ -15,7 +15,9 @@ depending on the retained global event cursor.
 Protocol 15 adds durable blocked/completed attention and conditional
 acknowledgment. Protocol-14 clients receive Agent snapshots without attention
 and do not receive acknowledgment events, while cursors still advance across
-those filtered events.
+those filtered events. Protocol 18 adds the latest non-durable focused terminal
+and its monotonic revision to baseline snapshots. It does not add an event type;
+protocol-17 clients receive the same baseline without that field.
 
 `boomux agent wait <id> --after-revision <revision>` is the preferred way to
 await one Agent. It returns on a newer accepted durable observation, returns

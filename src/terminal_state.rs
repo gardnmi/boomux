@@ -1,9 +1,12 @@
+use crate::terminal_focus::FocusMode;
+
 const SCROLLBACK_ROWS: usize = 2_000;
 const MAX_RECONSTRUCTION_BYTES: usize = 1024 * 1024;
 
 pub(crate) struct TerminalState {
     parser: vt100::Parser,
     primary_before_alternate: Option<vt100::Screen>,
+    focus_mode: FocusMode,
 }
 
 impl TerminalState {
@@ -12,10 +15,12 @@ impl TerminalState {
         Self {
             parser,
             primary_before_alternate: None,
+            focus_mode: FocusMode::default(),
         }
     }
 
     pub(crate) fn process(&mut self, bytes: &[u8]) {
+        self.focus_mode.process(bytes);
         let was_alternate = self.parser.screen().alternate_screen();
         if !was_alternate && let Some(offset) = alternate_screen_start(bytes) {
             self.parser.process(&bytes[..offset]);
@@ -51,6 +56,7 @@ impl TerminalState {
             output.extend(screen.contents_formatted());
         }
         output.extend(screen.input_mode_formatted());
+        output.extend(self.focus_mode.restore_sequence());
         if output.len() <= MAX_RECONSTRUCTION_BYTES {
             return output;
         }
@@ -60,9 +66,13 @@ impl TerminalState {
             fallback.extend_from_slice(b"\x1b[?1049h\x1b[H\x1b[2J");
         }
         let suffix = state_suffix(screen);
-        let text_limit = MAX_RECONSTRUCTION_BYTES.saturating_sub(suffix.len());
+        let focus_mode = self.focus_mode.restore_sequence();
+        let text_limit = MAX_RECONSTRUCTION_BYTES
+            .saturating_sub(suffix.len())
+            .saturating_sub(focus_mode.len());
         append_terminal_text_bounded(&mut fallback, &screen.contents(), text_limit);
         fallback.extend(suffix);
+        fallback.extend(focus_mode);
         fallback
     }
 
@@ -171,6 +181,21 @@ mod tests {
         assert!(!reconstruction.windows(2).any(|bytes| bytes == b"\x1b]"));
         assert!(!String::from_utf8_lossy(&reconstruction).contains("Y2xpcGJvYXJk"));
         assert_eq!(state.plain_text(), "beforeafter");
+    }
+
+    #[test]
+    fn reconstruction_restores_child_focus_mode() {
+        let mut state = TerminalState::new(4, 40);
+        state.process(b"\x1b[?1004h");
+        assert!(state.reconstruction().ends_with(b"\x1b[?1004h"));
+
+        state.process(b"\x1b[?1004;2004l");
+        assert!(
+            !state
+                .reconstruction()
+                .windows(8)
+                .any(|bytes| bytes == b"\x1b[?1004h")
+        );
     }
 
     #[test]

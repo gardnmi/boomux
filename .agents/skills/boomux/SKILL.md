@@ -373,16 +373,20 @@ The dashboard has workspace, Agent, launcher, shell, and command views. `/` or
 restores the selected workspace or opens the selected entry, and `x` followed
 by `y` confirms close or removal. Shell previews are bounded and read-only.
 Restoring a workspace has the same launcher, takeover, restart, and
-partial-success behavior as `workspace open`.
+partial-success behavior as `workspace open`. By default, a newly focused
+managed terminal selects its owning workspace and shell or Agent row once;
+manual navigation remains until another focus change.
 
 ## Configuration
 
 Boomux reads `$XDG_CONFIG_HOME/boomux/config.toml`, falling back to
 `~/.config/boomux/config.toml`. `BOOMUX_CONFIG` points to an additional
 field-level override loaded last. Configuration controls terminal selection,
-project discovery roots and depth, and desktop and sound notifications. Unknown
-fields are rejected. Project roots provide dashboard workspace-name suggestions
-only; they do not bind a workspace to a directory.
+project discovery roots and depth, dashboard focus following, and desktop and
+sound notifications. Unknown fields are rejected. Project roots provide
+dashboard workspace-name suggestions only; they do not bind a workspace to a
+directory. Set `[dashboard] follow_focused_terminal = false` to disable the
+default focus-following behavior.
 
 ## Manage Workspaces
 

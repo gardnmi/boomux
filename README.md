@@ -226,6 +226,9 @@ terminal = "Alacritty.desktop"
 roots = ["~/Projects", "~/Work"]
 max_depth = 3
 
+[dashboard]
+follow_focused_terminal = true
+
 [notifications]
 enabled = false
 blocked = true
@@ -239,6 +242,11 @@ completed = "complete"
 
 Project roots provide workspace-name suggestions in the dashboard. Selecting a
 suggestion does not bind the workspace to that path.
+
+The dashboard follows the most recently focused Boomux terminal by default,
+selecting its workspace and shell or Agent row. Manual dashboard navigation is
+preserved until another managed terminal gains focus. Set
+`dashboard.follow_focused_terminal` to `false` to disable this behavior.
 
 Desktop and sound notifications are independently disabled by default. Desktop
 delivery requires `notify-send` and a desktop notification service. Sound

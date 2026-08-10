@@ -349,6 +349,98 @@ fn replacement_bootstrap_receives_listener_and_lock_ownership() {
 }
 
 #[test]
+fn focused_attachment_is_exposed_in_daemon_snapshots() {
+    let mut daemon = TestDaemon::start();
+    let workspace = daemon
+        .client
+        .create_workspace(
+            "focused-terminal",
+            vec![ShellSpec::login("shell", std::env::temp_dir())],
+        )
+        .unwrap();
+    let shell_id = workspace.shells[0].id.clone();
+    let mut attachment = daemon.client.attach(&shell_id, false, profile()).unwrap();
+    assert_eq!(attachment.protocol_version, 18);
+
+    AttachFrame::FocusGained
+        .write_to(&mut attachment.stream)
+        .unwrap();
+    wait_until(
+        || {
+            daemon
+                .client
+                .snapshot()
+                .unwrap()
+                .focused_terminal
+                .is_some_and(|focused| {
+                    focused.revision == 1
+                        && focused.workspace_id == workspace.id
+                        && focused.shell_id == shell_id
+                })
+        },
+        "daemon did not expose the focused attachment",
+    );
+
+    AttachFrame::FocusGained
+        .write_to(&mut attachment.stream)
+        .unwrap();
+    wait_until(
+        || {
+            daemon
+                .client
+                .snapshot()
+                .unwrap()
+                .focused_terminal
+                .is_some_and(|focused| focused.revision == 2)
+        },
+        "repeated focus did not advance the revision",
+    );
+    let restart = daemon
+        .command()
+        .args(["daemon", "restart"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    acknowledge_reconnect(&mut attachment.stream);
+    let restart = restart.wait_with_output().unwrap();
+    assert!(
+        restart.status.success(),
+        "daemon restart failed: {}",
+        String::from_utf8_lossy(&restart.stderr)
+    );
+    wait_until(
+        || {
+            daemon
+                .client
+                .snapshot()
+                .unwrap()
+                .focused_terminal
+                .is_some_and(|focused| focused.revision == 2 && focused.shell_id == shell_id)
+        },
+        "graceful handoff did not retain focused terminal state",
+    );
+    let mut reattached = wait_for_attach_with_profile(&daemon.client, &shell_id, profile());
+    AttachFrame::FocusGained
+        .write_to(&mut reattached.stream)
+        .unwrap();
+    wait_until(
+        || {
+            daemon
+                .client
+                .snapshot()
+                .unwrap()
+                .focused_terminal
+                .is_some_and(|focused| focused.revision == 3)
+        },
+        "focus revision did not continue after graceful handoff",
+    );
+    drop(reattached);
+    drop(attachment);
+    daemon.stop_with_cli();
+}
+
+#[test]
 fn native_daemon_recovers_reproducible_metadata_after_restart() {
     let mut daemon = TestDaemon::start();
     let workspace = daemon
@@ -3121,7 +3213,7 @@ fn native_daemon_lifecycle() {
     let capabilities: serde_json::Value = serde_json::from_slice(&capabilities.stdout).unwrap();
     assert_eq!(capabilities["schema"], "boomux.cli/v1");
     assert_eq!(capabilities["command"], "capabilities");
-    assert_eq!(capabilities["data"]["daemon_protocol_version"], 17);
+    assert_eq!(capabilities["data"]["daemon_protocol_version"], 18);
     assert_eq!(
         capabilities["data"]["session_transcript_integrations"],
         serde_json::json!(["opencode", "pi"])
@@ -3168,6 +3260,8 @@ fn native_daemon_lifecycle() {
         "protocol_15",
         "protocol_16",
         "protocol_17",
+        "protocol_18",
+        "focused_terminal_following",
         "inactive_agent_state",
         "protocol_11",
         "restartable_exited_shells",
@@ -3188,7 +3282,7 @@ fn native_daemon_lifecycle() {
         .output()
         .unwrap();
     assert!(status.status.success());
-    assert!(String::from_utf8_lossy(&status.stdout).contains("running (protocol 17"));
+    assert!(String::from_utf8_lossy(&status.stdout).contains("running (protocol 18"));
     let status = daemon
         .command()
         .args(["daemon", "status", "--json"])
@@ -3908,6 +4002,7 @@ fn attach_with_environment(
             token,
             reconstruction,
             warning,
+            protocol_version: 16,
         },
         response => panic!("unexpected attach response: {response:?}"),
     }

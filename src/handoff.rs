@@ -10,7 +10,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::client;
 use crate::fd_transfer::receive_descriptor;
-use crate::protocol::{self, DaemonEvent, NotificationDeliveryConfig, TerminalProfile};
+use crate::protocol::{
+    self, DaemonEvent, FocusedTerminalSnapshot, NotificationDeliveryConfig, TerminalProfile,
+};
 use crate::state_store;
 
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
@@ -35,6 +37,8 @@ pub(crate) struct Manifest {
     pub(crate) event_stream: EventStreamManifest,
     #[serde(default)]
     pub(crate) notifications: Option<NotificationDeliveryConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) focused_terminal: Option<FocusedTerminalSnapshot>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -87,6 +91,7 @@ pub(crate) enum Bootstrap {
         exited: Vec<TransferredExited>,
         event_stream: EventStreamManifest,
         notifications: Option<NotificationDeliveryConfig>,
+        focused_terminal: Option<Box<FocusedTerminalSnapshot>>,
     },
 }
 
@@ -106,6 +111,7 @@ pub(crate) fn receive_bootstrap(channel: RawFd) -> io::Result<Bootstrap> {
     validate_manifest(&manifest)?;
     let event_stream = manifest.event_stream.clone();
     let notifications = manifest.notifications.clone();
+    let focused_terminal = manifest.focused_terminal.clone().map(Box::new);
     let listener = receive_descriptor(&channel, LISTENER_MARKER)?;
     let runtime_lock = receive_descriptor(&channel, RUNTIME_LOCK_MARKER)?;
     let state_lock = receive_descriptor(&channel, STATE_LOCK_MARKER)?;
@@ -174,6 +180,7 @@ pub(crate) fn receive_bootstrap(channel: RawFd) -> io::Result<Bootstrap> {
             exited,
             event_stream,
             notifications,
+            focused_terminal,
         }),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -385,4 +392,52 @@ fn validate_lock(descriptor: &OwnedFd, path: &Path) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn event_stream() -> EventStreamManifest {
+        EventStreamManifest {
+            stream_id: uuid::Uuid::new_v4().to_string(),
+            latest_id: 0,
+            events: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn old_manifest_defaults_focused_terminal() {
+        let manifest: Manifest = serde_json::from_value(serde_json::json!({
+            "runtimes": [],
+            "exited": [],
+            "event_stream": event_stream(),
+            "notifications": null
+        }))
+        .unwrap();
+
+        assert!(manifest.focused_terminal.is_none());
+    }
+
+    #[test]
+    fn manifest_round_trips_focused_terminal() {
+        let focused_terminal = FocusedTerminalSnapshot {
+            revision: 4,
+            workspace_id: "w1".into(),
+            shell_id: "s1".into(),
+            run_id: "r1".into(),
+        };
+        let manifest = Manifest {
+            runtimes: Vec::new(),
+            exited: Vec::new(),
+            event_stream: event_stream(),
+            notifications: None,
+            focused_terminal: Some(focused_terminal.clone()),
+        };
+
+        let decoded: Manifest =
+            serde_json::from_value(serde_json::to_value(manifest).unwrap()).unwrap();
+
+        assert_eq!(decoded.focused_terminal, Some(focused_terminal));
+    }
 }

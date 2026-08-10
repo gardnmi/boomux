@@ -15,6 +15,7 @@ struct RawConfig {
     terminal: Option<String>,
     projects: Option<RawProjectsConfig>,
     notifications: Option<RawNotificationsConfig>,
+    dashboard: Option<RawDashboardConfig>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -41,18 +42,30 @@ struct RawNotificationSoundConfig {
     completed: Option<String>,
 }
 
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RawDashboardConfig {
+    follow_focused_terminal: Option<bool>,
+}
+
 #[derive(Debug)]
 pub(crate) struct Config {
     pub(crate) terminal: Option<String>,
     pub(crate) projects: ProjectsConfig,
     pub(crate) path: Option<PathBuf>,
     pub(crate) notifications: boomux::daemon::NotificationDeliverySettings,
+    pub(crate) dashboard: DashboardConfig,
 }
 
 #[derive(Debug)]
 pub(crate) struct ProjectsConfig {
     pub(crate) roots: Vec<PathBuf>,
     pub(crate) max_depth: usize,
+}
+
+#[derive(Debug)]
+pub(crate) struct DashboardConfig {
+    pub(crate) follow_focused_terminal: bool,
 }
 
 #[derive(Debug)]
@@ -158,6 +171,12 @@ fn merge(base: &mut RawConfig, next: RawConfig) {
             }
         }
     }
+    if let Some(next_dashboard) = next.dashboard {
+        let dashboard = base.dashboard.get_or_insert_default();
+        if next_dashboard.follow_focused_terminal.is_some() {
+            dashboard.follow_focused_terminal = next_dashboard.follow_focused_terminal;
+        }
+    }
 }
 
 fn resolve(raw: RawConfig, path: Option<PathBuf>) -> Result<Config, Box<dyn Error>> {
@@ -189,6 +208,13 @@ fn resolve(raw: RawConfig, path: Option<PathBuf>) -> Result<Config, Box<dyn Erro
         projects: ProjectsConfig { roots, max_depth },
         path,
         notifications: resolve_notifications(raw.notifications),
+        dashboard: DashboardConfig {
+            follow_focused_terminal: raw
+                .dashboard
+                .unwrap_or_default()
+                .follow_focused_terminal
+                .unwrap_or(true),
+        },
     })
 }
 
@@ -266,6 +292,33 @@ mod tests {
         let config = resolve(raw, None).expect("resolved config");
 
         assert_eq!(config.terminal.as_deref(), Some("Alacritty.desktop"));
+    }
+
+    #[test]
+    fn dashboard_follows_focused_terminals_by_default_and_can_be_disabled() {
+        let default = resolve(RawConfig::default(), None).expect("resolved default config");
+        assert!(default.dashboard.follow_focused_terminal);
+
+        let raw: RawConfig =
+            toml::from_str("[dashboard]\nfollow_focused_terminal = false").expect("valid config");
+        let config = resolve(raw, None).expect("resolved config");
+        assert!(!config.dashboard.follow_focused_terminal);
+    }
+
+    #[test]
+    fn dashboard_setting_merges_independently() {
+        let mut base: RawConfig = toml::from_str(
+            "[dashboard]\nfollow_focused_terminal = false\n[projects]\nmax_depth = 2",
+        )
+        .expect("valid base");
+        let next: RawConfig =
+            toml::from_str("[dashboard]\nfollow_focused_terminal = true").expect("valid override");
+
+        merge(&mut base, next);
+        let config = resolve(base, None).expect("resolved config");
+        assert!(config.dashboard.follow_focused_terminal);
+        assert_eq!(config.projects.max_depth, 2);
+        assert!(toml::from_str::<RawConfig>("[dashboard]\nunknown = true").is_err());
     }
 
     #[test]

@@ -1303,6 +1303,7 @@ mod tests {
         };
         let snapshot = Snapshot {
             workspaces: vec![workspace.clone()],
+            focused_terminal: None,
         };
         assert_eq!(
             inspect_runtime(IntegrationId::Opencode.spec(), Some(&snapshot)).state,
@@ -1332,6 +1333,7 @@ mod tests {
         });
         let snapshot = Snapshot {
             workspaces: vec![workspace.clone()],
+            focused_terminal: None,
         };
         assert_eq!(
             verification_targets(&snapshot, IntegrationId::Opencode, None),
@@ -1359,6 +1361,7 @@ mod tests {
         workspace.agents[0].observation.authority = AgentAuthority::ProcessAdapter;
         let snapshot = Snapshot {
             workspaces: vec![workspace],
+            focused_terminal: None,
         };
         assert_eq!(
             inspect_runtime(IntegrationId::Opencode.spec(), Some(&snapshot)).state,
