@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.0](https://github.com/gardnmi/boomux/compare/v0.6.0...v0.7.0) (2026-08-10)
+
+
+### Features
+
+* **tui:** pin dashboard selection ([#86](https://github.com/gardnmi/boomux/issues/86)) ([390fb78](https://github.com/gardnmi/boomux/commit/390fb78d4c311c296d5bdae0bf3316d19891ed4a))
+
 ## [0.6.0](https://github.com/gardnmi/boomux/compare/v0.5.1...v0.6.0) (2026-08-10)
 
 
