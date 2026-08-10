@@ -1213,15 +1213,16 @@ fn dashboard_views_from_sessions(
             let attention =
                 agent_attention_projection::project_attention(std::slice::from_ref(workspace))
                     .into_iter()
-                    .next()
                     .map(|item| tui::WorkspaceAttentionView {
+                        shell_id: item.agent.shell_id,
                         agent_name: item.agent.name,
                         reason: agent_attention_projection::attention_reason(item.attention.reason)
                             .into(),
                         evidence: item.attention.observation.evidence,
                         observed_at_ms: item.attention.observation.observed_at_ms,
                         observation_is_current: item.observation_is_current,
-                    });
+                    })
+                    .collect();
             let shells = workspace.shells.iter().map(|shell| {
                 let git = git_cache.inspect(&shell.cwd);
                 let shell_view = tui::TerminalView {
@@ -4940,7 +4941,7 @@ mod tests {
             items: Vec::new(),
             agent_state_counts: agent_attention_projection::AgentStateCounts::default(),
             attention_count: 0,
-            attention: None,
+            attention: Vec::new(),
             sessions: vec![tui::AgentSessionView {
                 id: "session".into(),
                 label: "opencode".into(),

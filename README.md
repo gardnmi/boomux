@@ -174,6 +174,8 @@ override, then Boomux configuration, then Omarchy's default.
 | Key | Action |
 | --- | --- |
 | `Tab`, `Shift-Tab`, `1`-`5` | Change view. |
+| `/` or `:` | Search actions grouped by action and item kind. Type `blocked` or `attention` to filter urgent work. |
+| `?` | Explain available keys plus the selected kind and state. |
 | `h`, `l`, left, right | Move between workspace and item tables. |
 | `j`, `k`, up, down | Navigate rows. |
 | `Enter` | Restore a workspace, open a shell, or invoke a launcher. |
@@ -189,6 +191,10 @@ to 16 retained terminal rows; commands show exact arguments and run metadata;
 launchers explain that output is not retained; and integrated agents show their
 current evidence and matching canonical session. Closing the dashboard or a
 terminal attachment does not stop managed shells. Closing a workspace does.
+
+Palette actions use durable workspace and item identities. Open, rename, and
+close results therefore reuse the same typed action and confirmation paths as
+the dashboard, even if the daemon refreshes while the palette is open.
 
 ## CLI Reference
 

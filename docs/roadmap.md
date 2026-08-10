@@ -46,13 +46,14 @@ commitments.
   `$XDG_STATE_HOME`; restore shells as pending after daemon restart.
 - [x] Preserve running shells and reconnect active terminal clients across a
   transactional graceful daemon restart.
+- [x] Search workspaces, items, blocked agents, attention, and typed actions from
+  a dashboard command palette with contextual kind, state, and keybinding help.
 
 ## Workspace Control
 
 See [`native-terminal-follow-up.md`](native-terminal-follow-up.md) for the
 terminal handshake, VT reconstruction, and restart-persistence plan.
 
-- Search workspaces and actions from a command palette.
 - Launch workspace templates such as editor, agent, tests, and LazyGit.
 - Duplicate a workspace structure for another branch or worktree.
 - Archive inactive workspaces without terminating their shells.
@@ -166,7 +167,6 @@ eternal process.
 
 ## Distribution And Polish
 
-- Add a LazyGit-style interactive keybinding panel.
 - Support configuration for refresh rate.
 - Package Boomux and its daemon lifecycle for Arch and Omarchy users.
 - Validate compatible `xdg-terminal-exec` versions in `boomux doctor`.
