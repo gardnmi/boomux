@@ -1284,7 +1284,6 @@ fn dashboard_views_from_sessions(
                     (Some(agent), _) => tui::WorkspaceItemView::AgentShell(tui::AgentShellView {
                         shell: shell_view,
                         agent: Some(tui::AgentView {
-                            id: agent.id.clone(),
                             state: cli_output::agent_state(agent.observation.state).into(),
                             integration: agent.integration.clone(),
                             external_session_id: agent.external_session_id.clone(),
@@ -5250,7 +5249,6 @@ mod tests {
         };
         assert_eq!(item.shell.name, "terminal");
         let agent = item.agent.as_ref().expect("durable agent");
-        assert_eq!(agent.id, "a1");
         assert_eq!(agent.state, "blocked");
         assert_eq!(agent.evidence, "needs approval");
     }
@@ -5303,6 +5301,7 @@ mod tests {
         tied_first.integration = "other".into();
         let mut tied_last = agent("agent-z", "w1", "s1");
         tied_last.observation.observed_at_ms = 30;
+        tied_last.observation.evidence = "latest evidence".into();
         tied_last.name = "latest".into();
         tied_last.integration = "other".into();
         workspace.agents = vec![tied_last, older, tied_first];
@@ -5312,7 +5311,7 @@ mod tests {
         let tui::WorkspaceItemView::AgentShell(item) = &views[0].items[0] else {
             panic!("expected agent-shell item");
         };
-        assert_eq!(item.agent.as_ref().unwrap().id, "agent-z");
+        assert_eq!(item.agent.as_ref().unwrap().evidence, "latest evidence");
     }
 
     #[test]
