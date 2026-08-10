@@ -250,7 +250,9 @@ dashboard was opened. An explicit shell cwd always takes precedence.
 
 The dashboard follows the most recently focused Boomux terminal by default,
 selecting its workspace and shell or Agent row. Manual dashboard navigation is
-preserved until another managed terminal gains focus. Set
+preserved until another managed terminal gains focus. Press `Space` to pin the
+current selection and pause following; press it again to unpin and catch up to
+the currently focused terminal. Set
 `dashboard.follow_focused_terminal` to `false` to disable this behavior.
 
 Desktop and sound notifications are independently disabled by default. Desktop

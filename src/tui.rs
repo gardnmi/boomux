@@ -282,6 +282,7 @@ struct App {
     project_context: ProjectContext,
     terminal_preview: Option<TerminalPreviewState>,
     follow_focused_terminal: bool,
+    selection_pinned: bool,
     observed_focus_revision: Option<u64>,
 }
 
@@ -880,6 +881,7 @@ impl App {
             project_context,
             terminal_preview: None,
             follow_focused_terminal: false,
+            selection_pinned: false,
             observed_focus_revision: None,
         }
     }
@@ -890,7 +892,7 @@ impl App {
     }
 
     fn apply_focused_terminal(&mut self, focused_terminal: Option<&FocusedTerminalView>) {
-        if !self.follow_focused_terminal {
+        if !self.follow_focused_terminal || self.selection_pinned {
             return;
         }
         let Some(focused) = focused_terminal else {
@@ -927,6 +929,16 @@ impl App {
         self.workspace_state.select(Some(workspace_index));
         self.item_state.select(Some(item_index));
         self.set_focus(Focus::Items);
+    }
+
+    fn toggle_selection_pin(&mut self) {
+        if !self.follow_focused_terminal {
+            return;
+        }
+        self.selection_pinned = !self.selection_pinned;
+        if !self.selection_pinned {
+            self.observed_focus_revision = None;
+        }
     }
 
     fn selected_index(&self) -> Option<usize> {
@@ -1702,6 +1714,7 @@ where
                 }
             }
             KeyCode::Char('e') => app.request_rename(),
+            KeyCode::Char(' ') => app.toggle_selection_pin(),
             KeyCode::Char('/' | ':') => app.open_palette(),
             KeyCode::Char('?') => app.mode = Mode::Help,
             KeyCode::Tab => app.cycle_tab(false),
@@ -2233,6 +2246,16 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
             Style::new().fg(BLUE).add_modifier(Modifier::BOLD),
         )),
     ];
+    if app.follow_focused_terminal {
+        lines.insert(
+            7,
+            Line::from(if app.selection_pinned {
+                "  Space    unpin selection and resume focused-terminal following"
+            } else {
+                "  Space    pin selection and pause focused-terminal following"
+            }),
+        );
+    }
     if app.primary_tab == PrimaryTab::Workspaces && app.focus == Focus::Workspaces {
         if let Some(workspace) = app.selected() {
             lines.extend([
@@ -3206,6 +3229,32 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
             Span::styled("?", Style::new().fg(BLUE)),
             Span::styled(" help  ", Style::new().fg(SUBTEXT)),
         ];
+        if app.follow_focused_terminal {
+            spans.extend([
+                Span::styled(
+                    if app.selection_pinned {
+                        "PINNED"
+                    } else {
+                        "space"
+                    },
+                    Style::new()
+                        .fg(if app.selection_pinned { YELLOW } else { BLUE })
+                        .add_modifier(if app.selection_pinned {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
+                ),
+                Span::styled(
+                    if app.selection_pinned {
+                        " unpin  "
+                    } else {
+                        " pin selection  "
+                    },
+                    Style::new().fg(SUBTEXT),
+                ),
+            ]);
+        }
         if app.primary_tab == PrimaryTab::Workspaces {
             spans.extend([
                 Span::styled("a", Style::new().fg(GREEN)),
@@ -3533,6 +3582,53 @@ mod tests {
             disabled.selected().map(|workspace| workspace.id.as_str()),
             Some("w2")
         );
+    }
+
+    #[test]
+    fn pinned_selection_ignores_focus_revisions_until_unpinned() {
+        let mut one = workspace("w1", "one");
+        set_shell_id(&mut one, "s1");
+        let mut two = workspace("w2", "two");
+        set_shell_id(&mut two, "s2");
+        let mut app = App::new(vec![one, two], project_context());
+        app.enable_focus_following(Some(&FocusedTerminalView {
+            revision: 1,
+            workspace_id: "w1".into(),
+            shell_id: "s1".into(),
+        }));
+
+        app.toggle_selection_pin();
+        app.apply_focused_terminal(Some(&FocusedTerminalView {
+            revision: 2,
+            workspace_id: "w2".into(),
+            shell_id: "s2".into(),
+        }));
+        app.apply_focused_terminal(None);
+
+        assert!(app.selection_pinned);
+        assert_eq!(app.observed_focus_revision, Some(1));
+        assert_eq!(app.selected_item().map(WorkspaceItemView::id), Some("s1"));
+
+        app.toggle_selection_pin();
+        assert_eq!(app.observed_focus_revision, None);
+        app.apply_focused_terminal(Some(&FocusedTerminalView {
+            revision: 2,
+            workspace_id: "w2".into(),
+            shell_id: "s2".into(),
+        }));
+
+        assert!(!app.selection_pinned);
+        assert_eq!(app.observed_focus_revision, Some(2));
+        assert_eq!(app.selected_item().map(WorkspaceItemView::id), Some("s2"));
+    }
+
+    #[test]
+    fn selection_pin_is_inert_when_focus_following_is_disabled() {
+        let mut app = app();
+
+        app.toggle_selection_pin();
+
+        assert!(!app.selection_pinned);
     }
 
     #[test]
@@ -4358,6 +4454,35 @@ mod tests {
         assert!(text.contains("STATE QUICK REFERENCE"));
         assert!(text.contains("Attention is durable"));
         assert!(text.contains("command palette"));
+    }
+
+    #[test]
+    fn footer_and_help_show_selection_pin_state() {
+        let mut app = app();
+        app.enable_focus_following(None);
+        let mut terminal = Terminal::new(TestBackend::new(180, 34)).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let footer_text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(footer_text.contains("space pin selection"));
+
+        app.toggle_selection_pin();
+        app.mode = Mode::Help;
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let pinned_text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(pinned_text.contains("unpin selection and resume focused-terminal following"));
     }
 
     #[test]
