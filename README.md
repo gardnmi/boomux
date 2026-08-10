@@ -10,6 +10,8 @@ native windows.
 Optional integrations show whether supported coding agents are working, blocked,
 idle, or untracked without trying to infer state from quiet terminal output.
 
+![Boomux workspace dashboard showing shells, commands, agents, and launchers](assets/dashboard-workspaces.png)
+
 > [!WARNING]
 > Boomux is an early proof of concept. Commands, storage, and session behavior
 > may change without migration support.
@@ -185,6 +187,8 @@ boomux integration verify opencode --wait-ms 30000
 Integrated agents can report `working`, `blocked`, `idle`, `inactive`, and
 `done`. An `untracked` row means a supported coding agent is visible but its
 integration is not currently reporting lifecycle state.
+
+![Boomux agents view showing tracked and untracked coding-agent shells](assets/dashboard-agents.png)
 
 Inspect installation and runtime status with:
 
