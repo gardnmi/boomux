@@ -7,6 +7,11 @@
 
 * **notifications:** deliver agent completion alerts ([#75](https://github.com/gardnmi/boomux/issues/75)) ([bfa6ee3](https://github.com/gardnmi/boomux/commit/bfa6ee34dbe969be3e6e74cb96dea9792209b73d))
 
+
+### Performance Improvements
+
+* **opencode:** coalesce working activity reports ([#77](https://github.com/gardnmi/boomux/issues/77)) ([e6aa0fa](https://github.com/gardnmi/boomux/commit/e6aa0fa953c38ef997e7faf18880869ccb2c5d03))
+
 ## [0.4.1](https://github.com/gardnmi/boomux/compare/v0.4.0...v0.4.1) (2026-08-10)
 
 
