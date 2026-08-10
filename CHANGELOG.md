@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.1](https://github.com/gardnmi/boomux/compare/v0.5.0...v0.5.1) (2026-08-10)
+
+
+### Bug Fixes
+
+* **workspace:** preserve project cwd for new shells ([#81](https://github.com/gardnmi/boomux/issues/81)) ([cdcfaa4](https://github.com/gardnmi/boomux/commit/cdcfaa44fffc09b2ae167c94f7b79ae78af26169))
+
 ## [0.5.0](https://github.com/gardnmi/boomux/compare/v0.4.2...v0.5.0) (2026-08-10)
 
 
