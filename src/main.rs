@@ -94,6 +94,7 @@ const INTEGRATION_FEATURES: &[&str] = &[
     "protocol_14",
     "protocol_15",
     "protocol_16",
+    "protocol_17",
     "restartable_exited_shells",
     "inactive_agent_state",
     "idempotent_agent_ensure",
@@ -1016,7 +1017,8 @@ fn daemon_control(command: DaemonCommands, json: bool) -> Result<(), Box<dyn Err
             client.socket_path().display()
         ),
         DaemonCommands::Restart => {
-            client.restart()?;
+            client
+                .restart_with_notification_config(config::load_notification_settings()?.into())?;
             println!("Restarted Boomux daemon");
         }
         DaemonCommands::Stop => {
@@ -5975,7 +5977,7 @@ mod tests {
             session_transcript::supported_integrations(),
             ["opencode", "pi"]
         );
-        assert_eq!(protocol::PROTOCOL_VERSION, 16);
+        assert_eq!(protocol::PROTOCOL_VERSION, 17);
     }
 
     #[test]

@@ -470,22 +470,30 @@ reports fixed lifecycle-state and attention counts per workspace.
 
 Opt-in desktop and sound notifications are a daemon-owned projection of committed
 Agent state transitions, not durable queue state. A transition from any other
-state into `blocked` or `done` schedules one asynchronous delivery request after
-persistence and event publication locks are released. Enabled desktop delivery
-invokes `notify-send`; enabled sound delivery invokes `canberra-gtk-play` with a
-configured freedesktop event ID. Same-state evidence or confidence revisions do
-not notify, and restored state is not replayed. A daemon handoff reloads
-configuration for the replacement, just like a cold daemon start. Both channels
-share one worker and a bounded, non-blocking queue. Delivery is at-most-once and
-fail-open: queue saturation, a missing command, desktop-bus or audio failure,
-timeout, or non-zero exit neither retries nor changes the successful Agent
-mutation.
+state into `blocked` or `done`, or from `working` into `idle`, schedules one
+asynchronous delivery request after persistence and event publication locks are
+released. The `working` to `idle` signal represents a completed unit of work but
+does not create durable completed attention or make the Agent terminal. Enabled
+desktop delivery invokes `notify-send`; enabled sound delivery invokes
+`canberra-gtk-play` with a configured freedesktop event ID. Same-state evidence
+or confidence revisions do not notify, and restored state is not replayed. Both
+channels share one worker and a bounded, non-blocking queue. Delivery is
+at-most-once and fail-open: queue saturation, a missing command, desktop-bus or
+audio failure, timeout, or non-zero exit neither retries nor changes the
+successful Agent mutation.
 Notification payloads include only sanitized Agent, workspace, and shell names;
 if retained Agent context outlives a removed shell, the shell is identified as
 removed rather than suppressing the transition. Notifications never acknowledge
 attention, advance an observation revision, or publish lifecycle events.
 `notification test` exercises the same configured delivery commands directly
 without fabricating or persisting an Agent transition.
+
+Protocol 17 lets a restart request carry the invoking client's resolved
+notification settings through the handoff manifest. This prevents a long-lived
+daemon's inherited `XDG_CONFIG_HOME` or `BOOMUX_CONFIG` from overriding the
+configuration intentionally selected by the restart caller. A protocol-16
+daemon is first upgraded with a compatibility handoff, followed by a protocol-17
+handoff that applies the settings.
 
 ### Transition Coordinator
 

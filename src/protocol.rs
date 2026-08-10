@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 16;
+pub const PROTOCOL_VERSION: u32 = 17;
 pub const MIN_PROTOCOL_VERSION: u32 = 6;
 pub const MAX_CONTROL_FRAME: usize = 8 * 1024 * 1024;
 pub const MAX_ATTACH_FRAME: usize = 1024 * 1024;
@@ -329,6 +329,16 @@ pub struct UnixEnvironmentVariable {
     pub value: Vec<u8>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotificationDeliveryConfig {
+    pub desktop_enabled: bool,
+    pub sound_enabled: bool,
+    pub blocked: bool,
+    pub completed: bool,
+    pub blocked_sound: String,
+    pub completed_sound: String,
+}
+
 impl std::fmt::Debug for UnixEnvironmentVariable {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("UnixEnvironmentVariable(<redacted>)")
@@ -358,6 +368,9 @@ impl ShellSpec {
 pub enum Request {
     Ping,
     Restart,
+    RestartWithNotificationConfig {
+        notifications: NotificationDeliveryConfig,
+    },
     Shutdown,
     Snapshot,
     GetWorkspace {
@@ -470,6 +483,7 @@ pub enum Request {
 impl Request {
     pub fn minimum_protocol_version(&self) -> u32 {
         match self {
+            Self::RestartWithNotificationConfig { .. } => 17,
             Self::Attach {
                 environment: Some(_),
                 ..
@@ -897,14 +911,27 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_sixteen_with_minimum_six() {
-        assert_eq!(PROTOCOL_VERSION, 16);
+    fn protocol_version_is_seventeen_with_minimum_six() {
+        assert_eq!(PROTOCOL_VERSION, 17);
         assert_eq!(MIN_PROTOCOL_VERSION, 6);
     }
 
     #[test]
     fn request_minimum_protocol_versions_cover_all_groups() {
         let groups = vec![
+            (
+                17,
+                vec![Request::RestartWithNotificationConfig {
+                    notifications: NotificationDeliveryConfig {
+                        desktop_enabled: true,
+                        sound_enabled: true,
+                        blocked: true,
+                        completed: true,
+                        blocked_sound: "dialog-warning".into(),
+                        completed_sound: "complete".into(),
+                    },
+                }],
+            ),
             (
                 6,
                 vec![
