@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.6.0](https://github.com/gardnmi/boomux/compare/v0.5.1...v0.6.0) (2026-08-10)
+
+
+### Features
+
+* **tui:** render colored shell previews ([#85](https://github.com/gardnmi/boomux/issues/85)) ([61d7dc2](https://github.com/gardnmi/boomux/commit/61d7dc21b4732386b33164e741c864d4ee1c777b))
+
+
+### Bug Fixes
+
+* **terminal:** preserve reattached output rendering ([#83](https://github.com/gardnmi/boomux/issues/83)) ([e27d535](https://github.com/gardnmi/boomux/commit/e27d535295dbd8c4f9562eda70fc2ffa69c928e5))
+
 ## [0.5.1](https://github.com/gardnmi/boomux/compare/v0.5.0...v0.5.1) (2026-08-10)
 
 
