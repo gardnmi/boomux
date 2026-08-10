@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.2](https://github.com/gardnmi/boomux/compare/v0.4.1...v0.4.2) (2026-08-10)
+
+
+### Bug Fixes
+
+* **notifications:** deliver agent completion alerts ([#75](https://github.com/gardnmi/boomux/issues/75)) ([bfa6ee3](https://github.com/gardnmi/boomux/commit/bfa6ee34dbe969be3e6e74cb96dea9792209b73d))
+
 ## [0.4.1](https://github.com/gardnmi/boomux/compare/v0.4.0...v0.4.1) (2026-08-10)
 
 
