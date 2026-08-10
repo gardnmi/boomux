@@ -84,7 +84,6 @@ impl AgentShellView {
 }
 
 pub(crate) struct AgentView {
-    pub(crate) id: String,
     pub(crate) state: String,
     pub(crate) integration: String,
     pub(crate) external_session_id: Option<String>,
@@ -1913,7 +1912,7 @@ fn render(frame: &mut Frame, app: &mut App) {
         render_global_items(frame, dashboard_area, app);
     } else if dashboard_area.width >= 114 {
         let [workspace_area, terminal_area] =
-            Layout::horizontal([Constraint::Length(42), Constraint::Fill(1)]).areas(dashboard_area);
+            Layout::horizontal([Constraint::Length(30), Constraint::Fill(1)]).areas(dashboard_area);
         render_workspaces(frame, workspace_area, app);
         render_items(frame, terminal_area, app);
     } else {
@@ -2308,51 +2307,27 @@ fn render_workspaces(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut A
             Layout::vertical([Constraint::Fill(1), Constraint::Length(preview_height)]).areas(area);
         (table_area, Some(preview_area))
     });
-    let rows = app.workspaces.iter().map(|workspace| {
-        Row::new([
-            Cell::from(workspace.name.as_str()),
-            Cell::from(workspace.shell_count().to_string()),
-            Cell::from(workspace.command_count().to_string()),
-            Cell::from(workspace.launcher_count().to_string()),
-            Cell::from(workspace.agent_count().to_string()),
-            Cell::from(workspace.agent_state_counts.blocked.to_string()),
-            Cell::from(workspace.agent_state_counts.done.to_string()),
-            Cell::from(workspace.attention_count.to_string()),
-        ])
-    });
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Min(8),
-            Constraint::Length(2),
-            Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Length(2),
-            Constraint::Length(3),
-            Constraint::Length(2),
-            Constraint::Length(1),
-        ],
-    )
-    .header(
-        Row::new(["NAME", "SH", "CMD", "LCH", "AG", "BLK", "DN", "!"])
-            .style(Style::new().fg(BLUE).add_modifier(Modifier::BOLD)),
-    )
-    .column_spacing(1)
-    .block(
-        Block::bordered()
-            .title(format!(" Workspaces ({}) ", app.workspaces.len()))
-            .border_style(Style::new().fg(if app.focus == Focus::Workspaces {
-                TEAL
-            } else {
-                OVERLAY
-            })),
-    )
-    .row_highlight_style(
-        Style::new()
-            .fg(TEXT)
-            .add_modifier(Modifier::BOLD | Modifier::REVERSED),
-    )
-    .highlight_symbol("> ");
+    let rows = app
+        .workspaces
+        .iter()
+        .map(|workspace| Row::new([Cell::from(workspace.name.as_str())]));
+    let table = Table::new(rows, [Constraint::Min(8)])
+        .header(Row::new(["NAME"]).style(Style::new().fg(BLUE).add_modifier(Modifier::BOLD)))
+        .block(
+            Block::bordered()
+                .title(format!(" Workspaces ({}) ", app.workspaces.len()))
+                .border_style(Style::new().fg(if app.focus == Focus::Workspaces {
+                    TEAL
+                } else {
+                    OVERLAY
+                })),
+        )
+        .row_highlight_style(
+            Style::new()
+                .fg(TEXT)
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED),
+        )
+        .highlight_symbol("> ");
 
     frame.render_stateful_widget(table, table_area, &mut app.workspace_state);
     if let (Some(preview), Some(preview_area)) = (preview, preview_area) {
@@ -2383,7 +2358,6 @@ fn render_global_items(frame: &mut Frame, area: Rect, app: &mut App) {
             Layout::vertical([Constraint::Fill(1), Constraint::Length(panel_height)]).areas(inner);
         (items_area, Some(preview_area))
     });
-    let show_full_ids = items_inner.width >= 150;
     let kind = app.primary_tab.kind().expect("global tab kind");
     let rows: Vec<_> = app
         .workspaces
@@ -2404,11 +2378,6 @@ fn render_global_items(frame: &mut Frame, area: Rect, app: &mut App) {
                             )),
                             Cell::from(shell.directory.clone()),
                             Cell::from(shell.detail().to_owned()),
-                            Cell::from(if show_full_ids {
-                                shell.id.clone()
-                            } else {
-                                short_id(&shell.id)
-                            }),
                         ]),
                         WorkspaceItemView::AgentShell(agent) => cells.extend([
                             Cell::from(agent.shell.name.clone()),
@@ -2430,49 +2399,22 @@ fn render_global_items(frame: &mut Frame, area: Rect, app: &mut App) {
                                     )
                                 },
                             )),
-                            Cell::from(if show_full_ids {
-                                agent.shell.id.clone()
-                            } else {
-                                short_id(&agent.shell.id)
-                            }),
                         ]),
                         WorkspaceItemView::Launcher(launcher) => cells.extend([
                             Cell::from(launcher.name.clone()),
                             Cell::from("-"),
                             Cell::from(launcher.directory.clone()),
                             Cell::from(launcher.command.clone()),
-                            Cell::from(if show_full_ids {
-                                launcher.id.clone()
-                            } else {
-                                short_id(&launcher.id)
-                            }),
                         ]),
                     }
                     Row::new(cells)
                 })
         })
         .collect();
-    let table_area = if show_full_ids {
-        items_inner
-    } else {
-        let [detail_area, table_area] =
-            Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(items_inner);
-        let detail = app.selected_item().map_or_else(
-            || {
-                vec![Line::from(Span::styled(
-                    " No item selected",
-                    Style::new().fg(SUBTEXT),
-                ))]
-            },
-            item_detail_lines,
-        );
-        frame.render_widget(Paragraph::new(detail), detail_area);
-        table_area
-    };
-    let widths = global_column_widths(items_inner.width, show_full_ids);
+    let widths = global_column_widths(items_inner.width);
     let table = Table::new(rows, widths)
         .header(
-            Row::new(["WORKSPACE", "NAME", "STATUS", "DIRECTORY", "DETAIL", "ID"])
+            Row::new(["WORKSPACE", "NAME", "STATUS", "DIRECTORY", "DETAIL"])
                 .style(Style::new().fg(BLUE).add_modifier(Modifier::BOLD)),
         )
         .column_spacing(1)
@@ -2483,14 +2425,14 @@ fn render_global_items(frame: &mut Frame, area: Rect, app: &mut App) {
         )
         .highlight_symbol("> ");
     frame.render_widget(block, area);
-    frame.render_stateful_widget(table, table_area, &mut app.global_state);
+    frame.render_stateful_widget(table, items_inner, &mut app.global_state);
     if let (Some(panel), Some(panel_area)) = (contextual_panel, preview_area) {
         render_contextual_preview(frame, panel_area, panel);
     }
 }
 
 fn render_items(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
-    let header = Row::new(["KIND", "NAME", "STATUS", "DIRECTORY", "DETAIL", "ID"])
+    let header = Row::new(["KIND", "NAME", "STATUS", "DIRECTORY", "DETAIL"])
         .style(Style::new().fg(BLUE).add_modifier(Modifier::BOLD));
     let selected = app
         .workspace_state
@@ -2524,7 +2466,6 @@ fn render_items(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
             Layout::vertical([Constraint::Fill(1), Constraint::Length(panel_height)]).areas(inner);
         (items_area, Some(preview_area))
     });
-    let show_full_ids = items_inner.width >= 150;
     let rows: Vec<_> = selected
         .into_iter()
         .flat_map(|workspace| {
@@ -2545,11 +2486,6 @@ fn render_items(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
                     )),
                     Cell::from(terminal.directory.as_str()),
                     Cell::from(terminal.detail()),
-                    Cell::from(if show_full_ids {
-                        terminal.id.clone()
-                    } else {
-                        short_id(&terminal.id)
-                    }),
                 ]),
                 WorkspaceItemView::AgentShell(agent_shell) => Row::new(vec![
                     Cell::from(Span::styled("agent", Style::new().fg(TEAL))),
@@ -2572,11 +2508,6 @@ fn render_items(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
                             )
                         },
                     )),
-                    Cell::from(if show_full_ids {
-                        agent_shell.shell.id.clone()
-                    } else {
-                        short_id(&agent_shell.shell.id)
-                    }),
                 ]),
                 WorkspaceItemView::Launcher(launcher) => Row::new(vec![
                     Cell::from(Span::styled("launcher", Style::new().fg(YELLOW))),
@@ -2584,34 +2515,12 @@ fn render_items(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
                     Cell::from("-"),
                     Cell::from(launcher.directory.as_str()),
                     Cell::from(launcher.command.as_str()),
-                    Cell::from(if show_full_ids {
-                        launcher.id.clone()
-                    } else {
-                        short_id(&launcher.id)
-                    }),
                 ]),
             })
         })
         .collect();
-    let widths = shell_column_widths(items_inner.width, show_full_ids);
+    let widths = shell_column_widths(items_inner.width);
     frame.render_widget(block, area);
-    let table_area = if show_full_ids {
-        items_inner
-    } else {
-        let [detail_area, table_area] =
-            Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(items_inner);
-        let detail = app.selected_item().map_or_else(
-            || {
-                vec![Line::from(Span::styled(
-                    " No item selected",
-                    Style::new().fg(SUBTEXT),
-                ))]
-            },
-            item_detail_lines,
-        );
-        frame.render_widget(Paragraph::new(detail), detail_area);
-        table_area
-    };
     let table = Table::new(rows, widths)
         .header(header)
         .column_spacing(1)
@@ -2621,7 +2530,7 @@ fn render_items(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
                 .add_modifier(Modifier::BOLD | Modifier::REVERSED),
         )
         .highlight_symbol("> ");
-    frame.render_stateful_widget(table, table_area, &mut app.item_state);
+    frame.render_stateful_widget(table, items_inner, &mut app.item_state);
     if let (Some(panel), Some(panel_area)) = (contextual_panel, preview_area) {
         render_contextual_preview(frame, panel_area, panel);
     }
@@ -2650,16 +2559,30 @@ fn workspace_preview(workspace: &WorkspaceView) -> ContextualPreview {
     let counts = workspace.agent_state_counts;
     let mut lines = vec![
         Line::from(format!(
-            "{} shell  {} command  {} launcher  {} agent",
+            "{:<9}{:<3}{:<9}{}",
+            "shell",
             workspace.shell_count(),
-            workspace.command_count(),
+            "command",
+            workspace.command_count()
+        )),
+        Line::from(format!(
+            "{:<9}{:<3}{:<9}{}",
+            "launcher",
             workspace.launcher_count(),
+            "agent",
             workspace.agent_count()
         )),
         Line::from(Span::styled(
             format!(
-                "working {}  blocked {}  idle {}  done {}",
-                counts.working, counts.blocked, counts.idle, counts.done
+                "{:<9}{:<3}{:<9}{}",
+                "working", counts.working, "blocked", counts.blocked
+            ),
+            Style::new().fg(SUBTEXT),
+        )),
+        Line::from(Span::styled(
+            format!(
+                "{:<9}{:<3}{:<9}{}",
+                "idle", counts.idle, "done", counts.done
             ),
             Style::new().fg(SUBTEXT),
         )),
@@ -2670,24 +2593,24 @@ fn workspace_preview(workspace: &WorkspaceView) -> ContextualPreview {
         } else {
             "stale"
         };
-        lines.push(Line::from(vec![
-            Span::styled(
+        lines.extend([
+            Line::from(Span::styled(
                 format!("{}: {}", attention.reason, attention.agent_name),
                 Style::new().fg(if attention.reason == "blocked" {
                     RED
                 } else {
                     BLUE
                 }),
-            ),
-            Span::styled(
-                format!(
-                    "  {}  {}  {currency}",
-                    attention.evidence,
-                    compact_recency(attention.observed_at_ms)
-                ),
+            )),
+            Line::from(Span::styled(
+                attention.evidence.clone(),
                 Style::new().fg(SUBTEXT),
-            ),
-        ]));
+            )),
+            Line::from(Span::styled(
+                format!("{}  {currency}", compact_recency(attention.observed_at_ms)),
+                Style::new().fg(SUBTEXT),
+            )),
+        ]);
     } else {
         lines.push(Line::from(Span::styled(
             "No outstanding attention",
@@ -3006,47 +2929,15 @@ fn integration_display_name(integration: &str) -> &str {
     }
 }
 
-fn item_detail_lines(item: &WorkspaceItemView) -> Vec<Line<'_>> {
-    match item {
-        WorkspaceItemView::Shell(shell) => {
-            let mut spans = vec![
-                Span::styled(" ID ", Style::new().fg(SUBTEXT)),
-                Span::styled(shell.id.as_str(), Style::new().fg(TEXT)),
-            ];
-            if !shell.command.is_empty() {
-                spans.extend([
-                    Span::styled("  Command ", Style::new().fg(SUBTEXT)),
-                    Span::styled(shell.command.as_str(), Style::new().fg(TEXT)),
-                ]);
-            }
-            vec![Line::from(spans)]
-        }
-        WorkspaceItemView::Launcher(launcher) => vec![Line::from(vec![
-            Span::styled(" ID ", Style::new().fg(SUBTEXT)),
-            Span::styled(launcher.id.as_str(), Style::new().fg(TEXT)),
-        ])],
-        WorkspaceItemView::AgentShell(agent_shell) => vec![Line::from(match &agent_shell.agent {
-            Some(agent) => format!(
-                " Shell {}  Agent {}  Branch {}",
-                agent_shell.shell.id, agent.id, agent_shell.shell.branch
-            ),
-            None => format!(
-                " Shell {}  Branch {}",
-                agent_shell.shell.id, agent_shell.shell.branch
-            ),
-        })],
-    }
-}
-
-fn shell_column_widths(width: u16, show_full_ids: bool) -> Vec<Constraint> {
-    let (name, status, detail, id, directory_min, directory_max) = if show_full_ids {
-        (18, 10, 30, 36, 24, 42)
+fn shell_column_widths(width: u16) -> Vec<Constraint> {
+    let (name, status, detail, directory_min, directory_max) = if width >= 120 {
+        (18, 10, 30, 24, 42)
     } else {
-        (16, 10, 18, 8, 16, 36)
+        (16, 10, 18, 16, 42)
     };
     let kind = 8;
-    // Five column gaps and the highlight marker also consume table width.
-    let fixed = kind + name + status + detail + id + 7;
+    // Four column gaps and the highlight marker also consume table width.
+    let fixed = kind + name + status + detail + 6;
     let directory = width
         .saturating_sub(fixed)
         .clamp(directory_min, directory_max);
@@ -3056,18 +2947,17 @@ fn shell_column_widths(width: u16, show_full_ids: bool) -> Vec<Constraint> {
         Constraint::Length(status),
         Constraint::Length(directory),
         Constraint::Length(detail),
-        Constraint::Length(id),
     ]
 }
 
-fn global_column_widths(width: u16, show_full_ids: bool) -> Vec<Constraint> {
-    let (workspace, name, status, detail, id, directory_min, directory_max) = if show_full_ids {
-        (20, 18, 10, 30, 36, 16, 42)
+fn global_column_widths(width: u16) -> Vec<Constraint> {
+    let (workspace, name, status, detail, directory_min, directory_max) = if width >= 120 {
+        (20, 18, 10, 30, 16, 42)
     } else {
-        (12, 12, 8, 12, 8, 8, 28)
+        (12, 12, 8, 12, 8, 42)
     };
-    // Five column gaps and the highlight marker also consume table width.
-    let fixed = workspace + name + status + detail + id + 7;
+    // Four column gaps and the highlight marker also consume table width.
+    let fixed = workspace + name + status + detail + 6;
     let directory = width
         .saturating_sub(fixed)
         .clamp(directory_min, directory_max);
@@ -3077,7 +2967,6 @@ fn global_column_widths(width: u16, show_full_ids: bool) -> Vec<Constraint> {
         Constraint::Length(status),
         Constraint::Length(directory),
         Constraint::Length(detail),
-        Constraint::Length(id),
     ]
 }
 
@@ -3318,7 +3207,6 @@ mod tests {
 
     fn agent() -> AgentView {
         AgentView {
-            id: "agent-1".into(),
             state: "working".into(),
             integration: "opencode".into(),
             external_session_id: Some("external-active".into()),
@@ -3443,14 +3331,13 @@ mod tests {
     #[test]
     fn wide_shell_columns_are_bounded_instead_of_absorbing_extra_space() {
         assert_eq!(
-            shell_column_widths(180, true),
+            shell_column_widths(180),
             vec![
                 Constraint::Length(8),
                 Constraint::Length(18),
                 Constraint::Length(10),
                 Constraint::Length(42),
                 Constraint::Length(30),
-                Constraint::Length(36),
             ]
         );
     }
@@ -3575,7 +3462,7 @@ mod tests {
     }
 
     #[test]
-    fn tabs_and_workspace_table_render_exclusive_counts() {
+    fn tabs_render_exclusive_counts_and_workspace_table_renders_names() {
         let backend = TestBackend::new(180, 24);
         let mut terminal_backend = Terminal::new(backend).unwrap();
         let mut mixed = workspace("w1", "mixed");
@@ -3611,18 +3498,11 @@ mod tests {
         assert!(text.contains("SHELLS 1"));
         assert!(text.contains("COMMANDS 1"));
         assert!(!text.contains("active agents"));
-        for header in ["SH", "CMD", "LCH", "AG", "BLK", "DN", "!"] {
-            assert!(text.contains(header), "missing {header}");
-        }
         let workspace_tab = text.find("WORKSPACES 1").expect("workspace tab");
         let aggregate_label = text.find("ALL:").expect("aggregate label");
         let agent_tab = text.find("AGENTS 1").expect("agent tab");
         assert!(workspace_tab < aggregate_label && aggregate_label < agent_tab);
-        assert!(
-            lines
-                .iter()
-                .any(|line| line.contains("mixed") && line.matches('1').count() >= 4)
-        );
+        assert!(lines.iter().any(|line| line.contains("> mixed")));
 
         app.select_tab(PrimaryTab::Agents);
         terminal_backend
@@ -4507,8 +4387,7 @@ mod tests {
             .collect();
         assert!(text.contains("DETAIL"));
         assert!(text.contains("DIRECTORY"));
-        assert!(text.contains("ID"));
-        assert!(text.contains("ID term_1"));
+        assert!(!text.contains("term_1"));
         assert!(text.contains("SHELLS"));
         assert!(text.contains("Items: boomux (1)"));
         assert!(!text.contains("DIRTY"));
@@ -4606,7 +4485,8 @@ mod tests {
         assert!(text.contains("agent"));
         assert!(text.contains("keepname"));
         assert!(text.contains("working"));
-        assert!(text.contains("Shell term_1  Agent agent-1"));
+        assert!(!text.contains("term_1"));
+        assert!(!text.contains("agent-1"));
         assert!(text.contains("tool call"));
         assert!(text.contains("main"));
         assert!(text.contains("rename shell"));
@@ -4640,7 +4520,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_dashboard_renders_hinted_agent_in_one_detail_line() {
+    fn compact_dashboard_renders_hinted_agent_without_ids() {
         let backend = TestBackend::new(80, 20);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = app();
@@ -4661,8 +4541,8 @@ mod tests {
             .collect();
 
         assert_eq!(app.workspaces[0].agent_count(), 1);
-        assert!(lines.iter().any(|line| line.contains("Shell term_1")));
-        assert!(!lines.iter().any(|line| line.contains("Agent agent-1")));
+        assert!(!lines.iter().any(|line| line.contains("term_1")));
+        assert!(!lines.iter().any(|line| line.contains("agent-1")));
         assert!(lines.iter().any(|line| line.contains("foreground process")));
         assert!(lines.iter().any(|line| line.contains("keepname")));
         assert!(!lines.iter().any(|line| line.contains("opencode")));
@@ -4708,6 +4588,10 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect();
         assert!(text.contains("Workspaces (1)"));
+        assert!(text.contains("shell    1  command  0"));
+        assert!(text.contains("launcher 0  agent    0"));
+        assert!(text.contains("working  0  blocked  0"));
+        assert!(text.contains("idle     0  done     0"));
         assert!(text.contains("agent"));
         assert!(text.contains("DIRECTORY"));
         assert!(text.contains("main"));
@@ -4772,7 +4656,6 @@ mod tests {
         }));
         assert!(!text.contains("first "));
         assert!(!text.contains("observed "));
-        assert!(!text.contains("tool call in progress"));
 
         app.workspaces[0].sessions[0].state_is_current = false;
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
@@ -4841,8 +4724,8 @@ mod tests {
         assert!(text.contains("WORKSPACE"));
         assert!(text.contains("DIRECTORY"));
         assert!(text.contains("DETAIL"));
-        assert!(text.contains("ID"));
-        assert!(text.contains("shell-on"));
+        assert!(text.contains("running"));
+        assert!(!text.contains("shell-on"));
     }
 
     #[test]
@@ -5271,8 +5154,8 @@ mod tests {
         assert!(text.contains("Items: boomux (1)"));
         assert!(text.contains("DIRECTORY"));
         assert!(text.contains("DETAIL"));
-        assert!(text.contains("ID"));
         assert!(text.contains("main"));
+        assert!(!text.contains("term_1"));
         assert!(!text.contains("DIRTY"));
         assert!(!text.contains("WORKTREE"));
     }
@@ -5295,8 +5178,7 @@ mod tests {
         assert!(text.contains("STATUS"));
         assert!(text.contains("DIRECTORY"));
         assert!(text.contains("DETAIL"));
-        assert!(text.contains("ID"));
-        assert!(text.contains("ID term_1"));
+        assert!(!text.contains("term_1"));
     }
 
     #[test]
