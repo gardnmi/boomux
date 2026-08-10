@@ -30,6 +30,8 @@ The private handoff channel will carry a versioned manifest followed by Unix
   and sanitized VT state
 - Exited-shell run identity, exit status, output revision, terminal profile, and
   sanitized final VT state without process descriptors
+- The latest non-durable focused-terminal revision and workspace/shell/run
+  identity, when it still refers to a transferred runtime
 
 The PTY master is full duplex, so reader and writer duplicates do not need to be
 transferred separately. The replacement cannot inherit Unix parenthood; process
@@ -59,7 +61,9 @@ opening a PTY or starting a process.
 Handoff version 4 also transfers the event stream UUID, high-water mark, and
 bounded retained events. The replacement publishes `handoff_completed` before
 resuming readers, so output revisions remain ordered after the ownership
-boundary.
+boundary. The optional focused-terminal snapshot crosses the same graceful
+handoff so dashboard following does not forget the last focused managed window;
+ordinary cold recovery does not restore it.
 
 ## Delivery Slices
 

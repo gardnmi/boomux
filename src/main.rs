@@ -95,6 +95,8 @@ const INTEGRATION_FEATURES: &[&str] = &[
     "protocol_15",
     "protocol_16",
     "protocol_17",
+    "protocol_18",
+    "focused_terminal_following",
     "restartable_exited_shells",
     "inactive_agent_state",
     "idempotent_agent_ensure",
@@ -1047,11 +1049,9 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
     let client = client::connect_or_start()?;
     let mut git_cache = git::Cache::default();
     let mut title_cache = host_session_titles::Cache::default();
-    let mut views = dashboard_views_with_catalog(
-        &client.snapshot()?.workspaces,
-        &mut git_cache,
-        &mut title_cache,
-    );
+    let snapshot = client.snapshot()?;
+    let mut views =
+        dashboard_views_with_catalog(&snapshot.workspaces, &mut git_cache, &mut title_cache);
     enrich_session_titles(&mut views, &mut title_cache);
     let config = config::load()?;
     let terminal = terminal_override
@@ -1076,7 +1076,11 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
     };
 
     tui::run(
-        views,
+        tui::DashboardState {
+            workspaces: views,
+            focused_terminal: snapshot.focused_terminal.map(focused_terminal_view),
+        },
+        config.dashboard.follow_focused_terminal,
         project_context,
         tui::Actions {
             on_restore: |workspace_id: &str| {
@@ -1184,7 +1188,10 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
                     &mut title_cache,
                 );
                 enrich_session_titles(&mut views, &mut title_cache);
-                Ok(views)
+                Ok(tui::DashboardState {
+                    workspaces: views,
+                    focused_terminal: snapshot.focused_terminal.map(focused_terminal_view),
+                })
             },
             on_terminal_preview: |shell_id: &str| {
                 let bytes = client
@@ -1195,6 +1202,14 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
         },
     )?;
     Ok(())
+}
+
+fn focused_terminal_view(focused: protocol::FocusedTerminalSnapshot) -> tui::FocusedTerminalView {
+    tui::FocusedTerminalView {
+        revision: focused.revision,
+        workspace_id: focused.workspace_id,
+        shell_id: focused.shell_id,
+    }
 }
 
 fn dispatch_dashboard_open<S, L>(
@@ -4877,6 +4892,7 @@ mod tests {
 
         let value = json_snapshot(Snapshot {
             workspaces: vec![project],
+            focused_terminal: None,
         })
         .unwrap();
 
@@ -4893,6 +4909,7 @@ mod tests {
         project.launchers.push(launcher("l1", "w1", "editor"));
         let snapshot = Snapshot {
             workspaces: vec![workspace("w2", "w1", vec![]), project],
+            focused_terminal: None,
         };
 
         assert_eq!(
@@ -4939,6 +4956,7 @@ mod tests {
                 workspace("w1", "one", vec![shell("s1", "w1", "tests")]),
                 workspace("w2", "two", vec![shell("s2", "w2", "tests")]),
             ],
+            focused_terminal: None,
         };
         assert_eq!(
             resolve_shell_target(&snapshot, None, "s2").unwrap().id,
@@ -5740,6 +5758,7 @@ mod tests {
                 workspace("w2", "Zeta", vec![shell("s2", "w2", "backend")]),
                 workspace("w1", "Alpha", vec![shell("s1", "w1", "frontend")]),
             ],
+            focused_terminal: None,
         };
         let targets = vec![
             integration_management::VerificationTarget {
@@ -5977,7 +5996,7 @@ mod tests {
             session_transcript::supported_integrations(),
             ["opencode", "pi"]
         );
-        assert_eq!(protocol::PROTOCOL_VERSION, 17);
+        assert_eq!(protocol::PROTOCOL_VERSION, 18);
     }
 
     #[test]

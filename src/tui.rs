@@ -37,6 +37,18 @@ pub(crate) struct WorkspaceView {
     pub(crate) attention: Vec<WorkspaceAttentionView>,
 }
 
+pub(crate) struct DashboardState {
+    pub(crate) workspaces: Vec<WorkspaceView>,
+    pub(crate) focused_terminal: Option<FocusedTerminalView>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FocusedTerminalView {
+    pub(crate) revision: u64,
+    pub(crate) workspace_id: String,
+    pub(crate) shell_id: String,
+}
+
 pub(crate) struct WorkspaceAttentionView {
     pub(crate) shell_id: String,
     pub(crate) agent_name: String,
@@ -267,6 +279,8 @@ struct App {
     pending_close: Option<PendingClose>,
     project_context: ProjectContext,
     terminal_preview: Option<TerminalPreviewState>,
+    follow_focused_terminal: bool,
+    observed_focus_revision: Option<u64>,
 }
 
 struct TerminalPreviewState {
@@ -863,7 +877,54 @@ impl App {
             pending_close: None,
             project_context,
             terminal_preview: None,
+            follow_focused_terminal: false,
+            observed_focus_revision: None,
         }
+    }
+
+    fn enable_focus_following(&mut self, focused_terminal: Option<&FocusedTerminalView>) {
+        self.follow_focused_terminal = true;
+        self.apply_focused_terminal(focused_terminal);
+    }
+
+    fn apply_focused_terminal(&mut self, focused_terminal: Option<&FocusedTerminalView>) {
+        if !self.follow_focused_terminal {
+            return;
+        }
+        let Some(focused) = focused_terminal else {
+            self.observed_focus_revision = None;
+            return;
+        };
+        if self
+            .observed_focus_revision
+            .is_some_and(|revision| revision >= focused.revision)
+        {
+            return;
+        }
+        if !matches!(self.mode, Mode::Normal) || self.pending_close.is_some() {
+            return;
+        }
+        let Some(workspace_index) = self
+            .workspaces
+            .iter()
+            .position(|workspace| workspace.id == focused.workspace_id)
+        else {
+            return;
+        };
+        let Some(item_index) = self.workspaces[workspace_index]
+            .items
+            .iter()
+            .position(|item| {
+                !matches!(item, WorkspaceItemView::Launcher(_)) && item.id() == focused.shell_id
+            })
+        else {
+            return;
+        };
+        self.observed_focus_revision = Some(focused.revision);
+        self.select_tab(PrimaryTab::Workspaces);
+        self.workspace_state.select(Some(workspace_index));
+        self.item_state.select(Some(item_index));
+        self.set_focus(Focus::Items);
     }
 
     fn selected_index(&self) -> Option<usize> {
@@ -1247,10 +1308,13 @@ impl App {
 
     fn refresh<F>(&mut self, on_refresh: &mut F)
     where
-        F: FnMut() -> Result<Vec<WorkspaceView>, String>,
+        F: FnMut() -> Result<DashboardState, String>,
     {
         match on_refresh() {
-            Ok(workspaces) => self.replace_workspaces(workspaces),
+            Ok(state) => {
+                self.replace_workspaces(state.workspaces);
+                self.apply_focused_terminal(state.focused_terminal.as_ref());
+            }
             Err(text) => self.message = Some(Message { text, error: true }),
         }
     }
@@ -1485,7 +1549,8 @@ fn item_pending_close(item: &WorkspaceItemView) -> PendingClose {
 }
 
 pub(crate) fn run<R, O, C, W, N, E, F, P>(
-    workspaces: Vec<WorkspaceView>,
+    state: DashboardState,
+    follow_focused_terminal: bool,
     project_context: ProjectContext,
     actions: Actions<R, O, C, W, N, E, F, P>,
 ) -> io::Result<()>
@@ -1496,15 +1561,15 @@ where
     W: FnMut(&str) -> Result<String, String>,
     N: FnMut(&str) -> Result<String, String>,
     E: FnMut(&RenameTarget, &str) -> Result<String, String>,
-    F: FnMut() -> Result<Vec<WorkspaceView>, String>,
+    F: FnMut() -> Result<DashboardState, String>,
     P: FnMut(&str) -> Result<String, String>,
 {
     let mut terminal = ratatui::init();
-    let result = run_loop(
-        &mut terminal,
-        App::new(workspaces, project_context),
-        actions,
-    );
+    let mut app = App::new(state.workspaces, project_context);
+    if follow_focused_terminal {
+        app.enable_focus_following(state.focused_terminal.as_ref());
+    }
+    let result = run_loop(&mut terminal, app, actions);
     ratatui::restore();
     result
 }
@@ -1521,7 +1586,7 @@ where
     W: FnMut(&str) -> Result<String, String>,
     N: FnMut(&str) -> Result<String, String>,
     E: FnMut(&RenameTarget, &str) -> Result<String, String>,
-    F: FnMut() -> Result<Vec<WorkspaceView>, String>,
+    F: FnMut() -> Result<DashboardState, String>,
     P: FnMut(&str) -> Result<String, String>,
 {
     let mut last_refresh = Instant::now();
@@ -1656,7 +1721,7 @@ where
     W: FnMut(&str) -> Result<String, String>,
     N: FnMut(&str) -> Result<String, String>,
     E: FnMut(&RenameTarget, &str) -> Result<String, String>,
-    F: FnMut() -> Result<Vec<WorkspaceView>, String>,
+    F: FnMut() -> Result<DashboardState, String>,
     P: FnMut(&str) -> Result<String, String>,
 {
     match command {
@@ -3205,6 +3270,14 @@ mod tests {
         }
     }
 
+    fn set_shell_id(workspace: &mut WorkspaceView, shell_id: &str) {
+        match &mut workspace.items[0] {
+            WorkspaceItemView::Shell(shell) => shell.id = shell_id.into(),
+            WorkspaceItemView::AgentShell(agent) => agent.shell.id = shell_id.into(),
+            WorkspaceItemView::Launcher(_) => panic!("expected shell item"),
+        }
+    }
+
     fn agent() -> AgentView {
         AgentView {
             state: "working".into(),
@@ -3269,8 +3342,125 @@ mod tests {
         Ok(String::new())
     }
 
-    fn empty_refresh() -> Result<Vec<WorkspaceView>, String> {
-        Ok(Vec::new())
+    fn empty_refresh() -> Result<DashboardState, String> {
+        Ok(DashboardState {
+            workspaces: Vec::new(),
+            focused_terminal: None,
+        })
+    }
+
+    #[test]
+    fn focus_following_selects_shell_once_per_revision() {
+        let mut one = workspace("w1", "one");
+        set_shell_id(&mut one, "s1");
+        let mut two = workspace("w2", "two");
+        two.items[0] = WorkspaceItemView::AgentShell(agent_shell());
+        set_shell_id(&mut two, "s2");
+        let mut app = App::new(vec![one, two], project_context());
+        let focused = FocusedTerminalView {
+            revision: 1,
+            workspace_id: "w2".into(),
+            shell_id: "s2".into(),
+        };
+
+        app.enable_focus_following(Some(&focused));
+        assert_eq!(
+            app.selected().map(|workspace| workspace.id.as_str()),
+            Some("w2")
+        );
+        assert_eq!(app.selected_item().map(WorkspaceItemView::id), Some("s2"));
+        assert_eq!(app.focus, Focus::Items);
+
+        app.set_focus(Focus::Workspaces);
+        app.previous();
+        assert_eq!(
+            app.selected().map(|workspace| workspace.id.as_str()),
+            Some("w1")
+        );
+        app.apply_focused_terminal(Some(&focused));
+        assert_eq!(
+            app.selected().map(|workspace| workspace.id.as_str()),
+            Some("w1")
+        );
+
+        app.apply_focused_terminal(Some(&FocusedTerminalView {
+            revision: 2,
+            ..focused.clone()
+        }));
+        assert_eq!(
+            app.selected().map(|workspace| workspace.id.as_str()),
+            Some("w2")
+        );
+
+        app.apply_focused_terminal(None);
+        app.apply_focused_terminal(Some(&FocusedTerminalView {
+            revision: 1,
+            workspace_id: "w1".into(),
+            shell_id: "s1".into(),
+        }));
+        assert_eq!(
+            app.selected().map(|workspace| workspace.id.as_str()),
+            Some("w1")
+        );
+    }
+
+    #[test]
+    fn focus_following_can_be_disabled_and_defers_during_overlays() {
+        let mut one = workspace("w1", "one");
+        set_shell_id(&mut one, "s1");
+        let mut two = workspace("w2", "two");
+        set_shell_id(&mut two, "s2");
+        let focused = FocusedTerminalView {
+            revision: 1,
+            workspace_id: "w2".into(),
+            shell_id: "s2".into(),
+        };
+        let mut disabled = App::new(vec![one, two], project_context());
+        disabled.apply_focused_terminal(Some(&focused));
+        assert_eq!(
+            disabled.selected().map(|workspace| workspace.id.as_str()),
+            Some("w1")
+        );
+
+        disabled.enable_focus_following(None);
+        disabled.mode = Mode::Help;
+        disabled.apply_focused_terminal(Some(&focused));
+        assert_eq!(
+            disabled.selected().map(|workspace| workspace.id.as_str()),
+            Some("w1")
+        );
+        assert_eq!(disabled.observed_focus_revision, None);
+        disabled.mode = Mode::Normal;
+        disabled.apply_focused_terminal(Some(&focused));
+        assert_eq!(
+            disabled.selected().map(|workspace| workspace.id.as_str()),
+            Some("w2")
+        );
+    }
+
+    #[test]
+    fn unresolved_focus_revision_is_retried_after_projection_refresh() {
+        let mut one = workspace("w1", "one");
+        set_shell_id(&mut one, "s1");
+        let focused = FocusedTerminalView {
+            revision: 1,
+            workspace_id: "w2".into(),
+            shell_id: "s2".into(),
+        };
+        let mut app = App::new(vec![one], project_context());
+        app.enable_focus_following(Some(&focused));
+        assert_eq!(app.observed_focus_revision, None);
+
+        let mut two = workspace("w2", "two");
+        set_shell_id(&mut two, "s2");
+        app.replace_workspaces(vec![workspace("w1", "one"), two]);
+        app.apply_focused_terminal(Some(&focused));
+
+        assert_eq!(app.observed_focus_revision, Some(1));
+        assert_eq!(
+            app.selected().map(|workspace| workspace.id.as_str()),
+            Some("w2")
+        );
     }
 
     fn hinted_agent_shell() -> AgentShellView {

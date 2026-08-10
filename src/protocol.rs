@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 17;
+pub const PROTOCOL_VERSION: u32 = 18;
 pub const MIN_PROTOCOL_VERSION: u32 = 6;
 pub const MAX_CONTROL_FRAME: usize = 8 * 1024 * 1024;
 pub const MAX_ATTACH_FRAME: usize = 1024 * 1024;
@@ -31,6 +31,16 @@ impl<T> Envelope<T> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Snapshot {
     pub workspaces: Vec<WorkspaceSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focused_terminal: Option<FocusedTerminalSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FocusedTerminalSnapshot {
+    pub revision: u64,
+    pub workspace_id: String,
+    pub shell_id: String,
+    pub run_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -599,6 +609,7 @@ pub enum AttachFrame {
     Detached,
     Reconnect,
     ReconnectAck,
+    FocusGained,
 }
 
 impl AttachFrame {
@@ -608,6 +619,7 @@ impl AttachFrame {
     const DETACHED: u8 = 4;
     const RECONNECT: u8 = 5;
     const RECONNECT_ACK: u8 = 6;
+    const FOCUS_GAINED: u8 = 7;
 
     pub fn write_to(&self, writer: &mut impl Write) -> io::Result<()> {
         let (kind, payload): (u8, &[u8]) = match self {
@@ -629,6 +641,7 @@ impl AttachFrame {
             Self::Detached => (Self::DETACHED, &[]),
             Self::Reconnect => (Self::RECONNECT, &[]),
             Self::ReconnectAck => (Self::RECONNECT_ACK, &[]),
+            Self::FocusGained => (Self::FOCUS_GAINED, &[]),
         };
         if payload.len() > MAX_ATTACH_FRAME {
             return Err(io::Error::new(
@@ -667,6 +680,7 @@ impl AttachFrame {
             Self::DETACHED if payload.is_empty() => Ok(Self::Detached),
             Self::RECONNECT if payload.is_empty() => Ok(Self::Reconnect),
             Self::RECONNECT_ACK if payload.is_empty() => Ok(Self::ReconnectAck),
+            Self::FOCUS_GAINED if payload.is_empty() => Ok(Self::FocusGained),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid attach frame",
@@ -911,9 +925,16 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_seventeen_with_minimum_six() {
-        assert_eq!(PROTOCOL_VERSION, 17);
+    fn protocol_version_is_eighteen_with_minimum_six() {
+        assert_eq!(PROTOCOL_VERSION, 18);
         assert_eq!(MIN_PROTOCOL_VERSION, 6);
+    }
+
+    #[test]
+    fn old_snapshot_defaults_focused_terminal() {
+        let snapshot: Snapshot = serde_json::from_str(r#"{"workspaces":[]}"#).unwrap();
+
+        assert_eq!(snapshot.focused_terminal, None);
     }
 
     #[test]
@@ -1368,6 +1389,7 @@ mod tests {
             AttachFrame::Detached,
             AttachFrame::Reconnect,
             AttachFrame::ReconnectAck,
+            AttachFrame::FocusGained,
         ];
         for frame in frames {
             let mut bytes = Vec::new();
@@ -1377,6 +1399,9 @@ mod tests {
                 frame
             );
         }
+        let mut bytes = Vec::new();
+        AttachFrame::FocusGained.write_to(&mut bytes).unwrap();
+        assert_eq!(bytes, [7, 0, 0, 0, 0]);
     }
 
     #[test]

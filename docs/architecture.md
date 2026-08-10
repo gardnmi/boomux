@@ -110,9 +110,15 @@ an ungrouped shell.
 ### Attachment
 
 `src/attach.rs` runs inside the selected terminal emulator. It enables raw mode,
-reports dimensions, and copies bytes in both directions without interpreting
-keys or transforming live PTY output. An RAII guard restores terminal mode when
-the attachment exits.
+reports dimensions, and copies bytes in both directions without transforming
+live PTY output. Protocol-18 attachments also enable xterm focus reporting and
+recognize focus-gained input. Physical focus events are forwarded to the PTY
+only while the child has requested focus mode; otherwise they are consumed so
+ordinary shells do not receive synthetic escape input. Child mode changes are
+tracked across output chunks and reconstruction while Boomux keeps physical
+reporting enabled. Each focus gain is also reported through the
+controller-authorized attach stream. RAII cleanup restores terminal and
+focus-reporting modes when the attachment exits.
 
 The daemon keeps a bounded output queue per active controller. A slow client
 drops output rather than blocking the PTY reader and child process.
@@ -150,6 +156,16 @@ dashboard presents an empty vector as `shell` and a non-empty vector as
 durable shell model. Command rows show the stored argv in their detail column.
 Agent presentation takes precedence when the current run has an active Agent or
 an exact `opencode` or `pi` foreground hint.
+
+The daemon retains the latest controller-authorized terminal focus gain as
+ephemeral workspace, shell, run, and monotonic revision metadata. With
+`dashboard.follow_focused_terminal` enabled (the default), the dashboard uses a
+new revision as a one-shot selection trigger and resolves both shell and Agent
+rows by durable shell ID. Repeated snapshot refreshes do not enforce the
+selection, so manual navigation remains usable until another terminal focus
+gain. Focus changes are deferred while an overlay or close confirmation is
+active. The setting is dashboard-local and disabling it does not stop focus
+reporting by attachments.
 
 Selected-kind previews remain read-only. Workspace, launcher, and run metadata
 come from the polled snapshot. Shell output uses a bounded plain-text read only
@@ -473,6 +489,13 @@ the lifecycle revision used by `agent wait`. Version-5 state migrates with no
 outstanding items so upgrading does not reinterpret historical work as unseen.
 The CLI projects these records into a deterministic blocked-first queue and
 reports fixed lifecycle-state and attention counts per workspace.
+
+Protocol 18 adds native-attachment focus reports and an optional focused
+terminal snapshot. The state is non-durable, is accepted only from the current
+controller for the current shell run, and uses a monotonic revision so clients
+can distinguish a later refocus of the same shell. Protocol-17 responses omit
+the additive field. Graceful handoff transfers a still-current focus target;
+cold daemon recovery clears it.
 
 Opt-in desktop and sound notifications are a daemon-owned projection of committed
 Agent state transitions, not durable queue state. A transition from any other

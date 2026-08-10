@@ -30,10 +30,10 @@ use crate::handoff;
 use crate::protocol::{
     self, AgentAttentionReason, AgentAttentionSnapshot, AgentAuthority, AgentInstanceSnapshot,
     AgentObservationSnapshot, AgentRegistrationSpec, AgentReport, AgentState, AttachFrame,
-    DaemonEvent, DaemonEventKind, Envelope, ErrorCode, EventCursor, NotificationDeliveryConfig,
-    Request, Response, ShellRunExitReason, ShellRunSnapshot, ShellSnapshot, ShellSpec, ShellStatus,
-    Snapshot, TerminalProfile, UnixEnvironment, WorkspaceLauncherSnapshot, WorkspaceLauncherSpec,
-    WorkspaceSnapshot,
+    DaemonEvent, DaemonEventKind, Envelope, ErrorCode, EventCursor, FocusedTerminalSnapshot,
+    NotificationDeliveryConfig, Request, Response, ShellRunExitReason, ShellRunSnapshot,
+    ShellSnapshot, ShellSpec, ShellStatus, Snapshot, TerminalProfile, UnixEnvironment,
+    WorkspaceLauncherSnapshot, WorkspaceLauncherSpec, WorkspaceSnapshot,
 };
 use crate::state_store::{
     PersistedAgentInstance, PersistedShell, PersistedShellRun, PersistedState, PersistedWorkspace,
@@ -183,6 +183,7 @@ pub fn receive_handoff_with_notification_delivery(
             exited,
             event_stream,
             notifications,
+            focused_terminal,
         } => {
             let store = StateStore::from_transferred_lock(state_lock)?;
             let socket_path = client::socket_path()?;
@@ -195,6 +196,7 @@ pub fn receive_handoff_with_notification_delivery(
                     runtimes,
                     exited,
                     events: Some(event_stream),
+                    focused_terminal: focused_terminal.map(|focused| *focused),
                 },
                 Some(&mut channel),
                 notifications
@@ -250,6 +252,7 @@ struct TransferredState {
     runtimes: Vec<handoff::TransferredRuntime>,
     exited: Vec<handoff::TransferredExited>,
     events: Option<handoff::EventStreamManifest>,
+    focused_terminal: Option<FocusedTerminalSnapshot>,
 }
 
 fn run_daemon(
@@ -266,6 +269,7 @@ fn run_daemon(
     registry.notification_sink = Arc::new(DesktopNotificationSink::new(notification_settings));
     let registry = Arc::new(registry);
     let gated_readers = registry.import_handoff(transferred.runtimes, transferred.exited)?;
+    registry.import_focused_terminal(transferred.focused_terminal)?;
     if let Some(channel) = committed {
         {
             let _transition = lock(&registry.transitions)?;
@@ -559,6 +563,7 @@ fn launch_replacement(
             registry.events.changed.notify_all();
         }
         let state_lock = registry.state_lock_descriptor()?;
+        let focused_terminal = registry.focused_terminal_for_handoff()?;
         launch_replacement_process(
             listener.as_fd(),
             daemon_lock.as_fd(),
@@ -566,7 +571,10 @@ fn launch_replacement(
             &transfers,
             &exited,
             &event_stream,
-            notification_settings,
+            ReplacementOptions {
+                focused_terminal,
+                notification_settings,
+            },
         )
     })();
     if result.is_err() {
@@ -578,6 +586,11 @@ fn launch_replacement(
     result
 }
 
+struct ReplacementOptions {
+    focused_terminal: Option<FocusedTerminalSnapshot>,
+    notification_settings: Option<NotificationDeliverySettings>,
+}
+
 fn launch_replacement_process(
     listener: BorrowedFd<'_>,
     runtime_lock: BorrowedFd<'_>,
@@ -585,8 +598,12 @@ fn launch_replacement_process(
     runtimes: &[OutgoingRuntime],
     exited: &[OutgoingExited],
     event_stream: &handoff::EventStreamManifest,
-    notification_settings: Option<NotificationDeliverySettings>,
+    options: ReplacementOptions,
 ) -> io::Result<()> {
+    let ReplacementOptions {
+        focused_terminal,
+        notification_settings,
+    } = options;
     let (mut channel, child_channel) = UnixStream::pair()?;
     let child_channel_fd = child_channel.as_raw_fd();
     let mut command = Command::new(replacement_executable()?);
@@ -628,6 +645,7 @@ fn launch_replacement_process(
                 exited: exited.iter().map(|shell| shell.manifest.clone()).collect(),
                 event_stream: event_stream.clone(),
                 notifications: notification_settings.map(Into::into),
+                focused_terminal,
             },
         )?;
         send_descriptor(&channel, listener, handoff::LISTENER_MARKER)?;
@@ -883,6 +901,9 @@ fn unsupported_request_message(request: &Request, minimum_version: u32) -> Strin
 
 fn response_for_version(response: Response, version: u32) -> Response {
     let mut response = response;
+    if version < 18 {
+        remove_focused_terminal(&mut response);
+    }
     if version < 15 {
         remove_agent_attention(&mut response);
         if let Response::Events { events, .. } = &mut response {
@@ -947,6 +968,17 @@ fn response_for_version(response: Response, version: u32) -> Response {
             }
         }
         response => response,
+    }
+}
+
+fn remove_focused_terminal(response: &mut Response) {
+    match response {
+        Response::Snapshot { snapshot } => snapshot.focused_terminal = None,
+        Response::Events {
+            snapshot: Some(snapshot),
+            ..
+        } => snapshot.focused_terminal = None,
+        _ => {}
     }
 }
 
@@ -1064,6 +1096,7 @@ fn coded_error(code: ErrorCode, message: impl Into<String>) -> io::Error {
 
 struct Registry {
     state: Mutex<RegistryState>,
+    focus: Mutex<FocusState>,
     store: Option<StateStore>,
     events: EventLog,
     transitions: Mutex<TransitionState>,
@@ -1073,6 +1106,12 @@ struct Registry {
     persistence_dirty: AtomicBool,
     notification_settings: NotificationDeliverySettings,
     notification_sink: Arc<dyn NotificationSink>,
+}
+
+#[derive(Default)]
+struct FocusState {
+    revision: u64,
+    focused_terminal: Option<FocusedTerminalSnapshot>,
 }
 
 enum DurableMutation<T> {
@@ -1205,6 +1244,7 @@ impl Default for Registry {
     fn default() -> Self {
         Self {
             state: Mutex::new(RegistryState::default()),
+            focus: Mutex::new(FocusState::default()),
             store: None,
             events: EventLog::new(),
             transitions: Mutex::new(TransitionState::default()),
@@ -2225,6 +2265,7 @@ impl Registry {
         }
         let registry = Self {
             state: Mutex::new(state),
+            focus: Mutex::new(FocusState::default()),
             store: Some(store),
             events: EventLog::from_transfer(transferred_events),
             transitions: Mutex::new(TransitionState::default()),
@@ -2929,7 +2970,112 @@ impl Registry {
                 .into_iter()
                 .map(|workspace| workspace.snapshot(self))
                 .collect::<io::Result<_>>()?,
+            focused_terminal: self.focused_terminal()?,
         })
+    }
+
+    fn focused_terminal(&self) -> io::Result<Option<FocusedTerminalSnapshot>> {
+        let focused = lock(&self.focus)?.focused_terminal.clone();
+        let Some(focused) = focused else {
+            return Ok(None);
+        };
+        Ok(self.focus_target_is_current(&focused)?.then_some(focused))
+    }
+
+    fn focused_terminal_for_handoff(&self) -> io::Result<Option<FocusedTerminalSnapshot>> {
+        Ok(lock(&self.focus)?.focused_terminal.clone())
+    }
+
+    fn focus_target_is_current(&self, focused: &FocusedTerminalSnapshot) -> io::Result<bool> {
+        let state = lock(&self.state)?;
+        let Some(shell) = state.shells.get(&focused.shell_id) else {
+            return Ok(false);
+        };
+        if shell.workspace_id != focused.workspace_id {
+            return Ok(false);
+        }
+        let lifecycle = lock(&shell.lifecycle)?;
+        let current_run_id = match &*lifecycle {
+            ShellLifecycle::Running { run, .. } | ShellLifecycle::Exited { run, .. } => &run.id,
+            ShellLifecycle::Pending | ShellLifecycle::Closed => return Ok(false),
+        };
+        Ok(current_run_id == &focused.run_id)
+    }
+
+    fn record_focus_gained(
+        &self,
+        protocol_version: u32,
+        shell: &Arc<Shell>,
+        run: &Arc<ShellRun>,
+        runtime: &Arc<ShellRuntime>,
+    ) -> io::Result<()> {
+        if protocol_version < 18 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "focus frames require daemon protocol 18",
+            ));
+        }
+        let state = lock(&self.state)?;
+        if !state
+            .shells
+            .get(&shell.id)
+            .is_some_and(|current| Arc::ptr_eq(current, shell))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "focus frame targets a stale shell",
+            ));
+        }
+        let lifecycle = lock(&shell.lifecycle)?;
+        let ShellLifecycle::Running {
+            run: current_run,
+            runtime: current_runtime,
+            ..
+        } = &*lifecycle
+        else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "focus frame targets a shell that is not running",
+            ));
+        };
+        if !Arc::ptr_eq(current_run, run) || !Arc::ptr_eq(current_runtime, runtime) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "focus frame targets a stale shell run",
+            ));
+        }
+        let mut focus = lock(&self.focus)?;
+        let revision = focus
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("focused terminal revision exhausted"))?;
+        focus.revision = revision;
+        focus.focused_terminal = Some(FocusedTerminalSnapshot {
+            revision,
+            workspace_id: shell.workspace_id.clone(),
+            shell_id: shell.id.clone(),
+            run_id: current_run.id.clone(),
+        });
+        Ok(())
+    }
+
+    fn import_focused_terminal(
+        &self,
+        focused_terminal: Option<FocusedTerminalSnapshot>,
+    ) -> io::Result<()> {
+        let Some(focused_terminal) = focused_terminal else {
+            return Ok(());
+        };
+        if focused_terminal.revision == 0 {
+            return Ok(());
+        }
+        let current = self.focus_target_is_current(&focused_terminal)?;
+        let mut focus = lock(&self.focus)?;
+        if focused_terminal.revision >= focus.revision {
+            focus.revision = focused_terminal.revision;
+            focus.focused_terminal = current.then_some(focused_terminal);
+        }
+        Ok(())
     }
 
     fn shutdown(&self) -> io::Result<()> {
@@ -4626,7 +4772,7 @@ fn handle_attach(
     } else {
         false
     };
-    let (runtime, terminal, startup_profile, running, started) = {
+    let (attached_run, runtime, terminal, startup_profile, running, started) = {
         let mut lifecycle = lock(&shell.lifecycle)?;
         let mut started = false;
         if !registry.contains_shell(&shell)? {
@@ -4703,8 +4849,11 @@ fn handle_attach(
         }
         match &*lifecycle {
             ShellLifecycle::Running {
-                profile, runtime, ..
+                profile,
+                run,
+                runtime,
             } => (
+                Some(Arc::clone(run)),
                 Some(Arc::clone(runtime)),
                 Arc::clone(&runtime.terminal),
                 profile.clone(),
@@ -4713,7 +4862,14 @@ fn handle_attach(
             ),
             ShellLifecycle::Exited {
                 profile, terminal, ..
-            } => (None, Arc::clone(terminal), profile.clone(), false, started),
+            } => (
+                None,
+                None,
+                Arc::clone(terminal),
+                profile.clone(),
+                false,
+                started,
+            ),
             ShellLifecycle::Pending => unreachable!(),
             ShellLifecycle::Closed => {
                 return send_response(
@@ -4787,6 +4943,7 @@ fn handle_attach(
         return AttachFrame::Detached.write_to(&mut stream);
     }
     drop(mutation);
+    let attached_run = attached_run.expect("running shell has a run");
     let runtime = runtime.expect("running shell has a runtime");
     let control = lock(&runtime.control)?;
     if !registry.contains_shell(&shell)? {
@@ -4948,6 +5105,9 @@ fn handle_attach(
             AttachFrame::Detached => {
                 drop(control);
                 break;
+            }
+            AttachFrame::FocusGained => {
+                registry.record_focus_gained(response_version, &shell, &attached_run, &runtime)
             }
             AttachFrame::Output(_) | AttachFrame::Reconnect | AttachFrame::ReconnectAck => {
                 Err(io::Error::new(
@@ -5559,6 +5719,68 @@ mod tests {
                 .workspaces
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn focus_reports_require_protocol_eighteen_and_increment_revision() {
+        let registry = Registry::default();
+        let (_workspace, shell, runtime) = running_shell(&registry);
+        let run = match &*lock(&shell.lifecycle).unwrap() {
+            ShellLifecycle::Running { run, .. } => Arc::clone(run),
+            _ => panic!("expected running shell"),
+        };
+
+        assert!(
+            registry
+                .record_focus_gained(17, &shell, &run, &runtime)
+                .is_err()
+        );
+        assert!(registry.snapshot().unwrap().focused_terminal.is_none());
+
+        registry
+            .record_focus_gained(18, &shell, &run, &runtime)
+            .unwrap();
+        registry
+            .record_focus_gained(18, &shell, &run, &runtime)
+            .unwrap();
+
+        let focused = registry.snapshot().unwrap().focused_terminal.unwrap();
+        assert_eq!(focused.revision, 2);
+        assert_eq!(focused.workspace_id, shell.workspace_id);
+        assert_eq!(focused.shell_id, shell.id);
+        let lifecycle = lock(&shell.lifecycle).unwrap();
+        let ShellLifecycle::Running { run, .. } = &*lifecycle else {
+            panic!("expected running shell");
+        };
+        assert_eq!(focused.run_id, run.id);
+        drop(lifecycle);
+
+        *lock(&shell.lifecycle).unwrap() = ShellLifecycle::Running {
+            profile: profile(),
+            run: Arc::new(ShellRun::new(2)),
+            runtime: Arc::clone(&runtime),
+        };
+        assert!(registry.snapshot().unwrap().focused_terminal.is_none());
+
+        lock(&registry.state).unwrap().shells.remove(&shell.id);
+        assert!(registry.snapshot().unwrap().focused_terminal.is_none());
+    }
+
+    #[test]
+    fn stale_handoff_focus_target_is_not_imported() {
+        let registry = Registry::default();
+
+        registry
+            .import_focused_terminal(Some(FocusedTerminalSnapshot {
+                revision: 9,
+                workspace_id: "missing-workspace".into(),
+                shell_id: "missing-shell".into(),
+                run_id: "missing-run".into(),
+            }))
+            .unwrap();
+
+        assert!(registry.snapshot().unwrap().focused_terminal.is_none());
+        assert_eq!(lock(&registry.focus).unwrap().revision, 9);
     }
 
     #[test]
@@ -6960,6 +7182,7 @@ mod tests {
             },
             snapshot: Some(Snapshot {
                 workspaces: vec![workspace],
+                focused_terminal: None,
             }),
             events: vec![
                 DaemonEvent {
@@ -7001,6 +7224,26 @@ mod tests {
         let encoded =
             serde_json::to_value(response_for_version(Response::Snapshot { snapshot }, 8)).unwrap();
         assert!(encoded["snapshot"]["workspaces"][0].get("agents").is_none());
+    }
+
+    #[test]
+    fn protocol_seventeen_responses_hide_focused_terminal() {
+        let response = Response::Snapshot {
+            snapshot: Snapshot {
+                workspaces: Vec::new(),
+                focused_terminal: Some(FocusedTerminalSnapshot {
+                    revision: 1,
+                    workspace_id: "w1".into(),
+                    shell_id: "s1".into(),
+                    run_id: "r1".into(),
+                }),
+            },
+        };
+
+        let Response::Snapshot { snapshot } = response_for_version(response, 17) else {
+            panic!("expected snapshot response");
+        };
+        assert!(snapshot.focused_terminal.is_none());
     }
 
     #[test]
@@ -7095,6 +7338,7 @@ mod tests {
                 },
                 snapshot: Some(Snapshot {
                     workspaces: vec![workspace],
+                    focused_terminal: None,
                 }),
                 events: vec![DaemonEvent {
                     id: 1,
@@ -7163,6 +7407,7 @@ mod tests {
                     launchers: Vec::new(),
                     agents: vec![agent.clone()],
                 }],
+                focused_terminal: None,
             }),
             events: vec![DaemonEvent {
                 id: 2,
