@@ -654,6 +654,54 @@ fn native_daemon_recovers_reproducible_metadata_after_restart() {
 }
 
 #[test]
+fn reattachment_reflows_retained_output_for_the_new_terminal_width() {
+    let mut daemon = TestDaemon::start();
+    let workspace = daemon
+        .client
+        .create_workspace(
+            "reflow-on-attach",
+            vec![ShellSpec::login("shell", std::env::temp_dir())],
+        )
+        .unwrap();
+    let shell_id = workspace.shells[0].id.clone();
+    let mut wide_profile = profile();
+    wide_profile.rows = 6;
+    wide_profile.cols = 60;
+    let mut first = daemon
+        .client
+        .attach(&shell_id, false, wide_profile)
+        .unwrap();
+    AttachFrame::Input(
+        b"printf 'first: a description that must remain complete\\nsecond: another description that must remain complete\\nreflow-finished\\n'\n"
+            .to_vec(),
+    )
+    .write_to(&mut first.stream)
+    .unwrap();
+    assert!(contains(
+        &read_until(&mut first.stream, b"reflow-finished"),
+        b"reflow-finished"
+    ));
+    drop(first);
+
+    let mut narrow_profile = profile();
+    narrow_profile.rows = 12;
+    narrow_profile.cols = 24;
+    let second = wait_for_attach_with_profile(&daemon.client, &shell_id, narrow_profile);
+    let contents = String::from_utf8(daemon.client.read_shell(&shell_id, 1_024).unwrap()).unwrap();
+    assert!(
+        contents.contains("first: a description that must remain complete"),
+        "{contents:?}"
+    );
+    assert!(
+        contents.contains("second: another description that must remain complete"),
+        "{contents:?}"
+    );
+
+    drop(second);
+    daemon.stop_with_cli();
+}
+
+#[test]
 fn attach_environment_is_ephemeral_and_authoritative_for_initial_and_restarted_runs() {
     let daemon = TestDaemon::start();
     let client_shell = daemon.runtime_dir.join("client-shell");
