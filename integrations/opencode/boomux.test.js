@@ -150,7 +150,7 @@ describe("event mapping and reducer", () => {
     ).toBe("working");
   });
 
-  test("updates working evidence and suppresses only exact duplicates", () => {
+  test("suppresses evidence-only updates while already working", () => {
     const state = createReducerState();
     const chat = {
       kind: "working",
@@ -164,9 +164,7 @@ describe("event mapping and reducer", () => {
     };
 
     expect(reduce(state, chat, true).evidence).toBe("OpenCode chat.message");
-    expect(reduce(state, tool, true).evidence).toBe(
-      "OpenCode tool.execute.before",
-    );
+    expect(reduce(state, tool, true)).toBeUndefined();
     expect(reduce(state, tool, true)).toBeUndefined();
   });
 });
@@ -517,7 +515,7 @@ describe("Boomux commands", () => {
     expect(calls[1]).toContain(env.BOOMUX_RUN_ID);
   });
 
-  test("same-state Ensure with different evidence reports immediately", async () => {
+  test("same-state Ensure with different working evidence does not report", async () => {
     const calls = [];
     const lifecycle = createLifecycle({
       client: {
@@ -537,17 +535,33 @@ describe("Boomux commands", () => {
       event("session.status", { sessionID: "root", status: "busy" }),
     );
 
-    expect(calls).toHaveLength(2);
-    expect(calls[1].slice(0, 4)).toEqual([
-      "boomux",
-      "agent",
-      "report",
-      "existing",
-    ]);
-    expect(calls[1][calls[1].indexOf("--state") + 1]).toBe("working");
-    expect(calls[1][calls[1].indexOf("--evidence") + 1]).toBe(
-      "OpenCode session busy",
+    expect(calls).toHaveLength(1);
+  });
+
+  test("coalesces a burst of working activity into one lifecycle command", async () => {
+    const calls = [];
+    const lifecycle = createLifecycle({
+      client: { session: { get: async ({ path }) => ({ data: { id: path.id } }) } },
+      env,
+      run: async (argv) => {
+        calls.push(argv);
+        return successfulEnsure("agent", "working");
+      },
+      log: () => {},
+    });
+
+    await lifecycle.enqueue(
+      event("session.status", { sessionID: "root", status: "busy" }),
     );
+    for (let index = 0; index < 100; index += 1) {
+      await lifecycle.enqueue(
+        event(index % 2 ? "tool.execute.before" : "tool.execute.after", {
+          sessionID: "root",
+        }),
+      );
+    }
+
+    expect(calls).toHaveLength(1);
   });
 
   test("reattached working agent reports the first idle event", async () => {
