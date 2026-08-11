@@ -3292,16 +3292,18 @@ fn global_column_widths(width: u16) -> Vec<Constraint> {
 }
 
 fn agent_column_widths(width: u16) -> Vec<Constraint> {
-    let (status, updated, workspace, shell, branch, worktree) = if width >= 140 {
-        (10, 9, 18, 16, 20, 16)
+    let (status, updated, workspace, shell, branch, worktree, task_max) = if width >= 160 {
+        (10, 9, 24, 16, 28, 18, 52)
+    } else if width >= 140 {
+        (10, 9, 20, 16, 24, 16, 44)
     } else if width >= 100 {
-        (9, 8, 14, 12, 16, 14)
+        (9, 8, 14, 12, 16, 14, 32)
     } else {
-        (8, 7, 11, 10, 12, 13)
+        (8, 7, 11, 10, 12, 13, 24)
     };
     // Six column gaps and the highlight marker also consume table width.
     let fixed = status + updated + workspace + shell + branch + worktree + 8;
-    let task = width.saturating_sub(fixed).max(8);
+    let task = width.saturating_sub(fixed).clamp(8, task_max);
     vec![
         Constraint::Length(status),
         Constraint::Length(updated),
@@ -3978,6 +3980,34 @@ mod tests {
                 Constraint::Length(10),
                 Constraint::Length(42),
                 Constraint::Length(30),
+            ]
+        );
+    }
+
+    #[test]
+    fn agent_task_column_is_bounded_and_narrow_columns_still_fit() {
+        assert_eq!(
+            agent_column_widths(240),
+            vec![
+                Constraint::Length(10),
+                Constraint::Length(9),
+                Constraint::Length(24),
+                Constraint::Length(16),
+                Constraint::Length(52),
+                Constraint::Length(28),
+                Constraint::Length(18),
+            ]
+        );
+        assert_eq!(
+            agent_column_widths(80),
+            vec![
+                Constraint::Length(8),
+                Constraint::Length(7),
+                Constraint::Length(11),
+                Constraint::Length(10),
+                Constraint::Length(11),
+                Constraint::Length(12),
+                Constraint::Length(13),
             ]
         );
     }
