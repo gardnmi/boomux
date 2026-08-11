@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.0](https://github.com/gardnmi/boomux/compare/v0.9.1...v0.10.0) (2026-08-11)
+
+
+### Features
+
+* **tui:** improve agent management table ([#96](https://github.com/gardnmi/boomux/issues/96)) ([f122411](https://github.com/gardnmi/boomux/commit/f122411fca06d67100d70b264d60138ffd4f85e9))
+
 ## [0.9.1](https://github.com/gardnmi/boomux/compare/v0.9.0...v0.9.1) (2026-08-11)
 
 
