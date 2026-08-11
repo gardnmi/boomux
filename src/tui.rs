@@ -303,27 +303,17 @@ enum Focus {
 enum PrimaryTab {
     Workspaces,
     Agents,
-    Launchers,
     Shells,
-    Commands,
 }
 
 impl PrimaryTab {
-    const ALL: [Self; 5] = [
-        Self::Workspaces,
-        Self::Agents,
-        Self::Launchers,
-        Self::Shells,
-        Self::Commands,
-    ];
+    const ALL: [Self; 3] = [Self::Workspaces, Self::Agents, Self::Shells];
 
     fn kind(self) -> Option<ItemKind> {
         match self {
             Self::Workspaces => None,
             Self::Agents => Some(ItemKind::Agent),
-            Self::Launchers => Some(ItemKind::Launcher),
             Self::Shells => Some(ItemKind::Shell),
-            Self::Commands => Some(ItemKind::Command),
         }
     }
 
@@ -331,9 +321,7 @@ impl PrimaryTab {
         match self {
             Self::Workspaces => "WORKSPACES",
             Self::Agents => "AGENTS",
-            Self::Launchers => "LAUNCHERS",
             Self::Shells => "SHELLS",
-            Self::Commands => "COMMANDS",
         }
     }
 }
@@ -2354,7 +2342,7 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
         Line::from("  attention filter palette results to outstanding durable attention"),
         Line::from("  Enter    restore a workspace, open a shell, or invoke a launcher"),
         Line::from("  a/e/x    add, rename, or request confirmed close/remove"),
-        Line::from("  Tab/1-5 change view; h/l change pane; j/k navigate"),
+        Line::from("  Tab/1-3 change view; h/l change pane; j/k navigate"),
         Line::from(""),
         Line::from(Span::styled(
             "SELECTED CONTEXT",
@@ -2475,19 +2463,9 @@ fn render_tabs(frame: &mut Frame, area: Rect, app: &App) {
                     PrimaryTab::Agents => {
                         app.workspaces.iter().map(WorkspaceView::agent_count).sum()
                     }
-                    PrimaryTab::Launchers => app
-                        .workspaces
-                        .iter()
-                        .map(WorkspaceView::launcher_count)
-                        .sum(),
                     PrimaryTab::Shells => {
                         app.workspaces.iter().map(WorkspaceView::shell_count).sum()
                     }
-                    PrimaryTab::Commands => app
-                        .workspaces
-                        .iter()
-                        .map(WorkspaceView::command_count)
-                        .sum(),
                     PrimaryTab::Workspaces => unreachable!("workspace tab is rendered separately"),
                 };
                 let style = if *tab == app.primary_tab {
@@ -3854,7 +3832,7 @@ mod tests {
         app.cycle_tab(false);
         assert_eq!(app.primary_tab, PrimaryTab::Agents);
         app.cycle_tab(false);
-        assert_eq!(app.primary_tab, PrimaryTab::Launchers);
+        assert_eq!(app.primary_tab, PrimaryTab::Shells);
         app.cycle_tab(true);
         assert_eq!(app.primary_tab, PrimaryTab::Agents);
         app.cycle_tab(true);
@@ -3865,11 +3843,11 @@ mod tests {
     #[test]
     fn numeric_shortcuts_match_primary_tab_order() {
         assert_eq!(
-            ('1'..='5').filter_map(shortcut_tab).collect::<Vec<_>>(),
+            ('1'..='3').filter_map(shortcut_tab).collect::<Vec<_>>(),
             PrimaryTab::ALL
         );
         assert_eq!(shortcut_tab('0'), None);
-        assert_eq!(shortcut_tab('6'), None);
+        assert_eq!(shortcut_tab('4'), None);
     }
 
     #[test]
@@ -3895,20 +3873,17 @@ mod tests {
     #[test]
     fn direct_tab_selection_selects_first_matching_item_or_none() {
         let mut app = app();
-        app.workspaces[0]
-            .items
-            .push(launcher_view("launch-1", "editor"));
 
-        app.select_tab(PrimaryTab::Launchers);
-        assert_eq!(app.primary_tab, PrimaryTab::Launchers);
+        app.select_tab(PrimaryTab::Agents);
+        assert!(app.global_state.selected().is_none());
+
+        app.select_tab(PrimaryTab::Shells);
+        assert_eq!(app.primary_tab, PrimaryTab::Shells);
         assert_eq!(app.global_state.selected(), Some(0));
         assert!(matches!(
             app.selected_item(),
-            Some(WorkspaceItemView::Launcher(launcher)) if launcher.id == "launch-1"
+            Some(WorkspaceItemView::Shell(shell)) if shell.id == "term_1"
         ));
-
-        app.select_tab(PrimaryTab::Commands);
-        assert!(app.global_state.selected().is_none());
     }
 
     #[test]
@@ -3962,9 +3937,9 @@ mod tests {
         assert!(text.contains("WORKSPACES 1"));
         assert!(text.contains("AGENTS 1"));
         assert!(!text.contains("SESSIONS"));
-        assert!(text.contains("LAUNCHERS 1"));
+        assert!(!text.contains("LAUNCHERS 1"));
         assert!(text.contains("SHELLS 1"));
-        assert!(text.contains("COMMANDS 1"));
+        assert!(!text.contains("COMMANDS 1"));
         assert!(!text.contains("active agents"));
         let workspace_tab = text.find("WORKSPACES 1").expect("workspace tab");
         let aggregate_label = text.find("ALL:").expect("aggregate label");
@@ -5279,65 +5254,28 @@ mod tests {
     }
 
     #[test]
-    fn global_launcher_actions_dispatch_exact_item_and_owner() {
-        let mut one = workspace("w1", "one");
-        one.items = vec![launcher_view("same-id", "first")];
-        let mut two = workspace("w2", "two");
-        two.items = vec![launcher_view("same-id", "second")];
-        let mut app = App::new(vec![one, two], project_context());
-        app.select_tab(PrimaryTab::Launchers);
-        app.next();
-        let mut opened = None;
-
-        app.open_selected_item(&mut |target| {
-            opened = Some(target.clone());
-            Ok(String::new())
-        });
-        app.request_rename();
-        assert!(matches!(
-            app.mode,
-            Mode::Rename { target: RenameTarget::Launcher(ref id), .. } if id == "same-id"
-        ));
-        app.mode = Mode::Normal;
-        app.request_close();
-
-        assert_eq!(
-            opened,
-            Some(OpenTarget::Launcher {
-                workspace_id: "w2".into(),
-                launcher_id: "same-id".into(),
-            })
-        );
-        assert!(matches!(
-            app.pending_close,
-            Some(PendingClose { target: CloseTarget::Launcher(ref id), ref name, .. })
-                if id == "same-id" && name == "second"
-        ));
-    }
-
-    #[test]
     fn refresh_preserves_global_selection_by_workspace_and_item_identity() {
         let mut one = workspace("w1", "one");
-        one.items = vec![launcher_view("same-id", "first")];
+        one.items = vec![terminal("same-id", "first", "")];
         let mut two = workspace("w2", "two");
-        two.items = vec![launcher_view("same-id", "second")];
+        two.items = vec![terminal("same-id", "second", "")];
         let mut app = App::new(vec![one, two], project_context());
-        app.select_tab(PrimaryTab::Launchers);
+        app.select_tab(PrimaryTab::Shells);
         app.next();
 
         let mut refreshed_two = workspace("w2", "two");
         refreshed_two.items = vec![
-            launcher_view("new", "new"),
-            launcher_view("same-id", "second"),
+            terminal("new", "new", ""),
+            terminal("same-id", "second", ""),
         ];
         let mut refreshed_one = workspace("w1", "one");
-        refreshed_one.items = vec![launcher_view("same-id", "first")];
+        refreshed_one.items = vec![terminal("same-id", "first", "")];
         app.replace_workspaces(vec![refreshed_two, refreshed_one]);
 
         assert_eq!(app.global_state.selected(), Some(1));
         assert!(matches!(
             app.selected_item(),
-            Some(WorkspaceItemView::Launcher(launcher)) if launcher.name == "second"
+            Some(WorkspaceItemView::Shell(shell)) if shell.name == "second"
         ));
         assert_eq!(
             app.selected_item_workspace()
@@ -5435,7 +5373,7 @@ mod tests {
         };
         command.argv = vec!["printf".into(), "a b".into(), String::new()];
         let mut app = App::new(vec![workspace], project_context());
-        app.select_tab(PrimaryTab::Commands);
+        focus_items(&mut app);
         let reads = std::cell::Cell::new(0);
         app.refresh_terminal_preview(&mut |_| {
             reads.set(reads.get() + 1);
