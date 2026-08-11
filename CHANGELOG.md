@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.1](https://github.com/gardnmi/boomux/compare/v0.9.0...v0.9.1) (2026-08-11)
+
+
+### Bug Fixes
+
+* **tui:** keep focus following within active tab ([#94](https://github.com/gardnmi/boomux/issues/94)) ([9692622](https://github.com/gardnmi/boomux/commit/969262212da215b2847e906bdab230ab58883a44))
+
 ## [0.9.0](https://github.com/gardnmi/boomux/compare/v0.8.0...v0.9.0) (2026-08-11)
 
 
