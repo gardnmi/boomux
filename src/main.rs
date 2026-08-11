@@ -1279,7 +1279,6 @@ fn dashboard_views_from_sessions(
                             .into(),
                         evidence: item.attention.observation.evidence,
                         observed_at_ms: item.attention.observation.observed_at_ms,
-                        observation_is_current: item.observation_is_current,
                     })
                     .collect();
             let shells = workspace.shells.iter().map(|shell| {
@@ -5633,14 +5632,22 @@ mod tests {
 
         let error = open_workspace(&workspace, None).unwrap_err();
         assert!(error.to_string().contains("launcher missing"));
-        for _ in 0..100 {
-            if marker.is_file() {
-                break;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let contents = loop {
+            if let Ok(contents) = fs::read_to_string(&marker)
+                && contents == "launched"
+            {
+                break contents;
+            }
+            if std::time::Instant::now() >= deadline {
+                break String::new();
             }
             thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert_eq!(contents, "launched");
+        if marker.is_file() {
+            fs::remove_file(marker).unwrap();
         }
-        assert_eq!(fs::read_to_string(&marker).unwrap(), "launched");
-        fs::remove_file(marker).unwrap();
     }
 
     #[test]

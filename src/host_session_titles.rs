@@ -216,8 +216,8 @@ mod tests {
     use std::ffi::OsString;
     use std::fs::{self, File, FileTimes};
     use std::os::unix::fs::symlink;
-    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Barrier, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
@@ -618,12 +618,17 @@ mod tests {
     fn cache_is_async_deduplicated_and_routes_opencode_and_pi() {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let worker_calls = Arc::clone(&calls);
+        let first_inspection = Arc::new(Barrier::new(2));
+        let worker_first_inspection = Arc::clone(&first_inspection);
         let (finished_sender, finished_receiver) = mpsc::channel();
         let mut cache = Cache::with_inspector(Arc::new(move |integration, directory| {
             worker_calls
                 .lock()
                 .expect("calls lock")
                 .push((integration.to_owned(), directory.to_owned()));
+            if integration == "opencode" {
+                worker_first_inspection.wait();
+            }
             let _ = finished_sender.send(integration.to_owned());
             let catalog = (integration == "opencode")
                 .then(|| HostSession {
@@ -654,6 +659,7 @@ mod tests {
             None
         );
         assert_eq!(cache.title("pi", Path::new("/repo"), "pi-id"), None);
+        first_inspection.wait();
         finished_receiver
             .recv_timeout(Duration::from_secs(2))
             .expect("first inspection");

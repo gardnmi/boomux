@@ -57,7 +57,6 @@ pub(crate) struct WorkspaceAttentionView {
     pub(crate) reason: String,
     pub(crate) evidence: String,
     pub(crate) observed_at_ms: u64,
-    pub(crate) observation_is_current: bool,
 }
 
 pub(crate) struct AgentSessionView {
@@ -2804,36 +2803,6 @@ fn workspace_preview(workspace: &WorkspaceView) -> ContextualPreview {
             Style::new().fg(SUBTEXT),
         )),
     ]);
-    if let Some(attention) = workspace.attention.first() {
-        let currency = if attention.observation_is_current {
-            "current"
-        } else {
-            "stale"
-        };
-        lines.extend([
-            Line::from(Span::styled(
-                format!("{}: {}", attention.reason, attention.agent_name),
-                Style::new().fg(if attention.reason == "blocked" {
-                    RED
-                } else {
-                    BLUE
-                }),
-            )),
-            Line::from(Span::styled(
-                attention.evidence.clone(),
-                Style::new().fg(SUBTEXT),
-            )),
-            Line::from(Span::styled(
-                format!("{}  {currency}", compact_recency(attention.observed_at_ms)),
-                Style::new().fg(SUBTEXT),
-            )),
-        ]);
-    } else {
-        lines.push(Line::from(Span::styled(
-            "No outstanding attention",
-            Style::new().fg(SUBTEXT),
-        )));
-    }
     ContextualPreview {
         title: format!(" {} overview ", workspace.name),
         content_height: lines.len() as u16,
@@ -4315,7 +4284,6 @@ mod tests {
             reason: "blocked".into(),
             evidence: "approval required".into(),
             observed_at_ms: 1,
-            observation_is_current: true,
         }];
         workspace.attention_count = 1;
         let mut palette = CommandPalette::new(&[workspace]);
@@ -4361,7 +4329,6 @@ mod tests {
             reason: "completed".into(),
             evidence: "finished".into(),
             observed_at_ms: 20,
-            observation_is_current: true,
         }];
         let mut blocked = workspace("w2", "second");
         blocked.attention = vec![WorkspaceAttentionView {
@@ -4370,7 +4337,6 @@ mod tests {
             reason: "blocked".into(),
             evidence: "approval required".into(),
             observed_at_ms: 10,
-            observation_is_current: true,
         }];
         let mut palette = CommandPalette::new(&[completed, blocked]);
 
@@ -5721,7 +5687,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_preview_surfaces_most_urgent_attention() {
+    fn workspace_preview_omits_attention_details() {
         let backend = TestBackend::new(140, 34);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut workspace = workspace("w1", "review");
@@ -5731,7 +5697,6 @@ mod tests {
             reason: "blocked".into(),
             evidence: "approval required".into(),
             observed_at_ms: current_time_ms(),
-            observation_is_current: true,
         }];
         workspace.attention_count = 1;
         let mut app = App::new(vec![workspace], project_context());
@@ -5746,8 +5711,11 @@ mod tests {
             .collect();
 
         assert!(text.contains("review overview"));
-        assert!(text.contains("blocked: review-agent"));
-        assert!(text.contains("approval required"));
+        assert!(text.contains("working"));
+        assert!(text.contains("blocked"));
+        assert!(!text.contains("blocked: review-agent"));
+        assert!(!text.contains("approval required"));
+        assert!(!text.contains("No outstanding attention"));
     }
 
     #[test]
