@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.8.0](https://github.com/gardnmi/boomux/compare/v0.7.0...v0.8.0) (2026-08-11)
+
+
+### Features
+
+* recover sessions after cold restarts ([#88](https://github.com/gardnmi/boomux/issues/88)) ([5779b9e](https://github.com/gardnmi/boomux/commit/5779b9e7450d2ce0d896e7275388fad6172bf952))
+
+
+### Bug Fixes
+
+* remove stale overview attention and harden process timing ([#91](https://github.com/gardnmi/boomux/issues/91)) ([6caaf8a](https://github.com/gardnmi/boomux/commit/6caaf8ae58d398203efff4f60ea41effad6bda34))
+* **tui:** expose by-name workspace creation ([#89](https://github.com/gardnmi/boomux/issues/89)) ([5cf0e0d](https://github.com/gardnmi/boomux/commit/5cf0e0d8ac0bdf9e4d8ca3fa25db2b4c3cda9da8))
+
 ## [0.7.0](https://github.com/gardnmi/boomux/compare/v0.6.0...v0.7.0) (2026-08-10)
 
 
