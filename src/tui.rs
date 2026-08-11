@@ -941,10 +941,21 @@ impl App {
         else {
             return;
         };
+        let item = &self.workspaces[workspace_index].items[item_index];
+        if self.primary_tab != PrimaryTab::Workspaces
+            && self.primary_tab.kind() != Some(item.kind())
+        {
+            return;
+        }
         self.observed_focus_revision = Some(focused.revision);
-        self.select_tab(PrimaryTab::Workspaces);
-        self.workspace_state.select(Some(workspace_index));
-        self.item_state.select(Some(item_index));
+        if self.primary_tab == PrimaryTab::Workspaces {
+            self.workspace_state.select(Some(workspace_index));
+            self.item_state.select(Some(item_index));
+        } else {
+            let identity = item_identity(&self.workspaces[workspace_index], item);
+            self.global_state
+                .select(self.global_item_position(&identity));
+        }
         self.set_focus(Focus::Items);
     }
 
@@ -3610,6 +3621,73 @@ mod tests {
         assert_eq!(
             app.selected().map(|workspace| workspace.id.as_str()),
             Some("w1")
+        );
+    }
+
+    #[test]
+    fn focus_following_stays_in_the_current_global_tab() {
+        let mut first_agent = workspace("w1", "first agent");
+        first_agent.items[0] = WorkspaceItemView::AgentShell(agent_shell());
+        set_shell_id(&mut first_agent, "agent-1");
+        let mut first_shell = workspace("w2", "first shell");
+        set_shell_id(&mut first_shell, "shell-1");
+        let mut second_agent = workspace("w3", "second agent");
+        second_agent.items[0] = WorkspaceItemView::AgentShell(agent_shell());
+        set_shell_id(&mut second_agent, "agent-2");
+        let mut second_shell = workspace("w4", "second shell");
+        set_shell_id(&mut second_shell, "shell-2");
+        let mut app = App::new(
+            vec![first_agent, first_shell, second_agent, second_shell],
+            project_context(),
+        );
+        app.enable_focus_following(None);
+
+        app.select_tab(PrimaryTab::Agents);
+        app.apply_focused_terminal(Some(&FocusedTerminalView {
+            revision: 1,
+            workspace_id: "w3".into(),
+            shell_id: "agent-2".into(),
+        }));
+        assert_eq!(app.primary_tab, PrimaryTab::Agents);
+        assert_eq!(
+            app.selected_item().map(WorkspaceItemView::id),
+            Some("agent-2")
+        );
+
+        app.apply_focused_terminal(Some(&FocusedTerminalView {
+            revision: 2,
+            workspace_id: "w2".into(),
+            shell_id: "shell-1".into(),
+        }));
+        assert_eq!(app.primary_tab, PrimaryTab::Agents);
+        assert_eq!(app.observed_focus_revision, Some(1));
+        assert_eq!(
+            app.selected_item().map(WorkspaceItemView::id),
+            Some("agent-2")
+        );
+
+        app.select_tab(PrimaryTab::Shells);
+        app.apply_focused_terminal(Some(&FocusedTerminalView {
+            revision: 3,
+            workspace_id: "w4".into(),
+            shell_id: "shell-2".into(),
+        }));
+        assert_eq!(app.primary_tab, PrimaryTab::Shells);
+        assert_eq!(
+            app.selected_item().map(WorkspaceItemView::id),
+            Some("shell-2")
+        );
+
+        app.apply_focused_terminal(Some(&FocusedTerminalView {
+            revision: 4,
+            workspace_id: "w1".into(),
+            shell_id: "agent-1".into(),
+        }));
+        assert_eq!(app.primary_tab, PrimaryTab::Shells);
+        assert_eq!(app.observed_focus_revision, Some(3));
+        assert_eq!(
+            app.selected_item().map(WorkspaceItemView::id),
+            Some("shell-2")
         );
     }
 
