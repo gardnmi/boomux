@@ -1279,7 +1279,6 @@ fn dashboard_views_from_sessions(
                             .into(),
                         evidence: item.attention.observation.evidence,
                         observed_at_ms: item.attention.observation.observed_at_ms,
-                        observation_is_current: item.observation_is_current,
                     })
                     .collect();
             let shells = workspace.shells.iter().map(|shell| {
