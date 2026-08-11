@@ -1338,10 +1338,20 @@ fn dashboard_views_from_sessions(
                                 ))
                     })
                 });
+                let root_git = agent
+                    .and_then(|agent| {
+                        sessions
+                            .iter()
+                            .find(|session| session.runs.iter().any(|run| run.agent_id == agent.id))
+                    })
+                    .and_then(|session| session.source_cwd.as_deref())
+                    .map(|directory| git_cache.inspect(directory))
+                    .unwrap_or_default();
                 match (agent, shell.foreground_process.as_deref()) {
                     (Some(agent), _) => tui::WorkspaceItemView::AgentShell(tui::AgentShellView {
                         shell: shell_view,
                         agent: Some(tui::AgentView {
+                            id: agent.id.clone(),
                             state: cli_output::agent_state(agent.observation.state).into(),
                             integration: agent.integration.clone(),
                             external_session_id: agent.external_session_id.clone(),
@@ -1349,6 +1359,9 @@ fn dashboard_views_from_sessions(
                                 .into(),
                             confidence: agent.observation.confidence,
                             evidence: agent.observation.evidence.clone(),
+                            updated_at_ms: agent.observation.observed_at_ms,
+                            root_branch: root_git.branch,
+                            root_worktree: root_git.worktree,
                         }),
                     }),
                     (None, Some("opencode" | "pi")) if !suppress_foreground_hint => {
@@ -1396,6 +1409,7 @@ fn workspace_session_views<'a>(
                 .occurrences
                 .iter()
                 .map(|occurrence| tui::AgentSessionRunView {
+                    agent_id: occurrence.agent_id.clone(),
                     shell_name: occurrence.retained_shell_name.clone(),
                     directory: occurrence.source_cwd.clone(),
                 })
@@ -5150,10 +5164,12 @@ mod tests {
                 source_cwd: Some("/tmp/project".into()),
                 runs: vec![
                     tui::AgentSessionRunView {
+                        agent_id: "old-agent".into(),
                         shell_name: Some("old-shell".into()),
                         directory: Some("/tmp/project".into()),
                     },
                     tui::AgentSessionRunView {
+                        agent_id: "new-agent".into(),
                         shell_name: None,
                         directory: None,
                     },
@@ -5354,9 +5370,14 @@ mod tests {
         assert_eq!(shell.branch, "-");
         assert_eq!(shell.command, "opencode");
         let agent = agent.as_ref().expect("durable agent");
+        assert_eq!(agent.id, "a1");
         assert_eq!(agent.state, "working");
         assert_eq!(agent.authority, "lifecycle_integration");
         assert_eq!(agent.confidence, 95);
+        assert_eq!(agent.updated_at_ms, 11);
+        assert_eq!(agent.root_branch, "-");
+        assert_eq!(agent.root_worktree, "-");
+        assert_eq!(views[0].sessions[0].runs[0].agent_id, "a1");
         assert!(matches!(
             views[0].items[1],
             tui::WorkspaceItemView::Launcher(_)

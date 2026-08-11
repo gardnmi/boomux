@@ -27,6 +27,15 @@ const REFRESH_INTERVAL: Duration = Duration::from_millis(250);
 const TERMINAL_PREVIEW_ROWS: usize = 16;
 const TERMINAL_PREVIEW_SCROLL_STEP: usize = 12;
 const PREVIEW_RESERVED_ITEM_HEIGHT: u16 = 6;
+const AGENT_TABLE_HEADERS: [&str; 7] = [
+    "STATUS",
+    "UPDATED",
+    "WORKSPACE",
+    "SHELL",
+    "TASK",
+    "ROOT BRANCH",
+    "ROOT WORKTREE",
+];
 
 pub(crate) struct WorkspaceView {
     pub(crate) id: String,
@@ -72,6 +81,7 @@ pub(crate) struct AgentSessionView {
 }
 
 pub(crate) struct AgentSessionRunView {
+    pub(crate) agent_id: String,
     pub(crate) shell_name: Option<String>,
     pub(crate) directory: Option<PathBuf>,
 }
@@ -97,12 +107,16 @@ impl AgentShellView {
 }
 
 pub(crate) struct AgentView {
+    pub(crate) id: String,
     pub(crate) state: String,
     pub(crate) integration: String,
     pub(crate) external_session_id: Option<String>,
     pub(crate) authority: String,
     pub(crate) confidence: u8,
     pub(crate) evidence: String,
+    pub(crate) updated_at_ms: u64,
+    pub(crate) root_branch: String,
+    pub(crate) root_worktree: String,
 }
 
 pub(crate) struct LauncherView {
@@ -2556,65 +2570,123 @@ fn render_global_items(frame: &mut Frame, area: Rect, app: &mut App) {
             Layout::vertical([Constraint::Fill(1), Constraint::Length(panel_height)]).areas(inner);
         (items_area, Some(preview_area))
     });
-    let kind = app.primary_tab.kind().expect("global tab kind");
-    let rows: Vec<_> = app
-        .workspaces
-        .iter()
-        .flat_map(|workspace| {
-            workspace
-                .items
-                .iter()
-                .filter(move |item| item.kind() == kind)
-                .map(move |item| {
-                    let mut cells = vec![Cell::from(workspace.name.clone())];
-                    match item {
-                        WorkspaceItemView::Shell(shell) => cells.extend([
-                            Cell::from(shell.name.clone()),
-                            Cell::from(Span::styled(
-                                shell.status.clone(),
-                                Style::new().fg(status_color(&shell.status)),
-                            )),
-                            Cell::from(shell.directory.clone()),
-                            Cell::from(shell.detail().to_owned()),
-                        ]),
-                        WorkspaceItemView::AgentShell(agent) => cells.extend([
-                            Cell::from(agent.shell.name.clone()),
-                            Cell::from(Span::styled(
-                                agent.status().to_owned(),
-                                Style::new().fg(status_color(agent.status())),
-                            )),
-                            Cell::from(agent.shell.directory.clone()),
-                            Cell::from(agent.agent.as_ref().map_or_else(
-                                || format!("foreground process | {}", agent.shell.branch),
-                                |view| {
-                                    format!(
-                                        "{} | {} | {} / {} {}%",
-                                        view.evidence,
-                                        agent.shell.branch,
-                                        view.integration,
-                                        view.authority,
-                                        view.confidence
-                                    )
-                                },
-                            )),
-                        ]),
-                        WorkspaceItemView::Launcher(launcher) => cells.extend([
-                            Cell::from(launcher.name.clone()),
-                            Cell::from("-"),
-                            Cell::from(launcher.directory.clone()),
-                            Cell::from(launcher.command.clone()),
-                        ]),
-                    }
-                    Row::new(cells)
+    let (rows, widths, header) = if app.primary_tab == PrimaryTab::Agents {
+        let values: Vec<[String; 7]> = app
+            .workspaces
+            .iter()
+            .flat_map(|workspace| {
+                workspace.items.iter().filter_map(move |item| {
+                    let WorkspaceItemView::AgentShell(agent) = item else {
+                        return None;
+                    };
+                    let task = matched_agent_session(workspace, agent)
+                        .and_then(session_task_label)
+                        .unwrap_or("-");
+                    let (updated, branch, worktree) = agent.agent.as_ref().map_or_else(
+                        || ("-".into(), "-".into(), "-".into()),
+                        |view| {
+                            (
+                                compact_recency(view.updated_at_ms),
+                                view.root_branch.clone(),
+                                view.root_worktree.clone(),
+                            )
+                        },
+                    );
+                    Some([
+                        agent.status().to_owned(),
+                        updated,
+                        workspace.name.clone(),
+                        agent.shell.name.clone(),
+                        task.to_owned(),
+                        branch,
+                        worktree,
+                    ])
                 })
-        })
-        .collect();
-    let widths = global_column_widths(items_inner.width);
-    let table = Table::new(rows, widths)
-        .header(
-            Row::new(["WORKSPACE", "NAME", "STATUS", "DIRECTORY", "DETAIL"])
-                .style(Style::new().fg(BLUE).add_modifier(Modifier::BOLD)),
+            })
+            .collect();
+        let widths = agent_column_widths(items_inner.width, &values);
+        let rows: Vec<_> = values
+            .into_iter()
+            .map(
+                |[status, updated, workspace, shell, task, branch, worktree]| {
+                    Row::new([
+                        Cell::from(Span::styled(
+                            status.clone(),
+                            Style::new().fg(status_color(&status)),
+                        )),
+                        Cell::from(updated),
+                        Cell::from(workspace),
+                        Cell::from(shell),
+                        Cell::from(task),
+                        Cell::from(branch),
+                        Cell::from(worktree),
+                    ])
+                },
+            )
+            .collect();
+        (rows, widths, AGENT_TABLE_HEADERS.to_vec())
+    } else {
+        let kind = app.primary_tab.kind().expect("global tab kind");
+        let rows: Vec<_> = app
+            .workspaces
+            .iter()
+            .flat_map(|workspace| {
+                workspace
+                    .items
+                    .iter()
+                    .filter(move |item| item.kind() == kind)
+                    .map(move |item| {
+                        let mut cells = vec![Cell::from(workspace.name.clone())];
+                        match item {
+                            WorkspaceItemView::Shell(shell) => cells.extend([
+                                Cell::from(shell.name.clone()),
+                                Cell::from(Span::styled(
+                                    shell.status.clone(),
+                                    Style::new().fg(status_color(&shell.status)),
+                                )),
+                                Cell::from(shell.directory.clone()),
+                                Cell::from(shell.detail().to_owned()),
+                            ]),
+                            WorkspaceItemView::AgentShell(agent) => cells.extend([
+                                Cell::from(agent.shell.name.clone()),
+                                Cell::from(Span::styled(
+                                    agent.status().to_owned(),
+                                    Style::new().fg(status_color(agent.status())),
+                                )),
+                                Cell::from(agent.shell.directory.clone()),
+                                Cell::from(agent.agent.as_ref().map_or_else(
+                                    || format!("foreground process | {}", agent.shell.branch),
+                                    |view| {
+                                        format!(
+                                            "{} | {} | {} / {} {}%",
+                                            view.evidence,
+                                            agent.shell.branch,
+                                            view.integration,
+                                            view.authority,
+                                            view.confidence
+                                        )
+                                    },
+                                )),
+                            ]),
+                            WorkspaceItemView::Launcher(launcher) => cells.extend([
+                                Cell::from(launcher.name.clone()),
+                                Cell::from("-"),
+                                Cell::from(launcher.directory.clone()),
+                                Cell::from(launcher.command.clone()),
+                            ]),
+                        }
+                        Row::new(cells)
+                    })
+            })
+            .collect();
+        (
+            rows,
+            global_column_widths(items_inner.width),
+            vec!["WORKSPACE", "NAME", "STATUS", "DIRECTORY", "DETAIL"],
         )
+    };
+    let table = Table::new(rows, widths)
+        .header(Row::new(header).style(Style::new().fg(BLUE).add_modifier(Modifier::BOLD)))
         .column_spacing(1)
         .row_highlight_style(
             Style::new()
@@ -3032,21 +3104,8 @@ fn format_argv(argv: &[String]) -> String {
 
 fn agent_session_preview(app: &App, agent_shell: &AgentShellView) -> Option<ContextualPreview> {
     let agent = agent_shell.agent.as_ref()?;
-    let external_session_id = agent.external_session_id.as_deref()?;
     let workspace = app.selected_item_workspace()?;
-    let session = workspace
-        .sessions
-        .iter()
-        .filter(|session| {
-            session.integration == agent.integration
-                && session.external_session_id.as_deref() == Some(external_session_id)
-        })
-        .max_by(|left, right| {
-            left.state_is_current
-                .cmp(&right.state_is_current)
-                .then_with(|| left.last_at_ms.cmp(&right.last_at_ms))
-                .then_with(|| left.id.cmp(&right.id))
-        })?;
+    let session = matched_agent_session(workspace, agent_shell)?;
     let label = best_session_label(session);
     let external_identity = session
         .external_session_id
@@ -3068,6 +3127,10 @@ fn agent_session_preview(app: &App, agent_shell: &AgentShellView) -> Option<Cont
     } else {
         "last known"
     };
+    let root_directory = session
+        .source_cwd
+        .as_deref()
+        .map_or_else(|| "-".into(), |path| path.display().to_string());
     let rows = vec![
         Row::new([
             Cell::from(Span::styled(
@@ -3086,17 +3149,53 @@ fn agent_session_preview(app: &App, agent_shell: &AgentShellView) -> Option<Cont
                     ),
                     Style::new().fg(SUBTEXT),
                 )),
+                Line::from(Span::styled(
+                    format!(
+                        "root {root_directory}  {}  {}",
+                        agent.root_branch, agent.root_worktree
+                    ),
+                    Style::new().fg(SUBTEXT),
+                )),
+                Line::from(Span::styled(
+                    format!(
+                        "{}  {} {}%",
+                        agent.evidence, agent.authority, agent.confidence
+                    ),
+                    Style::new().fg(SUBTEXT),
+                )),
             ]),
             Cell::from(session.state.clone()),
-            Cell::from(compact_recency(session.last_at_ms)),
+            Cell::from(compact_recency(agent.updated_at_ms)),
         ])
-        .height(2),
+        .height(4),
     ];
     Some(ContextualPreview {
         title: format!(" {} session ", integration_display_name(&agent.integration)),
         content: PreviewContent::AgentSession(rows),
-        content_height: 2,
+        content_height: 4,
     })
+}
+
+fn matched_agent_session<'a>(
+    workspace: &'a WorkspaceView,
+    agent_shell: &AgentShellView,
+) -> Option<&'a AgentSessionView> {
+    let agent = agent_shell.agent.as_ref()?;
+    workspace
+        .sessions
+        .iter()
+        .filter(|session| {
+            session.runs.iter().any(|run| run.agent_id == agent.id)
+                || (session.integration == agent.integration
+                    && agent.external_session_id.is_some()
+                    && session.external_session_id == agent.external_session_id)
+        })
+        .max_by(|left, right| {
+            left.state_is_current
+                .cmp(&right.state_is_current)
+                .then_with(|| left.last_at_ms.cmp(&right.last_at_ms))
+                .then_with(|| left.id.cmp(&right.id))
+        })
 }
 
 fn render_contextual_preview(frame: &mut Frame, area: Rect, preview: ContextualPreview) {
@@ -3125,11 +3224,7 @@ fn render_contextual_preview(frame: &mut Frame, area: Rect, preview: ContextualP
 }
 
 fn best_session_label(session: &AgentSessionView) -> String {
-    let label = session.label.trim();
-    if !label.is_empty()
-        && !label.eq_ignore_ascii_case(&session.integration)
-        && !label.eq_ignore_ascii_case(integration_display_name(&session.integration))
-    {
+    if let Some(label) = session_task_label(session) {
         return label.to_owned();
     }
     let identity = session
@@ -3151,6 +3246,14 @@ fn best_session_label(session: &AgentSessionView) -> String {
             },
             |shell| format!("{shell} ({identity})"),
         )
+}
+
+fn session_task_label(session: &AgentSessionView) -> Option<&str> {
+    let label = session.label.trim();
+    (!label.is_empty()
+        && !label.eq_ignore_ascii_case(&session.integration)
+        && !label.eq_ignore_ascii_case(integration_display_name(&session.integration)))
+    .then_some(label)
 }
 
 fn integration_display_name(integration: &str) -> &str {
@@ -3200,6 +3303,39 @@ fn global_column_widths(width: u16) -> Vec<Constraint> {
         Constraint::Length(directory),
         Constraint::Length(detail),
     ]
+}
+
+fn agent_column_widths(width: u16, rows: &[[String; 7]]) -> Vec<Constraint> {
+    let caps = if width >= 160 {
+        [10, 9, 24, 16, 52, 36, 24]
+    } else if width >= 140 {
+        [10, 9, 20, 16, 44, 28, 20]
+    } else if width >= 100 {
+        [9, 8, 14, 12, 32, 18, 16]
+    } else {
+        [8, 7, 11, 10, 24, 12, 13]
+    };
+    let minimums = AGENT_TABLE_HEADERS.map(|header| header.len() as u16);
+    let mut widths: [u16; 7] = std::array::from_fn(|index| {
+        rows.iter()
+            .map(|row| row[index].chars().count() as u16)
+            .max()
+            .unwrap_or(0)
+            .max(minimums[index])
+            .saturating_add(2)
+            .min(caps[index])
+    });
+
+    // Six column gaps and the highlight marker also consume table width.
+    let available = width.saturating_sub(8);
+    let mut overflow = widths.iter().sum::<u16>().saturating_sub(available);
+    for index in [4, 2, 5, 3, 6, 0, 1] {
+        let reduction = widths[index].saturating_sub(minimums[index]).min(overflow);
+        widths[index] -= reduction;
+        overflow -= reduction;
+    }
+
+    widths.into_iter().map(Constraint::Length).collect()
 }
 
 fn short_id(id: &str) -> String {
@@ -3474,12 +3610,16 @@ mod tests {
 
     fn agent() -> AgentView {
         AgentView {
+            id: "agent-active".into(),
             state: "working".into(),
             integration: "opencode".into(),
             external_session_id: Some("external-active".into()),
             authority: "lifecycle_integration".into(),
             confidence: 95,
             evidence: "tool call in progress".into(),
+            updated_at_ms: current_time_ms(),
+            root_branch: "feat/agents".into(),
+            root_worktree: "linked:agents".into(),
         }
     }
 
@@ -3510,6 +3650,7 @@ mod tests {
             last_at_ms: 30,
             source_cwd: Some("/tmp/boomux".into()),
             runs: vec![AgentSessionRunView {
+                agent_id: format!("agent-{id}"),
                 shell_name: Some("agent".into()),
                 directory: Some("/tmp/boomux".into()),
             }],
@@ -3862,6 +4003,44 @@ mod tests {
                 Constraint::Length(10),
                 Constraint::Length(42),
                 Constraint::Length(30),
+            ]
+        );
+    }
+
+    #[test]
+    fn agent_columns_fit_content_and_shrink_task_first() {
+        let rows = [[
+            "idle",
+            "7h ago",
+            "edge-datapipe-support",
+            "agent",
+            "Check Slack tickets against GitHub releases",
+            "fix/confluent-direct-download",
+            "primary",
+        ]
+        .map(str::to_owned)];
+        assert_eq!(
+            agent_column_widths(240, &rows),
+            vec![
+                Constraint::Length(8),
+                Constraint::Length(9),
+                Constraint::Length(23),
+                Constraint::Length(7),
+                Constraint::Length(45),
+                Constraint::Length(31),
+                Constraint::Length(15),
+            ]
+        );
+        assert_eq!(
+            agent_column_widths(80, &rows),
+            vec![
+                Constraint::Length(8),
+                Constraint::Length(7),
+                Constraint::Length(11),
+                Constraint::Length(7),
+                Constraint::Length(14),
+                Constraint::Length(12),
+                Constraint::Length(13),
             ]
         );
     }
@@ -5383,16 +5562,60 @@ mod tests {
         terminal_backend
             .draw(|frame| render(frame, &mut app))
             .unwrap();
-        let text: String = terminal_backend
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
+        let buffer = terminal_backend.backend().buffer();
+        let lines: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect()
+            })
             .collect();
+        let text = lines.join("\n");
+        let row = lines
+            .iter()
+            .find(|line| line.contains("working") && line.contains("two"))
+            .expect("tracked agent row");
 
-        assert!(text.contains("Owning workspace session"));
+        assert!(text.contains("STATUS"));
+        assert!(text.contains("UPDATED"));
+        assert!(text.contains("WORKSPACE"));
+        assert!(text.contains("SHELL"));
+        assert!(text.contains("TASK"));
+        assert!(text.contains("ROOT BRANCH"));
+        assert!(text.contains("ROOT WORKTREE"));
+        assert!(row.contains("Owning workspace session"));
+        assert!(row.contains("feat/agents"));
+        assert!(row.contains("linked:agents"));
         assert!(!text.contains("Wrong workspace session"));
+        assert!(!text.contains("DETAIL"));
+    }
+
+    #[test]
+    fn agents_table_leaves_untracked_metadata_unknown() {
+        let backend = TestBackend::new(100, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut workspace = workspace("w1", "project");
+        workspace.items = vec![WorkspaceItemView::AgentShell(hinted_agent_shell())];
+        let mut app = App::new(vec![workspace], project_context());
+        app.select_tab(PrimaryTab::Agents);
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let lines: Vec<String> = (0..terminal.backend().buffer().area.height)
+            .map(|y| {
+                (0..terminal.backend().buffer().area.width)
+                    .map(|x| terminal.backend().buffer()[(x, y)].symbol())
+                    .collect()
+            })
+            .collect();
+        let row = lines
+            .iter()
+            .find(|line| line.contains("project") && line.contains("agent"))
+            .expect("untracked agent row");
+
+        assert!(row.contains("untrack"));
+        assert!(row.contains("project"));
+        assert!(row.contains("agent"));
+        assert!(row.matches('-').count() >= 4);
     }
 
     #[test]
@@ -5740,6 +5963,7 @@ mod tests {
         view.label = "opencode".into();
         view.external_session_id = Some("ses_123456789".into());
 
+        assert_eq!(session_task_label(&view), None);
         assert_eq!(best_session_label(&view), "agent (ses_1234)");
     }
 
@@ -5750,6 +5974,7 @@ mod tests {
         view.label = "Pi".into();
         view.external_session_id = Some("pi_123456789".into());
 
+        assert_eq!(session_task_label(&view), None);
         assert_eq!(best_session_label(&view), "agent (pi_12345)");
     }
 
