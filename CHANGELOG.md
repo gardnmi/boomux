@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.0](https://github.com/gardnmi/boomux/compare/v0.8.0...v0.9.0) (2026-08-11)
+
+
+### Features
+
+* **tui:** focus dashboard tabs on agents and shells ([#92](https://github.com/gardnmi/boomux/issues/92)) ([a3df999](https://github.com/gardnmi/boomux/commit/a3df99907d481db317c97e5e2793c89ee10d0295))
+
 ## [0.8.0](https://github.com/gardnmi/boomux/compare/v0.7.0...v0.8.0) (2026-08-11)
 
 
