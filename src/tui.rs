@@ -27,6 +27,15 @@ const REFRESH_INTERVAL: Duration = Duration::from_millis(250);
 const TERMINAL_PREVIEW_ROWS: usize = 16;
 const TERMINAL_PREVIEW_SCROLL_STEP: usize = 12;
 const PREVIEW_RESERVED_ITEM_HEIGHT: u16 = 6;
+const AGENT_TABLE_HEADERS: [&str; 7] = [
+    "STATUS",
+    "UPDATED",
+    "WORKSPACE",
+    "SHELL",
+    "TASK",
+    "ROOT BRANCH",
+    "ROOT WORKTREE",
+];
 
 pub(crate) struct WorkspaceView {
     pub(crate) id: String,
@@ -2562,7 +2571,7 @@ fn render_global_items(frame: &mut Frame, area: Rect, app: &mut App) {
         (items_area, Some(preview_area))
     });
     let (rows, widths, header) = if app.primary_tab == PrimaryTab::Agents {
-        let rows: Vec<_> = app
+        let values: Vec<[String; 7]> = app
             .workspaces
             .iter()
             .flat_map(|workspace| {
@@ -2583,34 +2592,39 @@ fn render_global_items(frame: &mut Frame, area: Rect, app: &mut App) {
                             )
                         },
                     );
-                    Some(Row::new([
-                        Cell::from(Span::styled(
-                            agent.status().to_owned(),
-                            Style::new().fg(status_color(agent.status())),
-                        )),
-                        Cell::from(updated),
-                        Cell::from(workspace.name.clone()),
-                        Cell::from(agent.shell.name.clone()),
-                        Cell::from(task.to_owned()),
-                        Cell::from(branch),
-                        Cell::from(worktree),
-                    ]))
+                    Some([
+                        agent.status().to_owned(),
+                        updated,
+                        workspace.name.clone(),
+                        agent.shell.name.clone(),
+                        task.to_owned(),
+                        branch,
+                        worktree,
+                    ])
                 })
             })
             .collect();
-        (
-            rows,
-            agent_column_widths(items_inner.width),
-            vec![
-                "STATUS",
-                "UPDATED",
-                "WORKSPACE",
-                "SHELL",
-                "TASK",
-                "ROOT BRANCH",
-                "ROOT WORKTREE",
-            ],
-        )
+        let widths = agent_column_widths(items_inner.width, &values);
+        let rows: Vec<_> = values
+            .into_iter()
+            .map(
+                |[status, updated, workspace, shell, task, branch, worktree]| {
+                    Row::new([
+                        Cell::from(Span::styled(
+                            status.clone(),
+                            Style::new().fg(status_color(&status)),
+                        )),
+                        Cell::from(updated),
+                        Cell::from(workspace),
+                        Cell::from(shell),
+                        Cell::from(task),
+                        Cell::from(branch),
+                        Cell::from(worktree),
+                    ])
+                },
+            )
+            .collect();
+        (rows, widths, AGENT_TABLE_HEADERS.to_vec())
     } else {
         let kind = app.primary_tab.kind().expect("global tab kind");
         let rows: Vec<_> = app
@@ -3291,28 +3305,36 @@ fn global_column_widths(width: u16) -> Vec<Constraint> {
     ]
 }
 
-fn agent_column_widths(width: u16) -> Vec<Constraint> {
-    let (status, updated, workspace, shell, branch, worktree, task_max) = if width >= 160 {
-        (10, 9, 24, 16, 28, 18, 52)
+fn agent_column_widths(width: u16, rows: &[[String; 7]]) -> Vec<Constraint> {
+    let caps = if width >= 160 {
+        [10, 9, 24, 16, 52, 36, 24]
     } else if width >= 140 {
-        (10, 9, 20, 16, 24, 16, 44)
+        [10, 9, 20, 16, 44, 28, 20]
     } else if width >= 100 {
-        (9, 8, 14, 12, 16, 14, 32)
+        [9, 8, 14, 12, 32, 18, 16]
     } else {
-        (8, 7, 11, 10, 12, 13, 24)
+        [8, 7, 11, 10, 24, 12, 13]
     };
+    let minimums = AGENT_TABLE_HEADERS.map(|header| header.len() as u16);
+    let mut widths: [u16; 7] = std::array::from_fn(|index| {
+        rows.iter()
+            .map(|row| row[index].chars().count() as u16)
+            .max()
+            .unwrap_or(0)
+            .max(minimums[index])
+            .min(caps[index])
+    });
+
     // Six column gaps and the highlight marker also consume table width.
-    let fixed = status + updated + workspace + shell + branch + worktree + 8;
-    let task = width.saturating_sub(fixed).clamp(8, task_max);
-    vec![
-        Constraint::Length(status),
-        Constraint::Length(updated),
-        Constraint::Length(workspace),
-        Constraint::Length(shell),
-        Constraint::Length(task),
-        Constraint::Length(branch),
-        Constraint::Length(worktree),
-    ]
+    let available = width.saturating_sub(8);
+    let mut overflow = widths.iter().sum::<u16>().saturating_sub(available);
+    for index in [4, 2, 5, 3, 6, 0, 1] {
+        let reduction = widths[index].saturating_sub(minimums[index]).min(overflow);
+        widths[index] -= reduction;
+        overflow -= reduction;
+    }
+
+    widths.into_iter().map(Constraint::Length).collect()
 }
 
 fn short_id(id: &str) -> String {
@@ -3985,27 +4007,37 @@ mod tests {
     }
 
     #[test]
-    fn agent_task_column_is_bounded_and_narrow_columns_still_fit() {
+    fn agent_columns_fit_content_and_shrink_task_first() {
+        let rows = [[
+            "idle",
+            "7h ago",
+            "edge-datapipe-support",
+            "agent",
+            "Check Slack tickets against GitHub releases",
+            "fix/confluent-direct-download",
+            "primary",
+        ]
+        .map(str::to_owned)];
         assert_eq!(
-            agent_column_widths(240),
+            agent_column_widths(240, &rows),
             vec![
-                Constraint::Length(10),
-                Constraint::Length(9),
-                Constraint::Length(24),
-                Constraint::Length(16),
-                Constraint::Length(52),
-                Constraint::Length(28),
-                Constraint::Length(18),
+                Constraint::Length(6),
+                Constraint::Length(7),
+                Constraint::Length(21),
+                Constraint::Length(5),
+                Constraint::Length(43),
+                Constraint::Length(29),
+                Constraint::Length(13),
             ]
         );
         assert_eq!(
-            agent_column_widths(80),
+            agent_column_widths(80, &rows),
             vec![
-                Constraint::Length(8),
+                Constraint::Length(6),
                 Constraint::Length(7),
                 Constraint::Length(11),
-                Constraint::Length(10),
-                Constraint::Length(11),
+                Constraint::Length(5),
+                Constraint::Length(18),
                 Constraint::Length(12),
                 Constraint::Length(13),
             ]
