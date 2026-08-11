@@ -3322,6 +3322,7 @@ fn agent_column_widths(width: u16, rows: &[[String; 7]]) -> Vec<Constraint> {
             .max()
             .unwrap_or(0)
             .max(minimums[index])
+            .saturating_add(2)
             .min(caps[index])
     });
 
@@ -4021,23 +4022,23 @@ mod tests {
         assert_eq!(
             agent_column_widths(240, &rows),
             vec![
-                Constraint::Length(6),
+                Constraint::Length(8),
+                Constraint::Length(9),
+                Constraint::Length(23),
                 Constraint::Length(7),
-                Constraint::Length(21),
-                Constraint::Length(5),
-                Constraint::Length(43),
-                Constraint::Length(29),
-                Constraint::Length(13),
+                Constraint::Length(45),
+                Constraint::Length(31),
+                Constraint::Length(15),
             ]
         );
         assert_eq!(
             agent_column_widths(80, &rows),
             vec![
-                Constraint::Length(6),
+                Constraint::Length(8),
                 Constraint::Length(7),
                 Constraint::Length(11),
-                Constraint::Length(5),
-                Constraint::Length(18),
+                Constraint::Length(7),
+                Constraint::Length(14),
                 Constraint::Length(12),
                 Constraint::Length(13),
             ]
