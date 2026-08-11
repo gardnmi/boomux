@@ -539,13 +539,26 @@ fn probe_version(executable: &Path) -> io::Result<String> {
 }
 
 fn probe_version_with_timeout(executable: &Path, timeout: Duration) -> io::Result<String> {
-    let mut child = Command::new(executable)
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .process_group(0)
-        .spawn()?;
+    let deadline = Instant::now() + timeout;
+    let mut child = loop {
+        let result = Command::new(executable)
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn();
+        match result {
+            Ok(child) => break child,
+            Err(error)
+                if error.kind() == io::ErrorKind::ExecutableFileBusy
+                    && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => return Err(error),
+        }
+    };
     let stdout = child
         .stdout
         .take()
@@ -561,7 +574,6 @@ fn probe_version_with_timeout(executable: &Path, timeout: Duration) -> io::Resul
     });
     let process_group = i32::try_from(child.id())
         .map_err(|_| io::Error::other("version probe process ID exceeded i32"))?;
-    let deadline = Instant::now() + timeout;
     let result = (|| {
         let mut status = None;
         let mut output = None;
