@@ -394,6 +394,7 @@ enum Mode {
 }
 
 struct ProjectPicker {
+    mode: WorkspaceCreationMode,
     projects: Vec<ProjectView>,
     matches: Vec<usize>,
     state: ListState,
@@ -401,6 +402,12 @@ struct ProjectPicker {
     config_path: Option<PathBuf>,
     warning: Option<String>,
     roots_configured: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkspaceCreationMode {
+    ByName,
+    Project,
 }
 
 struct CommandPalette {
@@ -530,6 +537,11 @@ struct PendingClose {
 impl ProjectPicker {
     fn new(context: &ProjectContext) -> Self {
         let mut picker = Self {
+            mode: if context.roots_configured {
+                WorkspaceCreationMode::Project
+            } else {
+                WorkspaceCreationMode::ByName
+            },
             projects: context.projects.clone(),
             matches: Vec::new(),
             state: ListState::default(),
@@ -554,10 +566,28 @@ impl ProjectPicker {
             .collect();
         matches.sort_by_key(|(index, score)| (self.projects[*index].group_order, *score));
         self.matches = matches.into_iter().map(|(index, _)| index).collect();
-        self.state.select((!self.matches.is_empty()).then_some(0));
+        self.state.select(
+            (self.mode == WorkspaceCreationMode::Project && !self.matches.is_empty()).then_some(0),
+        );
+    }
+
+    fn custom_name(&self) -> Option<&str> {
+        let name = self.query.trim();
+        (!name.is_empty()).then_some(name)
+    }
+
+    fn toggle_mode(&mut self) {
+        self.mode = match self.mode {
+            WorkspaceCreationMode::ByName => WorkspaceCreationMode::Project,
+            WorkspaceCreationMode::Project => WorkspaceCreationMode::ByName,
+        };
+        self.update_matches();
     }
 
     fn selected(&self) -> Option<&ProjectView> {
+        if self.mode != WorkspaceCreationMode::Project {
+            return None;
+        }
         self.state
             .selected()
             .and_then(|index| self.matches.get(index))
@@ -565,7 +595,7 @@ impl ProjectPicker {
     }
 
     fn next(&mut self) {
-        if self.matches.is_empty() {
+        if self.mode != WorkspaceCreationMode::Project || self.matches.is_empty() {
             return;
         }
         let next = self
@@ -576,7 +606,7 @@ impl ProjectPicker {
     }
 
     fn previous(&mut self) {
-        if self.matches.is_empty() {
+        if self.mode != WorkspaceCreationMode::Project || self.matches.is_empty() {
             return;
         }
         let previous = self.state.selected().map_or(0, |index| {
@@ -1913,14 +1943,20 @@ where
         Mode::Normal => false,
         Mode::Palette(_) | Mode::Help => false,
         Mode::PickProject(mut picker) => match key {
+            KeyCode::Enter
+                if picker.mode == WorkspaceCreationMode::ByName
+                    && picker.custom_name().is_some() =>
+            {
+                let name = picker
+                    .custom_name()
+                    .expect("nonempty workspace name")
+                    .to_owned();
+                app.create_workspace(&name, None, on_create_workspace);
+                true
+            }
             KeyCode::Enter if picker.selected().is_some() => {
                 let project = picker.selected().expect("selected project").clone();
                 app.create_workspace(&project.name, Some(&project.path), on_create_workspace);
-                true
-            }
-            KeyCode::Enter if !picker.query.trim().is_empty() => {
-                let name = picker.query.trim().to_owned();
-                app.create_workspace(&name, None, on_create_workspace);
                 true
             }
             KeyCode::Enter => {
@@ -1928,6 +1964,11 @@ where
                 false
             }
             KeyCode::Esc => false,
+            KeyCode::Tab | KeyCode::BackTab => {
+                picker.toggle_mode();
+                app.mode = Mode::PickProject(picker);
+                false
+            }
             KeyCode::Down => {
                 picker.next();
                 app.mode = Mode::PickProject(picker);
@@ -2026,81 +2067,156 @@ fn render_project_picker(frame: &mut Frame, area: Rect, picker: &mut ProjectPick
     ])
     .areas(popup_area);
 
+    let selected_tab = Style::new().fg(BASE).bg(TEAL).add_modifier(Modifier::BOLD);
+    let idle_tab = Style::new().fg(SUBTEXT);
     let search = Paragraph::new(format!("> {}_", picker.query)).block(
         Block::bordered()
-            .title(" Create workspace ")
+            .title(Line::from(vec![
+                Span::raw(" Create workspace  "),
+                Span::styled(
+                    " BY NAME ",
+                    if picker.mode == WorkspaceCreationMode::ByName {
+                        selected_tab
+                    } else {
+                        idle_tab
+                    },
+                ),
+                Span::raw(" "),
+                Span::styled(
+                    " FROM PROJECT ",
+                    if picker.mode == WorkspaceCreationMode::Project {
+                        selected_tab
+                    } else {
+                        idle_tab
+                    },
+                ),
+                Span::raw(" "),
+            ]))
             .border_style(Style::new().fg(TEAL)),
     );
     frame.render_widget(search, search_area);
 
-    let items: Vec<_> = if picker.matches.is_empty() {
-        let message = if !picker.roots_configured {
-            let path = picker.config_path.as_deref().map_or_else(
-                || "config.toml".to_owned(),
-                |path| path.display().to_string(),
-            );
-            format!("No project suggestions. Add [projects] roots to {path}")
-        } else if picker.query.is_empty() {
-            "No project suggestions discovered".to_owned()
+    if picker.mode == WorkspaceCreationMode::ByName {
+        let name = picker
+            .custom_name()
+            .unwrap_or("Type a workspace name above");
+        let name_style = if picker.custom_name().is_some() {
+            Style::new().fg(TEXT).add_modifier(Modifier::BOLD)
         } else {
-            "No matching suggestion; Enter creates this workspace name".to_owned()
+            Style::new().fg(SUBTEXT)
         };
-        vec![ListItem::new(Span::styled(
-            message,
-            Style::new().fg(SUBTEXT),
-        ))]
-    } else {
-        let mut previous_group = None;
-        picker
-            .matches
-            .iter()
-            .filter_map(|index| picker.projects.get(*index))
-            .map(|project| {
-                let group = if previous_group.as_deref() == Some(project.group.as_str()) {
-                    String::new()
-                } else {
-                    previous_group = Some(project.group.clone());
-                    project.group.clone()
-                };
-                ListItem::new(Line::from(vec![
-                    Span::styled(
-                        format!("{group:<14}"),
-                        Style::new().fg(TEAL).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        format!("{:<24}", project.name),
-                        Style::new().fg(TEXT).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(project.path.display().to_string(), Style::new().fg(SUBTEXT)),
-                ]))
-            })
-            .collect()
-    };
-    let list = List::new(items)
-        .block(
-            Block::bordered()
-                .title(format!(" {} project suggestions ", picker.matches.len()))
-                .border_style(Style::new().fg(OVERLAY)),
-        )
-        .highlight_symbol("> ")
-        .highlight_style(Style::new().fg(TEXT).add_modifier(Modifier::REVERSED));
-    frame.render_stateful_widget(list, list_area, &mut picker.state);
-
-    let help = picker.warning.as_ref().map_or_else(
-        || {
-            Line::from(vec![
-                Span::styled(" type", Style::new().fg(TEAL)),
-                Span::raw(" name or filter  "),
-                Span::styled("up/down", Style::new().fg(BLUE)),
-                Span::raw(" select  "),
-                Span::styled("enter", Style::new().fg(GREEN)),
-                Span::raw(" create  "),
-                Span::styled("esc", Style::new().fg(RED)),
-                Span::raw(" cancel"),
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::default(),
+                Line::from(Span::styled(
+                    "  Create a workspace by name",
+                    Style::new().fg(TEAL).add_modifier(Modifier::BOLD),
+                )),
+                Line::default(),
+                Line::from(vec![
+                    Span::styled("  NAME       ", Style::new().fg(SUBTEXT)),
+                    Span::styled(name.to_owned(), name_style),
+                ]),
+                Line::from(vec![
+                    Span::styled("  PROJECT    ", Style::new().fg(SUBTEXT)),
+                    Span::styled("No project directory", Style::new().fg(SUBTEXT)),
+                ]),
+                Line::default(),
+                Line::from(Span::styled(
+                    "  Add shells or launchers after creating the workspace.",
+                    Style::new().fg(SUBTEXT),
+                )),
             ])
-        },
-        |warning| Line::from(Span::styled(format!(" {warning}"), Style::new().fg(YELLOW))),
-    );
+            .block(
+                Block::bordered()
+                    .title(" By name ")
+                    .border_style(Style::new().fg(OVERLAY)),
+            ),
+            list_area,
+        );
+    } else {
+        let items = if picker.matches.is_empty() {
+            let message = if !picker.roots_configured {
+                let path = picker.config_path.as_deref().map_or_else(
+                    || "config.toml".to_owned(),
+                    |path| path.display().to_string(),
+                );
+                format!("No project suggestions. Add [projects] roots to {path}")
+            } else if picker.query.is_empty() {
+                "No project suggestions discovered".to_owned()
+            } else {
+                "No matching project suggestions".to_owned()
+            };
+            vec![ListItem::new(Span::styled(
+                message,
+                Style::new().fg(SUBTEXT),
+            ))]
+        } else {
+            let mut previous_group = None;
+            picker
+                .matches
+                .iter()
+                .filter_map(|index| picker.projects.get(*index))
+                .map(|project| {
+                    let group = if previous_group.as_deref() == Some(project.group.as_str()) {
+                        String::new()
+                    } else {
+                        previous_group = Some(project.group.clone());
+                        project.group.clone()
+                    };
+                    ListItem::new(Line::from(vec![
+                        Span::styled(
+                            format!("{group:<14}"),
+                            Style::new().fg(TEAL).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            format!("{:<24}", project.name),
+                            Style::new().fg(TEXT).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(project.path.display().to_string(), Style::new().fg(SUBTEXT)),
+                    ]))
+                })
+                .collect()
+        };
+        let list = List::new(items)
+            .block(
+                Block::bordered()
+                    .title(format!(" {} project suggestions ", picker.matches.len()))
+                    .border_style(Style::new().fg(OVERLAY)),
+            )
+            .highlight_symbol("> ")
+            .highlight_style(Style::new().fg(TEXT).add_modifier(Modifier::REVERSED));
+        frame.render_stateful_widget(list, list_area, &mut picker.state);
+    }
+
+    let action_help = if picker.mode == WorkspaceCreationMode::ByName {
+        Line::from(vec![
+            Span::styled(" type", Style::new().fg(TEAL)),
+            Span::raw(" workspace name  "),
+            Span::styled("enter", Style::new().fg(GREEN)),
+            Span::raw(" create workspace by name"),
+        ])
+    } else if let Some(warning) = &picker.warning {
+        Line::from(Span::styled(format!(" {warning}"), Style::new().fg(YELLOW)))
+    } else {
+        Line::from(vec![
+            Span::styled(" type", Style::new().fg(TEAL)),
+            Span::raw(" filter  "),
+            Span::styled("up/down", Style::new().fg(BLUE)),
+            Span::raw(" choose  "),
+            Span::styled("enter", Style::new().fg(GREEN)),
+            Span::raw(" create from project"),
+        ])
+    };
+    let help = vec![
+        Line::from(vec![
+            Span::styled(" tab", Style::new().fg(BLUE)),
+            Span::raw(" switch mode  "),
+            Span::styled("esc", Style::new().fg(RED)),
+            Span::raw(" cancel"),
+        ]),
+        action_help,
+    ];
     frame.render_widget(Paragraph::new(help).style(Style::new().bg(BASE)), help_area);
 }
 
@@ -4046,6 +4162,13 @@ mod tests {
         let mut app = app();
         let mut created = None;
         app.request_add(&mut |_| Ok(String::new()));
+        handle_mode_key(
+            &mut app,
+            KeyCode::Tab,
+            KeyModifiers::NONE,
+            &mut |_, _| Ok(String::new()),
+            &mut |_, _| Ok(String::new()),
+        );
         if let Mode::PickProject(picker) = &mut app.mode {
             picker.query = "  custom workspace  ".into();
             picker.update_matches();
@@ -4064,6 +4187,40 @@ mod tests {
 
         assert!(changed);
         assert_eq!(created, Some(("custom workspace".into(), None)));
+    }
+
+    #[test]
+    fn by_name_creation_wins_even_when_its_name_matches_a_project() {
+        let mut app = app();
+        let mut created = None;
+        app.request_add(&mut |_| Ok(String::new()));
+        handle_mode_key(
+            &mut app,
+            KeyCode::Tab,
+            KeyModifiers::NONE,
+            &mut |_, _| Ok(String::new()),
+            &mut |_, _| Ok(String::new()),
+        );
+        if let Mode::PickProject(picker) = &mut app.mode {
+            picker.query = "alpha".into();
+            picker.update_matches();
+            assert_eq!(picker.mode, WorkspaceCreationMode::ByName);
+            assert!(picker.selected().is_none());
+        }
+
+        let changed = handle_mode_key(
+            &mut app,
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+            &mut |name, default_cwd| {
+                created = Some((name.to_owned(), default_cwd.cloned()));
+                Ok("Created workspace".into())
+            },
+            &mut |_, _| Ok(String::new()),
+        );
+
+        assert!(changed);
+        assert_eq!(created, Some(("alpha".into(), None)));
     }
 
     #[test]
@@ -4091,6 +4248,21 @@ mod tests {
             .map(|index| picker.projects[*index].group.as_str())
             .collect();
         assert_eq!(groups, ["Projects", "Work"]);
+    }
+
+    #[test]
+    fn picker_defaults_to_projects_only_when_roots_are_configured() {
+        assert_eq!(
+            ProjectPicker::new(&project_context()).mode,
+            WorkspaceCreationMode::Project
+        );
+
+        let mut context = project_context();
+        context.roots_configured = false;
+        assert_eq!(
+            ProjectPicker::new(&context).mode,
+            WorkspaceCreationMode::ByName
+        );
     }
 
     #[test]
@@ -5650,5 +5822,34 @@ mod tests {
         app.request_add(&mut |_| Ok(String::new()));
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    }
+
+    #[test]
+    fn project_launcher_shows_explicit_by_name_and_project_modes() {
+        let backend = TestBackend::new(120, 34);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = app();
+        app.request_add(&mut |_| Ok(String::new()));
+        if let Mode::PickProject(picker) = &mut app.mode {
+            picker.toggle_mode();
+        }
+        if let Mode::PickProject(picker) = &mut app.mode {
+            picker.query = "alpha".into();
+            picker.update_matches();
+        }
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+
+        assert!(text.contains("BY NAME"));
+        assert!(text.contains("FROM PROJECT"));
+        assert!(text.contains("Create a workspace by name"));
+        assert!(text.contains("alpha"));
     }
 }
