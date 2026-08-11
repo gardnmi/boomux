@@ -13,7 +13,8 @@ use crate::protocol::{
     AgentAttentionSnapshot, AgentObservationSnapshot, ShellRunExitReason, TerminalProfile,
 };
 
-const STATE_VERSION: u32 = 7;
+const STATE_VERSION: u32 = 8;
+const VERSION_SEVEN_STATE_VERSION: u32 = 7;
 const PREVIOUS_STATE_VERSION: u32 = 6;
 const VERSION_FIVE_STATE_VERSION: u32 = 5;
 const VERSION_FOUR_STATE_VERSION: u32 = 4;
@@ -95,11 +96,54 @@ pub(crate) struct PersistedShellRun {
     pub(crate) output_revision: u64,
     pub(crate) environment_has_run_id: bool,
     pub(crate) profile: TerminalProfile,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) terminal_history: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct StateVersion {
     version: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VersionSevenPersistedState {
+    version: u32,
+    workspaces: Vec<VersionSevenPersistedWorkspace>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VersionSevenPersistedWorkspace {
+    id: String,
+    name: String,
+    default_cwd: Option<PathBuf>,
+    shells: Vec<VersionSevenPersistedShell>,
+    launchers: Vec<PersistedWorkspaceLauncher>,
+    agents: Vec<PersistedAgentInstance>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VersionSevenPersistedShell {
+    id: String,
+    name: String,
+    cwd: PathBuf,
+    command: Vec<String>,
+    last_run: Option<VersionSevenPersistedShellRun>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VersionSevenPersistedShellRun {
+    id: String,
+    generation: u64,
+    started_at_ms: u64,
+    ended_at_ms: Option<u64>,
+    exit_reason: Option<ShellRunExitReason>,
+    output_revision: u64,
+    environment_has_run_id: bool,
+    profile: TerminalProfile,
 }
 
 #[derive(Deserialize)]
@@ -341,6 +385,10 @@ impl StateStore {
         })?;
         let (state, migrated) = match version.version {
             STATE_VERSION => (parse_state(&bytes, &self.path)?, false),
+            VERSION_SEVEN_STATE_VERSION => {
+                let previous: VersionSevenPersistedState = parse_state(&bytes, &self.path)?;
+                (migrate_version_seven_state(previous), true)
+            }
             PREVIOUS_STATE_VERSION => {
                 let previous: PreviousPersistedState = parse_state(&bytes, &self.path)?;
                 (migrate_previous_state(previous), true)
@@ -447,11 +495,51 @@ fn migrate_legacy_state(legacy: LegacyPersistedState) -> PersistedState {
                             output_revision: 0,
                             environment_has_run_id: false,
                             profile,
+                            terminal_history: None,
                         }),
                     })
                     .collect(),
                 launchers: Vec::new(),
                 agents: Vec::new(),
+            })
+            .collect(),
+    }
+}
+
+fn migrate_version_seven_state(previous: VersionSevenPersistedState) -> PersistedState {
+    debug_assert_eq!(previous.version, VERSION_SEVEN_STATE_VERSION);
+    PersistedState {
+        version: STATE_VERSION,
+        workspaces: previous
+            .workspaces
+            .into_iter()
+            .map(|workspace| PersistedWorkspace {
+                id: workspace.id,
+                name: workspace.name,
+                default_cwd: workspace.default_cwd,
+                shells: workspace
+                    .shells
+                    .into_iter()
+                    .map(|shell| PersistedShell {
+                        id: shell.id,
+                        name: shell.name,
+                        cwd: shell.cwd,
+                        command: shell.command,
+                        last_run: shell.last_run.map(|run| PersistedShellRun {
+                            id: run.id,
+                            generation: run.generation,
+                            started_at_ms: run.started_at_ms,
+                            ended_at_ms: run.ended_at_ms,
+                            exit_reason: run.exit_reason,
+                            output_revision: run.output_revision,
+                            environment_has_run_id: run.environment_has_run_id,
+                            profile: run.profile,
+                            terminal_history: None,
+                        }),
+                    })
+                    .collect(),
+                launchers: workspace.launchers,
+                agents: workspace.agents,
             })
             .collect(),
     }
@@ -650,7 +738,32 @@ mod tests {
                 id: Uuid::new_v4().to_string(),
                 name: "saved".into(),
                 default_cwd: Some("/tmp/project".into()),
-                shells: Vec::new(),
+                shells: vec![PersistedShell {
+                    id: "shell-1".into(),
+                    name: "agent".into(),
+                    cwd: "/tmp/project".into(),
+                    command: vec!["opencode".into()],
+                    last_run: Some(PersistedShellRun {
+                        id: "run-1".into(),
+                        generation: 1,
+                        started_at_ms: 1,
+                        ended_at_ms: Some(2),
+                        exit_reason: Some(ShellRunExitReason::Interrupted),
+                        output_revision: 3,
+                        environment_has_run_id: true,
+                        profile: TerminalProfile {
+                            term: Some("xterm-256color".into()),
+                            colorterm: None,
+                            term_program: None,
+                            term_program_version: None,
+                            rows: 24,
+                            cols: 80,
+                            pixel_width: 0,
+                            pixel_height: 0,
+                        },
+                        terminal_history: Some("bounded output".into()),
+                    }),
+                }],
                 launchers: vec![
                     PersistedWorkspaceLauncher {
                         id: "launcher-1".into(),
@@ -725,6 +838,13 @@ mod tests {
 
         assert_eq!(restored.workspaces[0].name, "saved");
         assert_eq!(
+            restored.workspaces[0].shells[0]
+                .last_run
+                .as_ref()
+                .and_then(|run| run.terminal_history.as_deref()),
+            Some("bounded output")
+        );
+        assert_eq!(
             restored.workspaces[0].default_cwd.as_deref(),
             Some(Path::new("/tmp/project"))
         );
@@ -782,6 +902,55 @@ mod tests {
     }
 
     #[test]
+    fn migrates_version_seven_runs_without_terminal_history() {
+        let directory = env::temp_dir().join(format!("boomux-state-{}", Uuid::new_v4()));
+        let path = directory.join("boomux/state.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            br#"{
+  "version": 7,
+  "workspaces": [{
+    "id": "w1", "name": "version-seven", "default_cwd": "/tmp/project",
+    "shells": [{
+      "id": "s1", "name": "agent", "cwd": "/tmp/project", "command": ["opencode"],
+      "last_run": {
+        "id": "r1", "generation": 1, "started_at_ms": 1, "ended_at_ms": 2,
+        "exit_reason": {"reason": "interrupted"}, "output_revision": 3,
+        "environment_has_run_id": true,
+        "profile": {
+          "term": "xterm-256color", "colorterm": null, "term_program": null,
+          "term_program_version": null, "rows": 24, "cols": 80,
+          "pixel_width": 0, "pixel_height": 0
+        }
+      }
+    }],
+    "launchers": [], "agents": []
+  }]
+}"#,
+        )
+        .unwrap();
+        let store = StateStore::at(path.clone());
+
+        let migrated = store.load().unwrap().unwrap();
+
+        assert!(
+            migrated.workspaces[0].shells[0]
+                .last_run
+                .as_ref()
+                .unwrap()
+                .terminal_history
+                .is_none()
+        );
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .contains("\"version\": 8")
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn migrates_version_one_runs_once_and_preserves_the_generated_identity() {
         let directory = env::temp_dir().join(format!("boomux-state-{}", Uuid::new_v4()));
         let path = directory.join("boomux/state.json");
@@ -832,7 +1001,7 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .contains("\"version\": 7")
+                .contains("\"version\": 8")
         );
         assert!(migrated.workspaces[0].launchers.is_empty());
         assert!(migrated.workspaces[0].agents.is_empty());
@@ -882,7 +1051,7 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .contains("\"version\": 7")
+                .contains("\"version\": 8")
         );
         assert!(migrated.workspaces[0].agents.is_empty());
         fs::remove_dir_all(directory).unwrap();
@@ -920,7 +1089,7 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .contains("\"version\": 7")
+                .contains("\"version\": 8")
         );
         fs::remove_dir_all(directory).unwrap();
     }
@@ -996,7 +1165,7 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .contains("\"version\": 7")
+                .contains("\"version\": 8")
         );
         fs::remove_dir_all(directory).unwrap();
     }
@@ -1031,7 +1200,7 @@ mod tests {
 
         assert!(migrated.workspaces[0].agents[0].attention.is_none());
         let saved = fs::read_to_string(&path).unwrap();
-        assert!(saved.contains("\"version\": 7"));
+        assert!(saved.contains("\"version\": 8"));
         assert!(saved.contains("\"attention\": null"));
         fs::remove_dir_all(directory).unwrap();
     }
@@ -1063,7 +1232,7 @@ mod tests {
         assert!(!original.contains("default_cwd"));
         store.save(&migrated).unwrap();
         let saved = fs::read_to_string(&path).unwrap();
-        assert!(saved.contains("\"version\": 7"));
+        assert!(saved.contains("\"version\": 8"));
         assert!(saved.contains("\"default_cwd\": null"));
         fs::remove_dir_all(directory).unwrap();
     }

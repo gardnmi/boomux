@@ -179,6 +179,10 @@ Desktop and sound delivery are independently disabled by default. Desktop uses
 event IDs. The top-level blocked and completed category flags filter both.
 
 ```toml
+[recovery]
+resume_agents = true
+persist_terminal_history = false
+
 [notifications]
 enabled = false
 blocked = true
@@ -189,6 +193,11 @@ enabled = false
 blocked = "message-new-instant"
 completed = "complete"
 ```
+
+Cold recovery resumes only a unique OpenCode or Pi external session reported by
+the lifecycle integration. Persisted terminal history is disabled by default
+because output can contain secrets; enabling it stores up to 256 KiB of
+plain-text history per shell in Boomux's user-only state file.
 
 `notifications.enabled` controls desktop delivery;
 `notifications.sound.enabled` controls sound. Test all currently configured,

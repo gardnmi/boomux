@@ -581,9 +581,18 @@ The daemon atomically writes reproducible registry metadata to
 `~/.local/state/boomux/state.json`. Workspace, launcher, shell, and agent IDs;
  names and grouping; working directories; argument vectors; agent observations and attention;
 and last terminal profiles survive restart. The last run record also preserves
-its identity and outcome. Recovered
-shells are pending: Boomux does not claim that arbitrary
-processes, mutated environments, or PTYs survive daemon restart or crash.
+its identity and outcome. Recovered shells are pending: Boomux does not claim
+that arbitrary processes, mutated environments, or PTYs survive daemon restart
+or crash. When enabled, cold recovery substitutes an integration-native resume
+command for a uniquely identified, lifecycle-authoritative OpenCode or Pi Agent
+from an interrupted run. Ambiguous or invalid candidates use the shell's normal
+command instead.
+
+Plain-text terminal history is a separate opt-in recovery field because output
+can contain secrets. The shadow terminal checkpoints a UTF-8-safe suffix of at
+most 256 KiB per shell while output is active. A new run presents that text as
+historical context before its own banner; the text is not replayed to the child
+and does not reconstruct terminal modes or process state.
 
 `boomux daemon restart` transfers the existing listener and both ownership locks
 to a replacement process through a private, versioned `SCM_RIGHTS` handshake.
@@ -595,8 +604,8 @@ changing the child PID. Attached clients receive a reconnect request,
 acknowledge an input-ordering boundary, and reconnect to the replacement while
 remaining in raw mode. Exited shells transfer their final run metadata and
 bounded reconstructed terminal state without a PTY, pidfd, or replacement
-process. Cold startup and crash recovery remain metadata-only and restore shells
-as pending.
+process. Cold startup and crash recovery still restore shells as pending and do
+not preserve live process or PTY ownership.
 
 ## Next Technical Steps
 

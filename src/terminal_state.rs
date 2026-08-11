@@ -108,6 +108,15 @@ impl TerminalState {
             .collect()
     }
 
+    pub(crate) fn cold_history(&self, max_bytes: usize) -> String {
+        let text = self.plain_text();
+        let mut start = text.len().saturating_sub(max_bytes);
+        while !text.is_char_boundary(start) {
+            start += 1;
+        }
+        text[start..].to_owned()
+    }
+
     pub(crate) fn preview(
         &self,
         max_bytes: usize,
@@ -635,6 +644,17 @@ mod tests {
         let mut restored = TerminalState::new(2, 20);
         restored.process(&state.reconstruction());
         assert_eq!(restored.plain_text(), "one\ntwo\nthree");
+    }
+
+    #[test]
+    fn cold_history_keeps_a_utf8_safe_bounded_suffix() {
+        let mut state = TerminalState::new(2, 20);
+        state.process("prefix-abcdé".as_bytes());
+
+        let history = state.cold_history(3);
+
+        assert_eq!(history, "dé");
+        assert!(history.len() <= 3);
     }
 
     #[test]
