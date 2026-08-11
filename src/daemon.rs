@@ -47,6 +47,8 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 const RESTART_TIMEOUT: Duration = Duration::from_secs(10);
 const IO_RETRY_DELAY: Duration = Duration::from_millis(2);
 const PERSIST_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+const TERMINAL_HISTORY_INTERVAL: Duration = Duration::from_secs(5);
+const MAX_TERMINAL_HISTORY_BYTES: usize = 256 * 1024;
 const MAX_TERMINAL_ENV_VALUE: usize = 256;
 const MAX_NAME_BYTES: usize = 256;
 const MAX_AGENT_EVIDENCE_BYTES: usize = 4 * 1024;
@@ -101,6 +103,8 @@ impl From<NotificationDeliveryConfig> for NotificationDeliverySettings {
                 blocked: config.blocked_sound,
                 completed: config.completed_sound,
             },
+            resume_agents: config.resume_agents,
+            persist_terminal_history: config.persist_terminal_history,
         }
     }
 }
@@ -114,14 +118,29 @@ impl From<NotificationDeliverySettings> for NotificationDeliveryConfig {
             completed: settings.desktop.completed,
             blocked_sound: settings.sound.blocked,
             completed_sound: settings.sound.completed,
+            resume_agents: settings.resume_agents,
+            persist_terminal_history: settings.persist_terminal_history,
         }
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NotificationDeliverySettings {
     pub desktop: NotificationSettings,
     pub sound: NotificationSoundSettings,
+    pub resume_agents: bool,
+    pub persist_terminal_history: bool,
+}
+
+impl Default for NotificationDeliverySettings {
+    fn default() -> Self {
+        Self {
+            desktop: NotificationSettings::default(),
+            sound: NotificationSoundSettings::default(),
+            resume_agents: true,
+            persist_terminal_history: false,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -268,6 +287,9 @@ fn run_daemon(
 ) -> io::Result<()> {
     let mut registry = Registry::restore(store, committed.is_some(), transferred.events)?;
     registry.notification_settings = notification_settings.clone();
+    if !registry.notification_settings.persist_terminal_history {
+        registry.clear_terminal_histories()?;
+    }
     registry.notification_sink = Arc::new(DesktopNotificationSink::new(notification_settings));
     let registry = Arc::new(registry);
     let gated_readers = registry.import_handoff(transferred.runtimes, transferred.exited)?;
@@ -1451,6 +1473,7 @@ impl ShellRun {
             output_revision: snapshot.output_revision,
             environment_has_run_id: snapshot.environment_has_run_id,
             profile,
+            terminal_history: None,
         })
     }
 }
@@ -1833,7 +1856,129 @@ fn workspace_created_events(workspace: &WorkspaceSnapshot) -> Vec<DaemonEventKin
     events
 }
 
+fn resume_identity(
+    agent: &AgentInstance,
+    shell: &Shell,
+    previous_run: &PersistedShellRun,
+) -> io::Result<Option<(String, String)>> {
+    if agent.workspace_id != shell.workspace_id
+        || agent.shell_id != shell.id
+        || agent.run_id != previous_run.id
+        || agent.cwd.as_ref() != Some(&shell.cwd)
+        || !matches!(agent.integration.as_str(), "opencode" | "pi")
+    {
+        return Ok(None);
+    }
+    let Some(external_session_id) = agent
+        .external_session_id
+        .as_ref()
+        .filter(|id| !id.is_empty())
+    else {
+        return Ok(None);
+    };
+    let state = lock(&agent.state)?;
+    if state.ended_at_ms.is_some()
+        || state.observation.authority != AgentAuthority::LifecycleIntegration
+        || state.observation.state == AgentState::Done
+    {
+        return Ok(None);
+    }
+    Ok(Some((
+        agent.integration.clone(),
+        external_session_id.clone(),
+    )))
+}
+
 impl Registry {
+    fn clear_terminal_histories(&self) -> io::Result<()> {
+        let state = lock(&self.state)?;
+        let mut changed = false;
+        for shell in state.shells.values() {
+            if let Some(run) = lock(&shell.last_run)?.as_mut()
+                && run.terminal_history.take().is_some()
+            {
+                changed = true;
+            }
+        }
+        drop(state);
+        if changed {
+            self.persistence_dirty.store(true, Ordering::Release);
+        }
+        Ok(())
+    }
+
+    fn agent_resume_command(
+        &self,
+        shell: &Shell,
+        previous_run: Option<&PersistedShellRun>,
+    ) -> io::Result<Option<Vec<String>>> {
+        if !self.notification_settings.resume_agents {
+            return Ok(None);
+        }
+        let Some(previous_run) = previous_run
+            .filter(|run| matches!(run.exit_reason, Some(ShellRunExitReason::Interrupted)))
+        else {
+            return Ok(None);
+        };
+        let state = lock(&self.state)?;
+        let mut candidates = Vec::new();
+        for agent in state.agents.values() {
+            if let Some(identity) = resume_identity(agent, shell, previous_run)? {
+                candidates.push(identity);
+            }
+        }
+        candidates.sort();
+        candidates.dedup();
+        let [(integration, external_session_id)] = candidates.as_slice() else {
+            return Ok(None);
+        };
+
+        let duplicate = state
+            .shells
+            .values()
+            .try_fold(false, |duplicate, other_shell| {
+                if duplicate {
+                    return Ok::<_, io::Error>(true);
+                }
+                if other_shell.id == shell.id {
+                    return Ok(false);
+                }
+                let last_run = lock(&other_shell.last_run)?;
+                let Some(last_run) = last_run.as_ref() else {
+                    return Ok(false);
+                };
+                for agent in state.agents.values() {
+                    if resume_identity(agent, other_shell, last_run)?.is_some_and(|identity| {
+                        identity.0 == *integration && identity.1 == *external_session_id
+                    }) {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            })?;
+        if duplicate {
+            return Ok(None);
+        }
+
+        let executable = if shell.command.is_empty() {
+            integration.clone()
+        } else if shell.command.len() == 1
+            && Path::new(&shell.command[0])
+                .file_name()
+                .and_then(|name| name.to_str())
+                == Some(integration.as_str())
+        {
+            shell.command[0].clone()
+        } else {
+            return Ok(None);
+        };
+        Ok(Some(vec![
+            executable,
+            "--session".into(),
+            external_session_id.clone(),
+        ]))
+    }
+
     fn dispatch(&self, request: Request) -> io::Result<Response> {
         match request {
             Request::Ping => Ok(Response::Pong),
@@ -4484,10 +4629,24 @@ fn initial_terminal_state(
     cols: u16,
     workspace_name: &str,
     shell_name: &str,
+    history: Option<&str>,
 ) -> TerminalState {
     let mut terminal = TerminalState::new(rows, cols);
+    if let Some(history) = history.filter(|history| !history.is_empty()) {
+        terminal.process(b"\x1b[2mBoomux: restored bounded history from previous run\x1b[0m\r\n");
+        terminal.process(history.replace('\n', "\r\n").as_bytes());
+        if !history.ends_with('\n') {
+            terminal.process(b"\r\n");
+        }
+    }
     terminal.process(format!("\x1b[2mBoomux: {workspace_name}/{shell_name}\x1b[0m\r\n").as_bytes());
     terminal
+}
+
+#[derive(Default)]
+struct RuntimeRecovery<'a> {
+    effective_command: Option<&'a [String]>,
+    history: Option<&'a str>,
 }
 
 fn spawn_runtime(
@@ -4497,6 +4656,7 @@ fn spawn_runtime(
     shell_name: &str,
     profile: &TerminalProfile,
     environment: Option<&UnixEnvironment>,
+    recovery: RuntimeRecovery<'_>,
 ) -> io::Result<(Arc<ShellRuntime>, PtyReader)> {
     let pty = native_pty_system()
         .openpty(PtySize {
@@ -4524,11 +4684,12 @@ fn spawn_runtime(
                 .flatten()
         })
         .unwrap_or_else(|| "/bin/sh".into());
-    let mut command = if shell.command.is_empty() {
+    let selected_command = recovery.effective_command.unwrap_or(&shell.command);
+    let mut command = if selected_command.is_empty() {
         CommandBuilder::new(client_shell)
     } else {
-        let mut command = CommandBuilder::new(&shell.command[0]);
-        command.args(&shell.command[1..]);
+        let mut command = CommandBuilder::new(&selected_command[0]);
+        command.args(&selected_command[1..]);
         command
     };
     command.cwd(&shell.cwd);
@@ -4566,7 +4727,13 @@ fn spawn_runtime(
     drop(pty.slave);
     drop(pty.master);
 
-    let terminal = initial_terminal_state(profile.rows, profile.cols, workspace_name, shell_name);
+    let terminal = initial_terminal_state(
+        profile.rows,
+        profile.cols,
+        workspace_name,
+        shell_name,
+        recovery.history,
+    );
 
     Ok((
         Arc::new(ShellRuntime {
@@ -4598,6 +4765,7 @@ fn start_pty_reader(
             let mut buffer = [0; 16 * 1024];
             let mut stopped = false;
             let mut paused = start_paused;
+            let mut last_history_checkpoint = Instant::now();
             let mut pause_cancellation: Option<Arc<AtomicBool>> = None;
             loop {
                 if paused {
@@ -4721,6 +4889,18 @@ fn start_pty_reader(
                         drop(events);
                         drop(transition);
                         registry.events.changed.notify_all();
+                        if registry.notification_settings.persist_terminal_history
+                            && last_history_checkpoint.elapsed() >= TERMINAL_HISTORY_INTERVAL
+                            && checkpoint_terminal_history(
+                                &registry,
+                                &shell,
+                                &reader_run,
+                                &reader_runtime,
+                            )
+                            .is_ok()
+                        {
+                            last_history_checkpoint = Instant::now();
+                        }
                     }
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -4747,11 +4927,20 @@ fn start_pty_reader(
                 .lock()
                 .ok()
                 .and_then(|mut process| process.try_wait_code().ok().flatten().flatten());
-            if let Some(registry) = registry.upgrade()
-                && let Err(error) =
+            if let Some(registry) = registry.upgrade() {
+                if registry.notification_settings.persist_terminal_history {
+                    let _ = checkpoint_terminal_history(
+                        &registry,
+                        &shell,
+                        &reader_run,
+                        &reader_runtime,
+                    );
+                }
+                if let Err(error) =
                     registry.record_run_exit(&shell, &reader_run, &reader_runtime, code)
-            {
-                eprintln!("boomux: could not persist shell run exit: {error}");
+                {
+                    eprintln!("boomux: could not persist shell run exit: {error}");
+                }
             }
             let _ = reader_runtime
                 .controller
@@ -4759,6 +4948,25 @@ fn start_pty_reader(
                 .map(|mut controller| controller.take());
         })?;
     *lock(&runtime.reader)? = Some(ReaderTask { commands, handle });
+    Ok(())
+}
+
+fn checkpoint_terminal_history(
+    registry: &Registry,
+    shell: &Shell,
+    run: &ShellRun,
+    runtime: &ShellRuntime,
+) -> io::Result<()> {
+    let history = lock(&runtime.terminal)?.cold_history(MAX_TERMINAL_HISTORY_BYTES);
+    let mut last_run = lock(&shell.last_run)?;
+    let Some(last_run) = last_run.as_mut().filter(|saved| saved.id == run.id) else {
+        return Ok(());
+    };
+    if last_run.terminal_history.as_deref() == Some(&history) {
+        return Ok(());
+    }
+    last_run.terminal_history = Some(history);
+    registry.persistence_dirty.store(true, Ordering::Release);
     Ok(())
 }
 
@@ -4845,6 +5053,19 @@ fn handle_attach(
     }
     let previous_run = lock(&shell.last_run)?.clone();
     let needs_start = matches!(*lock(&shell.lifecycle)?, ShellLifecycle::Pending);
+    let resume_command = needs_start
+        .then(|| registry.agent_resume_command(&shell, previous_run.as_ref()))
+        .transpose()?
+        .flatten();
+    let restored_history = needs_start
+        .then(|| {
+            registry
+                .notification_settings
+                .persist_terminal_history
+                .then(|| previous_run.as_ref()?.terminal_history.clone())
+                .flatten()
+        })
+        .flatten();
     if needs_start && transition.is_none() {
         transition = Some(lock(&registry.transitions)?);
     }
@@ -4891,6 +5112,10 @@ fn handle_attach(
                 &shell_name,
                 &profile,
                 environment.as_ref(),
+                RuntimeRecovery {
+                    effective_command: resume_command.as_deref(),
+                    history: restored_history.as_deref(),
+                },
             ) {
                 Ok(runtime) => runtime,
                 Err(error) => {
@@ -5750,9 +5975,164 @@ mod tests {
 
     #[test]
     fn new_shell_terminal_starts_with_its_workspace_and_shell_name() {
-        let terminal = initial_terminal_state(24, 80, "project", "build");
+        let terminal = initial_terminal_state(24, 80, "project", "build", None);
 
         assert!(terminal.plain_text().contains("Boomux: project/build"));
+    }
+
+    #[test]
+    fn cold_terminal_history_is_presented_before_the_new_run_banner() {
+        let terminal = initial_terminal_state(24, 80, "project", "agent", Some("old output\n"));
+        let text = terminal.plain_text();
+
+        assert!(text.contains("restored bounded history from previous run\nold output"));
+        assert!(text.find("old output").unwrap() < text.find("Boomux: project/agent").unwrap());
+    }
+
+    fn add_recovery_agent(
+        registry: &Registry,
+        shell: &Shell,
+        run_id: &str,
+        integration: &str,
+        external_session_id: &str,
+    ) {
+        let agent = Arc::new(AgentInstance {
+            id: Uuid::new_v4().to_string(),
+            workspace_id: shell.workspace_id.clone(),
+            shell_id: shell.id.clone(),
+            run_id: run_id.into(),
+            name: integration.into(),
+            integration: integration.into(),
+            external_session_id: Some(external_session_id.into()),
+            cwd: Some(shell.cwd.clone()),
+            started_at_ms: 1,
+            state: Mutex::new(AgentInstanceState {
+                ended_at_ms: None,
+                observation: AgentObservationSnapshot {
+                    revision: 1,
+                    state: AgentState::Working,
+                    authority: AgentAuthority::LifecycleIntegration,
+                    evidence: "active before interruption".into(),
+                    confidence: 100,
+                    observed_at_ms: 1,
+                },
+                attention: None,
+            }),
+        });
+        lock(&registry.state)
+            .unwrap()
+            .agents
+            .insert(agent.id.clone(), agent);
+    }
+
+    fn recovery_shell(
+        registry: &Registry,
+        command: Vec<String>,
+    ) -> (Arc<Shell>, PersistedShellRun) {
+        let workspace = registry
+            .create_workspace(
+                "recovery".into(),
+                vec![ShellSpec {
+                    name: "agent".into(),
+                    command,
+                    cwd: env::temp_dir(),
+                }],
+            )
+            .unwrap();
+        let shell = registry.shell(&workspace.shells[0].id).unwrap();
+        let run = PersistedShellRun {
+            id: Uuid::new_v4().to_string(),
+            generation: 1,
+            started_at_ms: 1,
+            ended_at_ms: Some(2),
+            exit_reason: Some(ShellRunExitReason::Interrupted),
+            output_revision: 1,
+            environment_has_run_id: true,
+            profile: profile(),
+            terminal_history: None,
+        };
+        *lock(&shell.last_run).unwrap() = Some(run.clone());
+        (shell, run)
+    }
+
+    #[test]
+    fn interrupted_authoritative_agent_builds_native_resume_command() {
+        let registry = Registry::default();
+        let (shell, run) = recovery_shell(&registry, vec!["/opt/bin/opencode".into()]);
+        add_recovery_agent(&registry, &shell, &run.id, "opencode", "session-1");
+
+        assert_eq!(
+            registry.agent_resume_command(&shell, Some(&run)).unwrap(),
+            Some(vec![
+                "/opt/bin/opencode".into(),
+                "--session".into(),
+                "session-1".into()
+            ])
+        );
+
+        let agent = lock(&registry.state)
+            .unwrap()
+            .agents
+            .values()
+            .next()
+            .unwrap()
+            .clone();
+        lock(&agent.state).unwrap().observation.authority = AgentAuthority::TerminalHeuristic;
+        assert!(
+            registry
+                .agent_resume_command(&shell, Some(&run))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn recovery_falls_back_when_agent_identity_is_ambiguous_or_disabled() {
+        let mut registry = Registry::default();
+        let (shell, run) = recovery_shell(&registry, Vec::new());
+        add_recovery_agent(&registry, &shell, &run.id, "pi", "session-1");
+        add_recovery_agent(&registry, &shell, &run.id, "pi", "session-2");
+
+        assert!(
+            registry
+                .agent_resume_command(&shell, Some(&run))
+                .unwrap()
+                .is_none()
+        );
+
+        lock(&registry.state)
+            .unwrap()
+            .agents
+            .retain(|_, agent| agent.external_session_id.as_deref() == Some("session-1"));
+        registry.notification_settings.resume_agents = false;
+        assert!(
+            registry
+                .agent_resume_command(&shell, Some(&run))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn disabling_history_persistence_clears_retained_history() {
+        let registry = Registry::default();
+        let (shell, _) = recovery_shell(&registry, Vec::new());
+        lock(&shell.last_run)
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .terminal_history = Some("secret output".into());
+
+        registry.clear_terminal_histories().unwrap();
+
+        assert!(
+            lock(&shell.last_run)
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .terminal_history
+                .is_none()
+        );
     }
 
     fn agent_spec(state: AgentState) -> AgentRegistrationSpec {
@@ -5791,8 +6171,16 @@ mod tests {
             .unwrap();
         let shell = registry.shell(&workspace.shells[0].id).unwrap();
         let run = Arc::new(ShellRun::new(1));
-        let (runtime, _reader) =
-            spawn_runtime(&shell, &run, "agents", "agent-shell", &profile(), None).unwrap();
+        let (runtime, _reader) = spawn_runtime(
+            &shell,
+            &run,
+            "agents",
+            "agent-shell",
+            &profile(),
+            None,
+            RuntimeRecovery::default(),
+        )
+        .unwrap();
         *lock(&shell.last_run).unwrap() = Some(run.persisted(profile()).unwrap());
         *lock(&shell.lifecycle).unwrap() = ShellLifecycle::Running {
             profile: profile(),
@@ -7603,6 +7991,7 @@ mod tests {
             "pause-test",
             &terminal_profile,
             None,
+            RuntimeRecovery::default(),
         )
         .unwrap();
         *lock(&shell.last_run).unwrap() = Some(run.persisted(terminal_profile.clone()).unwrap());
@@ -7674,6 +8063,7 @@ mod tests {
             "short-lived",
             &terminal_profile,
             None,
+            RuntimeRecovery::default(),
         )
         .unwrap();
         *lock(&shell.last_run).unwrap() = Some(run.persisted(terminal_profile.clone()).unwrap());

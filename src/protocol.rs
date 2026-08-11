@@ -397,6 +397,14 @@ pub struct NotificationDeliveryConfig {
     pub completed: bool,
     pub blocked_sound: String,
     pub completed_sound: String,
+    #[serde(default = "default_true")]
+    pub resume_agents: bool,
+    #[serde(default)]
+    pub persist_terminal_history: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl std::fmt::Debug for UnixEnvironmentVariable {
@@ -863,6 +871,24 @@ mod tests {
     }
 
     #[test]
+    fn old_notification_config_defaults_recovery_safely() {
+        let config: NotificationDeliveryConfig = serde_json::from_str(
+            r#"{
+                "desktop_enabled": false,
+                "sound_enabled": false,
+                "blocked": true,
+                "completed": true,
+                "blocked_sound": "message-new-instant",
+                "completed_sound": "complete"
+            }"#,
+        )
+        .unwrap();
+
+        assert!(config.resume_agents);
+        assert!(!config.persist_terminal_history);
+    }
+
+    #[test]
     fn typed_errors_are_additive_within_protocol_six() {
         let legacy: Response =
             serde_json::from_str(r#"{"response":"error","message":"legacy daemon"}"#).unwrap();
@@ -1091,6 +1117,8 @@ mod tests {
                         completed: true,
                         blocked_sound: "dialog-warning".into(),
                         completed_sound: "complete".into(),
+                        resume_agents: true,
+                        persist_terminal_history: false,
                     },
                 }],
             ),

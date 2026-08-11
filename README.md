@@ -232,6 +232,10 @@ max_depth = 3
 [dashboard]
 follow_focused_terminal = true
 
+[recovery]
+resume_agents = true
+persist_terminal_history = false
+
 [notifications]
 enabled = false
 blocked = true
@@ -254,6 +258,21 @@ preserved until another managed terminal gains focus. Press `Space` to pin the
 current selection and pause following; press it again to unpin and catch up to
 the currently focused terminal. Set
 `dashboard.follow_focused_terminal` to `false` to disable this behavior.
+
+After a cold daemon restart, Boomux resumes a uniquely identified OpenCode or Pi
+session when its interrupted shell is next started. Recovery requires a retained
+external session ID reported by the lifecycle integration; ambiguous, completed,
+or heuristic-only Agents fall back to the shell's configured command. Set
+`recovery.resume_agents` to `false` to disable this behavior.
+
+Terminal history persistence is opt-in because terminal output can contain
+secrets. With `recovery.persist_terminal_history = true`, Boomux checkpoints up
+to 256 KiB of plain-text history per shell into the user-only
+`$XDG_STATE_HOME/boomux/state.json` file approximately every five seconds while
+output is active. The bounded history is shown before the new run starts; it
+does not restore the previous process, PTY, terminal modes, or interactive state.
+Disabling the setting again removes previously retained history from daemon
+state at startup.
 
 Desktop and sound notifications are independently disabled by default. Desktop
 delivery requires `notify-send` and a desktop notification service. Sound

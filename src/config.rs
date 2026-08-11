@@ -16,6 +16,7 @@ struct RawConfig {
     projects: Option<RawProjectsConfig>,
     notifications: Option<RawNotificationsConfig>,
     dashboard: Option<RawDashboardConfig>,
+    recovery: Option<RawRecoveryConfig>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -46,6 +47,13 @@ struct RawNotificationSoundConfig {
 #[serde(default, deny_unknown_fields)]
 struct RawDashboardConfig {
     follow_focused_terminal: Option<bool>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RawRecoveryConfig {
+    resume_agents: Option<bool>,
+    persist_terminal_history: Option<bool>,
 }
 
 #[derive(Debug)]
@@ -87,7 +95,7 @@ pub(crate) fn load() -> Result<Config, Box<dyn Error>> {
 pub(crate) fn load_notification_settings()
 -> Result<boomux::daemon::NotificationDeliverySettings, Box<dyn Error>> {
     let (raw, _) = load_raw()?;
-    Ok(resolve_notifications(raw.notifications))
+    Ok(resolve_daemon_settings(raw.notifications, raw.recovery))
 }
 
 fn load_raw() -> Result<(RawConfig, Option<PathBuf>), Box<dyn Error>> {
@@ -177,6 +185,15 @@ fn merge(base: &mut RawConfig, next: RawConfig) {
             dashboard.follow_focused_terminal = next_dashboard.follow_focused_terminal;
         }
     }
+    if let Some(next_recovery) = next.recovery {
+        let recovery = base.recovery.get_or_insert_default();
+        if next_recovery.resume_agents.is_some() {
+            recovery.resume_agents = next_recovery.resume_agents;
+        }
+        if next_recovery.persist_terminal_history.is_some() {
+            recovery.persist_terminal_history = next_recovery.persist_terminal_history;
+        }
+    }
 }
 
 fn resolve(raw: RawConfig, path: Option<PathBuf>) -> Result<Config, Box<dyn Error>> {
@@ -207,7 +224,7 @@ fn resolve(raw: RawConfig, path: Option<PathBuf>) -> Result<Config, Box<dyn Erro
         terminal,
         projects: ProjectsConfig { roots, max_depth },
         path,
-        notifications: resolve_notifications(raw.notifications),
+        notifications: resolve_daemon_settings(raw.notifications, raw.recovery),
         dashboard: DashboardConfig {
             follow_focused_terminal: raw
                 .dashboard
@@ -218,10 +235,19 @@ fn resolve(raw: RawConfig, path: Option<PathBuf>) -> Result<Config, Box<dyn Erro
     })
 }
 
+#[cfg(test)]
 fn resolve_notifications(
     raw: Option<RawNotificationsConfig>,
 ) -> boomux::daemon::NotificationDeliverySettings {
-    let raw = raw.unwrap_or_default();
+    resolve_daemon_settings(raw, None)
+}
+
+fn resolve_daemon_settings(
+    notifications: Option<RawNotificationsConfig>,
+    recovery: Option<RawRecoveryConfig>,
+) -> boomux::daemon::NotificationDeliverySettings {
+    let raw = notifications.unwrap_or_default();
+    let recovery = recovery.unwrap_or_default();
     boomux::daemon::NotificationDeliverySettings {
         desktop: boomux::daemon::NotificationSettings {
             enabled: raw.enabled.unwrap_or(false),
@@ -237,6 +263,8 @@ fn resolve_notifications(
                 completed: sound.completed.unwrap_or_else(|| "complete".into()),
             }
         }),
+        resume_agents: recovery.resume_agents.unwrap_or(true),
+        persist_terminal_history: recovery.persist_terminal_history.unwrap_or(false),
     }
 }
 
@@ -419,6 +447,24 @@ mod tests {
     }
 
     #[test]
+    fn recovery_settings_default_and_merge_per_field() {
+        let defaults = resolve_daemon_settings(None, None);
+        assert!(defaults.resume_agents);
+        assert!(!defaults.persist_terminal_history);
+
+        let mut base: RawConfig =
+            toml::from_str("[recovery]\nresume_agents = false\npersist_terminal_history = true")
+                .unwrap();
+        let next: RawConfig = toml::from_str("[recovery]\nresume_agents = true").unwrap();
+        merge(&mut base, next);
+
+        let settings = resolve_daemon_settings(base.notifications, base.recovery);
+        assert!(settings.resume_agents);
+        assert!(settings.persist_terminal_history);
+        assert!(toml::from_str::<RawConfig>("[recovery]\nunknown = true").is_err());
+    }
+
+    #[test]
     fn notification_overrides_merge_per_field() {
         let mut base: RawConfig =
             toml::from_str("[notifications]\nenabled = true\nblocked = false\ncompleted = false")
@@ -443,6 +489,8 @@ mod tests {
                     blocked: "message-new-instant".into(),
                     completed: "service-login".into(),
                 },
+                resume_agents: true,
+                persist_terminal_history: false,
             }
         );
     }
