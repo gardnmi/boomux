@@ -36,6 +36,16 @@ const AGENT_TABLE_HEADERS: [&str; 7] = [
     "ROOT BRANCH",
     "ROOT WORKTREE",
 ];
+const SHELL_TABLE_HEADERS: [&str; 8] = [
+    "STATUS",
+    "RUN",
+    "WORKSPACE",
+    "SHELL",
+    "KIND",
+    "PROCESS",
+    "BRANCH",
+    "WORKTREE",
+];
 
 pub(crate) struct WorkspaceView {
     pub(crate) id: String,
@@ -147,7 +157,11 @@ pub(crate) struct TerminalView {
     pub(crate) name: String,
     pub(crate) status: String,
     pub(crate) directory: String,
+    pub(crate) repository: String,
     pub(crate) branch: String,
+    pub(crate) git_state: String,
+    pub(crate) worktree: String,
+    pub(crate) foreground_process: Option<String>,
     pub(crate) command: String,
     pub(crate) argv: Vec<String>,
     pub(crate) run: Option<TerminalRunView>,
@@ -176,6 +190,27 @@ impl TerminalView {
             &self.branch
         } else {
             &self.command
+        }
+    }
+
+    fn process(&self) -> &str {
+        if self.command.is_empty() {
+            self.foreground_process.as_deref().unwrap_or("shell")
+        } else {
+            &self.command
+        }
+    }
+
+    fn table_status(&self) -> String {
+        if self.status != "exited" {
+            return self.status.clone();
+        }
+        match self.run.as_ref().and_then(|run| run.exit_reason.as_deref()) {
+            Some("exited (code unavailable)") | None => "exited".into(),
+            Some(reason) => reason
+                .strip_prefix("exited (")
+                .and_then(|reason| reason.strip_suffix(')'))
+                .map_or_else(|| reason.to_owned(), |code| format!("exit {code}")),
         }
     }
 }
@@ -2625,6 +2660,62 @@ fn render_global_items(frame: &mut Frame, area: Rect, app: &mut App) {
             )
             .collect();
         (rows, widths, AGENT_TABLE_HEADERS.to_vec())
+    } else if app.primary_tab == PrimaryTab::Shells {
+        let values: Vec<[String; 8]> = app
+            .workspaces
+            .iter()
+            .flat_map(|workspace| {
+                workspace.items.iter().filter_map(move |item| {
+                    let WorkspaceItemView::Shell(shell) = item else {
+                        return None;
+                    };
+                    Some([
+                        shell.table_status(),
+                        shell
+                            .run
+                            .as_ref()
+                            .map_or_else(|| "-".into(), |run| format!("#{}", run.generation)),
+                        workspace.name.clone(),
+                        shell.name.clone(),
+                        shell.kind().into(),
+                        shell.process().into(),
+                        shell.branch.clone(),
+                        shell.worktree.clone(),
+                    ])
+                })
+            })
+            .collect();
+        let widths = shell_column_widths(items_inner.width, &values);
+        let rows = values
+            .into_iter()
+            .map(
+                |[
+                    status,
+                    run,
+                    workspace,
+                    shell,
+                    kind,
+                    process,
+                    branch,
+                    worktree,
+                ]| {
+                    Row::new([
+                        Cell::from(Span::styled(
+                            status.clone(),
+                            Style::new().fg(status_color(&status)),
+                        )),
+                        Cell::from(run),
+                        Cell::from(workspace),
+                        Cell::from(shell),
+                        Cell::from(kind),
+                        Cell::from(process),
+                        Cell::from(branch),
+                        Cell::from(worktree),
+                    ])
+                },
+            )
+            .collect();
+        (rows, widths, SHELL_TABLE_HEADERS.to_vec())
     } else {
         let kind = app.primary_tab.kind().expect("global tab kind");
         let rows: Vec<_> = app
@@ -2789,7 +2880,7 @@ fn render_items(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
             })
         })
         .collect();
-    let widths = shell_column_widths(items_inner.width);
+    let widths = item_column_widths(items_inner.width);
     frame.render_widget(block, area);
     let table = Table::new(rows, widths)
         .header(header)
@@ -2904,8 +2995,16 @@ fn terminal_preview(app: &App, terminal: &TerminalView) -> Option<ContextualPrev
     lines.push(Line::from(vec![
         Span::styled("cwd  ", Style::new().fg(SUBTEXT)),
         Span::raw(terminal.directory.clone()),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("git  ", Style::new().fg(SUBTEXT)),
+        Span::raw(terminal.repository.clone()),
         Span::styled("  branch ", Style::new().fg(SUBTEXT)),
         Span::raw(terminal.branch.clone()),
+        Span::styled("  state ", Style::new().fg(SUBTEXT)),
+        Span::raw(terminal.git_state.clone()),
+        Span::styled("  worktree ", Style::new().fg(SUBTEXT)),
+        Span::raw(terminal.worktree.clone()),
     ]));
     let run_detail = terminal.run.as_ref().map_or_else(
         || "no run yet".to_owned(),
@@ -2988,7 +3087,7 @@ fn terminal_preview(app: &App, terminal: &TerminalView) -> Option<ContextualPrev
         content_height: if is_command {
             lines.len() as u16
         } else {
-            (TERMINAL_PREVIEW_ROWS + 3) as u16
+            (TERMINAL_PREVIEW_ROWS + 4) as u16
         },
         content: PreviewContent::Lines(lines),
     })
@@ -3264,7 +3363,7 @@ fn integration_display_name(integration: &str) -> &str {
     }
 }
 
-fn shell_column_widths(width: u16) -> Vec<Constraint> {
+fn item_column_widths(width: u16) -> Vec<Constraint> {
     let (name, status, detail, directory_min, directory_max) = if width >= 120 {
         (18, 10, 30, 24, 42)
     } else {
@@ -3283,6 +3382,39 @@ fn shell_column_widths(width: u16) -> Vec<Constraint> {
         Constraint::Length(directory),
         Constraint::Length(detail),
     ]
+}
+
+fn shell_column_widths(width: u16, rows: &[[String; 8]]) -> Vec<Constraint> {
+    let caps = if width >= 160 {
+        [12, 6, 24, 20, 9, 40, 32, 24]
+    } else if width >= 120 {
+        [12, 6, 18, 16, 9, 28, 24, 20]
+    } else if width >= 90 {
+        [11, 5, 14, 13, 8, 20, 18, 16]
+    } else {
+        [10, 4, 11, 10, 7, 14, 12, 13]
+    };
+    let minimums = SHELL_TABLE_HEADERS.map(|header| header.len() as u16);
+    let mut widths: [u16; 8] = std::array::from_fn(|index| {
+        rows.iter()
+            .map(|row| row[index].chars().count() as u16)
+            .max()
+            .unwrap_or(0)
+            .max(minimums[index])
+            .saturating_add(2)
+            .min(caps[index])
+    });
+
+    // Seven column gaps and the highlight marker also consume table width.
+    let available = width.saturating_sub(9);
+    let mut overflow = widths.iter().sum::<u16>().saturating_sub(available);
+    for index in [5, 7, 2, 3, 6, 4, 0, 1] {
+        let reduction = widths[index].saturating_sub(minimums[index]).min(overflow);
+        widths[index] -= reduction;
+        overflow -= reduction;
+    }
+
+    widths.into_iter().map(Constraint::Length).collect()
 }
 
 fn global_column_widths(width: u16) -> Vec<Constraint> {
@@ -3537,9 +3669,9 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
 }
 
 fn status_color(status: &str) -> Color {
-    match status {
+    match status.split_whitespace().next().unwrap_or(status) {
         "pending" | "untracked" => YELLOW,
-        "exited" => SUBTEXT,
+        "exited" | "exit" | "terminated" | "interrupted" => SUBTEXT,
         _ => TEAL,
     }
 }
@@ -3588,7 +3720,11 @@ mod tests {
                 name: "agent".into(),
                 status: "running".into(),
                 directory: "/tmp/boomux".into(),
+                repository: "boomux".into(),
                 branch: "main".into(),
+                git_state: "clean".into(),
+                worktree: "primary".into(),
+                foreground_process: Some("bash".into()),
                 command: String::new(),
                 argv: Vec::new(),
                 run: None,
@@ -3630,7 +3766,11 @@ mod tests {
                 name: "agent".into(),
                 status: "running".into(),
                 directory: "/tmp/boomux".into(),
+                repository: "boomux".into(),
                 branch: "main".into(),
+                git_state: "clean".into(),
+                worktree: "primary".into(),
+                foreground_process: Some("opencode".into()),
                 command: String::new(),
                 argv: Vec::new(),
                 run: None,
@@ -3945,7 +4085,11 @@ mod tests {
                 name: "agent".into(),
                 status: "running".into(),
                 directory: "/tmp/boomux".into(),
+                repository: "boomux".into(),
                 branch: "main".into(),
+                git_state: "clean".into(),
+                worktree: "primary".into(),
+                foreground_process: Some("opencode".into()),
                 command: String::new(),
                 argv: Vec::new(),
                 run: None,
@@ -3960,7 +4104,11 @@ mod tests {
             name: name.into(),
             status: "running".into(),
             directory: format!("/tmp/{name}"),
+            repository: name.into(),
             branch: "main".into(),
+            git_state: "clean".into(),
+            worktree: "primary".into(),
+            foreground_process: Some("bash".into()),
             command: command.into(),
             argv: command.split_whitespace().map(str::to_owned).collect(),
             run: None,
@@ -3994,9 +4142,9 @@ mod tests {
     }
 
     #[test]
-    fn wide_shell_columns_are_bounded_instead_of_absorbing_extra_space() {
+    fn mixed_item_columns_are_bounded_instead_of_absorbing_extra_space() {
         assert_eq!(
-            shell_column_widths(180),
+            item_column_widths(180),
             vec![
                 Constraint::Length(8),
                 Constraint::Length(18),
@@ -4005,6 +4153,76 @@ mod tests {
                 Constraint::Length(30),
             ]
         );
+    }
+
+    #[test]
+    fn shell_columns_fit_content_and_shrink_process_first() {
+        let rows = [[
+            "interrupted",
+            "#12",
+            "edge-datapipe-support",
+            "integration-tests",
+            "command",
+            "cargo test --all-targets --release",
+            "fix/confluent-direct-download",
+            "linked:confluent-direct-download",
+        ]
+        .map(str::to_owned)];
+        assert_eq!(
+            shell_column_widths(240, &rows),
+            vec![
+                Constraint::Length(12),
+                Constraint::Length(5),
+                Constraint::Length(23),
+                Constraint::Length(19),
+                Constraint::Length(9),
+                Constraint::Length(36),
+                Constraint::Length(31),
+                Constraint::Length(24),
+            ]
+        );
+        assert_eq!(
+            shell_column_widths(80, &rows),
+            vec![
+                Constraint::Length(10),
+                Constraint::Length(4),
+                Constraint::Length(11),
+                Constraint::Length(10),
+                Constraint::Length(7),
+                Constraint::Length(7),
+                Constraint::Length(12),
+                Constraint::Length(10),
+            ]
+        );
+    }
+
+    #[test]
+    fn shell_rows_distinguish_processes_and_exit_outcomes() {
+        let mut shell = match terminal("shell", "editor", "") {
+            WorkspaceItemView::Shell(shell) => shell,
+            _ => unreachable!(),
+        };
+        shell.foreground_process = Some("nvim".into());
+        assert_eq!(shell.kind(), "shell");
+        assert_eq!(shell.process(), "nvim");
+
+        let mut command = match terminal("command", "tests", "cargo test") {
+            WorkspaceItemView::Shell(shell) => shell,
+            _ => unreachable!(),
+        };
+        command.status = "exited".into();
+        command.foreground_process = None;
+        command.run = Some(TerminalRunView {
+            id: "run-3".into(),
+            generation: 3,
+            started_at_ms: 1,
+            ended_at_ms: Some(2),
+            exit_reason: Some("exited (1)".into()),
+            output_revision: 4,
+        });
+        assert_eq!(command.kind(), "command");
+        assert_eq!(command.process(), "cargo test");
+        assert_eq!(command.table_status(), "exit 1");
     }
 
     #[test]
@@ -4050,6 +4268,8 @@ mod tests {
         assert_eq!(status_color("pending"), YELLOW);
         assert_eq!(status_color("running"), TEAL);
         assert_eq!(status_color("exited"), SUBTEXT);
+        assert_eq!(status_color("exit 1"), SUBTEXT);
+        assert_eq!(status_color("interrupted"), SUBTEXT);
     }
 
     #[test]
@@ -4258,7 +4478,11 @@ mod tests {
             name: "tests".into(),
             status: "pending".into(),
             directory: "/tmp/boomux".into(),
+            repository: "boomux".into(),
             branch: "main".into(),
+            git_state: "clean".into(),
+            worktree: "primary".into(),
+            foreground_process: None,
             command: String::new(),
             argv: Vec::new(),
             run: None,
@@ -5477,6 +5701,8 @@ mod tests {
         assert_eq!(app.global_item_count(), 2);
         assert!(text.contains("SHELLS (2)"));
         assert!(text.contains("WORKSPACE"));
+        assert!(text.contains("PROCESS"));
+        assert!(text.contains("WORKTREE"));
         assert!(text.contains("alpha-shell"));
         assert!(text.contains("beta-shell"));
         assert!(text.contains("one"));
@@ -5484,7 +5710,7 @@ mod tests {
     }
 
     #[test]
-    fn narrow_global_view_keeps_all_aggregate_columns_visible() {
+    fn narrow_global_view_keeps_all_shell_columns_visible() {
         let backend = TestBackend::new(80, 20);
         let mut terminal_backend = Terminal::new(backend).unwrap();
         let mut workspace = workspace("w1", "one");
@@ -5504,8 +5730,9 @@ mod tests {
             .collect();
 
         assert!(text.contains("WORKSPACE"));
-        assert!(text.contains("DIRECTORY"));
-        assert!(text.contains("DETAIL"));
+        assert!(text.contains("PROCESS"));
+        assert!(text.contains("WORKTREE"));
+        assert!(!text.contains("DETAIL"));
         assert!(text.contains("running"));
         assert!(!text.contains("shell-on"));
     }
