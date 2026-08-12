@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.1](https://github.com/gardnmi/boomux/compare/v0.10.0...v0.10.1) (2026-08-12)
+
+
+### Bug Fixes
+
+* **session:** capture complete OpenCode exports ([#98](https://github.com/gardnmi/boomux/issues/98)) ([0559943](https://github.com/gardnmi/boomux/commit/0559943940383e4d11087bfa77247709174999bd))
+
 ## [0.10.0](https://github.com/gardnmi/boomux/compare/v0.9.1...v0.10.0) (2026-08-11)
 
 
