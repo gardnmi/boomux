@@ -31,7 +31,18 @@ Installing from source also requires:
 
 - A Rust toolchain.
 
-Install directly from the repository:
+Download and install the latest Linux x86_64 release with the GitHub CLI:
+
+```console
+version=$(gh release view --repo gardnmi/boomux --json tagName --jq .tagName)
+gh release download "$version" --repo gardnmi/boomux --pattern "boomux-$version-x86_64-unknown-linux-gnu.tar.gz*"
+sha256sum --check "boomux-$version-x86_64-unknown-linux-gnu.tar.gz.sha256"
+tar -xzf "boomux-$version-x86_64-unknown-linux-gnu.tar.gz"
+install -Dm755 "boomux-$version-x86_64-unknown-linux-gnu/boomux" ~/.local/bin/boomux
+boomux doctor
+```
+
+Alternatively, install directly from the repository with a Rust toolchain:
 
 ```console
 cargo install --git https://github.com/gardnmi/boomux --locked
