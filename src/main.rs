@@ -1281,107 +1281,120 @@ fn dashboard_views_from_sessions(
                         observed_at_ms: item.attention.observation.observed_at_ms,
                     })
                     .collect();
-            let shells = workspace.shells.iter().map(|shell| {
-                let git = git_cache.inspect(&shell.cwd);
-                let shell_view = tui::TerminalView {
-                    id: shell.id.clone(),
-                    name: shell.name.clone(),
-                    status: shell_status(&shell.status).into(),
-                    directory: shell.cwd.display().to_string(),
-                    repository: git.repository,
-                    branch: git.branch,
-                    git_state: git.state,
-                    worktree: git.worktree,
-                    foreground_process: shell.foreground_process.clone(),
-                    command: shell.command.join(" "),
-                    argv: shell.command.clone(),
-                    run: shell.run.as_ref().map(|run| tui::TerminalRunView {
-                        id: run.id.clone(),
-                        generation: run.generation,
-                        started_at_ms: run.started_at_ms,
-                        ended_at_ms: run.ended_at_ms,
-                        exit_reason: run.exit_reason.as_ref().map(shell_exit_reason),
-                        output_revision: run.output_revision,
-                    }),
-                };
-                let agent = matches!(shell.status, ShellStatus::Running)
-                    .then(|| {
-                        shell.run.as_ref().and_then(|run| {
-                            workspace
-                                .agents
-                                .iter()
-                                .filter(|agent| {
-                                    agent.workspace_id == workspace.id
-                                        && agent.shell_id == shell.id
-                                        && agent.run_id == run.id
-                                        && agent.ended_at_ms.is_none()
-                                        && !matches!(
-                                            agent.observation.state,
-                                            AgentState::Inactive | AgentState::Done
-                                        )
-                                })
-                                .max_by(|left, right| {
-                                    left.observation
-                                        .observed_at_ms
-                                        .cmp(&right.observation.observed_at_ms)
-                                        .then_with(|| left.id.cmp(&right.id))
-                                })
-                        })
-                    })
-                    .flatten();
-                let suppress_foreground_hint = shell.run.as_ref().is_some_and(|run| {
-                    workspace.agents.iter().any(|agent| {
-                        agent.shell_id == shell.id
-                            && agent.run_id == run.id
-                            && shell.foreground_process.as_deref()
-                                == Some(agent.integration.as_str())
-                            && (agent.ended_at_ms.is_some()
-                                || matches!(
-                                    agent.observation.state,
-                                    AgentState::Inactive | AgentState::Done
-                                ))
-                    })
-                });
-                let root_git = agent
-                    .and_then(|agent| {
-                        sessions
-                            .iter()
-                            .find(|session| session.runs.iter().any(|run| run.agent_id == agent.id))
-                    })
-                    .and_then(|session| session.source_cwd.as_deref())
-                    .map(|directory| git_cache.inspect(directory))
-                    .unwrap_or_default();
-                match (agent, shell.foreground_process.as_deref()) {
-                    (Some(agent), _) => tui::WorkspaceItemView::AgentShell(tui::AgentShellView {
-                        shell: shell_view,
-                        agent: Some(tui::AgentView {
-                            id: agent.id.clone(),
-                            state: cli_output::agent_state(agent.observation.state).into(),
-                            integration: agent.integration.clone(),
-                            external_session_id: agent.external_session_id.clone(),
-                            authority: cli_output::agent_authority(agent.observation.authority)
-                                .into(),
-                            confidence: agent.observation.confidence,
-                            evidence: agent.observation.evidence.clone(),
-                            updated_at_ms: agent.observation.observed_at_ms,
-                            root_branch: root_git.branch,
-                            root_worktree: root_git.worktree,
+            let shells = workspace
+                .shells
+                .iter()
+                .map(|shell| {
+                    let git = git_cache.inspect(&shell.cwd);
+                    let shell_view = tui::TerminalView {
+                        id: shell.id.clone(),
+                        name: shell.name.clone(),
+                        status: shell_status(&shell.status).into(),
+                        directory: shell.cwd.display().to_string(),
+                        repository: git.repository,
+                        branch: git.branch,
+                        git_state: git.state,
+                        worktree: git.worktree,
+                        foreground_process: shell.foreground_process.clone(),
+                        command: shell.command.join(" "),
+                        argv: shell.command.clone(),
+                        run: shell.run.as_ref().map(|run| tui::TerminalRunView {
+                            id: run.id.clone(),
+                            generation: run.generation,
+                            started_at_ms: run.started_at_ms,
+                            ended_at_ms: run.ended_at_ms,
+                            exit_reason: run.exit_reason.as_ref().map(shell_exit_reason),
+                            output_revision: run.output_revision,
                         }),
-                    }),
-                    (None, Some("opencode" | "pi")) if !suppress_foreground_hint => {
-                        tui::WorkspaceItemView::AgentShell(tui::AgentShellView {
-                            shell: shell_view,
-                            agent: None,
+                    };
+                    let agent = matches!(shell.status, ShellStatus::Running)
+                        .then(|| {
+                            shell.run.as_ref().and_then(|run| {
+                                workspace
+                                    .agents
+                                    .iter()
+                                    .filter(|agent| {
+                                        agent.workspace_id == workspace.id
+                                            && agent.shell_id == shell.id
+                                            && agent.run_id == run.id
+                                            && agent.ended_at_ms.is_none()
+                                            && !matches!(
+                                                agent.observation.state,
+                                                AgentState::Inactive | AgentState::Done
+                                            )
+                                    })
+                                    .max_by(|left, right| {
+                                        left.observation
+                                            .observed_at_ms
+                                            .cmp(&right.observation.observed_at_ms)
+                                            .then_with(|| left.id.cmp(&right.id))
+                                    })
+                            })
                         })
+                        .flatten();
+                    let suppress_foreground_hint = shell.run.as_ref().is_some_and(|run| {
+                        workspace.agents.iter().any(|agent| {
+                            agent.shell_id == shell.id
+                                && agent.run_id == run.id
+                                && shell.foreground_process.as_deref()
+                                    == Some(agent.integration.as_str())
+                                && (agent.ended_at_ms.is_some()
+                                    || matches!(
+                                        agent.observation.state,
+                                        AgentState::Inactive | AgentState::Done
+                                    ))
+                        })
+                    });
+                    let root_git = agent
+                        .and_then(|agent| {
+                            sessions.iter().find(|session| {
+                                session.runs.iter().any(|run| run.agent_id == agent.id)
+                            })
+                        })
+                        .and_then(|session| session.source_cwd.as_deref())
+                        .map(|directory| git_cache.inspect(directory))
+                        .unwrap_or_default();
+                    match (agent, shell.foreground_process.as_deref()) {
+                        (Some(agent), _) => {
+                            tui::WorkspaceItemView::AgentShell(tui::AgentShellView {
+                                shell: shell_view,
+                                agent: Some(tui::AgentView {
+                                    id: agent.id.clone(),
+                                    state: cli_output::agent_state(agent.observation.state).into(),
+                                    integration: agent.integration.clone(),
+                                    external_session_id: agent.external_session_id.clone(),
+                                    authority: cli_output::agent_authority(
+                                        agent.observation.authority,
+                                    )
+                                    .into(),
+                                    confidence: agent.observation.confidence,
+                                    evidence: agent.observation.evidence.clone(),
+                                    updated_at_ms: agent.observation.observed_at_ms,
+                                    root_branch: root_git.branch,
+                                    root_worktree: root_git.worktree,
+                                }),
+                            })
+                        }
+                        (None, Some("opencode" | "pi")) if !suppress_foreground_hint => {
+                            tui::WorkspaceItemView::AgentShell(tui::AgentShellView {
+                                shell: shell_view,
+                                agent: None,
+                            })
+                        }
+                        (None, _) => tui::WorkspaceItemView::Shell(shell_view),
                     }
-                    (None, _) => tui::WorkspaceItemView::Shell(shell_view),
-                }
-            });
+                })
+                .collect::<Vec<_>>();
             let launchers = workspace.launchers.iter().map(|launcher| {
+                let git = git_cache.inspect(&launcher.cwd);
                 tui::WorkspaceItemView::Launcher(tui::LauncherView {
                     id: launcher.id.clone(),
                     name: launcher.name.clone(),
                     directory: launcher.cwd.display().to_string(),
+                    repository: git.repository,
+                    branch: git.branch,
+                    git_state: git.state,
+                    worktree: git.worktree,
                     command: launcher.command.join(" "),
                     argv: launcher.command.clone(),
                 })
@@ -1393,7 +1406,7 @@ fn dashboard_views_from_sessions(
                     .default_cwd
                     .as_ref()
                     .map(|cwd| cwd.display().to_string()),
-                items: shells.chain(launchers).collect(),
+                items: shells.into_iter().chain(launchers).collect(),
                 sessions,
                 agent_state_counts: agent_summary.states,
                 attention_count: agent_summary.attention_count,

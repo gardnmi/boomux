@@ -46,6 +46,7 @@ const SHELL_TABLE_HEADERS: [&str; 8] = [
     "BRANCH",
     "WORKTREE",
 ];
+const ITEM_TABLE_HEADERS: [&str; 6] = ["KIND", "STATUS", "NAME", "ACTIVITY", "BRANCH", "WORKTREE"];
 
 pub(crate) struct WorkspaceView {
     pub(crate) id: String,
@@ -133,6 +134,10 @@ pub(crate) struct LauncherView {
     pub(crate) id: String,
     pub(crate) name: String,
     pub(crate) directory: String,
+    pub(crate) repository: String,
+    pub(crate) branch: String,
+    pub(crate) git_state: String,
+    pub(crate) worktree: String,
     pub(crate) command: String,
     pub(crate) argv: Vec<String>,
 }
@@ -2793,8 +2798,6 @@ fn render_global_items(frame: &mut Frame, area: Rect, app: &mut App) {
 }
 
 fn render_items(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
-    let header = Row::new(["KIND", "NAME", "STATUS", "DIRECTORY", "DETAIL"])
-        .style(Style::new().fg(BLUE).add_modifier(Modifier::BOLD));
     let selected = app
         .workspace_state
         .selected()
@@ -2827,63 +2830,84 @@ fn render_items(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
             Layout::vertical([Constraint::Fill(1), Constraint::Length(panel_height)]).areas(inner);
         (items_area, Some(preview_area))
     });
-    let rows: Vec<_> = selected
+    let values: Vec<[String; 6]> = selected
         .into_iter()
         .flat_map(|workspace| {
             workspace.items.iter().map(|item| match item {
-                WorkspaceItemView::Shell(terminal) => Row::new(vec![
-                    Cell::from(Span::styled(
-                        terminal.kind(),
-                        Style::new().fg(if terminal.command.is_empty() {
-                            TEXT
-                        } else {
-                            YELLOW
-                        }),
-                    )),
-                    Cell::from(terminal.name.as_str()),
-                    Cell::from(Span::styled(
-                        terminal.status.as_str(),
-                        Style::new().fg(status_color(&terminal.status)),
-                    )),
-                    Cell::from(terminal.directory.as_str()),
-                    Cell::from(terminal.detail()),
-                ]),
-                WorkspaceItemView::AgentShell(agent_shell) => Row::new(vec![
-                    Cell::from(Span::styled("agent", Style::new().fg(TEAL))),
-                    Cell::from(agent_shell.shell.name.as_str()),
-                    Cell::from(Span::styled(
-                        agent_shell.status(),
-                        Style::new().fg(status_color(agent_shell.status())),
-                    )),
-                    Cell::from(agent_shell.shell.directory.as_str()),
-                    Cell::from(agent_shell.agent.as_ref().map_or_else(
-                        || format!("foreground process | {}", agent_shell.shell.branch),
-                        |agent| {
-                            format!(
-                                "{} | {} | {} / {} {}%",
-                                agent.evidence,
-                                agent_shell.shell.branch,
-                                agent.integration,
-                                agent.authority,
-                                agent.confidence
+                WorkspaceItemView::Shell(terminal) => [
+                    terminal.kind().into(),
+                    terminal.table_status(),
+                    terminal.name.clone(),
+                    terminal.process().into(),
+                    terminal.branch.clone(),
+                    terminal.worktree.clone(),
+                ],
+                WorkspaceItemView::AgentShell(agent_shell) => {
+                    let (activity, branch, worktree) = agent_shell.agent.as_ref().map_or_else(
+                        || {
+                            (
+                                agent_shell.shell.process().to_owned(),
+                                agent_shell.shell.branch.clone(),
+                                agent_shell.shell.worktree.clone(),
                             )
                         },
-                    )),
-                ]),
-                WorkspaceItemView::Launcher(launcher) => Row::new(vec![
-                    Cell::from(Span::styled("launcher", Style::new().fg(YELLOW))),
-                    Cell::from(launcher.name.as_str()),
-                    Cell::from("-"),
-                    Cell::from(launcher.directory.as_str()),
-                    Cell::from(launcher.command.as_str()),
-                ]),
+                        |agent| {
+                            (
+                                matched_agent_session(workspace, agent_shell)
+                                    .and_then(session_task_label)
+                                    .unwrap_or(&agent.integration)
+                                    .to_owned(),
+                                agent.root_branch.clone(),
+                                agent.root_worktree.clone(),
+                            )
+                        },
+                    );
+                    [
+                        "agent".into(),
+                        agent_shell.status().into(),
+                        agent_shell.shell.name.clone(),
+                        activity,
+                        branch,
+                        worktree,
+                    ]
+                }
+                WorkspaceItemView::Launcher(launcher) => [
+                    "launcher".into(),
+                    "ready".into(),
+                    launcher.name.clone(),
+                    launcher.command.clone(),
+                    launcher.branch.clone(),
+                    launcher.worktree.clone(),
+                ],
             })
         })
         .collect();
-    let widths = item_column_widths(items_inner.width);
+    let widths = item_column_widths(items_inner.width, &values);
+    let rows = values
+        .into_iter()
+        .map(|[kind, status, name, activity, branch, worktree]| {
+            let kind_color = match kind.as_str() {
+                "agent" => TEAL,
+                "command" | "launcher" => YELLOW,
+                _ => TEXT,
+            };
+            Row::new([
+                Cell::from(Span::styled(kind, Style::new().fg(kind_color))),
+                Cell::from(Span::styled(
+                    status.clone(),
+                    Style::new().fg(status_color(&status)),
+                )),
+                Cell::from(name),
+                Cell::from(activity),
+                Cell::from(branch),
+                Cell::from(worktree),
+            ])
+        });
     frame.render_widget(block, area);
     let table = Table::new(rows, widths)
-        .header(header)
+        .header(
+            Row::new(ITEM_TABLE_HEADERS).style(Style::new().fg(BLUE).add_modifier(Modifier::BOLD)),
+        )
         .column_spacing(1)
         .row_highlight_style(
             Style::new()
@@ -2965,7 +2989,7 @@ fn workspace_preview(workspace: &WorkspaceView) -> ContextualPreview {
 fn launcher_preview(launcher: &LauncherView) -> ContextualPreview {
     ContextualPreview {
         title: " Launcher configuration ".into(),
-        content_height: 3,
+        content_height: 4,
         content: PreviewContent::Lines(vec![
             Line::from(vec![
                 Span::styled("cwd  ", Style::new().fg(SUBTEXT)),
@@ -2974,6 +2998,16 @@ fn launcher_preview(launcher: &LauncherView) -> ContextualPreview {
             Line::from(vec![
                 Span::styled("argv ", Style::new().fg(SUBTEXT)),
                 Span::raw(format_argv(&launcher.argv)),
+            ]),
+            Line::from(vec![
+                Span::styled("git  ", Style::new().fg(SUBTEXT)),
+                Span::raw(launcher.repository.clone()),
+                Span::styled("  branch ", Style::new().fg(SUBTEXT)),
+                Span::raw(launcher.branch.clone()),
+                Span::styled("  state ", Style::new().fg(SUBTEXT)),
+                Span::raw(launcher.git_state.clone()),
+                Span::styled("  worktree ", Style::new().fg(SUBTEXT)),
+                Span::raw(launcher.worktree.clone()),
             ]),
             Line::from(Span::styled(
                 "Detached invocation; output and run history are not retained",
@@ -3363,25 +3397,35 @@ fn integration_display_name(integration: &str) -> &str {
     }
 }
 
-fn item_column_widths(width: u16) -> Vec<Constraint> {
-    let (name, status, detail, directory_min, directory_max) = if width >= 120 {
-        (18, 10, 30, 24, 42)
+fn item_column_widths(width: u16, rows: &[[String; 6]]) -> Vec<Constraint> {
+    let caps = if width >= 140 {
+        [10, 12, 24, 52, 32, 24]
+    } else if width >= 100 {
+        [10, 11, 18, 36, 24, 20]
     } else {
-        (16, 10, 18, 16, 42)
+        [8, 10, 14, 24, 18, 16]
     };
-    let kind = 8;
-    // Four column gaps and the highlight marker also consume table width.
-    let fixed = kind + name + status + detail + 6;
-    let directory = width
-        .saturating_sub(fixed)
-        .clamp(directory_min, directory_max);
-    vec![
-        Constraint::Length(kind),
-        Constraint::Length(name),
-        Constraint::Length(status),
-        Constraint::Length(directory),
-        Constraint::Length(detail),
-    ]
+    let minimums = ITEM_TABLE_HEADERS.map(|header| header.len() as u16);
+    let mut widths: [u16; 6] = std::array::from_fn(|index| {
+        rows.iter()
+            .map(|row| row[index].chars().count() as u16)
+            .max()
+            .unwrap_or(0)
+            .max(minimums[index])
+            .saturating_add(2)
+            .min(caps[index])
+    });
+
+    // Five column gaps and the highlight marker also consume table width.
+    let available = width.saturating_sub(7);
+    let mut overflow = widths.iter().sum::<u16>().saturating_sub(available);
+    for index in [3, 5, 4, 2, 1, 0] {
+        let reduction = widths[index].saturating_sub(minimums[index]).min(overflow);
+        widths[index] -= reduction;
+        overflow -= reduction;
+    }
+
+    widths.into_iter().map(Constraint::Length).collect()
 }
 
 fn shell_column_widths(width: u16, rows: &[[String; 8]]) -> Vec<Constraint> {
@@ -4120,6 +4164,10 @@ mod tests {
             id: id.into(),
             name: name.into(),
             directory: format!("/tmp/{name}"),
+            repository: name.into(),
+            branch: "main".into(),
+            git_state: "clean".into(),
+            worktree: "primary".into(),
             command: format!("run-{name}"),
             argv: vec![format!("run-{name}")],
         })
@@ -4142,15 +4190,36 @@ mod tests {
     }
 
     #[test]
-    fn mixed_item_columns_are_bounded_instead_of_absorbing_extra_space() {
+    fn mixed_item_columns_fit_content_and_shrink_activity_first() {
+        let rows = [[
+            "launcher",
+            "ready",
+            "editor",
+            "zeditor --foreground .",
+            "feature/workspace-items",
+            "linked:workspace-items",
+        ]
+        .map(str::to_owned)];
         assert_eq!(
-            item_column_widths(180),
+            item_column_widths(180, &rows),
+            vec![
+                Constraint::Length(10),
+                Constraint::Length(8),
+                Constraint::Length(8),
+                Constraint::Length(24),
+                Constraint::Length(25),
+                Constraint::Length(24),
+            ]
+        );
+        assert_eq!(
+            item_column_widths(70, &rows),
             vec![
                 Constraint::Length(8),
+                Constraint::Length(8),
+                Constraint::Length(8),
+                Constraint::Length(8),
                 Constraint::Length(18),
-                Constraint::Length(10),
-                Constraint::Length(42),
-                Constraint::Length(30),
+                Constraint::Length(13),
             ]
         );
     }
@@ -4459,6 +4528,10 @@ mod tests {
             id: "launcher-1".into(),
             name: "editor".into(),
             directory: "/tmp/boomux".into(),
+            repository: "boomux".into(),
+            branch: "main".into(),
+            git_state: "clean".into(),
+            worktree: "primary".into(),
             command: "zeditor .".into(),
             argv: vec!["zeditor".into(), ".".into()],
         };
@@ -4520,6 +4593,10 @@ mod tests {
                 id: "launcher-1".into(),
                 name: "editor".into(),
                 directory: "/tmp/boomux".into(),
+                repository: "boomux".into(),
+                branch: "main".into(),
+                git_state: "clean".into(),
+                worktree: "primary".into(),
                 command: "true".into(),
                 argv: vec!["true".into()],
             }),
@@ -5118,6 +5195,10 @@ mod tests {
                 id: "launcher-1".into(),
                 name: "editor".into(),
                 directory: "/tmp/boomux".into(),
+                repository: "boomux".into(),
+                branch: "main".into(),
+                git_state: "clean".into(),
+                worktree: "primary".into(),
                 command: "zeditor .".into(),
                 argv: vec!["zeditor".into(), ".".into()],
             }));
@@ -5145,6 +5226,10 @@ mod tests {
             id: "launcher-1".into(),
             name: "editor".into(),
             directory: "/tmp/boomux".into(),
+            repository: "boomux".into(),
+            branch: "main".into(),
+            git_state: "clean".into(),
+            worktree: "primary".into(),
             command: "zeditor .".into(),
             argv: vec!["zeditor".into(), ".".into()],
         };
@@ -5391,13 +5476,13 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect();
-        assert!(text.contains("DETAIL"));
-        assert!(text.contains("DIRECTORY"));
+        assert!(text.contains("ACTIVITY"));
+        assert!(text.contains("BRANCH"));
         assert!(!text.contains("term_1"));
         assert!(text.contains("SHELLS"));
         assert!(text.contains("Items: boomux (1)"));
         assert!(!text.contains("DIRTY"));
-        assert!(!text.contains("WORKTREE"));
+        assert!(text.contains("WORKTREE"));
     }
 
     #[test]
@@ -5411,6 +5496,10 @@ mod tests {
                 id: "launcher-12345678".into(),
                 name: "editor".into(),
                 directory: "/tmp/boomux".into(),
+                repository: "boomux".into(),
+                branch: "main".into(),
+                git_state: "clean".into(),
+                worktree: "primary".into(),
                 command: "zeditor .".into(),
                 argv: vec!["zeditor".into(), ".".into()],
             }));
@@ -5425,7 +5514,8 @@ mod tests {
             .collect();
         assert!(text.contains("Items: boomux (2)"));
         assert!(!text.contains("Launchers: boomux"));
-        assert!(text.contains("DETAIL"));
+        assert!(text.contains("ACTIVITY"));
+        assert!(text.contains("ready"));
         assert!(text.contains("editor"));
         assert!(text.contains("zeditor ."));
         assert!(text.contains("launcher"));
@@ -5441,6 +5531,10 @@ mod tests {
                 id: format!("launcher-{index:08}"),
                 name: format!("launcher-{index}"),
                 directory: "/tmp/boomux".into(),
+                repository: "boomux".into(),
+                branch: "main".into(),
+                git_state: "clean".into(),
+                worktree: "primary".into(),
                 command: format!("command-{index}"),
                 argv: vec![format!("command-{index}")],
             })
@@ -5471,6 +5565,9 @@ mod tests {
         let mut agent_shell = agent_shell();
         agent_shell.shell.name = "keepname".into();
         app.workspaces[0].items[0] = WorkspaceItemView::AgentShell(agent_shell);
+        app.workspaces[0]
+            .sessions
+            .push(session("active", "working"));
         focus_items(&mut app);
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
@@ -5493,8 +5590,9 @@ mod tests {
         assert!(text.contains("working"));
         assert!(!text.contains("term_1"));
         assert!(!text.contains("agent-1"));
-        assert!(text.contains("tool call"));
-        assert!(text.contains("main"));
+        assert!(text.contains("OpenCode review"));
+        assert!(text.contains("feat/agents"));
+        assert!(text.contains("linked:agents"));
         assert!(text.contains("rename shell"));
         assert!(text.contains("open shell"));
         assert!(text.contains("close shell"));
@@ -5549,9 +5647,8 @@ mod tests {
         assert_eq!(app.workspaces[0].agent_count(), 1);
         assert!(!lines.iter().any(|line| line.contains("term_1")));
         assert!(!lines.iter().any(|line| line.contains("agent-1")));
-        assert!(lines.iter().any(|line| line.contains("foreground process")));
+        assert!(lines.iter().any(|line| line.contains("opencode")));
         assert!(lines.iter().any(|line| line.contains("keepname")));
-        assert!(!lines.iter().any(|line| line.contains("opencode")));
         assert!(lines.iter().any(|line| line.contains("untracked")));
         assert!(!lines.iter().any(|line| line.contains("idle")));
         assert!(!lines.iter().any(|line| line.contains("OpenCode session")));
@@ -5567,6 +5664,10 @@ mod tests {
                 id: "launcher".into(),
                 name: "editor".into(),
                 directory: "/tmp/boomux".into(),
+                repository: "boomux".into(),
+                branch: "main".into(),
+                git_state: "clean".into(),
+                worktree: "primary".into(),
                 command: "zeditor .".into(),
                 argv: vec!["zeditor".into(), ".".into()],
             }));
@@ -5599,7 +5700,7 @@ mod tests {
         assert!(text.contains("working  0  blocked  0"));
         assert!(text.contains("idle     0  done     0"));
         assert!(text.contains("agent"));
-        assert!(text.contains("DIRECTORY"));
+        assert!(text.contains("ACTIVITY"));
         assert!(text.contains("main"));
         assert!(!text.contains("REPOSITORY"));
     }
@@ -5871,6 +5972,10 @@ mod tests {
                 id: "launcher".into(),
                 name: "editor".into(),
                 directory: "/tmp/boomux".into(),
+                repository: "boomux".into(),
+                branch: "main".into(),
+                git_state: "clean".into(),
+                worktree: "primary".into(),
                 command: "editor .".into(),
                 argv: vec!["editor".into(), ".".into()],
             }));
@@ -6221,12 +6326,12 @@ mod tests {
             .collect();
         assert!(text.contains("Workspaces (1)"));
         assert!(text.contains("Items: boomux (1)"));
-        assert!(text.contains("DIRECTORY"));
-        assert!(text.contains("DETAIL"));
+        assert!(text.contains("ACTIVITY"));
+        assert!(text.contains("WORKTREE"));
         assert!(text.contains("main"));
         assert!(!text.contains("term_1"));
         assert!(!text.contains("DIRTY"));
-        assert!(!text.contains("WORKTREE"));
+        assert!(text.contains("WORKTREE"));
     }
 
     #[test]
@@ -6245,8 +6350,8 @@ mod tests {
             .collect();
         assert!(text.contains("NAME"));
         assert!(text.contains("STATUS"));
-        assert!(text.contains("DIRECTORY"));
-        assert!(text.contains("DETAIL"));
+        assert!(text.contains("ACTIVITY"));
+        assert!(text.contains("WORKTREE"));
         assert!(!text.contains("term_1"));
     }
 
