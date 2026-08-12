@@ -2928,7 +2928,6 @@ struct ContextualPreview {
 }
 
 enum PreviewContent {
-    AgentSession(Vec<Row<'static>>),
     Lines(Vec<Line<'static>>),
 }
 
@@ -3264,49 +3263,67 @@ fn agent_session_preview(app: &App, agent_shell: &AgentShellView) -> Option<Cont
         .source_cwd
         .as_deref()
         .map_or_else(|| "-".into(), |path| path.display().to_string());
-    let rows = vec![
-        Row::new([
-            Cell::from(Span::styled(
-                session_state_symbol(&session.state),
-                Style::new().fg(session_state_color(&session.state)),
-            )),
-            Cell::from(vec![
-                Line::from(Span::styled(
-                    label,
-                    Style::new().add_modifier(Modifier::BOLD),
-                )),
-                Line::from(Span::styled(
-                    format!(
-                        "{shell}  {external_identity}  {occurrences} occurrence{}  {currency}",
-                        if occurrences == 1 { "" } else { "s" }
-                    ),
-                    Style::new().fg(SUBTEXT),
-                )),
-                Line::from(Span::styled(
-                    format!(
-                        "root {root_directory}  {}  {}",
-                        agent.root_branch, agent.root_worktree
-                    ),
-                    Style::new().fg(SUBTEXT),
-                )),
-                Line::from(Span::styled(
-                    format!(
-                        "{}  {} {}%",
-                        agent.evidence, agent.authority, agent.confidence
-                    ),
-                    Style::new().fg(SUBTEXT),
-                )),
-            ]),
-            Cell::from(session.state.clone()),
-            Cell::from(compact_recency(agent.updated_at_ms)),
-        ])
-        .height(4),
+    let mut lines = vec![
+        preview_field("TASK", label),
+        Line::from(vec![
+            preview_label("STATUS"),
+            Span::styled(
+                session.state.clone(),
+                Style::new()
+                    .fg(session_state_color(&session.state))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(
+                    "  ·  {currency}  ·  updated {}",
+                    compact_recency(agent.updated_at_ms)
+                ),
+                Style::new().fg(SUBTEXT),
+            ),
+        ]),
+        preview_field(
+            "SESSION",
+            format!(
+                "{external_identity}  ·  {occurrences} occurrence{}  ·  shell {shell}",
+                if occurrences == 1 { "" } else { "s" }
+            ),
+        ),
+        preview_field("ROOT", root_directory),
     ];
+    if agent.root_branch != "-" || agent.root_worktree != "-" {
+        lines.push(preview_field(
+            "GIT",
+            format!(
+                "branch {}  ·  worktree {}",
+                agent.root_branch, agent.root_worktree
+            ),
+        ));
+    }
+    lines.extend([
+        preview_field("EVIDENCE", agent.evidence.clone()),
+        preview_field(
+            "SOURCE",
+            format!(
+                "{}  ·  confidence {}%",
+                agent.authority.replace('_', " "),
+                agent.confidence
+            ),
+        ),
+    ]);
+    let content_height = lines.len() as u16;
     Some(ContextualPreview {
         title: format!(" {} session ", integration_display_name(&agent.integration)),
-        content: PreviewContent::AgentSession(rows),
-        content_height: 4,
+        content: PreviewContent::Lines(lines),
+        content_height,
     })
+}
+
+fn preview_field(label: &'static str, value: impl Into<String>) -> Line<'static> {
+    Line::from(vec![preview_label(label), Span::raw(value.into())])
+}
+
+fn preview_label(label: &'static str) -> Span<'static> {
+    Span::styled(format!("{label:<10}"), Style::new().fg(SUBTEXT))
 }
 
 fn matched_agent_session<'a>(
@@ -3335,25 +3352,8 @@ fn render_contextual_preview(frame: &mut Frame, area: Rect, preview: ContextualP
     let block = Block::bordered()
         .title(preview.title)
         .border_style(Style::new().fg(OVERLAY));
-    match preview.content {
-        PreviewContent::AgentSession(rows) => {
-            let table = Table::new(
-                rows,
-                [
-                    Constraint::Length(2),
-                    Constraint::Fill(1),
-                    Constraint::Length(10),
-                    Constraint::Length(9),
-                ],
-            )
-            .column_spacing(1)
-            .block(block);
-            frame.render_widget(table, area);
-        }
-        PreviewContent::Lines(lines) => {
-            frame.render_widget(Paragraph::new(lines).block(block), area);
-        }
-    }
+    let PreviewContent::Lines(lines) = preview.content;
+    frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 fn best_session_label(session: &AgentSessionView) -> String {
@@ -3533,17 +3533,6 @@ fn current_time_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
-}
-
-fn session_state_symbol(state: &str) -> &'static str {
-    match state {
-        "blocked" => "!",
-        "working" => ">",
-        "idle" => ".",
-        "inactive" => "-",
-        "done" => "x",
-        _ => "?",
-    }
 }
 
 fn session_state_color(state: &str) -> Color {
@@ -5752,14 +5741,40 @@ mod tests {
         assert!(!text.contains("Finished build"));
         assert!(!text.contains("Pi session must be filtered"));
         assert!(text.contains("Items: boomux (1)"));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("TASK") && line.contains("Current work"))
+        );
         assert!(lines.iter().any(|line| {
-            line.contains("Current work") && line.contains("working") && line.contains("now")
+            line.contains("STATUS")
+                && line.contains("working")
+                && line.contains("current")
+                && line.contains("updated now")
         }));
         assert!(lines.iter().any(|line| {
-            line.contains("agent")
+            line.contains("SESSION")
                 && line.contains("external")
                 && line.contains("1 occurrence")
-                && line.contains("current")
+                && line.contains("shell agent")
+        }));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("ROOT") && line.contains("/tmp/boomux"))
+        );
+        assert!(lines.iter().any(|line| {
+            line.contains("GIT") && line.contains("feat/agents") && line.contains("linked:agents")
+        }));
+        assert!(
+            lines.iter().any(|line| {
+                line.contains("EVIDENCE") && line.contains("tool call in progress")
+            })
+        );
+        assert!(lines.iter().any(|line| {
+            line.contains("SOURCE")
+                && line.contains("lifecycle integration")
+                && line.contains("confidence 95%")
         }));
         assert!(!text.contains("first "));
         assert!(!text.contains("observed "));
@@ -5775,6 +5790,94 @@ mod tests {
             .collect();
         assert!(latest_text.contains("Recent review"));
         assert!(!latest_text.contains("Current work"));
+    }
+
+    #[test]
+    fn agent_session_preview_labels_historical_and_missing_context() {
+        let mut workspace = workspace("w1", "boomux");
+        workspace.items[0] = WorkspaceItemView::AgentShell(agent_shell());
+        let mut catalog = session("catalog", "idle");
+        catalog.external_session_id = Some("external-active".into());
+        catalog.state_is_current = false;
+        catalog.source_cwd = None;
+        catalog.runs.clear();
+        workspace.sessions = vec![catalog];
+        let mut app = App::new(vec![workspace], project_context());
+        focus_items(&mut app);
+        {
+            let WorkspaceItemView::AgentShell(agent_shell) = &mut app.workspaces[0].items[0] else {
+                unreachable!();
+            };
+            let agent = agent_shell.agent.as_mut().expect("durable Agent");
+            agent.root_branch = "-".into();
+            agent.root_worktree = "-".into();
+        }
+
+        let WorkspaceItemView::AgentShell(agent_shell) = &app.workspaces[0].items[0] else {
+            unreachable!();
+        };
+        let preview = agent_session_preview(&app, agent_shell).expect("session preview");
+        let PreviewContent::Lines(lines) = preview.content;
+        let text = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(preview.content_height, 6);
+        assert!(text.contains("STATUS    idle  ·  last known"));
+        assert!(text.contains("SESSION   external  ·  0 occurrences  ·  shell catalog only"));
+        assert!(text.contains("ROOT      -"));
+        assert!(!text.contains("GIT"));
+
+        app.workspaces[0].sessions[0]
+            .runs
+            .push(AgentSessionRunView {
+                agent_id: "agent-active".into(),
+                shell_name: None,
+                directory: None,
+            });
+        let WorkspaceItemView::AgentShell(agent_shell) = &app.workspaces[0].items[0] else {
+            unreachable!();
+        };
+        let preview = agent_session_preview(&app, agent_shell).expect("session preview");
+        let PreviewContent::Lines(lines) = preview.content;
+        let session_line = lines[2]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(session_line.contains("1 occurrence  ·  shell removed shell"));
+    }
+
+    #[test]
+    fn narrow_agent_session_preview_keeps_all_labels_visible() {
+        let backend = TestBackend::new(80, 34);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = app();
+        app.workspaces[0].items[0] = WorkspaceItemView::AgentShell(agent_shell());
+        app.workspaces[0]
+            .sessions
+            .push(session("active", "working"));
+        focus_items(&mut app);
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        for label in [
+            "TASK", "STATUS", "SESSION", "ROOT", "GIT", "EVIDENCE", "SOURCE",
+        ] {
+            assert!(text.contains(label), "missing {label}");
+        }
     }
 
     #[test]
