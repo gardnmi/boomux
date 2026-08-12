@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.12.0](https://github.com/gardnmi/boomux/compare/v0.11.0...v0.12.0) (2026-08-12)
+
+
+### Features
+
+* **tui:** improve workspace items table ([#102](https://github.com/gardnmi/boomux/issues/102)) ([3ebe01c](https://github.com/gardnmi/boomux/commit/3ebe01c0ddf6763afcb06762fdc6a585fdb28172))
+* **tui:** organize agent session preview ([#104](https://github.com/gardnmi/boomux/issues/104)) ([25e885d](https://github.com/gardnmi/boomux/commit/25e885dcc04bb6608bdae2e769233eb7a4707808))
+* **tui:** organize shell preview ([#105](https://github.com/gardnmi/boomux/issues/105)) ([11758f2](https://github.com/gardnmi/boomux/commit/11758f2f2e79ee8e1c0bf91945301fcdf103c54b))
+
 ## [0.11.0](https://github.com/gardnmi/boomux/compare/v0.10.1...v0.11.0) (2026-08-12)
 
 
