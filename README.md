@@ -10,7 +10,7 @@ native windows.
 Optional integrations show whether supported coding agents are working, blocked,
 idle, or untracked without trying to infer state from quiet terminal output.
 
-![Boomux workspace dashboard showing shells, commands, agents, and launchers](assets/dashboard-workspaces.png)
+![Boomux Workspaces view showing mixed items and a labeled Agent session preview](assets/dashboard-workspaces.png)
 
 > [!WARNING]
 > Boomux is an early proof of concept. Commands, storage, and session behavior
@@ -147,14 +147,26 @@ terminate applications launched earlier.
 
 ## Dashboard
 
-The dashboard has views for workspaces, shells, commands, agents, and launchers.
-Its workspace and entry tables let you act on either the whole workspace or one
-selected entry. The selected workspace overview includes entry and agent-state
-counts plus its most urgent outstanding attention item.
+The dashboard has three primary views: Workspaces, Agents, and Shells. The
+Workspaces view combines the selected workspace's Agents, shells, commands, and
+launchers in one item table. Its `ACTIVITY` column shows an Agent task, shell
+foreground process, stored command, or launcher command; branch and worktree
+columns keep repository context visible without repeating full paths.
+
+The Agents view shows lifecycle status and recency, owning workspace and shell,
+root-session task, branch, and worktree. The Shells view distinguishes login
+shells from stored commands and shows run generation, process, branch, and
+worktree. Selecting an item opens a labeled detail panel with the full path,
+Git, run, lifecycle, or launcher information that does not fit cleanly in a
+table. Shell output previews retain terminal colors and expose viewport and
+follow state without allowing input from the dashboard.
+
+The workspace overview includes item and Agent-state counts plus its most urgent
+outstanding attention item.
 
 | Key | Action |
 | --- | --- |
-| `Tab`, `Shift-Tab`, `1`-`5` | Change view. |
+| `Tab`, `Shift-Tab`, `1`-`3` | Change view. |
 | `/` or `:` | Search actions, workspaces, and entries. |
 | `?` | Explain keys plus the selected kind and state. |
 | `h`, `l`, left, right | Move between workspace and entry tables. |
@@ -191,7 +203,7 @@ Integrated agents can report `working`, `blocked`, `idle`, `inactive`, and
 `done`. An `untracked` row means a supported coding agent is visible but its
 integration is not currently reporting lifecycle state.
 
-![Boomux agents view showing tracked and untracked coding-agent shells](assets/dashboard-agents.png)
+![Boomux Agents view showing task, branch, worktree, and session metadata](assets/dashboard-agents.png)
 
 Inspect installation and runtime status with:
 
@@ -203,6 +215,36 @@ boomux integration status
 The validated host versions and test evidence are documented in
 [`docs/lifecycle-validation.md`](docs/lifecycle-validation.md). They are
 compatibility test points, not runtime pins.
+
+### Agent Sessions and Transcripts
+
+Boomux projects canonical OpenCode and Pi sessions into each matching workspace.
+A projected session groups every Boomux Agent occurrence for the same external
+root session. `current` means an occurrence belongs to the current run of a
+running retained shell; `last known` means the session is historical.
+Catalog-only host history can appear without a fabricated Boomux Agent
+occurrence.
+
+Discover and inspect sessions with exact IDs returned by `session list`:
+
+```console
+boomux session list --workspace my-project
+boomux session inspect <session-id>
+boomux session read <session-id> --limit 100
+```
+
+`session read` returns a bounded, normalized suffix of canonical messages,
+reasoning, and tool activity rather than terminal scrollback. OpenCode is read
+through its session export and Pi through its project session file. Source reads
+are capped at 16 MiB and may time out; response entry count and content bytes
+have separate caller-selected bounds. Boomux does not cache or persist the
+transcript. OpenCode capture uses an unlinked private temporary file that exists
+only for the duration of the read.
+
+Boomux does not redact host transcript content. Use transcript commands only
+when reading that session's content is appropriate. Opaque continuation cursors
+can request older pages; discard one and start a fresh read if Boomux reports
+that it expired.
 
 ### Agent Skill
 
@@ -308,6 +350,9 @@ boomux --help
 boomux workspace --help
 boomux shell --help
 boomux launcher --help
+boomux agent --help
+boomux attention --help
+boomux session --help
 boomux notification --help
 boomux integration --help
 ```
