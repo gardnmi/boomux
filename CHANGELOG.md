@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.0](https://github.com/gardnmi/boomux/compare/v0.10.1...v0.11.0) (2026-08-12)
+
+
+### Features
+
+* **tui:** improve shell management table ([#100](https://github.com/gardnmi/boomux/issues/100)) ([b9f8f00](https://github.com/gardnmi/boomux/commit/b9f8f00a38d03835a7c5432f0ca7fb5f8afc5e85))
+
 ## [0.10.1](https://github.com/gardnmi/boomux/compare/v0.10.0...v0.10.1) (2026-08-12)
 
 
