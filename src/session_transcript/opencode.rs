@@ -1,11 +1,13 @@
-use std::io::Read;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::mpsc::{self, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
+use uuid::Uuid;
 
 use super::{
     SOURCE_LIMIT_BYTES, TranscriptAdapter, TranscriptEntry, TranscriptError, TranscriptRequest,
@@ -37,11 +39,27 @@ impl TranscriptAdapter for OpenCodeAdapter {
 }
 
 fn run_export(directory: &Path, external_session_id: &str) -> Result<Vec<u8>, TranscriptError> {
-    let mut child = Command::new("opencode")
-        .args(["export", external_session_id])
+    run_export_command("opencode", &["export", external_session_id], directory)
+}
+
+fn run_export_command(
+    program: &str,
+    arguments: &[&str],
+    directory: &Path,
+) -> Result<Vec<u8>, TranscriptError> {
+    // OpenCode exits without draining piped stdout, so use an unlinked regular file.
+    let mut output = export_output()?;
+    let child_output = output.try_clone().map_err(|error| {
+        TranscriptError::new(
+            "session_source_unavailable",
+            format!("could not capture OpenCode export: {error}"),
+        )
+    })?;
+    let mut child = Command::new(program)
+        .args(arguments)
         .current_dir(directory)
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
+        .stdout(Stdio::from(child_output))
         .stderr(Stdio::null())
         .spawn()
         .map_err(|error| {
@@ -50,53 +68,21 @@ fn run_export(directory: &Path, external_session_id: &str) -> Result<Vec<u8>, Tr
                 format!("could not start OpenCode export: {error}"),
             )
         })?;
-    let mut stdout = child.stdout.take().ok_or_else(|| {
-        TranscriptError::new(
-            "session_source_unavailable",
-            "could not capture OpenCode export",
-        )
-    })?;
-    let (sender, receiver) = mpsc::channel();
-    thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let result = stdout
-            .by_ref()
-            .take(SOURCE_LIMIT_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .map(|_| bytes);
-        let _ = sender.send(result);
-    });
 
     let deadline = Instant::now() + TIMEOUT;
-    let mut output = None;
-    let mut status = None;
     loop {
-        if output.is_none() {
-            match receiver.try_recv() {
-                Ok(Ok(bytes)) => output = Some(bytes),
-                Ok(Err(error)) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(TranscriptError::new(
-                        "session_source_unavailable",
-                        format!("could not read OpenCode export: {error}"),
-                    ));
-                }
-                Err(TryRecvError::Disconnected) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(TranscriptError::new(
-                        "session_source_unavailable",
-                        "OpenCode export reader stopped unexpectedly",
-                    ));
-                }
-                Err(TryRecvError::Empty) => {}
+        let output_len = match output.metadata() {
+            Ok(metadata) => metadata.len(),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(TranscriptError::new(
+                    "session_source_unavailable",
+                    format!("could not inspect OpenCode export: {error}"),
+                ));
             }
-        }
-        if output
-            .as_ref()
-            .is_some_and(|bytes| bytes.len() as u64 > SOURCE_LIMIT_BYTES)
-        {
+        };
+        if output_len > SOURCE_LIMIT_BYTES {
             let _ = child.kill();
             let _ = child.wait();
             return Err(TranscriptError::new(
@@ -104,23 +90,31 @@ fn run_export(directory: &Path, external_session_id: &str) -> Result<Vec<u8>, Tr
                 format!("OpenCode export exceeds {SOURCE_LIMIT_BYTES} bytes"),
             ));
         }
-        if status.is_none() {
-            status = match child.try_wait() {
-                Ok(status) => status,
-                Err(error) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
+        let status = match child.try_wait() {
+            Ok(status) => status,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(TranscriptError::new(
+                    "session_source_unavailable",
+                    format!("could not wait for OpenCode export: {error}"),
+                ));
+            }
+        };
+        if let Some(status) = status {
+            if status.success() {
+                output.seek(SeekFrom::Start(0)).map_err(export_read_error)?;
+                let mut bytes = Vec::new();
+                output
+                    .take(SOURCE_LIMIT_BYTES + 1)
+                    .read_to_end(&mut bytes)
+                    .map_err(export_read_error)?;
+                if bytes.len() as u64 > SOURCE_LIMIT_BYTES {
                     return Err(TranscriptError::new(
-                        "session_source_unavailable",
-                        format!("could not wait for OpenCode export: {error}"),
+                        "session_source_too_large",
+                        format!("OpenCode export exceeds {SOURCE_LIMIT_BYTES} bytes"),
                     ));
                 }
-            };
-        }
-        if let Some(status) = status.as_ref()
-            && let Some(bytes) = output.take()
-        {
-            if status.success() {
                 return Ok(bytes);
             }
             return Err(TranscriptError::new(
@@ -135,6 +129,37 @@ fn run_export(directory: &Path, external_session_id: &str) -> Result<Vec<u8>, Tr
         }
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+fn export_output() -> Result<File, TranscriptError> {
+    let path = std::env::temp_dir().join(format!("boomux-opencode-export-{}", Uuid::new_v4()));
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC)
+        .open(&path)
+        .map_err(|error| {
+            TranscriptError::new(
+                "session_source_unavailable",
+                format!("could not create OpenCode export capture: {error}"),
+            )
+        })?;
+    fs::remove_file(path).map_err(|error| {
+        TranscriptError::new(
+            "session_source_unavailable",
+            format!("could not unlink OpenCode export capture: {error}"),
+        )
+    })?;
+    Ok(file)
+}
+
+fn export_read_error(error: std::io::Error) -> TranscriptError {
+    TranscriptError::new(
+        "session_source_unavailable",
+        format!("could not read OpenCode export: {error}"),
+    )
 }
 
 pub(super) fn parse(
@@ -235,4 +260,20 @@ pub(super) fn parse(
         }
     }
     Ok(entries)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn captures_exports_larger_than_a_pipe_buffer() {
+        let output =
+            run_export_command("/bin/sh", &["-c", "yes x | head -c 524288"], Path::new("/"))
+                .expect("capture succeeds");
+
+        assert_eq!(output.len(), 524_288);
+        assert!(output.starts_with(b"x\n"));
+        assert!(output.ends_with(b"x\n"));
+    }
 }
