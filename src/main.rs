@@ -1288,7 +1288,11 @@ fn dashboard_views_from_sessions(
                     name: shell.name.clone(),
                     status: shell_status(&shell.status).into(),
                     directory: shell.cwd.display().to_string(),
+                    repository: git.repository,
                     branch: git.branch,
+                    git_state: git.state,
+                    worktree: git.worktree,
+                    foreground_process: shell.foreground_process.clone(),
                     command: shell.command.join(" "),
                     argv: shell.command.clone(),
                     run: shell.run.as_ref().map(|run| tui::TerminalRunView {
