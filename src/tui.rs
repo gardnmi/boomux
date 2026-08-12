@@ -6161,9 +6161,7 @@ mod tests {
             unreachable!();
         };
         let preview = terminal_preview(&app, shell).expect("shell preview");
-        let PreviewContent::Lines(lines) = preview.content else {
-            panic!("expected line preview");
-        };
+        let PreviewContent::Lines(lines) = preview.content;
         let text = lines
             .iter()
             .map(|line| {
@@ -6194,9 +6192,7 @@ mod tests {
             unreachable!();
         };
         let preview = terminal_preview(&app, shell).expect("shell preview");
-        let PreviewContent::Lines(lines) = preview.content else {
-            panic!("expected line preview");
-        };
+        let PreviewContent::Lines(lines) = preview.content;
         let run_line = lines[2]
             .spans
             .iter()
