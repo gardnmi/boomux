@@ -3021,51 +3021,42 @@ fn terminal_preview(app: &App, terminal: &TerminalView) -> Option<ContextualPrev
     let is_command = !terminal.command.is_empty();
     let mut lines = Vec::new();
     if is_command {
-        lines.push(Line::from(vec![
-            Span::styled("argv ", Style::new().fg(SUBTEXT)),
-            Span::raw(format_argv(&terminal.argv)),
-        ]));
+        lines.push(terminal_preview_field(
+            "COMMAND",
+            format_argv(&terminal.argv),
+        ));
     }
-    lines.push(Line::from(vec![
-        Span::styled("cwd  ", Style::new().fg(SUBTEXT)),
-        Span::raw(terminal.directory.clone()),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled("git  ", Style::new().fg(SUBTEXT)),
-        Span::raw(terminal.repository.clone()),
-        Span::styled("  branch ", Style::new().fg(SUBTEXT)),
-        Span::raw(terminal.branch.clone()),
-        Span::styled("  state ", Style::new().fg(SUBTEXT)),
-        Span::raw(terminal.git_state.clone()),
-        Span::styled("  worktree ", Style::new().fg(SUBTEXT)),
-        Span::raw(terminal.worktree.clone()),
-    ]));
+    lines.push(terminal_preview_field("PATH", terminal.directory.clone()));
+    lines.push(terminal_preview_field(
+        "GIT",
+        format!(
+            "{}  ·  {}  ·  {}  ·  {}",
+            terminal.repository, terminal.branch, terminal.git_state, terminal.worktree
+        ),
+    ));
     let run_detail = terminal.run.as_ref().map_or_else(
-        || "no run yet".to_owned(),
+        || format!("{}  ·  no run yet", terminal.table_status()),
         |run| {
-            let outcome = run
-                .exit_reason
-                .as_deref()
-                .map_or_else(String::new, |reason| format!("{reason}  "));
             let timing = run.ended_at_ms.map_or_else(
                 || format!("started {}", compact_recency(run.started_at_ms)),
                 |ended| format!("ended {}", compact_recency(ended)),
             );
             format!(
-                "{outcome}run {}  generation {}  {timing}",
-                short_id(&run.id),
-                run.generation
+                "{}  ·  generation {}  ·  {timing}  ·  id {}",
+                terminal.table_status(),
+                run.generation,
+                short_id(&run.id)
             )
         },
     );
     lines.push(Line::from(vec![
+        terminal_preview_label("RUN"),
         Span::styled(
-            terminal.status.clone(),
+            run_detail,
             Style::new()
-                .fg(status_color(&terminal.status))
+                .fg(status_color(&terminal.table_status()))
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(format!("  {run_detail}"), Style::new().fg(SUBTEXT)),
     ]));
 
     if let Some(preview) = app
@@ -3074,30 +3065,28 @@ fn terminal_preview(app: &App, terminal: &TerminalView) -> Option<ContextualPrev
         .filter(|preview| !is_command && preview.shell_id == terminal.id)
     {
         match &preview.output {
-            Ok(output) if terminal_preview_is_empty(output) => lines.push(Line::from(vec![
-                Span::styled(" Output ", Style::new().fg(BASE).bg(BLUE)),
-                Span::styled(" no terminal output", Style::new().fg(SUBTEXT)),
-            ])),
+            Ok(output) if terminal_preview_is_empty(output) => {
+                lines.push(terminal_preview_field("OUTPUT", "no terminal output"))
+            }
             Ok(output) => {
                 let viewport =
                     terminal_viewport(output, TERMINAL_PREVIEW_ROWS, preview.scroll_from_bottom);
                 lines.push(Line::from(vec![
-                    Span::styled(" Output ", Style::new().fg(BASE).bg(BLUE)),
+                    terminal_preview_label("OUTPUT"),
                     Span::styled(
                         format!(
-                            " {}-{} / {}  revision {}  ",
+                            "lines {}-{} of {}  ·  ",
                             viewport.start + 1,
                             viewport.end,
-                            viewport.total,
-                            preview.output_revision
+                            viewport.total
                         ),
                         Style::new().fg(SUBTEXT),
                     ),
                     Span::styled(
                         if viewport.following {
-                            "FOLLOW"
+                            "following"
                         } else {
-                            "SCROLLED"
+                            "scrolled"
                         },
                         Style::new()
                             .fg(if viewport.following { GREEN } else { YELLOW })
@@ -3106,17 +3095,20 @@ fn terminal_preview(app: &App, terminal: &TerminalView) -> Option<ContextualPrev
                 ]));
                 lines.extend(viewport.lines.into_iter().map(terminal_preview_line));
             }
-            Err(error) => lines.push(Line::from(Span::styled(
-                format!("Output unavailable: {error}"),
-                Style::new().fg(YELLOW),
-            ))),
+            Err(error) => lines.push(Line::from(vec![
+                terminal_preview_label("OUTPUT"),
+                Span::styled(format!("unavailable: {error}"), Style::new().fg(YELLOW)),
+            ])),
         }
     }
+    let workspace = app
+        .selected_item_workspace()
+        .map_or("-", |workspace| workspace.name.as_str());
     Some(ContextualPreview {
         title: if is_command {
-            format!(" Command: {} ", terminal.name)
+            format!(" Command · {workspace} / {} ", terminal.name)
         } else {
-            format!(" Shell: {} ", terminal.name)
+            format!(" Shell · {workspace} / {} ", terminal.name)
         },
         content_height: if is_command {
             lines.len() as u16
@@ -3125,6 +3117,14 @@ fn terminal_preview(app: &App, terminal: &TerminalView) -> Option<ContextualPrev
         },
         content: PreviewContent::Lines(lines),
     })
+}
+
+fn terminal_preview_field(label: &'static str, value: impl Into<String>) -> Line<'static> {
+    Line::from(vec![terminal_preview_label(label), Span::raw(value.into())])
+}
+
+fn terminal_preview_label(label: &'static str) -> Span<'static> {
+    Span::styled(format!("{label:<10}"), Style::new().fg(SUBTEXT))
 }
 
 struct TerminalViewport {
@@ -5962,7 +5962,10 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect();
-        assert!(shell_text.contains("Shell: agent"));
+        assert!(shell_text.contains("Shell · boomux / agent"));
+        assert!(shell_text.contains("PATH"));
+        assert!(shell_text.contains("GIT"));
+        assert!(shell_text.contains("RUN"));
         assert!(shell_text.contains("/tmp/boomux"));
         assert!(!shell_text.contains("OpenCode session"));
 
@@ -6024,12 +6027,113 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect();
 
-        assert!(text.contains("Command: format"));
+        assert!(text.contains("Command · commands / format"));
+        assert!(text.contains("COMMAND"));
         assert!(text.contains("[\"printf\", \"a b\", \"\"]"));
-        assert!(!text.contains(" Output "));
+        assert!(!text.contains("OUTPUT"));
         assert!(!text.contains("pgup/dn"));
         assert_eq!(reads.get(), 0);
         assert!(app.terminal_preview.is_none());
+    }
+
+    #[test]
+    fn shell_preview_labels_running_and_exited_runs() {
+        let mut app = app();
+        focus_items(&mut app);
+        let now = current_time_ms();
+        {
+            let WorkspaceItemView::Shell(shell) = &mut app.workspaces[0].items[0] else {
+                unreachable!();
+            };
+            shell.run = Some(TerminalRunView {
+                id: "135c1aee-long".into(),
+                generation: 3,
+                started_at_ms: now,
+                ended_at_ms: None,
+                exit_reason: None,
+                output_revision: 1,
+            });
+        }
+        let WorkspaceItemView::Shell(shell) = &app.workspaces[0].items[0] else {
+            unreachable!();
+        };
+        let preview = terminal_preview(&app, shell).expect("shell preview");
+        let PreviewContent::Lines(lines) = preview.content else {
+            panic!("expected line preview");
+        };
+        let text = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(preview.title.contains("Shell · boomux / agent"));
+        assert!(text.contains("PATH      /tmp/boomux"));
+        assert!(text.contains("GIT       boomux  ·  main  ·  clean  ·  primary"));
+        assert!(
+            text.contains("RUN       running  ·  generation 3  ·  started now  ·  id 135c1aee")
+        );
+
+        {
+            let WorkspaceItemView::Shell(shell) = &mut app.workspaces[0].items[0] else {
+                unreachable!();
+            };
+            shell.status = "exited".into();
+            let run = shell.run.as_mut().unwrap();
+            run.ended_at_ms = Some(now);
+            run.exit_reason = Some("exited (1)".into());
+        }
+        let WorkspaceItemView::Shell(shell) = &app.workspaces[0].items[0] else {
+            unreachable!();
+        };
+        let preview = terminal_preview(&app, shell).expect("shell preview");
+        let PreviewContent::Lines(lines) = preview.content else {
+            panic!("expected line preview");
+        };
+        let run_line = lines[2]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(run_line.contains("RUN       exit 1  ·  generation 3  ·  ended now"));
+    }
+
+    #[test]
+    fn narrow_shell_preview_keeps_labeled_metadata_visible() {
+        let backend = TestBackend::new(80, 64);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = app();
+        focus_items(&mut app);
+        {
+            let WorkspaceItemView::Shell(shell) = &mut app.workspaces[0].items[0] else {
+                unreachable!();
+            };
+            shell.run = Some(TerminalRunView {
+                id: "run-1".into(),
+                generation: 1,
+                started_at_ms: current_time_ms(),
+                ended_at_ms: None,
+                exit_reason: None,
+                output_revision: 1,
+            });
+        }
+        app.refresh_terminal_preview(&mut |_| Ok(text_preview("output")));
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        for label in ["PATH", "GIT", "RUN", "OUTPUT"] {
+            assert!(text.contains(label), "missing {label}");
+        }
     }
 
     #[test]
@@ -6080,9 +6184,9 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect();
-        assert!(text.contains("Output"));
-        assert!(text.contains("revision 5"));
-        assert!(text.contains("FOLLOW"));
+        assert!(text.contains("OUTPUT"));
+        assert!(!text.contains("revision 5"));
+        assert!(text.contains("following"));
         assert!(text.contains("latest"));
         assert!(text.contains("pgup/dn"));
     }
@@ -6239,7 +6343,11 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect();
-        assert!(wide_text.contains("Shell: agent"));
+        assert!(wide_text.contains("Shell · boomux / agent"));
+        assert!(wide_text.contains("OUTPUT"));
+        assert!(wide_text.contains("lines 15-30 of 30"));
+        assert!(wide_text.contains("following"));
+        assert!(!wide_text.contains("revision"));
         assert!(wide_text.contains("viewport line 15"));
         assert!(wide_text.contains("viewport line 30"));
         assert!(!wide_text.contains("viewport line 14"));
@@ -6253,7 +6361,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect();
-        assert!(!short_text.contains("Shell: agent"));
+        assert!(!short_text.contains("Shell · boomux / agent"));
         assert!(short_text.contains("Items: boomux"));
     }
 
