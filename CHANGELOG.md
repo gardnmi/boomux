@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.13.0](https://github.com/gardnmi/boomux/compare/v0.12.0...v0.13.0) (2026-08-12)
+
+
+### Features
+
+* **doctor:** report version and platform ([#108](https://github.com/gardnmi/boomux/issues/108)) ([d7dbf6f](https://github.com/gardnmi/boomux/commit/d7dbf6fe687cba55ec7a634db1f60591d18fa061))
+
 ## [0.12.0](https://github.com/gardnmi/boomux/compare/v0.11.0...v0.12.0) (2026-08-12)
 
 
