@@ -4094,7 +4094,19 @@ fn legacy_skill_install_path(home: &Path) -> PathBuf {
     home.join(".agents/skills/boomux-shells/SKILL.md")
 }
 
+fn doctor_version_line(version: &str, architecture: &str, operating_system: &str) -> String {
+    format!("ok  boomux: {version} ({architecture}-{operating_system})")
+}
+
 fn doctor(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
+    println!(
+        "{}",
+        doctor_version_line(
+            env!("CARGO_PKG_VERSION"),
+            env::consts::ARCH,
+            env::consts::OS
+        )
+    );
     let mut healthy = true;
     let daemon_snapshot = match client::connect_or_start() {
         Ok(client) => {
@@ -6118,6 +6130,14 @@ mod tests {
             ["opencode", "pi"]
         );
         assert_eq!(protocol::PROTOCOL_VERSION, 20);
+    }
+
+    #[test]
+    fn doctor_reports_version_and_platform() {
+        assert_eq!(
+            doctor_version_line("1.2.3", "x86_64", "linux"),
+            "ok  boomux: 1.2.3 (x86_64-linux)"
+        );
     }
 
     #[test]
