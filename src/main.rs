@@ -1116,23 +1116,27 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
         },
         config.dashboard.follow_focused_terminal,
         project_context,
-        tui::Actions {
-            on_restore: |workspace_id: &str| {
-                let workspace = client
-                    .get_workspace(workspace_id)
-                    .map_err(|error| error.to_string())?;
-                open_workspace(&workspace, terminal.as_deref())
-                    .map_err(|error| error.to_string())?;
-                Ok(format!(
-                    "Opened {} launcher(s) and {} shell(s) for {}",
-                    workspace.launchers.len(),
-                    workspace.shells.len(),
-                    workspace.name
-                ))
-            },
-            on_open: |target: &tui::OpenTarget| {
-                dispatch_dashboard_open(
-                    target,
+        |effect| match effect {
+            tui::DashboardEffect::Quit => unreachable!("quit is handled by the dashboard runtime"),
+            tui::DashboardEffect::RestoreWorkspace(workspace_id) => {
+                let result = (|| {
+                    let workspace = client
+                        .get_workspace(&workspace_id)
+                        .map_err(|error| error.to_string())?;
+                    open_workspace(&workspace, terminal.as_deref())
+                        .map_err(|error| error.to_string())?;
+                    Ok(format!(
+                        "Opened {} launcher(s) and {} shell(s) for {}",
+                        workspace.launchers.len(),
+                        workspace.shells.len(),
+                        workspace.name
+                    ))
+                })();
+                tui::DashboardEvent::OperationCompleted(result)
+            }
+            tui::DashboardEffect::Open(target) => {
+                let result = dispatch_dashboard_open(
+                    &target,
                     |shell_id| {
                         open_dashboard_shell(&client, shell_id, terminal.as_deref())
                             .map_err(|error| error.to_string())
@@ -1151,87 +1155,108 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
                             launcher.name, workspace.name
                         ))
                     },
-                )
-            },
-            on_close: |target: &tui::CloseTarget| match target {
-                tui::CloseTarget::Workspace(workspace_id) => {
-                    let name = client
-                        .get_workspace(workspace_id)
-                        .map(|workspace| workspace.name)
-                        .unwrap_or_else(|_| "workspace".into());
-                    client
-                        .close_workspace(workspace_id)
-                        .map_err(|error| error.to_string())?;
-                    Ok(format!(
-                        "Closed {name}, its launchers, and all of its shells"
-                    ))
-                }
-                tui::CloseTarget::Shell(shell_id) => {
-                    let name = client
-                        .get_shell(shell_id)
-                        .map(|shell| shell.name)
-                        .unwrap_or_else(|_| "shell".into());
-                    client
-                        .close_shell(shell_id)
-                        .map_err(|error| error.to_string())?;
-                    Ok(format!("Closed shell {name}"))
-                }
-                tui::CloseTarget::Launcher(launcher_id) => {
-                    let name = client
-                        .get_launcher(launcher_id)
-                        .map(|launcher| launcher.name)
-                        .unwrap_or_else(|_| "launcher".into());
-                    client
-                        .remove_launcher(launcher_id)
-                        .map_err(|error| error.to_string())?;
-                    Ok(format!("Removed launcher {name}"))
-                }
-            },
-            on_create_workspace: |name: &str, default_cwd: Option<&PathBuf>| {
-                create_dashboard_workspace(&client, name, default_cwd)
-                    .map_err(|error| error.to_string())
-            },
-            on_create_shell: |workspace_id: &str| {
-                create_dashboard_shell(&client, workspace_id, &launch_cwd)
-                    .map_err(|error| error.to_string())
-            },
-            on_rename: |target: &tui::RenameTarget, name: &str| match target {
-                tui::RenameTarget::Workspace(workspace_id) => {
-                    client
-                        .rename_workspace(workspace_id, name)
-                        .map_err(|error| error.to_string())?;
-                    Ok(format!("Renamed workspace to {name}"))
-                }
-                tui::RenameTarget::Shell(shell_id) => {
-                    client
-                        .rename_shell(shell_id, name)
-                        .map_err(|error| error.to_string())?;
-                    Ok(format!("Renamed shell to {name}"))
-                }
-                tui::RenameTarget::Launcher(launcher_id) => {
-                    client
-                        .rename_launcher(launcher_id, name)
-                        .map_err(|error| error.to_string())?;
-                    Ok(format!("Renamed launcher to {name}"))
-                }
-            },
-            on_refresh: || {
-                let snapshot = client.snapshot().map_err(|error| error.to_string())?;
-                let mut views = dashboard_views_with_catalog(
-                    &snapshot.workspaces,
-                    &mut git_cache,
-                    &mut title_cache,
                 );
-                enrich_session_titles(&mut views, &mut title_cache);
-                Ok(tui::DashboardState {
-                    workspaces: views,
-                    focused_terminal: snapshot.focused_terminal.map(focused_terminal_view),
-                })
-            },
-            on_terminal_preview: |shell_id: &str| {
-                client
-                    .read_shell_preview(shell_id, READ_BYTES, 500)
-                    .map_err(|error| error.to_string())
+                tui::DashboardEvent::OperationCompleted(result)
+            }
+            tui::DashboardEffect::Close(target) => {
+                let result = (|| match &target {
+                    tui::CloseTarget::Workspace(workspace_id) => {
+                        let name = client
+                            .get_workspace(workspace_id)
+                            .map(|workspace| workspace.name)
+                            .unwrap_or_else(|_| "workspace".into());
+                        client
+                            .close_workspace(workspace_id)
+                            .map_err(|error| error.to_string())?;
+                        Ok(format!(
+                            "Closed {name}, its launchers, and all of its shells"
+                        ))
+                    }
+                    tui::CloseTarget::Shell(shell_id) => {
+                        let name = client
+                            .get_shell(shell_id)
+                            .map(|shell| shell.name)
+                            .unwrap_or_else(|_| "shell".into());
+                        client
+                            .close_shell(shell_id)
+                            .map_err(|error| error.to_string())?;
+                        Ok(format!("Closed shell {name}"))
+                    }
+                    tui::CloseTarget::Launcher(launcher_id) => {
+                        let name = client
+                            .get_launcher(launcher_id)
+                            .map(|launcher| launcher.name)
+                            .unwrap_or_else(|_| "launcher".into());
+                        client
+                            .remove_launcher(launcher_id)
+                            .map_err(|error| error.to_string())?;
+                        Ok(format!("Removed launcher {name}"))
+                    }
+                })();
+                tui::DashboardEvent::OperationCompleted(result)
+            }
+            tui::DashboardEffect::CreateWorkspace { name, default_cwd } => {
+                tui::DashboardEvent::OperationCompleted(
+                    create_dashboard_workspace(&client, &name, default_cwd.as_ref())
+                        .map_err(|error| error.to_string()),
+                )
+            }
+            tui::DashboardEffect::CreateShell(workspace_id) => {
+                tui::DashboardEvent::OperationCompleted(
+                    create_dashboard_shell(&client, &workspace_id, &launch_cwd)
+                        .map_err(|error| error.to_string()),
+                )
+            }
+            tui::DashboardEffect::Rename { target, name } => {
+                let result = (|| match &target {
+                    tui::RenameTarget::Workspace(workspace_id) => {
+                        client
+                            .rename_workspace(workspace_id, &name)
+                            .map_err(|error| error.to_string())?;
+                        Ok(format!("Renamed workspace to {name}"))
+                    }
+                    tui::RenameTarget::Shell(shell_id) => {
+                        client
+                            .rename_shell(shell_id, &name)
+                            .map_err(|error| error.to_string())?;
+                        Ok(format!("Renamed shell to {name}"))
+                    }
+                    tui::RenameTarget::Launcher(launcher_id) => {
+                        client
+                            .rename_launcher(launcher_id, &name)
+                            .map_err(|error| error.to_string())?;
+                        Ok(format!("Renamed launcher to {name}"))
+                    }
+                })();
+                tui::DashboardEvent::OperationCompleted(result)
+            }
+            tui::DashboardEffect::Refresh => {
+                let result = (|| {
+                    let snapshot = client.snapshot().map_err(|error| error.to_string())?;
+                    let mut views = dashboard_views_with_catalog(
+                        &snapshot.workspaces,
+                        &mut git_cache,
+                        &mut title_cache,
+                    );
+                    enrich_session_titles(&mut views, &mut title_cache);
+                    Ok(tui::DashboardState {
+                        workspaces: views,
+                        focused_terminal: snapshot.focused_terminal.map(focused_terminal_view),
+                    })
+                })();
+                tui::DashboardEvent::RefreshCompleted(result)
+            }
+            tui::DashboardEffect::ReadTerminalPreview {
+                shell_id,
+                run_id,
+                output_revision,
+            } => tui::DashboardEvent::TerminalPreviewCompleted {
+                output: client
+                    .read_shell_preview(&shell_id, READ_BYTES, 500)
+                    .map_err(|error| error.to_string()),
+                shell_id,
+                run_id,
+                output_revision,
             },
         },
     )?;

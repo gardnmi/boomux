@@ -384,15 +384,57 @@ impl AttentionReason {
     }
 }
 
-pub(crate) struct Actions<R, O, C, W, N, E, F, P> {
-    pub(crate) on_restore: R,
-    pub(crate) on_open: O,
-    pub(crate) on_close: C,
-    pub(crate) on_create_workspace: W,
-    pub(crate) on_create_shell: N,
-    pub(crate) on_rename: E,
-    pub(crate) on_refresh: F,
-    pub(crate) on_terminal_preview: P,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum DashboardEffect {
+    Quit,
+    RestoreWorkspace(String),
+    Open(OpenTarget),
+    Close(CloseTarget),
+    CreateWorkspace {
+        name: String,
+        default_cwd: Option<PathBuf>,
+    },
+    CreateShell(String),
+    Rename {
+        target: RenameTarget,
+        name: String,
+    },
+    Refresh,
+    ReadTerminalPreview {
+        shell_id: String,
+        run_id: Option<String>,
+        output_revision: u64,
+    },
+}
+
+pub(crate) enum DashboardEvent {
+    KeyPressed {
+        code: KeyCode,
+        modifiers: KeyModifiers,
+    },
+    RefreshElapsed,
+    PreviewRequested,
+    OperationCompleted(Result<String, String>),
+    RefreshCompleted(Result<DashboardState, String>),
+    TerminalPreviewCompleted {
+        shell_id: String,
+        run_id: Option<String>,
+        output_revision: u64,
+        output: Result<TerminalPreview, String>,
+    },
+}
+
+pub(crate) trait DashboardBackend {
+    fn execute(&mut self, effect: DashboardEffect) -> DashboardEvent;
+}
+
+impl<F> DashboardBackend for F
+where
+    F: FnMut(DashboardEffect) -> DashboardEvent,
+{
+    fn execute(&mut self, effect: DashboardEffect) -> DashboardEvent {
+        self(effect)
+    }
 }
 
 struct App {
@@ -1367,74 +1409,49 @@ impl App {
         }
     }
 
-    fn request_add<F>(&mut self, on_create_shell: &mut F) -> bool
-    where
-        F: FnMut(&str) -> Result<String, String>,
-    {
+    fn request_add(&mut self) -> Option<DashboardEffect> {
         if self.primary_tab != PrimaryTab::Workspaces {
-            return false;
+            return None;
         }
         match self.focus {
             Focus::Workspaces => {
                 self.mode = Mode::PickProject(ProjectPicker::new(&self.project_context));
                 self.message = None;
-                false
+                None
             }
             Focus::Items => {
-                let Some(workspace_id) = self.selected().map(|workspace| workspace.id.clone())
-                else {
-                    return false;
-                };
-                self.message = Some(Message::from_result(on_create_shell(&workspace_id)));
-                true
+                let workspace_id = self.selected().map(|workspace| workspace.id.clone())?;
+                Some(DashboardEffect::CreateShell(workspace_id))
             }
         }
     }
 
-    fn create_workspace<F>(
-        &mut self,
-        name: &str,
-        default_cwd: Option<&PathBuf>,
-        on_create_workspace: &mut F,
-    ) where
-        F: FnMut(&str, Option<&PathBuf>) -> Result<String, String>,
-    {
+    fn create_workspace(&mut self, name: &str, default_cwd: Option<PathBuf>) -> DashboardEffect {
         self.mode = Mode::Normal;
-        self.message = Some(Message::from_result(on_create_workspace(name, default_cwd)));
-    }
-
-    fn rename<F>(&mut self, target: &RenameTarget, name: &str, on_rename: &mut F)
-    where
-        F: FnMut(&RenameTarget, &str) -> Result<String, String>,
-    {
-        self.mode = Mode::Normal;
-        self.message = Some(Message::from_result(on_rename(target, name)));
-    }
-
-    fn restore_selected<F>(&mut self, on_restore: &mut F)
-    where
-        F: FnMut(&str) -> Result<String, String>,
-    {
-        if self.primary_tab != PrimaryTab::Workspaces {
-            return;
+        DashboardEffect::CreateWorkspace {
+            name: name.to_owned(),
+            default_cwd,
         }
-        let Some(workspace_id) = self.selected().map(|workspace| workspace.id.clone()) else {
-            return;
-        };
-        self.message = Some(Message::from_result(on_restore(&workspace_id)));
     }
 
-    fn open_selected_item<F>(&mut self, on_open: &mut F) -> bool
-    where
-        F: FnMut(&OpenTarget) -> Result<String, String>,
-    {
-        let Some(workspace_id) = self
+    fn rename(&mut self, target: RenameTarget, name: String) -> DashboardEffect {
+        self.mode = Mode::Normal;
+        DashboardEffect::Rename { target, name }
+    }
+
+    fn restore_selected(&self) -> Option<DashboardEffect> {
+        if self.primary_tab != PrimaryTab::Workspaces {
+            return None;
+        }
+        self.selected()
+            .map(|workspace| DashboardEffect::RestoreWorkspace(workspace.id.clone()))
+    }
+
+    fn open_selected_item(&self) -> Option<DashboardEffect> {
+        let workspace_id = self
             .selected_item_workspace()
-            .map(|workspace| workspace.id.clone())
-        else {
-            return false;
-        };
-        let Some(target) = self.selected_item().map(|item| match item {
+            .map(|workspace| workspace.id.clone())?;
+        let target = self.selected_item().map(|item| match item {
             WorkspaceItemView::Shell(shell) => OpenTarget::Shell(shell.id.clone()),
             WorkspaceItemView::AgentShell(agent_shell) => {
                 OpenTarget::Shell(agent_shell.shell.id.clone())
@@ -1443,11 +1460,8 @@ impl App {
                 workspace_id,
                 launcher_id: launcher.id.clone(),
             },
-        }) else {
-            return false;
-        };
-        self.message = Some(Message::from_result(on_open(&target)));
-        true
+        })?;
+        Some(DashboardEffect::Open(target))
     }
 
     fn request_close(&mut self) {
@@ -1470,21 +1484,104 @@ impl App {
         self.pending_close = None;
     }
 
-    fn confirm_close<F>(&mut self, on_close: &mut F)
-    where
-        F: FnMut(&CloseTarget) -> Result<String, String>,
-    {
-        let Some(pending) = self.pending_close.take() else {
-            return;
-        };
-        self.message = Some(Message::from_result(on_close(&pending.target)));
+    fn confirm_close(&mut self) -> Option<DashboardEffect> {
+        let pending = self.pending_close.take()?;
+        Some(DashboardEffect::Close(pending.target))
     }
 
-    fn refresh<F>(&mut self, on_refresh: &mut F)
-    where
-        F: FnMut() -> Result<DashboardState, String>,
-    {
-        match on_refresh() {
+    fn update(&mut self, event: DashboardEvent) -> Vec<DashboardEffect> {
+        match event {
+            DashboardEvent::KeyPressed { code, modifiers } => {
+                return self.update_key(code, modifiers).into_iter().collect();
+            }
+            DashboardEvent::RefreshElapsed => return vec![DashboardEffect::Refresh],
+            DashboardEvent::PreviewRequested => {
+                return self.terminal_preview_effect().into_iter().collect();
+            }
+            DashboardEvent::OperationCompleted(result) => {
+                self.message = Some(Message::from_result(result));
+                return vec![DashboardEffect::Refresh];
+            }
+            DashboardEvent::RefreshCompleted(result) => self.apply_refresh(result),
+            DashboardEvent::TerminalPreviewCompleted {
+                shell_id,
+                run_id,
+                output_revision,
+                output,
+            } => self.apply_terminal_preview(shell_id, run_id, output_revision, output),
+        }
+        Vec::new()
+    }
+
+    fn update_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Option<DashboardEffect> {
+        if modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('c') {
+            return Some(DashboardEffect::Quit);
+        }
+        if self.pending_close.is_some() {
+            if !modifiers.is_empty() {
+                return None;
+            }
+            return match code {
+                KeyCode::Char('y') => self.confirm_close(),
+                KeyCode::Char('n') | KeyCode::Esc => {
+                    self.cancel_close();
+                    None
+                }
+                _ => None,
+            };
+        }
+        if matches!(self.mode, Mode::Help) {
+            handle_help_key(self, code, modifiers);
+            return None;
+        }
+        if matches!(self.mode, Mode::Palette(_)) {
+            return handle_palette_key(self, code, modifiers)
+                .and_then(|command| execute_palette_command(self, command));
+        }
+        if !matches!(self.mode, Mode::Normal) {
+            return handle_mode_key(self, code, modifiers);
+        }
+        if !normal_mode_modifiers_supported(code, modifiers) {
+            return None;
+        }
+        match code {
+            KeyCode::Char('q') | KeyCode::Esc => return Some(DashboardEffect::Quit),
+            KeyCode::Down | KeyCode::Char('j') => self.next(),
+            KeyCode::Up | KeyCode::Char('k') => self.previous(),
+            KeyCode::PageUp => self.scroll_terminal_preview_up(),
+            KeyCode::PageDown => self.scroll_terminal_preview_down(),
+            KeyCode::Home => self.scroll_terminal_preview_to_start(),
+            KeyCode::End => self.scroll_terminal_preview_to_end(),
+            KeyCode::Enter => {
+                return if self.primary_tab != PrimaryTab::Workspaces {
+                    self.open_selected_item()
+                } else {
+                    match self.focus {
+                        Focus::Workspaces => self.restore_selected(),
+                        Focus::Items => self.open_selected_item(),
+                    }
+                };
+            }
+            KeyCode::Char('r') => return Some(DashboardEffect::Refresh),
+            KeyCode::Char('x') => self.request_close(),
+            KeyCode::Char('a') => return self.request_add(),
+            KeyCode::Char('e') => self.request_rename(),
+            KeyCode::Char(' ') => self.toggle_selection_pin(),
+            KeyCode::Char('/' | ':') => self.open_palette(),
+            KeyCode::Char('?') => self.mode = Mode::Help,
+            KeyCode::Tab => self.cycle_tab(false),
+            KeyCode::BackTab => self.cycle_tab(true),
+            KeyCode::Char(key) if shortcut_tab(key).is_some() => {
+                self.select_tab(shortcut_tab(key).expect("validated tab shortcut"));
+            }
+            key if self.handle_focus_key(key) => {}
+            _ => {}
+        }
+        None
+    }
+
+    fn apply_refresh(&mut self, result: Result<DashboardState, String>) {
+        match result {
             Ok(state) => {
                 self.replace_workspaces(state.workspaces);
                 self.apply_focused_terminal(state.focused_terminal.as_ref());
@@ -1493,10 +1590,7 @@ impl App {
         }
     }
 
-    fn refresh_terminal_preview<P>(&mut self, on_preview: &mut P)
-    where
-        P: FnMut(&str) -> Result<TerminalPreview, String>,
-    {
+    fn terminal_preview_effect(&mut self) -> Option<DashboardEffect> {
         let selected = if self.primary_tab == PrimaryTab::Workspaces && self.focus != Focus::Items {
             None
         } else {
@@ -1513,7 +1607,7 @@ impl App {
         };
         let Some((shell_id, run_id, output_revision)) = selected else {
             self.terminal_preview = None;
-            return;
+            return None;
         };
         if self.terminal_preview.as_ref().is_some_and(|preview| {
             preview.shell_id == shell_id
@@ -1521,9 +1615,22 @@ impl App {
                 && preview.output_revision == output_revision
                 && preview.output.is_ok()
         }) {
-            return;
+            return None;
         }
-        let output = on_preview(&shell_id);
+        Some(DashboardEffect::ReadTerminalPreview {
+            shell_id,
+            run_id,
+            output_revision,
+        })
+    }
+
+    fn apply_terminal_preview(
+        &mut self,
+        shell_id: String,
+        run_id: Option<String>,
+        output_revision: u64,
+        output: Result<TerminalPreview, String>,
+    ) {
         let scroll_from_bottom = self
             .terminal_preview
             .as_ref()
@@ -1722,54 +1829,36 @@ fn item_pending_close(item: &WorkspaceItemView) -> PendingClose {
     }
 }
 
-pub(crate) fn run<R, O, C, W, N, E, F, P>(
+pub(crate) fn run<B: DashboardBackend>(
     state: DashboardState,
     follow_focused_terminal: bool,
     project_context: ProjectContext,
-    actions: Actions<R, O, C, W, N, E, F, P>,
-) -> io::Result<()>
-where
-    R: FnMut(&str) -> Result<String, String>,
-    O: FnMut(&OpenTarget) -> Result<String, String>,
-    C: FnMut(&CloseTarget) -> Result<String, String>,
-    W: FnMut(&str, Option<&PathBuf>) -> Result<String, String>,
-    N: FnMut(&str) -> Result<String, String>,
-    E: FnMut(&RenameTarget, &str) -> Result<String, String>,
-    F: FnMut() -> Result<DashboardState, String>,
-    P: FnMut(&str) -> Result<TerminalPreview, String>,
-{
+    backend: B,
+) -> io::Result<()> {
     let mut terminal = ratatui::init();
     let mut app = App::new(state.workspaces, project_context);
     if follow_focused_terminal {
         app.enable_focus_following(state.focused_terminal.as_ref());
     }
-    let result = run_loop(&mut terminal, app, actions);
+    let result = run_loop(&mut terminal, app, backend);
     ratatui::restore();
     result
 }
 
-fn run_loop<R, O, C, W, N, E, F, P>(
+fn run_loop<B: DashboardBackend>(
     terminal: &mut ratatui::DefaultTerminal,
     mut app: App,
-    mut actions: Actions<R, O, C, W, N, E, F, P>,
-) -> io::Result<()>
-where
-    R: FnMut(&str) -> Result<String, String>,
-    O: FnMut(&OpenTarget) -> Result<String, String>,
-    C: FnMut(&CloseTarget) -> Result<String, String>,
-    W: FnMut(&str, Option<&PathBuf>) -> Result<String, String>,
-    N: FnMut(&str) -> Result<String, String>,
-    E: FnMut(&RenameTarget, &str) -> Result<String, String>,
-    F: FnMut() -> Result<DashboardState, String>,
-    P: FnMut(&str) -> Result<TerminalPreview, String>,
-{
+    mut backend: B,
+) -> io::Result<()> {
     let mut last_refresh = Instant::now();
     loop {
         if last_refresh.elapsed() >= REFRESH_INTERVAL {
-            app.refresh(&mut actions.on_refresh);
+            let effects = app.update(DashboardEvent::RefreshElapsed);
+            execute_effects(&mut app, &mut backend, effects);
             last_refresh = Instant::now();
         }
-        app.refresh_terminal_preview(&mut actions.on_terminal_preview);
+        let effects = app.update(DashboardEvent::PreviewRequested);
+        execute_effects(&mut app, &mut backend, effects);
         terminal.draw(|frame| render(frame, &mut app))?;
 
         if !event::poll(Duration::from_millis(250))? {
@@ -1781,132 +1870,43 @@ where
         if key.kind != KeyEventKind::Press {
             continue;
         }
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+        let effects = app.update(DashboardEvent::KeyPressed {
+            code: key.code,
+            modifiers: key.modifiers,
+        });
+        if effects.contains(&DashboardEffect::Quit) {
             return Ok(());
         }
-
-        if app.pending_close.is_some() {
-            if !key.modifiers.is_empty() {
-                continue;
-            }
-            match key.code {
-                KeyCode::Char('y') => {
-                    app.confirm_close(&mut actions.on_close);
-                    app.refresh(&mut actions.on_refresh);
-                    last_refresh = Instant::now();
-                }
-                KeyCode::Char('n') | KeyCode::Esc => app.cancel_close(),
-                _ => {}
-            }
-            continue;
-        }
-
-        if matches!(app.mode, Mode::Help) {
-            handle_help_key(&mut app, key.code, key.modifiers);
-            continue;
-        }
-
-        if matches!(app.mode, Mode::Palette(_)) {
-            if let Some(command) = handle_palette_key(&mut app, key.code, key.modifiers)
-                && execute_palette_command(&mut app, command, &mut actions)
-            {
-                app.refresh(&mut actions.on_refresh);
-                last_refresh = Instant::now();
-            }
-            continue;
-        }
-
-        if !matches!(app.mode, Mode::Normal) {
-            if handle_mode_key(
-                &mut app,
-                key.code,
-                key.modifiers,
-                &mut actions.on_create_workspace,
-                &mut actions.on_rename,
-            ) {
-                app.refresh(&mut actions.on_refresh);
-                last_refresh = Instant::now();
-            }
-            continue;
-        }
-        if !normal_mode_modifiers_supported(key.code, key.modifiers) {
-            continue;
-        }
-
-        match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
-            KeyCode::Down | KeyCode::Char('j') => app.next(),
-            KeyCode::Up | KeyCode::Char('k') => app.previous(),
-            KeyCode::PageUp => app.scroll_terminal_preview_up(),
-            KeyCode::PageDown => app.scroll_terminal_preview_down(),
-            KeyCode::Home => app.scroll_terminal_preview_to_start(),
-            KeyCode::End => app.scroll_terminal_preview_to_end(),
-            KeyCode::Enter => {
-                let dispatched = if app.primary_tab != PrimaryTab::Workspaces {
-                    app.open_selected_item(&mut actions.on_open)
-                } else {
-                    match app.focus {
-                        Focus::Workspaces => {
-                            app.restore_selected(&mut actions.on_restore);
-                            true
-                        }
-                        Focus::Items => app.open_selected_item(&mut actions.on_open),
-                    }
-                };
-                if dispatched {
-                    app.refresh(&mut actions.on_refresh);
-                    last_refresh = Instant::now();
-                }
-            }
-            KeyCode::Char('r') => {
-                app.refresh(&mut actions.on_refresh);
-                last_refresh = Instant::now();
-            }
-            KeyCode::Char('x') => app.request_close(),
-            KeyCode::Char('a') => {
-                if app.request_add(&mut actions.on_create_shell) {
-                    app.refresh(&mut actions.on_refresh);
-                    last_refresh = Instant::now();
-                }
-            }
-            KeyCode::Char('e') => app.request_rename(),
-            KeyCode::Char(' ') => app.toggle_selection_pin(),
-            KeyCode::Char('/' | ':') => app.open_palette(),
-            KeyCode::Char('?') => app.mode = Mode::Help,
-            KeyCode::Tab => app.cycle_tab(false),
-            KeyCode::BackTab => app.cycle_tab(true),
-            KeyCode::Char(key) if shortcut_tab(key).is_some() => {
-                app.select_tab(shortcut_tab(key).expect("validated tab shortcut"));
-            }
-            key if app.handle_focus_key(key) => {}
-            _ => {}
+        if !effects.is_empty() {
+            execute_effects(&mut app, &mut backend, effects);
+            last_refresh = Instant::now();
         }
     }
 }
 
-fn execute_palette_command<R, O, C, W, N, E, F, P>(
+fn execute_effects(
     app: &mut App,
-    command: PaletteCommand,
-    actions: &mut Actions<R, O, C, W, N, E, F, P>,
-) -> bool
-where
-    R: FnMut(&str) -> Result<String, String>,
-    O: FnMut(&OpenTarget) -> Result<String, String>,
-    C: FnMut(&CloseTarget) -> Result<String, String>,
-    W: FnMut(&str, Option<&PathBuf>) -> Result<String, String>,
-    N: FnMut(&str) -> Result<String, String>,
-    E: FnMut(&RenameTarget, &str) -> Result<String, String>,
-    F: FnMut() -> Result<DashboardState, String>,
-    P: FnMut(&str) -> Result<TerminalPreview, String>,
-{
+    backend: &mut impl DashboardBackend,
+    effects: Vec<DashboardEffect>,
+) {
+    let mut pending = effects;
+    while let Some(effect) = pending.pop() {
+        if effect == DashboardEffect::Quit {
+            continue;
+        }
+        pending.extend(app.update(backend.execute(effect)));
+    }
+}
+
+fn execute_palette_command(app: &mut App, command: PaletteCommand) -> Option<DashboardEffect> {
     match command {
         PaletteCommand::CreateWorkspace => {
             app.mode = Mode::PickProject(ProjectPicker::new(&app.project_context));
-            false
+            None
         }
         PaletteCommand::ShowHelp => {
             app.mode = Mode::Help;
-            false
+            None
         }
         PaletteCommand::Workspace {
             workspace_id,
@@ -1918,39 +1918,36 @@ where
                 Focus::Workspaces
             };
             if !app.select_workspace(&workspace_id, focus) {
-                return false;
+                return None;
             }
             match action {
-                WorkspacePaletteAction::GoTo => false,
-                WorkspacePaletteAction::Restore => {
-                    app.restore_selected(&mut actions.on_restore);
-                    true
-                }
-                WorkspacePaletteAction::AddShell => app.request_add(&mut actions.on_create_shell),
+                WorkspacePaletteAction::GoTo => None,
+                WorkspacePaletteAction::Restore => app.restore_selected(),
+                WorkspacePaletteAction::AddShell => app.request_add(),
                 WorkspacePaletteAction::Rename => {
                     app.request_rename();
-                    false
+                    None
                 }
                 WorkspacePaletteAction::Close => {
                     app.request_close();
-                    false
+                    None
                 }
             }
         }
         PaletteCommand::Item { identity, action } => {
             if !app.select_item_identity(&identity) {
-                return false;
+                return None;
             }
             match action {
-                ItemPaletteAction::GoTo => false,
-                ItemPaletteAction::Open => app.open_selected_item(&mut actions.on_open),
+                ItemPaletteAction::GoTo => None,
+                ItemPaletteAction::Open => app.open_selected_item(),
                 ItemPaletteAction::Rename => {
                     app.request_rename();
-                    false
+                    None
                 }
                 ItemPaletteAction::Close => {
                     app.request_close();
-                    false
+                    None
                 }
             }
         }
@@ -1978,7 +1975,7 @@ where
                     });
                 }
             }
-            false
+            None
         }
     }
 }
@@ -2049,25 +2046,19 @@ fn handle_palette_key(
     }
 }
 
-fn handle_mode_key<W, E>(
+fn handle_mode_key(
     app: &mut App,
     key: KeyCode,
     modifiers: KeyModifiers,
-    on_create_workspace: &mut W,
-    on_rename: &mut E,
-) -> bool
-where
-    W: FnMut(&str, Option<&PathBuf>) -> Result<String, String>,
-    E: FnMut(&RenameTarget, &str) -> Result<String, String>,
-{
+) -> Option<DashboardEffect> {
     let mode = std::mem::replace(&mut app.mode, Mode::Normal);
     if !modifiers.difference(KeyModifiers::SHIFT).is_empty() {
         app.mode = mode;
-        return false;
+        return None;
     }
     match mode {
-        Mode::Normal => false,
-        Mode::Palette(_) | Mode::Help => false,
+        Mode::Normal => None,
+        Mode::Palette(_) | Mode::Help => None,
         Mode::PickProject(mut picker) => match key {
             KeyCode::Enter
                 if picker.mode == WorkspaceCreationMode::ByName
@@ -2077,71 +2068,68 @@ where
                     .custom_name()
                     .expect("nonempty workspace name")
                     .to_owned();
-                app.create_workspace(&name, None, on_create_workspace);
-                true
+                Some(app.create_workspace(&name, None))
             }
             KeyCode::Enter if picker.selected().is_some() => {
                 let project = picker.selected().expect("selected project").clone();
-                app.create_workspace(&project.name, Some(&project.path), on_create_workspace);
-                true
+                Some(app.create_workspace(&project.name, Some(project.path)))
             }
             KeyCode::Enter => {
                 app.mode = Mode::PickProject(picker);
-                false
+                None
             }
-            KeyCode::Esc => false,
+            KeyCode::Esc => None,
             KeyCode::Tab | KeyCode::BackTab => {
                 picker.toggle_mode();
                 app.mode = Mode::PickProject(picker);
-                false
+                None
             }
             KeyCode::Down => {
                 picker.next();
                 app.mode = Mode::PickProject(picker);
-                false
+                None
             }
             KeyCode::Up => {
                 picker.previous();
                 app.mode = Mode::PickProject(picker);
-                false
+                None
             }
             KeyCode::Backspace => {
                 picker.query.pop();
                 picker.update_matches();
                 app.mode = Mode::PickProject(picker);
-                false
+                None
             }
             KeyCode::Char(character) => {
                 picker.query.push(character);
                 picker.update_matches();
                 app.mode = Mode::PickProject(picker);
-                false
+                None
             }
             _ => {
                 app.mode = Mode::PickProject(picker);
-                false
+                None
             }
         },
         Mode::Rename { target, mut input } => match key {
             KeyCode::Enter if !input.trim().is_empty() => {
                 let name = input.trim().to_owned();
-                app.rename(&target, &name, on_rename);
-                true
+                Some(app.rename(target, name))
             }
-            KeyCode::Esc => false,
+            KeyCode::Esc => None,
             KeyCode::Backspace => {
                 input.pop();
                 app.mode = Mode::Rename { target, input };
-                false
+                None
             }
             KeyCode::Char(character) => {
                 input.push(character);
                 app.mode = Mode::Rename { target, input };
-                false
+                None
             }
             _ => {
                 app.mode = Mode::Rename { target, input };
-                false
+                None
             }
         },
     }
@@ -3799,7 +3787,6 @@ fn status_color(status: &str) -> Color {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
 
     use super::*;
     use ratatui::Terminal;
@@ -3924,14 +3911,6 @@ mod tests {
         app.set_focus(Focus::Items);
     }
 
-    fn successful_text(_: &str) -> Result<String, String> {
-        Ok(String::new())
-    }
-
-    fn successful_preview(_: &str) -> Result<TerminalPreview, String> {
-        Ok(TerminalPreview::default())
-    }
-
     fn text_preview(text: &str) -> TerminalPreview {
         TerminalPreview {
             lines: text
@@ -3950,27 +3929,25 @@ mod tests {
         line.spans.iter().map(|span| span.text.as_str()).collect()
     }
 
-    fn successful_workspace(_: &str, _: Option<&PathBuf>) -> Result<String, String> {
-        Ok(String::new())
-    }
-
-    fn successful_open(_: &OpenTarget) -> Result<String, String> {
-        Ok(String::new())
-    }
-
-    fn successful_close(_: &CloseTarget) -> Result<String, String> {
-        Ok(String::new())
-    }
-
-    fn successful_rename(_: &RenameTarget, _: &str) -> Result<String, String> {
-        Ok(String::new())
-    }
-
-    fn empty_refresh() -> Result<DashboardState, String> {
-        Ok(DashboardState {
-            workspaces: Vec::new(),
-            focused_terminal: None,
-        })
+    fn refresh_terminal_preview(
+        app: &mut App,
+        read: &mut impl FnMut(&str) -> Result<TerminalPreview, String>,
+    ) {
+        let Some(DashboardEffect::ReadTerminalPreview {
+            shell_id,
+            run_id,
+            output_revision,
+        }) = app.terminal_preview_effect()
+        else {
+            return;
+        };
+        let output = read(&shell_id);
+        app.update(DashboardEvent::TerminalPreviewCompleted {
+            shell_id,
+            run_id,
+            output_revision,
+            output,
+        });
     }
 
     #[test]
@@ -4705,92 +4682,53 @@ mod tests {
         empty.items.clear();
         let mut app = App::new(vec![empty], project_context());
         focus_items(&mut app);
-        let mut selected_workspace = None;
-
-        let changed = app.request_add(&mut |workspace_id| {
-            selected_workspace = Some(workspace_id.to_owned());
-            Ok("Created shell".into())
-        });
-
-        assert!(changed);
-        assert_eq!(selected_workspace.as_deref(), Some("w1"));
+        assert_eq!(
+            app.request_add(),
+            Some(DashboardEffect::CreateShell("w1".into()))
+        );
     }
 
     #[test]
     fn project_suggestion_creates_workspace_with_default_cwd() {
         let mut app = app();
-        let mut created = None;
-
-        assert!(!app.request_add(&mut |_| Ok(String::new())));
+        assert!(app.request_add().is_none());
         for character in "alp".chars() {
-            handle_mode_key(
-                &mut app,
-                KeyCode::Char(character),
-                KeyModifiers::NONE,
-                &mut |_, _| Ok(String::new()),
-                &mut |_, _| Ok(String::new()),
-            );
+            handle_mode_key(&mut app, KeyCode::Char(character), KeyModifiers::NONE);
         }
-        let changed = handle_mode_key(
-            &mut app,
-            KeyCode::Enter,
-            KeyModifiers::NONE,
-            &mut |name, default_cwd| {
-                created = Some((name.to_owned(), default_cwd.cloned()));
-                Ok("Created workspace".into())
-            },
-            &mut |_, _| Ok(String::new()),
+        assert_eq!(
+            handle_mode_key(&mut app, KeyCode::Enter, KeyModifiers::NONE),
+            Some(DashboardEffect::CreateWorkspace {
+                name: "alpha".into(),
+                default_cwd: Some("/tmp/alpha".into()),
+            })
         );
-
-        assert!(changed);
-        assert_eq!(created, Some(("alpha".into(), Some("/tmp/alpha".into()))));
         assert!(matches!(app.mode, Mode::Normal));
     }
 
     #[test]
     fn arbitrary_text_creates_trimmed_workspace_name() {
         let mut app = app();
-        let mut created = None;
-        app.request_add(&mut |_| Ok(String::new()));
-        handle_mode_key(
-            &mut app,
-            KeyCode::Tab,
-            KeyModifiers::NONE,
-            &mut |_, _| Ok(String::new()),
-            &mut |_, _| Ok(String::new()),
-        );
+        app.request_add();
+        handle_mode_key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
         if let Mode::PickProject(picker) = &mut app.mode {
             picker.query = "  custom workspace  ".into();
             picker.update_matches();
             assert!(picker.selected().is_none());
         }
-        let changed = handle_mode_key(
-            &mut app,
-            KeyCode::Enter,
-            KeyModifiers::NONE,
-            &mut |name, default_cwd| {
-                created = Some((name.to_owned(), default_cwd.cloned()));
-                Ok("Created workspace".into())
-            },
-            &mut |_, _| Ok(String::new()),
+        assert_eq!(
+            handle_mode_key(&mut app, KeyCode::Enter, KeyModifiers::NONE),
+            Some(DashboardEffect::CreateWorkspace {
+                name: "custom workspace".into(),
+                default_cwd: None,
+            })
         );
-
-        assert!(changed);
-        assert_eq!(created, Some(("custom workspace".into(), None)));
     }
 
     #[test]
     fn by_name_creation_wins_even_when_its_name_matches_a_project() {
         let mut app = app();
-        let mut created = None;
-        app.request_add(&mut |_| Ok(String::new()));
-        handle_mode_key(
-            &mut app,
-            KeyCode::Tab,
-            KeyModifiers::NONE,
-            &mut |_, _| Ok(String::new()),
-            &mut |_, _| Ok(String::new()),
-        );
+        app.request_add();
+        handle_mode_key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
         if let Mode::PickProject(picker) = &mut app.mode {
             picker.query = "alpha".into();
             picker.update_matches();
@@ -4798,19 +4736,13 @@ mod tests {
             assert!(picker.selected().is_none());
         }
 
-        let changed = handle_mode_key(
-            &mut app,
-            KeyCode::Enter,
-            KeyModifiers::NONE,
-            &mut |name, default_cwd| {
-                created = Some((name.to_owned(), default_cwd.cloned()));
-                Ok("Created workspace".into())
-            },
-            &mut |_, _| Ok(String::new()),
+        assert_eq!(
+            handle_mode_key(&mut app, KeyCode::Enter, KeyModifiers::NONE),
+            Some(DashboardEffect::CreateWorkspace {
+                name: "alpha".into(),
+                default_cwd: None,
+            })
         );
-
-        assert!(changed);
-        assert_eq!(created, Some(("alpha".into(), None)));
     }
 
     #[test]
@@ -4858,15 +4790,9 @@ mod tests {
     #[test]
     fn project_search_ignores_modified_characters() {
         let mut app = app();
-        app.request_add(&mut |_| Ok(String::new()));
+        app.request_add();
 
-        handle_mode_key(
-            &mut app,
-            KeyCode::Char('c'),
-            KeyModifiers::CONTROL,
-            &mut |_, _| Ok(String::new()),
-            &mut |_, _| Ok(String::new()),
-        );
+        handle_mode_key(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
 
         let Mode::PickProject(picker) = &app.mode else {
             panic!("expected project picker");
@@ -4877,15 +4803,9 @@ mod tests {
     #[test]
     fn project_search_accepts_shifted_characters() {
         let mut app = app();
-        app.request_add(&mut |_| Ok(String::new()));
+        app.request_add();
 
-        handle_mode_key(
-            &mut app,
-            KeyCode::Char('_'),
-            KeyModifiers::SHIFT,
-            &mut |_, _| Ok(String::new()),
-            &mut |_, _| Ok(String::new()),
-        );
+        handle_mode_key(&mut app, KeyCode::Char('_'), KeyModifiers::SHIFT);
 
         let Mode::PickProject(picker) = &app.mode else {
             panic!("expected project picker");
@@ -5021,49 +4941,34 @@ mod tests {
 
     #[test]
     fn palette_open_reuses_typed_item_dispatch() {
-        let opened = RefCell::new(Vec::new());
         let mut app = app();
         let identity = ItemIdentity {
             workspace_id: "w1".into(),
             item_id: "term_1".into(),
             launcher: false,
         };
-        let mut actions = Actions {
-            on_restore: successful_text,
-            on_open: |target: &OpenTarget| {
-                opened.borrow_mut().push(target.clone());
-                Ok("opened".into())
-            },
-            on_close: successful_close,
-            on_create_workspace: successful_workspace,
-            on_create_shell: successful_text,
-            on_rename: successful_rename,
-            on_refresh: empty_refresh,
-            on_terminal_preview: successful_preview,
-        };
-
-        assert!(execute_palette_command(
-            &mut app,
-            PaletteCommand::Item {
-                identity: identity.clone(),
-                action: ItemPaletteAction::Open,
-            },
-            &mut actions,
-        ));
         assert_eq!(
-            opened.borrow().as_slice(),
-            &[OpenTarget::Shell("term_1".into())]
+            execute_palette_command(
+                &mut app,
+                PaletteCommand::Item {
+                    identity: identity.clone(),
+                    action: ItemPaletteAction::Open,
+                }
+            ),
+            Some(DashboardEffect::Open(OpenTarget::Shell("term_1".into())))
         );
         assert_eq!(app.focus, Focus::Items);
 
-        assert!(!execute_palette_command(
-            &mut app,
-            PaletteCommand::Item {
-                identity: identity.clone(),
-                action: ItemPaletteAction::Rename,
-            },
-            &mut actions,
-        ));
+        assert!(
+            execute_palette_command(
+                &mut app,
+                PaletteCommand::Item {
+                    identity: identity.clone(),
+                    action: ItemPaletteAction::Rename,
+                }
+            )
+            .is_none()
+        );
         assert!(matches!(
             app.mode,
             Mode::Rename {
@@ -5079,7 +4984,6 @@ mod tests {
                 identity,
                 action: ItemPaletteAction::Close,
             },
-            &mut actions,
         );
         assert!(matches!(
             app.pending_close,
@@ -5093,16 +4997,6 @@ mod tests {
     #[test]
     fn attention_jump_falls_back_when_shell_is_not_retained() {
         let mut app = app();
-        let mut actions = Actions {
-            on_restore: successful_text,
-            on_open: successful_open,
-            on_close: successful_close,
-            on_create_workspace: successful_workspace,
-            on_create_shell: successful_text,
-            on_rename: successful_rename,
-            on_refresh: empty_refresh,
-            on_terminal_preview: successful_preview,
-        };
 
         execute_palette_command(
             &mut app,
@@ -5110,7 +5004,6 @@ mod tests {
                 workspace_id: "w1".into(),
                 shell_id: "removed".into(),
             },
-            &mut actions,
         );
         assert_eq!(app.focus, Focus::Workspaces);
         assert!(app.message.as_ref().is_some_and(|message| {
@@ -5121,16 +5014,6 @@ mod tests {
     #[test]
     fn attention_jump_reports_when_workspace_is_not_retained() {
         let mut app = app();
-        let mut actions = Actions {
-            on_restore: successful_text,
-            on_open: successful_open,
-            on_close: successful_close,
-            on_create_workspace: successful_workspace,
-            on_create_shell: successful_text,
-            on_rename: successful_rename,
-            on_refresh: empty_refresh,
-            on_terminal_preview: successful_preview,
-        };
 
         execute_palette_command(
             &mut app,
@@ -5138,7 +5021,6 @@ mod tests {
                 workspace_id: "removed".into(),
                 shell_id: "removed".into(),
             },
-            &mut actions,
         );
 
         assert!(app.message.as_ref().is_some_and(|message| {
@@ -5247,31 +5129,56 @@ mod tests {
     #[test]
     fn add_creates_a_shell_from_terminal_focus() {
         let mut app = app();
-        let mut workspace_id = None;
         focus_items(&mut app);
 
-        let changed = app.request_add(&mut |selected_workspace_id| {
-            workspace_id = Some(selected_workspace_id.to_owned());
-            Ok("Created shell".into())
-        });
-
-        assert!(changed);
-        assert_eq!(workspace_id.as_deref(), Some("w1"));
+        assert_eq!(
+            app.request_add(),
+            Some(DashboardEffect::CreateShell("w1".into()))
+        );
         assert!(matches!(app.mode, Mode::Normal));
     }
 
     #[test]
     fn enter_on_terminal_opens_only_the_selected_shell() {
         let mut app = app();
-        let mut opened = None;
         focus_items(&mut app);
 
-        app.open_selected_item(&mut |target| {
-            opened = Some(target.clone());
-            Ok("Opened shell".into())
-        });
+        assert_eq!(
+            app.update(DashboardEvent::KeyPressed {
+                code: KeyCode::Enter,
+                modifiers: KeyModifiers::NONE,
+            }),
+            vec![DashboardEffect::Open(OpenTarget::Shell("term_1".into()))]
+        );
+    }
 
-        assert_eq!(opened, Some(OpenTarget::Shell("term_1".into())));
+    #[test]
+    fn completed_operation_updates_model_and_requests_refresh() {
+        let mut app = app();
+
+        assert_eq!(
+            app.update(DashboardEvent::OperationCompleted(Err("failed".into()))),
+            vec![DashboardEffect::Refresh]
+        );
+        assert!(
+            app.message
+                .as_ref()
+                .is_some_and(|message| { message.error && message.text == "failed" })
+        );
+    }
+
+    #[test]
+    fn control_c_produces_quit_effect_in_every_mode() {
+        let mut app = app();
+        app.mode = Mode::Help;
+
+        assert_eq!(
+            app.update(DashboardEvent::KeyPressed {
+                code: KeyCode::Char('c'),
+                modifiers: KeyModifiers::CONTROL,
+            }),
+            vec![DashboardEffect::Quit]
+        );
     }
 
     #[test]
@@ -5292,19 +5199,12 @@ mod tests {
             }));
         focus_items(&mut app);
         app.next();
-        let mut opened = None;
-
-        app.open_selected_item(&mut |target| {
-            opened = Some(target.clone());
-            Ok("Launched editor".into())
-        });
-
         assert_eq!(
-            opened,
-            Some(OpenTarget::Launcher {
+            app.open_selected_item(),
+            Some(DashboardEffect::Open(OpenTarget::Launcher {
                 workspace_id: "w1".into(),
                 launcher_id: "launcher-1".into(),
-            })
+            }))
         );
     }
 
@@ -5352,12 +5252,7 @@ mod tests {
         let mut app = app();
         app.workspaces[0].items = vec![WorkspaceItemView::AgentShell(agent_shell())];
         focus_items(&mut app);
-        let mut opened = None;
-
-        let dispatched = app.open_selected_item(&mut |target| {
-            opened = Some(target.clone());
-            Ok(String::new())
-        });
+        let effect = app.open_selected_item();
         app.request_rename();
         assert!(matches!(
             app.mode,
@@ -5369,8 +5264,10 @@ mod tests {
         app.mode = Mode::Normal;
         app.request_close();
 
-        assert!(dispatched);
-        assert_eq!(opened, Some(OpenTarget::Shell("term_1".into())));
+        assert_eq!(
+            effect,
+            Some(DashboardEffect::Open(OpenTarget::Shell("term_1".into())))
+        );
         assert!(matches!(
             app.pending_close,
             Some(PendingClose {
@@ -5383,34 +5280,18 @@ mod tests {
     #[test]
     fn rename_mode_dispatches_the_selected_shell_and_name() {
         let mut app = app();
-        let mut renamed = None;
         focus_items(&mut app);
         app.request_rename();
 
         for character in ['a', 'p', 'i'] {
-            handle_mode_key(
-                &mut app,
-                KeyCode::Char(character),
-                KeyModifiers::NONE,
-                &mut |_, _| Ok(String::new()),
-                &mut |_, _| Ok(String::new()),
-            );
+            handle_mode_key(&mut app, KeyCode::Char(character), KeyModifiers::NONE);
         }
-        let changed = handle_mode_key(
-            &mut app,
-            KeyCode::Enter,
-            KeyModifiers::NONE,
-            &mut |_, _| Ok(String::new()),
-            &mut |target, name| {
-                renamed = Some((target.clone(), name.to_owned()));
-                Ok("Renamed shell".into())
-            },
-        );
-
-        assert!(changed);
         assert_eq!(
-            renamed,
-            Some((RenameTarget::Shell("term_1".into()), "api".into()))
+            handle_mode_key(&mut app, KeyCode::Enter, KeyModifiers::NONE),
+            Some(DashboardEffect::Rename {
+                target: RenameTarget::Shell("term_1".into()),
+                name: "api".into(),
+            })
         );
         assert!(matches!(app.mode, Mode::Normal));
     }
@@ -5418,7 +5299,6 @@ mod tests {
     #[test]
     fn rename_mode_dispatches_the_selected_workspace_and_name() {
         let mut app = app();
-        let mut renamed = None;
 
         app.request_rename();
         assert!(matches!(
@@ -5429,43 +5309,28 @@ mod tests {
             } if id == "w1"
         ));
         for character in "renamed".chars() {
-            handle_mode_key(
-                &mut app,
-                KeyCode::Char(character),
-                KeyModifiers::NONE,
-                &mut |_, _| Ok(String::new()),
-                &mut |_, _| Ok(String::new()),
-            );
+            handle_mode_key(&mut app, KeyCode::Char(character), KeyModifiers::NONE);
         }
-        let changed = handle_mode_key(
-            &mut app,
-            KeyCode::Enter,
-            KeyModifiers::NONE,
-            &mut |_, _| Ok(String::new()),
-            &mut |target, name| {
-                renamed = Some((target.clone(), name.to_owned()));
-                Ok("Renamed workspace".into())
-            },
-        );
-
-        assert!(changed);
         assert_eq!(
-            renamed,
-            Some((RenameTarget::Workspace("w1".into()), "renamed".into()))
+            handle_mode_key(&mut app, KeyCode::Enter, KeyModifiers::NONE),
+            Some(DashboardEffect::Rename {
+                target: RenameTarget::Workspace("w1".into()),
+                name: "renamed".into(),
+            })
         );
     }
 
     #[test]
     fn restore_keeps_app_active_and_reports_success() {
         let mut app = app();
-        let mut restored = None;
-
-        app.restore_selected(&mut |workspace_id| {
-            restored = Some(workspace_id.to_owned());
-            Ok("Restored workspace".into())
-        });
-
-        assert_eq!(restored.as_deref(), Some("w1"));
+        assert_eq!(
+            app.restore_selected(),
+            Some(DashboardEffect::RestoreWorkspace("w1".into()))
+        );
+        let effects = app.update(DashboardEvent::OperationCompleted(Ok(
+            "Restored workspace".into()
+        )));
+        assert_eq!(effects, vec![DashboardEffect::Refresh]);
         let message = app.message.expect("restore message");
         assert_eq!(message.text, "Restored workspace");
         assert!(!message.error);
@@ -5474,7 +5339,6 @@ mod tests {
     #[test]
     fn closing_a_workspace_requires_confirmation() {
         let mut app = app();
-        let mut closed = None;
 
         app.request_close();
         let pending = app.pending_close.as_ref().expect("pending close");
@@ -5484,13 +5348,16 @@ mod tests {
         app.cancel_close();
         assert!(app.pending_close.is_none());
         app.request_close();
-        app.confirm_close(&mut |target| {
-            closed = Some(target.clone());
-            Ok("Closed workspace".into())
-        });
+        let effect = app.confirm_close();
 
-        assert_eq!(closed, Some(CloseTarget::Workspace("w1".into())));
+        assert_eq!(
+            effect,
+            Some(DashboardEffect::Close(CloseTarget::Workspace("w1".into())))
+        );
         assert!(app.pending_close.is_none());
+        app.update(DashboardEvent::OperationCompleted(Ok(
+            "Closed workspace".into()
+        )));
         let message = app.message.expect("close message");
         assert_eq!(message.text, "Closed workspace");
         assert!(!message.error);
@@ -5499,7 +5366,6 @@ mod tests {
     #[test]
     fn closing_a_shell_uses_terminal_focus() {
         let mut app = app();
-        let mut closed = None;
         focus_items(&mut app);
 
         app.request_close();
@@ -5507,12 +5373,10 @@ mod tests {
         assert_eq!(pending.target, CloseTarget::Shell("term_1".into()));
         assert_eq!(pending.name, "agent");
 
-        app.confirm_close(&mut |target| {
-            closed = Some(target.clone());
-            Ok("Closed shell".into())
-        });
-
-        assert_eq!(closed, Some(CloseTarget::Shell("term_1".into())));
+        assert_eq!(
+            app.confirm_close(),
+            Some(DashboardEffect::Close(CloseTarget::Shell("term_1".into())))
+        );
         assert!(app.pending_close.is_none());
     }
 
@@ -6216,7 +6080,7 @@ mod tests {
         let mut app = App::new(vec![workspace], project_context());
         focus_items(&mut app);
         let reads = std::cell::Cell::new(0);
-        app.refresh_terminal_preview(&mut |_| {
+        refresh_terminal_preview(&mut app, &mut |_| {
             reads.set(reads.get() + 1);
             Ok(text_preview("command output"))
         });
@@ -6322,7 +6186,7 @@ mod tests {
                 output_revision: 1,
             });
         }
-        app.refresh_terminal_preview(&mut |_| Ok(text_preview("output")));
+        refresh_terminal_preview(&mut app, &mut |_| Ok(text_preview("output")));
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let text = terminal
@@ -6358,21 +6222,21 @@ mod tests {
             Ok(text_preview("first\nlatest"))
         };
 
-        app.refresh_terminal_preview(&mut read);
-        app.refresh_terminal_preview(&mut read);
+        refresh_terminal_preview(&mut app, &mut read);
+        refresh_terminal_preview(&mut app, &mut read);
         assert_eq!(calls.get(), 1);
 
         let WorkspaceItemView::Shell(shell) = &mut app.workspaces[0].items[0] else {
             unreachable!();
         };
         shell.run.as_mut().unwrap().output_revision = 5;
-        app.refresh_terminal_preview(&mut read);
+        refresh_terminal_preview(&mut app, &mut read);
         assert_eq!(calls.get(), 2);
         let WorkspaceItemView::Shell(shell) = &mut app.workspaces[0].items[0] else {
             unreachable!();
         };
         shell.run.as_mut().unwrap().id = "run-2".into();
-        app.refresh_terminal_preview(&mut read);
+        refresh_terminal_preview(&mut app, &mut read);
         assert_eq!(calls.get(), 3);
 
         let backend = TestBackend::new(180, 34);
@@ -6481,7 +6345,7 @@ mod tests {
             )
         };
 
-        app.refresh_terminal_preview(&mut |_| Ok(output(40)));
+        refresh_terminal_preview(&mut app, &mut |_| Ok(output(40)));
         app.scroll_terminal_preview_up();
         assert_eq!(
             app.terminal_preview.as_ref().unwrap().scroll_from_bottom,
@@ -6502,7 +6366,7 @@ mod tests {
             unreachable!();
         };
         shell.run.as_mut().unwrap().output_revision = 2;
-        app.refresh_terminal_preview(&mut |_| Ok(output(42)));
+        refresh_terminal_preview(&mut app, &mut |_| Ok(output(42)));
         assert_eq!(
             app.terminal_preview.as_ref().unwrap().scroll_from_bottom,
             14
@@ -6533,7 +6397,7 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n"),
         );
-        app.refresh_terminal_preview(&mut |_| Ok(output.clone()));
+        refresh_terminal_preview(&mut app, &mut |_| Ok(output.clone()));
 
         let mut wide = Terminal::new(TestBackend::new(180, 40)).unwrap();
         wide.draw(|frame| render(frame, &mut app)).unwrap();
@@ -6669,7 +6533,7 @@ mod tests {
         let backend = TestBackend::new(120, 34);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = app();
-        app.request_add(&mut |_| Ok(String::new()));
+        app.request_add();
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
     }
@@ -6679,7 +6543,7 @@ mod tests {
         let backend = TestBackend::new(120, 34);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = app();
-        app.request_add(&mut |_| Ok(String::new()));
+        app.request_add();
         if let Mode::PickProject(picker) = &mut app.mode {
             picker.toggle_mode();
         }

@@ -198,14 +198,17 @@ window has spawned, preserving retained output when terminal preparation fails.
 
 ### Dashboard
 
-`src/tui.rs` remains a control plane. It receives backend-neutral view models
-and callback functions rather than opening sockets itself. One daemon snapshot
-contains each workspace, its launchers, and its shells, avoiding races between separate list
-operations. Configured project roots provide workspace suggestions; selecting
-one persists its canonical path as the workspace's default cwd. Git information
-is still collected independently from shell directories and cached. A default
-cwd does not create workspace-level Git identity, and mixed-directory
-workspaces remain valid.
+`src/tui.rs` remains a control plane. Its typed model update boundary consumes
+dashboard events and returns explicit external effects. The terminal runtime
+executes those effects through one backend interface and feeds typed completion
+events back into the model; model transitions do not call daemon or terminal
+callbacks directly. Rendering remains a function of typed model state. One
+daemon snapshot contains each workspace, its launchers, and its shells, avoiding
+races between separate list operations. Configured project roots provide
+workspace suggestions; selecting one persists its canonical path as the
+workspace's default cwd. Git information is still collected independently from
+shell directories and cached. A default cwd does not create workspace-level Git
+identity, and mixed-directory workspaces remain valid.
 
 Shell snapshots include their additive stored startup argument vector. The
 dashboard presents an empty vector as `shell` and a non-empty vector as
