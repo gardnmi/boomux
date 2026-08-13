@@ -47,35 +47,6 @@ const BOOMUX_OPENCODE_PLUGIN: &str = integration_management::OPENCODE_ASSET;
 #[cfg(test)]
 const BOOMUX_PI_EXTENSION: &str = integration_management::PI_ASSET;
 const MAX_HOST_CATALOG_DIRECTORIES: usize = 8;
-const JSON_COMMANDS: &[&str] = &[
-    "capabilities",
-    "list",
-    "shells",
-    "read",
-    "events",
-    "workspace.list",
-    "workspace.inspect",
-    "shell.inspect",
-    "launcher.list",
-    "launcher.inspect",
-    "agent.list",
-    "agent.inspect",
-    "agent.register",
-    "agent.ensure",
-    "agent.report",
-    "agent.wait",
-    "attention.list",
-    "attention.acknowledge",
-    "integration.list",
-    "integration.status",
-    "integration.install",
-    "integration.uninstall",
-    "integration.verify",
-    "session.list",
-    "session.inspect",
-    "session.read",
-    "daemon.status",
-];
 const INTEGRATION_FEATURES: &[&str] = &[
     "typed_errors",
     "shell_run_identity",
@@ -677,6 +648,229 @@ enum DaemonCommands {
     Stop,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OutputMode {
+    HumanOnly,
+    Json,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CommandDescriptor {
+    key: &'static str,
+    output: OutputMode,
+}
+
+macro_rules! command_keys {
+    ($($variant:ident => ($key:literal, $output:ident)),+ $(,)?) => {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum CommandKey {
+            $($variant),+
+        }
+
+        impl CommandKey {
+            const ALL: &[Self] = &[$(Self::$variant),+];
+
+            const fn descriptor(self) -> CommandDescriptor {
+                match self {
+                    $(Self::$variant => CommandDescriptor {
+                        key: $key,
+                        output: OutputMode::$output,
+                    }),+
+                }
+            }
+        }
+    };
+}
+
+command_keys! {
+    Ui => ("ui", HumanOnly),
+    Doctor => ("doctor", HumanOnly),
+    Capabilities => ("capabilities", Json),
+    List => ("list", Json),
+    Shells => ("shells", Json),
+    Read => ("read", Json),
+    Events => ("events", Json),
+    Close => ("close", HumanOnly),
+    WorkspaceList => ("workspace.list", Json),
+    WorkspaceInspect => ("workspace.inspect", Json),
+    Workspace => ("workspace", HumanOnly),
+    ShellInspect => ("shell.inspect", Json),
+    Shell => ("shell", HumanOnly),
+    LauncherList => ("launcher.list", Json),
+    LauncherInspect => ("launcher.inspect", Json),
+    Launcher => ("launcher", HumanOnly),
+    AgentList => ("agent.list", Json),
+    AgentInspect => ("agent.inspect", Json),
+    AgentRegister => ("agent.register", Json),
+    AgentEnsure => ("agent.ensure", Json),
+    AgentSupervise => ("agent.supervise", HumanOnly),
+    AgentReport => ("agent.report", Json),
+    AgentWait => ("agent.wait", Json),
+    AttentionList => ("attention.list", Json),
+    AttentionAcknowledge => ("attention.acknowledge", Json),
+    NotificationTest => ("notification.test", HumanOnly),
+    IntegrationList => ("integration.list", Json),
+    IntegrationStatus => ("integration.status", Json),
+    IntegrationInstall => ("integration.install", Json),
+    IntegrationUninstall => ("integration.uninstall", Json),
+    IntegrationSetup => ("integration.setup", HumanOnly),
+    IntegrationVerify => ("integration.verify", Json),
+    SessionList => ("session.list", Json),
+    SessionInspect => ("session.inspect", Json),
+    SessionRead => ("session.read", Json),
+    Skill => ("skill", HumanOnly),
+    Opencode => ("opencode", HumanOnly),
+    Pi => ("pi", HumanOnly),
+    Open => ("open", HumanOnly),
+    Prompt => ("prompt", HumanOnly),
+    DaemonStatus => ("daemon.status", Json),
+    Daemon => ("daemon", HumanOnly),
+    Attach => ("attach", HumanOnly),
+}
+
+impl Cli {
+    fn command_descriptor(&self) -> CommandDescriptor {
+        self.command_key().descriptor()
+    }
+
+    fn command_key(&self) -> CommandKey {
+        match self.command.as_ref() {
+            Some(Commands::Capabilities) => CommandKey::Capabilities,
+            Some(Commands::List) => CommandKey::List,
+            Some(Commands::Shells) => CommandKey::Shells,
+            Some(Commands::Read { .. }) => CommandKey::Read,
+            Some(Commands::Events { .. }) => CommandKey::Events,
+            Some(Commands::Workspace {
+                command: WorkspaceCommands::List,
+            }) => CommandKey::WorkspaceList,
+            Some(Commands::Workspace {
+                command: WorkspaceCommands::Inspect { .. },
+            }) => CommandKey::WorkspaceInspect,
+            Some(Commands::Shell {
+                command: ShellCommands::Inspect { .. },
+            }) => CommandKey::ShellInspect,
+            Some(Commands::Launcher {
+                command: LauncherCommands::List { .. },
+            }) => CommandKey::LauncherList,
+            Some(Commands::Launcher {
+                command: LauncherCommands::Inspect { .. },
+            }) => CommandKey::LauncherInspect,
+            Some(Commands::Agent {
+                command: AgentCommands::List { .. },
+            }) => CommandKey::AgentList,
+            Some(Commands::Agent {
+                command: AgentCommands::Inspect { .. },
+            }) => CommandKey::AgentInspect,
+            Some(Commands::Agent {
+                command: AgentCommands::Wait { .. },
+            }) => CommandKey::AgentWait,
+            Some(Commands::Agent {
+                command: AgentCommands::Register(..),
+            }) => CommandKey::AgentRegister,
+            Some(Commands::Agent {
+                command: AgentCommands::Ensure(..),
+            }) => CommandKey::AgentEnsure,
+            Some(Commands::Agent {
+                command: AgentCommands::Supervise(..),
+            }) => CommandKey::AgentSupervise,
+            Some(Commands::Agent {
+                command: AgentCommands::Report { .. },
+            }) => CommandKey::AgentReport,
+            Some(Commands::Attention {
+                command: AttentionCommands::List { .. },
+            }) => CommandKey::AttentionList,
+            Some(Commands::Attention {
+                command: AttentionCommands::Acknowledge { .. },
+            }) => CommandKey::AttentionAcknowledge,
+            Some(Commands::Notification {
+                command: NotificationCommands::Test { .. },
+            }) => CommandKey::NotificationTest,
+            Some(Commands::Session {
+                command: SessionCommands::List { .. },
+            }) => CommandKey::SessionList,
+            Some(Commands::Session {
+                command: SessionCommands::Inspect { .. },
+            }) => CommandKey::SessionInspect,
+            Some(Commands::Session {
+                command: SessionCommands::Read { .. },
+            }) => CommandKey::SessionRead,
+            Some(Commands::Integration {
+                command: IntegrationCommands::List,
+            }) => CommandKey::IntegrationList,
+            Some(Commands::Integration {
+                command: IntegrationCommands::Status { .. },
+            }) => CommandKey::IntegrationStatus,
+            Some(Commands::Integration {
+                command: IntegrationCommands::Install { .. },
+            }) => CommandKey::IntegrationInstall,
+            Some(Commands::Integration {
+                command: IntegrationCommands::Uninstall { .. },
+            }) => CommandKey::IntegrationUninstall,
+            Some(Commands::Integration {
+                command: IntegrationCommands::Setup { .. },
+            }) => CommandKey::IntegrationSetup,
+            Some(Commands::Integration {
+                command: IntegrationCommands::Verify { .. },
+            }) => CommandKey::IntegrationVerify,
+            Some(Commands::Daemon {
+                command: DaemonCommands::Status,
+            }) => CommandKey::DaemonStatus,
+            Some(Commands::Workspace {
+                command:
+                    WorkspaceCommands::Create { .. }
+                    | WorkspaceCommands::Open { .. }
+                    | WorkspaceCommands::Rename { .. }
+                    | WorkspaceCommands::Close { .. },
+            }) => CommandKey::Workspace,
+            Some(Commands::Shell {
+                command:
+                    ShellCommands::Create { .. }
+                    | ShellCommands::Rename { .. }
+                    | ShellCommands::Close { .. },
+            }) => CommandKey::Shell,
+            Some(Commands::Launcher {
+                command:
+                    LauncherCommands::Create { .. }
+                    | LauncherCommands::Rename { .. }
+                    | LauncherCommands::Remove { .. },
+            }) => CommandKey::Launcher,
+            Some(Commands::Daemon {
+                command:
+                    DaemonCommands::Run
+                    | DaemonCommands::ReceiveHandoff { .. }
+                    | DaemonCommands::Restart
+                    | DaemonCommands::Stop,
+            }) => CommandKey::Daemon,
+            Some(Commands::Ui) | None => CommandKey::Ui,
+            Some(Commands::Doctor) => CommandKey::Doctor,
+            Some(Commands::Close { .. }) => CommandKey::Close,
+            Some(Commands::Skill {
+                command: SkillCommands::Install { .. },
+            }) => CommandKey::Skill,
+            Some(Commands::Opencode {
+                command: OpenCodeCommands::Install { .. },
+            }) => CommandKey::Opencode,
+            Some(Commands::Pi {
+                command: PiCommands::Install { .. },
+            }) => CommandKey::Pi,
+            Some(Commands::Open { .. }) => CommandKey::Open,
+            Some(Commands::Prompt) => CommandKey::Prompt,
+            Some(Commands::Attach { .. }) => CommandKey::Attach,
+        }
+    }
+}
+
+fn json_commands() -> impl Iterator<Item = &'static str> {
+    CommandKey::ALL.iter().filter_map(|key| {
+        let descriptor = key.descriptor();
+        (descriptor.output == OutputMode::Json).then_some(descriptor.key)
+    })
+}
+
+fn print_json(command: CommandKey, data: serde_json::Value) -> Result<(), Box<dyn Error>> {
+    cli_output::print(command.descriptor().key, data)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CliExit {
     Success,
@@ -725,7 +919,7 @@ fn main() -> ExitCode {
         }
     };
     let json = cli.json;
-    let command = command_name(&cli);
+    let command = cli.command_descriptor().key;
     match run(cli) {
         Ok(outcome) => outcome.code(),
         Err(error) => {
@@ -747,10 +941,11 @@ fn requests_json(arguments: impl IntoIterator<Item = OsString>) -> bool {
 }
 
 fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
-    if cli.json && !supports_json(&cli) {
+    let descriptor = cli.command_descriptor();
+    if cli.json && descriptor.output != OutputMode::Json {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("--json is not supported for {}", command_name(&cli)),
+            format!("--json is not supported for {}", descriptor.key),
         )
         .into());
     }
@@ -867,151 +1062,13 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
     Ok(CliExit::Success)
 }
 
-fn command_name(cli: &Cli) -> &'static str {
-    match cli.command.as_ref() {
-        Some(Commands::Capabilities) => "capabilities",
-        Some(Commands::List) => "list",
-        Some(Commands::Shells) => "shells",
-        Some(Commands::Read { .. }) => "read",
-        Some(Commands::Events { .. }) => "events",
-        Some(Commands::Workspace {
-            command: WorkspaceCommands::List,
-        }) => "workspace.list",
-        Some(Commands::Workspace {
-            command: WorkspaceCommands::Inspect { .. },
-        }) => "workspace.inspect",
-        Some(Commands::Shell {
-            command: ShellCommands::Inspect { .. },
-        }) => "shell.inspect",
-        Some(Commands::Launcher {
-            command: LauncherCommands::List { .. },
-        }) => "launcher.list",
-        Some(Commands::Launcher {
-            command: LauncherCommands::Inspect { .. },
-        }) => "launcher.inspect",
-        Some(Commands::Agent {
-            command: AgentCommands::List { .. },
-        }) => "agent.list",
-        Some(Commands::Agent {
-            command: AgentCommands::Inspect { .. },
-        }) => "agent.inspect",
-        Some(Commands::Agent {
-            command: AgentCommands::Wait { .. },
-        }) => "agent.wait",
-        Some(Commands::Agent {
-            command: AgentCommands::Register(..),
-        }) => "agent.register",
-        Some(Commands::Agent {
-            command: AgentCommands::Ensure(..),
-        }) => "agent.ensure",
-        Some(Commands::Agent {
-            command: AgentCommands::Supervise(..),
-        }) => "agent.supervise",
-        Some(Commands::Agent {
-            command: AgentCommands::Report { .. },
-        }) => "agent.report",
-        Some(Commands::Attention {
-            command: AttentionCommands::List { .. },
-        }) => "attention.list",
-        Some(Commands::Attention {
-            command: AttentionCommands::Acknowledge { .. },
-        }) => "attention.acknowledge",
-        Some(Commands::Notification {
-            command: NotificationCommands::Test { .. },
-        }) => "notification.test",
-        Some(Commands::Session {
-            command: SessionCommands::List { .. },
-        }) => "session.list",
-        Some(Commands::Session {
-            command: SessionCommands::Inspect { .. },
-        }) => "session.inspect",
-        Some(Commands::Session {
-            command: SessionCommands::Read { .. },
-        }) => "session.read",
-        Some(Commands::Integration {
-            command: IntegrationCommands::List,
-        }) => "integration.list",
-        Some(Commands::Integration {
-            command: IntegrationCommands::Status { .. },
-        }) => "integration.status",
-        Some(Commands::Integration {
-            command: IntegrationCommands::Install { .. },
-        }) => "integration.install",
-        Some(Commands::Integration {
-            command: IntegrationCommands::Uninstall { .. },
-        }) => "integration.uninstall",
-        Some(Commands::Integration {
-            command: IntegrationCommands::Setup { .. },
-        }) => "integration.setup",
-        Some(Commands::Integration {
-            command: IntegrationCommands::Verify { .. },
-        }) => "integration.verify",
-        Some(Commands::Daemon {
-            command: DaemonCommands::Status,
-        }) => "daemon.status",
-        Some(Commands::Workspace { .. }) => "workspace",
-        Some(Commands::Shell { .. }) => "shell",
-        Some(Commands::Launcher { .. }) => "launcher",
-        Some(Commands::Daemon { .. }) => "daemon",
-        Some(Commands::Ui) | None => "ui",
-        Some(Commands::Doctor) => "doctor",
-        Some(Commands::Close { .. }) => "close",
-        Some(Commands::Skill { .. }) => "skill",
-        Some(Commands::Opencode { .. }) => "opencode",
-        Some(Commands::Pi { .. }) => "pi",
-        Some(Commands::Open { .. }) => "open",
-        Some(Commands::Prompt) => "prompt",
-        Some(Commands::Attach { .. }) => "attach",
-    }
-}
-
-fn supports_json(cli: &Cli) -> bool {
-    matches!(
-        cli.command.as_ref(),
-        Some(
-            Commands::Capabilities
-                | Commands::List
-                | Commands::Shells
-                | Commands::Read { .. }
-                | Commands::Events { .. }
-        ) | Some(Commands::Workspace {
-            command: WorkspaceCommands::List | WorkspaceCommands::Inspect { .. }
-        }) | Some(Commands::Shell {
-            command: ShellCommands::Inspect { .. }
-        }) | Some(Commands::Launcher {
-            command: LauncherCommands::List { .. } | LauncherCommands::Inspect { .. }
-        }) | Some(Commands::Agent {
-            command: AgentCommands::List { .. }
-                | AgentCommands::Inspect { .. }
-                | AgentCommands::Wait { .. }
-                | AgentCommands::Register(..)
-                | AgentCommands::Ensure(..)
-                | AgentCommands::Report { .. }
-        }) | Some(Commands::Daemon {
-            command: DaemonCommands::Status
-        }) | Some(Commands::Attention {
-            command: AttentionCommands::List { .. } | AttentionCommands::Acknowledge { .. }
-        }) | Some(Commands::Session {
-            command: SessionCommands::List { .. }
-                | SessionCommands::Inspect { .. }
-                | SessionCommands::Read { .. }
-        }) | Some(Commands::Integration {
-            command: IntegrationCommands::List
-                | IntegrationCommands::Status { .. }
-                | IntegrationCommands::Install { .. }
-                | IntegrationCommands::Uninstall { .. }
-                | IntegrationCommands::Verify { .. }
-        })
-    )
-}
-
 fn daemon_control(command: DaemonCommands, json: bool) -> Result<(), Box<dyn Error>> {
     let client = client::connect()?;
     match command {
         DaemonCommands::Status if json => {
             let protocol_version = client.protocol_version()?;
-            cli_output::print(
-                "daemon.status",
+            print_json(
+                CommandKey::DaemonStatus,
                 serde_json::json!({
                     "status": "running",
                     "protocol_version": protocol_version,
@@ -1862,8 +1919,8 @@ fn verify_integration(
                         .iter()
                         .map(|agent| cli_output::agent(agent, Some(&workspace_name)))
                         .collect::<Vec<_>>();
-                    return cli_output::print(
-                        "integration.verify",
+                    return print_json(
+                        CommandKey::IntegrationVerify,
                         serde_json::json!({
                             "integration": spec.name,
                             "verified": true,
@@ -1964,8 +2021,8 @@ fn list_integrations(json: bool) -> Result<(), Box<dyn Error>> {
         .map(integration_management::IntegrationSummary::from)
         .collect::<Vec<_>>();
     if json {
-        return cli_output::print(
-            "integration.list",
+        return print_json(
+            CommandKey::IntegrationList,
             serde_json::json!({ "integrations": integrations }),
         );
     }
@@ -2021,8 +2078,8 @@ fn integration_status(
         })
         .collect::<Vec<_>>();
     if json {
-        return cli_output::print(
-            "integration.status",
+        return print_json(
+            CommandKey::IntegrationStatus,
             serde_json::json!({ "integrations": statuses }),
         );
     }
@@ -2132,8 +2189,8 @@ fn install_integrations(
         .collect::<Result<Vec<_>, _>>()?;
     if dry_run {
         if json {
-            return cli_output::print(
-                "integration.install",
+            return print_json(
+                CommandKey::IntegrationInstall,
                 serde_json::json!({ "dry_run": true, "integrations": plans }),
             );
         }
@@ -2162,8 +2219,8 @@ fn install_integrations(
         .map(|integration| integration_management::install(integration, &environment, force))
         .collect::<Result<Vec<_>, _>>()?;
     if json {
-        return cli_output::print(
-            "integration.install",
+        return print_json(
+            CommandKey::IntegrationInstall,
             serde_json::json!({ "integrations": results }),
         );
     }
@@ -2209,8 +2266,8 @@ fn uninstall_integrations(
         .map(|integration| integration_management::uninstall(integration, &environment, force))
         .collect::<Result<Vec<_>, _>>()?;
     if json {
-        return cli_output::print(
-            "integration.uninstall",
+        return print_json(
+            CommandKey::IntegrationUninstall,
             serde_json::json!({ "integrations": results }),
         );
     }
@@ -2330,6 +2387,7 @@ fn print_setup_next_step(
 }
 
 fn capabilities(json: bool) -> Result<(), Box<dyn Error>> {
+    let json_commands = json_commands().collect::<Vec<_>>();
     let error_codes = [
         "invalid_argument",
         "not_found",
@@ -2367,13 +2425,13 @@ fn capabilities(json: bool) -> Result<(), Box<dyn Error>> {
         })
         .collect::<serde_json::Map<_, _>>();
     if json {
-        return cli_output::print(
-            "capabilities",
+        return print_json(
+            CommandKey::Capabilities,
             serde_json::json!({
                 "cli_version": env!("CARGO_PKG_VERSION"),
                 "daemon_protocol_version": protocol::PROTOCOL_VERSION,
                 "json_schemas": [cli_output::SCHEMA],
-                "json_commands": JSON_COMMANDS,
+                "json_commands": json_commands,
                 "features": INTEGRATION_FEATURES,
                 "session_transcript_integrations": session_transcript::supported_integrations(),
                 "integration_hosts": integration_hosts,
@@ -2384,7 +2442,7 @@ fn capabilities(json: bool) -> Result<(), Box<dyn Error>> {
     println!("CLI VERSION\t{}", env!("CARGO_PKG_VERSION"));
     println!("DAEMON PROTOCOL\t{}", protocol::PROTOCOL_VERSION);
     println!("JSON SCHEMAS\t{}", cli_output::SCHEMA);
-    println!("JSON COMMANDS\t{}", JSON_COMMANDS.join(","));
+    println!("JSON COMMANDS\t{}", json_commands.join(","));
     println!("FEATURES\t{}", INTEGRATION_FEATURES.join(","));
     println!(
         "SESSION TRANSCRIPT INTEGRATIONS\t{}",
@@ -2418,7 +2476,7 @@ fn list_shells(json: bool) -> Result<(), Box<dyn Error>> {
                     .map(|shell| cli_output::shell(shell, Some(&workspace.name)))
             })
             .collect::<Vec<_>>();
-        return cli_output::print("list", serde_json::json!({ "shells": shells }));
+        return print_json(CommandKey::List, serde_json::json!({ "shells": shells }));
     }
     println!("WORKSPACE\tNAME\tSHELL ID\tRUN ID\tSTATUS");
     for workspace in snapshot.workspaces {
@@ -2461,8 +2519,8 @@ fn workspace_command(
                         }
                     })
                     .collect::<Vec<_>>();
-                return cli_output::print(
-                    "workspace.list",
+                return print_json(
+                    CommandKey::WorkspaceList,
                     serde_json::json!({ "workspaces": workspaces }),
                 );
             }
@@ -2511,8 +2569,8 @@ fn workspace_command(
                     .iter()
                     .map(|shell| cli_output::shell(shell, Some(&workspace.name)))
                     .collect::<Vec<_>>();
-                return cli_output::print(
-                    "workspace.inspect",
+                return print_json(
+                    CommandKey::WorkspaceInspect,
                     serde_json::json!({
                         "workspace": {
                             "id": workspace.id,
@@ -2646,8 +2704,8 @@ fn shell_command(command: ShellCommands, json: bool) -> Result<(), Box<dyn Error
                     cli_output::failure("not_found", "shell workspace no longer exists")
                 })?;
             if json {
-                return cli_output::print(
-                    "shell.inspect",
+                return print_json(
+                    CommandKey::ShellInspect,
                     serde_json::json!({
                         "shell": cli_output::shell(shell, Some(&workspace.name)),
                     }),
@@ -2707,8 +2765,8 @@ fn launcher_command(command: LauncherCommands, json: bool) -> Result<(), Box<dyn
                     .iter()
                     .map(|launcher| cli_output::launcher(launcher, Some(&workspace.name)))
                     .collect::<Vec<_>>();
-                return cli_output::print(
-                    "launcher.list",
+                return print_json(
+                    CommandKey::LauncherList,
                     serde_json::json!({
                         "workspace_id": workspace.id,
                         "workspace_name": workspace.name,
@@ -2760,8 +2818,8 @@ fn launcher_command(command: LauncherCommands, json: bool) -> Result<(), Box<dyn
                     cli_output::failure("not_found", "launcher workspace no longer exists")
                 })?;
             if json {
-                return cli_output::print(
-                    "launcher.inspect",
+                return print_json(
+                    CommandKey::LauncherInspect,
                     serde_json::json!({
                         "launcher": cli_output::launcher(launcher, Some(&workspace.name)),
                     }),
@@ -2814,7 +2872,10 @@ fn agent_command(command: AgentCommands, json: bool) -> Result<(), Box<dyn Error
                             .map(|agent| cli_output::agent(agent, Some(&workspace.name)))
                     })
                     .collect::<Vec<_>>();
-                return cli_output::print("agent.list", serde_json::json!({ "agents": agents }));
+                return print_json(
+                    CommandKey::AgentList,
+                    serde_json::json!({ "agents": agents }),
+                );
             }
             println!("WORKSPACE\tNAME\tAGENT ID\tSHELL ID\tRUN ID\tSTATE\tCONFIDENCE");
             for workspace in workspaces {
@@ -2836,8 +2897,8 @@ fn agent_command(command: AgentCommands, json: bool) -> Result<(), Box<dyn Error
             let agent = client.get_agent(agent_id)?;
             let workspace = client.get_workspace(&agent.workspace_id)?;
             if json {
-                return cli_output::print(
-                    "agent.inspect",
+                return print_json(
+                    CommandKey::AgentInspect,
                     serde_json::json!({
                         "agent": cli_output::agent(&agent, Some(&workspace.name)),
                     }),
@@ -2853,8 +2914,8 @@ fn agent_command(command: AgentCommands, json: bool) -> Result<(), Box<dyn Error
             let waited = client.wait_agent(agent_id, after_revision, wait_ms)?;
             if json {
                 let workspace = client.get_workspace(&waited.agent.workspace_id)?;
-                return cli_output::print(
-                    "agent.wait",
+                return print_json(
+                    CommandKey::AgentWait,
                     serde_json::json!({
                         "changed": waited.changed,
                         "agent": cli_output::agent(&waited.agent, Some(&workspace.name)),
@@ -2916,8 +2977,8 @@ fn agent_command(command: AgentCommands, json: bool) -> Result<(), Box<dyn Error
             )?;
             if json {
                 let workspace = client.get_workspace(&agent.workspace_id)?;
-                return cli_output::print(
-                    "agent.report",
+                return print_json(
+                    CommandKey::AgentReport,
                     serde_json::json!({
                         "agent": cli_output::agent(&agent, Some(&workspace.name)),
                     }),
@@ -2971,8 +3032,8 @@ fn attention_command(command: AttentionCommands, json: bool) -> Result<(), Box<d
                         })
                     })
                     .collect::<Vec<_>>();
-                return cli_output::print(
-                    "attention.list",
+                return print_json(
+                    CommandKey::AttentionList,
                     serde_json::json!({ "attention": attention }),
                 );
             }
@@ -3006,8 +3067,8 @@ fn attention_command(command: AttentionCommands, json: bool) -> Result<(), Box<d
                 client.acknowledge_agent_attention(agent_id, observation_revision)?;
             if json {
                 let workspace = client.get_workspace(&acknowledged.agent.workspace_id)?;
-                return cli_output::print(
-                    "attention.acknowledge",
+                return print_json(
+                    CommandKey::AttentionAcknowledge,
                     serde_json::json!({
                         "changed": acknowledged.changed,
                         "agent": cli_output::agent(&acknowledged.agent, Some(&workspace.name)),
@@ -3050,8 +3111,8 @@ fn session_command(command: SessionCommands, json: bool) -> Result<(), Box<dyn E
                     .iter()
                     .map(|session| cli_output::session_summary(session))
                     .collect::<Vec<_>>();
-                return cli_output::print(
-                    "session.list",
+                return print_json(
+                    CommandKey::SessionList,
                     serde_json::json!({ "sessions": sessions }),
                 );
             }
@@ -3096,8 +3157,8 @@ fn session_command(command: SessionCommands, json: bool) -> Result<(), Box<dyn E
                 }
             };
             if json {
-                return cli_output::print(
-                    "session.inspect",
+                return print_json(
+                    CommandKey::SessionInspect,
                     serde_json::json!({ "session": cli_output::session(session) }),
                 );
             }
@@ -3135,8 +3196,8 @@ fn session_command(command: SessionCommands, json: bool) -> Result<(), Box<dyn E
             )
             .map_err(|error| cli_output::failure(error.code, error.to_string()))?;
             if json {
-                return cli_output::print(
-                    "session.read",
+                return print_json(
+                    CommandKey::SessionRead,
                     serde_json::json!({ "transcript": transcript }),
                 );
             }
@@ -3364,11 +3425,11 @@ fn register_or_ensure_agent(
     };
     if json {
         let workspace = client.get_workspace(&agent.workspace_id)?;
-        return cli_output::print(
+        return print_json(
             if ensure {
-                "agent.ensure"
+                CommandKey::AgentEnsure
             } else {
-                "agent.register"
+                CommandKey::AgentRegister
             },
             serde_json::json!({
                 "agent": cli_output::agent(&agent, Some(&workspace.name)),
@@ -3462,8 +3523,8 @@ fn list_workspace_shells(json: bool) -> Result<(), Box<dyn Error>> {
             .iter()
             .map(|shell| cli_output::shell(shell, Some(&workspace.name)))
             .collect::<Vec<_>>();
-        return cli_output::print(
-            "shells",
+        return print_json(
+            CommandKey::Shells,
             serde_json::json!({
                 "workspace_id": workspace.id,
                 "workspace_name": workspace.name,
@@ -3495,8 +3556,8 @@ fn read_events(
     let cursor = format_event_cursor(&batch.cursor);
     if json {
         let snapshot = batch.snapshot.map(json_snapshot).transpose()?;
-        return cli_output::print(
-            "events",
+        return print_json(
+            CommandKey::Events,
             serde_json::json!({
                 "stream_id": batch.stream_id,
                 "cursor": cursor,
@@ -3600,8 +3661,8 @@ fn read_shell(
         )?;
         let output = recent_lines(&String::from_utf8_lossy(&state.bytes), lines as usize);
         if json {
-            return cli_output::print(
-                "read",
+            return print_json(
+                CommandKey::Read,
                 serde_json::json!({
                     "shell_id": shell.id,
                     "run_id": state.run_id,
@@ -4493,12 +4554,12 @@ mod tests {
         ] {
             let cli = Cli::try_parse_from(arguments).unwrap();
             assert!(cli.json);
-            assert!(supports_json(&cli));
+            assert_eq!(cli.command_descriptor().output, OutputMode::Json);
         }
         let cli = Cli::try_parse_from(["boomux", "workspace", "create", "test", "--json"]).unwrap();
-        assert!(!supports_json(&cli));
+        assert_eq!(cli.command_descriptor().output, OutputMode::HumanOnly);
         let cli = Cli::try_parse_from(["boomux", "opencode", "install", "--json"]).unwrap();
-        assert!(!supports_json(&cli));
+        assert_eq!(cli.command_descriptor().output, OutputMode::HumanOnly);
         assert!(
             Cli::try_parse_from([
                 "boomux",
@@ -4698,8 +4759,8 @@ mod tests {
             "--json",
         ])
         .unwrap();
-        assert_eq!(command_name(&ensure), "agent.ensure");
-        assert!(supports_json(&ensure));
+        assert_eq!(ensure.command_descriptor().key, "agent.ensure");
+        assert_eq!(ensure.command_descriptor().output, OutputMode::Json);
 
         let cli = Cli::try_parse_from([
             "boomux",
@@ -4710,10 +4771,10 @@ mod tests {
             "--json",
         ])
         .unwrap();
-        assert!(supports_json(&cli));
+        assert_eq!(cli.command_descriptor().output, OutputMode::Json);
         let cli = Cli::try_parse_from(["boomux", "agent", "get", "a1", "--json"]).unwrap();
-        assert_eq!(command_name(&cli), "agent.inspect");
-        assert!(supports_json(&cli));
+        assert_eq!(cli.command_descriptor().key, "agent.inspect");
+        assert_eq!(cli.command_descriptor().output, OutputMode::Json);
         let cli = Cli::try_parse_from([
             "boomux",
             "agent",
@@ -4726,8 +4787,8 @@ mod tests {
             "--json",
         ])
         .unwrap();
-        assert_eq!(command_name(&cli), "agent.wait");
-        assert!(supports_json(&cli));
+        assert_eq!(cli.command_descriptor().key, "agent.wait");
+        assert_eq!(cli.command_descriptor().output, OutputMode::Json);
         assert!(matches!(
             cli.command,
             Some(Commands::Agent {
@@ -4754,8 +4815,8 @@ mod tests {
             "--json",
         ])
         .unwrap();
-        assert_eq!(command_name(&cli), "agent.report");
-        assert!(supports_json(&cli));
+        assert_eq!(cli.command_descriptor().key, "agent.report");
+        assert_eq!(cli.command_descriptor().output, OutputMode::Json);
         let register = Cli::try_parse_from([
             "boomux",
             "agent",
@@ -4774,8 +4835,8 @@ mod tests {
             "--json",
         ])
         .unwrap();
-        assert_eq!(command_name(&register), "agent.register");
-        assert!(supports_json(&register));
+        assert_eq!(register.command_descriptor().key, "agent.register");
+        assert_eq!(register.command_descriptor().output, OutputMode::Json);
         assert!(
             Cli::try_parse_from([
                 "boomux",
@@ -4829,8 +4890,8 @@ mod tests {
             "literal; argument",
         ])
         .unwrap();
-        assert_eq!(command_name(&supervise), "agent.supervise");
-        assert!(!supports_json(&supervise));
+        assert_eq!(supervise.command_descriptor().key, "agent.supervise");
+        assert_eq!(supervise.command_descriptor().output, OutputMode::HumanOnly);
         assert!(matches!(
             supervise.command,
             Some(Commands::Agent {
@@ -4864,8 +4925,8 @@ mod tests {
             "--json",
         ])
         .unwrap();
-        assert_eq!(command_name(&list), "attention.list");
-        assert!(supports_json(&list));
+        assert_eq!(list.command_descriptor().key, "attention.list");
+        assert_eq!(list.command_descriptor().output, OutputMode::Json);
 
         let acknowledge = Cli::try_parse_from([
             "boomux",
@@ -4877,8 +4938,11 @@ mod tests {
             "--json",
         ])
         .unwrap();
-        assert_eq!(command_name(&acknowledge), "attention.acknowledge");
-        assert!(supports_json(&acknowledge));
+        assert_eq!(
+            acknowledge.command_descriptor().key,
+            "attention.acknowledge"
+        );
+        assert_eq!(acknowledge.command_descriptor().output, OutputMode::Json);
         assert_eq!(
             sanitize_table_cell("approval\tneeded\nnow\u{7}"),
             "approval needed now "
@@ -4888,8 +4952,8 @@ mod tests {
     #[test]
     fn parses_notification_test_commands_without_json_support() {
         let blocked = Cli::try_parse_from(["boomux", "notification", "test", "blocked"]).unwrap();
-        assert_eq!(command_name(&blocked), "notification.test");
-        assert!(!supports_json(&blocked));
+        assert_eq!(blocked.command_descriptor().key, "notification.test");
+        assert_eq!(blocked.command_descriptor().output, OutputMode::HumanOnly);
         assert!(matches!(
             blocked.command,
             Some(Commands::Notification {
@@ -4925,8 +4989,8 @@ mod tests {
             "--json",
         ])
         .unwrap();
-        assert_eq!(command_name(&list), "session.list");
-        assert!(supports_json(&list));
+        assert_eq!(list.command_descriptor().key, "session.list");
+        assert_eq!(list.command_descriptor().output, OutputMode::Json);
         assert!(matches!(
             list.command,
             Some(Commands::Session {
@@ -4938,8 +5002,8 @@ mod tests {
 
         let inspect =
             Cli::try_parse_from(["boomux", "session", "get", "opaque", "--json"]).unwrap();
-        assert_eq!(command_name(&inspect), "session.inspect");
-        assert!(supports_json(&inspect));
+        assert_eq!(inspect.command_descriptor().key, "session.inspect");
+        assert_eq!(inspect.command_descriptor().output, OutputMode::Json);
 
         let read = Cli::try_parse_from([
             "boomux",
@@ -4955,8 +5019,8 @@ mod tests {
             "--json",
         ])
         .unwrap();
-        assert_eq!(command_name(&read), "session.read");
-        assert!(supports_json(&read));
+        assert_eq!(read.command_descriptor().key, "session.read");
+        assert_eq!(read.command_descriptor().output, OutputMode::Json);
         assert!(matches!(
             read.command,
             Some(Commands::Session {
@@ -5765,7 +5829,7 @@ mod tests {
                 command: IntegrationCommands::List
             })
         ));
-        assert_eq!(command_name(&list), "integration.list");
+        assert_eq!(list.command_descriptor().key, "integration.list");
 
         let status = Cli::try_parse_from(["boomux", "integration", "status", "pi"]).unwrap();
         assert!(matches!(
@@ -5776,7 +5840,7 @@ mod tests {
                 }
             })
         ));
-        assert_eq!(command_name(&status), "integration.status");
+        assert_eq!(status.command_descriptor().key, "integration.status");
 
         let install =
             Cli::try_parse_from(["boomux", "integration", "install", "opencode", "--force"])
@@ -5792,7 +5856,7 @@ mod tests {
                 }
             })
         ));
-        assert_eq!(command_name(&install), "integration.install");
+        assert_eq!(install.command_descriptor().key, "integration.install");
 
         let preview = Cli::try_parse_from([
             "boomux",
@@ -5814,7 +5878,7 @@ mod tests {
                 }
             })
         ));
-        assert!(supports_json(&preview));
+        assert_eq!(preview.command_descriptor().output, OutputMode::Json);
 
         let uninstall = Cli::try_parse_from([
             "boomux",
@@ -5835,8 +5899,8 @@ mod tests {
                 }
             })
         ));
-        assert_eq!(command_name(&uninstall), "integration.uninstall");
-        assert!(supports_json(&uninstall));
+        assert_eq!(uninstall.command_descriptor().key, "integration.uninstall");
+        assert_eq!(uninstall.command_descriptor().output, OutputMode::Json);
 
         let setup =
             Cli::try_parse_from(["boomux", "integration", "setup", "pi", "--yes", "--force"])
@@ -5851,8 +5915,8 @@ mod tests {
                 }
             })
         ));
-        assert_eq!(command_name(&setup), "integration.setup");
-        assert!(!supports_json(&setup));
+        assert_eq!(setup.command_descriptor().key, "integration.setup");
+        assert_eq!(setup.command_descriptor().output, OutputMode::HumanOnly);
 
         assert!(Cli::try_parse_from(["boomux", "integration", "install", "--all"]).is_ok());
         assert!(Cli::try_parse_from(["boomux", "integration", "install"]).is_err());
@@ -5880,8 +5944,8 @@ mod tests {
                 }
             }) if shell == "s1"
         ));
-        assert_eq!(command_name(&verify), "integration.verify");
-        assert!(supports_json(&verify));
+        assert_eq!(verify.command_descriptor().key, "integration.verify");
+        assert_eq!(verify.command_descriptor().output, OutputMode::Json);
     }
 
     #[test]
@@ -6072,6 +6136,7 @@ mod tests {
 
     #[test]
     fn capabilities_advertise_phase_two_agent_integration_surface() {
+        let json_commands = json_commands().collect::<Vec<_>>();
         for command in [
             "agent.register",
             "agent.ensure",
@@ -6080,10 +6145,10 @@ mod tests {
             "attention.list",
             "attention.acknowledge",
         ] {
-            assert!(JSON_COMMANDS.contains(&command));
+            assert!(json_commands.contains(&command));
         }
         for command in ["session.list", "session.inspect", "session.read"] {
-            assert!(JSON_COMMANDS.contains(&command));
+            assert!(json_commands.contains(&command));
         }
         for command in [
             "integration.list",
@@ -6092,7 +6157,7 @@ mod tests {
             "integration.uninstall",
             "integration.verify",
         ] {
-            assert!(JSON_COMMANDS.contains(&command));
+            assert!(json_commands.contains(&command));
         }
         for feature in [
             "protocol_10",
@@ -6130,6 +6195,51 @@ mod tests {
             ["opencode", "pi"]
         );
         assert_eq!(protocol::PROTOCOL_VERSION, 20);
+    }
+
+    #[test]
+    fn command_descriptors_have_unique_names_and_drive_json_capabilities() {
+        let mut names = CommandKey::ALL
+            .iter()
+            .map(|key| key.descriptor().key)
+            .collect::<Vec<_>>();
+        let command_count = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), command_count);
+
+        assert_eq!(
+            json_commands().collect::<Vec<_>>(),
+            [
+                "capabilities",
+                "list",
+                "shells",
+                "read",
+                "events",
+                "workspace.list",
+                "workspace.inspect",
+                "shell.inspect",
+                "launcher.list",
+                "launcher.inspect",
+                "agent.list",
+                "agent.inspect",
+                "agent.register",
+                "agent.ensure",
+                "agent.report",
+                "agent.wait",
+                "attention.list",
+                "attention.acknowledge",
+                "integration.list",
+                "integration.status",
+                "integration.install",
+                "integration.uninstall",
+                "integration.verify",
+                "session.list",
+                "session.inspect",
+                "session.read",
+                "daemon.status",
+            ]
+        );
     }
 
     #[test]
