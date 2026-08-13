@@ -1,5 +1,52 @@
 # Architecture
 
+> **Status: Current reference.** This document describes the implemented
+> architecture. `CONTEXT.md` is authoritative for domain terminology; source and
+> compatibility tests are authoritative for exact protocol and state versions.
+
+## Module Ownership
+
+| Path | Responsibility |
+| --- | --- |
+| `src/main.rs` | CLI schema, process composition, command dispatch, and snapshot-to-UI orchestration |
+| `src/protocol.rs` | Versioned control and attachment wire models, framing, and request version requirements |
+| `src/client.rs` | Daemon discovery/startup, protocol negotiation, typed management requests, and attachment setup |
+| `src/daemon.rs` | Runtime authority for workspaces, shells, agents, PTYs, processes, events, persistence coordination, and handoff |
+| `src/state_store.rs` | Versioned durable schemas, validation, atomic state storage, and migrations |
+| `src/handoff.rs`, `src/fd_transfer.rs` | Graceful daemon replacement records and Unix descriptor transfer |
+| `src/attach.rs` | Terminal-side raw mode, control frames, live input/output, resize, focus, and reconnect handling |
+| `src/terminal.rs` | Selection and launch of native terminal windows through `xdg-terminal-exec` |
+| `src/terminal_state.rs` | Shadow VT parsing, bounded reconstruction, logical output, and structured previews |
+| `src/terminal_focus.rs` | Stateful parsing and restoration of child focus-reporting mode |
+| `src/tui.rs` | Dashboard state, interaction, palette, polling, and Ratatui rendering; no direct daemon transport |
+| `src/session_projection.rs` | Projection of daemon Agent state and host catalogs into client-visible sessions |
+| `src/host_session_titles.rs` and children | Shared title/catalog policy and host-specific discovery adapters |
+| `src/host_session_source.rs` and children | Canonical host source paths, normalization, and secure source lookup |
+| `src/session_transcript.rs` and children | Shared transcript identity, bounds, pagination, and host-specific normalization |
+| `src/integration_management.rs` | Integration inventory, status, setup, verification, install, and uninstall workflows |
+| `src/process_adapter.rs` | Exact-argv child supervision and fail-open process-bound Agent observation |
+| `src/config.rs`, `src/projects.rs`, `src/git.rs` | Layered configuration, bounded project discovery, and asynchronous Git metadata |
+| `src/cli_output.rs` | Stable `boomux.cli/v1` output and error presentation |
+| `src/desktop_notifications.rs` | Bounded fail-open desktop and sound delivery |
+
+## Invariant Index
+
+- **Durable identity and lifecycle:** `CONTEXT.md` and the Protocol section below.
+  Primary coverage lives in protocol, daemon, state-store, and native-backend
+  tests.
+- **Persistence before event publication:** Transition Coordinator below and
+  [`event-stream.md`](event-stream.md).
+- **Single PTY reader during replacement:**
+  [`live-pty-handoff.md`](live-pty-handoff.md), enforced by handoff and native
+  replacement tests.
+- **Exact run binding and Agent authority:** Agent runtime sections below and
+  `CONTEXT.md`; process exit never implies Agent completion.
+- **Ephemeral attachment environment:** Daemon and Runtime Semantics sections
+  below; startup environment is validated but never persisted or projected.
+- **Exact argument vectors:** workspace launchers, process adapters, terminal
+  launch, and integration management execute argv directly without shell
+  interpretation.
+
 ## Product Boundary
 
 Boomux is a native-terminal session manager, not a terminal emulator or an
@@ -342,8 +389,9 @@ bundled harnesses, inspect host versions, assets, and current-run lifecycle
 reporting, and install one or all assets with each write atomic and accompanied
 by reload guidance.
 Individual host installers remain equivalent shortcuts over the same registry
-and safe primitives. Guided consent, end-to-end verification, and uninstall
-remain future workflow additions.
+and safe primitives. `integration setup` provides guided consent and reload
+guidance, `integration verify` checks current-run authoritative lifecycle
+reporting, and `integration uninstall` safely removes one or all managed assets.
 
 Observed host compatibility and provider-dependent gaps are recorded in
 [`lifecycle-validation.md`](lifecycle-validation.md). Focused unit fixtures
@@ -499,6 +547,13 @@ controller for the current shell run, and uses a monotonic revision so clients
 can distinguish a later refocus of the same shell. Protocol-17 responses omit
 the additive field. Graceful handoff transfers a still-current focus target;
 cold daemon recovery clears it.
+
+Protocol 19 adds optional workspace default working directories and shell
+creation without an explicit workspace. Older responses omit the additive
+workspace field, and requests using either new behavior require protocol 19.
+Protocol 20 adds bounded structured terminal previews, including styles and
+modifiers, so the dashboard can render colors and emphasis without replaying
+terminal control sequences. Older clients continue to use plain rendered reads.
 
 Opt-in desktop and sound notifications are a daemon-owned projection of committed
 Agent state transitions, not durable queue state. A transition from any other

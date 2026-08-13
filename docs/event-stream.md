@@ -1,5 +1,9 @@
 # Daemon Event Stream
 
+> **Status: Current protocol contract.** Source and compatibility tests are
+> authoritative for exact version gates; this document defines event and cursor
+> semantics.
+
 Boomux protocol 7 added bounded long polling for daemon events and atomic,
 revision-aware terminal reads. Protocol 9 adds run-scoped agent snapshots and
 events while retaining negotiation with older management clients. Protocol 10

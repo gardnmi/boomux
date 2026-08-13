@@ -1,5 +1,8 @@
 # CLI JSON Contract
 
+> **Status: Current stable contract.** Incompatible output requires a new schema
+> value; human-readable output is not a parsing contract.
+
 Boomux exposes a versioned JSON contract for integrations. Human output remains
 the default; pass `--json` to a supported command to emit one
 JSON document on stdout:

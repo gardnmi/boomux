@@ -1,8 +1,8 @@
 # Roadmap
 
-Boomux is under active development. This document tracks shipped capabilities
-and possible directions for exploration; future ideas are not release
-commitments.
+> **Status: Non-authoritative roadmap.** This document tracks shipped work and
+> possible exploration. Future ideas are not release commitments and do not
+> override `CONTEXT.md`, `architecture.md`, source, or tests.
 
 ## Completed
 
@@ -112,7 +112,7 @@ eternal process.
    root/subagent aggregation where available, blocked prompts, idle transitions,
    explicit completion semantics, and graceful daemon replacement against real
    sessions.
-2. [In progress] Build a first-class integration setup workflow that discovers supported
+2. [Complete] Build a first-class integration setup workflow that discovers supported
    installed harnesses, explains why authoritative lifecycle access is required,
    previews and obtains consent for configuration changes, installs or updates
    each integration safely, prompts for required harness reloads, and verifies
@@ -120,8 +120,8 @@ eternal process.
    version compatibility, diagnostics, repair, and uninstall paths so stronger
    guarantees do not require users to manage plugin files manually.
    Unified list, status, host-version detection, runtime registration diagnosis,
-   and atomic single/all installation are complete; guided verification,
-   consented previews, repair guidance, and uninstall remain.
+   atomic single/all installation, guided setup, current-run verification,
+   repair guidance, and uninstall are complete.
 3. [Complete] Aggregate agent states into workspace counts and add an explainable,
    persistent attention queue for blocked and completed work.
 4. [Complete] Add revision-aware `agent wait` so scripts can await durable state
