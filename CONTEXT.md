@@ -1,5 +1,8 @@
 # Domain Glossary
 
+> **Status: Canonical terminology.** These product distinctions govern naming
+> and semantics even when implementation names are less precise.
+
 ## Workspace Launcher
 
 A durable detached argument-vector command associated with a workspace and invoked on every

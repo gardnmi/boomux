@@ -1,5 +1,8 @@
 # Lifecycle Integration Validation
 
+> **Status: Version-specific validation record.** This is observed compatibility
+> evidence for the named host and Boomux versions, not a timeless host contract.
+
 This record separates observed host behavior from reducer fixtures and intended
 semantics. Host compatibility is not inferred from process names, terminal
 output, or database recency.

@@ -2,14 +2,20 @@
 
 Date: 2026-08-03
 
+> **Status: Historical implementation plan.** The terminal handshake, VT
+> reconstruction, persistence, and graceful handoff phases are implemented.
+> Current behavior is documented in `architecture.md`; the manual matrix and
+> unresolved emulator/performance questions remain useful validation context.
+
 ## Purpose
 
 Boomux owns its PTYs and shell processes. Live attachment is transparent, and
 the terminal initialization, reconstruction, persistence, and graceful handoff
 phases described here are implemented.
 
-This document records the remaining work needed to make Boomux shells behave
-consistently in Ghostty, Alacritty, Kitty, and other XDG terminal emulators.
+This document records the implementation plan and the remaining validation work
+for consistent behavior in Ghostty, Alacritty, Kitty, and other XDG terminal
+emulators.
 
 ## Current Status
 
@@ -78,11 +84,11 @@ only after the application decides to emit it.
 The PTY begins with the first attachment's rows, columns, pixel width, and pixel
 height. Pixel dimensions may remain zero when the terminal does not report them.
 
-## Phase 1: Terminal Handshake
+## Phase 1: Terminal Handshake (Complete)
 
-### Target Sequence
+### Implemented Sequence
 
-Change shell creation to a two-stage operation:
+Shell creation uses this two-stage operation:
 
 ```text
 create pending shell metadata
@@ -95,7 +101,7 @@ create pending shell metadata
 
 ### Protocol Model
 
-The initial attachment request should include a bounded, explicit profile:
+The initial attachment request includes a bounded, explicit profile:
 
 ```rust
 struct TerminalProfile {
@@ -110,16 +116,17 @@ struct TerminalProfile {
 }
 ```
 
-Forward the attachment client's environment only in the startup request that
-can create a new run. Preserve Unix bytes, reject invalid names, duplicates, and
-NUL bytes, redact the payload from debug output, and never persist it.
+The attachment client's environment is forwarded only in the startup request
+that can create a new run. Boomux preserves Unix bytes, rejects invalid names,
+duplicates, and NUL bytes, redacts the payload from debug output, and never
+persists it.
 
 Read cell and pixel dimensions from `TIOCGWINSZ` on Unix. Pixel dimensions may
 legitimately remain zero when the emulator or kernel does not report them.
 
 ### Shell Lifecycle
 
-Extend the shell state model:
+The shell state model is:
 
 ```text
 Pending -> Running -> Exited
@@ -166,9 +173,8 @@ testing shows that warnings are insufficient.
 
 ### Product Decision
 
-Workspace creation must remain empty. A future explicit shell creation or first
-attachment can create pending shell metadata and delay the command until a
-terminal profile is available.
+Workspace creation remains empty. Explicit shell creation creates pending shell
+metadata and delays the command until a terminal profile is available.
 
 Boomux uses option 2:
 
@@ -181,7 +187,7 @@ Boomux uses option 2:
 Pending shells remain visible and retryable until opened. Headless startup is
 not supported without a concrete terminal profile.
 
-## Phase 2: VT Reconnection State
+## Phase 2: VT Reconnection State (Implemented; Performance Validation Open)
 
 ### Implementation
 
@@ -199,9 +205,9 @@ styles, modes, and the current alternate screen. Known limits remain for:
 Historical OSC title, notification, hyperlink, and clipboard commands are
 intentionally omitted so reconnection cannot repeat their side effects.
 
-### Target Data Flow
+### Implemented Data Flow
 
-Keep the native live path unchanged and parse a shadow copy:
+The native live path remains unchanged while Boomux parses a shadow copy:
 
 ```text
 PTY output
@@ -247,7 +253,8 @@ effects merely to reconstruct presentation.
 - Truncation never begins by emitting an incomplete escape sequence.
 - Live Kitty graphics, Sixel, hyperlinks, and OSC behavior remain unchanged.
 - `boomux read` returns plain logical lines without ANSI escape sequences.
-- Slow parsing cannot block the PTY reader or child process.
+- [Open] Profile whether synchronous shadow parsing creates meaningful PTY
+  backpressure and move it off the reader if necessary.
 
 ### Open Engineering Decisions
 
@@ -255,7 +262,7 @@ effects merely to reconstruct presentation.
 - Evaluate moving shadow parsing off the PTY reader if profiling shows meaningful
   backpressure.
 
-## Phase 3: Restart Persistence
+## Phase 3: Restart Persistence (Complete)
 
 The daemon atomically persists versioned JSON state at
 `$XDG_STATE_HOME/boomux/state.json`, with the XDG default
@@ -265,7 +272,8 @@ Persist only reproducible metadata under `$XDG_STATE_HOME/boomux`:
 
 - Workspace and shell IDs
 - Workspace and shell names and grouping
-- Shell working directories; workspaces have no path
+- Workspace default working directories and authoritative per-shell working
+  directories
 - Explicit shell startup commands
 - Last terminal profile when useful for diagnostics
 

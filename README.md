@@ -388,13 +388,19 @@ Revision-aware output reads and daemon event cursors are documented in
 
 ## Further Documentation
 
+- [Domain glossary](CONTEXT.md)
 - [Architecture](docs/architecture.md)
 - [CLI JSON contract](docs/cli-json.md)
 - [Daemon events and revision-aware reads](docs/event-stream.md)
 - [Live PTY handoff](docs/live-pty-handoff.md)
 - [Integration lifecycle validation](docs/lifecycle-validation.md)
+- [Roadmap](docs/roadmap.md)
 
 ## Development
+
+Contributors should begin with [`AGENTS.md`](AGENTS.md) for documentation
+authority, module ownership, compatibility checklists, safety guidance, and the
+CI-equivalent validation commands.
 
 ```console
 cargo run

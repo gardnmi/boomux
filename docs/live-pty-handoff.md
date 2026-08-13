@@ -1,5 +1,9 @@
 # Live PTY Handoff
 
+> **Status: Current invariant reference and completed delivery record.** The
+> invariants and transfer behavior are current; all delivery slices below are
+> implemented.
+
 ## Goal
 
 Replace the Boomux daemon without terminating running shell processes or ending
@@ -20,7 +24,7 @@ handoff is an explicit, acknowledged upgrade path.
 
 ## Transfer Manifest
 
-The private handoff channel will carry a versioned manifest followed by Unix
+The private handoff channel carries a versioned manifest followed by Unix
 `SCM_RIGHTS` descriptors:
 
 - Existing listener socket
