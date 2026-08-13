@@ -23,7 +23,7 @@ const BLUE: Color = Color::Blue;
 const GREEN: Color = Color::Green;
 const YELLOW: Color = Color::Yellow;
 const RED: Color = Color::Red;
-const REFRESH_INTERVAL: Duration = Duration::from_millis(250);
+const UPDATE_CHECK_INTERVAL: Duration = Duration::from_millis(250);
 const TERMINAL_PREVIEW_ROWS: usize = 16;
 const TERMINAL_PREVIEW_SCROLL_STEP: usize = 12;
 const PREVIEW_RESERVED_ITEM_HEIGHT: u16 = 6;
@@ -62,6 +62,7 @@ pub(crate) struct WorkspaceView {
 pub(crate) struct DashboardState {
     pub(crate) workspaces: Vec<WorkspaceView>,
     pub(crate) focused_terminal: Option<FocusedTerminalView>,
+    pub(crate) reset_focus_revision: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -399,6 +400,7 @@ pub(crate) enum DashboardEffect {
         target: RenameTarget,
         name: String,
     },
+    CheckForUpdates,
     Refresh,
     ReadTerminalPreview {
         shell_id: String,
@@ -414,6 +416,7 @@ pub(crate) enum DashboardEvent {
     },
     RefreshElapsed,
     PreviewRequested,
+    UpdateCheckCompleted,
     OperationCompleted(Result<String, String>),
     RefreshCompleted(Result<DashboardState, String>),
     TerminalPreviewCompleted {
@@ -1494,10 +1497,11 @@ impl App {
             DashboardEvent::KeyPressed { code, modifiers } => {
                 return self.update_key(code, modifiers).into_iter().collect();
             }
-            DashboardEvent::RefreshElapsed => return vec![DashboardEffect::Refresh],
+            DashboardEvent::RefreshElapsed => return vec![DashboardEffect::CheckForUpdates],
             DashboardEvent::PreviewRequested => {
                 return self.terminal_preview_effect().into_iter().collect();
             }
+            DashboardEvent::UpdateCheckCompleted => {}
             DashboardEvent::OperationCompleted(result) => {
                 self.message = Some(Message::from_result(result));
                 return vec![DashboardEffect::Refresh];
@@ -1584,6 +1588,9 @@ impl App {
         match result {
             Ok(state) => {
                 self.replace_workspaces(state.workspaces);
+                if state.reset_focus_revision {
+                    self.observed_focus_revision = None;
+                }
                 self.apply_focused_terminal(state.focused_terminal.as_ref());
             }
             Err(text) => self.message = Some(Message { text, error: true }),
@@ -1852,7 +1859,7 @@ fn run_loop<B: DashboardBackend>(
 ) -> io::Result<()> {
     let mut last_refresh = Instant::now();
     loop {
-        if last_refresh.elapsed() >= REFRESH_INTERVAL {
+        if last_refresh.elapsed() >= UPDATE_CHECK_INTERVAL {
             let effects = app.update(DashboardEvent::RefreshElapsed);
             execute_effects(&mut app, &mut backend, effects);
             last_refresh = Instant::now();
@@ -5165,6 +5172,17 @@ mod tests {
                 .as_ref()
                 .is_some_and(|message| { message.error && message.text == "failed" })
         );
+    }
+
+    #[test]
+    fn idle_refresh_tick_checks_for_updates_without_requesting_a_snapshot() {
+        let mut app = app();
+
+        assert_eq!(
+            app.update(DashboardEvent::RefreshElapsed),
+            vec![DashboardEffect::CheckForUpdates]
+        );
+        assert!(app.update(DashboardEvent::UpdateCheckCompleted).is_empty());
     }
 
     #[test]

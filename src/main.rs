@@ -10,6 +10,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use clap::error::ErrorKind as ClapErrorKind;
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -41,6 +42,74 @@ mod session_projection;
 mod session_transcript;
 mod terminal;
 mod tui;
+
+const DASHBOARD_FALLBACK_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+
+struct DashboardRefresh {
+    watch: client::SnapshotWatch,
+    last_snapshot_at: Instant,
+}
+
+impl DashboardRefresh {
+    fn baseline(client: &client::Client) -> io::Result<Self> {
+        Ok(Self {
+            watch: client::SnapshotWatch::baseline(client)?,
+            last_snapshot_at: Instant::now(),
+        })
+    }
+
+    fn snapshot(&self) -> &Snapshot {
+        self.watch.snapshot()
+    }
+
+    fn check(&mut self, client: &client::Client) -> io::Result<Option<(Snapshot, bool)>> {
+        match self.watch.poll(client) {
+            Ok((changed, stream_changed)) => {
+                if changed {
+                    self.last_snapshot_at = Instant::now();
+                    return Ok(Some((self.watch.snapshot().clone(), stream_changed)));
+                }
+                if self.last_snapshot_at.elapsed() < DASHBOARD_FALLBACK_REFRESH_INTERVAL {
+                    return Ok(None);
+                }
+                if !self.watch.uses_events()
+                    || !client.supports(protocol::ProtocolFeature::FocusedTerminalRead)?
+                {
+                    *self = Self::baseline(client)?;
+                    return Ok(Some((self.watch.snapshot().clone(), false)));
+                }
+                self.refresh_ephemeral_fields(client)?;
+                self.last_snapshot_at = Instant::now();
+                Ok(Some((self.watch.snapshot().clone(), false)))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn refresh(&mut self, client: &client::Client) -> io::Result<(Snapshot, bool)> {
+        let stream_id = self.watch.stream_id().map(str::to_owned);
+        *self = Self::baseline(client)?;
+        Ok((
+            self.watch.snapshot().clone(),
+            self.watch.stream_id() != stream_id.as_deref(),
+        ))
+    }
+
+    fn refresh_ephemeral_fields(&mut self, client: &client::Client) -> io::Result<()> {
+        self.watch.snapshot_mut().focused_terminal = client.focused_terminal()?;
+        for shell in self
+            .watch
+            .snapshot_mut()
+            .workspaces
+            .iter_mut()
+            .flat_map(|workspace| &mut workspace.shells)
+            .filter(|shell| shell.status == ShellStatus::Running)
+        {
+            shell.foreground_process = client.get_shell(&shell.id)?.foreground_process;
+        }
+        Ok(())
+    }
+}
 
 const BOOMUX_SKILL: &str = include_str!("../.agents/skills/boomux/SKILL.md");
 #[cfg(test)]
@@ -1083,7 +1152,8 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
     let client = client::connect_or_start()?;
     let mut git_cache = git::Cache::default();
     let mut title_cache = host_session_titles::Cache::default();
-    let snapshot = client.snapshot()?;
+    let mut refresh = DashboardRefresh::baseline(&client)?;
+    let snapshot = refresh.snapshot().clone();
     let mut views =
         dashboard_views_with_catalog(&snapshot.workspaces, &mut git_cache, &mut title_cache);
     enrich_session_titles(&mut views, &mut title_cache);
@@ -1113,11 +1183,32 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
         tui::DashboardState {
             workspaces: views,
             focused_terminal: snapshot.focused_terminal.map(focused_terminal_view),
+            reset_focus_revision: false,
         },
         config.dashboard.follow_focused_terminal,
         project_context,
         |effect| match effect {
             tui::DashboardEffect::Quit => unreachable!("quit is handled by the dashboard runtime"),
+            tui::DashboardEffect::CheckForUpdates => {
+                let result = refresh.check(&client).map_err(|error| error.to_string());
+                match result {
+                    Ok(Some((snapshot, reset_focus_revision))) => {
+                        let mut views = dashboard_views_with_catalog(
+                            &snapshot.workspaces,
+                            &mut git_cache,
+                            &mut title_cache,
+                        );
+                        enrich_session_titles(&mut views, &mut title_cache);
+                        tui::DashboardEvent::RefreshCompleted(Ok(tui::DashboardState {
+                            workspaces: views,
+                            focused_terminal: snapshot.focused_terminal.map(focused_terminal_view),
+                            reset_focus_revision,
+                        }))
+                    }
+                    Ok(None) => tui::DashboardEvent::UpdateCheckCompleted,
+                    Err(error) => tui::DashboardEvent::RefreshCompleted(Err(error)),
+                }
+            }
             tui::DashboardEffect::RestoreWorkspace(workspace_id) => {
                 let result = (|| {
                     let workspace = client
@@ -1232,7 +1323,9 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
             }
             tui::DashboardEffect::Refresh => {
                 let result = (|| {
-                    let snapshot = client.snapshot().map_err(|error| error.to_string())?;
+                    let (snapshot, reset_focus_revision) = refresh
+                        .refresh(&client)
+                        .map_err(|error| error.to_string())?;
                     let mut views = dashboard_views_with_catalog(
                         &snapshot.workspaces,
                         &mut git_cache,
@@ -1242,6 +1335,7 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
                     Ok(tui::DashboardState {
                         workspaces: views,
                         focused_terminal: snapshot.focused_terminal.map(focused_terminal_view),
+                        reset_focus_revision,
                     })
                 })();
                 tui::DashboardEvent::RefreshCompleted(result)
@@ -5998,7 +6092,7 @@ mod tests {
             session_transcript::supported_integrations(),
             ["opencode", "pi"]
         );
-        assert_eq!(protocol::PROTOCOL_VERSION, 20);
+        assert_eq!(protocol::PROTOCOL_VERSION, 21);
     }
 
     #[test]

@@ -15,10 +15,10 @@ use std::time::Duration;
 
 use crate::protocol::{
     self, AgentInstanceSnapshot, AgentRegistrationSpec, AgentReport, DaemonEvent, Envelope,
-    ErrorCode, EventCursor, NotificationDeliveryConfig, Request, Response, ShellSnapshot,
-    ShellSpec, ShellStatus, Snapshot, TerminalPreview, TerminalPreviewLine, TerminalPreviewSpan,
-    TerminalProfile, UnixEnvironment, UnixEnvironmentVariable, WorkspaceLauncherSnapshot,
-    WorkspaceLauncherSpec, WorkspaceSnapshot,
+    ErrorCode, EventCursor, FocusedTerminalSnapshot, NotificationDeliveryConfig, Request, Response,
+    ShellSnapshot, ShellSpec, ShellStatus, Snapshot, TerminalPreview, TerminalPreviewLine,
+    TerminalPreviewSpan, TerminalProfile, UnixEnvironment, UnixEnvironmentVariable,
+    WorkspaceLauncherSnapshot, WorkspaceLauncherSpec, WorkspaceSnapshot,
 };
 
 const CONNECT_ATTEMPTS: usize = 40;
@@ -55,6 +55,73 @@ pub struct EventBatch {
     pub cursor: EventCursor,
     pub snapshot: Option<Snapshot>,
     pub events: Vec<DaemonEvent>,
+}
+
+#[derive(Debug)]
+pub struct SnapshotWatch {
+    cursor: Option<EventCursor>,
+    snapshot: Snapshot,
+}
+
+impl SnapshotWatch {
+    pub fn baseline(client: &Client) -> io::Result<Self> {
+        if !client.supports(protocol::ProtocolFeature::AtomicOutputReads)? {
+            return Ok(Self {
+                cursor: None,
+                snapshot: client.snapshot()?,
+            });
+        }
+        let batch = client.events(None, 1, 0)?;
+        let snapshot = batch
+            .snapshot
+            .ok_or_else(|| io::Error::other("event baseline omitted its snapshot"))?;
+        Ok(Self {
+            cursor: Some(batch.cursor),
+            snapshot,
+        })
+    }
+
+    pub fn snapshot(&self) -> &Snapshot {
+        &self.snapshot
+    }
+
+    pub fn snapshot_mut(&mut self) -> &mut Snapshot {
+        &mut self.snapshot
+    }
+
+    pub fn uses_events(&self) -> bool {
+        self.cursor.is_some()
+    }
+
+    pub fn poll(&mut self, client: &Client) -> io::Result<(bool, bool)> {
+        let Some(cursor) = self.cursor.clone() else {
+            return Ok((false, false));
+        };
+        let stream_id = cursor.stream_id.clone();
+        match client.events(Some(cursor), 256, 0) {
+            Ok(batch) => {
+                if batch.events.is_empty() {
+                    self.cursor = Some(batch.cursor);
+                    return Ok((false, false));
+                }
+                *self = Self::baseline(client)?;
+                Ok((true, self.stream_id() != Some(stream_id.as_str())))
+            }
+            Err(error) if remote_code(&error) == Some(ErrorCode::CursorExpired) => {
+                *self = Self::baseline(client)?;
+                Ok((true, self.stream_id() != Some(stream_id.as_str())))
+            }
+            Err(error) if remote_code(&error) == Some(ErrorCode::UnsupportedVersion) => {
+                *self = Self::baseline(client)?;
+                Ok((true, self.stream_id() != Some(stream_id.as_str())))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn stream_id(&self) -> Option<&str> {
+        self.cursor.as_ref().map(|cursor| cursor.stream_id.as_str())
+    }
 }
 
 #[derive(Debug)]
@@ -332,6 +399,13 @@ impl Client {
     pub fn snapshot(&self) -> io::Result<Snapshot> {
         match self.request(Request::Snapshot)? {
             Response::Snapshot { snapshot } => Ok(snapshot),
+            other => unexpected(other),
+        }
+    }
+
+    pub fn focused_terminal(&self) -> io::Result<Option<FocusedTerminalSnapshot>> {
+        match self.request(Request::GetFocusedTerminal)? {
+            Response::FocusedTerminal { focused_terminal } => Ok(focused_terminal),
             other => unexpected(other),
         }
     }
@@ -877,6 +951,27 @@ mod tests {
 
     use uuid::Uuid;
 
+    fn reject_protocol(listener: &UnixListener, attempted: u32, supported: u32) {
+        let (mut stream, _) = listener.accept().unwrap();
+        let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+        assert_eq!(request.version, attempted);
+        assert!(matches!(
+            request.message,
+            Request::Ping | Request::Attach { .. }
+        ));
+        protocol::write_message(
+            &mut stream,
+            &Envelope::with_version(
+                supported,
+                Response::Error {
+                    message: format!("protocol {attempted} unsupported"),
+                    code: Some(ErrorCode::UnsupportedVersion),
+                },
+            ),
+        )
+        .unwrap();
+    }
+
     fn test_profile() -> TerminalProfile {
         TerminalProfile {
             term: None,
@@ -897,6 +992,7 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
+            reject_protocol(&listener, 21, 20);
             let (mut stream, _) = listener.accept().unwrap();
             let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
             assert_eq!(request.version, 20);
@@ -1042,7 +1138,7 @@ mod tests {
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
-            assert_eq!(request.version, 20);
+            assert_eq!(request.version, 21);
             let Request::Attach {
                 environment: Some(environment),
                 ..
@@ -1059,7 +1155,7 @@ mod tests {
             protocol::write_message(
                 &mut stream,
                 &Envelope::with_version(
-                    20,
+                    21,
                     Response::Attached {
                         token: "token".into(),
                         reconstruction: Vec::new(),
@@ -1087,21 +1183,8 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
-            assert_eq!(request.version, 20);
-            assert!(matches!(request.message, Request::Attach { .. }));
-            protocol::write_message(
-                &mut stream,
-                &Envelope::with_version(
-                    20,
-                    Response::Error {
-                        message: "protocol 20 unsupported".into(),
-                        code: Some(ErrorCode::UnsupportedVersion),
-                    },
-                ),
-            )
-            .unwrap();
+            reject_protocol(&listener, 21, 20);
+            reject_protocol(&listener, 21, 20);
 
             let (mut stream, _) = listener.accept().unwrap();
             let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
@@ -1191,6 +1274,7 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
+            reject_protocol(&listener, 21, 20);
             let (mut stream, _) = listener.accept().unwrap();
             let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
             assert_eq!(request.version, 20);
@@ -1247,6 +1331,7 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
+            reject_protocol(&listener, 21, 20);
             let (mut stream, _) = listener.accept().unwrap();
             let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
             assert_eq!(request.version, 20);

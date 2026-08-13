@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 20;
+pub const PROTOCOL_VERSION: u32 = 21;
 pub const MIN_PROTOCOL_VERSION: u32 = 6;
 pub const MAX_CONTROL_FRAME: usize = 8 * 1024 * 1024;
 pub const MAX_ATTACH_FRAME: usize = 1024 * 1024;
@@ -77,6 +77,7 @@ define_protocol_features! {
     FocusedTerminal => (18, "request", ["protocol_18", "focused_terminal_following"]),
     WorkspaceDefaultCwd => (19, "request", ["protocol_19", "workspace_default_cwd"]),
     StructuredTerminalPreview => (20, "request", ["protocol_20", "structured_terminal_previews"]),
+    FocusedTerminalRead => (21, "request", ["protocol_21", "focused_terminal_read"]),
 }
 
 pub fn protocol_capabilities() -> impl Iterator<Item = &'static str> {
@@ -520,6 +521,7 @@ pub enum Request {
     },
     Shutdown,
     Snapshot,
+    GetFocusedTerminal,
     GetWorkspace {
         workspace_id: String,
     },
@@ -638,6 +640,7 @@ impl Request {
     pub fn required_feature(&self) -> Option<ProtocolFeature> {
         match self {
             Self::ReadShellPreview { .. } => Some(ProtocolFeature::StructuredTerminalPreview),
+            Self::GetFocusedTerminal => Some(ProtocolFeature::FocusedTerminalRead),
             Self::CreateWorkspace {
                 default_cwd: Some(_),
                 ..
@@ -704,6 +707,9 @@ pub enum Response {
     Pong,
     Snapshot {
         snapshot: Snapshot,
+    },
+    FocusedTerminal {
+        focused_terminal: Option<FocusedTerminalSnapshot>,
     },
     Workspace {
         workspace: WorkspaceSnapshot,
@@ -1125,8 +1131,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_twenty_with_minimum_six() {
-        assert_eq!(PROTOCOL_VERSION, 20);
+    fn protocol_version_is_twenty_one_with_minimum_six() {
+        assert_eq!(PROTOCOL_VERSION, 21);
         assert_eq!(MIN_PROTOCOL_VERSION, 6);
     }
 
@@ -1172,8 +1178,33 @@ mod tests {
     }
 
     #[test]
+    fn focused_terminal_read_round_trips() {
+        let request = serde_json::to_value(Request::GetFocusedTerminal).unwrap();
+        assert_eq!(request["request"], "get_focused_terminal");
+        assert_eq!(
+            serde_json::from_value::<Request>(request).unwrap(),
+            Request::GetFocusedTerminal
+        );
+        let response = Response::FocusedTerminal {
+            focused_terminal: Some(FocusedTerminalSnapshot {
+                revision: 1,
+                workspace_id: "w1".into(),
+                shell_id: "s1".into(),
+                run_id: "r1".into(),
+            }),
+        };
+        let encoded = serde_json::to_value(&response).unwrap();
+        assert_eq!(encoded["response"], "focused_terminal");
+        assert_eq!(
+            serde_json::from_value::<Response>(encoded).unwrap(),
+            response
+        );
+    }
+
+    #[test]
     fn request_feature_requirements_cover_all_groups() {
         let groups = vec![
+            (21, vec![Request::GetFocusedTerminal]),
             (
                 20,
                 vec![Request::ReadShellPreview {
@@ -1447,6 +1478,7 @@ mod tests {
             (18, &["protocol_18", "focused_terminal_following"][..]),
             (19, &["protocol_19", "workspace_default_cwd"][..]),
             (20, &["protocol_20", "structured_terminal_previews"][..]),
+            (21, &["protocol_21", "focused_terminal_read"][..]),
         ];
 
         let actual = ProtocolFeature::ALL
