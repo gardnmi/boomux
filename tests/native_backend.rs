@@ -3195,6 +3195,65 @@ fn workspace_launchers_persist_emit_events_and_open_without_shells() {
 }
 
 #[test]
+fn launcher_invoke_uses_tui_detached_process_semantics() {
+    let mut daemon = TestDaemon::start();
+    let workspace = daemon
+        .client
+        .create_workspace("launcher-cli", Vec::new())
+        .unwrap();
+    let output = daemon.runtime_dir.join("launcher-invoke-output");
+    let launcher = daemon
+        .client
+        .create_launcher(
+            &workspace.id,
+            WorkspaceLauncherSpec {
+                name: "capture".into(),
+                cwd: daemon.runtime_dir.clone(),
+                command: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "printf '%s|%s|%s|%s|%s|%s|%s|%s' \"$PWD\" \"$BOOMUX_WORKSPACE_ID\" \"$BOOMUX_WORKSPACE\" \"$BOOMUX_LAUNCHER_ID\" \"$BOOMUX_LAUNCHER_NAME\" \"$BOOMUX_INVOKE_TEST\" \"${BOOMUX_SHELL_ID-unset}\" \"$2\" > \"$1\"".into(),
+                    "launcher".into(),
+                    output.display().to_string(),
+                    "exact argument".into(),
+                ],
+            },
+        )
+        .unwrap();
+
+    let invoked = daemon
+        .command()
+        .args(["launcher", "invoke", &launcher.id])
+        .env("BOOMUX_INVOKE_TEST", "inherited")
+        .env("BOOMUX_SHELL_ID", "stale-shell")
+        .output()
+        .unwrap();
+    assert!(
+        invoked.status.success(),
+        "launcher invoke failed: {}",
+        String::from_utf8_lossy(&invoked.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(invoked.stdout).unwrap(),
+        "Launched capture from launcher-cli\n"
+    );
+    wait_until(|| output.is_file(), "invoked launcher did not run");
+    assert_eq!(
+        fs::read_to_string(output).unwrap(),
+        format!(
+            "{}|{}|{}|{}|{}|inherited|unset|exact argument",
+            daemon.runtime_dir.display(),
+            workspace.id,
+            workspace.name,
+            launcher.id,
+            launcher.name,
+        )
+    );
+
+    daemon.stop_with_cli();
+}
+
+#[test]
 fn failed_implicit_terminal_launch_rolls_back_created_state() {
     let daemon = TestDaemon::start();
     let project = daemon.runtime_dir.join("project");

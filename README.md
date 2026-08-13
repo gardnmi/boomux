@@ -150,11 +150,14 @@ not need a retained terminal:
 boomux workspace create boomux
 boomux launcher create editor --workspace boomux --cwd . -- zeditor .
 boomux launcher create browser --workspace boomux -- firefox http://localhost:3000
+boomux launcher invoke editor --workspace boomux
 boomux workspace open boomux
 ```
 
 Removing a launcher affects future workspace opens. Boomux does not track or
-terminate applications launched earlier.
+terminate applications launched earlier. Exact launcher IDs can be invoked
+without `--workspace`; launcher names use the current managed workspace or an
+explicit `--workspace`.
 
 ## Dashboard
 
