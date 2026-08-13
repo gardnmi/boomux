@@ -180,7 +180,11 @@ The daemon keeps a bounded output queue per active controller. A slow client
 drops output rather than blocking the PTY reader and child process.
 It also feeds a shadow `vt100` parser while forwarding the original PTY bytes
 unchanged. Reattachment receives a bounded reconstruction of rendered state,
-not historical OSC or graphics commands.
+not historical OSC or graphics commands. Plain reads and structured previews
+clone the bounded shadow screen under the per-shell terminal lock, then format
+that snapshot after releasing the lock. They traverse physical rows from newest
+to oldest and stop once the requested byte, logical-line, and span bounds are
+satisfied, so retained history does not extend PTY-writer lock hold time.
 
 ### Terminal Launcher
 

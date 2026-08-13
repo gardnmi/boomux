@@ -4097,10 +4097,9 @@ impl Registry {
             ShellLifecycle::Closed => return Err(not_found("shell", shell_id)),
         };
         drop(lifecycle);
-        let text = lock(&terminal)?.plain_text();
-        Ok(tail_utf8(&text, max_bytes.min(MAX_SHELL_READ_BYTES))
-            .as_bytes()
-            .to_vec())
+        let max_bytes = max_bytes.min(MAX_SHELL_READ_BYTES);
+        let snapshot = lock(&terminal)?.snapshot();
+        Ok(snapshot.plain_text_suffix(max_bytes).into_bytes())
     }
 
     fn read_shell_preview(
@@ -4118,7 +4117,8 @@ impl Registry {
             ShellLifecycle::Closed => return Err(not_found("shell", shell_id)),
         };
         drop(lifecycle);
-        let preview = lock(&terminal)?.preview(
+        let snapshot = lock(&terminal)?.snapshot();
+        let preview = snapshot.preview(
             max_bytes.min(MAX_SHELL_READ_BYTES),
             usize::from(max_lines).min(MAX_TERMINAL_PREVIEW_LINES),
             MAX_TERMINAL_PREVIEW_SPANS,
@@ -4233,15 +4233,17 @@ impl Registry {
             let terminal_state = lock(&terminal)?;
             let revision = run.output_revision.load(Ordering::Acquire);
             let changed = after_revision.is_none_or(|after| after < revision);
-            let bytes = if changed || after_revision.is_none() {
-                let text = terminal_state.plain_text();
-                tail_utf8(&text, max_bytes.min(MAX_SHELL_READ_BYTES))
-                    .as_bytes()
-                    .to_vec()
+            let snapshot = if changed || after_revision.is_none() {
+                Some(terminal_state.snapshot())
             } else {
-                Vec::new()
+                None
             };
             drop(terminal_state);
+            let bytes = snapshot.map_or_else(Vec::new, |snapshot| {
+                snapshot
+                    .plain_text_suffix(max_bytes.min(MAX_SHELL_READ_BYTES))
+                    .into_bytes()
+            });
             let lifecycle = lock(&shell.lifecycle)?;
             let observation_is_current = match (&*lifecycle, &status) {
                 (
@@ -5311,7 +5313,8 @@ fn checkpoint_terminal_history(
     run: &ShellRun,
     runtime: &ShellRuntime,
 ) -> io::Result<()> {
-    let history = lock(&runtime.terminal)?.cold_history(MAX_TERMINAL_HISTORY_BYTES);
+    let snapshot = lock(&runtime.terminal)?.snapshot();
+    let history = snapshot.plain_text_suffix(MAX_TERMINAL_HISTORY_BYTES);
     let mut last_run = lock(&shell.last_run)?;
     let Some(last_run) = last_run.as_mut().filter(|saved| saved.id == run.id) else {
         return Ok(());
@@ -5322,14 +5325,6 @@ fn checkpoint_terminal_history(
     last_run.terminal_history = Some(history);
     registry.mark_persistence_dirty();
     Ok(())
-}
-
-fn tail_utf8(text: &str, max_bytes: usize) -> &str {
-    let mut start = text.len().saturating_sub(max_bytes);
-    while !text.is_char_boundary(start) {
-        start += 1;
-    }
-    &text[start..]
 }
 
 struct AttachRequestOptions {
@@ -6739,12 +6734,6 @@ mod tests {
                 ..
             })
         ));
-    }
-
-    #[test]
-    fn rendered_output_tail_preserves_utf8_boundaries() {
-        assert_eq!(tail_utf8("one-λ", 2), "λ");
-        assert_eq!(tail_utf8("one-λ", 3), "-λ");
     }
 
     #[test]
