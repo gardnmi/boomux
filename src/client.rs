@@ -187,16 +187,26 @@ impl Client {
         Ok(self.protocol_version.load(Ordering::Acquire))
     }
 
+    pub fn supports(&self, feature: protocol::ProtocolFeature) -> io::Result<bool> {
+        Ok(feature.is_supported_by(self.protocol_version()?))
+    }
+
     pub fn request(&self, request: Request) -> io::Result<Response> {
         self.send(request).map(|(_, _, response)| response)
     }
 
     fn send(&self, request: Request) -> io::Result<(UnixStream, u32, Response)> {
         let mut version = self.protocol_version.load(Ordering::Acquire);
-        if version < request.minimum_protocol_version() {
+        if request
+            .required_feature()
+            .is_some_and(|feature| !feature.is_supported_by(version))
+        {
             self.probe_latest()?;
             version = self.protocol_version.load(Ordering::Acquire);
-            if version < request.minimum_protocol_version() {
+            if request
+                .required_feature()
+                .is_some_and(|feature| !feature.is_supported_by(version))
+            {
                 return Err(remote_error(
                     ErrorCode::UnsupportedVersion,
                     "daemon does not support this request",
@@ -210,7 +220,10 @@ impl Client {
             {
                 self.probe_latest()?;
                 let negotiated = self.protocol_version.load(Ordering::Acquire);
-                if negotiated < request.minimum_protocol_version() {
+                if request
+                    .required_feature()
+                    .is_some_and(|feature| !feature.is_supported_by(negotiated))
+                {
                     return Err(remote_error(
                         ErrorCode::UnsupportedVersion,
                         "daemon does not support this request",
@@ -297,7 +310,7 @@ impl Client {
         &self,
         notifications: NotificationDeliveryConfig,
     ) -> io::Result<()> {
-        if self.protocol_version()? < 17 {
+        if !self.supports(protocol::ProtocolFeature::RestartNotificationConfig)? {
             self.restart_request(Request::Restart)?;
         }
         self.restart_request(Request::RestartWithNotificationConfig { notifications })
@@ -483,7 +496,7 @@ impl Client {
             after_revision,
             wait_ms,
         };
-        if self.protocol_version()? < request.minimum_protocol_version() {
+        if !self.supports(protocol::ProtocolFeature::RevisionAwareAgentWait)? {
             return Err(remote_error(
                 ErrorCode::UnsupportedVersion,
                 "daemon does not support Agent wait",
@@ -528,7 +541,7 @@ impl Client {
         max_lines: u16,
     ) -> io::Result<TerminalPreview> {
         let shell_id = shell_id.into();
-        if self.protocol_version()? < 20 {
+        if !self.supports(protocol::ProtocolFeature::StructuredTerminalPreview)? {
             let bytes = self.read_shell(shell_id, max_bytes)?;
             let text = String::from_utf8_lossy(&bytes);
             let lines = text.lines().collect::<Vec<_>>();

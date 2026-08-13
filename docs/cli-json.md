@@ -26,6 +26,9 @@ the CLI version, daemon protocol version, supported JSON schemas and commands,
 stable error codes, feature names, and the package and validated version for
 each bundled integration host under `integration_hosts`. Validated versions are
 compatibility test points, not runtime pins or minimum-version guarantees.
+Protocol-backed feature names are derived from the same typed registry as
+request gating and negotiated client feature checks, so each name has one
+minimum protocol version authority.
 `session_transcript_integrations` lists the integration keys with registered
 canonical transcript adapters.
 The `desktop_notifications` feature means this binary supports daemon-owned

@@ -48,42 +48,12 @@ const BOOMUX_OPENCODE_PLUGIN: &str = integration_management::OPENCODE_ASSET;
 #[cfg(test)]
 const BOOMUX_PI_EXTENSION: &str = integration_management::PI_ASSET;
 const MAX_HOST_CATALOG_DIRECTORIES: usize = 8;
-const INTEGRATION_FEATURES: &[&str] = &[
-    "typed_errors",
-    "shell_run_identity",
-    "rendered_scrollback",
-    "graceful_live_handoff",
-    "graceful_exited_handoff",
-    "daemon_events",
-    "reconnectable_event_cursors",
-    "revision_aware_reads",
-    "workspace_launchers",
-    "run_scoped_agent_instances",
-    "protocol_10",
-    "protocol_11",
-    "protocol_12",
-    "protocol_13",
-    "protocol_14",
-    "protocol_15",
-    "protocol_16",
-    "protocol_17",
-    "protocol_18",
-    "protocol_19",
-    "workspace_default_cwd",
-    "focused_terminal_following",
-    "restartable_exited_shells",
-    "inactive_agent_state",
-    "idempotent_agent_ensure",
-    "agent_authority_precedence",
+const NON_PROTOCOL_FEATURES: &[&str] = &[
     "opencode_lifecycle_plugin",
     "pi_lifecycle_extension",
     "process_adapters",
-    "projected_agent_sessions",
     "canonical_session_transcripts",
     "transcript_pagination",
-    "durable_session_source_context",
-    "revision_aware_agent_wait",
-    "persistent_agent_attention",
     "desktop_notifications",
     "sound_notifications",
     "integration_management",
@@ -2169,6 +2139,11 @@ fn print_setup_next_step(
 
 fn capabilities(json: bool) -> Result<(), Box<dyn Error>> {
     let json_commands = json_commands().collect::<Vec<_>>();
+    let features = NON_PROTOCOL_FEATURES
+        .iter()
+        .copied()
+        .chain(protocol::protocol_capabilities())
+        .collect::<Vec<_>>();
     let error_codes = [
         "invalid_argument",
         "not_found",
@@ -2213,7 +2188,7 @@ fn capabilities(json: bool) -> Result<(), Box<dyn Error>> {
                 "daemon_protocol_version": protocol::PROTOCOL_VERSION,
                 "json_schemas": [cli_output::SCHEMA],
                 "json_commands": json_commands,
-                "features": INTEGRATION_FEATURES,
+                "features": features,
                 "session_transcript_integrations": session_transcript::supported_integrations(),
                 "integration_hosts": integration_hosts,
                 "error_codes": error_codes,
@@ -2224,7 +2199,7 @@ fn capabilities(json: bool) -> Result<(), Box<dyn Error>> {
     println!("DAEMON PROTOCOL\t{}", protocol::PROTOCOL_VERSION);
     println!("JSON SCHEMAS\t{}", cli_output::SCHEMA);
     println!("JSON COMMANDS\t{}", json_commands.join(","));
-    println!("FEATURES\t{}", INTEGRATION_FEATURES.join(","));
+    println!("FEATURES\t{}", features.join(","));
     println!(
         "SESSION TRANSCRIPT INTEGRATIONS\t{}",
         session_transcript::supported_integrations().join(",")
@@ -2989,12 +2964,19 @@ fn session_command(command: SessionCommands, json: bool) -> Result<(), Box<dyn E
 }
 
 fn validate_attention_protocol(negotiated: u32) -> Result<(), Box<dyn Error>> {
-    (negotiated >= 15).then_some(()).ok_or_else(|| {
-        cli_output::failure(
-            "unsupported_version",
-            format!("Agent attention requires daemon protocol 15; negotiated {negotiated}"),
-        )
-    })
+    let feature = protocol::ProtocolFeature::PersistentAgentAttention;
+    feature
+        .is_supported_by(negotiated)
+        .then_some(())
+        .ok_or_else(|| {
+            cli_output::failure(
+                "unsupported_version",
+                format!(
+                    "Agent attention requires daemon protocol {}; negotiated {negotiated}",
+                    feature.minimum_version()
+                ),
+            )
+        })
 }
 
 fn sanitize_table_cell(value: &str) -> String {
@@ -3011,12 +2993,19 @@ fn sanitize_table_cell(value: &str) -> String {
 }
 
 fn validate_session_protocol(negotiated: u32) -> Result<(), Box<dyn Error>> {
-    (negotiated >= 12).then_some(()).ok_or_else(|| {
-        cli_output::failure(
-            "unsupported_version",
-            format!("session projection requires daemon protocol 12; negotiated {negotiated}"),
-        )
-    })
+    let feature = protocol::ProtocolFeature::InactiveAgentState;
+    feature
+        .is_supported_by(negotiated)
+        .then_some(())
+        .ok_or_else(|| {
+            cli_output::failure(
+                "unsupported_version",
+                format!(
+                    "session projection requires daemon protocol {}; negotiated {negotiated}",
+                    feature.minimum_version()
+                ),
+            )
+        })
 }
 
 fn print_session(session: &session_projection::SessionProjection) {
@@ -4692,7 +4681,7 @@ mod tests {
             ])
             .is_err()
         );
-        assert!(INTEGRATION_FEATURES.contains(&"process_adapters"));
+        assert!(NON_PROTOCOL_FEATURES.contains(&"process_adapters"));
     }
 
     #[test]
@@ -5963,7 +5952,10 @@ mod tests {
             "sound_notifications",
             "integration_management",
         ] {
-            assert!(INTEGRATION_FEATURES.contains(&feature));
+            assert!(
+                NON_PROTOCOL_FEATURES.contains(&feature)
+                    || protocol::protocol_capabilities().any(|current| current == feature)
+            );
         }
         assert_eq!(
             integration_management::IntegrationId::Opencode
