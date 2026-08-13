@@ -3237,17 +3237,17 @@ fn launcher_invoke_uses_tui_detached_process_semantics() {
         String::from_utf8(invoked.stdout).unwrap(),
         "Launched capture from launcher-cli\n"
     );
-    wait_until(|| output.is_file(), "invoked launcher did not run");
-    assert_eq!(
-        fs::read_to_string(output).unwrap(),
-        format!(
-            "{}|{}|{}|{}|{}|inherited|unset|exact argument",
-            daemon.runtime_dir.display(),
-            workspace.id,
-            workspace.name,
-            launcher.id,
-            launcher.name,
-        )
+    let expected = format!(
+        "{}|{}|{}|{}|{}|inherited|unset|exact argument",
+        daemon.runtime_dir.display(),
+        workspace.id,
+        workspace.name,
+        launcher.id,
+        launcher.name,
+    );
+    wait_until(
+        || fs::read_to_string(&output).is_ok_and(|actual| actual == expected),
+        "invoked launcher did not finish writing",
     );
 
     daemon.stop_with_cli();
