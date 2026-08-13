@@ -5,6 +5,8 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -285,6 +287,8 @@ struct LegacyPersistedShell {
 pub(crate) struct StateStore {
     path: PathBuf,
     _lock: Option<File>,
+    #[cfg(test)]
+    before_save: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl StateStore {
@@ -317,6 +321,8 @@ impl StateStore {
         Ok(Self {
             path: directory.join("state.json"),
             _lock: Some(lock),
+            #[cfg(test)]
+            before_save: None,
         })
     }
 
@@ -329,6 +335,8 @@ impl StateStore {
         Ok(Self {
             path: directory.join("state.json"),
             _lock: Some(File::from(lock)),
+            #[cfg(test)]
+            before_save: None,
         })
     }
 
@@ -341,7 +349,23 @@ impl StateStore {
 
     #[cfg(test)]
     pub(crate) fn at(path: PathBuf) -> Self {
-        Self { path, _lock: None }
+        Self {
+            path,
+            _lock: None,
+            before_save: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn at_with_save_hook(
+        path: PathBuf,
+        before_save: Arc<dyn Fn() + Send + Sync>,
+    ) -> Self {
+        Self {
+            path,
+            _lock: None,
+            before_save: Some(before_save),
+        }
     }
 
     #[cfg(test)]
@@ -424,6 +448,10 @@ impl StateStore {
     }
 
     pub(crate) fn save(&self, state: &PersistedState) -> io::Result<()> {
+        #[cfg(test)]
+        if let Some(before_save) = &self.before_save {
+            before_save();
+        }
         let Some(parent) = self.path.parent() else {
             return Err(io::Error::other("state path has no parent"));
         };

@@ -578,17 +578,14 @@ fn launch_replacement(
                 reconstruction,
             });
         }
-        let mut transition = lock(&registry.transitions)?;
-        let _persistence = lock(&registry.persist_lock)?;
-        let mut events = lock(&registry.events.state)?;
-        let published = registry.flush_pending_locked(&mut transition, &mut events)?;
+        let published = registry.flush_pending()?;
+        let events = lock(&registry.events.state)?;
         let event_stream = handoff::EventStreamManifest {
             stream_id: events.stream_id.clone(),
             latest_id: events.latest_id,
             events: events.events.iter().cloned().collect(),
         };
         drop(events);
-        drop(transition);
         if published {
             registry.events.changed.notify_all();
         }
@@ -1137,13 +1134,15 @@ fn coded_error(code: ErrorCode, message: impl Into<String>) -> io::Error {
 struct Registry {
     state: Mutex<RegistryState>,
     focus: Mutex<FocusState>,
-    store: Option<StateStore>,
+    store: Option<Arc<StateStore>>,
+    persistence_writer: Option<PersistenceWriter>,
     events: EventLog,
     transitions: Mutex<TransitionState>,
     mutation_lock: Mutex<()>,
     persist_lock: Mutex<()>,
     stopping: AtomicBool,
     persistence_dirty: AtomicBool,
+    persistence_revision: AtomicU64,
     notification_settings: NotificationDeliverySettings,
     notification_sink: Arc<dyn NotificationSink>,
 }
@@ -1162,6 +1161,85 @@ enum DurableMutation<T> {
 #[derive(Default)]
 struct TransitionState {
     pending_durable_events: VecDeque<Vec<DaemonEventKind>>,
+    persistence_in_flight: bool,
+    in_flight_event_count: usize,
+    pending_runtime_events: VecDeque<DaemonEventKind>,
+}
+
+impl TransitionState {
+    fn publication_blocked(&self) -> bool {
+        self.persistence_in_flight || !self.pending_durable_events.is_empty()
+    }
+
+    fn queue_runtime_event(&mut self, event: DaemonEventKind) {
+        if let DaemonEventKind::OutputChanged {
+            shell_id, run_id, ..
+        } = &event
+            && let Some(index) = self.pending_runtime_events.iter().position(|pending| {
+                matches!(
+                    pending,
+                    DaemonEventKind::OutputChanged {
+                        shell_id: pending_shell_id,
+                        run_id: pending_run_id,
+                        ..
+                    } if pending_shell_id == shell_id && pending_run_id == run_id
+                )
+            })
+        {
+            self.pending_runtime_events.remove(index);
+        }
+        self.pending_runtime_events.push_back(event);
+    }
+
+    fn reserved_event_count(&self) -> usize {
+        self.in_flight_event_count
+            .saturating_add(
+                self.pending_durable_events
+                    .iter()
+                    .map(Vec::len)
+                    .sum::<usize>(),
+            )
+            .saturating_add(self.pending_runtime_events.len())
+    }
+}
+
+struct PersistenceWriter {
+    sender: mpsc::Sender<PersistenceWrite>,
+}
+
+struct PersistenceWrite {
+    generation: PersistenceGeneration,
+    completion: SyncSender<io::Result<()>>,
+}
+
+struct PersistenceGeneration {
+    revision: u64,
+    state: PersistedState,
+}
+
+impl PersistenceWriter {
+    fn start(store: Arc<StateStore>) -> Self {
+        let (sender, receiver) = mpsc::channel::<PersistenceWrite>();
+        thread::spawn(move || {
+            while let Ok(write) = receiver.recv() {
+                let _ = write.completion.send(store.save(&write.generation.state));
+            }
+        });
+        Self { sender }
+    }
+
+    fn save(&self, generation: PersistenceGeneration) -> io::Result<()> {
+        let (completion, result) = mpsc::sync_channel(1);
+        self.sender
+            .send(PersistenceWrite {
+                generation,
+                completion,
+            })
+            .map_err(|_| io::Error::other("persistence writer stopped"))?;
+        result
+            .recv()
+            .map_err(|_| io::Error::other("persistence writer stopped"))?
+    }
 }
 
 struct EventLog {
@@ -1286,12 +1364,14 @@ impl Default for Registry {
             state: Mutex::new(RegistryState::default()),
             focus: Mutex::new(FocusState::default()),
             store: None,
+            persistence_writer: None,
             events: EventLog::new(),
             transitions: Mutex::new(TransitionState::default()),
             mutation_lock: Mutex::new(()),
             persist_lock: Mutex::new(()),
             stopping: AtomicBool::new(false),
             persistence_dirty: AtomicBool::new(false),
+            persistence_revision: AtomicU64::new(0),
             notification_settings: NotificationDeliverySettings::default(),
             notification_sink: Arc::new(DisabledNotificationSink),
         }
@@ -1891,7 +1971,7 @@ impl Registry {
         }
         drop(state);
         if changed {
-            self.persistence_dirty.store(true, Ordering::Release);
+            self.mark_persistence_dirty();
         }
         Ok(())
     }
@@ -2243,10 +2323,10 @@ impl Registry {
         let deadline =
             Instant::now() + Duration::from_millis(u64::from(wait_ms)).min(MAX_EVENT_WAIT);
         if after.is_none() {
-            let mut transition = lock(&self.transitions)?;
-            let _persistence = lock(&self.persist_lock)?;
-            let mut state = lock(&self.events.state)?;
-            let published = self.flush_pending_locked(&mut transition, &mut state)?;
+            let _mutation = lock(&self.mutation_lock)?;
+            let published = self.flush_pending()?;
+            let _transition = lock(&self.transitions)?;
+            let state = lock(&self.events.state)?;
             let snapshot = self.snapshot()?;
             let cursor = EventCursor {
                 stream_id: state.stream_id.clone(),
@@ -2259,7 +2339,6 @@ impl Registry {
                 events: Vec::new(),
             };
             drop(state);
-            drop(transition);
             if published {
                 self.events.changed.notify_all();
             }
@@ -2449,16 +2528,20 @@ impl Registry {
             });
             state.workspaces.insert(saved_workspace.id, workspace);
         }
+        let store = Arc::new(store);
+        let persistence_writer = PersistenceWriter::start(Arc::clone(&store));
         let registry = Self {
             state: Mutex::new(state),
             focus: Mutex::new(FocusState::default()),
             store: Some(store),
+            persistence_writer: Some(persistence_writer),
             events: EventLog::from_transfer(transferred_events),
             transitions: Mutex::new(TransitionState::default()),
             mutation_lock: Mutex::new(()),
             persist_lock: Mutex::new(()),
             stopping: AtomicBool::new(false),
             persistence_dirty: AtomicBool::new(migrated),
+            persistence_revision: AtomicU64::new(u64::from(migrated)),
             notification_settings: NotificationDeliverySettings::default(),
             notification_sink: Arc::new(DisabledNotificationSink),
         };
@@ -2656,11 +2739,11 @@ impl Registry {
         operation: impl FnOnce() -> io::Result<DurableMutation<T>>,
     ) -> io::Result<T> {
         let mutation = lock(&self.mutation_lock)?;
-        let mut transition = lock(&self.transitions)?;
-        let persistence = lock(&self.persist_lock)?;
-        let mut events = lock(&self.events.state)?;
         self.ensure_running()?;
-        self.flush_pending_locked(&mut transition, &mut events)?;
+        self.flush_pending()?;
+        let persistence = lock(&self.persist_lock)?;
+        let mut transition = lock(&self.transitions)?;
+        let events = lock(&self.events.state)?;
         let backup = self.backup()?;
         match operation() {
             Ok(DurableMutation::Unchanged(value)) => Ok(value),
@@ -2670,9 +2753,19 @@ impl Registry {
                     return Err(error);
                 }
                 let notifications = self.notification_requests(&kinds, &backup);
-                match self.persist_unlocked().map_err(persistence_error) {
+                let saved = self.capture_persisted_state()?;
+                transition.persistence_in_flight = true;
+                transition.in_flight_event_count = kinds.len();
+                drop(events);
+                drop(transition);
+                match self.write_persisted_state(saved).map_err(persistence_error) {
                     Ok(()) => {
+                        let mut transition = lock(&self.transitions)?;
+                        let mut events = lock(&self.events.state)?;
                         EventLog::append_batch_locked(&mut events, kinds);
+                        transition.persistence_in_flight = false;
+                        transition.in_flight_event_count = 0;
+                        self.publish_pending_runtime_locked(&mut transition, &mut events);
                         drop(events);
                         drop(transition);
                         drop(persistence);
@@ -2685,7 +2778,14 @@ impl Registry {
                     }
                     Err(error) => {
                         self.restore_backup(backup)?;
-                        self.persistence_dirty.store(false, Ordering::Release);
+                        let mut transition = lock(&self.transitions)?;
+                        let mut events = lock(&self.events.state)?;
+                        transition.persistence_in_flight = false;
+                        transition.in_flight_event_count = 0;
+                        self.publish_pending_runtime_locked(&mut transition, &mut events);
+                        drop(events);
+                        drop(transition);
+                        self.events.changed.notify_all();
                         Err(error)
                     }
                 }
@@ -2787,37 +2887,55 @@ impl Registry {
         (workspace, shell)
     }
 
-    fn flush_pending_locked(
-        &self,
-        transition: &mut TransitionState,
-        events: &mut EventLogState,
-    ) -> io::Result<bool> {
+    fn flush_pending(&self) -> io::Result<bool> {
+        let _persistence = lock(&self.persist_lock)?;
+        let mut transition = lock(&self.transitions)?;
+        let events = lock(&self.events.state)?;
         if transition.pending_durable_events.is_empty()
             && !self.persistence_dirty.load(Ordering::Acquire)
         {
             return Ok(false);
         }
-        let count = transition.pending_durable_events.iter().map(Vec::len).sum();
-        EventLog::ensure_capacity(events, count)?;
-        self.persist_unlocked().map_err(persistence_error)?;
-        while let Some(batch) = transition.pending_durable_events.pop_front() {
-            EventLog::append_batch_locked(events, batch);
-        }
-        self.events.changed.notify_all();
-        Ok(true)
-    }
-
-    fn flush_pending(&self) -> io::Result<()> {
-        let mut transition = lock(&self.transitions)?;
-        let _persistence = lock(&self.persist_lock)?;
-        let mut events = lock(&self.events.state)?;
-        let published = self.flush_pending_locked(&mut transition, &mut events)?;
+        let pending_count = transition.pending_durable_events.len();
+        let count = transition
+            .pending_durable_events
+            .iter()
+            .take(pending_count)
+            .map(Vec::len)
+            .sum();
+        EventLog::ensure_capacity(&events, count)?;
+        let saved = self.capture_persisted_state()?;
+        let pending = transition
+            .pending_durable_events
+            .drain(..pending_count)
+            .collect::<VecDeque<_>>();
+        transition.persistence_in_flight = true;
+        transition.in_flight_event_count = count;
         drop(events);
         drop(transition);
-        if published {
-            self.events.changed.notify_all();
+        if let Err(error) = self.write_persisted_state(saved).map_err(persistence_error) {
+            let mut transition = lock(&self.transitions)?;
+            for batch in pending.into_iter().rev() {
+                transition.pending_durable_events.push_front(batch);
+            }
+            transition.persistence_in_flight = false;
+            transition.in_flight_event_count = 0;
+            let mut events = lock(&self.events.state)?;
+            self.publish_pending_runtime_locked(&mut transition, &mut events);
+            return Err(error);
         }
-        Ok(())
+        let mut transition = lock(&self.transitions)?;
+        let mut events = lock(&self.events.state)?;
+        EventLog::ensure_capacity(&events, count)?;
+        for batch in pending {
+            EventLog::append_batch_locked(&mut events, batch);
+        }
+        transition.persistence_in_flight = false;
+        transition.in_flight_event_count = 0;
+        self.publish_pending_runtime_locked(&mut transition, &mut events);
+        drop(events);
+        self.events.changed.notify_all();
+        Ok(count != 0)
     }
 
     fn compensate_stopped_locked(
@@ -2843,18 +2961,42 @@ impl Registry {
     ) {
         if !batch.is_empty() {
             transition.pending_durable_events.push_back(batch);
-            self.persistence_dirty.store(true, Ordering::Release);
+            self.mark_persistence_dirty();
         }
     }
 
     fn publish_runtime_batch(&self, kinds: Vec<DaemonEventKind>) -> io::Result<()> {
-        let _transition = lock(&self.transitions)?;
+        let mut transition = lock(&self.transitions)?;
         let mut events = lock(&self.events.state)?;
-        EventLog::ensure_capacity(&events, kinds.len())?;
+        EventLog::ensure_capacity(
+            &events,
+            transition
+                .reserved_event_count()
+                .saturating_add(kinds.len()),
+        )?;
+        if transition.publication_blocked() {
+            for kind in kinds {
+                transition.queue_runtime_event(kind);
+            }
+            return Ok(());
+        }
         EventLog::append_batch_locked(&mut events, kinds);
         drop(events);
         self.events.changed.notify_all();
         Ok(())
+    }
+
+    fn publish_pending_runtime_locked(
+        &self,
+        transition: &mut TransitionState,
+        events: &mut EventLogState,
+    ) {
+        if transition.publication_blocked() {
+            return;
+        }
+        while let Some(kind) = transition.pending_runtime_events.pop_front() {
+            EventLog::append_batch_locked(events, vec![kind]);
+        }
     }
 
     fn ensure_running(&self) -> io::Result<()> {
@@ -3026,13 +3168,11 @@ impl Registry {
 
     fn persist(&self) -> io::Result<()> {
         let _persist = lock(&self.persist_lock)?;
-        self.persist_unlocked()
+        let saved = self.capture_persisted_state()?;
+        self.write_persisted_state(saved)
     }
 
-    fn persist_unlocked(&self) -> io::Result<()> {
-        let Some(store) = &self.store else {
-            return Ok(());
-        };
+    fn capture_persisted_state(&self) -> io::Result<PersistenceGeneration> {
         let state = lock(&self.state)?;
         let mut workspaces = state.workspaces.values().cloned().collect::<Vec<_>>();
         workspaces.sort_by(|left, right| left.id.cmp(&right.id));
@@ -3082,11 +3222,29 @@ impl Registry {
                 agents,
             });
         }
-        drop(state);
-        let result = store.save(&saved);
-        self.persistence_dirty
-            .store(result.is_err(), Ordering::Release);
+        Ok(PersistenceGeneration {
+            revision: self.persistence_revision.load(Ordering::Acquire),
+            state: saved,
+        })
+    }
+
+    fn write_persisted_state(&self, generation: PersistenceGeneration) -> io::Result<()> {
+        let Some(writer) = &self.persistence_writer else {
+            return Ok(());
+        };
+        let revision = generation.revision;
+        let result = writer.save(generation);
+        if result.is_err() {
+            self.persistence_dirty.store(true, Ordering::Release);
+        } else if self.persistence_revision.load(Ordering::Acquire) == revision {
+            self.persistence_dirty.store(false, Ordering::Release);
+        }
         result
+    }
+
+    fn mark_persistence_dirty(&self) {
+        self.persistence_revision.fetch_add(1, Ordering::AcqRel);
+        self.persistence_dirty.store(true, Ordering::Release);
     }
 
     fn record_run_exit(
@@ -3096,14 +3254,10 @@ impl Registry {
         runtime: &Arc<ShellRuntime>,
         code: Option<u32>,
     ) -> io::Result<()> {
-        let mut transition = lock(&self.transitions)?;
         let _persistence = lock(&self.persist_lock)?;
-        let mut events = lock(&self.events.state)?;
-        let pending_count = transition
-            .pending_durable_events
-            .iter()
-            .map(Vec::len)
-            .sum::<usize>();
+        let mut transition = lock(&self.transitions)?;
+        let events = lock(&self.events.state)?;
+        let pending_count = transition.reserved_event_count();
         EventLog::ensure_capacity(&events, pending_count.saturating_add(1))?;
         let mut lifecycle = lock(&shell.lifecycle)?;
         let profile = match &*lifecycle {
@@ -3131,19 +3285,37 @@ impl Registry {
             shell_id: shell.id.clone(),
             run: run.snapshot()?,
         }];
-        match self.persist_unlocked().map_err(persistence_error) {
+        let saved = self.capture_persisted_state()?;
+        transition.persistence_in_flight = true;
+        transition.in_flight_event_count = pending_count.saturating_add(1);
+        drop(events);
+        drop(transition);
+        match self.write_persisted_state(saved).map_err(persistence_error) {
             Ok(()) => {
+                let mut transition = lock(&self.transitions)?;
+                let mut events = lock(&self.events.state)?;
                 while let Some(pending) = transition.pending_durable_events.pop_front() {
                     EventLog::append_batch_locked(&mut events, pending);
                 }
                 EventLog::append_batch_locked(&mut events, batch);
+                transition.persistence_in_flight = false;
+                transition.in_flight_event_count = 0;
+                self.publish_pending_runtime_locked(&mut transition, &mut events);
                 drop(events);
                 drop(transition);
                 self.events.changed.notify_all();
                 Ok(())
             }
             Err(error) => {
+                let mut transition = lock(&self.transitions)?;
                 transition.pending_durable_events.push_back(batch);
+                transition.persistence_in_flight = false;
+                transition.in_flight_event_count = 0;
+                let mut events = lock(&self.events.state)?;
+                self.publish_pending_runtime_locked(&mut transition, &mut events);
+                drop(events);
+                drop(transition);
+                self.events.changed.notify_all();
                 Err(error)
             }
         }
@@ -3289,17 +3461,15 @@ impl Registry {
             }
             stopped.push(Arc::clone(shell));
         }
-        let mut transition = lock(&self.transitions)?;
+        if let Err(error) = self.flush_pending() {
+            let mut transition = lock(&self.transitions)?;
+            self.compensate_stopped_locked(&stopped, &mut transition)?;
+            self.stopping.store(false, Ordering::Release);
+            return Err(error);
+        }
         let _persistence = lock(&self.persist_lock)?;
-        let mut events = lock(&self.events.state)?;
-        let published = match self.flush_pending_locked(&mut transition, &mut events) {
-            Ok(published) => published,
-            Err(error) => {
-                self.compensate_stopped_locked(&stopped, &mut transition)?;
-                self.stopping.store(false, Ordering::Release);
-                return Err(error);
-            }
-        };
+        let mut transition = lock(&self.transitions)?;
+        let events = lock(&self.events.state)?;
         let mut rollbacks = Vec::with_capacity(shells.len());
         for shell in &shells {
             match shell.finalize_stop() {
@@ -3313,7 +3483,12 @@ impl Registry {
                 }
             }
         }
-        if let Err(error) = self.persist_unlocked().map_err(persistence_error) {
+        let saved = self.capture_persisted_state()?;
+        transition.persistence_in_flight = true;
+        transition.in_flight_event_count = 0;
+        drop(events);
+        drop(transition);
+        if let Err(error) = self.write_persisted_state(saved).map_err(persistence_error) {
             let batch = rollbacks
                 .iter()
                 .filter_map(|(_, rollback)| rollback.event.clone())
@@ -3321,7 +3496,12 @@ impl Registry {
             for (shell, rollback) in rollbacks {
                 shell.restore_stopped(rollback)?;
             }
+            let mut transition = lock(&self.transitions)?;
             self.queue_durable_batch_locked(batch, &mut transition);
+            transition.persistence_in_flight = false;
+            transition.in_flight_event_count = 0;
+            let mut events = lock(&self.events.state)?;
+            self.publish_pending_runtime_locked(&mut transition, &mut events);
             self.stopping.store(false, Ordering::Release);
             return Err(error);
         }
@@ -3331,11 +3511,11 @@ impl Registry {
         state.launchers.clear();
         state.agents.clear();
         drop(state);
-        drop(events);
-        drop(transition);
-        if published {
-            self.events.changed.notify_all();
-        }
+        let mut transition = lock(&self.transitions)?;
+        let mut events = lock(&self.events.state)?;
+        transition.persistence_in_flight = false;
+        transition.in_flight_event_count = 0;
+        self.publish_pending_runtime_locked(&mut transition, &mut events);
         Ok(())
     }
 
@@ -4137,26 +4317,39 @@ impl Registry {
             }
             return Err(error.source);
         }
-        let mut transition = lock(&self.transitions)?;
-        let _persistence = lock(&self.persist_lock)?;
-        let mut events = lock(&self.events.state)?;
-        if let Err(error) = self.flush_pending_locked(&mut transition, &mut events) {
+        if let Err(error) = self.flush_pending() {
+            let mut transition = lock(&self.transitions)?;
             self.compensate_stopped_locked(std::slice::from_ref(&shell), &mut transition)?;
             return Err(error);
         }
+        let _persistence = lock(&self.persist_lock)?;
+        let mut transition = lock(&self.transitions)?;
+        let events = lock(&self.events.state)?;
         if let Err(error) = EventLog::ensure_capacity(&events, 1) {
             self.compensate_stopped_locked(std::slice::from_ref(&shell), &mut transition)?;
             return Err(error);
         }
         let rollback = shell.finalize_stop()?;
         self.remove_shell(shell_id)?;
-        if let Err(error) = self.persist_unlocked().map_err(persistence_error) {
+        let saved = self.capture_persisted_state()?;
+        transition.persistence_in_flight = true;
+        transition.in_flight_event_count = 1;
+        drop(events);
+        drop(transition);
+        if let Err(error) = self.write_persisted_state(saved).map_err(persistence_error) {
             self.restore_backup(backup)?;
             let event = rollback.event.clone();
             shell.restore_stopped(rollback)?;
+            let mut transition = lock(&self.transitions)?;
             self.queue_durable_batch_locked(event.into_iter().collect(), &mut transition);
+            transition.persistence_in_flight = false;
+            transition.in_flight_event_count = 0;
+            let mut events = lock(&self.events.state)?;
+            self.publish_pending_runtime_locked(&mut transition, &mut events);
             return Err(error);
         }
+        let mut transition = lock(&self.transitions)?;
+        let mut events = lock(&self.events.state)?;
         EventLog::append_batch_locked(
             &mut events,
             vec![DaemonEventKind::ShellClosed {
@@ -4164,8 +4357,10 @@ impl Registry {
                 shell_id: shell_id.into(),
             }],
         );
+        transition.persistence_in_flight = false;
+        transition.in_flight_event_count = 0;
+        self.publish_pending_runtime_locked(&mut transition, &mut events);
         drop(events);
-        drop(transition);
         self.events.changed.notify_all();
         Ok(())
     }
@@ -4194,13 +4389,14 @@ impl Registry {
             }
             stopped.push(Arc::clone(shell));
         }
-        let mut transition = lock(&self.transitions)?;
-        let _persistence = lock(&self.persist_lock)?;
-        let mut events = lock(&self.events.state)?;
-        if let Err(error) = self.flush_pending_locked(&mut transition, &mut events) {
+        if let Err(error) = self.flush_pending() {
+            let mut transition = lock(&self.transitions)?;
             self.compensate_stopped_locked(&stopped, &mut transition)?;
             return Err(error);
         }
+        let _persistence = lock(&self.persist_lock)?;
+        let mut transition = lock(&self.transitions)?;
+        let events = lock(&self.events.state)?;
         if let Err(error) = EventLog::ensure_capacity(&events, 1) {
             self.compensate_stopped_locked(&stopped, &mut transition)?;
             return Err(error);
@@ -4218,7 +4414,12 @@ impl Registry {
             }
         }
         self.remove_workspace(workspace_id)?;
-        if let Err(error) = self.persist_unlocked().map_err(persistence_error) {
+        let saved = self.capture_persisted_state()?;
+        transition.persistence_in_flight = true;
+        transition.in_flight_event_count = 1;
+        drop(events);
+        drop(transition);
+        if let Err(error) = self.write_persisted_state(saved).map_err(persistence_error) {
             self.restore_backup(backup)?;
             let batch = rollbacks
                 .iter()
@@ -4227,17 +4428,26 @@ impl Registry {
             for (shell, rollback) in rollbacks {
                 shell.restore_stopped(rollback)?;
             }
+            let mut transition = lock(&self.transitions)?;
             self.queue_durable_batch_locked(batch, &mut transition);
+            transition.persistence_in_flight = false;
+            transition.in_flight_event_count = 0;
+            let mut events = lock(&self.events.state)?;
+            self.publish_pending_runtime_locked(&mut transition, &mut events);
             return Err(error);
         }
+        let mut transition = lock(&self.transitions)?;
+        let mut events = lock(&self.events.state)?;
         EventLog::append_batch_locked(
             &mut events,
             vec![DaemonEventKind::WorkspaceClosed {
                 workspace_id: workspace_id.into(),
             }],
         );
+        transition.persistence_in_flight = false;
+        transition.in_flight_event_count = 0;
+        self.publish_pending_runtime_locked(&mut transition, &mut events);
         drop(events);
-        drop(transition);
         self.events.changed.notify_all();
         Ok(())
     }
@@ -4836,7 +5046,7 @@ fn start_pty_reader(
                         let Some(registry) = registry.upgrade() else {
                             break;
                         };
-                        let (transition, mut events, mut terminal) = loop {
+                        let (mut transition, mut events, mut terminal) = loop {
                             let Ok(transition) = registry.transitions.lock() else {
                                 return;
                             };
@@ -4853,7 +5063,12 @@ fn start_pty_reader(
                                 Err(TryLockError::Poisoned(_)) => return,
                             }
                         };
-                        if EventLog::ensure_capacity(&events, 1).is_err() {
+                        if EventLog::ensure_capacity(
+                            &events,
+                            transition.reserved_event_count().saturating_add(1),
+                        )
+                        .is_err()
+                        {
                             break;
                         }
                         terminal.process(bytes);
@@ -4884,15 +5099,17 @@ fn start_pty_reader(
                                 let _ = current.connection.shutdown(std::net::Shutdown::Both);
                             }
                         }
-                        EventLog::append_batch_locked(
-                            &mut events,
-                            vec![DaemonEventKind::OutputChanged {
-                                workspace_id: shell.workspace_id.clone(),
-                                shell_id: shell.id.clone(),
-                                run_id: reader_run.id.clone(),
-                                output_revision: revision,
-                            }],
-                        );
+                        let output_event = DaemonEventKind::OutputChanged {
+                            workspace_id: shell.workspace_id.clone(),
+                            shell_id: shell.id.clone(),
+                            run_id: reader_run.id.clone(),
+                            output_revision: revision,
+                        };
+                        if transition.publication_blocked() {
+                            transition.queue_runtime_event(output_event);
+                        } else {
+                            EventLog::append_batch_locked(&mut events, vec![output_event]);
+                        }
                         drop(terminal);
                         drop(events);
                         drop(transition);
@@ -4974,7 +5191,7 @@ fn checkpoint_terminal_history(
         return Ok(());
     }
     last_run.terminal_history = Some(history);
-    registry.persistence_dirty.store(true, Ordering::Release);
+    registry.mark_persistence_dirty();
     Ok(())
 }
 
@@ -5043,9 +5260,7 @@ fn handle_attach(
     let token = Uuid::new_v4().to_string();
     let (output, receiver) = mpsc::sync_channel(CONTROLLER_QUEUE);
     let connection = stream.try_clone()?;
-    let mut transition = restart_exited
-        .then(|| lock(&registry.transitions))
-        .transpose()?;
+    let mut transition = None;
     if restart_exited {
         let old_runtime = match &*lock(&shell.lifecycle)? {
             ShellLifecycle::Exited { runtime, .. } => runtime.clone(),
@@ -5074,25 +5289,21 @@ fn handle_attach(
                 .flatten()
         })
         .flatten();
-    if needs_start && transition.is_none() {
-        transition = Some(lock(&registry.transitions)?);
+    if needs_start {
+        registry.flush_pending()?;
     }
     let persistence = needs_start
         .then(|| lock(&registry.persist_lock))
         .transpose()?;
+    if needs_start {
+        transition = Some(lock(&registry.transitions)?);
+    }
     let mut events = needs_start
         .then(|| lock(&registry.events.state))
         .transpose()?;
-    let published_pending = if needs_start {
-        let published = registry.flush_pending_locked(
-            transition.as_mut().expect("start transition is locked"),
-            events.as_mut().expect("start event log is locked"),
-        )?;
+    if needs_start {
         EventLog::ensure_capacity(events.as_ref().expect("start event log is locked"), 1)?;
-        published
-    } else {
-        false
-    };
+    }
     let (attached_run, runtime, terminal, startup_profile, running, started) = {
         let mut lifecycle = lock(&shell.lifecycle)?;
         let mut started = false;
@@ -5205,24 +5416,47 @@ fn handle_attach(
             }
         }
     };
-    if started && let Err(error) = registry.persist_unlocked().map_err(persistence_error) {
-        let cleanup = shell.kill();
-        shell.reset_pending()?;
-        return send_response(
-            &mut stream,
-            response_version,
-            error_response(
-                ErrorCode::PersistenceFailed,
-                cleanup.map_or_else(
-                    |cleanup| {
-                        format!(
-                            "could not persist started shell: {error}; process cleanup also failed: {cleanup}"
-                        )
-                    },
-                    |()| format!("could not persist started shell: {error}"),
+    if started {
+        let saved = registry.capture_persisted_state()?;
+        transition
+            .as_mut()
+            .expect("start transition is locked")
+            .persistence_in_flight = true;
+        transition
+            .as_mut()
+            .expect("start transition is locked")
+            .in_flight_event_count = 1;
+        drop(events);
+        drop(transition);
+        if let Err(error) = registry
+            .write_persisted_state(saved)
+            .map_err(persistence_error)
+        {
+            let cleanup = shell.kill();
+            shell.reset_pending()?;
+            let mut transition = lock(&registry.transitions)?;
+            let mut events = lock(&registry.events.state)?;
+            transition.persistence_in_flight = false;
+            transition.in_flight_event_count = 0;
+            registry.publish_pending_runtime_locked(&mut transition, &mut events);
+            return send_response(
+                &mut stream,
+                response_version,
+                error_response(
+                    ErrorCode::PersistenceFailed,
+                    cleanup.map_or_else(
+                        |cleanup| {
+                            format!(
+                                "could not persist started shell: {error}; process cleanup also failed: {cleanup}"
+                            )
+                        },
+                        |()| format!("could not persist started shell: {error}"),
+                    ),
                 ),
-            ),
-        );
+            );
+        }
+        transition = Some(lock(&registry.transitions)?);
+        events = Some(lock(&registry.events.state)?);
     }
     if started {
         let run = shell
@@ -5238,11 +5472,15 @@ fn handle_attach(
                 run,
             }],
         );
+        let transition = transition.as_mut().expect("start transition is locked");
+        transition.persistence_in_flight = false;
+        transition.in_flight_event_count = 0;
+        registry.publish_pending_runtime_locked(transition, events);
     }
     drop(events);
     drop(persistence);
     drop(transition);
-    if started || published_pending {
+    if started {
         registry.events.changed.notify_all();
     }
     if started {
@@ -6350,6 +6588,31 @@ mod tests {
     }
 
     #[test]
+    fn blocked_publication_coalesces_output_by_shell_run() {
+        let mut transition = TransitionState {
+            persistence_in_flight: true,
+            ..TransitionState::default()
+        };
+        for revision in 1..=10_000 {
+            transition.queue_runtime_event(DaemonEventKind::OutputChanged {
+                workspace_id: "w1".into(),
+                shell_id: "s1".into(),
+                run_id: "r1".into(),
+                output_revision: revision,
+            });
+        }
+
+        assert_eq!(transition.pending_runtime_events.len(), 1);
+        assert!(matches!(
+            transition.pending_runtime_events.front(),
+            Some(DaemonEventKind::OutputChanged {
+                output_revision: 10_000,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn rendered_output_tail_preserves_utf8_boundaries() {
         assert_eq!(tail_utf8("one-λ", 2), "λ");
         assert_eq!(tail_utf8("one-λ", 3), "-λ");
@@ -6512,6 +6775,133 @@ mod tests {
         assert!(result.is_err());
         assert!(registry.snapshot().unwrap().workspaces.is_empty());
         assert!(lock(&registry.events.state).unwrap().events.is_empty());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn slow_persistence_does_not_block_pty_draining() {
+        let directory = env::temp_dir().join(format!("boomux-slow-store-{}", Uuid::new_v4()));
+        let gate = Arc::new((Mutex::new((false, false, false)), Condvar::new()));
+        let hook_gate = Arc::clone(&gate);
+        let store = StateStore::at_with_save_hook(
+            directory.join("state/state.json"),
+            Arc::new(move || {
+                let (state, changed) = &*hook_gate;
+                let mut state = state.lock().unwrap();
+                if !state.0 {
+                    return;
+                }
+                state.1 = true;
+                changed.notify_all();
+                while !state.2 {
+                    state = changed.wait(state).unwrap();
+                }
+            }),
+        );
+        let registry = Arc::new(Registry::restore(store, false, None).unwrap());
+        let workspace = registry
+            .create_workspace(
+                "slow-store".into(),
+                vec![ShellSpec {
+                    name: "draining".into(),
+                    command: vec![
+                        "/bin/sh".into(),
+                        "-c".into(),
+                        "stty -echo; while IFS= read -r line; do printf 'observed:%s\\n' \"$line\"; done"
+                            .into(),
+                    ],
+                    cwd: env::temp_dir(),
+                }],
+            )
+            .unwrap();
+        let shell = registry.shell(&workspace.shells[0].id).unwrap();
+        let terminal_profile = profile();
+        let run = Arc::new(ShellRun::new(1));
+        let (runtime, reader) = spawn_runtime(
+            &shell,
+            &run,
+            "slow-store",
+            "draining",
+            &terminal_profile,
+            None,
+            RuntimeRecovery::default(),
+        )
+        .unwrap();
+        *lock(&shell.last_run).unwrap() = Some(run.persisted(terminal_profile.clone()).unwrap());
+        *lock(&shell.lifecycle).unwrap() = ShellLifecycle::Running {
+            profile: terminal_profile,
+            run: Arc::clone(&run),
+            runtime: Arc::clone(&runtime),
+        };
+        start_pty_reader(
+            Arc::downgrade(&registry),
+            Arc::clone(&shell),
+            Arc::clone(&run),
+            Arc::clone(&runtime),
+            reader,
+            false,
+        )
+        .unwrap();
+        lock(&gate.0).unwrap().0 = true;
+
+        let mutation_registry = Arc::clone(&registry);
+        let workspace_id = workspace.id.clone();
+        let mutation = thread::spawn(move || {
+            mutation_registry.dispatch(Request::RenameWorkspace {
+                workspace_id,
+                name: "renamed".into(),
+            })
+        });
+        {
+            let (state, changed) = &*gate;
+            let state = state.lock().unwrap();
+            let (state, timeout) = changed
+                .wait_timeout_while(state, Duration::from_secs(2), |state| !state.1)
+                .unwrap();
+            assert!(!timeout.timed_out(), "persistence write did not start");
+            drop(state);
+        }
+
+        let previous_revision = run.output_revision.load(Ordering::Acquire);
+        lock(&runtime.master)
+            .unwrap()
+            .write(b"during-save\n")
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline
+            && run.output_revision.load(Ordering::Acquire) == previous_revision
+        {
+            thread::sleep(IO_RETRY_DELAY);
+        }
+        assert!(run.output_revision.load(Ordering::Acquire) > previous_revision);
+        assert!(
+            lock(&runtime.terminal)
+                .unwrap()
+                .plain_text()
+                .contains("observed:during-save")
+        );
+
+        {
+            let (state, changed) = &*gate;
+            let mut state = state.lock().unwrap();
+            state.2 = true;
+            changed.notify_all();
+        }
+        assert!(mutation.join().unwrap().is_ok());
+        let events = lock(&registry.events.state).unwrap();
+        let rename = events
+            .events
+            .iter()
+            .position(|event| matches!(event.kind, DaemonEventKind::WorkspaceRenamed { .. }))
+            .unwrap();
+        let output = events
+            .events
+            .iter()
+            .position(|event| matches!(event.kind, DaemonEventKind::OutputChanged { .. }))
+            .unwrap();
+        assert!(rename < output);
+        drop(events);
+        shell.kill().unwrap();
         fs::remove_dir_all(directory).unwrap();
     }
 
