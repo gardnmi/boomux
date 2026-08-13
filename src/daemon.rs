@@ -48,6 +48,7 @@ const RESTART_TIMEOUT: Duration = Duration::from_secs(10);
 const IO_RETRY_DELAY: Duration = Duration::from_millis(2);
 const PERSIST_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const TERMINAL_HISTORY_INTERVAL: Duration = Duration::from_secs(5);
+const FOREGROUND_PROCESS_CACHE_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_TERMINAL_HISTORY_BYTES: usize = 256 * 1024;
 const MAX_TERMINAL_ENV_VALUE: usize = 256;
 const MAX_NAME_BYTES: usize = 256;
@@ -1342,6 +1343,7 @@ struct Shell {
     command: Vec<String>,
     last_run: Mutex<Option<PersistedShellRun>>,
     lifecycle: Mutex<ShellLifecycle>,
+    foreground_process_cache: Mutex<Option<(String, Instant, Option<String>)>>,
 }
 
 enum ShellLifecycle {
@@ -1976,6 +1978,9 @@ impl Registry {
             Request::Snapshot => Ok(Response::Snapshot {
                 snapshot: self.snapshot()?,
             }),
+            Request::GetFocusedTerminal => Ok(Response::FocusedTerminal {
+                focused_terminal: self.focused_terminal()?,
+            }),
             Request::GetWorkspace { workspace_id } => Ok(Response::Workspace {
                 workspace: self.workspace(&workspace_id)?.snapshot(self)?,
             }),
@@ -2380,6 +2385,7 @@ impl Registry {
                     command: saved_shell.command,
                     last_run: Mutex::new(saved_shell.last_run),
                     lifecycle: Mutex::new(ShellLifecycle::Pending),
+                    foreground_process_cache: Mutex::new(None),
                 });
                 shell_ids.push(shell.id.clone());
                 state.shells.insert(shell.id.clone(), shell);
@@ -4395,15 +4401,28 @@ impl Shell {
             ),
             ShellLifecycle::Closed => return Err(not_found("shell", &self.id)),
         };
-        let foreground_process = runtime.and_then(|runtime| {
-            lock(&runtime.master)
-                .ok()
-                .and_then(|master| master.foreground_process())
-                .or_else(|| {
-                    let pid = lock(&runtime.process).ok()?.process_id()?;
-                    foreground_process_for_session_leader(pid)
-                })
-        });
+        let foreground_process = match (runtime, run.as_ref()) {
+            (Some(runtime), Some(run)) => {
+                let mut cache = lock(&self.foreground_process_cache)?;
+                if let Some((cached_run_id, observed_at, process)) = cache.as_ref()
+                    && cached_run_id == &run.id
+                    && observed_at.elapsed() < FOREGROUND_PROCESS_CACHE_INTERVAL
+                {
+                    process.clone()
+                } else {
+                    let process = lock(&runtime.master)
+                        .ok()
+                        .and_then(|master| master.foreground_process())
+                        .or_else(|| {
+                            let pid = lock(&runtime.process).ok()?.process_id()?;
+                            foreground_process_for_session_leader(pid)
+                        });
+                    *cache = Some((run.id.clone(), Instant::now(), process.clone()));
+                    process
+                }
+            }
+            _ => None,
+        };
         Ok(ShellSnapshot {
             id: self.id.clone(),
             workspace_id: self.workspace_id.clone(),
@@ -4609,6 +4628,7 @@ fn create_pending_shell(workspace_id: &str, spec: ShellSpec) -> io::Result<Arc<S
         command: spec.command,
         last_run: Mutex::new(None),
         lifecycle: Mutex::new(ShellLifecycle::Pending),
+        foreground_process_cache: Mutex::new(None),
     }))
 }
 

@@ -9,7 +9,7 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use boomux::client::{Attachment, Client, RemoteError};
+use boomux::client::{self, Attachment, Client, RemoteError};
 use boomux::protocol::{
     self, AgentAuthority, AgentRegistrationSpec, AgentReport, AgentState, AttachFrame, ErrorCode,
     ShellRunExitReason, ShellSpec, ShellStatus, TerminalProfile, UnixEnvironment,
@@ -485,7 +485,7 @@ fn focused_attachment_is_exposed_in_daemon_snapshots() {
         .unwrap();
     let shell_id = workspace.shells[0].id.clone();
     let mut attachment = daemon.client.attach(&shell_id, false, profile()).unwrap();
-    assert_eq!(attachment.protocol_version, 20);
+    assert_eq!(attachment.protocol_version, 21);
 
     AttachFrame::FocusGained
         .write_to(&mut attachment.stream)
@@ -1460,6 +1460,27 @@ fn daemon_events_and_revision_reads_survive_handoff() {
             .and_then(|error| error.code),
         Some(ErrorCode::DaemonStopping)
     );
+}
+
+#[test]
+fn snapshot_watch_refreshes_on_events_and_recovers_after_cold_restart() {
+    let mut daemon = TestDaemon::start();
+    let mut watch = client::SnapshotWatch::baseline(&daemon.client).unwrap();
+    assert!(watch.snapshot().workspaces.is_empty());
+    assert_eq!(watch.poll(&daemon.client).unwrap(), (false, false));
+
+    daemon
+        .client
+        .create_workspace("watched", Vec::new())
+        .unwrap();
+    assert_eq!(watch.poll(&daemon.client).unwrap(), (true, false));
+    assert_eq!(watch.snapshot().workspaces[0].name, "watched");
+    assert_eq!(watch.poll(&daemon.client).unwrap(), (false, false));
+
+    daemon.stop_with_cli();
+    daemon.restart();
+    assert_eq!(watch.poll(&daemon.client).unwrap(), (true, true));
+    assert_eq!(watch.snapshot().workspaces[0].name, "watched");
 }
 
 #[test]
@@ -3430,7 +3451,7 @@ fn native_daemon_lifecycle() {
     let capabilities: serde_json::Value = serde_json::from_slice(&capabilities.stdout).unwrap();
     assert_eq!(capabilities["schema"], "boomux.cli/v1");
     assert_eq!(capabilities["command"], "capabilities");
-    assert_eq!(capabilities["data"]["daemon_protocol_version"], 20);
+    assert_eq!(capabilities["data"]["daemon_protocol_version"], 21);
     assert_eq!(
         capabilities["data"]["session_transcript_integrations"],
         serde_json::json!(["opencode", "pi"])
@@ -3480,8 +3501,10 @@ fn native_daemon_lifecycle() {
         "protocol_18",
         "protocol_19",
         "protocol_20",
+        "protocol_21",
         "workspace_default_cwd",
         "structured_terminal_previews",
+        "focused_terminal_read",
         "focused_terminal_following",
         "inactive_agent_state",
         "protocol_11",
@@ -3503,7 +3526,7 @@ fn native_daemon_lifecycle() {
         .output()
         .unwrap();
     assert!(status.status.success());
-    assert!(String::from_utf8_lossy(&status.stdout).contains("running (protocol 20"));
+    assert!(String::from_utf8_lossy(&status.stdout).contains("running (protocol 21"));
     let status = daemon
         .command()
         .args(["daemon", "status", "--json"])

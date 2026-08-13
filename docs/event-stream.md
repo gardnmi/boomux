@@ -22,6 +22,10 @@ and do not receive acknowledgment events, while cursors still advance across
 those filtered events. Protocol 18 adds the latest non-durable focused terminal
 and its monotonic revision to baseline snapshots. It does not add an event type;
 protocol-17 clients receive the same baseline without that field.
+Protocol 21 adds a targeted focused-terminal read for clients that use events as
+registry invalidation while refreshing ephemeral focus independently. Running
+shell reads refresh foreground-process hints from a daemon-side one-second cache
+shared by concurrent clients.
 
 `boomux agent wait <id> --after-revision <revision>` is the preferred way to
 await one Agent. It returns on a newer accepted durable observation, returns
