@@ -12,6 +12,10 @@ pub(crate) struct TerminalState {
     focus_mode: FocusMode,
 }
 
+pub(crate) struct TerminalSnapshot {
+    screen: vt100::Screen,
+}
+
 impl TerminalState {
     pub(crate) fn new(rows: u16, cols: u16) -> Self {
         let parser = vt100::Parser::new(rows, cols, SCROLLBACK_ROWS);
@@ -99,6 +103,7 @@ impl TerminalState {
         fallback
     }
 
+    #[cfg(test)]
     pub(crate) fn plain_text(&self) -> String {
         let screen = self.parser.screen();
         let mut text = scrollback_text(screen);
@@ -108,73 +113,278 @@ impl TerminalState {
             .collect()
     }
 
-    pub(crate) fn cold_history(&self, max_bytes: usize) -> String {
-        let text = self.plain_text();
-        let mut start = text.len().saturating_sub(max_bytes);
-        while !text.is_char_boundary(start) {
-            start += 1;
+    pub(crate) fn snapshot(&self) -> TerminalSnapshot {
+        TerminalSnapshot {
+            screen: self.parser.screen().clone(),
         }
-        text[start..].to_owned()
     }
 
+    #[cfg(test)]
+    pub(crate) fn cold_history(&self, max_bytes: usize) -> String {
+        self.snapshot().plain_text_suffix(max_bytes)
+    }
+
+    #[cfg(test)]
     pub(crate) fn preview(
         &self,
         max_bytes: usize,
         max_lines: usize,
         max_spans: usize,
     ) -> TerminalPreview {
-        let screen = self.parser.screen();
-        let mut scrolled = screen.clone();
-        scrolled.set_scrollback(usize::MAX);
-        let scrollback_rows = scrolled.scrollback();
-        let mut lines = Vec::new();
-        let mut current = TerminalPreviewLine::default();
+        self.snapshot().preview(max_bytes, max_lines, max_spans)
+    }
+}
 
-        for offset in (1..=scrollback_rows).rev() {
-            scrolled.set_scrollback(offset);
-            append_preview_row(&mut lines, &mut current, &scrolled, 0);
-        }
-        scrolled.set_scrollback(0);
-        for row in 0..scrolled.size().0 {
-            append_preview_row(&mut lines, &mut current, &scrolled, row);
-        }
-        if !current.spans.is_empty() {
-            lines.push(current);
+impl TerminalSnapshot {
+    pub(crate) fn plain_text_suffix(mut self, max_bytes: usize) -> String {
+        if max_bytes == 0 {
+            return String::new();
         }
 
-        let first = lines
-            .iter()
-            .position(|line| !preview_line_is_blank(line))
-            .unwrap_or(lines.len());
-        let end = lines
-            .iter()
-            .rposition(|line| !preview_line_is_blank(line))
-            .map_or(first, |last| last + 1);
-        let lines = &lines[first..end];
-        let start = lines.len().saturating_sub(max_lines);
+        self.screen.set_scrollback(usize::MAX);
+        let scrollback_rows = self.screen.scrollback();
+        self.screen.set_scrollback(0);
+        let (rows, cols) = self.screen.size();
+        let mut pieces = Vec::new();
+        let mut bytes = 0usize;
+        let mut trimming_end = true;
+
+        for row in (0..rows).rev() {
+            let wrapping = if row > 0 {
+                self.screen.row_wrapped(row - 1)
+            } else if scrollback_rows > 0 {
+                self.screen.set_scrollback(1);
+                let wrapped = self.screen.row_wrapped(0);
+                self.screen.set_scrollback(0);
+                wrapped
+            } else {
+                false
+            };
+            let mut piece = plain_row(&self.screen, row, cols, wrapping);
+            if !self.screen.row_wrapped(row) {
+                piece.push('\n');
+            }
+            if trimming_end {
+                piece.truncate(piece.trim_end_matches('\n').len());
+                trimming_end = piece.is_empty();
+            }
+            bytes = bytes.saturating_add(piece.len());
+            pieces.push(piece);
+            if bytes >= max_bytes {
+                return join_utf8_suffix(pieces, max_bytes);
+            }
+        }
+
+        for offset in 1..=scrollback_rows {
+            self.screen.set_scrollback(offset);
+            let wrapping = if offset < scrollback_rows {
+                self.screen.set_scrollback(offset + 1);
+                let wrapped = self.screen.row_wrapped(0);
+                self.screen.set_scrollback(offset);
+                wrapped
+            } else {
+                false
+            };
+            let mut piece = plain_row(&self.screen, 0, cols, wrapping);
+            if !self.screen.row_wrapped(0) {
+                piece.push('\n');
+            }
+            bytes = bytes.saturating_add(piece.len());
+            pieces.push(piece);
+            if bytes >= max_bytes {
+                break;
+            }
+        }
+
+        join_utf8_suffix(pieces, max_bytes)
+    }
+
+    pub(crate) fn preview(
+        mut self,
+        max_bytes: usize,
+        max_lines: usize,
+        max_spans: usize,
+    ) -> TerminalPreview {
+        if max_lines == 0 {
+            return TerminalPreview::default();
+        }
+
+        self.screen.set_scrollback(usize::MAX);
+        let scrollback_rows = self.screen.scrollback();
+        self.screen.set_scrollback(0);
+        let (rows, _) = self.screen.size();
         let mut selected = Vec::new();
+        let mut pending_blanks = Vec::new();
+        let mut current = TerminalPreviewLine::default();
         let mut bytes = 0usize;
         let mut spans = 0usize;
-        for line in lines[start..].iter().rev() {
-            let line_bytes = line.spans.iter().map(|span| span.text.len()).sum::<usize>();
-            let line_spans = line.spans.len();
-            if !selected.is_empty()
-                && (bytes.saturating_add(line_bytes) > max_bytes
-                    || spans.saturating_add(line_spans) > max_spans)
+        let mut saw_content = false;
+
+        for row in (0..rows).rev() {
+            prepend_preview_row(&mut current, &self.screen, row);
+            let previous_wrapped = if row > 0 {
+                self.screen.row_wrapped(row - 1)
+            } else if scrollback_rows > 0 {
+                self.screen.set_scrollback(1);
+                let wrapped = self.screen.row_wrapped(0);
+                self.screen.set_scrollback(0);
+                wrapped
+            } else {
+                false
+            };
+            if !previous_wrapped
+                && select_preview_line(
+                    &mut selected,
+                    &mut pending_blanks,
+                    &mut current,
+                    &mut bytes,
+                    &mut spans,
+                    &mut saw_content,
+                    max_bytes,
+                    max_lines,
+                    max_spans,
+                )
+            {
+                selected.reverse();
+                return TerminalPreview { lines: selected };
+            }
+        }
+
+        for offset in 1..=scrollback_rows {
+            self.screen.set_scrollback(offset);
+            prepend_preview_row(&mut current, &self.screen, 0);
+            let previous_wrapped = if offset < scrollback_rows {
+                self.screen.set_scrollback(offset + 1);
+                let wrapped = self.screen.row_wrapped(0);
+                self.screen.set_scrollback(offset);
+                wrapped
+            } else {
+                false
+            };
+            if !previous_wrapped
+                && select_preview_line(
+                    &mut selected,
+                    &mut pending_blanks,
+                    &mut current,
+                    &mut bytes,
+                    &mut spans,
+                    &mut saw_content,
+                    max_bytes,
+                    max_lines,
+                    max_spans,
+                )
             {
                 break;
             }
-            bytes = bytes.saturating_add(line_bytes);
-            spans = spans.saturating_add(line_spans);
-            selected.push(line.clone());
         }
+
         selected.reverse();
         TerminalPreview { lines: selected }
     }
 }
 
-fn append_preview_row(
-    lines: &mut Vec<TerminalPreviewLine>,
+fn plain_row(screen: &vt100::Screen, row: u16, cols: u16, wrapping: bool) -> String {
+    let mut text = String::new();
+    let mut next_col = 0;
+    for col in 0..cols {
+        let Some(cell) = screen.cell(row, col) else {
+            continue;
+        };
+        if cell.is_wide_continuation() || !cell.has_contents() {
+            continue;
+        }
+        for _ in next_col..col {
+            text.push(' ');
+        }
+        text.extend(
+            cell.contents()
+                .chars()
+                .filter(|character| !character.is_control() || matches!(character, '\n' | '\t')),
+        );
+        next_col = col.saturating_add(if cell.is_wide() { 2 } else { 1 });
+    }
+    if next_col == 0 && wrapping {
+        text.push('\n');
+    }
+    text
+}
+
+fn join_utf8_suffix(mut pieces: Vec<String>, max_bytes: usize) -> String {
+    pieces.reverse();
+    let text = pieces.concat();
+    let mut start = text.len().saturating_sub(max_bytes);
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    text[start..].to_owned()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn select_preview_line(
+    selected: &mut Vec<TerminalPreviewLine>,
+    pending_blanks: &mut Vec<TerminalPreviewLine>,
+    current: &mut TerminalPreviewLine,
+    bytes: &mut usize,
+    spans: &mut usize,
+    saw_content: &mut bool,
+    max_bytes: usize,
+    max_lines: usize,
+    max_spans: usize,
+) -> bool {
+    let line = std::mem::take(current);
+    if !*saw_content && preview_line_is_blank(&line) {
+        return false;
+    }
+    if preview_line_is_blank(&line) {
+        pending_blanks.push(line);
+        return false;
+    }
+    *saw_content = true;
+    for blank in pending_blanks.drain(..) {
+        if push_preview_line(
+            selected, blank, bytes, spans, max_bytes, max_lines, max_spans,
+        ) {
+            return true;
+        }
+    }
+    push_preview_line(
+        selected, line, bytes, spans, max_bytes, max_lines, max_spans,
+    )
+}
+
+fn push_preview_line(
+    selected: &mut Vec<TerminalPreviewLine>,
+    line: TerminalPreviewLine,
+    bytes: &mut usize,
+    spans: &mut usize,
+    max_bytes: usize,
+    max_lines: usize,
+    max_spans: usize,
+) -> bool {
+    let line_bytes = line.spans.iter().map(|span| span.text.len()).sum::<usize>();
+    let line_spans = line.spans.len();
+    if !selected.is_empty()
+        && (bytes.saturating_add(line_bytes) > max_bytes
+            || spans.saturating_add(line_spans) > max_spans)
+    {
+        return true;
+    }
+    *bytes = bytes.saturating_add(line_bytes);
+    *spans = spans.saturating_add(line_spans);
+    selected.push(line);
+    selected.len() >= max_lines
+}
+
+fn prepend_preview_row(current: &mut TerminalPreviewLine, screen: &vt100::Screen, row: u16) {
+    let mut prefix = TerminalPreviewLine::default();
+    append_preview_row_contents(&mut prefix, screen, row);
+    for span in std::mem::take(&mut current.spans) {
+        append_preview_span(&mut prefix, &span.text, span.style);
+    }
+    *current = prefix;
+}
+
+fn append_preview_row_contents(
     current: &mut TerminalPreviewLine,
     screen: &vt100::Screen,
     row: u16,
@@ -207,9 +417,6 @@ fn append_preview_row(
             append_preview_span(current, text, CellStyle::from_cell(cell).into());
         }
     }
-    if !wrapped {
-        lines.push(std::mem::take(current));
-    }
 }
 
 fn append_preview_span(line: &mut TerminalPreviewLine, text: &str, style: TerminalStyle) {
@@ -238,6 +445,7 @@ fn alternate_screen_start(bytes: &[u8]) -> Option<usize> {
         .min()
 }
 
+#[cfg(test)]
 fn scrollback_text(screen: &vt100::Screen) -> String {
     let mut screen = screen.clone();
     screen.set_scrollback(usize::MAX);
@@ -658,6 +866,36 @@ mod tests {
     }
 
     #[test]
+    fn bounded_plain_text_matches_full_rendering_suffixes() {
+        let mut state = TerminalState::new(3, 8);
+        state.process("one\r\nwide界\r\n\r\nfour\r\nfive é".as_bytes());
+        let full = state.plain_text();
+
+        for max_bytes in 0..=full.len() + 2 {
+            let mut start = full.len().saturating_sub(max_bytes);
+            while !full.is_char_boundary(start) {
+                start += 1;
+            }
+            assert_eq!(state.snapshot().plain_text_suffix(max_bytes), full[start..]);
+        }
+    }
+
+    #[test]
+    fn bounded_plain_text_matches_wrapping_across_scrollback_boundary() {
+        let mut state = TerminalState::new(2, 4);
+        state.process(b"abcd\r\nnext");
+        let full = state.plain_text();
+
+        for max_bytes in 0..=full.len() {
+            let mut start = full.len().saturating_sub(max_bytes);
+            while !full.is_char_boundary(start) {
+                start += 1;
+            }
+            assert_eq!(state.snapshot().plain_text_suffix(max_bytes), full[start..]);
+        }
+    }
+
+    #[test]
     fn preview_preserves_styles_and_matches_plain_text() {
         let mut state = TerminalState::new(3, 30);
         state.process(b"plain \x1b[1;31mred\x1b[0m\r\n\x1b[38;2;1;2;3;48;2;4;5;6mcolor\x1b[0m");
@@ -713,5 +951,51 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(text, ["two", "three"]);
+    }
+
+    #[test]
+    fn preview_preserves_interior_blanks_before_applying_line_limit() {
+        let mut state = TerminalState::new(4, 20);
+        state.process(b"one\r\n\r\nthree");
+
+        let preview = state.preview(1024, 2, 100);
+
+        assert_eq!(preview.lines.len(), 2);
+        assert!(preview_line_is_blank(&preview.lines[0]));
+        assert_eq!(preview.lines[1].spans[0].text, "three");
+    }
+
+    #[test]
+    fn bounded_preview_stops_at_newest_styled_scrollback_lines() {
+        let mut state = TerminalState::new(2, 20);
+        for line in 0..SCROLLBACK_ROWS + 20 {
+            state.process(format!("\x1b[3{}mline-{line:04}\x1b[0m\r\n", line % 8).as_bytes());
+        }
+
+        let preview = state.snapshot().preview(32, 2, 4);
+        let text = preview
+            .lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.text.as_str())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(text, ["line-2018", "line-2019"]);
+        assert_eq!(
+            preview
+                .lines
+                .iter()
+                .map(|line| line.spans.len())
+                .sum::<usize>(),
+            2
+        );
+        assert_ne!(
+            preview.lines[0].spans[0].style.foreground,
+            TerminalColor::Default
+        );
     }
 }
