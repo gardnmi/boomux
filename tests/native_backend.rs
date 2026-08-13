@@ -2271,9 +2271,12 @@ fn agent_runtime_is_revisioned_durable_and_version_compatible() {
     assert_eq!(list["command"], "agent.list");
     assert_eq!(list["data"]["agents"][0]["id"], agent_id);
     assert_eq!(list["data"]["agents"][0]["observation"]["revision"], 1);
+    let host_bin = daemon.runtime_dir.join("host-bin");
+    fs::create_dir(&host_bin).unwrap();
     let session_list = daemon
         .command()
         .args(["session", "list", "--workspace", &workspace.id, "--json"])
+        .env("PATH", &host_bin)
         .output()
         .unwrap();
     assert!(
@@ -2301,6 +2304,7 @@ fn agent_runtime_is_revisioned_durable_and_version_compatible() {
     let session_inspect = daemon
         .command()
         .args(["session", "inspect", session_id, "--json"])
+        .env("PATH", &host_bin)
         .output()
         .unwrap();
     assert!(session_inspect.status.success());
@@ -2371,6 +2375,7 @@ fn agent_runtime_is_revisioned_durable_and_version_compatible() {
     let pi_sessions = daemon
         .command()
         .args(["session", "list", "--json"])
+        .env("PATH", &host_bin)
         .output()
         .unwrap();
     let pi_sessions: serde_json::Value = serde_json::from_slice(&pi_sessions.stdout).unwrap();
