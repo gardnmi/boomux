@@ -6998,7 +6998,10 @@ mod tests {
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
         while Instant::now() < deadline
-            && run.output_revision.load(Ordering::Acquire) == previous_revision
+            && !lock(&runtime.terminal)
+                .unwrap()
+                .plain_text()
+                .contains("observed:during-save")
         {
             thread::sleep(IO_RETRY_DELAY);
         }
@@ -7118,9 +7121,12 @@ mod tests {
         }
         let deadline = Instant::now() + Duration::from_secs(3);
         while Instant::now() < deadline
-            && shells
-                .iter()
-                .any(|(_, run, _)| run.output_revision.load(Ordering::Acquire) < 2)
+            && shells.iter().enumerate().any(|(index, (_, _, runtime))| {
+                !lock(&runtime.terminal)
+                    .unwrap()
+                    .plain_text()
+                    .contains(&format!("shell-{index}-499"))
+            })
         {
             thread::sleep(IO_RETRY_DELAY);
         }
