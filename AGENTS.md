@@ -88,8 +88,9 @@ exercise process, socket, PTY, and daemon lifecycle behavior.
 - Use Conventional Commits for every commit: `type(scope): description` or
   `type: description`.
 - Use `feat` for user-visible capabilities, `fix` for user-visible corrections,
-  and `perf` for performance improvements. Use `docs`, `test`, `refactor`,
-  `build`, `ci`, or `chore` when the change is not release-note material.
+  `perf` for performance improvements, and `refactor` for internal product
+  improvements that preserve behavior. Use `docs`, `test`, `build`, `ci`, or
+  `chore` when the change is not release-note material.
 - Mark breaking changes with `!` after the type or scope and explain them in a
   `BREAKING CHANGE:` footer.
 - Keep the description imperative, lowercase, and concise.
@@ -100,11 +101,11 @@ exercise process, socket, PTY, and daemon lifecycle behavior.
   release impact of the complete PR, for example `feat: add workspace previews`
   or `fix(agent): preserve lifecycle registration`.
 - Choose a Release Please-recognized title deliberately: `feat` triggers a minor
-  release, `fix` and `perf` trigger a patch release, and `!` or a
+  release; `fix`, `perf`, and `refactor` trigger a patch release; and `!` or a
   `BREAKING CHANGE:` footer triggers a major release. Use non-release types such
-  as `refactor`, `docs`, `test`, `ci`, or `chore` only when the PR has no
-  release-visible impact; those changes ship with the next release-triggering
-  PR. Never mislabel internal work solely to force a version.
+  as `docs`, `test`, `build`, `ci`, or `chore` only when the PR has no
+  release-visible impact. Never mislabel internal work solely to force a
+  version.
 - Squash-merge PRs into `main` so the conventional PR title becomes the
   main-branch commit consumed by Release Please.
 - Before merging, update the PR title if its release type or scope changed.
