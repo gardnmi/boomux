@@ -435,6 +435,7 @@ launcher-only workspace is valid, but an empty workspace cannot be opened.
 boomux launcher list --workspace "<workspace-name-or-id>"
 boomux launcher create "<name>" --workspace "<workspace-name-or-id>" --cwd "/path" -- command arg
 boomux launcher inspect "<name-or-id>" --workspace "<workspace-name-or-id>"
+boomux launcher invoke "<name-or-id>" --workspace "<workspace-name-or-id>"
 boomux launcher rename "<name-or-id>" "<new-name>" --workspace "<workspace-name-or-id>"
 boomux launcher remove "<name-or-id>" --workspace "<workspace-name-or-id>"
 ```

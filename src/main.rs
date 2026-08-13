@@ -364,6 +364,12 @@ enum LauncherCommands {
         #[arg(long, value_name = "NAME_OR_ID")]
         workspace: Option<String>,
     },
+    /// Invoke a launcher as a detached process
+    Invoke {
+        target: String,
+        #[arg(long, value_name = "NAME_OR_ID")]
+        workspace: Option<String>,
+    },
     /// Rename a launcher
     Rename {
         target: String,
@@ -871,6 +877,7 @@ impl Cli {
             Some(Commands::Launcher {
                 command:
                     LauncherCommands::Create { .. }
+                    | LauncherCommands::Invoke { .. }
                     | LauncherCommands::Rename { .. }
                     | LauncherCommands::Remove { .. },
             }) => CommandKey::Launcher,
@@ -2705,6 +2712,19 @@ fn launcher_command(command: LauncherCommands, json: bool) -> Result<(), Box<dyn
             println!("WORKSPACE\t{}", workspace.name);
             println!("CWD\t{}", launcher.cwd.display());
             println!("COMMAND\t{}", launcher.command.join(" "));
+        }
+        LauncherCommands::Invoke { target, workspace } => {
+            let snapshot = client.snapshot()?;
+            let launcher = resolve_cli_launcher(&snapshot, &target, workspace.as_deref())?;
+            let workspace = snapshot
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.id == launcher.workspace_id)
+                .ok_or_else(|| {
+                    cli_output::failure("not_found", "launcher workspace no longer exists")
+                })?;
+            invoke_workspace_launcher(workspace, launcher)?;
+            println!("Launched {} from {}", launcher.name, workspace.name);
         }
         LauncherCommands::Rename {
             target,
@@ -4557,6 +4577,25 @@ mod tests {
                 && cwd == Path::new("/tmp")
                 && command == ["zeditor", "."]
         ));
+        let cli = Cli::try_parse_from([
+            "boomux",
+            "launcher",
+            "invoke",
+            "editor",
+            "--workspace",
+            "project",
+        ])
+        .unwrap();
+        assert_eq!(cli.command_descriptor().output, OutputMode::HumanOnly);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Launcher {
+                command: LauncherCommands::Invoke {
+                    target,
+                    workspace: Some(workspace),
+                }
+            }) if target == "editor" && workspace == "project"
+        ));
         assert!(matches!(
             Cli::try_parse_from(["boomux", "workspace", "open", "project"])
                 .unwrap()
@@ -6313,6 +6352,7 @@ mod tests {
             "boomux launcher list",
             "boomux launcher create",
             "boomux launcher inspect",
+            "boomux launcher invoke",
             "boomux launcher rename",
             "boomux launcher remove",
             "boomux agent list",
