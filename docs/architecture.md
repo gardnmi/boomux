@@ -615,12 +615,14 @@ coordinated transition covers the affected in-memory lifecycle, durable state,
 retained event batches, and handoff capture. This gives clients one ordering
 boundary instead of independent persistence and event locks.
 
-Coordinator paths acquire the operation or mutation lock, transition
-coordinator, persistence lock, and event state in that order. Fine-grained
-registry, lifecycle, and terminal locks are acquired only where each path needs
-them; code does not wait on blocking PTY I/O or process shutdown while holding
-the coordinator. Close and shutdown first stop runtimes, then finalize visible
-lifecycle changes inside the coordinator.
+Durable paths acquire the operation or mutation lock and persistence-ordering
+gate before the transition coordinator and event state. They prepare an owned,
+immutable persistence generation while domain locks are held, then release the
+transition, event, registry, lifecycle, and terminal locks before submitting it
+to one FIFO writer. JSON serialization, temporary-file writes, fsync, rename,
+and directory fsync therefore never retain locks required by PTY readers. Close
+and shutdown first stop runtimes, then finalize visible lifecycle changes inside
+the coordinator.
 
 Durable lifecycle events are published only after their state is persisted. A
 failed persistence attempt queues the event batch; background recovery persists
@@ -628,6 +630,14 @@ the latest state and publishes each queued batch exactly once. If a close cannot
 commit after stopping a runtime, a running shell becomes pending with a
 terminated last run, while an already-exited shell recovers its exact exited
 lifecycle and terminal state.
+
+While a persistence generation is in flight, PTY readers continue parsing bytes,
+advancing output revisions, and delivering controller output. Their runtime
+events wait in the ordered publication frontier behind the durable generation.
+Writer success publishes the durable batch and then those runtime events; a
+rollback removes the rejected durable transition and releases the runtime events.
+Monotonic dirty revisions ensure a terminal-history checkpoint made after an
+older generation was captured remains eligible for a later retry.
 
 Baseline reads capture their snapshot and event cursor inside the same boundary,
 so the cursor describes the exact cut represented by the snapshot. PTY bytes are
