@@ -639,11 +639,16 @@ rollback removes the rejected durable transition and releases the runtime events
 Monotonic dirty revisions ensure a terminal-history checkpoint made after an
 older generation was captured remains eligible for a later retry.
 
-Baseline reads capture their snapshot and event cursor inside the same boundary,
-so the cursor describes the exact cut represented by the snapshot. PTY bytes are
-not persisted per chunk, but output revision mutation and `output_changed`
-publication cross the coordinator together. A non-blocking terminal lock keeps
-output processing from holding global locks while waiting on terminal snapshots.
+Baseline reads capture their snapshot and event cursor inside the durable
+transition boundary, so the cursor describes the exact published cut represented
+by the snapshot. Each PTY reader parses bytes, advances its run revision, updates
+retained run metadata, and attempts bounded controller delivery using only
+per-shell synchronization. It publishes the latest revision at most once per
+16-millisecond window, with forced publication at pause, stop, and exit
+boundaries. Output events may therefore skip intermediate revisions and event
+IDs describe publication order rather than byte-arrival order. Revision-aware
+reads use a per-runtime condition variable and do not depend on global event
+publication for wakeups.
 
 Agent registration, ensure, reports, and attention acknowledgment use the same
 durable mutation coordinator.

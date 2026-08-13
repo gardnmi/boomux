@@ -67,7 +67,10 @@ The event vocabulary is:
 
 Output events carry run identity and the latest output revision, not raw PTY
 bytes. Consumers use revision-aware reads to retrieve the current bounded,
-rendered terminal state.
+rendered terminal state. PTY readers coalesce output publication over a bounded
+16-millisecond window, so event revisions may skip intermediate reader
+revisions. Pause, stop, and exit boundaries force the latest revision into the
+publication frontier.
 
 Agent events carry the complete durable agent snapshot, including exact shell
 and run IDs and the latest state, authority, evidence, confidence, observation
@@ -102,9 +105,11 @@ fails, the event batch remains pending; background recovery publishes queued
 batches in transition order and exactly once.
 
 The baseline snapshot and cursor are captured under this same coordinator, so no
-transition can be published between those observations. PTY bytes are not
-persisted on every chunk, but output revision mutation and `output_changed`
-publication still cross the transition boundary together.
+event can be published between those observations. PTY output revision advances
+under per-runtime synchronization and can be newer than the latest published
+event at that instant. Every unpublished advance causes a later
+`output_changed` carrying that revision or a newer one. Event IDs remain a total
+publication order, not a byte-arrival order.
 
 ## Revision Reads
 
@@ -116,6 +121,9 @@ publication still cross the transition boundary together.
   `changed: true`.
 - An equal revision waits or returns empty output with `changed: false`.
 - A different run returns `run_changed`.
+
+Conditional reads wait on the requested runtime directly. They can therefore
+return a newer revision before its coalesced `output_changed` event is published.
 - A future revision returns `revision_ahead`.
 - Exit and daemon restart wake waiting reads.
 

@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError, Weak};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -46,6 +46,7 @@ const SHUTDOWN_GRACE: Duration = Duration::from_millis(50);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 const RESTART_TIMEOUT: Duration = Duration::from_secs(10);
 const IO_RETRY_DELAY: Duration = Duration::from_millis(2);
+const OUTPUT_PUBLICATION_INTERVAL: Duration = Duration::from_millis(16);
 const PERSIST_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const TERMINAL_HISTORY_INTERVAL: Duration = Duration::from_secs(5);
 const FOREGROUND_PROCESS_CACHE_INTERVAL: Duration = Duration::from_secs(1);
@@ -521,6 +522,7 @@ fn launch_replacement(
     registry.ensure_running()?;
     registry.stopping.store(true, Ordering::Release);
     registry.events.notify();
+    registry.notify_output_waiters();
     let mut paused = Vec::new();
     let result = (|| {
         registry.quiesce_controllers()?;
@@ -1554,6 +1556,8 @@ struct ShellRuntime {
     terminal: Arc<Mutex<TerminalState>>,
     controller: Mutex<Option<Controller>>,
     reader: Mutex<Option<ReaderTask>>,
+    output_changed: Condvar,
+    output_wait: Mutex<()>,
 }
 
 enum ManagedProcess {
@@ -1600,12 +1604,12 @@ struct PtyReader {
 
 struct ReaderTask {
     commands: mpsc::Sender<ReaderCommand>,
-    handle: thread::JoinHandle<()>,
+    handle: Mutex<Option<thread::JoinHandle<io::Result<()>>>>,
 }
 
 enum ReaderCommand {
     Pause {
-        acknowledge: SyncSender<()>,
+        acknowledge: SyncSender<io::Result<()>>,
         cancelled: Arc<AtomicBool>,
     },
     Resume,
@@ -1840,13 +1844,31 @@ impl Read for PtyReader {
 }
 
 impl ReaderTask {
+    fn is_finished(&self) -> bool {
+        self.handle
+            .lock()
+            .ok()
+            .and_then(|handle| handle.as_ref().map(thread::JoinHandle::is_finished))
+            .unwrap_or(true)
+    }
+
+    fn finish(&self) -> io::Result<()> {
+        let handle = lock(&self.handle)?.take();
+        match handle {
+            Some(handle) => handle
+                .join()
+                .map_err(|_| io::Error::other("PTY reader thread panicked"))?,
+            None => Ok(()),
+        }
+    }
+
     fn pause(&self) -> io::Result<()> {
         self.pause_with_timeout(HANDSHAKE_TIMEOUT)
     }
 
     fn pause_with_timeout(&self, timeout: Duration) -> io::Result<()> {
-        if self.handle.is_finished() {
-            return Ok(());
+        if self.is_finished() {
+            return self.finish();
         }
         let (acknowledge, acknowledged) = mpsc::sync_channel(1);
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -1858,22 +1880,29 @@ impl ReaderTask {
             })
             .is_err()
         {
-            return self.handle.is_finished().then_some(()).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::BrokenPipe, "PTY reader control closed")
-            });
+            return if self.is_finished() {
+                self.finish()
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "PTY reader control closed",
+                ))
+            };
         }
         let deadline = Instant::now() + timeout;
         loop {
             match acknowledged.try_recv() {
-                Ok(()) => return Ok(()),
-                Err(mpsc::TryRecvError::Disconnected) if self.handle.is_finished() => return Ok(()),
+                Ok(result) => return result,
+                Err(mpsc::TryRecvError::Disconnected) if self.is_finished() => {
+                    return self.finish();
+                }
                 Err(mpsc::TryRecvError::Disconnected) => {
                     return Err(io::Error::new(
                         io::ErrorKind::BrokenPipe,
                         "PTY reader stopped before acknowledging pause",
                     ));
                 }
-                Err(mpsc::TryRecvError::Empty) if self.handle.is_finished() => return Ok(()),
+                Err(mpsc::TryRecvError::Empty) if self.is_finished() => return self.finish(),
                 Err(mpsc::TryRecvError::Empty) if Instant::now() >= deadline => {
                     cancelled.store(true, Ordering::Release);
                     return Err(io::Error::new(
@@ -1887,7 +1916,9 @@ impl ReaderTask {
     }
 
     fn resume(&self) -> io::Result<()> {
-        if self.handle.is_finished() || self.commands.send(ReaderCommand::Resume).is_ok() {
+        if self.is_finished() {
+            self.finish()
+        } else if self.commands.send(ReaderCommand::Resume).is_ok() {
             Ok(())
         } else {
             Err(io::Error::new(
@@ -1898,12 +1929,10 @@ impl ReaderTask {
     }
 
     fn stop(self) -> io::Result<()> {
-        if !self.handle.is_finished() {
+        if !self.is_finished() {
             let _ = self.commands.send(ReaderCommand::Stop);
         }
-        self.handle
-            .join()
-            .map_err(|_| io::Error::other("PTY reader thread panicked"))
+        self.finish()
     }
 }
 
@@ -2624,6 +2653,8 @@ impl Registry {
                 terminal: Arc::new(Mutex::new(terminal)),
                 controller: Mutex::new(None),
                 reader: Mutex::new(None),
+                output_changed: Condvar::new(),
+                output_wait: Mutex::new(()),
             });
             prepared.push((shell, saved_run, run, runtime, reader));
         }
@@ -2943,13 +2974,18 @@ impl Registry {
         shells: &[Arc<Shell>],
         transition: &mut TransitionState,
     ) -> io::Result<()> {
-        let batch = shells
-            .iter()
-            .map(|shell| shell.compensate_stopped())
-            .collect::<io::Result<Vec<_>>>()?
-            .into_iter()
-            .flatten()
+        let mut batch = transition
+            .pending_runtime_events
+            .drain(..)
             .collect::<Vec<_>>();
+        batch.extend(
+            shells
+                .iter()
+                .map(|shell| shell.compensate_stopped())
+                .collect::<io::Result<Vec<_>>>()?
+                .into_iter()
+                .flatten(),
+        );
         self.queue_durable_batch_locked(batch, transition);
         Ok(())
     }
@@ -3007,6 +3043,19 @@ impl Registry {
             ))
         } else {
             Ok(())
+        }
+    }
+
+    fn notify_output_waiters(&self) {
+        if let Ok(state) = self.state.lock() {
+            for shell in state.shells.values() {
+                if let Ok(lifecycle) = shell.lifecycle.lock()
+                    && let ShellLifecycle::Running { runtime, .. } = &*lifecycle
+                {
+                    let _wait = runtime.output_wait.lock();
+                    runtime.output_changed.notify_all();
+                }
+            }
         }
     }
 
@@ -3280,11 +3329,18 @@ impl Registry {
             terminal: Arc::clone(&runtime.terminal),
         };
         drop(lifecycle);
-        let batch = vec![DaemonEventKind::RunExited {
+        let _wait = lock(&runtime.output_wait)?;
+        runtime.output_changed.notify_all();
+        drop(_wait);
+        let mut batch = transition
+            .pending_runtime_events
+            .drain(..)
+            .collect::<Vec<_>>();
+        batch.push(DaemonEventKind::RunExited {
             workspace_id: shell.workspace_id.clone(),
             shell_id: shell.id.clone(),
             run: run.snapshot()?,
-        }];
+        });
         let saved = self.capture_persisted_state()?;
         transition.persistence_in_flight = true;
         transition.in_flight_event_count = pending_count.saturating_add(1);
@@ -3448,6 +3504,7 @@ impl Registry {
             let state = lock(&self.state)?;
             state.shells.values().cloned().collect::<Vec<_>>()
         };
+        self.notify_output_waiters();
         let mut stopped: Vec<Arc<Shell>> = Vec::with_capacity(shells.len());
         for shell in &shells {
             if let Err(error) = shell.stop_runtime() {
@@ -4135,10 +4192,9 @@ impl Registry {
         let deadline =
             Instant::now() + Duration::from_millis(u64::from(wait_ms)).min(MAX_EVENT_WAIT);
         loop {
-            let observed_event_id = lock(&self.events.state)?.latest_id;
             let shell = self.shell(shell_id)?;
             let lifecycle = lock(&shell.lifecycle)?;
-            let (status, run, terminal) = match &*lifecycle {
+            let (status, run, runtime, terminal) = match &*lifecycle {
                 ShellLifecycle::Pending => {
                     if expected_run_id.is_some() {
                         return Err(coded_error(
@@ -4157,6 +4213,7 @@ impl Registry {
                 ShellLifecycle::Running { run, runtime, .. } => (
                     ShellStatus::Running,
                     Arc::clone(run),
+                    Some(Arc::clone(runtime)),
                     Arc::clone(&runtime.terminal),
                 ),
                 ShellLifecycle::Exited {
@@ -4167,6 +4224,7 @@ impl Registry {
                 } => (
                     ShellStatus::Exited { code: *code },
                     Arc::clone(run),
+                    None,
                     Arc::clone(terminal),
                 ),
                 ShellLifecycle::Closed => return Err(not_found("shell", shell_id)),
@@ -4249,22 +4307,22 @@ impl Registry {
                     "Boomux daemon is stopping",
                 ));
             }
-            let state = lock(&self.events.state)?;
+            let runtime = runtime.expect("running shell has a runtime");
+            let wait = lock(&runtime.output_wait)?;
             if self.stopping.load(Ordering::Acquire) {
                 return Err(coded_error(
                     ErrorCode::DaemonStopping,
                     "Boomux daemon is stopping",
                 ));
             }
-            if state.latest_id != observed_event_id {
+            if run.output_revision.load(Ordering::Acquire) != revision {
                 continue;
             }
             let timeout = deadline.saturating_duration_since(Instant::now());
-            let _ = self
-                .events
-                .changed
-                .wait_timeout(state, timeout)
-                .map_err(|_| io::Error::other("daemon event lock poisoned"))?;
+            let _ = runtime
+                .output_changed
+                .wait_timeout(wait, timeout)
+                .map_err(|_| io::Error::other("shell output wait lock poisoned"))?;
         }
     }
 
@@ -4456,7 +4514,6 @@ impl Registry {
         let _mutation = lock(&self.mutation_lock)?;
         self.ensure_running()?;
         let shell = self.shell(shell_id)?;
-        let _transition = lock(&self.transitions)?;
         let old_runtime = {
             let mut lifecycle = lock(&shell.lifecycle)?;
             let old_runtime = match &*lifecycle {
@@ -4730,9 +4787,15 @@ impl Shell {
                 lifecycle: ShellLifecycle::Pending,
                 event: None,
             }),
-            ShellLifecycle::Running { profile, run, .. } => {
+            ShellLifecycle::Running {
+                profile,
+                run,
+                runtime,
+            } => {
                 run.finish(ShellRunExitReason::Terminated)?;
                 *lock(&self.last_run)? = Some(run.persisted(profile.clone())?);
+                let _wait = lock(&runtime.output_wait)?;
+                runtime.output_changed.notify_all();
                 Ok(StopRollback {
                     lifecycle: ShellLifecycle::Pending,
                     event: Some(DaemonEventKind::RunExited {
@@ -4961,6 +5024,8 @@ fn spawn_runtime(
             terminal: Arc::new(Mutex::new(terminal)),
             controller: Mutex::new(None),
             reader: Mutex::new(None),
+            output_changed: Condvar::new(),
+            output_wait: Mutex::new(()),
         }),
         reader,
     ))
@@ -4985,6 +5050,8 @@ fn start_pty_reader(
             let mut paused = start_paused;
             let mut last_history_checkpoint = Instant::now();
             let mut pause_cancellation: Option<Arc<AtomicBool>> = None;
+            let mut pending_output_revision = None;
+            let mut output_publication_deadline = None;
             loop {
                 if paused {
                     if pause_cancellation
@@ -5000,8 +5067,15 @@ fn start_pty_reader(
                             acknowledge,
                             cancelled,
                         }) => {
+                            let result = publish_pending_output(
+                                &registry,
+                                &shell,
+                                &reader_run,
+                                &mut pending_output_revision,
+                                &mut output_publication_deadline,
+                            );
                             if !cancelled.load(Ordering::Acquire) {
-                                let _ = acknowledge.send(());
+                                let _ = acknowledge.send(result);
                             }
                         }
                         Ok(ReaderCommand::Resume) => {
@@ -5024,9 +5098,19 @@ fn start_pty_reader(
                         if cancelled.load(Ordering::Acquire) {
                             continue;
                         }
+                        if let Err(error) = publish_pending_output(
+                            &registry,
+                            &shell,
+                            &reader_run,
+                            &mut pending_output_revision,
+                            &mut output_publication_deadline,
+                        ) {
+                            let _ = acknowledge.send(Err(error));
+                            return Err(io::Error::other("could not publish output before pause"));
+                        }
                         paused = true;
                         pause_cancellation = Some(Arc::clone(&cancelled));
-                        if acknowledge.send(()).is_err() || cancelled.load(Ordering::Acquire) {
+                        if acknowledge.send(Ok(())).is_err() || cancelled.load(Ordering::Acquire) {
                             paused = false;
                             pause_cancellation = None;
                         }
@@ -5034,6 +5118,13 @@ fn start_pty_reader(
                     }
                     Ok(ReaderCommand::Resume) => continue,
                     Ok(ReaderCommand::Stop) | Err(mpsc::TryRecvError::Disconnected) => {
+                        publish_pending_output(
+                            &registry,
+                            &shell,
+                            &reader_run,
+                            &mut pending_output_revision,
+                            &mut output_publication_deadline,
+                        )?;
                         stopped = true;
                         break;
                     }
@@ -5043,34 +5134,15 @@ fn start_pty_reader(
                     Ok(0) => break,
                     Ok(count) => {
                         let bytes = &buffer[..count];
-                        let Some(registry) = registry.upgrade() else {
+                        let Some(active_registry) = registry.upgrade() else {
                             break;
                         };
-                        let (mut transition, mut events, mut terminal) = loop {
-                            let Ok(transition) = registry.transitions.lock() else {
-                                return;
-                            };
-                            let Ok(events) = registry.events.state.lock() else {
-                                return;
-                            };
-                            match reader_runtime.terminal.try_lock() {
-                                Ok(terminal) => break (transition, events, terminal),
-                                Err(TryLockError::WouldBlock) => {
-                                    drop(events);
-                                    drop(transition);
-                                    thread::sleep(IO_RETRY_DELAY);
-                                }
-                                Err(TryLockError::Poisoned(_)) => return,
-                            }
-                        };
-                        if EventLog::ensure_capacity(
-                            &events,
-                            transition.reserved_event_count().saturating_add(1),
-                        )
-                        .is_err()
-                        {
+                        let Ok(_output_wait) = reader_runtime.output_wait.lock() else {
                             break;
-                        }
+                        };
+                        let Ok(mut terminal) = reader_runtime.terminal.lock() else {
+                            break;
+                        };
                         terminal.process(bytes);
                         let Ok(previous_revision) = reader_run.output_revision.fetch_update(
                             Ordering::AcqRel,
@@ -5099,25 +5171,31 @@ fn start_pty_reader(
                                 let _ = current.connection.shutdown(std::net::Shutdown::Both);
                             }
                         }
-                        let output_event = DaemonEventKind::OutputChanged {
-                            workspace_id: shell.workspace_id.clone(),
-                            shell_id: shell.id.clone(),
-                            run_id: reader_run.id.clone(),
-                            output_revision: revision,
-                        };
-                        if transition.publication_blocked() {
-                            transition.queue_runtime_event(output_event);
-                        } else {
-                            EventLog::append_batch_locked(&mut events, vec![output_event]);
-                        }
                         drop(terminal);
-                        drop(events);
-                        drop(transition);
-                        registry.events.changed.notify_all();
-                        if registry.notification_settings.persist_terminal_history
+                        reader_runtime.output_changed.notify_all();
+                        drop(_output_wait);
+                        pending_output_revision = Some(revision);
+                        output_publication_deadline
+                            .get_or_insert_with(|| Instant::now() + OUTPUT_PUBLICATION_INTERVAL);
+                        if output_publication_deadline
+                            .is_some_and(|deadline| Instant::now() >= deadline)
+                            && publish_pending_output(
+                                &registry,
+                                &shell,
+                                &reader_run,
+                                &mut pending_output_revision,
+                                &mut output_publication_deadline,
+                            )
+                            .is_err()
+                        {
+                            break;
+                        }
+                        if active_registry
+                            .notification_settings
+                            .persist_terminal_history
                             && last_history_checkpoint.elapsed() >= TERMINAL_HISTORY_INTERVAL
                             && checkpoint_terminal_history(
-                                &registry,
+                                &active_registry,
                                 &shell,
                                 &reader_run,
                                 &reader_runtime,
@@ -5129,6 +5207,19 @@ fn start_pty_reader(
                     }
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        if output_publication_deadline
+                            .is_some_and(|deadline| Instant::now() >= deadline)
+                            && publish_pending_output(
+                                &registry,
+                                &shell,
+                                &reader_run,
+                                &mut pending_output_revision,
+                                &mut output_publication_deadline,
+                            )
+                            .is_err()
+                        {
+                            break;
+                        }
                         let process_exited = reader_runtime
                             .process
                             .lock()
@@ -5144,8 +5235,18 @@ fn start_pty_reader(
                     Err(_) => break,
                 }
             }
+            publish_pending_output(
+                &registry,
+                &shell,
+                &reader_run,
+                &mut pending_output_revision,
+                &mut output_publication_deadline,
+            )?;
+            let _wait = lock(&reader_runtime.output_wait)?;
+            reader_runtime.output_changed.notify_all();
+            drop(_wait);
             if stopped {
-                return;
+                return Ok(());
             }
             let code = reader_runtime
                 .process
@@ -5171,8 +5272,36 @@ fn start_pty_reader(
                 .controller
                 .lock()
                 .map(|mut controller| controller.take());
+            Ok(())
         })?;
-    *lock(&runtime.reader)? = Some(ReaderTask { commands, handle });
+    *lock(&runtime.reader)? = Some(ReaderTask {
+        commands,
+        handle: Mutex::new(Some(handle)),
+    });
+    Ok(())
+}
+
+fn publish_pending_output(
+    registry: &Weak<Registry>,
+    shell: &Shell,
+    run: &ShellRun,
+    pending_revision: &mut Option<u64>,
+    deadline: &mut Option<Instant>,
+) -> io::Result<()> {
+    let Some(revision) = *pending_revision else {
+        return Ok(());
+    };
+    let Some(registry) = registry.upgrade() else {
+        return Ok(());
+    };
+    registry.publish_runtime_batch(vec![DaemonEventKind::OutputChanged {
+        workspace_id: shell.workspace_id.clone(),
+        shell_id: shell.id.clone(),
+        run_id: run.id.clone(),
+        output_revision: revision,
+    }])?;
+    *pending_revision = None;
+    *deadline = None;
     Ok(())
 }
 
@@ -6869,7 +6998,10 @@ mod tests {
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
         while Instant::now() < deadline
-            && run.output_revision.load(Ordering::Acquire) == previous_revision
+            && !lock(&runtime.terminal)
+                .unwrap()
+                .plain_text()
+                .contains("observed:during-save")
         {
             thread::sleep(IO_RETRY_DELAY);
         }
@@ -6880,6 +7012,19 @@ mod tests {
                 .plain_text()
                 .contains("observed:during-save")
         );
+        let response = registry
+            .read_shell_at(
+                &shell.id,
+                MAX_SHELL_READ_BYTES,
+                Some(&run.id),
+                Some(previous_revision),
+                500,
+            )
+            .unwrap();
+        assert!(matches!(
+            response,
+            Response::OutputState { changed: true, .. }
+        ));
 
         {
             let (state, changed) = &*gate;
@@ -6888,6 +7033,16 @@ mod tests {
             changed.notify_all();
         }
         assert!(mutation.join().unwrap().is_ok());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline
+            && !lock(&registry.events.state)
+                .unwrap()
+                .events
+                .iter()
+                .any(|event| matches!(event.kind, DaemonEventKind::OutputChanged { .. }))
+        {
+            thread::sleep(IO_RETRY_DELAY);
+        }
         let events = lock(&registry.events.state).unwrap();
         let rename = events
             .events
@@ -6903,6 +7058,88 @@ mod tests {
         drop(events);
         shell.kill().unwrap();
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn independent_pty_readers_process_output_concurrently() {
+        let registry = Arc::new(Registry::default());
+        let mut shells = Vec::new();
+        for index in 0..2 {
+            let shell = create_pending_shell(
+                "workspace-id",
+                ShellSpec {
+                    name: format!("concurrent-{index}"),
+                    command: vec![
+                        "/bin/sh".into(),
+                        "-c".into(),
+                        "stty -echo; while IFS= read -r line; do printf '%s\\n' \"$line\"; done"
+                            .into(),
+                    ],
+                    cwd: env::temp_dir(),
+                },
+            )
+            .unwrap();
+            let run = Arc::new(ShellRun::new(1));
+            let terminal_profile = profile();
+            let (runtime, reader) = spawn_runtime(
+                &shell,
+                &run,
+                "workspace",
+                &format!("concurrent-{index}"),
+                &terminal_profile,
+                None,
+                RuntimeRecovery::default(),
+            )
+            .unwrap();
+            *lock(&shell.last_run).unwrap() =
+                Some(run.persisted(terminal_profile.clone()).unwrap());
+            *lock(&shell.lifecycle).unwrap() = ShellLifecycle::Running {
+                profile: terminal_profile,
+                run: Arc::clone(&run),
+                runtime: Arc::clone(&runtime),
+            };
+            start_pty_reader(
+                Arc::downgrade(&registry),
+                Arc::clone(&shell),
+                Arc::clone(&run),
+                Arc::clone(&runtime),
+                reader,
+                false,
+            )
+            .unwrap();
+            shells.push((shell, run, runtime));
+        }
+
+        for (index, (_, _, runtime)) in shells.iter().enumerate() {
+            let input = (0..500)
+                .map(|line| format!("shell-{index}-{line}\n"))
+                .collect::<String>();
+            lock(&runtime.master)
+                .unwrap()
+                .write(input.as_bytes())
+                .unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline
+            && shells.iter().enumerate().any(|(index, (_, _, runtime))| {
+                !lock(&runtime.terminal)
+                    .unwrap()
+                    .plain_text()
+                    .contains(&format!("shell-{index}-499"))
+            })
+        {
+            thread::sleep(IO_RETRY_DELAY);
+        }
+        for (index, (shell, run, runtime)) in shells.into_iter().enumerate() {
+            assert!(run.output_revision.load(Ordering::Acquire) >= 2);
+            assert!(
+                lock(&runtime.terminal)
+                    .unwrap()
+                    .plain_text()
+                    .contains(&format!("shell-{index}-499"))
+            );
+            shell.kill().unwrap();
+        }
     }
 
     #[test]
@@ -8500,8 +8737,12 @@ mod tests {
             if let ReaderCommand::Pause { cancelled, .. } = receiver.recv().unwrap() {
                 observed.send(cancelled.load(Ordering::Acquire)).unwrap();
             }
+            Ok(())
         });
-        let task = ReaderTask { commands, handle };
+        let task = ReaderTask {
+            commands,
+            handle: Mutex::new(Some(handle)),
+        };
 
         let error = task
             .pause_with_timeout(Duration::from_millis(5))
