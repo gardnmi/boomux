@@ -79,9 +79,14 @@ dashboard to combine one daemon snapshot with bounded host session catalogs.
 
 ### Protocol
 
-`src/protocol.rs` defines the versioned wire model. Control messages are JSON
-with a four-byte big-endian length prefix. Attachment traffic uses small binary
-frames for input, output, resize, and detach events.
+`src/protocol.rs` defines the versioned wire model and the typed protocol-feature
+registry. Each feature owns its minimum negotiated version and stable capability
+names. Request gating and client feature checks refer to that registry rather
+than repeating numeric versions. Control messages are JSON with a four-byte
+big-endian length prefix. Attachment traffic uses small binary frames for input,
+output, resize, and detach events. Old-peer response transforms remain isolated
+in the daemon compatibility boundary and use the same feature registry when
+deciding which fields, values, and events to downgrade.
 
 The domain has five durable identities:
 

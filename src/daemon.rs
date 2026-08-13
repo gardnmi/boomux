@@ -773,14 +773,15 @@ fn handle_connection(
         );
     }
     let response_version = request.version;
-    let minimum_version = request.message.minimum_protocol_version();
-    if response_version < minimum_version {
+    if let Some(feature) = request.message.required_feature()
+        && !feature.is_supported_by(response_version)
+    {
         return send_response(
             &mut stream,
             response_version,
             error_response(
                 ErrorCode::UnsupportedVersion,
-                unsupported_request_message(&request.message, minimum_version),
+                unsupported_request_message(feature),
             ),
         );
     }
@@ -906,37 +907,23 @@ fn handle_connection(
     )
 }
 
-fn unsupported_request_message(request: &Request, minimum_version: u32) -> String {
-    match request {
-        Request::RegisterAgent { spec, .. } | Request::EnsureAgent { spec, .. }
-            if spec.report.state == AgentState::Inactive =>
-        {
-            "inactive agent state requires daemon protocol 12".into()
-        }
-        Request::ReportAgent { report, .. } if report.state == AgentState::Inactive => {
-            "inactive agent state requires daemon protocol 12".into()
-        }
-        Request::WaitAgent { .. } => "agent wait requires daemon protocol 14".into(),
-        Request::AcknowledgeAgentAttention { .. } => {
-            "agent attention acknowledgment requires daemon protocol 15".into()
-        }
-        Request::Attach {
-            environment: Some(_),
-            ..
-        } => "client environment requires daemon protocol 16".into(),
-        _ => format!("request requires daemon protocol {minimum_version}"),
-    }
+fn unsupported_request_message(feature: protocol::ProtocolFeature) -> String {
+    format!(
+        "{} requires daemon protocol {}",
+        feature.requirement(),
+        feature.minimum_version()
+    )
 }
 
 fn response_for_version(response: Response, version: u32) -> Response {
     let mut response = response;
-    if version < 19 {
+    if !protocol::ProtocolFeature::WorkspaceDefaultCwd.is_supported_by(version) {
         remove_workspace_default_cwds(&mut response);
     }
-    if version < 18 {
+    if !protocol::ProtocolFeature::FocusedTerminal.is_supported_by(version) {
         remove_focused_terminal(&mut response);
     }
-    if version < 15 {
+    if !protocol::ProtocolFeature::PersistentAgentAttention.is_supported_by(version) {
         remove_agent_attention(&mut response);
         if let Response::Events { events, .. } = &mut response {
             events.retain(|event| {
@@ -947,13 +934,13 @@ fn response_for_version(response: Response, version: u32) -> Response {
             });
         }
     }
-    if version < 13 {
+    if !protocol::ProtocolFeature::DurableAgentCwd.is_supported_by(version) {
         remove_agent_cwds(&mut response);
     }
-    if version < 12 {
+    if !protocol::ProtocolFeature::InactiveAgentState.is_supported_by(version) {
         downgrade_inactive_agent_states(&mut response);
     }
-    if version >= 9 {
+    if protocol::ProtocolFeature::AgentInstances.is_supported_by(version) {
         return response;
     }
     match response {
@@ -982,7 +969,7 @@ fn response_for_version(response: Response, version: u32) -> Response {
                         | DaemonEventKind::AgentCompleted { .. }
                 )
             });
-            if version < 8 {
+            if !protocol::ProtocolFeature::WorkspaceLaunchers.is_supported_by(version) {
                 events.retain(|event| {
                     !matches!(
                         event.kind,
@@ -3203,10 +3190,11 @@ impl Registry {
         run: &Arc<ShellRun>,
         runtime: &Arc<ShellRuntime>,
     ) -> io::Result<()> {
-        if protocol_version < 18 {
+        if !protocol::ProtocolFeature::FocusedTerminal.is_supported_by(protocol_version) {
+            let minimum_version = protocol::ProtocolFeature::FocusedTerminal.minimum_version();
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "focus frames require daemon protocol 18",
+                format!("focus frames require daemon protocol {minimum_version}"),
             ));
         }
         let state = lock(&self.state)?;

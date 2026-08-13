@@ -9,6 +9,85 @@ pub const MIN_PROTOCOL_VERSION: u32 = 6;
 pub const MAX_CONTROL_FRAME: usize = 8 * 1024 * 1024;
 pub const MAX_ATTACH_FRAME: usize = 1024 * 1024;
 
+macro_rules! define_protocol_features {
+    ($($variant:ident => ($version:literal, $requirement:literal, [$($capability:literal),* $(,)?])),* $(,)?) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum ProtocolFeature {
+            $($variant),*
+        }
+
+        impl ProtocolFeature {
+            pub const ALL: &'static [Self] = &[$(Self::$variant),*];
+
+            pub const fn minimum_version(self) -> u32 {
+                match self {
+                    $(Self::$variant => $version),*
+                }
+            }
+
+            pub const fn is_supported_by(self, negotiated_version: u32) -> bool {
+                negotiated_version >= self.minimum_version()
+            }
+
+            pub const fn capability_names(self) -> &'static [&'static str] {
+                match self {
+                    $(Self::$variant => &[$($capability),*]),*
+                }
+            }
+
+            pub const fn requirement(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $requirement),*
+                }
+            }
+        }
+    };
+}
+
+define_protocol_features! {
+    Baseline => (6, "request", [
+        "typed_errors",
+        "shell_run_identity",
+        "rendered_scrollback",
+        "graceful_live_handoff",
+        "graceful_exited_handoff",
+    ]),
+    AtomicOutputReads => (7, "request", [
+        "daemon_events",
+        "reconnectable_event_cursors",
+        "revision_aware_reads",
+    ]),
+    WorkspaceLaunchers => (8, "request", ["workspace_launchers"]),
+    AgentInstances => (9, "request", ["run_scoped_agent_instances", "agent_authority_precedence"]),
+    IdempotentAgentEnsure => (10, "request", ["protocol_10", "idempotent_agent_ensure"]),
+    RestartableExitedShells => (11, "request", ["protocol_11", "restartable_exited_shells"]),
+    InactiveAgentState => (12, "inactive agent state", [
+        "protocol_12",
+        "inactive_agent_state",
+        "projected_agent_sessions",
+    ]),
+    DurableAgentCwd => (13, "request", ["protocol_13", "durable_session_source_context"]),
+    RevisionAwareAgentWait => (14, "agent wait", ["protocol_14", "revision_aware_agent_wait"]),
+    PersistentAgentAttention => (15, "agent attention acknowledgment", [
+        "protocol_15",
+        "persistent_agent_attention",
+    ]),
+    ClientEnvironment => (16, "client environment", ["protocol_16"]),
+    RestartNotificationConfig => (17, "request", ["protocol_17"]),
+    FocusedTerminal => (18, "request", ["protocol_18", "focused_terminal_following"]),
+    WorkspaceDefaultCwd => (19, "request", ["protocol_19", "workspace_default_cwd"]),
+    StructuredTerminalPreview => (20, "request", ["protocol_20", "structured_terminal_previews"]),
+}
+
+pub fn protocol_capabilities() -> impl Iterator<Item = &'static str> {
+    ProtocolFeature::ALL
+        .iter()
+        .copied()
+        .filter(|feature| feature.is_supported_by(PROTOCOL_VERSION))
+        .flat_map(ProtocolFeature::capability_names)
+        .copied()
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TerminalColor {
@@ -556,41 +635,51 @@ pub enum Request {
 }
 
 impl Request {
-    pub fn minimum_protocol_version(&self) -> u32 {
+    pub fn required_feature(&self) -> Option<ProtocolFeature> {
         match self {
-            Self::ReadShellPreview { .. } => 20,
+            Self::ReadShellPreview { .. } => Some(ProtocolFeature::StructuredTerminalPreview),
             Self::CreateWorkspace {
                 default_cwd: Some(_),
                 ..
             }
             | Self::CreateShell {
                 workspace_id: None, ..
-            } => 19,
-            Self::RestartWithNotificationConfig { .. } => 17,
+            } => Some(ProtocolFeature::WorkspaceDefaultCwd),
+            Self::RestartWithNotificationConfig { .. } => {
+                Some(ProtocolFeature::RestartNotificationConfig)
+            }
             Self::Attach {
                 environment: Some(_),
                 ..
-            } => 16,
-            Self::AcknowledgeAgentAttention { .. } => 15,
-            Self::WaitAgent { .. } => 14,
+            } => Some(ProtocolFeature::ClientEnvironment),
+            Self::AcknowledgeAgentAttention { .. } => {
+                Some(ProtocolFeature::PersistentAgentAttention)
+            }
+            Self::WaitAgent { .. } => Some(ProtocolFeature::RevisionAwareAgentWait),
             Self::RegisterAgent { spec, .. } | Self::EnsureAgent { spec, .. }
                 if spec.report.state == AgentState::Inactive =>
             {
-                12
+                Some(ProtocolFeature::InactiveAgentState)
             }
-            Self::ReportAgent { report, .. } if report.state == AgentState::Inactive => 12,
+            Self::ReportAgent { report, .. } if report.state == AgentState::Inactive => {
+                Some(ProtocolFeature::InactiveAgentState)
+            }
             Self::RestartShell { .. }
             | Self::Attach {
                 restart_exited: true,
                 ..
-            } => 11,
-            Self::EnsureAgent { .. } => 10,
-            Self::GetAgent { .. } | Self::RegisterAgent { .. } | Self::ReportAgent { .. } => 9,
+            } => Some(ProtocolFeature::RestartableExitedShells),
+            Self::EnsureAgent { .. } => Some(ProtocolFeature::IdempotentAgentEnsure),
+            Self::GetAgent { .. } | Self::RegisterAgent { .. } | Self::ReportAgent { .. } => {
+                Some(ProtocolFeature::AgentInstances)
+            }
             Self::GetLauncher { .. }
             | Self::CreateLauncher { .. }
             | Self::RenameLauncher { .. }
-            | Self::RemoveLauncher { .. } => 8,
-            Self::ReadShellAt { .. } | Self::Events { .. } => 7,
+            | Self::RemoveLauncher { .. } => Some(ProtocolFeature::WorkspaceLaunchers),
+            Self::ReadShellAt { .. } | Self::Events { .. } => {
+                Some(ProtocolFeature::AtomicOutputReads)
+            }
             Self::Ping
             | Self::Restart
             | Self::Shutdown
@@ -604,7 +693,7 @@ impl Request {
             | Self::RenameShell { .. }
             | Self::CloseWorkspace { .. }
             | Self::CloseShell { .. }
-            | Self::Attach { .. } => MIN_PROTOCOL_VERSION,
+            | Self::Attach { .. } => None,
         }
     }
 }
@@ -1083,7 +1172,7 @@ mod tests {
     }
 
     #[test]
-    fn request_minimum_protocol_versions_cover_all_groups() {
+    fn request_feature_requirements_cover_all_groups() {
         let groups = vec![
             (
                 20,
@@ -1304,12 +1393,75 @@ mod tests {
         for (expected, requests) in groups {
             for request in requests {
                 assert_eq!(
-                    request.minimum_protocol_version(),
+                    request
+                        .required_feature()
+                        .map_or(MIN_PROTOCOL_VERSION, ProtocolFeature::minimum_version),
                     expected,
                     "unexpected minimum protocol version for {request:?}"
                 );
             }
         }
+    }
+
+    #[test]
+    fn protocol_features_have_stable_versions_and_capability_names() {
+        let expected = [
+            (
+                6,
+                &[
+                    "typed_errors",
+                    "shell_run_identity",
+                    "rendered_scrollback",
+                    "graceful_live_handoff",
+                    "graceful_exited_handoff",
+                ][..],
+            ),
+            (
+                7,
+                &[
+                    "daemon_events",
+                    "reconnectable_event_cursors",
+                    "revision_aware_reads",
+                ][..],
+            ),
+            (8, &["workspace_launchers"][..]),
+            (
+                9,
+                &["run_scoped_agent_instances", "agent_authority_precedence"][..],
+            ),
+            (10, &["protocol_10", "idempotent_agent_ensure"][..]),
+            (11, &["protocol_11", "restartable_exited_shells"][..]),
+            (
+                12,
+                &[
+                    "protocol_12",
+                    "inactive_agent_state",
+                    "projected_agent_sessions",
+                ][..],
+            ),
+            (13, &["protocol_13", "durable_session_source_context"][..]),
+            (14, &["protocol_14", "revision_aware_agent_wait"][..]),
+            (15, &["protocol_15", "persistent_agent_attention"][..]),
+            (16, &["protocol_16"][..]),
+            (17, &["protocol_17"][..]),
+            (18, &["protocol_18", "focused_terminal_following"][..]),
+            (19, &["protocol_19", "workspace_default_cwd"][..]),
+            (20, &["protocol_20", "structured_terminal_previews"][..]),
+        ];
+
+        let actual = ProtocolFeature::ALL
+            .iter()
+            .map(|feature| (feature.minimum_version(), feature.capability_names()))
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+        assert!(ProtocolFeature::StructuredTerminalPreview.is_supported_by(PROTOCOL_VERSION));
+        assert_eq!(
+            protocol_capabilities().collect::<Vec<_>>(),
+            expected
+                .into_iter()
+                .flat_map(|(_, capabilities)| capabilities.iter().copied())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

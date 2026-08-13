@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use crossterm::terminal;
 
 use crate::client;
-use crate::protocol::{AttachFrame, TerminalProfile};
+use crate::protocol::{AttachFrame, ProtocolFeature, TerminalProfile};
 use crate::terminal_focus::FocusMode;
 
 const POLL_INTERVAL_MS: i32 = 100;
@@ -131,7 +131,8 @@ pub fn run(shell_id: &str, takeover: bool, restart_exited: bool) -> io::Result<(
 
     let result = (|| {
         loop {
-            let report_focus = attachment.protocol_version >= 18;
+            let report_focus =
+                ProtocolFeature::FocusedTerminal.is_supported_by(attachment.protocol_version);
             if report_focus != focus_reporting {
                 stdout.write_all(if report_focus {
                     ENABLE_FOCUS_REPORTING
@@ -207,7 +208,7 @@ fn attach_once(
     restart_exited: bool,
     profile: &TerminalProfile,
 ) -> io::Result<client::Attachment> {
-    let transfers_environment = client.protocol_version()? >= 16;
+    let transfers_environment = client.supports(ProtocolFeature::ClientEnvironment)?;
     match (restart_exited, transfers_environment) {
         (true, true) => {
             client.attach_restarting_with_client_environment(shell_id, takeover, profile.clone())
