@@ -99,6 +99,12 @@ exercise process, socket, PTY, and daemon lifecycle behavior.
 - Use a Conventional Commit title for every PR. The title must describe the
   release impact of the complete PR, for example `feat: add workspace previews`
   or `fix(agent): preserve lifecycle registration`.
+- Choose a Release Please-recognized title deliberately: `feat` triggers a minor
+  release, `fix` and `perf` trigger a patch release, and `!` or a
+  `BREAKING CHANGE:` footer triggers a major release. Use non-release types such
+  as `refactor`, `docs`, `test`, `ci`, or `chore` only when the PR has no
+  release-visible impact; those changes ship with the next release-triggering
+  PR. Never mislabel internal work solely to force a version.
 - Squash-merge PRs into `main` so the conventional PR title becomes the
   main-branch commit consumed by Release Please.
 - Before merging, update the PR title if its release type or scope changed.
@@ -110,7 +116,3 @@ exercise process, socket, PTY, and daemon lifecycle behavior.
   feat: describe the complete release-visible change
   END_COMMIT_OVERRIDE
   ```
-
-- `feat` produces a minor release, `fix` and `perf` produce a patch release, and
-  a breaking change produces a major release under the default Release Please
-  versioning strategy.

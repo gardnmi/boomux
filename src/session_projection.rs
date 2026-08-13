@@ -292,17 +292,28 @@ fn normalized_directory(directory: &Path) -> Option<PathBuf> {
     normalize_absolute(directory)
 }
 
-fn occurrence_is_current(workspace: &WorkspaceSnapshot, agent: &AgentInstanceSnapshot) -> bool {
-    agent.workspace_id == workspace.id
+pub(crate) fn agent_is_active_for_run(
+    agent: &AgentInstanceSnapshot,
+    shell_id: &str,
+    run_id: &str,
+) -> bool {
+    agent.shell_id == shell_id
+        && agent.run_id == run_id
         && agent.ended_at_ms.is_none()
         && !matches!(
             agent.observation.state,
             AgentState::Inactive | AgentState::Done
         )
+}
+
+fn occurrence_is_current(workspace: &WorkspaceSnapshot, agent: &AgentInstanceSnapshot) -> bool {
+    agent.workspace_id == workspace.id
         && workspace.shells.iter().any(|shell| {
             matches!(shell.status, ShellStatus::Running)
-                && shell.id == agent.shell_id
-                && shell.run.as_ref().is_some_and(|run| run.id == agent.run_id)
+                && shell
+                    .run
+                    .as_ref()
+                    .is_some_and(|run| agent_is_active_for_run(agent, &shell.id, &run.id))
         })
 }
 
@@ -395,6 +406,31 @@ mod tests {
                     },
                 })
                 .collect(),
+        }
+    }
+
+    #[test]
+    fn active_run_match_requires_exact_live_nonterminal_identity() {
+        let mut workspace = workspace("w1", &["a1"]);
+        let agent = &workspace.agents[0];
+        assert!(agent_is_active_for_run(agent, "shell", "run"));
+        assert!(!agent_is_active_for_run(agent, "other", "run"));
+        assert!(!agent_is_active_for_run(agent, "shell", "other"));
+
+        workspace.agents[0].ended_at_ms = Some(30);
+        assert!(!agent_is_active_for_run(
+            &workspace.agents[0],
+            "shell",
+            "run"
+        ));
+        workspace.agents[0].ended_at_ms = None;
+        for state in [AgentState::Inactive, AgentState::Done] {
+            workspace.agents[0].observation.state = state;
+            assert!(!agent_is_active_for_run(
+                &workspace.agents[0],
+                "shell",
+                "run"
+            ));
         }
     }
 

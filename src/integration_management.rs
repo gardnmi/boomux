@@ -13,7 +13,7 @@ use clap::ValueEnum;
 use serde::Serialize;
 use uuid::Uuid;
 
-use boomux::protocol::{AgentAuthority, AgentState, ShellStatus, Snapshot};
+use boomux::protocol::{AgentAuthority, ShellStatus, Snapshot};
 
 pub(crate) const OPENCODE_ASSET: &str = include_str!("../integrations/opencode/boomux.js");
 pub(crate) const PI_ASSET: &str = include_str!("../integrations/pi/boomux.js");
@@ -515,14 +515,8 @@ fn authoritative_agent_matches(
     run: &boomux::protocol::ShellRunSnapshot,
 ) -> bool {
     agent.integration == spec.name
-        && agent.shell_id == shell.id
-        && agent.run_id == run.id
-        && agent.ended_at_ms.is_none()
         && agent.observation.authority == AgentAuthority::LifecycleIntegration
-        && !matches!(
-            agent.observation.state,
-            AgentState::Inactive | AgentState::Done
-        )
+        && crate::session_projection::agent_is_active_for_run(agent, &shell.id, &run.id)
 }
 
 fn executable_on_path(name: &str, path: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
@@ -1072,8 +1066,8 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use boomux::protocol::{
-        AgentAuthority, AgentInstanceSnapshot, AgentObservationSnapshot, ShellRunSnapshot,
-        ShellSnapshot, WorkspaceSnapshot,
+        AgentAuthority, AgentInstanceSnapshot, AgentObservationSnapshot, AgentState,
+        ShellRunSnapshot, ShellSnapshot, WorkspaceSnapshot,
     };
 
     use super::*;

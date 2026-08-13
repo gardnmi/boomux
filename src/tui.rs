@@ -74,7 +74,7 @@ pub(crate) struct FocusedTerminalView {
 pub(crate) struct WorkspaceAttentionView {
     pub(crate) shell_id: String,
     pub(crate) agent_name: String,
-    pub(crate) reason: String,
+    pub(crate) reason: AttentionReason,
     pub(crate) evidence: String,
     pub(crate) observed_at_ms: u64,
 }
@@ -84,7 +84,7 @@ pub(crate) struct AgentSessionView {
     pub(crate) label: String,
     pub(crate) integration: String,
     pub(crate) external_session_id: Option<String>,
-    pub(crate) state: String,
+    pub(crate) state: AgentDisplayState,
     pub(crate) state_is_current: bool,
     pub(crate) last_at_ms: u64,
     pub(crate) source_cwd: Option<PathBuf>,
@@ -110,19 +110,19 @@ pub(crate) struct AgentShellView {
 }
 
 impl AgentShellView {
-    fn status(&self) -> &str {
+    pub(crate) fn state(&self) -> AgentDisplayState {
         self.agent
             .as_ref()
-            .map_or("untracked", |agent| agent.state.as_str())
+            .map_or(AgentDisplayState::Untracked, |agent| agent.state)
     }
 }
 
 pub(crate) struct AgentView {
     pub(crate) id: String,
-    pub(crate) state: String,
+    pub(crate) state: AgentDisplayState,
     pub(crate) integration: String,
     pub(crate) external_session_id: Option<String>,
-    pub(crate) authority: String,
+    pub(crate) authority: AgentAuthorityDisplay,
     pub(crate) confidence: u8,
     pub(crate) evidence: String,
     pub(crate) updated_at_ms: u64,
@@ -167,6 +167,7 @@ pub(crate) struct TerminalView {
     pub(crate) git_state: String,
     pub(crate) worktree: String,
     pub(crate) foreground_process: Option<String>,
+    pub(crate) kind: TerminalKind,
     pub(crate) command: String,
     pub(crate) argv: Vec<String>,
     pub(crate) run: Option<TerminalRunView>,
@@ -182,27 +183,17 @@ pub(crate) struct TerminalRunView {
 }
 
 impl TerminalView {
-    fn kind(&self) -> &'static str {
-        if self.command.is_empty() {
-            "shell"
-        } else {
-            "command"
-        }
-    }
-
     fn detail(&self) -> &str {
-        if self.command.is_empty() {
-            &self.branch
-        } else {
-            &self.command
+        match self.kind {
+            TerminalKind::Shell => &self.branch,
+            TerminalKind::Command => &self.command,
         }
     }
 
     fn process(&self) -> &str {
-        if self.command.is_empty() {
-            self.foreground_process.as_deref().unwrap_or("shell")
-        } else {
-            &self.command
+        match self.kind {
+            TerminalKind::Shell => self.foreground_process.as_deref().unwrap_or("shell"),
+            TerminalKind::Command => &self.command,
         }
     }
 
@@ -258,7 +249,7 @@ impl WorkspaceView {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ItemKind {
+pub(crate) enum ItemKind {
     Agent,
     Launcher,
     Shell,
@@ -270,8 +261,7 @@ impl WorkspaceItemView {
         match self {
             Self::AgentShell(_) => ItemKind::Agent,
             Self::Launcher(_) => ItemKind::Launcher,
-            Self::Shell(shell) if shell.command.is_empty() => ItemKind::Shell,
-            Self::Shell(_) => ItemKind::Command,
+            Self::Shell(shell) => shell.kind.into(),
         }
     }
 
@@ -286,7 +276,7 @@ impl WorkspaceItemView {
     fn status(&self) -> &str {
         match self {
             Self::Shell(shell) => &shell.status,
-            Self::AgentShell(agent) => agent.status(),
+            Self::AgentShell(agent) => agent.state().label(),
             Self::Launcher(_) => "launcher",
         }
     }
@@ -307,6 +297,89 @@ impl ItemKind {
             Self::Launcher => "launcher",
             Self::Shell => "shell",
             Self::Command => "command",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TerminalKind {
+    Shell,
+    Command,
+}
+
+impl TerminalKind {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Shell => "shell",
+            Self::Command => "command",
+        }
+    }
+}
+
+impl From<TerminalKind> for ItemKind {
+    fn from(kind: TerminalKind) -> Self {
+        match kind {
+            TerminalKind::Shell => Self::Shell,
+            TerminalKind::Command => Self::Command,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AgentDisplayState {
+    Unknown,
+    Working,
+    Blocked,
+    Idle,
+    Inactive,
+    Done,
+    Untracked,
+}
+
+impl AgentDisplayState {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Working => "working",
+            Self::Blocked => "blocked",
+            Self::Idle => "idle",
+            Self::Inactive => "inactive",
+            Self::Done => "done",
+            Self::Untracked => "untracked",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AttentionReason {
+    Blocked,
+    Completed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AgentAuthorityDisplay {
+    DaemonLifecycle,
+    LifecycleIntegration,
+    ProcessAdapter,
+    TerminalHeuristic,
+}
+
+impl AgentAuthorityDisplay {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::DaemonLifecycle => "daemon_lifecycle",
+            Self::LifecycleIntegration => "lifecycle_integration",
+            Self::ProcessAdapter => "process_adapter",
+            Self::TerminalHeuristic => "terminal_heuristic",
+        }
+    }
+}
+
+impl AttentionReason {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Blocked => "blocked",
+            Self::Completed => "completed",
         }
     }
 }
@@ -756,7 +829,8 @@ impl CommandPalette {
                         },
                     });
                 }
-                if kind == ItemKind::Agent && item.status() == "blocked" {
+                if matches!(item, WorkspaceItemView::AgentShell(agent) if agent.state() == AgentDisplayState::Blocked)
+                {
                     entries.push(PaletteEntry {
                         action_group: PaletteActionGroup::QuickAccess,
                         kind_group: PaletteKindGroup::BlockedAgents,
@@ -773,7 +847,7 @@ impl CommandPalette {
 
             for attention in &workspace.attention {
                 attention_entries.push((
-                    usize::from(attention.reason != "blocked"),
+                    usize::from(attention.reason != AttentionReason::Blocked),
                     attention.observed_at_ms,
                     workspace.id.clone(),
                     attention.shell_id.clone(),
@@ -781,10 +855,10 @@ impl CommandPalette {
                         action_group: PaletteActionGroup::QuickAccess,
                         kind_group: PaletteKindGroup::Attention,
                         label: format!("{} / {}", workspace.name, attention.agent_name),
-                        detail: format!("{}: {}", attention.reason, attention.evidence),
+                        detail: format!("{}: {}", attention.reason.label(), attention.evidence),
                         keywords: format!(
                             "attention unseen outstanding {} {} {} {}",
-                            attention.reason,
+                            attention.reason.label(),
                             attention.evidence,
                             workspace.name,
                             attention.shell_id
@@ -1427,7 +1501,7 @@ impl App {
             None
         } else {
             self.selected_item().and_then(|item| match item {
-                WorkspaceItemView::Shell(shell) if shell.command.is_empty() => Some((
+                WorkspaceItemView::Shell(shell) if shell.kind == TerminalKind::Shell => Some((
                     shell.id.clone(),
                     shell.run.as_ref().map(|run| run.id.clone()),
                     shell.run.as_ref().map_or(0, |run| run.output_revision),
@@ -2465,11 +2539,13 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
             Line::from(format!("  {summary}")),
             Line::from(format!("  {exit}")),
         ]);
-        if item.status() == "untracked" {
+        if matches!(item, WorkspaceItemView::AgentShell(agent) if agent.state() == AgentDisplayState::Untracked)
+        {
             lines.push(Line::from(
                 "  Untracked means a supported foreground host has no authoritative report.",
             ));
-        } else if item.status() == "blocked" {
+        } else if matches!(item, WorkspaceItemView::AgentShell(agent) if agent.state() == AgentDisplayState::Blocked)
+        {
             lines.push(Line::from(
                 "  Blocked means the current Agent observation requires user input.",
             ));
@@ -2633,7 +2709,7 @@ fn render_global_items(frame: &mut Frame, area: Rect, app: &mut App) {
                         },
                     );
                     Some([
-                        agent.status().to_owned(),
+                        agent.state().label().to_owned(),
                         updated,
                         workspace.name.clone(),
                         agent.shell.name.clone(),
@@ -2682,7 +2758,7 @@ fn render_global_items(frame: &mut Frame, area: Rect, app: &mut App) {
                             .map_or_else(|| "-".into(), |run| format!("#{}", run.generation)),
                         workspace.name.clone(),
                         shell.name.clone(),
-                        shell.kind().into(),
+                        shell.kind.label().into(),
                         shell.process().into(),
                         shell.branch.clone(),
                         shell.worktree.clone(),
@@ -2746,8 +2822,8 @@ fn render_global_items(frame: &mut Frame, area: Rect, app: &mut App) {
                             WorkspaceItemView::AgentShell(agent) => cells.extend([
                                 Cell::from(agent.shell.name.clone()),
                                 Cell::from(Span::styled(
-                                    agent.status().to_owned(),
-                                    Style::new().fg(status_color(agent.status())),
+                                    agent.state().label().to_owned(),
+                                    Style::new().fg(agent_row_color(agent.state())),
                                 )),
                                 Cell::from(agent.shell.directory.clone()),
                                 Cell::from(agent.agent.as_ref().map_or_else(
@@ -2758,7 +2834,7 @@ fn render_global_items(frame: &mut Frame, area: Rect, app: &mut App) {
                                             view.evidence,
                                             agent.shell.branch,
                                             view.integration,
-                                            view.authority,
+                                            view.authority.label(),
                                             view.confidence
                                         )
                                     },
@@ -2835,7 +2911,7 @@ fn render_items(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
         .flat_map(|workspace| {
             workspace.items.iter().map(|item| match item {
                 WorkspaceItemView::Shell(terminal) => [
-                    terminal.kind().into(),
+                    terminal.kind.label().into(),
                     terminal.table_status(),
                     terminal.name.clone(),
                     terminal.process().into(),
@@ -2864,7 +2940,7 @@ fn render_items(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
                     );
                     [
                         "agent".into(),
-                        agent_shell.status().into(),
+                        agent_shell.state().label().into(),
                         agent_shell.shell.name.clone(),
                         activity,
                         branch,
@@ -3017,7 +3093,7 @@ fn launcher_preview(launcher: &LauncherView) -> ContextualPreview {
 }
 
 fn terminal_preview(app: &App, terminal: &TerminalView) -> Option<ContextualPreview> {
-    let is_command = !terminal.command.is_empty();
+    let is_command = terminal.kind == TerminalKind::Command;
     let mut lines = Vec::new();
     if is_command {
         lines.push(terminal_preview_field(
@@ -3268,9 +3344,9 @@ fn agent_session_preview(app: &App, agent_shell: &AgentShellView) -> Option<Cont
         Line::from(vec![
             preview_label("STATUS"),
             Span::styled(
-                session.state.clone(),
+                session.state.label(),
                 Style::new()
-                    .fg(session_state_color(&session.state))
+                    .fg(session_state_color(session.state))
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
@@ -3305,7 +3381,7 @@ fn agent_session_preview(app: &App, agent_shell: &AgentShellView) -> Option<Cont
             "SOURCE",
             format!(
                 "{}  ·  confidence {}%",
-                agent.authority.replace('_', " "),
+                agent.authority.label().replace('_', " "),
                 agent.confidence
             ),
         ),
@@ -3535,14 +3611,26 @@ fn current_time_ms() -> u64 {
         .as_millis() as u64
 }
 
-fn session_state_color(state: &str) -> Color {
+fn agent_row_color(state: AgentDisplayState) -> Color {
     match state {
-        "blocked" => RED,
-        "working" => TEAL,
-        "idle" => GREEN,
-        "inactive" => SUBTEXT,
-        "done" => BLUE,
-        _ => YELLOW,
+        AgentDisplayState::Untracked => YELLOW,
+        AgentDisplayState::Unknown
+        | AgentDisplayState::Working
+        | AgentDisplayState::Blocked
+        | AgentDisplayState::Idle
+        | AgentDisplayState::Inactive
+        | AgentDisplayState::Done => TEAL,
+    }
+}
+
+fn session_state_color(state: AgentDisplayState) -> Color {
+    match state {
+        AgentDisplayState::Blocked => RED,
+        AgentDisplayState::Working => TEAL,
+        AgentDisplayState::Idle => GREEN,
+        AgentDisplayState::Inactive | AgentDisplayState::Untracked => SUBTEXT,
+        AgentDisplayState::Done => BLUE,
+        AgentDisplayState::Unknown => YELLOW,
     }
 }
 
@@ -3758,6 +3846,7 @@ mod tests {
                 git_state: "clean".into(),
                 worktree: "primary".into(),
                 foreground_process: Some("bash".into()),
+                kind: TerminalKind::Shell,
                 command: String::new(),
                 argv: Vec::new(),
                 run: None,
@@ -3780,10 +3869,10 @@ mod tests {
     fn agent() -> AgentView {
         AgentView {
             id: "agent-active".into(),
-            state: "working".into(),
+            state: AgentDisplayState::Working,
             integration: "opencode".into(),
             external_session_id: Some("external-active".into()),
-            authority: "lifecycle_integration".into(),
+            authority: AgentAuthorityDisplay::LifecycleIntegration,
             confidence: 95,
             evidence: "tool call in progress".into(),
             updated_at_ms: current_time_ms(),
@@ -3804,6 +3893,7 @@ mod tests {
                 git_state: "clean".into(),
                 worktree: "primary".into(),
                 foreground_process: Some("opencode".into()),
+                kind: TerminalKind::Shell,
                 command: String::new(),
                 argv: Vec::new(),
                 run: None,
@@ -3812,13 +3902,13 @@ mod tests {
         }
     }
 
-    fn session(id: &str, state: &str) -> AgentSessionView {
+    fn session(id: &str, state: AgentDisplayState) -> AgentSessionView {
         AgentSessionView {
             id: id.into(),
             label: "OpenCode review".into(),
             integration: "opencode".into(),
             external_session_id: Some(format!("external-{id}")),
-            state: state.into(),
+            state,
             state_is_current: true,
             last_at_ms: 30,
             source_cwd: Some("/tmp/boomux".into()),
@@ -4123,6 +4213,7 @@ mod tests {
                 git_state: "clean".into(),
                 worktree: "primary".into(),
                 foreground_process: Some("opencode".into()),
+                kind: TerminalKind::Shell,
                 command: String::new(),
                 argv: Vec::new(),
                 run: None,
@@ -4142,6 +4233,11 @@ mod tests {
             git_state: "clean".into(),
             worktree: "primary".into(),
             foreground_process: Some("bash".into()),
+            kind: if command.is_empty() {
+                TerminalKind::Shell
+            } else {
+                TerminalKind::Command
+            },
             command: command.into(),
             argv: command.split_whitespace().map(str::to_owned).collect(),
             run: None,
@@ -4261,7 +4357,7 @@ mod tests {
             _ => unreachable!(),
         };
         shell.foreground_process = Some("nvim".into());
-        assert_eq!(shell.kind(), "shell");
+        assert_eq!(shell.kind, TerminalKind::Shell);
         assert_eq!(shell.process(), "nvim");
 
         let mut command = match terminal("command", "tests", "cargo test") {
@@ -4278,7 +4374,7 @@ mod tests {
             exit_reason: Some("exited (1)".into()),
             output_revision: 4,
         });
-        assert_eq!(command.kind(), "command");
+        assert_eq!(command.kind, TerminalKind::Command);
         assert_eq!(command.process(), "cargo test");
         assert_eq!(command.table_status(), "exit 1");
     }
@@ -4450,7 +4546,9 @@ mod tests {
             WorkspaceItemView::AgentShell(agent_shell()),
             launcher_view("launcher-1", "editor"),
         ];
-        mixed.sessions.push(session("durable-1", "working"));
+        mixed
+            .sessions
+            .push(session("durable-1", AgentDisplayState::Working));
         mixed.agent_state_counts.blocked = 1;
         mixed.agent_state_counts.done = 1;
         mixed.attention_count = 2;
@@ -4545,6 +4643,7 @@ mod tests {
             git_state: "clean".into(),
             worktree: "primary".into(),
             foreground_process: None,
+            kind: TerminalKind::Shell,
             command: String::new(),
             argv: Vec::new(),
             run: None,
@@ -4798,12 +4897,12 @@ mod tests {
     fn command_palette_finds_blocked_agents_and_attention() {
         let mut workspace = workspace("w1", "review");
         let mut agent = agent_shell();
-        agent.agent.as_mut().unwrap().state = "blocked".into();
+        agent.agent.as_mut().unwrap().state = AgentDisplayState::Blocked;
         workspace.items[0] = WorkspaceItemView::AgentShell(agent);
         workspace.attention = vec![WorkspaceAttentionView {
             shell_id: "term_1".into(),
             agent_name: "review-agent".into(),
-            reason: "blocked".into(),
+            reason: AttentionReason::Blocked,
             evidence: "approval required".into(),
             observed_at_ms: 1,
         }];
@@ -4848,7 +4947,7 @@ mod tests {
         completed.attention = vec![WorkspaceAttentionView {
             shell_id: "completed-shell".into(),
             agent_name: "completed-agent".into(),
-            reason: "completed".into(),
+            reason: AttentionReason::Completed,
             evidence: "finished".into(),
             observed_at_ms: 20,
         }];
@@ -4856,7 +4955,7 @@ mod tests {
         blocked.attention = vec![WorkspaceAttentionView {
             shell_id: "blocked-shell".into(),
             agent_name: "blocked-agent".into(),
-            reason: "blocked".into(),
+            reason: AttentionReason::Blocked,
             evidence: "approval required".into(),
             observed_at_ms: 10,
         }];
@@ -5556,7 +5655,7 @@ mod tests {
         app.workspaces[0].items[0] = WorkspaceItemView::AgentShell(agent_shell);
         app.workspaces[0]
             .sessions
-            .push(session("active", "working"));
+            .push(session("active", AgentDisplayState::Working));
         focus_items(&mut app);
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
@@ -5596,6 +5695,7 @@ mod tests {
             panic!("expected shell item");
         };
         command.name = "clock".into();
+        command.kind = TerminalKind::Command;
         command.command = "watch -n 1 date".into();
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
@@ -5620,7 +5720,7 @@ mod tests {
         let mut agent_shell = hinted_agent_shell();
         agent_shell.shell.name = "keepname".into();
         app.workspaces[0].items[0] = WorkspaceItemView::AgentShell(agent_shell);
-        app.workspaces[0].sessions = vec![session("active", "working")];
+        app.workspaces[0].sessions = vec![session("active", AgentDisplayState::Working)];
         focus_items(&mut app);
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
@@ -5702,23 +5802,23 @@ mod tests {
         app.workspaces[0].items[0] = WorkspaceItemView::AgentShell(agent_shell());
         focus_items(&mut app);
         let now = current_time_ms();
-        let mut active = session("active", "working");
+        let mut active = session("active", AgentDisplayState::Working);
         active.label = "Current work".into();
         active.last_at_ms = now;
-        let mut recent = session("recent", "inactive");
+        let mut recent = session("recent", AgentDisplayState::Inactive);
         recent.label = "Recent review".into();
         recent.external_session_id = Some("external-active".into());
         recent.state_is_current = false;
         recent.last_at_ms = now + 1;
-        let mut week = session("week", "done");
+        let mut week = session("week", AgentDisplayState::Done);
         week.label = "Finished build".into();
         week.state_is_current = false;
         week.last_at_ms = now - 2 * 24 * 60 * 60 * 1_000;
-        let mut older = session("older", "inactive");
+        let mut older = session("older", AgentDisplayState::Inactive);
         older.label = "Dormant review".into();
         older.state_is_current = false;
         older.last_at_ms = now - 8 * 24 * 60 * 60 * 1_000;
-        let mut pi = session("pi", "done");
+        let mut pi = session("pi", AgentDisplayState::Done);
         pi.integration = "pi".into();
         pi.label = "Pi session must be filtered".into();
         app.workspaces[0].sessions = vec![active, recent, week, older, pi];
@@ -5796,7 +5896,7 @@ mod tests {
     fn agent_session_preview_labels_historical_and_missing_context() {
         let mut workspace = workspace("w1", "boomux");
         workspace.items[0] = WorkspaceItemView::AgentShell(agent_shell());
-        let mut catalog = session("catalog", "idle");
+        let mut catalog = session("catalog", AgentDisplayState::Idle);
         catalog.external_session_id = Some("external-active".into());
         catalog.state_is_current = false;
         catalog.source_cwd = None;
@@ -5862,7 +5962,7 @@ mod tests {
         app.workspaces[0].items[0] = WorkspaceItemView::AgentShell(agent_shell());
         app.workspaces[0]
             .sessions
-            .push(session("active", "working"));
+            .push(session("active", AgentDisplayState::Working));
         focus_items(&mut app);
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
@@ -5978,12 +6078,12 @@ mod tests {
         let mut terminal_backend = Terminal::new(backend).unwrap();
         let mut one = workspace("w1", "one");
         one.items.clear();
-        let mut wrong = session("wrong", "working");
+        let mut wrong = session("wrong", AgentDisplayState::Working);
         wrong.label = "Wrong workspace session".into();
         one.sessions.push(wrong);
         let mut two = workspace("w2", "two");
         two.items = vec![WorkspaceItemView::AgentShell(agent_shell())];
-        let mut right = session("right", "working");
+        let mut right = session("right", AgentDisplayState::Working);
         right.external_session_id = Some("external-active".into());
         right.label = "Owning workspace session".into();
         two.sessions.push(right);
@@ -6054,7 +6154,9 @@ mod tests {
         let backend = TestBackend::new(180, 34);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = app();
-        app.workspaces[0].sessions.push(session("hidden", "done"));
+        app.workspaces[0]
+            .sessions
+            .push(session("hidden", AgentDisplayState::Done));
         focus_items(&mut app);
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
@@ -6472,7 +6574,7 @@ mod tests {
         workspace.attention = vec![WorkspaceAttentionView {
             shell_id: "term_1".into(),
             agent_name: "review-agent".into(),
-            reason: "blocked".into(),
+            reason: AttentionReason::Blocked,
             evidence: "approval required".into(),
             observed_at_ms: current_time_ms(),
         }];
@@ -6498,7 +6600,7 @@ mod tests {
 
     #[test]
     fn generic_agent_names_fall_back_to_shell_and_identity() {
-        let mut view = session("generic", "idle");
+        let mut view = session("generic", AgentDisplayState::Idle);
         view.label = "opencode".into();
         view.external_session_id = Some("ses_123456789".into());
 
@@ -6508,7 +6610,7 @@ mod tests {
 
     #[test]
     fn pi_sessions_keep_the_shell_and_identity_fallback() {
-        let mut view = session("pi-generic", "idle");
+        let mut view = session("pi-generic", AgentDisplayState::Idle);
         view.integration = "pi".into();
         view.label = "Pi".into();
         view.external_session_id = Some("pi_123456789".into());

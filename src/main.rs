@@ -30,6 +30,7 @@ use crate::integration_management::{
 mod agent_attention_projection;
 mod cli_output;
 mod config;
+mod dashboard_projection;
 mod git;
 mod host_session_source;
 mod host_session_titles;
@@ -1298,8 +1299,7 @@ fn dashboard_views(
     workspaces: &[WorkspaceSnapshot],
     git_cache: &mut git::Cache,
 ) -> Vec<tui::WorkspaceView> {
-    let sessions = session_projection::project_workspaces(workspaces);
-    dashboard_views_from_sessions(workspaces, git_cache, &sessions)
+    dashboard_projection::project(workspaces, git_cache)
 }
 
 fn dashboard_views_with_catalog(
@@ -1309,198 +1309,7 @@ fn dashboard_views_with_catalog(
 ) -> Vec<tui::WorkspaceView> {
     let catalog = cached_host_catalog(workspaces, title_cache);
     let sessions = session_projection::project_workspaces_with_catalog(workspaces, Some(&catalog));
-    dashboard_views_from_sessions(workspaces, git_cache, &sessions)
-}
-
-fn dashboard_views_from_sessions(
-    workspaces: &[WorkspaceSnapshot],
-    git_cache: &mut git::Cache,
-    sessions: &[session_projection::SessionProjection],
-) -> Vec<tui::WorkspaceView> {
-    workspaces
-        .iter()
-        .map(|workspace| {
-            let sessions = workspace_session_views(
-                sessions
-                    .iter()
-                    .filter(|session| session.workspace_id == workspace.id),
-            );
-            let agent_summary = agent_attention_projection::summarize_workspace(workspace);
-            let attention =
-                agent_attention_projection::project_attention(std::slice::from_ref(workspace))
-                    .into_iter()
-                    .map(|item| tui::WorkspaceAttentionView {
-                        shell_id: item.agent.shell_id,
-                        agent_name: item.agent.name,
-                        reason: agent_attention_projection::attention_reason(item.attention.reason)
-                            .into(),
-                        evidence: item.attention.observation.evidence,
-                        observed_at_ms: item.attention.observation.observed_at_ms,
-                    })
-                    .collect();
-            let shells = workspace
-                .shells
-                .iter()
-                .map(|shell| {
-                    let git = git_cache.inspect(&shell.cwd);
-                    let shell_view = tui::TerminalView {
-                        id: shell.id.clone(),
-                        name: shell.name.clone(),
-                        status: shell_status(&shell.status).into(),
-                        directory: shell.cwd.display().to_string(),
-                        repository: git.repository,
-                        branch: git.branch,
-                        git_state: git.state,
-                        worktree: git.worktree,
-                        foreground_process: shell.foreground_process.clone(),
-                        command: shell.command.join(" "),
-                        argv: shell.command.clone(),
-                        run: shell.run.as_ref().map(|run| tui::TerminalRunView {
-                            id: run.id.clone(),
-                            generation: run.generation,
-                            started_at_ms: run.started_at_ms,
-                            ended_at_ms: run.ended_at_ms,
-                            exit_reason: run.exit_reason.as_ref().map(shell_exit_reason),
-                            output_revision: run.output_revision,
-                        }),
-                    };
-                    let agent = matches!(shell.status, ShellStatus::Running)
-                        .then(|| {
-                            shell.run.as_ref().and_then(|run| {
-                                workspace
-                                    .agents
-                                    .iter()
-                                    .filter(|agent| {
-                                        agent.workspace_id == workspace.id
-                                            && agent.shell_id == shell.id
-                                            && agent.run_id == run.id
-                                            && agent.ended_at_ms.is_none()
-                                            && !matches!(
-                                                agent.observation.state,
-                                                AgentState::Inactive | AgentState::Done
-                                            )
-                                    })
-                                    .max_by(|left, right| {
-                                        left.observation
-                                            .observed_at_ms
-                                            .cmp(&right.observation.observed_at_ms)
-                                            .then_with(|| left.id.cmp(&right.id))
-                                    })
-                            })
-                        })
-                        .flatten();
-                    let suppress_foreground_hint = shell.run.as_ref().is_some_and(|run| {
-                        workspace.agents.iter().any(|agent| {
-                            agent.shell_id == shell.id
-                                && agent.run_id == run.id
-                                && shell.foreground_process.as_deref()
-                                    == Some(agent.integration.as_str())
-                                && (agent.ended_at_ms.is_some()
-                                    || matches!(
-                                        agent.observation.state,
-                                        AgentState::Inactive | AgentState::Done
-                                    ))
-                        })
-                    });
-                    let root_git = agent
-                        .and_then(|agent| {
-                            sessions.iter().find(|session| {
-                                session.runs.iter().any(|run| run.agent_id == agent.id)
-                            })
-                        })
-                        .and_then(|session| session.source_cwd.as_deref())
-                        .map(|directory| git_cache.inspect(directory))
-                        .unwrap_or_default();
-                    match (agent, shell.foreground_process.as_deref()) {
-                        (Some(agent), _) => {
-                            tui::WorkspaceItemView::AgentShell(tui::AgentShellView {
-                                shell: shell_view,
-                                agent: Some(tui::AgentView {
-                                    id: agent.id.clone(),
-                                    state: cli_output::agent_state(agent.observation.state).into(),
-                                    integration: agent.integration.clone(),
-                                    external_session_id: agent.external_session_id.clone(),
-                                    authority: cli_output::agent_authority(
-                                        agent.observation.authority,
-                                    )
-                                    .into(),
-                                    confidence: agent.observation.confidence,
-                                    evidence: agent.observation.evidence.clone(),
-                                    updated_at_ms: agent.observation.observed_at_ms,
-                                    root_branch: root_git.branch,
-                                    root_worktree: root_git.worktree,
-                                }),
-                            })
-                        }
-                        (None, Some("opencode" | "pi")) if !suppress_foreground_hint => {
-                            tui::WorkspaceItemView::AgentShell(tui::AgentShellView {
-                                shell: shell_view,
-                                agent: None,
-                            })
-                        }
-                        (None, _) => tui::WorkspaceItemView::Shell(shell_view),
-                    }
-                })
-                .collect::<Vec<_>>();
-            let launchers = workspace.launchers.iter().map(|launcher| {
-                let git = git_cache.inspect(&launcher.cwd);
-                tui::WorkspaceItemView::Launcher(tui::LauncherView {
-                    id: launcher.id.clone(),
-                    name: launcher.name.clone(),
-                    directory: launcher.cwd.display().to_string(),
-                    repository: git.repository,
-                    branch: git.branch,
-                    git_state: git.state,
-                    worktree: git.worktree,
-                    command: launcher.command.join(" "),
-                    argv: launcher.command.clone(),
-                })
-            });
-            tui::WorkspaceView {
-                id: workspace.id.clone(),
-                name: workspace.name.clone(),
-                default_cwd: workspace
-                    .default_cwd
-                    .as_ref()
-                    .map(|cwd| cwd.display().to_string()),
-                items: shells.into_iter().chain(launchers).collect(),
-                sessions,
-                agent_state_counts: agent_summary.states,
-                attention_count: agent_summary.attention_count,
-                attention,
-            }
-        })
-        .collect()
-}
-
-fn workspace_session_views<'a>(
-    sessions: impl IntoIterator<Item = &'a session_projection::SessionProjection>,
-) -> Vec<tui::AgentSessionView> {
-    sessions
-        .into_iter()
-        .map(|session| {
-            let runs = session
-                .occurrences
-                .iter()
-                .map(|occurrence| tui::AgentSessionRunView {
-                    agent_id: occurrence.agent_id.clone(),
-                    shell_name: occurrence.retained_shell_name.clone(),
-                    directory: occurrence.source_cwd.clone(),
-                })
-                .collect();
-            tui::AgentSessionView {
-                id: session.id.clone(),
-                label: session.description.clone(),
-                integration: session.integration.clone(),
-                external_session_id: session.external_session_id.clone(),
-                state: cli_output::agent_state(session.state).into(),
-                state_is_current: session.state_is_current,
-                last_at_ms: session.last_at_ms,
-                source_cwd: session.source_cwd.clone(),
-                runs,
-            }
-        })
-        .collect()
+    dashboard_projection::project_with_sessions(workspaces, git_cache, &sessions)
 }
 
 fn workspace_source_directories(workspaces: &[WorkspaceSnapshot]) -> BTreeSet<PathBuf> {
@@ -1574,35 +1383,7 @@ fn enrich_session_titles(
     workspaces: &mut [tui::WorkspaceView],
     title_cache: &mut host_session_titles::Cache,
 ) {
-    enrich_session_titles_with(workspaces, |integration, directory, external_session_id| {
-        title_cache.title(integration, directory, external_session_id)
-    });
-}
-
-fn enrich_session_titles_with<F>(workspaces: &mut [tui::WorkspaceView], mut title: F)
-where
-    F: FnMut(&str, &Path, &str) -> Option<String>,
-{
-    for session in workspaces
-        .iter_mut()
-        .flat_map(|workspace| workspace.sessions.iter_mut())
-    {
-        let Some(external_session_id) = session.external_session_id.as_deref() else {
-            continue;
-        };
-        let Some(directory) = session
-            .runs
-            .iter()
-            .rev()
-            .find_map(|run| run.directory.as_deref())
-            .or(session.source_cwd.as_deref())
-        else {
-            continue;
-        };
-        if let Some(host_title) = title(&session.integration, directory, external_session_id) {
-            session.label = host_title;
-        }
-    }
+    dashboard_projection::enrich_session_titles(workspaces, title_cache);
 }
 
 fn open_directory(
@@ -5209,7 +4990,7 @@ mod tests {
         assert_eq!(views[0].sessions.len(), 1);
         let session = &views[0].sessions[0];
         assert!(Uuid::parse_str(&session.id).is_ok());
-        assert_eq!(session.state, "blocked");
+        assert_eq!(session.state, tui::AgentDisplayState::Blocked);
         assert!(session.state_is_current);
         assert_eq!(session.runs.len(), 2);
         assert_eq!(session.runs[0].shell_name.as_deref(), Some("build"));
@@ -5226,12 +5007,15 @@ mod tests {
         workspace.agents = vec![agent("agent-1", "w1", "s1")];
         let mut views = dashboard_views(&[workspace], &mut git::Cache::default());
 
-        enrich_session_titles_with(&mut views, |integration, directory, external_id| {
-            (integration == "opencode"
-                && directory == Path::new("/tmp/project")
-                && external_id == "external-1")
-                .then(|| "Review async title cache".into())
-        });
+        dashboard_projection::enrich_session_titles_with(
+            &mut views,
+            |integration, directory, external_id| {
+                (integration == "opencode"
+                    && directory == Path::new("/tmp/project")
+                    && external_id == "external-1")
+                    .then(|| "Review async title cache".into())
+            },
+        );
 
         assert_eq!(views[0].sessions[0].label, "Review async title cache");
     }
@@ -5251,7 +5035,7 @@ mod tests {
                 label: "opencode".into(),
                 integration: "opencode".into(),
                 external_session_id: Some("external-1".into()),
-                state: "inactive".into(),
+                state: tui::AgentDisplayState::Inactive,
                 state_is_current: false,
                 last_at_ms: 30,
                 source_cwd: Some("/tmp/project".into()),
@@ -5270,7 +5054,7 @@ mod tests {
             }],
         }];
 
-        enrich_session_titles_with(&mut views, |_, directory, _| {
+        dashboard_projection::enrich_session_titles_with(&mut views, |_, directory, _| {
             (directory == Path::new("/tmp/project")).then(|| "Historical title".into())
         });
 
@@ -5309,7 +5093,7 @@ mod tests {
 
         let views = dashboard_views(&[workspace], &mut git::Cache::default());
 
-        assert_eq!(views[0].sessions[0].state, "blocked");
+        assert_eq!(views[0].sessions[0].state, tui::AgentDisplayState::Blocked);
     }
 
     #[test]
@@ -5329,7 +5113,7 @@ mod tests {
 
         let views = dashboard_views(&[workspace], &mut git::Cache::default());
 
-        assert_eq!(views[0].sessions[0].state, "working");
+        assert_eq!(views[0].sessions[0].state, tui::AgentDisplayState::Working);
         assert!(views[0].sessions[0].state_is_current);
     }
 
@@ -5343,7 +5127,7 @@ mod tests {
 
         let views = dashboard_views(&[workspace], &mut git::Cache::default());
 
-        assert_eq!(views[0].sessions[0].state, "blocked");
+        assert_eq!(views[0].sessions[0].state, tui::AgentDisplayState::Blocked);
         assert!(!views[0].sessions[0].state_is_current);
     }
 
@@ -5354,13 +5138,13 @@ mod tests {
         first.started_at_ms = 10;
         workspace.agents = vec![first.clone()];
         let initial = session_projection::project_workspaces(std::slice::from_ref(&workspace));
-        let initial_id = workspace_session_views(&initial)[0].id.clone();
+        let initial_id = dashboard_projection::session_views(&initial)[0].id.clone();
 
         let mut added = agent("agent-a", "w1", "s1");
         added.started_at_ms = 10;
         workspace.agents.push(added);
         let projected = session_projection::project_workspaces(std::slice::from_ref(&workspace));
-        let sessions = workspace_session_views(&projected);
+        let sessions = dashboard_projection::session_views(&projected);
 
         assert_eq!(sessions[0].id, initial_id);
         assert_eq!(sessions[0].runs.len(), 2);
@@ -5389,13 +5173,13 @@ mod tests {
             views[0]
                 .sessions
                 .iter()
-                .any(|session| session.state == "inactive")
+                .any(|session| session.state == tui::AgentDisplayState::Inactive)
         );
         assert!(
             views[0]
                 .sessions
                 .iter()
-                .any(|session| session.state == "done")
+                .any(|session| session.state == tui::AgentDisplayState::Done)
         );
         assert!(
             views[0]
@@ -5464,8 +5248,11 @@ mod tests {
         assert_eq!(shell.command, "opencode");
         let agent = agent.as_ref().expect("durable agent");
         assert_eq!(agent.id, "a1");
-        assert_eq!(agent.state, "working");
-        assert_eq!(agent.authority, "lifecycle_integration");
+        assert_eq!(agent.state, tui::AgentDisplayState::Working);
+        assert_eq!(
+            agent.authority,
+            tui::AgentAuthorityDisplay::LifecycleIntegration
+        );
         assert_eq!(agent.confidence, 95);
         assert_eq!(agent.updated_at_ms, 11);
         assert_eq!(agent.root_branch, "-");
@@ -5561,7 +5348,7 @@ mod tests {
         };
         assert_eq!(item.shell.name, "terminal");
         let agent = item.agent.as_ref().expect("durable agent");
-        assert_eq!(agent.state, "blocked");
+        assert_eq!(agent.state, tui::AgentDisplayState::Blocked);
         assert_eq!(agent.evidence, "needs approval");
     }
 

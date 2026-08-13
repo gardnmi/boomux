@@ -8,7 +8,8 @@
 
 | Path | Responsibility |
 | --- | --- |
-| `src/main.rs` | CLI schema, process composition, command dispatch, and snapshot-to-UI orchestration |
+| `src/main.rs` | CLI schema, process composition, command dispatch, and dashboard backend orchestration |
+| `src/dashboard_projection.rs` | Typed snapshot/session-to-dashboard classification, view construction, and title enrichment |
 | `src/protocol.rs` | Versioned control and attachment wire models, framing, and request version requirements |
 | `src/client.rs` | Daemon discovery/startup, protocol negotiation, typed management requests, and attachment setup |
 | `src/daemon.rs` | Runtime authority for workspaces, shells, agents, PTYs, processes, events, persistence coordination, and handoff |
@@ -71,7 +72,8 @@ persistence across attachment disconnects, naming, grouping, and orchestration.
 ### Application
 
 `src/main.rs` owns the CLI, project-name suggestions, dashboard actions, shell
-name resolution, and conversion from daemon snapshots into TUI view models.
+name resolution, and dashboard backend orchestration. `src/dashboard_projection.rs`
+converts daemon snapshots and projected sessions into typed TUI view models.
 `src/session_projection.rs` is the shared binary projection used by the CLI and
 dashboard to combine one daemon snapshot with bounded host session catalogs.
 
