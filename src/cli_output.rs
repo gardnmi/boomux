@@ -6,6 +6,7 @@ use serde::Serialize;
 use boomux::client::{ClientError, LifecycleError, ProtocolError};
 use boomux::protocol::{
     AgentAttentionReason, AgentAuthority, AgentInstanceSnapshot, AgentObservationSnapshot,
+    AgentScheduleOverlapPolicy, AgentScheduleSession, AgentScheduleSnapshot, AgentScheduleState,
     AgentState, ErrorCode, ShellRunExitReason, ShellSnapshot, ShellStatus,
     WorkspaceLauncherSnapshot,
 };
@@ -82,6 +83,7 @@ pub(crate) struct WorkspaceSummary {
     pub(crate) name: String,
     pub(crate) shell_count: usize,
     pub(crate) launcher_count: usize,
+    pub(crate) schedule_count: usize,
     pub(crate) agent_count: usize,
     pub(crate) agent_state_counts: AgentStateCounts,
     pub(crate) attention_count: usize,
@@ -95,6 +97,36 @@ pub(crate) struct LauncherData {
     pub(crate) name: String,
     pub(crate) cwd: String,
     pub(crate) command: Vec<String>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct ScheduleData {
+    pub(crate) id: String,
+    pub(crate) workspace_id: String,
+    pub(crate) workspace_name: Option<String>,
+    pub(crate) name: String,
+    pub(crate) cwd: String,
+    pub(crate) integration: String,
+    pub(crate) session_mode: &'static str,
+    pub(crate) external_session_id: Option<String>,
+    pub(crate) cron: String,
+    pub(crate) timezone: String,
+    pub(crate) state: &'static str,
+    pub(crate) overlap_policy: &'static str,
+    pub(crate) revision: u64,
+    pub(crate) prompt_revision: u64,
+    pub(crate) trigger_revision: u64,
+    pub(crate) created_at_ms: u64,
+    pub(crate) updated_at_ms: u64,
+    pub(crate) evaluation_frontier_ms: u64,
+    pub(crate) execution_shell_id: Option<String>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct ScheduleInspectionData {
+    #[serde(flatten)]
+    pub(crate) schedule: ScheduleData,
+    pub(crate) prompt: String,
 }
 
 #[derive(Serialize)]
@@ -257,6 +289,59 @@ pub(crate) fn launcher(
     }
 }
 
+pub(crate) fn schedule(
+    schedule: &AgentScheduleSnapshot,
+    workspace_name: Option<&str>,
+) -> ScheduleData {
+    let (session_mode, external_session_id) = match &schedule.session {
+        AgentScheduleSession::Fresh => ("fresh", None),
+        AgentScheduleSession::Continue {
+            external_session_id,
+        } => ("continue", Some(external_session_id.clone())),
+    };
+    ScheduleData {
+        id: schedule.id.clone(),
+        workspace_id: schedule.workspace_id.clone(),
+        workspace_name: workspace_name.map(str::to_owned),
+        name: schedule.name.clone(),
+        cwd: schedule.cwd.display().to_string(),
+        integration: schedule.integration.clone(),
+        session_mode,
+        external_session_id,
+        cron: schedule.trigger.cron.clone(),
+        timezone: schedule.trigger.timezone.clone(),
+        state: schedule_state(schedule.state),
+        overlap_policy: match schedule.overlap_policy {
+            AgentScheduleOverlapPolicy::Skip => "skip",
+        },
+        revision: schedule.revision,
+        prompt_revision: schedule.prompt_revision,
+        trigger_revision: schedule.trigger_revision,
+        created_at_ms: schedule.created_at_ms,
+        updated_at_ms: schedule.updated_at_ms,
+        evaluation_frontier_ms: schedule.evaluation_frontier_ms,
+        execution_shell_id: schedule.execution_shell_id.clone(),
+    }
+}
+
+pub(crate) fn schedule_inspection(
+    schedule: &AgentScheduleSnapshot,
+    workspace_name: Option<&str>,
+    prompt: &str,
+) -> ScheduleInspectionData {
+    ScheduleInspectionData {
+        schedule: self::schedule(schedule, workspace_name),
+        prompt: prompt.to_owned(),
+    }
+}
+
+pub(crate) fn schedule_state(state: AgentScheduleState) -> &'static str {
+    match state {
+        AgentScheduleState::Paused => "paused",
+        AgentScheduleState::Enabled => "enabled",
+    }
+}
+
 pub(crate) fn agent(agent: &AgentInstanceSnapshot, workspace_name: Option<&str>) -> AgentData {
     AgentData {
         id: agent.id.clone(),
@@ -374,6 +459,12 @@ fn classify_error(command: &str, error: &(dyn Error + 'static)) -> &'static str 
         }
         if let Some(client) = candidate.downcast_ref::<ClientError>() {
             return classify_client_error(command, client);
+        }
+        if candidate
+            .downcast_ref::<boomux::scheduling::SchedulingError>()
+            .is_some()
+        {
+            return "invalid_argument";
         }
         if let Some(io_error) = candidate.downcast_ref::<io::Error>() {
             return classify_io_error(command, io_error);
@@ -547,6 +638,44 @@ mod tests {
     }
 
     #[test]
+    fn schedule_summary_is_prompt_free_and_inspection_discloses_prompt() {
+        let snapshot = AgentScheduleSnapshot {
+            id: "schedule-1".into(),
+            workspace_id: "w1".into(),
+            name: "review".into(),
+            cwd: "/tmp/project".into(),
+            integration: "opencode".into(),
+            session: AgentScheduleSession::Fresh,
+            trigger: boomux::protocol::AgentScheduleTrigger {
+                cron: "0 9 * * 1-5".into(),
+                timezone: "UTC".into(),
+            },
+            state: AgentScheduleState::Paused,
+            overlap_policy: AgentScheduleOverlapPolicy::Skip,
+            revision: 1,
+            prompt_revision: 2,
+            trigger_revision: 1,
+            created_at_ms: 10,
+            updated_at_ms: 11,
+            evaluation_frontier_ms: 11,
+            execution_shell_id: None,
+        };
+        let private = "private prompt contents\n";
+
+        let summary = serde_json::to_value(schedule(&snapshot, Some("project"))).unwrap();
+        assert!(summary.get("prompt").is_none());
+        assert!(!summary.to_string().contains(private));
+        assert!(summary["external_session_id"].is_null());
+        assert!(summary["execution_shell_id"].is_null());
+        assert_eq!(summary["session_mode"], "fresh");
+        assert_eq!(summary["state"], "paused");
+
+        let inspection =
+            serde_json::to_value(schedule_inspection(&snapshot, Some("project"), private)).unwrap();
+        assert_eq!(inspection["prompt"], private);
+    }
+
+    #[test]
     fn client_errors_convert_to_stable_cli_codes() {
         let remote = ClientError::Remote(RemoteError {
             code: Some(ErrorCode::ShellStartFailed),
@@ -560,6 +689,7 @@ mod tests {
             "connection refused",
         ));
         let timeout = ClientError::Lifecycle(LifecycleError::ShutdownTimeout);
+        let schedule = boomux::scheduling::canonicalize_cron("not a cron").unwrap_err();
 
         assert_eq!(classify_error("shell.open", &remote), "shell_start_failed");
         assert_eq!(
@@ -571,5 +701,9 @@ mod tests {
             "daemon_unavailable"
         );
         assert_eq!(classify_error("daemon.stop", &timeout), "timeout");
+        assert_eq!(
+            classify_error("schedule.create", &schedule),
+            "invalid_argument"
+        );
     }
 }

@@ -27,6 +27,7 @@
 | `src/session_transcript.rs` and children | Shared transcript identity, bounds, pagination, and host-specific normalization |
 | `src/integration_management.rs` | Integration inventory, status, setup, verification, install, and uninstall workflows |
 | `src/process_adapter.rs` | Exact-argv child supervision and fail-open process-bound Agent observation |
+| `src/scheduling.rs` | Bounded canonical cron, IANA timezone, prompt, and schedule identity validation |
 | `src/config.rs`, `src/projects.rs`, `src/git.rs` | Layered configuration, bounded project discovery, and asynchronous Git metadata |
 | `src/cli_output.rs` | Stable `boomux.cli/v1` output and error presentation |
 | `src/desktop_notifications.rs` | Bounded fail-open desktop and sound delivery |
@@ -358,20 +359,26 @@ requiring a daemon. Protocol 6 error responses carry an additive optional code;
 clients expose it as `ClientError::Remote(RemoteError)`, while mixed-version
 peers retain message compatibility.
 
-### Scheduled Agent Work (Accepted, Not Yet Implemented)
+### Scheduled Agent Work (Management Implemented; Dispatch Planned)
 
-Agent scheduling will add two durable identities without changing ShellRun,
-Agent Instance, or projected Agent Session semantics. An Agent Schedule belongs
-to exactly one workspace and snapshots a bounded prompt revision, explicit
-working directory, integration, session policy, canonical five-field cron
-expression, IANA timezone, and dispatch policy. A Scheduled Execution records
-one manual or timed decision against exact schedule and prompt revisions. An
-execution that binds the internal runner acquires a shell run, even when the
-external host later fails to launch. The first such execution lazily creates one
-schedule-owned durable shell that later executions reuse for distinct runs;
-ordinary shell or workspace open never starts or restarts it. Lifecycle
-integration may bind an Agent Instance to the exact execution run under the
-existing authority rules.
+Protocol 22 and state schema 9 implement the Agent Schedule identity without
+changing ShellRun, Agent Instance, or projected Agent Session semantics. A
+schedule belongs to exactly one workspace and snapshots a bounded prompt
+revision, explicit working directory, integration, session policy, canonical
+five-field cron expression, IANA timezone, and overlap policy. Create, list,
+exact inspect, pause, resume, remove, cold recovery, graceful handoff, workspace
+closure, and prompt-free events are available. Exact inspection is the only
+management response that contains prompt content; protocol-21 and older peers
+omit schedule summaries and events while their cursors still advance.
+
+Scheduled Execution, timing, and process dispatch remain planned. An execution
+will record one manual or timed decision against exact schedule and prompt
+revisions. An execution that binds the internal runner acquires a shell run, even
+when the external host later fails to launch. The first such execution lazily
+creates one schedule-owned durable shell that later executions reuse for
+distinct runs; ordinary shell or workspace open never starts or restarts it.
+Lifecycle integration may bind an Agent Instance to the exact execution run
+under the existing authority rules.
 
 The schedule-owned shell stores a stable internal runner argument vector rather
 than a host prompt. Each persisted execution claim snapshots its working
@@ -683,6 +690,12 @@ Protocol 21 adds a targeted focused-terminal read so event-driven dashboards can
 refresh non-durable focus without rebuilding the complete registry. Protocols
 7-20 use the event stream with a one-second snapshot fallback for ephemeral
 fields; protocol 6 retains one-second snapshot refreshes.
+Protocol 22 adds workspace-owned Agent Schedule definitions and prompt-free
+schedule events. Schedule requests require protocol 22. Older snapshots omit the
+additive schedule summaries, and older event readers filter schedule events
+without rewinding their cursor. State schema 9 explicitly migrates schema 8
+workspaces with empty schedule collections rather than reinterpreting missing
+durable fields.
 
 Opt-in desktop and sound notifications are a daemon-owned projection of committed
 Agent state transitions, not durable queue state. A transition from any other

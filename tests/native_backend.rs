@@ -12,5 +12,7 @@ mod launchers_integrations;
 mod notifications;
 #[path = "native_backend/protocol_control.rs"]
 mod protocol_control;
+#[path = "native_backend/schedules.rs"]
+mod schedules;
 #[path = "native_backend/shell_lifecycle.rs"]
 mod shell_lifecycle;

@@ -26,6 +26,9 @@ Protocol 21 adds a targeted focused-terminal read for clients that use events as
 registry invalidation while refreshing ephemeral focus independently. Running
 shell reads refresh foreground-process hints from a daemon-side one-second cache
 shared by concurrent clients.
+Protocol 22 adds durable Agent Schedule management. Workspace snapshots include
+ordered, prompt-free schedule summaries, while exact schedule inspection is the
+only management response that discloses the current prompt.
 
 `boomux agent wait <id> --after-revision <revision>` is the preferred way to
 await one Agent. It returns on a newer accepted durable observation, returns
@@ -63,6 +66,8 @@ The event vocabulary is:
 - `run_started`, `output_changed`, `run_exited`
 - `agent_registered`, `agent_state_changed`, `agent_completed`,
   `agent_attention_acknowledged`
+- `agent_schedule_created`, `agent_schedule_paused`, `agent_schedule_resumed`,
+  `agent_schedule_removed`
 - `handoff_completed`
 
 Output events carry run identity and the latest output revision, not raw PTY
@@ -92,11 +97,27 @@ resulting Agent snapshot after the item is removed. The acknowledgment is
 conditional on its raising observation revision, persists before publication,
 and does not increment the lifecycle observation revision.
 
+Schedule create, pause, resume, and remove events never contain prompt content.
+Create and changed pause/resume operations publish the complete prompt-free
+schedule summary after persistence. Idempotent pause or resume emits no event and
+does not advance the schedule revision. Removing a schedule emits only its
+workspace and schedule identities.
+
+Closing a workspace removes all of its schedules and stored prompts as part of
+the workspace transaction. The stream publishes the existing single
+`workspace_closed` event; it does not publish one `agent_schedule_removed` event
+per owned schedule.
+
 Protocol-8 and older event clients do not receive protocol-9 agent snapshots or
 agent events. Filtering does not rewrite the journal: their returned cursor
 still advances across filtered agent events, preserving the stream's total
 publication order. Agent get, register, and report requests require protocol 9;
 ensure requires protocol 10.
+
+Protocol-21 and older clients receive workspace snapshots without schedules and
+do not receive schedule events. The returned cursor still advances across those
+filtered events, preserving the stream's total publication order. Schedule
+management requests require protocol 22.
 
 Event IDs provide one total publication order. The daemon transition coordinator
 couples durable lifecycle mutation, persistence, and event publication. Events

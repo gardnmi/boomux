@@ -4,8 +4,8 @@ use std::error::Error;
 use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::fs;
-use std::io;
-use std::os::unix::fs::PermissionsExt;
+use std::io::{self, Read};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
@@ -13,13 +13,14 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use clap::error::ErrorKind as ClapErrorKind;
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use uuid::Uuid;
 
 use boomux::protocol::{
-    AgentAuthority, AgentInstanceSnapshot, AgentRegistrationSpec, AgentReport, AgentState,
-    EventCursor, ShellSnapshot, ShellSpec, ShellStatus, Snapshot, WorkspaceLauncherSnapshot,
-    WorkspaceLauncherSpec, WorkspaceSnapshot,
+    AgentAuthority, AgentInstanceSnapshot, AgentRegistrationSpec, AgentReport,
+    AgentScheduleOverlapPolicy, AgentScheduleSession, AgentScheduleSnapshot, AgentScheduleSpec,
+    AgentScheduleState, AgentScheduleTrigger, AgentState, EventCursor, ShellSnapshot, ShellSpec,
+    ShellStatus, Snapshot, WorkspaceLauncherSnapshot, WorkspaceLauncherSpec, WorkspaceSnapshot,
 };
 use boomux::{attach, client, daemon, protocol};
 
@@ -258,6 +259,11 @@ enum Commands {
     Session {
         #[command(subcommand)]
         command: SessionCommands,
+    },
+    /// Manage recurring Agent work definitions
+    Schedule {
+        #[command(subcommand)]
+        command: ScheduleCommands,
     },
     /// Inspect and install supported harness integrations
     Integration {
@@ -505,6 +511,111 @@ enum SessionCommands {
     },
 }
 
+#[derive(Subcommand)]
+enum ScheduleCommands {
+    /// Create a durable schedule definition
+    Create(Box<ScheduleCreateArgs>),
+    /// List schedule definitions without disclosing prompts
+    List {
+        #[arg(long, value_name = "NAME_OR_ID")]
+        workspace: Option<String>,
+    },
+    /// Inspect a schedule, including its private prompt
+    Inspect {
+        target: String,
+        #[arg(long, value_name = "NAME_OR_ID")]
+        workspace: Option<String>,
+    },
+    /// Mark a schedule paused in durable management state
+    Pause {
+        target: String,
+        #[arg(long, value_name = "NAME_OR_ID")]
+        workspace: Option<String>,
+    },
+    /// Mark a schedule enabled for a later dispatcher
+    Resume {
+        target: String,
+        #[arg(long, value_name = "NAME_OR_ID")]
+        workspace: Option<String>,
+    },
+    /// Remove an inactive schedule and its persisted prompt
+    Remove {
+        target: String,
+        #[arg(long, value_name = "NAME_OR_ID")]
+        workspace: Option<String>,
+    },
+}
+
+#[derive(Args)]
+#[command(group(
+    ArgGroup::new("prompt_source")
+        .required(true)
+        .multiple(false)
+        .args(["prompt", "prompt_file"])
+), group(
+    ArgGroup::new("trigger_source")
+        .required(true)
+        .multiple(false)
+        .args(["cron", "every", "daily", "weekdays", "weekly"])
+), group(
+    ArgGroup::new("session_mode")
+        .multiple(false)
+        .args(["fresh", "continue_session"])
+), group(
+    ArgGroup::new("initial_state")
+        .multiple(false)
+        .args(["paused", "enabled"])
+))]
+struct ScheduleCreateArgs {
+    /// Workspace-unique schedule name
+    name: String,
+    /// Owning workspace name or ID
+    #[arg(long, value_name = "NAME_OR_ID")]
+    workspace: String,
+    /// Existing working directory to snapshot
+    #[arg(long, value_name = "PATH")]
+    cwd: PathBuf,
+    /// Integration accepted for future scheduled execution
+    #[arg(long)]
+    integration: String,
+    /// Exact inline prompt to persist
+    #[arg(long)]
+    prompt: Option<String>,
+    /// Regular UTF-8 file to snapshot as the prompt
+    #[arg(long, value_name = "PATH")]
+    prompt_file: Option<PathBuf>,
+    /// Canonical five-field cron expression
+    #[arg(long)]
+    cron: Option<String>,
+    /// Minute or hour interval, such as 15m or 6h
+    #[arg(long, value_name = "Nm|Nh")]
+    every: Option<String>,
+    /// Store a daily trigger at this local time
+    #[arg(long, value_name = "HH:MM")]
+    daily: Option<String>,
+    /// Store a weekday trigger at this local time
+    #[arg(long, value_name = "HH:MM")]
+    weekdays: Option<String>,
+    /// Store a weekly trigger for this English day and local time
+    #[arg(long, value_name = "DAY@HH:MM")]
+    weekly: Option<String>,
+    /// IANA timezone; defaults to the resolved system timezone
+    #[arg(long, value_name = "IANA_TIMEZONE")]
+    timezone: Option<String>,
+    /// Plan a new external Agent Session for every future execution
+    #[arg(long)]
+    fresh: bool,
+    /// Pin one exact projected Agent Session
+    #[arg(long = "continue", value_name = "PROJECTED_SESSION_ID")]
+    continue_session: Option<String>,
+    /// Create paused, which is the default
+    #[arg(long)]
+    paused: bool,
+    /// Record consent for a later dispatcher; this layer does not run work
+    #[arg(long)]
+    enabled: bool,
+}
+
 #[derive(Args)]
 struct AgentSuperviseArgs {
     name: Option<String>,
@@ -745,6 +856,12 @@ command_keys! {
     SessionList => ("session.list", Json),
     SessionInspect => ("session.inspect", Json),
     SessionRead => ("session.read", Json),
+    ScheduleCreate => ("schedule.create", Json),
+    ScheduleList => ("schedule.list", Json),
+    ScheduleInspect => ("schedule.inspect", Json),
+    SchedulePause => ("schedule.pause", Json),
+    ScheduleResume => ("schedule.resume", Json),
+    ScheduleRemove => ("schedule.remove", Json),
     Skill => ("skill", HumanOnly),
     Opencode => ("opencode", HumanOnly),
     Pi => ("pi", HumanOnly),
@@ -821,6 +938,24 @@ impl Cli {
             Some(Commands::Session {
                 command: SessionCommands::Read { .. },
             }) => CommandKey::SessionRead,
+            Some(Commands::Schedule {
+                command: ScheduleCommands::Create(..),
+            }) => CommandKey::ScheduleCreate,
+            Some(Commands::Schedule {
+                command: ScheduleCommands::List { .. },
+            }) => CommandKey::ScheduleList,
+            Some(Commands::Schedule {
+                command: ScheduleCommands::Inspect { .. },
+            }) => CommandKey::ScheduleInspect,
+            Some(Commands::Schedule {
+                command: ScheduleCommands::Pause { .. },
+            }) => CommandKey::SchedulePause,
+            Some(Commands::Schedule {
+                command: ScheduleCommands::Resume { .. },
+            }) => CommandKey::ScheduleResume,
+            Some(Commands::Schedule {
+                command: ScheduleCommands::Remove { .. },
+            }) => CommandKey::ScheduleRemove,
             Some(Commands::Integration {
                 command: IntegrationCommands::List,
             }) => CommandKey::IntegrationList,
@@ -1063,6 +1198,7 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
             command: NotificationCommands::Test { reason },
         }) => test_notification(reason),
         Some(Commands::Session { command }) => session_command(command, cli.json),
+        Some(Commands::Schedule { command }) => schedule_command(command, cli.json),
         Some(Commands::Integration { command }) => integration_command(command, cli.json),
         Some(Commands::Skill {
             command: SkillCommands::Install { force },
@@ -1249,7 +1385,7 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
                             .close_workspace(workspace_id)
                             .map_err(|error| error.to_string())?;
                         Ok(format!(
-                            "Closed {name}, its launchers, and all of its shells"
+                            "Closed {name}, its launchers, shells, schedules, and persisted prompts"
                         ))
                     }
                     tui::CloseTarget::Shell(shell_id) => {
@@ -2299,17 +2435,17 @@ fn capabilities(json: bool) -> Result<(), Box<dyn Error>> {
         "internal",
         "unknown",
     ];
-    let integration_hosts = integration_management::IntegrationId::all()
-        .map(|integration| {
-            let spec = integration.spec();
-            let installation = integration.installation();
-            (
-                spec.key.to_owned(),
+    let integration_hosts = boomux::integrations::ALL
+        .iter()
+        .filter_map(|descriptor| {
+            let installation = descriptor.installation?;
+            Some((
+                descriptor.key.to_owned(),
                 serde_json::json!({
                     "package": installation.package,
                     "validated_version": installation.validated_version,
                 }),
-            )
+            ))
         })
         .collect::<serde_json::Map<_, _>>();
     if json {
@@ -2401,6 +2537,7 @@ fn workspace_command(
                             name: workspace.name.clone(),
                             shell_count: workspace.shells.len(),
                             launcher_count: workspace.launchers.len(),
+                            schedule_count: workspace.schedules.len(),
                             agent_count: workspace.agents.len(),
                             agent_state_counts: summary.states,
                             attention_count: summary.attention_count,
@@ -2412,15 +2549,18 @@ fn workspace_command(
                     serde_json::json!({ "workspaces": workspaces }),
                 );
             }
-            println!("NAME\tWORKSPACE ID\tSHELLS\tLAUNCHERS\tAGENTS\tBLOCKED\tDONE\tATTENTION");
+            println!(
+                "NAME\tWORKSPACE ID\tSHELLS\tLAUNCHERS\tSCHEDULES\tAGENTS\tBLOCKED\tDONE\tATTENTION"
+            );
             for workspace in workspaces {
                 let summary = agent_attention_projection::summarize_workspace(&workspace);
                 println!(
-                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                     sanitize_table_cell(&workspace.name),
                     workspace.id,
                     workspace.shells.len(),
                     workspace.launchers.len(),
+                    workspace.schedules.len(),
                     workspace.agents.len(),
                     summary.states.blocked,
                     summary.states.done,
@@ -2468,6 +2608,9 @@ fn workspace_command(
                             "launchers": workspace.launchers.iter()
                                 .map(|launcher| cli_output::launcher(launcher, Some(&workspace.name)))
                                 .collect::<Vec<_>>(),
+                            "schedules": workspace.schedules.iter()
+                                .map(|schedule| cli_output::schedule(schedule, Some(&workspace.name)))
+                                .collect::<Vec<_>>(),
                             "agents": workspace.agents.iter()
                                 .map(|agent| cli_output::agent(agent, Some(&workspace.name)))
                                 .collect::<Vec<_>>(),
@@ -2488,6 +2631,7 @@ fn workspace_command(
             );
             println!("SHELLS\t{}", workspace.shells.len());
             println!("LAUNCHERS\t{}", workspace.launchers.len());
+            println!("SCHEDULES\t{}", workspace.schedules.len());
             println!("AGENTS\t{}", workspace.agents.len());
             println!("BLOCKED AGENTS\t{}", agent_summary.states.blocked);
             println!("COMPLETED AGENTS\t{}", agent_summary.states.done);
@@ -2514,6 +2658,20 @@ fn workspace_command(
                         launcher.id,
                         launcher.cwd.display(),
                         launcher.command.join(" ")
+                    );
+                }
+            }
+            if !workspace.schedules.is_empty() {
+                println!("\nNAME\tSCHEDULE ID\tSTATE\tINTEGRATION\tCRON\tTIMEZONE");
+                for schedule in &workspace.schedules {
+                    println!(
+                        "{}\t{}\t{}\t{}\t{}\t{}",
+                        sanitize_table_cell(&schedule.name),
+                        sanitize_table_cell(&schedule.id),
+                        cli_output::schedule_state(schedule.state),
+                        sanitize_table_cell(&schedule.integration),
+                        sanitize_table_cell(&schedule.trigger.cron),
+                        sanitize_table_cell(&schedule.trigger.timezone),
                     );
                 }
             }
@@ -2552,7 +2710,10 @@ fn workspace_command(
                 );
             }
             client.close_workspace(&workspace.id)?;
-            println!("Closed workspace {}", workspace.name);
+            println!(
+                "Closed workspace {}; its schedules and persisted prompts were removed",
+                workspace.name
+            );
         }
     }
     Ok(())
@@ -3109,6 +3270,541 @@ fn session_command(command: SessionCommands, json: bool) -> Result<(), Box<dyn E
         }
     }
     Ok(())
+}
+
+fn schedule_command(command: ScheduleCommands, json: bool) -> Result<(), Box<dyn Error>> {
+    let client = client::connect_or_start()?;
+    validate_schedule_protocol(client.protocol_version()?)?;
+    match command {
+        ScheduleCommands::Create(arguments) => create_schedule(&client, *arguments, json),
+        ScheduleCommands::List { workspace } => {
+            let snapshot = client.snapshot()?;
+            let selected = workspace
+                .as_deref()
+                .map(|target| resolve_workspace_target(&snapshot.workspaces, target))
+                .transpose()?;
+            let schedules = snapshot
+                .workspaces
+                .iter()
+                .filter(|candidate| selected.is_none_or(|selected| candidate.id == selected.id))
+                .flat_map(|workspace| {
+                    workspace
+                        .schedules
+                        .iter()
+                        .map(move |schedule| (schedule, workspace.name.as_str()))
+                })
+                .collect::<Vec<_>>();
+            if json {
+                let schedules = schedules
+                    .iter()
+                    .map(|(schedule, workspace_name)| {
+                        cli_output::schedule(schedule, Some(workspace_name))
+                    })
+                    .collect::<Vec<_>>();
+                return print_json(
+                    CommandKey::ScheduleList,
+                    serde_json::json!({ "schedules": schedules }),
+                );
+            }
+            println!(
+                "WORKSPACE\tNAME\tSCHEDULE ID\tSTATE\tINTEGRATION\tTRIGGER\tTIMEZONE\tSESSION"
+            );
+            for (schedule, workspace_name) in schedules {
+                println!(
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    sanitize_table_cell(workspace_name),
+                    sanitize_table_cell(&schedule.name),
+                    sanitize_table_cell(&schedule.id),
+                    cli_output::schedule_state(schedule.state),
+                    sanitize_table_cell(&schedule.integration),
+                    sanitize_table_cell(&schedule.trigger.cron),
+                    sanitize_table_cell(&schedule.trigger.timezone),
+                    sanitize_table_cell(&schedule_session_label(&schedule.session)),
+                );
+            }
+            Ok(())
+        }
+        ScheduleCommands::Inspect { target, workspace } => {
+            let snapshot = client.snapshot()?;
+            let schedule = resolve_cli_schedule(&snapshot, &target, workspace.as_deref())?;
+            let workspace_name = schedule_workspace_name(&snapshot, schedule);
+            let inspection = client.get_agent_schedule(&schedule.id)?;
+            if json {
+                return print_json(
+                    CommandKey::ScheduleInspect,
+                    serde_json::json!({
+                        "schedule": cli_output::schedule_inspection(
+                            &inspection.schedule,
+                            workspace_name,
+                            &inspection.prompt,
+                        ),
+                    }),
+                );
+            }
+            print_schedule_inspection(&inspection.schedule, workspace_name, &inspection.prompt);
+            Ok(())
+        }
+        ScheduleCommands::Pause { target, workspace } => {
+            let snapshot = client.snapshot()?;
+            let schedule = resolve_cli_schedule(&snapshot, &target, workspace.as_deref())?;
+            let workspace_name = schedule_workspace_name(&snapshot, schedule).map(str::to_owned);
+            let schedule = client.pause_agent_schedule(&schedule.id)?;
+            print_schedule_mutation(
+                CommandKey::SchedulePause,
+                &schedule,
+                workspace_name.as_deref(),
+                json,
+            )?;
+            if !json {
+                println!("Paused schedule {}", sanitize_table_cell(&schedule.name));
+            }
+            Ok(())
+        }
+        ScheduleCommands::Resume { target, workspace } => {
+            let snapshot = client.snapshot()?;
+            let schedule = resolve_cli_schedule(&snapshot, &target, workspace.as_deref())?;
+            let workspace_name = schedule_workspace_name(&snapshot, schedule).map(str::to_owned);
+            let schedule = client.resume_agent_schedule(&schedule.id)?;
+            print_schedule_mutation(
+                CommandKey::ScheduleResume,
+                &schedule,
+                workspace_name.as_deref(),
+                json,
+            )?;
+            if !json {
+                println!(
+                    "Enabled schedule {} in durable management state; scheduled dispatch is not available yet",
+                    sanitize_table_cell(&schedule.name)
+                );
+            }
+            Ok(())
+        }
+        ScheduleCommands::Remove { target, workspace } => {
+            let snapshot = client.snapshot()?;
+            let schedule = resolve_cli_schedule(&snapshot, &target, workspace.as_deref())?;
+            let removed =
+                cli_output::schedule(schedule, schedule_workspace_name(&snapshot, schedule));
+            let name = schedule.name.clone();
+            client.remove_agent_schedule(&schedule.id)?;
+            if json {
+                return print_json(
+                    CommandKey::ScheduleRemove,
+                    serde_json::json!({ "removed": true, "schedule": removed }),
+                );
+            }
+            println!(
+                "Removed schedule {} and its persisted prompt",
+                sanitize_table_cell(&name)
+            );
+            Ok(())
+        }
+    }
+}
+
+fn validate_schedule_protocol(negotiated: u32) -> Result<(), Box<dyn Error>> {
+    let feature = protocol::ProtocolFeature::AgentSchedules;
+    feature
+        .is_supported_by(negotiated)
+        .then_some(())
+        .ok_or_else(|| {
+            cli_output::failure(
+                "unsupported_version",
+                format!(
+                    "Agent schedule management requires daemon protocol {}; negotiated {negotiated}",
+                    feature.minimum_version()
+                ),
+            )
+        })
+}
+
+fn create_schedule(
+    client: &client::Client,
+    arguments: ScheduleCreateArgs,
+    json: bool,
+) -> Result<(), Box<dyn Error>> {
+    let snapshot = client.snapshot()?;
+    let workspace = resolve_workspace_target(&snapshot.workspaces, &arguments.workspace)?;
+    let name = cli_name(arguments.name, "schedule")?;
+    let cwd = resolve_directory(&arguments.cwd).map_err(|error| {
+        cli_output::failure(
+            "invalid_argument",
+            format!("schedule working directory is invalid: {error}"),
+        )
+    })?;
+    let prompt = schedule_prompt(arguments.prompt, arguments.prompt_file.as_deref())?;
+    let cron = schedule_cron(
+        arguments.cron.as_deref(),
+        arguments.every.as_deref(),
+        arguments.daily.as_deref(),
+        arguments.weekdays.as_deref(),
+        arguments.weekly.as_deref(),
+    )?;
+    let timezone = arguments
+        .timezone
+        .as_deref()
+        .map(boomux::scheduling::canonicalize_timezone)
+        .transpose()?
+        .map_or_else(boomux::scheduling::resolve_system_timezone, Ok)?;
+    let integration = schedule_integration(&arguments.integration)?;
+    let session = if let Some(session_id) = arguments.continue_session.as_deref() {
+        let catalog = discover_host_catalog(std::slice::from_ref(workspace));
+        let sessions = session_projection::project_workspaces_with_catalog(
+            std::slice::from_ref(workspace),
+            Some(&catalog),
+        );
+        let session = session_projection::resolve_exact(&sessions, session_id).map_err(
+            |error| match error {
+                session_projection::ResolveError::NotFound => cli_output::failure(
+                    "not_found",
+                    format!(
+                        "projected session not found in workspace {}: {session_id}",
+                        workspace.name
+                    ),
+                ),
+                session_projection::ResolveError::DuplicateId => cli_output::failure(
+                    "internal",
+                    format!("duplicate projected session ID: {session_id}"),
+                ),
+            },
+        )?;
+        if session.integration != integration.key {
+            return Err(cli_output::failure(
+                "invalid_argument",
+                "continued session integration does not match --integration",
+            ));
+        }
+        let external_session_id = session.external_session_id.as_deref().ok_or_else(|| {
+            cli_output::failure(
+                "invalid_argument",
+                "continued projected session has no canonical external session ID",
+            )
+        })?;
+        boomux::scheduling::validate_external_session_id(external_session_id)?;
+        if !integration
+            .schedule_dispatch
+            .is_some_and(|dispatch| dispatch.continuation)
+        {
+            return Err(cli_output::failure(
+                "unsupported_integration",
+                "integration does not support continuation schedule dispatch",
+            ));
+        }
+        AgentScheduleSession::Continue {
+            external_session_id: external_session_id.to_owned(),
+        }
+    } else {
+        if !integration
+            .schedule_dispatch
+            .is_some_and(|dispatch| dispatch.fresh)
+        {
+            return Err(cli_output::failure(
+                "unsupported_integration",
+                "integration does not support fresh schedule dispatch",
+            ));
+        }
+        AgentScheduleSession::Fresh
+    };
+    let spec = AgentScheduleSpec {
+        name,
+        cwd,
+        integration: integration.key.to_owned(),
+        prompt,
+        session,
+        trigger: AgentScheduleTrigger { cron, timezone },
+        state: if arguments.enabled {
+            AgentScheduleState::Enabled
+        } else {
+            AgentScheduleState::Paused
+        },
+        overlap_policy: AgentScheduleOverlapPolicy::Skip,
+    };
+    let schedule = client.create_agent_schedule(&workspace.id, spec)?;
+    if json {
+        return print_json(
+            CommandKey::ScheduleCreate,
+            serde_json::json!({
+                "schedule": cli_output::schedule(&schedule, Some(&workspace.name)),
+            }),
+        );
+    }
+    println!(
+        "Created {} schedule {} ({})",
+        cli_output::schedule_state(schedule.state),
+        sanitize_table_cell(&schedule.name),
+        sanitize_table_cell(&schedule.id)
+    );
+    if schedule.state == AgentScheduleState::Enabled {
+        println!("Scheduled dispatch is not available yet; only consent state was recorded");
+    }
+    Ok(())
+}
+
+fn schedule_prompt(inline: Option<String>, file: Option<&Path>) -> Result<String, Box<dyn Error>> {
+    let prompt = match (inline, file) {
+        (Some(prompt), None) => prompt,
+        (None, Some(path)) => {
+            let metadata = fs::symlink_metadata(path).map_err(|error| {
+                io::Error::new(error.kind(), format!("cannot inspect prompt file: {error}"))
+            })?;
+            if !metadata.file_type().is_file() {
+                return Err(cli_output::failure(
+                    "invalid_argument",
+                    "prompt file must be a regular file and not a symlink",
+                ));
+            }
+            let mut file = fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(path)
+                .map_err(|_| {
+                    cli_output::failure(
+                        "invalid_argument",
+                        "prompt file changed or could not be opened safely",
+                    )
+                })?;
+            if !file.metadata()?.file_type().is_file() {
+                return Err(cli_output::failure(
+                    "invalid_argument",
+                    "prompt file changed before it could be read safely",
+                ));
+            }
+            let mut bytes = Vec::new();
+            file.by_ref()
+                .take((boomux::scheduling::MAX_PROMPT_BYTES + 1) as u64)
+                .read_to_end(&mut bytes)?;
+            if bytes.len() > boomux::scheduling::MAX_PROMPT_BYTES {
+                return Err(cli_output::failure(
+                    "invalid_argument",
+                    format!(
+                        "prompt must be at most {} bytes",
+                        boomux::scheduling::MAX_PROMPT_BYTES
+                    ),
+                ));
+            }
+            String::from_utf8(bytes).map_err(|_| {
+                cli_output::failure("invalid_argument", "prompt file must contain valid UTF-8")
+            })?
+        }
+        _ => {
+            return Err(cli_output::failure(
+                "invalid_argument",
+                "exactly one prompt source is required",
+            ));
+        }
+    };
+    boomux::scheduling::validate_prompt(&prompt)?;
+    Ok(prompt)
+}
+
+fn schedule_cron(
+    cron: Option<&str>,
+    every: Option<&str>,
+    daily: Option<&str>,
+    weekdays: Option<&str>,
+    weekly: Option<&str>,
+) -> Result<String, Box<dyn Error>> {
+    let expression = if let Some(cron) = cron {
+        boomux::scheduling::canonicalize_cron(cron)?
+    } else if let Some(every) = every {
+        let (amount, unit) = every.split_at(every.len().saturating_sub(1));
+        let amount = amount
+            .parse::<u8>()
+            .map_err(|_| cli_output::failure("invalid_argument", "--every must use Nm or Nh"))?;
+        match unit {
+            "m" => boomux::scheduling::every_minutes_cron(amount)?,
+            "h" => boomux::scheduling::every_hours_cron(amount)?,
+            _ => {
+                return Err(cli_output::failure(
+                    "invalid_argument",
+                    "--every must use Nm or Nh",
+                ));
+            }
+        }
+    } else if let Some(time) = daily {
+        let (hour, minute) = schedule_time(time)?;
+        boomux::scheduling::daily_cron(hour, minute)?
+    } else if let Some(time) = weekdays {
+        let (hour, minute) = schedule_time(time)?;
+        boomux::scheduling::weekdays_cron(hour, minute)?
+    } else if let Some(value) = weekly {
+        let (day, time) = value.split_once('@').ok_or_else(|| {
+            cli_output::failure("invalid_argument", "--weekly must use DAY@HH:MM")
+        })?;
+        let (hour, minute) = schedule_time(time)?;
+        boomux::scheduling::weekly_cron(day, hour, minute)?
+    } else {
+        return Err(cli_output::failure(
+            "invalid_argument",
+            "exactly one trigger source is required",
+        ));
+    };
+    Ok(expression)
+}
+
+fn schedule_time(value: &str) -> Result<(u8, u8), Box<dyn Error>> {
+    let bytes = value.as_bytes();
+    if bytes.len() != 5
+        || bytes[2] != b':'
+        || !bytes[..2].iter().chain(&bytes[3..]).all(u8::is_ascii_digit)
+    {
+        return Err(cli_output::failure(
+            "invalid_argument",
+            "schedule time must use HH:MM",
+        ));
+    }
+    Ok((value[..2].parse()?, value[3..].parse()?))
+}
+
+fn schedule_integration(
+    key: &str,
+) -> Result<&'static boomux::integrations::IntegrationDescriptor, Box<dyn Error>> {
+    boomux::scheduling::validate_integration_key(key)?;
+    boomux::integrations::by_key(key)
+        .filter(|integration| integration.schedule_dispatch.is_some())
+        .ok_or_else(|| {
+            cli_output::failure(
+                "unsupported_integration",
+                "integration does not support schedule dispatch",
+            )
+        })
+}
+
+fn print_schedule_mutation(
+    command: CommandKey,
+    schedule: &AgentScheduleSnapshot,
+    workspace_name: Option<&str>,
+    json: bool,
+) -> Result<(), Box<dyn Error>> {
+    if json {
+        print_json(
+            command,
+            serde_json::json!({
+                "schedule": cli_output::schedule(schedule, workspace_name),
+            }),
+        )?;
+    }
+    Ok(())
+}
+
+fn print_schedule_inspection(
+    schedule: &AgentScheduleSnapshot,
+    workspace_name: Option<&str>,
+    prompt: &str,
+) {
+    println!("ID\t{}", sanitize_table_cell(&schedule.id));
+    println!("NAME\t{}", sanitize_table_cell(&schedule.name));
+    println!(
+        "WORKSPACE\t{}",
+        sanitize_table_cell(workspace_name.unwrap_or("-"))
+    );
+    println!("STATE\t{}", cli_output::schedule_state(schedule.state));
+    println!(
+        "CWD\t{}",
+        sanitize_table_cell(&schedule.cwd.display().to_string())
+    );
+    println!(
+        "INTEGRATION\t{}",
+        sanitize_table_cell(&schedule.integration)
+    );
+    println!(
+        "SESSION\t{}",
+        sanitize_table_cell(&schedule_session_label(&schedule.session))
+    );
+    println!("CRON\t{}", sanitize_table_cell(&schedule.trigger.cron));
+    println!(
+        "TIMEZONE\t{}",
+        sanitize_table_cell(&schedule.trigger.timezone)
+    );
+    println!("OVERLAP POLICY\tskip");
+    println!("REVISION\t{}", schedule.revision);
+    println!("PROMPT REVISION\t{}", schedule.prompt_revision);
+    println!("TRIGGER REVISION\t{}", schedule.trigger_revision);
+    println!("CREATED AT MS\t{}", schedule.created_at_ms);
+    println!("UPDATED AT MS\t{}", schedule.updated_at_ms);
+    println!(
+        "EVALUATION FRONTIER MS\t{}",
+        schedule.evaluation_frontier_ms
+    );
+    println!(
+        "EXECUTION SHELL ID\t{}",
+        sanitize_table_cell(schedule.execution_shell_id.as_deref().unwrap_or("-"))
+    );
+    println!(
+        "PROMPT (PRIVATE; ESCAPED FOR TERMINAL SAFETY)\n{}",
+        escape_terminal_text(prompt)
+    );
+}
+
+fn escape_terminal_text(value: &str) -> String {
+    value.escape_debug().to_string()
+}
+
+fn schedule_session_label(session: &AgentScheduleSession) -> String {
+    match session {
+        AgentScheduleSession::Fresh => "fresh".into(),
+        AgentScheduleSession::Continue {
+            external_session_id,
+        } => format!("continue:{external_session_id}"),
+    }
+}
+
+fn resolve_cli_schedule<'a>(
+    snapshot: &'a Snapshot,
+    target: &str,
+    workspace: Option<&str>,
+) -> Result<&'a AgentScheduleSnapshot, Box<dyn Error>> {
+    if let Some(schedule) = find_schedule(snapshot, target) {
+        return Ok(schedule);
+    }
+    let workspace_id = if let Some(workspace) = workspace {
+        resolve_workspace_target(&snapshot.workspaces, workspace)?
+            .id
+            .clone()
+    } else {
+        env::var("BOOMUX_WORKSPACE_ID").map_err(|_| {
+            cli_output::failure(
+                "context_required",
+                format!("schedule name {target:?} requires --workspace or BOOMUX_WORKSPACE_ID"),
+            )
+        })?
+    };
+    let workspace = snapshot
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.id == workspace_id)
+        .ok_or_else(|| cli_output::failure("not_found", "current workspace no longer exists"))?;
+    workspace
+        .schedules
+        .iter()
+        .find(|schedule| schedule.name == target)
+        .ok_or_else(|| {
+            cli_output::failure(
+                "not_found",
+                format!(
+                    "schedule {target:?} was not found in workspace {}",
+                    workspace.name
+                ),
+            )
+        })
+}
+
+fn find_schedule<'a>(snapshot: &'a Snapshot, id: &str) -> Option<&'a AgentScheduleSnapshot> {
+    snapshot
+        .workspaces
+        .iter()
+        .flat_map(|workspace| &workspace.schedules)
+        .find(|schedule| schedule.id == id)
+}
+
+fn schedule_workspace_name<'a>(
+    snapshot: &'a Snapshot,
+    schedule: &AgentScheduleSnapshot,
+) -> Option<&'a str> {
+    snapshot
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.id == schedule.workspace_id)
+        .map(|workspace| workspace.name.as_str())
 }
 
 fn validate_attention_protocol(negotiated: u32) -> Result<(), Box<dyn Error>> {
@@ -4377,6 +5073,31 @@ mod tests {
             shells,
             launchers: Vec::new(),
             agents: Vec::new(),
+            schedules: Vec::new(),
+        }
+    }
+
+    fn schedule(id: &str, workspace_id: &str, name: &str) -> AgentScheduleSnapshot {
+        AgentScheduleSnapshot {
+            id: id.into(),
+            workspace_id: workspace_id.into(),
+            name: name.into(),
+            cwd: PathBuf::from("/tmp/project"),
+            integration: "opencode".into(),
+            session: AgentScheduleSession::Fresh,
+            trigger: AgentScheduleTrigger {
+                cron: "0 9 * * 1-5".into(),
+                timezone: "UTC".into(),
+            },
+            state: AgentScheduleState::Paused,
+            overlap_policy: AgentScheduleOverlapPolicy::Skip,
+            revision: 1,
+            prompt_revision: 1,
+            trigger_revision: 1,
+            created_at_ms: 10,
+            updated_at_ms: 10,
+            evaluation_frontier_ms: 10,
+            execution_shell_id: None,
         }
     }
 
@@ -6267,6 +6988,192 @@ mod tests {
     }
 
     #[test]
+    fn schedule_parser_enforces_sources_and_descriptors() {
+        let valid = [
+            "boomux",
+            "schedule",
+            "create",
+            "review",
+            "--workspace",
+            "project",
+            "--cwd",
+            "/tmp",
+            "--integration",
+            "opencode",
+            "--prompt",
+            "review exactly\n",
+            "--weekdays",
+            "09:30",
+            "--continue",
+            "projected-session",
+            "--enabled",
+            "--json",
+        ];
+        let cli = Cli::try_parse_from(valid).unwrap();
+        assert_eq!(cli.command_descriptor().key, "schedule.create");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Schedule {
+                command: ScheduleCommands::Create(arguments)
+            }) if arguments.prompt.as_deref() == Some("review exactly\n")
+                && arguments.continue_session.as_deref() == Some("projected-session")
+                && arguments.enabled
+        ));
+
+        for arguments in [
+            vec!["boomux", "schedule", "list", "--json"],
+            vec!["boomux", "schedule", "inspect", "id", "--json"],
+            vec!["boomux", "schedule", "pause", "id", "--json"],
+            vec!["boomux", "schedule", "resume", "id", "--json"],
+            vec!["boomux", "schedule", "remove", "id", "--json"],
+        ] {
+            assert_eq!(
+                Cli::try_parse_from(arguments)
+                    .unwrap()
+                    .command_descriptor()
+                    .output,
+                OutputMode::Json
+            );
+        }
+
+        let required = [
+            "boomux",
+            "schedule",
+            "create",
+            "review",
+            "--workspace",
+            "project",
+            "--cwd",
+            "/tmp",
+            "--integration",
+            "opencode",
+        ];
+        assert!(Cli::try_parse_from(required.into_iter().chain(["--daily", "09:00"])).is_err());
+        assert!(
+            Cli::try_parse_from(required.into_iter().chain([
+                "--prompt",
+                "one",
+                "--prompt-file",
+                "/tmp/prompt",
+                "--daily",
+                "09:00",
+            ]))
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from(required.into_iter().chain([
+                "--prompt",
+                "one",
+                "--daily",
+                "09:00",
+                "--cron",
+                "0 9 * * *",
+            ]))
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from(required.into_iter().chain([
+                "--prompt",
+                "one",
+                "--daily",
+                "09:00",
+                "--fresh",
+                "--continue",
+                "session",
+            ]))
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from(required.into_iter().chain([
+                "--prompt",
+                "one",
+                "--daily",
+                "09:00",
+                "--paused",
+                "--enabled",
+            ]))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn schedule_helpers_preserve_prompt_files_and_resolve_targets_safely() {
+        use std::os::unix::fs::symlink;
+        use std::os::unix::net::UnixListener;
+
+        assert!(validate_schedule_protocol(21).is_err());
+        assert!(validate_schedule_protocol(22).is_ok());
+        assert_eq!(
+            schedule_cron(None, Some("15m"), None, None, None).unwrap(),
+            "*/15 * * * *"
+        );
+        assert_eq!(
+            schedule_cron(None, None, None, Some("17:30"), None).unwrap(),
+            "30 17 * * 1-5"
+        );
+        assert_eq!(
+            schedule_cron(None, None, None, None, Some("mon@08:00")).unwrap(),
+            "0 8 * * 1"
+        );
+        assert!(schedule_cron(None, None, Some("9:00"), None, None).is_err());
+
+        let directory = test_skill_home("schedule-prompt");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("prompt.txt");
+        fs::write(&path, b"private instructions\n").unwrap();
+        assert_eq!(
+            schedule_prompt(None, Some(&path)).unwrap(),
+            "private instructions\n"
+        );
+        assert!(schedule_prompt(None, Some(&directory)).is_err());
+        let link = directory.join("prompt-link");
+        symlink(&path, &link).unwrap();
+        let error = schedule_prompt(None, Some(&link)).unwrap_err();
+        assert_eq!(
+            cli_output::classify_for_test("schedule.create", error.as_ref()),
+            "invalid_argument"
+        );
+        let socket = directory.join("prompt.sock");
+        let _listener = UnixListener::bind(&socket).unwrap();
+        let error = schedule_prompt(None, Some(&socket)).unwrap_err();
+        assert_eq!(
+            cli_output::classify_for_test("schedule.create", error.as_ref()),
+            "invalid_argument"
+        );
+        assert_eq!(
+            escape_terminal_text("line one\nsecret\u{1b}]52;c;payload\u{7}"),
+            "line one\\nsecret\\u{1b}]52;c;payload\\u{7}"
+        );
+        fs::write(&path, vec![b'x'; boomux::scheduling::MAX_PROMPT_BYTES + 1]).unwrap();
+        let error = schedule_prompt(None, Some(&path)).unwrap_err().to_string();
+        assert!(!error.contains(&"x".repeat(100)));
+        fs::remove_dir_all(directory).unwrap();
+
+        let mut first = workspace("w1", "first", Vec::new());
+        first.schedules.push(schedule("schedule-1", "w1", "review"));
+        let mut second = workspace("w2", "second", Vec::new());
+        second
+            .schedules
+            .push(schedule("schedule-2", "w2", "review"));
+        let snapshot = Snapshot {
+            workspaces: vec![first, second],
+            focused_terminal: None,
+        };
+        assert_eq!(
+            resolve_cli_schedule(&snapshot, "schedule-2", None)
+                .unwrap()
+                .workspace_id,
+            "w2"
+        );
+        assert_eq!(
+            resolve_cli_schedule(&snapshot, "review", Some("first"))
+                .unwrap()
+                .id,
+            "schedule-1"
+        );
+    }
+
+    #[test]
     fn capabilities_advertise_phase_two_agent_integration_surface() {
         let json_commands = json_commands().collect::<Vec<_>>();
         for command in [
@@ -6288,6 +7195,16 @@ mod tests {
             "integration.install",
             "integration.uninstall",
             "integration.verify",
+        ] {
+            assert!(json_commands.contains(&command));
+        }
+        for command in [
+            "schedule.create",
+            "schedule.list",
+            "schedule.inspect",
+            "schedule.pause",
+            "schedule.resume",
+            "schedule.remove",
         ] {
             assert!(json_commands.contains(&command));
         }
@@ -6329,7 +7246,7 @@ mod tests {
             session_transcript::supported_integrations(),
             ["opencode", "pi"]
         );
-        assert_eq!(protocol::PROTOCOL_VERSION, 21);
+        assert_eq!(protocol::PROTOCOL_VERSION, 22);
     }
 
     #[test]
@@ -6372,6 +7289,12 @@ mod tests {
                 "session.list",
                 "session.inspect",
                 "session.read",
+                "schedule.create",
+                "schedule.list",
+                "schedule.inspect",
+                "schedule.pause",
+                "schedule.resume",
+                "schedule.remove",
                 "daemon.status",
             ]
         );

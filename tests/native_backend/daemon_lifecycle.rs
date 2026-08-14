@@ -25,7 +25,7 @@ fn native_daemon_lifecycle() {
     let capabilities: serde_json::Value = serde_json::from_slice(&capabilities.stdout).unwrap();
     assert_eq!(capabilities["schema"], "boomux.cli/v1");
     assert_eq!(capabilities["command"], "capabilities");
-    assert_eq!(capabilities["data"]["daemon_protocol_version"], 21);
+    assert_eq!(capabilities["data"]["daemon_protocol_version"], 22);
     assert_eq!(
         capabilities["data"]["session_transcript_integrations"],
         serde_json::json!(["opencode", "pi"])
@@ -59,9 +59,20 @@ fn native_daemon_lifecycle() {
         "integration.status",
         "integration.install",
         "integration.verify",
+        "schedule.create",
+        "schedule.list",
+        "schedule.inspect",
+        "schedule.pause",
+        "schedule.resume",
+        "schedule.remove",
     ] {
         assert!(json_commands.iter().any(|current| current == command));
     }
+    assert!(
+        capabilities["data"]["integration_hosts"]["opencode"]
+            .get("schedule_dispatch")
+            .is_none()
+    );
     let features = capabilities["data"]["features"].as_array().unwrap();
     for feature in [
         "revision_aware_reads",
@@ -76,6 +87,9 @@ fn native_daemon_lifecycle() {
         "protocol_19",
         "protocol_20",
         "protocol_21",
+        "protocol_22",
+        "agent_schedule_management",
+        "durable_agent_schedules",
         "workspace_default_cwd",
         "structured_terminal_previews",
         "focused_terminal_read",
@@ -100,7 +114,7 @@ fn native_daemon_lifecycle() {
         .output()
         .unwrap();
     assert!(status.status.success());
-    assert!(String::from_utf8_lossy(&status.stdout).contains("running (protocol 21"));
+    assert!(String::from_utf8_lossy(&status.stdout).contains("running (protocol 22"));
     let status = daemon
         .command()
         .args(["daemon", "status", "--json"])

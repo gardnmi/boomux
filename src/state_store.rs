@@ -12,10 +12,13 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::protocol::{
-    AgentAttentionSnapshot, AgentObservationSnapshot, ShellRunExitReason, TerminalProfile,
+    AgentAttentionSnapshot, AgentObservationSnapshot, AgentScheduleOverlapPolicy,
+    AgentScheduleSession, AgentScheduleState, AgentScheduleTrigger, ShellRunExitReason,
+    TerminalProfile,
 };
 
-const STATE_VERSION: u32 = 8;
+const STATE_VERSION: u32 = 9;
+const VERSION_EIGHT_STATE_VERSION: u32 = 8;
 const VERSION_SEVEN_STATE_VERSION: u32 = 7;
 const PREVIOUS_STATE_VERSION: u32 = 6;
 const VERSION_FIVE_STATE_VERSION: u32 = 5;
@@ -50,6 +53,52 @@ pub(crate) struct PersistedWorkspace {
     pub(crate) shells: Vec<PersistedShell>,
     pub(crate) launchers: Vec<PersistedWorkspaceLauncher>,
     pub(crate) agents: Vec<PersistedAgentInstance>,
+    pub(crate) schedules: Vec<PersistedAgentSchedule>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PersistedAgentSchedule {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) cwd: PathBuf,
+    pub(crate) integration: String,
+    pub(crate) prompt: String,
+    pub(crate) session: AgentScheduleSession,
+    pub(crate) trigger: AgentScheduleTrigger,
+    pub(crate) state: AgentScheduleState,
+    pub(crate) overlap_policy: AgentScheduleOverlapPolicy,
+    pub(crate) revision: u64,
+    pub(crate) prompt_revision: u64,
+    pub(crate) trigger_revision: u64,
+    pub(crate) created_at_ms: u64,
+    pub(crate) updated_at_ms: u64,
+    pub(crate) evaluation_frontier_ms: u64,
+    pub(crate) execution_shell_id: Option<String>,
+}
+
+impl std::fmt::Debug for PersistedAgentSchedule {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PersistedAgentSchedule")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("cwd", &self.cwd)
+            .field("integration", &self.integration)
+            .field("prompt", &"<redacted>")
+            .field("session", &self.session)
+            .field("trigger", &self.trigger)
+            .field("state", &self.state)
+            .field("overlap_policy", &self.overlap_policy)
+            .field("revision", &self.revision)
+            .field("prompt_revision", &self.prompt_revision)
+            .field("trigger_revision", &self.trigger_revision)
+            .field("created_at_ms", &self.created_at_ms)
+            .field("updated_at_ms", &self.updated_at_ms)
+            .field("evaluation_frontier_ms", &self.evaluation_frontier_ms)
+            .field("execution_shell_id", &self.execution_shell_id)
+            .finish()
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -105,6 +154,24 @@ pub(crate) struct PersistedShellRun {
 #[derive(Deserialize)]
 struct StateVersion {
     version: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VersionEightPersistedState {
+    version: u32,
+    workspaces: Vec<VersionEightPersistedWorkspace>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VersionEightPersistedWorkspace {
+    id: String,
+    name: String,
+    default_cwd: Option<PathBuf>,
+    shells: Vec<PersistedShell>,
+    launchers: Vec<PersistedWorkspaceLauncher>,
+    agents: Vec<PersistedAgentInstance>,
 }
 
 #[derive(Deserialize)]
@@ -409,6 +476,10 @@ impl StateStore {
         })?;
         let (state, migrated) = match version.version {
             STATE_VERSION => (parse_state(&bytes, &self.path)?, false),
+            VERSION_EIGHT_STATE_VERSION => {
+                let previous: VersionEightPersistedState = parse_state(&bytes, &self.path)?;
+                (migrate_version_eight_state(previous), true)
+            }
             VERSION_SEVEN_STATE_VERSION => {
                 let previous: VersionSevenPersistedState = parse_state(&bytes, &self.path)?;
                 (migrate_version_seven_state(previous), true)
@@ -529,6 +600,27 @@ fn migrate_legacy_state(legacy: LegacyPersistedState) -> PersistedState {
                     .collect(),
                 launchers: Vec::new(),
                 agents: Vec::new(),
+                schedules: Vec::new(),
+            })
+            .collect(),
+    }
+}
+
+fn migrate_version_eight_state(previous: VersionEightPersistedState) -> PersistedState {
+    debug_assert_eq!(previous.version, VERSION_EIGHT_STATE_VERSION);
+    PersistedState {
+        version: STATE_VERSION,
+        workspaces: previous
+            .workspaces
+            .into_iter()
+            .map(|workspace| PersistedWorkspace {
+                id: workspace.id,
+                name: workspace.name,
+                default_cwd: workspace.default_cwd,
+                shells: workspace.shells,
+                launchers: workspace.launchers,
+                agents: workspace.agents,
+                schedules: Vec::new(),
             })
             .collect(),
     }
@@ -568,6 +660,7 @@ fn migrate_version_seven_state(previous: VersionSevenPersistedState) -> Persiste
                     .collect(),
                 launchers: workspace.launchers,
                 agents: workspace.agents,
+                schedules: Vec::new(),
             })
             .collect(),
     }
@@ -587,6 +680,7 @@ fn migrate_previous_state(previous: PreviousPersistedState) -> PersistedState {
                 shells: workspace.shells,
                 launchers: workspace.launchers,
                 agents: workspace.agents,
+                schedules: Vec::new(),
             })
             .collect(),
     }
@@ -622,6 +716,7 @@ fn migrate_version_five_state(previous: VersionFivePersistedState) -> PersistedS
                         attention: None,
                     })
                     .collect(),
+                schedules: Vec::new(),
             })
             .collect(),
     }
@@ -663,6 +758,7 @@ fn migrate_version_four_state(previous: VersionFourPersistedState) -> PersistedS
                             attention: None,
                         })
                         .collect(),
+                    schedules: Vec::new(),
                 }
             })
             .collect(),
@@ -683,6 +779,7 @@ fn migrate_version_three_state(previous: VersionThreePersistedState) -> Persiste
                 shells: workspace.shells,
                 launchers: workspace.launchers,
                 agents: Vec::new(),
+                schedules: Vec::new(),
             })
             .collect(),
     }
@@ -702,6 +799,7 @@ fn migrate_version_two_state(previous: VersionTwoPersistedState) -> PersistedSta
                 shells: workspace.shells,
                 launchers: Vec::new(),
                 agents: Vec::new(),
+                schedules: Vec::new(),
             })
             .collect(),
     }
@@ -858,8 +956,34 @@ mod tests {
                         }),
                     },
                 ],
+                schedules: vec![PersistedAgentSchedule {
+                    id: "schedule-1".into(),
+                    name: "daily review".into(),
+                    cwd: "/tmp/project".into(),
+                    integration: "opencode".into(),
+                    prompt: "Review the current changes".into(),
+                    session: AgentScheduleSession::Continue {
+                        external_session_id: "external-1".into(),
+                    },
+                    trigger: AgentScheduleTrigger {
+                        cron: "0 9 * * 1-5".into(),
+                        timezone: "America/New_York".into(),
+                    },
+                    state: AgentScheduleState::Enabled,
+                    overlap_policy: AgentScheduleOverlapPolicy::Skip,
+                    revision: 4,
+                    prompt_revision: 2,
+                    trigger_revision: 3,
+                    created_at_ms: 40,
+                    updated_at_ms: 50,
+                    evaluation_frontier_ms: 60,
+                    execution_shell_id: Some("shell-1".into()),
+                }],
             }],
         };
+        let debug = format!("{state:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("Review the current changes"));
 
         store.save(&state).unwrap();
         let restored = store.load().unwrap().unwrap();
@@ -904,6 +1028,17 @@ mod tests {
                 .map(|attention| attention.reason),
             Some(crate::protocol::AgentAttentionReason::Completed)
         );
+        let schedule = &restored.workspaces[0].schedules[0];
+        assert_eq!(schedule.id, "schedule-1");
+        assert_eq!(schedule.prompt, "Review the current changes");
+        assert_eq!(
+            schedule.session,
+            AgentScheduleSession::Continue {
+                external_session_id: "external-1".into()
+            }
+        );
+        assert_eq!(schedule.trigger.cron, "0 9 * * 1-5");
+        assert_eq!(schedule.execution_shell_id.as_deref(), Some("shell-1"));
         assert_eq!(
             fs::metadata(directory.join("boomux/state.json"))
                 .unwrap()
@@ -927,6 +1062,134 @@ mod tests {
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn migrates_version_eight_workspaces_without_schedules() {
+        let directory = env::temp_dir().join(format!("boomux-state-{}", Uuid::new_v4()));
+        let path = directory.join("boomux/state.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            br#"{
+  "version": 8,
+  "workspaces": [{
+    "id": "w1", "name": "version-eight", "default_cwd": "/tmp/project",
+    "shells": [{
+      "id": "s1", "name": "agent", "cwd": "/tmp/project", "command": ["opencode"],
+      "last_run": {
+        "id": "r1", "generation": 2, "started_at_ms": 1, "ended_at_ms": 2,
+        "exit_reason": {"reason": "interrupted"}, "output_revision": 3,
+        "environment_has_run_id": true,
+        "profile": {
+          "term": "xterm-256color", "colorterm": null, "term_program": null,
+          "term_program_version": null, "rows": 24, "cols": 80,
+          "pixel_width": 0, "pixel_height": 0
+        },
+        "terminal_history": "bounded output"
+      }
+    }],
+    "launchers": [{
+      "id": "l1", "name": "editor", "cwd": "/tmp/project", "command": ["editor"]
+    }],
+    "agents": [{
+      "id": "a1", "shell_id": "s1", "run_id": "r1", "name": "agent",
+      "integration": "opencode", "external_session_id": "external-1",
+      "cwd": "/tmp/project", "started_at_ms": 1, "ended_at_ms": null,
+      "observation": {
+        "revision": 2, "state": "blocked", "authority": "lifecycle_integration",
+        "evidence": "question", "confidence": 100, "observed_at_ms": 2
+      },
+      "attention": {
+        "reason": "blocked",
+        "observation": {
+          "revision": 2, "state": "blocked", "authority": "lifecycle_integration",
+          "evidence": "question", "confidence": 100, "observed_at_ms": 2
+        }
+      }
+    }]
+  }]
+}"#,
+        )
+        .unwrap();
+        let store = StateStore::at(path.clone());
+
+        let migrated = store.load().unwrap().unwrap();
+
+        let workspace = &migrated.workspaces[0];
+        assert_eq!(
+            workspace.default_cwd.as_deref(),
+            Some(Path::new("/tmp/project"))
+        );
+        assert_eq!(
+            workspace.shells[0]
+                .last_run
+                .as_ref()
+                .and_then(|run| run.terminal_history.as_deref()),
+            Some("bounded output")
+        );
+        assert_eq!(workspace.launchers[0].command, ["editor"]);
+        assert_eq!(
+            workspace.agents[0].external_session_id.as_deref(),
+            Some("external-1")
+        );
+        assert!(workspace.agents[0].attention.is_some());
+        assert!(workspace.schedules.is_empty());
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .contains("\"version\": 9")
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn rejects_malformed_current_schedule_schema() {
+        let schedule_missing_frontier = r#"{
+          "id":"schedule-1","name":"review","cwd":"/tmp/project",
+          "integration":"opencode","prompt":"Review changes","session":"fresh",
+          "trigger":{"cron":"0 9 * * 1-5","timezone":"UTC"},"state":"paused",
+          "overlap_policy":"skip","revision":1,"prompt_revision":1,
+          "trigger_revision":1,"created_at_ms":1,"updated_at_ms":1,
+          "execution_shell_id":null
+        }"#;
+        let schedule_with_unknown_field = r#"{
+          "id":"schedule-1","name":"review","cwd":"/tmp/project",
+          "integration":"opencode","prompt":"Review changes","session":"fresh",
+          "trigger":{"cron":"0 9 * * 1-5","timezone":"UTC"},"state":"paused",
+          "overlap_policy":"skip","revision":1,"prompt_revision":1,
+          "trigger_revision":1,"created_at_ms":1,"updated_at_ms":1,
+          "evaluation_frontier_ms":1,"execution_shell_id":null,"workspace_id":"w1"
+        }"#;
+        let schedule_with_unknown_trigger_field = r#"{
+          "id":"schedule-1","name":"review","cwd":"/tmp/project",
+          "integration":"opencode","prompt":"Review changes","session":"fresh",
+          "trigger":{"cron":"0 9 * * 1-5","timezone":"UTC","private":"ignored"},
+          "state":"paused","overlap_policy":"skip","revision":1,"prompt_revision":1,
+          "trigger_revision":1,"created_at_ms":1,"updated_at_ms":1,
+          "evaluation_frontier_ms":1,"execution_shell_id":null
+        }"#;
+
+        for schedule in [
+            schedule_missing_frontier,
+            schedule_with_unknown_field,
+            schedule_with_unknown_trigger_field,
+        ] {
+            let directory = env::temp_dir().join(format!("boomux-state-{}", Uuid::new_v4()));
+            let path = directory.join("boomux/state.json");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(
+                &path,
+                format!(
+                    r#"{{"version":9,"workspaces":[{{"id":"w1","name":"saved","default_cwd":null,"shells":[],"launchers":[],"agents":[],"schedules":[{schedule}]}}]}}"#
+                ),
+            )
+            .unwrap();
+
+            let error = StateStore::at(path).load().unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            fs::remove_dir_all(directory).unwrap();
+        }
     }
 
     #[test]
@@ -970,10 +1233,11 @@ mod tests {
                 .terminal_history
                 .is_none()
         );
+        assert!(migrated.workspaces[0].schedules.is_empty());
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .contains("\"version\": 8")
+                .contains("\"version\": 9")
         );
         fs::remove_dir_all(directory).unwrap();
     }
@@ -1029,10 +1293,11 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .contains("\"version\": 8")
+                .contains("\"version\": 9")
         );
         assert!(migrated.workspaces[0].launchers.is_empty());
         assert!(migrated.workspaces[0].agents.is_empty());
+        assert!(migrated.workspaces[0].schedules.is_empty());
 
         let reloaded = store.load().unwrap().unwrap();
         assert_eq!(
@@ -1079,9 +1344,10 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .contains("\"version\": 8")
+                .contains("\"version\": 9")
         );
         assert!(migrated.workspaces[0].agents.is_empty());
+        assert!(migrated.workspaces[0].schedules.is_empty());
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -1114,10 +1380,11 @@ mod tests {
 
         assert_eq!(migrated.workspaces[0].launchers[0].id, "l1");
         assert!(migrated.workspaces[0].agents.is_empty());
+        assert!(migrated.workspaces[0].schedules.is_empty());
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .contains("\"version\": 8")
+                .contains("\"version\": 9")
         );
         fs::remove_dir_all(directory).unwrap();
     }
@@ -1190,10 +1457,11 @@ mod tests {
             Some(Path::new("/tmp/project"))
         );
         assert!(migrated.workspaces[0].agents[1].cwd.is_none());
+        assert!(migrated.workspaces[0].schedules.is_empty());
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .contains("\"version\": 8")
+                .contains("\"version\": 9")
         );
         fs::remove_dir_all(directory).unwrap();
     }
@@ -1227,8 +1495,9 @@ mod tests {
         let migrated = store.load().unwrap().unwrap();
 
         assert!(migrated.workspaces[0].agents[0].attention.is_none());
+        assert!(migrated.workspaces[0].schedules.is_empty());
         let saved = fs::read_to_string(&path).unwrap();
-        assert!(saved.contains("\"version\": 8"));
+        assert!(saved.contains("\"version\": 9"));
         assert!(saved.contains("\"attention\": null"));
         fs::remove_dir_all(directory).unwrap();
     }
@@ -1255,12 +1524,13 @@ mod tests {
 
         assert!(deferred);
         assert!(migrated.workspaces[0].default_cwd.is_none());
+        assert!(migrated.workspaces[0].schedules.is_empty());
         let original = fs::read_to_string(&path).unwrap();
         assert!(original.contains("\"version\": 6"));
         assert!(!original.contains("default_cwd"));
         store.save(&migrated).unwrap();
         let saved = fs::read_to_string(&path).unwrap();
-        assert!(saved.contains("\"version\": 8"));
+        assert!(saved.contains("\"version\": 9"));
         assert!(saved.contains("\"default_cwd\": null"));
         fs::remove_dir_all(directory).unwrap();
     }

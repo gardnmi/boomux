@@ -66,6 +66,12 @@ The following commands support `--json`:
 - `boomux session list`
 - `boomux session inspect`
 - `boomux session read`
+- `boomux schedule create`
+- `boomux schedule list`
+- `boomux schedule inspect`
+- `boomux schedule pause`
+- `boomux schedule resume`
+- `boomux schedule remove`
 - `boomux integration list`
 - `boomux integration status [opencode|pi]`
 - `boomux integration install <opencode|pi>`
@@ -75,10 +81,10 @@ The following commands support `--json`:
 - `boomux integration verify <opencode|pi>`
 - `boomux daemon status`
 
-JSON mutations are deliberately narrow: only `agent register`, `agent ensure`,
-`agent report`, `attention acknowledge`, `integration install`, and
-`integration uninstall` support the contract. Other mutation commands retain
-human output. Passing `--json` to an unsupported command fails with
+JSON mutations are deliberately narrow. Agent register, ensure, and report;
+attention acknowledgment; schedule create, pause, resume, and remove; and
+integration install and uninstall support the contract. Other mutation commands
+retain human output. Passing `--json` to an unsupported command fails with
 `invalid_argument` before performing the operation.
 
 `boomux integration setup <opencode|pi>` is intentionally human-oriented and
@@ -94,10 +100,11 @@ Command payloads are:
 - `list`: a `shells` array.
 - `shells`: workspace identity plus a `shells` array.
 - `workspace.list`: a `workspaces` array of `id`, `name`, `shell_count`,
-  `launcher_count`, `agent_count`, fixed `agent_state_counts`, and
+  `launcher_count`, `schedule_count`, `agent_count`, fixed `agent_state_counts`, and
   `attention_count`.
 - `workspace.inspect`: one `workspace` object containing `id`, `name`, nullable
-  `default_cwd`, and `shells`, `launchers`, and `agents` arrays.
+  `default_cwd`, and prompt-free `shells`, `launchers`, `schedules`, and `agents`
+  arrays.
 - `shell.inspect`: one `shell` object.
 - `launcher.list`: workspace identity plus a `launchers` array.
 - `launcher.inspect`: one `launcher` object.
@@ -116,6 +123,15 @@ Command payloads are:
   opaque session ID.
 - `session.read`: one bounded canonical `transcript` selected only by exact
   opaque session ID.
+- `schedule.create`, `schedule.pause`, and `schedule.resume`: one prompt-free
+  `schedule` summary. New schedules default to `fresh` and `paused`; resume
+  changes state to `enabled`.
+- `schedule.list`: a prompt-free `schedules` array, globally or limited by
+  `--workspace`.
+- `schedule.inspect`: one exact `schedule` detail and the only schedule command
+  that includes its `prompt`.
+- `schedule.remove`: `removed: true` plus the removed prompt-free `schedule`
+  summary.
 - `integration.list`: an `integrations` array containing bundled integration
   names, display names, packages, and validated host versions.
 - `integration.status`: an `integrations` array containing independent `host`,
@@ -145,6 +161,10 @@ Command payloads are:
 
 Integration arrays are ordered `opencode`, then `pi`. List entries contain
 `name`, `display_name`, `package`, and `validated_version`.
+
+Protocol 22 advertises `protocol_22`, `agent_schedule_management`, and
+`durable_agent_schedules`. These capabilities describe durable management only;
+they do not advertise timed or manual dispatch.
 
 Status entries contain those four fields plus `host`, `asset`, `runtime`, and
 `recommended_action`.
@@ -324,6 +344,45 @@ changes, and adapter-normalization changes return
 `cursor_expired`; callers discard the cursor and request a fresh newest page.
 Malformed, oversized, or cross-session cursors return `invalid_argument`.
 Pagination remains client-side and does not create daemon cursor state.
+
+## Schedule Data
+
+Schedule summaries contain `id`, `workspace_id`, nullable `workspace_name`,
+`name`, `cwd`, `integration`, `session_mode`, nullable `external_session_id`,
+`cron`, `timezone`, `state`, `overlap_policy`, `revision`, `prompt_revision`,
+`trigger_revision`, `created_at_ms`, `updated_at_ms`,
+`evaluation_frontier_ms`, and nullable `execution_shell_id`. Optional values are
+JSON `null`. State is `paused` or `enabled`; session mode is `fresh` or
+`continue`; the initial overlap policy is always `skip`.
+All schedule commands require negotiated daemon protocol 22 and return
+`unsupported_version` against an older daemon rather than presenting an empty
+schedule list.
+
+Only `schedule.inspect` adds `prompt`. Prompts are intentionally absent from
+list, create, pause, resume, remove, capabilities, events, and errors. Inspection
+is an explicit private-content disclosure. A prompt file is read once at create
+time as exact UTF-8, including a trailing newline; later file changes do not
+alter the persisted prompt revision. Files must be regular and prompts are
+bounded to 65,536 UTF-8 bytes.
+
+Create requires explicit `--workspace`, `--cwd`, and `--integration`, exactly
+one of `--prompt` or `--prompt-file`, and exactly one trigger source. `--cron`
+accepts the canonical numeric five-field subset. `--every Nm|Nh`, `--daily
+HH:MM`, `--weekdays HH:MM`, and `--weekly DAY@HH:MM` compile to that canonical
+cron representation. `--timezone` accepts an IANA timezone; omission snapshots
+the current system IANA timezone or fails if it cannot be resolved. `--fresh`
+conflicts with `--continue`, and `--paused` conflicts with `--enabled`.
+
+`--continue` accepts only an exact opaque projected session ID resolved in the
+selected workspace. The projection must have a canonical external session ID
+and its integration must equal `--integration`; descriptions, external IDs,
+latest-session selection, and names are never substitutes.
+
+Exact schedule IDs resolve globally for inspect, pause, resume, and remove.
+Schedule names resolve only with explicit `--workspace` or the exact current
+`BOOMUX_WORKSPACE_ID`. List is global unless `--workspace` is supplied. Removing
+a schedule removes its persisted prompt. Closing a workspace removes all owned
+schedules and persisted prompts along with the workspace.
 
 `read` returns `shell_id`, `run_id`, `output_revision`, `changed`, `status`, and
 `output`. Output is a JSON string containing the same bounded plain rendered text

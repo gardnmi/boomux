@@ -1343,6 +1343,7 @@ mod tests {
             default_cwd: None,
             shells: vec![shell],
             launchers: Vec::new(),
+            schedules: Vec::new(),
             agents: Vec::new(),
         };
         let snapshot = Snapshot {
