@@ -72,13 +72,11 @@ impl DashboardRefresh {
                 if self.last_snapshot_at.elapsed() < DASHBOARD_FALLBACK_REFRESH_INTERVAL {
                     return Ok(None);
                 }
-                if !self.watch.uses_events()
-                    || !client.supports(protocol::ProtocolFeature::FocusedTerminalRead)?
-                {
+                if !self.watch.uses_events() {
                     *self = Self::baseline(client)?;
                     return Ok(Some((self.watch.snapshot().clone(), false)));
                 }
-                self.refresh_ephemeral_fields(client)?;
+                *self.watch.snapshot_mut() = client.snapshot()?;
                 self.last_snapshot_at = Instant::now();
                 Ok(Some((self.watch.snapshot().clone(), false)))
             }
@@ -93,21 +91,6 @@ impl DashboardRefresh {
             self.watch.snapshot().clone(),
             self.watch.stream_id() != stream_id.as_deref(),
         ))
-    }
-
-    fn refresh_ephemeral_fields(&mut self, client: &client::Client) -> client::Result<()> {
-        self.watch.snapshot_mut().focused_terminal = client.focused_terminal()?;
-        for shell in self
-            .watch
-            .snapshot_mut()
-            .workspaces
-            .iter_mut()
-            .flat_map(|workspace| &mut workspace.shells)
-            .filter(|shell| shell.status == ShellStatus::Running)
-        {
-            shell.foreground_process = client.get_shell(&shell.id)?.foreground_process;
-        }
-        Ok(())
     }
 }
 
@@ -4340,6 +4323,7 @@ fn plausible_desktop_bus() -> bool {
 mod tests {
     use super::*;
     use crate::integration_management::{opencode_config_root, pi_config_root};
+    use std::os::unix::net::UnixListener;
 
     fn shell(id: &str, workspace_id: &str, name: &str) -> ShellSnapshot {
         ShellSnapshot {
@@ -4405,6 +4389,146 @@ mod tests {
             cwd: PathBuf::from("/tmp/project"),
             command: vec!["zeditor".into(), ".".into()],
         }
+    }
+
+    #[test]
+    fn dashboard_refresh_uses_one_snapshot_request() {
+        let directory =
+            env::temp_dir().join(format!("boomux-dashboard-refresh-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let socket = directory.join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let initial = Snapshot {
+            workspaces: vec![workspace(
+                "w1",
+                "before",
+                vec![shell("s1", "w1", "one"), shell("s2", "w1", "two")],
+            )],
+            focused_terminal: None,
+        };
+        let event_refreshed = Snapshot {
+            workspaces: vec![workspace(
+                "w1",
+                "after-event",
+                vec![shell("s1", "w1", "one"), shell("s2", "w1", "two")],
+            )],
+            focused_terminal: None,
+        };
+        let fallback_refreshed = Snapshot {
+            workspaces: vec![workspace(
+                "w1",
+                "after-fallback",
+                vec![shell("s1", "w1", "one"), shell("s2", "w1", "two")],
+            )],
+            focused_terminal: None,
+        };
+        let server = thread::spawn({
+            let initial = initial.clone();
+            let event_refreshed = event_refreshed.clone();
+            let fallback_refreshed = fallback_refreshed.clone();
+            move || {
+                for expected in [
+                    "ping",
+                    "baseline",
+                    "changed_poll",
+                    "event_snapshot",
+                    "idle_poll",
+                    "fallback_snapshot",
+                ] {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let request: protocol::Envelope<protocol::Request> =
+                        protocol::read_message(&mut stream).unwrap();
+                    let response = match (expected, request.message) {
+                        ("ping", protocol::Request::Ping) => protocol::Response::Pong,
+                        (
+                            "baseline",
+                            protocol::Request::Events {
+                                after: None,
+                                wait_ms: 0,
+                                ..
+                            },
+                        ) => protocol::Response::Events {
+                            stream_id: "stream-1".into(),
+                            cursor: EventCursor {
+                                stream_id: "stream-1".into(),
+                                event_id: 0,
+                            },
+                            snapshot: Some(initial.clone()),
+                            events: Vec::new(),
+                        },
+                        (
+                            "changed_poll",
+                            protocol::Request::Events {
+                                after: Some(_),
+                                wait_ms: 0,
+                                ..
+                            },
+                        ) => protocol::Response::Events {
+                            stream_id: "stream-1".into(),
+                            cursor: EventCursor {
+                                stream_id: "stream-1".into(),
+                                event_id: 1,
+                            },
+                            snapshot: None,
+                            events: vec![protocol::DaemonEvent {
+                                id: 1,
+                                at_ms: 1,
+                                kind: protocol::DaemonEventKind::WorkspaceRenamed {
+                                    workspace_id: "w1".into(),
+                                    name: "after-event".into(),
+                                },
+                            }],
+                        },
+                        ("event_snapshot", protocol::Request::Snapshot) => {
+                            protocol::Response::Snapshot {
+                                snapshot: event_refreshed.clone(),
+                            }
+                        }
+                        (
+                            "idle_poll",
+                            protocol::Request::Events {
+                                after: Some(_),
+                                wait_ms: 0,
+                                ..
+                            },
+                        ) => protocol::Response::Events {
+                            stream_id: "stream-1".into(),
+                            cursor: EventCursor {
+                                stream_id: "stream-1".into(),
+                                event_id: 1,
+                            },
+                            snapshot: None,
+                            events: Vec::new(),
+                        },
+                        ("fallback_snapshot", protocol::Request::Snapshot) => {
+                            protocol::Response::Snapshot {
+                                snapshot: fallback_refreshed.clone(),
+                            }
+                        }
+                        (_, request) => panic!("unexpected {expected} request: {request:?}"),
+                    };
+                    protocol::write_message(
+                        &mut stream,
+                        &protocol::Envelope::with_version(request.version, response),
+                    )
+                    .unwrap();
+                }
+            }
+        });
+        let client = client::Client::from_socket_path(socket);
+        let mut refresh = DashboardRefresh::baseline(&client).unwrap();
+
+        let (snapshot, stream_changed) = refresh.check(&client).unwrap().unwrap();
+        assert_eq!(snapshot, event_refreshed);
+        assert!(!stream_changed);
+
+        refresh.last_snapshot_at = Instant::now() - DASHBOARD_FALLBACK_REFRESH_INTERVAL;
+        let (snapshot, stream_changed) = refresh.check(&client).unwrap().unwrap();
+
+        assert_eq!(snapshot, fallback_refreshed);
+        assert!(!stream_changed);
+        server.join().unwrap();
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
