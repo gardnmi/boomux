@@ -42,8 +42,10 @@ use crate::state_store::{
 use crate::terminal_state::TerminalState;
 
 const CONTROLLER_QUEUE: usize = 64;
+const MAX_CONNECTION_HANDLERS: usize = 64;
 const SHUTDOWN_GRACE: Duration = Duration::from_millis(50);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
+const RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 const RESTART_TIMEOUT: Duration = Duration::from_secs(10);
 const IO_RETRY_DELAY: Duration = Duration::from_millis(2);
 const OUTPUT_PUBLICATION_INTERVAL: Duration = Duration::from_millis(16);
@@ -381,14 +383,27 @@ fn run_daemon(
         }
         match listener.accept() {
             Ok((stream, _)) => {
+                if handlers.len() >= MAX_CONNECTION_HANDLERS {
+                    drop(stream);
+                    continue;
+                }
                 let registry = Arc::clone(&registry);
                 let shutdown = Arc::clone(&shutdown);
                 let transition = Arc::clone(&transition);
                 let restart_sender = restart_sender.clone();
-                handlers.push(thread::spawn(move || {
-                    let _ =
-                        handle_connection(stream, registry, shutdown, transition, restart_sender);
-                }));
+                handlers.push(
+                    thread::Builder::new()
+                        .name("boomux-connection".into())
+                        .spawn(move || {
+                            let _ = handle_connection(
+                                stream,
+                                registry,
+                                shutdown,
+                                transition,
+                                restart_sender,
+                            );
+                        })?,
+                );
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(25));
@@ -1088,6 +1103,7 @@ fn remove_agent_snapshots(snapshot: &mut Snapshot) {
 }
 
 fn send_response(stream: &mut UnixStream, version: u32, response: Response) -> io::Result<()> {
+    stream.set_write_timeout(Some(RESPONSE_WRITE_TIMEOUT))?;
     protocol::write_message(stream, &Envelope::with_version(version, response))
 }
 
@@ -5616,7 +5632,6 @@ fn handle_attach(
     let warning = term_mismatch_warning(startup_profile.term.as_deref(), profile.term.as_deref());
     if !running {
         lock(&terminal)?.resize(profile.rows, profile.cols);
-        stream.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
         send_response(
             &mut stream,
             response_version,
@@ -5626,7 +5641,6 @@ fn handle_attach(
                 warning,
             },
         )?;
-        stream.set_write_timeout(None)?;
         return AttachFrame::Detached.write_to(&mut stream);
     }
     drop(mutation);
@@ -5659,7 +5673,6 @@ fn handle_attach(
     // Keep terminal state locked until the controller is installed so the
     // reconstruction ends exactly where live delivery begins.
     let terminal = lock(&terminal)?;
-    stream.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
     send_response(
         &mut stream,
         response_version,
@@ -5669,7 +5682,6 @@ fn handle_attach(
             warning,
         },
     )?;
-    stream.set_write_timeout(None)?;
     let lifecycle = lock(&shell.lifecycle)?;
     let still_running = registry.contains_shell(&shell)?
         && matches!(
@@ -5682,6 +5694,8 @@ fn handle_attach(
     if !still_running {
         return AttachFrame::Detached.write_to(&mut stream);
     }
+    let mut output_stream = stream.try_clone()?;
+    output_stream.set_write_timeout(Some(RESPONSE_WRITE_TIMEOUT))?;
     {
         let mut controller = lock(&runtime.controller)?;
         if let Some(previous) = controller.take() {
@@ -5694,121 +5708,128 @@ fn handle_attach(
             reconnect_ack: None,
         });
     }
-    let mut output_stream = stream.try_clone()?;
     let output_runtime = Arc::clone(&runtime);
     let output_token = token.clone();
-    thread::spawn(move || {
-        let mut reconnect = false;
-        while let Ok(output) = receiver.recv() {
-            match output {
-                ControllerOutput::Data(bytes) => {
-                    if AttachFrame::Output(bytes)
-                        .write_to(&mut output_stream)
-                        .is_err()
-                    {
+    let output_worker = match thread::Builder::new()
+        .name(format!("boomux-attachment-{}", shell.id))
+        .spawn(move || {
+            let mut reconnect = false;
+            while let Ok(output) = receiver.recv() {
+                match output {
+                    ControllerOutput::Data(bytes) => {
+                        if AttachFrame::Output(bytes)
+                            .write_to(&mut output_stream)
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    ControllerOutput::Reconnect(acknowledge) => {
+                        reconnect = true;
+                        let result = AttachFrame::Reconnect.write_to(&mut output_stream);
+                        let _ = acknowledge.send(result.is_ok());
+                        if result.is_ok() {
+                            while receiver.recv().is_ok() {}
+                        }
                         break;
                     }
                 }
-                ControllerOutput::Reconnect(acknowledge) => {
-                    reconnect = true;
-                    let result = AttachFrame::Reconnect.write_to(&mut output_stream);
-                    let _ = acknowledge.send(result.is_ok());
-                    if result.is_ok() {
-                        while receiver.recv().is_ok() {}
-                    }
-                    break;
-                }
             }
-        }
-        if reconnect {
+            if !reconnect {
+                let _ = AttachFrame::Detached.write_to(&mut output_stream);
+            }
             let _ = output_stream.shutdown(std::net::Shutdown::Both);
-        } else {
-            let _ = AttachFrame::Detached.write_to(&mut output_stream);
+            let _ = output_runtime.release_controller(&output_token);
+        }) {
+        Ok(worker) => worker,
+        Err(error) => {
+            runtime.release_controller(&token)?;
+            return Err(error);
         }
-        let _ = output_runtime.release_controller(&output_token);
-    });
+    };
     drop(lifecycle);
     drop(terminal);
     drop(control);
 
-    loop {
-        let frame = match AttachFrame::read_from(&mut stream) {
-            Ok(frame) => frame,
-            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
-            Err(error) => {
-                runtime.release_controller(&token)?;
-                return Err(error);
-            }
-        };
-        if matches!(frame, AttachFrame::ReconnectAck) {
-            let acknowledge = {
-                let mut controller = lock(&runtime.controller)?;
-                controller
-                    .as_mut()
-                    .filter(|controller| controller.token == token)
-                    .and_then(|controller| controller.reconnect_ack.take())
+    let input_result = (|| {
+        loop {
+            let frame = match AttachFrame::read_from(&mut stream) {
+                Ok(frame) => frame,
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+                Err(error) => return Err(error),
             };
-            if let Some(acknowledge) = acknowledge {
-                let _ = acknowledge.send(());
-            }
-            break;
-        }
-        if let AttachFrame::Input(bytes) = frame {
-            if !write_controller_input(&runtime, &token, &bytes)? {
-                break;
-            }
-            continue;
-        }
-        let control = lock(&runtime.control)?;
-        let authorized = lock(&runtime.controller)?
-            .as_ref()
-            .is_some_and(|controller| controller.token == token);
-        if !authorized {
-            break;
-        }
-        let result = match frame {
-            AttachFrame::Input(_) => unreachable!(),
-            AttachFrame::Resize {
-                rows,
-                cols,
-                pixel_width,
-                pixel_height,
-            } => {
-                if let Err(error) = validate_terminal_dimensions(rows, cols) {
-                    Err(error)
-                } else {
-                    let size = PtySize {
-                        rows,
-                        cols,
-                        pixel_width,
-                        pixel_height,
-                    };
-                    lock(&runtime.master)?.resize(size)?;
-                    lock(&runtime.terminal)?.resize(rows, cols);
-                    update_runtime_dimensions(&shell, &runtime, size)?;
-                    Ok(())
+            if matches!(frame, AttachFrame::ReconnectAck) {
+                let acknowledge = {
+                    let mut controller = lock(&runtime.controller)?;
+                    controller
+                        .as_mut()
+                        .filter(|controller| controller.token == token)
+                        .and_then(|controller| controller.reconnect_ack.take())
+                };
+                if let Some(acknowledge) = acknowledge {
+                    let _ = acknowledge.send(());
                 }
+                return Ok(());
             }
-            AttachFrame::Detached => {
-                drop(control);
-                break;
+            if let AttachFrame::Input(bytes) = frame {
+                if !write_controller_input(&runtime, &token, &bytes)? {
+                    return Ok(());
+                }
+                continue;
             }
-            AttachFrame::FocusGained => {
-                registry.record_focus_gained(response_version, &shell, &attached_run, &runtime)
+            let control = lock(&runtime.control)?;
+            let authorized = lock(&runtime.controller)?
+                .as_ref()
+                .is_some_and(|controller| controller.token == token);
+            if !authorized {
+                return Ok(());
             }
-            AttachFrame::Output(_) | AttachFrame::Reconnect | AttachFrame::ReconnectAck => {
-                Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "client sent a daemon-only attach frame",
-                ))
-            }
-        };
-        if let Err(error) = result {
-            runtime.release_controller(&token)?;
-            return Err(error);
+            let result = match frame {
+                AttachFrame::Input(_) => unreachable!(),
+                AttachFrame::Resize {
+                    rows,
+                    cols,
+                    pixel_width,
+                    pixel_height,
+                } => {
+                    if let Err(error) = validate_terminal_dimensions(rows, cols) {
+                        Err(error)
+                    } else {
+                        let size = PtySize {
+                            rows,
+                            cols,
+                            pixel_width,
+                            pixel_height,
+                        };
+                        lock(&runtime.master)?.resize(size)?;
+                        lock(&runtime.terminal)?.resize(rows, cols);
+                        update_runtime_dimensions(&shell, &runtime, size)?;
+                        Ok(())
+                    }
+                }
+                AttachFrame::Detached => return Ok(()),
+                AttachFrame::FocusGained => {
+                    registry.record_focus_gained(response_version, &shell, &attached_run, &runtime)
+                }
+                AttachFrame::Output(_) | AttachFrame::Reconnect | AttachFrame::ReconnectAck => {
+                    Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "client sent a daemon-only attach frame",
+                    ))
+                }
+            };
+            drop(control);
+            result?;
         }
-    }
-    runtime.release_controller(&token)
+    })();
+    let release_result = runtime.release_controller(&token);
+    let _ = stream.shutdown(std::net::Shutdown::Both);
+    let output_result = output_worker
+        .join()
+        .map_err(|_| io::Error::other("attachment output thread panicked"));
+    release_result?;
+    output_result?;
+    input_result
 }
 
 fn write_controller_input(runtime: &ShellRuntime, token: &str, bytes: &[u8]) -> io::Result<bool> {
@@ -6869,6 +6890,24 @@ mod tests {
             io::ErrorKind::InvalidInput
         );
         assert!(validate_persisted_name("real\nlegacy row").is_ok());
+    }
+
+    #[test]
+    fn response_writes_time_out_when_the_client_does_not_read() {
+        let (mut server, _client) = UnixStream::pair().unwrap();
+        let response = Response::Error {
+            message: "x".repeat(4 * 1024 * 1024),
+            code: Some(ErrorCode::Busy),
+        };
+        let started = Instant::now();
+
+        let error = send_response(&mut server, protocol::PROTOCOL_VERSION, response).unwrap_err();
+
+        assert!(matches!(
+            error.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+        ));
+        assert!(started.elapsed() < Duration::from_secs(3));
     }
 
     #[test]

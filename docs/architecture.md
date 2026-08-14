@@ -178,6 +178,12 @@ focus-reporting modes when the attachment exits.
 
 The daemon keeps a bounded output queue per active controller. A slow client
 drops output rather than blocking the PTY reader and child process.
+The listener admits at most 64 concurrent connection handlers and closes newly
+accepted sockets while that capacity is exhausted. Management responses and
+attachment output use bounded write deadlines. Attachments retain one admission
+slot for their lifetime, and their input handler joins the output worker after
+either side closes the shared socket, so abandoned clients cannot delay shutdown
+indefinitely.
 It also feeds a shadow `vt100` parser while forwarding the original PTY bytes
 unchanged. Reattachment receives a bounded reconstruction of rendered state,
 not historical OSC or graphics commands. Plain reads and structured previews
