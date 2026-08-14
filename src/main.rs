@@ -32,6 +32,7 @@ mod agent_attention_projection;
 mod cli_output;
 mod config;
 mod dashboard_projection;
+mod generated_names;
 mod git;
 mod host_session_source;
 mod host_session_titles;
@@ -506,7 +507,7 @@ enum SessionCommands {
 
 #[derive(Args)]
 struct AgentSuperviseArgs {
-    name: String,
+    name: Option<String>,
     #[arg(long)]
     integration: String,
     #[arg(long)]
@@ -521,7 +522,7 @@ struct AgentSuperviseArgs {
 
 #[derive(Args)]
 struct AgentRegistrationArgs {
-    name: String,
+    name: Option<String>,
     #[arg(long)]
     integration: String,
     #[arg(long)]
@@ -1480,12 +1481,8 @@ fn open_directory(
     let (shell, workspace_name, created_workspace) = if let Some(name) = requested_name {
         let (shell, created_workspace) =
             if let Some(workspace) = find_workspace(&snapshot.workspaces, &name) {
-                let shell_name = unique_shell_name("shell", &workspace.shells);
                 (
-                    client.create_shell(
-                        &workspace.id,
-                        shell_spec(shell_name, &directory, startup_command),
-                    )?,
+                    create_generated_shell(&client, &workspace.id, &directory, startup_command)?,
                     false,
                 )
             } else {
@@ -1494,7 +1491,11 @@ fn open_directory(
                         .create_workspace_with_default_cwd(
                             &name,
                             Some(directory.clone()),
-                            vec![shell_spec("shell-1", &directory, startup_command)],
+                            vec![shell_spec(
+                                generated_names::random(),
+                                &directory,
+                                startup_command,
+                            )],
                         )?
                         .shells
                         .into_iter()
@@ -1506,7 +1507,7 @@ fn open_directory(
         (shell, name, created_workspace)
     } else {
         let shell = client.create_shell_with_workspace(shell_spec(
-            "shell-1",
+            generated_names::random(),
             &directory,
             startup_command,
         ))?;
@@ -1583,6 +1584,12 @@ fn cli_name(name: String, kind: &str) -> Result<String, Box<dyn Error>> {
     Ok(name.to_owned())
 }
 
+fn cli_name_or_generated(name: Option<String>, kind: &str) -> Result<String, Box<dyn Error>> {
+    name.map(|name| cli_name(name, kind))
+        .transpose()
+        .map(|name| name.unwrap_or_else(generated_names::random))
+}
+
 fn find_workspace<'a>(
     workspaces: &'a [WorkspaceSnapshot],
     name: &str,
@@ -1620,10 +1627,9 @@ fn create_dashboard_shell(
     launch_cwd: &Path,
 ) -> Result<String, Box<dyn Error>> {
     let workspace = client.get_workspace(workspace_id)?;
-    let name = unique_shell_name("shell", &workspace.shells);
     let cwd = resolve_shell_cwd(workspace.default_cwd.as_deref(), None, launch_cwd)?;
-    client.create_shell(workspace_id, ShellSpec::login(&name, cwd))?;
-    Ok(format!("Created {name} in {}", workspace.name))
+    let shell = create_generated_shell(client, workspace_id, &cwd, &[])?;
+    Ok(format!("Created {} in {}", shell.name, workspace.name))
 }
 
 fn resolve_shell_cwd(
@@ -1646,25 +1652,38 @@ fn resolve_shell_cwd(
     })
 }
 
-fn unique_shell_name(base_name: &str, shells: &[ShellSnapshot]) -> String {
-    let highest_suffix = shells
-        .iter()
-        .filter_map(|shell| {
-            if shell.name == base_name {
-                Some(1)
-            } else {
-                shell
-                    .name
-                    .strip_prefix(base_name)
-                    .and_then(|suffix| suffix.strip_prefix('-'))
-                    .and_then(|suffix| suffix.parse::<usize>().ok())
+fn create_generated_shell(
+    client: &client::Client,
+    workspace_id: &str,
+    cwd: &Path,
+    command: &[String],
+) -> Result<ShellSnapshot, Box<dyn Error>> {
+    let mut rejected = BTreeSet::new();
+    loop {
+        let workspace = client.get_workspace(workspace_id)?;
+        let name = generated_names::random_excluding(
+            workspace
+                .shells
+                .iter()
+                .map(|shell| shell.name.as_str())
+                .chain(rejected.iter().map(String::as_str)),
+        )
+        .ok_or_else(|| {
+            cli_output::failure(
+                "already_exists",
+                "all generated shell names are already in use",
+            )
+        })?;
+        match client.create_shell(workspace_id, shell_spec(&name, cwd, command)) {
+            Ok(shell) => return Ok(shell),
+            Err(client::ClientError::Remote(error))
+                if error.code == Some(protocol::ErrorCode::AlreadyExists) =>
+            {
+                rejected.insert(name);
             }
-        })
-        .max();
-    highest_suffix.map_or_else(
-        || base_name.to_owned(),
-        |suffix| format!("{base_name}-{}", suffix + 1),
-    )
+            Err(error) => return Err(error.into()),
+        }
+    }
 }
 
 fn integration_command(command: IntegrationCommands, json: bool) -> Result<(), Box<dyn Error>> {
@@ -2549,16 +2568,19 @@ fn shell_command(command: ShellCommands, json: bool) -> Result<(), Box<dyn Error
         } => {
             let snapshot = client.snapshot()?;
             let workspace = resolve_workspace_target(&snapshot.workspaces, &workspace)?;
-            let name = name
-                .map(|name| cli_name(name, "shell"))
-                .transpose()?
-                .unwrap_or_else(|| unique_shell_name("shell", &workspace.shells));
             let cwd = resolve_shell_cwd(
                 workspace.default_cwd.as_deref(),
                 cwd.as_deref(),
                 Path::new("."),
             )?;
-            let shell = client.create_shell(&workspace.id, shell_spec(name, &cwd, &command))?;
+            let shell = if let Some(name) = name {
+                client.create_shell(
+                    &workspace.id,
+                    shell_spec(cli_name(name, "shell")?, &cwd, &command),
+                )?
+            } else {
+                create_generated_shell(&client, &workspace.id, &cwd, &command)?
+            };
             println!("Created pending shell {} ({})", shell.name, shell.id);
         }
         ShellCommands::Inspect { target, workspace } => {
@@ -3280,7 +3302,7 @@ fn supervise_agent(
     )?;
     Ok(process_adapter::supervise(
         process_adapter::SuperviseSpec {
-            name: arguments.name,
+            name: cli_name_or_generated(arguments.name, "agent")?,
             integration: arguments.integration,
             external_session_id: arguments.external_session_id,
             shell_id,
@@ -3303,7 +3325,7 @@ fn register_or_ensure_agent(
         env::var("BOOMUX_RUN_ID").ok(),
     )?;
     let spec = AgentRegistrationSpec {
-        name: cli_name(arguments.name, "agent")?,
+        name: cli_name_or_generated(arguments.name, "agent")?,
         integration: arguments.integration,
         external_session_id: arguments.external_session_id,
         report: AgentReport {
@@ -4893,6 +4915,28 @@ mod tests {
         .unwrap();
         assert_eq!(register.command_descriptor().key, "agent.register");
         assert_eq!(register.command_descriptor().output, OutputMode::Json);
+        let unnamed_register = Cli::try_parse_from([
+            "boomux",
+            "agent",
+            "register",
+            "--integration",
+            "test",
+            "--state",
+            "working",
+            "--authority",
+            "process-adapter",
+            "--evidence",
+            "running",
+            "--confidence",
+            "80",
+        ])
+        .unwrap();
+        assert!(matches!(
+            unnamed_register.command,
+            Some(Commands::Agent {
+                command: AgentCommands::Register(AgentRegistrationArgs { name: None, .. })
+            })
+        ));
         assert!(
             Cli::try_parse_from([
                 "boomux",
@@ -4953,6 +4997,28 @@ mod tests {
             Some(Commands::Agent {
                 command: AgentCommands::Supervise(AgentSuperviseArgs { command, .. })
             }) if command == ["agent-bin", "literal; argument"]
+        ));
+        let unnamed_supervise = Cli::try_parse_from([
+            "boomux",
+            "agent",
+            "supervise",
+            "--integration",
+            "opencode",
+            "--external-session-id",
+            "session-1",
+            "--shell-id",
+            "s1",
+            "--run-id",
+            "r1",
+            "--",
+            "agent-bin",
+        ])
+        .unwrap();
+        assert!(matches!(
+            unnamed_supervise.command,
+            Some(Commands::Agent {
+                command: AgentCommands::Supervise(AgentSuperviseArgs { name: None, .. })
+            })
         ));
         assert!(
             Cli::try_parse_from([
@@ -5187,6 +5253,18 @@ mod tests {
     }
 
     #[test]
+    fn resolves_explicit_and_generated_cli_names() {
+        assert_eq!(
+            cli_name_or_generated(Some("  explicit  ".into()), "agent").unwrap(),
+            "explicit"
+        );
+        let generated = cli_name_or_generated(None, "agent").unwrap();
+        let (adjective, noun) = generated.split_once('-').unwrap();
+        assert!(adjective.bytes().all(|byte| byte.is_ascii_lowercase()));
+        assert!(noun.bytes().all(|byte| byte.is_ascii_lowercase()));
+    }
+
+    #[test]
     fn resolves_shell_ids_and_contextual_names() {
         let snapshot = Snapshot {
             workspaces: vec![
@@ -5206,14 +5284,6 @@ mod tests {
             "s1"
         );
         assert!(resolve_shell_target(&snapshot, None, "tests").is_err());
-    }
-
-    #[test]
-    fn generates_unique_native_shell_names() {
-        let shells = vec![shell("s1", "w1", "shell-1"), shell("s2", "w1", "api")];
-        assert_eq!(unique_shell_name("shell", &shells), "shell-2");
-        assert_eq!(unique_shell_name("api", &shells), "api-2");
-        assert_eq!(unique_shell_name("logs", &shells), "logs");
     }
 
     #[test]

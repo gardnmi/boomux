@@ -214,6 +214,11 @@ the unchanged snapshot. Equal-authority changed reports update the observation.
 an unchanged success, while conflicting later reports fail. Completed records
 remain durable and inspectable.
 
+The positional name is optional for `agent register` and `agent ensure`. When
+omitted, the CLI supplies a random lowercase `adjective-noun` value before the
+request. The returned Agent object always contains the concrete durable name.
+Explicit names and an existing record returned by `agent.ensure` are unchanged.
+
 Protocol 15 raises one durable outstanding attention item for every accepted
 `blocked` or `done` observation. The item records `reason` (`blocked` or
 `completed`) and a copy of the exact raising observation, so later working or

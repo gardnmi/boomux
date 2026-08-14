@@ -9,7 +9,7 @@ use boomux::protocol::{
     self, AgentAuthority, AgentRegistrationSpec, AgentReport, AgentState, ErrorCode, ShellSpec,
 };
 
-use crate::support::{TestDaemon, assert_remote_code, contains, profile};
+use crate::support::{TestDaemon, assert_generated_name, assert_remote_code, contains, profile};
 
 #[test]
 fn agent_runtime_is_revisioned_durable_and_version_compatible() {
@@ -49,7 +49,6 @@ fn agent_runtime_is_revisioned_durable_and_version_compatible() {
             .args([
                 "agent",
                 "ensure",
-                "runtime-agent",
                 "--integration",
                 "native-test",
                 "--external-session-id",
@@ -86,9 +85,12 @@ fn agent_runtime_is_revisioned_durable_and_version_compatible() {
     assert_eq!(ensure["data"]["agent"]["external_session_id"], "session-1");
     assert_eq!(ensure["data"]["agent"]["workspace_name"], "agent-runtime");
     assert_eq!(ensure["data"]["agent"]["observation"]["revision"], 1);
+    let generated_name = ensure["data"]["agent"]["name"].as_str().unwrap();
+    assert_generated_name(generated_name);
 
     let repeated = ensure_agent(&daemon);
     assert_eq!(repeated["data"]["agent"]["id"], agent_id);
+    assert_eq!(repeated["data"]["agent"]["name"], generated_name);
     assert_eq!(repeated["data"]["agent"]["observation"]["revision"], 1);
     let ensured_events = daemon
         .client
@@ -494,7 +496,7 @@ fn agent_runtime_is_revisioned_durable_and_version_compatible() {
 
     let list = daemon.command().args(["agent", "list"]).output().unwrap();
     assert!(list.status.success());
-    assert!(contains(&list.stdout, b"runtime-agent"));
+    assert!(contains(&list.stdout, generated_name.as_bytes()));
     assert!(contains(&list.stdout, agent_id.as_bytes()));
     let list = daemon
         .command()
@@ -533,7 +535,7 @@ fn agent_runtime_is_revisioned_durable_and_version_compatible() {
         .find(|session| session["external_session_id"] == "session-1")
         .unwrap();
     let session_id = projected["id"].as_str().unwrap();
-    assert_eq!(projected["description"], "runtime-agent");
+    assert_eq!(projected["description"], generated_name);
     assert_eq!(projected["occurrence_count"], 1);
 
     let session_inspect = daemon
@@ -870,6 +872,82 @@ fn agent_runtime_is_revisioned_durable_and_version_compatible() {
     assert!(cursor.event_id > filtered_cursor.event_id);
 
     daemon.stop_with_cli();
+}
+
+#[test]
+fn unnamed_agent_registration_and_supervision_generate_names() {
+    let daemon = TestDaemon::start();
+    let workspace = daemon
+        .client
+        .create_workspace(
+            "generated-agent-names",
+            vec![ShellSpec::login("runtime", std::env::temp_dir())],
+        )
+        .unwrap();
+    let shell_id = workspace.shells[0].id.clone();
+    let attachment = daemon.client.attach(&shell_id, false, profile()).unwrap();
+    let run_id = daemon.client.get_shell(&shell_id).unwrap().run.unwrap().id;
+
+    let registered = daemon
+        .command()
+        .args([
+            "agent",
+            "register",
+            "--integration",
+            "native-test",
+            "--external-session-id",
+            "registered-session",
+            "--shell-id",
+            &shell_id,
+            "--run-id",
+            &run_id,
+            "--state",
+            "working",
+            "--authority",
+            "lifecycle-integration",
+            "--evidence",
+            "registered",
+            "--confidence",
+            "100",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(registered.status.success());
+    let registered: serde_json::Value = serde_json::from_slice(&registered.stdout).unwrap();
+    assert_generated_name(registered["data"]["agent"]["name"].as_str().unwrap());
+
+    let supervised = daemon
+        .command()
+        .args([
+            "agent",
+            "supervise",
+            "--integration",
+            "native-test",
+            "--external-session-id",
+            "supervised-session",
+            "--shell-id",
+            &shell_id,
+            "--run-id",
+            &run_id,
+            "--",
+            "/bin/true",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        supervised.status.success(),
+        "{}",
+        String::from_utf8_lossy(&supervised.stderr)
+    );
+    let agents = daemon.client.get_workspace(&workspace.id).unwrap().agents;
+    let supervised = agents
+        .iter()
+        .find(|agent| agent.external_session_id.as_deref() == Some("supervised-session"))
+        .expect("supervisor did not register its agent");
+    assert_generated_name(&supervised.name);
+
+    drop(attachment.stream);
 }
 
 #[test]

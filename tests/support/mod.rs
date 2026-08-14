@@ -12,6 +12,16 @@ use uuid::Uuid;
 
 pub(crate) const TIMEOUT: Duration = Duration::from_secs(10);
 
+pub(crate) fn assert_generated_name(name: &str) {
+    let Some((adjective, noun)) = name.split_once('-') else {
+        panic!("generated name is not adjective-noun: {name}");
+    };
+    assert!(!adjective.is_empty());
+    assert!(!noun.is_empty());
+    assert!(adjective.bytes().all(|byte| byte.is_ascii_lowercase()));
+    assert!(noun.bytes().all(|byte| byte.is_ascii_lowercase()));
+}
+
 pub(crate) struct TestDaemon {
     pub(crate) executable: PathBuf,
     pub(crate) runtime_dir: PathBuf,

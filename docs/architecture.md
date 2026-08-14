@@ -77,6 +77,10 @@ name resolution, and dashboard backend orchestration. `src/dashboard_projection.
 converts daemon snapshots and projected sessions into typed TUI view models.
 `src/session_projection.rs` is the shared binary projection used by the CLI and
 dashboard to combine one daemon snapshot with bounded host session catalogs.
+Omitted Shell and Agent Instance names are resolved here to random lowercase
+`adjective-noun` values before requests are sent. Generated shell names are
+checked against the workspace snapshot and retried on a typed daemon collision;
+the resulting concrete names use the ordinary protocol and durable state fields.
 
 ### Protocol
 
@@ -403,10 +407,11 @@ reports after completion are rejected.
 `src/process_adapter.rs` implements the first process-adapter foundation behind:
 
 ```console
-boomux agent supervise <name> --integration <integration> --external-session-id <canonical-root-id> [--shell-id <shell-id>] [--run-id <run-id>] -- <exact argv>
+boomux agent supervise [<name>] --integration <integration> --external-session-id <canonical-root-id> [--shell-id <shell-id>] [--run-id <run-id>] -- <exact argv>
 ```
 
-Shell and run IDs default from `BOOMUX_SHELL_ID` and `BOOMUX_RUN_ID`. The
+An omitted descriptive Agent name is generated as `adjective-noun`. Shell and
+run IDs default from `BOOMUX_SHELL_ID` and `BOOMUX_RUN_ID`. The
 supervisor validates the supplied identity, spawns the exact argv directly with
 inherited stdin, stdout, and stderr, and waits for that child. It returns the
 child's exit code, or `128 + signal` for signal termination. There is no PTY,
