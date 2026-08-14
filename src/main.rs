@@ -1284,20 +1284,43 @@ fn daemon_control(command: DaemonCommands, json: bool) -> Result<(), Box<dyn Err
     match command {
         DaemonCommands::Status if json => {
             let protocol_version = client.protocol_version()?;
+            let scheduler = client.snapshot()?.scheduler;
             print_json(
                 CommandKey::DaemonStatus,
                 serde_json::json!({
                     "status": "running",
                     "protocol_version": protocol_version,
                     "socket_path": client.socket_path().display().to_string(),
+                    "scheduler": scheduler.map(|health| serde_json::json!({
+                        "state": match health.state {
+                            protocol::SchedulerState::Active => "active",
+                            protocol::SchedulerState::Offline => "offline",
+                        },
+                        "max_concurrent": health.max_concurrent,
+                        "active_executions": health.active_executions,
+                    })),
                 }),
             )?
         }
-        DaemonCommands::Status => println!(
-            "running (protocol {}, {})",
-            client.protocol_version()?,
-            client.socket_path().display()
-        ),
+        DaemonCommands::Status => {
+            let scheduler = client.snapshot()?.scheduler;
+            println!(
+                "running (protocol {}, {})",
+                client.protocol_version()?,
+                client.socket_path().display()
+            );
+            if let Some(scheduler) = scheduler {
+                println!(
+                    "scheduler {} ({}/{} active executions)",
+                    match scheduler.state {
+                        protocol::SchedulerState::Active => "active",
+                        protocol::SchedulerState::Offline => "offline",
+                    },
+                    scheduler.active_executions,
+                    scheduler.max_concurrent
+                );
+            }
+        }
         DaemonCommands::Restart => {
             client
                 .restart_with_notification_config(config::load_notification_settings()?.into())?;
@@ -3577,6 +3600,7 @@ fn print_execution(
 fn execution_state(execution: &ScheduledExecutionSnapshot) -> &'static str {
     use protocol::ScheduledExecutionState::*;
     match execution.state {
+        Skipped => "skipped",
         Claimed => "claimed",
         Starting => "starting",
         Active => "active",
@@ -5180,6 +5204,39 @@ fn doctor(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
                     eprintln!("    {warning}");
                 }
             }
+            match daemon_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.scheduler.as_ref())
+            {
+                Some(scheduler)
+                    if scheduler.state == protocol::SchedulerState::Active
+                        && scheduler.max_concurrent
+                            == config.notifications.max_scheduled_execution_concurrency =>
+                {
+                    println!(
+                        "ok  scheduler: active, max_concurrent={} (sampled at daemon start)",
+                        scheduler.max_concurrent
+                    );
+                }
+                Some(scheduler) if scheduler.state == protocol::SchedulerState::Offline => {
+                    healthy = false;
+                    eprintln!("err scheduler: offline; timed schedules are not being evaluated");
+                }
+                Some(scheduler) => {
+                    healthy = false;
+                    eprintln!(
+                        "err scheduler: daemon uses max_concurrent={}, config resolves {}; restart daemon after changes",
+                        scheduler.max_concurrent,
+                        config.notifications.max_scheduled_execution_concurrency
+                    );
+                }
+                None => {
+                    healthy = false;
+                    eprintln!(
+                        "err scheduler: offline or unavailable; timed schedules require the Boomux daemon and user session"
+                    );
+                }
+            }
             let terminal = terminal_override.or(config.terminal.as_deref());
             match terminal::selected(terminal) {
                 Ok(selected) => println!("ok  terminal: {selected}"),
@@ -5440,6 +5497,7 @@ mod tests {
             updated_at_ms: 10,
             evaluation_frontier_ms: 10,
             execution_shell_id: None,
+            next_occurrence: None,
         }
     }
 
@@ -5491,6 +5549,7 @@ mod tests {
                 vec![shell("s1", "w1", "one"), shell("s2", "w1", "two")],
             )],
             focused_terminal: None,
+            scheduler: None,
         };
         let event_refreshed = Snapshot {
             workspaces: vec![workspace(
@@ -5499,6 +5558,7 @@ mod tests {
                 vec![shell("s1", "w1", "one"), shell("s2", "w1", "two")],
             )],
             focused_terminal: None,
+            scheduler: None,
         };
         let fallback_refreshed = Snapshot {
             workspaces: vec![workspace(
@@ -5507,6 +5567,7 @@ mod tests {
                 vec![shell("s1", "w1", "one"), shell("s2", "w1", "two")],
             )],
             focused_terminal: None,
+            scheduler: None,
         };
         let server = thread::spawn({
             let initial = initial.clone();
@@ -6260,6 +6321,7 @@ mod tests {
         let value = json_snapshot(Snapshot {
             workspaces: vec![project],
             focused_terminal: None,
+            scheduler: None,
         })
         .unwrap();
 
@@ -6277,6 +6339,7 @@ mod tests {
         let snapshot = Snapshot {
             workspaces: vec![workspace("w2", "w1", vec![]), project],
             focused_terminal: None,
+            scheduler: None,
         };
 
         assert_eq!(
@@ -6336,6 +6399,7 @@ mod tests {
                 workspace("w2", "two", vec![shell("s2", "w2", "tests")]),
             ],
             focused_terminal: None,
+            scheduler: None,
         };
         assert_eq!(
             resolve_shell_target(&snapshot, None, "s2").unwrap().id,
@@ -7152,6 +7216,7 @@ mod tests {
                 workspace("w1", "Alpha", vec![shell("s1", "w1", "frontend")]),
             ],
             focused_terminal: None,
+            scheduler: None,
         };
         let targets = vec![
             integration_management::VerificationTarget {
@@ -7500,6 +7565,7 @@ mod tests {
         let snapshot = Snapshot {
             workspaces: vec![first, second],
             focused_terminal: None,
+            scheduler: None,
         };
         assert_eq!(
             resolve_cli_schedule(&snapshot, "schedule-2", None)
@@ -7588,7 +7654,7 @@ mod tests {
             session_transcript::supported_integrations(),
             ["opencode", "pi"]
         );
-        assert_eq!(protocol::PROTOCOL_VERSION, 23);
+        assert_eq!(protocol::PROTOCOL_VERSION, 24);
     }
 
     #[test]

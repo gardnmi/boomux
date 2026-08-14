@@ -166,7 +166,11 @@ Command payloads are:
 - `read`: shell/run identity, observed output revision, and rendered output.
 - `events`: stream identity, reconnect cursor, optional baseline snapshot, and a
   bounded event array.
-- `daemon.status`: `status`, `protocol_version`, and `socket_path`.
+- `daemon.status`: `status`, `protocol_version`, `socket_path`, and nullable
+  `scheduler`. Scheduler data contains `state`, `max_concurrent`, and
+  `active_executions`. State is `active` only for a running worker whose latest
+  evaluation and next-occurrence projection succeeded; otherwise it is
+  `offline`.
 
 ## Integration Data
 
@@ -176,21 +180,27 @@ Integration arrays are ordered `opencode`, then `pi`. List entries contain
 Protocol 22 advertises `protocol_22`, `agent_schedule_management`, and
 `durable_agent_schedules`. Protocol 23 adds `protocol_23`,
 `scheduled_execution_dispatch`, `scheduled_execution_cancellation`, and
-`schedule_owned_shells`. These capabilities advertise manual run-now dispatch;
-they do not advertise cron evaluation or timed dispatch.
+`schedule_owned_shells`. Protocol 24 adds `protocol_24`,
+`timed_schedule_dispatch`, `scheduler_health`, and
+`bounded_scheduled_execution_concurrency`.
 
 ## Execution Data
 
-Execution objects contain `id`, `workspace_id`, `schedule_id`, `state`,
+Schedule objects include nullable `next_occurrence`, containing
+`trigger_revision` and `scheduled_at_ms`. Execution objects contain `id`,
+`workspace_id`, `schedule_id`, `state`,
 `dispatch_kind`, `dispatch_key`, exact `schedule_revision`, `prompt_revision`,
-and `trigger_revision`, requested/start/end timestamps, snapshotted `cwd`,
+and `trigger_revision`, `requested_at_ms`, nullable `scheduled_at_ms`, nullable
+`coalesced_through_ms`, start/end timestamps, snapshotted `cwd`,
 `integration`, and `session`, nullable typed `reason` and `outcome`, and nullable
 `shell_id`, `run_id`, `agent_id`, and discovered `external_session_id` links.
 They never contain the retained prompt or environment.
 
-State is `claimed`, `starting`, `active`, `dispatch_failed`, `exited`,
-`cancelled`, or `interrupted`; dispatch kind is currently `manual`. Reasons are
-stable safe values `runner_start_failed`, `host_spawn_failed`,
+State is `skipped`, `claimed`, `starting`, `active`, `dispatch_failed`, `exited`,
+`cancelled`, or `interrupted`; dispatch kind is `manual` or `timed`. Reasons are
+stable safe values `overlap`, `active_session`, `workspace_capacity`,
+`global_capacity`, `missed`, `paused_race`, `invalid_target`,
+`runner_start_failed`, `host_spawn_failed`,
 `cancelled_by_user`, `cold_daemon_recovery`, or
 `runner_exited_without_report`; explicit daemon shutdown uses `daemon_shutdown`.
 Exit outcomes are tagged
@@ -384,9 +394,12 @@ Schedule summaries contain `id`, `workspace_id`, nullable `workspace_name`,
 `name`, `cwd`, `integration`, `session_mode`, nullable `external_session_id`,
 `cron`, `timezone`, `state`, `overlap_policy`, `revision`, `prompt_revision`,
 `trigger_revision`, `created_at_ms`, `updated_at_ms`,
-`evaluation_frontier_ms`, and nullable `execution_shell_id`. Optional values are
-JSON `null`. State is `paused` or `enabled`; session mode is `fresh` or
-`continue`; the initial overlap policy is always `skip`.
+`evaluation_frontier_ms`, nullable `execution_shell_id`, and nullable
+`next_occurrence`. A non-null `next_occurrence` contains `trigger_revision` and
+`scheduled_at_ms`. Optional values are JSON `null`; paused schedules have a null
+next occurrence, while an accepted enabled schedule has a non-null next
+occurrence. State is `paused` or `enabled`; session mode is `fresh` or `continue`;
+the initial overlap policy is always `skip`.
 Schedule management commands require negotiated daemon protocol 22. `schedule
 run` and every `execution` command require protocol 23. Unsupported commands
 return `unsupported_version` rather than presenting empty data.

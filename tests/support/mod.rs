@@ -80,16 +80,20 @@ impl TestDaemon {
     }
 
     pub(crate) fn restart(&mut self) {
+        self.restart_with(|_| {});
+    }
+
+    pub(crate) fn restart_with(&mut self, configure: impl FnOnce(&mut Command)) {
         assert!(self.child.is_none());
-        let child = self
-            .command()
+        let mut command = self.command();
+        command
             .args(["daemon", "run"])
             .env("SHELL", "/bin/sh")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+            .stderr(Stdio::null());
+        configure(&mut command);
+        let child = command.spawn().unwrap();
         self.child = Some(child);
         wait_until(
             || self.client.ping().is_ok(),

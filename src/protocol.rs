@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 23;
+pub const PROTOCOL_VERSION: u32 = 24;
 pub const MIN_PROTOCOL_VERSION: u32 = 6;
 pub const MAX_CONTROL_FRAME: usize = 8 * 1024 * 1024;
 pub const MAX_ATTACH_FRAME: usize = 1024 * 1024;
@@ -89,6 +89,12 @@ define_protocol_features! {
         "scheduled_execution_cancellation",
         "schedule_owned_shells",
     ]),
+    TimedScheduling => (24, "timed scheduling", [
+        "protocol_24",
+        "timed_schedule_dispatch",
+        "scheduler_health",
+        "bounded_scheduled_execution_concurrency",
+    ]),
 }
 
 pub fn protocol_capabilities() -> impl Iterator<Item = &'static str> {
@@ -172,6 +178,22 @@ pub struct Snapshot {
     pub workspaces: Vec<WorkspaceSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub focused_terminal: Option<FocusedTerminalSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduler: Option<SchedulerHealth>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SchedulerState {
+    Active,
+    Offline,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SchedulerHealth {
+    pub state: SchedulerState,
+    pub max_concurrent: u16,
+    pub active_executions: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -282,6 +304,14 @@ pub struct AgentScheduleSnapshot {
     pub evaluation_frontier_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_shell_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_occurrence: Option<ScheduledOccurrence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScheduledOccurrence {
+    pub trigger_revision: u64,
+    pub scheduled_at_ms: u64,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -293,6 +323,7 @@ pub struct AgentScheduleInspection {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ScheduledExecutionState {
+    Skipped,
     Claimed,
     Starting,
     Active,
@@ -306,7 +337,11 @@ impl ScheduledExecutionState {
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
-            Self::DispatchFailed | Self::Exited | Self::Cancelled | Self::Interrupted
+            Self::Skipped
+                | Self::DispatchFailed
+                | Self::Exited
+                | Self::Cancelled
+                | Self::Interrupted
         )
     }
 }
@@ -315,11 +350,19 @@ impl ScheduledExecutionState {
 #[serde(rename_all = "snake_case")]
 pub enum ScheduledExecutionDispatchKind {
     Manual,
+    Timed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ScheduledExecutionReason {
+    Overlap,
+    ActiveSession,
+    WorkspaceCapacity,
+    GlobalCapacity,
+    Missed,
+    PausedRace,
+    InvalidTarget,
     RunnerStartFailed,
     HostSpawnFailed,
     CancelledByUser,
@@ -347,6 +390,10 @@ pub struct ScheduledExecutionSnapshot {
     pub prompt_revision: u64,
     pub trigger_revision: u64,
     pub requested_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduled_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coalesced_through_ms: Option<u64>,
     pub started_at_ms: Option<u64>,
     pub ended_at_ms: Option<u64>,
     pub cwd: PathBuf,
@@ -748,6 +795,12 @@ pub struct NotificationDeliveryConfig {
     pub resume_agents: bool,
     #[serde(default)]
     pub persist_terminal_history: bool,
+    #[serde(default = "default_max_scheduled_execution_concurrency")]
+    pub max_scheduled_execution_concurrency: u16,
+}
+
+fn default_max_scheduled_execution_concurrency() -> u16 {
+    4
 }
 
 fn default_true() -> bool {
@@ -973,6 +1026,11 @@ impl Request {
             | Self::CreateShell {
                 workspace_id: None, ..
             } => Some(ProtocolFeature::WorkspaceDefaultCwd),
+            Self::RestartWithNotificationConfig { notifications, .. }
+                if notifications.max_scheduled_execution_concurrency != 4 =>
+            {
+                Some(ProtocolFeature::TimedScheduling)
+            }
             Self::RestartWithNotificationConfig {
                 environment: Some(_),
                 ..
@@ -1289,6 +1347,10 @@ mod tests {
             updated_at_ms: 20,
             evaluation_frontier_ms: 30,
             execution_shell_id: Some("shell-1".into()),
+            next_occurrence: Some(ScheduledOccurrence {
+                trigger_revision: 1,
+                scheduled_at_ms: 60,
+            }),
         }
     }
 
@@ -1351,6 +1413,7 @@ mod tests {
 
         assert!(config.resume_agents);
         assert!(!config.persist_terminal_history);
+        assert_eq!(config.max_scheduled_execution_concurrency, 4);
     }
 
     #[test]
@@ -1508,8 +1571,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_twenty_three_with_minimum_six() {
-        assert_eq!(PROTOCOL_VERSION, 23);
+    fn protocol_version_is_twenty_four_with_minimum_six() {
+        assert_eq!(PROTOCOL_VERSION, 24);
         assert_eq!(MIN_PROTOCOL_VERSION, 6);
     }
 
@@ -1623,6 +1686,8 @@ mod tests {
             prompt_revision: 2,
             trigger_revision: 1,
             requested_at_ms: 10,
+            scheduled_at_ms: None,
+            coalesced_through_ms: None,
             started_at_ms: None,
             ended_at_ms: None,
             cwd: "/tmp/project".into(),
@@ -1873,6 +1938,7 @@ mod tests {
                         completed_sound: "complete".into(),
                         resume_agents: true,
                         persist_terminal_history: false,
+                        max_scheduled_execution_concurrency: 4,
                     },
                     environment: None,
                 }],
@@ -2129,6 +2195,15 @@ mod tests {
                     "scheduled_execution_dispatch",
                     "scheduled_execution_cancellation",
                     "schedule_owned_shells",
+                ][..],
+            ),
+            (
+                24,
+                &[
+                    "protocol_24",
+                    "timed_schedule_dispatch",
+                    "scheduler_health",
+                    "bounded_scheduled_execution_concurrency",
                 ][..],
             ),
         ];

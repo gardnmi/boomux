@@ -492,14 +492,27 @@ impl Client {
         &self,
         notifications: NotificationDeliveryConfig,
     ) -> Result<()> {
-        if !self.supports(protocol::ProtocolFeature::ScheduledExecutions)? {
-            if self.supports(protocol::ProtocolFeature::RestartNotificationConfig)? {
+        if !self.supports(protocol::ProtocolFeature::TimedScheduling)? {
+            let mut compatibility = notifications.clone();
+            compatibility.max_scheduled_execution_concurrency = 4;
+            if self.supports(protocol::ProtocolFeature::ScheduledExecutions)? {
                 self.restart_request(Request::RestartWithNotificationConfig {
-                    notifications: notifications.clone(),
+                    notifications: compatibility,
+                    environment: Some(current_environment()),
+                })?;
+            } else if self.supports(protocol::ProtocolFeature::RestartNotificationConfig)? {
+                self.restart_request(Request::RestartWithNotificationConfig {
+                    notifications: compatibility,
                     environment: None,
                 })?;
             } else {
                 self.restart_request(Request::Restart)?;
+            }
+            self.probe_latest()?;
+            if !self.supports(protocol::ProtocolFeature::TimedScheduling)? {
+                return Err(unsupported_version(
+                    "replacement daemon does not support timed scheduling settings",
+                ));
             }
         }
         self.restart_request(Request::RestartWithNotificationConfig {
@@ -1226,6 +1239,122 @@ mod tests {
         .unwrap();
     }
 
+    fn assert_two_stage_restart_from(old_version: u32) {
+        let directory = env::temp_dir().join(format!("boomux-client-restart-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let socket = directory.join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let settings = NotificationDeliveryConfig {
+            desktop_enabled: true,
+            sound_enabled: false,
+            blocked: true,
+            completed: false,
+            blocked_sound: "blocked".into(),
+            completed_sound: "completed".into(),
+            resume_agents: false,
+            persist_terminal_history: true,
+            max_scheduled_execution_concurrency: 1,
+        };
+        let expected_settings = settings.clone();
+        let expected_environment = current_environment();
+        let server = thread::spawn(move || {
+            let mut upgraded = false;
+            let mut full_restart_seen = false;
+            loop {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+                if !upgraded {
+                    match request.message {
+                        Request::Ping if request.version > old_version => {
+                            protocol::write_message(
+                                &mut stream,
+                                &Envelope::with_version(
+                                    old_version,
+                                    Response::Error {
+                                        message: "newer protocol unsupported".into(),
+                                        code: Some(ErrorCode::UnsupportedVersion),
+                                    },
+                                ),
+                            )
+                            .unwrap();
+                        }
+                        Request::Ping => {
+                            assert_eq!(request.version, old_version);
+                            protocol::write_message(
+                                &mut stream,
+                                &Envelope::with_version(old_version, Response::Pong),
+                            )
+                            .unwrap();
+                        }
+                        Request::Restart if old_version == 16 => {
+                            upgraded = true;
+                            protocol::write_message(
+                                &mut stream,
+                                &Envelope::with_version(old_version, Response::Ok),
+                            )
+                            .unwrap();
+                        }
+                        Request::RestartWithNotificationConfig {
+                            notifications,
+                            environment,
+                        } if old_version >= 17 => {
+                            assert_eq!(notifications.max_scheduled_execution_concurrency, 4);
+                            assert_eq!(environment.is_some(), old_version >= 23);
+                            upgraded = true;
+                            protocol::write_message(
+                                &mut stream,
+                                &Envelope::with_version(old_version, Response::Ok),
+                            )
+                            .unwrap();
+                        }
+                        request => panic!("unexpected old-daemon request: {request:?}"),
+                    }
+                } else {
+                    match request.message {
+                        Request::Ping => {
+                            protocol::write_message(
+                                &mut stream,
+                                &Envelope::with_version(request.version, Response::Pong),
+                            )
+                            .unwrap();
+                            if full_restart_seen {
+                                break;
+                            }
+                        }
+                        Request::RestartWithNotificationConfig {
+                            notifications,
+                            environment: Some(environment),
+                        } => {
+                            assert_eq!(request.version, 24);
+                            assert_eq!(notifications, expected_settings);
+                            assert_eq!(environment, expected_environment);
+                            full_restart_seen = true;
+                            protocol::write_message(
+                                &mut stream,
+                                &Envelope::with_version(24, Response::Ok),
+                            )
+                            .unwrap();
+                        }
+                        request => panic!("unexpected upgraded-daemon request: {request:?}"),
+                    }
+                }
+            }
+        });
+        let client = Client::from_socket_path(socket);
+        client
+            .restart_with_notification_config(settings.clone())
+            .unwrap();
+        server.join().unwrap();
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn mixed_version_restart_applies_full_settings_after_compatibility_handoff() {
+        for version in [16, 22, 23] {
+            assert_two_stage_restart_from(version);
+        }
+    }
+
     fn test_profile() -> TerminalProfile {
         TerminalProfile {
             term: None,
@@ -1246,6 +1375,7 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
+            reject_protocol(&listener, 24, 23);
             reject_protocol(&listener, 23, 22);
             reject_protocol(&listener, 22, 21);
             reject_protocol(&listener, 21, 20);
@@ -1427,7 +1557,7 @@ mod tests {
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
-            assert_eq!(request.version, 23);
+            assert_eq!(request.version, 24);
             let Request::Attach {
                 environment: Some(environment),
                 ..
@@ -1444,7 +1574,7 @@ mod tests {
             protocol::write_message(
                 &mut stream,
                 &Envelope::with_version(
-                    23,
+                    24,
                     Response::Attached {
                         token: "token".into(),
                         reconstruction: Vec::new(),
@@ -1535,6 +1665,7 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
+            reject_protocol(&listener, 24, 23);
             reject_protocol(&listener, 23, 22);
             reject_protocol(&listener, 22, 21);
             reject_protocol(&listener, 21, 20);
@@ -1594,6 +1725,7 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
+            reject_protocol(&listener, 24, 23);
             reject_protocol(&listener, 23, 22);
             reject_protocol(&listener, 22, 21);
             reject_protocol(&listener, 21, 20);

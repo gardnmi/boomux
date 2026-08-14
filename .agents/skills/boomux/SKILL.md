@@ -303,10 +303,20 @@ Inspect the returned exact execution ID, and cancel only when process-tree
 termination is authorized. Execution exit or cancellation never means Agent
 `done`.
 
-This version does not evaluate cron triggers or run a timer. Enabling records
-future timed-work consent but does not itself dispatch. Do not claim workspace
-or global scheduled concurrency limits, skipped timer decisions, or
-`[scheduling]` configuration are active.
+Enabled schedules are evaluated by the daemon in their stored timezone. Timed
+work runs only while the daemon and user session are active. Offline periods are
+recorded as one coalesced missed decision, paused periods are not caught up, and
+policy contention is skipped rather than queued. Manual and timed decisions share
+one active execution per schedule and workspace, exact continuation exclusion,
+and `[scheduling] max_concurrent` (default 4, range 1-64). Use `daemon status`
+and `doctor` to inspect scheduler health and whether a config change needs
+`daemon restart`.
+
+Cron day-field semantics preserve syntax: `*` and `*/n` are wildcard-origin;
+numeric lists/ranges are restricted even when they cover the full field, and two
+restricted day fields use OR. Boomux rejects schedules with no occurrence in a
+Gregorian 400-year cycle. Treat scheduler `offline` health as not evaluating
+timed work even when the daemon still answers other requests.
 
 Exact shell IDs resolve globally. Shell names resolve in the current workspace,
 or through `--workspace` for `shell inspect`, `shell rename`, and `shell close`.

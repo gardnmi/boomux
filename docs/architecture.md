@@ -27,7 +27,7 @@
 | `src/session_transcript.rs` and children | Shared transcript identity, bounds, pagination, and host-specific normalization |
 | `src/integration_management.rs` | Integration inventory, status, setup, verification, install, and uninstall workflows |
 | `src/process_adapter.rs` | Exact-argv child supervision and fail-open process-bound Agent observation |
-| `src/scheduling.rs` | Bounded canonical cron, IANA timezone, prompt, and schedule identity validation |
+| `src/scheduling.rs` | Bounded canonical cron parsing and occurrence evaluation, IANA timezone and DST policy, prompt bounds, and schedule identity validation |
 | `src/config.rs`, `src/projects.rs`, `src/git.rs` | Layered configuration, bounded project discovery, and asynchronous Git metadata |
 | `src/cli_output.rs` | Stable `boomux.cli/v1` output and error presentation |
 | `src/desktop_notifications.rs` | Bounded fail-open desktop and sound delivery |
@@ -50,7 +50,7 @@
   launch, and integration management execute argv directly without shell
   interpretation.
 - **Scheduled Agent authority:** [`scheduled-agent-work.md`](scheduled-agent-work.md)
-  defines the boundary between implemented manual dispatch, future timing,
+  defines the boundary between manual and timed dispatch, concurrency policy,
   process outcome, and authoritative Agent lifecycle.
 
 ## Product Boundary
@@ -403,14 +403,15 @@ input into an active session, or infer a canonical external session.
 Fresh is the default session mode and starts a new external Agent Session for
 each dispatched execution. Continuation schedules pin one exact existing
 integration and external session identity; they never select the latest session
-or fall back to fresh work. The manual layer prevents a second nonterminal
-execution on the same schedule. Continuation leases, workspace/global
-concurrency, and timed skip decisions remain part of #150 rather than this
-dispatch layer.
+or fall back to fresh work. Manual and timed decisions atomically enforce one
+nonterminal execution per schedule and workspace, the configured daemon-wide
+bound, and exact continuation leases. Policy refusals are durable skipped
+decisions rather than queued work.
 
 New schedules are paused by default, and manual run-now remains available while
-paused. Cron evaluation, timer loops, skipped timed decisions, and `[scheduling]`
-configuration remain deferred. There is no automatic retry or timeout: an
+paused. Protocol 24 evaluates canonical cron triggers in their stored IANA
+timezone and exposes deterministic next occurrences, scheduler health, timed
+and skipped decisions, and `[scheduling] max_concurrent`. There is no automatic retry or timeout: an
 execution remains active until its process exits, the user cancels it, or runner
 or cold-daemon loss interrupts it. Scheduled starts use the daemon's
 startup environment as ephemeral input; it is never persisted, and environment
@@ -706,6 +707,28 @@ execution events, and durable schedule-owned shell identity. Protocol-22 peers
 omit execution events, schedule-owned shells, and execution-shell links. State schema 10
 explicitly migrates schema 9: existing shells become user-owned and schedules
 receive empty execution histories.
+Protocol 24 adds timezone-aware timed dispatch, skipped policy outcomes,
+deterministic next occurrences, scheduler health, and bounded schedule/workspace/
+daemon concurrency. Protocol-23 peers omit scheduler and next-occurrence fields
+and filter timed or skipped execution records and events while preserving event
+cursors. State schema 11 adds the trigger-revision-qualified durable evaluation
+frontier and timed occurrence metadata; its explicit schema-10 migration retains
+manual execution history without reinterpreting it as timed work.
+
+Cron day matching preserves syntactic wildcard origin: `*/n` is wildcard-origin,
+while numeric lists and ranges remain restricted even when they cover the full
+field. Trigger acceptance proves at least one occurrence across a Gregorian
+400-year cycle. Enabled snapshot projection propagates evaluator failures rather
+than presenting them as a normal absent next occurrence. State schema 11 also
+requires durable schedule timestamps to fit Chrono and validates timed IDs,
+frontiers, scheduled/requested ordering, and coalescing reason/state combinations.
+
+The scheduler reports active health only while its worker is running after a
+successful evaluation and next-occurrence projection. Failure marks it offline
+and uses an interruptible 50 ms through 5 second exponential retry delay without
+acknowledging deterministic test ticks. Graceful restart transfers active work
+even when a newly sampled lower limit is already exceeded; the truthful active
+count is reported and admission remains blocked until enough terminal releases.
 
 Opt-in desktop and sound notifications are a daemon-owned projection of committed
 Agent state transitions, not durable queue state. A transition from any other
@@ -733,6 +756,10 @@ daemon's inherited `XDG_CONFIG_HOME` or `BOOMUX_CONFIG` from overriding the
 configuration intentionally selected by the restart caller. A protocol-16
 daemon is first upgraded with a compatibility handoff, followed by a protocol-17
 handoff that applies the settings.
+The same two-stage rule applies when a protocol-16, protocol-22, or protocol-23
+daemon is upgraded for protocol-24 scheduling settings: after the compatibility
+handoff the client renegotiates, then sends complete notification, recovery,
+environment, and `max_concurrent` values to the replacement.
 
 ### Transition Coordinator
 

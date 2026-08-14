@@ -1,4 +1,5 @@
 use std::fs;
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::os::unix::net::UnixStream;
 use std::process::{Command, Stdio};
 use std::thread;
@@ -11,6 +12,26 @@ use crate::support::{
     TestDaemon, acknowledge_reconnect, assert_generated_name, assert_remote_code, contains,
     parse_pid, process_exists, profile, read_until, wait_for_attach_with_profile, wait_until,
 };
+
+fn assert_unsafe_native_clock_rejected(runtime_dir: &std::path::Path, clock: &std::path::Path) {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_boomux"))
+        .args(["daemon", "run"])
+        .env("XDG_RUNTIME_DIR", runtime_dir)
+        .env("XDG_STATE_HOME", runtime_dir.join("state"))
+        .env("SHELL", "/bin/sh")
+        .env("BOOMUX_NATIVE_TEST_HOOKS", "1")
+        .env("BOOMUX_NATIVE_TEST_CLOCK", clock)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_until(
+        || child.try_wait().unwrap().is_some(),
+        "daemon accepted an unsafe native clock path",
+    );
+    assert!(!child.wait().unwrap().success());
+}
 
 #[test]
 fn native_daemon_lifecycle() {
@@ -25,7 +46,7 @@ fn native_daemon_lifecycle() {
     let capabilities: serde_json::Value = serde_json::from_slice(&capabilities.stdout).unwrap();
     assert_eq!(capabilities["schema"], "boomux.cli/v1");
     assert_eq!(capabilities["command"], "capabilities");
-    assert_eq!(capabilities["data"]["daemon_protocol_version"], 23);
+    assert_eq!(capabilities["data"]["daemon_protocol_version"], 24);
     assert_eq!(
         capabilities["data"]["session_transcript_integrations"],
         serde_json::json!(["opencode", "pi"])
@@ -89,8 +110,12 @@ fn native_daemon_lifecycle() {
         "protocol_21",
         "protocol_22",
         "protocol_23",
+        "protocol_24",
         "agent_schedule_management",
         "durable_agent_schedules",
+        "timed_schedule_dispatch",
+        "scheduler_health",
+        "bounded_scheduled_execution_concurrency",
         "workspace_default_cwd",
         "structured_terminal_previews",
         "focused_terminal_read",
@@ -115,7 +140,9 @@ fn native_daemon_lifecycle() {
         .output()
         .unwrap();
     assert!(status.status.success());
-    assert!(String::from_utf8_lossy(&status.stdout).contains("running (protocol 23"));
+    let status_text = String::from_utf8_lossy(&status.stdout);
+    assert!(status_text.contains("running (protocol 24"));
+    assert!(status_text.contains("scheduler active (0/4 active executions)"));
     let status = daemon
         .command()
         .args(["daemon", "status", "--json"])
@@ -124,6 +151,42 @@ fn native_daemon_lifecycle() {
     let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
     assert_eq!(status["schema"], "boomux.cli/v1");
     assert_eq!(status["data"]["status"], "running");
+    assert_eq!(status["data"]["scheduler"]["state"], "active");
+    assert_eq!(status["data"]["scheduler"]["active_executions"], 0);
+    assert_eq!(status["data"]["scheduler"]["max_concurrent"], 4);
+    for max_concurrent in [0, 65, u16::MAX] {
+        let mut stream = UnixStream::connect(daemon.client.socket_path()).unwrap();
+        protocol::write_message(
+            &mut stream,
+            &protocol::Envelope::with_version(
+                24,
+                protocol::Request::RestartWithNotificationConfig {
+                    notifications: protocol::NotificationDeliveryConfig {
+                        desktop_enabled: false,
+                        sound_enabled: false,
+                        blocked: true,
+                        completed: true,
+                        blocked_sound: "blocked".into(),
+                        completed_sound: "completed".into(),
+                        resume_agents: true,
+                        persist_terminal_history: false,
+                        max_scheduled_execution_concurrency: max_concurrent,
+                    },
+                    environment: None,
+                },
+            ),
+        )
+        .unwrap();
+        let response: protocol::Envelope<protocol::Response> =
+            protocol::read_message(&mut stream).unwrap();
+        assert!(matches!(
+            response.message,
+            protocol::Response::Error {
+                code: Some(ErrorCode::InvalidArgument),
+                ..
+            }
+        ));
+    }
     let mut protocol_six = UnixStream::connect(daemon.client.socket_path()).unwrap();
     protocol::write_message(
         &mut protocol_six,
@@ -736,4 +799,115 @@ fn native_daemon_lifecycle() {
     assert!(daemon.client.snapshot().unwrap().workspaces.is_empty());
 
     daemon.stop_with_cli();
+}
+
+#[test]
+fn scheduling_config_is_sampled_and_applied_by_graceful_restart() {
+    let config = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let config_for_daemon = std::sync::Arc::clone(&config);
+    let daemon = TestDaemon::start_with(move |command, runtime_dir| {
+        let path = runtime_dir.join("config.toml");
+        fs::write(&path, "[scheduling]\nmax_concurrent = 2\n").unwrap();
+        *config_for_daemon.lock().unwrap() = Some(path.clone());
+        command.env("BOOMUX_CONFIG", path);
+    });
+    let config = config.lock().unwrap().clone().unwrap();
+
+    assert_eq!(
+        daemon
+            .client
+            .snapshot()
+            .unwrap()
+            .scheduler
+            .unwrap()
+            .max_concurrent,
+        2
+    );
+    fs::write(&config, "[scheduling]\nmax_concurrent = 3\n").unwrap();
+    assert_eq!(
+        daemon
+            .client
+            .snapshot()
+            .unwrap()
+            .scheduler
+            .unwrap()
+            .max_concurrent,
+        2
+    );
+
+    let doctor = daemon
+        .command()
+        .env("BOOMUX_CONFIG", &config)
+        .arg("doctor")
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&doctor.stderr).contains(
+            "daemon uses max_concurrent=2, config resolves 3; restart daemon after changes"
+        )
+    );
+
+    let restart = daemon
+        .command()
+        .env("BOOMUX_CONFIG", &config)
+        .args(["daemon", "restart"])
+        .output()
+        .unwrap();
+    assert!(
+        restart.status.success(),
+        "daemon restart failed: {}",
+        String::from_utf8_lossy(&restart.stderr)
+    );
+    assert_eq!(
+        daemon
+            .client
+            .snapshot()
+            .unwrap()
+            .scheduler
+            .unwrap()
+            .max_concurrent,
+        3
+    );
+}
+
+#[test]
+fn native_clock_hook_rejects_outside_symlinked_and_unsafe_paths() {
+    for case in ["outside", "symlink", "marker-symlink", "unsafe-marker"] {
+        let runtime_dir =
+            std::env::temp_dir().join(format!("boomux-unsafe-clock-{}-{}", case, Uuid::new_v4()));
+        let private_runtime = runtime_dir.join("boomux");
+        fs::create_dir_all(&private_runtime).unwrap();
+        fs::set_permissions(&private_runtime, fs::Permissions::from_mode(0o700)).unwrap();
+        let outside = runtime_dir.join("outside-clock");
+        fs::create_dir(&outside).unwrap();
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(outside.join("tick"), "1 1767225600000").unwrap();
+        fs::set_permissions(outside.join("tick"), fs::Permissions::from_mode(0o600)).unwrap();
+        let clock = match case {
+            "outside" => outside.clone(),
+            "symlink" => {
+                let path = private_runtime.join("clock-link");
+                symlink(&outside, &path).unwrap();
+                path
+            }
+            "marker-symlink" => {
+                let path = private_runtime.join("clock-marker-link");
+                fs::create_dir(&path).unwrap();
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+                symlink(outside.join("tick"), path.join("tick")).unwrap();
+                path
+            }
+            "unsafe-marker" => {
+                let path = private_runtime.join("clock");
+                fs::create_dir(&path).unwrap();
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+                fs::write(path.join("tick"), "1 1767225600000").unwrap();
+                fs::set_permissions(path.join("tick"), fs::Permissions::from_mode(0o644)).unwrap();
+                path
+            }
+            _ => unreachable!(),
+        };
+        assert_unsafe_native_clock_rejected(&runtime_dir, &clock);
+        fs::remove_dir_all(runtime_dir).unwrap();
+    }
 }

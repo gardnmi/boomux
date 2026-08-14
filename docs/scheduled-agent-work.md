@@ -1,8 +1,7 @@
 # Scheduled Agent Work
 
-> **Status: Partially implemented contract.** Schedule management and manual
-> run-now execution are implemented; timer evaluation and timed policy remain
-> deferred. This document governs the
+> **Status: Current contract.** Schedule management, manual run-now execution,
+> and daemon-native timed dispatch are implemented. This document governs the
 > scheduled Agent work tracked by [#146](https://github.com/gardnmi/boomux/issues/146).
 > Source and compatibility tests become authoritative for exact protocol,
 > persistence, and bound values as each implementation slice ships.
@@ -35,7 +34,8 @@ A **Scheduled Execution** is the durable record of one timed occurrence or
 explicit run-now decision. It captures the exact schedule revision, prompt
 revision, requested or scheduled time, working directory, integration dispatch
 mode, decision, reason, and available runtime references. Schedule edits affect
-only later executions.
+only later executions when an edit surface is added; the current CLI does not
+expose schedule editing.
 
 The identities remain separate:
 
@@ -82,17 +82,14 @@ The ownership is exclusive:
 An exited schedule-owned shell can retain the latest bounded terminal state, but
 the bounded Scheduled Execution history is the authority for earlier occurrence
 outcomes. Reusing the shell does not reuse a ShellRun or Agent Instance. Each
-execution snapshots its effective working directory. An inactive schedule update
-can atomically update the shell metadata for the next run; an update during an
-active run leaves that run and shell process unchanged and applies when the next
-claim is bound.
+execution snapshots its effective working directory.
 
 ## Prompt Revisions And Privacy
 
-Creation and update snapshot the prompt content into Boomux's user-only durable
+Creation snapshots the prompt content into Boomux's user-only durable
 state. A prompt-file option reads the file at that mutation boundary; later file
-changes do not silently alter the schedule. Changing prompt content creates a
-new prompt revision, and every Scheduled Execution retains the revision it used.
+changes do not silently alter the schedule. Every Scheduled Execution retains
+the prompt revision it used; prompt editing is not currently exposed.
 
 Prompt content may contain private instructions or data. It is bounded and:
 
@@ -151,6 +148,13 @@ restricted, either field matching selects the local time. Seconds, names,
 nicknames, and implementation-specific operators such as `?`, `L`, `W`, and `#`
 are not accepted.
 
+Restriction follows the field's syntax rather than its expanded values. A
+star-origin component such as `*` or `*/2` is wildcard-origin for the standard
+day-of-month/day-of-week rule. Numeric values, lists, and ranges remain
+restricted, including full ranges such as `1-31` and `0-6`; two restricted day
+fields use OR. Duplicate list values are harmless. Creation and restored-state
+validation reject a trigger with no occurrence in a Gregorian 400-year cycle.
+
 Manual conveniences such as every, daily, weekdays, and weekly compile to the
 same canonical expression rather than creating another persisted trigger model.
 Clients expose both a friendly rendering and the exact expression.
@@ -174,13 +178,20 @@ records one bounded, coalesced missed-period decision per affected schedule and
 computes the next future occurrence; it does not materialize an unbounded record
 for every missed minute.
 
+A delayed live tick records one coalesced `missed` decision for due instants
+before the latest due instant, then evaluates that latest instant normally. A
+paused schedule advances no frontier and creates no records. Resuming moves its
+frontier to the resume time, so paused time is never caught up. A pause that wins
+after evaluation sampled an enabled schedule but before its durable decision is
+recorded as `paused_race` rather than dispatched.
+
 Every timed decision has an occurrence key containing the schedule ID, trigger
 revision, and selected scheduled UTC instant. Each schedule persists an
 evaluation frontier independently of bounded execution history. The frontier
 advances monotonically before publication and is not pruned with audit records,
 so clock rollback and history pruning cannot make an old occurrence eligible.
-Editing a trigger creates a new trigger revision whose first eligible occurrence
-is strictly after the committed edit; it never re-evaluates past wall time.
+Trigger editing is not currently exposed. The persisted trigger revision remains
+part of occurrence identity so a future edit cannot reinterpret old decisions.
 
 The occurrence key, Scheduled Execution decision, and evaluation-frontier
 advance commit as one durable mutation before the corresponding event is
@@ -203,16 +214,20 @@ the exact session cannot be reacquired, dispatch fails visibly and does not fall
 back to fresh. A durable continuation lease keyed by integration and exact
 external session ID prevents Scheduled Executions from using that session
 concurrently. The occurrence is also skipped when daemon state contains a
-current running Agent Instance for that exact key, or when the integration's
-dispatch capability authoritatively refuses an active session. Boomux never
+current running Agent Instance for that exact key, or when its dispatch lease is
+already occupied. One dispatch eligibility lease serializes Agent
+register/ensure/report with the final policy decision, claim creation, shell/run
+binding, and runner spawn. An Agent mutation that wins the lease first produces
+`Skipped` with `active_session`; a dispatch that wins retains the lease through
+spawn eligibility. No intermediate visible claim can later become a policy skip,
+and rejection creates no shell or run. Boomux never
 injects a prompt into known active user or Agent work and never takes over its
 terminal controller.
 
 Boomux cannot prove that an exact session is inactive in an unmanaged process
 that provides no lifecycle or lease signal. The UI must describe this limit; the
 scheduler does not substitute process, catalog, argv, or terminal heuristics.
-Integrations that can acquire a stronger host-native session lease should expose
-it through their dispatch capability.
+Host-native session leases are not currently implemented.
 
 An integration must advertise the applicable fresh or continuation dispatch
 capability and construct the exact host argument vector. Unsupported integrations
@@ -221,9 +236,7 @@ database recency, terminal output, and catalog order are not session identity.
 
 ## Dispatch And Concurrency
 
-The complete initial scheduler design uses these policies. The manual run-now
-slice currently enforces only the per-schedule limit because one reusable shell
-cannot run twice; workspace and daemon-wide limits arrive with timed dispatch:
+Manual run-now and timed decisions use the same atomic policy:
 
 - At most one nonterminal Scheduled Execution per Agent Schedule.
 - At most one nonterminal Scheduled Execution per workspace.
@@ -233,6 +246,20 @@ cannot run twice; workspace and daemon-wide limits arrive with timed dispatch:
 - No automatic retry after skip, dispatch failure, process failure, or daemon
   interruption.
 - No automatic timeout.
+
+`[scheduling] max_concurrent = 4` configures the daemon-wide limit. Accepted
+values are 1 through 64. Configuration layers normally, is sampled when the
+daemon starts, and is not watched. `boomux daemon restart` applies the invoking
+client's resolved value to the replacement daemon; `boomux doctor` reports when
+the running sampled value differs. Scheduler health and the active/maximum count
+are exposed by `boomux daemon status`.
+
+Health is `active` only while the scheduler worker is running and its latest
+evaluation and next-occurrence projection succeeded. It is `offline` while
+stopped or after worker failure or panic. Evaluation failures retain any pending
+deterministic test-tick acknowledgment and retry with an interruptible nonzero
+exponential delay bounded at five seconds; one diagnostic is emitted per failure
+streak.
 
 An eligible decision is first persisted as **Claimed**; a policy rejection is
 persisted directly as **Skipped** and never owns a dispatch claim. One
@@ -267,8 +294,8 @@ changing existing schedules.
 A Scheduled Execution has one of these observable states or outcomes:
 
 - **Skipped**: policy prevented dispatch, with an overlap, active-session,
-  workspace-capacity, global-capacity, or missed reason. Paused schedules do not
-  produce timed decisions.
+  workspace-capacity, global-capacity, missed, paused-race, or invalid-target
+  reason. A schedule that remains paused produces no timed decisions.
 - **Claimed**: dispatch eligibility and idempotency ownership are durable, but a
   ShellRun is not yet bound.
 - **Starting**: the internal runner ShellRun is bound, but the exact external

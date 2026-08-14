@@ -30,6 +30,8 @@ Protocol 22 adds durable Agent Schedule management. Workspace snapshots include
 ordered, prompt-free schedule summaries, while exact schedule inspection is the
 only management response that discloses the current prompt.
 Protocol 23 adds durable manual Scheduled Executions and schedule-owned shells.
+Protocol 24 adds daemon-native timed decisions, skipped policy outcomes,
+deterministic next occurrences, and scheduler health.
 
 `boomux agent wait <id> --after-revision <revision>` is the preferred way to
 await one Agent. It returns on a newer accepted durable observation, returns
@@ -105,7 +107,8 @@ schedule summary after persistence. Idempotent pause or resume emits no event an
 does not advance the schedule revision. Removing a schedule emits only its
 workspace and schedule identities.
 
-`scheduled_execution_created` publishes the persisted manual claim.
+`scheduled_execution_created` publishes every persisted manual or timed claim or
+skip decision.
 `scheduled_execution_changed` publishes later prompt-free shell/run binding,
 active, dispatch-failed, exited, cancelled, interrupted, and Agent-link changes.
 Both carry the complete public execution snapshot and never carry the retained
@@ -141,6 +144,19 @@ schedule-owned shells and execution-shell links rather than presenting those
 shells as user-owned. Historical schedule-shell ownership used for this filtering
 is retained exactly while the bounded event journal still contains a generic
 event for that shell; it cannot be evicted independently of that event.
+
+Protocol-23 clients retain manual non-skipped execution records but omit timed
+and skipped records and their events. Snapshot scheduler health and schedule
+next-occurrence fields are also omitted. Filtering never rewinds the event
+cursor, so an old client can reconnect across hidden scheduler activity without
+replaying or stalling the stream.
+
+Manual final eligibility, claim creation, shell/run binding, and runner spawn are
+serialized against Agent activity mutations. A protocol-23 client therefore
+cannot observe a manual `claimed` creation whose only terminal transition is a
+protocol-24-only policy skip. If Agent activity wins first, the execution is
+created directly as skipped and its event is hidden consistently while the
+protocol-23 cursor still advances.
 
 Event IDs provide one total publication order. The daemon transition coordinator
 couples durable lifecycle mutation, persistence, and event publication. Events
