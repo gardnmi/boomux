@@ -20,10 +20,6 @@ struct PiAdapter;
 pub(super) static ADAPTER: &dyn TranscriptAdapter = &PiAdapter;
 
 impl TranscriptAdapter for PiAdapter {
-    fn integration(&self) -> &'static str {
-        "pi"
-    }
-
     fn normalization_revision(&self) -> u32 {
         1
     }

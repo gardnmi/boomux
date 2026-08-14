@@ -7,74 +7,77 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::str::FromStr;
 use std::time::{Duration, Instant};
 
-use clap::ValueEnum;
-use serde::Serialize;
+use serde::{Serialize, Serializer};
 use uuid::Uuid;
 
+use boomux::integrations::{InstallTargetKind, InstallationCapability, IntegrationDescriptor};
 use boomux::protocol::{AgentAuthority, ShellStatus, Snapshot};
-
-pub(crate) const OPENCODE_ASSET: &str = include_str!("../integrations/opencode/boomux.js");
-pub(crate) const PI_ASSET: &str = include_str!("../integrations/pi/boomux.js");
 
 const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_VERSION_OUTPUT_BYTES: u64 = 4096;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, ValueEnum)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum IntegrationId {
-    Opencode,
-    Pi,
-}
+#[cfg(test)]
+pub(crate) const OPENCODE_ASSET: &str = boomux::integrations::OPENCODE
+    .installation
+    .as_ref()
+    .expect("OpenCode installation capability")
+    .content;
+#[cfg(test)]
+pub(crate) const PI_ASSET: &str = boomux::integrations::PI
+    .installation
+    .as_ref()
+    .expect("Pi installation capability")
+    .content;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct IntegrationId(&'static IntegrationDescriptor);
 
 impl IntegrationId {
-    pub(crate) const ALL: [Self; 2] = [Self::Opencode, Self::Pi];
+    pub(crate) const OPENCODE: Self = Self(&boomux::integrations::OPENCODE);
+    pub(crate) const PI: Self = Self(&boomux::integrations::PI);
+    #[allow(non_upper_case_globals)]
+    pub(crate) const Opencode: Self = Self::OPENCODE;
+    #[allow(non_upper_case_globals)]
+    pub(crate) const Pi: Self = Self::PI;
 
-    pub(crate) const fn spec(self) -> &'static IntegrationSpec {
-        match self {
-            Self::Opencode => &OPENCODE,
-            Self::Pi => &PI,
+    pub(crate) const fn spec(self) -> &'static IntegrationDescriptor {
+        self.0
+    }
+
+    pub(crate) const fn installation(self) -> &'static InstallationCapability {
+        match self.spec().installation.as_ref() {
+            Some(installation) => installation,
+            None => panic!("CLI integration must support installation"),
         }
+    }
+
+    pub(crate) fn all() -> impl Iterator<Item = Self> {
+        boomux::integrations::installable().map(Self)
     }
 }
 
-#[derive(Debug)]
-pub(crate) struct IntegrationSpec {
-    pub(crate) id: IntegrationId,
-    pub(crate) name: &'static str,
-    pub(crate) display_name: &'static str,
-    pub(crate) package: &'static str,
-    pub(crate) validated_version: &'static str,
-    pub(crate) asset_name: &'static str,
-    pub(crate) content: &'static str,
-    pub(crate) executable: &'static str,
-    pub(crate) reload_message: &'static str,
+impl FromStr for IntegrationId {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        boomux::integrations::by_key(value)
+            .filter(|descriptor| descriptor.installation.is_some())
+            .map(Self)
+            .ok_or_else(|| format!("unknown installable integration: {value}"))
+    }
 }
 
-const OPENCODE: IntegrationSpec = IntegrationSpec {
-    id: IntegrationId::Opencode,
-    name: "opencode",
-    display_name: "OpenCode",
-    package: "opencode-ai",
-    validated_version: "1.18.15",
-    asset_name: "plugin",
-    content: OPENCODE_ASSET,
-    executable: "opencode",
-    reload_message: "Restart any running OpenCode process to activate the plugin",
-};
-
-const PI: IntegrationSpec = IntegrationSpec {
-    id: IntegrationId::Pi,
-    name: "pi",
-    display_name: "Pi",
-    package: "@earendil-works/pi-coding-agent",
-    validated_version: "0.84.1",
-    asset_name: "extension",
-    content: PI_ASSET,
-    executable: "pi",
-    reload_message: "Restart any running Pi process to activate the extension",
-};
+impl Serialize for IntegrationId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.spec().key)
+    }
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct Environment {
@@ -121,11 +124,12 @@ pub(crate) struct IntegrationSummary {
 impl From<IntegrationId> for IntegrationSummary {
     fn from(id: IntegrationId) -> Self {
         let spec = id.spec();
+        let installation = id.installation();
         Self {
-            name: spec.name,
+            name: spec.key,
             display_name: spec.display_name,
-            package: spec.package,
-            validated_version: spec.validated_version,
+            package: installation.package,
+            validated_version: installation.validated_version,
         }
     }
 }
@@ -236,7 +240,11 @@ pub(crate) fn verification_targets(
     id: IntegrationId,
     shell_id: Option<&str>,
 ) -> Vec<VerificationTarget> {
-    let executable = id.spec().executable;
+    let executable = id
+        .spec()
+        .foreground
+        .expect("CLI integration must recognize its foreground process")
+        .process_name;
     let mut targets = snapshot
         .workspaces
         .iter()
@@ -262,7 +270,10 @@ pub(crate) fn check_verification_target(
     id: IntegrationId,
     target: &VerificationTarget,
 ) -> VerificationCheck {
-    let spec = id.spec();
+    let descriptor = id.spec();
+    let foreground = descriptor
+        .foreground
+        .expect("CLI integration must recognize its foreground process");
     for workspace in &snapshot.workspaces {
         let Some(shell) = workspace
             .shells
@@ -272,7 +283,7 @@ pub(crate) fn check_verification_target(
             continue;
         };
         if !matches!(shell.status, ShellStatus::Running)
-            || shell.foreground_process.as_deref() != Some(spec.executable)
+            || shell.foreground_process.as_deref() != Some(foreground.process_name)
         {
             return VerificationCheck::Missing;
         }
@@ -285,7 +296,7 @@ pub(crate) fn check_verification_target(
         let mut agents = workspace
             .agents
             .iter()
-            .filter(|agent| authoritative_agent_matches(agent, spec, shell, run))
+            .filter(|agent| authoritative_agent_matches(agent, descriptor, shell, run))
             .cloned()
             .collect::<Vec<_>>();
         agents.sort_by(|left, right| left.id.cmp(&right.id));
@@ -345,17 +356,18 @@ fn inspect_with_host_probe(
     snapshot: Option<&Snapshot>,
     probe_host: bool,
 ) -> IntegrationStatus {
-    let spec = id.spec();
-    let asset = inspect_asset(spec, environment);
-    let runtime = inspect_runtime(spec, snapshot);
+    let descriptor = id.spec();
+    let installation = id.installation();
+    let asset = inspect_asset(id, installation, environment);
+    let runtime = inspect_runtime(descriptor, snapshot);
     let recommended_action = recommended_action(asset.state, runtime.state);
     IntegrationStatus {
-        name: spec.name,
-        display_name: spec.display_name,
-        package: spec.package,
-        validated_version: spec.validated_version,
+        name: descriptor.key,
+        display_name: descriptor.display_name,
+        package: installation.package,
+        validated_version: installation.validated_version,
         host: if probe_host {
-            inspect_host(spec, environment)
+            inspect_host(installation, environment)
         } else {
             HostStatus {
                 state: HostState::NotChecked,
@@ -383,8 +395,12 @@ const fn recommended_action(asset: AssetState, runtime: RuntimeState) -> Recomme
     }
 }
 
-fn inspect_asset(spec: &IntegrationSpec, environment: &Environment) -> AssetStatus {
-    let path = match install_target(spec.id, environment) {
+fn inspect_asset(
+    id: IntegrationId,
+    installation: &InstallationCapability,
+    environment: &Environment,
+) -> AssetStatus {
+    let path = match install_target(id, environment) {
         Ok(target) => target.path,
         Err(error) => {
             return AssetStatus {
@@ -399,7 +415,7 @@ fn inspect_asset(spec: &IntegrationSpec, environment: &Environment) -> AssetStat
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "install path has no parent"))
         .and_then(validate_existing_directory_chain)
-        .and_then(|()| inspect_existing_asset(&path, spec.content));
+        .and_then(|()| inspect_existing_asset(&path, installation.content));
     match result {
         Ok(ExistingAsset::Missing) => AssetStatus {
             state: AssetState::Missing,
@@ -424,8 +440,9 @@ fn inspect_asset(spec: &IntegrationSpec, environment: &Environment) -> AssetStat
     }
 }
 
-fn inspect_host(spec: &IntegrationSpec, environment: &Environment) -> HostStatus {
-    let Some(executable) = executable_on_path(spec.executable, environment.path.as_deref()) else {
+fn inspect_host(installation: &InstallationCapability, environment: &Environment) -> HostStatus {
+    let Some(executable) = executable_on_path(installation.executable, environment.path.as_deref())
+    else {
         return HostStatus {
             state: HostState::Missing,
             executable: None,
@@ -438,7 +455,7 @@ fn inspect_host(spec: &IntegrationSpec, environment: &Environment) -> HostStatus
     match probe_version(&executable) {
         Ok(output) => {
             let version = version_token(&output);
-            let compatibility = if version.as_deref() == Some(spec.validated_version) {
+            let compatibility = if version.as_deref() == Some(installation.validated_version) {
                 "validated"
             } else if version.is_some() {
                 "unvalidated"
@@ -463,8 +480,19 @@ fn inspect_host(spec: &IntegrationSpec, environment: &Environment) -> HostStatus
     }
 }
 
-fn inspect_runtime(spec: &IntegrationSpec, snapshot: Option<&Snapshot>) -> RuntimeStatus {
+fn inspect_runtime(
+    descriptor: &IntegrationDescriptor,
+    snapshot: Option<&Snapshot>,
+) -> RuntimeStatus {
     let Some(snapshot) = snapshot else {
+        return RuntimeStatus {
+            state: RuntimeState::NotObservable,
+            running_processes: 0,
+            tracked_processes: 0,
+            untracked_processes: 0,
+        };
+    };
+    let Some(foreground) = descriptor.foreground else {
         return RuntimeStatus {
             state: RuntimeState::NotObservable,
             running_processes: 0,
@@ -475,7 +503,7 @@ fn inspect_runtime(spec: &IntegrationSpec, snapshot: Option<&Snapshot>) -> Runti
     let running = snapshot.workspaces.iter().flat_map(|workspace| {
         workspace.shells.iter().filter_map(move |shell| {
             (matches!(shell.status, ShellStatus::Running)
-                && shell.foreground_process.as_deref() == Some(spec.executable))
+                && shell.foreground_process.as_deref() == Some(foreground.process_name))
             .then_some((workspace, shell))
         })
     });
@@ -487,7 +515,7 @@ fn inspect_runtime(spec: &IntegrationSpec, snapshot: Option<&Snapshot>) -> Runti
             workspace
                 .agents
                 .iter()
-                .any(|agent| authoritative_agent_matches(agent, spec, shell, run))
+                .any(|agent| authoritative_agent_matches(agent, descriptor, shell, run))
         }) {
             tracked_processes += 1;
         }
@@ -510,11 +538,11 @@ fn inspect_runtime(spec: &IntegrationSpec, snapshot: Option<&Snapshot>) -> Runti
 
 fn authoritative_agent_matches(
     agent: &boomux::protocol::AgentInstanceSnapshot,
-    spec: &IntegrationSpec,
+    descriptor: &IntegrationDescriptor,
     shell: &boomux::protocol::ShellSnapshot,
     run: &boomux::protocol::ShellRunSnapshot,
 ) -> bool {
-    agent.integration == spec.name
+    agent.integration == descriptor.key
         && agent.observation.authority == AgentAuthority::LifecycleIntegration
         && crate::session_projection::agent_is_active_for_run(agent, &shell.id, &run.id)
 }
@@ -704,13 +732,14 @@ pub(crate) fn install(
     environment: &Environment,
     force: bool,
 ) -> Result<InstallResult, Box<dyn Error>> {
-    let spec = id.spec();
+    let descriptor = id.spec();
+    let installation = id.installation();
     let target = install_target(id, environment)?;
     let directory = ensure_safe_directory(&target.directory)?;
-    let result = install_asset_at(&directory, &target.path, spec.content, force)?;
+    let result = install_asset_at(&directory, &target.path, installation.content, force)?;
     Ok(InstallResult {
         integration: id,
-        name: spec.name,
+        name: descriptor.key,
         result,
         path: target.path.display().to_string(),
         restart_required: result != InstallOutcome::Unchanged,
@@ -722,10 +751,11 @@ pub(crate) fn plan_install(
     environment: &Environment,
     force: bool,
 ) -> Result<InstallPlan, Box<dyn Error>> {
-    let spec = id.spec();
+    let descriptor = id.spec();
+    let installation = id.installation();
     let target = install_target(id, environment)?;
     validate_existing_directory_chain(&target.directory)?;
-    let existing = inspect_existing_asset(&target.path, spec.content)?;
+    let existing = inspect_existing_asset(&target.path, installation.content)?;
     let (current_state, action) = match existing {
         ExistingAsset::Missing => (AssetState::Missing, InstallAction::Install),
         ExistingAsset::Current => (AssetState::Current, InstallAction::Unchanged),
@@ -734,7 +764,7 @@ pub(crate) fn plan_install(
     };
     Ok(InstallPlan {
         integration: id,
-        name: spec.name,
+        name: descriptor.key,
         current_state,
         action,
         path: target.path.display().to_string(),
@@ -747,10 +777,12 @@ pub(crate) fn preflight_uninstall(
     environment: &Environment,
     force: bool,
 ) -> Result<(), Box<dyn Error>> {
-    let spec = id.spec();
+    let installation = id.installation();
     let target = install_target(id, environment)?;
     validate_existing_directory_chain(&target.directory)?;
-    if inspect_existing_asset(&target.path, spec.content)? == ExistingAsset::Modified && !force {
+    if inspect_existing_asset(&target.path, installation.content)? == ExistingAsset::Modified
+        && !force
+    {
         return Err(modified_uninstall_error(&target.path).into());
     }
     Ok(())
@@ -761,10 +793,11 @@ pub(crate) fn uninstall(
     environment: &Environment,
     force: bool,
 ) -> Result<UninstallResult, Box<dyn Error>> {
-    let spec = id.spec();
+    let descriptor = id.spec();
+    let installation = id.installation();
     let target = install_target(id, environment)?;
     validate_existing_directory_chain(&target.directory)?;
-    let existing = inspect_existing_asset(&target.path, spec.content)?;
+    let existing = inspect_existing_asset(&target.path, installation.content)?;
     let result = match existing {
         ExistingAsset::Missing => UninstallOutcome::NotInstalled,
         ExistingAsset::Modified if !force => {
@@ -777,7 +810,7 @@ pub(crate) fn uninstall(
     };
     Ok(UninstallResult {
         integration: id,
-        name: spec.name,
+        name: descriptor.key,
         result,
         path: target.path.display().to_string(),
         restart_required: result == UninstallOutcome::Removed,
@@ -791,13 +824,14 @@ pub(crate) fn install_at(
     force: bool,
 ) -> Result<InstallResult, Box<dyn Error>> {
     require_absolute_root(config_root, config_root_name(id))?;
-    let spec = id.spec();
+    let descriptor = id.spec();
+    let installation = id.installation();
     let target = target_at(id, config_root);
     let directory = ensure_safe_directory(&target.directory)?;
-    let result = install_asset_at(&directory, &target.path, spec.content, force)?;
+    let result = install_asset_at(&directory, &target.path, installation.content, force)?;
     Ok(InstallResult {
         integration: id,
-        name: spec.name,
+        name: descriptor.key,
         result,
         path: target.path.display().to_string(),
         restart_required: result != InstallOutcome::Unchanged,
@@ -823,12 +857,12 @@ fn install_target(
 }
 
 fn config_root(id: IntegrationId, environment: &Environment) -> Result<PathBuf, Box<dyn Error>> {
-    match id {
-        IntegrationId::Opencode => opencode_config_root(
+    match id.installation().target {
+        InstallTargetKind::OpenCode => opencode_config_root(
             environment.xdg_config_home.clone(),
             environment.home.clone(),
         ),
-        IntegrationId::Pi => pi_config_root(
+        InstallTargetKind::Pi => pi_config_root(
             environment.pi_coding_agent_dir.clone(),
             environment.home.clone(),
         ),
@@ -836,12 +870,12 @@ fn config_root(id: IntegrationId, environment: &Environment) -> Result<PathBuf, 
 }
 
 fn target_at(id: IntegrationId, config_root: &Path) -> InstallTarget {
-    match id {
-        IntegrationId::Opencode => InstallTarget {
+    match id.installation().target {
+        InstallTargetKind::OpenCode => InstallTarget {
             directory: config_root.join("opencode/plugins"),
             path: config_root.join("opencode/plugins/boomux.js"),
         },
-        IntegrationId::Pi => InstallTarget {
+        InstallTargetKind::Pi => InstallTarget {
             directory: config_root.join("extensions"),
             path: config_root.join("extensions/boomux.js"),
         },
@@ -850,9 +884,9 @@ fn target_at(id: IntegrationId, config_root: &Path) -> InstallTarget {
 
 #[cfg(test)]
 const fn config_root_name(id: IntegrationId) -> &'static str {
-    match id {
-        IntegrationId::Opencode => "XDG configuration root",
-        IntegrationId::Pi => "Pi configuration root",
+    match id.installation().target {
+        InstallTargetKind::OpenCode => "XDG configuration root",
+        InstallTargetKind::Pi => "Pi configuration root",
     }
 }
 
@@ -1114,11 +1148,14 @@ mod tests {
 
     #[test]
     fn descriptors_have_unique_names_and_expected_metadata() {
-        assert_eq!(IntegrationId::Opencode.spec().package, "opencode-ai");
-        assert_eq!(IntegrationId::Pi.spec().validated_version, "0.84.1");
+        assert_eq!(
+            IntegrationId::Opencode.installation().package,
+            "opencode-ai"
+        );
+        assert_eq!(IntegrationId::Pi.installation().validated_version, "0.84.1");
         assert_ne!(
-            IntegrationId::Opencode.spec().name,
-            IntegrationId::Pi.spec().name
+            IntegrationId::Opencode.spec().key,
+            IntegrationId::Pi.spec().key
         );
     }
 

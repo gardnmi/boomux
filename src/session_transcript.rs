@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use boomux::integrations::{self, TranscriptProvider};
+
 use crate::host_session_source::normalize_absolute;
 use crate::session_projection::SessionProjection;
 
@@ -24,8 +26,6 @@ const CURSOR_PREFIX: &str = "v1.";
 const CURSOR_MAX_BYTES: usize = 4096;
 
 trait TranscriptAdapter: Sync {
-    fn integration(&self) -> &'static str;
-
     fn normalization_revision(&self) -> u32;
 
     fn read(&self, request: TranscriptRequest<'_>)
@@ -37,8 +37,6 @@ struct TranscriptRequest<'a> {
     directory: &'a Path,
     external_session_id: &'a str,
 }
-
-static ADAPTERS: &[&dyn TranscriptAdapter] = &[opencode::ADAPTER, pi::ADAPTER];
 
 #[derive(Debug)]
 pub(crate) struct TranscriptError {
@@ -129,22 +127,30 @@ pub(crate) fn read(
     limit: usize,
     max_bytes: usize,
 ) -> Result<Transcript, TranscriptError> {
-    read_with_adapters(session, before, limit, max_bytes, ADAPTERS)
+    let adapter = integrations::by_key(&session.integration)
+        .and_then(|descriptor| descriptor.transcript)
+        .map(|transcript| match transcript.provider {
+            TranscriptProvider::OpenCode => opencode::ADAPTER,
+            TranscriptProvider::Pi => pi::ADAPTER,
+        })
+        .ok_or_else(|| unsupported_integration(&session.integration))?;
+    read_with_adapter(session, before, limit, max_bytes, adapter)
 }
 
 pub(crate) fn supported_integrations() -> Vec<&'static str> {
-    ADAPTERS
+    integrations::ALL
         .iter()
-        .map(|adapter| adapter.integration())
+        .filter(|descriptor| descriptor.transcript.is_some())
+        .map(|descriptor| descriptor.key)
         .collect()
 }
 
-fn read_with_adapters(
+fn read_with_adapter(
     session: &SessionProjection,
     before: Option<&str>,
     limit: usize,
     max_bytes: usize,
-    adapters: &[&dyn TranscriptAdapter],
+    adapter: &dyn TranscriptAdapter,
 ) -> Result<Transcript, TranscriptError> {
     let external_session_id = session.external_session_id.as_deref().ok_or_else(|| {
         TranscriptError::new(
@@ -159,18 +165,6 @@ fn read_with_adapters(
         )
     })?;
 
-    let adapter = adapters
-        .iter()
-        .find(|adapter| adapter.integration() == session.integration)
-        .ok_or_else(|| {
-            TranscriptError::new(
-                "unsupported_integration",
-                format!(
-                    "session transcript integration is not supported: {}",
-                    session.integration
-                ),
-            )
-        })?;
     let source_fingerprint =
         source_context_fingerprint(&session.integration, external_session_id, directory)?;
     let cursor = before.map(decode_cursor).transpose()?;
@@ -222,6 +216,13 @@ fn read_with_adapters(
             max_bytes,
         },
     ))
+}
+
+fn unsupported_integration(integration: &str) -> TranscriptError {
+    TranscriptError::new(
+        "unsupported_integration",
+        format!("session transcript integration is not supported: {integration}"),
+    )
 }
 
 fn message_entry(
@@ -468,10 +469,6 @@ mod tests {
     struct FutureHarnessAdapter;
 
     impl TranscriptAdapter for FutureHarnessAdapter {
-        fn integration(&self) -> &'static str {
-            "future-harness"
-        }
-
         fn normalization_revision(&self) -> u32 {
             1
         }
@@ -507,10 +504,6 @@ mod tests {
     }
 
     impl TranscriptAdapter for MutableAdapter {
-        fn integration(&self) -> &'static str {
-            "mutable"
-        }
-
         fn normalization_revision(&self) -> u32 {
             self.revision.load(Ordering::Relaxed)
         }
@@ -536,13 +529,7 @@ mod tests {
         limit: usize,
         max_bytes: usize,
     ) -> Result<Transcript, TranscriptError> {
-        read_with_adapters(
-            session,
-            before,
-            limit,
-            max_bytes,
-            &[adapter as &dyn TranscriptAdapter],
-        )
+        read_with_adapter(session, before, limit, max_bytes, adapter)
     }
 
     fn session(integration: &str) -> SessionProjection {
@@ -679,14 +666,8 @@ mod tests {
     #[test]
     fn registered_adapter_uses_the_shared_identity_and_bounding_contract() {
         let adapter = FutureHarnessAdapter;
-        let transcript = read_with_adapters(
-            &session("future-harness"),
-            None,
-            10,
-            7,
-            &[&adapter as &dyn TranscriptAdapter],
-        )
-        .unwrap();
+        let transcript =
+            read_with_adapter(&session("future-harness"), None, 10, 7, &adapter).unwrap();
 
         assert_eq!(transcript.integration, "future-harness");
         assert_eq!(transcript.entries[0].text.as_deref(), Some("adapter"));
@@ -699,14 +680,7 @@ mod tests {
         let mut catalog_only = session("future-harness");
         catalog_only.occurrences.clear();
 
-        let transcript = read_with_adapters(
-            &catalog_only,
-            None,
-            10,
-            usize::MAX,
-            &[&adapter as &dyn TranscriptAdapter],
-        )
-        .unwrap();
+        let transcript = read_with_adapter(&catalog_only, None, 10, usize::MAX, &adapter).unwrap();
 
         assert_eq!(
             transcript.entries[0].text.as_deref(),

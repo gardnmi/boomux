@@ -428,7 +428,13 @@ fn run_daemon(
         socket_cleanup.disarm();
         Ok(())
     } else {
-        registry.shutdown()
+        registry.shutdown().map_err(|error| match error {
+            DaemonError::Validation(source)
+            | DaemonError::Protocol(source)
+            | DaemonError::Internal(source)
+            | DaemonError::Lifecycle { source, .. }
+            | DaemonError::Persistence { source, .. } => source,
+        })
     };
     drop(registry);
     drop(listener);
@@ -438,36 +444,116 @@ fn run_daemon(
 }
 
 struct RestartRequest {
-    reply: SyncSender<io::Result<()>>,
+    reply: SyncSender<DaemonResult<()>>,
     notification_settings: Option<NotificationDeliverySettings>,
 }
 
 #[derive(Debug)]
-struct PersistenceError(io::Error);
-
-#[derive(Debug)]
-struct DaemonCodeError {
-    code: ErrorCode,
-    message: String,
+enum DaemonError {
+    Validation(io::Error),
+    Lifecycle { code: ErrorCode, source: io::Error },
+    Persistence { message: String, source: io::Error },
+    Protocol(io::Error),
+    Internal(io::Error),
 }
 
-impl std::fmt::Display for DaemonCodeError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.message)
+type DaemonResult<T> = Result<T, DaemonError>;
+
+impl DaemonError {
+    fn validation(message: impl Into<String>) -> Self {
+        Self::Validation(io::Error::new(io::ErrorKind::InvalidInput, message.into()))
+    }
+
+    fn lifecycle(code: ErrorCode, message: impl Into<String>) -> Self {
+        Self::Lifecycle {
+            code,
+            source: io::Error::other(message.into()),
+        }
+    }
+
+    fn protocol(message: impl Into<String>) -> Self {
+        Self::Protocol(io::Error::new(io::ErrorKind::InvalidData, message.into()))
+    }
+
+    fn persistence(source: io::Error) -> Self {
+        Self::Persistence {
+            message: source.to_string(),
+            source,
+        }
+    }
+
+    fn persistence_context(source: io::Error, message: impl Into<String>) -> Self {
+        Self::Persistence {
+            message: message.into(),
+            source,
+        }
+    }
+
+    fn wire_code(&self) -> ErrorCode {
+        match self {
+            Self::Validation(_) => ErrorCode::InvalidArgument,
+            Self::Lifecycle { code, .. } => *code,
+            Self::Persistence { .. } => ErrorCode::PersistenceFailed,
+            Self::Protocol(_) => ErrorCode::UnsupportedVersion,
+            Self::Internal(_) => ErrorCode::Internal,
+        }
+    }
+
+    fn into_response(self) -> Response {
+        error_response(self.wire_code(), self.to_string())
     }
 }
 
-impl std::error::Error for DaemonCodeError {}
-
-impl std::fmt::Display for PersistenceError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(formatter)
+impl From<io::Error> for DaemonError {
+    fn from(source: io::Error) -> Self {
+        match source.kind() {
+            io::ErrorKind::InvalidInput | io::ErrorKind::InvalidData => Self::Validation(source),
+            io::ErrorKind::NotFound => Self::Lifecycle {
+                code: ErrorCode::NotFound,
+                source,
+            },
+            io::ErrorKind::AlreadyExists => Self::Lifecycle {
+                code: ErrorCode::AlreadyExists,
+                source,
+            },
+            io::ErrorKind::WouldBlock | io::ErrorKind::AddrInUse => Self::Lifecycle {
+                code: ErrorCode::Busy,
+                source,
+            },
+            io::ErrorKind::ConnectionAborted => Self::Lifecycle {
+                code: ErrorCode::DaemonStopping,
+                source,
+            },
+            io::ErrorKind::TimedOut => Self::Lifecycle {
+                code: ErrorCode::Timeout,
+                source,
+            },
+            _ => Self::Internal(source),
+        }
     }
 }
 
-impl std::error::Error for PersistenceError {
+impl std::fmt::Display for DaemonError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Persistence { message, .. } => formatter.write_str(message),
+            Self::Validation(source)
+            | Self::Protocol(source)
+            | Self::Internal(source)
+            | Self::Lifecycle { source, .. } => source.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for DaemonError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.0)
+        match self {
+            Self::Persistence { source, .. }
+            | Self::Validation(source)
+            | Self::Protocol(source)
+            | Self::Internal(source)
+            | Self::Lifecycle { source, .. } => Some(source),
+        }
     }
 }
 
@@ -541,7 +627,7 @@ fn launch_replacement(
     daemon_lock: &File,
     registry: &DaemonService,
     notification_settings: Option<NotificationDeliverySettings>,
-) -> io::Result<()> {
+) -> DaemonResult<()> {
     let _mutation = lock(&registry.mutation_lock)?;
     registry.ensure_running()?;
     registry.runtimes.begin_stopping();
@@ -573,6 +659,7 @@ fn launch_replacement(
                 notification_settings,
             },
         )
+        .map_err(DaemonError::from)
     })();
     if result.is_err() {
         registry.runtimes.cancel_stopping();
@@ -729,14 +816,12 @@ fn handle_connection(
         return send_response(
             &mut stream,
             protocol::PROTOCOL_VERSION,
-            error_response(
-                ErrorCode::UnsupportedVersion,
-                format!(
-                    "protocol version {} is unsupported; expected {}",
-                    request.version,
-                    protocol::PROTOCOL_VERSION
-                ),
-            ),
+            DaemonError::protocol(format!(
+                "protocol version {} is unsupported; expected {}",
+                request.version,
+                protocol::PROTOCOL_VERSION
+            ))
+            .into_response(),
         );
     }
     let response_version = request.version;
@@ -746,10 +831,7 @@ fn handle_connection(
         return send_response(
             &mut stream,
             response_version,
-            error_response(
-                ErrorCode::UnsupportedVersion,
-                unsupported_request_message(feature),
-            ),
+            DaemonError::protocol(unsupported_request_message(feature)).into_response(),
         );
     }
 
@@ -787,10 +869,11 @@ fn handle_connection(
             return send_response(
                 &mut stream,
                 response_version,
-                error_response(
+                DaemonError::lifecycle(
                     ErrorCode::Busy,
                     "another daemon transition is already in progress",
-                ),
+                )
+                .into_response(),
             );
         }
         return match registry.shutdown() {
@@ -803,10 +886,11 @@ fn handle_connection(
                 send_response(
                     &mut stream,
                     response_version,
-                    error_response(
-                        error_code(&error),
+                    DaemonError::lifecycle(
+                        error.wire_code(),
                         format!("could not stop Boomux daemon: {error}"),
-                    ),
+                    )
+                    .into_response(),
                 )
             }
         };
@@ -831,7 +915,8 @@ fn handle_connection(
             return send_response(
                 &mut stream,
                 response_version,
-                error_response(ErrorCode::Busy, "daemon restart is already in progress"),
+                DaemonError::lifecycle(ErrorCode::Busy, "daemon restart is already in progress")
+                    .into_response(),
             );
         }
         let (reply, response) = mpsc::sync_channel(1);
@@ -847,25 +932,22 @@ fn handle_connection(
         }
         return match response.recv_timeout(RESTART_TIMEOUT) {
             Ok(Ok(())) => send_response(&mut stream, response_version, Response::Ok),
-            Ok(Err(error)) => send_response(
-                &mut stream,
-                response_version,
-                error_response(error_code(&error), error.to_string()),
-            ),
+            Ok(Err(error)) => send_response(&mut stream, response_version, error.into_response()),
             Err(error) => send_response(
                 &mut stream,
                 response_version,
-                error_response(
+                DaemonError::lifecycle(
                     ErrorCode::Timeout,
                     format!("daemon restart timed out: {error}"),
-                ),
+                )
+                .into_response(),
             ),
         };
     }
 
     let response = match registry.dispatch(request.message) {
         Ok(response) => response,
-        Err(error) => error_response(error_code(&error), error.to_string()),
+        Err(error) => error.into_response(),
     };
     send_response(
         &mut stream,
@@ -1059,46 +1141,15 @@ fn send_response(stream: &mut UnixStream, version: u32, response: Response) -> i
     protocol::write_message(stream, &Envelope::with_version(version, response))
 }
 
+fn send_daemon_error(stream: &mut UnixStream, version: u32, error: DaemonError) -> io::Result<()> {
+    send_response(stream, version, error.into_response())
+}
+
 fn error_response(code: ErrorCode, message: impl Into<String>) -> Response {
     Response::Error {
         message: message.into(),
         code: Some(code),
     }
-}
-
-fn error_code(error: &io::Error) -> ErrorCode {
-    if let Some(error) = error
-        .get_ref()
-        .and_then(|error| error.downcast_ref::<DaemonCodeError>())
-    {
-        return error.code;
-    }
-    if error
-        .get_ref()
-        .is_some_and(|error| error.downcast_ref::<PersistenceError>().is_some())
-    {
-        return ErrorCode::PersistenceFailed;
-    }
-    match error.kind() {
-        io::ErrorKind::InvalidInput | io::ErrorKind::InvalidData => ErrorCode::InvalidArgument,
-        io::ErrorKind::NotFound => ErrorCode::NotFound,
-        io::ErrorKind::AlreadyExists => ErrorCode::AlreadyExists,
-        io::ErrorKind::WouldBlock | io::ErrorKind::AddrInUse => ErrorCode::Busy,
-        io::ErrorKind::ConnectionAborted => ErrorCode::DaemonStopping,
-        io::ErrorKind::TimedOut => ErrorCode::Timeout,
-        _ => ErrorCode::Internal,
-    }
-}
-
-fn persistence_error(error: io::Error) -> io::Error {
-    io::Error::new(error.kind(), PersistenceError(error))
-}
-
-fn coded_error(code: ErrorCode, message: impl Into<String>) -> io::Error {
-    io::Error::other(DaemonCodeError {
-        code,
-        message: message.into(),
-    })
 }
 
 struct DaemonService {
@@ -1555,14 +1606,14 @@ impl EventStream {
         &self,
         wait_ms: u32,
         stopping: impl Fn() -> bool,
-        mut inspect: impl FnMut(bool) -> io::Result<Option<T>>,
-    ) -> io::Result<T> {
+        mut inspect: impl FnMut(bool) -> DaemonResult<Option<T>>,
+    ) -> DaemonResult<T> {
         let deadline =
             Instant::now() + Duration::from_millis(u64::from(wait_ms)).min(MAX_EVENT_WAIT);
         let mut state = lock(&self.state)?;
         loop {
             if stopping() {
-                return Err(coded_error(
+                return Err(DaemonError::lifecycle(
                     ErrorCode::DaemonStopping,
                     "Boomux daemon is stopping",
                 ));
@@ -1628,7 +1679,7 @@ impl EventStream {
         limit: usize,
         wait_ms: u32,
         stopping: impl Fn() -> bool,
-    ) -> io::Result<Response> {
+    ) -> DaemonResult<Response> {
         let deadline =
             Instant::now() + Duration::from_millis(u64::from(wait_ms)).min(MAX_EVENT_WAIT);
         let mut state = lock(&self.state)?;
@@ -1641,7 +1692,7 @@ impl EventStream {
                 || after.event_id < earliest
                 || after.event_id > state.latest_id
             {
-                return Err(coded_error(
+                return Err(DaemonError::lifecycle(
                     ErrorCode::CursorExpired,
                     "event cursor is no longer available",
                 ));
@@ -1666,7 +1717,7 @@ impl EventStream {
                 });
             }
             if stopping() {
-                return Err(coded_error(
+                return Err(DaemonError::lifecycle(
                     ErrorCode::DaemonStopping,
                     "Boomux daemon is stopping",
                 ));
@@ -1812,23 +1863,9 @@ impl DurableRegistry {
             return Ok(None);
         }
 
-        let executable = if shell.command.is_empty() {
-            integration.clone()
-        } else if shell.command.len() == 1
-            && Path::new(&shell.command[0])
-                .file_name()
-                .and_then(|name| name.to_str())
-                == Some(integration.as_str())
-        {
-            shell.command[0].clone()
-        } else {
-            return Ok(None);
-        };
-        Ok(Some(vec![
-            executable,
-            "--session".into(),
-            external_session_id.clone(),
-        ]))
+        Ok(crate::integrations::by_key(integration)
+            .and_then(|descriptor| descriptor.resume)
+            .and_then(|resume| resume.command(&shell.command, external_session_id)))
     }
 
     fn notification_context(&self, workspace_id: &str, shell_id: &str) -> (String, String) {
@@ -2128,7 +2165,7 @@ impl DurableRegistry {
         shell_id: &str,
         run_id: &str,
         spec: AgentRegistrationSpec,
-    ) -> io::Result<(AgentInstanceSnapshot, DurableUndo)> {
+    ) -> DaemonResult<(AgentInstanceSnapshot, DurableUndo)> {
         validate_agent_registration(&spec)?;
         validate_external_agent_authority(spec.report.authority)?;
         let shell = self.shell(shell_id)?;
@@ -2165,13 +2202,13 @@ impl DurableRegistry {
         let snapshot = agent.snapshot()?;
         let mut state = lock(&self.state)?;
         let Some(current_shell) = state.shells.get(shell_id) else {
-            return Err(not_found("shell", shell_id));
+            return Err(not_found("shell", shell_id).into());
         };
         let Some(current_workspace) = state.workspaces.get(&shell.workspace_id) else {
-            return Err(not_found("workspace", &shell.workspace_id));
+            return Err(not_found("workspace", &shell.workspace_id).into());
         };
         if !Arc::ptr_eq(current_shell, &shell) || !Arc::ptr_eq(current_workspace, &workspace) {
-            return Err(not_found("shell", shell_id));
+            return Err(not_found("shell", shell_id).into());
         }
         let lifecycle = lock(&shell.lifecycle)?;
         match &*lifecycle {
@@ -2179,12 +2216,12 @@ impl DurableRegistry {
             ShellLifecycle::Running { .. }
             | ShellLifecycle::Exited { .. }
             | ShellLifecycle::Pending => {
-                return Err(coded_error(
+                return Err(DaemonError::lifecycle(
                     ErrorCode::RunChanged,
                     "shell does not have the requested active run",
                 ));
             }
-            ShellLifecycle::Closed => return Err(not_found("shell", shell_id)),
+            ShellLifecycle::Closed => return Err(not_found("shell", shell_id).into()),
         }
         let mut agent_ids = lock(&workspace.agent_ids)?;
         state.agents.insert(agent.id.clone(), Arc::clone(&agent));
@@ -2200,7 +2237,7 @@ impl DurableRegistry {
         shell_id: &str,
         run_id: &str,
         spec: AgentRegistrationSpec,
-    ) -> io::Result<(AgentInstanceSnapshot, bool, Option<DurableUndo>)> {
+    ) -> DaemonResult<(AgentInstanceSnapshot, bool, Option<DurableUndo>)> {
         validate_agent_registration(&spec)?;
         validate_external_agent_authority(spec.report.authority)?;
         let external_session_id = spec.external_session_id.as_deref().ok_or_else(|| {
@@ -2239,7 +2276,8 @@ impl DurableRegistry {
                         return Err(io::Error::new(
                             io::ErrorKind::AlreadyExists,
                             "multiple agent instances match the ensured identity",
-                        ));
+                        )
+                        .into());
                     }
                 }
             }
@@ -2256,12 +2294,12 @@ impl DurableRegistry {
         agent_id: &str,
         run_id: &str,
         report: AgentReport,
-    ) -> io::Result<(AgentInstanceSnapshot, bool, bool, Option<DurableUndo>)> {
+    ) -> DaemonResult<(AgentInstanceSnapshot, bool, bool, Option<DurableUndo>)> {
         validate_agent_report(&report)?;
         validate_external_agent_authority(report.authority)?;
         let agent = self.agent(agent_id)?;
         if agent.run_id != run_id {
-            return Err(coded_error(
+            return Err(DaemonError::lifecycle(
                 ErrorCode::RunChanged,
                 "agent instance is bound to a different shell run",
             ));
@@ -2274,7 +2312,8 @@ impl DurableRegistry {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "completed agent instance cannot be reported again",
-            ));
+            )
+            .into());
         }
         let repeated_working = state.observation.state == AgentState::Working
             && report.state == AgentState::Working
@@ -2325,14 +2364,14 @@ impl DurableRegistry {
         &self,
         agent_id: &str,
         observation_revision: u64,
-    ) -> io::Result<(AgentInstanceSnapshot, bool, Option<DurableUndo>)> {
+    ) -> DaemonResult<(AgentInstanceSnapshot, bool, Option<DurableUndo>)> {
         let agent = self.agent(agent_id)?;
         let mut state = lock(&agent.state)?;
         let Some(attention) = &state.attention else {
             return Ok((agent.snapshot_from(&state), false, None));
         };
         if attention.observation.revision != observation_revision {
-            return Err(coded_error(
+            return Err(DaemonError::lifecycle(
                 ErrorCode::RevisionAhead,
                 format!(
                     "agent attention observation revision is {}; acknowledgment supplied {}",
@@ -2705,10 +2744,9 @@ impl ShellRuntimeManager {
         expected_run_id: Option<&str>,
         after_revision: Option<u64>,
         wait_ms: u32,
-    ) -> io::Result<Response> {
+    ) -> DaemonResult<Response> {
         if expected_run_id.is_some() != after_revision.is_some() {
-            return Err(coded_error(
-                ErrorCode::InvalidArgument,
+            return Err(DaemonError::validation(
                 "run_id and after_revision must be provided together",
             ));
         }
@@ -2720,7 +2758,7 @@ impl ShellRuntimeManager {
             let (status, run, runtime, terminal) = match &*lifecycle {
                 ShellLifecycle::Pending => {
                     if expected_run_id.is_some() {
-                        return Err(coded_error(
+                        return Err(DaemonError::lifecycle(
                             ErrorCode::RunChanged,
                             "shell no longer has the requested run",
                         ));
@@ -2750,7 +2788,7 @@ impl ShellRuntimeManager {
                     None,
                     Arc::clone(terminal),
                 ),
-                ShellLifecycle::Closed => return Err(not_found("shell", shell_id)),
+                ShellLifecycle::Closed => return Err(not_found("shell", shell_id).into()),
             };
             drop(lifecycle);
             let terminal_state = lock(&terminal)?;
@@ -2797,13 +2835,13 @@ impl ShellRuntimeManager {
                 continue;
             }
             if expected_run_id.is_some_and(|expected| expected != run.id) {
-                return Err(coded_error(
+                return Err(DaemonError::lifecycle(
                     ErrorCode::RunChanged,
                     "shell run identity changed",
                 ));
             }
             if after_revision.is_some_and(|after| after > revision) {
-                return Err(coded_error(
+                return Err(DaemonError::lifecycle(
                     ErrorCode::RevisionAhead,
                     "requested output revision is ahead of the current run",
                 ));
@@ -2827,7 +2865,7 @@ impl ShellRuntimeManager {
                 });
             }
             if self.is_stopping() {
-                return Err(coded_error(
+                return Err(DaemonError::lifecycle(
                     ErrorCode::DaemonStopping,
                     "Boomux daemon is stopping",
                 ));
@@ -2835,7 +2873,7 @@ impl ShellRuntimeManager {
             let runtime = runtime.expect("running shell has a runtime");
             let wait = lock(&runtime.output_wait)?;
             if self.is_stopping() {
-                return Err(coded_error(
+                return Err(DaemonError::lifecycle(
                     ErrorCode::DaemonStopping,
                     "Boomux daemon is stopping",
                 ));
@@ -3861,7 +3899,8 @@ fn resume_identity(
         || agent.shell_id != shell.id
         || agent.run_id != previous_run.id
         || agent.cwd.as_ref() != Some(&shell.cwd)
-        || !matches!(agent.integration.as_str(), "opencode" | "pi")
+        || !crate::integrations::by_key(&agent.integration)
+            .is_some_and(|descriptor| descriptor.resume.is_some())
     {
         return Ok(None);
     }
@@ -3909,7 +3948,7 @@ impl DaemonService {
         self.durable.agent_resume_command(shell, previous_run)
     }
 
-    fn dispatch(&self, request: Request) -> io::Result<Response> {
+    fn dispatch(&self, request: Request) -> DaemonResult<Response> {
         match request {
             Request::Ping => Ok(Response::Pong),
             Request::Restart | Request::RestartWithNotificationConfig { .. } => {
@@ -4110,18 +4149,21 @@ impl DaemonService {
             } => self.read_events(after.as_ref(), limit, wait_ms),
             Request::RenameWorkspace { workspace_id, name } => {
                 self.durable_mutation_outcome(|undo| {
-                    self.rename_workspace_mutation(undo, &workspace_id, name)
-                        .map(|mutation| mutation.map(|()| Response::Ok))
+                    Ok(self
+                        .rename_workspace_mutation(undo, &workspace_id, name)?
+                        .map(|()| Response::Ok))
                 })
             }
             Request::RenameShell { shell_id, name } => self.durable_mutation_outcome(|undo| {
-                self.rename_shell_mutation(undo, &shell_id, name)
-                    .map(|mutation| mutation.map(|()| Response::Ok))
+                Ok(self
+                    .rename_shell_mutation(undo, &shell_id, name)?
+                    .map(|()| Response::Ok))
             }),
             Request::RenameLauncher { launcher_id, name } => {
                 self.durable_mutation_outcome(|undo| {
-                    self.rename_launcher_mutation(undo, &launcher_id, name)
-                        .map(|mutation| mutation.map(|()| Response::Ok))
+                    Ok(self
+                        .rename_launcher_mutation(undo, &launcher_id, name)?
+                        .map(|()| Response::Ok))
                 })
             }
             Request::CloseWorkspace { workspace_id } => {
@@ -4154,7 +4196,7 @@ impl DaemonService {
         after: Option<&EventCursor>,
         limit: u16,
         wait_ms: u32,
-    ) -> io::Result<Response> {
+    ) -> DaemonResult<Response> {
         let limit = usize::from(limit.clamp(1, MAX_EVENT_BATCH));
         if after.is_none() {
             let _mutation = lock(&self.mutation_lock)?;
@@ -4521,8 +4563,8 @@ impl ShellRuntimeManager {
 impl DaemonService {
     fn durable_mutation<T>(
         &self,
-        operation: impl FnOnce(&mut DurableUndoLog) -> io::Result<(T, Vec<DaemonEventKind>)>,
-    ) -> io::Result<T> {
+        operation: impl FnOnce(&mut DurableUndoLog) -> DaemonResult<(T, Vec<DaemonEventKind>)>,
+    ) -> DaemonResult<T> {
         self.durable_mutation_outcome(|undo| {
             let (value, events) = operation(undo)?;
             Ok(DurableMutation::Changed(value, events))
@@ -4531,8 +4573,8 @@ impl DaemonService {
 
     fn durable_mutation_outcome<T>(
         &self,
-        operation: impl FnOnce(&mut DurableUndoLog) -> io::Result<DurableMutation<T>>,
-    ) -> io::Result<T> {
+        operation: impl FnOnce(&mut DurableUndoLog) -> DaemonResult<DurableMutation<T>>,
+    ) -> DaemonResult<T> {
         let mutation = lock(&self.mutation_lock)?;
         self.ensure_running()?;
         self.flush_pending()?;
@@ -4543,7 +4585,7 @@ impl DaemonService {
         #[cfg(test)]
         let outcome = if !undo.is_empty() && self.fail_after_mutation.swap(false, Ordering::AcqRel)
         {
-            Err(io::Error::other("injected post-mutation failure"))
+            Err(io::Error::other("injected post-mutation failure").into())
         } else {
             outcome
         };
@@ -4551,22 +4593,34 @@ impl DaemonService {
             Ok(DurableMutation::Unchanged(value)) if undo.is_empty() => Ok(value),
             Ok(DurableMutation::Unchanged(_)) => {
                 let error = io::Error::other("unchanged durable mutation recorded undo");
-                Err(Self::mutation_failure(error, undo.rollback(&self.durable)))
+                Err(Self::mutation_failure(
+                    error.into(),
+                    undo.rollback(&self.durable),
+                ))
             }
             Ok(DurableMutation::Changed(value, kinds)) if !undo.is_empty() => {
                 if let Err(error) = transaction.reserve_with_pending(kinds.len()) {
-                    return Err(Self::mutation_failure(error, undo.rollback(&self.durable)));
+                    return Err(Self::mutation_failure(
+                        error.into(),
+                        undo.rollback(&self.durable),
+                    ));
                 }
                 let notifications = self.notification_requests(&kinds, &undo);
                 let saved = match self.capture_persisted_state() {
                     Ok(saved) => saved,
                     Err(error) => {
-                        return Err(Self::mutation_failure(error, undo.rollback(&self.durable)));
+                        return Err(Self::mutation_failure(
+                            error.into(),
+                            undo.rollback(&self.durable),
+                        ));
                     }
                 };
                 transaction.begin_persistence(kinds.len());
                 drop(transaction);
-                match self.write_persisted_state(saved).map_err(persistence_error) {
+                match self
+                    .write_persisted_state(saved)
+                    .map_err(DaemonError::persistence)
+                {
                     Ok(()) => {
                         let mut transaction = self.events.transaction()?;
                         transaction.append_batch(kinds);
@@ -4590,20 +4644,45 @@ impl DaemonService {
                     }
                 }
             }
-            Ok(DurableMutation::Changed(_, _)) => Err(io::Error::other(
-                "changed durable mutation did not record undo",
-            )),
+            Ok(DurableMutation::Changed(_, _)) => {
+                Err(io::Error::other("changed durable mutation did not record undo").into())
+            }
             Err(error) => Err(Self::mutation_failure(error, undo.rollback(&self.durable))),
         }
     }
 
-    fn mutation_failure(primary: io::Error, rollback: io::Result<()>) -> io::Error {
+    fn mutation_failure(primary: DaemonError, rollback: io::Result<()>) -> DaemonError {
         match rollback {
             Ok(()) => primary,
-            Err(rollback) => io::Error::new(
-                primary.kind(),
-                format!("{primary}; durable rollback also failed: {rollback}"),
+            Err(rollback) => Self::append_error_context(
+                primary,
+                format!("durable rollback also failed: {rollback}"),
             ),
+        }
+    }
+
+    fn append_error_context(primary: DaemonError, context: String) -> DaemonError {
+        match primary {
+            DaemonError::Validation(source) => DaemonError::Validation(io::Error::new(
+                source.kind(),
+                format!("{source}; {context}"),
+            )),
+            DaemonError::Lifecycle { code, source } => DaemonError::Lifecycle {
+                code,
+                source: io::Error::new(source.kind(), format!("{source}; {context}")),
+            },
+            DaemonError::Persistence { message, source } => DaemonError::Persistence {
+                message: format!("{message}; {context}"),
+                source,
+            },
+            DaemonError::Protocol(source) => DaemonError::Protocol(io::Error::new(
+                source.kind(),
+                format!("{source}; {context}"),
+            )),
+            DaemonError::Internal(source) => DaemonError::Internal(io::Error::new(
+                source.kind(),
+                format!("{source}; {context}"),
+            )),
         }
     }
 
@@ -4681,7 +4760,7 @@ impl DaemonService {
         self.durable.notification_context(workspace_id, shell_id)
     }
 
-    fn flush_pending(&self) -> io::Result<bool> {
+    fn flush_pending(&self) -> DaemonResult<bool> {
         let _persistence = lock(&self.durable.persist_lock)?;
         let mut transaction = self.events.transaction()?;
         if transaction.pending_durable_batch_count() == 0
@@ -4696,7 +4775,10 @@ impl DaemonService {
         let pending = transaction.take_pending_durable(pending_count);
         transaction.begin_persistence(count);
         drop(transaction);
-        if let Err(error) = self.write_persisted_state(saved).map_err(persistence_error) {
+        if let Err(error) = self
+            .write_persisted_state(saved)
+            .map_err(DaemonError::persistence)
+        {
             let mut transaction = self.events.transaction()?;
             transaction.restore_pending_durable(pending);
             transaction.finish_persistence();
@@ -4753,12 +4835,12 @@ impl DaemonService {
         failure.map_or(Ok(()), Err)
     }
 
-    fn lifecycle_failure(primary: io::Error, compensation: io::Result<()>) -> io::Error {
+    fn lifecycle_failure(primary: DaemonError, compensation: io::Result<()>) -> DaemonError {
         match compensation {
             Ok(()) => primary,
-            Err(compensation) => io::Error::new(
-                primary.kind(),
-                format!("{primary}; lifecycle compensation also failed: {compensation}"),
+            Err(compensation) => Self::append_error_context(
+                primary,
+                format!("lifecycle compensation also failed: {compensation}"),
             ),
         }
     }
@@ -4866,7 +4948,7 @@ impl DaemonService {
         let saved = self.capture_persisted_state()?;
         transaction.begin_persistence(event_count);
         drop(transaction);
-        match self.write_persisted_state(saved).map_err(persistence_error) {
+        match self.write_persisted_state(saved) {
             Ok(()) => {
                 let mut transaction = self.events.transaction()?;
                 transaction.append_pending_durable();
@@ -5024,10 +5106,10 @@ impl DaemonService {
     fn lifecycle_transaction(
         &self,
         stopping: bool,
-        select_shells: impl FnOnce() -> io::Result<Vec<Arc<Shell>>>,
-        durable_apply: impl FnOnce() -> io::Result<Option<DurableUndo>>,
+        select_shells: impl FnOnce() -> DaemonResult<Vec<Arc<Shell>>>,
+        durable_apply: impl FnOnce() -> DaemonResult<Option<DurableUndo>>,
         committed_events: impl FnOnce(&[Arc<Shell>]) -> Vec<DaemonEventKind>,
-    ) -> io::Result<()> {
+    ) -> DaemonResult<()> {
         let _mutation = lock(&self.mutation_lock)?;
         if stopping {
             if !self.runtimes.begin_stopping() {
@@ -5055,14 +5137,14 @@ impl DaemonService {
                 if stopping {
                     self.runtimes.cancel_stopping();
                 }
-                return Err(error);
+                return Err(error.into());
             }
         };
         if let Err(error) = transaction.reserve_with_pending(lifecycle_event_capacity) {
             if stopping {
                 self.runtimes.cancel_stopping();
             }
-            return Err(error);
+            return Err(error.into());
         }
         transaction.begin_lifecycle_reservation(lifecycle_event_capacity);
         drop(transaction);
@@ -5079,7 +5161,7 @@ impl DaemonService {
                 if stopping {
                     self.runtimes.cancel_stopping();
                 }
-                return Err(Self::lifecycle_failure(error.source, compensation));
+                return Err(Self::lifecycle_failure(error.source.into(), compensation));
             }
             stopped.push(Arc::clone(shell));
         }
@@ -5101,7 +5183,7 @@ impl DaemonService {
                 if stopping {
                     self.runtimes.cancel_stopping();
                 }
-                return Err(Self::lifecycle_failure(error, compensation));
+                return Err(Self::lifecycle_failure(error.into(), compensation));
             }
         };
         let mut transaction = self.events.transaction()?;
@@ -5122,7 +5204,7 @@ impl DaemonService {
                         self.runtimes.cancel_stopping();
                     }
                     transaction.finish_lifecycle_reservation();
-                    return Err(Self::lifecycle_failure(error, compensation));
+                    return Err(Self::lifecycle_failure(error.into(), compensation));
                 }
             }
         }
@@ -5147,7 +5229,7 @@ impl DaemonService {
                 }
                 transaction.finish_lifecycle_reservation();
                 return Err(Self::lifecycle_failure(
-                    Self::lifecycle_failure(error, durable),
+                    Self::lifecycle_failure(error.into(), durable),
                     runtime,
                 ));
             }
@@ -5158,7 +5240,10 @@ impl DaemonService {
         );
         transaction.begin_persistence(committed_events.len());
         drop(transaction);
-        if let Err(error) = self.write_persisted_state(saved).map_err(persistence_error) {
+        if let Err(error) = self
+            .write_persisted_state(saved)
+            .map_err(DaemonError::persistence)
+        {
             let mut transaction = self.events.transaction()?;
             let durable = undo.map_or(Ok(()), |undo| self.durable.rollback(undo));
             let runtime = self.restore_finalized_locked(rollbacks, &mut transaction);
@@ -5181,8 +5266,13 @@ impl DaemonService {
         Ok(())
     }
 
-    fn shutdown(&self) -> io::Result<()> {
-        self.lifecycle_transaction(true, || self.durable.shells(), || Ok(None), |_| Vec::new())
+    fn shutdown(&self) -> DaemonResult<()> {
+        self.lifecycle_transaction(
+            true,
+            || Ok(self.durable.shells()?),
+            || Ok(None),
+            |_| Vec::new(),
+        )
     }
 
     fn workspace(&self, id: &str) -> io::Result<Arc<Workspace>> {
@@ -5283,7 +5373,7 @@ impl DaemonService {
         shell_id: &str,
         run_id: &str,
         spec: AgentRegistrationSpec,
-    ) -> io::Result<AgentInstanceSnapshot> {
+    ) -> DaemonResult<AgentInstanceSnapshot> {
         self.durable
             .register_agent(shell_id, run_id, spec)
             .map(|(snapshot, _)| snapshot)
@@ -5295,7 +5385,7 @@ impl DaemonService {
         shell_id: &str,
         run_id: &str,
         spec: AgentRegistrationSpec,
-    ) -> io::Result<AgentInstanceSnapshot> {
+    ) -> DaemonResult<AgentInstanceSnapshot> {
         let (snapshot, record) = self.durable.register_agent(shell_id, run_id, spec)?;
         undo.record(record);
         Ok(snapshot)
@@ -5307,7 +5397,7 @@ impl DaemonService {
         shell_id: &str,
         run_id: &str,
         spec: AgentRegistrationSpec,
-    ) -> io::Result<(AgentInstanceSnapshot, bool)> {
+    ) -> DaemonResult<(AgentInstanceSnapshot, bool)> {
         self.durable
             .ensure_agent(shell_id, run_id, spec)
             .map(|(snapshot, created, _)| (snapshot, created))
@@ -5319,7 +5409,7 @@ impl DaemonService {
         agent_id: &str,
         run_id: &str,
         report: AgentReport,
-    ) -> io::Result<(AgentInstanceSnapshot, bool, bool)> {
+    ) -> DaemonResult<(AgentInstanceSnapshot, bool, bool)> {
         self.durable
             .report_agent(agent_id, run_id, report)
             .map(|(snapshot, changed, completed, _)| (snapshot, changed, completed))
@@ -5331,7 +5421,7 @@ impl DaemonService {
         agent_id: &str,
         run_id: &str,
         report: AgentReport,
-    ) -> io::Result<(AgentInstanceSnapshot, bool, bool)> {
+    ) -> DaemonResult<(AgentInstanceSnapshot, bool, bool)> {
         let (snapshot, changed, completed, record) =
             self.durable.report_agent(agent_id, run_id, report)?;
         if let Some(record) = record {
@@ -5345,7 +5435,7 @@ impl DaemonService {
         &self,
         agent_id: &str,
         observation_revision: u64,
-    ) -> io::Result<(AgentInstanceSnapshot, bool)> {
+    ) -> DaemonResult<(AgentInstanceSnapshot, bool)> {
         self.durable
             .acknowledge_agent_attention(agent_id, observation_revision)
             .map(|(snapshot, changed, _)| (snapshot, changed))
@@ -5356,7 +5446,7 @@ impl DaemonService {
         undo: &mut DurableUndoLog,
         agent_id: &str,
         observation_revision: u64,
-    ) -> io::Result<(AgentInstanceSnapshot, bool)> {
+    ) -> DaemonResult<(AgentInstanceSnapshot, bool)> {
         let (snapshot, changed, record) = self
             .durable
             .acknowledge_agent_attention(agent_id, observation_revision)?;
@@ -5491,7 +5581,7 @@ impl DaemonService {
         agent_id: &str,
         after_revision: u64,
         wait_ms: u32,
-    ) -> io::Result<Response> {
+    ) -> DaemonResult<Response> {
         self.events.wait_for(
             wait_ms,
             || self.runtimes.is_stopping(),
@@ -5505,7 +5595,7 @@ impl DaemonService {
                     }));
                 }
                 if after_revision > revision {
-                    return Err(coded_error(
+                    return Err(DaemonError::lifecycle(
                         ErrorCode::RevisionAhead,
                         "requested Agent revision is ahead of the current observation",
                     ));
@@ -5528,7 +5618,7 @@ impl DaemonService {
         expected_run_id: Option<&str>,
         after_revision: Option<u64>,
         wait_ms: u32,
-    ) -> io::Result<Response> {
+    ) -> DaemonResult<Response> {
         self.runtimes.read_shell_at(
             self,
             shell_id,
@@ -5608,11 +5698,11 @@ impl DaemonService {
         })
     }
 
-    fn close_shell(&self, shell_id: &str) -> io::Result<()> {
+    fn close_shell(&self, shell_id: &str) -> DaemonResult<()> {
         self.lifecycle_transaction(
             false,
             || Ok(vec![self.shell(shell_id)?]),
-            || self.remove_shell_mutation(shell_id).map(Some),
+            || Ok(Some(self.remove_shell_mutation(shell_id)?)),
             |shells| {
                 vec![DaemonEventKind::ShellClosed {
                     workspace_id: shells.first().map(|shell| shell.workspace_id.clone()),
@@ -5622,14 +5712,14 @@ impl DaemonService {
         )
     }
 
-    fn close_workspace(&self, workspace_id: &str) -> io::Result<()> {
+    fn close_workspace(&self, workspace_id: &str) -> DaemonResult<()> {
         self.lifecycle_transaction(
             false,
             || {
                 let workspace = self.workspace(workspace_id)?;
-                self.durable.workspace_shells(&workspace)
+                Ok(self.durable.workspace_shells(&workspace)?)
             },
-            || self.remove_workspace_mutation(workspace_id).map(Some),
+            || Ok(Some(self.remove_workspace_mutation(workspace_id)?)),
             |_| {
                 vec![DaemonEventKind::WorkspaceClosed {
                     workspace_id: workspace_id.into(),
@@ -5638,7 +5728,7 @@ impl DaemonService {
         )
     }
 
-    fn restart_shell(&self, shell_id: &str) -> io::Result<ShellSnapshot> {
+    fn restart_shell(&self, shell_id: &str) -> DaemonResult<ShellSnapshot> {
         let _mutation = lock(&self.mutation_lock)?;
         self.ensure_running()?;
         let shell = self.shell(shell_id)?;
@@ -5647,16 +5737,16 @@ impl DaemonService {
             let old_runtime = match &*lifecycle {
                 ShellLifecycle::Pending => {
                     drop(lifecycle);
-                    return shell.snapshot();
+                    return Ok(shell.snapshot()?);
                 }
                 ShellLifecycle::Running { .. } => {
-                    return Err(coded_error(
+                    return Err(DaemonError::lifecycle(
                         ErrorCode::Busy,
                         format!("shell is still running: {shell_id}"),
                     ));
                 }
                 ShellLifecycle::Exited { runtime, .. } => runtime.clone(),
-                ShellLifecycle::Closed => return Err(not_found("shell", shell_id)),
+                ShellLifecycle::Closed => return Err(not_found("shell", shell_id).into()),
             };
             *lifecycle = ShellLifecycle::Pending;
             old_runtime
@@ -5664,7 +5754,7 @@ impl DaemonService {
         if let Some(runtime) = old_runtime {
             self.runtimes.stop_reader(&runtime)?;
         }
-        shell.snapshot()
+        Ok(shell.snapshot()?)
     }
 }
 
@@ -6319,29 +6409,17 @@ impl ShellRuntimeManager {
             environment,
         } = options;
         if let Err(error) = validate_terminal_profile(&profile) {
-            return send_response(
-                &mut stream,
-                response_version,
-                error_response(ErrorCode::InvalidArgument, error.to_string()),
-            );
+            return send_daemon_error(&mut stream, response_version, error.into());
         }
         if let Some(environment) = &environment
             && let Err(error) = validate_unix_environment(environment)
         {
-            return send_response(
-                &mut stream,
-                response_version,
-                error_response(ErrorCode::InvalidArgument, error.to_string()),
-            );
+            return send_daemon_error(&mut stream, response_version, error.into());
         }
         let shell = match registry.shell(shell_id) {
             Ok(shell) => shell,
             Err(error) => {
-                return send_response(
-                    &mut stream,
-                    response_version,
-                    error_response(error_code(&error), error.to_string()),
-                );
+                return send_daemon_error(&mut stream, response_version, error.into());
             }
         };
         let mutation = lock(&registry.mutation_lock)?;
@@ -6349,7 +6427,8 @@ impl ShellRuntimeManager {
             return send_response(
                 &mut stream,
                 response_version,
-                error_response(ErrorCode::DaemonStopping, "Boomux daemon is stopping"),
+                DaemonError::lifecycle(ErrorCode::DaemonStopping, "Boomux daemon is stopping")
+                    .into_response(),
             );
         }
         let token = Uuid::new_v4().to_string();
@@ -6359,7 +6438,8 @@ impl ShellRuntimeManager {
             return send_response(
                 &mut stream,
                 response_version,
-                error_response(ErrorCode::NotFound, format!("shell not found: {shell_id}")),
+                DaemonError::lifecycle(ErrorCode::NotFound, format!("shell not found: {shell_id}"))
+                    .into_response(),
             );
         }
         let workspace = registry.workspace(&shell.workspace_id)?;
@@ -6393,8 +6473,8 @@ impl ShellRuntimeManager {
                     .flatten()
             })
             .flatten();
-        if needs_start {
-            registry.flush_pending()?;
+        if needs_start && let Err(error) = registry.flush_pending() {
+            return send_daemon_error(&mut stream, response_version, error);
         }
         let persistence = needs_start
             .then(|| lock(&registry.durable.persist_lock))
@@ -6437,10 +6517,11 @@ impl ShellRuntimeManager {
                         return send_response(
                             &mut stream,
                             response_version,
-                            error_response(
+                            DaemonError::lifecycle(
                                 ErrorCode::ShellStartFailed,
                                 format!("could not start shell: {error}"),
-                            ),
+                            )
+                            .into_response(),
                         );
                     }
                 };
@@ -6465,7 +6546,7 @@ impl ShellRuntimeManager {
                     return send_response(
                     &mut stream,
                     response_version,
-                    error_response(
+                    DaemonError::lifecycle(
                         ErrorCode::ShellStartFailed,
                         cleanup.map_or_else(
                             |cleanup| {
@@ -6475,7 +6556,8 @@ impl ShellRuntimeManager {
                             },
                             |()| format!("could not start shell reader: {error}"),
                         ),
-                    ),
+                    )
+                    .into_response(),
                 );
                 }
             }
@@ -6507,7 +6589,11 @@ impl ShellRuntimeManager {
                     return send_response(
                         &mut stream,
                         response_version,
-                        error_response(ErrorCode::NotFound, format!("shell not found: {shell_id}")),
+                        DaemonError::lifecycle(
+                            ErrorCode::NotFound,
+                            format!("shell not found: {shell_id}"),
+                        )
+                        .into_response(),
                     );
                 }
             }
@@ -6519,29 +6605,24 @@ impl ShellRuntimeManager {
                 .expect("start event transaction is locked")
                 .begin_persistence(1);
             drop(event_transaction);
-            if let Err(error) = registry
-                .write_persisted_state(saved)
-                .map_err(persistence_error)
-            {
+            if let Err(error) = registry.write_persisted_state(saved) {
                 let cleanup = self.kill(&shell);
                 self.reset_pending(&shell)?;
                 let mut transaction = registry.events.transaction()?;
                 transaction.finish_persistence();
-                return send_response(
-                &mut stream,
-                response_version,
-                error_response(
-                    ErrorCode::PersistenceFailed,
-                    cleanup.map_or_else(
-                        |cleanup| {
-                            format!(
-                                "could not persist started shell: {error}; process cleanup also failed: {cleanup}"
-                            )
-                        },
-                        |()| format!("could not persist started shell: {error}"),
-                    ),
-                ),
-            );
+                let message = cleanup.map_or_else(
+                    |cleanup| {
+                        format!(
+                            "could not persist started shell: {error}; process cleanup also failed: {cleanup}"
+                        )
+                    },
+                    |()| format!("could not persist started shell: {error}"),
+                );
+                return send_daemon_error(
+                    &mut stream,
+                    response_version,
+                    DaemonError::persistence_context(error, message),
+                );
             }
             event_transaction = Some(registry.events.transaction()?);
         }
@@ -6592,10 +6673,11 @@ impl ShellRuntimeManager {
                 return send_response(
                     &mut stream,
                     response_version,
-                    error_response(
+                    DaemonError::lifecycle(
                         ErrorCode::Busy,
                         "shell already has an active controller; use takeover",
-                    ),
+                    )
+                    .into_response(),
                 );
             }
         }
@@ -7809,7 +7891,7 @@ mod tests {
         }
 
         let error = registry.read_events(Some(&cursor), 256, 0).unwrap_err();
-        assert_eq!(error_code(&error), ErrorCode::CursorExpired);
+        assert_eq!(error.wire_code(), ErrorCode::CursorExpired);
     }
 
     #[test]
@@ -7988,6 +8070,51 @@ mod tests {
             io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
         ));
         assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn daemon_errors_convert_to_stable_codes_at_the_wire_boundary() {
+        let cases = [
+            (
+                io::Error::new(io::ErrorKind::InvalidInput, "invalid request").into(),
+                ErrorCode::InvalidArgument,
+                "invalid request",
+            ),
+            (
+                DaemonError::lifecycle(ErrorCode::RunChanged, "run changed"),
+                ErrorCode::RunChanged,
+                "run changed",
+            ),
+            (
+                DaemonError::persistence(io::Error::other("state write failed")),
+                ErrorCode::PersistenceFailed,
+                "state write failed",
+            ),
+            (
+                DaemonError::protocol("unsupported request"),
+                ErrorCode::UnsupportedVersion,
+                "unsupported request",
+            ),
+            (
+                io::Error::other("unexpected failure").into(),
+                ErrorCode::Internal,
+                "unexpected failure",
+            ),
+        ];
+
+        for (error, expected_code, expected_message) in cases {
+            let (mut server, mut client) = UnixStream::pair().unwrap();
+            send_daemon_error(&mut server, protocol::PROTOCOL_VERSION, error).unwrap();
+            let response: Envelope<Response> = protocol::read_message(&mut client).unwrap();
+            assert_eq!(response.version, protocol::PROTOCOL_VERSION);
+            assert_eq!(
+                response.message,
+                Response::Error {
+                    message: expected_message.into(),
+                    code: Some(expected_code),
+                }
+            );
+        }
     }
 
     #[test]
@@ -8911,7 +9038,7 @@ mod tests {
             run_id: Uuid::new_v4().to_string(),
             spec: agent_spec(AgentState::Working),
         });
-        assert_eq!(error_code(&wrong_run.unwrap_err()), ErrorCode::RunChanged);
+        assert_eq!(wrong_run.unwrap_err().wire_code(), ErrorCode::RunChanged);
 
         let Response::Agent { agent } = registry
             .dispatch(Request::RegisterAgent {
@@ -8927,15 +9054,14 @@ mod tests {
         assert_eq!(agent.observation.revision, 1);
         assert!(agent.ended_at_ms.is_none());
         assert_eq!(
-            error_code(
-                &registry
-                    .dispatch(Request::ReportAgent {
-                        agent_id: agent.id.clone(),
-                        run_id: Uuid::new_v4().to_string(),
-                        report: agent_spec(AgentState::Idle).report,
-                    })
-                    .unwrap_err()
-            ),
+            registry
+                .dispatch(Request::ReportAgent {
+                    agent_id: agent.id.clone(),
+                    run_id: Uuid::new_v4().to_string(),
+                    report: agent_spec(AgentState::Idle).report,
+                })
+                .unwrap_err()
+                .wire_code(),
             ErrorCode::RunChanged
         );
 
@@ -9090,8 +9216,8 @@ mod tests {
             registry
                 .ensure_agent(&shell.id, &run_id, agent_spec(AgentState::Working))
                 .unwrap_err()
-                .kind(),
-            io::ErrorKind::AlreadyExists
+                .wire_code(),
+            ErrorCode::AlreadyExists
         );
         shell.kill().unwrap();
         registry.close_workspace(&workspace.id).unwrap();
@@ -9112,8 +9238,8 @@ mod tests {
                     spec: missing_id,
                 })
                 .unwrap_err()
-                .kind(),
-            io::ErrorKind::InvalidInput
+                .wire_code(),
+            ErrorCode::InvalidArgument
         );
         let Response::Agent { agent: first } = registry
             .dispatch(Request::EnsureAgent {
@@ -9662,7 +9788,7 @@ mod tests {
             })
             .unwrap_err();
 
-        assert_eq!(error_code(&error), ErrorCode::PersistenceFailed);
+        assert_eq!(error.wire_code(), ErrorCode::PersistenceFailed);
         assert!(
             registry
                 .agent(&agent.id)
@@ -9689,7 +9815,23 @@ mod tests {
         let revision = agent.observation.revision;
 
         let mismatch = registry.acknowledge_agent_attention(&agent.id, revision + 1);
-        assert_eq!(error_code(&mismatch.unwrap_err()), ErrorCode::RevisionAhead);
+        assert_eq!(mismatch.unwrap_err().wire_code(), ErrorCode::RevisionAhead);
+        assert!(
+            registry
+                .agent(&agent.id)
+                .unwrap()
+                .snapshot()
+                .unwrap()
+                .attention
+                .is_some()
+        );
+
+        registry.fail_after_next_mutation();
+        let result = registry.dispatch(Request::AcknowledgeAgentAttention {
+            agent_id: agent.id.clone(),
+            observation_revision: revision,
+        });
+        assert!(result.is_err());
         assert!(
             registry
                 .agent(&agent.id)
@@ -9764,7 +9906,10 @@ mod tests {
         };
         assert!(!changed);
         assert_eq!(
-            error_code(&registry.wait_agent(&agent.id, 2, 0).unwrap_err()),
+            registry
+                .wait_agent(&agent.id, 2, 0)
+                .unwrap_err()
+                .wire_code(),
             ErrorCode::RevisionAhead
         );
 
@@ -9841,7 +9986,7 @@ mod tests {
         registry.events.notify();
 
         assert_eq!(
-            error_code(&waiter.join().unwrap().unwrap_err()),
+            waiter.join().unwrap().unwrap_err().wire_code(),
             ErrorCode::DaemonStopping
         );
         registry.runtimes.cancel_stopping();

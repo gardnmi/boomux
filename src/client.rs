@@ -25,6 +25,122 @@ const CONNECT_ATTEMPTS: usize = 40;
 const CONNECT_DELAY: Duration = Duration::from_millis(25);
 const SHUTDOWN_ATTEMPTS: usize = 200;
 
+pub type Result<T> = std::result::Result<T, ClientError>;
+
+#[derive(Debug)]
+pub enum ClientError {
+    Transport(io::Error),
+    Protocol(ProtocolError),
+    Remote(RemoteError),
+    Validation(io::Error),
+    Lifecycle(LifecycleError),
+}
+
+impl std::fmt::Display for ClientError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Transport(error) | Self::Validation(error) => error.fmt(formatter),
+            Self::Protocol(error) => error.fmt(formatter),
+            Self::Remote(error) => error.fmt(formatter),
+            Self::Lifecycle(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl Error for ClientError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Transport(error) | Self::Validation(error) => Some(error),
+            Self::Protocol(error) => Some(error),
+            Self::Remote(error) => Some(error),
+            Self::Lifecycle(error) => Some(error),
+        }
+    }
+}
+
+impl From<io::Error> for ClientError {
+    fn from(error: io::Error) -> Self {
+        Self::Transport(error)
+    }
+}
+
+#[derive(Debug)]
+pub enum ProtocolError {
+    UnsupportedVersion(String),
+    VersionMismatch { expected: u32, actual: u32 },
+    InvalidMessage(io::Error),
+    EventBaselineMissing,
+    UnexpectedResponse(Box<Response>),
+}
+
+impl std::fmt::Display for ProtocolError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedVersion(message) => formatter.write_str(message),
+            Self::VersionMismatch { .. } => formatter.write_str("protocol version mismatch"),
+            Self::InvalidMessage(error) => error.fmt(formatter),
+            Self::EventBaselineMissing => {
+                formatter.write_str("event baseline omitted its snapshot")
+            }
+            Self::UnexpectedResponse(response) => {
+                write!(formatter, "unexpected daemon response: {response:?}")
+            }
+        }
+    }
+}
+
+impl Error for ProtocolError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::InvalidMessage(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum LifecycleError {
+    DaemonStart(io::Error),
+    DaemonStartTimeout(Option<Box<ClientError>>),
+    ShutdownTimeout,
+    ReplacementStartTimeout(Option<Box<ClientError>>),
+    AttachmentReconnectTimeout(Option<Box<ClientError>>),
+}
+
+impl std::fmt::Display for LifecycleError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DaemonStart(error) => write!(formatter, "daemon did not start: {error}"),
+            Self::DaemonStartTimeout(Some(error)) | Self::ReplacementStartTimeout(Some(error)) => {
+                error.fmt(formatter)
+            }
+            Self::DaemonStartTimeout(None) => formatter.write_str("daemon did not start"),
+            Self::ShutdownTimeout => {
+                formatter.write_str("Boomux daemon did not finish shutting down")
+            }
+            Self::ReplacementStartTimeout(None) => {
+                formatter.write_str("replacement daemon did not start")
+            }
+            Self::AttachmentReconnectTimeout(Some(error)) => error.fmt(formatter),
+            Self::AttachmentReconnectTimeout(None) => {
+                formatter.write_str("daemon attachment did not reconnect")
+            }
+        }
+    }
+}
+
+impl Error for LifecycleError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::DaemonStart(error) => Some(error),
+            Self::DaemonStartTimeout(Some(error))
+            | Self::ReplacementStartTimeout(Some(error))
+            | Self::AttachmentReconnectTimeout(Some(error)) => Some(error.as_ref()),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Client {
     socket_path: PathBuf,
@@ -64,7 +180,7 @@ pub struct SnapshotWatch {
 }
 
 impl SnapshotWatch {
-    pub fn baseline(client: &Client) -> io::Result<Self> {
+    pub fn baseline(client: &Client) -> Result<Self> {
         if !client.supports(protocol::ProtocolFeature::AtomicOutputReads)? {
             return Ok(Self {
                 cursor: None,
@@ -74,7 +190,7 @@ impl SnapshotWatch {
         let batch = client.events(None, 1, 0)?;
         let snapshot = batch
             .snapshot
-            .ok_or_else(|| io::Error::other("event baseline omitted its snapshot"))?;
+            .ok_or(ClientError::Protocol(ProtocolError::EventBaselineMissing))?;
         Ok(Self {
             cursor: Some(batch.cursor),
             snapshot,
@@ -93,7 +209,7 @@ impl SnapshotWatch {
         self.cursor.is_some()
     }
 
-    pub fn poll(&mut self, client: &Client) -> io::Result<(bool, bool)> {
+    pub fn poll(&mut self, client: &Client) -> Result<(bool, bool)> {
         let Some(cursor) = self.cursor.clone() else {
             return Ok((false, false));
         };
@@ -107,11 +223,18 @@ impl SnapshotWatch {
                 *self = Self::baseline(client)?;
                 Ok((true, self.stream_id() != Some(stream_id.as_str())))
             }
-            Err(error) if remote_code(&error) == Some(ErrorCode::CursorExpired) => {
+            Err(ClientError::Remote(RemoteError {
+                code: Some(ErrorCode::CursorExpired),
+                ..
+            })) => {
                 *self = Self::baseline(client)?;
                 Ok((true, self.stream_id() != Some(stream_id.as_str())))
             }
-            Err(error) if remote_code(&error) == Some(ErrorCode::UnsupportedVersion) => {
+            Err(ClientError::Remote(RemoteError {
+                code: Some(ErrorCode::UnsupportedVersion),
+                ..
+            }))
+            | Err(ClientError::Protocol(ProtocolError::UnsupportedVersion(_))) => {
                 *self = Self::baseline(client)?;
                 Ok((true, self.stream_id() != Some(stream_id.as_str())))
             }
@@ -163,7 +286,7 @@ pub fn socket_path() -> io::Result<PathBuf> {
     Ok(runtime.join("boomux").join("daemon.sock"))
 }
 
-pub fn connect_or_start() -> io::Result<Client> {
+pub fn connect_or_start() -> Result<Client> {
     let client = connect_client()?;
     match client.ping() {
         Ok(()) => return Ok(client),
@@ -171,7 +294,7 @@ pub fn connect_or_start() -> io::Result<Client> {
         Err(_) => {}
     }
 
-    let mut command = Command::new(env::current_exe()?);
+    let mut command = Command::new(env::current_exe().map_err(ClientError::Validation)?);
     command
         .args(["daemon", "run"])
         .stdin(Stdio::null())
@@ -188,12 +311,9 @@ pub fn connect_or_start() -> io::Result<Client> {
             }
         });
     }
-    command.spawn().map_err(|error| {
-        io::Error::new(
-            io::ErrorKind::ConnectionRefused,
-            format!("daemon did not start: {error}"),
-        )
-    })?;
+    command
+        .spawn()
+        .map_err(|error| ClientError::Lifecycle(LifecycleError::DaemonStart(error)))?;
 
     let mut last_error = None;
     for _ in 0..CONNECT_ATTEMPTS {
@@ -204,35 +324,35 @@ pub fn connect_or_start() -> io::Result<Client> {
         }
         thread::sleep(CONNECT_DELAY);
     }
-    Err(io::Error::new(
-        io::ErrorKind::ConnectionRefused,
-        last_error.unwrap_or_else(|| io::Error::other("daemon did not start")),
-    ))
+    Err(ClientError::Lifecycle(LifecycleError::DaemonStartTimeout(
+        last_error.map(Box::new),
+    )))
 }
 
-fn daemon_unreachable(error: &io::Error) -> bool {
-    error
-        .get_ref()
-        .is_none_or(|error| !error.is::<RemoteError>())
-        && matches!(
-            error.kind(),
+fn daemon_unreachable(error: &ClientError) -> bool {
+    matches!(
+        error,
+        ClientError::Transport(error)
+            if matches!(
+                error.kind(),
             io::ErrorKind::NotFound
                 | io::ErrorKind::ConnectionRefused
                 | io::ErrorKind::ConnectionReset
                 | io::ErrorKind::BrokenPipe
                 | io::ErrorKind::UnexpectedEof
-        )
+            )
+    )
 }
 
-pub fn connect() -> io::Result<Client> {
+pub fn connect() -> Result<Client> {
     let client = connect_client()?;
     client.ping()?;
     Ok(client)
 }
 
-fn connect_client() -> io::Result<Client> {
+fn connect_client() -> Result<Client> {
     Ok(Client {
-        socket_path: socket_path()?,
+        socket_path: socket_path().map_err(ClientError::Validation)?,
         protocol_version: Arc::new(AtomicU32::new(protocol::PROTOCOL_VERSION)),
     })
 }
@@ -249,20 +369,20 @@ impl Client {
         &self.socket_path
     }
 
-    pub fn protocol_version(&self) -> io::Result<u32> {
+    pub fn protocol_version(&self) -> Result<u32> {
         let _ = self.probe_latest()?;
         Ok(self.protocol_version.load(Ordering::Acquire))
     }
 
-    pub fn supports(&self, feature: protocol::ProtocolFeature) -> io::Result<bool> {
+    pub fn supports(&self, feature: protocol::ProtocolFeature) -> Result<bool> {
         Ok(feature.is_supported_by(self.protocol_version()?))
     }
 
-    pub fn request(&self, request: Request) -> io::Result<Response> {
+    pub fn request(&self, request: Request) -> Result<Response> {
         self.send(request).map(|(_, _, response)| response)
     }
 
-    fn send(&self, request: Request) -> io::Result<(UnixStream, u32, Response)> {
+    fn send(&self, request: Request) -> Result<(UnixStream, u32, Response)> {
         let mut version = self.protocol_version.load(Ordering::Acquire);
         if request
             .required_feature()
@@ -274,10 +394,7 @@ impl Client {
                 .required_feature()
                 .is_some_and(|feature| !feature.is_supported_by(version))
             {
-                return Err(remote_error(
-                    ErrorCode::UnsupportedVersion,
-                    "daemon does not support this request",
-                ));
+                return Err(unsupported_version("daemon does not support this request"));
             }
         }
         match self.send_with_version(request.clone(), version) {
@@ -291,10 +408,7 @@ impl Client {
                     .required_feature()
                     .is_some_and(|feature| !feature.is_supported_by(negotiated))
                 {
-                    return Err(remote_error(
-                        ErrorCode::UnsupportedVersion,
-                        "daemon does not support this request",
-                    ));
+                    return Err(unsupported_version("daemon does not support this request"));
                 }
                 self.send_with_version(request, negotiated)
                     .map(|(stream, response)| (stream, negotiated, response))
@@ -303,37 +417,37 @@ impl Client {
         }
     }
 
-    fn send_with_version(
-        &self,
-        request: Request,
-        version: u32,
-    ) -> io::Result<(UnixStream, Response)> {
-        let mut stream = UnixStream::connect(&self.socket_path)?;
-        protocol::write_message(&mut stream, &Envelope::with_version(version, request))?;
-        let response: Envelope<Response> = protocol::read_message(&mut stream)?;
+    fn send_with_version(&self, request: Request, version: u32) -> Result<(UnixStream, Response)> {
+        let mut stream = UnixStream::connect(&self.socket_path).map_err(ClientError::Transport)?;
+        protocol::write_message(&mut stream, &Envelope::with_version(version, request))
+            .map_err(classify_wire_error)?;
+        let response: Envelope<Response> =
+            protocol::read_message(&mut stream).map_err(classify_wire_error)?;
         if response.version != version {
             if let Response::Error {
                 message,
                 code: Some(ErrorCode::UnsupportedVersion),
             } = response.message
             {
-                return Err(remote_error(ErrorCode::UnsupportedVersion, message));
+                return Err(ClientError::Remote(RemoteError {
+                    code: Some(ErrorCode::UnsupportedVersion),
+                    message,
+                }));
             }
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "protocol version mismatch",
-            ));
+            return Err(ClientError::Protocol(ProtocolError::VersionMismatch {
+                expected: version,
+                actual: response.version,
+            }));
         }
         match response.message {
-            Response::Error { message, code } => Err(io::Error::new(
-                error_kind(code),
-                RemoteError { code, message },
-            )),
+            Response::Error { message, code } => {
+                Err(ClientError::Remote(RemoteError { code, message }))
+            }
             response => Ok((stream, response)),
         }
     }
 
-    fn probe_latest(&self) -> io::Result<bool> {
+    fn probe_latest(&self) -> Result<bool> {
         for version in (protocol::MIN_PROTOCOL_VERSION..=protocol::PROTOCOL_VERSION).rev() {
             match self.send_with_version(Request::Ping, version) {
                 Ok((_, Response::Pong)) => {
@@ -345,17 +459,16 @@ impl Client {
                 Err(error) => return Err(error),
             }
         }
-        Err(remote_error(
-            ErrorCode::UnsupportedVersion,
+        Err(unsupported_version(
             "daemon has no compatible protocol version",
         ))
     }
 
-    pub fn ping(&self) -> io::Result<()> {
+    pub fn ping(&self) -> Result<()> {
         expect_ok(self.request(Request::Ping)?, Response::Pong)
     }
 
-    pub fn shutdown(&self) -> io::Result<()> {
+    pub fn shutdown(&self) -> Result<()> {
         expect_ok(self.request(Request::Shutdown)?, Response::Ok)?;
         for _ in 0..SHUTDOWN_ATTEMPTS {
             if !self.socket_path.exists() && daemon_lock_available(&self.socket_path)? {
@@ -363,27 +476,24 @@ impl Client {
             }
             thread::sleep(CONNECT_DELAY);
         }
-        Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            "Boomux daemon did not finish shutting down",
-        ))
+        Err(ClientError::Lifecycle(LifecycleError::ShutdownTimeout))
     }
 
-    pub fn restart(&self) -> io::Result<()> {
+    pub fn restart(&self) -> Result<()> {
         self.restart_request(Request::Restart)
     }
 
     pub fn restart_with_notification_config(
         &self,
         notifications: NotificationDeliveryConfig,
-    ) -> io::Result<()> {
+    ) -> Result<()> {
         if !self.supports(protocol::ProtocolFeature::RestartNotificationConfig)? {
             self.restart_request(Request::Restart)?;
         }
         self.restart_request(Request::RestartWithNotificationConfig { notifications })
     }
 
-    fn restart_request(&self, request: Request) -> io::Result<()> {
+    fn restart_request(&self, request: Request) -> Result<()> {
         expect_ok(self.request(request)?, Response::Ok)?;
         let mut last_error = None;
         for _ in 0..CONNECT_ATTEMPTS {
@@ -393,24 +503,26 @@ impl Client {
             }
             thread::sleep(CONNECT_DELAY);
         }
-        Err(last_error.unwrap_or_else(|| io::Error::other("replacement daemon did not start")))
+        Err(ClientError::Lifecycle(
+            LifecycleError::ReplacementStartTimeout(last_error.map(Box::new)),
+        ))
     }
 
-    pub fn snapshot(&self) -> io::Result<Snapshot> {
+    pub fn snapshot(&self) -> Result<Snapshot> {
         match self.request(Request::Snapshot)? {
             Response::Snapshot { snapshot } => Ok(snapshot),
             other => unexpected(other),
         }
     }
 
-    pub fn focused_terminal(&self) -> io::Result<Option<FocusedTerminalSnapshot>> {
+    pub fn focused_terminal(&self) -> Result<Option<FocusedTerminalSnapshot>> {
         match self.request(Request::GetFocusedTerminal)? {
             Response::FocusedTerminal { focused_terminal } => Ok(focused_terminal),
             other => unexpected(other),
         }
     }
 
-    pub fn get_workspace(&self, workspace_id: impl Into<String>) -> io::Result<WorkspaceSnapshot> {
+    pub fn get_workspace(&self, workspace_id: impl Into<String>) -> Result<WorkspaceSnapshot> {
         match self.request(Request::GetWorkspace {
             workspace_id: workspace_id.into(),
         })? {
@@ -419,7 +531,7 @@ impl Client {
         }
     }
 
-    pub fn get_shell(&self, shell_id: impl Into<String>) -> io::Result<ShellSnapshot> {
+    pub fn get_shell(&self, shell_id: impl Into<String>) -> Result<ShellSnapshot> {
         match self.request(Request::GetShell {
             shell_id: shell_id.into(),
         })? {
@@ -431,7 +543,7 @@ impl Client {
     pub fn get_launcher(
         &self,
         launcher_id: impl Into<String>,
-    ) -> io::Result<WorkspaceLauncherSnapshot> {
+    ) -> Result<WorkspaceLauncherSnapshot> {
         match self.request(Request::GetLauncher {
             launcher_id: launcher_id.into(),
         })? {
@@ -440,7 +552,7 @@ impl Client {
         }
     }
 
-    pub fn get_agent(&self, agent_id: impl Into<String>) -> io::Result<AgentInstanceSnapshot> {
+    pub fn get_agent(&self, agent_id: impl Into<String>) -> Result<AgentInstanceSnapshot> {
         match self.request(Request::GetAgent {
             agent_id: agent_id.into(),
         })? {
@@ -453,7 +565,7 @@ impl Client {
         &self,
         name: impl Into<String>,
         shells: Vec<ShellSpec>,
-    ) -> io::Result<WorkspaceSnapshot> {
+    ) -> Result<WorkspaceSnapshot> {
         self.create_workspace_with_default_cwd(name, None, shells)
     }
 
@@ -462,7 +574,7 @@ impl Client {
         name: impl Into<String>,
         default_cwd: Option<PathBuf>,
         shells: Vec<ShellSpec>,
-    ) -> io::Result<WorkspaceSnapshot> {
+    ) -> Result<WorkspaceSnapshot> {
         match self.request(Request::CreateWorkspace {
             name: name.into(),
             default_cwd,
@@ -477,7 +589,7 @@ impl Client {
         &self,
         workspace_id: impl Into<String>,
         shell: ShellSpec,
-    ) -> io::Result<ShellSnapshot> {
+    ) -> Result<ShellSnapshot> {
         match self.request(Request::CreateShell {
             workspace_id: Some(workspace_id.into()),
             shell,
@@ -487,7 +599,7 @@ impl Client {
         }
     }
 
-    pub fn create_shell_with_workspace(&self, shell: ShellSpec) -> io::Result<ShellSnapshot> {
+    pub fn create_shell_with_workspace(&self, shell: ShellSpec) -> Result<ShellSnapshot> {
         match self.request(Request::CreateShell {
             workspace_id: None,
             shell,
@@ -501,7 +613,7 @@ impl Client {
         &self,
         workspace_id: impl Into<String>,
         spec: WorkspaceLauncherSpec,
-    ) -> io::Result<WorkspaceLauncherSnapshot> {
+    ) -> Result<WorkspaceLauncherSnapshot> {
         match self.request(Request::CreateLauncher {
             workspace_id: workspace_id.into(),
             spec,
@@ -516,7 +628,7 @@ impl Client {
         shell_id: impl Into<String>,
         run_id: impl Into<String>,
         spec: AgentRegistrationSpec,
-    ) -> io::Result<AgentInstanceSnapshot> {
+    ) -> Result<AgentInstanceSnapshot> {
         match self.request(Request::RegisterAgent {
             shell_id: shell_id.into(),
             run_id: run_id.into(),
@@ -532,7 +644,7 @@ impl Client {
         shell_id: impl Into<String>,
         run_id: impl Into<String>,
         spec: AgentRegistrationSpec,
-    ) -> io::Result<AgentInstanceSnapshot> {
+    ) -> Result<AgentInstanceSnapshot> {
         match self.request(Request::EnsureAgent {
             shell_id: shell_id.into(),
             run_id: run_id.into(),
@@ -548,7 +660,7 @@ impl Client {
         agent_id: impl Into<String>,
         run_id: impl Into<String>,
         report: AgentReport,
-    ) -> io::Result<AgentInstanceSnapshot> {
+    ) -> Result<AgentInstanceSnapshot> {
         match self.request(Request::ReportAgent {
             agent_id: agent_id.into(),
             run_id: run_id.into(),
@@ -564,17 +676,14 @@ impl Client {
         agent_id: impl Into<String>,
         after_revision: u64,
         wait_ms: u32,
-    ) -> io::Result<AgentWait> {
+    ) -> Result<AgentWait> {
         let request = Request::WaitAgent {
             agent_id: agent_id.into(),
             after_revision,
             wait_ms,
         };
         if !self.supports(protocol::ProtocolFeature::RevisionAwareAgentWait)? {
-            return Err(remote_error(
-                ErrorCode::UnsupportedVersion,
-                "daemon does not support Agent wait",
-            ));
+            return Err(unsupported_version("daemon does not support Agent wait"));
         }
         match self.request(request)? {
             Response::AgentWait { agent, changed } => Ok(AgentWait { agent, changed }),
@@ -586,7 +695,7 @@ impl Client {
         &self,
         agent_id: impl Into<String>,
         observation_revision: u64,
-    ) -> io::Result<AgentAttentionAcknowledgement> {
+    ) -> Result<AgentAttentionAcknowledgement> {
         match self.request(Request::AcknowledgeAgentAttention {
             agent_id: agent_id.into(),
             observation_revision,
@@ -598,7 +707,7 @@ impl Client {
         }
     }
 
-    pub fn read_shell(&self, shell_id: impl Into<String>, max_bytes: usize) -> io::Result<Vec<u8>> {
+    pub fn read_shell(&self, shell_id: impl Into<String>, max_bytes: usize) -> Result<Vec<u8>> {
         match self.request(Request::ReadShell {
             shell_id: shell_id.into(),
             max_bytes,
@@ -613,7 +722,7 @@ impl Client {
         shell_id: impl Into<String>,
         max_bytes: usize,
         max_lines: u16,
-    ) -> io::Result<TerminalPreview> {
+    ) -> Result<TerminalPreview> {
         let shell_id = shell_id.into();
         if !self.supports(protocol::ProtocolFeature::StructuredTerminalPreview)? {
             let bytes = self.read_shell(shell_id, max_bytes)?;
@@ -649,7 +758,7 @@ impl Client {
         run_id: Option<String>,
         after_revision: Option<u64>,
         wait_ms: u32,
-    ) -> io::Result<OutputState> {
+    ) -> Result<OutputState> {
         match self.request(Request::ReadShellAt {
             shell_id: shell_id.into(),
             max_bytes,
@@ -679,7 +788,7 @@ impl Client {
         after: Option<EventCursor>,
         limit: u16,
         wait_ms: u32,
-    ) -> io::Result<EventBatch> {
+    ) -> Result<EventBatch> {
         match self.request(Request::Events {
             after,
             limit,
@@ -704,7 +813,7 @@ impl Client {
         &self,
         workspace_id: impl Into<String>,
         name: impl Into<String>,
-    ) -> io::Result<()> {
+    ) -> Result<()> {
         expect_ok(
             self.request(Request::RenameWorkspace {
                 workspace_id: workspace_id.into(),
@@ -714,11 +823,7 @@ impl Client {
         )
     }
 
-    pub fn rename_shell(
-        &self,
-        shell_id: impl Into<String>,
-        name: impl Into<String>,
-    ) -> io::Result<()> {
+    pub fn rename_shell(&self, shell_id: impl Into<String>, name: impl Into<String>) -> Result<()> {
         expect_ok(
             self.request(Request::RenameShell {
                 shell_id: shell_id.into(),
@@ -732,7 +837,7 @@ impl Client {
         &self,
         launcher_id: impl Into<String>,
         name: impl Into<String>,
-    ) -> io::Result<()> {
+    ) -> Result<()> {
         expect_ok(
             self.request(Request::RenameLauncher {
                 launcher_id: launcher_id.into(),
@@ -742,7 +847,7 @@ impl Client {
         )
     }
 
-    pub fn remove_launcher(&self, launcher_id: impl Into<String>) -> io::Result<()> {
+    pub fn remove_launcher(&self, launcher_id: impl Into<String>) -> Result<()> {
         expect_ok(
             self.request(Request::RemoveLauncher {
                 launcher_id: launcher_id.into(),
@@ -751,7 +856,7 @@ impl Client {
         )
     }
 
-    pub fn close_workspace(&self, workspace_id: impl Into<String>) -> io::Result<()> {
+    pub fn close_workspace(&self, workspace_id: impl Into<String>) -> Result<()> {
         expect_ok(
             self.request(Request::CloseWorkspace {
                 workspace_id: workspace_id.into(),
@@ -760,7 +865,7 @@ impl Client {
         )
     }
 
-    pub fn close_shell(&self, shell_id: impl Into<String>) -> io::Result<()> {
+    pub fn close_shell(&self, shell_id: impl Into<String>) -> Result<()> {
         expect_ok(
             self.request(Request::CloseShell {
                 shell_id: shell_id.into(),
@@ -769,7 +874,7 @@ impl Client {
         )
     }
 
-    pub fn restart_shell(&self, shell_id: impl Into<String>) -> io::Result<ShellSnapshot> {
+    pub fn restart_shell(&self, shell_id: impl Into<String>) -> Result<ShellSnapshot> {
         match self.request(Request::RestartShell {
             shell_id: shell_id.into(),
         })? {
@@ -783,7 +888,7 @@ impl Client {
         shell_id: impl Into<String>,
         takeover: bool,
         profile: TerminalProfile,
-    ) -> io::Result<Attachment> {
+    ) -> Result<Attachment> {
         self.attach_with_restart(shell_id.into(), takeover, false, profile, None)
     }
 
@@ -792,7 +897,7 @@ impl Client {
         shell_id: impl Into<String>,
         takeover: bool,
         profile: TerminalProfile,
-    ) -> io::Result<Attachment> {
+    ) -> Result<Attachment> {
         self.attach_with_restart(
             shell_id.into(),
             takeover,
@@ -807,7 +912,7 @@ impl Client {
         shell_id: impl Into<String>,
         takeover: bool,
         profile: TerminalProfile,
-    ) -> io::Result<Attachment> {
+    ) -> Result<Attachment> {
         self.attach_with_restart(shell_id.into(), takeover, true, profile, None)
     }
 
@@ -816,7 +921,7 @@ impl Client {
         shell_id: impl Into<String>,
         takeover: bool,
         profile: TerminalProfile,
-    ) -> io::Result<Attachment> {
+    ) -> Result<Attachment> {
         self.attach_with_restart(
             shell_id.into(),
             takeover,
@@ -833,7 +938,7 @@ impl Client {
         restart_exited: bool,
         profile: TerminalProfile,
         environment: Option<UnixEnvironment>,
-    ) -> io::Result<Attachment> {
+    ) -> Result<Attachment> {
         let (stream, protocol_version, response) = self.send(Request::Attach {
             shell_id,
             takeover,
@@ -869,39 +974,25 @@ fn current_environment() -> UnixEnvironment {
     }
 }
 
-fn remote_code(error: &io::Error) -> Option<ErrorCode> {
-    error
-        .get_ref()
-        .and_then(|error| error.downcast_ref::<RemoteError>())
-        .and_then(|error| error.code)
-}
-
-fn is_protocol_rejection(error: &io::Error) -> bool {
-    remote_code(error) == Some(ErrorCode::UnsupportedVersion)
-        || (error.kind() == io::ErrorKind::InvalidData
-            && error.to_string() == "protocol version mismatch")
-}
-
-fn remote_error(code: ErrorCode, message: impl Into<String>) -> io::Error {
-    io::Error::new(
-        error_kind(Some(code)),
-        RemoteError {
-            code: Some(code),
-            message: message.into(),
-        },
+fn is_protocol_rejection(error: &ClientError) -> bool {
+    matches!(
+        error,
+        ClientError::Remote(RemoteError {
+            code: Some(ErrorCode::UnsupportedVersion),
+            ..
+        }) | ClientError::Protocol(ProtocolError::VersionMismatch { .. })
     )
 }
 
-fn error_kind(code: Option<ErrorCode>) -> io::ErrorKind {
-    match code {
-        Some(ErrorCode::InvalidArgument) => io::ErrorKind::InvalidInput,
-        Some(ErrorCode::NotFound) => io::ErrorKind::NotFound,
-        Some(ErrorCode::AlreadyExists) => io::ErrorKind::AlreadyExists,
-        Some(ErrorCode::Busy) => io::ErrorKind::WouldBlock,
-        Some(ErrorCode::DaemonStopping) => io::ErrorKind::ConnectionAborted,
-        Some(ErrorCode::Timeout) => io::ErrorKind::TimedOut,
-        Some(ErrorCode::UnsupportedVersion) => io::ErrorKind::InvalidData,
-        _ => io::ErrorKind::Other,
+fn unsupported_version(message: impl Into<String>) -> ClientError {
+    ClientError::Protocol(ProtocolError::UnsupportedVersion(message.into()))
+}
+
+fn classify_wire_error(error: io::Error) -> ClientError {
+    if error.kind() == io::ErrorKind::InvalidData {
+        ClientError::Protocol(ProtocolError::InvalidMessage(error))
+    } else {
+        ClientError::Transport(error)
     }
 }
 
@@ -928,7 +1019,7 @@ fn daemon_lock_available(socket_path: &Path) -> io::Result<bool> {
     }
 }
 
-fn expect_ok(actual: Response, expected: Response) -> io::Result<()> {
+fn expect_ok(actual: Response, expected: Response) -> Result<()> {
     if actual == expected {
         Ok(())
     } else {
@@ -936,11 +1027,10 @@ fn expect_ok(actual: Response, expected: Response) -> io::Result<()> {
     }
 }
 
-fn unexpected<T>(response: Response) -> io::Result<T> {
-    Err(io::Error::new(
-        io::ErrorKind::InvalidData,
-        format!("unexpected daemon response: {response:?}"),
-    ))
+fn unexpected<T>(response: Response) -> Result<T> {
+    Err(ClientError::Protocol(ProtocolError::UnexpectedResponse(
+        Box::new(response),
+    )))
 }
 
 #[cfg(test)]
@@ -1116,9 +1206,42 @@ mod tests {
 
         let error = client.wait_agent("a1", 1, 0).unwrap_err();
 
-        assert_eq!(remote_code(&error), Some(ErrorCode::UnsupportedVersion));
+        assert!(matches!(
+            error,
+            ClientError::Protocol(ProtocolError::UnsupportedVersion(ref message))
+                if message == "daemon does not support Agent wait"
+        ));
         server.join().unwrap();
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn io_errors_convert_to_transport_errors() {
+        let error = ClientError::from(io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            "connection refused",
+        ));
+
+        assert!(matches!(
+            error,
+            ClientError::Transport(ref error)
+                if error.kind() == io::ErrorKind::ConnectionRefused
+                    && error.to_string() == "connection refused"
+        ));
+    }
+
+    #[test]
+    fn invalid_wire_data_converts_to_a_protocol_error() {
+        let error = classify_wire_error(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid response",
+        ));
+
+        assert!(matches!(
+            error,
+            ClientError::Protocol(ProtocolError::InvalidMessage(ref error))
+                if error.to_string() == "invalid response"
+        ));
     }
 
     #[test]
