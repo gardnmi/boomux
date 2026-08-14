@@ -116,6 +116,11 @@ There are no separate tab, pane, and terminal identity layers.
 `src/client.rs` resolves the socket at
 `$XDG_RUNTIME_DIR/boomux/daemon.sock`. It starts a detached daemon on demand,
 waits for the protocol ping to succeed, and exposes typed management requests.
+Its public operations return `ClientError`, which keeps transport, protocol,
+remote daemon, local validation, and lifecycle failures structurally distinct.
+Protocol negotiation uses typed mismatch and unsupported-version failures rather
+than inspecting error messages, and remote errors retain their protocol code
+without passing through `io::Error`.
 An owner-held file lock prevents concurrent daemons from unlinking each other's
 sockets or splitting the registry.
 
@@ -143,6 +148,12 @@ transition frontier, retained event state, durable collection, then applicable
 shell/runtime locks. Paths that need only a suffix of that order start at the
 first required owner; PTY output releases runtime locks before entering the
 `EventStream` publication boundary.
+
+Request handling uses `DaemonError` to retain validation, lifecycle, persistence,
+protocol, and internal failure classes until the wire boundary. Stable protocol
+codes are selected from those variants directly; transport errors remain on the
+connection path and are not reinterpreted as domain failures through
+`io::Error` downcasting.
 
 The daemon supports:
 
@@ -334,8 +345,8 @@ Read-only CLI integrations use the separate `boomux.cli/v1` JSON envelope rather
 than serializing daemon protocol snapshots directly. `boomux capabilities`
 advertises supported commands, features, schemas, and error codes without
 requiring a daemon. Protocol 6 error responses carry an additive optional code;
-new clients expose it through a typed `RemoteError`, while mixed-version peers
-retain message compatibility.
+clients expose it as `ClientError::Remote(RemoteError)`, while mixed-version
+peers retain message compatibility.
 
 Protocol 7 adds a bounded in-memory daemon event journal and atomic output-state
 reads. Clients reconnect through stream UUID/event-ID cursors and recover from

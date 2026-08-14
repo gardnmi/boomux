@@ -51,7 +51,7 @@ struct DashboardRefresh {
 }
 
 impl DashboardRefresh {
-    fn baseline(client: &client::Client) -> io::Result<Self> {
+    fn baseline(client: &client::Client) -> client::Result<Self> {
         Ok(Self {
             watch: client::SnapshotWatch::baseline(client)?,
             last_snapshot_at: Instant::now(),
@@ -62,7 +62,7 @@ impl DashboardRefresh {
         self.watch.snapshot()
     }
 
-    fn check(&mut self, client: &client::Client) -> io::Result<Option<(Snapshot, bool)>> {
+    fn check(&mut self, client: &client::Client) -> client::Result<Option<(Snapshot, bool)>> {
         match self.watch.poll(client) {
             Ok((changed, stream_changed)) => {
                 if changed {
@@ -86,7 +86,7 @@ impl DashboardRefresh {
         }
     }
 
-    fn refresh(&mut self, client: &client::Client) -> io::Result<(Snapshot, bool)> {
+    fn refresh(&mut self, client: &client::Client) -> client::Result<(Snapshot, bool)> {
         let stream_id = self.watch.stream_id().map(str::to_owned);
         *self = Self::baseline(client)?;
         Ok((
@@ -95,7 +95,7 @@ impl DashboardRefresh {
         ))
     }
 
-    fn refresh_ephemeral_fields(&mut self, client: &client::Client) -> io::Result<()> {
+    fn refresh_ephemeral_fields(&mut self, client: &client::Client) -> client::Result<()> {
         self.watch.snapshot_mut().focused_terminal = client.focused_terminal()?;
         for shell in self
             .watch

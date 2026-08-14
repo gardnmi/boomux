@@ -9,7 +9,7 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use boomux::client::{self, Attachment, Client, RemoteError};
+use boomux::client::{self, Attachment, Client, ClientError, RemoteError};
 use boomux::protocol::{
     self, AgentAuthority, AgentRegistrationSpec, AgentReport, AgentState, AttachFrame, ErrorCode,
     ShellRunExitReason, ShellSpec, ShellStatus, TerminalProfile, UnixEnvironment,
@@ -978,13 +978,7 @@ fn exited_run_persistence_retries_after_storage_recovers() {
             .any(|event| matches!(event.kind, protocol::DaemonEventKind::RunExited { .. }))
     );
     let error = daemon.client.events(None, 256, 0).unwrap_err();
-    assert_eq!(
-        error
-            .get_ref()
-            .and_then(|error| error.downcast_ref::<RemoteError>())
-            .and_then(|error| error.code),
-        Some(ErrorCode::PersistenceFailed)
-    );
+    assert_remote_code(&error, ErrorCode::PersistenceFailed);
     let restart = daemon
         .command()
         .args(["daemon", "restart"])
@@ -1198,13 +1192,7 @@ fn graceful_restart_preserves_exited_run_and_terminal_state() {
     fs::rename(&state_directory, &saved_directory).unwrap();
     fs::write(&state_directory, b"not a directory").unwrap();
     let error = daemon.client.close_shell(&shell_id).unwrap_err();
-    assert_eq!(
-        error
-            .get_ref()
-            .and_then(|error| error.downcast_ref::<RemoteError>())
-            .and_then(|error| error.code),
-        Some(ErrorCode::PersistenceFailed)
-    );
+    assert_remote_code(&error, ErrorCode::PersistenceFailed);
     let rolled_back = daemon.client.get_shell(&shell_id).unwrap();
     assert_eq!(rolled_back.status, ShellStatus::Exited { code: Some(7) });
     assert_eq!(rolled_back.run.as_ref(), Some(&before_run));
@@ -1408,24 +1396,12 @@ fn daemon_events_and_revision_reads_survive_handoff() {
             0,
         )
         .unwrap_err();
-    assert_eq!(
-        error
-            .get_ref()
-            .and_then(|error| error.downcast_ref::<RemoteError>())
-            .and_then(|error| error.code),
-        Some(ErrorCode::RunChanged)
-    );
+    assert_remote_code(&error, ErrorCode::RunChanged);
     let error = daemon
         .client
         .read_shell_at(&shell_id, 1024, Some(run_id.clone()), Some(u64::MAX), 0)
         .unwrap_err();
-    assert_eq!(
-        error
-            .get_ref()
-            .and_then(|error| error.downcast_ref::<RemoteError>())
-            .and_then(|error| error.code),
-        Some(ErrorCode::RevisionAhead)
-    );
+    assert_remote_code(&error, ErrorCode::RevisionAhead);
 
     let waiting_client = daemon.client.clone();
     let waiting_shell_id = shell_id.clone();
@@ -1446,13 +1422,7 @@ fn daemon_events_and_revision_reads_survive_handoff() {
         .unwrap();
     assert!(restart.status.success());
     let error = wait.join().unwrap().unwrap_err();
-    assert_eq!(
-        error
-            .get_ref()
-            .and_then(|error| error.downcast_ref::<RemoteError>())
-            .and_then(|error| error.code),
-        Some(ErrorCode::DaemonStopping)
-    );
+    assert_remote_code(&error, ErrorCode::DaemonStopping);
     let handed_off = daemon.client.events(Some(cursor), 256, 1_000).unwrap();
     assert_eq!(handed_off.stream_id, stream_id);
     assert!(
@@ -1481,26 +1451,14 @@ fn daemon_events_and_revision_reads_survive_handoff() {
     daemon.stop_with_cli();
     daemon.restart();
     let error = daemon.client.events(Some(cursor), 256, 0).unwrap_err();
-    assert_eq!(
-        error
-            .get_ref()
-            .and_then(|error| error.downcast_ref::<RemoteError>())
-            .and_then(|error| error.code),
-        Some(ErrorCode::CursorExpired)
-    );
+    assert_remote_code(&error, ErrorCode::CursorExpired);
     let baseline = daemon.client.events(None, 256, 0).unwrap();
     let waiting_client = daemon.client.clone();
     let wait = thread::spawn(move || waiting_client.events(Some(baseline.cursor), 256, 5_000));
     thread::sleep(Duration::from_millis(50));
     daemon.stop_with_cli();
     let error = wait.join().unwrap().unwrap_err();
-    assert_eq!(
-        error
-            .get_ref()
-            .and_then(|error| error.downcast_ref::<RemoteError>())
-            .and_then(|error| error.code),
-        Some(ErrorCode::DaemonStopping)
-    );
+    assert_remote_code(&error, ErrorCode::DaemonStopping);
 }
 
 #[test]
@@ -3653,12 +3611,7 @@ fn native_daemon_lifecycle() {
 
     let missing_id = Uuid::new_v4().to_string();
     let error = daemon.client.get_shell(&missing_id).unwrap_err();
-    assert_eq!(error.kind(), io::ErrorKind::NotFound);
-    let remote = error
-        .get_ref()
-        .and_then(|error| error.downcast_ref::<RemoteError>())
-        .unwrap();
-    assert_eq!(remote.code, Some(ErrorCode::NotFound));
+    assert_remote_code(&error, ErrorCode::NotFound);
     let typed_failure = daemon
         .command()
         .args(["shells", "--json"])
@@ -3908,13 +3861,7 @@ fn native_daemon_lifecycle() {
         .attach(&failed_shell.id, false, profile())
         .unwrap_err();
     assert!(error.to_string().contains("could not start shell"));
-    assert_eq!(
-        error
-            .get_ref()
-            .and_then(|error| error.downcast_ref::<RemoteError>())
-            .and_then(|error| error.code),
-        Some(ErrorCode::ShellStartFailed)
-    );
+    assert_remote_code(&error, ErrorCode::ShellStartFailed);
     assert_eq!(
         daemon.client.get_shell(&failed_shell.id).unwrap().status,
         ShellStatus::Pending
@@ -4476,14 +4423,14 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
         .any(|window| window == needle)
 }
 
-fn assert_remote_code(error: &io::Error, expected: ErrorCode) {
-    assert_eq!(
-        error
-            .get_ref()
-            .and_then(|error| error.downcast_ref::<RemoteError>())
-            .and_then(|error| error.code),
-        Some(expected)
-    );
+fn assert_remote_code(error: &ClientError, expected: ErrorCode) {
+    assert!(matches!(
+        error,
+        ClientError::Remote(RemoteError {
+            code: Some(actual),
+            ..
+        }) if *actual == expected
+    ));
 }
 
 fn versioned_request(

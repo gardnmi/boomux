@@ -3,7 +3,7 @@ use std::io;
 
 use serde::Serialize;
 
-use boomux::client::RemoteError;
+use boomux::client::{ClientError, LifecycleError, ProtocolError};
 use boomux::protocol::{
     AgentAttentionReason, AgentAuthority, AgentInstanceSnapshot, AgentObservationSnapshot,
     AgentState, ErrorCode, ShellRunExitReason, ShellSnapshot, ShellStatus,
@@ -372,38 +372,56 @@ fn classify_error(command: &str, error: &(dyn Error + 'static)) -> &'static str 
         if let Some(cli) = candidate.downcast_ref::<CliError>() {
             return cli.code;
         }
-        if let Some(remote) = candidate.downcast_ref::<RemoteError>() {
-            return remote.code.map_or("unknown", protocol_error_code);
+        if let Some(client) = candidate.downcast_ref::<ClientError>() {
+            return classify_client_error(command, client);
         }
         if let Some(io_error) = candidate.downcast_ref::<io::Error>() {
-            if let Some(remote) = io_error
-                .get_ref()
-                .and_then(|inner| inner.downcast_ref::<RemoteError>())
-            {
-                return remote.code.map_or("unknown", protocol_error_code);
-            }
-            if command == "daemon.status"
-                && matches!(
-                    io_error.kind(),
-                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
-                )
-            {
-                return "daemon_unavailable";
-            }
-            return match io_error.kind() {
-                io::ErrorKind::InvalidInput | io::ErrorKind::InvalidData => "invalid_argument",
-                io::ErrorKind::NotFound => "not_found",
-                io::ErrorKind::AlreadyExists => "already_exists",
-                io::ErrorKind::WouldBlock | io::ErrorKind::AddrInUse => "busy",
-                io::ErrorKind::ConnectionAborted => "daemon_stopping",
-                io::ErrorKind::ConnectionRefused => "daemon_unavailable",
-                io::ErrorKind::TimedOut => "timeout",
-                _ => "internal",
-            };
+            return classify_io_error(command, io_error);
         }
         current = candidate.source();
     }
     "internal"
+}
+
+fn classify_client_error(command: &str, error: &ClientError) -> &'static str {
+    match error {
+        ClientError::Transport(error) | ClientError::Validation(error) => {
+            classify_io_error(command, error)
+        }
+        ClientError::Protocol(ProtocolError::UnsupportedVersion(_)) => "unsupported_version",
+        ClientError::Protocol(_) => "invalid_argument",
+        ClientError::Remote(error) => error.code.map_or("unknown", protocol_error_code),
+        ClientError::Lifecycle(LifecycleError::ShutdownTimeout) => "timeout",
+        ClientError::Lifecycle(LifecycleError::DaemonStart(_))
+        | ClientError::Lifecycle(LifecycleError::DaemonStartTimeout(_)) => "daemon_unavailable",
+        ClientError::Lifecycle(LifecycleError::ReplacementStartTimeout(Some(error)))
+        | ClientError::Lifecycle(LifecycleError::AttachmentReconnectTimeout(Some(error))) => {
+            classify_client_error(command, error)
+        }
+        ClientError::Lifecycle(LifecycleError::ReplacementStartTimeout(None))
+        | ClientError::Lifecycle(LifecycleError::AttachmentReconnectTimeout(None)) => "internal",
+    }
+}
+
+fn classify_io_error(command: &str, error: &io::Error) -> &'static str {
+    if command == "daemon.status"
+        && matches!(
+            error.kind(),
+            io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+        )
+    {
+        return "daemon_unavailable";
+    }
+    match error.kind() {
+        io::ErrorKind::InvalidInput | io::ErrorKind::InvalidData => "invalid_argument",
+        io::ErrorKind::NotFound => "not_found",
+        io::ErrorKind::AlreadyExists => "already_exists",
+        io::ErrorKind::WouldBlock | io::ErrorKind::AddrInUse => "busy",
+        io::ErrorKind::ConnectionAborted => "daemon_stopping",
+        io::ErrorKind::ConnectionRefused => "daemon_unavailable",
+        io::ErrorKind::TimedOut => "timeout",
+        _ => "internal",
+    }
 }
 
 #[cfg(test)]
@@ -433,6 +451,7 @@ fn protocol_error_code(code: ErrorCode) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use boomux::client::RemoteError;
     use boomux::protocol::AgentObservationSnapshot;
 
     #[test]
@@ -525,5 +544,32 @@ mod tests {
         assert!(value["occurrences"][0]["ended_at_ms"].is_null());
         assert_eq!(value["occurrences"][0]["shell_id"], "removed-shell");
         assert_eq!(value["occurrences"][0]["observation"]["state"], "inactive");
+    }
+
+    #[test]
+    fn client_errors_convert_to_stable_cli_codes() {
+        let remote = ClientError::Remote(RemoteError {
+            code: Some(ErrorCode::ShellStartFailed),
+            message: "could not start shell".into(),
+        });
+        let unsupported = ClientError::Protocol(ProtocolError::UnsupportedVersion(
+            "daemon does not support this request".into(),
+        ));
+        let transport = ClientError::Transport(io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            "connection refused",
+        ));
+        let timeout = ClientError::Lifecycle(LifecycleError::ShutdownTimeout);
+
+        assert_eq!(classify_error("shell.open", &remote), "shell_start_failed");
+        assert_eq!(
+            classify_error("shell.open", &unsupported),
+            "unsupported_version"
+        );
+        assert_eq!(
+            classify_error("shell.open", &transport),
+            "daemon_unavailable"
+        );
+        assert_eq!(classify_error("daemon.stop", &timeout), "timeout");
     }
 }
