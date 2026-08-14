@@ -430,6 +430,26 @@ fn manual_execution_succeeds_and_duplicate_key_never_spawns_twice() {
         },
         "scheduled execution did not exit",
     );
+    wait_until(
+        || {
+            daemon
+                .client
+                .events(Some(event_cursor.clone()), 256, 0)
+                .is_ok_and(|page| {
+                    page.events.iter().any(|event| {
+                        matches!(
+                            &event.kind,
+                            protocol::DaemonEventKind::ScheduledExecutionChanged {
+                                execution,
+                                ..
+                            } if execution.id == first.id
+                                && execution.state == ScheduledExecutionState::Exited
+                        )
+                    })
+                })
+        },
+        "scheduled execution exit event was not published",
+    );
     assert_eq!(fs::read_to_string(&capture).unwrap(), "spawn\n");
     assert_eq!(
         fs::read(daemon.runtime_dir.join("argv")).unwrap(),
