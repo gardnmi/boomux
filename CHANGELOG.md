@@ -1,5 +1,33 @@
 # Changelog
 
+## [0.14.0](https://github.com/gardnmi/boomux/compare/v0.13.0...v0.14.0) (2026-08-14)
+
+
+### Features
+
+* invoke individual launchers ([#135](https://github.com/gardnmi/boomux/issues/135)) ([ee74631](https://github.com/gardnmi/boomux/commit/ee746314d68075ca021b2d45716f267f99556f8e))
+
+
+### Performance Improvements
+
+* **daemon:** bound connection and response resources ([#138](https://github.com/gardnmi/boomux/issues/138)) ([554fb1c](https://github.com/gardnmi/boomux/commit/554fb1c34f4c1a2af20500bcad8921bb810009bf))
+* **daemon:** move persistence out of PTY-critical coordination ([#133](https://github.com/gardnmi/boomux/issues/133)) ([cee1caa](https://github.com/gardnmi/boomux/commit/cee1caa6998f11aeee8c53af1a80dca14d83b657))
+* **daemon:** remove global serialization from PTY output ([#136](https://github.com/gardnmi/boomux/issues/136)) ([e25d8d2](https://github.com/gardnmi/boomux/commit/e25d8d2df3621cd38d6f4bb62d83c294003bea3c))
+* **dashboard:** refresh from events instead of full polling ([#131](https://github.com/gardnmi/boomux/issues/131)) ([cb5d6a4](https://github.com/gardnmi/boomux/commit/cb5d6a45380be70b2af22796af4bf3f243eb2a42))
+* **terminal:** bound preview work before formatting ([#137](https://github.com/gardnmi/boomux/issues/137)) ([8bfc0fb](https://github.com/gardnmi/boomux/commit/8bfc0fbef70f9d1fefbc16f9570b4340742c5ac1))
+
+
+### Code Refactoring
+
+* **cli:** centralize command metadata ([#126](https://github.com/gardnmi/boomux/issues/126)) ([264df3d](https://github.com/gardnmi/boomux/commit/264df3dfa36d52989374261d77b9f0010a40df56))
+* **daemon:** replace whole-registry rollback with lifecycle transactions ([#141](https://github.com/gardnmi/boomux/issues/141)) ([d3c0ac8](https://github.com/gardnmi/boomux/commit/d3c0ac88ea9aa48038b811a282470c55659b7c10))
+* **daemon:** separate durable state from runtime services ([#139](https://github.com/gardnmi/boomux/issues/139)) ([434ba90](https://github.com/gardnmi/boomux/commit/434ba906b9a5ea7489197da93d8d6baac6fae42f))
+* **dashboard:** add typed view projection ([#127](https://github.com/gardnmi/boomux/issues/127)) ([bf130da](https://github.com/gardnmi/boomux/commit/bf130da115340db376f4c1182f9127e017a0ad05))
+* **errors:** preserve typed daemon and client failures ([316b4af](https://github.com/gardnmi/boomux/commit/316b4af7a73d1b26138430ef6ca6e37ef5a63579)), closes [#123](https://github.com/gardnmi/boomux/issues/123)
+* **integrations:** centralize capability descriptors ([88e1321](https://github.com/gardnmi/boomux/commit/88e1321d45fc9ea9a6652dce263c5a8543b35a46)), closes [#122](https://github.com/gardnmi/boomux/issues/122)
+* **protocol:** centralize feature compatibility policy ([#129](https://github.com/gardnmi/boomux/issues/129)) ([57dc608](https://github.com/gardnmi/boomux/commit/57dc60845c60c4e4eb0ed6736c810ec852797bfb))
+* **tui:** separate model updates from effects ([#130](https://github.com/gardnmi/boomux/issues/130)) ([2c83a43](https://github.com/gardnmi/boomux/commit/2c83a431431ffe33bc3f9dc6a3126cab5ace36b6))
+
 ## [0.13.0](https://github.com/gardnmi/boomux/compare/v0.12.0...v0.13.0) (2026-08-12)
 
 
