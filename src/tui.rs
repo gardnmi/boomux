@@ -2630,10 +2630,17 @@ fn render_workspaces(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut A
             Layout::vertical([Constraint::Fill(1), Constraint::Length(preview_height)]).areas(area);
         (table_area, Some(preview_area))
     });
-    let rows = app
-        .workspaces
-        .iter()
-        .map(|workspace| Row::new([Cell::from(workspace.name.as_str())]));
+    let rows = if app.workspaces.is_empty() {
+        vec![Row::new([Cell::from(Span::styled(
+            "No workspaces. Press a to create one.",
+            Style::new().fg(SUBTEXT),
+        ))])]
+    } else {
+        app.workspaces
+            .iter()
+            .map(|workspace| Row::new([Cell::from(workspace.name.as_str())]))
+            .collect()
+    };
     let table = Table::new(rows, [Constraint::Min(8)])
         .header(Row::new(["NAME"]).style(Style::new().fg(BLUE).add_modifier(Modifier::BOLD)))
         .block(
@@ -6519,6 +6526,24 @@ mod tests {
         assert!(!text.contains("term_1"));
         assert!(!text.contains("DIRTY"));
         assert!(text.contains("WORKTREE"));
+    }
+
+    #[test]
+    fn empty_dashboard_explains_how_to_create_a_workspace() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new(Vec::new(), project_context());
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+
+        assert!(text.contains("No workspaces. Press a to create one."));
     }
 
     #[test]
