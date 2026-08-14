@@ -45,6 +45,27 @@ A foreground process hint is not an Agent Instance and is presented as Untracked
 Catalog-only OpenCode history is a client-side projected session with Unknown state and no
 fabricated Agent occurrence.
 
+## Agent Session
+
+The canonical external conversation projected into one workspace from Agent Instances or host
+history. It can span multiple shell runs and Agent Instances that share an integration and exact
+external session identity, but it owns no process, PTY, or lifecycle observation.
+
+## Agent Schedule
+
+A durable workspace-owned definition for recurring prompt-driven Agent work with fixed execution
+context, session policy, and trigger policy. Creating a schedule does not create a shell, shell run,
+Agent Instance, or Agent Session. Its first dispatch creates one reusable schedule-owned shell for
+later execution runs, and a new schedule is paused until explicitly enabled.
+
+## Scheduled Execution
+
+A durable record of one manual or timed Agent Schedule decision, bound to the exact schedule and
+prompt revisions evaluated for that decision. A skipped or pre-shell failed dispatch has no shell
+run; an execution whose internal runner started retains that run even if the external host failed
+to launch. It may acquire an Agent Instance, whose lifecycle remains authoritative independently
+of the execution's process outcome.
+
 ## Process Adapter
 
 A process-bound observer for an agent instance whose evidence is limited to process events. The

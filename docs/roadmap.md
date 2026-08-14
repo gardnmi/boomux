@@ -166,6 +166,21 @@ eternal process.
 - Defer hooks, tests, focus actions, and other automatic reactions until waits,
   notification deduplication, and durable transition semantics are proven.
 
+### Scheduled Agent Work
+
+The accepted pre-implementation contract is documented in
+[`scheduled-agent-work.md`](scheduled-agent-work.md) and tracked by
+[#146](https://github.com/gardnmi/boomux/issues/146). Delivery is intentionally
+stacked: terminology and safety policy, durable management, manual dispatch,
+timed dispatch, observation, dashboard UX, companion-plugin UX, then an
+evidence-based decision about optional user-service activation.
+
+The first version uses workspace-owned paused-by-default schedules, snapshotted
+prompt revisions, fresh or exact-session continuation, canonical five-field cron
+with friendly creation conveniences, skipped overlap and missed work, no retry,
+no automatic timeout, one active execution per workspace, and a configurable
+daemon-wide concurrency limit that defaults to four.
+
 ## Distribution And Polish
 
 - Support configuration for refresh rate.
