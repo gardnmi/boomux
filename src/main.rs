@@ -630,12 +630,11 @@ enum IntegrationCommands {
     List,
     /// Inspect host, asset, and runtime reporting status
     Status {
-        #[arg(value_enum)]
         integration: Option<integration_management::IntegrationId>,
     },
     /// Install one integration or every bundled integration
     Install {
-        #[arg(value_enum, required_unless_present = "all", conflicts_with = "all")]
+        #[arg(required_unless_present = "all", conflicts_with = "all")]
         integration: Option<integration_management::IntegrationId>,
         #[arg(long, conflicts_with = "integration")]
         all: bool,
@@ -646,7 +645,7 @@ enum IntegrationCommands {
     },
     /// Remove one integration or every bundled integration
     Uninstall {
-        #[arg(value_enum, required_unless_present = "all", conflicts_with = "all")]
+        #[arg(required_unless_present = "all", conflicts_with = "all")]
         integration: Option<integration_management::IntegrationId>,
         #[arg(long, conflicts_with = "integration")]
         all: bool,
@@ -655,7 +654,6 @@ enum IntegrationCommands {
     },
     /// Inspect, install, and explain verification for one integration
     Setup {
-        #[arg(value_enum)]
         integration: integration_management::IntegrationId,
         /// Accept the proposed installation without prompting
         #[arg(long)]
@@ -666,7 +664,6 @@ enum IntegrationCommands {
     },
     /// Verify authoritative lifecycle reporting in a running host shell
     Verify {
-        #[arg(value_enum)]
         integration: integration_management::IntegrationId,
         #[arg(long, value_name = "ID")]
         shell: Option<String>,
@@ -1698,7 +1695,7 @@ fn integration_command(command: IntegrationCommands, json: bool) -> Result<(), B
             dry_run,
         } => {
             let integrations = if all {
-                integration_management::IntegrationId::ALL.to_vec()
+                integration_management::IntegrationId::all().collect()
             } else {
                 vec![integration.ok_or_else(|| {
                     cli_output::failure(
@@ -1715,7 +1712,7 @@ fn integration_command(command: IntegrationCommands, json: bool) -> Result<(), B
             force,
         } => {
             let integrations = if all {
-                integration_management::IntegrationId::ALL.to_vec()
+                integration_management::IntegrationId::all().collect()
             } else {
                 vec![integration.ok_or_else(|| {
                     cli_output::failure(
@@ -1765,14 +1762,14 @@ fn verify_integration(
                 format!(
                     "shell {} is not a running {} host shell",
                     shell_id.expect("checked above"),
-                    spec.name
+                    spec.key
                 ),
             ));
         }
         [] => {
             return Err(cli_output::failure(
                 "not_found",
-                format!("no running {} host shell found", spec.name),
+                format!("no running {} host shell found", spec.key),
             ));
         }
         _ => {
@@ -1799,7 +1796,7 @@ fn verify_integration(
                     return print_json(
                         CommandKey::IntegrationVerify,
                         serde_json::json!({
-                            "integration": spec.name,
+                            "integration": spec.key,
                             "verified": true,
                             "shell_id": target.shell_id,
                             "run_id": target.run_id,
@@ -1818,7 +1815,7 @@ fn verify_integration(
                     "not_found",
                     format!(
                         "shell {} is no longer a running {} host shell",
-                        target.shell_id, spec.name
+                        target.shell_id, spec.key
                     ),
                 ));
             }
@@ -1836,7 +1833,7 @@ fn verify_integration(
                 io::ErrorKind::TimedOut,
                 format!(
                     "did not observe lifecycle integration reporting for {} in shell {} within {} ms",
-                    spec.name, target.shell_id, wait_ms
+                    spec.key, target.shell_id, wait_ms
                 ),
             )
             .into());
@@ -1885,7 +1882,7 @@ fn format_ambiguous_verification_targets(
         write!(
             output,
             "\n  {workspace} / {shell}\n    boomux integration verify {} --shell {shell_id}",
-            spec.name
+            spec.key
         )
         .expect("writing to a string cannot fail");
     }
@@ -1893,8 +1890,7 @@ fn format_ambiguous_verification_targets(
 }
 
 fn list_integrations(json: bool) -> Result<(), Box<dyn Error>> {
-    let integrations = integration_management::IntegrationId::ALL
-        .into_iter()
+    let integrations = integration_management::IntegrationId::all()
         .map(integration_management::IntegrationSummary::from)
         .collect::<Vec<_>>();
     if json {
@@ -1945,7 +1941,7 @@ fn integration_status(
     let environment = integration_management::Environment::from_process();
     let snapshot = client::connect().and_then(|client| client.snapshot()).ok();
     let integrations = integration.map_or_else(
-        || integration_management::IntegrationId::ALL.to_vec(),
+        || integration_management::IntegrationId::all().collect(),
         |integration| vec![integration],
     );
     let statuses = integrations
@@ -2073,18 +2069,19 @@ fn install_integrations(
         }
         for plan in &plans {
             let spec = plan.integration.spec();
+            let installation = plan.integration.installation();
             match plan.action {
                 integration_management::InstallAction::Install => println!(
                     "Would install Boomux {} {} at {}",
-                    spec.display_name, spec.asset_name, plan.path
+                    spec.display_name, installation.asset_name, plan.path
                 ),
                 integration_management::InstallAction::Replace => println!(
                     "Would replace Boomux {} {} at {}",
-                    spec.display_name, spec.asset_name, plan.path
+                    spec.display_name, installation.asset_name, plan.path
                 ),
                 integration_management::InstallAction::Unchanged => println!(
                     "Boomux {} {} is already installed at {}",
-                    spec.display_name, spec.asset_name, plan.path
+                    spec.display_name, installation.asset_name, plan.path
                 ),
             }
         }
@@ -2108,22 +2105,23 @@ fn install_integrations(
 fn print_integration_install_results(results: &[integration_management::InstallResult]) {
     for result in results {
         let spec = result.integration.spec();
+        let installation = result.integration.installation();
         match result.result {
             integration_management::InstallOutcome::Unchanged => println!(
                 "Boomux {} {} is already installed at {}",
-                spec.display_name, spec.asset_name, result.path
+                spec.display_name, installation.asset_name, result.path
             ),
             integration_management::InstallOutcome::Installed => println!(
                 "Installed Boomux {} {} at {}",
-                spec.display_name, spec.asset_name, result.path
+                spec.display_name, installation.asset_name, result.path
             ),
             integration_management::InstallOutcome::Replaced => println!(
                 "Replaced Boomux {} {} at {}",
-                spec.display_name, spec.asset_name, result.path
+                spec.display_name, installation.asset_name, result.path
             ),
         }
         if result.restart_required {
-            println!("{}", spec.reload_message);
+            println!("{}", installation.reload_message);
         }
     }
 }
@@ -2150,18 +2148,19 @@ fn uninstall_integrations(
     }
     for result in &results {
         let spec = result.integration.spec();
+        let installation = result.integration.installation();
         match result.result {
             integration_management::UninstallOutcome::Removed => println!(
                 "Removed Boomux {} {} from {}",
-                spec.display_name, spec.asset_name, result.path
+                spec.display_name, installation.asset_name, result.path
             ),
             integration_management::UninstallOutcome::NotInstalled => println!(
                 "Boomux {} {} is not installed at {}",
-                spec.display_name, spec.asset_name, result.path
+                spec.display_name, installation.asset_name, result.path
             ),
         }
         if result.restart_required {
-            println!("{}", spec.reload_message);
+            println!("{}", installation.reload_message);
         }
     }
     Ok(())
@@ -2181,6 +2180,7 @@ fn setup_integration(
     );
 
     let spec = integration.spec();
+    let installation = integration.installation();
     if status.asset.state == integration_management::AssetState::Current {
         print_setup_next_step(integration, status.runtime.state);
         return Ok(());
@@ -2203,7 +2203,10 @@ fn setup_integration(
         integration_management::InstallAction::Replace => "replace",
         integration_management::InstallAction::Unchanged => "leave unchanged",
     };
-    println!("Plan: {action} Boomux {} at {}", spec.asset_name, plan.path);
+    println!(
+        "Plan: {action} Boomux {} at {}",
+        installation.asset_name, plan.path
+    );
 
     if yes && replacing && !force {
         return Err(io::Error::new(
@@ -2228,7 +2231,7 @@ fn setup_integration(
     print_integration_install_results(&[result]);
     println!(
         "After restarting {}, run: boomux integration verify {}",
-        spec.display_name, spec.name
+        spec.display_name, spec.key
     );
     Ok(())
 }
@@ -2258,7 +2261,7 @@ fn print_setup_next_step(
     } else {
         println!(
             "The asset is current. Restart {}, open it in a Boomux-managed shell, then run: boomux integration verify {}",
-            spec.display_name, spec.name
+            spec.display_name, spec.key
         );
     }
 }
@@ -2293,15 +2296,15 @@ fn capabilities(json: bool) -> Result<(), Box<dyn Error>> {
         "internal",
         "unknown",
     ];
-    let integration_hosts = integration_management::IntegrationId::ALL
-        .into_iter()
+    let integration_hosts = integration_management::IntegrationId::all()
         .map(|integration| {
             let spec = integration.spec();
+            let installation = integration.installation();
             (
-                spec.name.to_owned(),
+                spec.key.to_owned(),
                 serde_json::json!({
-                    "package": spec.package,
-                    "validated_version": spec.validated_version,
+                    "package": installation.package,
+                    "validated_version": installation.validated_version,
                 }),
             )
         })
@@ -2332,11 +2335,11 @@ fn capabilities(json: bool) -> Result<(), Box<dyn Error>> {
     );
     println!(
         "INTEGRATION HOSTS\t{}",
-        integration_management::IntegrationId::ALL
-            .into_iter()
+        integration_management::IntegrationId::all()
             .map(|integration| {
                 let spec = integration.spec();
-                format!("{}={}", spec.name, spec.validated_version)
+                let installation = integration.installation();
+                format!("{}={}", spec.key, installation.validated_version)
             })
             .collect::<Vec<_>>()
             .join(",")
@@ -4190,7 +4193,7 @@ fn doctor(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
         }
     }
     let integration_environment = integration_management::Environment::from_process();
-    for integration in integration_management::IntegrationId::ALL {
+    for integration in integration_management::IntegrationId::all() {
         let status = integration_management::inspect_without_host_probe(
             integration,
             &integration_environment,
@@ -4210,12 +4213,13 @@ fn print_integration_diagnostic(
     status: &integration_management::IntegrationStatus,
 ) -> bool {
     let spec = integration.spec();
+    let installation = integration.installation();
     let path = status.asset.path.as_deref().unwrap_or("unresolved path");
     if status.asset.state == integration_management::AssetState::Unavailable {
         eprintln!(
             "err {} integration: cannot inspect {} at {path}: {}",
-            spec.name,
-            spec.asset_name,
+            spec.key,
+            installation.asset_name,
             status.asset.error.as_deref().unwrap_or("unknown error")
         );
         return false;
@@ -4223,8 +4227,8 @@ fn print_integration_diagnostic(
     if status.runtime.running_processes == 0 {
         println!(
             "ok  {} integration: {} {} at {path}",
-            spec.name,
-            spec.asset_name,
+            spec.key,
+            installation.asset_name,
             status.asset.state.as_str(),
         );
         return true;
@@ -4232,10 +4236,10 @@ fn print_integration_diagnostic(
     if status.asset.state != integration_management::AssetState::Current {
         eprintln!(
             "err {} integration: {} {} at {path}; run boomux integration install {}{}",
-            spec.name,
-            spec.asset_name,
+            spec.key,
+            installation.asset_name,
             status.asset.state.as_str(),
-            spec.name,
+            spec.key,
             if status.asset.state == integration_management::AssetState::Modified {
                 " --force"
             } else {
@@ -4247,13 +4251,13 @@ fn print_integration_diagnostic(
     if status.runtime.untracked_processes == 0 {
         println!(
             "ok  {} integration: lifecycle registration active",
-            spec.name
+            spec.key
         );
         true
     } else {
         eprintln!(
             "err {} integration: {} foreground process(es) are untracked; restart {} and verify it loads {path}",
-            spec.name, status.runtime.untracked_processes, spec.display_name
+            spec.key, status.runtime.untracked_processes, spec.display_name
         );
         false
     }
@@ -5929,8 +5933,7 @@ mod tests {
 
     #[test]
     fn formats_integration_output_without_tab_alignment() {
-        let integrations = integration_management::IntegrationId::ALL
-            .into_iter()
+        let integrations = integration_management::IntegrationId::all()
             .map(integration_management::IntegrationSummary::from)
             .collect::<Vec<_>>();
         assert_eq!(
@@ -6117,13 +6120,13 @@ mod tests {
         }
         assert_eq!(
             integration_management::IntegrationId::Opencode
-                .spec()
+                .installation()
                 .validated_version,
             "1.18.15"
         );
         assert_eq!(
             integration_management::IntegrationId::Pi
-                .spec()
+                .installation()
                 .validated_version,
             "0.84.1"
         );

@@ -12,10 +12,6 @@ struct PiAdapter;
 pub(super) static ADAPTER: &dyn TitleAdapter = &PiAdapter;
 
 impl TitleAdapter for PiAdapter {
-    fn integration(&self) -> &'static str {
-        "pi"
-    }
-
     fn inspect(&self, directory: &Path) -> Option<Inspection> {
         inspect(directory, &Environment::from_process())
     }

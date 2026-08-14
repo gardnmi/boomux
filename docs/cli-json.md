@@ -26,11 +26,14 @@ the CLI version, daemon protocol version, supported JSON schemas and commands,
 stable error codes, feature names, and the package and validated version for
 each bundled integration host under `integration_hosts`. Validated versions are
 compatibility test points, not runtime pins or minimum-version guarantees.
+Integration ordering and host metadata come from the same capability descriptor
+registry used by installation, foreground recognition, recovery, titles, and
+transcripts.
 Protocol-backed feature names are derived from the same typed registry as
 request gating and negotiated client feature checks, so each name has one
 minimum protocol version authority.
-`session_transcript_integrations` lists the integration keys with registered
-canonical transcript adapters.
+`session_transcript_integrations` lists the integration keys whose descriptors
+declare canonical transcript support.
 The `desktop_notifications` feature means this binary supports daemon-owned
 notification delivery; it does not imply notifications are enabled or that
 `notify-send` and a desktop notification service are available. Configuration is

@@ -1669,23 +1669,9 @@ impl DurableRegistry {
             return Ok(None);
         }
 
-        let executable = if shell.command.is_empty() {
-            integration.clone()
-        } else if shell.command.len() == 1
-            && Path::new(&shell.command[0])
-                .file_name()
-                .and_then(|name| name.to_str())
-                == Some(integration.as_str())
-        {
-            shell.command[0].clone()
-        } else {
-            return Ok(None);
-        };
-        Ok(Some(vec![
-            executable,
-            "--session".into(),
-            external_session_id.clone(),
-        ]))
+        Ok(crate::integrations::by_key(integration)
+            .and_then(|descriptor| descriptor.resume)
+            .and_then(|resume| resume.command(&shell.command, external_session_id)))
     }
 
     fn notification_context(&self, workspace_id: &str, shell_id: &str) -> (String, String) {
@@ -3656,7 +3642,8 @@ fn resume_identity(
         || agent.shell_id != shell.id
         || agent.run_id != previous_run.id
         || agent.cwd.as_ref() != Some(&shell.cwd)
-        || !matches!(agent.integration.as_str(), "opencode" | "pi")
+        || !crate::integrations::by_key(&agent.integration)
+            .is_some_and(|descriptor| descriptor.resume.is_some())
     {
         return Ok(None);
     }

@@ -5,6 +5,8 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use boomux::integrations::{self, TitleProvider};
+
 mod opencode;
 mod pi;
 
@@ -45,16 +47,8 @@ struct Inspection {
 }
 
 trait TitleAdapter: Sync {
-    fn integration(&self) -> &'static str;
-
     fn inspect(&self, directory: &Path) -> Option<Inspection>;
-
-    fn provides_catalog(&self) -> bool {
-        false
-    }
 }
-
-static ADAPTERS: &[&dyn TitleAdapter] = &[opencode::ADAPTER, pi::ADAPTER];
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct CacheKey {
@@ -123,7 +117,10 @@ impl Cache {
         integration: &str,
         directory: &Path,
     ) -> Option<Vec<HostSession>> {
-        if !adapter(integration).is_some_and(|adapter| adapter.provides_catalog()) {
+        if !integrations::by_key(integration)
+            .and_then(|descriptor| descriptor.titles)
+            .is_some_and(|titles| titles.provides_catalog)
+        {
             return None;
         }
         self.refresh(integration, directory);
@@ -176,27 +173,31 @@ fn inspect(integration: &str, directory: &Path) -> Option<Inspection> {
 }
 
 pub(crate) fn catalog_integrations() -> impl Iterator<Item = &'static str> {
-    ADAPTERS
+    integrations::ALL
         .iter()
-        .filter(|adapter| adapter.provides_catalog())
-        .map(|adapter| adapter.integration())
+        .filter(|descriptor| {
+            descriptor
+                .titles
+                .is_some_and(|titles| titles.provides_catalog)
+        })
+        .map(|descriptor| descriptor.key)
 }
 
 pub(crate) fn catalog(integration: &str, directory: &Path) -> Option<Vec<HostSession>> {
-    let adapter = adapter(integration)?;
-    if !adapter.provides_catalog() {
+    if !integrations::by_key(integration)?.titles?.provides_catalog {
         return None;
     }
+    let adapter = adapter(integration)?;
     adapter
         .inspect(directory)
         .map(|inspection| inspection.catalog)
 }
 
 fn adapter(integration: &str) -> Option<&'static dyn TitleAdapter> {
-    ADAPTERS
-        .iter()
-        .copied()
-        .find(|adapter| adapter.integration() == integration)
+    match integrations::by_key(integration)?.titles?.provider {
+        TitleProvider::OpenCode => Some(opencode::ADAPTER),
+        TitleProvider::Pi => Some(pi::ADAPTER),
+    }
 }
 
 fn sanitize_title(title: &str) -> Option<String> {
