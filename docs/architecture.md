@@ -251,15 +251,15 @@ identity, and mixed-directory workspaces remain valid.
 
 The dashboard establishes an atomic event-stream baseline and treats later
 events as invalidation signals for authoritative snapshot reprojection. Idle
-checks advance only the event cursor. Once per second, protocol-21 dashboards
-refresh ephemeral focus through its targeted read and foreground-process hints
-through targeted running-shell reads; they do not rebuild the complete registry.
-The daemon caches foreground inspection per shell run for one second, so
-concurrent dashboards reuse the result. Cursor expiration or cold daemon
-replacement establishes a new baseline and resets client-side focus revision
-tracking when the stream identity changes. Protocols 7-20 use a one-second
-snapshot fallback for ephemeral fields. Protocol-6 dashboards retain that
-fallback for all state because that version predates the event stream.
+checks advance only the event cursor. Once per second, event-stream dashboards
+refresh one authoritative snapshot while retaining the advanced cursor. This
+keeps ephemeral focus and foreground-process hints current without serial
+per-shell client requests. The daemon caches foreground inspection per shell run
+for one second, so concurrent dashboards reuse the result. Cursor expiration or
+cold daemon replacement establishes a new baseline and resets client-side focus
+revision tracking when the stream identity changes. Protocol-6 dashboards use a
+one-second snapshot fallback for all state because that version predates the
+event stream.
 
 Shell snapshots include their additive stored startup argument vector. The
 dashboard presents an empty vector as `shell` and a non-empty vector as

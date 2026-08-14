@@ -1886,8 +1886,10 @@ fn run_loop<B: DashboardBackend>(
         }
         if !effects.is_empty() {
             execute_effects(&mut app, &mut backend, effects);
-            last_refresh = Instant::now();
         }
+        // Keep navigation responsive by waiting for an idle input window before
+        // performing the next synchronous background refresh.
+        last_refresh = Instant::now();
     }
 }
 

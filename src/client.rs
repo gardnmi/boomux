@@ -220,8 +220,11 @@ impl SnapshotWatch {
                     self.cursor = Some(batch.cursor);
                     return Ok((false, false));
                 }
-                *self = Self::baseline(client)?;
-                Ok((true, self.stream_id() != Some(stream_id.as_str())))
+                let stream_changed = batch.stream_id != stream_id;
+                let snapshot = client.snapshot()?;
+                self.cursor = Some(batch.cursor);
+                self.snapshot = snapshot;
+                Ok((true, stream_changed))
             }
             Err(ClientError::Remote(RemoteError {
                 code: Some(ErrorCode::CursorExpired),
