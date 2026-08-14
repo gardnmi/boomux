@@ -195,6 +195,27 @@ Closing a workspace terminates its managed shells. Closing a shell or command
 terminates its managed process. Removing a launcher affects future workspace
 opens only. Press `?` in the dashboard for context-specific controls.
 
+## Omarchy Plugin
+
+Omarchy users can add the optional
+[Boomux for Omarchy](https://github.com/gardnmi/omarchy-boomux) companion plugin
+to monitor Agents and manage Boomux workspaces from the Omarchy bar. It shows
+working, idle, blocked, and completed activity; opens workspaces or individual
+items; creates workspaces, shells, and coding-agent commands; acknowledges
+durable attention; and launches the full Boomux dashboard in a native terminal.
+
+The plugin requires Boomux `0.14.0` or newer and Omarchy's Quattro shell plugin
+system. Review its source before installation because Omarchy plugins run as
+unsandboxed code inside the long-running shell process.
+
+```console
+omarchy plugin add https://github.com/gardnmi/omarchy-boomux.git --enable
+```
+
+See the [plugin documentation](https://github.com/gardnmi/omarchy-boomux#readme)
+for controls, lifecycle-integration setup, updates, removal, privacy details,
+and troubleshooting.
+
 ## Coding-Agent Integrations
 
 Boomux includes optional lifecycle integrations for OpenCode and Pi. Guided
@@ -397,6 +418,7 @@ Revision-aware output reads and daemon event cursors are documented in
 - [Daemon events and revision-aware reads](docs/event-stream.md)
 - [Live PTY handoff](docs/live-pty-handoff.md)
 - [Integration lifecycle validation](docs/lifecycle-validation.md)
+- [Boomux for Omarchy companion plugin](https://github.com/gardnmi/omarchy-boomux)
 - [Roadmap](docs/roadmap.md)
 
 ## Development
