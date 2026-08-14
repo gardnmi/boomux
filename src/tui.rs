@@ -3461,11 +3461,7 @@ fn session_task_label(session: &AgentSessionView) -> Option<&str> {
 }
 
 fn integration_display_name(integration: &str) -> &str {
-    match integration {
-        "opencode" => "OpenCode",
-        "pi" => "Pi",
-        other => other,
-    }
+    boomux::integrations::display_name(integration)
 }
 
 fn item_column_widths(width: u16, rows: &[[String; 6]]) -> Vec<Constraint> {

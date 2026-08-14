@@ -112,7 +112,11 @@ fn project_workspace(
                     agent.workspace_id == workspace.id
                         && agent.shell_id == shell.id
                         && agent.run_id == run.id
-                        && shell.foreground_process.as_deref() == Some(agent.integration.as_str())
+                        && boomux::integrations::by_key(&agent.integration)
+                            .and_then(|descriptor| descriptor.foreground)
+                            .is_some_and(|foreground| {
+                                shell.foreground_process.as_deref() == Some(foreground.process_name)
+                            })
                         && !session_projection::agent_is_active_for_run(agent, &shell.id, &run.id)
                 })
             });
@@ -144,7 +148,10 @@ fn project_workspace(
                         root_worktree: root_git.worktree,
                     }),
                 }),
-                (None, Some("opencode" | "pi")) if !suppress_foreground_hint => {
+                (None, Some(process))
+                    if boomux::integrations::by_foreground_process(process).is_some()
+                        && !suppress_foreground_hint =>
+                {
                     WorkspaceItemView::AgentShell(AgentShellView {
                         shell: shell_view,
                         agent: None,

@@ -16,16 +16,8 @@ struct OpenCodeAdapter;
 pub(super) static ADAPTER: &dyn TitleAdapter = &OpenCodeAdapter;
 
 impl TitleAdapter for OpenCodeAdapter {
-    fn integration(&self) -> &'static str {
-        "opencode"
-    }
-
     fn inspect(&self, directory: &Path) -> Option<Inspection> {
         inspect_catalog(directory)
-    }
-
-    fn provides_catalog(&self) -> bool {
-        true
     }
 }
 
@@ -119,7 +111,7 @@ pub(super) fn parse_catalog(output: &[u8]) -> Option<Inspection> {
             continue;
         };
         catalog.push(HostSession {
-            integration: "opencode".into(),
+            integration: boomux::integrations::OPENCODE.key.into(),
             root_id: session.id,
             title,
             directory,

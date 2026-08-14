@@ -21,6 +21,7 @@
 | `src/terminal_focus.rs` | Stateful parsing and restoration of child focus-reporting mode |
 | `src/tui.rs` | Dashboard state, interaction, palette, polling, and Ratatui rendering; no direct daemon transport |
 | `src/session_projection.rs` | Projection of daemon Agent state and host catalogs into client-visible sessions |
+| `src/integrations.rs` | Integration identity, display metadata, and optional installation, title/catalog, transcript, resume, and foreground capabilities |
 | `src/host_session_titles.rs` and children | Shared title/catalog policy and host-specific discovery adapters |
 | `src/host_session_source.rs` and children | Canonical host source paths, normalization, and secure source lookup |
 | `src/session_transcript.rs` and children | Shared transcript identity, bounds, pagination, and host-specific normalization |
@@ -287,13 +288,15 @@ workspace that references their exact normalized directory. The dashboard maps
 the active or latest exact match into a durable Agent's contextual preview and
 discovers catalogs asynchronously; session CLI listing performs the same bounded
 discovery synchronously. Sessions are not a dashboard kind.
-Title enrichment has its own adapter registry. Each adapter declares whether it
-also provides a session catalog. The shared layer owns asynchronous cache,
-refresh, deduplication, sanitization, and fallback policy; OpenCode and Pi modules
-own host command execution and title extraction. Neutral host source modules own
-shared path normalization and secure source discovery. Title and catalog support
-remain independent from transcript support so a future harness may implement
-the relevant capabilities without claiming transcript support.
+The integration descriptor registry is the authority for integration keys,
+display names, and optional typed capabilities. A title capability selects its
+host adapter and independently declares catalog support. The shared title layer
+owns asynchronous cache, refresh, deduplication, sanitization, and fallback
+policy; OpenCode and Pi modules own host command execution and title extraction.
+Neutral host source modules own shared path normalization and secure source
+discovery. Title and catalog support remain independent from transcript support,
+installation, foreground recognition, and recovery eligibility, so a future
+harness can implement only the capabilities it provides.
 
 Session list/inspect requires a negotiated protocol-12 snapshot because the
 projection depends on that complete Agent state model. Protocol 13 adds an
@@ -542,25 +545,25 @@ Cursor data is untrusted consistency metadata rather than authorization; exact
 projected-session resolution and canonical source access remain the security
 boundary.
 
-The transcript layer is an adapter registry keyed by the Agent integration
-name. An adapter receives only the canonical external session ID and retained
+The integration descriptor's optional transcript capability selects a host
+adapter. An adapter receives only the canonical external session ID and retained
 working directory and returns host-neutral transcript entries. Exact projected
 session resolution, access preconditions, newest-suffix pagination, byte and
 entry bounds, cursor validation, truncation, typed errors, human output, and
 `boomux.cli/v1` JSON
 remain shared. Adding Claude Code, Codex, or another harness therefore requires
-one canonical source adapter and one registry entry, not another CLI path.
+one canonical source adapter and one descriptor capability, not another CLI path.
 `boomux capabilities --json` derives `session_transcript_integrations` from this
-registry so integrations can discover support without hard-coded host lists.
+descriptor registry so integrations can discover support without hard-coded host lists.
 
 The implementation mirrors these boundaries in both adapter families:
-`host_session_titles.rs` and `session_transcript.rs` contain only shared policy,
-contracts, and registries, while their `opencode.rs` and `pi.rs` child modules
+`host_session_titles.rs` and `session_transcript.rs` contain only shared policy
+and contracts, while their `opencode.rs` and `pi.rs` child modules
 contain host-specific parsing and normalization. Shared source lookup belongs in
 `host_session_source.rs` and its host-specific child modules rather than either
 capability adapter. Adding Claude Code, Codex, or another harness means adding
-isolated title and transcript modules as supported, then registering each
-capability explicitly; existing host parsers do not grow new conditional branches.
+isolated title and transcript modules as supported, then declaring each provider
+on its descriptor; existing host parsers do not grow new conditional branches.
 
 Protocol 12 adds `inactive`. Protocol-9 through protocol-11 clients receive that
 observation as `unknown`, while protocol-12 clients can distinguish a resumable

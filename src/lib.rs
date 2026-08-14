@@ -4,6 +4,7 @@ pub mod daemon;
 mod desktop_notifications;
 mod fd_transfer;
 mod handoff;
+pub mod integrations;
 pub mod protocol;
 mod state_store;
 mod terminal_focus;

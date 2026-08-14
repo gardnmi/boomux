@@ -21,10 +21,6 @@ struct OpenCodeAdapter;
 pub(super) static ADAPTER: &dyn TranscriptAdapter = &OpenCodeAdapter;
 
 impl TranscriptAdapter for OpenCodeAdapter {
-    fn integration(&self) -> &'static str {
-        "opencode"
-    }
-
     fn normalization_revision(&self) -> u32 {
         1
     }
