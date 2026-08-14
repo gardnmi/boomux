@@ -1174,6 +1174,7 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
         },
         config.dashboard.follow_focused_terminal,
         project_context,
+        true,
         |effect| match effect {
             tui::DashboardEffect::Quit => unreachable!("quit is handled by the dashboard runtime"),
             tui::DashboardEffect::CheckForUpdates => {
