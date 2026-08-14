@@ -1320,6 +1320,7 @@ mod tests {
     #[test]
     fn runtime_status_requires_exact_current_run_registration() {
         let shell = ShellSnapshot {
+            owner: boomux::protocol::ShellOwner::User,
             id: "s1".into(),
             workspace_id: "w1".into(),
             name: "shell".into(),

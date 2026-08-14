@@ -46,6 +46,8 @@ pub(crate) struct EventStreamManifest {
     pub(crate) stream_id: String,
     pub(crate) latest_id: u64,
     pub(crate) events: Vec<DaemonEvent>,
+    #[serde(default)]
+    pub(crate) schedule_shell_ids: Vec<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -89,7 +91,7 @@ pub(crate) enum Bootstrap {
         state_lock: OwnedFd,
         runtimes: Vec<TransferredRuntime>,
         exited: Vec<TransferredExited>,
-        event_stream: EventStreamManifest,
+        event_stream: Box<EventStreamManifest>,
         notifications: Option<NotificationDeliveryConfig>,
         focused_terminal: Option<Box<FocusedTerminalSnapshot>>,
     },
@@ -178,7 +180,7 @@ pub(crate) fn receive_bootstrap(channel: RawFd) -> io::Result<Bootstrap> {
             state_lock,
             runtimes,
             exited,
-            event_stream,
+            event_stream: Box::new(event_stream),
             notifications,
             focused_terminal,
         }),
@@ -266,8 +268,15 @@ fn validate_manifest(manifest: &Manifest) -> io::Result<()> {
             ));
         }
     }
+    let mut schedule_shell_ids = std::collections::HashSet::new();
     if uuid::Uuid::parse_str(&manifest.event_stream.stream_id).is_err()
         || manifest.event_stream.events.len() > 8_192
+        || manifest.event_stream.schedule_shell_ids.len() > manifest.event_stream.events.len()
+        || manifest
+            .event_stream
+            .schedule_shell_ids
+            .iter()
+            .any(|id| uuid::Uuid::parse_str(id).is_err() || !schedule_shell_ids.insert(id))
         || manifest
             .event_stream
             .events
@@ -403,6 +412,7 @@ mod tests {
             stream_id: uuid::Uuid::new_v4().to_string(),
             latest_id: 0,
             events: Vec::new(),
+            schedule_shell_ids: Vec::new(),
         }
     }
 

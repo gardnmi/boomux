@@ -358,6 +358,7 @@ mod tests {
 
     fn workspace(id: &str, agent_ids: &[&str]) -> WorkspaceSnapshot {
         let shell = boomux::protocol::ShellSnapshot {
+            owner: boomux::protocol::ShellOwner::User,
             id: "shell".into(),
             workspace_id: id.into(),
             name: "agent".into(),

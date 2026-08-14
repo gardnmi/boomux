@@ -101,7 +101,10 @@ fn workspace_launchers_persist_emit_events_and_open_without_shells() {
         "launcher-only workspace failed to open: {}",
         String::from_utf8_lossy(&opened.stderr)
     );
-    wait_until(|| output.is_file(), "workspace launcher did not run");
+    wait_until(
+        || fs::metadata(&output).is_ok_and(|metadata| metadata.len() > 0),
+        "workspace launcher did not run",
+    );
     assert_eq!(
         fs::read_to_string(&output).unwrap(),
         format!(

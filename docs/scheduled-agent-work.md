@@ -1,6 +1,8 @@
 # Scheduled Agent Work
 
-> **Status: Accepted pre-implementation contract.** This document governs the
+> **Status: Partially implemented contract.** Schedule management and manual
+> run-now execution are implemented; timer evaluation and timed policy remain
+> deferred. This document governs the
 > scheduled Agent work tracked by [#146](https://github.com/gardnmi/boomux/issues/146).
 > Source and compatibility tests become authoritative for exact protocol,
 > persistence, and bound values as each implementation slice ships.
@@ -60,7 +62,9 @@ containing the schedule identity, not the prompt or revisioned host command. For
 each run the runner resolves only the exact persisted execution claim, then asks
 the integration adapter to construct and execute the host argument vector without
 shell interpretation. It cannot select a later pending claim or rerun the latest
-prompt implicitly.
+prompt implicitly. Claim resolution and runner reports require one private
+per-execution capability. That capability is removed from the external host's
+environment before spawn.
 
 The ownership is exclusive:
 
@@ -217,7 +221,9 @@ database recency, terminal output, and catalog order are not session identity.
 
 ## Dispatch And Concurrency
 
-The first release uses these policies:
+The complete initial scheduler design uses these policies. The manual run-now
+slice currently enforces only the per-schedule limit because one reusable shell
+cannot run twice; workspace and daemon-wide limits arrive with timed dispatch:
 
 - At most one nonterminal Scheduled Execution per Agent Schedule.
 - At most one nonterminal Scheduled Execution per workspace.
@@ -247,7 +253,8 @@ Graceful handoff establishes a dispatch barrier, transfers claimed executions
 with or without a live ShellRun, and prevents the old daemon from spawning after
 ownership transfer. The replacement either continues the one transferred claim
 or observes its terminal outcome. Cold recovery marks a nonterminal claim or
-active execution interrupted; it never starts a replacement process implicitly.
+active execution interrupted; it clears any process outcome staged before the
+runner's EOF commit and never starts a replacement process implicitly.
 
 Because there is no initial automatic timeout, blocked or hung work can remain
 active indefinitely and occupy its schedule, workspace, and daemon concurrency
@@ -275,8 +282,13 @@ A Scheduled Execution has one of these observable states or outcomes:
   process later exited, retaining its exit reason and code.
 - **Cancelled**: an explicit user action revoked a pre-spawn claim or terminated
   the managed process.
-- **Interrupted**: cold daemon loss ended ownership without a known ordinary
-  process exit.
+- **Interrupted**: cold daemon loss or internal runner exit without a terminal
+  report ended ownership without a known ordinary host outcome.
+
+The runner stages a host exit outcome or host-spawn failure while the execution
+remains Starting or Active. Exact runner-shell EOF commits the terminal state and
+publishes `run_exited` first, so a subsequent run never races a terminal record
+against a still-running reusable shell.
 
 These are orchestration and process outcomes. They do not report or infer Agent
 `working`, `blocked`, `idle`, `inactive`, or `done`. In particular, exit code zero
@@ -301,9 +313,13 @@ activity and cannot be undone by a later tick. Pausing affects future ticks only
 Opening or attaching to an execution permits ordinary user interaction but does
 not silently alter its schedule or remove its concurrency lease.
 
-`boomux daemon stop` and confirmed workspace closure cancel Claimed, Starting,
-or Active Scheduled Executions before removing runtime ownership. Graceful
-daemon restart uses the transfer rule instead and does not cancel them.
+`boomux daemon stop` marks Claimed, Starting, or Active Scheduled Executions
+Cancelled with `daemon_shutdown` before completing shutdown. Confirmed workspace
+closure terminates active owned work and removes its schedule. If an irreversible
+stop is followed by failed workspace persistence, the retained execution is
+reconciled to Interrupted and its shell remains pending rather than restoring a
+false Active process. Graceful daemon restart uses the transfer rule instead and
+does not cancel work.
 
 Removing a schedule is rejected while any execution is Claimed, Starting, or
 Active. Cancellation can move any of those states to Cancelled; cancelling
@@ -320,6 +336,10 @@ Each schedule retains every nonterminal execution plus a bounded newest suffix o
 terminal execution records; pruning removes the oldest terminal records first.
 The exact suffix bound belongs to source and compatibility tests. Scheduler
 events use the existing bounded event-stream retention and cursor-expiry model.
+Pruned dispatch keys remain represented by a bounded durable probabilistic set;
+a retry that matches it is rejected with `idempotency_expired` rather than
+creating duplicate work. A false positive is therefore a stable explicit
+rejection, never an accidental second dispatch.
 The per-schedule occurrence frontier is not audit history and is never pruned
 while the schedule exists.
 

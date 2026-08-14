@@ -29,6 +29,7 @@ shared by concurrent clients.
 Protocol 22 adds durable Agent Schedule management. Workspace snapshots include
 ordered, prompt-free schedule summaries, while exact schedule inspection is the
 only management response that discloses the current prompt.
+Protocol 23 adds durable manual Scheduled Executions and schedule-owned shells.
 
 `boomux agent wait <id> --after-revision <revision>` is the preferred way to
 await one Agent. It returns on a newer accepted durable observation, returns
@@ -68,6 +69,7 @@ The event vocabulary is:
   `agent_attention_acknowledged`
 - `agent_schedule_created`, `agent_schedule_paused`, `agent_schedule_resumed`,
   `agent_schedule_removed`
+- `scheduled_execution_created`, `scheduled_execution_changed`
 - `handoff_completed`
 
 Output events carry run identity and the latest output revision, not raw PTY
@@ -103,6 +105,19 @@ schedule summary after persistence. Idempotent pause or resume emits no event an
 does not advance the schedule revision. Removing a schedule emits only its
 workspace and schedule identities.
 
+`scheduled_execution_created` publishes the persisted manual claim.
+`scheduled_execution_changed` publishes later prompt-free shell/run binding,
+active, dispatch-failed, exited, cancelled, interrupted, and Agent-link changes.
+Both carry the complete public execution snapshot and never carry the retained
+prompt or daemon startup environment. Process outcomes do not imply Agent
+lifecycle observations.
+
+An exact runner ShellRun exit reconciles a still-starting or active execution in
+the same persisted event batch. A staged host outcome produces `exited`, a staged
+host-spawn failure produces `dispatch_failed`, and an EOF without either produces
+`interrupted`. `run_exited` precedes the terminal
+`scheduled_execution_changed`. The staged host outcome remains authoritative.
+
 Closing a workspace removes all of its schedules and stored prompts as part of
 the workspace transaction. The stream publishes the existing single
 `workspace_closed` event; it does not publish one `agent_schedule_removed` event
@@ -118,6 +133,14 @@ Protocol-21 and older clients receive workspace snapshots without schedules and
 do not receive schedule events. The returned cursor still advances across those
 filtered events, preserving the stream's total publication order. Schedule
 management requests require protocol 22.
+
+Protocol-22 and older clients do not receive scheduled-execution events, but
+their cursor advances across them. Execution dispatch, list, exact inspect, and
+cancel requests require protocol 23. Protocol-22 snapshots also omit
+schedule-owned shells and execution-shell links rather than presenting those
+shells as user-owned. Historical schedule-shell ownership used for this filtering
+is retained exactly while the bounded event journal still contains a generic
+event for that shell; it cannot be evicted independently of that event.
 
 Event IDs provide one total publication order. The daemon transition coordinator
 couples durable lifecycle mutation, persistence, and event publication. Events

@@ -72,6 +72,10 @@ The following commands support `--json`:
 - `boomux schedule pause`
 - `boomux schedule resume`
 - `boomux schedule remove`
+- `boomux schedule run`
+- `boomux execution list`
+- `boomux execution inspect`
+- `boomux execution cancel`
 - `boomux integration list`
 - `boomux integration status [opencode|pi]`
 - `boomux integration install <opencode|pi>`
@@ -82,7 +86,8 @@ The following commands support `--json`:
 - `boomux daemon status`
 
 JSON mutations are deliberately narrow. Agent register, ensure, and report;
-attention acknowledgment; schedule create, pause, resume, and remove; and
+attention acknowledgment; schedule create, pause, resume, remove, and run;
+execution cancellation; and
 integration install and uninstall support the contract. Other mutation commands
 retain human output. Passing `--json` to an unsupported command fails with
 `invalid_argument` before performing the operation.
@@ -132,6 +137,12 @@ Command payloads are:
   that includes its `prompt`.
 - `schedule.remove`: `removed: true` plus the removed prompt-free `schedule`
   summary.
+- `schedule.run`: one prompt-free `execution`. The CLI generates a UUID
+  `dispatch_key` before the request unless `--idempotency-key` supplies one.
+- `execution.list`: newest-first prompt-free `executions`, optionally filtered by
+  `--workspace` and `--schedule`.
+- `execution.inspect` and `execution.cancel`: one prompt-free `execution`
+  selected only by exact execution ID.
 - `integration.list`: an `integrations` array containing bundled integration
   names, display names, packages, and validated host versions.
 - `integration.status`: an `integrations` array containing independent `host`,
@@ -163,8 +174,28 @@ Integration arrays are ordered `opencode`, then `pi`. List entries contain
 `name`, `display_name`, `package`, and `validated_version`.
 
 Protocol 22 advertises `protocol_22`, `agent_schedule_management`, and
-`durable_agent_schedules`. These capabilities describe durable management only;
-they do not advertise timed or manual dispatch.
+`durable_agent_schedules`. Protocol 23 adds `protocol_23`,
+`scheduled_execution_dispatch`, `scheduled_execution_cancellation`, and
+`schedule_owned_shells`. These capabilities advertise manual run-now dispatch;
+they do not advertise cron evaluation or timed dispatch.
+
+## Execution Data
+
+Execution objects contain `id`, `workspace_id`, `schedule_id`, `state`,
+`dispatch_kind`, `dispatch_key`, exact `schedule_revision`, `prompt_revision`,
+and `trigger_revision`, requested/start/end timestamps, snapshotted `cwd`,
+`integration`, and `session`, nullable typed `reason` and `outcome`, and nullable
+`shell_id`, `run_id`, `agent_id`, and discovered `external_session_id` links.
+They never contain the retained prompt or environment.
+
+State is `claimed`, `starting`, `active`, `dispatch_failed`, `exited`,
+`cancelled`, or `interrupted`; dispatch kind is currently `manual`. Reasons are
+stable safe values `runner_start_failed`, `host_spawn_failed`,
+`cancelled_by_user`, `cold_daemon_recovery`, or
+`runner_exited_without_report`; explicit daemon shutdown uses `daemon_shutdown`.
+Exit outcomes are tagged
+`exit_code` with `code` or `signal` with `signal`. These are process-orchestration
+outcomes and never imply Agent `working`, `idle`, `blocked`, or `done`.
 
 Status entries contain those four fields plus `host`, `asset`, `runtime`, and
 `recommended_action`.
@@ -204,7 +235,9 @@ requires `--force`, while unsafe paths fail before any removal.
 ## Shell Data
 
 Shell objects use stable scalar fields: `id`, `workspace_id`, `workspace_name`,
-`name`, `cwd`, `status`, `exit_code`, and `run`. Missing values are JSON `null`,
+`name`, `cwd`, `owner`, `owner_schedule_id`, `status`, `exit_code`, and `run`.
+Owner is `user` or `schedule`; only the latter has a non-null schedule ID and is
+protected from direct rename, close, restart, and inactive open. Missing values are JSON `null`,
 not omitted or represented as human placeholders. `status` is `pending`,
 `running`, or `exited`.
 
@@ -354,12 +387,13 @@ Schedule summaries contain `id`, `workspace_id`, nullable `workspace_name`,
 `evaluation_frontier_ms`, and nullable `execution_shell_id`. Optional values are
 JSON `null`. State is `paused` or `enabled`; session mode is `fresh` or
 `continue`; the initial overlap policy is always `skip`.
-All schedule commands require negotiated daemon protocol 22 and return
-`unsupported_version` against an older daemon rather than presenting an empty
-schedule list.
+Schedule management commands require negotiated daemon protocol 22. `schedule
+run` and every `execution` command require protocol 23. Unsupported commands
+return `unsupported_version` rather than presenting empty data.
 
 Only `schedule.inspect` adds `prompt`. Prompts are intentionally absent from
-list, create, pause, resume, remove, capabilities, events, and errors. Inspection
+list, create, pause, resume, remove, run, execution records, capabilities,
+events, and errors. Inspection
 is an explicit private-content disclosure. A prompt file is read once at create
 time as exact UTF-8, including a trailing newline; later file changes do not
 alter the persisted prompt revision. Files must be regular and prompts are

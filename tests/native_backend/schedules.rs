@@ -1,11 +1,17 @@
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
+use std::thread;
 
+use boomux::client::Client;
 use boomux::protocol::{
-    self, AgentScheduleOverlapPolicy, AgentScheduleSession, AgentScheduleSpec, AgentScheduleState,
-    AgentScheduleTrigger,
+    self, AgentAuthority, AgentRegistrationSpec, AgentReport, AgentScheduleOverlapPolicy,
+    AgentScheduleSession, AgentScheduleSpec, AgentScheduleState, AgentScheduleTrigger, AgentState,
+    ScheduledExecutionState, ShellSpec,
 };
+use uuid::Uuid;
 
-use crate::support::{TestDaemon, assert_remote_code};
+use crate::support::{TestDaemon, assert_remote_code, process_exists, profile, wait_until};
 
 fn schedule_spec(daemon: &TestDaemon, name: &str, prompt: &str) -> AgentScheduleSpec {
     AgentScheduleSpec {
@@ -317,4 +323,1814 @@ fn versioned_request(
         protocol::read_message(&mut stream).unwrap();
     assert_eq!(response.version, version);
     response.message
+}
+
+#[test]
+fn manual_execution_succeeds_and_duplicate_key_never_spawns_twice() {
+    let mut daemon = TestDaemon::start_with(|command, runtime_dir| {
+        let bin = runtime_dir.join("bin");
+        fs::create_dir(&bin).unwrap();
+        let host = bin.join("opencode");
+        fs::write(
+            &host,
+            "#!/bin/sh\nprintf '%s\\0' \"$@\" > \"$BOOMUX_ARGV_CAPTURE\"\nprintf '%s' \"$PWD\" > \"$BOOMUX_CWD_CAPTURE\"\nprintf '%s|%s|%s' \"${BOOMUX_SCHEDULE_RUNNER_TOKEN-unset}\" \"${BOOMUX_DISPATCH_ENV-unset}\" \"${BOOMUX_NATIVE_TEST_HOOKS-unset}\" > \"$BOOMUX_ENV_CAPTURE\"\nprintf 'spawn\\n' >> \"$BOOMUX_EXECUTION_CAPTURE\"\nexit 0\n",
+        )
+        .unwrap();
+        fs::set_permissions(&host, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut paths = vec![bin];
+        paths.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        command
+            .env("PATH", std::env::join_paths(paths).unwrap())
+            .env("BOOMUX_EXECUTION_CAPTURE", runtime_dir.join("executions"))
+            .env("BOOMUX_ARGV_CAPTURE", runtime_dir.join("argv"))
+            .env("BOOMUX_CWD_CAPTURE", runtime_dir.join("cwd"))
+            .env("BOOMUX_ENV_CAPTURE", runtime_dir.join("environment"))
+            .env("BOOMUX_DISPATCH_ENV", "daemon-start");
+    });
+    let capture = daemon.runtime_dir.join("executions");
+    let workspace = daemon
+        .client
+        .create_workspace("run-now", Vec::new())
+        .unwrap();
+    let schedule = daemon
+        .client
+        .create_agent_schedule(
+            &workspace.id,
+            schedule_spec(&daemon, "manual", "exact prompt"),
+        )
+        .unwrap();
+    let protocol::Response::Events {
+        cursor: protocol_22_cursor,
+        ..
+    } = versioned_request(
+        &daemon,
+        22,
+        protocol::Request::Events {
+            after: None,
+            limit: 256,
+            wait_ms: 0,
+        },
+    )
+    else {
+        panic!("expected protocol-22 event baseline");
+    };
+    let event_cursor = daemon.client.events(None, 256, 0).unwrap().cursor;
+    let key = Uuid::new_v4().to_string();
+    let first = daemon
+        .client
+        .run_agent_schedule(&schedule.id, &key)
+        .unwrap();
+    let duplicate = daemon
+        .client
+        .run_agent_schedule(&schedule.id, &key)
+        .unwrap();
+    assert_eq!(first.id, duplicate.id);
+    wait_until(
+        || {
+            daemon
+                .client
+                .get_scheduled_execution(&first.id)
+                .is_ok_and(|execution| execution.state == ScheduledExecutionState::Exited)
+        },
+        "scheduled execution did not exit",
+    );
+    assert_eq!(fs::read_to_string(&capture).unwrap(), "spawn\n");
+    assert_eq!(
+        fs::read(daemon.runtime_dir.join("argv")).unwrap(),
+        b"run\0--\0exact prompt\0"
+    );
+    assert_eq!(
+        fs::read_to_string(daemon.runtime_dir.join("cwd")).unwrap(),
+        daemon.runtime_dir.display().to_string()
+    );
+    assert_eq!(
+        fs::read_to_string(daemon.runtime_dir.join("environment")).unwrap(),
+        "unset|daemon-start|unset"
+    );
+    let event_page = daemon.client.events(Some(event_cursor), 256, 0).unwrap();
+    assert!(
+        !serde_json::to_string(&event_page.events)
+            .unwrap()
+            .contains("exact prompt")
+    );
+    let created = event_page
+        .events
+        .iter()
+        .position(|event| {
+            matches!(
+                &event.kind,
+                protocol::DaemonEventKind::ScheduledExecutionCreated { execution, .. }
+                    if execution.id == first.id
+            )
+        })
+        .unwrap();
+    let run_started = event_page
+        .events
+        .iter()
+        .position(|event| {
+            matches!(
+                &event.kind,
+                protocol::DaemonEventKind::RunStarted { run, .. }
+                    if Some(run.id.as_str()) == first.run_id.as_deref()
+            )
+        })
+        .unwrap();
+    let active = event_page
+        .events
+        .iter()
+        .position(|event| {
+            matches!(
+                &event.kind,
+                protocol::DaemonEventKind::ScheduledExecutionChanged { execution, .. }
+                    if execution.id == first.id
+                        && execution.state == ScheduledExecutionState::Active
+            )
+        })
+        .unwrap();
+    let run_exited = event_page
+        .events
+        .iter()
+        .position(|event| {
+            matches!(
+                &event.kind,
+                protocol::DaemonEventKind::RunExited { run, .. }
+                    if Some(run.id.as_str()) == first.run_id.as_deref()
+            )
+        })
+        .unwrap();
+    let exited = event_page
+        .events
+        .iter()
+        .position(|event| {
+            matches!(
+                &event.kind,
+                protocol::DaemonEventKind::ScheduledExecutionChanged { execution, .. }
+                    if execution.id == first.id
+                        && execution.state == ScheduledExecutionState::Exited
+            )
+        })
+        .unwrap();
+    assert!(
+        created < run_started && run_started < active && active < run_exited && run_exited < exited
+    );
+    let second = daemon
+        .command()
+        .args([
+            "schedule",
+            "run",
+            &schedule.id,
+            "--idempotency-key",
+            &Uuid::new_v4().to_string(),
+            "--json",
+        ])
+        .env("BOOMUX_DISPATCH_ENV", "run-client")
+        .output()
+        .unwrap();
+    assert!(second.status.success());
+    let second: serde_json::Value = serde_json::from_slice(&second.stdout).unwrap();
+    let second_id = second["data"]["execution"]["id"].as_str().unwrap();
+    wait_until(
+        || {
+            daemon
+                .client
+                .get_scheduled_execution(second_id)
+                .is_ok_and(|execution| execution.state == ScheduledExecutionState::Exited)
+        },
+        "second environment execution did not exit",
+    );
+    assert_eq!(
+        fs::read_to_string(daemon.runtime_dir.join("environment")).unwrap(),
+        "unset|daemon-start|unset"
+    );
+    let shell = daemon
+        .client
+        .get_shell(first.shell_id.as_ref().unwrap())
+        .unwrap();
+    assert_eq!(shell.command.len(), 3);
+    assert!(!shell.command.join(" ").contains("exact prompt"));
+    assert!(matches!(
+        shell.owner,
+        protocol::ShellOwner::Schedule { ref schedule_id } if schedule_id == &schedule.id
+    ));
+    let protocol::Response::Snapshot { snapshot } =
+        versioned_request(&daemon, 22, protocol::Request::Snapshot)
+    else {
+        panic!("expected protocol-22 snapshot");
+    };
+    assert!(snapshot.workspaces[0].shells.is_empty());
+    assert!(
+        snapshot.workspaces[0].schedules[0]
+            .execution_shell_id
+            .is_none()
+    );
+    let protocol::Response::Error { code, .. } = versioned_request(
+        &daemon,
+        22,
+        protocol::Request::GetShell {
+            shell_id: shell.id.clone(),
+        },
+    ) else {
+        panic!("expected protocol-22 schedule shell to be hidden");
+    };
+    assert_eq!(code, Some(protocol::ErrorCode::NotFound));
+    let protocol::Response::Events { cursor, events, .. } = versioned_request(
+        &daemon,
+        22,
+        protocol::Request::Events {
+            after: Some(protocol_22_cursor.clone()),
+            limit: 256,
+            wait_ms: 0,
+        },
+    ) else {
+        panic!("expected protocol-22 event page");
+    };
+    assert!(cursor.event_id > protocol_22_cursor.event_id);
+    assert!(!events.iter().any(|event| matches!(
+        event.kind,
+        protocol::DaemonEventKind::ShellCreated { .. }
+            | protocol::DaemonEventKind::RunStarted { .. }
+            | protocol::DaemonEventKind::OutputChanged { .. }
+            | protocol::DaemonEventKind::RunExited { .. }
+            | protocol::DaemonEventKind::ScheduledExecutionCreated { .. }
+            | protocol::DaemonEventKind::ScheduledExecutionChanged { .. }
+    )));
+    assert_remote_code(
+        &daemon
+            .client
+            .rename_shell(&shell.id, "renamed")
+            .unwrap_err(),
+        protocol::ErrorCode::Busy,
+    );
+    assert_remote_code(
+        &daemon.client.close_shell(&shell.id).unwrap_err(),
+        protocol::ErrorCode::Busy,
+    );
+    assert_remote_code(
+        &daemon.client.restart_shell(&shell.id).unwrap_err(),
+        protocol::ErrorCode::Busy,
+    );
+    daemon.client.remove_agent_schedule(&schedule.id).unwrap();
+    assert!(daemon.client.get_shell(&shell.id).is_err());
+    let protocol::Response::Events { events, .. } = versioned_request(
+        &daemon,
+        22,
+        protocol::Request::Events {
+            after: Some(protocol_22_cursor),
+            limit: 256,
+            wait_ms: 0,
+        },
+    ) else {
+        panic!("expected historical protocol-22 event page");
+    };
+    assert!(!events.iter().any(|event| {
+        matches!(
+            event.kind,
+            protocol::DaemonEventKind::ShellCreated { .. }
+                | protocol::DaemonEventKind::RunStarted { .. }
+                | protocol::DaemonEventKind::OutputChanged { .. }
+                | protocol::DaemonEventKind::RunExited { .. }
+        )
+    }));
+    daemon.stop_with_cli();
+}
+
+#[test]
+fn pi_dispatch_preserves_exact_argv_stdin_eof_and_continuation_identity() {
+    let mut daemon = TestDaemon::start_with(|command, runtime_dir| {
+        let bin = runtime_dir.join("bin");
+        fs::create_dir(&bin).unwrap();
+        let host = bin.join("pi");
+        fs::write(
+            &host,
+            "#!/bin/sh\nprintf '%s\\0' \"$@\" > \"$BOOMUX_PI_ARGV_DIR/$BOOMUX_PI_CASE\"\ncat > \"$BOOMUX_PI_STDIN_DIR/$BOOMUX_PI_CASE\"\nprintf '%s' \"${BOOMUX_SCHEDULE_RUNNER_TOKEN-unset}\" > \"$BOOMUX_PI_TOKEN_DIR/$BOOMUX_PI_CASE\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&host, fs::Permissions::from_mode(0o755)).unwrap();
+        for directory in ["pi-argv", "pi-stdin", "pi-token"] {
+            fs::create_dir(runtime_dir.join(directory)).unwrap();
+        }
+        let mut paths = vec![bin];
+        paths.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        command
+            .env("PATH", std::env::join_paths(paths).unwrap())
+            .env("BOOMUX_PI_ARGV_DIR", runtime_dir.join("pi-argv"))
+            .env("BOOMUX_PI_STDIN_DIR", runtime_dir.join("pi-stdin"))
+            .env("BOOMUX_PI_TOKEN_DIR", runtime_dir.join("pi-token"))
+            .env("BOOMUX_PI_CASE", "fresh");
+    });
+    let workspace = daemon.client.create_workspace("pi", Vec::new()).unwrap();
+    let prompt = "-@leading\nsecond line\n";
+    let mut fresh_spec = schedule_spec(&daemon, "pi-fresh", prompt);
+    fresh_spec.integration = "pi".into();
+    let fresh = daemon
+        .client
+        .create_agent_schedule(&workspace.id, fresh_spec)
+        .unwrap();
+    let execution = daemon
+        .client
+        .run_agent_schedule(&fresh.id, Uuid::new_v4().to_string())
+        .unwrap();
+    wait_until(
+        || {
+            daemon
+                .client
+                .get_scheduled_execution(&execution.id)
+                .is_ok_and(|execution| execution.state == ScheduledExecutionState::Exited)
+        },
+        "fresh Pi execution did not exit",
+    );
+    assert_eq!(
+        fs::read(daemon.runtime_dir.join("pi-argv/fresh")).unwrap(),
+        b"--print\0"
+    );
+    assert_eq!(
+        fs::read(daemon.runtime_dir.join("pi-stdin/fresh")).unwrap(),
+        prompt.as_bytes()
+    );
+    assert_eq!(
+        fs::read_to_string(daemon.runtime_dir.join("pi-token/fresh")).unwrap(),
+        "unset"
+    );
+
+    let restart = daemon
+        .command()
+        .args(["daemon", "restart"])
+        .env("PATH", {
+            let mut paths = vec![daemon.runtime_dir.join("bin")];
+            paths.extend(std::env::split_paths(
+                &std::env::var_os("PATH").unwrap_or_default(),
+            ));
+            std::env::join_paths(paths).unwrap()
+        })
+        .env("BOOMUX_PI_ARGV_DIR", daemon.runtime_dir.join("pi-argv"))
+        .env("BOOMUX_PI_STDIN_DIR", daemon.runtime_dir.join("pi-stdin"))
+        .env("BOOMUX_PI_TOKEN_DIR", daemon.runtime_dir.join("pi-token"))
+        .env("BOOMUX_PI_CASE", "continue")
+        .output()
+        .unwrap();
+    assert!(restart.status.success());
+    let external_id = "exact-pi-session";
+    let mut continuation_spec = schedule_spec(&daemon, "pi-continue", "continued");
+    continuation_spec.integration = "pi".into();
+    continuation_spec.session = AgentScheduleSession::Continue {
+        external_session_id: external_id.into(),
+    };
+    let continuation = daemon
+        .client
+        .create_agent_schedule(&workspace.id, continuation_spec)
+        .unwrap();
+    let execution = daemon
+        .client
+        .run_agent_schedule(&continuation.id, Uuid::new_v4().to_string())
+        .unwrap();
+    wait_until(
+        || {
+            daemon
+                .client
+                .get_scheduled_execution(&execution.id)
+                .is_ok_and(|execution| execution.state == ScheduledExecutionState::Exited)
+        },
+        "continued Pi execution did not exit",
+    );
+    assert_eq!(
+        fs::read(daemon.runtime_dir.join("pi-argv/continue")).unwrap(),
+        b"--session\0exact-pi-session\0--print\0"
+    );
+    assert_eq!(
+        fs::read(daemon.runtime_dir.join("pi-stdin/continue")).unwrap(),
+        b"continued"
+    );
+    daemon.stop_with_cli();
+}
+
+#[test]
+fn inactive_agent_does_not_block_exact_continuation_dispatch() {
+    let mut daemon = TestDaemon::start_with(|command, runtime_dir| {
+        let bin = runtime_dir.join("bin");
+        fs::create_dir(&bin).unwrap();
+        let host = bin.join("opencode");
+        fs::write(&host, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&host, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut paths = vec![bin];
+        paths.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        command.env("PATH", std::env::join_paths(paths).unwrap());
+    });
+    let workspace = daemon
+        .client
+        .create_workspace(
+            "inactive-continuation",
+            vec![ShellSpec {
+                name: "user".into(),
+                cwd: daemon.runtime_dir.clone(),
+                command: vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
+            }],
+        )
+        .unwrap();
+    let attachment = daemon
+        .client
+        .attach(&workspace.shells[0].id, false, profile())
+        .unwrap();
+    let run_id = daemon
+        .client
+        .get_shell(&workspace.shells[0].id)
+        .unwrap()
+        .run
+        .unwrap()
+        .id;
+    daemon
+        .client
+        .register_agent(
+            &workspace.shells[0].id,
+            run_id,
+            AgentRegistrationSpec {
+                name: "inactive".into(),
+                integration: "opencode".into(),
+                external_session_id: Some("continued-session".into()),
+                report: AgentReport {
+                    state: AgentState::Inactive,
+                    authority: AgentAuthority::LifecycleIntegration,
+                    evidence: "inactive".into(),
+                    confidence: 100,
+                },
+            },
+        )
+        .unwrap();
+    let mut spec = schedule_spec(&daemon, "continue-inactive", "continue");
+    spec.session = AgentScheduleSession::Continue {
+        external_session_id: "continued-session".into(),
+    };
+    let schedule = daemon
+        .client
+        .create_agent_schedule(&workspace.id, spec)
+        .unwrap();
+    let execution = daemon
+        .client
+        .run_agent_schedule(&schedule.id, Uuid::new_v4().to_string())
+        .unwrap();
+    wait_until(
+        || {
+            daemon
+                .client
+                .get_scheduled_execution(&execution.id)
+                .is_ok_and(|execution| execution.state == ScheduledExecutionState::Exited)
+        },
+        "inactive Agent incorrectly blocked continuation",
+    );
+    drop(attachment.stream);
+    daemon.client.close_workspace(&workspace.id).unwrap();
+    daemon.stop_with_cli();
+}
+
+#[test]
+fn linked_agents_remain_authoritative_after_exit_and_late_ensure_repairs_links() {
+    let mut daemon = TestDaemon::start_with(|command, runtime_dir| {
+        let bin = runtime_dir.join("bin");
+        fs::create_dir(&bin).unwrap();
+        let host = bin.join("opencode");
+        fs::write(
+            &host,
+            "#!/bin/sh\nif [ ! -e \"$BOOMUX_FIRST_AGENT\" ]; then\n  : > \"$BOOMUX_FIRST_AGENT\"\n  \"$BOOMUX_TEST_EXECUTABLE\" agent ensure scheduled --integration opencode --external-session-id linked-session --state working --authority lifecycle-integration --evidence running --confidence 100 >/dev/null\nfi\n",
+        )
+        .unwrap();
+        fs::set_permissions(&host, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut paths = vec![bin];
+        paths.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        command
+            .env("PATH", std::env::join_paths(paths).unwrap())
+            .env("BOOMUX_TEST_EXECUTABLE", env!("CARGO_BIN_EXE_boomux"))
+            .env("BOOMUX_FIRST_AGENT", runtime_dir.join("first-agent"));
+    });
+    let workspace = daemon
+        .client
+        .create_workspace("agent-link", Vec::new())
+        .unwrap();
+    let schedule = daemon
+        .client
+        .create_agent_schedule(
+            &workspace.id,
+            schedule_spec(&daemon, "agent-link", "private"),
+        )
+        .unwrap();
+    let cursor = daemon.client.events(None, 256, 0).unwrap().cursor;
+    let first = daemon
+        .client
+        .run_agent_schedule(&schedule.id, Uuid::new_v4().to_string())
+        .unwrap();
+    wait_until(
+        || {
+            daemon
+                .client
+                .get_scheduled_execution(&first.id)
+                .is_ok_and(|execution| {
+                    execution.state == ScheduledExecutionState::Exited
+                        && execution.agent_id.is_some()
+                })
+        },
+        "first execution did not exit with an Agent link",
+    );
+    let first = daemon.client.get_scheduled_execution(&first.id).unwrap();
+    let agent = daemon
+        .client
+        .get_agent(first.agent_id.as_ref().unwrap())
+        .unwrap();
+    assert_eq!(agent.observation.state, AgentState::Working);
+    assert!(agent.ended_at_ms.is_none());
+
+    let second = daemon
+        .client
+        .run_agent_schedule(&schedule.id, Uuid::new_v4().to_string())
+        .unwrap();
+    wait_until(
+        || {
+            daemon
+                .client
+                .get_scheduled_execution(&second.id)
+                .is_ok_and(|execution| execution.state == ScheduledExecutionState::Exited)
+        },
+        "second execution did not exit",
+    );
+    let second = daemon.client.get_scheduled_execution(&second.id).unwrap();
+    assert!(second.agent_id.is_none());
+    let late = daemon
+        .client
+        .ensure_agent(
+            second.shell_id.clone().unwrap(),
+            second.run_id.clone().unwrap(),
+            AgentRegistrationSpec {
+                name: "late".into(),
+                integration: "opencode".into(),
+                external_session_id: Some("late-session".into()),
+                report: AgentReport {
+                    state: AgentState::Idle,
+                    authority: AgentAuthority::LifecycleIntegration,
+                    evidence: "late registration".into(),
+                    confidence: 100,
+                },
+            },
+        )
+        .unwrap();
+    let linked = daemon.client.get_scheduled_execution(&second.id).unwrap();
+    assert_eq!(linked.agent_id.as_deref(), Some(late.id.as_str()));
+    assert_eq!(linked.state, ScheduledExecutionState::Exited);
+    let events = daemon.client.events(Some(cursor), 256, 0).unwrap();
+    assert!(
+        !events
+            .events
+            .iter()
+            .any(|event| matches!(event.kind, protocol::DaemonEventKind::AgentCompleted { .. }))
+    );
+    daemon.stop_with_cli();
+}
+
+#[test]
+fn host_spawn_failure_is_distinct_from_process_exit() {
+    let mut daemon = TestDaemon::start_with(|command, _| {
+        command.env("PATH", "/nonexistent");
+    });
+    let workspace = daemon
+        .client
+        .create_workspace("spawn-fail", Vec::new())
+        .unwrap();
+    let schedule = daemon
+        .client
+        .create_agent_schedule(&workspace.id, schedule_spec(&daemon, "fail", "private"))
+        .unwrap();
+    let execution = daemon
+        .client
+        .run_agent_schedule(&schedule.id, Uuid::new_v4().to_string())
+        .unwrap();
+    wait_until(
+        || {
+            daemon
+                .client
+                .get_scheduled_execution(&execution.id)
+                .is_ok_and(|execution| execution.state == ScheduledExecutionState::DispatchFailed)
+        },
+        "host spawn failure was not recorded",
+    );
+    daemon.stop_with_cli();
+}
+
+#[test]
+fn runner_exit_without_a_terminal_report_interrupts_the_execution() {
+    let mut daemon = TestDaemon::start_with(|command, runtime_dir| {
+        let bin = runtime_dir.join("bin");
+        fs::create_dir(&bin).unwrap();
+        let host = bin.join("opencode");
+        fs::write(&host, "#!/bin/sh\nkill -KILL \"$PPID\"\n").unwrap();
+        fs::set_permissions(&host, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut paths = vec![bin];
+        paths.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        command.env("PATH", std::env::join_paths(paths).unwrap());
+    });
+    let workspace = daemon
+        .client
+        .create_workspace("runner-exit", Vec::new())
+        .unwrap();
+    let schedule = daemon
+        .client
+        .create_agent_schedule(
+            &workspace.id,
+            schedule_spec(&daemon, "runner-exit", "private"),
+        )
+        .unwrap();
+    let execution = daemon
+        .client
+        .run_agent_schedule(&schedule.id, Uuid::new_v4().to_string())
+        .unwrap();
+
+    wait_until(
+        || {
+            daemon
+                .client
+                .get_scheduled_execution(&execution.id)
+                .is_ok_and(|execution| execution.state == ScheduledExecutionState::Interrupted)
+        },
+        "runner exit did not reconcile the scheduled execution",
+    );
+    daemon.stop_with_cli();
+}
+
+#[test]
+fn execution_cli_json_shapes_are_stable_and_prompt_free() {
+    let mut daemon = TestDaemon::start_with(|command, _| {
+        command.env("PATH", "/nonexistent");
+    });
+    let workspace = daemon
+        .client
+        .create_workspace("execution-cli", Vec::new())
+        .unwrap();
+    let prompt = "PRIVATE CLI EXECUTION PROMPT";
+    let schedule = daemon
+        .client
+        .create_agent_schedule(&workspace.id, schedule_spec(&daemon, "cli", prompt))
+        .unwrap();
+    let key = Uuid::new_v4().to_string();
+    let run = daemon
+        .command()
+        .args([
+            "schedule",
+            "run",
+            &schedule.id,
+            "--idempotency-key",
+            &key,
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(!String::from_utf8_lossy(&run.stdout).contains(prompt));
+    let run: serde_json::Value = serde_json::from_slice(&run.stdout).unwrap();
+    assert_eq!(run["command"], "schedule.run");
+    assert_eq!(run["data"]["execution"]["dispatch_key"], key);
+    let execution_id = run["data"]["execution"]["id"].as_str().unwrap();
+    wait_until(
+        || {
+            daemon
+                .client
+                .get_scheduled_execution(execution_id)
+                .is_ok_and(|execution| execution.state == ScheduledExecutionState::DispatchFailed)
+        },
+        "CLI execution did not record spawn failure",
+    );
+    for (arguments, expected) in [
+        (
+            vec!["execution", "list", "--schedule", &schedule.id, "--json"],
+            "execution.list",
+        ),
+        (
+            vec!["execution", "inspect", execution_id, "--json"],
+            "execution.inspect",
+        ),
+        (
+            vec!["execution", "cancel", execution_id, "--json"],
+            "execution.cancel",
+        ),
+    ] {
+        let output = daemon.command().args(arguments).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!String::from_utf8_lossy(&output.stdout).contains(prompt));
+        let output: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(output["command"], expected);
+        if expected == "execution.inspect" {
+            assert!(output["data"]["execution"]["cwd"].is_string());
+            assert_eq!(output["data"]["execution"]["reason"], "host_spawn_failed");
+            assert!(output["data"]["execution"]["outcome"].is_null());
+            assert!(output["data"]["execution"]["agent_id"].is_null());
+        }
+    }
+    daemon.stop_with_cli();
+}
+
+#[test]
+fn active_execution_cancellation_terminates_the_host_process_tree() {
+    let mut daemon = TestDaemon::start_with(|command, runtime_dir| {
+        let bin = runtime_dir.join("bin");
+        fs::create_dir(&bin).unwrap();
+        let host = bin.join("opencode");
+        fs::write(
+            &host,
+            "#!/bin/sh\nsleep 30 &\nprintf '%s %s' \"$$\" \"$!\" > \"$BOOMUX_PID_CAPTURE\"\nwait\n",
+        )
+        .unwrap();
+        fs::set_permissions(&host, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut paths = vec![bin];
+        paths.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        command
+            .env("PATH", std::env::join_paths(paths).unwrap())
+            .env("BOOMUX_PID_CAPTURE", runtime_dir.join("pids"));
+    });
+    let workspace = daemon
+        .client
+        .create_workspace("cancel", Vec::new())
+        .unwrap();
+    let schedule = daemon
+        .client
+        .create_agent_schedule(&workspace.id, schedule_spec(&daemon, "cancel", "private"))
+        .unwrap();
+    let execution = daemon
+        .client
+        .run_agent_schedule(&schedule.id, Uuid::new_v4().to_string())
+        .unwrap();
+    let pids = daemon.runtime_dir.join("pids");
+    wait_until(|| pids.is_file(), "scheduled host did not start");
+    wait_until(
+        || {
+            daemon
+                .client
+                .get_scheduled_execution(&execution.id)
+                .is_ok_and(|execution| execution.state == ScheduledExecutionState::Active)
+        },
+        "scheduled execution did not become active",
+    );
+    assert_remote_code(
+        &daemon
+            .client
+            .remove_agent_schedule(&schedule.id)
+            .unwrap_err(),
+        protocol::ErrorCode::Busy,
+    );
+    let current = daemon
+        .client
+        .get_scheduled_execution(&execution.id)
+        .unwrap();
+    let unauthorized = versioned_request(
+        &daemon,
+        protocol::PROTOCOL_VERSION,
+        protocol::Request::ResolveScheduledExecutionClaim {
+            schedule_id: schedule.id.clone(),
+            shell_id: current.shell_id.clone().unwrap(),
+            run_id: current.run_id.clone().unwrap(),
+            runner_token: protocol::ScheduledRunnerCapability::new(Uuid::new_v4().to_string()),
+        },
+    );
+    assert!(matches!(
+        &unauthorized,
+        protocol::Response::Error {
+            code: Some(protocol::ErrorCode::RunChanged),
+            ..
+        }
+    ));
+    assert!(
+        !serde_json::to_string(&unauthorized)
+            .unwrap()
+            .contains("private")
+    );
+    assert_remote_code(
+        &daemon
+            .client
+            .run_agent_schedule(&schedule.id, Uuid::new_v4().to_string())
+            .unwrap_err(),
+        protocol::ErrorCode::Busy,
+    );
+    let pids = fs::read_to_string(pids)
+        .unwrap()
+        .split_whitespace()
+        .map(|pid| pid.parse::<libc::pid_t>().unwrap())
+        .collect::<Vec<_>>();
+    let cursor = daemon.client.events(None, 256, 0).unwrap().cursor;
+    let cancelled = daemon
+        .client
+        .cancel_scheduled_execution(&execution.id)
+        .unwrap();
+    assert_eq!(cancelled.state, ScheduledExecutionState::Cancelled);
+    wait_until(
+        || pids.iter().all(|pid| !process_exists(*pid)),
+        "scheduled process tree survived cancellation",
+    );
+    let events = daemon.client.events(Some(cursor), 256, 0).unwrap().events;
+    let run_exited = events
+        .iter()
+        .position(|event| matches!(event.kind, protocol::DaemonEventKind::RunExited { .. }))
+        .unwrap();
+    let execution_cancelled = events
+        .iter()
+        .position(|event| {
+            matches!(
+                &event.kind,
+                protocol::DaemonEventKind::ScheduledExecutionChanged { execution, .. }
+                    if execution.state == ScheduledExecutionState::Cancelled
+            )
+        })
+        .unwrap();
+    assert!(run_exited < execution_cancelled);
+    daemon.stop_with_cli();
+}
+
+#[test]
+fn cancelling_a_terminal_execution_does_not_stop_the_reused_shells_new_run() {
+    let mut daemon = TestDaemon::start_with(|command, runtime_dir| {
+        let bin = runtime_dir.join("bin");
+        fs::create_dir(&bin).unwrap();
+        let host = bin.join("opencode");
+        fs::write(
+            &host,
+            "#!/bin/sh\nif [ ! -e \"$BOOMUX_EXECUTION_CAPTURE\" ]; then : > \"$BOOMUX_EXECUTION_CAPTURE\"; exit 0; fi\nprintf '%s' \"$$\" > \"$BOOMUX_PID_CAPTURE\"\nsleep 30\n",
+        )
+        .unwrap();
+        fs::set_permissions(&host, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut paths = vec![bin];
+        paths.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        command
+            .env("PATH", std::env::join_paths(paths).unwrap())
+            .env("BOOMUX_EXECUTION_CAPTURE", runtime_dir.join("first"))
+            .env("BOOMUX_PID_CAPTURE", runtime_dir.join("pid"));
+    });
+    let workspace = daemon
+        .client
+        .create_workspace("cancel-old", Vec::new())
+        .unwrap();
+    let schedule = daemon
+        .client
+        .create_agent_schedule(
+            &workspace.id,
+            schedule_spec(&daemon, "cancel-old", "private"),
+        )
+        .unwrap();
+    let first = daemon
+        .client
+        .run_agent_schedule(&schedule.id, Uuid::new_v4().to_string())
+        .unwrap();
+    wait_until(
+        || {
+            daemon
+                .client
+                .get_scheduled_execution(&first.id)
+                .is_ok_and(|execution| execution.state == ScheduledExecutionState::Exited)
+        },
+        "first execution did not exit",
+    );
+    let second = daemon
+        .client
+        .run_agent_schedule(&schedule.id, Uuid::new_v4().to_string())
+        .unwrap();
+    let pid_path = daemon.runtime_dir.join("pid");
+    wait_until(|| pid_path.is_file(), "second execution did not start");
+    let pid = fs::read_to_string(pid_path)
+        .unwrap()
+        .parse::<libc::pid_t>()
+        .unwrap();
+
+    let unchanged = daemon.client.cancel_scheduled_execution(&first.id).unwrap();
+    assert_eq!(unchanged.state, ScheduledExecutionState::Exited);
+    assert!(process_exists(pid));
+
+    daemon
+        .client
+        .cancel_scheduled_execution(&second.id)
+        .unwrap();
+    wait_until(
+        || !process_exists(pid),
+        "second execution survived cancellation",
+    );
+    daemon.stop_with_cli();
+}
+
+#[test]
+fn claimed_cancellation_wins_before_spawn() {
+    let mut daemon = TestDaemon::start_with(|command, runtime_dir| {
+        let barrier = runtime_dir.join("claim-barrier");
+        fs::create_dir(&barrier).unwrap();
+        let bin = runtime_dir.join("bin");
+        fs::create_dir(&bin).unwrap();
+        let host = bin.join("opencode");
+        fs::write(&host, "#!/bin/sh\n: > \"$BOOMUX_SPAWN_CAPTURE\"\n").unwrap();
+        fs::set_permissions(&host, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut paths = vec![bin];
+        paths.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        command
+            .env("PATH", std::env::join_paths(paths).unwrap())
+            .env("BOOMUX_NATIVE_TEST_CLAIM_BARRIER", &barrier)
+            .env("BOOMUX_SPAWN_CAPTURE", runtime_dir.join("spawned"));
+    });
+    let workspace = daemon
+        .client
+        .create_workspace("claim-cancel", Vec::new())
+        .unwrap();
+    let schedule = daemon
+        .client
+        .create_agent_schedule(
+            &workspace.id,
+            schedule_spec(&daemon, "claim-cancel", "private"),
+        )
+        .unwrap();
+    let key = Uuid::new_v4().to_string();
+    let client = Client::from_socket_path(daemon.client.socket_path().to_path_buf());
+    let schedule_id = schedule.id.clone();
+    let key_for_thread = key.clone();
+    let run = thread::spawn(move || client.run_agent_schedule(schedule_id, key_for_thread));
+    let barrier = daemon.runtime_dir.join("claim-barrier");
+    wait_until(
+        || barrier.join("claimed").is_file(),
+        "claim barrier was not reached",
+    );
+    let claimed = daemon
+        .client
+        .scheduled_executions(None, Some(schedule.id.clone()))
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(claimed.state, ScheduledExecutionState::Claimed);
+
+    let cancelled = daemon
+        .client
+        .cancel_scheduled_execution(&claimed.id)
+        .unwrap();
+    assert_eq!(cancelled.state, ScheduledExecutionState::Cancelled);
+    fs::write(barrier.join("release"), b"release").unwrap();
+    assert_eq!(
+        run.join().unwrap().unwrap().state,
+        ScheduledExecutionState::Cancelled
+    );
+    assert!(!daemon.runtime_dir.join("spawned").exists());
+    daemon.stop_with_cli();
+}
+
+#[test]
+fn post_claim_persistence_failure_terminalizes_without_spawning() {
+    let mut daemon = TestDaemon::start_with(|command, runtime_dir| {
+        let barrier = runtime_dir.join("dispatch-failure-barrier");
+        fs::create_dir(&barrier).unwrap();
+        let bin = runtime_dir.join("bin");
+        fs::create_dir(&bin).unwrap();
+        let host = bin.join("opencode");
+        fs::write(&host, "#!/bin/sh\n: > \"$BOOMUX_SPAWN_CAPTURE\"\n").unwrap();
+        fs::set_permissions(&host, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut paths = vec![bin];
+        paths.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        command
+            .env("PATH", std::env::join_paths(paths).unwrap())
+            .env("BOOMUX_NATIVE_TEST_CLAIM_BARRIER", &barrier)
+            .env(
+                "BOOMUX_SPAWN_CAPTURE",
+                runtime_dir.join("dispatch-failure-spawn"),
+            );
+    });
+    let workspace = daemon
+        .client
+        .create_workspace("dispatch-failure", Vec::new())
+        .unwrap();
+    let schedule = daemon
+        .client
+        .create_agent_schedule(
+            &workspace.id,
+            schedule_spec(&daemon, "dispatch-failure", "private"),
+        )
+        .unwrap();
+    let request_client = Client::from_socket_path(daemon.client.socket_path().to_path_buf());
+    let schedule_id = schedule.id.clone();
+    let request = thread::spawn(move || {
+        request_client.run_agent_schedule(schedule_id, Uuid::new_v4().to_string())
+    });
+    let barrier = daemon.runtime_dir.join("dispatch-failure-barrier");
+    wait_until(
+        || barrier.join("claimed").is_file(),
+        "claim barrier was not reached",
+    );
+    let execution_id = daemon
+        .client
+        .scheduled_executions(None, Some(schedule.id.clone()))
+        .unwrap()[0]
+        .id
+        .clone();
+    let state_directory = daemon.runtime_dir.join("state/boomux");
+    let saved_directory = daemon.runtime_dir.join("saved-dispatch-failure-state");
+    fs::rename(&state_directory, &saved_directory).unwrap();
+    fs::write(&state_directory, b"not a directory").unwrap();
+    fs::write(barrier.join("release"), b"release").unwrap();
+    assert!(request.join().unwrap().is_err());
+    assert_eq!(
+        daemon
+            .client
+            .get_scheduled_execution(&execution_id)
+            .unwrap()
+            .state,
+        ScheduledExecutionState::DispatchFailed
+    );
+    assert!(!daemon.runtime_dir.join("dispatch-failure-spawn").exists());
+
+    fs::remove_file(&state_directory).unwrap();
+    fs::rename(&saved_directory, &state_directory).unwrap();
+    wait_until(
+        || {
+            daemon
+                .client
+                .get_scheduled_execution(&execution_id)
+                .is_ok_and(|execution| execution.state == ScheduledExecutionState::DispatchFailed)
+        },
+        "dispatch failure was not retained after persistence recovery",
+    );
+    daemon.stop_with_cli();
+}
+
+#[test]
+fn runner_start_persistence_failure_kills_runtime_and_terminalizes() {
+    let mut daemon = TestDaemon::start_with(|command, runtime_dir| {
+        let barrier = runtime_dir.join("start-barrier");
+        fs::create_dir(&barrier).unwrap();
+        let bin = runtime_dir.join("bin");
+        fs::create_dir(&bin).unwrap();
+        let host = bin.join("opencode");
+        fs::write(&host, "#!/bin/sh\n: > \"$BOOMUX_HOST_CAPTURE\"\n").unwrap();
+        fs::set_permissions(&host, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut paths = vec![bin];
+        paths.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        command
+            .env("PATH", std::env::join_paths(paths).unwrap())
+            .env("BOOMUX_NATIVE_TEST_START_BARRIER", &barrier)
+            .env(
+                "BOOMUX_HOST_CAPTURE",
+                runtime_dir.join("start-failure-host"),
+            );
+    });
+    let workspace = daemon
+        .client
+        .create_workspace("start-failure", Vec::new())
+        .unwrap();
+    let schedule = daemon
+        .client
+        .create_agent_schedule(
+            &workspace.id,
+            schedule_spec(&daemon, "start-failure", "private"),
+        )
+        .unwrap();
+    let request_client = Client::from_socket_path(daemon.client.socket_path().to_path_buf());
+    let schedule_id = schedule.id.clone();
+    let request = thread::spawn(move || {
+        request_client.run_agent_schedule(schedule_id, Uuid::new_v4().to_string())
+    });
+    let barrier = daemon.runtime_dir.join("start-barrier");
+    wait_until(
+        || barrier.join("started").is_file(),
+        "runner start barrier was not reached",
+    );
+    let state_directory = daemon.runtime_dir.join("state/boomux");
+    let saved_directory = daemon.runtime_dir.join("saved-start-failure-state");
+    fs::rename(&state_directory, &saved_directory).unwrap();
+    fs::write(&state_directory, b"not a directory").unwrap();
+    fs::write(barrier.join("release"), b"release").unwrap();
+    assert!(request.join().unwrap().is_err());
+    let execution_id = daemon
+        .client
+        .scheduled_executions(None, Some(schedule.id.clone()))
+        .unwrap()[0]
+        .id
+        .clone();
+    let failed = daemon
+        .client
+        .get_scheduled_execution(&execution_id)
+        .unwrap();
+    assert_eq!(failed.state, ScheduledExecutionState::DispatchFailed);
+    assert_eq!(
+        daemon
+            .client
+            .get_shell(failed.shell_id.as_ref().unwrap())
+            .unwrap()
+            .status,
+        protocol::ShellStatus::Pending
+    );
+    assert!(!daemon.runtime_dir.join("start-failure-host").exists());
+
+    fs::remove_file(&state_directory).unwrap();
+    fs::rename(&saved_directory, &state_directory).unwrap();
+    daemon.stop_with_cli();
+}
+
+#[test]
+fn cancellation_persistence_failure_keeps_dead_process_terminal_and_retries() {
+    let mut daemon = long_running_schedule_daemon("cancel-persistence");
+    let (workspace_id, _schedule_id, execution_id, pid) =
+        start_long_running_execution(&daemon, "cancel-persistence");
+    let cursor = daemon.client.events(None, 256, 0).unwrap().cursor;
+    let state_directory = daemon.runtime_dir.join("state/boomux");
+    let saved_directory = daemon.runtime_dir.join("saved-cancel-state");
+    fs::rename(&state_directory, &saved_directory).unwrap();
+    fs::write(&state_directory, b"not a directory").unwrap();
+
+    assert!(
+        daemon
+            .client
+            .cancel_scheduled_execution(&execution_id)
+            .is_err()
+    );
+    wait_until(
+        || !process_exists(pid),
+        "cancelled host survived persistence failure",
+    );
+    let execution = daemon
+        .client
+        .get_scheduled_execution(&execution_id)
+        .unwrap();
+    assert_eq!(execution.state, ScheduledExecutionState::Cancelled);
+    assert_eq!(
+        execution.reason,
+        Some(protocol::ScheduledExecutionReason::CancelledByUser)
+    );
+    assert_eq!(
+        daemon.client.get_workspace(&workspace_id).unwrap().shells[0].status,
+        protocol::ShellStatus::Pending
+    );
+
+    fs::remove_file(&state_directory).unwrap();
+    fs::rename(&saved_directory, &state_directory).unwrap();
+    wait_until(
+        || {
+            daemon
+                .client
+                .events(Some(cursor.clone()), 256, 0)
+                .is_ok_and(|events| {
+                    events.events.iter().any(|event| {
+                        matches!(
+                            &event.kind,
+                            protocol::DaemonEventKind::ScheduledExecutionChanged { execution, .. }
+                                if execution.id == execution_id
+                                    && execution.state == ScheduledExecutionState::Cancelled
+                        )
+                    })
+                })
+        },
+        "cancelled execution was not persisted and published after recovery",
+    );
+    daemon.stop_with_cli();
+}
+
+#[test]
+fn cancellation_stop_failure_leaves_live_exact_run_active() {
+    let mut daemon = TestDaemon::start_with(|command, runtime_dir| {
+        let bin = runtime_dir.join("bin");
+        fs::create_dir(&bin).unwrap();
+        let host = bin.join("opencode");
+        fs::write(
+            &host,
+            "#!/bin/sh\nprintf '%s' \"$$\" > \"$BOOMUX_PID_CAPTURE\"\nsleep 30\n",
+        )
+        .unwrap();
+        fs::set_permissions(&host, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut paths = vec![bin];
+        paths.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        command
+            .env("PATH", std::env::join_paths(paths).unwrap())
+            .env("BOOMUX_PID_CAPTURE", runtime_dir.join("stop-failure-pid"))
+            .env("BOOMUX_NATIVE_TEST_CANCEL_STOP_FAILURE", "1");
+    });
+    let (workspace_id, schedule_id, execution_id, pid) =
+        start_long_running_execution(&daemon, "stop-failure");
+    assert!(
+        daemon
+            .client
+            .cancel_scheduled_execution(&execution_id)
+            .is_err()
+    );
+    assert!(process_exists(pid));
+    assert_eq!(
+        daemon
+            .client
+            .get_scheduled_execution(&execution_id)
+            .unwrap()
+            .state,
+        ScheduledExecutionState::Active
+    );
+
+    let restart = daemon
+        .command()
+        .args(["daemon", "restart"])
+        .output()
+        .unwrap();
+    assert!(restart.status.success());
+    daemon
+        .client
+        .cancel_scheduled_execution(&execution_id)
+        .unwrap();
+    wait_until(
+        || !process_exists(pid),
+        "host survived cancellation after stop recovery",
+    );
+    daemon.client.remove_agent_schedule(&schedule_id).unwrap();
+    daemon.client.close_workspace(&workspace_id).unwrap();
+    daemon.stop_with_cli();
+}
+
+#[test]
+fn failed_active_workspace_close_reconciles_execution_and_pending_shell() {
+    let mut daemon = long_running_schedule_daemon("workspace-close-persistence");
+    let (workspace_id, _schedule_id, execution_id, pid) =
+        start_long_running_execution(&daemon, "workspace-close-persistence");
+    let state_directory = daemon.runtime_dir.join("state/boomux");
+    let saved_directory = daemon.runtime_dir.join("saved-workspace-close-state");
+    fs::rename(&state_directory, &saved_directory).unwrap();
+    fs::write(&state_directory, b"not a directory").unwrap();
+
+    assert!(daemon.client.close_workspace(&workspace_id).is_err());
+    wait_until(
+        || !process_exists(pid),
+        "workspace close did not stop the host",
+    );
+    let workspace = daemon.client.get_workspace(&workspace_id).unwrap();
+    assert_eq!(workspace.shells[0].status, protocol::ShellStatus::Pending);
+    let execution = daemon
+        .client
+        .get_scheduled_execution(&execution_id)
+        .unwrap();
+    assert_eq!(execution.state, ScheduledExecutionState::Interrupted);
+    assert_eq!(execution.outcome, None);
+
+    fs::remove_file(&state_directory).unwrap();
+    fs::rename(&saved_directory, &state_directory).unwrap();
+    wait_until(
+        || {
+            daemon
+                .client
+                .get_scheduled_execution(&execution_id)
+                .is_ok_and(|execution| execution.state == ScheduledExecutionState::Interrupted)
+        },
+        "workspace close compensation was not persisted",
+    );
+    daemon.client.close_workspace(&workspace_id).unwrap();
+    daemon.stop_with_cli();
+}
+
+#[test]
+fn active_workspace_close_kills_and_removes_scheduled_work() {
+    let mut daemon = long_running_schedule_daemon("workspace-close-active");
+    let (workspace_id, _schedule_id, execution_id, pid) =
+        start_long_running_execution(&daemon, "workspace-close-active");
+
+    daemon.client.close_workspace(&workspace_id).unwrap();
+    wait_until(
+        || !process_exists(pid),
+        "active workspace close left host alive",
+    );
+    assert!(daemon.client.get_workspace(&workspace_id).is_err());
+    assert!(
+        daemon
+            .client
+            .get_scheduled_execution(&execution_id)
+            .is_err()
+    );
+    daemon.stop_with_cli();
+}
+
+fn long_running_schedule_daemon(label: &str) -> TestDaemon {
+    let label = label.to_owned();
+    TestDaemon::start_with(move |command, runtime_dir| {
+        let bin = runtime_dir.join("bin");
+        fs::create_dir(&bin).unwrap();
+        let host = bin.join("opencode");
+        fs::write(
+            &host,
+            "#!/bin/sh\nprintf '%s' \"$$\" > \"$BOOMUX_PID_CAPTURE\"\nsleep 30\n",
+        )
+        .unwrap();
+        fs::set_permissions(&host, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut paths = vec![bin];
+        paths.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        command
+            .env("PATH", std::env::join_paths(paths).unwrap())
+            .env(
+                "BOOMUX_PID_CAPTURE",
+                runtime_dir.join(format!("{label}-pid")),
+            );
+    })
+}
+
+fn start_long_running_execution(
+    daemon: &TestDaemon,
+    label: &str,
+) -> (String, String, String, libc::pid_t) {
+    let workspace = daemon.client.create_workspace(label, Vec::new()).unwrap();
+    let schedule = daemon
+        .client
+        .create_agent_schedule(&workspace.id, schedule_spec(daemon, label, "private"))
+        .unwrap();
+    let execution = daemon
+        .client
+        .run_agent_schedule(&schedule.id, Uuid::new_v4().to_string())
+        .unwrap();
+    let pid_path = daemon.runtime_dir.join(format!("{label}-pid"));
+    wait_until(|| pid_path.is_file(), "scheduled host did not start");
+    wait_until(
+        || {
+            daemon
+                .client
+                .get_scheduled_execution(&execution.id)
+                .is_ok_and(|execution| execution.state == ScheduledExecutionState::Active)
+        },
+        "scheduled execution did not become active",
+    );
+    let pid = fs::read_to_string(pid_path)
+        .unwrap()
+        .parse::<libc::pid_t>()
+        .unwrap();
+    (workspace.id, schedule.id, execution.id, pid)
+}
+
+#[test]
+fn cold_recovery_interrupts_active_execution_without_respawn() {
+    let mut daemon = TestDaemon::start_with(|command, runtime_dir| {
+        let bin = runtime_dir.join("bin");
+        fs::create_dir(&bin).unwrap();
+        let host = bin.join("opencode");
+        fs::write(
+            &host,
+            "#!/bin/sh\nprintf 'spawn\\n' >> \"$BOOMUX_EXECUTION_CAPTURE\"\nprintf '%s\\n' \"$$\" >> \"$BOOMUX_PID_CAPTURE\"\nsleep 30\n",
+        )
+        .unwrap();
+        fs::set_permissions(&host, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut paths = vec![bin];
+        paths.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        command
+            .env("PATH", std::env::join_paths(paths).unwrap())
+            .env("BOOMUX_EXECUTION_CAPTURE", runtime_dir.join("executions"))
+            .env("BOOMUX_PID_CAPTURE", runtime_dir.join("pids"));
+    });
+    let workspace = daemon.client.create_workspace("cold", Vec::new()).unwrap();
+    let schedule = daemon
+        .client
+        .create_agent_schedule(&workspace.id, schedule_spec(&daemon, "cold", "private"))
+        .unwrap();
+    let execution = daemon
+        .client
+        .run_agent_schedule(&schedule.id, Uuid::new_v4().to_string())
+        .unwrap();
+    let capture = daemon.runtime_dir.join("executions");
+    wait_until(|| capture.is_file(), "scheduled host did not start");
+    let active = daemon
+        .client
+        .get_scheduled_execution(&execution.id)
+        .unwrap();
+    let old_pid = fs::read_to_string(daemon.runtime_dir.join("pids"))
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .parse::<libc::pid_t>()
+        .unwrap();
+    daemon.crash();
+    wait_until(
+        || !process_exists(old_pid),
+        "cold-crashed host remained alive",
+    );
+    daemon.restart();
+    let recovered = daemon
+        .client
+        .get_scheduled_execution(&execution.id)
+        .unwrap();
+    assert_eq!(recovered.state, ScheduledExecutionState::Interrupted);
+    assert_eq!(
+        recovered.reason,
+        Some(protocol::ScheduledExecutionReason::ColdDaemonRecovery)
+    );
+    assert_eq!(recovered.outcome, None);
+    assert_eq!(recovered.shell_id, active.shell_id);
+    assert_eq!(recovered.run_id, active.run_id);
+    assert_eq!(
+        daemon
+            .client
+            .run_agent_schedule(&schedule.id, &execution.dispatch_key)
+            .unwrap()
+            .id,
+        execution.id
+    );
+    assert_eq!(fs::read_to_string(&capture).unwrap(), "spawn\n");
+    let mut paths = vec![daemon.runtime_dir.join("bin")];
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    let restart = daemon
+        .command()
+        .args(["daemon", "restart"])
+        .env("PATH", std::env::join_paths(paths).unwrap())
+        .env("BOOMUX_EXECUTION_CAPTURE", &capture)
+        .env("BOOMUX_PID_CAPTURE", daemon.runtime_dir.join("pids"))
+        .output()
+        .unwrap();
+    assert!(restart.status.success());
+    let next = daemon
+        .client
+        .run_agent_schedule(&schedule.id, Uuid::new_v4().to_string())
+        .unwrap();
+    wait_until(
+        || fs::read_to_string(&capture).is_ok_and(|capture| capture.lines().count() == 2),
+        "new key did not start exactly one new run",
+    );
+    let next = daemon.client.get_scheduled_execution(&next.id).unwrap();
+    assert_eq!(next.shell_id, recovered.shell_id);
+    assert_ne!(next.run_id, recovered.run_id);
+    daemon.client.cancel_scheduled_execution(&next.id).unwrap();
+    daemon.stop_with_cli();
+}
+
+#[test]
+fn cold_recovery_clears_staged_outcome_and_survives_second_restart() {
+    let mut daemon = TestDaemon::start_with(|command, runtime_dir| {
+        let barrier = runtime_dir.join("outcome-barrier");
+        fs::create_dir(&barrier).unwrap();
+        let bin = runtime_dir.join("bin");
+        fs::create_dir(&bin).unwrap();
+        let host = bin.join("opencode");
+        fs::write(&host, "#!/bin/sh\nexit 17\n").unwrap();
+        fs::set_permissions(&host, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut paths = vec![bin];
+        paths.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        command
+            .env("PATH", std::env::join_paths(paths).unwrap())
+            .env("BOOMUX_NATIVE_TEST_OUTCOME_BARRIER", &barrier);
+    });
+    let workspace = daemon
+        .client
+        .create_workspace("cold-staged-outcome", Vec::new())
+        .unwrap();
+    let schedule = daemon
+        .client
+        .create_agent_schedule(
+            &workspace.id,
+            schedule_spec(&daemon, "cold-staged-outcome", "private"),
+        )
+        .unwrap();
+    let execution = daemon
+        .client
+        .run_agent_schedule(&schedule.id, Uuid::new_v4().to_string())
+        .unwrap();
+    let barrier = daemon.runtime_dir.join("outcome-barrier");
+    wait_until(
+        || barrier.join("outcome").is_file(),
+        "runner outcome was not staged before EOF",
+    );
+    let staged = daemon
+        .client
+        .get_scheduled_execution(&execution.id)
+        .unwrap();
+    assert_eq!(staged.state, ScheduledExecutionState::Active);
+    assert_eq!(
+        staged.outcome,
+        Some(protocol::ScheduledExecutionOutcome::ExitCode { code: 17 })
+    );
+
+    daemon.crash();
+    daemon.restart();
+    let recovered = daemon
+        .client
+        .get_scheduled_execution(&execution.id)
+        .unwrap();
+    assert_eq!(recovered.state, ScheduledExecutionState::Interrupted);
+    assert_eq!(
+        recovered.reason,
+        Some(protocol::ScheduledExecutionReason::ColdDaemonRecovery)
+    );
+    assert_eq!(recovered.outcome, None);
+
+    daemon.crash();
+    daemon.restart();
+    let restored_again = daemon
+        .client
+        .get_scheduled_execution(&execution.id)
+        .unwrap();
+    assert_eq!(restored_again, recovered);
+    daemon.stop_with_cli();
+}
+
+#[test]
+fn daemon_stop_persists_explicit_cancellation_for_active_execution() {
+    let mut daemon = long_running_schedule_daemon("daemon-stop");
+    let (_workspace_id, _schedule_id, execution_id, pid) =
+        start_long_running_execution(&daemon, "daemon-stop");
+
+    daemon.stop_with_cli();
+    wait_until(
+        || !process_exists(pid),
+        "daemon stop left scheduled host running",
+    );
+    let state: serde_json::Value = serde_json::from_slice(
+        &fs::read(daemon.runtime_dir.join("state/boomux/state.json")).unwrap(),
+    )
+    .unwrap();
+    let execution = state["workspaces"][0]["schedules"][0]["executions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|execution| execution["id"] == execution_id)
+        .unwrap();
+    assert_eq!(execution["state"], "cancelled");
+    assert_eq!(execution["reason"], "daemon_shutdown");
+    assert!(execution["outcome"].is_null());
+}
+
+#[test]
+fn daemon_stop_cancels_persisted_claim_before_it_can_spawn() {
+    let mut daemon = TestDaemon::start_with(|command, runtime_dir| {
+        let barrier = runtime_dir.join("stop-claim-barrier");
+        fs::create_dir(&barrier).unwrap();
+        let bin = runtime_dir.join("bin");
+        fs::create_dir(&bin).unwrap();
+        let host = bin.join("opencode");
+        fs::write(&host, "#!/bin/sh\n: > \"$BOOMUX_STOP_SPAWN\"\n").unwrap();
+        fs::set_permissions(&host, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut paths = vec![bin];
+        paths.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        command
+            .env("PATH", std::env::join_paths(paths).unwrap())
+            .env("BOOMUX_NATIVE_TEST_CLAIM_BARRIER", &barrier)
+            .env("BOOMUX_STOP_SPAWN", runtime_dir.join("stop-claim-spawn"));
+    });
+    let workspace = daemon
+        .client
+        .create_workspace("stop-claim", Vec::new())
+        .unwrap();
+    let schedule = daemon
+        .client
+        .create_agent_schedule(
+            &workspace.id,
+            schedule_spec(&daemon, "stop-claim", "private"),
+        )
+        .unwrap();
+    let request_client = Client::from_socket_path(daemon.client.socket_path().to_path_buf());
+    let schedule_id = schedule.id.clone();
+    let request = thread::spawn(move || {
+        request_client.run_agent_schedule(schedule_id, Uuid::new_v4().to_string())
+    });
+    let barrier = daemon.runtime_dir.join("stop-claim-barrier");
+    wait_until(
+        || barrier.join("claimed").is_file(),
+        "claim barrier was not reached",
+    );
+    let execution_id = daemon
+        .client
+        .scheduled_executions(None, Some(schedule.id))
+        .unwrap()[0]
+        .id
+        .clone();
+
+    daemon.stop_with_cli();
+    let _ = request.join().unwrap();
+    assert!(!daemon.runtime_dir.join("stop-claim-spawn").exists());
+    let state: serde_json::Value = serde_json::from_slice(
+        &fs::read(daemon.runtime_dir.join("state/boomux/state.json")).unwrap(),
+    )
+    .unwrap();
+    let execution = state["workspaces"][0]["schedules"][0]["executions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|execution| execution["id"] == execution_id)
+        .unwrap();
+    assert_eq!(execution["state"], "cancelled");
+    assert_eq!(execution["reason"], "daemon_shutdown");
+}
+
+#[test]
+fn graceful_handoff_preserves_active_host_and_dispatches_at_most_once() {
+    let mut daemon = TestDaemon::start_with(|command, runtime_dir| {
+        let bin = runtime_dir.join("bin");
+        fs::create_dir(&bin).unwrap();
+        let host = bin.join("opencode");
+        fs::write(
+            &host,
+            "#!/bin/sh\nprintf '%s\\n' \"$$\" >> \"$BOOMUX_PID_CAPTURE\"\nsleep 2\n",
+        )
+        .unwrap();
+        fs::set_permissions(&host, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut paths = vec![bin];
+        paths.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        command
+            .env("PATH", std::env::join_paths(paths).unwrap())
+            .env("BOOMUX_PID_CAPTURE", runtime_dir.join("pids"));
+    });
+    let workspace = daemon
+        .client
+        .create_workspace("handoff", Vec::new())
+        .unwrap();
+    let schedule = daemon
+        .client
+        .create_agent_schedule(&workspace.id, schedule_spec(&daemon, "handoff", "private"))
+        .unwrap();
+    let key = Uuid::new_v4().to_string();
+    let execution = daemon
+        .client
+        .run_agent_schedule(&schedule.id, &key)
+        .unwrap();
+    let capture = daemon.runtime_dir.join("pids");
+    wait_until(|| capture.is_file(), "scheduled host did not start");
+    wait_until(
+        || {
+            daemon
+                .client
+                .get_scheduled_execution(&execution.id)
+                .is_ok_and(|execution| execution.state == ScheduledExecutionState::Active)
+        },
+        "scheduled execution did not become active before handoff",
+    );
+    let active = daemon
+        .client
+        .get_scheduled_execution(&execution.id)
+        .unwrap();
+    let pid = fs::read_to_string(&capture)
+        .unwrap()
+        .trim()
+        .parse::<libc::pid_t>()
+        .unwrap();
+    let restart = daemon
+        .command()
+        .args(["daemon", "restart"])
+        .output()
+        .unwrap();
+    assert!(
+        restart.status.success(),
+        "{}",
+        String::from_utf8_lossy(&restart.stderr)
+    );
+    assert!(process_exists(pid));
+    assert_eq!(
+        daemon
+            .client
+            .run_agent_schedule(&schedule.id, &key)
+            .unwrap()
+            .id,
+        execution.id
+    );
+    assert_eq!(fs::read_to_string(&capture).unwrap().lines().count(), 1);
+    wait_until(
+        || {
+            daemon
+                .client
+                .get_scheduled_execution(&execution.id)
+                .is_ok_and(|execution| execution.state == ScheduledExecutionState::Exited)
+        },
+        "handoff-preserved host did not report natural exit",
+    );
+    let exited = daemon
+        .client
+        .get_scheduled_execution(&execution.id)
+        .unwrap();
+    assert_eq!(exited.shell_id, active.shell_id);
+    assert_eq!(exited.run_id, active.run_id);
+    assert_eq!(
+        exited.outcome,
+        Some(protocol::ScheduledExecutionOutcome::ExitCode { code: 0 })
+    );
+    wait_until(
+        || !process_exists(pid),
+        "naturally exited host PID remained alive",
+    );
+    daemon.stop_with_cli();
+}
+
+#[test]
+fn graceful_handoff_resumes_a_persisted_claim_exactly_once() {
+    let mut daemon = TestDaemon::start_with(|command, runtime_dir| {
+        let barrier = runtime_dir.join("handoff-claim-barrier");
+        fs::create_dir(&barrier).unwrap();
+        let bin = runtime_dir.join("bin");
+        fs::create_dir(&bin).unwrap();
+        let host = bin.join("opencode");
+        fs::write(
+            &host,
+            "#!/bin/sh\nprintf 'spawn\\n' >> \"$BOOMUX_EXECUTION_CAPTURE\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&host, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut paths = vec![bin];
+        paths.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        command
+            .env("PATH", std::env::join_paths(paths).unwrap())
+            .env("BOOMUX_NATIVE_TEST_CLAIM_BARRIER", &barrier)
+            .env(
+                "BOOMUX_EXECUTION_CAPTURE",
+                runtime_dir.join("claim-handoff-spawns"),
+            );
+    });
+    let workspace = daemon
+        .client
+        .create_workspace("claim-handoff", Vec::new())
+        .unwrap();
+    let schedule = daemon
+        .client
+        .create_agent_schedule(
+            &workspace.id,
+            schedule_spec(&daemon, "claim-handoff", "private"),
+        )
+        .unwrap();
+    let key = Uuid::new_v4().to_string();
+    let request_client = Client::from_socket_path(daemon.client.socket_path().to_path_buf());
+    let schedule_id = schedule.id.clone();
+    let request_key = key.clone();
+    let request =
+        thread::spawn(move || request_client.run_agent_schedule(schedule_id, request_key));
+    let barrier = daemon.runtime_dir.join("handoff-claim-barrier");
+    wait_until(
+        || barrier.join("claimed").is_file(),
+        "claim barrier was not reached",
+    );
+    let claimed = daemon
+        .client
+        .scheduled_executions(None, Some(schedule.id.clone()))
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(claimed.state, ScheduledExecutionState::Claimed);
+
+    let mut paths = vec![daemon.runtime_dir.join("bin")];
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    let restart = daemon
+        .command()
+        .args(["daemon", "restart"])
+        .env("PATH", std::env::join_paths(paths).unwrap())
+        .env(
+            "BOOMUX_EXECUTION_CAPTURE",
+            daemon.runtime_dir.join("claim-handoff-spawns"),
+        )
+        .output()
+        .unwrap();
+    assert!(
+        restart.status.success(),
+        "{}",
+        String::from_utf8_lossy(&restart.stderr)
+    );
+    fs::write(barrier.join("release"), b"release").unwrap();
+    let _ = request.join().unwrap();
+    wait_until(
+        || {
+            daemon
+                .client
+                .get_scheduled_execution(&claimed.id)
+                .is_ok_and(|execution| execution.state == ScheduledExecutionState::Exited)
+        },
+        "replacement did not resume the persisted claim",
+    );
+    assert_eq!(
+        fs::read_to_string(daemon.runtime_dir.join("claim-handoff-spawns"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    let same = daemon
+        .client
+        .run_agent_schedule(&schedule.id, &key)
+        .unwrap();
+    assert_eq!(same.id, claimed.id);
+    daemon.stop_with_cli();
 }

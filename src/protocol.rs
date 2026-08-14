@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 22;
+pub const PROTOCOL_VERSION: u32 = 23;
 pub const MIN_PROTOCOL_VERSION: u32 = 6;
 pub const MAX_CONTROL_FRAME: usize = 8 * 1024 * 1024;
 pub const MAX_ATTACH_FRAME: usize = 1024 * 1024;
@@ -82,6 +82,12 @@ define_protocol_features! {
         "protocol_22",
         "agent_schedule_management",
         "durable_agent_schedules",
+    ]),
+    ScheduledExecutions => (23, "scheduled execution dispatch", [
+        "protocol_23",
+        "scheduled_execution_dispatch",
+        "scheduled_execution_cancellation",
+        "schedule_owned_shells",
     ]),
 }
 
@@ -284,6 +290,120 @@ pub struct AgentScheduleInspection {
     pub prompt: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScheduledExecutionState {
+    Claimed,
+    Starting,
+    Active,
+    DispatchFailed,
+    Exited,
+    Cancelled,
+    Interrupted,
+}
+
+impl ScheduledExecutionState {
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::DispatchFailed | Self::Exited | Self::Cancelled | Self::Interrupted
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScheduledExecutionDispatchKind {
+    Manual,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScheduledExecutionReason {
+    RunnerStartFailed,
+    HostSpawnFailed,
+    CancelledByUser,
+    ColdDaemonRecovery,
+    RunnerExitedWithoutReport,
+    DaemonShutdown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ScheduledExecutionOutcome {
+    ExitCode { code: i32 },
+    Signal { signal: i32 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScheduledExecutionSnapshot {
+    pub id: String,
+    pub workspace_id: String,
+    pub schedule_id: String,
+    pub state: ScheduledExecutionState,
+    pub dispatch_kind: ScheduledExecutionDispatchKind,
+    pub dispatch_key: String,
+    pub schedule_revision: u64,
+    pub prompt_revision: u64,
+    pub trigger_revision: u64,
+    pub requested_at_ms: u64,
+    pub started_at_ms: Option<u64>,
+    pub ended_at_ms: Option<u64>,
+    pub cwd: PathBuf,
+    pub integration: String,
+    pub session: AgentScheduleSession,
+    pub reason: Option<ScheduledExecutionReason>,
+    pub outcome: Option<ScheduledExecutionOutcome>,
+    pub shell_id: Option<String>,
+    pub run_id: Option<String>,
+    pub agent_id: Option<String>,
+    pub external_session_id: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScheduledExecutionClaim {
+    pub execution: ScheduledExecutionSnapshot,
+    pub prompt: String,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ScheduledRunnerCapability(String);
+
+impl ScheduledRunnerCapability {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for ScheduledRunnerCapability {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("<redacted>")
+    }
+}
+
+impl std::fmt::Debug for ScheduledExecutionClaim {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ScheduledExecutionClaim")
+            .field("execution", &self.execution)
+            .field("prompt", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum ScheduledRunnerResult {
+    Active,
+    SpawnFailed,
+    Exited { outcome: ScheduledExecutionOutcome },
+}
+
 impl std::fmt::Debug for AgentScheduleInspection {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -395,11 +515,23 @@ pub struct ShellSnapshot {
     pub cwd: PathBuf,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub command: Vec<String>,
+    #[serde(default)]
+    pub owner: ShellOwner,
     pub status: ShellStatus,
     #[serde(default)]
     pub run: Option<ShellRunSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub foreground_process: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ShellOwner {
+    #[default]
+    User,
+    Schedule {
+        schedule_id: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -444,6 +576,7 @@ pub enum ErrorCode {
     CursorExpired,
     RunChanged,
     RevisionAhead,
+    IdempotencyExpired,
     Internal,
     #[serde(other)]
     Unknown,
@@ -557,6 +690,14 @@ pub enum DaemonEventKind {
         workspace_id: String,
         schedule_id: String,
     },
+    ScheduledExecutionCreated {
+        workspace_id: String,
+        execution: ScheduledExecutionSnapshot,
+    },
+    ScheduledExecutionChanged {
+        workspace_id: String,
+        execution: ScheduledExecutionSnapshot,
+    },
     HandoffCompleted,
 }
 
@@ -644,6 +785,8 @@ pub enum Request {
     Restart,
     RestartWithNotificationConfig {
         notifications: NotificationDeliveryConfig,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        environment: Option<UnixEnvironment>,
     },
     Shutdown,
     Snapshot,
@@ -662,6 +805,15 @@ pub enum Request {
     },
     GetAgentSchedule {
         schedule_id: String,
+    },
+    ListScheduledExecutions {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        schedule_id: Option<String>,
+    },
+    GetScheduledExecution {
+        execution_id: String,
     },
     WaitAgent {
         agent_id: String,
@@ -687,6 +839,26 @@ pub enum Request {
     CreateAgentSchedule {
         workspace_id: String,
         spec: AgentScheduleSpec,
+    },
+    RunAgentSchedule {
+        schedule_id: String,
+        dispatch_key: String,
+    },
+    CancelScheduledExecution {
+        execution_id: String,
+    },
+    ResolveScheduledExecutionClaim {
+        schedule_id: String,
+        shell_id: String,
+        run_id: String,
+        runner_token: ScheduledRunnerCapability,
+    },
+    ReportScheduledRunner {
+        execution_id: String,
+        shell_id: String,
+        run_id: String,
+        runner_token: ScheduledRunnerCapability,
+        result: ScheduledRunnerResult,
     },
     RegisterAgent {
         shell_id: String,
@@ -781,6 +953,12 @@ pub enum Request {
 impl Request {
     pub fn required_feature(&self) -> Option<ProtocolFeature> {
         match self {
+            Self::ListScheduledExecutions { .. }
+            | Self::GetScheduledExecution { .. }
+            | Self::RunAgentSchedule { .. }
+            | Self::CancelScheduledExecution { .. }
+            | Self::ResolveScheduledExecutionClaim { .. }
+            | Self::ReportScheduledRunner { .. } => Some(ProtocolFeature::ScheduledExecutions),
             Self::CreateAgentSchedule { .. }
             | Self::GetAgentSchedule { .. }
             | Self::PauseAgentSchedule { .. }
@@ -795,6 +973,10 @@ impl Request {
             | Self::CreateShell {
                 workspace_id: None, ..
             } => Some(ProtocolFeature::WorkspaceDefaultCwd),
+            Self::RestartWithNotificationConfig {
+                environment: Some(_),
+                ..
+            } => Some(ProtocolFeature::ScheduledExecutions),
             Self::RestartWithNotificationConfig { .. } => {
                 Some(ProtocolFeature::RestartNotificationConfig)
             }
@@ -875,6 +1057,15 @@ pub enum Response {
     },
     AgentScheduleInspection {
         inspection: AgentScheduleInspection,
+    },
+    ScheduledExecution {
+        execution: ScheduledExecutionSnapshot,
+    },
+    ScheduledExecutions {
+        executions: Vec<ScheduledExecutionSnapshot>,
+    },
+    ScheduledExecutionClaim {
+        claim: ScheduledExecutionClaim,
     },
     AgentWait {
         agent: AgentInstanceSnapshot,
@@ -1317,8 +1508,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_twenty_two_with_minimum_six() {
-        assert_eq!(PROTOCOL_VERSION, 22);
+    fn protocol_version_is_twenty_three_with_minimum_six() {
+        assert_eq!(PROTOCOL_VERSION, 23);
         assert_eq!(MIN_PROTOCOL_VERSION, 6);
     }
 
@@ -1417,6 +1608,68 @@ mod tests {
                 response
             );
         }
+    }
+
+    #[test]
+    fn scheduled_execution_wire_and_events_are_prompt_free() {
+        let execution = ScheduledExecutionSnapshot {
+            id: "execution-1".into(),
+            workspace_id: "workspace-1".into(),
+            schedule_id: "schedule-1".into(),
+            state: ScheduledExecutionState::Starting,
+            dispatch_kind: ScheduledExecutionDispatchKind::Manual,
+            dispatch_key: "dispatch-1".into(),
+            schedule_revision: 3,
+            prompt_revision: 2,
+            trigger_revision: 1,
+            requested_at_ms: 10,
+            started_at_ms: None,
+            ended_at_ms: None,
+            cwd: "/tmp/project".into(),
+            integration: "opencode".into(),
+            session: AgentScheduleSession::Fresh,
+            reason: None,
+            outcome: None,
+            shell_id: Some("shell-1".into()),
+            run_id: Some("run-1".into()),
+            agent_id: None,
+            external_session_id: None,
+        };
+        let prompt = "PRIVATE EXECUTION PROMPT";
+        let claim = ScheduledExecutionClaim {
+            execution: execution.clone(),
+            prompt: prompt.into(),
+        };
+        assert!(!format!("{claim:?}").contains(prompt));
+        let event = DaemonEventKind::ScheduledExecutionChanged {
+            workspace_id: execution.workspace_id.clone(),
+            execution: execution.clone(),
+        };
+        assert!(!serde_json::to_string(&event).unwrap().contains(prompt));
+        let request = Request::RunAgentSchedule {
+            schedule_id: execution.schedule_id.clone(),
+            dispatch_key: execution.dispatch_key.clone(),
+        };
+        assert_eq!(
+            serde_json::from_value::<Request>(serde_json::to_value(&request).unwrap()).unwrap(),
+            request
+        );
+        assert_eq!(
+            request.required_feature(),
+            Some(ProtocolFeature::ScheduledExecutions)
+        );
+        let capability = "PRIVATE RUNNER CAPABILITY";
+        let request = Request::ResolveScheduledExecutionClaim {
+            schedule_id: execution.schedule_id,
+            shell_id: execution.shell_id.unwrap(),
+            run_id: execution.run_id.unwrap(),
+            runner_token: ScheduledRunnerCapability::new(capability),
+        };
+        assert!(!format!("{request:?}").contains(capability));
+        assert_eq!(
+            serde_json::from_value::<Request>(serde_json::to_value(&request).unwrap()).unwrap(),
+            request
+        );
     }
 
     #[test]
@@ -1621,6 +1874,7 @@ mod tests {
                         resume_agents: true,
                         persist_terminal_history: false,
                     },
+                    environment: None,
                 }],
             ),
             (
@@ -1868,6 +2122,15 @@ mod tests {
                     "durable_agent_schedules",
                 ][..],
             ),
+            (
+                23,
+                &[
+                    "protocol_23",
+                    "scheduled_execution_dispatch",
+                    "scheduled_execution_cancellation",
+                    "schedule_owned_shells",
+                ][..],
+            ),
         ];
 
         let actual = ProtocolFeature::ALL
@@ -2101,6 +2364,7 @@ mod tests {
             name: "shell".into(),
             cwd: "/tmp".into(),
             command: vec!["sleep".into(), "1".into()],
+            owner: ShellOwner::User,
             status: ShellStatus::Running,
             run: Some(ShellRunSnapshot {
                 id: "r1".into(),

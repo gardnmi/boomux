@@ -50,7 +50,7 @@
   launch, and integration management execute argv directly without shell
   interpretation.
 - **Scheduled Agent authority:** [`scheduled-agent-work.md`](scheduled-agent-work.md)
-  defines the accepted, not-yet-implemented boundary between scheduling,
+  defines the boundary between implemented manual dispatch, future timing,
   process outcome, and authoritative Agent lifecycle.
 
 ## Product Boundary
@@ -359,7 +359,7 @@ requiring a daemon. Protocol 6 error responses carry an additive optional code;
 clients expose it as `ClientError::Remote(RemoteError)`, while mixed-version
 peers retain message compatibility.
 
-### Scheduled Agent Work (Management Implemented; Dispatch Planned)
+### Scheduled Agent Work (Manual Dispatch Implemented; Timing Planned)
 
 Protocol 22 and state schema 9 implement the Agent Schedule identity without
 changing ShellRun, Agent Instance, or projected Agent Session semantics. A
@@ -371,24 +371,27 @@ closure, and prompt-free events are available. Exact inspection is the only
 management response that contains prompt content; protocol-21 and older peers
 omit schedule summaries and events while their cursors still advance.
 
-Scheduled Execution, timing, and process dispatch remain planned. An execution
-will record one manual or timed decision against exact schedule and prompt
-revisions. An execution that binds the internal runner acquires a shell run, even
-when the external host later fails to launch. The first such execution lazily
-creates one schedule-owned durable shell that later executions reuse for
-distinct runs; ordinary shell or workspace open never starts or restarts it.
-Lifecycle integration may bind an Agent Instance to the exact execution run
-under the existing authority rules.
+Protocol 23 and state schema 10 add manual Scheduled Execution dispatch. A
+prompt-free public record retains one durable claim against exact schedule,
+prompt, and trigger revisions, while its exact prompt snapshot remains private
+durable dispatch input. The first execution lazily creates one schedule-owned
+durable shell; later executions reuse it with distinct ShellRuns. Ordinary shell
+or workspace open never starts or restarts that shell, but an active run remains
+attachable. Rename, close, and restart are rejected outside schedule or workspace
+ownership. State schema 10 explicitly migrates schema-9 shells to user ownership
+and schedules to empty execution histories.
 
-The schedule-owned shell stores a stable internal runner argument vector rather
-than a host prompt. Each persisted execution claim snapshots its working
-directory and dispatch inputs; the runner resolves that exact claim and invokes
-the integration adapter without shell interpretation. Schedule updates while a
-run is active affect only later claims. A durable per-schedule evaluation
-frontier and occurrence key prevent clock rollback, history pruning, restart,
-or graceful handoff from dispatching one timed occurrence twice. The frontier,
-occurrence decision, and execution record commit as one durable mutation before
-event publication.
+The shell stores only the Boomux executable, hidden runner command, and exact
+schedule ID. The runner resolves the exact schedule, `BOOMUX_SHELL_ID`, and
+`BOOMUX_RUN_ID` claim using a private per-execution capability and invokes
+integration-owned argv builders without shell interpretation. The capability is
+persisted with private dispatch input, supplied only to that runner's ephemeral
+environment, removed before the external host is spawned, and required for claim
+resolution and outcome reports. OpenCode
+uses `opencode run [--session exact-id] -- prompt`.
+Pi uses `pi [--session exact-full-id] --print`, receives the exact prompt on
+stdin, and closes stdin; host stdout and stderr remain on the PTY. The runner
+retries daemon connections through handoff without starting a daemon.
 
 Scheduling is process orchestration, not lifecycle observation. Spawn failure,
 process exit, cancellation, and cold-daemon interruption are Scheduled Execution
@@ -400,22 +403,24 @@ input into an active session, or infer a canonical external session.
 Fresh is the default session mode and starts a new external Agent Session for
 each dispatched execution. Continuation schedules pin one exact existing
 integration and external session identity; they never select the latest session
-or fall back to fresh work. An occurrence is skipped while a continuation lease,
-an exact current daemon Agent occurrence, the schedule, or the workspace is
-active. Boomux cannot prove inactivity in an unmanaged host process without an
-integration-provided lease and does not substitute heuristics. Daemon-wide
-scheduled concurrency defaults to four and is configurable within a positive
-bound.
+or fall back to fresh work. The manual layer prevents a second nonterminal
+execution on the same schedule. Continuation leases, workspace/global
+concurrency, and timed skip decisions remain part of #150 rather than this
+dispatch layer.
 
-New schedules are paused by default. Timed work skips overlap and offline
-occurrences rather than queueing or catching up, and automatic retries are not
-part of the initial contract. The initial release also has no automatic timeout:
-an execution remains active until its process exits, the user cancels it, or a
-cold daemon loss interrupts it. Future scheduled starts use the daemon's
+New schedules are paused by default, and manual run-now remains available while
+paused. Cron evaluation, timer loops, skipped timed decisions, and `[scheduling]`
+configuration remain deferred. There is no automatic retry or timeout: an
+execution remains active until its process exits, the user cancels it, or runner
+or cold-daemon loss interrupts it. Scheduled starts use the daemon's
 startup environment as ephemeral input; it is never persisted, and environment
 changes require daemon restart. Scheduled-work support extends graceful restart
 so the invoking client's validated environment becomes the replacement daemon's
 startup environment without entering durable state or the handoff manifest.
+Host exit and host-spawn-failure reports are staged on the nonterminal execution;
+the exact runner ShellRun EOF publishes `run_exited` before committing the
+terminal execution transition. This prevents a later dispatch from observing a
+terminal execution while the reusable runner shell is still live.
 These limitations and scheduler health must be visible to clients. See
 [`scheduled-agent-work.md`](scheduled-agent-work.md) and [ADR 0002](adr/0002-separate-agent-schedules-from-runtime-identity.md).
 
@@ -696,6 +701,11 @@ additive schedule summaries, and older event readers filter schedule events
 without rewinding their cursor. State schema 9 explicitly migrates schema 8
 workspaces with empty schedule collections rather than reinterpreting missing
 durable fields.
+Protocol 23 adds manual Scheduled Execution dispatch, cancellation, prompt-free
+execution events, and durable schedule-owned shell identity. Protocol-22 peers
+omit execution events, schedule-owned shells, and execution-shell links. State schema 10
+explicitly migrates schema 9: existing shells become user-owned and schedules
+receive empty execution histories.
 
 Opt-in desktop and sound notifications are a daemon-owned projection of committed
 Agent state transitions, not durable queue state. A transition from any other
