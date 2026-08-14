@@ -351,3 +351,6 @@ The stable codes are reported by `boomux capabilities --json`. Messages remain
 human-readable context and are not stable parsing targets. `run_changed` means
 a supplied run ID no longer matches the run-scoped operation; integrations must
 reacquire exact context rather than substitute or guess another run.
+The CLI maps typed client failures directly: daemon `RemoteError` codes retain
+their stable spelling, while transport, protocol, validation, and lifecycle
+variants map to the existing CLI code set without inspecting message text.

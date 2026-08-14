@@ -112,7 +112,11 @@ impl Drop for RawMode {
     }
 }
 
-pub fn run(shell_id: &str, takeover: bool, restart_exited: bool) -> io::Result<()> {
+pub fn run(
+    shell_id: &str,
+    takeover: bool,
+    restart_exited: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut profile = terminal_profile()?;
     let mut size = (
         profile.rows,
@@ -129,7 +133,7 @@ pub fn run(shell_id: &str, takeover: bool, restart_exited: bool) -> io::Result<(
     let mut focus_reporting = false;
     let mut focus = FocusTracking::default();
 
-    let result = (|| {
+    let result: Result<(), Box<dyn std::error::Error>> = (|| {
         loop {
             let report_focus =
                 ProtocolFeature::FocusedTerminal.is_supported_by(attachment.protocol_version);
@@ -189,7 +193,7 @@ fn reconnect(
     shell_id: &str,
     takeover: bool,
     profile: &TerminalProfile,
-) -> io::Result<client::Attachment> {
+) -> client::Result<client::Attachment> {
     let mut last_error = None;
     for _ in 0..RECONNECT_ATTEMPTS {
         match attach_once(client, shell_id, takeover, false, profile) {
@@ -198,7 +202,9 @@ fn reconnect(
         }
         thread::sleep(RECONNECT_DELAY);
     }
-    Err(last_error.unwrap_or_else(|| io::Error::other("daemon attachment did not reconnect")))
+    Err(client::ClientError::Lifecycle(
+        client::LifecycleError::AttachmentReconnectTimeout(last_error.map(Box::new)),
+    ))
 }
 
 fn attach_once(
@@ -207,7 +213,7 @@ fn attach_once(
     takeover: bool,
     restart_exited: bool,
     profile: &TerminalProfile,
-) -> io::Result<client::Attachment> {
+) -> client::Result<client::Attachment> {
     let transfers_environment = client.supports(ProtocolFeature::ClientEnvironment)?;
     match (restart_exited, transfers_environment) {
         (true, true) => {

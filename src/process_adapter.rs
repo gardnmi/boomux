@@ -91,13 +91,13 @@ trait Reporter {
         shell_id: &str,
         run_id: &str,
         spec: AgentRegistrationSpec,
-    ) -> io::Result<AgentInstanceSnapshot>;
+    ) -> client::Result<AgentInstanceSnapshot>;
     fn report(
         &mut self,
         agent_id: &str,
         run_id: &str,
         report: AgentReport,
-    ) -> io::Result<AgentInstanceSnapshot>;
+    ) -> client::Result<AgentInstanceSnapshot>;
 }
 
 #[derive(Default)]
@@ -106,7 +106,7 @@ struct BoomuxReporter {
 }
 
 impl BoomuxReporter {
-    fn client(&mut self) -> io::Result<&client::Client> {
+    fn client(&mut self) -> client::Result<&client::Client> {
         if self.client.is_none() {
             self.client = Some(client::connect_or_start()?);
         }
@@ -120,7 +120,7 @@ impl Reporter for BoomuxReporter {
         shell_id: &str,
         run_id: &str,
         spec: AgentRegistrationSpec,
-    ) -> io::Result<AgentInstanceSnapshot> {
+    ) -> client::Result<AgentInstanceSnapshot> {
         self.client()?.ensure_agent(shell_id, run_id, spec)
     }
 
@@ -129,7 +129,7 @@ impl Reporter for BoomuxReporter {
         agent_id: &str,
         run_id: &str,
         report: AgentReport,
-    ) -> io::Result<AgentInstanceSnapshot> {
+    ) -> client::Result<AgentInstanceSnapshot> {
         self.client()?.report_agent(agent_id, run_id, report)
     }
 }
@@ -293,11 +293,11 @@ mod tests {
             _shell_id: &str,
             _run_id: &str,
             spec: AgentRegistrationSpec,
-        ) -> io::Result<AgentInstanceSnapshot> {
+        ) -> client::Result<AgentInstanceSnapshot> {
             assert_eq!(spec.external_session_id.as_deref(), Some("session-1"));
             assert_report(&spec.report);
             if self.fail_ensure {
-                Err(io::Error::other("offline"))
+                Err(io::Error::other("offline").into())
             } else {
                 Ok(self.ensured.clone())
             }
@@ -308,10 +308,10 @@ mod tests {
             _agent_id: &str,
             _run_id: &str,
             report: AgentReport,
-        ) -> io::Result<AgentInstanceSnapshot> {
+        ) -> client::Result<AgentInstanceSnapshot> {
             self.reports.push(report);
             if self.fail_reports {
-                Err(io::Error::other("offline"))
+                Err(io::Error::other("offline").into())
             } else {
                 Ok(self.ensured.clone())
             }
