@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -1159,6 +1159,8 @@ struct DaemonService {
     mutation_lock: Mutex<()>,
     notification_settings: NotificationDeliverySettings,
     notification_sink: Arc<dyn NotificationSink>,
+    #[cfg(test)]
+    fail_after_mutation: AtomicBool,
 }
 
 struct DurableRegistry {
@@ -1187,11 +1189,108 @@ enum DurableMutation<T> {
     Unchanged(T),
 }
 
+impl<T> DurableMutation<T> {
+    fn map<U>(self, map: impl FnOnce(T) -> U) -> DurableMutation<U> {
+        match self {
+            Self::Changed(value, events) => DurableMutation::Changed(map(value), events),
+            Self::Unchanged(value) => DurableMutation::Unchanged(map(value)),
+        }
+    }
+}
+
+#[derive(Default)]
+struct DurableUndoLog {
+    records: Vec<DurableUndo>,
+}
+
+impl DurableUndoLog {
+    fn record(&mut self, undo: DurableUndo) {
+        self.records.push(undo);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+
+    fn previous_agent_state(&self, agent_id: &str) -> Option<AgentState> {
+        self.records.iter().rev().find_map(|undo| match undo {
+            DurableUndo::AgentState { agent, previous } if agent.id == agent_id => {
+                Some(previous.observation.state)
+            }
+            _ => None,
+        })
+    }
+
+    fn rollback(self, registry: &DurableRegistry) -> io::Result<()> {
+        let mut failure = None;
+        for undo in self.records.into_iter().rev() {
+            if let Err(error) = registry.rollback(undo)
+                && failure.is_none()
+            {
+                failure = Some(error);
+            }
+        }
+        failure.map_or(Ok(()), Err)
+    }
+}
+
+enum DurableUndo {
+    CreatedWorkspace {
+        workspace: Arc<Workspace>,
+        shells: Vec<Arc<Shell>>,
+    },
+    CreatedShell {
+        workspace: Arc<Workspace>,
+        shell: Arc<Shell>,
+    },
+    CreatedLauncher {
+        workspace: Arc<Workspace>,
+        launcher: Arc<WorkspaceLauncher>,
+    },
+    RegisteredAgent {
+        workspace: Arc<Workspace>,
+        agent: Arc<AgentInstance>,
+    },
+    RenamedWorkspace {
+        workspace: Arc<Workspace>,
+        previous: String,
+    },
+    RenamedShell {
+        shell: Arc<Shell>,
+        previous: String,
+    },
+    RenamedLauncher {
+        launcher: Arc<WorkspaceLauncher>,
+        previous: String,
+    },
+    AgentState {
+        agent: Arc<AgentInstance>,
+        previous: AgentInstanceState,
+    },
+    RemovedLauncher {
+        workspace: Arc<Workspace>,
+        launcher: Arc<WorkspaceLauncher>,
+        index: usize,
+    },
+    RemovedShell {
+        workspace: Arc<Workspace>,
+        shell: Arc<Shell>,
+        index: usize,
+    },
+    RemovedWorkspace {
+        workspace: Arc<Workspace>,
+        shells: Vec<Arc<Shell>>,
+        launchers: Vec<Arc<WorkspaceLauncher>>,
+        agents: Vec<Arc<AgentInstance>>,
+    },
+}
+
 #[derive(Default)]
 struct TransitionState {
     pending_durable_events: VecDeque<Vec<DaemonEventKind>>,
     persistence_in_flight: bool,
     in_flight_event_count: usize,
+    lifecycle_event_reservation: usize,
     pending_runtime_events: VecDeque<DaemonEventKind>,
 }
 
@@ -1229,11 +1328,14 @@ impl TransitionState {
                     .sum::<usize>(),
             )
             .saturating_add(self.pending_runtime_events.len())
+            .saturating_add(self.lifecycle_event_reservation)
     }
 }
 
 struct PersistenceWriter {
     sender: mpsc::Sender<PersistenceWrite>,
+    #[cfg(test)]
+    fail_next: Arc<AtomicBool>,
 }
 
 struct PersistenceWrite {
@@ -1249,12 +1351,28 @@ struct PersistenceGeneration {
 impl PersistenceWriter {
     fn start(store: Arc<StateStore>) -> Self {
         let (sender, receiver) = mpsc::channel::<PersistenceWrite>();
+        #[cfg(test)]
+        let fail_next = Arc::new(AtomicBool::new(false));
+        #[cfg(test)]
+        let writer_fail_next = Arc::clone(&fail_next);
         thread::spawn(move || {
             while let Ok(write) = receiver.recv() {
-                let _ = write.completion.send(store.save(&write.generation.state));
+                #[cfg(test)]
+                let result = if writer_fail_next.swap(false, Ordering::AcqRel) {
+                    Err(io::Error::other("injected persistence failure"))
+                } else {
+                    store.save(&write.generation.state)
+                };
+                #[cfg(not(test))]
+                let result = store.save(&write.generation.state);
+                let _ = write.completion.send(result);
             }
         });
-        Self { sender }
+        Self {
+            sender,
+            #[cfg(test)]
+            fail_next,
+        }
     }
 
     fn save(&self, generation: PersistenceGeneration) -> io::Result<()> {
@@ -1269,12 +1387,35 @@ impl PersistenceWriter {
             .recv()
             .map_err(|_| io::Error::other("persistence writer stopped"))?
     }
+
+    #[cfg(test)]
+    fn fail_next(&self) {
+        self.fail_next.store(true, Ordering::Release);
+    }
 }
 
 struct EventStream {
     state: Mutex<EventStreamState>,
     transitions: Mutex<TransitionState>,
     changed: Condvar,
+    lifecycle_active: AtomicBool,
+}
+
+struct LifecycleActivity<'a> {
+    active: &'a AtomicBool,
+}
+
+impl<'a> LifecycleActivity<'a> {
+    fn begin(active: &'a AtomicBool) -> Self {
+        active.store(true, Ordering::Release);
+        Self { active }
+    }
+}
+
+impl Drop for LifecycleActivity<'_> {
+    fn drop(&mut self) {
+        self.active.store(false, Ordering::Release);
+    }
 }
 
 struct EventStreamState {
@@ -1283,13 +1424,16 @@ struct EventStreamState {
     events: VecDeque<DaemonEvent>,
 }
 
-struct EventTransition<'a> {
-    state: MutexGuard<'a, TransitionState>,
-}
-
 struct EventTransaction<'a> {
     transition: MutexGuard<'a, TransitionState>,
     events: MutexGuard<'a, EventStreamState>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RunExitRecord {
+    Recorded,
+    Unchanged,
+    Deferred,
 }
 
 trait EventTransitionAccess {
@@ -1297,32 +1441,26 @@ trait EventTransitionAccess {
     fn queue_durable_batch(&mut self, batch: Vec<DaemonEventKind>) -> bool;
 }
 
-impl EventTransitionAccess for EventTransition<'_> {
-    fn drain_runtime_events(&mut self) -> Vec<DaemonEventKind> {
-        self.state.pending_runtime_events.drain(..).collect()
-    }
-
-    fn queue_durable_batch(&mut self, batch: Vec<DaemonEventKind>) -> bool {
-        if batch.is_empty() {
-            false
-        } else {
-            self.state.pending_durable_events.push_back(batch);
-            true
-        }
-    }
-}
-
 impl EventTransaction<'_> {
-    fn reserved_event_count(&self) -> usize {
-        self.transition.reserved_event_count()
-    }
-
     fn reserve(&self, count: usize) -> io::Result<()> {
         EventStream::ensure_capacity(&self.events, count)
     }
 
     fn reserve_with_pending(&self, count: usize) -> io::Result<()> {
         self.reserve(self.transition.reserved_event_count().saturating_add(count))
+    }
+
+    fn capacity_is_blocked_only_by_lifecycle_reservation(&self, count: usize) -> bool {
+        let reservation = self.transition.lifecycle_event_reservation;
+        reservation != 0
+            && self
+                .reserve(
+                    self.transition
+                        .reserved_event_count()
+                        .saturating_sub(reservation)
+                        .saturating_add(count),
+                )
+                .is_ok()
     }
 
     fn pending_durable_batch_count(&self) -> usize {
@@ -1354,6 +1492,15 @@ impl EventTransaction<'_> {
     fn begin_persistence(&mut self, event_count: usize) {
         self.transition.persistence_in_flight = true;
         self.transition.in_flight_event_count = event_count;
+    }
+
+    fn begin_lifecycle_reservation(&mut self, event_count: usize) {
+        debug_assert_eq!(self.transition.lifecycle_event_reservation, 0);
+        self.transition.lifecycle_event_reservation = event_count;
+    }
+
+    fn finish_lifecycle_reservation(&mut self) {
+        self.transition.lifecycle_event_reservation = 0;
     }
 
     fn append_batch(&mut self, batch: Vec<DaemonEventKind>) {
@@ -1405,6 +1552,7 @@ impl EventStream {
             }),
             transitions: Mutex::new(TransitionState::default()),
             changed: Condvar::new(),
+            lifecycle_active: AtomicBool::new(false),
         }
     }
 
@@ -1425,6 +1573,7 @@ impl EventStream {
             state: Mutex::new(state),
             transitions: Mutex::new(TransitionState::default()),
             changed: Condvar::new(),
+            lifecycle_active: AtomicBool::new(false),
         }
     }
 
@@ -1435,12 +1584,6 @@ impl EventStream {
             .checked_add(count)
             .map(|_| ())
             .ok_or_else(|| io::Error::other("daemon event ID exhausted"))
-    }
-
-    fn transition(&self) -> io::Result<EventTransition<'_>> {
-        Ok(EventTransition {
-            state: lock(&self.transitions)?,
-        })
     }
 
     fn transaction(&self) -> io::Result<EventTransaction<'_>> {
@@ -1747,7 +1890,7 @@ impl DurableRegistry {
         name: String,
         default_cwd: Option<PathBuf>,
         specs: Vec<ShellSpec>,
-    ) -> io::Result<WorkspaceSnapshot> {
+    ) -> io::Result<(WorkspaceSnapshot, DurableUndo)> {
         validate_name(&name)?;
         if let Some(default_cwd) = &default_cwd {
             validate_cwd(default_cwd)?;
@@ -1766,6 +1909,17 @@ impl DurableRegistry {
             launcher_ids: Mutex::new(Vec::new()),
             agent_ids: Mutex::new(Vec::new()),
         });
+        let snapshot = WorkspaceSnapshot {
+            id: workspace_id.clone(),
+            name: name.clone(),
+            default_cwd: workspace.default_cwd.clone(),
+            shells: shells
+                .iter()
+                .map(|shell| shell.snapshot())
+                .collect::<io::Result<_>>()?,
+            launchers: Vec::new(),
+            agents: Vec::new(),
+        };
         let mut state = lock(&self.state)?;
         if state
             .workspaces
@@ -1783,11 +1937,17 @@ impl DurableRegistry {
         state
             .workspaces
             .insert(workspace_id, Arc::clone(&workspace));
-        drop(state);
-        workspace.snapshot(self)
+        Ok((
+            snapshot,
+            DurableUndo::CreatedWorkspace { workspace, shells },
+        ))
     }
 
-    fn create_shell(&self, workspace_id: &str, spec: ShellSpec) -> io::Result<ShellSnapshot> {
+    fn create_shell(
+        &self,
+        workspace_id: &str,
+        spec: ShellSpec,
+    ) -> io::Result<(ShellSnapshot, DurableUndo)> {
         let workspace = self.workspace(workspace_id)?;
         let shell = create_pending_shell(workspace_id, spec)?;
         let snapshot = shell.snapshot()?;
@@ -1813,20 +1973,26 @@ impl DurableRegistry {
         }
         state.shells.insert(shell.id.clone(), Arc::clone(&shell));
         shell_ids.push(shell.id.clone());
-        Ok(snapshot)
+        drop(shell_ids);
+        drop(state);
+        Ok((snapshot, DurableUndo::CreatedShell { workspace, shell }))
     }
 
-    fn create_shell_with_workspace(&self, spec: ShellSpec) -> io::Result<ShellSnapshot> {
+    fn create_shell_with_workspace(
+        &self,
+        spec: ShellSpec,
+    ) -> io::Result<(ShellSnapshot, DurableUndo)> {
         let default_cwd = spec.cwd.clone();
         loop {
             let name = self.next_workspace_name()?;
             match self.create_workspace(name, Some(default_cwd.clone()), vec![spec.clone()]) {
-                Ok(workspace) => {
-                    return workspace
+                Ok((workspace, undo)) => {
+                    let shell = workspace
                         .shells
                         .into_iter()
                         .next()
-                        .ok_or_else(|| io::Error::other("implicit workspace has no shell"));
+                        .expect("implicit workspace is created with one shell");
+                    return Ok((shell, undo));
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(error) => return Err(error),
@@ -1838,7 +2004,7 @@ impl DurableRegistry {
         &self,
         workspace_id: &str,
         spec: WorkspaceLauncherSpec,
-    ) -> io::Result<WorkspaceLauncherSnapshot> {
+    ) -> io::Result<(WorkspaceLauncherSnapshot, DurableUndo)> {
         validate_name(&spec.name)?;
         validate_cwd(&spec.cwd)?;
         validate_launcher_command(&spec.command)?;
@@ -1875,7 +2041,15 @@ impl DurableRegistry {
             .launchers
             .insert(launcher.id.clone(), Arc::clone(&launcher));
         launcher_ids.push(launcher.id.clone());
-        Ok(snapshot)
+        drop(launcher_ids);
+        drop(state);
+        Ok((
+            snapshot,
+            DurableUndo::CreatedLauncher {
+                workspace,
+                launcher,
+            },
+        ))
     }
 
     fn next_workspace_name(&self) -> io::Result<String> {
@@ -1896,7 +2070,7 @@ impl DurableRegistry {
         }
     }
 
-    fn rename_shell(&self, shell_id: &str, name: String) -> io::Result<()> {
+    fn rename_shell(&self, shell_id: &str, name: String) -> io::Result<Option<DurableUndo>> {
         validate_name(&name)?;
         let shell = self.shell(shell_id)?;
         let workspace = self.workspace(&shell.workspace_id)?;
@@ -1918,11 +2092,16 @@ impl DurableRegistry {
                 format!("shell name already exists: {name}"),
             ));
         }
-        *lock(&shell.name)? = name;
-        Ok(())
+        let mut current_name = lock(&shell.name)?;
+        if *current_name == name {
+            return Ok(None);
+        }
+        let previous = std::mem::replace(&mut *current_name, name);
+        drop(current_name);
+        Ok(Some(DurableUndo::RenamedShell { shell, previous }))
     }
 
-    fn rename_launcher(&self, launcher_id: &str, name: String) -> io::Result<()> {
+    fn rename_launcher(&self, launcher_id: &str, name: String) -> io::Result<Option<DurableUndo>> {
         validate_name(&name)?;
         let launcher = self.launcher(launcher_id)?;
         let workspace = self.workspace(&launcher.workspace_id)?;
@@ -1944,11 +2123,20 @@ impl DurableRegistry {
                 format!("workspace launcher name already exists: {name}"),
             ));
         }
-        *lock(&launcher.name)? = name;
-        Ok(())
+        let mut current_name = lock(&launcher.name)?;
+        if *current_name == name {
+            return Ok(None);
+        }
+        let previous = std::mem::replace(&mut *current_name, name);
+        drop(current_name);
+        Ok(Some(DurableUndo::RenamedLauncher { launcher, previous }))
     }
 
-    fn rename_workspace(&self, workspace_id: &str, name: String) -> io::Result<String> {
+    fn rename_workspace(
+        &self,
+        workspace_id: &str,
+        name: String,
+    ) -> io::Result<Option<DurableUndo>> {
         validate_name(&name)?;
         let workspace = self.workspace(workspace_id)?;
         let state = lock(&self.state)?;
@@ -1960,8 +2148,16 @@ impl DurableRegistry {
                 ));
             }
         }
-        *lock(&workspace.name)? = name.clone();
-        Ok(name)
+        let mut current_name = lock(&workspace.name)?;
+        if *current_name == name {
+            return Ok(None);
+        }
+        let previous = std::mem::replace(&mut *current_name, name);
+        drop(current_name);
+        Ok(Some(DurableUndo::RenamedWorkspace {
+            workspace,
+            previous,
+        }))
     }
 
     fn register_agent(
@@ -1969,7 +2165,7 @@ impl DurableRegistry {
         shell_id: &str,
         run_id: &str,
         spec: AgentRegistrationSpec,
-    ) -> DaemonResult<AgentInstanceSnapshot> {
+    ) -> DaemonResult<(AgentInstanceSnapshot, DurableUndo)> {
         validate_agent_registration(&spec)?;
         validate_external_agent_authority(spec.report.authority)?;
         let shell = self.shell(shell_id)?;
@@ -2027,9 +2223,13 @@ impl DurableRegistry {
             }
             ShellLifecycle::Closed => return Err(not_found("shell", shell_id).into()),
         }
+        let mut agent_ids = lock(&workspace.agent_ids)?;
         state.agents.insert(agent.id.clone(), Arc::clone(&agent));
-        lock(&workspace.agent_ids)?.push(agent.id.clone());
-        Ok(snapshot)
+        agent_ids.push(agent.id.clone());
+        drop(agent_ids);
+        drop(lifecycle);
+        drop(state);
+        Ok((snapshot, DurableUndo::RegisteredAgent { workspace, agent }))
     }
 
     fn ensure_agent(
@@ -2037,7 +2237,7 @@ impl DurableRegistry {
         shell_id: &str,
         run_id: &str,
         spec: AgentRegistrationSpec,
-    ) -> DaemonResult<(AgentInstanceSnapshot, bool)> {
+    ) -> DaemonResult<(AgentInstanceSnapshot, bool, Option<DurableUndo>)> {
         validate_agent_registration(&spec)?;
         validate_external_agent_authority(spec.report.authority)?;
         let external_session_id = spec.external_session_id.as_deref().ok_or_else(|| {
@@ -2083,10 +2283,10 @@ impl DurableRegistry {
             }
         };
         if let Some(agent) = existing {
-            return Ok((agent.snapshot()?, false));
+            return Ok((agent.snapshot()?, false, None));
         }
         self.register_agent(shell_id, run_id, spec)
-            .map(|agent| (agent, true))
+            .map(|(agent, undo)| (agent, true, Some(undo)))
     }
 
     fn report_agent(
@@ -2094,7 +2294,7 @@ impl DurableRegistry {
         agent_id: &str,
         run_id: &str,
         report: AgentReport,
-    ) -> DaemonResult<(AgentInstanceSnapshot, bool, bool)> {
+    ) -> DaemonResult<(AgentInstanceSnapshot, bool, bool, Option<DurableUndo>)> {
         validate_agent_report(&report)?;
         validate_external_agent_authority(report.authority)?;
         let agent = self.agent(agent_id)?;
@@ -2107,8 +2307,7 @@ impl DurableRegistry {
         let mut state = lock(&agent.state)?;
         if state.ended_at_ms.is_some() {
             if observation_matches_report(&state.observation, &report) {
-                drop(state);
-                return Ok((agent.snapshot()?, false, true));
+                return Ok((agent.snapshot_from(&state), false, true, None));
             }
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -2125,8 +2324,7 @@ impl DurableRegistry {
             || agent_authority_rank(report.authority)
                 < agent_authority_rank(state.observation.authority)
         {
-            drop(state);
-            return Ok((agent.snapshot()?, false, false));
+            return Ok((agent.snapshot_from(&state), false, false, None));
         }
         let revision = state
             .observation
@@ -2137,6 +2335,7 @@ impl DurableRegistry {
             .max(agent.started_at_ms)
             .max(state.observation.observed_at_ms);
         let completed = report.state == AgentState::Done;
+        let previous = state.clone();
         state.observation = AgentObservationSnapshot {
             revision,
             state: report.state,
@@ -2151,20 +2350,25 @@ impl DurableRegistry {
         if completed {
             state.ended_at_ms = Some(observed_at_ms);
         }
+        let snapshot = agent.snapshot_from(&state);
         drop(state);
-        Ok((agent.snapshot()?, true, completed))
+        Ok((
+            snapshot,
+            true,
+            completed,
+            Some(DurableUndo::AgentState { agent, previous }),
+        ))
     }
 
     fn acknowledge_agent_attention(
         &self,
         agent_id: &str,
         observation_revision: u64,
-    ) -> DaemonResult<(AgentInstanceSnapshot, bool)> {
+    ) -> DaemonResult<(AgentInstanceSnapshot, bool, Option<DurableUndo>)> {
         let agent = self.agent(agent_id)?;
         let mut state = lock(&agent.state)?;
         let Some(attention) = &state.attention else {
-            drop(state);
-            return Ok((agent.snapshot()?, false));
+            return Ok((agent.snapshot_from(&state), false, None));
         };
         if attention.observation.revision != observation_revision {
             return Err(DaemonError::lifecycle(
@@ -2175,33 +2379,15 @@ impl DurableRegistry {
                 ),
             ));
         }
+        let previous = state.clone();
         state.attention = None;
+        let snapshot = agent.snapshot_from(&state);
         drop(state);
-        Ok((agent.snapshot()?, true))
-    }
-
-    fn remove_launcher(&self, launcher_id: &str) -> io::Result<Arc<WorkspaceLauncher>> {
-        let mut state = lock(&self.state)?;
-        let launcher = state
-            .launchers
-            .remove(launcher_id)
-            .ok_or_else(|| not_found("workspace launcher", launcher_id))?;
-        if let Some(workspace) = state.workspaces.get(&launcher.workspace_id) {
-            lock(&workspace.launcher_ids)?.retain(|id| id != launcher_id);
-        }
-        Ok(launcher)
-    }
-
-    fn remove_shell(&self, shell_id: &str) -> io::Result<Arc<Shell>> {
-        let mut state = lock(&self.state)?;
-        let shell = state
-            .shells
-            .remove(shell_id)
-            .ok_or_else(|| not_found("shell", shell_id))?;
-        if let Some(workspace) = state.workspaces.get(&shell.workspace_id) {
-            lock(&workspace.shell_ids)?.retain(|id| id != shell_id);
-        }
-        Ok(shell)
+        Ok((
+            snapshot,
+            true,
+            Some(DurableUndo::AgentState { agent, previous }),
+        ))
     }
 
     fn workspace_shells(&self, workspace: &Arc<Workspace>) -> io::Result<Vec<Arc<Shell>>> {
@@ -2218,109 +2404,115 @@ impl DurableRegistry {
             .collect())
     }
 
-    fn remove_workspace(&self, workspace_id: &str) -> io::Result<Vec<Arc<Shell>>> {
-        let mut state = lock(&self.state)?;
-        let workspace = state
-            .workspaces
-            .remove(workspace_id)
-            .ok_or_else(|| not_found("workspace", workspace_id))?;
-        for id in lock(&workspace.launcher_ids)?.iter() {
-            state.launchers.remove(id);
-        }
-        for id in lock(&workspace.agent_ids)?.iter() {
-            state.agents.remove(id);
-        }
-        let ids = lock(&workspace.shell_ids)?.clone();
-        Ok(ids
-            .into_iter()
-            .filter_map(|id| state.shells.remove(&id))
-            .collect())
-    }
-
-    fn clear(&self) -> io::Result<()> {
-        let mut state = lock(&self.state)?;
-        state.workspaces.clear();
-        state.shells.clear();
-        state.launchers.clear();
-        state.agents.clear();
-        Ok(())
-    }
-
-    fn backup(&self) -> io::Result<DurableBackup> {
-        let state = lock(&self.state)?;
-        let mut workspace_names = HashMap::new();
-        let mut workspace_shell_ids = HashMap::new();
-        let mut workspace_launcher_ids = HashMap::new();
-        let mut workspace_agent_ids = HashMap::new();
-        for workspace in state.workspaces.values() {
-            workspace_names.insert(workspace.id.clone(), lock(&workspace.name)?.clone());
-            workspace_shell_ids.insert(workspace.id.clone(), lock(&workspace.shell_ids)?.clone());
-            workspace_launcher_ids
-                .insert(workspace.id.clone(), lock(&workspace.launcher_ids)?.clone());
-            workspace_agent_ids.insert(workspace.id.clone(), lock(&workspace.agent_ids)?.clone());
-        }
-        let mut shell_names = HashMap::new();
-        for shell in state.shells.values() {
-            shell_names.insert(shell.id.clone(), lock(&shell.name)?.clone());
-        }
-        let mut launcher_names = HashMap::new();
-        for launcher in state.launchers.values() {
-            launcher_names.insert(launcher.id.clone(), lock(&launcher.name)?.clone());
-        }
-        let mut agent_states = HashMap::new();
-        for agent in state.agents.values() {
-            agent_states.insert(agent.id.clone(), lock(&agent.state)?.clone());
-        }
-        Ok(DurableBackup {
-            workspaces: state.workspaces.clone(),
-            shells: state.shells.clone(),
-            launchers: state.launchers.clone(),
-            agents: state.agents.clone(),
-            workspace_names,
-            workspace_shell_ids,
-            workspace_launcher_ids,
-            workspace_agent_ids,
-            shell_names,
-            launcher_names,
-            agent_states,
-        })
-    }
-
-    fn restore_backup(&self, backup: DurableBackup) -> io::Result<()> {
-        let mut state = lock(&self.state)?;
-        for workspace in backup.workspaces.values() {
-            if let Some(name) = backup.workspace_names.get(&workspace.id) {
-                *lock(&workspace.name)? = name.clone();
+    fn rollback(&self, undo: DurableUndo) -> io::Result<()> {
+        match undo {
+            DurableUndo::CreatedWorkspace { workspace, shells } => {
+                let mut state = lock(&self.state)?;
+                if state
+                    .workspaces
+                    .get(&workspace.id)
+                    .is_some_and(|current| Arc::ptr_eq(current, &workspace))
+                {
+                    state.workspaces.remove(&workspace.id);
+                }
+                for shell in shells {
+                    if state
+                        .shells
+                        .get(&shell.id)
+                        .is_some_and(|current| Arc::ptr_eq(current, &shell))
+                    {
+                        state.shells.remove(&shell.id);
+                    }
+                }
             }
-            if let Some(ids) = backup.workspace_shell_ids.get(&workspace.id) {
-                *lock(&workspace.shell_ids)? = ids.clone();
+            DurableUndo::CreatedShell { workspace, shell } => {
+                let mut state = lock(&self.state)?;
+                if state
+                    .shells
+                    .get(&shell.id)
+                    .is_some_and(|current| Arc::ptr_eq(current, &shell))
+                {
+                    state.shells.remove(&shell.id);
+                }
+                lock(&workspace.shell_ids)?.retain(|id| id != &shell.id);
             }
-            if let Some(ids) = backup.workspace_launcher_ids.get(&workspace.id) {
-                *lock(&workspace.launcher_ids)? = ids.clone();
+            DurableUndo::CreatedLauncher {
+                workspace,
+                launcher,
+            } => {
+                let mut state = lock(&self.state)?;
+                if state
+                    .launchers
+                    .get(&launcher.id)
+                    .is_some_and(|current| Arc::ptr_eq(current, &launcher))
+                {
+                    state.launchers.remove(&launcher.id);
+                }
+                lock(&workspace.launcher_ids)?.retain(|id| id != &launcher.id);
             }
-            if let Some(ids) = backup.workspace_agent_ids.get(&workspace.id) {
-                *lock(&workspace.agent_ids)? = ids.clone();
+            DurableUndo::RegisteredAgent { workspace, agent } => {
+                let mut state = lock(&self.state)?;
+                if state
+                    .agents
+                    .get(&agent.id)
+                    .is_some_and(|current| Arc::ptr_eq(current, &agent))
+                {
+                    state.agents.remove(&agent.id);
+                }
+                lock(&workspace.agent_ids)?.retain(|id| id != &agent.id);
+            }
+            DurableUndo::RenamedWorkspace {
+                workspace,
+                previous,
+            } => *lock(&workspace.name)? = previous,
+            DurableUndo::RenamedShell { shell, previous } => {
+                *lock(&shell.name)? = previous;
+            }
+            DurableUndo::RenamedLauncher { launcher, previous } => {
+                *lock(&launcher.name)? = previous;
+            }
+            DurableUndo::AgentState { agent, previous } => {
+                *lock(&agent.state)? = previous;
+            }
+            DurableUndo::RemovedLauncher {
+                workspace,
+                launcher,
+                index,
+            } => {
+                lock(&self.state)?
+                    .launchers
+                    .insert(launcher.id.clone(), Arc::clone(&launcher));
+                lock(&workspace.launcher_ids)?.insert(index, launcher.id.clone());
+            }
+            DurableUndo::RemovedShell {
+                workspace,
+                shell,
+                index,
+            } => {
+                lock(&self.state)?
+                    .shells
+                    .insert(shell.id.clone(), Arc::clone(&shell));
+                lock(&workspace.shell_ids)?.insert(index, shell.id.clone());
+            }
+            DurableUndo::RemovedWorkspace {
+                workspace,
+                shells,
+                launchers,
+                agents,
+            } => {
+                let mut state = lock(&self.state)?;
+                for shell in shells {
+                    state.shells.insert(shell.id.clone(), shell);
+                }
+                for launcher in launchers {
+                    state.launchers.insert(launcher.id.clone(), launcher);
+                }
+                for agent in agents {
+                    state.agents.insert(agent.id.clone(), agent);
+                }
+                state.workspaces.insert(workspace.id.clone(), workspace);
             }
         }
-        for shell in backup.shells.values() {
-            if let Some(name) = backup.shell_names.get(&shell.id) {
-                *lock(&shell.name)? = name.clone();
-            }
-        }
-        for launcher in backup.launchers.values() {
-            if let Some(name) = backup.launcher_names.get(&launcher.id) {
-                *lock(&launcher.name)? = name.clone();
-            }
-        }
-        for agent in backup.agents.values() {
-            if let Some(agent_state) = backup.agent_states.get(&agent.id) {
-                *lock(&agent.state)? = agent_state.clone();
-            }
-        }
-        state.workspaces = backup.workspaces;
-        state.shells = backup.shells;
-        state.launchers = backup.launchers;
-        state.agents = backup.agents;
         Ok(())
     }
 
@@ -2761,28 +2953,34 @@ impl ShellRuntimeManager {
 
     fn finalize_stop(&self, shell: &Shell) -> io::Result<StopRollback> {
         let mut lifecycle = lock(&shell.lifecycle)?;
-        let previous = std::mem::replace(&mut *lifecycle, ShellLifecycle::Closed);
-        match previous {
-            ShellLifecycle::Pending => Ok(StopRollback {
-                lifecycle: ShellLifecycle::Pending,
-                event: None,
-            }),
+        match &*lifecycle {
+            ShellLifecycle::Pending => {
+                *lifecycle = ShellLifecycle::Closed;
+                Ok(StopRollback {
+                    lifecycle: ShellLifecycle::Pending,
+                    event: None,
+                })
+            }
             ShellLifecycle::Running {
                 profile,
                 run,
                 runtime,
             } => {
                 run.finish(ShellRunExitReason::Terminated)?;
-                *lock(&shell.last_run)? = Some(run.persisted(profile.clone())?);
+                let persisted = run.persisted(profile.clone())?;
+                let event = DaemonEventKind::RunExited {
+                    workspace_id: shell.workspace_id.clone(),
+                    shell_id: shell.id.clone(),
+                    run: run.snapshot()?,
+                };
+                *lock(&shell.last_run)? = Some(persisted);
                 let _wait = lock(&runtime.output_wait)?;
                 runtime.output_changed.notify_all();
+                drop(_wait);
+                *lifecycle = ShellLifecycle::Closed;
                 Ok(StopRollback {
                     lifecycle: ShellLifecycle::Pending,
-                    event: Some(DaemonEventKind::RunExited {
-                        workspace_id: shell.workspace_id.clone(),
-                        shell_id: shell.id.clone(),
-                        run: run.snapshot()?,
-                    }),
+                    event: Some(event),
                 })
             }
             ShellLifecycle::Exited {
@@ -2792,17 +2990,20 @@ impl ShellRuntimeManager {
                 runtime,
                 terminal,
             } => {
-                *lock(&shell.last_run)? = Some(run.persisted(profile.clone())?);
-                Ok(StopRollback {
+                let persisted = run.persisted(profile.clone())?;
+                *lock(&shell.last_run)? = Some(persisted);
+                let rollback = StopRollback {
                     lifecycle: ShellLifecycle::Exited {
-                        code,
-                        profile,
-                        run,
-                        runtime,
-                        terminal,
+                        code: *code,
+                        profile: profile.clone(),
+                        run: Arc::clone(run),
+                        runtime: runtime.clone(),
+                        terminal: Arc::clone(terminal),
                     },
                     event: None,
-                })
+                };
+                *lifecycle = ShellLifecycle::Closed;
+                Ok(rollback)
             }
             ShellLifecycle::Closed => Ok(StopRollback {
                 lifecycle: ShellLifecycle::Closed,
@@ -2847,6 +3048,22 @@ impl ShellRuntimeManager {
             shell_id: shell.id.clone(),
             run: run.snapshot()?,
         }))
+    }
+
+    fn run_exit_is_current(
+        &self,
+        shell: &Shell,
+        run: &Arc<ShellRun>,
+        runtime: &Arc<ShellRuntime>,
+    ) -> io::Result<bool> {
+        Ok(matches!(
+            &*lock(&shell.lifecycle)?,
+            ShellLifecycle::Running {
+                run: current_run,
+                runtime: current_runtime,
+                ..
+            } if Arc::ptr_eq(current_run, run) && Arc::ptr_eq(current_runtime, runtime)
+        ))
     }
 
     fn restore_stopped(&self, shell: &Shell, rollback: StopRollback) -> io::Result<()> {
@@ -3068,20 +3285,6 @@ struct DurableState {
     agents: HashMap<String, Arc<AgentInstance>>,
 }
 
-struct DurableBackup {
-    workspaces: HashMap<String, Arc<Workspace>>,
-    shells: HashMap<String, Arc<Shell>>,
-    launchers: HashMap<String, Arc<WorkspaceLauncher>>,
-    agents: HashMap<String, Arc<AgentInstance>>,
-    workspace_names: HashMap<String, String>,
-    workspace_shell_ids: HashMap<String, Vec<String>>,
-    workspace_launcher_ids: HashMap<String, Vec<String>>,
-    workspace_agent_ids: HashMap<String, Vec<String>>,
-    shell_names: HashMap<String, String>,
-    launcher_names: HashMap<String, String>,
-    agent_states: HashMap<String, AgentInstanceState>,
-}
-
 impl Default for DaemonService {
     fn default() -> Self {
         Self {
@@ -3101,6 +3304,8 @@ impl Default for DaemonService {
             mutation_lock: Mutex::new(()),
             notification_settings: NotificationDeliverySettings::default(),
             notification_sink: Arc::new(DisabledNotificationSink),
+            #[cfg(test)]
+            fail_after_mutation: AtomicBool::new(false),
         }
     }
 }
@@ -3776,9 +3981,12 @@ impl DaemonService {
             Request::AcknowledgeAgentAttention {
                 agent_id,
                 observation_revision,
-            } => self.durable_mutation_outcome(|| {
-                let (agent, changed) =
-                    self.acknowledge_agent_attention(&agent_id, observation_revision)?;
+            } => self.durable_mutation_outcome(|undo| {
+                let (agent, changed) = self.acknowledge_agent_attention_mutation(
+                    undo,
+                    &agent_id,
+                    observation_revision,
+                )?;
                 if !changed {
                     return Ok(DurableMutation::Unchanged(
                         Response::AgentAttentionAcknowledged { agent, changed },
@@ -3798,21 +4006,17 @@ impl DaemonService {
                 name,
                 default_cwd,
                 shells,
-            } => self.durable_mutation(|| {
-                let workspace =
-                    self.create_workspace_with_default_cwd(name, default_cwd, shells)?;
+            } => self.durable_mutation(|undo| {
+                let workspace = self.create_workspace_mutation(undo, name, default_cwd, shells)?;
                 let events = workspace_created_events(&workspace);
                 Ok((Response::Workspace { workspace }, events))
             }),
             Request::CreateShell {
                 workspace_id,
                 shell,
-            } => self.durable_mutation(|| {
+            } => self.durable_mutation(|undo| {
                 let implicit_workspace = workspace_id.is_none();
-                let shell = match workspace_id {
-                    Some(workspace_id) => self.create_shell(&workspace_id, shell)?,
-                    None => self.create_shell_with_workspace(shell)?,
-                };
+                let shell = self.create_shell_mutation(undo, workspace_id.as_deref(), shell)?;
                 let mut events = Vec::new();
                 if implicit_workspace {
                     let workspace = self.workspace(&shell.workspace_id)?;
@@ -3828,8 +4032,8 @@ impl DaemonService {
                 });
                 Ok((Response::Shell { shell }, events))
             }),
-            Request::CreateLauncher { workspace_id, spec } => self.durable_mutation(|| {
-                let launcher = self.create_launcher(&workspace_id, spec)?;
+            Request::CreateLauncher { workspace_id, spec } => self.durable_mutation(|undo| {
+                let launcher = self.create_launcher_mutation(undo, &workspace_id, spec)?;
                 let event = DaemonEventKind::LauncherCreated {
                     workspace_id,
                     launcher_id: launcher.id.clone(),
@@ -3841,8 +4045,8 @@ impl DaemonService {
                 shell_id,
                 run_id,
                 spec,
-            } => self.durable_mutation(|| {
-                let agent = self.register_agent(&shell_id, &run_id, spec)?;
+            } => self.durable_mutation(|undo| {
+                let agent = self.register_agent_mutation(undo, &shell_id, &run_id, spec)?;
                 let mut events = vec![DaemonEventKind::AgentRegistered {
                     workspace_id: agent.workspace_id.clone(),
                     shell_id: agent.shell_id.clone(),
@@ -3861,8 +4065,12 @@ impl DaemonService {
                 shell_id,
                 run_id,
                 spec,
-            } => self.durable_mutation_outcome(|| {
-                let (agent, created) = self.ensure_agent(&shell_id, &run_id, spec)?;
+            } => self.durable_mutation_outcome(|undo| {
+                let (agent, created, record) =
+                    self.durable.ensure_agent(&shell_id, &run_id, spec)?;
+                if let Some(record) = record {
+                    undo.record(record);
+                }
                 if !created {
                     return Ok(DurableMutation::Unchanged(Response::Agent { agent }));
                 }
@@ -3884,8 +4092,9 @@ impl DaemonService {
                 agent_id,
                 run_id,
                 report,
-            } => self.durable_mutation_outcome(|| {
-                let (agent, changed, completed) = self.report_agent(&agent_id, &run_id, report)?;
+            } => self.durable_mutation_outcome(|undo| {
+                let (agent, changed, completed) =
+                    self.report_agent_mutation(undo, &agent_id, &run_id, report)?;
                 if !changed {
                     return Ok(DurableMutation::Unchanged(Response::Agent { agent }));
                 }
@@ -3938,37 +4147,25 @@ impl DaemonService {
                 limit,
                 wait_ms,
             } => self.read_events(after.as_ref(), limit, wait_ms),
-            Request::RenameWorkspace { workspace_id, name } => self.durable_mutation(|| {
-                let name = self.durable.rename_workspace(&workspace_id, name)?;
-                Ok((
-                    Response::Ok,
-                    vec![DaemonEventKind::WorkspaceRenamed { workspace_id, name }],
-                ))
+            Request::RenameWorkspace { workspace_id, name } => {
+                self.durable_mutation_outcome(|undo| {
+                    Ok(self
+                        .rename_workspace_mutation(undo, &workspace_id, name)?
+                        .map(|()| Response::Ok))
+                })
+            }
+            Request::RenameShell { shell_id, name } => self.durable_mutation_outcome(|undo| {
+                Ok(self
+                    .rename_shell_mutation(undo, &shell_id, name)?
+                    .map(|()| Response::Ok))
             }),
-            Request::RenameShell { shell_id, name } => self.durable_mutation(|| {
-                self.rename_shell(&shell_id, name.clone())?;
-                let shell = self.shell(&shell_id)?;
-                Ok((
-                    Response::Ok,
-                    vec![DaemonEventKind::ShellRenamed {
-                        workspace_id: shell.workspace_id.clone(),
-                        shell_id,
-                        name,
-                    }],
-                ))
-            }),
-            Request::RenameLauncher { launcher_id, name } => self.durable_mutation(|| {
-                self.rename_launcher(&launcher_id, name.clone())?;
-                let launcher = self.launcher(&launcher_id)?;
-                Ok((
-                    Response::Ok,
-                    vec![DaemonEventKind::LauncherRenamed {
-                        workspace_id: launcher.workspace_id.clone(),
-                        launcher_id,
-                        name,
-                    }],
-                ))
-            }),
+            Request::RenameLauncher { launcher_id, name } => {
+                self.durable_mutation_outcome(|undo| {
+                    Ok(self
+                        .rename_launcher_mutation(undo, &launcher_id, name)?
+                        .map(|()| Response::Ok))
+                })
+            }
             Request::CloseWorkspace { workspace_id } => {
                 self.close_workspace(&workspace_id)?;
                 Ok(Response::Ok)
@@ -3980,8 +4177,8 @@ impl DaemonService {
             Request::RestartShell { shell_id } => Ok(Response::Shell {
                 shell: self.restart_shell(&shell_id)?,
             }),
-            Request::RemoveLauncher { launcher_id } => self.durable_mutation(|| {
-                let launcher = self.remove_launcher(&launcher_id)?;
+            Request::RemoveLauncher { launcher_id } => self.durable_mutation(|undo| {
+                let launcher = self.remove_launcher_mutation(undo, &launcher_id)?;
                 Ok((
                     Response::Ok,
                     vec![DaemonEventKind::LauncherRemoved {
@@ -4176,6 +4373,8 @@ impl DaemonService {
             mutation_lock: Mutex::new(()),
             notification_settings: NotificationDeliverySettings::default(),
             notification_sink: Arc::new(DisabledNotificationSink),
+            #[cfg(test)]
+            fail_after_mutation: AtomicBool::new(false),
         };
         if recovered_interrupted_run {
             registry.persist()?;
@@ -4364,33 +4563,58 @@ impl ShellRuntimeManager {
 impl DaemonService {
     fn durable_mutation<T>(
         &self,
-        operation: impl FnOnce() -> DaemonResult<(T, Vec<DaemonEventKind>)>,
+        operation: impl FnOnce(&mut DurableUndoLog) -> DaemonResult<(T, Vec<DaemonEventKind>)>,
     ) -> DaemonResult<T> {
-        self.durable_mutation_outcome(|| {
-            let (value, events) = operation()?;
+        self.durable_mutation_outcome(|undo| {
+            let (value, events) = operation(undo)?;
             Ok(DurableMutation::Changed(value, events))
         })
     }
 
     fn durable_mutation_outcome<T>(
         &self,
-        operation: impl FnOnce() -> DaemonResult<DurableMutation<T>>,
+        operation: impl FnOnce(&mut DurableUndoLog) -> DaemonResult<DurableMutation<T>>,
     ) -> DaemonResult<T> {
         let mutation = lock(&self.mutation_lock)?;
         self.ensure_running()?;
         self.flush_pending()?;
         let persistence = lock(&self.durable.persist_lock)?;
         let mut transaction = self.events.transaction()?;
-        let backup = self.backup()?;
-        match operation() {
-            Ok(DurableMutation::Unchanged(value)) => Ok(value),
-            Ok(DurableMutation::Changed(value, kinds)) => {
-                if let Err(error) = transaction.reserve(kinds.len()) {
-                    self.restore_backup(backup)?;
-                    return Err(error.into());
+        let mut undo = DurableUndoLog::default();
+        let outcome = operation(&mut undo);
+        #[cfg(test)]
+        let outcome = if !undo.is_empty() && self.fail_after_mutation.swap(false, Ordering::AcqRel)
+        {
+            Err(io::Error::other("injected post-mutation failure").into())
+        } else {
+            outcome
+        };
+        match outcome {
+            Ok(DurableMutation::Unchanged(value)) if undo.is_empty() => Ok(value),
+            Ok(DurableMutation::Unchanged(_)) => {
+                let error = io::Error::other("unchanged durable mutation recorded undo");
+                Err(Self::mutation_failure(
+                    error.into(),
+                    undo.rollback(&self.durable),
+                ))
+            }
+            Ok(DurableMutation::Changed(value, kinds)) if !undo.is_empty() => {
+                if let Err(error) = transaction.reserve_with_pending(kinds.len()) {
+                    return Err(Self::mutation_failure(
+                        error.into(),
+                        undo.rollback(&self.durable),
+                    ));
                 }
-                let notifications = self.notification_requests(&kinds, &backup);
-                let saved = self.capture_persisted_state()?;
+                let notifications = self.notification_requests(&kinds, &undo);
+                let saved = match self.capture_persisted_state() {
+                    Ok(saved) => saved,
+                    Err(error) => {
+                        return Err(Self::mutation_failure(
+                            error.into(),
+                            undo.rollback(&self.durable),
+                        ));
+                    }
+                };
                 transaction.begin_persistence(kinds.len());
                 drop(transaction);
                 match self
@@ -4411,7 +4635,7 @@ impl DaemonService {
                         Ok(value)
                     }
                     Err(error) => {
-                        self.restore_backup(backup)?;
+                        let error = Self::mutation_failure(error, undo.rollback(&self.durable));
                         let mut transaction = self.events.transaction()?;
                         transaction.finish_persistence();
                         drop(transaction);
@@ -4420,17 +4644,52 @@ impl DaemonService {
                     }
                 }
             }
-            Err(error) => {
-                self.restore_backup(backup)?;
-                Err(error)
+            Ok(DurableMutation::Changed(_, _)) => {
+                Err(io::Error::other("changed durable mutation did not record undo").into())
             }
+            Err(error) => Err(Self::mutation_failure(error, undo.rollback(&self.durable))),
+        }
+    }
+
+    fn mutation_failure(primary: DaemonError, rollback: io::Result<()>) -> DaemonError {
+        match rollback {
+            Ok(()) => primary,
+            Err(rollback) => Self::append_error_context(
+                primary,
+                format!("durable rollback also failed: {rollback}"),
+            ),
+        }
+    }
+
+    fn append_error_context(primary: DaemonError, context: String) -> DaemonError {
+        match primary {
+            DaemonError::Validation(source) => DaemonError::Validation(io::Error::new(
+                source.kind(),
+                format!("{source}; {context}"),
+            )),
+            DaemonError::Lifecycle { code, source } => DaemonError::Lifecycle {
+                code,
+                source: io::Error::new(source.kind(), format!("{source}; {context}")),
+            },
+            DaemonError::Persistence { message, source } => DaemonError::Persistence {
+                message: format!("{message}; {context}"),
+                source,
+            },
+            DaemonError::Protocol(source) => DaemonError::Protocol(io::Error::new(
+                source.kind(),
+                format!("{source}; {context}"),
+            )),
+            DaemonError::Internal(source) => DaemonError::Internal(io::Error::new(
+                source.kind(),
+                format!("{source}; {context}"),
+            )),
         }
     }
 
     fn notification_requests(
         &self,
         kinds: &[DaemonEventKind],
-        previous: &DurableBackup,
+        undo: &DurableUndoLog,
     ) -> Vec<NotificationRequest> {
         let mut seen = HashSet::new();
         let mut requests = Vec::new();
@@ -4453,10 +4712,7 @@ impl DaemonService {
                 } => (workspace_id, shell_id, agent),
                 _ => continue,
             };
-            let previous_state = previous
-                .agent_states
-                .get(&agent.id)
-                .map(|state| state.observation.state);
+            let previous_state = undo.previous_agent_state(&agent.id);
             if previous_state == Some(agent.observation.state) {
                 continue;
             }
@@ -4514,7 +4770,7 @@ impl DaemonService {
         }
         let pending_count = transaction.pending_durable_batch_count();
         let count = transaction.pending_durable_event_count(pending_count);
-        transaction.reserve(count)?;
+        transaction.reserve_with_pending(0)?;
         let saved = self.capture_persisted_state()?;
         let pending = transaction.take_pending_durable(pending_count);
         transaction.begin_persistence(count);
@@ -4529,7 +4785,7 @@ impl DaemonService {
             return Err(error);
         }
         let mut transaction = self.events.transaction()?;
-        transaction.reserve(count)?;
+        transaction.reserve_with_pending(0)?;
         for batch in pending {
             transaction.append_batch(batch);
         }
@@ -4545,16 +4801,48 @@ impl DaemonService {
         transition: &mut T,
     ) -> io::Result<()> {
         let mut batch = transition.drain_runtime_events();
-        batch.extend(
-            shells
-                .iter()
-                .map(|shell| self.runtimes.compensate_stopped(shell))
-                .collect::<io::Result<Vec<_>>>()?
-                .into_iter()
-                .flatten(),
-        );
+        let mut failure = None;
+        for shell in shells {
+            match self.runtimes.compensate_stopped(shell) {
+                Ok(Some(event)) => batch.push(event),
+                Ok(None) => {}
+                Err(error) if failure.is_none() => failure = Some(error),
+                Err(_) => {}
+            }
+        }
         self.queue_durable_batch_locked(batch, transition);
-        Ok(())
+        failure.map_or(Ok(()), Err)
+    }
+
+    fn restore_finalized_locked<T: EventTransitionAccess>(
+        &self,
+        finalized: Vec<(Arc<Shell>, StopRollback)>,
+        transition: &mut T,
+    ) -> io::Result<()> {
+        let mut batch = transition.drain_runtime_events();
+        let mut failure = None;
+        for (shell, rollback) in finalized {
+            if let Some(event) = rollback.event.clone() {
+                batch.push(event);
+            }
+            if let Err(error) = self.runtimes.restore_stopped(&shell, rollback)
+                && failure.is_none()
+            {
+                failure = Some(error);
+            }
+        }
+        self.queue_durable_batch_locked(batch, transition);
+        failure.map_or(Ok(()), Err)
+    }
+
+    fn lifecycle_failure(primary: DaemonError, compensation: io::Result<()>) -> DaemonError {
+        match compensation {
+            Ok(()) => primary,
+            Err(compensation) => Self::append_error_context(
+                primary,
+                format!("lifecycle compensation also failed: {compensation}"),
+            ),
+        }
     }
 
     fn queue_durable_batch_locked<T: EventTransitionAccess>(
@@ -4588,14 +4876,6 @@ impl DaemonService {
         self.durable.state_lock_descriptor()
     }
 
-    fn backup(&self) -> io::Result<DurableBackup> {
-        self.durable.backup()
-    }
-
-    fn restore_backup(&self, backup: DurableBackup) -> io::Result<()> {
-        self.durable.restore_backup(backup)
-    }
-
     fn persist(&self) -> io::Result<()> {
         let _persist = lock(&self.durable.persist_lock)?;
         let saved = self.durable.capture_persisted_state()?;
@@ -4610,28 +4890,63 @@ impl DaemonService {
         self.durable.write_persisted_state(generation)
     }
 
+    #[cfg(test)]
+    fn fail_next_persistence(&self) {
+        self.durable
+            .persistence_writer
+            .as_ref()
+            .expect("test registry has persistence")
+            .fail_next();
+    }
+
+    #[cfg(test)]
+    fn fail_after_next_mutation(&self) {
+        self.fail_after_mutation.store(true, Ordering::Release);
+    }
+
     fn mark_persistence_dirty(&self) {
         self.durable.mark_persistence_dirty();
     }
 
-    fn record_run_exit(
+    fn try_record_run_exit(
         &self,
         shell: &Arc<Shell>,
         run: &Arc<ShellRun>,
         runtime: &Arc<ShellRuntime>,
         code: Option<u32>,
-    ) -> io::Result<()> {
-        let _persistence = lock(&self.durable.persist_lock)?;
+    ) -> io::Result<RunExitRecord> {
+        if !self.runtimes.run_exit_is_current(shell, run, runtime)? {
+            return Ok(RunExitRecord::Unchanged);
+        }
+        let _persistence = match self.durable.persist_lock.try_lock() {
+            Ok(persistence) => persistence,
+            Err(TryLockError::WouldBlock)
+                if self.events.lifecycle_active.load(Ordering::Acquire) =>
+            {
+                return Ok(RunExitRecord::Deferred);
+            }
+            Err(TryLockError::WouldBlock) => lock(&self.durable.persist_lock)?,
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(io::Error::other("daemon state lock poisoned"));
+            }
+        };
         let mut transaction = self.events.transaction()?;
-        let pending_count = transaction.reserved_event_count();
-        transaction.reserve_with_pending(1)?;
+        if let Err(error) = transaction.reserve_with_pending(1) {
+            if transaction.capacity_is_blocked_only_by_lifecycle_reservation(1) {
+                return Ok(RunExitRecord::Deferred);
+            }
+            return Err(error);
+        }
         let Some(exit_event) = self.runtimes.finalize_run_exit(shell, run, runtime, code)? else {
-            return Ok(());
+            return Ok(RunExitRecord::Unchanged);
         };
         let mut batch = transaction.drain_runtime_events();
         batch.push(exit_event);
+        let pending_count =
+            transaction.pending_durable_event_count(transaction.pending_durable_batch_count());
+        let event_count = pending_count.saturating_add(batch.len());
         let saved = self.capture_persisted_state()?;
-        transaction.begin_persistence(pending_count.saturating_add(1));
+        transaction.begin_persistence(event_count);
         drop(transaction);
         match self.write_persisted_state(saved) {
             Ok(()) => {
@@ -4641,7 +4956,7 @@ impl DaemonService {
                 transaction.finish_persistence();
                 drop(transaction);
                 self.events.notify();
-                Ok(())
+                Ok(RunExitRecord::Recorded)
             }
             Err(error) => {
                 let mut transaction = self.events.transaction()?;
@@ -4652,6 +4967,37 @@ impl DaemonService {
                 Err(error)
             }
         }
+    }
+
+    fn defer_run_exit(
+        registry: Weak<Self>,
+        shell: Arc<Shell>,
+        run: Arc<ShellRun>,
+        runtime: Arc<ShellRuntime>,
+        code: Option<u32>,
+    ) -> io::Result<()> {
+        let shell_id = shell.id.clone();
+        thread::Builder::new()
+            .name(format!("boomux-exit-retry-{shell_id}"))
+            .spawn(move || {
+                loop {
+                    let Some(service) = registry.upgrade() else {
+                        return;
+                    };
+                    match service.try_record_run_exit(&shell, &run, &runtime, code) {
+                        Ok(RunExitRecord::Recorded | RunExitRecord::Unchanged) => return,
+                        Ok(RunExitRecord::Deferred) => {
+                            drop(service);
+                            thread::sleep(IO_RETRY_DELAY);
+                        }
+                        Err(error) => {
+                            eprintln!("boomux: could not persist shell run exit: {error}");
+                            return;
+                        }
+                    }
+                }
+            })
+            .map(|_| ())
     }
 
     fn snapshot(&self) -> io::Result<Snapshot> {
@@ -4757,74 +5103,176 @@ impl DaemonService {
             .import_focused_terminal(focused_terminal, current)
     }
 
-    fn shutdown(&self) -> DaemonResult<()> {
+    fn lifecycle_transaction(
+        &self,
+        stopping: bool,
+        select_shells: impl FnOnce() -> DaemonResult<Vec<Arc<Shell>>>,
+        durable_apply: impl FnOnce() -> DaemonResult<Option<DurableUndo>>,
+        committed_events: impl FnOnce(&[Arc<Shell>]) -> Vec<DaemonEventKind>,
+    ) -> DaemonResult<()> {
         let _mutation = lock(&self.mutation_lock)?;
-        if !self.runtimes.begin_stopping() {
-            return Ok(());
+        if stopping {
+            if !self.runtimes.begin_stopping() {
+                return Ok(());
+            }
+            self.events.notify();
+            self.notify_output_waiters();
+        } else {
+            self.ensure_running()?;
         }
-        self.events.notify();
-        let shells = self.durable.shells()?;
-        self.notify_output_waiters();
+        let shells = match select_shells() {
+            Ok(shells) => shells,
+            Err(error) => {
+                if stopping {
+                    self.runtimes.cancel_stopping();
+                }
+                return Err(error);
+            }
+        };
+        let committed_events = committed_events(&shells);
+        let lifecycle_event_capacity = committed_events.len().max(shells.len());
+        let mut transaction = match self.events.transaction() {
+            Ok(transaction) => transaction,
+            Err(error) => {
+                if stopping {
+                    self.runtimes.cancel_stopping();
+                }
+                return Err(error.into());
+            }
+        };
+        if let Err(error) = transaction.reserve_with_pending(lifecycle_event_capacity) {
+            if stopping {
+                self.runtimes.cancel_stopping();
+            }
+            return Err(error.into());
+        }
+        transaction.begin_lifecycle_reservation(lifecycle_event_capacity);
+        drop(transaction);
+        let _lifecycle_activity = LifecycleActivity::begin(&self.events.lifecycle_active);
         let mut stopped: Vec<Arc<Shell>> = Vec::with_capacity(shells.len());
         for shell in &shells {
             if let Err(error) = self.runtimes.stop_runtime(shell) {
                 if error.stopped {
                     stopped.push(Arc::clone(shell));
                 }
-                let mut transition = self.events.transition()?;
-                self.compensate_stopped_locked(&stopped, &mut transition)?;
-                self.runtimes.cancel_stopping();
-                return Err(error.source.into());
+                let mut transaction = self.events.transaction()?;
+                let compensation = self.compensate_stopped_locked(&stopped, &mut transaction);
+                transaction.finish_lifecycle_reservation();
+                if stopping {
+                    self.runtimes.cancel_stopping();
+                }
+                return Err(Self::lifecycle_failure(error.source.into(), compensation));
             }
             stopped.push(Arc::clone(shell));
         }
         if let Err(error) = self.flush_pending() {
-            let mut transition = self.events.transition()?;
-            self.compensate_stopped_locked(&stopped, &mut transition)?;
-            self.runtimes.cancel_stopping();
-            return Err(error);
+            let mut transaction = self.events.transaction()?;
+            let compensation = self.compensate_stopped_locked(&stopped, &mut transaction);
+            transaction.finish_lifecycle_reservation();
+            if stopping {
+                self.runtimes.cancel_stopping();
+            }
+            return Err(Self::lifecycle_failure(error, compensation));
         }
-        let _persistence = lock(&self.durable.persist_lock)?;
+        let _persistence = match lock(&self.durable.persist_lock) {
+            Ok(persistence) => persistence,
+            Err(error) => {
+                let mut transaction = self.events.transaction()?;
+                let compensation = self.compensate_stopped_locked(&stopped, &mut transaction);
+                transaction.finish_lifecycle_reservation();
+                if stopping {
+                    self.runtimes.cancel_stopping();
+                }
+                return Err(Self::lifecycle_failure(error.into(), compensation));
+            }
+        };
         let mut transaction = self.events.transaction()?;
         let mut rollbacks = Vec::with_capacity(shells.len());
-        for shell in &shells {
+        for (index, shell) in shells.iter().enumerate() {
             match self.runtimes.finalize_stop(shell) {
                 Ok(rollback) => rollbacks.push((Arc::clone(shell), rollback)),
                 Err(error) => {
-                    for (shell, rollback) in rollbacks {
-                        self.runtimes.restore_stopped(&shell, rollback)?;
+                    let mut compensation =
+                        self.restore_finalized_locked(rollbacks, &mut transaction);
+                    if let Err(remaining) =
+                        self.compensate_stopped_locked(&shells[index..], &mut transaction)
+                        && compensation.is_ok()
+                    {
+                        compensation = Err(remaining);
                     }
-                    self.runtimes.cancel_stopping();
-                    return Err(error.into());
+                    if stopping {
+                        self.runtimes.cancel_stopping();
+                    }
+                    transaction.finish_lifecycle_reservation();
+                    return Err(Self::lifecycle_failure(error.into(), compensation));
                 }
             }
         }
-        let saved = self.capture_persisted_state()?;
-        transaction.begin_persistence(0);
+        let undo = match durable_apply() {
+            Ok(undo) => undo,
+            Err(error) => {
+                let compensation = self.restore_finalized_locked(rollbacks, &mut transaction);
+                if stopping {
+                    self.runtimes.cancel_stopping();
+                }
+                transaction.finish_lifecycle_reservation();
+                return Err(Self::lifecycle_failure(error, compensation));
+            }
+        };
+        let saved = match self.capture_persisted_state() {
+            Ok(saved) => saved,
+            Err(error) => {
+                let durable = undo.map_or(Ok(()), |undo| self.durable.rollback(undo));
+                let runtime = self.restore_finalized_locked(rollbacks, &mut transaction);
+                if stopping {
+                    self.runtimes.cancel_stopping();
+                }
+                transaction.finish_lifecycle_reservation();
+                return Err(Self::lifecycle_failure(
+                    Self::lifecycle_failure(error.into(), durable),
+                    runtime,
+                ));
+            }
+        };
+        transaction.finish_lifecycle_reservation();
+        transaction.begin_lifecycle_reservation(
+            lifecycle_event_capacity.saturating_sub(committed_events.len()),
+        );
+        transaction.begin_persistence(committed_events.len());
         drop(transaction);
         if let Err(error) = self
             .write_persisted_state(saved)
             .map_err(DaemonError::persistence)
         {
-            let batch = rollbacks
-                .iter()
-                .filter_map(|(_, rollback)| rollback.event.clone())
-                .collect();
-            for (shell, rollback) in rollbacks {
-                self.runtimes.restore_stopped(&shell, rollback)?;
-            }
             let mut transaction = self.events.transaction()?;
-            if transaction.queue_durable_batch(batch) {
-                self.mark_persistence_dirty();
-            }
+            let durable = undo.map_or(Ok(()), |undo| self.durable.rollback(undo));
+            let runtime = self.restore_finalized_locked(rollbacks, &mut transaction);
+            transaction.finish_lifecycle_reservation();
             transaction.finish_persistence();
-            self.runtimes.cancel_stopping();
-            return Err(error);
+            if stopping {
+                self.runtimes.cancel_stopping();
+            }
+            return Err(Self::lifecycle_failure(
+                Self::lifecycle_failure(error, durable),
+                runtime,
+            ));
         }
-        self.durable.clear()?;
         let mut transaction = self.events.transaction()?;
+        transaction.append_batch(committed_events);
+        transaction.finish_lifecycle_reservation();
         transaction.finish_persistence();
+        drop(transaction);
+        self.events.notify();
         Ok(())
+    }
+
+    fn shutdown(&self) -> DaemonResult<()> {
+        self.lifecycle_transaction(
+            true,
+            || Ok(self.durable.shells()?),
+            || Ok(None),
+            |_| Vec::new(),
+        )
     }
 
     fn workspace(&self, id: &str) -> io::Result<Arc<Workspace>> {
@@ -4856,58 +5304,133 @@ impl DaemonService {
         self.create_workspace_with_default_cwd(name, None, specs)
     }
 
+    #[cfg(test)]
     fn create_workspace_with_default_cwd(
         &self,
         name: String,
         default_cwd: Option<PathBuf>,
         specs: Vec<ShellSpec>,
     ) -> io::Result<WorkspaceSnapshot> {
-        self.durable.create_workspace(name, default_cwd, specs)
+        self.durable
+            .create_workspace(name, default_cwd, specs)
+            .map(|(snapshot, _)| snapshot)
     }
 
-    fn create_shell(&self, workspace_id: &str, spec: ShellSpec) -> io::Result<ShellSnapshot> {
-        self.durable.create_shell(workspace_id, spec)
-    }
-
-    fn create_shell_with_workspace(&self, spec: ShellSpec) -> io::Result<ShellSnapshot> {
-        self.durable.create_shell_with_workspace(spec)
-    }
-
-    fn create_launcher(
+    fn create_workspace_mutation(
         &self,
+        undo: &mut DurableUndoLog,
+        name: String,
+        default_cwd: Option<PathBuf>,
+        specs: Vec<ShellSpec>,
+    ) -> io::Result<WorkspaceSnapshot> {
+        let (snapshot, record) = self.durable.create_workspace(name, default_cwd, specs)?;
+        undo.record(record);
+        Ok(snapshot)
+    }
+
+    #[cfg(test)]
+    fn create_shell(&self, workspace_id: &str, spec: ShellSpec) -> io::Result<ShellSnapshot> {
+        self.durable
+            .create_shell(workspace_id, spec)
+            .map(|(snapshot, _)| snapshot)
+    }
+
+    #[cfg(test)]
+    fn create_shell_with_workspace(&self, spec: ShellSpec) -> io::Result<ShellSnapshot> {
+        self.durable
+            .create_shell_with_workspace(spec)
+            .map(|(snapshot, _)| snapshot)
+    }
+
+    fn create_shell_mutation(
+        &self,
+        undo: &mut DurableUndoLog,
+        workspace_id: Option<&str>,
+        spec: ShellSpec,
+    ) -> io::Result<ShellSnapshot> {
+        let (snapshot, record) = match workspace_id {
+            Some(workspace_id) => self.durable.create_shell(workspace_id, spec)?,
+            None => self.durable.create_shell_with_workspace(spec)?,
+        };
+        undo.record(record);
+        Ok(snapshot)
+    }
+
+    fn create_launcher_mutation(
+        &self,
+        undo: &mut DurableUndoLog,
         workspace_id: &str,
         spec: WorkspaceLauncherSpec,
     ) -> io::Result<WorkspaceLauncherSnapshot> {
-        self.durable.create_launcher(workspace_id, spec)
+        let (snapshot, record) = self.durable.create_launcher(workspace_id, spec)?;
+        undo.record(record);
+        Ok(snapshot)
     }
 
+    #[cfg(test)]
     fn register_agent(
         &self,
         shell_id: &str,
         run_id: &str,
         spec: AgentRegistrationSpec,
     ) -> DaemonResult<AgentInstanceSnapshot> {
-        self.durable.register_agent(shell_id, run_id, spec)
+        self.durable
+            .register_agent(shell_id, run_id, spec)
+            .map(|(snapshot, _)| snapshot)
     }
 
+    fn register_agent_mutation(
+        &self,
+        undo: &mut DurableUndoLog,
+        shell_id: &str,
+        run_id: &str,
+        spec: AgentRegistrationSpec,
+    ) -> DaemonResult<AgentInstanceSnapshot> {
+        let (snapshot, record) = self.durable.register_agent(shell_id, run_id, spec)?;
+        undo.record(record);
+        Ok(snapshot)
+    }
+
+    #[cfg(test)]
     fn ensure_agent(
         &self,
         shell_id: &str,
         run_id: &str,
         spec: AgentRegistrationSpec,
     ) -> DaemonResult<(AgentInstanceSnapshot, bool)> {
-        self.durable.ensure_agent(shell_id, run_id, spec)
+        self.durable
+            .ensure_agent(shell_id, run_id, spec)
+            .map(|(snapshot, created, _)| (snapshot, created))
     }
 
+    #[cfg(test)]
     fn report_agent(
         &self,
         agent_id: &str,
         run_id: &str,
         report: AgentReport,
     ) -> DaemonResult<(AgentInstanceSnapshot, bool, bool)> {
-        self.durable.report_agent(agent_id, run_id, report)
+        self.durable
+            .report_agent(agent_id, run_id, report)
+            .map(|(snapshot, changed, completed, _)| (snapshot, changed, completed))
     }
 
+    fn report_agent_mutation(
+        &self,
+        undo: &mut DurableUndoLog,
+        agent_id: &str,
+        run_id: &str,
+        report: AgentReport,
+    ) -> DaemonResult<(AgentInstanceSnapshot, bool, bool)> {
+        let (snapshot, changed, completed, record) =
+            self.durable.report_agent(agent_id, run_id, report)?;
+        if let Some(record) = record {
+            undo.record(record);
+        }
+        Ok((snapshot, changed, completed))
+    }
+
+    #[cfg(test)]
     fn acknowledge_agent_attention(
         &self,
         agent_id: &str,
@@ -4915,18 +5438,126 @@ impl DaemonService {
     ) -> DaemonResult<(AgentInstanceSnapshot, bool)> {
         self.durable
             .acknowledge_agent_attention(agent_id, observation_revision)
+            .map(|(snapshot, changed, _)| (snapshot, changed))
     }
 
-    fn rename_launcher(&self, launcher_id: &str, name: String) -> io::Result<()> {
-        self.durable.rename_launcher(launcher_id, name)
+    fn acknowledge_agent_attention_mutation(
+        &self,
+        undo: &mut DurableUndoLog,
+        agent_id: &str,
+        observation_revision: u64,
+    ) -> DaemonResult<(AgentInstanceSnapshot, bool)> {
+        let (snapshot, changed, record) = self
+            .durable
+            .acknowledge_agent_attention(agent_id, observation_revision)?;
+        if let Some(record) = record {
+            undo.record(record);
+        }
+        Ok((snapshot, changed))
     }
 
-    fn remove_launcher(&self, launcher_id: &str) -> io::Result<Arc<WorkspaceLauncher>> {
-        self.durable.remove_launcher(launcher_id)
+    fn rename_workspace_mutation(
+        &self,
+        undo: &mut DurableUndoLog,
+        workspace_id: &str,
+        name: String,
+    ) -> io::Result<DurableMutation<()>> {
+        let event_name = name.clone();
+        let Some(record) = self.durable.rename_workspace(workspace_id, name)? else {
+            return Ok(DurableMutation::Unchanged(()));
+        };
+        undo.record(record);
+        Ok(DurableMutation::Changed(
+            (),
+            vec![DaemonEventKind::WorkspaceRenamed {
+                workspace_id: workspace_id.into(),
+                name: event_name,
+            }],
+        ))
     }
 
-    fn rename_shell(&self, shell_id: &str, name: String) -> io::Result<()> {
-        self.durable.rename_shell(shell_id, name)
+    fn rename_shell_mutation(
+        &self,
+        undo: &mut DurableUndoLog,
+        shell_id: &str,
+        name: String,
+    ) -> io::Result<DurableMutation<()>> {
+        let event_name = name.clone();
+        let Some(record) = self.durable.rename_shell(shell_id, name)? else {
+            return Ok(DurableMutation::Unchanged(()));
+        };
+        let workspace_id = match &record {
+            DurableUndo::RenamedShell { shell, .. } => shell.workspace_id.clone(),
+            _ => unreachable!("shell rename returned the wrong undo record"),
+        };
+        undo.record(record);
+        Ok(DurableMutation::Changed(
+            (),
+            vec![DaemonEventKind::ShellRenamed {
+                workspace_id,
+                shell_id: shell_id.into(),
+                name: event_name,
+            }],
+        ))
+    }
+
+    fn rename_launcher_mutation(
+        &self,
+        undo: &mut DurableUndoLog,
+        launcher_id: &str,
+        name: String,
+    ) -> io::Result<DurableMutation<()>> {
+        let event_name = name.clone();
+        let Some(record) = self.durable.rename_launcher(launcher_id, name)? else {
+            return Ok(DurableMutation::Unchanged(()));
+        };
+        let workspace_id = match &record {
+            DurableUndo::RenamedLauncher { launcher, .. } => launcher.workspace_id.clone(),
+            _ => unreachable!("launcher rename returned the wrong undo record"),
+        };
+        undo.record(record);
+        Ok(DurableMutation::Changed(
+            (),
+            vec![DaemonEventKind::LauncherRenamed {
+                workspace_id,
+                launcher_id: launcher_id.into(),
+                name: event_name,
+            }],
+        ))
+    }
+
+    fn remove_launcher_mutation(
+        &self,
+        undo: &mut DurableUndoLog,
+        launcher_id: &str,
+    ) -> io::Result<Arc<WorkspaceLauncher>> {
+        let mut state = lock(&self.durable.state)?;
+        let launcher = state
+            .launchers
+            .get(launcher_id)
+            .cloned()
+            .ok_or_else(|| not_found("workspace launcher", launcher_id))?;
+        let workspace = state
+            .workspaces
+            .get(&launcher.workspace_id)
+            .cloned()
+            .ok_or_else(|| not_found("workspace", &launcher.workspace_id))?;
+        let mut launcher_ids = lock(&workspace.launcher_ids)?;
+        let index = launcher_ids
+            .iter()
+            .position(|id| id == launcher_id)
+            .ok_or_else(|| not_found("workspace launcher", launcher_id))?;
+        state.launchers.remove(launcher_id);
+        launcher_ids.remove(index);
+        drop(launcher_ids);
+        drop(state);
+        let result = Arc::clone(&launcher);
+        undo.record(DurableUndo::RemovedLauncher {
+            workspace,
+            launcher,
+            index,
+        });
+        Ok(result)
     }
 
     fn read_shell(&self, shell_id: &str, max_bytes: usize) -> io::Result<Vec<u8>> {
@@ -4998,139 +5629,103 @@ impl DaemonService {
         )
     }
 
-    fn remove_shell(&self, shell_id: &str) -> io::Result<Arc<Shell>> {
-        self.durable.remove_shell(shell_id)
+    fn remove_shell_mutation(&self, shell_id: &str) -> io::Result<DurableUndo> {
+        let mut state = lock(&self.durable.state)?;
+        let shell = state
+            .shells
+            .get(shell_id)
+            .cloned()
+            .ok_or_else(|| not_found("shell", shell_id))?;
+        let workspace = state
+            .workspaces
+            .get(&shell.workspace_id)
+            .cloned()
+            .ok_or_else(|| not_found("workspace", &shell.workspace_id))?;
+        let mut shell_ids = lock(&workspace.shell_ids)?;
+        let index = shell_ids
+            .iter()
+            .position(|id| id == shell_id)
+            .ok_or_else(|| not_found("shell", shell_id))?;
+        state.shells.remove(shell_id);
+        shell_ids.remove(index);
+        drop(shell_ids);
+        drop(state);
+        Ok(DurableUndo::RemovedShell {
+            workspace,
+            shell,
+            index,
+        })
     }
 
-    fn remove_workspace(&self, workspace_id: &str) -> io::Result<Vec<Arc<Shell>>> {
-        self.durable.remove_workspace(workspace_id)
+    fn remove_workspace_mutation(&self, workspace_id: &str) -> io::Result<DurableUndo> {
+        let mut state = lock(&self.durable.state)?;
+        let workspace = state
+            .workspaces
+            .get(workspace_id)
+            .cloned()
+            .ok_or_else(|| not_found("workspace", workspace_id))?;
+        let shell_ids = lock(&workspace.shell_ids)?.clone();
+        let launcher_ids = lock(&workspace.launcher_ids)?.clone();
+        let agent_ids = lock(&workspace.agent_ids)?.clone();
+        let shells = shell_ids
+            .iter()
+            .filter_map(|id| state.shells.get(id).cloned())
+            .collect();
+        let launchers = launcher_ids
+            .iter()
+            .filter_map(|id| state.launchers.get(id).cloned())
+            .collect();
+        let agents = agent_ids
+            .iter()
+            .filter_map(|id| state.agents.get(id).cloned())
+            .collect();
+        state.workspaces.remove(workspace_id);
+        for id in shell_ids {
+            state.shells.remove(&id);
+        }
+        for id in launcher_ids {
+            state.launchers.remove(&id);
+        }
+        for id in agent_ids {
+            state.agents.remove(&id);
+        }
+        drop(state);
+        Ok(DurableUndo::RemovedWorkspace {
+            workspace,
+            shells,
+            launchers,
+            agents,
+        })
     }
 
     fn close_shell(&self, shell_id: &str) -> DaemonResult<()> {
-        let _mutation = lock(&self.mutation_lock)?;
-        self.ensure_running()?;
-        let backup = self.backup()?;
-        let shell = self.shell(shell_id)?;
-        if let Err(error) = self.runtimes.stop_runtime(&shell) {
-            if error.stopped {
-                let mut transition = self.events.transition()?;
-                self.compensate_stopped_locked(std::slice::from_ref(&shell), &mut transition)?;
-            }
-            return Err(error.source.into());
-        }
-        if let Err(error) = self.flush_pending() {
-            let mut transition = self.events.transition()?;
-            self.compensate_stopped_locked(std::slice::from_ref(&shell), &mut transition)?;
-            return Err(error);
-        }
-        let _persistence = lock(&self.durable.persist_lock)?;
-        let mut transaction = self.events.transaction()?;
-        if let Err(error) = transaction.reserve(1) {
-            self.compensate_stopped_locked(std::slice::from_ref(&shell), &mut transaction)?;
-            return Err(error.into());
-        }
-        let rollback = self.runtimes.finalize_stop(&shell)?;
-        self.remove_shell(shell_id)?;
-        let saved = self.capture_persisted_state()?;
-        transaction.begin_persistence(1);
-        drop(transaction);
-        if let Err(error) = self
-            .write_persisted_state(saved)
-            .map_err(DaemonError::persistence)
-        {
-            self.restore_backup(backup)?;
-            let event = rollback.event.clone();
-            self.runtimes.restore_stopped(&shell, rollback)?;
-            let mut transaction = self.events.transaction()?;
-            if transaction.queue_durable_batch(event.into_iter().collect()) {
-                self.mark_persistence_dirty();
-            }
-            transaction.finish_persistence();
-            return Err(error);
-        }
-        let mut transaction = self.events.transaction()?;
-        transaction.append_batch(vec![DaemonEventKind::ShellClosed {
-            workspace_id: Some(shell.workspace_id.clone()),
-            shell_id: shell_id.into(),
-        }]);
-        transaction.finish_persistence();
-        drop(transaction);
-        self.events.notify();
-        Ok(())
+        self.lifecycle_transaction(
+            false,
+            || Ok(vec![self.shell(shell_id)?]),
+            || Ok(Some(self.remove_shell_mutation(shell_id)?)),
+            |shells| {
+                vec![DaemonEventKind::ShellClosed {
+                    workspace_id: shells.first().map(|shell| shell.workspace_id.clone()),
+                    shell_id: shell_id.into(),
+                }]
+            },
+        )
     }
 
     fn close_workspace(&self, workspace_id: &str) -> DaemonResult<()> {
-        let _mutation = lock(&self.mutation_lock)?;
-        self.ensure_running()?;
-        let backup = self.backup()?;
-        let workspace = self.workspace(workspace_id)?;
-        let shells = self.durable.workspace_shells(&workspace)?;
-        let mut stopped: Vec<Arc<Shell>> = Vec::with_capacity(shells.len());
-        for shell in &shells {
-            if let Err(error) = self.runtimes.stop_runtime(shell) {
-                if error.stopped {
-                    stopped.push(Arc::clone(shell));
-                }
-                let mut transition = self.events.transition()?;
-                self.compensate_stopped_locked(&stopped, &mut transition)?;
-                return Err(error.source.into());
-            }
-            stopped.push(Arc::clone(shell));
-        }
-        if let Err(error) = self.flush_pending() {
-            let mut transition = self.events.transition()?;
-            self.compensate_stopped_locked(&stopped, &mut transition)?;
-            return Err(error);
-        }
-        let _persistence = lock(&self.durable.persist_lock)?;
-        let mut transaction = self.events.transaction()?;
-        if let Err(error) = transaction.reserve(1) {
-            self.compensate_stopped_locked(&stopped, &mut transaction)?;
-            return Err(error.into());
-        }
-        let mut rollbacks = Vec::with_capacity(shells.len());
-        for shell in &shells {
-            match self.runtimes.finalize_stop(shell) {
-                Ok(rollback) => rollbacks.push((Arc::clone(shell), rollback)),
-                Err(error) => {
-                    for (shell, rollback) in rollbacks {
-                        self.runtimes.restore_stopped(&shell, rollback)?;
-                    }
-                    return Err(error.into());
-                }
-            }
-        }
-        self.remove_workspace(workspace_id)?;
-        let saved = self.capture_persisted_state()?;
-        transaction.begin_persistence(1);
-        drop(transaction);
-        if let Err(error) = self
-            .write_persisted_state(saved)
-            .map_err(DaemonError::persistence)
-        {
-            self.restore_backup(backup)?;
-            let batch = rollbacks
-                .iter()
-                .filter_map(|(_, rollback)| rollback.event.clone())
-                .collect();
-            for (shell, rollback) in rollbacks {
-                self.runtimes.restore_stopped(&shell, rollback)?;
-            }
-            let mut transaction = self.events.transaction()?;
-            if transaction.queue_durable_batch(batch) {
-                self.mark_persistence_dirty();
-            }
-            transaction.finish_persistence();
-            return Err(error);
-        }
-        let mut transaction = self.events.transaction()?;
-        transaction.append_batch(vec![DaemonEventKind::WorkspaceClosed {
-            workspace_id: workspace_id.into(),
-        }]);
-        transaction.finish_persistence();
-        drop(transaction);
-        self.events.notify();
-        Ok(())
+        self.lifecycle_transaction(
+            false,
+            || {
+                let workspace = self.workspace(workspace_id)?;
+                Ok(self.durable.workspace_shells(&workspace)?)
+            },
+            || Ok(Some(self.remove_workspace_mutation(workspace_id)?)),
+            |_| {
+                vec![DaemonEventKind::WorkspaceClosed {
+                    workspace_id: workspace_id.into(),
+                }]
+            },
+        )
     }
 
     fn restart_shell(&self, shell_id: &str) -> DaemonResult<ShellSnapshot> {
@@ -5241,7 +5836,11 @@ impl AgentInstance {
 
     fn snapshot(&self) -> io::Result<AgentInstanceSnapshot> {
         let state = lock(&self.state)?;
-        Ok(AgentInstanceSnapshot {
+        Ok(self.snapshot_from(&state))
+    }
+
+    fn snapshot_from(&self, state: &AgentInstanceState) -> AgentInstanceSnapshot {
+        AgentInstanceSnapshot {
             id: self.id.clone(),
             workspace_id: self.workspace_id.clone(),
             shell_id: self.shell_id.clone(),
@@ -5254,7 +5853,7 @@ impl AgentInstance {
             ended_at_ms: state.ended_at_ms,
             observation: state.observation.clone(),
             attention: state.attention.clone(),
-        })
+        }
     }
 
     fn persisted(&self) -> io::Result<PersistedAgentInstance> {
@@ -5692,19 +6291,39 @@ impl ShellRuntimeManager {
                     .lock()
                     .ok()
                     .and_then(|mut process| process.try_wait_code().ok().flatten().flatten());
-                if let Some(registry) = registry.upgrade() {
-                    if registry.notification_settings.persist_terminal_history {
+                if let Some(active_registry) = registry.upgrade() {
+                    if active_registry
+                        .notification_settings
+                        .persist_terminal_history
+                    {
                         let _ = Self::checkpoint_terminal_history(
-                            &registry,
+                            &active_registry,
                             &shell,
                             &reader_run,
                             &reader_runtime,
                         );
                     }
-                    if let Err(error) =
-                        registry.record_run_exit(&shell, &reader_run, &reader_runtime, code)
-                    {
-                        eprintln!("boomux: could not persist shell run exit: {error}");
+                    match active_registry.try_record_run_exit(
+                        &shell,
+                        &reader_run,
+                        &reader_runtime,
+                        code,
+                    ) {
+                        Ok(RunExitRecord::Deferred) => {
+                            if let Err(error) = DaemonService::defer_run_exit(
+                                Weak::clone(&registry),
+                                Arc::clone(&shell),
+                                Arc::clone(&reader_run),
+                                Arc::clone(&reader_runtime),
+                                code,
+                            ) {
+                                eprintln!("boomux: could not defer shell run exit: {error}");
+                            }
+                        }
+                        Ok(RunExitRecord::Recorded | RunExitRecord::Unchanged) => {}
+                        Err(error) => {
+                            eprintln!("boomux: could not persist shell run exit: {error}");
+                        }
                     }
                 }
                 let _ = reader_runtime
@@ -7342,7 +7961,7 @@ mod tests {
         let registry = DaemonService::default();
         let (_workspace, shell, _runtime) = running_shell(&registry);
 
-        let deadline = Instant::now() + Duration::from_secs(1);
+        let deadline = Instant::now() + FOREGROUND_PROCESS_CACHE_INTERVAL + Duration::from_secs(1);
         loop {
             let foreground_process = shell.snapshot().unwrap().foreground_process;
             if foreground_process.as_deref() == Some("sleep") {
@@ -7501,15 +8120,13 @@ mod tests {
     #[test]
     fn failed_persistence_rolls_back_registry_mutation() {
         let directory = env::temp_dir().join(format!("boomux-rollback-{}", Uuid::new_v4()));
-        let state_directory = directory.join("state");
         let registry = DaemonService::restore(
-            StateStore::at(state_directory.join("state.json")),
+            StateStore::at(directory.join("state/state.json")),
             false,
             None,
         )
         .unwrap();
-        fs::remove_dir(&state_directory).unwrap();
-        fs::write(&state_directory, b"not a directory").unwrap();
+        registry.fail_next_persistence();
 
         let result = registry.dispatch(Request::CreateWorkspace {
             name: "rolled-back".into(),
@@ -7520,6 +8137,561 @@ mod tests {
         assert!(result.is_err());
         assert!(registry.snapshot().unwrap().workspaces.is_empty());
         assert!(lock(&registry.events.state).unwrap().events.is_empty());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn same_name_rename_is_a_noop_without_preparing_persistence() {
+        let directory = env::temp_dir().join(format!("boomux-noop-{}", Uuid::new_v4()));
+        let registry = DaemonService::restore(
+            StateStore::at(directory.join("state/state.json")),
+            false,
+            None,
+        )
+        .unwrap();
+        let Response::Workspace { workspace } = registry
+            .dispatch(Request::CreateWorkspace {
+                name: "unchanged".into(),
+                default_cwd: None,
+                shells: vec![ShellSpec::login("shell", env::temp_dir())],
+            })
+            .unwrap()
+        else {
+            panic!("expected workspace");
+        };
+        let shell = workspace.shells[0].clone();
+        let Response::Launcher { launcher } = registry
+            .dispatch(Request::CreateLauncher {
+                workspace_id: workspace.id.clone(),
+                spec: WorkspaceLauncherSpec {
+                    name: "launcher".into(),
+                    cwd: env::temp_dir(),
+                    command: vec!["true".into()],
+                },
+            })
+            .unwrap()
+        else {
+            panic!("expected launcher");
+        };
+        let event_id = lock(&registry.events.state).unwrap().latest_id;
+        registry.fail_next_persistence();
+
+        registry
+            .dispatch(Request::RenameWorkspace {
+                workspace_id: workspace.id.clone(),
+                name: workspace.name.clone(),
+            })
+            .unwrap();
+
+        assert_eq!(lock(&registry.events.state).unwrap().latest_id, event_id);
+        assert!(
+            registry
+                .dispatch(Request::RenameWorkspace {
+                    workspace_id: workspace.id.clone(),
+                    name: "changed".into(),
+                })
+                .is_err(),
+            "the no-op must not consume the injected persistence failure"
+        );
+        assert_eq!(registry.snapshot().unwrap().workspaces[0].name, "unchanged");
+        registry.flush_pending().unwrap();
+
+        registry.fail_next_persistence();
+        registry
+            .dispatch(Request::RenameShell {
+                shell_id: shell.id.clone(),
+                name: shell.name.clone(),
+            })
+            .unwrap();
+        assert!(
+            registry
+                .dispatch(Request::RenameShell {
+                    shell_id: shell.id.clone(),
+                    name: "changed-shell".into(),
+                })
+                .is_err(),
+            "the shell no-op must not consume the injected persistence failure"
+        );
+        assert_eq!(
+            registry.shell(&shell.id).unwrap().snapshot().unwrap().name,
+            "shell"
+        );
+        registry.flush_pending().unwrap();
+
+        registry.fail_next_persistence();
+        registry
+            .dispatch(Request::RenameLauncher {
+                launcher_id: launcher.id.clone(),
+                name: launcher.name.clone(),
+            })
+            .unwrap();
+        assert!(
+            registry
+                .dispatch(Request::RenameLauncher {
+                    launcher_id: launcher.id.clone(),
+                    name: "changed-launcher".into(),
+                })
+                .is_err(),
+            "the launcher no-op must not consume the injected persistence failure"
+        );
+        assert_eq!(
+            registry
+                .launcher(&launcher.id)
+                .unwrap()
+                .snapshot()
+                .unwrap()
+                .name,
+            "launcher"
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn post_mutation_errors_rollback_create_rename_and_remove_shapes() {
+        let registry = DaemonService::default();
+        let assert_rollback = |request| {
+            let before = registry.snapshot().unwrap();
+            let event_id = lock(&registry.events.state).unwrap().latest_id;
+            registry.fail_after_next_mutation();
+            assert!(registry.dispatch(request).is_err());
+            assert_eq!(registry.snapshot().unwrap(), before);
+            assert_eq!(lock(&registry.events.state).unwrap().latest_id, event_id);
+        };
+
+        assert_rollback(Request::CreateWorkspace {
+            name: "explicit".into(),
+            default_cwd: None,
+            shells: vec![ShellSpec::login("first", env::temp_dir())],
+        });
+        assert_rollback(Request::CreateShell {
+            workspace_id: None,
+            shell: ShellSpec::login("implicit", env::temp_dir()),
+        });
+
+        let Response::Workspace { workspace } = registry
+            .dispatch(Request::CreateWorkspace {
+                name: "retained".into(),
+                default_cwd: None,
+                shells: vec![ShellSpec::login("shell", env::temp_dir())],
+            })
+            .unwrap()
+        else {
+            panic!("expected workspace");
+        };
+        assert_rollback(Request::CreateShell {
+            workspace_id: Some(workspace.id.clone()),
+            shell: ShellSpec::login("second", env::temp_dir()),
+        });
+        assert_rollback(Request::CreateLauncher {
+            workspace_id: workspace.id.clone(),
+            spec: WorkspaceLauncherSpec {
+                name: "temporary".into(),
+                cwd: env::temp_dir(),
+                command: vec!["true".into()],
+            },
+        });
+
+        let Response::Launcher { launcher } = registry
+            .dispatch(Request::CreateLauncher {
+                workspace_id: workspace.id.clone(),
+                spec: WorkspaceLauncherSpec {
+                    name: "retained-launcher".into(),
+                    cwd: env::temp_dir(),
+                    command: vec!["true".into()],
+                },
+            })
+            .unwrap()
+        else {
+            panic!("expected launcher");
+        };
+        assert_rollback(Request::RenameWorkspace {
+            workspace_id: workspace.id.clone(),
+            name: "renamed".into(),
+        });
+        assert_rollback(Request::RenameShell {
+            shell_id: workspace.shells[0].id.clone(),
+            name: "renamed-shell".into(),
+        });
+        assert_rollback(Request::RenameLauncher {
+            launcher_id: launcher.id.clone(),
+            name: "renamed-launcher".into(),
+        });
+        assert_rollback(Request::RemoveLauncher {
+            launcher_id: launcher.id,
+        });
+    }
+
+    #[test]
+    fn post_mutation_errors_rollback_every_agent_mutation_shape() {
+        let registry = DaemonService::default();
+        let (workspace, shell, _runtime) = running_shell(&registry);
+        let run_id = shell.snapshot().unwrap().run.unwrap().id;
+        let assert_rollback = |request| {
+            let before = registry.snapshot().unwrap();
+            let event_id = lock(&registry.events.state).unwrap().latest_id;
+            registry.fail_after_next_mutation();
+            assert!(registry.dispatch(request).is_err());
+            assert_eq!(registry.snapshot().unwrap(), before);
+            assert_eq!(lock(&registry.events.state).unwrap().latest_id, event_id);
+        };
+
+        assert_rollback(Request::RegisterAgent {
+            shell_id: shell.id.clone(),
+            run_id: run_id.clone(),
+            spec: agent_spec(AgentState::Working),
+        });
+        let Response::Agent { agent } = registry
+            .dispatch(Request::RegisterAgent {
+                shell_id: shell.id.clone(),
+                run_id: run_id.clone(),
+                spec: agent_spec(AgentState::Working),
+            })
+            .unwrap()
+        else {
+            panic!("expected agent");
+        };
+        let mut ensured = agent_spec(AgentState::Working);
+        ensured.external_session_id = Some("external-2".into());
+        assert_rollback(Request::EnsureAgent {
+            shell_id: shell.id.clone(),
+            run_id: run_id.clone(),
+            spec: ensured,
+        });
+        assert_rollback(Request::ReportAgent {
+            agent_id: agent.id.clone(),
+            run_id: run_id.clone(),
+            report: agent_spec(AgentState::Blocked).report,
+        });
+        let Response::Agent { agent } = registry
+            .dispatch(Request::ReportAgent {
+                agent_id: agent.id,
+                run_id,
+                report: agent_spec(AgentState::Blocked).report,
+            })
+            .unwrap()
+        else {
+            panic!("expected blocked agent");
+        };
+        assert_rollback(Request::AcknowledgeAgentAttention {
+            agent_id: agent.id,
+            observation_revision: agent.observation.revision,
+        });
+
+        shell.kill().unwrap();
+        registry.close_workspace(&workspace.id).unwrap();
+    }
+
+    #[test]
+    fn failed_shutdown_persistence_compensates_and_cancels_stopping() {
+        let directory = env::temp_dir().join(format!("boomux-shutdown-{}", Uuid::new_v4()));
+        let registry = DaemonService::restore(
+            StateStore::at(directory.join("state/state.json")),
+            false,
+            None,
+        )
+        .unwrap();
+        let (workspace, shell, _runtime) = running_shell(&registry);
+        registry.fail_next_persistence();
+
+        assert!(registry.shutdown().is_err());
+
+        assert!(!registry.runtimes.is_stopping());
+        assert!(registry.workspace(&workspace.id).is_ok());
+        assert_eq!(shell.snapshot().unwrap().status, ShellStatus::Pending);
+        let transitions = lock(&registry.events.transitions).unwrap();
+        assert_eq!(transitions.lifecycle_event_reservation, 0);
+        assert_eq!(transitions.pending_durable_events.len(), 1);
+        assert!(matches!(
+            transitions.pending_durable_events[0].as_slice(),
+            [DaemonEventKind::RunExited { .. }]
+        ));
+        drop(transitions);
+
+        registry.close_workspace(&workspace.id).unwrap();
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn shutdown_reserves_pending_runtime_and_per_shell_compensation_capacity() {
+        let registry = DaemonService::default();
+        let workspace = registry
+            .create_workspace(
+                "capacity".into(),
+                vec![
+                    ShellSpec::login("first", env::temp_dir()),
+                    ShellSpec::login("second", env::temp_dir()),
+                ],
+            )
+            .unwrap();
+        lock(&registry.events.transitions)
+            .unwrap()
+            .pending_runtime_events
+            .push_back(DaemonEventKind::OutputChanged {
+                workspace_id: workspace.id.clone(),
+                shell_id: workspace.shells[0].id.clone(),
+                run_id: "pending-run".into(),
+                output_revision: 1,
+            });
+        lock(&registry.events.state).unwrap().latest_id = u64::MAX - 2;
+
+        assert!(registry.shutdown().is_err());
+
+        assert!(!registry.runtimes.is_stopping());
+        assert_eq!(registry.snapshot().unwrap().workspaces.len(), 1);
+        assert_eq!(
+            lock(&registry.events.transitions)
+                .unwrap()
+                .lifecycle_event_reservation,
+            0
+        );
+        lock(&registry.events.state).unwrap().latest_id = 0;
+        lock(&registry.events.transitions)
+            .unwrap()
+            .pending_runtime_events
+            .clear();
+        registry.close_workspace(&workspace.id).unwrap();
+    }
+
+    #[test]
+    fn deferred_natural_exit_retries_after_unrelated_lifecycle_reservation() {
+        let registry = Arc::new(DaemonService::default());
+        let (workspace, target, _target_runtime) = running_shell(&registry);
+        let unrelated_snapshot = registry
+            .create_shell(
+                &workspace.id,
+                ShellSpec {
+                    name: "unrelated".into(),
+                    command: vec!["/bin/sleep".into(), "30".into()],
+                    cwd: env::temp_dir(),
+                },
+            )
+            .unwrap();
+        let unrelated = registry.shell(&unrelated_snapshot.id).unwrap();
+        let unrelated_run = Arc::new(ShellRun::new(1));
+        let (unrelated_runtime, _reader) = spawn_runtime(
+            &unrelated,
+            &unrelated_run,
+            "agents",
+            "unrelated",
+            &profile(),
+            None,
+            RuntimeRecovery::default(),
+        )
+        .unwrap();
+        *lock(&unrelated.last_run).unwrap() = Some(unrelated_run.persisted(profile()).unwrap());
+        *lock(&unrelated.lifecycle).unwrap() = ShellLifecycle::Running {
+            profile: profile(),
+            run: Arc::clone(&unrelated_run),
+            runtime: Arc::clone(&unrelated_runtime),
+        };
+        registry
+            .runtimes
+            .stop_runtime(&unrelated)
+            .map_err(|error| error.source)
+            .unwrap();
+        lock(&registry.events.state).unwrap().latest_id = u64::MAX - 1;
+        let mut transaction = registry.events.transaction().unwrap();
+        transaction.reserve_with_pending(1).unwrap();
+        transaction.begin_lifecycle_reservation(1);
+        drop(transaction);
+
+        let started = Instant::now();
+        assert_eq!(
+            registry
+                .try_record_run_exit(&unrelated, &unrelated_run, &unrelated_runtime, Some(0))
+                .unwrap(),
+            RunExitRecord::Deferred
+        );
+        assert!(started.elapsed() < Duration::from_millis(100));
+        DaemonService::defer_run_exit(
+            Arc::downgrade(&registry),
+            Arc::clone(&unrelated),
+            Arc::clone(&unrelated_run),
+            Arc::clone(&unrelated_runtime),
+            Some(0),
+        )
+        .unwrap();
+
+        let mut transaction = registry.events.transaction().unwrap();
+        transaction.finish_lifecycle_reservation();
+        drop(transaction);
+        registry.events.notify();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let exited = matches!(
+                unrelated.snapshot().unwrap().status,
+                ShellStatus::Exited { code: Some(0) }
+            );
+            let exit_events = lock(&registry.events.state)
+                .unwrap()
+                .events
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        &event.kind,
+                        DaemonEventKind::RunExited { shell_id, .. }
+                            if shell_id == &unrelated.id
+                    )
+                })
+                .count();
+            if exited && exit_events == 1 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "deferred run exit did not commit"
+            );
+            thread::sleep(IO_RETRY_DELAY);
+        }
+        thread::sleep(Duration::from_millis(20));
+        assert_eq!(
+            lock(&registry.events.state)
+                .unwrap()
+                .events
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        &event.kind,
+                        DaemonEventKind::RunExited { shell_id, .. }
+                            if shell_id == &unrelated.id
+                    )
+                })
+                .count(),
+            1
+        );
+
+        let mut events = lock(&registry.events.state).unwrap();
+        events.events.clear();
+        events.latest_id = u64::MAX - 1;
+        drop(events);
+        let (target_run, target_runtime) = match &*lock(&target.lifecycle).unwrap() {
+            ShellLifecycle::Running { run, runtime, .. } => (Arc::clone(run), Arc::clone(runtime)),
+            _ => panic!("expected running target shell"),
+        };
+        registry
+            .runtimes
+            .stop_runtime(&target)
+            .map_err(|error| error.source)
+            .unwrap();
+        let mut transaction = registry.events.transaction().unwrap();
+        transaction.reserve_with_pending(1).unwrap();
+        transaction.begin_lifecycle_reservation(1);
+        drop(transaction);
+        assert_eq!(
+            registry
+                .try_record_run_exit(&target, &target_run, &target_runtime, None)
+                .unwrap(),
+            RunExitRecord::Deferred
+        );
+        DaemonService::defer_run_exit(
+            Arc::downgrade(&registry),
+            Arc::clone(&target),
+            target_run,
+            target_runtime,
+            None,
+        )
+        .unwrap();
+        let _rollback = registry.runtimes.finalize_stop(&target).unwrap();
+        let mut transaction = registry.events.transaction().unwrap();
+        transaction.finish_lifecycle_reservation();
+        drop(transaction);
+        registry.events.notify();
+        thread::sleep(Duration::from_millis(20));
+        assert!(
+            lock(&registry.events.state)
+                .unwrap()
+                .events
+                .iter()
+                .all(|event| !matches!(
+                    &event.kind,
+                    DaemonEventKind::RunExited { shell_id, .. } if shell_id == &target.id
+                ))
+        );
+
+        let mut events = lock(&registry.events.state).unwrap();
+        events.latest_id = 0;
+        events.events.clear();
+        drop(events);
+        registry.close_workspace(&workspace.id).unwrap();
+    }
+
+    #[test]
+    fn failed_workspace_close_compensates_every_stopped_shell() {
+        let directory =
+            env::temp_dir().join(format!("boomux-close-compensation-{}", Uuid::new_v4()));
+        let registry = DaemonService::restore(
+            StateStore::at(directory.join("state/state.json")),
+            false,
+            None,
+        )
+        .unwrap();
+        let (workspace, first, _runtime) = running_shell(&registry);
+        let second_snapshot = registry
+            .create_shell(
+                &workspace.id,
+                ShellSpec {
+                    name: "second".into(),
+                    command: vec!["/bin/sleep".into(), "30".into()],
+                    cwd: env::temp_dir(),
+                },
+            )
+            .unwrap();
+        let second = registry.shell(&second_snapshot.id).unwrap();
+        let second_run = Arc::new(ShellRun::new(1));
+        let (second_runtime, _reader) = spawn_runtime(
+            &second,
+            &second_run,
+            "agents",
+            "second",
+            &profile(),
+            None,
+            RuntimeRecovery::default(),
+        )
+        .unwrap();
+        *lock(&second.last_run).unwrap() = Some(second_run.persisted(profile()).unwrap());
+        *lock(&second.lifecycle).unwrap() = ShellLifecycle::Running {
+            profile: profile(),
+            run: second_run,
+            runtime: second_runtime,
+        };
+        registry.fail_next_persistence();
+
+        assert!(registry.close_workspace(&workspace.id).is_err());
+
+        let restored = registry
+            .workspace(&workspace.id)
+            .unwrap()
+            .snapshot(&registry.durable)
+            .unwrap();
+        assert_eq!(restored.shells.len(), 2);
+        assert!(
+            restored
+                .shells
+                .iter()
+                .all(|shell| shell.status == ShellStatus::Pending)
+        );
+        assert!(first.snapshot().unwrap().run.is_none());
+        assert!(second.snapshot().unwrap().run.is_none());
+        let transitions = lock(&registry.events.transitions).unwrap();
+        assert_eq!(transitions.pending_durable_events.len(), 1);
+        assert_eq!(transitions.pending_durable_events[0].len(), 2);
+        assert!(
+            transitions.pending_durable_events[0]
+                .iter()
+                .all(|event| matches!(event, DaemonEventKind::RunExited { .. }))
+        );
+        drop(transitions);
+        assert!(lock(&registry.events.state).unwrap().events.is_empty());
+
+        registry.close_workspace(&workspace.id).unwrap();
+        let events = lock(&registry.events.state).unwrap();
+        assert_eq!(events.events.len(), 3);
+        assert!(matches!(
+            events.events.back().map(|event| &event.kind),
+            Some(DaemonEventKind::WorkspaceClosed { .. })
+        ));
+        drop(events);
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -8233,16 +9405,31 @@ mod tests {
 
     #[test]
     fn failed_agent_mutation_restores_observation_revision() {
-        let registry = DaemonService::default();
+        let directory = env::temp_dir().join(format!("boomux-agent-undo-{}", Uuid::new_v4()));
+        let registry = DaemonService::restore(
+            StateStore::at(directory.join("state/state.json")),
+            false,
+            None,
+        )
+        .unwrap();
         let (workspace, shell, _runtime) = running_shell(&registry);
         let run_id = shell.snapshot().unwrap().run.unwrap().id;
-        let agent = registry
-            .register_agent(&shell.id, &run_id, agent_spec(AgentState::Working))
-            .unwrap();
+        let Response::Agent { agent } = registry
+            .dispatch(Request::RegisterAgent {
+                shell_id: shell.id.clone(),
+                run_id: run_id.clone(),
+                spec: agent_spec(AgentState::Working),
+            })
+            .unwrap()
+        else {
+            panic!("expected agent");
+        };
+        registry.fail_next_persistence();
 
-        let result: DaemonResult<()> = registry.durable_mutation(|| {
-            registry.report_agent(&agent.id, &run_id, agent_spec(AgentState::Blocked).report)?;
-            Err(io::Error::other("force rollback").into())
+        let result = registry.dispatch(Request::ReportAgent {
+            agent_id: agent.id.clone(),
+            run_id: run_id.clone(),
+            report: agent_spec(AgentState::Blocked).report,
         });
 
         assert!(result.is_err());
@@ -8252,6 +9439,7 @@ mod tests {
         assert!(restored.attention.is_none());
         shell.kill().unwrap();
         registry.close_workspace(&workspace.id).unwrap();
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -8638,9 +9826,10 @@ mod tests {
                 .is_some()
         );
 
-        let result: DaemonResult<()> = registry.durable_mutation(|| {
-            registry.acknowledge_agent_attention(&agent.id, revision)?;
-            Err(io::Error::other("force rollback").into())
+        registry.fail_after_next_mutation();
+        let result = registry.dispatch(Request::AcknowledgeAgentAttention {
+            agent_id: agent.id.clone(),
+            observation_revision: revision,
         });
         assert!(result.is_err());
         assert!(
