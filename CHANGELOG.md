@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.2](https://github.com/gardnmi/boomux/compare/v0.14.1...v0.14.2) (2026-08-14)
+
+
+### Bug Fixes
+
+* **tui:** keep navigation responsive during refresh ([#157](https://github.com/gardnmi/boomux/issues/157)) ([d22460a](https://github.com/gardnmi/boomux/commit/d22460adf78a0f1891cd9cbb11959f574233cae4))
+
 ## [0.14.1](https://github.com/gardnmi/boomux/compare/v0.14.0...v0.14.1) (2026-08-14)
 
 
