@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.1](https://github.com/gardnmi/boomux/compare/v0.14.0...v0.14.1) (2026-08-14)
+
+
+### Bug Fixes
+
+* **tui:** guide first-time workspace creation ([#144](https://github.com/gardnmi/boomux/issues/144)) ([28c2b61](https://github.com/gardnmi/boomux/commit/28c2b61c910cec59480653886010f794f6d4279f))
+
 ## [0.14.0](https://github.com/gardnmi/boomux/compare/v0.13.0...v0.14.0) (2026-08-14)
 
 
