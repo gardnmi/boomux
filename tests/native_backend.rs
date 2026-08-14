@@ -202,6 +202,47 @@ impl Drop for TestDaemon {
 }
 
 #[test]
+fn daemon_bounds_stalled_connections_and_recovers_capacity() {
+    let daemon = TestDaemon::start();
+    let mut stalled = (0..64)
+        .map(|_| UnixStream::connect(daemon.client.socket_path()).unwrap())
+        .collect::<Vec<_>>();
+    for stream in &mut stalled {
+        stream.write_all(&[0]).unwrap();
+    }
+    thread::sleep(Duration::from_millis(200));
+
+    let mut rejected = UnixStream::connect(daemon.client.socket_path()).unwrap();
+    rejected
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    let mut byte = [0];
+    assert_eq!(rejected.read(&mut byte).unwrap(), 0);
+
+    wait_until(
+        || daemon.client.ping().is_ok(),
+        "daemon did not recover connection capacity",
+    );
+}
+
+#[test]
+fn daemon_shutdown_does_not_wait_indefinitely_for_abandoned_handlers() {
+    let mut daemon = TestDaemon::start();
+    let mut stalled = (0..8)
+        .map(|_| UnixStream::connect(daemon.client.socket_path()).unwrap())
+        .collect::<Vec<_>>();
+    for stream in &mut stalled {
+        stream.write_all(&[0]).unwrap();
+    }
+    thread::sleep(Duration::from_millis(100));
+
+    let started = Instant::now();
+    daemon.stop_with_cli();
+
+    assert!(started.elapsed() < Duration::from_secs(5));
+}
+
+#[test]
 fn workspace_default_cwd_is_inherited_and_survives_handoff() {
     let mut daemon = TestDaemon::start();
     let project = daemon.runtime_dir.join("project");
