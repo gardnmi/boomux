@@ -289,20 +289,27 @@ fn run_daemon(
     committed: Option<&mut UnixStream>,
     notification_settings: NotificationDeliverySettings,
 ) -> io::Result<()> {
-    let mut registry = Registry::restore(store, committed.is_some(), transferred.events)?;
+    let mut registry = DaemonService::restore(store, committed.is_some(), transferred.events)?;
     registry.notification_settings = notification_settings.clone();
     if !registry.notification_settings.persist_terminal_history {
         registry.clear_terminal_histories()?;
     }
     registry.notification_sink = Arc::new(DesktopNotificationSink::new(notification_settings));
     let registry = Arc::new(registry);
-    let gated_readers = registry.import_handoff(transferred.runtimes, transferred.exited)?;
+    let shells = registry.durable.shells()?;
+    let (gated_readers, handoff_changed) = registry.runtimes.import_handoff(
+        Arc::downgrade(&registry),
+        shells,
+        transferred.runtimes,
+        transferred.exited,
+    )?;
+    if handoff_changed {
+        registry.persist()?;
+    }
     registry.import_focused_terminal(transferred.focused_terminal)?;
     if let Some(channel) = committed {
         {
-            let _transition = lock(&registry.transitions)?;
-            let events = lock(&registry.events.state)?;
-            EventLog::ensure_capacity(&events, 1)?;
+            registry.events.transaction()?.reserve(1)?;
         }
         channel.write_all(&[handoff::PREPARED])?;
         let mut decision = [0];
@@ -311,12 +318,14 @@ fn run_daemon(
             handoff::ABORT => return Ok(()),
             handoff::FINALIZE => {
                 socket_cleanup.arm();
-                if registry.persistence_dirty.load(Ordering::Acquire) {
+                if registry.durable.persistence_dirty.load(Ordering::Acquire) {
                     let _ = registry.persist();
                 }
-                registry.publish_runtime_batch(vec![DaemonEventKind::HandoffCompleted])?;
+                registry
+                    .events
+                    .publish_runtime_batch(vec![DaemonEventKind::HandoffCompleted])?;
                 for runtime in gated_readers {
-                    runtime.resume_reader()?;
+                    registry.runtimes.resume_reader(&runtime)?;
                 }
                 // FINALIZE is the irreversible ownership boundary. Failure to
                 // report COMMITTED must not make the old daemon resume.
@@ -334,7 +343,7 @@ fn run_daemon(
             io::ErrorKind::InvalidData,
             "transferred runtimes require a handoff commit channel",
         ));
-    } else if registry.persistence_dirty.load(Ordering::Acquire) {
+    } else if registry.durable.persistence_dirty.load(Ordering::Acquire) {
         registry.persist()?;
     }
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -353,7 +362,7 @@ fn run_daemon(
                 index += 1;
             }
         }
-        if registry.persistence_dirty.load(Ordering::Acquire)
+        if registry.durable.persistence_dirty.load(Ordering::Acquire)
             && last_persistence_retry.elapsed() >= PERSIST_RETRY_INTERVAL
         {
             let _ = registry.flush_pending();
@@ -530,81 +539,25 @@ fn acquire_daemon_lock(runtime_dir: &Path) -> io::Result<File> {
 fn launch_replacement(
     listener: &UnixListener,
     daemon_lock: &File,
-    registry: &Registry,
+    registry: &DaemonService,
     notification_settings: Option<NotificationDeliverySettings>,
 ) -> io::Result<()> {
     let _mutation = lock(&registry.mutation_lock)?;
     registry.ensure_running()?;
-    registry.stopping.store(true, Ordering::Release);
+    registry.runtimes.begin_stopping();
     registry.events.notify();
     registry.notify_output_waiters();
     let mut paused = Vec::new();
     let result = (|| {
-        registry.quiesce_controllers()?;
-        let shells = lock(&registry.state)?
-            .shells
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut transfers = Vec::new();
-        let mut exited = Vec::new();
-        for shell in shells {
-            let lifecycle = lock(&shell.lifecycle)?;
-            let (profile, run, runtime) = match &*lifecycle {
-                ShellLifecycle::Pending => continue,
-                ShellLifecycle::Running {
-                    profile,
-                    run,
-                    runtime,
-                } => (profile.clone(), Arc::clone(run), Arc::clone(runtime)),
-                ShellLifecycle::Exited {
-                    code,
-                    profile,
-                    run,
-                    terminal,
-                    ..
-                } => {
-                    exited.push(OutgoingExited {
-                        manifest: handoff::ExitedManifest {
-                            shell_id: shell.id.clone(),
-                            run_id: run.id.clone(),
-                            output_revision: run.output_revision.load(Ordering::Acquire),
-                            profile: profile.clone(),
-                            code: *code,
-                        },
-                        reconstruction: lock(terminal)?.reconstruction(),
-                    });
-                    continue;
-                }
-                ShellLifecycle::Closed => return Err(not_found("shell", &shell.id)),
-            };
-            runtime.pause_reader()?;
-            paused.push(Arc::clone(&runtime));
-            let (pid, pidfd) = lock(&runtime.process)?.transfer_identity()?;
-            let reconstruction = lock(&runtime.terminal)?.reconstruction();
-            transfers.push(OutgoingRuntime {
-                manifest: handoff::RuntimeManifest {
-                    shell_id: shell.id.clone(),
-                    run_id: Some(run.id.clone()),
-                    output_revision: Some(run.output_revision.load(Ordering::Acquire)),
-                    profile,
-                    pid,
-                },
-                runtime,
-                pidfd,
-                reconstruction,
-            });
-        }
+        let shells = registry.durable.shells()?;
+        let prepared = registry.runtimes.prepare_handoff(shells)?;
+        paused = prepared.paused;
+        let transfers = prepared.runtimes;
+        let exited = prepared.exited;
         let published = registry.flush_pending()?;
-        let events = lock(&registry.events.state)?;
-        let event_stream = handoff::EventStreamManifest {
-            stream_id: events.stream_id.clone(),
-            latest_id: events.latest_id,
-            events: events.events.iter().cloned().collect(),
-        };
-        drop(events);
+        let event_stream = registry.events.manifest()?;
         if published {
-            registry.events.changed.notify_all();
+            registry.events.notify();
         }
         let state_lock = registry.state_lock_descriptor()?;
         let focused_terminal = registry.focused_terminal_for_handoff()?;
@@ -622,9 +575,9 @@ fn launch_replacement(
         )
     })();
     if result.is_err() {
-        registry.stopping.store(false, Ordering::Release);
+        registry.runtimes.cancel_stopping();
         for runtime in paused {
-            let _ = runtime.resume_reader();
+            let _ = registry.runtimes.resume_reader(&runtime);
         }
     }
     result
@@ -696,8 +649,7 @@ fn launch_replacement_process(
         send_descriptor(&channel, runtime_lock, handoff::RUNTIME_LOCK_MARKER)?;
         send_descriptor(&channel, state_lock, handoff::STATE_LOCK_MARKER)?;
         for runtime in runtimes {
-            let master = lock(&runtime.runtime.master)?;
-            send_descriptor(&channel, master.descriptor.as_fd(), handoff::PTY_MARKER)?;
+            send_descriptor(&channel, runtime.pty.as_fd(), handoff::PTY_MARKER)?;
             send_descriptor(&channel, runtime.pidfd.as_fd(), handoff::PIDFD_MARKER)?;
             protocol::write_message(&mut channel, &runtime.reconstruction)?;
         }
@@ -765,7 +717,7 @@ fn select_replacement_executable(current: PathBuf, argument_zero: Option<PathBuf
 
 fn handle_connection(
     mut stream: UnixStream,
-    registry: Arc<Registry>,
+    registry: Arc<DaemonService>,
     shutdown: Arc<AtomicBool>,
     transition: Arc<AtomicU8>,
     restart_sender: mpsc::Sender<RestartRequest>,
@@ -809,7 +761,7 @@ fn handle_connection(
         environment,
     } = request.message
     {
-        return handle_attach(
+        return registry.runtimes.handle_attach(
             stream,
             response_version,
             &registry,
@@ -1149,20 +1101,28 @@ fn coded_error(code: ErrorCode, message: impl Into<String>) -> io::Error {
     })
 }
 
-struct Registry {
-    state: Mutex<RegistryState>,
-    focus: Mutex<FocusState>,
-    store: Option<Arc<StateStore>>,
-    persistence_writer: Option<PersistenceWriter>,
-    events: EventLog,
-    transitions: Mutex<TransitionState>,
+struct DaemonService {
+    durable: DurableRegistry,
+    events: EventStream,
+    runtimes: ShellRuntimeManager,
     mutation_lock: Mutex<()>,
-    persist_lock: Mutex<()>,
-    stopping: AtomicBool,
-    persistence_dirty: AtomicBool,
-    persistence_revision: AtomicU64,
     notification_settings: NotificationDeliverySettings,
     notification_sink: Arc<dyn NotificationSink>,
+}
+
+struct DurableRegistry {
+    state: Mutex<DurableState>,
+    store: Option<Arc<StateStore>>,
+    persistence_writer: Option<PersistenceWriter>,
+    persist_lock: Mutex<()>,
+    persistence_dirty: AtomicBool,
+    persistence_revision: AtomicU64,
+}
+
+#[derive(Default)]
+struct ShellRuntimeManager {
+    focus: Mutex<FocusState>,
+    stopping: AtomicBool,
 }
 
 #[derive(Default)]
@@ -1260,37 +1220,151 @@ impl PersistenceWriter {
     }
 }
 
-struct EventLog {
-    state: Mutex<EventLogState>,
+struct EventStream {
+    state: Mutex<EventStreamState>,
+    transitions: Mutex<TransitionState>,
     changed: Condvar,
 }
 
-struct EventLogState {
+struct EventStreamState {
     stream_id: String,
     latest_id: u64,
     events: VecDeque<DaemonEvent>,
 }
 
-impl EventLog {
+struct EventTransition<'a> {
+    state: MutexGuard<'a, TransitionState>,
+}
+
+struct EventTransaction<'a> {
+    transition: MutexGuard<'a, TransitionState>,
+    events: MutexGuard<'a, EventStreamState>,
+}
+
+trait EventTransitionAccess {
+    fn drain_runtime_events(&mut self) -> Vec<DaemonEventKind>;
+    fn queue_durable_batch(&mut self, batch: Vec<DaemonEventKind>) -> bool;
+}
+
+impl EventTransitionAccess for EventTransition<'_> {
+    fn drain_runtime_events(&mut self) -> Vec<DaemonEventKind> {
+        self.state.pending_runtime_events.drain(..).collect()
+    }
+
+    fn queue_durable_batch(&mut self, batch: Vec<DaemonEventKind>) -> bool {
+        if batch.is_empty() {
+            false
+        } else {
+            self.state.pending_durable_events.push_back(batch);
+            true
+        }
+    }
+}
+
+impl EventTransaction<'_> {
+    fn reserved_event_count(&self) -> usize {
+        self.transition.reserved_event_count()
+    }
+
+    fn reserve(&self, count: usize) -> io::Result<()> {
+        EventStream::ensure_capacity(&self.events, count)
+    }
+
+    fn reserve_with_pending(&self, count: usize) -> io::Result<()> {
+        self.reserve(self.transition.reserved_event_count().saturating_add(count))
+    }
+
+    fn pending_durable_batch_count(&self) -> usize {
+        self.transition.pending_durable_events.len()
+    }
+
+    fn pending_durable_event_count(&self, batch_count: usize) -> usize {
+        self.transition
+            .pending_durable_events
+            .iter()
+            .take(batch_count)
+            .map(Vec::len)
+            .sum()
+    }
+
+    fn take_pending_durable(&mut self, batch_count: usize) -> VecDeque<Vec<DaemonEventKind>> {
+        self.transition
+            .pending_durable_events
+            .drain(..batch_count)
+            .collect()
+    }
+
+    fn restore_pending_durable(&mut self, pending: VecDeque<Vec<DaemonEventKind>>) {
+        for batch in pending.into_iter().rev() {
+            self.transition.pending_durable_events.push_front(batch);
+        }
+    }
+
+    fn begin_persistence(&mut self, event_count: usize) {
+        self.transition.persistence_in_flight = true;
+        self.transition.in_flight_event_count = event_count;
+    }
+
+    fn append_batch(&mut self, batch: Vec<DaemonEventKind>) {
+        EventStream::append_batch_locked(&mut self.events, batch);
+    }
+
+    fn append_pending_durable(&mut self) {
+        while let Some(batch) = self.transition.pending_durable_events.pop_front() {
+            EventStream::append_batch_locked(&mut self.events, batch);
+        }
+    }
+
+    fn finish_persistence(&mut self) {
+        self.transition.persistence_in_flight = false;
+        self.transition.in_flight_event_count = 0;
+        EventStream::publish_pending_runtime_locked(&mut self.transition, &mut self.events);
+    }
+
+    fn cursor(&self) -> EventCursor {
+        EventCursor {
+            stream_id: self.events.stream_id.clone(),
+            event_id: self.events.latest_id,
+        }
+    }
+}
+
+impl EventTransitionAccess for EventTransaction<'_> {
+    fn drain_runtime_events(&mut self) -> Vec<DaemonEventKind> {
+        self.transition.pending_runtime_events.drain(..).collect()
+    }
+
+    fn queue_durable_batch(&mut self, batch: Vec<DaemonEventKind>) -> bool {
+        if batch.is_empty() {
+            false
+        } else {
+            self.transition.pending_durable_events.push_back(batch);
+            true
+        }
+    }
+}
+
+impl EventStream {
     fn new() -> Self {
         Self {
-            state: Mutex::new(EventLogState {
+            state: Mutex::new(EventStreamState {
                 stream_id: Uuid::new_v4().to_string(),
                 latest_id: 0,
                 events: VecDeque::new(),
             }),
+            transitions: Mutex::new(TransitionState::default()),
             changed: Condvar::new(),
         }
     }
 
     fn from_transfer(transfer: Option<handoff::EventStreamManifest>) -> Self {
         let state = transfer.map_or_else(
-            || EventLogState {
+            || EventStreamState {
                 stream_id: Uuid::new_v4().to_string(),
                 latest_id: 0,
                 events: VecDeque::new(),
             },
-            |transfer| EventLogState {
+            |transfer| EventStreamState {
                 stream_id: transfer.stream_id,
                 latest_id: transfer.latest_id,
                 events: transfer.events.into(),
@@ -1298,11 +1372,12 @@ impl EventLog {
         );
         Self {
             state: Mutex::new(state),
+            transitions: Mutex::new(TransitionState::default()),
             changed: Condvar::new(),
         }
     }
 
-    fn ensure_capacity(state: &EventLogState, count: usize) -> io::Result<()> {
+    fn ensure_capacity(state: &EventStreamState, count: usize) -> io::Result<()> {
         let count = u64::try_from(count).map_err(|_| io::Error::other("event batch too large"))?;
         state
             .latest_id
@@ -1311,8 +1386,59 @@ impl EventLog {
             .ok_or_else(|| io::Error::other("daemon event ID exhausted"))
     }
 
+    fn transition(&self) -> io::Result<EventTransition<'_>> {
+        Ok(EventTransition {
+            state: lock(&self.transitions)?,
+        })
+    }
+
+    fn transaction(&self) -> io::Result<EventTransaction<'_>> {
+        Ok(EventTransaction {
+            transition: lock(&self.transitions)?,
+            events: lock(&self.state)?,
+        })
+    }
+
+    fn manifest(&self) -> io::Result<handoff::EventStreamManifest> {
+        let state = lock(&self.state)?;
+        Ok(handoff::EventStreamManifest {
+            stream_id: state.stream_id.clone(),
+            latest_id: state.latest_id,
+            events: state.events.iter().cloned().collect(),
+        })
+    }
+
+    fn wait_for<T>(
+        &self,
+        wait_ms: u32,
+        stopping: impl Fn() -> bool,
+        mut inspect: impl FnMut(bool) -> io::Result<Option<T>>,
+    ) -> io::Result<T> {
+        let deadline =
+            Instant::now() + Duration::from_millis(u64::from(wait_ms)).min(MAX_EVENT_WAIT);
+        let mut state = lock(&self.state)?;
+        loop {
+            if stopping() {
+                return Err(coded_error(
+                    ErrorCode::DaemonStopping,
+                    "Boomux daemon is stopping",
+                ));
+            }
+            let expired = wait_ms == 0 || Instant::now() >= deadline;
+            if let Some(value) = inspect(expired)? {
+                return Ok(value);
+            }
+            let timeout = deadline.saturating_duration_since(Instant::now());
+            let (next, _) = self
+                .changed
+                .wait_timeout(state, timeout)
+                .map_err(|_| io::Error::other("event wait lock poisoned"))?;
+            state = next;
+        }
+    }
+
     fn append_batch_locked(
-        state: &mut EventLogState,
+        state: &mut EventStreamState,
         kinds: Vec<DaemonEventKind>,
     ) -> Vec<DaemonEvent> {
         debug_assert!(Self::ensure_capacity(state, kinds.len()).is_ok());
@@ -1352,17 +1478,1559 @@ impl EventLog {
             drop(state);
         }
     }
+
+    fn read_after(
+        &self,
+        after: &EventCursor,
+        limit: usize,
+        wait_ms: u32,
+        stopping: impl Fn() -> bool,
+    ) -> io::Result<Response> {
+        let deadline =
+            Instant::now() + Duration::from_millis(u64::from(wait_ms)).min(MAX_EVENT_WAIT);
+        let mut state = lock(&self.state)?;
+        loop {
+            let earliest = state
+                .events
+                .front()
+                .map_or(state.latest_id, |event| event.id.saturating_sub(1));
+            if after.stream_id != state.stream_id
+                || after.event_id < earliest
+                || after.event_id > state.latest_id
+            {
+                return Err(coded_error(
+                    ErrorCode::CursorExpired,
+                    "event cursor is no longer available",
+                ));
+            }
+            let events = state
+                .events
+                .iter()
+                .filter(|event| event.id > after.event_id)
+                .take(limit)
+                .cloned()
+                .collect::<Vec<_>>();
+            if !events.is_empty() || wait_ms == 0 || Instant::now() >= deadline {
+                let event_id = events.last().map_or(after.event_id, |event| event.id);
+                return Ok(Response::Events {
+                    stream_id: state.stream_id.clone(),
+                    cursor: EventCursor {
+                        stream_id: state.stream_id.clone(),
+                        event_id,
+                    },
+                    snapshot: None,
+                    events,
+                });
+            }
+            if stopping() {
+                return Err(coded_error(
+                    ErrorCode::DaemonStopping,
+                    "Boomux daemon is stopping",
+                ));
+            }
+            let timeout = deadline.saturating_duration_since(Instant::now());
+            let (next, _) = self
+                .changed
+                .wait_timeout(state, timeout)
+                .map_err(|_| io::Error::other("daemon event lock poisoned"))?;
+            state = next;
+        }
+    }
+
+    fn publish_runtime_batch(&self, kinds: Vec<DaemonEventKind>) -> io::Result<()> {
+        let mut transition = lock(&self.transitions)?;
+        let mut events = lock(&self.state)?;
+        Self::ensure_capacity(
+            &events,
+            transition
+                .reserved_event_count()
+                .saturating_add(kinds.len()),
+        )?;
+        if transition.publication_blocked() {
+            for kind in kinds {
+                transition.queue_runtime_event(kind);
+            }
+            return Ok(());
+        }
+        Self::append_batch_locked(&mut events, kinds);
+        drop(events);
+        self.changed.notify_all();
+        Ok(())
+    }
+
+    fn publish_pending_runtime_locked(
+        transition: &mut TransitionState,
+        events: &mut EventStreamState,
+    ) {
+        if transition.publication_blocked() {
+            return;
+        }
+        while let Some(kind) = transition.pending_runtime_events.pop_front() {
+            Self::append_batch_locked(events, vec![kind]);
+        }
+    }
+}
+
+impl DurableRegistry {
+    fn workspace(&self, id: &str) -> io::Result<Arc<Workspace>> {
+        lock(&self.state)?
+            .workspaces
+            .get(id)
+            .cloned()
+            .ok_or_else(|| not_found("workspace", id))
+    }
+
+    fn shell(&self, id: &str) -> io::Result<Arc<Shell>> {
+        lock(&self.state)?
+            .shells
+            .get(id)
+            .cloned()
+            .ok_or_else(|| not_found("shell", id))
+    }
+
+    fn launcher(&self, id: &str) -> io::Result<Arc<WorkspaceLauncher>> {
+        lock(&self.state)?
+            .launchers
+            .get(id)
+            .cloned()
+            .ok_or_else(|| not_found("workspace launcher", id))
+    }
+
+    fn agent(&self, id: &str) -> io::Result<Arc<AgentInstance>> {
+        lock(&self.state)?
+            .agents
+            .get(id)
+            .cloned()
+            .ok_or_else(|| not_found("agent instance", id))
+    }
+
+    fn contains_shell(&self, shell: &Arc<Shell>) -> io::Result<bool> {
+        Ok(lock(&self.state)?
+            .shells
+            .get(&shell.id)
+            .is_some_and(|current| Arc::ptr_eq(current, shell)))
+    }
+
+    fn clear_terminal_histories(&self) -> io::Result<bool> {
+        let state = lock(&self.state)?;
+        let mut changed = false;
+        for shell in state.shells.values() {
+            if let Some(run) = lock(&shell.last_run)?.as_mut()
+                && run.terminal_history.take().is_some()
+            {
+                changed = true;
+            }
+        }
+        Ok(changed)
+    }
+
+    fn agent_resume_command(
+        &self,
+        shell: &Shell,
+        previous_run: &PersistedShellRun,
+    ) -> io::Result<Option<Vec<String>>> {
+        let state = lock(&self.state)?;
+        let mut candidates = Vec::new();
+        for agent in state.agents.values() {
+            if let Some(identity) = resume_identity(agent, shell, previous_run)? {
+                candidates.push(identity);
+            }
+        }
+        candidates.sort();
+        candidates.dedup();
+        let [(integration, external_session_id)] = candidates.as_slice() else {
+            return Ok(None);
+        };
+
+        let duplicate = state
+            .shells
+            .values()
+            .try_fold(false, |duplicate, other_shell| {
+                if duplicate {
+                    return Ok::<_, io::Error>(true);
+                }
+                if other_shell.id == shell.id {
+                    return Ok(false);
+                }
+                let last_run = lock(&other_shell.last_run)?;
+                let Some(last_run) = last_run.as_ref() else {
+                    return Ok(false);
+                };
+                for agent in state.agents.values() {
+                    if resume_identity(agent, other_shell, last_run)?.is_some_and(|identity| {
+                        identity.0 == *integration && identity.1 == *external_session_id
+                    }) {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            })?;
+        if duplicate {
+            return Ok(None);
+        }
+
+        let executable = if shell.command.is_empty() {
+            integration.clone()
+        } else if shell.command.len() == 1
+            && Path::new(&shell.command[0])
+                .file_name()
+                .and_then(|name| name.to_str())
+                == Some(integration.as_str())
+        {
+            shell.command[0].clone()
+        } else {
+            return Ok(None);
+        };
+        Ok(Some(vec![
+            executable,
+            "--session".into(),
+            external_session_id.clone(),
+        ]))
+    }
+
+    fn notification_context(&self, workspace_id: &str, shell_id: &str) -> (String, String) {
+        let Ok(state) = self.state.lock() else {
+            return ("unknown".into(), "removed".into());
+        };
+        let workspace = state
+            .workspaces
+            .get(workspace_id)
+            .and_then(|workspace| workspace.name.lock().ok().map(|name| name.clone()))
+            .unwrap_or_else(|| "unknown".into());
+        let shell = state
+            .shells
+            .get(shell_id)
+            .and_then(|shell| shell.name.lock().ok().map(|name| name.clone()))
+            .unwrap_or_else(|| "removed".into());
+        (workspace, shell)
+    }
+
+    fn create_workspace(
+        &self,
+        name: String,
+        default_cwd: Option<PathBuf>,
+        specs: Vec<ShellSpec>,
+    ) -> io::Result<WorkspaceSnapshot> {
+        validate_name(&name)?;
+        if let Some(default_cwd) = &default_cwd {
+            validate_cwd(default_cwd)?;
+        }
+        validate_shell_specs(&specs)?;
+        let workspace_id = Uuid::new_v4().to_string();
+        let shells = specs
+            .into_iter()
+            .map(|spec| create_pending_shell(&workspace_id, spec))
+            .collect::<io::Result<Vec<_>>>()?;
+        let workspace = Arc::new(Workspace {
+            id: workspace_id.clone(),
+            name: Mutex::new(name.clone()),
+            default_cwd,
+            shell_ids: Mutex::new(shells.iter().map(|shell| shell.id.clone()).collect()),
+            launcher_ids: Mutex::new(Vec::new()),
+            agent_ids: Mutex::new(Vec::new()),
+        });
+        let mut state = lock(&self.state)?;
+        if state
+            .workspaces
+            .values()
+            .any(|current| current.name.lock().is_ok_and(|current| *current == name))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("workspace name already exists: {name}"),
+            ));
+        }
+        for shell in &shells {
+            state.shells.insert(shell.id.clone(), Arc::clone(shell));
+        }
+        state
+            .workspaces
+            .insert(workspace_id, Arc::clone(&workspace));
+        drop(state);
+        workspace.snapshot(self)
+    }
+
+    fn create_shell(&self, workspace_id: &str, spec: ShellSpec) -> io::Result<ShellSnapshot> {
+        let workspace = self.workspace(workspace_id)?;
+        let shell = create_pending_shell(workspace_id, spec)?;
+        let snapshot = shell.snapshot()?;
+        let mut state = lock(&self.state)?;
+        let Some(current) = state.workspaces.get(workspace_id) else {
+            return Err(not_found("workspace", workspace_id));
+        };
+        if !Arc::ptr_eq(current, &workspace) {
+            return Err(not_found("workspace", workspace_id));
+        }
+        let mut shell_ids = lock(&workspace.shell_ids)?;
+        if shell_ids.iter().any(|id| {
+            state
+                .shells
+                .get(id)
+                .and_then(|existing| existing.name.lock().ok())
+                .is_some_and(|name| *name == snapshot.name)
+        }) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("shell name already exists: {}", snapshot.name),
+            ));
+        }
+        state.shells.insert(shell.id.clone(), Arc::clone(&shell));
+        shell_ids.push(shell.id.clone());
+        Ok(snapshot)
+    }
+
+    fn create_shell_with_workspace(&self, spec: ShellSpec) -> io::Result<ShellSnapshot> {
+        let default_cwd = spec.cwd.clone();
+        loop {
+            let name = self.next_workspace_name()?;
+            match self.create_workspace(name, Some(default_cwd.clone()), vec![spec.clone()]) {
+                Ok(workspace) => {
+                    return workspace
+                        .shells
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| io::Error::other("implicit workspace has no shell"));
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn create_launcher(
+        &self,
+        workspace_id: &str,
+        spec: WorkspaceLauncherSpec,
+    ) -> io::Result<WorkspaceLauncherSnapshot> {
+        validate_name(&spec.name)?;
+        validate_cwd(&spec.cwd)?;
+        validate_launcher_command(&spec.command)?;
+        let workspace = self.workspace(workspace_id)?;
+        let launcher = Arc::new(WorkspaceLauncher {
+            id: Uuid::new_v4().to_string(),
+            workspace_id: workspace_id.into(),
+            name: Mutex::new(spec.name),
+            cwd: spec.cwd,
+            command: spec.command,
+        });
+        let snapshot = launcher.snapshot()?;
+        let mut state = lock(&self.state)?;
+        let Some(current) = state.workspaces.get(workspace_id) else {
+            return Err(not_found("workspace", workspace_id));
+        };
+        if !Arc::ptr_eq(current, &workspace) {
+            return Err(not_found("workspace", workspace_id));
+        }
+        let mut launcher_ids = lock(&workspace.launcher_ids)?;
+        if launcher_ids.iter().any(|id| {
+            state
+                .launchers
+                .get(id)
+                .and_then(|existing| existing.name.lock().ok())
+                .is_some_and(|name| *name == snapshot.name)
+        }) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("workspace launcher name already exists: {}", snapshot.name),
+            ));
+        }
+        state
+            .launchers
+            .insert(launcher.id.clone(), Arc::clone(&launcher));
+        launcher_ids.push(launcher.id.clone());
+        Ok(snapshot)
+    }
+
+    fn next_workspace_name(&self) -> io::Result<String> {
+        let state = lock(&self.state)?;
+        let mut suffix = 1_u64;
+        loop {
+            let candidate = format!("workspace-{suffix}");
+            let exists = state
+                .workspaces
+                .values()
+                .any(|workspace| workspace.name.lock().is_ok_and(|name| *name == candidate));
+            if !exists {
+                return Ok(candidate);
+            }
+            suffix = suffix
+                .checked_add(1)
+                .ok_or_else(|| io::Error::other("workspace name space exhausted"))?;
+        }
+    }
+
+    fn rename_shell(&self, shell_id: &str, name: String) -> io::Result<()> {
+        validate_name(&name)?;
+        let shell = self.shell(shell_id)?;
+        let workspace = self.workspace(&shell.workspace_id)?;
+        let state = lock(&self.state)?;
+        let shell_ids = lock(&workspace.shell_ids)?;
+        if shell_ids
+            .iter()
+            .filter(|id| id.as_str() != shell_id)
+            .any(|id| {
+                state
+                    .shells
+                    .get(id)
+                    .and_then(|existing| existing.name.lock().ok())
+                    .is_some_and(|existing| *existing == name)
+            })
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("shell name already exists: {name}"),
+            ));
+        }
+        *lock(&shell.name)? = name;
+        Ok(())
+    }
+
+    fn rename_launcher(&self, launcher_id: &str, name: String) -> io::Result<()> {
+        validate_name(&name)?;
+        let launcher = self.launcher(launcher_id)?;
+        let workspace = self.workspace(&launcher.workspace_id)?;
+        let state = lock(&self.state)?;
+        let launcher_ids = lock(&workspace.launcher_ids)?;
+        if launcher_ids
+            .iter()
+            .filter(|id| id.as_str() != launcher_id)
+            .any(|id| {
+                state
+                    .launchers
+                    .get(id)
+                    .and_then(|existing| existing.name.lock().ok())
+                    .is_some_and(|existing| *existing == name)
+            })
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("workspace launcher name already exists: {name}"),
+            ));
+        }
+        *lock(&launcher.name)? = name;
+        Ok(())
+    }
+
+    fn rename_workspace(&self, workspace_id: &str, name: String) -> io::Result<String> {
+        validate_name(&name)?;
+        let workspace = self.workspace(workspace_id)?;
+        let state = lock(&self.state)?;
+        for current in state.workspaces.values() {
+            if !Arc::ptr_eq(current, &workspace) && *lock(&current.name)? == name {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("workspace name already exists: {name}"),
+                ));
+            }
+        }
+        *lock(&workspace.name)? = name.clone();
+        Ok(name)
+    }
+
+    fn register_agent(
+        &self,
+        shell_id: &str,
+        run_id: &str,
+        spec: AgentRegistrationSpec,
+    ) -> io::Result<AgentInstanceSnapshot> {
+        validate_agent_registration(&spec)?;
+        validate_external_agent_authority(spec.report.authority)?;
+        let shell = self.shell(shell_id)?;
+        let workspace = self.workspace(&shell.workspace_id)?;
+        let started_at_ms = unix_time_ms();
+        let ended_at_ms = (spec.report.state == AgentState::Done).then_some(started_at_ms);
+        let agent = Arc::new(AgentInstance {
+            id: Uuid::new_v4().to_string(),
+            workspace_id: shell.workspace_id.clone(),
+            shell_id: shell.id.clone(),
+            run_id: run_id.into(),
+            name: spec.name,
+            integration: spec.integration,
+            external_session_id: spec.external_session_id,
+            cwd: Some(shell.cwd.clone()),
+            started_at_ms,
+            state: Mutex::new(AgentInstanceState {
+                ended_at_ms,
+                observation: AgentObservationSnapshot {
+                    revision: 1,
+                    state: spec.report.state,
+                    authority: spec.report.authority,
+                    evidence: spec.report.evidence,
+                    confidence: spec.report.confidence,
+                    observed_at_ms: started_at_ms,
+                },
+                attention: None,
+            }),
+        });
+        {
+            let mut agent_state = lock(&agent.state)?;
+            agent_state.attention = attention_for_observation(&agent_state.observation);
+        }
+        let snapshot = agent.snapshot()?;
+        let mut state = lock(&self.state)?;
+        let Some(current_shell) = state.shells.get(shell_id) else {
+            return Err(not_found("shell", shell_id));
+        };
+        let Some(current_workspace) = state.workspaces.get(&shell.workspace_id) else {
+            return Err(not_found("workspace", &shell.workspace_id));
+        };
+        if !Arc::ptr_eq(current_shell, &shell) || !Arc::ptr_eq(current_workspace, &workspace) {
+            return Err(not_found("shell", shell_id));
+        }
+        let lifecycle = lock(&shell.lifecycle)?;
+        match &*lifecycle {
+            ShellLifecycle::Running { run, .. } if run.id == run_id => {}
+            ShellLifecycle::Running { .. }
+            | ShellLifecycle::Exited { .. }
+            | ShellLifecycle::Pending => {
+                return Err(coded_error(
+                    ErrorCode::RunChanged,
+                    "shell does not have the requested active run",
+                ));
+            }
+            ShellLifecycle::Closed => return Err(not_found("shell", shell_id)),
+        }
+        state.agents.insert(agent.id.clone(), Arc::clone(&agent));
+        lock(&workspace.agent_ids)?.push(agent.id.clone());
+        Ok(snapshot)
+    }
+
+    fn ensure_agent(
+        &self,
+        shell_id: &str,
+        run_id: &str,
+        spec: AgentRegistrationSpec,
+    ) -> io::Result<(AgentInstanceSnapshot, bool)> {
+        validate_agent_registration(&spec)?;
+        validate_external_agent_authority(spec.report.authority)?;
+        let external_session_id = spec.external_session_id.as_deref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "agent external_session_id is required for ensure",
+            )
+        })?;
+        let matches = {
+            let state = lock(&self.state)?;
+            state
+                .agents
+                .values()
+                .filter(|agent| {
+                    agent.integration == spec.integration
+                        && agent.external_session_id.as_deref() == Some(external_session_id)
+                        && agent.shell_id == shell_id
+                        && agent.run_id == run_id
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let existing = match matches.as_slice() {
+            [] => None,
+            [agent] => Some(Arc::clone(agent)),
+            agents => {
+                let mut active = Vec::new();
+                for agent in agents {
+                    if lock(&agent.state)?.ended_at_ms.is_none() {
+                        active.push(Arc::clone(agent));
+                    }
+                }
+                match active.as_slice() {
+                    [agent] => Some(Arc::clone(agent)),
+                    _ => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::AlreadyExists,
+                            "multiple agent instances match the ensured identity",
+                        ));
+                    }
+                }
+            }
+        };
+        if let Some(agent) = existing {
+            return Ok((agent.snapshot()?, false));
+        }
+        self.register_agent(shell_id, run_id, spec)
+            .map(|agent| (agent, true))
+    }
+
+    fn report_agent(
+        &self,
+        agent_id: &str,
+        run_id: &str,
+        report: AgentReport,
+    ) -> io::Result<(AgentInstanceSnapshot, bool, bool)> {
+        validate_agent_report(&report)?;
+        validate_external_agent_authority(report.authority)?;
+        let agent = self.agent(agent_id)?;
+        if agent.run_id != run_id {
+            return Err(coded_error(
+                ErrorCode::RunChanged,
+                "agent instance is bound to a different shell run",
+            ));
+        }
+        let mut state = lock(&agent.state)?;
+        if state.ended_at_ms.is_some() {
+            if observation_matches_report(&state.observation, &report) {
+                drop(state);
+                return Ok((agent.snapshot()?, false, true));
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "completed agent instance cannot be reported again",
+            ));
+        }
+        let repeated_working = state.observation.state == AgentState::Working
+            && report.state == AgentState::Working
+            && state.observation.authority == report.authority
+            && state.observation.confidence == report.confidence;
+        if observation_matches_report(&state.observation, &report)
+            || repeated_working
+            || agent_authority_rank(report.authority)
+                < agent_authority_rank(state.observation.authority)
+        {
+            drop(state);
+            return Ok((agent.snapshot()?, false, false));
+        }
+        let revision = state
+            .observation
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("agent observation revision exhausted"))?;
+        let observed_at_ms = unix_time_ms()
+            .max(agent.started_at_ms)
+            .max(state.observation.observed_at_ms);
+        let completed = report.state == AgentState::Done;
+        state.observation = AgentObservationSnapshot {
+            revision,
+            state: report.state,
+            authority: report.authority,
+            evidence: report.evidence,
+            confidence: report.confidence,
+            observed_at_ms,
+        };
+        if let Some(attention) = attention_for_observation(&state.observation) {
+            state.attention = Some(attention);
+        }
+        if completed {
+            state.ended_at_ms = Some(observed_at_ms);
+        }
+        drop(state);
+        Ok((agent.snapshot()?, true, completed))
+    }
+
+    fn acknowledge_agent_attention(
+        &self,
+        agent_id: &str,
+        observation_revision: u64,
+    ) -> io::Result<(AgentInstanceSnapshot, bool)> {
+        let agent = self.agent(agent_id)?;
+        let mut state = lock(&agent.state)?;
+        let Some(attention) = &state.attention else {
+            drop(state);
+            return Ok((agent.snapshot()?, false));
+        };
+        if attention.observation.revision != observation_revision {
+            return Err(coded_error(
+                ErrorCode::RevisionAhead,
+                format!(
+                    "agent attention observation revision is {}; acknowledgment supplied {}",
+                    attention.observation.revision, observation_revision
+                ),
+            ));
+        }
+        state.attention = None;
+        drop(state);
+        Ok((agent.snapshot()?, true))
+    }
+
+    fn remove_launcher(&self, launcher_id: &str) -> io::Result<Arc<WorkspaceLauncher>> {
+        let mut state = lock(&self.state)?;
+        let launcher = state
+            .launchers
+            .remove(launcher_id)
+            .ok_or_else(|| not_found("workspace launcher", launcher_id))?;
+        if let Some(workspace) = state.workspaces.get(&launcher.workspace_id) {
+            lock(&workspace.launcher_ids)?.retain(|id| id != launcher_id);
+        }
+        Ok(launcher)
+    }
+
+    fn remove_shell(&self, shell_id: &str) -> io::Result<Arc<Shell>> {
+        let mut state = lock(&self.state)?;
+        let shell = state
+            .shells
+            .remove(shell_id)
+            .ok_or_else(|| not_found("shell", shell_id))?;
+        if let Some(workspace) = state.workspaces.get(&shell.workspace_id) {
+            lock(&workspace.shell_ids)?.retain(|id| id != shell_id);
+        }
+        Ok(shell)
+    }
+
+    fn workspace_shells(&self, workspace: &Arc<Workspace>) -> io::Result<Vec<Arc<Shell>>> {
+        let state = lock(&self.state)?;
+        let Some(current) = state.workspaces.get(&workspace.id) else {
+            return Err(not_found("workspace", &workspace.id));
+        };
+        if !Arc::ptr_eq(current, workspace) {
+            return Err(not_found("workspace", &workspace.id));
+        }
+        Ok(lock(&workspace.shell_ids)?
+            .iter()
+            .filter_map(|id| state.shells.get(id).cloned())
+            .collect())
+    }
+
+    fn remove_workspace(&self, workspace_id: &str) -> io::Result<Vec<Arc<Shell>>> {
+        let mut state = lock(&self.state)?;
+        let workspace = state
+            .workspaces
+            .remove(workspace_id)
+            .ok_or_else(|| not_found("workspace", workspace_id))?;
+        for id in lock(&workspace.launcher_ids)?.iter() {
+            state.launchers.remove(id);
+        }
+        for id in lock(&workspace.agent_ids)?.iter() {
+            state.agents.remove(id);
+        }
+        let ids = lock(&workspace.shell_ids)?.clone();
+        Ok(ids
+            .into_iter()
+            .filter_map(|id| state.shells.remove(&id))
+            .collect())
+    }
+
+    fn clear(&self) -> io::Result<()> {
+        let mut state = lock(&self.state)?;
+        state.workspaces.clear();
+        state.shells.clear();
+        state.launchers.clear();
+        state.agents.clear();
+        Ok(())
+    }
+
+    fn backup(&self) -> io::Result<DurableBackup> {
+        let state = lock(&self.state)?;
+        let mut workspace_names = HashMap::new();
+        let mut workspace_shell_ids = HashMap::new();
+        let mut workspace_launcher_ids = HashMap::new();
+        let mut workspace_agent_ids = HashMap::new();
+        for workspace in state.workspaces.values() {
+            workspace_names.insert(workspace.id.clone(), lock(&workspace.name)?.clone());
+            workspace_shell_ids.insert(workspace.id.clone(), lock(&workspace.shell_ids)?.clone());
+            workspace_launcher_ids
+                .insert(workspace.id.clone(), lock(&workspace.launcher_ids)?.clone());
+            workspace_agent_ids.insert(workspace.id.clone(), lock(&workspace.agent_ids)?.clone());
+        }
+        let mut shell_names = HashMap::new();
+        for shell in state.shells.values() {
+            shell_names.insert(shell.id.clone(), lock(&shell.name)?.clone());
+        }
+        let mut launcher_names = HashMap::new();
+        for launcher in state.launchers.values() {
+            launcher_names.insert(launcher.id.clone(), lock(&launcher.name)?.clone());
+        }
+        let mut agent_states = HashMap::new();
+        for agent in state.agents.values() {
+            agent_states.insert(agent.id.clone(), lock(&agent.state)?.clone());
+        }
+        Ok(DurableBackup {
+            workspaces: state.workspaces.clone(),
+            shells: state.shells.clone(),
+            launchers: state.launchers.clone(),
+            agents: state.agents.clone(),
+            workspace_names,
+            workspace_shell_ids,
+            workspace_launcher_ids,
+            workspace_agent_ids,
+            shell_names,
+            launcher_names,
+            agent_states,
+        })
+    }
+
+    fn restore_backup(&self, backup: DurableBackup) -> io::Result<()> {
+        let mut state = lock(&self.state)?;
+        for workspace in backup.workspaces.values() {
+            if let Some(name) = backup.workspace_names.get(&workspace.id) {
+                *lock(&workspace.name)? = name.clone();
+            }
+            if let Some(ids) = backup.workspace_shell_ids.get(&workspace.id) {
+                *lock(&workspace.shell_ids)? = ids.clone();
+            }
+            if let Some(ids) = backup.workspace_launcher_ids.get(&workspace.id) {
+                *lock(&workspace.launcher_ids)? = ids.clone();
+            }
+            if let Some(ids) = backup.workspace_agent_ids.get(&workspace.id) {
+                *lock(&workspace.agent_ids)? = ids.clone();
+            }
+        }
+        for shell in backup.shells.values() {
+            if let Some(name) = backup.shell_names.get(&shell.id) {
+                *lock(&shell.name)? = name.clone();
+            }
+        }
+        for launcher in backup.launchers.values() {
+            if let Some(name) = backup.launcher_names.get(&launcher.id) {
+                *lock(&launcher.name)? = name.clone();
+            }
+        }
+        for agent in backup.agents.values() {
+            if let Some(agent_state) = backup.agent_states.get(&agent.id) {
+                *lock(&agent.state)? = agent_state.clone();
+            }
+        }
+        state.workspaces = backup.workspaces;
+        state.shells = backup.shells;
+        state.launchers = backup.launchers;
+        state.agents = backup.agents;
+        Ok(())
+    }
+
+    fn state_lock_descriptor(&self) -> io::Result<BorrowedFd<'_>> {
+        self.store
+            .as_ref()
+            .ok_or_else(|| io::Error::other("registry has no persistent state store"))?
+            .lock_descriptor()
+    }
+
+    fn mark_persistence_dirty(&self) {
+        self.persistence_revision.fetch_add(1, Ordering::AcqRel);
+        self.persistence_dirty.store(true, Ordering::Release);
+    }
+
+    fn snapshot(&self, focused_terminal: Option<FocusedTerminalSnapshot>) -> io::Result<Snapshot> {
+        let mut workspaces: Vec<_> = lock(&self.state)?.workspaces.values().cloned().collect();
+        workspaces.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(Snapshot {
+            workspaces: workspaces
+                .into_iter()
+                .map(|workspace| workspace.snapshot(self))
+                .collect::<io::Result<_>>()?,
+            focused_terminal,
+        })
+    }
+
+    fn shells(&self) -> io::Result<Vec<Arc<Shell>>> {
+        Ok(lock(&self.state)?.shells.values().cloned().collect())
+    }
+
+    fn capture_persisted_state(&self) -> io::Result<PersistenceGeneration> {
+        let state = lock(&self.state)?;
+        let mut workspaces = state.workspaces.values().cloned().collect::<Vec<_>>();
+        workspaces.sort_by(|left, right| left.id.cmp(&right.id));
+        let mut saved = PersistedState::default();
+        for workspace in workspaces {
+            let ids = lock(&workspace.shell_ids)?.clone();
+            let mut shells = Vec::with_capacity(ids.len());
+            for id in ids {
+                let Some(shell) = state.shells.get(&id) else {
+                    continue;
+                };
+                shells.push(PersistedShell {
+                    id: shell.id.clone(),
+                    name: lock(&shell.name)?.clone(),
+                    cwd: shell.cwd.clone(),
+                    command: shell.command.clone(),
+                    last_run: lock(&shell.last_run)?.clone(),
+                });
+            }
+            let ids = lock(&workspace.launcher_ids)?.clone();
+            let mut launchers = Vec::with_capacity(ids.len());
+            for id in ids {
+                let Some(launcher) = state.launchers.get(&id) else {
+                    continue;
+                };
+                launchers.push(PersistedWorkspaceLauncher {
+                    id: launcher.id.clone(),
+                    name: lock(&launcher.name)?.clone(),
+                    cwd: launcher.cwd.clone(),
+                    command: launcher.command.clone(),
+                });
+            }
+            let ids = lock(&workspace.agent_ids)?.clone();
+            let mut agents = Vec::with_capacity(ids.len());
+            for id in ids {
+                let Some(agent) = state.agents.get(&id) else {
+                    continue;
+                };
+                agents.push(agent.persisted()?);
+            }
+            saved.workspaces.push(PersistedWorkspace {
+                id: workspace.id.clone(),
+                name: lock(&workspace.name)?.clone(),
+                default_cwd: workspace.default_cwd.clone(),
+                shells,
+                launchers,
+                agents,
+            });
+        }
+        Ok(PersistenceGeneration {
+            revision: self.persistence_revision.load(Ordering::Acquire),
+            state: saved,
+        })
+    }
+
+    fn write_persisted_state(&self, generation: PersistenceGeneration) -> io::Result<()> {
+        let Some(writer) = &self.persistence_writer else {
+            return Ok(());
+        };
+        let revision = generation.revision;
+        let result = writer.save(generation);
+        if result.is_err() {
+            self.persistence_dirty.store(true, Ordering::Release);
+        } else if self.persistence_revision.load(Ordering::Acquire) == revision {
+            self.persistence_dirty.store(false, Ordering::Release);
+        }
+        result
+    }
+}
+
+impl ShellRuntimeManager {
+    fn is_stopping(&self) -> bool {
+        self.stopping.load(Ordering::Acquire)
+    }
+
+    fn begin_stopping(&self) -> bool {
+        !self.stopping.swap(true, Ordering::AcqRel)
+    }
+
+    fn cancel_stopping(&self) {
+        self.stopping.store(false, Ordering::Release);
+    }
+
+    fn focused_terminal(&self) -> io::Result<Option<FocusedTerminalSnapshot>> {
+        Ok(lock(&self.focus)?.focused_terminal.clone())
+    }
+
+    fn record_focus_gained(
+        &self,
+        workspace_id: String,
+        shell_id: String,
+        run_id: String,
+    ) -> io::Result<()> {
+        let mut focus = lock(&self.focus)?;
+        let revision = focus
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("focused terminal revision exhausted"))?;
+        focus.revision = revision;
+        focus.focused_terminal = Some(FocusedTerminalSnapshot {
+            revision,
+            workspace_id,
+            shell_id,
+            run_id,
+        });
+        Ok(())
+    }
+
+    fn import_focused_terminal(
+        &self,
+        focused_terminal: FocusedTerminalSnapshot,
+        current: bool,
+    ) -> io::Result<()> {
+        let mut focus = lock(&self.focus)?;
+        if focused_terminal.revision >= focus.revision {
+            focus.revision = focused_terminal.revision;
+            focus.focused_terminal = current.then_some(focused_terminal);
+        }
+        Ok(())
+    }
+
+    fn notify_output_waiters(&self, shells: &[Arc<Shell>]) {
+        for shell in shells {
+            if let Ok(lifecycle) = shell.lifecycle.lock()
+                && let ShellLifecycle::Running { runtime, .. } = &*lifecycle
+            {
+                let _wait = runtime.output_wait.lock();
+                runtime.output_changed.notify_all();
+            }
+        }
+    }
+
+    fn read_shell(&self, shell: &Shell, max_bytes: usize) -> io::Result<Vec<u8>> {
+        let lifecycle = lock(&shell.lifecycle)?;
+        let terminal = match &*lifecycle {
+            ShellLifecycle::Pending => return Ok(Vec::new()),
+            ShellLifecycle::Running { runtime, .. } => Arc::clone(&runtime.terminal),
+            ShellLifecycle::Exited { terminal, .. } => Arc::clone(terminal),
+            ShellLifecycle::Closed => return Err(not_found("shell", &shell.id)),
+        };
+        drop(lifecycle);
+        let max_bytes = max_bytes.min(MAX_SHELL_READ_BYTES);
+        let snapshot = lock(&terminal)?.snapshot();
+        Ok(snapshot.plain_text_suffix(max_bytes).into_bytes())
+    }
+
+    fn foreground_process(
+        shell: &Shell,
+        runtime: &ShellRuntime,
+        run: &ShellRunSnapshot,
+    ) -> io::Result<Option<String>> {
+        let mut cache = lock(&shell.foreground_process_cache)?;
+        if let Some((cached_run_id, observed_at, process)) = cache.as_ref()
+            && cached_run_id == &run.id
+            && observed_at.elapsed() < FOREGROUND_PROCESS_CACHE_INTERVAL
+        {
+            return Ok(process.clone());
+        }
+        let process = lock(&runtime.master)
+            .ok()
+            .and_then(|master| master.foreground_process())
+            .or_else(|| {
+                let pid = lock(&runtime.process).ok()?.process_id()?;
+                foreground_process_for_session_leader(pid)
+            });
+        *cache = Some((run.id.clone(), Instant::now(), process.clone()));
+        Ok(process)
+    }
+
+    fn read_shell_preview(
+        &self,
+        shell: &Shell,
+        max_bytes: usize,
+        max_lines: u16,
+    ) -> io::Result<TerminalPreview> {
+        let lifecycle = lock(&shell.lifecycle)?;
+        let terminal = match &*lifecycle {
+            ShellLifecycle::Pending => return Ok(TerminalPreview::default()),
+            ShellLifecycle::Running { runtime, .. } => Arc::clone(&runtime.terminal),
+            ShellLifecycle::Exited { terminal, .. } => Arc::clone(terminal),
+            ShellLifecycle::Closed => return Err(not_found("shell", &shell.id)),
+        };
+        drop(lifecycle);
+        let snapshot = lock(&terminal)?.snapshot();
+        Ok(snapshot.preview(
+            max_bytes.min(MAX_SHELL_READ_BYTES),
+            usize::from(max_lines).min(MAX_TERMINAL_PREVIEW_LINES),
+            MAX_TERMINAL_PREVIEW_SPANS,
+        ))
+    }
+
+    fn read_shell_at(
+        &self,
+        service: &DaemonService,
+        shell_id: &str,
+        max_bytes: usize,
+        expected_run_id: Option<&str>,
+        after_revision: Option<u64>,
+        wait_ms: u32,
+    ) -> io::Result<Response> {
+        if expected_run_id.is_some() != after_revision.is_some() {
+            return Err(coded_error(
+                ErrorCode::InvalidArgument,
+                "run_id and after_revision must be provided together",
+            ));
+        }
+        let deadline =
+            Instant::now() + Duration::from_millis(u64::from(wait_ms)).min(MAX_EVENT_WAIT);
+        loop {
+            let shell = service.shell(shell_id)?;
+            let lifecycle = lock(&shell.lifecycle)?;
+            let (status, run, runtime, terminal) = match &*lifecycle {
+                ShellLifecycle::Pending => {
+                    if expected_run_id.is_some() {
+                        return Err(coded_error(
+                            ErrorCode::RunChanged,
+                            "shell no longer has the requested run",
+                        ));
+                    }
+                    return Ok(Response::OutputState {
+                        bytes: Vec::new(),
+                        run_id: None,
+                        output_revision: None,
+                        changed: true,
+                        status: ShellStatus::Pending,
+                    });
+                }
+                ShellLifecycle::Running { run, runtime, .. } => (
+                    ShellStatus::Running,
+                    Arc::clone(run),
+                    Some(Arc::clone(runtime)),
+                    Arc::clone(&runtime.terminal),
+                ),
+                ShellLifecycle::Exited {
+                    code,
+                    run,
+                    terminal,
+                    ..
+                } => (
+                    ShellStatus::Exited { code: *code },
+                    Arc::clone(run),
+                    None,
+                    Arc::clone(terminal),
+                ),
+                ShellLifecycle::Closed => return Err(not_found("shell", shell_id)),
+            };
+            drop(lifecycle);
+            let terminal_state = lock(&terminal)?;
+            let revision = run.output_revision.load(Ordering::Acquire);
+            let changed = after_revision.is_none_or(|after| after < revision);
+            let snapshot = if changed || after_revision.is_none() {
+                Some(terminal_state.snapshot())
+            } else {
+                None
+            };
+            drop(terminal_state);
+            let bytes = snapshot.map_or_else(Vec::new, |snapshot| {
+                snapshot
+                    .plain_text_suffix(max_bytes.min(MAX_SHELL_READ_BYTES))
+                    .into_bytes()
+            });
+            let lifecycle = lock(&shell.lifecycle)?;
+            let observation_is_current = match (&*lifecycle, &status) {
+                (
+                    ShellLifecycle::Running {
+                        run: current_run,
+                        runtime,
+                        ..
+                    },
+                    ShellStatus::Running,
+                ) => Arc::ptr_eq(current_run, &run) && Arc::ptr_eq(&runtime.terminal, &terminal),
+                (
+                    ShellLifecycle::Exited {
+                        code,
+                        run: current_run,
+                        terminal: current_terminal,
+                        ..
+                    },
+                    ShellStatus::Exited { code: current_code },
+                ) => {
+                    code == current_code
+                        && Arc::ptr_eq(current_run, &run)
+                        && Arc::ptr_eq(current_terminal, &terminal)
+                }
+                _ => false,
+            };
+            drop(lifecycle);
+            if !observation_is_current {
+                continue;
+            }
+            if expected_run_id.is_some_and(|expected| expected != run.id) {
+                return Err(coded_error(
+                    ErrorCode::RunChanged,
+                    "shell run identity changed",
+                ));
+            }
+            if after_revision.is_some_and(|after| after > revision) {
+                return Err(coded_error(
+                    ErrorCode::RevisionAhead,
+                    "requested output revision is ahead of the current run",
+                ));
+            }
+            if changed || !matches!(status, ShellStatus::Running) || wait_ms == 0 {
+                return Ok(Response::OutputState {
+                    bytes,
+                    run_id: Some(run.id.clone()),
+                    output_revision: Some(revision),
+                    changed,
+                    status,
+                });
+            }
+            if Instant::now() >= deadline {
+                return Ok(Response::OutputState {
+                    bytes: Vec::new(),
+                    run_id: Some(run.id.clone()),
+                    output_revision: Some(revision),
+                    changed: false,
+                    status,
+                });
+            }
+            if self.is_stopping() {
+                return Err(coded_error(
+                    ErrorCode::DaemonStopping,
+                    "Boomux daemon is stopping",
+                ));
+            }
+            let runtime = runtime.expect("running shell has a runtime");
+            let wait = lock(&runtime.output_wait)?;
+            if self.is_stopping() {
+                return Err(coded_error(
+                    ErrorCode::DaemonStopping,
+                    "Boomux daemon is stopping",
+                ));
+            }
+            if run.output_revision.load(Ordering::Acquire) != revision {
+                continue;
+            }
+            let timeout = deadline.saturating_duration_since(Instant::now());
+            let _ = runtime
+                .output_changed
+                .wait_timeout(wait, timeout)
+                .map_err(|_| io::Error::other("shell output wait lock poisoned"))?;
+        }
+    }
+
+    fn stop_runtime(&self, shell: &Shell) -> Result<(), StopRuntimeError> {
+        let runtime = {
+            let lifecycle = lock(&shell.lifecycle)?;
+            match &*lifecycle {
+                ShellLifecycle::Pending => return Ok(()),
+                ShellLifecycle::Running { runtime, .. } => Some(Arc::clone(runtime)),
+                ShellLifecycle::Exited { runtime, .. } => runtime.clone(),
+                ShellLifecycle::Closed => return Ok(()),
+            }
+        };
+        let Some(runtime) = runtime else {
+            return Ok(());
+        };
+        if let Some(controller) = lock(&runtime.controller)?.take() {
+            let _ = controller.connection.shutdown(std::net::Shutdown::Both);
+        }
+        self.pause_reader(&runtime)?;
+        let result = (|| {
+            let mut process = lock(&runtime.process)?;
+            let exited = process.try_wait_code()?.is_some();
+            let child_pid = process.process_id().map(|pid| pid as libc::pid_t);
+            if let Some(session_id) = child_pid {
+                signal_session(session_id, libc::SIGHUP);
+            }
+            thread::sleep(SHUTDOWN_GRACE);
+            if let Some(session_id) = child_pid {
+                signal_session(session_id, libc::SIGTERM);
+            }
+            let kill_result = if exited { Ok(()) } else { process.kill() };
+            thread::sleep(SHUTDOWN_GRACE);
+            if let Some(session_id) = child_pid {
+                signal_session(session_id, libc::SIGKILL);
+            }
+            let wait_result = if exited { Ok(()) } else { process.wait() };
+            match (kill_result, wait_result) {
+                (_, Ok(())) => Ok(()),
+                (Err(error), Err(_)) => Err(error),
+                (Ok(()), Err(error)) => Err(error),
+            }
+        })();
+        if let Err(error) = result {
+            self.resume_reader(&runtime)?;
+            return Err(error.into());
+        }
+        if let Some(session_id) = lock(&runtime.process)?.process_id()
+            && let Err(source) = wait_for_session_descendants(session_id as libc::pid_t)
+        {
+            let _ = self.stop_reader(&runtime);
+            return Err(StopRuntimeError {
+                source,
+                stopped: true,
+            });
+        }
+        if let Err(source) = self.stop_reader(&runtime) {
+            return Err(StopRuntimeError {
+                source,
+                stopped: true,
+            });
+        }
+        Ok(())
+    }
+
+    fn finalize_stop(&self, shell: &Shell) -> io::Result<StopRollback> {
+        let mut lifecycle = lock(&shell.lifecycle)?;
+        let previous = std::mem::replace(&mut *lifecycle, ShellLifecycle::Closed);
+        match previous {
+            ShellLifecycle::Pending => Ok(StopRollback {
+                lifecycle: ShellLifecycle::Pending,
+                event: None,
+            }),
+            ShellLifecycle::Running {
+                profile,
+                run,
+                runtime,
+            } => {
+                run.finish(ShellRunExitReason::Terminated)?;
+                *lock(&shell.last_run)? = Some(run.persisted(profile.clone())?);
+                let _wait = lock(&runtime.output_wait)?;
+                runtime.output_changed.notify_all();
+                Ok(StopRollback {
+                    lifecycle: ShellLifecycle::Pending,
+                    event: Some(DaemonEventKind::RunExited {
+                        workspace_id: shell.workspace_id.clone(),
+                        shell_id: shell.id.clone(),
+                        run: run.snapshot()?,
+                    }),
+                })
+            }
+            ShellLifecycle::Exited {
+                profile,
+                run,
+                code,
+                runtime,
+                terminal,
+            } => {
+                *lock(&shell.last_run)? = Some(run.persisted(profile.clone())?);
+                Ok(StopRollback {
+                    lifecycle: ShellLifecycle::Exited {
+                        code,
+                        profile,
+                        run,
+                        runtime,
+                        terminal,
+                    },
+                    event: None,
+                })
+            }
+            ShellLifecycle::Closed => Ok(StopRollback {
+                lifecycle: ShellLifecycle::Closed,
+                event: None,
+            }),
+        }
+    }
+
+    fn finalize_run_exit(
+        &self,
+        shell: &Shell,
+        run: &Arc<ShellRun>,
+        runtime: &Arc<ShellRuntime>,
+        code: Option<u32>,
+    ) -> io::Result<Option<DaemonEventKind>> {
+        let mut lifecycle = lock(&shell.lifecycle)?;
+        let profile = match &*lifecycle {
+            ShellLifecycle::Running {
+                profile,
+                run: current_run,
+                runtime: current_runtime,
+            } if Arc::ptr_eq(current_run, run) && Arc::ptr_eq(current_runtime, runtime) => {
+                profile.clone()
+            }
+            _ => return Ok(None),
+        };
+        run.finish(ShellRunExitReason::Exited { code })?;
+        *lock(&shell.last_run)? = Some(run.persisted(profile.clone())?);
+        *lifecycle = ShellLifecycle::Exited {
+            code,
+            profile,
+            run: Arc::clone(run),
+            runtime: Some(Arc::clone(runtime)),
+            terminal: Arc::clone(&runtime.terminal),
+        };
+        drop(lifecycle);
+        let _wait = lock(&runtime.output_wait)?;
+        runtime.output_changed.notify_all();
+        drop(_wait);
+        Ok(Some(DaemonEventKind::RunExited {
+            workspace_id: shell.workspace_id.clone(),
+            shell_id: shell.id.clone(),
+            run: run.snapshot()?,
+        }))
+    }
+
+    fn restore_stopped(&self, shell: &Shell, rollback: StopRollback) -> io::Result<()> {
+        let mut lifecycle = lock(&shell.lifecycle)?;
+        if matches!(*lifecycle, ShellLifecycle::Closed) {
+            *lifecycle = rollback.lifecycle;
+        }
+        Ok(())
+    }
+
+    fn compensate_stopped(&self, shell: &Shell) -> io::Result<Option<DaemonEventKind>> {
+        let rollback = self.finalize_stop(shell)?;
+        let event = rollback.event.clone();
+        self.restore_stopped(shell, rollback)?;
+        Ok(event)
+    }
+
+    fn reset_pending(&self, shell: &Shell) -> io::Result<()> {
+        let mut lifecycle = lock(&shell.lifecycle)?;
+        if matches!(*lifecycle, ShellLifecycle::Closed) {
+            *lifecycle = ShellLifecycle::Pending;
+        }
+        Ok(())
+    }
+
+    fn kill(&self, shell: &Shell) -> io::Result<()> {
+        match self.stop_runtime(shell) {
+            Ok(()) => {
+                let _ = self.finalize_stop(shell)?;
+                Ok(())
+            }
+            Err(error) => {
+                if error.stopped {
+                    let _ = self.finalize_stop(shell)?;
+                }
+                Err(error.source)
+            }
+        }
+    }
+
+    fn pause_reader(&self, runtime: &ShellRuntime) -> io::Result<()> {
+        if let Some(reader) = lock(&runtime.reader)?.as_ref() {
+            reader.pause()?;
+        }
+        Ok(())
+    }
+
+    fn resume_reader(&self, runtime: &ShellRuntime) -> io::Result<()> {
+        if let Some(reader) = lock(&runtime.reader)?.as_ref() {
+            reader.resume()?;
+        }
+        Ok(())
+    }
+
+    fn stop_reader(&self, runtime: &ShellRuntime) -> io::Result<()> {
+        let reader = lock(&runtime.reader)?.take();
+        if let Some(reader) = reader {
+            reader.stop()?;
+        }
+        Ok(())
+    }
+
+    fn release_controller(runtime: &ShellRuntime, token: &str) -> io::Result<()> {
+        let mut controller = lock(&runtime.controller)?;
+        if controller
+            .as_ref()
+            .is_some_and(|current| current.token == token)
+        {
+            controller.take();
+        }
+        Ok(())
+    }
+
+    fn quiesce_controllers(&self, runtimes: &[Arc<ShellRuntime>]) -> io::Result<()> {
+        let mut acknowledgements = Vec::new();
+        for runtime in runtimes {
+            let mut controller = lock(&runtime.controller)?;
+            let Some(current) = controller.as_mut() else {
+                continue;
+            };
+            let (written, write_acknowledged) = mpsc::sync_channel(1);
+            let (client_acknowledge, client_acknowledged) = mpsc::sync_channel(1);
+            current.reconnect_ack = Some(client_acknowledge);
+            match current
+                .output
+                .try_send(ControllerOutput::Reconnect(written))
+            {
+                Ok(()) => acknowledgements.push((write_acknowledged, client_acknowledged)),
+                Err(TrySendError::Disconnected(_)) => {
+                    if let Some(current) = controller.take() {
+                        let _ = current.connection.shutdown(std::net::Shutdown::Both);
+                    }
+                }
+                Err(TrySendError::Full(_)) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "active controller output queue is full",
+                    ));
+                }
+            }
+        }
+
+        for (written, client_acknowledged) in acknowledgements {
+            if !written.recv_timeout(HANDSHAKE_TIMEOUT).unwrap_or(false) {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "active controller did not receive reconnect request",
+                ));
+            }
+            if client_acknowledged.recv_timeout(HANDSHAKE_TIMEOUT).is_err() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "active controller did not acknowledge reconnect request",
+                ));
+            }
+        }
+
+        let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+        while Instant::now() < deadline {
+            let mut active = false;
+            for runtime in runtimes {
+                active |= lock(&runtime.controller)?.is_some();
+            }
+            if !active {
+                return Ok(());
+            }
+            thread::sleep(IO_RETRY_DELAY);
+        }
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "active controllers did not reconnect",
+        ))
+    }
+
+    fn prepare_handoff(&self, shells: Vec<Arc<Shell>>) -> io::Result<PreparedHandoff> {
+        let mut runtimes = Vec::new();
+        for shell in &shells {
+            if let ShellLifecycle::Running { runtime, .. } = &*lock(&shell.lifecycle)? {
+                runtimes.push(Arc::clone(runtime));
+            }
+        }
+        self.quiesce_controllers(&runtimes)?;
+
+        let mut paused = Vec::new();
+        let result = (|| {
+            let mut transfers = Vec::new();
+            let mut exited = Vec::new();
+            for shell in shells {
+                let lifecycle = lock(&shell.lifecycle)?;
+                let (profile, run, runtime) = match &*lifecycle {
+                    ShellLifecycle::Pending => continue,
+                    ShellLifecycle::Running {
+                        profile,
+                        run,
+                        runtime,
+                    } => (profile.clone(), Arc::clone(run), Arc::clone(runtime)),
+                    ShellLifecycle::Exited {
+                        code,
+                        profile,
+                        run,
+                        terminal,
+                        ..
+                    } => {
+                        exited.push(OutgoingExited {
+                            manifest: handoff::ExitedManifest {
+                                shell_id: shell.id.clone(),
+                                run_id: run.id.clone(),
+                                output_revision: run.output_revision.load(Ordering::Acquire),
+                                profile: profile.clone(),
+                                code: *code,
+                            },
+                            reconstruction: lock(terminal)?.reconstruction(),
+                        });
+                        continue;
+                    }
+                    ShellLifecycle::Closed => return Err(not_found("shell", &shell.id)),
+                };
+                self.pause_reader(&runtime)?;
+                paused.push(Arc::clone(&runtime));
+                let (pid, pidfd) = lock(&runtime.process)?.transfer_identity()?;
+                let pty = lock(&runtime.master)?.descriptor.try_clone()?;
+                let reconstruction = lock(&runtime.terminal)?.reconstruction();
+                transfers.push(OutgoingRuntime {
+                    manifest: handoff::RuntimeManifest {
+                        shell_id: shell.id.clone(),
+                        run_id: Some(run.id.clone()),
+                        output_revision: Some(run.output_revision.load(Ordering::Acquire)),
+                        profile,
+                        pid,
+                    },
+                    pty,
+                    pidfd,
+                    reconstruction,
+                });
+            }
+            Ok((transfers, exited))
+        })();
+        match result {
+            Ok((runtimes, exited)) => Ok(PreparedHandoff {
+                runtimes,
+                exited,
+                paused,
+            }),
+            Err(error) => {
+                for runtime in paused {
+                    let _ = self.resume_reader(&runtime);
+                }
+                Err(error)
+            }
+        }
+    }
 }
 
 #[derive(Default)]
-struct RegistryState {
+struct DurableState {
     workspaces: HashMap<String, Arc<Workspace>>,
     shells: HashMap<String, Arc<Shell>>,
     launchers: HashMap<String, Arc<WorkspaceLauncher>>,
     agents: HashMap<String, Arc<AgentInstance>>,
 }
 
-struct RegistryBackup {
+struct DurableBackup {
     workspaces: HashMap<String, Arc<Workspace>>,
     shells: HashMap<String, Arc<Shell>>,
     launchers: HashMap<String, Arc<WorkspaceLauncher>>,
@@ -1376,20 +3044,23 @@ struct RegistryBackup {
     agent_states: HashMap<String, AgentInstanceState>,
 }
 
-impl Default for Registry {
+impl Default for DaemonService {
     fn default() -> Self {
         Self {
-            state: Mutex::new(RegistryState::default()),
-            focus: Mutex::new(FocusState::default()),
-            store: None,
-            persistence_writer: None,
-            events: EventLog::new(),
-            transitions: Mutex::new(TransitionState::default()),
+            durable: DurableRegistry {
+                state: Mutex::new(DurableState::default()),
+                store: None,
+                persistence_writer: None,
+                persist_lock: Mutex::new(()),
+                persistence_dirty: AtomicBool::new(false),
+                persistence_revision: AtomicU64::new(0),
+            },
+            events: EventStream::new(),
+            runtimes: ShellRuntimeManager {
+                focus: Mutex::new(FocusState::default()),
+                stopping: AtomicBool::new(false),
+            },
             mutation_lock: Mutex::new(()),
-            persist_lock: Mutex::new(()),
-            stopping: AtomicBool::new(false),
-            persistence_dirty: AtomicBool::new(false),
-            persistence_revision: AtomicU64::new(0),
             notification_settings: NotificationDeliverySettings::default(),
             notification_sink: Arc::new(DisabledNotificationSink),
         }
@@ -1588,7 +3259,7 @@ struct ImportedProcess {
 
 struct OutgoingRuntime {
     manifest: handoff::RuntimeManifest,
-    runtime: Arc<ShellRuntime>,
+    pty: OwnedFd,
     pidfd: OwnedFd,
     reconstruction: Vec<u8>,
 }
@@ -1596,6 +3267,12 @@ struct OutgoingRuntime {
 struct OutgoingExited {
     manifest: handoff::ExitedManifest,
     reconstruction: Vec<u8>,
+}
+
+struct PreparedHandoff {
+    runtimes: Vec<OutgoingRuntime>,
+    exited: Vec<OutgoingExited>,
+    paused: Vec<Arc<ShellRuntime>>,
 }
 
 struct Controller {
@@ -2003,19 +3680,9 @@ fn resume_identity(
     )))
 }
 
-impl Registry {
+impl DaemonService {
     fn clear_terminal_histories(&self) -> io::Result<()> {
-        let state = lock(&self.state)?;
-        let mut changed = false;
-        for shell in state.shells.values() {
-            if let Some(run) = lock(&shell.last_run)?.as_mut()
-                && run.terminal_history.take().is_some()
-            {
-                changed = true;
-            }
-        }
-        drop(state);
-        if changed {
+        if self.durable.clear_terminal_histories()? {
             self.mark_persistence_dirty();
         }
         Ok(())
@@ -2034,63 +3701,7 @@ impl Registry {
         else {
             return Ok(None);
         };
-        let state = lock(&self.state)?;
-        let mut candidates = Vec::new();
-        for agent in state.agents.values() {
-            if let Some(identity) = resume_identity(agent, shell, previous_run)? {
-                candidates.push(identity);
-            }
-        }
-        candidates.sort();
-        candidates.dedup();
-        let [(integration, external_session_id)] = candidates.as_slice() else {
-            return Ok(None);
-        };
-
-        let duplicate = state
-            .shells
-            .values()
-            .try_fold(false, |duplicate, other_shell| {
-                if duplicate {
-                    return Ok::<_, io::Error>(true);
-                }
-                if other_shell.id == shell.id {
-                    return Ok(false);
-                }
-                let last_run = lock(&other_shell.last_run)?;
-                let Some(last_run) = last_run.as_ref() else {
-                    return Ok(false);
-                };
-                for agent in state.agents.values() {
-                    if resume_identity(agent, other_shell, last_run)?.is_some_and(|identity| {
-                        identity.0 == *integration && identity.1 == *external_session_id
-                    }) {
-                        return Ok(true);
-                    }
-                }
-                Ok(false)
-            })?;
-        if duplicate {
-            return Ok(None);
-        }
-
-        let executable = if shell.command.is_empty() {
-            integration.clone()
-        } else if shell.command.len() == 1
-            && Path::new(&shell.command[0])
-                .file_name()
-                .and_then(|name| name.to_str())
-                == Some(integration.as_str())
-        {
-            shell.command[0].clone()
-        } else {
-            return Ok(None);
-        };
-        Ok(Some(vec![
-            executable,
-            "--session".into(),
-            external_session_id.clone(),
-        ]))
+        self.durable.agent_resume_command(shell, previous_run)
     }
 
     fn dispatch(&self, request: Request) -> io::Result<Response> {
@@ -2107,7 +3718,7 @@ impl Registry {
                 focused_terminal: self.focused_terminal()?,
             }),
             Request::GetWorkspace { workspace_id } => Ok(Response::Workspace {
-                workspace: self.workspace(&workspace_id)?.snapshot(self)?,
+                workspace: self.workspace(&workspace_id)?.snapshot(&self.durable)?,
             }),
             Request::GetShell { shell_id } => Ok(Response::Shell {
                 shell: self.shell(&shell_id)?.snapshot()?,
@@ -2289,24 +3900,10 @@ impl Registry {
                 wait_ms,
             } => self.read_events(after.as_ref(), limit, wait_ms),
             Request::RenameWorkspace { workspace_id, name } => self.durable_mutation(|| {
-                validate_name(&name)?;
-                let workspace = self.workspace(&workspace_id)?;
-                let state = lock(&self.state)?;
-                for current in state.workspaces.values() {
-                    if !Arc::ptr_eq(current, &workspace) && *lock(&current.name)? == name {
-                        return Err(io::Error::new(
-                            io::ErrorKind::AlreadyExists,
-                            format!("workspace name already exists: {name}"),
-                        ));
-                    }
-                }
-                *lock(&workspace.name)? = name;
+                let name = self.durable.rename_workspace(&workspace_id, name)?;
                 Ok((
                     Response::Ok,
-                    vec![DaemonEventKind::WorkspaceRenamed {
-                        workspace_id,
-                        name: lock(&workspace.name)?.clone(),
-                    }],
+                    vec![DaemonEventKind::WorkspaceRenamed { workspace_id, name }],
                 ))
             }),
             Request::RenameShell { shell_id, name } => self.durable_mutation(|| {
@@ -2365,79 +3962,27 @@ impl Registry {
         wait_ms: u32,
     ) -> io::Result<Response> {
         let limit = usize::from(limit.clamp(1, MAX_EVENT_BATCH));
-        let deadline =
-            Instant::now() + Duration::from_millis(u64::from(wait_ms)).min(MAX_EVENT_WAIT);
         if after.is_none() {
             let _mutation = lock(&self.mutation_lock)?;
             let published = self.flush_pending()?;
-            let _transition = lock(&self.transitions)?;
-            let state = lock(&self.events.state)?;
+            let transaction = self.events.transaction()?;
             let snapshot = self.snapshot()?;
-            let cursor = EventCursor {
-                stream_id: state.stream_id.clone(),
-                event_id: state.latest_id,
-            };
+            let cursor = transaction.cursor();
             let response = Response::Events {
-                stream_id: state.stream_id.clone(),
+                stream_id: cursor.stream_id.clone(),
                 cursor,
                 snapshot: Some(snapshot),
                 events: Vec::new(),
             };
-            drop(state);
+            drop(transaction);
             if published {
-                self.events.changed.notify_all();
+                self.events.notify();
             }
             return Ok(response);
         }
-        let mut state = lock(&self.events.state)?;
         let after = after.expect("checked above");
-        loop {
-            let earliest = state
-                .events
-                .front()
-                .map_or(state.latest_id, |event| event.id.saturating_sub(1));
-            if after.stream_id != state.stream_id
-                || after.event_id < earliest
-                || after.event_id > state.latest_id
-            {
-                return Err(coded_error(
-                    ErrorCode::CursorExpired,
-                    "event cursor is no longer available",
-                ));
-            }
-            let events = state
-                .events
-                .iter()
-                .filter(|event| event.id > after.event_id)
-                .take(limit)
-                .cloned()
-                .collect::<Vec<_>>();
-            if !events.is_empty() || wait_ms == 0 || Instant::now() >= deadline {
-                let event_id = events.last().map_or(after.event_id, |event| event.id);
-                return Ok(Response::Events {
-                    stream_id: state.stream_id.clone(),
-                    cursor: EventCursor {
-                        stream_id: state.stream_id.clone(),
-                        event_id,
-                    },
-                    snapshot: None,
-                    events,
-                });
-            }
-            if self.stopping.load(Ordering::Acquire) {
-                return Err(coded_error(
-                    ErrorCode::DaemonStopping,
-                    "Boomux daemon is stopping",
-                ));
-            }
-            let timeout = deadline.saturating_duration_since(Instant::now());
-            let (next, _) = self
-                .events
-                .changed
-                .wait_timeout(state, timeout)
-                .map_err(|_| io::Error::other("daemon event lock poisoned"))?;
-            state = next;
-        }
+        self.events
+            .read_after(after, limit, wait_ms, || self.runtimes.is_stopping())
     }
 
     fn restore(
@@ -2447,7 +3992,7 @@ impl Registry {
     ) -> io::Result<Self> {
         let (persisted, migrated) = store.load_deferred()?;
         let persisted = persisted.unwrap_or_default();
-        let mut state = RegistryState::default();
+        let mut state = DurableState::default();
         let mut workspace_names = HashSet::new();
         let mut run_ids = HashSet::new();
         let mut agent_ids = HashSet::new();
@@ -2576,17 +4121,20 @@ impl Registry {
         let store = Arc::new(store);
         let persistence_writer = PersistenceWriter::start(Arc::clone(&store));
         let registry = Self {
-            state: Mutex::new(state),
-            focus: Mutex::new(FocusState::default()),
-            store: Some(store),
-            persistence_writer: Some(persistence_writer),
-            events: EventLog::from_transfer(transferred_events),
-            transitions: Mutex::new(TransitionState::default()),
+            durable: DurableRegistry {
+                state: Mutex::new(state),
+                store: Some(store),
+                persistence_writer: Some(persistence_writer),
+                persist_lock: Mutex::new(()),
+                persistence_dirty: AtomicBool::new(migrated),
+                persistence_revision: AtomicU64::new(u64::from(migrated)),
+            },
+            events: EventStream::from_transfer(transferred_events),
+            runtimes: ShellRuntimeManager {
+                focus: Mutex::new(FocusState::default()),
+                stopping: AtomicBool::new(false),
+            },
             mutation_lock: Mutex::new(()),
-            persist_lock: Mutex::new(()),
-            stopping: AtomicBool::new(false),
-            persistence_dirty: AtomicBool::new(migrated),
-            persistence_revision: AtomicU64::new(u64::from(migrated)),
             notification_settings: NotificationDeliverySettings::default(),
             notification_sink: Arc::new(DisabledNotificationSink),
         };
@@ -2595,20 +4143,26 @@ impl Registry {
         }
         Ok(registry)
     }
+}
 
+impl ShellRuntimeManager {
     fn import_handoff(
-        self: &Arc<Self>,
+        &self,
+        service: Weak<DaemonService>,
+        shells: Vec<Arc<Shell>>,
         transferred: Vec<handoff::TransferredRuntime>,
         transferred_exited: Vec<handoff::TransferredExited>,
-    ) -> io::Result<Vec<Arc<ShellRuntime>>> {
-        let state = lock(&self.state)?;
+    ) -> io::Result<(Vec<Arc<ShellRuntime>>, bool)> {
+        let shells = shells
+            .into_iter()
+            .map(|shell| (shell.id.clone(), shell))
+            .collect::<HashMap<_, _>>();
         let mut prepared = Vec::with_capacity(transferred.len());
         let mut imported_shell_ids = HashSet::new();
         for transferred in transferred {
             let manifest = transferred.manifest;
             validate_terminal_profile(&manifest.profile)?;
-            let shell = state
-                .shells
+            let shell = shells
                 .get(&manifest.shell_id)
                 .cloned()
                 .ok_or_else(|| not_found("persisted shell", &manifest.shell_id))?;
@@ -2678,8 +4232,7 @@ impl Registry {
         for transferred in transferred_exited {
             let manifest = transferred.manifest;
             validate_terminal_profile(&manifest.profile)?;
-            let shell = state
-                .shells
+            let shell = shells
                 .get(&manifest.shell_id)
                 .cloned()
                 .ok_or_else(|| not_found("persisted shell", &manifest.shell_id))?;
@@ -2721,7 +4274,7 @@ impl Registry {
             ));
         }
         let mut interrupted_untransferred_run = false;
-        for shell in state.shells.values() {
+        for shell in shells.values() {
             if imported_shell_ids.contains(&shell.id) {
                 continue;
             }
@@ -2734,8 +4287,6 @@ impl Registry {
                 interrupted_untransferred_run = true;
             }
         }
-        drop(state);
-
         let mut readers = Vec::with_capacity(prepared.len());
         for (shell, saved_run, run, runtime, reader) in prepared {
             let profile = saved_run.profile.clone();
@@ -2745,8 +4296,8 @@ impl Registry {
                 run: Arc::clone(&run),
                 runtime: Arc::clone(&runtime),
             };
-            start_pty_reader(
-                Arc::downgrade(self),
+            self.start_pty_reader(
+                service.clone(),
                 shell,
                 Arc::clone(&run),
                 Arc::clone(&runtime),
@@ -2765,12 +4316,13 @@ impl Registry {
                 terminal,
             };
         }
-        if interrupted_untransferred_run || !readers.is_empty() || !imported_shell_ids.is_empty() {
-            self.persist()?;
-        }
-        Ok(readers)
+        let changed =
+            interrupted_untransferred_run || !readers.is_empty() || !imported_shell_ids.is_empty();
+        Ok((readers, changed))
     }
+}
 
+impl DaemonService {
     fn durable_mutation<T>(
         &self,
         operation: impl FnOnce() -> io::Result<(T, Vec<DaemonEventKind>)>,
@@ -2788,35 +4340,28 @@ impl Registry {
         let mutation = lock(&self.mutation_lock)?;
         self.ensure_running()?;
         self.flush_pending()?;
-        let persistence = lock(&self.persist_lock)?;
-        let mut transition = lock(&self.transitions)?;
-        let events = lock(&self.events.state)?;
+        let persistence = lock(&self.durable.persist_lock)?;
+        let mut transaction = self.events.transaction()?;
         let backup = self.backup()?;
         match operation() {
             Ok(DurableMutation::Unchanged(value)) => Ok(value),
             Ok(DurableMutation::Changed(value, kinds)) => {
-                if let Err(error) = EventLog::ensure_capacity(&events, kinds.len()) {
+                if let Err(error) = transaction.reserve(kinds.len()) {
                     self.restore_backup(backup)?;
                     return Err(error);
                 }
                 let notifications = self.notification_requests(&kinds, &backup);
                 let saved = self.capture_persisted_state()?;
-                transition.persistence_in_flight = true;
-                transition.in_flight_event_count = kinds.len();
-                drop(events);
-                drop(transition);
+                transaction.begin_persistence(kinds.len());
+                drop(transaction);
                 match self.write_persisted_state(saved).map_err(persistence_error) {
                     Ok(()) => {
-                        let mut transition = lock(&self.transitions)?;
-                        let mut events = lock(&self.events.state)?;
-                        EventLog::append_batch_locked(&mut events, kinds);
-                        transition.persistence_in_flight = false;
-                        transition.in_flight_event_count = 0;
-                        self.publish_pending_runtime_locked(&mut transition, &mut events);
-                        drop(events);
-                        drop(transition);
+                        let mut transaction = self.events.transaction()?;
+                        transaction.append_batch(kinds);
+                        transaction.finish_persistence();
+                        drop(transaction);
                         drop(persistence);
-                        self.events.changed.notify_all();
+                        self.events.notify();
                         drop(mutation);
                         for notification in notifications {
                             self.notification_sink.notify(notification);
@@ -2825,14 +4370,10 @@ impl Registry {
                     }
                     Err(error) => {
                         self.restore_backup(backup)?;
-                        let mut transition = lock(&self.transitions)?;
-                        let mut events = lock(&self.events.state)?;
-                        transition.persistence_in_flight = false;
-                        transition.in_flight_event_count = 0;
-                        self.publish_pending_runtime_locked(&mut transition, &mut events);
-                        drop(events);
-                        drop(transition);
-                        self.events.changed.notify_all();
+                        let mut transaction = self.events.transaction()?;
+                        transaction.finish_persistence();
+                        drop(transaction);
+                        self.events.notify();
                         Err(error)
                     }
                 }
@@ -2847,7 +4388,7 @@ impl Registry {
     fn notification_requests(
         &self,
         kinds: &[DaemonEventKind],
-        previous: &RegistryBackup,
+        previous: &DurableBackup,
     ) -> Vec<NotificationRequest> {
         let mut seen = HashSet::new();
         let mut requests = Vec::new();
@@ -2918,86 +4459,51 @@ impl Registry {
     }
 
     fn notification_context(&self, workspace_id: &str, shell_id: &str) -> (String, String) {
-        let Ok(state) = self.state.lock() else {
-            return ("unknown".into(), "removed".into());
-        };
-        let workspace = state
-            .workspaces
-            .get(workspace_id)
-            .and_then(|workspace| workspace.name.lock().ok().map(|name| name.clone()))
-            .unwrap_or_else(|| "unknown".into());
-        let shell = state
-            .shells
-            .get(shell_id)
-            .and_then(|shell| shell.name.lock().ok().map(|name| name.clone()))
-            .unwrap_or_else(|| "removed".into());
-        (workspace, shell)
+        self.durable.notification_context(workspace_id, shell_id)
     }
 
     fn flush_pending(&self) -> io::Result<bool> {
-        let _persistence = lock(&self.persist_lock)?;
-        let mut transition = lock(&self.transitions)?;
-        let events = lock(&self.events.state)?;
-        if transition.pending_durable_events.is_empty()
-            && !self.persistence_dirty.load(Ordering::Acquire)
+        let _persistence = lock(&self.durable.persist_lock)?;
+        let mut transaction = self.events.transaction()?;
+        if transaction.pending_durable_batch_count() == 0
+            && !self.durable.persistence_dirty.load(Ordering::Acquire)
         {
             return Ok(false);
         }
-        let pending_count = transition.pending_durable_events.len();
-        let count = transition
-            .pending_durable_events
-            .iter()
-            .take(pending_count)
-            .map(Vec::len)
-            .sum();
-        EventLog::ensure_capacity(&events, count)?;
+        let pending_count = transaction.pending_durable_batch_count();
+        let count = transaction.pending_durable_event_count(pending_count);
+        transaction.reserve(count)?;
         let saved = self.capture_persisted_state()?;
-        let pending = transition
-            .pending_durable_events
-            .drain(..pending_count)
-            .collect::<VecDeque<_>>();
-        transition.persistence_in_flight = true;
-        transition.in_flight_event_count = count;
-        drop(events);
-        drop(transition);
+        let pending = transaction.take_pending_durable(pending_count);
+        transaction.begin_persistence(count);
+        drop(transaction);
         if let Err(error) = self.write_persisted_state(saved).map_err(persistence_error) {
-            let mut transition = lock(&self.transitions)?;
-            for batch in pending.into_iter().rev() {
-                transition.pending_durable_events.push_front(batch);
-            }
-            transition.persistence_in_flight = false;
-            transition.in_flight_event_count = 0;
-            let mut events = lock(&self.events.state)?;
-            self.publish_pending_runtime_locked(&mut transition, &mut events);
+            let mut transaction = self.events.transaction()?;
+            transaction.restore_pending_durable(pending);
+            transaction.finish_persistence();
             return Err(error);
         }
-        let mut transition = lock(&self.transitions)?;
-        let mut events = lock(&self.events.state)?;
-        EventLog::ensure_capacity(&events, count)?;
+        let mut transaction = self.events.transaction()?;
+        transaction.reserve(count)?;
         for batch in pending {
-            EventLog::append_batch_locked(&mut events, batch);
+            transaction.append_batch(batch);
         }
-        transition.persistence_in_flight = false;
-        transition.in_flight_event_count = 0;
-        self.publish_pending_runtime_locked(&mut transition, &mut events);
-        drop(events);
-        self.events.changed.notify_all();
+        transaction.finish_persistence();
+        drop(transaction);
+        self.events.notify();
         Ok(count != 0)
     }
 
-    fn compensate_stopped_locked(
+    fn compensate_stopped_locked<T: EventTransitionAccess>(
         &self,
         shells: &[Arc<Shell>],
-        transition: &mut TransitionState,
+        transition: &mut T,
     ) -> io::Result<()> {
-        let mut batch = transition
-            .pending_runtime_events
-            .drain(..)
-            .collect::<Vec<_>>();
+        let mut batch = transition.drain_runtime_events();
         batch.extend(
             shells
                 .iter()
-                .map(|shell| shell.compensate_stopped())
+                .map(|shell| self.runtimes.compensate_stopped(shell))
                 .collect::<io::Result<Vec<_>>>()?
                 .into_iter()
                 .flatten(),
@@ -3006,53 +4512,18 @@ impl Registry {
         Ok(())
     }
 
-    fn queue_durable_batch_locked(
+    fn queue_durable_batch_locked<T: EventTransitionAccess>(
         &self,
         batch: Vec<DaemonEventKind>,
-        transition: &mut TransitionState,
+        transition: &mut T,
     ) {
-        if !batch.is_empty() {
-            transition.pending_durable_events.push_back(batch);
+        if transition.queue_durable_batch(batch) {
             self.mark_persistence_dirty();
         }
     }
 
-    fn publish_runtime_batch(&self, kinds: Vec<DaemonEventKind>) -> io::Result<()> {
-        let mut transition = lock(&self.transitions)?;
-        let mut events = lock(&self.events.state)?;
-        EventLog::ensure_capacity(
-            &events,
-            transition
-                .reserved_event_count()
-                .saturating_add(kinds.len()),
-        )?;
-        if transition.publication_blocked() {
-            for kind in kinds {
-                transition.queue_runtime_event(kind);
-            }
-            return Ok(());
-        }
-        EventLog::append_batch_locked(&mut events, kinds);
-        drop(events);
-        self.events.changed.notify_all();
-        Ok(())
-    }
-
-    fn publish_pending_runtime_locked(
-        &self,
-        transition: &mut TransitionState,
-        events: &mut EventLogState,
-    ) {
-        if transition.publication_blocked() {
-            return;
-        }
-        while let Some(kind) = transition.pending_runtime_events.pop_front() {
-            EventLog::append_batch_locked(events, vec![kind]);
-        }
-    }
-
     fn ensure_running(&self) -> io::Result<()> {
-        if self.stopping.load(Ordering::Acquire) {
+        if self.runtimes.is_stopping() {
             Err(io::Error::new(
                 io::ErrorKind::ConnectionAborted,
                 "Boomux daemon is stopping",
@@ -3063,253 +4534,39 @@ impl Registry {
     }
 
     fn notify_output_waiters(&self) {
-        if let Ok(state) = self.state.lock() {
-            for shell in state.shells.values() {
-                if let Ok(lifecycle) = shell.lifecycle.lock()
-                    && let ShellLifecycle::Running { runtime, .. } = &*lifecycle
-                {
-                    let _wait = runtime.output_wait.lock();
-                    runtime.output_changed.notify_all();
-                }
-            }
+        if let Ok(shells) = self.durable.shells() {
+            self.runtimes.notify_output_waiters(&shells);
         }
-    }
-
-    fn quiesce_controllers(&self) -> io::Result<()> {
-        let runtimes = {
-            let state = lock(&self.state)?;
-            let mut runtimes = Vec::new();
-            for shell in state.shells.values() {
-                if let ShellLifecycle::Running { runtime, .. } = &*lock(&shell.lifecycle)? {
-                    runtimes.push(Arc::clone(runtime));
-                }
-            }
-            runtimes
-        };
-        let mut acknowledgements = Vec::new();
-        for runtime in &runtimes {
-            let mut controller = lock(&runtime.controller)?;
-            let Some(current) = controller.as_mut() else {
-                continue;
-            };
-            let (written, write_acknowledged) = mpsc::sync_channel(1);
-            let (client_acknowledge, client_acknowledged) = mpsc::sync_channel(1);
-            current.reconnect_ack = Some(client_acknowledge);
-            match current
-                .output
-                .try_send(ControllerOutput::Reconnect(written))
-            {
-                Ok(()) => acknowledgements.push((write_acknowledged, client_acknowledged)),
-                Err(TrySendError::Disconnected(_)) => {
-                    if let Some(current) = controller.take() {
-                        let _ = current.connection.shutdown(std::net::Shutdown::Both);
-                    }
-                }
-                Err(TrySendError::Full(_)) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::WouldBlock,
-                        "active controller output queue is full",
-                    ));
-                }
-            }
-        }
-
-        for (written, client_acknowledged) in acknowledgements {
-            if !written.recv_timeout(HANDSHAKE_TIMEOUT).unwrap_or(false) {
-                return Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "active controller did not receive reconnect request",
-                ));
-            }
-            if client_acknowledged.recv_timeout(HANDSHAKE_TIMEOUT).is_err() {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "active controller did not acknowledge reconnect request",
-                ));
-            }
-        }
-
-        let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
-        while Instant::now() < deadline {
-            let mut active = false;
-            for runtime in &runtimes {
-                active |= lock(&runtime.controller)?.is_some();
-            }
-            if !active {
-                return Ok(());
-            }
-            thread::sleep(IO_RETRY_DELAY);
-        }
-        Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            "active controllers did not reconnect",
-        ))
     }
 
     fn state_lock_descriptor(&self) -> io::Result<BorrowedFd<'_>> {
-        self.store
-            .as_ref()
-            .ok_or_else(|| io::Error::other("registry has no persistent state store"))?
-            .lock_descriptor()
+        self.durable.state_lock_descriptor()
     }
 
-    fn backup(&self) -> io::Result<RegistryBackup> {
-        let state = lock(&self.state)?;
-        let mut workspace_names = HashMap::new();
-        let mut workspace_shell_ids = HashMap::new();
-        let mut workspace_launcher_ids = HashMap::new();
-        let mut workspace_agent_ids = HashMap::new();
-        for workspace in state.workspaces.values() {
-            workspace_names.insert(workspace.id.clone(), lock(&workspace.name)?.clone());
-            workspace_shell_ids.insert(workspace.id.clone(), lock(&workspace.shell_ids)?.clone());
-            workspace_launcher_ids
-                .insert(workspace.id.clone(), lock(&workspace.launcher_ids)?.clone());
-            workspace_agent_ids.insert(workspace.id.clone(), lock(&workspace.agent_ids)?.clone());
-        }
-        let mut shell_names = HashMap::new();
-        for shell in state.shells.values() {
-            shell_names.insert(shell.id.clone(), lock(&shell.name)?.clone());
-        }
-        let mut launcher_names = HashMap::new();
-        for launcher in state.launchers.values() {
-            launcher_names.insert(launcher.id.clone(), lock(&launcher.name)?.clone());
-        }
-        let mut agent_states = HashMap::new();
-        for agent in state.agents.values() {
-            agent_states.insert(agent.id.clone(), lock(&agent.state)?.clone());
-        }
-        Ok(RegistryBackup {
-            workspaces: state.workspaces.clone(),
-            shells: state.shells.clone(),
-            launchers: state.launchers.clone(),
-            agents: state.agents.clone(),
-            workspace_names,
-            workspace_shell_ids,
-            workspace_launcher_ids,
-            workspace_agent_ids,
-            shell_names,
-            launcher_names,
-            agent_states,
-        })
+    fn backup(&self) -> io::Result<DurableBackup> {
+        self.durable.backup()
     }
 
-    fn restore_backup(&self, backup: RegistryBackup) -> io::Result<()> {
-        let mut state = lock(&self.state)?;
-        for workspace in backup.workspaces.values() {
-            if let Some(name) = backup.workspace_names.get(&workspace.id) {
-                *lock(&workspace.name)? = name.clone();
-            }
-            if let Some(ids) = backup.workspace_shell_ids.get(&workspace.id) {
-                *lock(&workspace.shell_ids)? = ids.clone();
-            }
-            if let Some(ids) = backup.workspace_launcher_ids.get(&workspace.id) {
-                *lock(&workspace.launcher_ids)? = ids.clone();
-            }
-            if let Some(ids) = backup.workspace_agent_ids.get(&workspace.id) {
-                *lock(&workspace.agent_ids)? = ids.clone();
-            }
-        }
-        for shell in backup.shells.values() {
-            if let Some(name) = backup.shell_names.get(&shell.id) {
-                *lock(&shell.name)? = name.clone();
-            }
-        }
-        for launcher in backup.launchers.values() {
-            if let Some(name) = backup.launcher_names.get(&launcher.id) {
-                *lock(&launcher.name)? = name.clone();
-            }
-        }
-        for agent in backup.agents.values() {
-            if let Some(agent_state) = backup.agent_states.get(&agent.id) {
-                *lock(&agent.state)? = agent_state.clone();
-            }
-        }
-        state.workspaces = backup.workspaces;
-        state.shells = backup.shells;
-        state.launchers = backup.launchers;
-        state.agents = backup.agents;
-        Ok(())
+    fn restore_backup(&self, backup: DurableBackup) -> io::Result<()> {
+        self.durable.restore_backup(backup)
     }
 
     fn persist(&self) -> io::Result<()> {
-        let _persist = lock(&self.persist_lock)?;
-        let saved = self.capture_persisted_state()?;
-        self.write_persisted_state(saved)
+        let _persist = lock(&self.durable.persist_lock)?;
+        let saved = self.durable.capture_persisted_state()?;
+        self.durable.write_persisted_state(saved)
     }
 
     fn capture_persisted_state(&self) -> io::Result<PersistenceGeneration> {
-        let state = lock(&self.state)?;
-        let mut workspaces = state.workspaces.values().cloned().collect::<Vec<_>>();
-        workspaces.sort_by(|left, right| left.id.cmp(&right.id));
-        let mut saved = PersistedState::default();
-        for workspace in workspaces {
-            let ids = lock(&workspace.shell_ids)?.clone();
-            let mut shells = Vec::with_capacity(ids.len());
-            for id in ids {
-                let Some(shell) = state.shells.get(&id) else {
-                    continue;
-                };
-                shells.push(PersistedShell {
-                    id: shell.id.clone(),
-                    name: lock(&shell.name)?.clone(),
-                    cwd: shell.cwd.clone(),
-                    command: shell.command.clone(),
-                    last_run: lock(&shell.last_run)?.clone(),
-                });
-            }
-            let ids = lock(&workspace.launcher_ids)?.clone();
-            let mut launchers = Vec::with_capacity(ids.len());
-            for id in ids {
-                let Some(launcher) = state.launchers.get(&id) else {
-                    continue;
-                };
-                launchers.push(PersistedWorkspaceLauncher {
-                    id: launcher.id.clone(),
-                    name: lock(&launcher.name)?.clone(),
-                    cwd: launcher.cwd.clone(),
-                    command: launcher.command.clone(),
-                });
-            }
-            let ids = lock(&workspace.agent_ids)?.clone();
-            let mut agents = Vec::with_capacity(ids.len());
-            for id in ids {
-                let Some(agent) = state.agents.get(&id) else {
-                    continue;
-                };
-                agents.push(agent.persisted()?);
-            }
-            saved.workspaces.push(PersistedWorkspace {
-                id: workspace.id.clone(),
-                name: lock(&workspace.name)?.clone(),
-                default_cwd: workspace.default_cwd.clone(),
-                shells,
-                launchers,
-                agents,
-            });
-        }
-        Ok(PersistenceGeneration {
-            revision: self.persistence_revision.load(Ordering::Acquire),
-            state: saved,
-        })
+        self.durable.capture_persisted_state()
     }
 
     fn write_persisted_state(&self, generation: PersistenceGeneration) -> io::Result<()> {
-        let Some(writer) = &self.persistence_writer else {
-            return Ok(());
-        };
-        let revision = generation.revision;
-        let result = writer.save(generation);
-        if result.is_err() {
-            self.persistence_dirty.store(true, Ordering::Release);
-        } else if self.persistence_revision.load(Ordering::Acquire) == revision {
-            self.persistence_dirty.store(false, Ordering::Release);
-        }
-        result
+        self.durable.write_persisted_state(generation)
     }
 
     fn mark_persistence_dirty(&self) {
-        self.persistence_revision.fetch_add(1, Ordering::AcqRel);
-        self.persistence_dirty.store(true, Ordering::Release);
+        self.durable.mark_persistence_dirty();
     }
 
     fn record_run_exit(
@@ -3319,94 +4576,45 @@ impl Registry {
         runtime: &Arc<ShellRuntime>,
         code: Option<u32>,
     ) -> io::Result<()> {
-        let _persistence = lock(&self.persist_lock)?;
-        let mut transition = lock(&self.transitions)?;
-        let events = lock(&self.events.state)?;
-        let pending_count = transition.reserved_event_count();
-        EventLog::ensure_capacity(&events, pending_count.saturating_add(1))?;
-        let mut lifecycle = lock(&shell.lifecycle)?;
-        let profile = match &*lifecycle {
-            ShellLifecycle::Running {
-                profile,
-                run: current_run,
-                runtime: current_runtime,
-            } if Arc::ptr_eq(current_run, run) && Arc::ptr_eq(current_runtime, runtime) => {
-                profile.clone()
-            }
-            _ => return Ok(()),
+        let _persistence = lock(&self.durable.persist_lock)?;
+        let mut transaction = self.events.transaction()?;
+        let pending_count = transaction.reserved_event_count();
+        transaction.reserve_with_pending(1)?;
+        let Some(exit_event) = self.runtimes.finalize_run_exit(shell, run, runtime, code)? else {
+            return Ok(());
         };
-        run.finish(ShellRunExitReason::Exited { code })?;
-        *lock(&shell.last_run)? = Some(run.persisted(profile.clone())?);
-        *lifecycle = ShellLifecycle::Exited {
-            code,
-            profile,
-            run: Arc::clone(run),
-            runtime: Some(Arc::clone(runtime)),
-            terminal: Arc::clone(&runtime.terminal),
-        };
-        drop(lifecycle);
-        let _wait = lock(&runtime.output_wait)?;
-        runtime.output_changed.notify_all();
-        drop(_wait);
-        let mut batch = transition
-            .pending_runtime_events
-            .drain(..)
-            .collect::<Vec<_>>();
-        batch.push(DaemonEventKind::RunExited {
-            workspace_id: shell.workspace_id.clone(),
-            shell_id: shell.id.clone(),
-            run: run.snapshot()?,
-        });
+        let mut batch = transaction.drain_runtime_events();
+        batch.push(exit_event);
         let saved = self.capture_persisted_state()?;
-        transition.persistence_in_flight = true;
-        transition.in_flight_event_count = pending_count.saturating_add(1);
-        drop(events);
-        drop(transition);
+        transaction.begin_persistence(pending_count.saturating_add(1));
+        drop(transaction);
         match self.write_persisted_state(saved).map_err(persistence_error) {
             Ok(()) => {
-                let mut transition = lock(&self.transitions)?;
-                let mut events = lock(&self.events.state)?;
-                while let Some(pending) = transition.pending_durable_events.pop_front() {
-                    EventLog::append_batch_locked(&mut events, pending);
-                }
-                EventLog::append_batch_locked(&mut events, batch);
-                transition.persistence_in_flight = false;
-                transition.in_flight_event_count = 0;
-                self.publish_pending_runtime_locked(&mut transition, &mut events);
-                drop(events);
-                drop(transition);
-                self.events.changed.notify_all();
+                let mut transaction = self.events.transaction()?;
+                transaction.append_pending_durable();
+                transaction.append_batch(batch);
+                transaction.finish_persistence();
+                drop(transaction);
+                self.events.notify();
                 Ok(())
             }
             Err(error) => {
-                let mut transition = lock(&self.transitions)?;
-                transition.pending_durable_events.push_back(batch);
-                transition.persistence_in_flight = false;
-                transition.in_flight_event_count = 0;
-                let mut events = lock(&self.events.state)?;
-                self.publish_pending_runtime_locked(&mut transition, &mut events);
-                drop(events);
-                drop(transition);
-                self.events.changed.notify_all();
+                let mut transaction = self.events.transaction()?;
+                transaction.queue_durable_batch(batch);
+                transaction.finish_persistence();
+                drop(transaction);
+                self.events.notify();
                 Err(error)
             }
         }
     }
 
     fn snapshot(&self) -> io::Result<Snapshot> {
-        let mut workspaces: Vec<_> = lock(&self.state)?.workspaces.values().cloned().collect();
-        workspaces.sort_by(|a, b| a.id.cmp(&b.id));
-        Ok(Snapshot {
-            workspaces: workspaces
-                .into_iter()
-                .map(|workspace| workspace.snapshot(self))
-                .collect::<io::Result<_>>()?,
-            focused_terminal: self.focused_terminal()?,
-        })
+        self.durable.snapshot(self.focused_terminal()?)
     }
 
     fn focused_terminal(&self) -> io::Result<Option<FocusedTerminalSnapshot>> {
-        let focused = lock(&self.focus)?.focused_terminal.clone();
+        let focused = self.runtimes.focused_terminal()?;
         let Some(focused) = focused else {
             return Ok(None);
         };
@@ -3414,23 +4622,25 @@ impl Registry {
     }
 
     fn focused_terminal_for_handoff(&self) -> io::Result<Option<FocusedTerminalSnapshot>> {
-        Ok(lock(&self.focus)?.focused_terminal.clone())
+        self.runtimes.focused_terminal()
     }
 
     fn focus_target_is_current(&self, focused: &FocusedTerminalSnapshot) -> io::Result<bool> {
-        let state = lock(&self.state)?;
-        let Some(shell) = state.shells.get(&focused.shell_id) else {
+        let Ok(shell) = self.durable.shell(&focused.shell_id) else {
             return Ok(false);
         };
         if shell.workspace_id != focused.workspace_id {
             return Ok(false);
         }
         let lifecycle = lock(&shell.lifecycle)?;
-        let current_run_id = match &*lifecycle {
-            ShellLifecycle::Running { run, .. } | ShellLifecycle::Exited { run, .. } => &run.id,
+        let current = match &*lifecycle {
+            ShellLifecycle::Running { run, .. } | ShellLifecycle::Exited { run, .. } => {
+                run.id == focused.run_id
+            }
             ShellLifecycle::Pending | ShellLifecycle::Closed => return Ok(false),
         };
-        Ok(current_run_id == &focused.run_id)
+        drop(lifecycle);
+        Ok(current && self.durable.contains_shell(&shell)?)
     }
 
     fn record_focus_gained(
@@ -3439,7 +4649,8 @@ impl Registry {
         shell: &Arc<Shell>,
         run: &Arc<ShellRun>,
         runtime: &Arc<ShellRuntime>,
-    ) -> io::Result<()> {
+        token: &str,
+    ) -> io::Result<bool> {
         if !protocol::ProtocolFeature::FocusedTerminal.is_supported_by(protocol_version) {
             let minimum_version = protocol::ProtocolFeature::FocusedTerminal.minimum_version();
             return Err(io::Error::new(
@@ -3447,12 +4658,9 @@ impl Registry {
                 format!("focus frames require daemon protocol {minimum_version}"),
             ));
         }
-        let state = lock(&self.state)?;
-        if !state
-            .shells
-            .get(&shell.id)
-            .is_some_and(|current| Arc::ptr_eq(current, shell))
-        {
+        let _mutation = lock(&self.mutation_lock)?;
+        self.ensure_running()?;
+        if !self.durable.contains_shell(shell)? {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "focus frame targets a stale shell",
@@ -3476,19 +4684,17 @@ impl Registry {
                 "focus frame targets a stale shell run",
             ));
         }
-        let mut focus = lock(&self.focus)?;
-        let revision = focus
-            .revision
-            .checked_add(1)
-            .ok_or_else(|| io::Error::other("focused terminal revision exhausted"))?;
-        focus.revision = revision;
-        focus.focused_terminal = Some(FocusedTerminalSnapshot {
-            revision,
-            workspace_id: shell.workspace_id.clone(),
-            shell_id: shell.id.clone(),
-            run_id: current_run.id.clone(),
-        });
-        Ok(())
+        let run_id = current_run.id.clone();
+        drop(lifecycle);
+        let authorized = lock(&runtime.controller)?
+            .as_ref()
+            .is_some_and(|controller| controller.token == token);
+        if !authorized {
+            return Ok(false);
+        }
+        self.runtimes
+            .record_focus_gained(shell.workspace_id.clone(), shell.id.clone(), run_id)?;
+        Ok(true)
     }
 
     fn import_focused_terminal(
@@ -3502,133 +4708,95 @@ impl Registry {
             return Ok(());
         }
         let current = self.focus_target_is_current(&focused_terminal)?;
-        let mut focus = lock(&self.focus)?;
-        if focused_terminal.revision >= focus.revision {
-            focus.revision = focused_terminal.revision;
-            focus.focused_terminal = current.then_some(focused_terminal);
-        }
-        Ok(())
+        self.runtimes
+            .import_focused_terminal(focused_terminal, current)
     }
 
     fn shutdown(&self) -> io::Result<()> {
         let _mutation = lock(&self.mutation_lock)?;
-        if self.stopping.swap(true, Ordering::AcqRel) {
+        if !self.runtimes.begin_stopping() {
             return Ok(());
         }
         self.events.notify();
-        let shells = {
-            let state = lock(&self.state)?;
-            state.shells.values().cloned().collect::<Vec<_>>()
-        };
+        let shells = self.durable.shells()?;
         self.notify_output_waiters();
         let mut stopped: Vec<Arc<Shell>> = Vec::with_capacity(shells.len());
         for shell in &shells {
-            if let Err(error) = shell.stop_runtime() {
+            if let Err(error) = self.runtimes.stop_runtime(shell) {
                 if error.stopped {
                     stopped.push(Arc::clone(shell));
                 }
-                let mut transition = lock(&self.transitions)?;
+                let mut transition = self.events.transition()?;
                 self.compensate_stopped_locked(&stopped, &mut transition)?;
-                self.stopping.store(false, Ordering::Release);
+                self.runtimes.cancel_stopping();
                 return Err(error.source);
             }
             stopped.push(Arc::clone(shell));
         }
         if let Err(error) = self.flush_pending() {
-            let mut transition = lock(&self.transitions)?;
+            let mut transition = self.events.transition()?;
             self.compensate_stopped_locked(&stopped, &mut transition)?;
-            self.stopping.store(false, Ordering::Release);
+            self.runtimes.cancel_stopping();
             return Err(error);
         }
-        let _persistence = lock(&self.persist_lock)?;
-        let mut transition = lock(&self.transitions)?;
-        let events = lock(&self.events.state)?;
+        let _persistence = lock(&self.durable.persist_lock)?;
+        let mut transaction = self.events.transaction()?;
         let mut rollbacks = Vec::with_capacity(shells.len());
         for shell in &shells {
-            match shell.finalize_stop() {
+            match self.runtimes.finalize_stop(shell) {
                 Ok(rollback) => rollbacks.push((Arc::clone(shell), rollback)),
                 Err(error) => {
                     for (shell, rollback) in rollbacks {
-                        shell.restore_stopped(rollback)?;
+                        self.runtimes.restore_stopped(&shell, rollback)?;
                     }
-                    self.stopping.store(false, Ordering::Release);
+                    self.runtimes.cancel_stopping();
                     return Err(error);
                 }
             }
         }
         let saved = self.capture_persisted_state()?;
-        transition.persistence_in_flight = true;
-        transition.in_flight_event_count = 0;
-        drop(events);
-        drop(transition);
+        transaction.begin_persistence(0);
+        drop(transaction);
         if let Err(error) = self.write_persisted_state(saved).map_err(persistence_error) {
             let batch = rollbacks
                 .iter()
                 .filter_map(|(_, rollback)| rollback.event.clone())
                 .collect();
             for (shell, rollback) in rollbacks {
-                shell.restore_stopped(rollback)?;
+                self.runtimes.restore_stopped(&shell, rollback)?;
             }
-            let mut transition = lock(&self.transitions)?;
-            self.queue_durable_batch_locked(batch, &mut transition);
-            transition.persistence_in_flight = false;
-            transition.in_flight_event_count = 0;
-            let mut events = lock(&self.events.state)?;
-            self.publish_pending_runtime_locked(&mut transition, &mut events);
-            self.stopping.store(false, Ordering::Release);
+            let mut transaction = self.events.transaction()?;
+            if transaction.queue_durable_batch(batch) {
+                self.mark_persistence_dirty();
+            }
+            transaction.finish_persistence();
+            self.runtimes.cancel_stopping();
             return Err(error);
         }
-        let mut state = lock(&self.state)?;
-        state.workspaces.clear();
-        state.shells.clear();
-        state.launchers.clear();
-        state.agents.clear();
-        drop(state);
-        let mut transition = lock(&self.transitions)?;
-        let mut events = lock(&self.events.state)?;
-        transition.persistence_in_flight = false;
-        transition.in_flight_event_count = 0;
-        self.publish_pending_runtime_locked(&mut transition, &mut events);
+        self.durable.clear()?;
+        let mut transaction = self.events.transaction()?;
+        transaction.finish_persistence();
         Ok(())
     }
 
     fn workspace(&self, id: &str) -> io::Result<Arc<Workspace>> {
-        lock(&self.state)?
-            .workspaces
-            .get(id)
-            .cloned()
-            .ok_or_else(|| not_found("workspace", id))
+        self.durable.workspace(id)
     }
 
     fn shell(&self, id: &str) -> io::Result<Arc<Shell>> {
-        lock(&self.state)?
-            .shells
-            .get(id)
-            .cloned()
-            .ok_or_else(|| not_found("shell", id))
+        self.durable.shell(id)
     }
 
     fn launcher(&self, id: &str) -> io::Result<Arc<WorkspaceLauncher>> {
-        lock(&self.state)?
-            .launchers
-            .get(id)
-            .cloned()
-            .ok_or_else(|| not_found("workspace launcher", id))
+        self.durable.launcher(id)
     }
 
     fn agent(&self, id: &str) -> io::Result<Arc<AgentInstance>> {
-        lock(&self.state)?
-            .agents
-            .get(id)
-            .cloned()
-            .ok_or_else(|| not_found("agent instance", id))
+        self.durable.agent(id)
     }
 
     fn contains_shell(&self, shell: &Arc<Shell>) -> io::Result<bool> {
-        Ok(lock(&self.state)?
-            .shells
-            .get(&shell.id)
-            .is_some_and(|current| Arc::ptr_eq(current, shell)))
+        self.durable.contains_shell(shell)
     }
 
     #[cfg(test)]
@@ -3646,115 +4814,15 @@ impl Registry {
         default_cwd: Option<PathBuf>,
         specs: Vec<ShellSpec>,
     ) -> io::Result<WorkspaceSnapshot> {
-        validate_name(&name)?;
-        if let Some(default_cwd) = &default_cwd {
-            validate_cwd(default_cwd)?;
-        }
-        let workspace_id = Uuid::new_v4().to_string();
-        validate_shell_specs(&specs)?;
-
-        let mut shells = Vec::with_capacity(specs.len());
-        for spec in specs {
-            match create_pending_shell(&workspace_id, spec) {
-                Ok(shell) => shells.push(shell),
-                Err(error) => {
-                    for shell in shells {
-                        let _ = shell.kill();
-                    }
-                    return Err(error);
-                }
-            }
-        }
-
-        let workspace_name = name.clone();
-        let workspace = Arc::new(Workspace {
-            id: workspace_id.clone(),
-            name: Mutex::new(name),
-            default_cwd,
-            shell_ids: Mutex::new(shells.iter().map(|shell| shell.id.clone()).collect()),
-            launcher_ids: Mutex::new(Vec::new()),
-            agent_ids: Mutex::new(Vec::new()),
-        });
-        {
-            let mut state = lock(&self.state)?;
-            for current in state.workspaces.values() {
-                if *lock(&current.name)? == workspace_name {
-                    drop(state);
-                    for shell in shells {
-                        let _ = shell.kill();
-                    }
-                    return Err(io::Error::new(
-                        io::ErrorKind::AlreadyExists,
-                        format!("workspace name already exists: {workspace_name}"),
-                    ));
-                }
-            }
-            for shell in &shells {
-                state.shells.insert(shell.id.clone(), Arc::clone(shell));
-            }
-            state
-                .workspaces
-                .insert(workspace_id, Arc::clone(&workspace));
-        }
-        workspace.snapshot(self)
+        self.durable.create_workspace(name, default_cwd, specs)
     }
 
     fn create_shell(&self, workspace_id: &str, spec: ShellSpec) -> io::Result<ShellSnapshot> {
-        let workspace = self.workspace(workspace_id)?;
-        let shell = create_pending_shell(workspace_id, spec)?;
-        let snapshot = shell.snapshot()?;
-        let mut state = lock(&self.state)?;
-        let Some(current) = state.workspaces.get(workspace_id) else {
-            drop(state);
-            let _ = shell.kill();
-            return Err(not_found("workspace", workspace_id));
-        };
-        if !Arc::ptr_eq(current, &workspace) {
-            drop(state);
-            let _ = shell.kill();
-            return Err(not_found("workspace", workspace_id));
-        }
-        let mut shell_ids = lock(&workspace.shell_ids)?;
-        if shell_ids.iter().any(|id| {
-            state
-                .shells
-                .get(id)
-                .and_then(|existing| existing.name.lock().ok())
-                .is_some_and(|name| *name == snapshot.name)
-        }) {
-            drop(shell_ids);
-            drop(state);
-            let _ = shell.kill();
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!("shell name already exists: {}", snapshot.name),
-            ));
-        }
-        state.shells.insert(shell.id.clone(), Arc::clone(&shell));
-        shell_ids.push(shell.id.clone());
-        Ok(snapshot)
+        self.durable.create_shell(workspace_id, spec)
     }
 
     fn create_shell_with_workspace(&self, spec: ShellSpec) -> io::Result<ShellSnapshot> {
-        let default_cwd = spec.cwd.clone();
-        loop {
-            let name = self.next_workspace_name()?;
-            match self.create_workspace_with_default_cwd(
-                name,
-                Some(default_cwd.clone()),
-                vec![spec.clone()],
-            ) {
-                Ok(workspace) => {
-                    return workspace
-                        .shells
-                        .into_iter()
-                        .next()
-                        .ok_or_else(|| io::Error::other("implicit workspace has no shell"));
-                }
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-                Err(error) => return Err(error),
-            }
-        }
+        self.durable.create_shell_with_workspace(spec)
     }
 
     fn create_launcher(
@@ -3762,43 +4830,7 @@ impl Registry {
         workspace_id: &str,
         spec: WorkspaceLauncherSpec,
     ) -> io::Result<WorkspaceLauncherSnapshot> {
-        validate_name(&spec.name)?;
-        validate_cwd(&spec.cwd)?;
-        validate_launcher_command(&spec.command)?;
-        let workspace = self.workspace(workspace_id)?;
-        let launcher = Arc::new(WorkspaceLauncher {
-            id: Uuid::new_v4().to_string(),
-            workspace_id: workspace_id.into(),
-            name: Mutex::new(spec.name),
-            cwd: spec.cwd,
-            command: spec.command,
-        });
-        let snapshot = launcher.snapshot()?;
-        let mut state = lock(&self.state)?;
-        let Some(current) = state.workspaces.get(workspace_id) else {
-            return Err(not_found("workspace", workspace_id));
-        };
-        if !Arc::ptr_eq(current, &workspace) {
-            return Err(not_found("workspace", workspace_id));
-        }
-        let mut launcher_ids = lock(&workspace.launcher_ids)?;
-        if launcher_ids.iter().any(|id| {
-            state
-                .launchers
-                .get(id)
-                .and_then(|existing| existing.name.lock().ok())
-                .is_some_and(|name| *name == snapshot.name)
-        }) {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!("workspace launcher name already exists: {}", snapshot.name),
-            ));
-        }
-        state
-            .launchers
-            .insert(launcher.id.clone(), Arc::clone(&launcher));
-        launcher_ids.push(launcher.id.clone());
-        Ok(snapshot)
+        self.durable.create_launcher(workspace_id, spec)
     }
 
     fn register_agent(
@@ -3807,67 +4839,7 @@ impl Registry {
         run_id: &str,
         spec: AgentRegistrationSpec,
     ) -> io::Result<AgentInstanceSnapshot> {
-        validate_agent_registration(&spec)?;
-        validate_external_agent_authority(spec.report.authority)?;
-        let shell = self.shell(shell_id)?;
-        let lifecycle = lock(&shell.lifecycle)?;
-        match &*lifecycle {
-            ShellLifecycle::Running { run, .. } if run.id == run_id => {}
-            ShellLifecycle::Running { .. }
-            | ShellLifecycle::Exited { .. }
-            | ShellLifecycle::Pending => {
-                return Err(coded_error(
-                    ErrorCode::RunChanged,
-                    "shell does not have the requested active run",
-                ));
-            }
-            ShellLifecycle::Closed => return Err(not_found("shell", shell_id)),
-        }
-        let workspace = self.workspace(&shell.workspace_id)?;
-        let started_at_ms = unix_time_ms();
-        let ended_at_ms = (spec.report.state == AgentState::Done).then_some(started_at_ms);
-        let agent = Arc::new(AgentInstance {
-            id: Uuid::new_v4().to_string(),
-            workspace_id: shell.workspace_id.clone(),
-            shell_id: shell.id.clone(),
-            run_id: run_id.into(),
-            name: spec.name,
-            integration: spec.integration,
-            external_session_id: spec.external_session_id,
-            cwd: Some(shell.cwd.clone()),
-            started_at_ms,
-            state: Mutex::new(AgentInstanceState {
-                ended_at_ms,
-                observation: AgentObservationSnapshot {
-                    revision: 1,
-                    state: spec.report.state,
-                    authority: spec.report.authority,
-                    evidence: spec.report.evidence,
-                    confidence: spec.report.confidence,
-                    observed_at_ms: started_at_ms,
-                },
-                attention: None,
-            }),
-        });
-        {
-            let mut state = lock(&agent.state)?;
-            state.attention = attention_for_observation(&state.observation);
-        }
-        let snapshot = agent.snapshot()?;
-        let mut state = lock(&self.state)?;
-        let Some(current_shell) = state.shells.get(shell_id) else {
-            return Err(not_found("shell", shell_id));
-        };
-        let Some(current_workspace) = state.workspaces.get(&shell.workspace_id) else {
-            return Err(not_found("workspace", &shell.workspace_id));
-        };
-        if !Arc::ptr_eq(current_shell, &shell) || !Arc::ptr_eq(current_workspace, &workspace) {
-            return Err(not_found("shell", shell_id));
-        }
-        state.agents.insert(agent.id.clone(), Arc::clone(&agent));
-        lock(&workspace.agent_ids)?.push(agent.id.clone());
-        drop(lifecycle);
-        Ok(snapshot)
+        self.durable.register_agent(shell_id, run_id, spec)
     }
 
     fn ensure_agent(
@@ -3876,55 +4848,7 @@ impl Registry {
         run_id: &str,
         spec: AgentRegistrationSpec,
     ) -> io::Result<(AgentInstanceSnapshot, bool)> {
-        validate_agent_registration(&spec)?;
-        validate_external_agent_authority(spec.report.authority)?;
-        let external_session_id = spec.external_session_id.as_deref().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "agent external_session_id is required for ensure",
-            )
-        })?;
-        let matches = {
-            let state = lock(&self.state)?;
-            state
-                .agents
-                .values()
-                .filter(|agent| {
-                    agent.integration == spec.integration
-                        && agent.external_session_id.as_deref() == Some(external_session_id)
-                        && agent.shell_id == shell_id
-                        && agent.run_id == run_id
-                })
-                .cloned()
-                .collect::<Vec<_>>()
-        };
-        let existing = match matches.as_slice() {
-            [] => None,
-            [agent] => Some(Arc::clone(agent)),
-            agents => {
-                let mut active = Vec::new();
-                for agent in agents {
-                    if lock(&agent.state)?.ended_at_ms.is_none() {
-                        active.push(Arc::clone(agent));
-                    }
-                }
-                match active.as_slice() {
-                    [agent] => Some(Arc::clone(agent)),
-                    _ => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::AlreadyExists,
-                            "multiple agent instances match the ensured identity",
-                        ));
-                    }
-                }
-            }
-        };
-        if let Some(agent) = existing {
-            return Ok((agent.snapshot()?, false));
-        }
-
-        self.register_agent(shell_id, run_id, spec)
-            .map(|agent| (agent, true))
+        self.durable.ensure_agent(shell_id, run_id, spec)
     }
 
     fn report_agent(
@@ -3933,63 +4857,7 @@ impl Registry {
         run_id: &str,
         report: AgentReport,
     ) -> io::Result<(AgentInstanceSnapshot, bool, bool)> {
-        validate_agent_report(&report)?;
-        validate_external_agent_authority(report.authority)?;
-        let agent = self.agent(agent_id)?;
-        if agent.run_id != run_id {
-            return Err(coded_error(
-                ErrorCode::RunChanged,
-                "agent instance is bound to a different shell run",
-            ));
-        }
-        let mut state = lock(&agent.state)?;
-        if state.ended_at_ms.is_some() {
-            if observation_matches_report(&state.observation, &report) {
-                drop(state);
-                return Ok((agent.snapshot()?, false, true));
-            }
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "completed agent instance cannot be reported again",
-            ));
-        }
-        let repeated_working = state.observation.state == AgentState::Working
-            && report.state == AgentState::Working
-            && state.observation.authority == report.authority
-            && state.observation.confidence == report.confidence;
-        if observation_matches_report(&state.observation, &report)
-            || repeated_working
-            || agent_authority_rank(report.authority)
-                < agent_authority_rank(state.observation.authority)
-        {
-            drop(state);
-            return Ok((agent.snapshot()?, false, false));
-        }
-        let revision = state
-            .observation
-            .revision
-            .checked_add(1)
-            .ok_or_else(|| io::Error::other("agent observation revision exhausted"))?;
-        let observed_at_ms = unix_time_ms()
-            .max(agent.started_at_ms)
-            .max(state.observation.observed_at_ms);
-        let completed = report.state == AgentState::Done;
-        state.observation = AgentObservationSnapshot {
-            revision,
-            state: report.state,
-            authority: report.authority,
-            evidence: report.evidence,
-            confidence: report.confidence,
-            observed_at_ms,
-        };
-        if let Some(attention) = attention_for_observation(&state.observation) {
-            state.attention = Some(attention);
-        }
-        if completed {
-            state.ended_at_ms = Some(observed_at_ms);
-        }
-        drop(state);
-        Ok((agent.snapshot()?, true, completed))
+        self.durable.report_agent(agent_id, run_id, report)
     }
 
     fn acknowledge_agent_attention(
@@ -3997,125 +4865,25 @@ impl Registry {
         agent_id: &str,
         observation_revision: u64,
     ) -> io::Result<(AgentInstanceSnapshot, bool)> {
-        let agent = self.agent(agent_id)?;
-        let mut state = lock(&agent.state)?;
-        let Some(attention) = &state.attention else {
-            drop(state);
-            return Ok((agent.snapshot()?, false));
-        };
-        if attention.observation.revision != observation_revision {
-            return Err(coded_error(
-                ErrorCode::RevisionAhead,
-                format!(
-                    "agent attention observation revision is {}; acknowledgment supplied {}",
-                    attention.observation.revision, observation_revision
-                ),
-            ));
-        }
-        state.attention = None;
-        drop(state);
-        Ok((agent.snapshot()?, true))
+        self.durable
+            .acknowledge_agent_attention(agent_id, observation_revision)
     }
 
     fn rename_launcher(&self, launcher_id: &str, name: String) -> io::Result<()> {
-        validate_name(&name)?;
-        let launcher = self.launcher(launcher_id)?;
-        let workspace = self.workspace(&launcher.workspace_id)?;
-        let state = lock(&self.state)?;
-        let launcher_ids = lock(&workspace.launcher_ids)?;
-        if launcher_ids
-            .iter()
-            .filter(|id| id.as_str() != launcher_id)
-            .any(|id| {
-                state
-                    .launchers
-                    .get(id)
-                    .and_then(|existing| existing.name.lock().ok())
-                    .is_some_and(|existing| *existing == name)
-            })
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!("workspace launcher name already exists: {name}"),
-            ));
-        }
-        *lock(&launcher.name)? = name;
-        Ok(())
+        self.durable.rename_launcher(launcher_id, name)
     }
 
     fn remove_launcher(&self, launcher_id: &str) -> io::Result<Arc<WorkspaceLauncher>> {
-        let (launcher, workspace) = {
-            let mut state = lock(&self.state)?;
-            let launcher = state
-                .launchers
-                .remove(launcher_id)
-                .ok_or_else(|| not_found("workspace launcher", launcher_id))?;
-            let workspace = state.workspaces.get(&launcher.workspace_id).cloned();
-            (launcher, workspace)
-        };
-        if let Some(workspace) = workspace {
-            lock(&workspace.launcher_ids)?.retain(|id| id != launcher_id);
-        }
-        Ok(launcher)
-    }
-
-    fn next_workspace_name(&self) -> io::Result<String> {
-        let state = lock(&self.state)?;
-        let mut suffix = 1_u64;
-        loop {
-            let candidate = format!("workspace-{suffix}");
-            let exists = state
-                .workspaces
-                .values()
-                .any(|workspace| workspace.name.lock().is_ok_and(|name| *name == candidate));
-            if !exists {
-                return Ok(candidate);
-            }
-            suffix = suffix
-                .checked_add(1)
-                .ok_or_else(|| io::Error::other("workspace name space exhausted"))?;
-        }
+        self.durable.remove_launcher(launcher_id)
     }
 
     fn rename_shell(&self, shell_id: &str, name: String) -> io::Result<()> {
-        validate_name(&name)?;
-        let shell = self.shell(shell_id)?;
-        let workspace = self.workspace(&shell.workspace_id)?;
-        let state = lock(&self.state)?;
-        let shell_ids = lock(&workspace.shell_ids)?;
-        if shell_ids
-            .iter()
-            .filter(|id| id.as_str() != shell_id)
-            .any(|id| {
-                state
-                    .shells
-                    .get(id)
-                    .and_then(|existing| existing.name.lock().ok())
-                    .is_some_and(|existing| *existing == name)
-            })
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!("shell name already exists: {name}"),
-            ));
-        }
-        *lock(&shell.name)? = name;
-        Ok(())
+        self.durable.rename_shell(shell_id, name)
     }
 
     fn read_shell(&self, shell_id: &str, max_bytes: usize) -> io::Result<Vec<u8>> {
         let shell = self.shell(shell_id)?;
-        let lifecycle = lock(&shell.lifecycle)?;
-        let terminal = match &*lifecycle {
-            ShellLifecycle::Pending => return Ok(Vec::new()),
-            ShellLifecycle::Running { runtime, .. } => Arc::clone(&runtime.terminal),
-            ShellLifecycle::Exited { terminal, .. } => Arc::clone(terminal),
-            ShellLifecycle::Closed => return Err(not_found("shell", shell_id)),
-        };
-        drop(lifecycle);
-        let max_bytes = max_bytes.min(MAX_SHELL_READ_BYTES);
-        let snapshot = lock(&terminal)?.snapshot();
-        Ok(snapshot.plain_text_suffix(max_bytes).into_bytes())
+        self.runtimes.read_shell(&shell, max_bytes)
     }
 
     fn read_shell_preview(
@@ -4125,21 +4893,8 @@ impl Registry {
         max_lines: u16,
     ) -> io::Result<TerminalPreview> {
         let shell = self.shell(shell_id)?;
-        let lifecycle = lock(&shell.lifecycle)?;
-        let terminal = match &*lifecycle {
-            ShellLifecycle::Pending => return Ok(TerminalPreview::default()),
-            ShellLifecycle::Running { runtime, .. } => Arc::clone(&runtime.terminal),
-            ShellLifecycle::Exited { terminal, .. } => Arc::clone(terminal),
-            ShellLifecycle::Closed => return Err(not_found("shell", shell_id)),
-        };
-        drop(lifecycle);
-        let snapshot = lock(&terminal)?.snapshot();
-        let preview = snapshot.preview(
-            max_bytes.min(MAX_SHELL_READ_BYTES),
-            usize::from(max_lines).min(MAX_TERMINAL_PREVIEW_LINES),
-            MAX_TERMINAL_PREVIEW_SPANS,
-        );
-        Ok(preview)
+        self.runtimes
+            .read_shell_preview(&shell, max_bytes, max_lines)
     }
 
     fn wait_agent(
@@ -4148,47 +4903,33 @@ impl Registry {
         after_revision: u64,
         wait_ms: u32,
     ) -> io::Result<Response> {
-        let deadline =
-            Instant::now() + Duration::from_millis(u64::from(wait_ms)).min(MAX_EVENT_WAIT);
-        let mut events = lock(&self.events.state)?;
-        loop {
-            if self.stopping.load(Ordering::Acquire) {
-                return Err(coded_error(
-                    ErrorCode::DaemonStopping,
-                    "Boomux daemon is stopping",
-                ));
-            }
-            let agent = self.agent(agent_id)?.snapshot()?;
-            let revision = agent.observation.revision;
-            if after_revision < revision {
-                return Ok(Response::AgentWait {
-                    agent,
-                    changed: true,
-                });
-            }
-            if after_revision > revision {
-                return Err(coded_error(
-                    ErrorCode::RevisionAhead,
-                    "requested Agent revision is ahead of the current observation",
-                ));
-            }
-            if agent.observation.state == AgentState::Done
-                || wait_ms == 0
-                || Instant::now() >= deadline
-            {
-                return Ok(Response::AgentWait {
-                    agent,
-                    changed: false,
-                });
-            }
-            let timeout = deadline.saturating_duration_since(Instant::now());
-            let (next, _) = self
-                .events
-                .changed
-                .wait_timeout(events, timeout)
-                .map_err(|_| io::Error::other("event wait lock poisoned"))?;
-            events = next;
-        }
+        self.events.wait_for(
+            wait_ms,
+            || self.runtimes.is_stopping(),
+            |expired| {
+                let agent = self.agent(agent_id)?.snapshot()?;
+                let revision = agent.observation.revision;
+                if after_revision < revision {
+                    return Ok(Some(Response::AgentWait {
+                        agent,
+                        changed: true,
+                    }));
+                }
+                if after_revision > revision {
+                    return Err(coded_error(
+                        ErrorCode::RevisionAhead,
+                        "requested Agent revision is ahead of the current observation",
+                    ));
+                }
+                if agent.observation.state == AgentState::Done || expired {
+                    return Ok(Some(Response::AgentWait {
+                        agent,
+                        changed: false,
+                    }));
+                }
+                Ok(None)
+            },
+        )
     }
 
     fn read_shell_at(
@@ -4199,186 +4940,22 @@ impl Registry {
         after_revision: Option<u64>,
         wait_ms: u32,
     ) -> io::Result<Response> {
-        if expected_run_id.is_some() != after_revision.is_some() {
-            return Err(coded_error(
-                ErrorCode::InvalidArgument,
-                "run_id and after_revision must be provided together",
-            ));
-        }
-        let deadline =
-            Instant::now() + Duration::from_millis(u64::from(wait_ms)).min(MAX_EVENT_WAIT);
-        loop {
-            let shell = self.shell(shell_id)?;
-            let lifecycle = lock(&shell.lifecycle)?;
-            let (status, run, runtime, terminal) = match &*lifecycle {
-                ShellLifecycle::Pending => {
-                    if expected_run_id.is_some() {
-                        return Err(coded_error(
-                            ErrorCode::RunChanged,
-                            "shell no longer has the requested run",
-                        ));
-                    }
-                    return Ok(Response::OutputState {
-                        bytes: Vec::new(),
-                        run_id: None,
-                        output_revision: None,
-                        changed: true,
-                        status: ShellStatus::Pending,
-                    });
-                }
-                ShellLifecycle::Running { run, runtime, .. } => (
-                    ShellStatus::Running,
-                    Arc::clone(run),
-                    Some(Arc::clone(runtime)),
-                    Arc::clone(&runtime.terminal),
-                ),
-                ShellLifecycle::Exited {
-                    code,
-                    run,
-                    terminal,
-                    ..
-                } => (
-                    ShellStatus::Exited { code: *code },
-                    Arc::clone(run),
-                    None,
-                    Arc::clone(terminal),
-                ),
-                ShellLifecycle::Closed => return Err(not_found("shell", shell_id)),
-            };
-            drop(lifecycle);
-            let terminal_state = lock(&terminal)?;
-            let revision = run.output_revision.load(Ordering::Acquire);
-            let changed = after_revision.is_none_or(|after| after < revision);
-            let snapshot = if changed || after_revision.is_none() {
-                Some(terminal_state.snapshot())
-            } else {
-                None
-            };
-            drop(terminal_state);
-            let bytes = snapshot.map_or_else(Vec::new, |snapshot| {
-                snapshot
-                    .plain_text_suffix(max_bytes.min(MAX_SHELL_READ_BYTES))
-                    .into_bytes()
-            });
-            let lifecycle = lock(&shell.lifecycle)?;
-            let observation_is_current = match (&*lifecycle, &status) {
-                (
-                    ShellLifecycle::Running {
-                        run: current_run,
-                        runtime,
-                        ..
-                    },
-                    ShellStatus::Running,
-                ) => Arc::ptr_eq(current_run, &run) && Arc::ptr_eq(&runtime.terminal, &terminal),
-                (
-                    ShellLifecycle::Exited {
-                        code,
-                        run: current_run,
-                        terminal: current_terminal,
-                        ..
-                    },
-                    ShellStatus::Exited { code: current_code },
-                ) => {
-                    code == current_code
-                        && Arc::ptr_eq(current_run, &run)
-                        && Arc::ptr_eq(current_terminal, &terminal)
-                }
-                _ => false,
-            };
-            drop(lifecycle);
-            if !observation_is_current {
-                continue;
-            }
-            if expected_run_id.is_some_and(|expected| expected != run.id) {
-                return Err(coded_error(
-                    ErrorCode::RunChanged,
-                    "shell run identity changed",
-                ));
-            }
-            if after_revision.is_some_and(|after| after > revision) {
-                return Err(coded_error(
-                    ErrorCode::RevisionAhead,
-                    "requested output revision is ahead of the current run",
-                ));
-            }
-            if changed || !matches!(status, ShellStatus::Running) || wait_ms == 0 {
-                return Ok(Response::OutputState {
-                    bytes,
-                    run_id: Some(run.id.clone()),
-                    output_revision: Some(revision),
-                    changed,
-                    status,
-                });
-            }
-            if Instant::now() >= deadline {
-                return Ok(Response::OutputState {
-                    bytes: Vec::new(),
-                    run_id: Some(run.id.clone()),
-                    output_revision: Some(revision),
-                    changed: false,
-                    status,
-                });
-            }
-            if self.stopping.load(Ordering::Acquire) {
-                return Err(coded_error(
-                    ErrorCode::DaemonStopping,
-                    "Boomux daemon is stopping",
-                ));
-            }
-            let runtime = runtime.expect("running shell has a runtime");
-            let wait = lock(&runtime.output_wait)?;
-            if self.stopping.load(Ordering::Acquire) {
-                return Err(coded_error(
-                    ErrorCode::DaemonStopping,
-                    "Boomux daemon is stopping",
-                ));
-            }
-            if run.output_revision.load(Ordering::Acquire) != revision {
-                continue;
-            }
-            let timeout = deadline.saturating_duration_since(Instant::now());
-            let _ = runtime
-                .output_changed
-                .wait_timeout(wait, timeout)
-                .map_err(|_| io::Error::other("shell output wait lock poisoned"))?;
-        }
+        self.runtimes.read_shell_at(
+            self,
+            shell_id,
+            max_bytes,
+            expected_run_id,
+            after_revision,
+            wait_ms,
+        )
     }
 
     fn remove_shell(&self, shell_id: &str) -> io::Result<Arc<Shell>> {
-        let (shell, workspace) = {
-            let mut state = lock(&self.state)?;
-            let shell = state
-                .shells
-                .remove(shell_id)
-                .ok_or_else(|| not_found("shell", shell_id))?;
-            let workspace = state.workspaces.get(&shell.workspace_id).cloned();
-            (shell, workspace)
-        };
-        if let Some(workspace) = workspace {
-            lock(&workspace.shell_ids)?.retain(|id| id != shell_id);
-        }
-        Ok(shell)
+        self.durable.remove_shell(shell_id)
     }
 
     fn remove_workspace(&self, workspace_id: &str) -> io::Result<Vec<Arc<Shell>>> {
-        let shells = {
-            let mut state = lock(&self.state)?;
-            let workspace = state
-                .workspaces
-                .remove(workspace_id)
-                .ok_or_else(|| not_found("workspace", workspace_id))?;
-            for id in lock(&workspace.launcher_ids)?.iter() {
-                state.launchers.remove(id);
-            }
-            for id in lock(&workspace.agent_ids)?.iter() {
-                state.agents.remove(id);
-            }
-            let ids = lock(&workspace.shell_ids)?.clone();
-            ids.into_iter()
-                .filter_map(|id| state.shells.remove(&id))
-                .collect::<Vec<_>>()
-        };
-        Ok(shells)
+        self.durable.remove_workspace(workspace_id)
     }
 
     fn close_shell(&self, shell_id: &str) -> io::Result<()> {
@@ -4386,58 +4963,48 @@ impl Registry {
         self.ensure_running()?;
         let backup = self.backup()?;
         let shell = self.shell(shell_id)?;
-        if let Err(error) = shell.stop_runtime() {
+        if let Err(error) = self.runtimes.stop_runtime(&shell) {
             if error.stopped {
-                let mut transition = lock(&self.transitions)?;
+                let mut transition = self.events.transition()?;
                 self.compensate_stopped_locked(std::slice::from_ref(&shell), &mut transition)?;
             }
             return Err(error.source);
         }
         if let Err(error) = self.flush_pending() {
-            let mut transition = lock(&self.transitions)?;
+            let mut transition = self.events.transition()?;
             self.compensate_stopped_locked(std::slice::from_ref(&shell), &mut transition)?;
             return Err(error);
         }
-        let _persistence = lock(&self.persist_lock)?;
-        let mut transition = lock(&self.transitions)?;
-        let events = lock(&self.events.state)?;
-        if let Err(error) = EventLog::ensure_capacity(&events, 1) {
-            self.compensate_stopped_locked(std::slice::from_ref(&shell), &mut transition)?;
+        let _persistence = lock(&self.durable.persist_lock)?;
+        let mut transaction = self.events.transaction()?;
+        if let Err(error) = transaction.reserve(1) {
+            self.compensate_stopped_locked(std::slice::from_ref(&shell), &mut transaction)?;
             return Err(error);
         }
-        let rollback = shell.finalize_stop()?;
+        let rollback = self.runtimes.finalize_stop(&shell)?;
         self.remove_shell(shell_id)?;
         let saved = self.capture_persisted_state()?;
-        transition.persistence_in_flight = true;
-        transition.in_flight_event_count = 1;
-        drop(events);
-        drop(transition);
+        transaction.begin_persistence(1);
+        drop(transaction);
         if let Err(error) = self.write_persisted_state(saved).map_err(persistence_error) {
             self.restore_backup(backup)?;
             let event = rollback.event.clone();
-            shell.restore_stopped(rollback)?;
-            let mut transition = lock(&self.transitions)?;
-            self.queue_durable_batch_locked(event.into_iter().collect(), &mut transition);
-            transition.persistence_in_flight = false;
-            transition.in_flight_event_count = 0;
-            let mut events = lock(&self.events.state)?;
-            self.publish_pending_runtime_locked(&mut transition, &mut events);
+            self.runtimes.restore_stopped(&shell, rollback)?;
+            let mut transaction = self.events.transaction()?;
+            if transaction.queue_durable_batch(event.into_iter().collect()) {
+                self.mark_persistence_dirty();
+            }
+            transaction.finish_persistence();
             return Err(error);
         }
-        let mut transition = lock(&self.transitions)?;
-        let mut events = lock(&self.events.state)?;
-        EventLog::append_batch_locked(
-            &mut events,
-            vec![DaemonEventKind::ShellClosed {
-                workspace_id: Some(shell.workspace_id.clone()),
-                shell_id: shell_id.into(),
-            }],
-        );
-        transition.persistence_in_flight = false;
-        transition.in_flight_event_count = 0;
-        self.publish_pending_runtime_locked(&mut transition, &mut events);
-        drop(events);
-        self.events.changed.notify_all();
+        let mut transaction = self.events.transaction()?;
+        transaction.append_batch(vec![DaemonEventKind::ShellClosed {
+            workspace_id: Some(shell.workspace_id.clone()),
+            shell_id: shell_id.into(),
+        }]);
+        transaction.finish_persistence();
+        drop(transaction);
+        self.events.notify();
         Ok(())
     }
 
@@ -4446,44 +5013,37 @@ impl Registry {
         self.ensure_running()?;
         let backup = self.backup()?;
         let workspace = self.workspace(workspace_id)?;
-        let shells = {
-            let state = lock(&self.state)?;
-            let ids = lock(&workspace.shell_ids)?;
-            ids.iter()
-                .filter_map(|id| state.shells.get(id).cloned())
-                .collect::<Vec<_>>()
-        };
+        let shells = self.durable.workspace_shells(&workspace)?;
         let mut stopped: Vec<Arc<Shell>> = Vec::with_capacity(shells.len());
         for shell in &shells {
-            if let Err(error) = shell.stop_runtime() {
+            if let Err(error) = self.runtimes.stop_runtime(shell) {
                 if error.stopped {
                     stopped.push(Arc::clone(shell));
                 }
-                let mut transition = lock(&self.transitions)?;
+                let mut transition = self.events.transition()?;
                 self.compensate_stopped_locked(&stopped, &mut transition)?;
                 return Err(error.source);
             }
             stopped.push(Arc::clone(shell));
         }
         if let Err(error) = self.flush_pending() {
-            let mut transition = lock(&self.transitions)?;
+            let mut transition = self.events.transition()?;
             self.compensate_stopped_locked(&stopped, &mut transition)?;
             return Err(error);
         }
-        let _persistence = lock(&self.persist_lock)?;
-        let mut transition = lock(&self.transitions)?;
-        let events = lock(&self.events.state)?;
-        if let Err(error) = EventLog::ensure_capacity(&events, 1) {
-            self.compensate_stopped_locked(&stopped, &mut transition)?;
+        let _persistence = lock(&self.durable.persist_lock)?;
+        let mut transaction = self.events.transaction()?;
+        if let Err(error) = transaction.reserve(1) {
+            self.compensate_stopped_locked(&stopped, &mut transaction)?;
             return Err(error);
         }
         let mut rollbacks = Vec::with_capacity(shells.len());
         for shell in &shells {
-            match shell.finalize_stop() {
+            match self.runtimes.finalize_stop(shell) {
                 Ok(rollback) => rollbacks.push((Arc::clone(shell), rollback)),
                 Err(error) => {
                     for (shell, rollback) in rollbacks {
-                        shell.restore_stopped(rollback)?;
+                        self.runtimes.restore_stopped(&shell, rollback)?;
                     }
                     return Err(error);
                 }
@@ -4491,10 +5051,8 @@ impl Registry {
         }
         self.remove_workspace(workspace_id)?;
         let saved = self.capture_persisted_state()?;
-        transition.persistence_in_flight = true;
-        transition.in_flight_event_count = 1;
-        drop(events);
-        drop(transition);
+        transaction.begin_persistence(1);
+        drop(transaction);
         if let Err(error) = self.write_persisted_state(saved).map_err(persistence_error) {
             self.restore_backup(backup)?;
             let batch = rollbacks
@@ -4502,29 +5060,22 @@ impl Registry {
                 .filter_map(|(_, rollback)| rollback.event.clone())
                 .collect();
             for (shell, rollback) in rollbacks {
-                shell.restore_stopped(rollback)?;
+                self.runtimes.restore_stopped(&shell, rollback)?;
             }
-            let mut transition = lock(&self.transitions)?;
-            self.queue_durable_batch_locked(batch, &mut transition);
-            transition.persistence_in_flight = false;
-            transition.in_flight_event_count = 0;
-            let mut events = lock(&self.events.state)?;
-            self.publish_pending_runtime_locked(&mut transition, &mut events);
+            let mut transaction = self.events.transaction()?;
+            if transaction.queue_durable_batch(batch) {
+                self.mark_persistence_dirty();
+            }
+            transaction.finish_persistence();
             return Err(error);
         }
-        let mut transition = lock(&self.transitions)?;
-        let mut events = lock(&self.events.state)?;
-        EventLog::append_batch_locked(
-            &mut events,
-            vec![DaemonEventKind::WorkspaceClosed {
-                workspace_id: workspace_id.into(),
-            }],
-        );
-        transition.persistence_in_flight = false;
-        transition.in_flight_event_count = 0;
-        self.publish_pending_runtime_locked(&mut transition, &mut events);
-        drop(events);
-        self.events.changed.notify_all();
+        let mut transaction = self.events.transaction()?;
+        transaction.append_batch(vec![DaemonEventKind::WorkspaceClosed {
+            workspace_id: workspace_id.into(),
+        }]);
+        transaction.finish_persistence();
+        drop(transaction);
+        self.events.notify();
         Ok(())
     }
 
@@ -4552,14 +5103,14 @@ impl Registry {
             old_runtime
         };
         if let Some(runtime) = old_runtime {
-            runtime.stop_reader()?;
+            self.runtimes.stop_reader(&runtime)?;
         }
         shell.snapshot()
     }
 }
 
 impl Workspace {
-    fn snapshot(&self, registry: &Registry) -> io::Result<WorkspaceSnapshot> {
+    fn snapshot(&self, registry: &DurableRegistry) -> io::Result<WorkspaceSnapshot> {
         let (shells, launchers, agents) = {
             let state = lock(&registry.state)?;
             let shell_ids = lock(&self.shell_ids)?;
@@ -4688,23 +5239,7 @@ impl Shell {
         };
         let foreground_process = match (runtime, run.as_ref()) {
             (Some(runtime), Some(run)) => {
-                let mut cache = lock(&self.foreground_process_cache)?;
-                if let Some((cached_run_id, observed_at, process)) = cache.as_ref()
-                    && cached_run_id == &run.id
-                    && observed_at.elapsed() < FOREGROUND_PROCESS_CACHE_INTERVAL
-                {
-                    process.clone()
-                } else {
-                    let process = lock(&runtime.master)
-                        .ok()
-                        .and_then(|master| master.foreground_process())
-                        .or_else(|| {
-                            let pid = lock(&runtime.process).ok()?.process_id()?;
-                            foreground_process_for_session_leader(pid)
-                        });
-                    *cache = Some((run.id.clone(), Instant::now(), process.clone()));
-                    process
-                }
+                ShellRuntimeManager::foreground_process(self, &runtime, run)?
             }
             _ => None,
         };
@@ -4718,193 +5253,6 @@ impl Shell {
             run,
             foreground_process,
         })
-    }
-
-    fn kill(&self) -> io::Result<()> {
-        match self.stop_runtime() {
-            Ok(()) => {
-                let _ = self.finalize_stop()?;
-                Ok(())
-            }
-            Err(error) => {
-                if error.stopped {
-                    let _ = self.finalize_stop()?;
-                }
-                Err(error.source)
-            }
-        }
-    }
-
-    fn stop_runtime(&self) -> Result<(), StopRuntimeError> {
-        let runtime = {
-            let lifecycle = lock(&self.lifecycle)?;
-            match &*lifecycle {
-                ShellLifecycle::Pending => return Ok(()),
-                ShellLifecycle::Running { runtime, .. } => Some(Arc::clone(runtime)),
-                ShellLifecycle::Exited { runtime, .. } => runtime.clone(),
-                ShellLifecycle::Closed => return Ok(()),
-            }
-        };
-        let Some(runtime) = runtime else {
-            return Ok(());
-        };
-        if let Some(controller) = lock(&runtime.controller)?.take() {
-            let _ = controller.connection.shutdown(std::net::Shutdown::Both);
-        }
-        runtime.pause_reader()?;
-        let result = (|| {
-            let mut process = lock(&runtime.process)?;
-            let exited = process.try_wait_code()?.is_some();
-            let child_pid = process.process_id().map(|pid| pid as libc::pid_t);
-            if let Some(session_id) = child_pid {
-                signal_session(session_id, libc::SIGHUP);
-            }
-            thread::sleep(SHUTDOWN_GRACE);
-            if let Some(session_id) = child_pid {
-                signal_session(session_id, libc::SIGTERM);
-            }
-            let kill_result = if exited { Ok(()) } else { process.kill() };
-            thread::sleep(SHUTDOWN_GRACE);
-            if let Some(session_id) = child_pid {
-                signal_session(session_id, libc::SIGKILL);
-            }
-            let wait_result = if exited { Ok(()) } else { process.wait() };
-            match (kill_result, wait_result) {
-                (_, Ok(())) => Ok(()),
-                (Err(error), Err(_)) => Err(error),
-                (Ok(()), Err(error)) => Err(error),
-            }
-        })();
-        if let Err(error) = result {
-            runtime.resume_reader()?;
-            return Err(error.into());
-        }
-        if let Some(session_id) = lock(&runtime.process)?.process_id()
-            && let Err(source) = wait_for_session_descendants(session_id as libc::pid_t)
-        {
-            let _ = runtime.stop_reader();
-            return Err(StopRuntimeError {
-                source,
-                stopped: true,
-            });
-        }
-        if let Err(source) = runtime.stop_reader() {
-            return Err(StopRuntimeError {
-                source,
-                stopped: true,
-            });
-        }
-        Ok(())
-    }
-
-    fn finalize_stop(&self) -> io::Result<StopRollback> {
-        let mut lifecycle = lock(&self.lifecycle)?;
-        let previous = std::mem::replace(&mut *lifecycle, ShellLifecycle::Closed);
-        match previous {
-            ShellLifecycle::Pending => Ok(StopRollback {
-                lifecycle: ShellLifecycle::Pending,
-                event: None,
-            }),
-            ShellLifecycle::Running {
-                profile,
-                run,
-                runtime,
-            } => {
-                run.finish(ShellRunExitReason::Terminated)?;
-                *lock(&self.last_run)? = Some(run.persisted(profile.clone())?);
-                let _wait = lock(&runtime.output_wait)?;
-                runtime.output_changed.notify_all();
-                Ok(StopRollback {
-                    lifecycle: ShellLifecycle::Pending,
-                    event: Some(DaemonEventKind::RunExited {
-                        workspace_id: self.workspace_id.clone(),
-                        shell_id: self.id.clone(),
-                        run: run.snapshot()?,
-                    }),
-                })
-            }
-            ShellLifecycle::Exited {
-                profile,
-                run,
-                code,
-                runtime,
-                terminal,
-            } => {
-                *lock(&self.last_run)? = Some(run.persisted(profile.clone())?);
-                Ok(StopRollback {
-                    lifecycle: ShellLifecycle::Exited {
-                        code,
-                        profile,
-                        run,
-                        runtime,
-                        terminal,
-                    },
-                    event: None,
-                })
-            }
-            ShellLifecycle::Closed => Ok(StopRollback {
-                lifecycle: ShellLifecycle::Closed,
-                event: None,
-            }),
-        }
-    }
-
-    fn restore_stopped(&self, rollback: StopRollback) -> io::Result<()> {
-        let mut lifecycle = lock(&self.lifecycle)?;
-        if matches!(*lifecycle, ShellLifecycle::Closed) {
-            *lifecycle = rollback.lifecycle;
-        }
-        Ok(())
-    }
-
-    fn compensate_stopped(&self) -> io::Result<Option<DaemonEventKind>> {
-        let rollback = self.finalize_stop()?;
-        let event = rollback.event.clone();
-        self.restore_stopped(rollback)?;
-        Ok(event)
-    }
-
-    fn reset_pending(&self) -> io::Result<()> {
-        let mut lifecycle = lock(&self.lifecycle)?;
-        if matches!(*lifecycle, ShellLifecycle::Closed) {
-            *lifecycle = ShellLifecycle::Pending;
-        }
-        Ok(())
-    }
-}
-
-impl ShellRuntime {
-    fn release_controller(&self, token: &str) -> io::Result<()> {
-        let mut controller = lock(&self.controller)?;
-        if controller
-            .as_ref()
-            .is_some_and(|current| current.token == token)
-        {
-            controller.take();
-        }
-        Ok(())
-    }
-
-    fn pause_reader(&self) -> io::Result<()> {
-        if let Some(reader) = lock(&self.reader)?.as_ref() {
-            reader.pause()?;
-        }
-        Ok(())
-    }
-
-    fn resume_reader(&self) -> io::Result<()> {
-        if let Some(reader) = lock(&self.reader)?.as_ref() {
-            reader.resume()?;
-        }
-        Ok(())
-    }
-
-    fn stop_reader(&self) -> io::Result<()> {
-        let reader = lock(&self.reader)?.take();
-        if let Some(reader) = reader {
-            reader.stop()?;
-        }
-        Ok(())
     }
 }
 
@@ -4948,399 +5296,421 @@ struct RuntimeRecovery<'a> {
     history: Option<&'a str>,
 }
 
-fn spawn_runtime(
-    shell: &Arc<Shell>,
-    run: &ShellRun,
-    workspace_name: &str,
-    shell_name: &str,
-    profile: &TerminalProfile,
-    environment: Option<&UnixEnvironment>,
-    recovery: RuntimeRecovery<'_>,
-) -> io::Result<(Arc<ShellRuntime>, PtyReader)> {
-    let pty = native_pty_system()
-        .openpty(PtySize {
-            rows: profile.rows,
-            cols: profile.cols,
-            pixel_width: profile.pixel_width,
-            pixel_height: profile.pixel_height,
-        })
-        .map_err(io::Error::other)?;
-    let master = PtyMaster::duplicate(pty.master.as_ref())?;
-    let reader = master.try_clone_reader()?;
-
-    let client_shell = environment
-        .and_then(|environment| {
-            environment
-                .variables
-                .iter()
-                .find(|variable| variable.name == b"SHELL")
-                .map(|variable| std::ffi::OsString::from_vec(variable.value.clone()))
-        })
-        .or_else(|| {
-            environment
-                .is_none()
-                .then(|| env::var_os("SHELL"))
-                .flatten()
-        })
-        .unwrap_or_else(|| "/bin/sh".into());
-    let selected_command = recovery.effective_command.unwrap_or(&shell.command);
-    let mut command = if selected_command.is_empty() {
-        CommandBuilder::new(client_shell)
-    } else {
-        let mut command = CommandBuilder::new(&selected_command[0]);
-        command.args(&selected_command[1..]);
-        command
-    };
-    command.cwd(&shell.cwd);
-    if let Some(environment) = environment {
-        command.env_clear();
-        for variable in &environment.variables {
-            command.env(
-                std::ffi::OsString::from_vec(variable.name.clone()),
-                std::ffi::OsString::from_vec(variable.value.clone()),
-            );
-        }
-    }
-    for name in ["TERM", "COLORTERM", "TERM_PROGRAM", "TERM_PROGRAM_VERSION"] {
-        command.env_remove(name);
-    }
-    for (name, value) in [
-        ("TERM", profile.term.as_deref()),
-        ("COLORTERM", profile.colorterm.as_deref()),
-        ("TERM_PROGRAM", profile.term_program.as_deref()),
-        (
-            "TERM_PROGRAM_VERSION",
-            profile.term_program_version.as_deref(),
-        ),
-    ] {
-        if let Some(value) = value {
-            command.env(name, value);
-        }
-    }
-    command.env("BOOMUX_WORKSPACE_ID", &shell.workspace_id);
-    command.env("BOOMUX_WORKSPACE", workspace_name);
-    command.env("BOOMUX_SHELL_ID", &shell.id);
-    command.env("BOOMUX_SHELL_NAME", shell_name);
-    command.env("BOOMUX_RUN_ID", &run.id);
-    let child = pty.slave.spawn_command(command).map_err(io::Error::other)?;
-    drop(pty.slave);
-    drop(pty.master);
-
-    let terminal = initial_terminal_state(
-        profile.rows,
-        profile.cols,
-        workspace_name,
-        shell_name,
-        recovery.history,
-    );
-
-    Ok((
-        Arc::new(ShellRuntime {
-            control: Mutex::new(()),
-            master: Mutex::new(master),
-            process: Mutex::new(ManagedProcess::Owned(child)),
-            terminal: Arc::new(Mutex::new(terminal)),
-            controller: Mutex::new(None),
-            reader: Mutex::new(None),
-            output_changed: Condvar::new(),
-            output_wait: Mutex::new(()),
-        }),
-        reader,
-    ))
+struct RuntimeStart<'a> {
+    workspace_name: &'a str,
+    shell_name: &'a str,
+    profile: &'a TerminalProfile,
+    environment: Option<&'a UnixEnvironment>,
+    recovery: RuntimeRecovery<'a>,
 }
 
-fn start_pty_reader(
-    registry: Weak<Registry>,
-    shell: Arc<Shell>,
-    run: Arc<ShellRun>,
-    runtime: Arc<ShellRuntime>,
-    mut reader: PtyReader,
-    start_paused: bool,
-) -> io::Result<()> {
-    let (commands, command_receiver) = mpsc::channel();
-    let reader_runtime = Arc::clone(&runtime);
-    let reader_run = Arc::clone(&run);
-    let handle = thread::Builder::new()
-        .name(format!("boomux-pty-{}", shell.id))
-        .spawn(move || {
-            let mut buffer = [0; 16 * 1024];
-            let mut stopped = false;
-            let mut paused = start_paused;
-            let mut last_history_checkpoint = Instant::now();
-            let mut pause_cancellation: Option<Arc<AtomicBool>> = None;
-            let mut pending_output_revision = None;
-            let mut output_publication_deadline = None;
-            loop {
-                if paused {
-                    if pause_cancellation
-                        .as_ref()
-                        .is_some_and(|cancelled| cancelled.load(Ordering::Acquire))
-                    {
-                        paused = false;
-                        pause_cancellation = None;
+impl ShellRuntimeManager {
+    fn spawn_runtime(
+        &self,
+        shell: &Arc<Shell>,
+        run: &ShellRun,
+        start: RuntimeStart<'_>,
+    ) -> io::Result<(Arc<ShellRuntime>, PtyReader)> {
+        let RuntimeStart {
+            workspace_name,
+            shell_name,
+            profile,
+            environment,
+            recovery,
+        } = start;
+        let pty = native_pty_system()
+            .openpty(PtySize {
+                rows: profile.rows,
+                cols: profile.cols,
+                pixel_width: profile.pixel_width,
+                pixel_height: profile.pixel_height,
+            })
+            .map_err(io::Error::other)?;
+        let master = PtyMaster::duplicate(pty.master.as_ref())?;
+        let reader = master.try_clone_reader()?;
+
+        let client_shell = environment
+            .and_then(|environment| {
+                environment
+                    .variables
+                    .iter()
+                    .find(|variable| variable.name == b"SHELL")
+                    .map(|variable| std::ffi::OsString::from_vec(variable.value.clone()))
+            })
+            .or_else(|| {
+                environment
+                    .is_none()
+                    .then(|| env::var_os("SHELL"))
+                    .flatten()
+            })
+            .unwrap_or_else(|| "/bin/sh".into());
+        let selected_command = recovery.effective_command.unwrap_or(&shell.command);
+        let mut command = if selected_command.is_empty() {
+            CommandBuilder::new(client_shell)
+        } else {
+            let mut command = CommandBuilder::new(&selected_command[0]);
+            command.args(&selected_command[1..]);
+            command
+        };
+        command.cwd(&shell.cwd);
+        if let Some(environment) = environment {
+            command.env_clear();
+            for variable in &environment.variables {
+                command.env(
+                    std::ffi::OsString::from_vec(variable.name.clone()),
+                    std::ffi::OsString::from_vec(variable.value.clone()),
+                );
+            }
+        }
+        for name in ["TERM", "COLORTERM", "TERM_PROGRAM", "TERM_PROGRAM_VERSION"] {
+            command.env_remove(name);
+        }
+        for (name, value) in [
+            ("TERM", profile.term.as_deref()),
+            ("COLORTERM", profile.colorterm.as_deref()),
+            ("TERM_PROGRAM", profile.term_program.as_deref()),
+            (
+                "TERM_PROGRAM_VERSION",
+                profile.term_program_version.as_deref(),
+            ),
+        ] {
+            if let Some(value) = value {
+                command.env(name, value);
+            }
+        }
+        command.env("BOOMUX_WORKSPACE_ID", &shell.workspace_id);
+        command.env("BOOMUX_WORKSPACE", workspace_name);
+        command.env("BOOMUX_SHELL_ID", &shell.id);
+        command.env("BOOMUX_SHELL_NAME", shell_name);
+        command.env("BOOMUX_RUN_ID", &run.id);
+        let child = pty.slave.spawn_command(command).map_err(io::Error::other)?;
+        drop(pty.slave);
+        drop(pty.master);
+
+        let terminal = initial_terminal_state(
+            profile.rows,
+            profile.cols,
+            workspace_name,
+            shell_name,
+            recovery.history,
+        );
+
+        Ok((
+            Arc::new(ShellRuntime {
+                control: Mutex::new(()),
+                master: Mutex::new(master),
+                process: Mutex::new(ManagedProcess::Owned(child)),
+                terminal: Arc::new(Mutex::new(terminal)),
+                controller: Mutex::new(None),
+                reader: Mutex::new(None),
+                output_changed: Condvar::new(),
+                output_wait: Mutex::new(()),
+            }),
+            reader,
+        ))
+    }
+
+    fn start_pty_reader(
+        &self,
+        registry: Weak<DaemonService>,
+        shell: Arc<Shell>,
+        run: Arc<ShellRun>,
+        runtime: Arc<ShellRuntime>,
+        mut reader: PtyReader,
+        start_paused: bool,
+    ) -> io::Result<()> {
+        let (commands, command_receiver) = mpsc::channel();
+        let reader_runtime = Arc::clone(&runtime);
+        let reader_run = Arc::clone(&run);
+        let handle = thread::Builder::new()
+            .name(format!("boomux-pty-{}", shell.id))
+            .spawn(move || {
+                let mut buffer = [0; 16 * 1024];
+                let mut stopped = false;
+                let mut paused = start_paused;
+                let mut last_history_checkpoint = Instant::now();
+                let mut pause_cancellation: Option<Arc<AtomicBool>> = None;
+                let mut pending_output_revision = None;
+                let mut output_publication_deadline = None;
+                loop {
+                    if paused {
+                        if pause_cancellation
+                            .as_ref()
+                            .is_some_and(|cancelled| cancelled.load(Ordering::Acquire))
+                        {
+                            paused = false;
+                            pause_cancellation = None;
+                            continue;
+                        }
+                        match command_receiver.recv_timeout(IO_RETRY_DELAY) {
+                            Ok(ReaderCommand::Pause {
+                                acknowledge,
+                                cancelled,
+                            }) => {
+                                let result = Self::publish_pending_output(
+                                    &registry,
+                                    &shell,
+                                    &reader_run,
+                                    &mut pending_output_revision,
+                                    &mut output_publication_deadline,
+                                );
+                                if !cancelled.load(Ordering::Acquire) {
+                                    let _ = acknowledge.send(result);
+                                }
+                            }
+                            Ok(ReaderCommand::Resume) => {
+                                paused = false;
+                                pause_cancellation = None;
+                            }
+                            Ok(ReaderCommand::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                                stopped = true;
+                                break;
+                            }
+                            Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        }
                         continue;
                     }
-                    match command_receiver.recv_timeout(IO_RETRY_DELAY) {
+                    match command_receiver.try_recv() {
                         Ok(ReaderCommand::Pause {
                             acknowledge,
                             cancelled,
                         }) => {
-                            let result = publish_pending_output(
+                            if cancelled.load(Ordering::Acquire) {
+                                continue;
+                            }
+                            if let Err(error) = Self::publish_pending_output(
                                 &registry,
                                 &shell,
                                 &reader_run,
                                 &mut pending_output_revision,
                                 &mut output_publication_deadline,
-                            );
-                            if !cancelled.load(Ordering::Acquire) {
-                                let _ = acknowledge.send(result);
+                            ) {
+                                let _ = acknowledge.send(Err(error));
+                                return Err(io::Error::other(
+                                    "could not publish output before pause",
+                                ));
                             }
+                            paused = true;
+                            pause_cancellation = Some(Arc::clone(&cancelled));
+                            if acknowledge.send(Ok(())).is_err()
+                                || cancelled.load(Ordering::Acquire)
+                            {
+                                paused = false;
+                                pause_cancellation = None;
+                            }
+                            continue;
                         }
-                        Ok(ReaderCommand::Resume) => {
-                            paused = false;
-                            pause_cancellation = None;
-                        }
-                        Ok(ReaderCommand::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        Ok(ReaderCommand::Resume) => continue,
+                        Ok(ReaderCommand::Stop) | Err(mpsc::TryRecvError::Disconnected) => {
+                            Self::publish_pending_output(
+                                &registry,
+                                &shell,
+                                &reader_run,
+                                &mut pending_output_revision,
+                                &mut output_publication_deadline,
+                            )?;
                             stopped = true;
                             break;
                         }
-                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(mpsc::TryRecvError::Empty) => {}
                     }
-                    continue;
-                }
-                match command_receiver.try_recv() {
-                    Ok(ReaderCommand::Pause {
-                        acknowledge,
-                        cancelled,
-                    }) => {
-                        if cancelled.load(Ordering::Acquire) {
-                            continue;
-                        }
-                        if let Err(error) = publish_pending_output(
-                            &registry,
-                            &shell,
-                            &reader_run,
-                            &mut pending_output_revision,
-                            &mut output_publication_deadline,
-                        ) {
-                            let _ = acknowledge.send(Err(error));
-                            return Err(io::Error::other("could not publish output before pause"));
-                        }
-                        paused = true;
-                        pause_cancellation = Some(Arc::clone(&cancelled));
-                        if acknowledge.send(Ok(())).is_err() || cancelled.load(Ordering::Acquire) {
-                            paused = false;
-                            pause_cancellation = None;
-                        }
-                        continue;
-                    }
-                    Ok(ReaderCommand::Resume) => continue,
-                    Ok(ReaderCommand::Stop) | Err(mpsc::TryRecvError::Disconnected) => {
-                        publish_pending_output(
-                            &registry,
-                            &shell,
-                            &reader_run,
-                            &mut pending_output_revision,
-                            &mut output_publication_deadline,
-                        )?;
-                        stopped = true;
-                        break;
-                    }
-                    Err(mpsc::TryRecvError::Empty) => {}
-                }
-                match reader.read(&mut buffer) {
-                    Ok(0) => break,
-                    Ok(count) => {
-                        let bytes = &buffer[..count];
-                        let Some(active_registry) = registry.upgrade() else {
-                            break;
-                        };
-                        let Ok(_output_wait) = reader_runtime.output_wait.lock() else {
-                            break;
-                        };
-                        let Ok(mut terminal) = reader_runtime.terminal.lock() else {
-                            break;
-                        };
-                        terminal.process(bytes);
-                        let Ok(previous_revision) = reader_run.output_revision.fetch_update(
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                            |revision| revision.checked_add(1),
-                        ) else {
-                            break;
-                        };
-                        let revision = previous_revision + 1;
-                        if let Ok(mut last_run) = shell.last_run.lock()
-                            && let Some(last_run) = last_run.as_mut()
-                            && last_run.id == reader_run.id
-                        {
-                            last_run.output_revision = revision;
-                        }
-                        if let Ok(mut controller) = reader_runtime.controller.lock() {
-                            let disconnect = controller.as_ref().is_some_and(|current| {
-                                matches!(
-                                    current
-                                        .output
-                                        .try_send(ControllerOutput::Data(bytes.to_vec())),
-                                    Err(TrySendError::Full(_) | TrySendError::Disconnected(_))
-                                )
+                    match reader.read(&mut buffer) {
+                        Ok(0) => break,
+                        Ok(count) => {
+                            let bytes = &buffer[..count];
+                            let Some(active_registry) = registry.upgrade() else {
+                                break;
+                            };
+                            let Ok(_output_wait) = reader_runtime.output_wait.lock() else {
+                                break;
+                            };
+                            let Ok(mut terminal) = reader_runtime.terminal.lock() else {
+                                break;
+                            };
+                            terminal.process(bytes);
+                            let Ok(previous_revision) = reader_run.output_revision.fetch_update(
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                                |revision| revision.checked_add(1),
+                            ) else {
+                                break;
+                            };
+                            let revision = previous_revision + 1;
+                            if let Ok(mut last_run) = shell.last_run.lock()
+                                && let Some(last_run) = last_run.as_mut()
+                                && last_run.id == reader_run.id
+                            {
+                                last_run.output_revision = revision;
+                            }
+                            if let Ok(mut controller) = reader_runtime.controller.lock() {
+                                let disconnect = controller.as_ref().is_some_and(|current| {
+                                    matches!(
+                                        current
+                                            .output
+                                            .try_send(ControllerOutput::Data(bytes.to_vec())),
+                                        Err(TrySendError::Full(_) | TrySendError::Disconnected(_))
+                                    )
+                                });
+                                if disconnect && let Some(current) = controller.take() {
+                                    let _ = current.connection.shutdown(std::net::Shutdown::Both);
+                                }
+                            }
+                            drop(terminal);
+                            reader_runtime.output_changed.notify_all();
+                            drop(_output_wait);
+                            pending_output_revision = Some(revision);
+                            output_publication_deadline.get_or_insert_with(|| {
+                                Instant::now() + OUTPUT_PUBLICATION_INTERVAL
                             });
-                            if disconnect && let Some(current) = controller.take() {
-                                let _ = current.connection.shutdown(std::net::Shutdown::Both);
+                            if output_publication_deadline
+                                .is_some_and(|deadline| Instant::now() >= deadline)
+                                && Self::publish_pending_output(
+                                    &registry,
+                                    &shell,
+                                    &reader_run,
+                                    &mut pending_output_revision,
+                                    &mut output_publication_deadline,
+                                )
+                                .is_err()
+                            {
+                                break;
+                            }
+                            if active_registry
+                                .notification_settings
+                                .persist_terminal_history
+                                && last_history_checkpoint.elapsed() >= TERMINAL_HISTORY_INTERVAL
+                                && Self::checkpoint_terminal_history(
+                                    &active_registry,
+                                    &shell,
+                                    &reader_run,
+                                    &reader_runtime,
+                                )
+                                .is_ok()
+                            {
+                                last_history_checkpoint = Instant::now();
                             }
                         }
-                        drop(terminal);
-                        reader_runtime.output_changed.notify_all();
-                        drop(_output_wait);
-                        pending_output_revision = Some(revision);
-                        output_publication_deadline
-                            .get_or_insert_with(|| Instant::now() + OUTPUT_PUBLICATION_INTERVAL);
-                        if output_publication_deadline
-                            .is_some_and(|deadline| Instant::now() >= deadline)
-                            && publish_pending_output(
-                                &registry,
-                                &shell,
-                                &reader_run,
-                                &mut pending_output_revision,
-                                &mut output_publication_deadline,
-                            )
-                            .is_err()
-                        {
-                            break;
+                        Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            if output_publication_deadline
+                                .is_some_and(|deadline| Instant::now() >= deadline)
+                                && Self::publish_pending_output(
+                                    &registry,
+                                    &shell,
+                                    &reader_run,
+                                    &mut pending_output_revision,
+                                    &mut output_publication_deadline,
+                                )
+                                .is_err()
+                            {
+                                break;
+                            }
+                            let process_exited = reader_runtime
+                                .process
+                                .lock()
+                                .ok()
+                                .and_then(|mut process| process.try_wait_code().ok())
+                                .flatten()
+                                .is_some();
+                            if process_exited {
+                                break;
+                            }
+                            thread::sleep(IO_RETRY_DELAY);
                         }
-                        if active_registry
-                            .notification_settings
-                            .persist_terminal_history
-                            && last_history_checkpoint.elapsed() >= TERMINAL_HISTORY_INTERVAL
-                            && checkpoint_terminal_history(
-                                &active_registry,
-                                &shell,
-                                &reader_run,
-                                &reader_runtime,
-                            )
-                            .is_ok()
-                        {
-                            last_history_checkpoint = Instant::now();
-                        }
+                        Err(_) => break,
                     }
-                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                        if output_publication_deadline
-                            .is_some_and(|deadline| Instant::now() >= deadline)
-                            && publish_pending_output(
-                                &registry,
-                                &shell,
-                                &reader_run,
-                                &mut pending_output_revision,
-                                &mut output_publication_deadline,
-                            )
-                            .is_err()
-                        {
-                            break;
-                        }
-                        let process_exited = reader_runtime
-                            .process
-                            .lock()
-                            .ok()
-                            .and_then(|mut process| process.try_wait_code().ok())
-                            .flatten()
-                            .is_some();
-                        if process_exited {
-                            break;
-                        }
-                        thread::sleep(IO_RETRY_DELAY);
+                }
+                Self::publish_pending_output(
+                    &registry,
+                    &shell,
+                    &reader_run,
+                    &mut pending_output_revision,
+                    &mut output_publication_deadline,
+                )?;
+                let _wait = lock(&reader_runtime.output_wait)?;
+                reader_runtime.output_changed.notify_all();
+                drop(_wait);
+                if stopped {
+                    return Ok(());
+                }
+                let code = reader_runtime
+                    .process
+                    .lock()
+                    .ok()
+                    .and_then(|mut process| process.try_wait_code().ok().flatten().flatten());
+                if let Some(registry) = registry.upgrade() {
+                    if registry.notification_settings.persist_terminal_history {
+                        let _ = Self::checkpoint_terminal_history(
+                            &registry,
+                            &shell,
+                            &reader_run,
+                            &reader_runtime,
+                        );
                     }
-                    Err(_) => break,
+                    if let Err(error) =
+                        registry.record_run_exit(&shell, &reader_run, &reader_runtime, code)
+                    {
+                        eprintln!("boomux: could not persist shell run exit: {error}");
+                    }
                 }
-            }
-            publish_pending_output(
-                &registry,
-                &shell,
-                &reader_run,
-                &mut pending_output_revision,
-                &mut output_publication_deadline,
-            )?;
-            let _wait = lock(&reader_runtime.output_wait)?;
-            reader_runtime.output_changed.notify_all();
-            drop(_wait);
-            if stopped {
-                return Ok(());
-            }
-            let code = reader_runtime
-                .process
-                .lock()
-                .ok()
-                .and_then(|mut process| process.try_wait_code().ok().flatten().flatten());
-            if let Some(registry) = registry.upgrade() {
-                if registry.notification_settings.persist_terminal_history {
-                    let _ = checkpoint_terminal_history(
-                        &registry,
-                        &shell,
-                        &reader_run,
-                        &reader_runtime,
-                    );
-                }
-                if let Err(error) =
-                    registry.record_run_exit(&shell, &reader_run, &reader_runtime, code)
-                {
-                    eprintln!("boomux: could not persist shell run exit: {error}");
-                }
-            }
-            let _ = reader_runtime
-                .controller
-                .lock()
-                .map(|mut controller| controller.take());
-            Ok(())
-        })?;
-    *lock(&runtime.reader)? = Some(ReaderTask {
-        commands,
-        handle: Mutex::new(Some(handle)),
-    });
-    Ok(())
-}
-
-fn publish_pending_output(
-    registry: &Weak<Registry>,
-    shell: &Shell,
-    run: &ShellRun,
-    pending_revision: &mut Option<u64>,
-    deadline: &mut Option<Instant>,
-) -> io::Result<()> {
-    let Some(revision) = *pending_revision else {
-        return Ok(());
-    };
-    let Some(registry) = registry.upgrade() else {
-        return Ok(());
-    };
-    registry.publish_runtime_batch(vec![DaemonEventKind::OutputChanged {
-        workspace_id: shell.workspace_id.clone(),
-        shell_id: shell.id.clone(),
-        run_id: run.id.clone(),
-        output_revision: revision,
-    }])?;
-    *pending_revision = None;
-    *deadline = None;
-    Ok(())
-}
-
-fn checkpoint_terminal_history(
-    registry: &Registry,
-    shell: &Shell,
-    run: &ShellRun,
-    runtime: &ShellRuntime,
-) -> io::Result<()> {
-    let snapshot = lock(&runtime.terminal)?.snapshot();
-    let history = snapshot.plain_text_suffix(MAX_TERMINAL_HISTORY_BYTES);
-    let mut last_run = lock(&shell.last_run)?;
-    let Some(last_run) = last_run.as_mut().filter(|saved| saved.id == run.id) else {
-        return Ok(());
-    };
-    if last_run.terminal_history.as_deref() == Some(&history) {
-        return Ok(());
+                let _ = reader_runtime
+                    .controller
+                    .lock()
+                    .map(|mut controller| controller.take());
+                Ok(())
+            })?;
+        *lock(&runtime.reader)? = Some(ReaderTask {
+            commands,
+            handle: Mutex::new(Some(handle)),
+        });
+        Ok(())
     }
-    last_run.terminal_history = Some(history);
-    registry.mark_persistence_dirty();
-    Ok(())
+
+    fn publish_pending_output(
+        registry: &Weak<DaemonService>,
+        shell: &Shell,
+        run: &ShellRun,
+        pending_revision: &mut Option<u64>,
+        deadline: &mut Option<Instant>,
+    ) -> io::Result<()> {
+        let Some(revision) = *pending_revision else {
+            return Ok(());
+        };
+        let Some(registry) = registry.upgrade() else {
+            return Ok(());
+        };
+        registry
+            .events
+            .publish_runtime_batch(vec![DaemonEventKind::OutputChanged {
+                workspace_id: shell.workspace_id.clone(),
+                shell_id: shell.id.clone(),
+                run_id: run.id.clone(),
+                output_revision: revision,
+            }])?;
+        *pending_revision = None;
+        *deadline = None;
+        Ok(())
+    }
+
+    fn checkpoint_terminal_history(
+        registry: &DaemonService,
+        shell: &Shell,
+        run: &ShellRun,
+        runtime: &ShellRuntime,
+    ) -> io::Result<()> {
+        let snapshot = lock(&runtime.terminal)?.snapshot();
+        let history = snapshot.plain_text_suffix(MAX_TERMINAL_HISTORY_BYTES);
+        let mut last_run = lock(&shell.last_run)?;
+        let Some(last_run) = last_run.as_mut().filter(|saved| saved.id == run.id) else {
+            return Ok(());
+        };
+        if last_run.terminal_history.as_deref() == Some(&history) {
+            return Ok(());
+        }
+        last_run.terminal_history = Some(history);
+        registry.mark_persistence_dirty();
+        Ok(())
+    }
 }
 
 struct AttachRequestOptions {
@@ -5350,103 +5720,58 @@ struct AttachRequestOptions {
     environment: Option<UnixEnvironment>,
 }
 
-fn handle_attach(
-    mut stream: UnixStream,
-    response_version: u32,
-    registry: &Arc<Registry>,
-    shell_id: &str,
-    options: AttachRequestOptions,
-) -> io::Result<()> {
-    let AttachRequestOptions {
-        takeover,
-        restart_exited,
-        profile,
-        environment,
-    } = options;
-    if let Err(error) = validate_terminal_profile(&profile) {
-        return send_response(
-            &mut stream,
-            response_version,
-            error_response(ErrorCode::InvalidArgument, error.to_string()),
-        );
-    }
-    if let Some(environment) = &environment
-        && let Err(error) = validate_unix_environment(environment)
-    {
-        return send_response(
-            &mut stream,
-            response_version,
-            error_response(ErrorCode::InvalidArgument, error.to_string()),
-        );
-    }
-    let shell = match registry.shell(shell_id) {
-        Ok(shell) => shell,
-        Err(error) => {
+impl ShellRuntimeManager {
+    fn handle_attach(
+        &self,
+        mut stream: UnixStream,
+        response_version: u32,
+        registry: &Arc<DaemonService>,
+        shell_id: &str,
+        options: AttachRequestOptions,
+    ) -> io::Result<()> {
+        let AttachRequestOptions {
+            takeover,
+            restart_exited,
+            profile,
+            environment,
+        } = options;
+        if let Err(error) = validate_terminal_profile(&profile) {
             return send_response(
                 &mut stream,
                 response_version,
-                error_response(error_code(&error), error.to_string()),
+                error_response(ErrorCode::InvalidArgument, error.to_string()),
             );
         }
-    };
-    let mutation = lock(&registry.mutation_lock)?;
-    if registry.stopping.load(Ordering::Acquire) {
-        return send_response(
-            &mut stream,
-            response_version,
-            error_response(ErrorCode::DaemonStopping, "Boomux daemon is stopping"),
-        );
-    }
-    let token = Uuid::new_v4().to_string();
-    let (output, receiver) = mpsc::sync_channel(CONTROLLER_QUEUE);
-    let connection = stream.try_clone()?;
-    let mut transition = None;
-    if restart_exited {
-        let old_runtime = match &*lock(&shell.lifecycle)? {
-            ShellLifecycle::Exited { runtime, .. } => runtime.clone(),
-            _ => None,
+        if let Some(environment) = &environment
+            && let Err(error) = validate_unix_environment(environment)
+        {
+            return send_response(
+                &mut stream,
+                response_version,
+                error_response(ErrorCode::InvalidArgument, error.to_string()),
+            );
+        }
+        let shell = match registry.shell(shell_id) {
+            Ok(shell) => shell,
+            Err(error) => {
+                return send_response(
+                    &mut stream,
+                    response_version,
+                    error_response(error_code(&error), error.to_string()),
+                );
+            }
         };
-        if let Some(runtime) = old_runtime {
-            runtime.stop_reader()?;
+        let mutation = lock(&registry.mutation_lock)?;
+        if registry.runtimes.is_stopping() {
+            return send_response(
+                &mut stream,
+                response_version,
+                error_response(ErrorCode::DaemonStopping, "Boomux daemon is stopping"),
+            );
         }
-        let mut lifecycle = lock(&shell.lifecycle)?;
-        if matches!(*lifecycle, ShellLifecycle::Exited { .. }) {
-            *lifecycle = ShellLifecycle::Pending;
-        }
-    }
-    let previous_run = lock(&shell.last_run)?.clone();
-    let needs_start = matches!(*lock(&shell.lifecycle)?, ShellLifecycle::Pending);
-    let resume_command = needs_start
-        .then(|| registry.agent_resume_command(&shell, previous_run.as_ref()))
-        .transpose()?
-        .flatten();
-    let restored_history = needs_start
-        .then(|| {
-            registry
-                .notification_settings
-                .persist_terminal_history
-                .then(|| previous_run.as_ref()?.terminal_history.clone())
-                .flatten()
-        })
-        .flatten();
-    if needs_start {
-        registry.flush_pending()?;
-    }
-    let persistence = needs_start
-        .then(|| lock(&registry.persist_lock))
-        .transpose()?;
-    if needs_start {
-        transition = Some(lock(&registry.transitions)?);
-    }
-    let mut events = needs_start
-        .then(|| lock(&registry.events.state))
-        .transpose()?;
-    if needs_start {
-        EventLog::ensure_capacity(events.as_ref().expect("start event log is locked"), 1)?;
-    }
-    let (attached_run, runtime, terminal, startup_profile, running, started) = {
-        let mut lifecycle = lock(&shell.lifecycle)?;
-        let mut started = false;
+        let token = Uuid::new_v4().to_string();
+        let (output, receiver) = mpsc::sync_channel(CONTROLLER_QUEUE);
+        let connection = stream.try_clone()?;
         if !registry.contains_shell(&shell)? {
             return send_response(
                 &mut stream,
@@ -5454,59 +5779,107 @@ fn handle_attach(
                 error_response(ErrorCode::NotFound, format!("shell not found: {shell_id}")),
             );
         }
-        if matches!(*lifecycle, ShellLifecycle::Pending) {
-            let workspace = registry.workspace(&shell.workspace_id)?;
-            let workspace_name = lock(&workspace.name)?.clone();
-            let shell_name = lock(&shell.name)?.clone();
-            let generation = previous_run.as_ref().map_or(Ok(1), |run| {
-                run.generation
-                    .checked_add(1)
-                    .ok_or_else(|| io::Error::other("shell run generation exhausted"))
-            })?;
-            let run = Arc::new(ShellRun::new(generation));
-            let (runtime, reader) = match spawn_runtime(
-                &shell,
-                &run,
-                &workspace_name,
-                &shell_name,
-                &profile,
-                environment.as_ref(),
-                RuntimeRecovery {
-                    effective_command: resume_command.as_deref(),
-                    history: restored_history.as_deref(),
-                },
-            ) {
-                Ok(runtime) => runtime,
-                Err(error) => {
+        let workspace = registry.workspace(&shell.workspace_id)?;
+        let workspace_name = lock(&workspace.name)?.clone();
+        let shell_name = lock(&shell.name)?.clone();
+        if restart_exited {
+            let old_runtime = match &*lock(&shell.lifecycle)? {
+                ShellLifecycle::Exited { runtime, .. } => runtime.clone(),
+                _ => None,
+            };
+            if let Some(runtime) = old_runtime {
+                self.stop_reader(&runtime)?;
+            }
+            let mut lifecycle = lock(&shell.lifecycle)?;
+            if matches!(*lifecycle, ShellLifecycle::Exited { .. }) {
+                *lifecycle = ShellLifecycle::Pending;
+            }
+        }
+        let previous_run = lock(&shell.last_run)?.clone();
+        let needs_start = matches!(*lock(&shell.lifecycle)?, ShellLifecycle::Pending);
+        let resume_command = needs_start
+            .then(|| registry.agent_resume_command(&shell, previous_run.as_ref()))
+            .transpose()?
+            .flatten();
+        let restored_history = needs_start
+            .then(|| {
+                registry
+                    .notification_settings
+                    .persist_terminal_history
+                    .then(|| previous_run.as_ref()?.terminal_history.clone())
+                    .flatten()
+            })
+            .flatten();
+        if needs_start {
+            registry.flush_pending()?;
+        }
+        let persistence = needs_start
+            .then(|| lock(&registry.durable.persist_lock))
+            .transpose()?;
+        let mut event_transaction = needs_start
+            .then(|| registry.events.transaction())
+            .transpose()?;
+        if needs_start {
+            event_transaction
+                .as_ref()
+                .expect("start event transaction is locked")
+                .reserve(1)?;
+        }
+        let (attached_run, runtime, terminal, startup_profile, running, started) = {
+            let mut lifecycle = lock(&shell.lifecycle)?;
+            let mut started = false;
+            if matches!(*lifecycle, ShellLifecycle::Pending) {
+                let generation = previous_run.as_ref().map_or(Ok(1), |run| {
+                    run.generation
+                        .checked_add(1)
+                        .ok_or_else(|| io::Error::other("shell run generation exhausted"))
+                })?;
+                let run = Arc::new(ShellRun::new(generation));
+                let (runtime, reader) = match self.spawn_runtime(
+                    &shell,
+                    &run,
+                    RuntimeStart {
+                        workspace_name: &workspace_name,
+                        shell_name: &shell_name,
+                        profile: &profile,
+                        environment: environment.as_ref(),
+                        recovery: RuntimeRecovery {
+                            effective_command: resume_command.as_deref(),
+                            history: restored_history.as_deref(),
+                        },
+                    },
+                ) {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        return send_response(
+                            &mut stream,
+                            response_version,
+                            error_response(
+                                ErrorCode::ShellStartFailed,
+                                format!("could not start shell: {error}"),
+                            ),
+                        );
+                    }
+                };
+                *lifecycle = ShellLifecycle::Running {
+                    profile: profile.clone(),
+                    run: Arc::clone(&run),
+                    runtime: Arc::clone(&runtime),
+                };
+                *lock(&shell.last_run)? = Some(run.persisted(profile.clone())?);
+                started = true;
+                if let Err(error) = self.start_pty_reader(
+                    Arc::downgrade(registry),
+                    Arc::clone(&shell),
+                    run,
+                    runtime,
+                    reader,
+                    true,
+                ) {
+                    drop(lifecycle);
+                    let cleanup = self.kill(&shell);
+                    self.reset_pending(&shell)?;
                     return send_response(
-                        &mut stream,
-                        response_version,
-                        error_response(
-                            ErrorCode::ShellStartFailed,
-                            format!("could not start shell: {error}"),
-                        ),
-                    );
-                }
-            };
-            *lifecycle = ShellLifecycle::Running {
-                profile: profile.clone(),
-                run: Arc::clone(&run),
-                runtime: Arc::clone(&runtime),
-            };
-            *lock(&shell.last_run)? = Some(run.persisted(profile.clone())?);
-            started = true;
-            if let Err(error) = start_pty_reader(
-                Arc::downgrade(registry),
-                Arc::clone(&shell),
-                run,
-                runtime,
-                reader,
-                true,
-            ) {
-                drop(lifecycle);
-                let cleanup = shell.kill();
-                shell.reset_pending()?;
-                return send_response(
                     &mut stream,
                     response_version,
                     error_response(
@@ -5521,65 +5894,57 @@ fn handle_attach(
                         ),
                     ),
                 );
+                }
             }
-        }
-        match &*lifecycle {
-            ShellLifecycle::Running {
-                profile,
-                run,
-                runtime,
-            } => (
-                Some(Arc::clone(run)),
-                Some(Arc::clone(runtime)),
-                Arc::clone(&runtime.terminal),
-                profile.clone(),
-                true,
-                started,
-            ),
-            ShellLifecycle::Exited {
-                profile, terminal, ..
-            } => (
-                None,
-                None,
-                Arc::clone(terminal),
-                profile.clone(),
-                false,
-                started,
-            ),
-            ShellLifecycle::Pending => unreachable!(),
-            ShellLifecycle::Closed => {
+            match &*lifecycle {
+                ShellLifecycle::Running {
+                    profile,
+                    run,
+                    runtime,
+                } => (
+                    Some(Arc::clone(run)),
+                    Some(Arc::clone(runtime)),
+                    Arc::clone(&runtime.terminal),
+                    profile.clone(),
+                    true,
+                    started,
+                ),
+                ShellLifecycle::Exited {
+                    profile, terminal, ..
+                } => (
+                    None,
+                    None,
+                    Arc::clone(terminal),
+                    profile.clone(),
+                    false,
+                    started,
+                ),
+                ShellLifecycle::Pending => unreachable!(),
+                ShellLifecycle::Closed => {
+                    return send_response(
+                        &mut stream,
+                        response_version,
+                        error_response(ErrorCode::NotFound, format!("shell not found: {shell_id}")),
+                    );
+                }
+            }
+        };
+        if started {
+            let saved = registry.capture_persisted_state()?;
+            event_transaction
+                .as_mut()
+                .expect("start event transaction is locked")
+                .begin_persistence(1);
+            drop(event_transaction);
+            if let Err(error) = registry
+                .write_persisted_state(saved)
+                .map_err(persistence_error)
+            {
+                let cleanup = self.kill(&shell);
+                self.reset_pending(&shell)?;
+                let mut transaction = registry.events.transaction()?;
+                transaction.finish_persistence();
                 return send_response(
-                    &mut stream,
-                    response_version,
-                    error_response(ErrorCode::NotFound, format!("shell not found: {shell_id}")),
-                );
-            }
-        }
-    };
-    if started {
-        let saved = registry.capture_persisted_state()?;
-        transition
-            .as_mut()
-            .expect("start transition is locked")
-            .persistence_in_flight = true;
-        transition
-            .as_mut()
-            .expect("start transition is locked")
-            .in_flight_event_count = 1;
-        drop(events);
-        drop(transition);
-        if let Err(error) = registry
-            .write_persisted_state(saved)
-            .map_err(persistence_error)
-        {
-            let cleanup = shell.kill();
-            shell.reset_pending()?;
-            let mut transition = lock(&registry.transitions)?;
-            let mut events = lock(&registry.events.state)?;
-            transition.persistence_in_flight = false;
-            transition.in_flight_event_count = 0;
-            registry.publish_pending_runtime_locked(&mut transition, &mut events);
-            return send_response(
                 &mut stream,
                 response_version,
                 error_response(
@@ -5594,300 +5959,299 @@ fn handle_attach(
                     ),
                 ),
             );
+            }
+            event_transaction = Some(registry.events.transaction()?);
         }
-        transition = Some(lock(&registry.transitions)?);
-        events = Some(lock(&registry.events.state)?);
-    }
-    if started {
-        let run = shell
-            .snapshot()?
-            .run
-            .ok_or_else(|| io::Error::other("started shell has no run identity"))?;
-        let events = events.as_mut().expect("start event log is locked");
-        EventLog::append_batch_locked(
-            events,
-            vec![DaemonEventKind::RunStarted {
+        if started {
+            let run = shell
+                .snapshot()?
+                .run
+                .ok_or_else(|| io::Error::other("started shell has no run identity"))?;
+            let transaction = event_transaction
+                .as_mut()
+                .expect("start event transaction is locked");
+            transaction.append_batch(vec![DaemonEventKind::RunStarted {
                 workspace_id: shell.workspace_id.clone(),
                 shell_id: shell.id.clone(),
                 run,
-            }],
-        );
-        let transition = transition.as_mut().expect("start transition is locked");
-        transition.persistence_in_flight = false;
-        transition.in_flight_event_count = 0;
-        registry.publish_pending_runtime_locked(transition, events);
-    }
-    drop(events);
-    drop(persistence);
-    drop(transition);
-    if started {
-        registry.events.changed.notify_all();
-    }
-    if started {
-        runtime
-            .as_ref()
-            .expect("started shell has a runtime")
-            .resume_reader()?;
-    }
-    let warning = term_mismatch_warning(startup_profile.term.as_deref(), profile.term.as_deref());
-    if !running {
+            }]);
+            transaction.finish_persistence();
+        }
+        drop(event_transaction);
+        drop(persistence);
+        if started {
+            registry.events.notify();
+        }
+        if started {
+            self.resume_reader(runtime.as_ref().expect("started shell has a runtime"))?;
+        }
+        let warning =
+            term_mismatch_warning(startup_profile.term.as_deref(), profile.term.as_deref());
+        if !running {
+            lock(&terminal)?.resize(profile.rows, profile.cols);
+            send_response(
+                &mut stream,
+                response_version,
+                Response::Attached {
+                    token,
+                    reconstruction: lock(&terminal)?.reconstruction(),
+                    warning,
+                },
+            )?;
+            return AttachFrame::Detached.write_to(&mut stream);
+        }
+        let attached_run = attached_run.expect("running shell has a run");
+        let runtime = runtime.expect("running shell has a runtime");
+        let control = lock(&runtime.control)?;
+        {
+            let controller = lock(&runtime.controller)?;
+            if controller.is_some() && !takeover {
+                return send_response(
+                    &mut stream,
+                    response_version,
+                    error_response(
+                        ErrorCode::Busy,
+                        "shell already has an active controller; use takeover",
+                    ),
+                );
+            }
+        }
+        lock(&runtime.master)?.resize(Self::profile_size(&profile))?;
+        Self::update_runtime_dimensions(&shell, &runtime, Self::profile_size(&profile))?;
         lock(&terminal)?.resize(profile.rows, profile.cols);
+        // Keep terminal state locked until the controller is installed so the
+        // reconstruction ends exactly where live delivery begins.
+        let terminal = lock(&terminal)?;
         send_response(
             &mut stream,
             response_version,
             Response::Attached {
-                token,
-                reconstruction: lock(&terminal)?.reconstruction(),
+                token: token.clone(),
+                reconstruction: terminal.reconstruction(),
                 warning,
             },
         )?;
-        return AttachFrame::Detached.write_to(&mut stream);
-    }
-    drop(mutation);
-    let attached_run = attached_run.expect("running shell has a run");
-    let runtime = runtime.expect("running shell has a runtime");
-    let control = lock(&runtime.control)?;
-    if !registry.contains_shell(&shell)? {
-        return send_response(
-            &mut stream,
-            response_version,
-            error_response(ErrorCode::NotFound, format!("shell not found: {shell_id}")),
-        );
-    }
-    {
-        let controller = lock(&runtime.controller)?;
-        if controller.is_some() && !takeover {
-            return send_response(
-                &mut stream,
-                response_version,
-                error_response(
-                    ErrorCode::Busy,
-                    "shell already has an active controller; use takeover",
-                ),
-            );
-        }
-    }
-    lock(&runtime.master)?.resize(profile_size(&profile))?;
-    update_runtime_dimensions(&shell, &runtime, profile_size(&profile))?;
-    lock(&terminal)?.resize(profile.rows, profile.cols);
-    // Keep terminal state locked until the controller is installed so the
-    // reconstruction ends exactly where live delivery begins.
-    let terminal = lock(&terminal)?;
-    send_response(
-        &mut stream,
-        response_version,
-        Response::Attached {
-            token: token.clone(),
-            reconstruction: terminal.reconstruction(),
-            warning,
-        },
-    )?;
-    let lifecycle = lock(&shell.lifecycle)?;
-    let still_running = registry.contains_shell(&shell)?
-        && matches!(
+        let lifecycle = lock(&shell.lifecycle)?;
+        let still_running = matches!(
             &*lifecycle,
             ShellLifecycle::Running {
                 runtime: current,
                 ..
             } if Arc::ptr_eq(current, &runtime)
         );
-    if !still_running {
-        return AttachFrame::Detached.write_to(&mut stream);
-    }
-    let mut output_stream = stream.try_clone()?;
-    output_stream.set_write_timeout(Some(RESPONSE_WRITE_TIMEOUT))?;
-    {
-        let mut controller = lock(&runtime.controller)?;
-        if let Some(previous) = controller.take() {
-            let _ = previous.connection.shutdown(std::net::Shutdown::Both);
+        if !still_running {
+            return AttachFrame::Detached.write_to(&mut stream);
         }
-        *controller = Some(Controller {
-            token: token.clone(),
-            output,
-            connection,
-            reconnect_ack: None,
-        });
-    }
-    let output_runtime = Arc::clone(&runtime);
-    let output_token = token.clone();
-    let output_worker = match thread::Builder::new()
-        .name(format!("boomux-attachment-{}", shell.id))
-        .spawn(move || {
-            let mut reconnect = false;
-            while let Ok(output) = receiver.recv() {
-                match output {
-                    ControllerOutput::Data(bytes) => {
-                        if AttachFrame::Output(bytes)
-                            .write_to(&mut output_stream)
-                            .is_err()
-                        {
+        let mut output_stream = stream.try_clone()?;
+        output_stream.set_write_timeout(Some(RESPONSE_WRITE_TIMEOUT))?;
+        {
+            let mut controller = lock(&runtime.controller)?;
+            if let Some(previous) = controller.take() {
+                let _ = previous.connection.shutdown(std::net::Shutdown::Both);
+            }
+            *controller = Some(Controller {
+                token: token.clone(),
+                output,
+                connection,
+                reconnect_ack: None,
+            });
+        }
+        let output_runtime = Arc::clone(&runtime);
+        let output_token = token.clone();
+        let output_worker = match thread::Builder::new()
+            .name(format!("boomux-attachment-{}", shell.id))
+            .spawn(move || {
+                let mut reconnect = false;
+                while let Ok(output) = receiver.recv() {
+                    match output {
+                        ControllerOutput::Data(bytes) => {
+                            if AttachFrame::Output(bytes)
+                                .write_to(&mut output_stream)
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        ControllerOutput::Reconnect(acknowledge) => {
+                            reconnect = true;
+                            let result = AttachFrame::Reconnect.write_to(&mut output_stream);
+                            let _ = acknowledge.send(result.is_ok());
+                            if result.is_ok() {
+                                while receiver.recv().is_ok() {}
+                            }
                             break;
                         }
                     }
-                    ControllerOutput::Reconnect(acknowledge) => {
-                        reconnect = true;
-                        let result = AttachFrame::Reconnect.write_to(&mut output_stream);
-                        let _ = acknowledge.send(result.is_ok());
-                        if result.is_ok() {
-                            while receiver.recv().is_ok() {}
-                        }
-                        break;
-                    }
                 }
+                if !reconnect {
+                    let _ = AttachFrame::Detached.write_to(&mut output_stream);
+                }
+                let _ = output_stream.shutdown(std::net::Shutdown::Both);
+                let _ = Self::release_controller(&output_runtime, &output_token);
+            }) {
+            Ok(worker) => worker,
+            Err(error) => {
+                Self::release_controller(&runtime, &token)?;
+                return Err(error);
             }
-            if !reconnect {
-                let _ = AttachFrame::Detached.write_to(&mut output_stream);
-            }
-            let _ = output_stream.shutdown(std::net::Shutdown::Both);
-            let _ = output_runtime.release_controller(&output_token);
-        }) {
-        Ok(worker) => worker,
-        Err(error) => {
-            runtime.release_controller(&token)?;
-            return Err(error);
-        }
-    };
-    drop(lifecycle);
-    drop(terminal);
-    drop(control);
+        };
+        drop(mutation);
+        drop(lifecycle);
+        drop(terminal);
+        drop(control);
 
-    let input_result = (|| {
-        loop {
-            let frame = match AttachFrame::read_from(&mut stream) {
-                Ok(frame) => frame,
-                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
-                Err(error) => return Err(error),
-            };
-            if matches!(frame, AttachFrame::ReconnectAck) {
-                let acknowledge = {
-                    let mut controller = lock(&runtime.controller)?;
-                    controller
-                        .as_mut()
-                        .filter(|controller| controller.token == token)
-                        .and_then(|controller| controller.reconnect_ack.take())
+        let input_result = (|| {
+            loop {
+                let frame = match AttachFrame::read_from(&mut stream) {
+                    Ok(frame) => frame,
+                    Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+                    Err(error) => return Err(error),
                 };
-                if let Some(acknowledge) = acknowledge {
-                    let _ = acknowledge.send(());
-                }
-                return Ok(());
-            }
-            if let AttachFrame::Input(bytes) = frame {
-                if !write_controller_input(&runtime, &token, &bytes)? {
+                if matches!(frame, AttachFrame::ReconnectAck) {
+                    let acknowledge = {
+                        let mut controller = lock(&runtime.controller)?;
+                        controller
+                            .as_mut()
+                            .filter(|controller| controller.token == token)
+                            .and_then(|controller| controller.reconnect_ack.take())
+                    };
+                    if let Some(acknowledge) = acknowledge {
+                        let _ = acknowledge.send(());
+                    }
                     return Ok(());
                 }
-                continue;
+                if let AttachFrame::Input(bytes) = frame {
+                    if !Self::write_controller_input(&runtime, &token, &bytes)? {
+                        return Ok(());
+                    }
+                    continue;
+                }
+                if matches!(frame, AttachFrame::FocusGained) {
+                    if !registry.record_focus_gained(
+                        response_version,
+                        &shell,
+                        &attached_run,
+                        &runtime,
+                        &token,
+                    )? {
+                        return Ok(());
+                    }
+                    continue;
+                }
+                let control = lock(&runtime.control)?;
+                let authorized = lock(&runtime.controller)?
+                    .as_ref()
+                    .is_some_and(|controller| controller.token == token);
+                if !authorized {
+                    return Ok(());
+                }
+                let result = match frame {
+                    AttachFrame::Input(_) => unreachable!(),
+                    AttachFrame::Resize {
+                        rows,
+                        cols,
+                        pixel_width,
+                        pixel_height,
+                    } => {
+                        if let Err(error) = validate_terminal_dimensions(rows, cols) {
+                            Err(error)
+                        } else {
+                            let size = PtySize {
+                                rows,
+                                cols,
+                                pixel_width,
+                                pixel_height,
+                            };
+                            lock(&runtime.master)?.resize(size)?;
+                            lock(&runtime.terminal)?.resize(rows, cols);
+                            Self::update_runtime_dimensions(&shell, &runtime, size)?;
+                            Ok(())
+                        }
+                    }
+                    AttachFrame::Detached => return Ok(()),
+                    AttachFrame::FocusGained => unreachable!(),
+                    AttachFrame::Output(_) | AttachFrame::Reconnect | AttachFrame::ReconnectAck => {
+                        Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "client sent a daemon-only attach frame",
+                        ))
+                    }
+                };
+                drop(control);
+                result?;
             }
+        })();
+        let release_result = Self::release_controller(&runtime, &token);
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+        let output_result = output_worker
+            .join()
+            .map_err(|_| io::Error::other("attachment output thread panicked"));
+        release_result?;
+        output_result?;
+        input_result
+    }
+
+    fn write_controller_input(
+        runtime: &ShellRuntime,
+        token: &str,
+        bytes: &[u8],
+    ) -> io::Result<bool> {
+        let mut offset = 0;
+        while offset < bytes.len() {
             let control = lock(&runtime.control)?;
             let authorized = lock(&runtime.controller)?
                 .as_ref()
                 .is_some_and(|controller| controller.token == token);
             if !authorized {
-                return Ok(());
+                return Ok(false);
             }
-            let result = match frame {
-                AttachFrame::Input(_) => unreachable!(),
-                AttachFrame::Resize {
-                    rows,
-                    cols,
-                    pixel_width,
-                    pixel_height,
-                } => {
-                    if let Err(error) = validate_terminal_dimensions(rows, cols) {
-                        Err(error)
-                    } else {
-                        let size = PtySize {
-                            rows,
-                            cols,
-                            pixel_width,
-                            pixel_height,
-                        };
-                        lock(&runtime.master)?.resize(size)?;
-                        lock(&runtime.terminal)?.resize(rows, cols);
-                        update_runtime_dimensions(&shell, &runtime, size)?;
-                        Ok(())
-                    }
-                }
-                AttachFrame::Detached => return Ok(()),
-                AttachFrame::FocusGained => {
-                    registry.record_focus_gained(response_version, &shell, &attached_run, &runtime)
-                }
-                AttachFrame::Output(_) | AttachFrame::Reconnect | AttachFrame::ReconnectAck => {
-                    Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "client sent a daemon-only attach frame",
-                    ))
-                }
-            };
+            let result = lock(&runtime.master)?.write(&bytes[offset..]);
             drop(control);
-            result?;
-        }
-    })();
-    let release_result = runtime.release_controller(&token);
-    let _ = stream.shutdown(std::net::Shutdown::Both);
-    let output_result = output_worker
-        .join()
-        .map_err(|_| io::Error::other("attachment output thread panicked"));
-    release_result?;
-    output_result?;
-    input_result
-}
-
-fn write_controller_input(runtime: &ShellRuntime, token: &str, bytes: &[u8]) -> io::Result<bool> {
-    let mut offset = 0;
-    while offset < bytes.len() {
-        let control = lock(&runtime.control)?;
-        let authorized = lock(&runtime.controller)?
-            .as_ref()
-            .is_some_and(|controller| controller.token == token);
-        if !authorized {
-            return Ok(false);
-        }
-        let result = lock(&runtime.master)?.write(&bytes[offset..]);
-        drop(control);
-        match result {
-            Ok(0) => return Err(io::Error::new(io::ErrorKind::WriteZero, "PTY input closed")),
-            Ok(count) => offset += count,
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                thread::sleep(IO_RETRY_DELAY);
+            match result {
+                Ok(0) => return Err(io::Error::new(io::ErrorKind::WriteZero, "PTY input closed")),
+                Ok(count) => offset += count,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(IO_RETRY_DELAY);
+                }
+                Err(error) => return Err(error),
             }
-            Err(error) => return Err(error),
+        }
+        Ok(true)
+    }
+
+    fn profile_size(profile: &TerminalProfile) -> PtySize {
+        PtySize {
+            rows: profile.rows,
+            cols: profile.cols,
+            pixel_width: profile.pixel_width,
+            pixel_height: profile.pixel_height,
         }
     }
-    Ok(true)
-}
 
-fn profile_size(profile: &TerminalProfile) -> PtySize {
-    PtySize {
-        rows: profile.rows,
-        cols: profile.cols,
-        pixel_width: profile.pixel_width,
-        pixel_height: profile.pixel_height,
+    fn update_runtime_dimensions(
+        shell: &Shell,
+        runtime: &Arc<ShellRuntime>,
+        size: PtySize,
+    ) -> io::Result<()> {
+        let mut lifecycle = lock(&shell.lifecycle)?;
+        let profile = match &mut *lifecycle {
+            ShellLifecycle::Running {
+                profile,
+                runtime: current,
+                ..
+            } if Arc::ptr_eq(current, runtime) => profile,
+            _ => return Ok(()),
+        };
+        profile.rows = size.rows;
+        profile.cols = size.cols;
+        profile.pixel_width = size.pixel_width;
+        profile.pixel_height = size.pixel_height;
+        if let Some(last_run) = lock(&shell.last_run)?.as_mut() {
+            last_run.profile = profile.clone();
+        }
+        Ok(())
     }
-}
-
-fn update_runtime_dimensions(
-    shell: &Shell,
-    runtime: &Arc<ShellRuntime>,
-    size: PtySize,
-) -> io::Result<()> {
-    let mut lifecycle = lock(&shell.lifecycle)?;
-    let profile = match &mut *lifecycle {
-        ShellLifecycle::Running {
-            profile,
-            runtime: current,
-            ..
-        } if Arc::ptr_eq(current, runtime) => profile,
-        _ => return Ok(()),
-    };
-    profile.rows = size.rows;
-    profile.cols = size.cols;
-    profile.pixel_width = size.pixel_width;
-    profile.pixel_height = size.pixel_height;
-    if let Some(last_run) = lock(&shell.last_run)?.as_mut() {
-        last_run.profile = profile.clone();
-    }
-    Ok(())
 }
 
 fn validate_terminal_profile(profile: &TerminalProfile) -> io::Result<()> {
@@ -6325,6 +6689,71 @@ mod tests {
 
     use crate::protocol::{AgentAuthority, AgentState};
 
+    trait ShellTestControl {
+        fn kill(&self) -> io::Result<()>;
+    }
+
+    impl ShellTestControl for Shell {
+        fn kill(&self) -> io::Result<()> {
+            ShellRuntimeManager::default().kill(self)
+        }
+    }
+
+    trait ReaderTestControl {
+        fn pause_reader(&self) -> io::Result<()>;
+        fn resume_reader(&self) -> io::Result<()>;
+    }
+
+    impl ReaderTestControl for ShellRuntime {
+        fn pause_reader(&self) -> io::Result<()> {
+            ShellRuntimeManager::default().pause_reader(self)
+        }
+
+        fn resume_reader(&self) -> io::Result<()> {
+            ShellRuntimeManager::default().resume_reader(self)
+        }
+    }
+
+    fn spawn_runtime(
+        shell: &Arc<Shell>,
+        run: &ShellRun,
+        workspace_name: &str,
+        shell_name: &str,
+        profile: &TerminalProfile,
+        environment: Option<&UnixEnvironment>,
+        recovery: RuntimeRecovery<'_>,
+    ) -> io::Result<(Arc<ShellRuntime>, PtyReader)> {
+        ShellRuntimeManager::default().spawn_runtime(
+            shell,
+            run,
+            RuntimeStart {
+                workspace_name,
+                shell_name,
+                profile,
+                environment,
+                recovery,
+            },
+        )
+    }
+
+    fn start_pty_reader(
+        registry: Weak<DaemonService>,
+        shell: Arc<Shell>,
+        run: Arc<ShellRun>,
+        runtime: Arc<ShellRuntime>,
+        reader: PtyReader,
+        start_paused: bool,
+    ) -> io::Result<()> {
+        ShellRuntimeManager::default().start_pty_reader(
+            registry,
+            shell,
+            run,
+            runtime,
+            reader,
+            start_paused,
+        )
+    }
+
     #[derive(Default)]
     struct RecordingNotificationSink {
         requests: Mutex<Vec<NotificationRequest>>,
@@ -6338,15 +6767,15 @@ mod tests {
 
     fn notification_registry(
         settings: NotificationSettings,
-    ) -> (Registry, Arc<RecordingNotificationSink>) {
+    ) -> (DaemonService, Arc<RecordingNotificationSink>) {
         let sink = Arc::new(RecordingNotificationSink::default());
-        let registry = Registry {
+        let registry = DaemonService {
             notification_settings: NotificationDeliverySettings {
                 desktop: settings,
                 ..Default::default()
             },
             notification_sink: sink.clone(),
-            ..Registry::default()
+            ..DaemonService::default()
         };
         (registry, sink)
     }
@@ -6381,7 +6810,7 @@ mod tests {
     }
 
     fn add_recovery_agent(
-        registry: &Registry,
+        registry: &DaemonService,
         shell: &Shell,
         run_id: &str,
         integration: &str,
@@ -6410,14 +6839,14 @@ mod tests {
                 attention: None,
             }),
         });
-        lock(&registry.state)
+        lock(&registry.durable.state)
             .unwrap()
             .agents
             .insert(agent.id.clone(), agent);
     }
 
     fn recovery_shell(
-        registry: &Registry,
+        registry: &DaemonService,
         command: Vec<String>,
     ) -> (Arc<Shell>, PersistedShellRun) {
         let workspace = registry
@@ -6448,7 +6877,7 @@ mod tests {
 
     #[test]
     fn interrupted_authoritative_agent_builds_native_resume_command() {
-        let registry = Registry::default();
+        let registry = DaemonService::default();
         let (shell, run) = recovery_shell(&registry, vec!["/opt/bin/opencode".into()]);
         add_recovery_agent(&registry, &shell, &run.id, "opencode", "session-1");
 
@@ -6461,7 +6890,7 @@ mod tests {
             ])
         );
 
-        let agent = lock(&registry.state)
+        let agent = lock(&registry.durable.state)
             .unwrap()
             .agents
             .values()
@@ -6479,7 +6908,7 @@ mod tests {
 
     #[test]
     fn recovery_falls_back_when_agent_identity_is_ambiguous_or_disabled() {
-        let mut registry = Registry::default();
+        let mut registry = DaemonService::default();
         let (shell, run) = recovery_shell(&registry, Vec::new());
         add_recovery_agent(&registry, &shell, &run.id, "pi", "session-1");
         add_recovery_agent(&registry, &shell, &run.id, "pi", "session-2");
@@ -6491,7 +6920,7 @@ mod tests {
                 .is_none()
         );
 
-        lock(&registry.state)
+        lock(&registry.durable.state)
             .unwrap()
             .agents
             .retain(|_, agent| agent.external_session_id.as_deref() == Some("session-1"));
@@ -6506,7 +6935,7 @@ mod tests {
 
     #[test]
     fn disabling_history_persistence_clears_retained_history() {
-        let registry = Registry::default();
+        let registry = DaemonService::default();
         let (shell, _) = recovery_shell(&registry, Vec::new());
         lock(&shell.last_run)
             .unwrap()
@@ -6549,7 +6978,9 @@ mod tests {
         }
     }
 
-    fn running_shell(registry: &Registry) -> (WorkspaceSnapshot, Arc<Shell>, Arc<ShellRuntime>) {
+    fn running_shell(
+        registry: &DaemonService,
+    ) -> (WorkspaceSnapshot, Arc<Shell>, Arc<ShellRuntime>) {
         let workspace = registry
             .create_workspace(
                 "agents".into(),
@@ -6581,10 +7012,21 @@ mod tests {
         (workspace, shell, runtime)
     }
 
+    fn install_test_controller(runtime: &ShellRuntime, token: &str) {
+        let (connection, _peer) = UnixStream::pair().unwrap();
+        let (output, _receiver) = mpsc::sync_channel(1);
+        *lock(&runtime.controller).unwrap() = Some(Controller {
+            token: token.into(),
+            output,
+            connection,
+            reconnect_ack: None,
+        });
+    }
+
     #[test]
     fn empty_registry_has_empty_snapshot() {
         assert!(
-            Registry::default()
+            DaemonService::default()
                 .snapshot()
                 .unwrap()
                 .workspaces
@@ -6594,7 +7036,7 @@ mod tests {
 
     #[test]
     fn focus_reports_require_protocol_eighteen_and_increment_revision() {
-        let registry = Registry::default();
+        let registry = DaemonService::default();
         let (_workspace, shell, runtime) = running_shell(&registry);
         let run = match &*lock(&shell.lifecycle).unwrap() {
             ShellLifecycle::Running { run, .. } => Arc::clone(run),
@@ -6603,17 +7045,22 @@ mod tests {
 
         assert!(
             registry
-                .record_focus_gained(17, &shell, &run, &runtime)
+                .record_focus_gained(17, &shell, &run, &runtime, "controller")
                 .is_err()
         );
         assert!(registry.snapshot().unwrap().focused_terminal.is_none());
 
-        registry
-            .record_focus_gained(18, &shell, &run, &runtime)
-            .unwrap();
-        registry
-            .record_focus_gained(18, &shell, &run, &runtime)
-            .unwrap();
+        install_test_controller(&runtime, "controller");
+        assert!(
+            registry
+                .record_focus_gained(18, &shell, &run, &runtime, "controller")
+                .unwrap()
+        );
+        assert!(
+            registry
+                .record_focus_gained(18, &shell, &run, &runtime, "controller")
+                .unwrap()
+        );
 
         let focused = registry.snapshot().unwrap().focused_terminal.unwrap();
         assert_eq!(focused.revision, 2);
@@ -6633,13 +7080,63 @@ mod tests {
         };
         assert!(registry.snapshot().unwrap().focused_terminal.is_none());
 
-        lock(&registry.state).unwrap().shells.remove(&shell.id);
+        lock(&registry.durable.state)
+            .unwrap()
+            .shells
+            .remove(&shell.id);
         assert!(registry.snapshot().unwrap().focused_terminal.is_none());
     }
 
     #[test]
+    fn focus_reports_from_a_replaced_controller_are_ignored() {
+        let registry = DaemonService::default();
+        let (_workspace, shell, runtime) = running_shell(&registry);
+        let run = match &*lock(&shell.lifecycle).unwrap() {
+            ShellLifecycle::Running { run, .. } => Arc::clone(run),
+            _ => panic!("expected running shell"),
+        };
+
+        install_test_controller(&runtime, "old-controller");
+        assert!(
+            registry
+                .record_focus_gained(18, &shell, &run, &runtime, "old-controller")
+                .unwrap()
+        );
+        install_test_controller(&runtime, "current-controller");
+        assert!(
+            !registry
+                .record_focus_gained(18, &shell, &run, &runtime, "old-controller")
+                .unwrap()
+        );
+        assert_eq!(
+            registry
+                .snapshot()
+                .unwrap()
+                .focused_terminal
+                .unwrap()
+                .revision,
+            1
+        );
+
+        assert!(
+            registry
+                .record_focus_gained(18, &shell, &run, &runtime, "current-controller")
+                .unwrap()
+        );
+        assert_eq!(
+            registry
+                .snapshot()
+                .unwrap()
+                .focused_terminal
+                .unwrap()
+                .revision,
+            2
+        );
+    }
+
+    #[test]
     fn stale_handoff_focus_target_is_not_imported() {
-        let registry = Registry::default();
+        let registry = DaemonService::default();
 
         registry
             .import_focused_terminal(Some(FocusedTerminalSnapshot {
@@ -6651,7 +7148,7 @@ mod tests {
             .unwrap();
 
         assert!(registry.snapshot().unwrap().focused_terminal.is_none());
-        assert_eq!(lock(&registry.focus).unwrap().revision, 9);
+        assert_eq!(lock(&registry.runtimes.focus).unwrap().revision, 9);
     }
 
     #[test]
@@ -6674,7 +7171,7 @@ mod tests {
 
     #[test]
     fn event_batches_are_monotonic_and_paginated() {
-        let registry = Registry::default();
+        let registry = DaemonService::default();
         let Response::Events {
             cursor, snapshot, ..
         } = registry.read_events(None, 256, 0).unwrap()
@@ -6715,7 +7212,7 @@ mod tests {
 
     #[test]
     fn event_cursor_expires_after_retention() {
-        let registry = Registry::default();
+        let registry = DaemonService::default();
         let Response::Events { cursor, .. } = registry.read_events(None, 256, 0).unwrap() else {
             panic!("expected event baseline");
         };
@@ -6796,7 +7293,7 @@ mod tests {
 
     #[test]
     fn running_shell_snapshot_reports_real_pty_foreground_process() {
-        let registry = Registry::default();
+        let registry = DaemonService::default();
         let (_workspace, shell, _runtime) = running_shell(&registry);
 
         let deadline = Instant::now() + Duration::from_secs(1);
@@ -6914,7 +7411,7 @@ mod tests {
     fn failed_persistence_rolls_back_registry_mutation() {
         let directory = env::temp_dir().join(format!("boomux-rollback-{}", Uuid::new_v4()));
         let state_directory = directory.join("state");
-        let registry = Registry::restore(
+        let registry = DaemonService::restore(
             StateStore::at(state_directory.join("state.json")),
             false,
             None,
@@ -6955,7 +7452,7 @@ mod tests {
                 }
             }),
         );
-        let registry = Arc::new(Registry::restore(store, false, None).unwrap());
+        let registry = Arc::new(DaemonService::restore(store, false, None).unwrap());
         let workspace = registry
             .create_workspace(
                 "slow-store".into(),
@@ -7090,7 +7587,7 @@ mod tests {
 
     #[test]
     fn independent_pty_readers_process_output_concurrently() {
-        let registry = Arc::new(Registry::default());
+        let registry = Arc::new(DaemonService::default());
         let mut shells = Vec::new();
         for index in 0..2 {
             let shell = create_pending_shell(
@@ -7172,7 +7669,7 @@ mod tests {
 
     #[test]
     fn coordinated_workspace_batch_is_included_in_baseline_cursor() {
-        let registry = Registry::default();
+        let registry = DaemonService::default();
         let response = registry
             .dispatch(Request::CreateWorkspace {
                 name: "coordinated".into(),
@@ -7217,7 +7714,7 @@ mod tests {
 
     #[test]
     fn launcher_mutations_are_coordinated_and_names_are_unique_per_workspace() {
-        let registry = Registry::default();
+        let registry = DaemonService::default();
         let Response::Workspace { workspace } = registry
             .dispatch(Request::CreateWorkspace {
                 name: "launchers".into(),
@@ -7253,7 +7750,7 @@ mod tests {
         let snapshot = registry
             .workspace(&workspace.id)
             .unwrap()
-            .snapshot(&registry)
+            .snapshot(&registry.durable)
             .unwrap();
         assert_eq!(snapshot.launchers, vec![launcher]);
         assert_eq!(
@@ -7269,7 +7766,7 @@ mod tests {
 
     #[test]
     fn agent_registration_and_reports_enforce_run_binding_and_complete_monotonically() {
-        let registry = Registry::default();
+        let registry = DaemonService::default();
         let (workspace, shell, _runtime) = running_shell(&registry);
         let run_id = shell.snapshot().unwrap().run.unwrap().id;
 
@@ -7358,7 +7855,7 @@ mod tests {
 
     #[test]
     fn ensure_agent_reuses_identity_without_events_or_revision_changes() {
-        let registry = Registry::default();
+        let registry = DaemonService::default();
         let (workspace, shell, _runtime) = running_shell(&registry);
         let run_id = shell.snapshot().unwrap().run.unwrap().id;
         let spec = agent_spec(AgentState::Working);
@@ -7394,7 +7891,7 @@ mod tests {
 
     #[test]
     fn concurrent_ensure_agent_creates_one_identity() {
-        let registry = Arc::new(Registry::default());
+        let registry = Arc::new(DaemonService::default());
         let (workspace, shell, _runtime) = running_shell(&registry);
         let run_id = shell.snapshot().unwrap().run.unwrap().id;
         let barrier = Arc::new(Barrier::new(3));
@@ -7433,7 +7930,7 @@ mod tests {
 
     #[test]
     fn ensure_agent_resolves_only_a_unique_active_legacy_match() {
-        let registry = Registry::default();
+        let registry = DaemonService::default();
         let (workspace, shell, _runtime) = running_shell(&registry);
         let run_id = shell.snapshot().unwrap().run.unwrap().id;
         let completed = registry
@@ -7466,7 +7963,7 @@ mod tests {
 
     #[test]
     fn ensure_agent_requires_external_id_and_distinguishes_runs() {
-        let registry = Registry::default();
+        let registry = DaemonService::default();
         let (workspace, shell, runtime) = running_shell(&registry);
         let first_run_id = shell.snapshot().unwrap().run.unwrap().id;
         let mut missing_id = agent_spec(AgentState::Working);
@@ -7528,7 +8025,7 @@ mod tests {
 
     #[test]
     fn reports_obey_authority_and_idempotent_completion_rules() {
-        let registry = Registry::default();
+        let registry = DaemonService::default();
         let (workspace, shell, _runtime) = running_shell(&registry);
         let run_id = shell.snapshot().unwrap().run.unwrap().id;
         let mut spec = agent_spec(AgentState::Working);
@@ -7646,7 +8143,7 @@ mod tests {
 
     #[test]
     fn failed_agent_mutation_restores_observation_revision() {
-        let registry = Registry::default();
+        let registry = DaemonService::default();
         let (workspace, shell, _runtime) = running_shell(&registry);
         let run_id = shell.snapshot().unwrap().run.unwrap().id;
         let agent = registry
@@ -7669,7 +8166,7 @@ mod tests {
 
     #[test]
     fn agent_attention_is_raised_preserved_and_superseded_by_completion() {
-        let registry = Registry::default();
+        let registry = DaemonService::default();
         let (workspace, shell, _runtime) = running_shell(&registry);
         let run_id = shell.snapshot().unwrap().run.unwrap().id;
         let registered = registry
@@ -7933,7 +8430,7 @@ mod tests {
     fn failed_persistence_does_not_notify() {
         let directory = env::temp_dir().join(format!("boomux-notification-{}", Uuid::new_v4()));
         let state_directory = directory.join("state");
-        let mut registry = Registry::restore(
+        let mut registry = DaemonService::restore(
             StateStore::at(state_directory.join("state.json")),
             false,
             None,
@@ -7984,7 +8481,7 @@ mod tests {
     fn failed_attention_acknowledgment_persistence_restores_attention() {
         let directory = env::temp_dir().join(format!("boomux-attention-{}", Uuid::new_v4()));
         let state_directory = directory.join("state");
-        let registry = Registry::restore(
+        let registry = DaemonService::restore(
             StateStore::at(state_directory.join("state.json")),
             false,
             None,
@@ -8031,7 +8528,7 @@ mod tests {
 
     #[test]
     fn agent_attention_acknowledgment_is_conditional_idempotent_and_rollback_safe() {
-        let registry = Registry::default();
+        let registry = DaemonService::default();
         let (workspace, shell, _runtime) = running_shell(&registry);
         let run_id = shell.snapshot().unwrap().run.unwrap().id;
         let agent = registry
@@ -8105,7 +8602,7 @@ mod tests {
 
     #[test]
     fn agent_wait_is_revision_conditional_and_wakes_after_durable_change() {
-        let registry = Arc::new(Registry::default());
+        let registry = Arc::new(DaemonService::default());
         let (workspace, shell, _runtime) = running_shell(&registry);
         let run_id = shell.snapshot().unwrap().run.unwrap().id;
         let Response::Agent { agent } = registry
@@ -8186,7 +8683,7 @@ mod tests {
 
     #[test]
     fn agent_wait_wakes_with_daemon_stopping_before_registry_cleanup() {
-        let registry = Arc::new(Registry::default());
+        let registry = Arc::new(DaemonService::default());
         let (workspace, shell, _runtime) = running_shell(&registry);
         let run_id = shell.snapshot().unwrap().run.unwrap().id;
         let Response::Agent { agent } = registry
@@ -8203,14 +8700,14 @@ mod tests {
         let waiter = thread::spawn(move || waiting_registry.wait_agent(&agent.id, 1, 2_000));
         thread::sleep(Duration::from_millis(20));
 
-        registry.stopping.store(true, Ordering::Release);
+        registry.runtimes.begin_stopping();
         registry.events.notify();
 
         assert_eq!(
             error_code(&waiter.join().unwrap().unwrap_err()),
             ErrorCode::DaemonStopping
         );
-        registry.stopping.store(false, Ordering::Release);
+        registry.runtimes.cancel_stopping();
         shell.kill().unwrap();
         registry.close_workspace(&workspace.id).unwrap();
     }
@@ -8219,7 +8716,7 @@ mod tests {
     fn agent_instances_restore_from_daemon_persistence() {
         let directory = env::temp_dir().join(format!("boomux-agent-restore-{}", Uuid::new_v4()));
         let path = directory.join("state/state.json");
-        let registry = Registry::restore(StateStore::at(path.clone()), false, None).unwrap();
+        let registry = DaemonService::restore(StateStore::at(path.clone()), false, None).unwrap();
         let (_workspace, shell, runtime) = running_shell(&registry);
         let shell_id = shell.id.clone();
         let run_id = shell.snapshot().unwrap().run.unwrap().id;
@@ -8252,7 +8749,7 @@ mod tests {
         drop(shell);
         drop(registry);
 
-        let restored = Registry::restore(StateStore::at(path), false, None).unwrap();
+        let restored = DaemonService::restore(StateStore::at(path), false, None).unwrap();
         assert_eq!(
             restored.agent(&agent.id).unwrap().snapshot().unwrap(),
             agent
@@ -8663,7 +9160,7 @@ mod tests {
             run: Arc::clone(&run),
             runtime: Arc::clone(&runtime),
         };
-        let registry = Arc::new(Registry::default());
+        let registry = Arc::new(DaemonService::default());
         start_pty_reader(
             Arc::downgrade(&registry),
             Arc::clone(&shell),
@@ -8705,7 +9202,7 @@ mod tests {
 
     #[test]
     fn close_does_not_deadlock_with_a_naturally_exiting_reader() {
-        let registry = Arc::new(Registry::default());
+        let registry = Arc::new(DaemonService::default());
         let workspace = registry
             .create_workspace(
                 "exit-race".into(),
@@ -8806,7 +9303,7 @@ mod tests {
 
     #[test]
     fn pathless_workspace_snapshot_has_no_default_cwd_and_no_shells() {
-        let registry = Registry::default();
+        let registry = DaemonService::default();
 
         let workspace = registry
             .create_workspace("empty".into(), Vec::new())
@@ -8820,7 +9317,7 @@ mod tests {
 
     #[test]
     fn workspace_snapshot_retains_default_cwd() {
-        let registry = Registry::default();
+        let registry = DaemonService::default();
         let cwd = env::temp_dir();
 
         let workspace = registry
@@ -8891,7 +9388,7 @@ mod tests {
 
     #[test]
     fn concurrent_duplicate_workspace_names_publish_only_once() {
-        let registry = Arc::new(Registry::default());
+        let registry = Arc::new(DaemonService::default());
         let barrier = Arc::new(Barrier::new(3));
         let threads = (0..2)
             .map(|_| {
@@ -8920,7 +9417,7 @@ mod tests {
 
     #[test]
     fn shell_without_workspace_gets_the_next_generated_workspace_name() {
-        let registry = Registry::default();
+        let registry = DaemonService::default();
         registry
             .create_workspace("workspace-1".into(), Vec::new())
             .unwrap();
@@ -8957,7 +9454,7 @@ mod tests {
 
     #[test]
     fn registry_closes_shell_without_removing_workspace() {
-        let registry = Registry::default();
+        let registry = DaemonService::default();
         let workspace = registry
             .create_workspace(
                 "test".into(),

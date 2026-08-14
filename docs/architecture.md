@@ -12,7 +12,7 @@
 | `src/dashboard_projection.rs` | Typed snapshot/session-to-dashboard classification, view construction, and title enrichment |
 | `src/protocol.rs` | Versioned control and attachment wire models, framing, and request version requirements |
 | `src/client.rs` | Daemon discovery/startup, protocol negotiation, typed management requests, and attachment setup |
-| `src/daemon.rs` | Runtime authority for workspaces, shells, agents, PTYs, processes, events, persistence coordination, and handoff |
+| `src/daemon.rs` | `DaemonService` coordination over durable registry, event-stream, shell-runtime, persistence, and handoff owners |
 | `src/state_store.rs` | Versioned durable schemas, validation, atomic state storage, and migrations |
 | `src/handoff.rs`, `src/fd_transfer.rs` | Graceful daemon replacement records and Unix descriptor transfer |
 | `src/attach.rs` | Terminal-side raw mode, control frames, live input/output, resize, focus, and reconnect handling |
@@ -128,6 +128,20 @@ alive, but Boomux does not retain or manage their runtime lifecycle.
 
 `src/daemon.rs` owns all PTY masters and child processes. Its runtime directory
 is restricted to the current user and the socket mode is `0600`.
+
+The daemon is composed from state-owning services rather than one shared
+registry. `DurableRegistry` owns workspace, shell, launcher, and Agent
+collections, their invariants and rollback snapshots, plus persistence
+projection. `EventStream` owns retained events, cursors, long-poll wakeups, and
+the transition frontier that orders durable and runtime publication.
+`ShellRuntimeManager` owns daemon-wide runtime stopping and focus policy and
+operates only on supplied shell/runtime handles. `DaemonService` owns request
+dispatch and coordinates transactions that cross those owners. Durable
+transactions acquire the mutation gate, persistence gate, `EventStream`
+transition frontier, retained event state, durable collection, then applicable
+shell/runtime locks. Paths that need only a suffix of that order start at the
+first required owner; PTY output releases runtime locks before entering the
+`EventStream` publication boundary.
 
 The daemon supports:
 
@@ -620,19 +634,19 @@ handoff that applies the settings.
 
 ### Transition Coordinator
 
-The daemon serializes observable runtime transitions through one coordinator. A
-coordinated transition covers the affected in-memory lifecycle, durable state,
-retained event batches, and handoff capture. This gives clients one ordering
-boundary instead of independent persistence and event locks.
+`EventStream` serializes observable runtime transitions through its transition
+frontier. A coordinated transaction covers the affected in-memory lifecycle,
+durable state, retained event batches, and handoff capture. This gives clients
+one ordering boundary instead of independent persistence and event locks.
 
 Durable paths acquire the operation or mutation lock and persistence-ordering
-gate before the transition coordinator and event state. They prepare an owned,
-immutable persistence generation while domain locks are held, then release the
-transition, event, registry, lifecycle, and terminal locks before submitting it
-to one FIFO writer. JSON serialization, temporary-file writes, fsync, rename,
-and directory fsync therefore never retain locks required by PTY readers. Close
-and shutdown first stop runtimes, then finalize visible lifecycle changes inside
-the coordinator.
+gate before the `EventStream` transition frontier and retained event state. They
+prepare an owned, immutable persistence generation while domain locks are held,
+then release the transition, event, registry, lifecycle, and terminal locks
+before submitting it to one FIFO writer. JSON serialization, temporary-file
+writes, fsync, rename, and directory fsync therefore never retain locks required
+by PTY readers. Close and shutdown first stop runtimes, then finalize visible
+lifecycle changes inside the coordinated transaction.
 
 Durable lifecycle events are published only after their state is persisted. A
 failed persistence attempt queues the event batch; background recovery persists
