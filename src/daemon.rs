@@ -7879,7 +7879,7 @@ mod tests {
         let registry = DaemonService::default();
         let (_workspace, shell, _runtime) = running_shell(&registry);
 
-        let deadline = Instant::now() + Duration::from_secs(1);
+        let deadline = Instant::now() + FOREGROUND_PROCESS_CACHE_INTERVAL + Duration::from_secs(1);
         loop {
             let foreground_process = shell.snapshot().unwrap().foreground_process;
             if foreground_process.as_deref() == Some("sleep") {
