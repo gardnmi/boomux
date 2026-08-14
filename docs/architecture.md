@@ -131,8 +131,11 @@ is restricted to the current user and the socket mode is `0600`.
 
 The daemon is composed from state-owning services rather than one shared
 registry. `DurableRegistry` owns workspace, shell, launcher, and Agent
-collections, their invariants and rollback snapshots, plus persistence
-projection. `EventStream` owns retained events, cursors, long-poll wakeups, and
+collections, their invariants, mutation-specific undo, and persistence
+projection. Undo records retain complete affected entities or complete mutable
+state rather than mirroring the registry shape, so unrelated mutations do not
+clone the registry and new entity fields remain part of rollback automatically.
+`EventStream` owns retained events, cursors, long-poll wakeups, and
 the transition frontier that orders durable and runtime publication.
 `ShellRuntimeManager` owns daemon-wide runtime stopping and focus policy and
 operates only on supplied shell/runtime handles. `DaemonService` owns request
@@ -645,8 +648,20 @@ prepare an owned, immutable persistence generation while domain locks are held,
 then release the transition, event, registry, lifecycle, and terminal locks
 before submitting it to one FIFO writer. JSON serialization, temporary-file
 writes, fsync, rename, and directory fsync therefore never retain locks required
-by PTY readers. Close and shutdown first stop runtimes, then finalize visible
-lifecycle changes inside the coordinated transaction.
+by PTY readers. Shell close, workspace close, and shutdown use one lifecycle
+transaction policy: prepare every runtime stop, finalize visible lifecycle
+changes, apply the operation-specific durable removal, persist, then publish.
+Failure at any stage restores removed entities and exhaustively compensates every
+stopped shell. Already-running processes cannot be resurrected, so their
+compensated durable state is pending with a terminated last run; exited shells
+recover their exact lifecycle and terminal state. Before preparing stops, the
+transaction reserves event-ID capacity for existing pending runtime events, its
+commit batch or one possible `run_exited` compensation per target shell,
+whichever outcome is larger. Commit and compensation are mutually exclusive. A
+natural exit for an unrelated shell that cannot reserve its event only because
+of this temporary capacity is retried asynchronously after revalidating its
+exact shell, run, and runtime identity; a shell finalized by the lifecycle
+transaction makes that retry a no-op.
 
 Durable lifecycle events are published only after their state is persisted. A
 failed persistence attempt queues the event batch; background recovery persists
