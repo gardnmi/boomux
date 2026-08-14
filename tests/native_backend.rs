@@ -1333,20 +1333,25 @@ fn daemon_events_and_revision_reads_survive_handoff() {
         b"event-output-one"
     ));
     drop(attachment);
-    let changed = daemon.client.events(Some(cursor), 256, 1_000).unwrap();
-    assert!(
-        changed
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let mut saw_run_started = false;
+    let mut saw_output_changed = false;
+    while !saw_run_started || !saw_output_changed {
+        let changed = daemon.client.events(Some(cursor), 256, 1_000).unwrap();
+        saw_run_started |= changed
             .events
             .iter()
-            .any(|event| matches!(event.kind, protocol::DaemonEventKind::RunStarted { .. }))
-    );
-    assert!(
-        changed
+            .any(|event| matches!(event.kind, protocol::DaemonEventKind::RunStarted { .. }));
+        saw_output_changed |= changed
             .events
             .iter()
-            .any(|event| matches!(event.kind, protocol::DaemonEventKind::OutputChanged { .. }))
-    );
-    cursor = changed.cursor;
+            .any(|event| matches!(event.kind, protocol::DaemonEventKind::OutputChanged { .. }));
+        cursor = changed.cursor;
+        assert!(
+            Instant::now() < deadline,
+            "run and output events were not both published"
+        );
+    }
 
     let observed = daemon
         .client
