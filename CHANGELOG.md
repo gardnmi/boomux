@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.18.1](https://github.com/gardnmi/boomux/compare/v0.18.0...v0.18.1) (2026-08-15)
+
+
+### Bug Fixes
+
+* **opencode:** clear stale child errors on root work ([#185](https://github.com/gardnmi/boomux/issues/185)) ([2d659aa](https://github.com/gardnmi/boomux/commit/2d659aae4afcd63b9f901fb90b21821ba17bf8a5))
+
 ## [0.18.0](https://github.com/gardnmi/boomux/compare/v0.17.0...v0.18.0) (2026-08-15)
 
 
