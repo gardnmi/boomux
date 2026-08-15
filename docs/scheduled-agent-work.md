@@ -49,6 +49,22 @@ The identities remain separate:
 - Removing bounded execution history does not reinterpret or delete canonical
   host session data.
 
+### Accepted Remote Node Ownership
+
+Remote Node federation is not yet implemented. When it ships, a Schedule belongs
+to the same Node as its owning Workspace and only that Node evaluates its
+trigger, advances its occurrence frontier, admits concurrency, resolves its
+filesystem and integration, or starts its Scheduled Executions. Local projection
+and loss of the local SSH connection do not affect remote timed work.
+
+The initial federation contract has no automatic cross-Node failover or global
+concurrency lease. A presentation-side network partition establishes only stale
+state. If the owning daemon actually stops, it applies its existing
+missed-occurrence policy after recovery and reports the durable result; another
+Node cannot synthesize that decision, substitute its environment, or continue
+its external Agent Session. Any future failover requires a separate explicit
+placement and portability contract. See [`remote-nodes.md`](remote-nodes.md).
+
 ## Schedule-Owned Shell
 
 The first execution that binds its internal runner lazily creates one durable
@@ -506,6 +522,7 @@ The initial contract excludes:
 - Automatic prompt answers or guarded actions.
 - Terminal-screen lifecycle heuristics.
 - Automatic commits, merges, or external message delivery by Boomux itself.
+- Automatic cross-Node failover or migration of active scheduled work.
 - Required systemd, Omarchy, or other desktop-specific activation.
 
 Optional user-service activation remains a post-MVP evidence-based decision in

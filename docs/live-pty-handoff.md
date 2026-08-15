@@ -69,6 +69,25 @@ boundary. The optional focused-terminal snapshot crosses the same graceful
 handoff so dashboard following does not forget the last focused managed window;
 ordinary cold recovery does not restore it.
 
+## Accepted Remote Node Boundary
+
+Remote Node federation is not yet implemented. Under its accepted contract, a
+remote PTY descriptor, process handle, runtime, and reconstruction state remain
+owned by the remote daemon and never enter a local handoff manifest. Remote
+daemon replacement uses this existing descriptor-transfer protocol on the
+remote machine, and its attachment reconnect frames pass unchanged through the
+SSH bridge.
+
+Local daemon replacement instead closes federation admission, drains admitted
+Node requests and projection commits to known outcome boundaries, stops
+synchronization workers, establishes a reconnect boundary with each local
+attachment client, and quiesces SSH proxies without claiming remote PTYs. The
+replacement opens fresh identity-verified bridges and starts workers only after
+finalization. Rollback returns routing and workers to the old local daemon and
+does not alter remote ownership. Simultaneous local and remote replacement must
+preserve both prepare/finalize boundaries independently; neither side can infer
+success from transport EOF. See [`remote-nodes.md`](remote-nodes.md).
+
 ## Delivery Slices
 
 1. [Complete] Implement and test strict single-descriptor `SCM_RIGHTS` transport.
