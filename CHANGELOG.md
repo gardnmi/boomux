@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.16.0](https://github.com/gardnmi/boomux/compare/v0.15.0...v0.16.0) (2026-08-15)
+
+
+### Features
+
+* **schedule:** add durable agent schedule management ([#155](https://github.com/gardnmi/boomux/issues/155)) ([772032e](https://github.com/gardnmi/boomux/commit/772032ef40a2367c6fa2776d8e9d514368b5b7f2))
+* **schedule:** dispatch scheduled agent executions ([#160](https://github.com/gardnmi/boomux/issues/160)) ([25fb4fd](https://github.com/gardnmi/boomux/commit/25fb4fdd0ac770af1156caa7a46efa18e44c0ec4))
+* **schedule:** expose execution history, waits, and alerts ([#163](https://github.com/gardnmi/boomux/issues/163)) ([b87af1d](https://github.com/gardnmi/boomux/commit/b87af1d98b20ad970e2317a5003cf28533ee1757))
+* **schedule:** trigger timed agent executions ([#161](https://github.com/gardnmi/boomux/issues/161)) ([39015fa](https://github.com/gardnmi/boomux/commit/39015fae1f55926a553a1339f0c090845a3afc41))
+* **tui:** manage schedules and scheduled executions ([#165](https://github.com/gardnmi/boomux/issues/165)) ([c222b76](https://github.com/gardnmi/boomux/commit/c222b76afb16e09dde6dbf59ad6ee2f58ed2981c))
+
 ## [0.15.0](https://github.com/gardnmi/boomux/compare/v0.14.2...v0.15.0) (2026-08-15)
 
 
