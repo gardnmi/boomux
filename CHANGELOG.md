@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.18.0](https://github.com/gardnmi/boomux/compare/v0.17.0...v0.18.0) (2026-08-15)
+
+
+### Features
+
+* **cli:** suggest generated shell names ([#171](https://github.com/gardnmi/boomux/issues/171)) ([a22beea](https://github.com/gardnmi/boomux/commit/a22beea680fcf28a0a21ad3ad175db3e272ee5c2))
+
 ## [0.17.0](https://github.com/gardnmi/boomux/compare/v0.16.0...v0.17.0) (2026-08-15)
 
 
