@@ -144,6 +144,7 @@ pub(crate) struct ExecutionData {
     pub(crate) id: String,
     pub(crate) workspace_id: String,
     pub(crate) schedule_id: String,
+    pub(crate) revision: u64,
     pub(crate) state: &'static str,
     pub(crate) dispatch_kind: &'static str,
     pub(crate) dispatch_key: String,
@@ -346,6 +347,7 @@ pub(crate) fn execution(execution: &ScheduledExecutionSnapshot) -> ExecutionData
         id: execution.id.clone(),
         workspace_id: execution.workspace_id.clone(),
         schedule_id: execution.schedule_id.clone(),
+        revision: execution.revision,
         state: match execution.state {
             boomux::protocol::ScheduledExecutionState::Skipped => "skipped",
             boomux::protocol::ScheduledExecutionState::Claimed => "claimed",
@@ -372,21 +374,7 @@ pub(crate) fn execution(execution: &ScheduledExecutionSnapshot) -> ExecutionData
         cwd: execution.cwd.display().to_string(),
         integration: execution.integration.clone(),
         session: execution.session.clone(),
-        reason: execution.reason.map(|reason| match reason {
-            ScheduledExecutionReason::Overlap => "overlap",
-            ScheduledExecutionReason::ActiveSession => "active_session",
-            ScheduledExecutionReason::WorkspaceCapacity => "workspace_capacity",
-            ScheduledExecutionReason::GlobalCapacity => "global_capacity",
-            ScheduledExecutionReason::Missed => "missed",
-            ScheduledExecutionReason::PausedRace => "paused_race",
-            ScheduledExecutionReason::InvalidTarget => "invalid_target",
-            ScheduledExecutionReason::RunnerStartFailed => "runner_start_failed",
-            ScheduledExecutionReason::HostSpawnFailed => "host_spawn_failed",
-            ScheduledExecutionReason::CancelledByUser => "cancelled_by_user",
-            ScheduledExecutionReason::ColdDaemonRecovery => "cold_daemon_recovery",
-            ScheduledExecutionReason::RunnerExitedWithoutReport => "runner_exited_without_report",
-            ScheduledExecutionReason::DaemonShutdown => "daemon_shutdown",
-        }),
+        reason: execution.reason.map(execution_reason),
         outcome: execution.outcome.as_ref().map(|outcome| match outcome {
             ScheduledExecutionOutcome::ExitCode { code } => {
                 ExecutionOutcomeData::ExitCode { code: *code }
@@ -399,6 +387,24 @@ pub(crate) fn execution(execution: &ScheduledExecutionSnapshot) -> ExecutionData
         run_id: execution.run_id.clone(),
         agent_id: execution.agent_id.clone(),
         external_session_id: execution.external_session_id.clone(),
+    }
+}
+
+pub(crate) fn execution_reason(reason: ScheduledExecutionReason) -> &'static str {
+    match reason {
+        ScheduledExecutionReason::Overlap => "overlap",
+        ScheduledExecutionReason::ActiveSession => "active_session",
+        ScheduledExecutionReason::WorkspaceCapacity => "workspace_capacity",
+        ScheduledExecutionReason::GlobalCapacity => "global_capacity",
+        ScheduledExecutionReason::Missed => "missed",
+        ScheduledExecutionReason::PausedRace => "paused_race",
+        ScheduledExecutionReason::InvalidTarget => "invalid_target",
+        ScheduledExecutionReason::RunnerStartFailed => "runner_start_failed",
+        ScheduledExecutionReason::HostSpawnFailed => "host_spawn_failed",
+        ScheduledExecutionReason::CancelledByUser => "cancelled_by_user",
+        ScheduledExecutionReason::ColdDaemonRecovery => "cold_daemon_recovery",
+        ScheduledExecutionReason::RunnerExitedWithoutReport => "runner_exited_without_report",
+        ScheduledExecutionReason::DaemonShutdown => "daemon_shutdown",
     }
 }
 

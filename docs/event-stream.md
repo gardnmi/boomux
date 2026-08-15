@@ -32,12 +32,25 @@ only management response that discloses the current prompt.
 Protocol 23 adds durable manual Scheduled Executions and schedule-owned shells.
 Protocol 24 adds daemon-native timed decisions, skipped policy outcomes,
 deterministic next occurrences, and scheduler health.
+Protocol 25 adds positive durable execution revisions, bounded execution-list
+metadata, and exact revision-aware execution waits.
 
 `boomux agent wait <id> --after-revision <revision>` is the preferred way to
 await one Agent. It returns on a newer accepted durable observation, returns
 unchanged on timeout, rejects future revisions, and wakes with
 `daemon_stopping` during replacement. Callers reconnect and repeat with the same
 revision; no waiter state is persisted.
+
+`boomux execution wait <id> --after-revision <revision>` has the same
+newer/timeout/future-revision and reconnect rules. Unlike terminal Agent `done`,
+an equal terminal execution revision continues waiting because a lifecycle
+integration may still link the canonical Agent for that exact ShellRun. The wait
+uses the event condition variable as a wakeup signal and does not consume the
+global cursor. It reads only the execution map installed at the persisted event
+publication frontier. Persistence in flight, pending durable storage, and
+lifecycle reservations do not extend `wait_ms`: timeout returns `changed: false`
+with the last committed exact snapshot, including when the mutable record has an
+unpublished revision or has been provisionally pruned.
 
 ## Cursors
 
@@ -111,7 +124,8 @@ workspace and schedule identities.
 skip decision.
 `scheduled_execution_changed` publishes later prompt-free shell/run binding,
 active, dispatch-failed, exited, cancelled, interrupted, and Agent-link changes.
-Both carry the complete public execution snapshot and never carry the retained
+Both carry the complete public execution snapshot and its positive durable
+revision and never carry the retained
 prompt or daemon startup environment. Process outcomes do not imply Agent
 lifecycle observations.
 
@@ -151,6 +165,10 @@ next-occurrence fields are also omitted. Filtering never rewinds the event
 cursor, so an old client can reconnect across hidden scheduler activity without
 replaying or stalling the stream.
 
+Protocol-24 and older clients ignore the additive execution revision and bounded
+list metadata. Their existing record/event filtering remains unchanged. In all
+versions the returned cursor advances across hidden execution events.
+
 Manual final eligibility, claim creation, shell/run binding, and runner spawn are
 serialized against Agent activity mutations. A protocol-23 client therefore
 cannot observe a manual `claimed` creation whose only terminal transition is a
@@ -163,6 +181,18 @@ couples durable lifecycle mutation, persistence, and event publication. Events
 are published only after their corresponding state is persisted. If persistence
 fails, the event batch remains pending; background recovery publishes queued
 batches in transition order and exactly once.
+Execution notifications are derived at that actual publication boundary, so a
+dispatch failure whose first persistence attempt fails is notified once after a
+later pending flush, never before durable commit. Qualification compares each
+published execution event with the prior committed snapshot, so revisions that
+retain a qualifying terminal state and reason, including late Agent linkage, do
+not notify again.
+
+Lifecycle event reservations have distinct abort and persistence-transfer exits.
+An abort releases and publishes queued runtime events immediately when no durable
+batch or persistence operation still blocks publication. A successful lifecycle
+mutation transfers the reservation to persistence atomically, keeping runtime
+events behind the corresponding durable commit.
 
 The baseline snapshot and cursor are captured under this same coordinator, so no
 event can be published between those observations. PTY output revision advances

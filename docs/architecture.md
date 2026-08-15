@@ -359,7 +359,7 @@ requiring a daemon. Protocol 6 error responses carry an additive optional code;
 clients expose it as `ClientError::Remote(RemoteError)`, while mixed-version
 peers retain message compatibility.
 
-### Scheduled Agent Work (Manual Dispatch Implemented; Timing Planned)
+### Scheduled Agent Work
 
 Protocol 22 and state schema 9 implement the Agent Schedule identity without
 changing ShellRun, Agent Instance, or projected Agent Session semantics. A
@@ -424,6 +424,44 @@ terminal execution transition. This prevents a later dispatch from observing a
 terminal execution while the reusable runner shell is still live.
 These limitations and scheduler health must be visible to clients. See
 [`scheduled-agent-work.md`](scheduled-agent-work.md) and [ADR 0002](adr/0002-separate-agent-schedules-from-runtime-identity.md).
+
+Protocol 25 and state schema 12 add revision-exact Scheduled Execution
+observation. Every retained execution has a positive durable revision; the
+schema-12 migration assigns schema-11 records revision 1 without changing any
+other field. Exact waits use the event condition variable only for wakeup and
+read an event-frontier-owned committed execution map rather than mutable durable
+state. The map is replaced from the complete retained execution set only when
+successful persistence is published. Persistence in flight, pending durable
+batches, and lifecycle event reservations therefore cannot expose revisions that
+may roll back. A deadline still returns the last committed exact snapshot without
+waiting for blocked storage, and equal terminal process revisions continue
+waiting because a canonical Agent link may arrive later.
+Protocol-25 lists are daemon-bounded, newest-first pages with explicit limit and
+truncation. The request limit is optional on the wire; protocol 25 defaults it to
+100 and clamps it to 1 through 1,000, while protocol-23 and protocol-24 requests
+remain uncapped. List responses carry schedule-keyed next-occurrence projections
+for the complete selected schedule scope, independent of the execution page.
+Projections are sorted by schedule ID, bounded to 100, and report
+`schedule_limit` and `schedules_truncated`. Exact inspection carries its
+projection separately from durable execution state; all projection shapes and
+metadata are removed when responding below protocol 25.
+Each schedule retains all nonterminal records and 100 terminal records, pruned by
+ascending requested time and execution ID during ordinary terminalization, cold
+recovery, and shutdown. The durable dispatch-key filter remains authoritative
+after pruning.
+
+Execution events carry the complete prompt-free revision and remain in the
+ordinary 8,192-event journal with 256-event pages. Protocol-23 and protocol-24
+visibility filtering is unchanged and filtered events still advance cursors.
+Opt-in dispatch-failure and cold-interruption notification categories use the
+same bounded fail-open sink as Agent notifications, but deduplicate independently
+by execution, revision, and reason. Cold interruption is persisted before sink
+setup and delivered only for records newly changed by that recovery.
+Dispatch-failure notifications are derived when their durable event batch is
+actually published, including after a failed first write and later pending flush.
+The prior committed execution snapshot must be nonqualifying, so late Agent links
+and other revisions that retain the same terminal state and reason do not notify
+again.
 
 Protocol 7 adds a bounded in-memory daemon event journal and atomic output-state
 reads. Clients reconnect through stream UUID/event-ID cursors and recover from
@@ -714,6 +752,12 @@ and filter timed or skipped execution records and events while preserving event
 cursors. State schema 11 adds the trigger-revision-qualified durable evaluation
 frontier and timed occurrence metadata; its explicit schema-10 migration retains
 manual execution history without reinterpreting it as timed work.
+
+Protocol 25 adds positive Scheduled Execution revisions, exact revision-aware
+wait, bounded execution list metadata, and independently configured execution
+notifications. Protocol-23 and protocol-24 execution visibility remains
+unchanged. State schema 12 explicitly assigns revision 1 to every schema-11
+execution while retaining all prior fields and data.
 
 Cron day matching preserves syntactic wildcard origin: `*/n` is wildcard-origin,
 while numeric lists and ranges remain restricted even when they cover the full

@@ -75,6 +75,7 @@ The following commands support `--json`:
 - `boomux schedule run`
 - `boomux execution list`
 - `boomux execution inspect`
+- `boomux execution wait`
 - `boomux execution cancel`
 - `boomux integration list`
 - `boomux integration status [opencode|pi]`
@@ -139,10 +140,16 @@ Command payloads are:
   summary.
 - `schedule.run`: one prompt-free `execution`. The CLI generates a UUID
   `dispatch_key` before the request unless `--idempotency-key` supplies one.
-- `execution.list`: newest-first prompt-free `executions`, optionally filtered by
-  `--workspace` and `--schedule`.
-- `execution.inspect` and `execution.cancel`: one prompt-free `execution`
-  selected only by exact execution ID.
+- `execution.list`: newest-first prompt-free `executions`, `limit`, `truncated`,
+  `schedule_limit`, `schedules_truncated`, and schedule-keyed `schedules`
+  next-occurrence projections, optionally filtered by `--workspace` and
+  `--schedule`.
+- `execution.inspect`: one prompt-free `execution` selected only by exact
+  execution ID plus its separate nullable `next_occurrence` projection.
+- `execution.cancel`: one prompt-free `execution` selected only by exact
+  execution ID.
+- `execution.wait`: `changed` plus one prompt-free exact `execution` after a
+  revision-aware conditional read.
 - `integration.list`: an `integrations` array containing bundled integration
   names, display names, packages, and validated host versions.
 - `integration.status`: an `integrations` array containing independent `host`,
@@ -183,18 +190,55 @@ Protocol 22 advertises `protocol_22`, `agent_schedule_management`, and
 `schedule_owned_shells`. Protocol 24 adds `protocol_24`,
 `timed_schedule_dispatch`, `scheduler_health`, and
 `bounded_scheduled_execution_concurrency`.
+Protocol 25 adds `protocol_25`, `revision_aware_scheduled_execution_wait`,
+`bounded_scheduled_execution_history`, and
+`scheduled_execution_notifications`.
 
 ## Execution Data
 
 Schedule objects include nullable `next_occurrence`, containing
 `trigger_revision` and `scheduled_at_ms`. Execution objects contain `id`,
-`workspace_id`, `schedule_id`, `state`,
+`workspace_id`, `schedule_id`, positive durable `revision`, `state`,
 `dispatch_kind`, `dispatch_key`, exact `schedule_revision`, `prompt_revision`,
 and `trigger_revision`, `requested_at_ms`, nullable `scheduled_at_ms`, nullable
 `coalesced_through_ms`, start/end timestamps, snapshotted `cwd`,
 `integration`, and `session`, nullable typed `reason` and `outcome`, and nullable
 `shell_id`, `run_id`, `agent_id`, and discovered `external_session_id` links.
 They never contain the retained prompt or environment.
+
+`execution list --limit` defaults to 100 and accepts 1 through 1,000. The daemon
+applies the bound after all filters and orders by `requested_at_ms` newest first,
+then execution ID descending. `truncated` is true when more matching retained
+records exist. Protocol-23 and protocol-24 peers retain their existing manual,
+timed, and skipped visibility rules; a protocol-25 client locally bounds a list
+returned by an older daemon.
+
+On the daemon wire, `ListScheduledExecutions.limit` is optional. Protocol 25
+defaults an absent value to 100 and clamps supplied values to 1 through 1,000.
+Protocol-23 and protocol-24 requests ignore the field and remain uncapped; their
+timed/skipped compatibility filter runs before any list operation. The
+protocol-25 list response includes `schedules`, an array of `schedule_id` and
+nullable `next_occurrence` projections for the complete selected schedule scope,
+including schedules with no history and schedules absent from the execution
+page. The array is sorted by schedule ID and independently capped at 100;
+`schedule_limit` is 100 and `schedules_truncated` reports omitted schedules.
+Exact inspection carries `next_occurrence` beside `execution`. These projections
+are current scheduler calculations, not durable execution fields or execution
+revision changes, and responses below protocol 25 omit them and return zero/false
+projection metadata defaults. A current client connected to protocol 23 or 24
+locally applies the caller's execution limit to the old unbounded response and
+computes `truncated` from the received matching records.
+
+`execution wait` requires protocol 25, an exact execution ID, and
+`--after-revision`. A newer current revision returns immediately with `changed:
+true`; an equal revision waits up to `--wait-ms` and returns the unchanged record
+with `changed: false`; a future revision fails with `revision_ahead`. Revision
+zero returns every existing execution immediately. Equal terminal process state
+does not return early because later canonical Agent linkage may advance the
+revision. Replacement wakes the request with `daemon_stopping`; reconnect and
+repeat the same revision. Waits do not consume event cursors. `wait_ms` remains a
+hard deadline while persistence or pending storage is blocked; timeout returns
+the last committed exact snapshot and never an unpublished revision.
 
 State is `skipped`, `claimed`, `starting`, `active`, `dispatch_failed`, `exited`,
 `cancelled`, or `interrupted`; dispatch kind is `manual` or `timed`. Reasons are
@@ -403,6 +447,7 @@ the initial overlap policy is always `skip`.
 Schedule management commands require negotiated daemon protocol 22. `schedule
 run` and every `execution` command require protocol 23. Unsupported commands
 return `unsupported_version` rather than presenting empty data.
+`execution wait` specifically requires protocol 25.
 
 Only `schedule.inspect` adds `prompt`. Prompts are intentionally absent from
 list, create, pause, resume, remove, run, execution records, capabilities,

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 24;
+pub const PROTOCOL_VERSION: u32 = 25;
 pub const MIN_PROTOCOL_VERSION: u32 = 6;
 pub const MAX_CONTROL_FRAME: usize = 8 * 1024 * 1024;
 pub const MAX_ATTACH_FRAME: usize = 1024 * 1024;
@@ -95,7 +95,17 @@ define_protocol_features! {
         "scheduler_health",
         "bounded_scheduled_execution_concurrency",
     ]),
+    ScheduledExecutionObservation => (25, "scheduled execution observation", [
+        "protocol_25",
+        "revision_aware_scheduled_execution_wait",
+        "bounded_scheduled_execution_history",
+        "scheduled_execution_notifications",
+    ]),
 }
+
+pub const DEFAULT_SCHEDULED_EXECUTION_LIST_LIMIT: u16 = 100;
+pub const MAX_SCHEDULED_EXECUTION_LIST_LIMIT: u16 = 1_000;
+pub const MAX_SCHEDULED_EXECUTION_SCHEDULE_PROJECTIONS: u16 = 100;
 
 pub fn protocol_capabilities() -> impl Iterator<Item = &'static str> {
     ProtocolFeature::ALL
@@ -314,6 +324,13 @@ pub struct ScheduledOccurrence {
     pub scheduled_at_ms: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScheduledExecutionScheduleProjection {
+    pub schedule_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_occurrence: Option<ScheduledOccurrence>,
+}
+
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentScheduleInspection {
     pub schedule: AgentScheduleSnapshot,
@@ -383,6 +400,8 @@ pub struct ScheduledExecutionSnapshot {
     pub id: String,
     pub workspace_id: String,
     pub schedule_id: String,
+    #[serde(default)]
+    pub revision: u64,
     pub state: ScheduledExecutionState,
     pub dispatch_kind: ScheduledExecutionDispatchKind,
     pub dispatch_key: String,
@@ -789,8 +808,16 @@ pub struct NotificationDeliveryConfig {
     pub sound_enabled: bool,
     pub blocked: bool,
     pub completed: bool,
+    #[serde(default)]
+    pub scheduled_dispatch_failed: bool,
+    #[serde(default)]
+    pub scheduled_interrupted: bool,
     pub blocked_sound: String,
     pub completed_sound: String,
+    #[serde(default = "default_scheduled_dispatch_failed_sound")]
+    pub scheduled_dispatch_failed_sound: String,
+    #[serde(default = "default_scheduled_interrupted_sound")]
+    pub scheduled_interrupted_sound: String,
     #[serde(default = "default_true")]
     pub resume_agents: bool,
     #[serde(default)]
@@ -799,12 +826,40 @@ pub struct NotificationDeliveryConfig {
     pub max_scheduled_execution_concurrency: u16,
 }
 
+impl Default for NotificationDeliveryConfig {
+    fn default() -> Self {
+        Self {
+            desktop_enabled: false,
+            sound_enabled: false,
+            blocked: true,
+            completed: true,
+            scheduled_dispatch_failed: false,
+            scheduled_interrupted: false,
+            blocked_sound: "message-new-instant".into(),
+            completed_sound: "complete".into(),
+            scheduled_dispatch_failed_sound: default_scheduled_dispatch_failed_sound(),
+            scheduled_interrupted_sound: default_scheduled_interrupted_sound(),
+            resume_agents: true,
+            persist_terminal_history: false,
+            max_scheduled_execution_concurrency: 4,
+        }
+    }
+}
+
 fn default_max_scheduled_execution_concurrency() -> u16 {
     4
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_scheduled_dispatch_failed_sound() -> String {
+    "dialog-warning".into()
+}
+
+fn default_scheduled_interrupted_sound() -> String {
+    "dialog-warning".into()
 }
 
 impl std::fmt::Debug for UnixEnvironmentVariable {
@@ -864,9 +919,17 @@ pub enum Request {
         workspace_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         schedule_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u16>,
     },
     GetScheduledExecution {
         execution_id: String,
+    },
+    WaitScheduledExecution {
+        execution_id: String,
+        after_revision: u64,
+        #[serde(default)]
+        wait_ms: u32,
     },
     WaitAgent {
         agent_id: String,
@@ -1006,6 +1069,9 @@ pub enum Request {
 impl Request {
     pub fn required_feature(&self) -> Option<ProtocolFeature> {
         match self {
+            Self::WaitScheduledExecution { .. } => {
+                Some(ProtocolFeature::ScheduledExecutionObservation)
+            }
             Self::ListScheduledExecutions { .. }
             | Self::GetScheduledExecution { .. }
             | Self::RunAgentSchedule { .. }
@@ -1026,6 +1092,12 @@ impl Request {
             | Self::CreateShell {
                 workspace_id: None, ..
             } => Some(ProtocolFeature::WorkspaceDefaultCwd),
+            Self::RestartWithNotificationConfig { notifications, .. }
+                if notifications.scheduled_dispatch_failed
+                    || notifications.scheduled_interrupted =>
+            {
+                Some(ProtocolFeature::ScheduledExecutionObservation)
+            }
             Self::RestartWithNotificationConfig { notifications, .. }
                 if notifications.max_scheduled_execution_concurrency != 4 =>
             {
@@ -1118,9 +1190,25 @@ pub enum Response {
     },
     ScheduledExecution {
         execution: ScheduledExecutionSnapshot,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        next_occurrence: Option<ScheduledOccurrence>,
     },
     ScheduledExecutions {
         executions: Vec<ScheduledExecutionSnapshot>,
+        #[serde(default)]
+        limit: u16,
+        #[serde(default)]
+        truncated: bool,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        schedules: Vec<ScheduledExecutionScheduleProjection>,
+        #[serde(default)]
+        schedule_limit: u16,
+        #[serde(default)]
+        schedules_truncated: bool,
+    },
+    ScheduledExecutionWait {
+        execution: ScheduledExecutionSnapshot,
+        changed: bool,
     },
     ScheduledExecutionClaim {
         claim: ScheduledExecutionClaim,
@@ -1354,6 +1442,88 @@ mod tests {
         }
     }
 
+    fn test_execution() -> ScheduledExecutionSnapshot {
+        ScheduledExecutionSnapshot {
+            id: "execution-1".into(),
+            workspace_id: "workspace-1".into(),
+            schedule_id: "schedule-1".into(),
+            revision: 4,
+            state: ScheduledExecutionState::Exited,
+            dispatch_kind: ScheduledExecutionDispatchKind::Manual,
+            dispatch_key: "dispatch-1".into(),
+            schedule_revision: 3,
+            prompt_revision: 2,
+            trigger_revision: 1,
+            requested_at_ms: 10,
+            scheduled_at_ms: None,
+            coalesced_through_ms: None,
+            started_at_ms: Some(11),
+            ended_at_ms: Some(12),
+            cwd: "/tmp/project".into(),
+            integration: "opencode".into(),
+            session: AgentScheduleSession::Fresh,
+            reason: None,
+            outcome: Some(ScheduledExecutionOutcome::ExitCode { code: 0 }),
+            shell_id: Some("shell-1".into()),
+            run_id: Some("run-1".into()),
+            agent_id: None,
+            external_session_id: None,
+        }
+    }
+
+    #[test]
+    fn scheduled_execution_observation_messages_round_trip_and_list_defaults_are_bounded() {
+        let legacy: Request = serde_json::from_str(
+            r#"{"request":"list_scheduled_executions","workspace_id":null,"schedule_id":null}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            legacy,
+            Request::ListScheduledExecutions { limit: None, .. }
+        ));
+
+        let wait = Request::WaitScheduledExecution {
+            execution_id: "execution-1".into(),
+            after_revision: 3,
+            wait_ms: 30_000,
+        };
+        assert_eq!(
+            serde_json::from_value::<Request>(serde_json::to_value(&wait).unwrap()).unwrap(),
+            wait
+        );
+        assert_eq!(
+            wait.required_feature(),
+            Some(ProtocolFeature::ScheduledExecutionObservation)
+        );
+
+        for response in [
+            Response::ScheduledExecutions {
+                executions: vec![test_execution()],
+                limit: 100,
+                truncated: true,
+                schedules: vec![ScheduledExecutionScheduleProjection {
+                    schedule_id: "schedule-1".into(),
+                    next_occurrence: Some(ScheduledOccurrence {
+                        trigger_revision: 1,
+                        scheduled_at_ms: 100,
+                    }),
+                }],
+                schedule_limit: 100,
+                schedules_truncated: false,
+            },
+            Response::ScheduledExecutionWait {
+                execution: test_execution(),
+                changed: true,
+            },
+        ] {
+            assert_eq!(
+                serde_json::from_value::<Response>(serde_json::to_value(&response).unwrap())
+                    .unwrap(),
+                response
+            );
+        }
+    }
+
     #[derive(Deserialize)]
     struct ProtocolSixShellSnapshot {
         id: String,
@@ -1414,6 +1584,8 @@ mod tests {
         assert!(config.resume_agents);
         assert!(!config.persist_terminal_history);
         assert_eq!(config.max_scheduled_execution_concurrency, 4);
+        assert!(!config.scheduled_dispatch_failed);
+        assert!(!config.scheduled_interrupted);
     }
 
     #[test]
@@ -1571,8 +1743,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_twenty_four_with_minimum_six() {
-        assert_eq!(PROTOCOL_VERSION, 24);
+    fn protocol_version_is_twenty_five_with_minimum_six() {
+        assert_eq!(PROTOCOL_VERSION, 25);
         assert_eq!(MIN_PROTOCOL_VERSION, 6);
     }
 
@@ -1679,6 +1851,7 @@ mod tests {
             id: "execution-1".into(),
             workspace_id: "workspace-1".into(),
             schedule_id: "schedule-1".into(),
+            revision: 2,
             state: ScheduledExecutionState::Starting,
             dispatch_kind: ScheduledExecutionDispatchKind::Manual,
             dispatch_key: "dispatch-1".into(),
@@ -1871,6 +2044,14 @@ mod tests {
     fn request_feature_requirements_cover_all_groups() {
         let groups = vec![
             (
+                25,
+                vec![Request::WaitScheduledExecution {
+                    execution_id: "execution-1".into(),
+                    after_revision: 1,
+                    wait_ms: 30_000,
+                }],
+            ),
+            (
                 22,
                 vec![
                     Request::CreateAgentSchedule {
@@ -1939,6 +2120,7 @@ mod tests {
                         resume_agents: true,
                         persist_terminal_history: false,
                         max_scheduled_execution_concurrency: 4,
+                        ..Default::default()
                     },
                     environment: None,
                 }],
@@ -2204,6 +2386,15 @@ mod tests {
                     "timed_schedule_dispatch",
                     "scheduler_health",
                     "bounded_scheduled_execution_concurrency",
+                ][..],
+            ),
+            (
+                25,
+                &[
+                    "protocol_25",
+                    "revision_aware_scheduled_execution_wait",
+                    "bounded_scheduled_execution_history",
+                    "scheduled_execution_notifications",
                 ][..],
             ),
         ];
