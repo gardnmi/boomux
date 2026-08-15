@@ -56,7 +56,11 @@ external session identity, but it owns no process, PTY, or lifecycle observation
 A durable workspace-owned definition for recurring prompt-driven Agent work with fixed execution
 context, session policy, and trigger policy. Creating a schedule does not create a shell, shell run,
 Agent Instance, or Agent Session. Its first dispatch creates one reusable schedule-owned shell for
-later execution runs, and a new schedule is paused until explicitly enabled.
+later execution runs, and a new schedule is paused until explicitly enabled. Definition edits are
+allowed only while paused, require the exact current definition revision, and affect only later
+Scheduled Executions; an already-active execution does not prevent editing, and active and
+historical executions retain the definition revisions they captured. Editing a trigger starts its future
+evaluation at the edit time, so neither the old trigger nor paused time is caught up after resume.
 
 ## Scheduled Execution
 

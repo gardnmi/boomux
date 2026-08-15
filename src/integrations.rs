@@ -30,17 +30,6 @@ pub struct TitleCapability {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TranscriptProvider {
-    OpenCode,
-    Pi,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TranscriptCapability {
-    pub provider: TranscriptProvider,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ResumeCapability {
     pub executable: &'static str,
     pub session_argument: &'static str,
@@ -155,7 +144,6 @@ pub struct IntegrationDescriptor {
     pub display_name: &'static str,
     pub installation: Option<InstallationCapability>,
     pub titles: Option<TitleCapability>,
-    pub transcript: Option<TranscriptCapability>,
     pub resume: Option<ResumeCapability>,
     pub schedule_dispatch: Option<ScheduleDispatchCapability>,
     pub foreground: Option<ForegroundCapability>,
@@ -176,9 +164,6 @@ pub const OPENCODE: IntegrationDescriptor = IntegrationDescriptor {
     titles: Some(TitleCapability {
         provider: TitleProvider::OpenCode,
         provides_catalog: true,
-    }),
-    transcript: Some(TranscriptCapability {
-        provider: TranscriptProvider::OpenCode,
     }),
     resume: Some(ResumeCapability {
         executable: "opencode",
@@ -209,9 +194,6 @@ pub const PI: IntegrationDescriptor = IntegrationDescriptor {
     titles: Some(TitleCapability {
         provider: TitleProvider::Pi,
         provides_catalog: false,
-    }),
-    transcript: Some(TranscriptCapability {
-        provider: TranscriptProvider::Pi,
     }),
     resume: Some(ResumeCapability {
         executable: "pi",
@@ -283,7 +265,6 @@ mod tests {
                 provider: TitleProvider::Pi,
                 provides_catalog: false,
             }),
-            transcript: None,
             resume: None,
             schedule_dispatch: None,
             foreground: Some(ForegroundCapability {
@@ -296,7 +277,6 @@ mod tests {
         assert_eq!(descriptor.display_name, "Partial Host");
         assert!(descriptor.installation.is_none());
         assert!(descriptor.titles.is_some());
-        assert!(descriptor.transcript.is_none());
         assert!(descriptor.resume.is_none());
         assert!(descriptor.schedule_dispatch.is_none());
         assert_eq!(
@@ -354,7 +334,6 @@ mod tests {
             display_name: "Resume Only",
             installation: None,
             titles: None,
-            transcript: None,
             resume: Some(ResumeCapability {
                 executable: "resume-only",
                 session_argument: "--session",

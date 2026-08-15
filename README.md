@@ -167,11 +167,13 @@ explicit `--workspace`.
 
 ## Dashboard
 
-The dashboard has three primary views: Workspaces, Agents, and Shells. The
-Workspaces view combines the selected workspace's Agents, shells, commands, and
-launchers in one item table. Its `ACTIVITY` column shows an Agent task, shell
-foreground process, stored command, or launcher command; branch and worktree
-columns keep repository context visible without repeating full paths.
+The dashboard has four primary views: Workspaces, Agents, Shells, and Schedules. The
+Workspaces view combines the selected workspace's Agents, shells, commands,
+launchers, and schedule definitions in one item table. A `schedule` row represents
+the durable definition, opens its specialized history and controls, and never
+represents an execution process. Its `ACTIVITY` column shows an Agent task, shell
+foreground process, stored command, launcher command, or schedule trigger; branch
+and worktree columns keep repository context visible without repeating full paths.
 
 The Agents view shows lifecycle status and recency, owning workspace and shell,
 root-session task, branch, and worktree. The Shells view distinguishes login
@@ -181,12 +183,20 @@ Git, run, lifecycle, or launcher information that does not fit cleanly in a
 table. Shell output previews retain terminal colors and expose viewport and
 follow state without allowing input from the dashboard.
 
+The Schedules view shows friendly triggers, next occurrences, last outcomes,
+active/paused state, workspace, integration, scheduler health, and bounded
+execution history in a dedicated selectable pane. Boomux retains the newest 100
+terminal records per schedule plus all nonterminal records, preventing history
+from growing without limit. The schedule and history panes render side by side,
+then stack when the terminal is narrow. Schedule-owned execution shells do not
+appear as ordinary shell rows; only the owning schedule definition does.
+
 The workspace overview includes item and Agent-state counts plus its most urgent
 outstanding attention item.
 
 | Key | Action |
 | --- | --- |
-| `Tab`, `Shift-Tab`, `1`-`3` | Change view. |
+| `Tab`, `Shift-Tab`, `1`-`4` | Change view. |
 | `/` or `:` | Search actions, workspaces, and entries. |
 | `?` | Explain keys plus the selected kind and state. |
 | `h`, `l`, left, right | Move between workspace and entry tables. |
@@ -196,6 +206,24 @@ outstanding attention item.
 | `e` | Rename the selection. |
 | `x`, then `y` | Confirm closing or removing the selection. |
 | `q` or `Esc` | Quit from normal mode. |
+
+In Schedules, Left/Right changes between the schedule and history panes, `j`/`k`
+navigates the focused pane, and `[`/`]` also selects retained executions by exact
+execution ID. `Enter` attaches a selected exact Starting or Active run. For a
+completed execution with a canonical session, it resumes that exact session with
+OpenCode or Pi in an unmanaged native terminal, without adding a workspace row.
+`e` opens the private definition editor for a paused schedule; it supports name,
+prompt, trigger presets or custom cron, and a searchable IANA timezone selector.
+Type to filter timezone names and use the arrow keys to choose a valid match.
+`Ctrl-S` saves only at the exact loaded revision. Trigger edits begin future evaluation at save time.
+Active executions retain their captured definition. `u` runs now with a fresh
+dispatch key, and `p` pauses or resumes. `c` then `y` confirms cancellation of the selected exact active execution, and `x` then `y` removes the schedule and
+persisted prompt. Selecting a schedule automatically loads its bounded retained
+history. `a` shows the schedule
+creation CLI help path. Protocol 25 has no skip-next control and the dashboard
+does not emulate one with pause/resume. Exact active Scheduled Execution attachment
+requires protocol 26; protocol-25 dashboards retain schedule controls and
+history while showing upgrade-and-restart guidance for Open.
 
 Closing a workspace terminates its managed shells and removes its schedules and
 persisted prompts. Closing a shell or command terminates its managed process.
@@ -258,7 +286,7 @@ The validated host versions and test evidence are documented in
 [`docs/lifecycle-validation.md`](docs/lifecycle-validation.md). They are
 compatibility test points, not runtime pins.
 
-### Agent Sessions and Transcripts
+### Agent Sessions
 
 Boomux projects canonical OpenCode and Pi sessions into each matching workspace.
 A projected session groups every Boomux Agent occurrence for the same external
@@ -272,21 +300,7 @@ Discover and inspect sessions with exact IDs returned by `session list`:
 ```console
 boomux session list --workspace my-project
 boomux session inspect <session-id>
-boomux session read <session-id> --limit 100
 ```
-
-`session read` returns a bounded, normalized suffix of canonical messages,
-reasoning, and tool activity rather than terminal scrollback. OpenCode is read
-through its session export and Pi through its project session file. Source reads
-are capped at 16 MiB and may time out; response entry count and content bytes
-have separate caller-selected bounds. Boomux does not cache or persist the
-transcript. OpenCode capture uses an unlinked private temporary file that exists
-only for the duration of the read.
-
-Boomux does not redact host transcript content. Use transcript commands only
-when reading that session's content is appropriate. Opaque continuation cursors
-can request older pages; discard one and start a fresh read if Boomux reports
-that it expired.
 
 ### Agent Schedules
 
@@ -327,6 +341,10 @@ execution and never spawn twice. Execution inspection and events omit prompts.
 Execution lists are bounded newest-first and report truncation. Revision-aware
 wait returns on the next committed process or Agent-link change; reconnect with
 the same revision when daemon replacement reports `daemon_stopping`.
+
+The dashboard's Schedules tab exposes the same typed controls and bounded
+history without showing prompt text. Blocked execution navigation uses only the
+exact linked Agent ID and preserves durable Agent attention semantics.
 
 Enabled schedules are evaluated by the daemon in their stored IANA timezone.
 DST gaps are skipped, repeated local minutes fire once, and persisted occurrence

@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 use boomux::client::Client;
 use boomux::protocol::{
     self, AgentAuthority, AgentRegistrationSpec, AgentReport, AgentScheduleOverlapPolicy,
-    AgentScheduleSession, AgentScheduleSpec, AgentScheduleState, AgentScheduleTrigger, AgentState,
-    ScheduledExecutionState, ShellSpec,
+    AgentScheduleSession, AgentScheduleSpec, AgentScheduleState, AgentScheduleTrigger,
+    AgentScheduleUpdate, AgentState, ScheduledExecutionState, ShellSpec,
 };
 use uuid::Uuid;
 
@@ -87,10 +87,40 @@ fn schedule_management_is_durable_private_and_process_free() {
     let inspection = daemon.client.get_agent_schedule(&schedule.id).unwrap();
     assert_eq!(inspection.prompt, prompt);
 
+    let updated_prompt = "updated private native schedule prompt\n";
+    let updated = daemon
+        .client
+        .update_agent_schedule(
+            &schedule.id,
+            schedule.revision,
+            AgentScheduleUpdate {
+                name: "nightly-edited".into(),
+                prompt: updated_prompt.into(),
+                trigger: AgentScheduleTrigger {
+                    cron: "15 3 * * 1-5".into(),
+                    timezone: "America/New_York".into(),
+                },
+            },
+        )
+        .unwrap();
+    assert_eq!(updated.revision, 2);
+    assert_eq!(updated.prompt_revision, 2);
+    assert_eq!(updated.trigger_revision, 2);
+    assert_eq!(updated.name, "nightly-edited");
+    assert_eq!(updated.trigger.cron, "15 3 * * 1-5");
+    assert_eq!(
+        daemon
+            .client
+            .get_agent_schedule(&schedule.id)
+            .unwrap()
+            .prompt,
+        updated_prompt
+    );
+
     let paused = daemon.client.pause_agent_schedule(&schedule.id).unwrap();
-    assert_eq!(paused.revision, 1);
+    assert_eq!(paused.revision, 2);
     let resumed = daemon.client.resume_agent_schedule(&schedule.id).unwrap();
-    assert_eq!(resumed.revision, 2);
+    assert_eq!(resumed.revision, 3);
     assert_eq!(
         daemon.client.resume_agent_schedule(&schedule.id).unwrap(),
         resumed
@@ -103,16 +133,17 @@ fn schedule_management_is_durable_private_and_process_free() {
             .filter(|event| matches!(
                 event.kind,
                 protocol::DaemonEventKind::AgentScheduleCreated { .. }
+                    | protocol::DaemonEventKind::AgentScheduleUpdated { .. }
                     | protocol::DaemonEventKind::AgentSchedulePaused { .. }
                     | protocol::DaemonEventKind::AgentScheduleResumed { .. }
             ))
             .count(),
-        2
+        3
     );
     assert!(
         !serde_json::to_string(&events.events)
             .unwrap()
-            .contains(prompt)
+            .contains(updated_prompt)
     );
 
     let restart = daemon
@@ -127,7 +158,7 @@ fn schedule_management_is_durable_private_and_process_free() {
             .get_agent_schedule(&schedule.id)
             .unwrap()
             .prompt,
-        prompt
+        updated_prompt
     );
 
     daemon.crash();
@@ -152,7 +183,7 @@ fn schedule_management_is_durable_private_and_process_free() {
             .get_agent_schedule(&schedule.id)
             .unwrap()
             .prompt,
-        prompt
+        updated_prompt
     );
     assert!(
         daemon.client.snapshot().unwrap().workspaces[0]

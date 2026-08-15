@@ -34,8 +34,8 @@ A **Scheduled Execution** is the durable record of one timed occurrence or
 explicit run-now decision. It captures the exact schedule revision, prompt
 revision, requested or scheduled time, working directory, integration dispatch
 mode, decision, reason, and available runtime references. Schedule edits affect
-only later executions when an edit surface is added; the current CLI does not
-expose schedule editing.
+only later executions; active and historical records retain their captured
+definition revisions.
 
 The identities remain separate:
 
@@ -89,7 +89,9 @@ execution snapshots its effective working directory.
 Creation snapshots the prompt content into Boomux's user-only durable
 state. A prompt-file option reads the file at that mutation boundary; later file
 changes do not silently alter the schedule. Every Scheduled Execution retains
-the prompt revision it used; prompt editing is not currently exposed.
+the prompt revision it used. The dashboard fetches prompt content only for an
+explicit exact-schedule edit and keeps it in the private editor until save or
+cancel.
 
 Prompt content may contain private instructions or data. It is bounded and:
 
@@ -190,8 +192,10 @@ revision, and selected scheduled UTC instant. Each schedule persists an
 evaluation frontier independently of bounded execution history. The frontier
 advances monotonically before publication and is not pruned with audit records,
 so clock rollback and history pruning cannot make an old occurrence eligible.
-Trigger editing is not currently exposed. The persisted trigger revision remains
-part of occurrence identity so a future edit cannot reinterpret old decisions.
+Editing a paused schedule's trigger increments its trigger revision and resets
+the evaluation frontier to the edit commit time. The persisted trigger revision
+remains part of occurrence identity, so an edit cannot reinterpret old decisions
+or catch up old-trigger or paused-time occurrences after resume.
 
 The occurrence key, Scheduled Execution decision, and evaluation-frontier
 advance commit as one durable mutation before the corresponding event is
@@ -356,6 +360,74 @@ and fail-open and neither acknowledges nor fabricates Agent attention.
 Cold startup persists all newly interrupted records before installing the sink
 and enqueueing their notifications. Already-terminal records are not replayed on
 later cold or graceful starts.
+
+## Dashboard Projection
+
+The dashboard has a specialized Schedules view and projects one typed `schedule`
+definition row into each owning workspace. That row counts as a workspace item,
+not a process, and navigates to the exact specialized schedule without opening or
+running it. Scheduled Executions are never workspace item kinds. Schedule-owned
+execution shells are hidden from ordinary workspace restore, process counts,
+shell presentation, rename, restart, and close. An exact linked Agent remains
+selectable in the Agents view without acquiring ordinary shell actions. The
+view shows friendly trigger, next occurrence, last outcome, active state,
+workspace, and integration as width permits. A separate history pane sits beside
+the schedule pane at normal widths and stacks below it when narrow. There is no
+additional schedule information panel, and prompt content remains absent.
+
+The initial execution cache is one bounded protocol-25 global page and is not
+requested from protocol-23 or protocol-24 peers. Complete execution event
+payloads replace cached records only at a higher revision; stale and duplicate
+records are ignored, while schedule removal clears that schedule's entries.
+Cursor expiration, event-stream replacement, and explicit refresh reseed once.
+A failed reseed leaves the prior cache visible and retries before the next event
+check. Idle checks, unrelated events, and the existing one-second
+snapshot fallback do not issue execution-list requests. Selecting an unscoped
+schedule automatically performs one bounded exact-scope load and reports page
+truncation; already scoped selections do not repeat it. Empty unscoped truncated history is unknown, not evidence that a
+schedule never ran; only complete global history or a complete exact-schedule
+page can establish never-run. A full terminal-history boundary is also
+identified as a possible durable pruning boundary because older retained
+records cannot be inferred.
+
+Run now creates a fresh dispatch key. Pause and resume affect future timed work.
+Execution selection is retained by execution ID across refresh and reorder and
+remains visible in a dedicated focusable history pane. Left and Right change
+panes, `j` and `k` navigate the focused pane, and
+the existing bracket keys remain exact-execution shortcuts. Open and cancel
+target only that selection.
+Scheduled Executions are not listed in the command palette; actionable schedule
+notices navigate to their exact selected execution instead.
+For Starting or Active records, Open requires exact shell and run IDs. It carries
+those IDs through terminal launch into a protocol-26 exact-run attachment
+request. The daemon checks the expected run while holding the attachment
+mutation/lifecycle boundary, returns `run_changed` if the shell moved, and never
+restarts into or takes over a later run. For a terminal record with an exact
+canonical Agent Session, Open freshly resolves that opaque session identity and
+launches the integration's exact interactive resume argv in an unmanaged native
+terminal at its retained working directory. It does not create an ordinary
+workspace shell or reuse the schedule-owned shell. An already-current managed
+session, permanently Done session, missing working directory, or unsupported
+integration is rejected.
+Cancel requires confirmation and backend revalidation. Removal also requires
+confirmation.
+Protocol-25 dashboards retain schedule controls and bounded history but disable
+exact terminal Open with actionable upgrade-and-restart guidance.
+Protocol 25 has no skip-next operation; clients must not emulate
+one with pause and resume. Creation remains discoverable through `boomux
+schedule create --help`. Protocol 27 dashboards fetch prompt content only after
+an explicit edit action on an exact paused schedule, retain it only in the private
+editor, and save name, prompt, trigger, and timezone atomically with the loaded
+revision. The timezone control searches the bundled IANA database and can select
+only valid names. A stale save is rejected without replacing the private editor buffer.
+
+Execution links are used only when their exact retained IDs are present. Active
+blocked work attaches to its exact run, while completed work resumes only its
+exact canonical Agent Session; neither path selects a newest or nearby identity.
+Durable Agent attention remains independent. Canonical session identity requires
+the exact linked Agent occurrence. Boomux does not read or
+project host transcript and tool content; OpenCode or Pi remains the interface
+for that content.
 
 ## User Control And Permissions
 

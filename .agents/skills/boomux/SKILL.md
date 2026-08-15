@@ -4,7 +4,7 @@ description: Inspect and manage Boomux persistent terminal workspaces, launchers
 compatibility: Requires boomux on PATH. Some name operations require Boomux workspace context or an explicit --workspace; schedule names require BOOMUX_WORKSPACE_ID or explicit --workspace; agent mutation and supervision require exact shell-run context, and continuation schedules or supervision require caller-supplied exact canonical session identity.
 metadata:
   author: boomux
-  version: "11"
+  version: "14"
 ---
 
 # Boomux
@@ -218,9 +218,8 @@ inherited a different config environment.
 Session discovery is not limited to daemon metadata. It may execute the
 PATH-resolved OpenCode CLI and inspect host catalogs in workspace-derived
 directories, exposing sanitized but potentially private session titles.
-`session read` additionally runs `opencode export` or reads Pi project session
-files. Require authorization appropriate to the host-history metadata or
-content before listing, inspecting, or reading sessions.
+Require authorization appropriate to the host-history metadata before listing
+or inspecting sessions.
 
 Discover projected session metadata with:
 
@@ -228,8 +227,6 @@ Discover projected session metadata with:
 boomux session list --json
 boomux session list --workspace "<workspace-name-or-id>" --json
 boomux session inspect "<exact-session-id>" --json
-boomux session read "<exact-session-id>" --limit 100 --max-bytes 1048576 --json
-boomux session read "<exact-session-id>" --before "<next-cursor>" --limit 100 --max-bytes 1048576 --json
 ```
 
 Use the exact opaque session ID returned by `session list`. Never guess or
@@ -238,17 +235,8 @@ Session state is marked current only when an occurrence is active on the current
 run of a running retained shell; otherwise it is last-known. Catalog-only
 OpenCode history has state `unknown`, no fabricated occurrence, and a sanitized
 host title. Registered-session descriptions remain durable Agent names.
-`session read` returns the newest bounded suffix of canonical OpenCode or Pi
-messages, reasoning, and tool activity, not terminal scrollback. Pi results
-follow its active branch. Inspect `truncated`, `truncated_by`, and per-entry
-`truncated` before deciding whether to request larger bounds. Boomux does not
-redact host content, so use it only when the user's request authorizes reading
-that exact session. Protocol-13 sessions retain a `source_cwd` for transcript
-lookup after shell removal; this does not preserve deleted harness data itself.
-When `has_more` is true, prepend older pages by passing the exact opaque
-`next_cursor` as `--before`; bounds may change between requests. Discard the
-cursor and start a fresh read on `cursor_expired`. Do not decode, edit, or reuse
-a cursor for another projected session.
+Protocol-13 sessions retain a `source_cwd` after shell removal so an exact
+canonical session can be resumed in its original context.
 
 ## Manage Agent Schedules
 
@@ -459,7 +447,7 @@ boomux doctor
 `boomux` and `boomux ui` must run from a fresh host terminal; they are rejected
 when `BOOMUX_SHELL_ID` is set. `boomux doctor` can run in either context.
 
-The dashboard has workspace, Agent, launcher, shell, and command views. `/` or
+The dashboard has Workspaces, Agents, Shells, and Schedules views. `/` or
 `:` opens its action and search palette, `?` shows contextual help, `Enter`
 restores the selected workspace or opens the selected entry, and `x` followed
 by `y` confirms close or removal. Shell previews are bounded and read-only.
@@ -469,6 +457,37 @@ managed terminal selects its owning workspace and shell or Agent row once;
 manual navigation remains until another focus change. Press `Space` to pin the
 current dashboard selection and pause focus following; press it again to unpin
 and catch up to the currently focused terminal.
+
+Each Agent Schedule appears once in its owning workspace with `KIND schedule`.
+That row is the durable definition, not a process; Enter navigates to its exact
+Schedules view. Schedule-owned execution shells remain absent from ordinary
+workspace rows and process counts.
+
+In Schedules, Left/Right changes between the schedule and history panes, `j`/`k`
+navigates the focused pane, and `[`/`]` also selects retained executions by exact
+execution ID. `Enter` attaches an exact Starting or Active run. For a completed
+execution with a canonical session, it resumes that exact OpenCode or Pi session
+in an unmanaged native terminal without adding a workspace row. `u` runs now with a fresh dispatch key, `p`
+pauses or resumes future timed work, `c` then
+`y` confirms cancellation of the selected exact active execution. Selecting a
+schedule automatically loads bounded exact-schedule history. `x` then `y`
+confirms removal. `a` shows `boomux
+schedule create --help`. Prompt text is shown only after explicit exact editing
+or inspection. Schedule-owned shells are excluded from ordinary rows and
+workspace restore; their exact Agents remain selectable without ordinary shell
+actions. Opening does not acknowledge durable attention. Protocol 25
+has no skip-next operation; never emulate one with pause and resume.
+Active Open uses a protocol-26 exact-run attachment that cannot restart into a
+later run. Protocol-25 dashboards retain schedule controls and history but
+disable exact active-run attachment with upgrade-and-restart guidance.
+
+Press `e` to fetch and edit the exact private definition of a paused schedule.
+The built-in editor changes name, prompt, trigger preset or custom cron, and IANA
+timezone. Its timezone control filters the bundled IANA names as the user types;
+arrows select only valid matches. `Ctrl-S` saves with the loaded revision and
+`Esc` discards the private buffer. A stale save must be cancelled and reloaded rather than blindly retried.
+Trigger edits start future evaluation at commit time, while active executions
+retain their captured definition.
 
 ## Configuration
 

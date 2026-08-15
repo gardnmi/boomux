@@ -695,6 +695,69 @@ fn restart_on_attach_reopens_an_exited_durable_shell() {
 }
 
 #[test]
+fn exact_run_attach_rejects_a_run_changed_after_validation_without_takeover() {
+    let mut daemon = TestDaemon::start();
+    let workspace = daemon
+        .client
+        .create_workspace(
+            "exact-attach-race",
+            vec![ShellSpec {
+                name: "shell".into(),
+                cwd: std::env::temp_dir(),
+                command: vec!["/bin/sh".into()],
+            }],
+        )
+        .unwrap();
+    let shell_id = workspace.shells[0].id.clone();
+    let mut first = daemon
+        .client
+        .attach(&shell_id, false, profile())
+        .unwrap()
+        .stream;
+    let validated_run = daemon.client.get_shell(&shell_id).unwrap().run.unwrap().id;
+
+    AttachFrame::Input(b"exit 0\n".to_vec())
+        .write_to(&mut first)
+        .unwrap();
+    drop(first);
+    wait_until(
+        || {
+            matches!(
+                daemon.client.get_shell(&shell_id).unwrap().status,
+                ShellStatus::Exited { .. }
+            )
+        },
+        "validated run did not exit",
+    );
+
+    let mut later = daemon
+        .client
+        .attach_restarting(&shell_id, false, profile())
+        .unwrap()
+        .stream;
+    let later_run = daemon.client.get_shell(&shell_id).unwrap().run.unwrap().id;
+    assert_ne!(later_run, validated_run);
+
+    let error = daemon
+        .client
+        .attach_exact_run_with_client_environment(&shell_id, &validated_run, true, profile())
+        .unwrap_err();
+    assert_remote_code(&error, ErrorCode::RunChanged);
+
+    AttachFrame::Input(b"printf 'later-run-still-attached\\n'\n".to_vec())
+        .write_to(&mut later)
+        .unwrap();
+    assert!(contains(
+        &read_until(&mut later, b"later-run-still-attached"),
+        b"later-run-still-attached"
+    ));
+
+    drop(later);
+    daemon.client.close_workspace(&workspace.id).unwrap();
+    daemon.stop_with_cli();
+}
+
+#[test]
 fn failed_implicit_terminal_launch_rolls_back_created_state() {
     let daemon = TestDaemon::start();
     let project = daemon.runtime_dir.join("project");
@@ -774,6 +837,7 @@ fn attach_with_environment(
                 shell_id: shell_id.into(),
                 takeover: false,
                 restart_exited,
+                expected_run_id: None,
                 profile: profile(),
                 environment: Some(environment),
             },

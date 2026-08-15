@@ -21,10 +21,9 @@
 | `src/terminal_focus.rs` | Stateful parsing and restoration of child focus-reporting mode |
 | `src/tui.rs` | Dashboard state, interaction, palette, polling, and Ratatui rendering; no direct daemon transport |
 | `src/session_projection.rs` | Projection of daemon Agent state and host catalogs into client-visible sessions |
-| `src/integrations.rs` | Integration identity, display metadata, and optional installation, title/catalog, transcript, resume, and foreground capabilities |
+| `src/integrations.rs` | Integration identity, display metadata, and optional installation, title/catalog, resume, and foreground capabilities |
 | `src/host_session_titles.rs` and children | Shared title/catalog policy and host-specific discovery adapters |
 | `src/host_session_source.rs` and children | Canonical host source paths, normalization, and secure source lookup |
-| `src/session_transcript.rs` and children | Shared transcript identity, bounds, pagination, and host-specific normalization |
 | `src/integration_management.rs` | Integration inventory, status, setup, verification, install, and uninstall workflows |
 | `src/process_adapter.rs` | Exact-argv child supervision and fail-open process-bound Agent observation |
 | `src/scheduling.rs` | Bounded canonical cron parsing and occurrence evaluation, IANA timezone and DST policy, prompt bounds, and schedule identity validation |
@@ -237,6 +236,13 @@ satisfied, so retained history does not extend PTY-writer lock hold time.
 boomux __attach <shell-id> --takeover --restart-exited
 ```
 
+Scheduled Execution opens instead launch `__attach` with the selected exact run
+ID and without `--restart-exited`. Protocol 26 carries that expected run through
+the attachment handshake. While holding the ordinary attachment mutation and
+shell lifecycle boundary, the daemon returns `run_changed` unless the shell is
+currently running that exact run. It cannot restart or take over a later run.
+Ordinary shell attachments retain their existing restart behavior.
+
 No emulator-specific adapter or compositor window ID is required.
 Spawned terminal windows start in independent process sessions with null
 standard streams, so exiting the dashboard cannot close their attachments.
@@ -258,7 +264,20 @@ shell directories and cached. A default cwd does not create workspace-level Git
 identity, and mixed-directory workspaces remain valid.
 
 The dashboard establishes an atomic event-stream baseline and treats later
-events as invalidation signals for authoritative snapshot reprojection. Idle
+events as invalidation signals for authoritative snapshot reprojection. It also
+preserves complete Scheduled Execution event payloads in one client-side cache
+bounded to 1,000 records. The cache is seeded once with a protocol-25 global
+page only when Scheduled Execution Observation is supported. Protocol-23 and
+protocol-24 dashboards render scheduling as unsupported and never request their
+uncapped execution history. Complete execution-created and execution-changed
+records replace cached records only at a higher durable revision; stale and
+duplicate revisions are ignored, and schedule removal clears all matching
+records. Cursor expiration, stream replacement, and explicit refresh reseed
+once. A failed reseed preserves the prior cache, keeps a retry requirement, and
+retries before the next event check. Idle checks and unrelated events never
+list executions. Selecting an unscoped schedule automatically replaces that
+schedule's cache entries with one bounded exact-scope page and retains its
+truncation metadata; a scoped selection does not repeat the read. Idle
 checks advance only the event cursor. Once per second, event-stream dashboards
 refresh one authoritative snapshot while retaining the advanced cursor. This
 keeps ephemeral focus and foreground-process hints current without serial
@@ -296,6 +315,45 @@ Command previews expose argv and run metadata without reading terminal output.
 Launcher previews never imply retained invocation state because launcher
 processes remain ephemeral.
 
+Schedules have a specialized fourth top-level view and a typed definition row in
+their owning workspace. The workspace row has `KIND schedule`, counts as an item
+but not a process, and navigates to the exact specialized schedule; it never
+represents or opens an execution shell. Typed schedule and execution projections
+show friendly triggers, next occurrences, last outcomes, state, scheduler health,
+and bounded history. Schedule-owned execution shells are excluded from ordinary
+workspace and shell presentation, process counts, restore, and actions. Their
+exact linked Agents remain selectable in the Agents view but
+expose no ordinary shell actions. The schedule view retains a selected execution
+ID across refresh and reorder and always renders it in a selected-containing
+focusable history pane. Open and cancellation
+actions use that exact selection. Executions are omitted from the
+command palette; actionable schedule notices navigate to their exact selection.
+The schedule and history panes are side by side at normal widths and stack
+vertically below the responsive breakpoint; there is no separate metadata panel.
+Protocol-27 dashboards open a private built-in editor only after exact schedule
+inspection. It edits name, prompt, trigger preset or custom cron, and timezone;
+the timezone control searches the bundled IANA database and can select only a
+valid name. Saves carry the inspected revision, failures retain the unsaved private
+buffer, and save or cancel drops it from dashboard state. Ordinary projections,
+messages, palette entries, events, and diagnostics remain prompt-free.
+Opening a Starting or Active record requires exact shell and run IDs, re-fetches
+and validates the execution and ownership before terminal launch, then uses the
+protocol-26 exact-run attachment handshake to close the post-launch race.
+Opening a terminal record freshly resolves its opaque canonical Agent Session
+ID, constructs the integration's exact interactive resume argv, and launches it
+in an unmanaged native terminal at the retained working directory. It does not
+create an ordinary workspace shell, restart the shared schedule-owned shell, or
+accept current managed or permanently Done sessions.
+Protocol-25 dashboards retain schedule controls and bounded history but disable
+exact terminal Open with upgrade-and-restart guidance.
+Cancellation requires confirmation and re-fetches the exact execution before
+mutation. Active blocked work attaches to its exact run; terminal work resumes
+only its exact canonical session. Canonical session links are derived from exact
+Agent occurrences, never latest or nearby identities. Boomux does not read or
+project host transcript and tool content.
+Protocol 25 has no skip-next action, and the dashboard does not emulate one by
+pausing and resuming.
+
 Agent sessions are a client-side projection, not a sixth durable daemon
 identity. The projection groups stored Agent instances by workspace,
 integration, and external session ID, while isolating instances without an
@@ -315,18 +373,18 @@ display names, and optional typed capabilities. A title capability selects its
 host adapter and independently declares catalog support. The shared title layer
 owns asynchronous cache, refresh, deduplication, sanitization, and fallback
 policy; OpenCode and Pi modules own host command execution and title extraction.
-Neutral host source modules own shared path normalization and secure source
-discovery. Title and catalog support remain independent from transcript support,
-installation, foreground recognition, and recovery eligibility, so a future
-harness can implement only the capabilities it provides.
+Neutral host source modules own shared path normalization and secure catalog
+discovery. Title and catalog support remain independent from installation,
+foreground recognition, and recovery eligibility, so a future harness can
+implement only the capabilities it provides.
 
 Session list/inspect requires a negotiated protocol-12 snapshot because the
 projection depends on that complete Agent state model. Protocol 13 adds an
 optional Agent `cwd` snapshot field, captured authoritatively from the bound
 shell during registration and persisted with the Agent. Projection exposes it as
-`source_cwd` separately from retained-shell metadata, allowing transcript lookup
-after shell removal without claiming that the shell remains openable. Protocol
-12 remains usable while a matching shell is retained.
+`source_cwd` separately from retained-shell metadata, retaining exact session
+context for interactive resume after shell removal without claiming that the
+shell remains openable. Protocol 12 remains usable while a matching shell is retained.
 
 An active Agent instance bound to a shell's exact current run decorates that
 shell as an agent-shell row rather than adding a second item. The row retains
@@ -436,6 +494,17 @@ batches, and lifecycle event reservations therefore cannot expose revisions that
 may roll back. A deadline still returns the last committed exact snapshot without
 waiting for blocked storage, and equal terminal process revisions continue
 waiting because a canonical Agent link may arrive later.
+Protocol 26 adds additive exact-run attachment. `Attach.expected_run_id`
+is optional and defaults absent for older clients. When present it requires the
+`exact_run_attachment` capability and disables exited-shell restart.
+Protocol 27 adds optimistic Agent Schedule definition editing. One atomic request
+replaces name, exact prompt, and canonical trigger only while paused and only at
+the caller's expected schedule revision. A changed prompt or trigger advances its
+component revision; any change advances the schedule revision once. Trigger
+changes reset the evaluation frontier to commit time. Exact no-ops do not persist
+or publish, active executions retain captured revisions, and update events remain
+prompt-free. Protocol-26 peers filter update events without rewinding cursors.
+The durable representation is unchanged, so state schema remains 12.
 Protocol-25 lists are daemon-bounded, newest-first pages with explicit limit and
 truncation. The request limit is optional on the wire; protocol 25 defaults it to
 100 and clamps it to 1 through 1,000, while protocol-23 and protocol-24 requests
@@ -636,62 +705,6 @@ use exact argument vectors and bounded JSON output, and fail open with
 rate-limited diagnostics. Session shutdown makes one bounded retry so a
 transient reporting failure is less likely to leave the old session active.
 
-### Canonical Session Transcripts
-
-`boomux session read` resolves only an exact projected session ID, then uses the
-canonical external ID and a retained occurrence working directory to invoke the
-matching host adapter. OpenCode is read through `opencode export`; Pi is read
-from its project-scoped JSONL file with no-follow regular-file checks. Pi's
-append-only tree is reduced to the latest leaf's parent chain so abandoned
-branches are not presented as the active transcript.
-
-Transcript lookup uses the newest occurrence `source_cwd`. For protocol-13 Agent
-records this directory survives shell removal and cold daemon restart; migrated
-protocol-12-era records recover it from a retained shell where possible. The
-source directory is a locator rather than copied transcript storage, so removing
-the directory or harness data still makes the transcript unavailable.
-
-Adapters normalize host text, reasoning, tool calls, inputs, results, status,
-source identity, and timestamps. Boomux does not redact this content because
-the harness is the content trust boundary. Reads remain explicit and bounded:
-the CLI returns a newest chronological suffix with entry and UTF-8 content-byte
-limits, marks partial entries and truncation causes, caps canonical source input
-at 16 MiB, and times out OpenCode export. Unsupported hosts and unavailable,
-invalid, or oversized sources return stable typed errors.
-
-Older-page reads use a stateless opaque cursor bound to the projected session,
-adapter normalization revision, retained source context, initial normalized
-entry count, and a SHA-256 fingerprint of that baseline. Each continuation
-re-reads the bounded canonical source. Appends that leave the normalized
-baseline prefix unchanged are ignored for the established sequence, while
-baseline mutation, removal, reordering, Pi branch changes, source-context
-changes, or normalization changes expire the cursor.
-Page selection and byte clipping remain shared and advance by whole normalized
-entries; cursors create no daemon identity, persistence, or retained state.
-Cursor data is untrusted consistency metadata rather than authorization; exact
-projected-session resolution and canonical source access remain the security
-boundary.
-
-The integration descriptor's optional transcript capability selects a host
-adapter. An adapter receives only the canonical external session ID and retained
-working directory and returns host-neutral transcript entries. Exact projected
-session resolution, access preconditions, newest-suffix pagination, byte and
-entry bounds, cursor validation, truncation, typed errors, human output, and
-`boomux.cli/v1` JSON
-remain shared. Adding Claude Code, Codex, or another harness therefore requires
-one canonical source adapter and one descriptor capability, not another CLI path.
-`boomux capabilities --json` derives `session_transcript_integrations` from this
-descriptor registry so integrations can discover support without hard-coded host lists.
-
-The implementation mirrors these boundaries in both adapter families:
-`host_session_titles.rs` and `session_transcript.rs` contain only shared policy
-and contracts, while their `opencode.rs` and `pi.rs` child modules
-contain host-specific parsing and normalization. Shared source lookup belongs in
-`host_session_source.rs` and its host-specific child modules rather than either
-capability adapter. Adding Claude Code, Codex, or another harness means adding
-isolated title and transcript modules as supported, then declaring each provider
-on its descriptor; existing host parsers do not grow new conditional branches.
-
 Protocol 12 adds `inactive`. Protocol-9 through protocol-11 clients receive that
 observation as `unknown`, while protocol-12 clients can distinguish a resumable
 session that is not currently active from permanent `done` completion. Protocol
@@ -758,6 +771,14 @@ wait, bounded execution list metadata, and independently configured execution
 notifications. Protocol-23 and protocol-24 execution visibility remains
 unchanged. State schema 12 explicitly assigns revision 1 to every schema-11
 execution while retaining all prior fields and data.
+
+Protocol 26 adds the optional exact-run attachment expectation used by Scheduled
+Execution terminal opens. Protocol-25 peers retain all observation, history,
+and non-Open schedule dashboard behavior.
+
+Protocol 27 adds paused, revision-conditional schedule definition updates and
+prompt-free `agent_schedule_updated` events. Protocol-26 peers filter those
+events while advancing their cursor. State schema remains 12.
 
 Cron day matching preserves syntactic wildcard origin: `*/n` is wildcard-origin,
 while numeric lists and ranges remain restricted even when they cover the full

@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { BoomuxOpenCodePlugin } from "./boomux.js";
 
 const {
+  COMMAND_TIMEOUT_MS,
   classifyEvent,
   createLifecycle,
   createProcessRunner,
@@ -401,6 +402,10 @@ describe("root aggregation", () => {
 });
 
 describe("Boomux commands", () => {
+  test("allows enough time for local lifecycle reporting under load", () => {
+    expect(COMMAND_TIMEOUT_MS).toBeGreaterThanOrEqual(5_000);
+  });
+
   test("uses exact argv and never invokes a shell", async () => {
     let received;
     const encoder = new TextEncoder();

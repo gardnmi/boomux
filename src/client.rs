@@ -15,8 +15,8 @@ use std::time::Duration;
 
 use crate::protocol::{
     self, AgentInstanceSnapshot, AgentRegistrationSpec, AgentReport, AgentScheduleInspection,
-    AgentScheduleSnapshot, AgentScheduleSpec, DaemonEvent, Envelope, ErrorCode, EventCursor,
-    FocusedTerminalSnapshot, NotificationDeliveryConfig, Request, Response,
+    AgentScheduleSnapshot, AgentScheduleSpec, AgentScheduleUpdate, DaemonEvent, Envelope,
+    ErrorCode, EventCursor, FocusedTerminalSnapshot, NotificationDeliveryConfig, Request, Response,
     ScheduledExecutionScheduleProjection, ScheduledExecutionSnapshot, ScheduledOccurrence,
     ScheduledRunnerResult, ShellSnapshot, ShellSpec, ShellStatus, Snapshot, TerminalPreview,
     TerminalPreviewLine, TerminalPreviewSpan, TerminalProfile, UnixEnvironment,
@@ -181,6 +181,14 @@ pub struct SnapshotWatch {
     snapshot: Snapshot,
 }
 
+#[derive(Debug)]
+pub struct SnapshotWatchPoll {
+    pub changed: bool,
+    pub stream_changed: bool,
+    pub baseline_replaced: bool,
+    pub events: Vec<DaemonEvent>,
+}
+
 impl SnapshotWatch {
     pub fn baseline(client: &Client) -> Result<Self> {
         if !client.supports(protocol::ProtocolFeature::AtomicOutputReads)? {
@@ -211,29 +219,49 @@ impl SnapshotWatch {
         self.cursor.is_some()
     }
 
-    pub fn poll(&mut self, client: &Client) -> Result<(bool, bool)> {
+    pub fn poll(&mut self, client: &Client) -> Result<SnapshotWatchPoll> {
         let Some(cursor) = self.cursor.clone() else {
-            return Ok((false, false));
+            return Ok(SnapshotWatchPoll {
+                changed: false,
+                stream_changed: false,
+                baseline_replaced: false,
+                events: Vec::new(),
+            });
         };
         let stream_id = cursor.stream_id.clone();
         match client.events(Some(cursor), 256, 0) {
             Ok(batch) => {
                 if batch.events.is_empty() {
                     self.cursor = Some(batch.cursor);
-                    return Ok((false, false));
+                    return Ok(SnapshotWatchPoll {
+                        changed: false,
+                        stream_changed: false,
+                        baseline_replaced: false,
+                        events: Vec::new(),
+                    });
                 }
                 let stream_changed = batch.stream_id != stream_id;
                 let snapshot = client.snapshot()?;
                 self.cursor = Some(batch.cursor);
                 self.snapshot = snapshot;
-                Ok((true, stream_changed))
+                Ok(SnapshotWatchPoll {
+                    changed: true,
+                    stream_changed,
+                    baseline_replaced: false,
+                    events: batch.events,
+                })
             }
             Err(ClientError::Remote(RemoteError {
                 code: Some(ErrorCode::CursorExpired),
                 ..
             })) => {
                 *self = Self::baseline(client)?;
-                Ok((true, self.stream_id() != Some(stream_id.as_str())))
+                Ok(SnapshotWatchPoll {
+                    changed: true,
+                    stream_changed: self.stream_id() != Some(stream_id.as_str()),
+                    baseline_replaced: true,
+                    events: Vec::new(),
+                })
             }
             Err(ClientError::Remote(RemoteError {
                 code: Some(ErrorCode::UnsupportedVersion),
@@ -241,7 +269,12 @@ impl SnapshotWatch {
             }))
             | Err(ClientError::Protocol(ProtocolError::UnsupportedVersion(_))) => {
                 *self = Self::baseline(client)?;
-                Ok((true, self.stream_id() != Some(stream_id.as_str())))
+                Ok(SnapshotWatchPoll {
+                    changed: true,
+                    stream_changed: self.stream_id() != Some(stream_id.as_str()),
+                    baseline_replaced: true,
+                    events: Vec::new(),
+                })
             }
             Err(error) => Err(error),
         }
@@ -710,6 +743,22 @@ impl Client {
         match self.request(Request::CreateAgentSchedule {
             workspace_id: workspace_id.into(),
             spec,
+        })? {
+            Response::AgentSchedule { schedule } => Ok(schedule),
+            other => unexpected(other),
+        }
+    }
+
+    pub fn update_agent_schedule(
+        &self,
+        schedule_id: impl Into<String>,
+        expected_revision: u64,
+        update: AgentScheduleUpdate,
+    ) -> Result<AgentScheduleSnapshot> {
+        match self.request(Request::UpdateAgentSchedule {
+            schedule_id: schedule_id.into(),
+            expected_revision,
+            update,
         })? {
             Response::AgentSchedule { schedule } => Ok(schedule),
             other => unexpected(other),
@@ -1195,7 +1244,7 @@ impl Client {
         takeover: bool,
         profile: TerminalProfile,
     ) -> Result<Attachment> {
-        self.attach_with_restart(shell_id.into(), takeover, false, profile, None)
+        self.attach_with_restart(shell_id.into(), takeover, false, None, profile, None)
     }
 
     pub fn attach_with_client_environment(
@@ -1208,6 +1257,7 @@ impl Client {
             shell_id.into(),
             takeover,
             false,
+            None,
             profile,
             Some(current_environment()),
         )
@@ -1219,7 +1269,7 @@ impl Client {
         takeover: bool,
         profile: TerminalProfile,
     ) -> Result<Attachment> {
-        self.attach_with_restart(shell_id.into(), takeover, true, profile, None)
+        self.attach_with_restart(shell_id.into(), takeover, true, None, profile, None)
     }
 
     pub fn attach_restarting_with_client_environment(
@@ -1232,6 +1282,24 @@ impl Client {
             shell_id.into(),
             takeover,
             true,
+            None,
+            profile,
+            Some(current_environment()),
+        )
+    }
+
+    pub fn attach_exact_run_with_client_environment(
+        &self,
+        shell_id: impl Into<String>,
+        expected_run_id: impl Into<String>,
+        takeover: bool,
+        profile: TerminalProfile,
+    ) -> Result<Attachment> {
+        self.attach_with_restart(
+            shell_id.into(),
+            takeover,
+            false,
+            Some(expected_run_id.into()),
             profile,
             Some(current_environment()),
         )
@@ -1242,6 +1310,7 @@ impl Client {
         shell_id: String,
         takeover: bool,
         restart_exited: bool,
+        expected_run_id: Option<String>,
         profile: TerminalProfile,
         environment: Option<UnixEnvironment>,
     ) -> Result<Attachment> {
@@ -1249,6 +1318,7 @@ impl Client {
             shell_id,
             takeover,
             restart_exited,
+            expected_run_id,
             profile,
             environment,
         })?;
@@ -1498,6 +1568,79 @@ mod tests {
         }
     }
 
+    #[test]
+    fn update_agent_schedule_sends_revisioned_private_definition() {
+        let directory = env::temp_dir().join(format!("boomux-client-update-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let socket = directory.join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+            assert_eq!(request.version, 27);
+            let Request::UpdateAgentSchedule {
+                schedule_id,
+                expected_revision,
+                update,
+            } = request.message
+            else {
+                panic!("expected schedule update");
+            };
+            assert_eq!(schedule_id, "schedule-1");
+            assert_eq!(expected_revision, 4);
+            assert_eq!(update.prompt, "private prompt");
+            protocol::write_message(
+                &mut stream,
+                &Envelope::with_version(
+                    27,
+                    Response::AgentSchedule {
+                        schedule: AgentScheduleSnapshot {
+                            id: schedule_id,
+                            workspace_id: "workspace-1".into(),
+                            name: update.name,
+                            cwd: env::temp_dir(),
+                            integration: "opencode".into(),
+                            session: protocol::AgentScheduleSession::Fresh,
+                            trigger: update.trigger,
+                            state: protocol::AgentScheduleState::Paused,
+                            overlap_policy: protocol::AgentScheduleOverlapPolicy::Skip,
+                            revision: 5,
+                            prompt_revision: 5,
+                            trigger_revision: 5,
+                            created_at_ms: 1,
+                            updated_at_ms: 2,
+                            evaluation_frontier_ms: 2,
+                            execution_shell_id: None,
+                            next_occurrence: None,
+                        },
+                    },
+                ),
+            )
+            .unwrap();
+        });
+        let client = Client::from_socket_path(socket);
+
+        let updated = client
+            .update_agent_schedule(
+                "schedule-1",
+                4,
+                AgentScheduleUpdate {
+                    name: "updated".into(),
+                    prompt: "private prompt".into(),
+                    trigger: protocol::AgentScheduleTrigger {
+                        cron: "0 3 * * *".into(),
+                        timezone: "UTC".into(),
+                    },
+                },
+            )
+            .unwrap();
+
+        assert_eq!(updated.revision, 5);
+        assert_eq!(updated.name, "updated");
+        server.join().unwrap();
+        fs::remove_dir_all(directory).unwrap();
+    }
+
     fn test_scheduled_execution(id: &str, requested_at_ms: u64) -> ScheduledExecutionSnapshot {
         ScheduledExecutionSnapshot {
             id: id.into(),
@@ -1600,6 +1743,8 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
+            reject_protocol(&listener, 27, 26);
+            reject_protocol(&listener, 26, 25);
             reject_protocol(&listener, 25, 24);
             reject_protocol(&listener, 24, 23);
             reject_protocol(&listener, 23, 22);
@@ -1891,6 +2036,8 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
+            reject_protocol(&listener, 27, 26);
+            reject_protocol(&listener, 26, 25);
             reject_protocol(&listener, 25, 24);
             reject_protocol(&listener, 24, 23);
             reject_protocol(&listener, 23, 22);
@@ -1952,6 +2099,8 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
+            reject_protocol(&listener, 27, 26);
+            reject_protocol(&listener, 26, 25);
             reject_protocol(&listener, 25, 24);
             reject_protocol(&listener, 24, 23);
             reject_protocol(&listener, 23, 22);

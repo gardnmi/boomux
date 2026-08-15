@@ -46,10 +46,11 @@ fn native_daemon_lifecycle() {
     let capabilities: serde_json::Value = serde_json::from_slice(&capabilities.stdout).unwrap();
     assert_eq!(capabilities["schema"], "boomux.cli/v1");
     assert_eq!(capabilities["command"], "capabilities");
-    assert_eq!(capabilities["data"]["daemon_protocol_version"], 25);
-    assert_eq!(
-        capabilities["data"]["session_transcript_integrations"],
-        serde_json::json!(["opencode", "pi"])
+    assert_eq!(capabilities["data"]["daemon_protocol_version"], 27);
+    assert!(
+        capabilities["data"]
+            .get("session_transcript_integrations")
+            .is_none()
     );
     assert_eq!(
         capabilities["data"]["integration_hosts"]["opencode"]["validated_version"],
@@ -112,6 +113,8 @@ fn native_daemon_lifecycle() {
         "protocol_23",
         "protocol_24",
         "protocol_25",
+        "protocol_26",
+        "exact_run_attachment",
         "revision_aware_scheduled_execution_wait",
         "bounded_scheduled_execution_history",
         "scheduled_execution_notifications",
@@ -132,7 +135,6 @@ fn native_daemon_lifecycle() {
         "opencode_lifecycle_plugin",
         "process_adapters",
         "persistent_agent_attention",
-        "transcript_pagination",
         "integration_management",
     ] {
         assert!(features.iter().any(|current| current == feature));
@@ -145,7 +147,7 @@ fn native_daemon_lifecycle() {
         .unwrap();
     assert!(status.status.success());
     let status_text = String::from_utf8_lossy(&status.stdout);
-    assert!(status_text.contains("running (protocol 25"));
+    assert!(status_text.contains("running (protocol 27"));
     assert!(status_text.contains("scheduler active (0/4 active executions)"));
     let status = daemon
         .command()

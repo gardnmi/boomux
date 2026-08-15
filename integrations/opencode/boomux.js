@@ -1,6 +1,6 @@
 const MAX_EVIDENCE = 160;
 const MAX_OUTPUT = 64 * 1024;
-const COMMAND_TIMEOUT_MS = 1_000;
+const COMMAND_TIMEOUT_MS = 5_000;
 const LOG_INTERVAL_MS = 30_000;
 const LIFECYCLE_AUTHORITY = "lifecycle_integration";
 const LIFECYCLE_CONFIDENCE = 100;
@@ -592,6 +592,7 @@ export async function BoomuxOpenCodePlugin({ client }) {
 // OpenCode treats every ESM export as a plugin. Keep test seams on the sole
 // plugin function so this asset remains directly auto-loadable.
 BoomuxOpenCodePlugin.__internal = Object.freeze({
+  COMMAND_TIMEOUT_MS,
   classifyEvent,
   createLifecycle,
   createProcessRunner,

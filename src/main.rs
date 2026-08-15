@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::error::Error;
 use std::ffi::OsString;
@@ -19,9 +19,10 @@ use uuid::Uuid;
 use boomux::protocol::{
     AgentAuthority, AgentInstanceSnapshot, AgentRegistrationSpec, AgentReport,
     AgentScheduleOverlapPolicy, AgentScheduleSession, AgentScheduleSnapshot, AgentScheduleSpec,
-    AgentScheduleState, AgentScheduleTrigger, AgentState, EventCursor, ScheduledExecutionOutcome,
-    ScheduledExecutionSnapshot, ScheduledRunnerResult, ShellSnapshot, ShellSpec, ShellStatus,
-    Snapshot, WorkspaceLauncherSnapshot, WorkspaceLauncherSpec, WorkspaceSnapshot,
+    AgentScheduleState, AgentScheduleTrigger, AgentScheduleUpdate, AgentState, EventCursor,
+    ScheduledExecutionOutcome, ScheduledExecutionSnapshot, ScheduledRunnerResult, ShellSnapshot,
+    ShellSpec, ShellStatus, Snapshot, WorkspaceLauncherSnapshot, WorkspaceLauncherSpec,
+    WorkspaceSnapshot,
 };
 use boomux::{attach, client, daemon, protocol};
 
@@ -42,22 +43,48 @@ mod integration_management;
 mod process_adapter;
 mod projects;
 mod session_projection;
-mod session_transcript;
 mod terminal;
 mod tui;
 
 const DASHBOARD_FALLBACK_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+const DASHBOARD_EXECUTION_CACHE_LIMIT: u16 = 1_000;
 
 struct DashboardRefresh {
     watch: client::SnapshotWatch,
     last_snapshot_at: Instant,
+    executions: BTreeMap<String, ScheduledExecutionSnapshot>,
+    history_truncated: bool,
+    scoped_history: BTreeMap<String, bool>,
+    negotiated_protocol: u32,
+    needs_reseed: bool,
+    reseed_stream_changed: bool,
 }
 
 impl DashboardRefresh {
     fn baseline(client: &client::Client) -> client::Result<Self> {
+        let watch = client::SnapshotWatch::baseline(client)?;
+        let negotiated_protocol = client.protocol_version()?;
+        let page = if protocol::ProtocolFeature::ScheduledExecutionObservation
+            .is_supported_by(negotiated_protocol)
+        {
+            Some(client.scheduled_execution_page(None, None, DASHBOARD_EXECUTION_CACHE_LIMIT)?)
+        } else {
+            None
+        };
         Ok(Self {
-            watch: client::SnapshotWatch::baseline(client)?,
+            watch,
             last_snapshot_at: Instant::now(),
+            executions: page
+                .as_ref()
+                .into_iter()
+                .flat_map(|page| page.executions.iter().cloned())
+                .map(|execution| (execution.id.clone(), execution))
+                .collect(),
+            history_truncated: page.as_ref().is_some_and(|page| page.truncated),
+            scoped_history: BTreeMap::new(),
+            negotiated_protocol,
+            needs_reseed: false,
+            reseed_stream_changed: false,
         })
     }
 
@@ -66,11 +93,24 @@ impl DashboardRefresh {
     }
 
     fn check(&mut self, client: &client::Client) -> client::Result<Option<(Snapshot, bool)>> {
+        if self.needs_reseed {
+            let stream_changed = self.reseed_stream_changed;
+            self.reseed_executions(client)?;
+            self.last_snapshot_at = Instant::now();
+            return Ok(Some((self.watch.snapshot().clone(), stream_changed)));
+        }
         match self.watch.poll(client) {
-            Ok((changed, stream_changed)) => {
-                if changed {
+            Ok(poll) => {
+                if poll.changed {
+                    if poll.stream_changed || poll.baseline_replaced {
+                        self.needs_reseed = true;
+                        self.reseed_stream_changed |= poll.stream_changed;
+                        self.reseed_executions(client)?;
+                    } else {
+                        self.apply_events(&poll.events);
+                    }
                     self.last_snapshot_at = Instant::now();
-                    return Ok(Some((self.watch.snapshot().clone(), stream_changed)));
+                    return Ok(Some((self.watch.snapshot().clone(), poll.stream_changed)));
                 }
                 if self.last_snapshot_at.elapsed() < DASHBOARD_FALLBACK_REFRESH_INTERVAL {
                     return Ok(None);
@@ -95,6 +135,118 @@ impl DashboardRefresh {
             self.watch.stream_id() != stream_id.as_deref(),
         ))
     }
+
+    fn executions(&self) -> Vec<ScheduledExecutionSnapshot> {
+        let mut executions = self.executions.values().cloned().collect::<Vec<_>>();
+        executions.sort_by(|left, right| {
+            right
+                .requested_at_ms
+                .cmp(&left.requested_at_ms)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        executions
+    }
+
+    fn load_schedule_history(
+        &mut self,
+        client: &client::Client,
+        schedule_id: &str,
+        limit: u16,
+    ) -> client::Result<(Vec<ScheduledExecutionSnapshot>, bool)> {
+        let page = client.scheduled_execution_page(None, Some(schedule_id.to_owned()), limit)?;
+        self.executions
+            .retain(|_, execution| execution.schedule_id != schedule_id);
+        for execution in &page.executions {
+            self.executions
+                .insert(execution.id.clone(), execution.clone());
+        }
+        self.scoped_history.clear();
+        self.scoped_history
+            .insert(schedule_id.to_owned(), page.truncated);
+        self.bound_execution_cache();
+        Ok((page.executions, page.truncated))
+    }
+
+    fn reseed_executions(&mut self, client: &client::Client) -> client::Result<()> {
+        if !protocol::ProtocolFeature::ScheduledExecutionObservation
+            .is_supported_by(self.negotiated_protocol)
+        {
+            self.executions.clear();
+            self.scoped_history.clear();
+            self.history_truncated = false;
+            self.needs_reseed = false;
+            self.reseed_stream_changed = false;
+            return Ok(());
+        }
+        let page = client.scheduled_execution_page(None, None, DASHBOARD_EXECUTION_CACHE_LIMIT)?;
+        let executions = page
+            .executions
+            .into_iter()
+            .map(|execution| (execution.id.clone(), execution))
+            .collect();
+        self.executions = executions;
+        self.scoped_history.clear();
+        self.history_truncated = page.truncated;
+        self.needs_reseed = false;
+        self.reseed_stream_changed = false;
+        Ok(())
+    }
+
+    fn apply_events(&mut self, events: &[protocol::DaemonEvent]) {
+        for event in events {
+            match &event.kind {
+                protocol::DaemonEventKind::ScheduledExecutionCreated { execution, .. }
+                | protocol::DaemonEventKind::ScheduledExecutionChanged { execution, .. } => {
+                    let should_replace = self
+                        .executions
+                        .get(&execution.id)
+                        .is_none_or(|current| execution.revision > current.revision);
+                    if should_replace {
+                        self.executions
+                            .insert(execution.id.clone(), execution.clone());
+                    }
+                }
+                protocol::DaemonEventKind::AgentScheduleRemoved { schedule_id, .. } => {
+                    self.executions
+                        .retain(|_, execution| execution.schedule_id != *schedule_id);
+                    self.scoped_history.remove(schedule_id);
+                }
+                _ => {}
+            }
+        }
+        self.bound_execution_cache();
+    }
+
+    fn bound_execution_cache(&mut self) {
+        while self.executions.len() > usize::from(DASHBOARD_EXECUTION_CACHE_LIMIT) {
+            let oldest_terminal = self
+                .executions
+                .values()
+                .filter(|execution| {
+                    execution.state.is_terminal()
+                        && !self.scoped_history.contains_key(&execution.schedule_id)
+                })
+                .min_by(|left, right| {
+                    left.requested_at_ms
+                        .cmp(&right.requested_at_ms)
+                        .then_with(|| left.id.cmp(&right.id))
+                })
+                .map(|execution| execution.id.clone())
+                .or_else(|| {
+                    self.executions
+                        .values()
+                        .filter(|execution| execution.state.is_terminal())
+                        .min_by(|left, right| {
+                            left.requested_at_ms
+                                .cmp(&right.requested_at_ms)
+                                .then_with(|| left.id.cmp(&right.id))
+                        })
+                        .map(|execution| execution.id.clone())
+                });
+            let Some(id) = oldest_terminal else { break };
+            self.executions.remove(&id);
+        }
+    }
 }
 
 const BOOMUX_SKILL: &str = include_str!("../.agents/skills/boomux/SKILL.md");
@@ -107,8 +259,6 @@ const NON_PROTOCOL_FEATURES: &[&str] = &[
     "opencode_lifecycle_plugin",
     "pi_lifecycle_extension",
     "process_adapters",
-    "canonical_session_transcripts",
-    "transcript_pagination",
     "desktop_notifications",
     "sound_notifications",
     "integration_management",
@@ -314,6 +464,8 @@ enum Commands {
         takeover: bool,
         #[arg(long)]
         restart_exited: bool,
+        #[arg(long)]
+        expected_run_id: Option<String>,
     },
     #[command(name = "__scheduled-runner", hide = true)]
     ScheduledRunner { schedule_id: String },
@@ -507,16 +659,6 @@ enum SessionCommands {
     /// Show a projected session by exact opaque ID
     #[command(alias = "get")]
     Inspect { session_id: String },
-    /// Read canonical messages and tool activity by exact opaque ID
-    Read {
-        session_id: String,
-        #[arg(long)]
-        before: Option<String>,
-        #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u16).range(1..=1000))]
-        limit: u16,
-        #[arg(long, default_value_t = 1024 * 1024, value_parser = clap::value_parser!(u32).range(1..=4 * 1024 * 1024))]
-        max_bytes: u32,
-    },
 }
 
 #[derive(Subcommand)]
@@ -900,7 +1042,6 @@ command_keys! {
     IntegrationVerify => ("integration.verify", Json),
     SessionList => ("session.list", Json),
     SessionInspect => ("session.inspect", Json),
-    SessionRead => ("session.read", Json),
     ScheduleCreate => ("schedule.create", Json),
     ScheduleList => ("schedule.list", Json),
     ScheduleInspect => ("schedule.inspect", Json),
@@ -985,9 +1126,6 @@ impl Cli {
             Some(Commands::Session {
                 command: SessionCommands::Inspect { .. },
             }) => CommandKey::SessionInspect,
-            Some(Commands::Session {
-                command: SessionCommands::Read { .. },
-            }) => CommandKey::SessionRead,
             Some(Commands::Schedule {
                 command: ScheduleCommands::Create(..),
             }) => CommandKey::ScheduleCreate,
@@ -1198,8 +1336,14 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
             shell_id,
             takeover,
             restart_exited,
+            expected_run_id,
         }) => {
-            attach::run(shell_id, *takeover, *restart_exited)?;
+            attach::run(
+                shell_id,
+                *takeover,
+                *restart_exited,
+                expected_run_id.as_deref(),
+            )?;
             return Ok(CliExit::Success);
         }
         Some(Commands::ScheduledRunner { schedule_id }) => {
@@ -1372,9 +1516,6 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
     let mut title_cache = host_session_titles::Cache::default();
     let mut refresh = DashboardRefresh::baseline(&client)?;
     let snapshot = refresh.snapshot().clone();
-    let mut views =
-        dashboard_views_with_catalog(&snapshot.workspaces, &mut git_cache, &mut title_cache);
-    enrich_session_titles(&mut views, &mut title_cache);
     let config = config::load()?;
     let terminal = terminal_override
         .map(str::to_owned)
@@ -1398,11 +1539,7 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
     };
 
     tui::run(
-        tui::DashboardState {
-            workspaces: views,
-            focused_terminal: snapshot.focused_terminal.map(focused_terminal_view),
-            reset_focus_revision: false,
-        },
+        dashboard_state(snapshot, &refresh, &mut git_cache, &mut title_cache, false),
         config.dashboard.follow_focused_terminal,
         project_context,
         true,
@@ -1412,17 +1549,13 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
                 let result = refresh.check(&client).map_err(|error| error.to_string());
                 match result {
                     Ok(Some((snapshot, reset_focus_revision))) => {
-                        let mut views = dashboard_views_with_catalog(
-                            &snapshot.workspaces,
+                        tui::DashboardEvent::RefreshCompleted(Ok(dashboard_state(
+                            snapshot,
+                            &refresh,
                             &mut git_cache,
                             &mut title_cache,
-                        );
-                        enrich_session_titles(&mut views, &mut title_cache);
-                        tui::DashboardEvent::RefreshCompleted(Ok(tui::DashboardState {
-                            workspaces: views,
-                            focused_terminal: snapshot.focused_terminal.map(focused_terminal_view),
                             reset_focus_revision,
-                        }))
+                        )))
                     }
                     Ok(None) => tui::DashboardEvent::UpdateCheckCompleted,
                     Err(error) => tui::DashboardEvent::RefreshCompleted(Err(error)),
@@ -1438,7 +1571,7 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
                     Ok(format!(
                         "Opened {} launcher(s) and {} shell(s) for {}",
                         workspace.launchers.len(),
-                        workspace.shells.len(),
+                        workspace_user_shell_count(&workspace),
                         workspace.name
                     ))
                 })();
@@ -1502,6 +1635,12 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
                             .map_err(|error| error.to_string())?;
                         Ok(format!("Removed launcher {name}"))
                     }
+                    tui::CloseTarget::Schedule(_) => {
+                        unreachable!("schedule removal has a typed effect")
+                    }
+                    tui::CloseTarget::Execution(_) => {
+                        unreachable!("execution cancellation has a typed effect")
+                    }
                 })();
                 tui::DashboardEvent::OperationCompleted(result)
             }
@@ -1545,19 +1684,144 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
                     let (snapshot, reset_focus_revision) = refresh
                         .refresh(&client)
                         .map_err(|error| error.to_string())?;
-                    let mut views = dashboard_views_with_catalog(
-                        &snapshot.workspaces,
+                    Ok(dashboard_state(
+                        snapshot,
+                        &refresh,
                         &mut git_cache,
                         &mut title_cache,
-                    );
-                    enrich_session_titles(&mut views, &mut title_cache);
-                    Ok(tui::DashboardState {
-                        workspaces: views,
-                        focused_terminal: snapshot.focused_terminal.map(focused_terminal_view),
                         reset_focus_revision,
-                    })
+                    ))
                 })();
                 tui::DashboardEvent::RefreshCompleted(result)
+            }
+            tui::DashboardEffect::RunSchedule(schedule_id) => {
+                let result = run_dashboard_schedule(&client, &schedule_id);
+                tui::DashboardEvent::OperationCompleted(result)
+            }
+            tui::DashboardEffect::PauseSchedule(schedule_id) => {
+                let result = client
+                    .pause_agent_schedule(&schedule_id)
+                    .map(|schedule| format!("Paused schedule {}", schedule.name))
+                    .map_err(|error| error.to_string());
+                tui::DashboardEvent::OperationCompleted(result)
+            }
+            tui::DashboardEffect::ResumeSchedule(schedule_id) => {
+                let result = client
+                    .resume_agent_schedule(&schedule_id)
+                    .map(|schedule| {
+                        format!(
+                            "Enabled schedule {} for future timed dispatch",
+                            schedule.name
+                        )
+                    })
+                    .map_err(|error| error.to_string());
+                tui::DashboardEvent::OperationCompleted(result)
+            }
+            tui::DashboardEffect::LoadScheduleEditor { schedule_id } => {
+                let result = client
+                    .get_agent_schedule(&schedule_id)
+                    .map(|inspection| tui::ScheduleEditInspection {
+                        schedule_id: inspection.schedule.id,
+                        name: inspection.schedule.name,
+                        cron: inspection.schedule.trigger.cron,
+                        timezone: inspection.schedule.trigger.timezone,
+                        prompt: inspection.prompt,
+                        revision: inspection.schedule.revision,
+                        paused: inspection.schedule.state == AgentScheduleState::Paused,
+                    })
+                    .map_err(|error| error.to_string());
+                tui::DashboardEvent::ScheduleEditorLoaded {
+                    schedule_id,
+                    result,
+                }
+            }
+            tui::DashboardEffect::UpdateSchedule {
+                schedule_id,
+                expected_revision,
+                update,
+            } => {
+                let result = client
+                    .update_agent_schedule(
+                        &schedule_id,
+                        expected_revision,
+                        AgentScheduleUpdate {
+                            name: update.name,
+                            prompt: update.prompt,
+                            trigger: AgentScheduleTrigger {
+                                cron: update.cron,
+                                timezone: update.timezone,
+                            },
+                        },
+                    )
+                    .map(|schedule| format!("Updated schedule {}", schedule.name))
+                    .map_err(|error| error.to_string());
+                tui::DashboardEvent::ScheduleEditorSaved {
+                    schedule_id,
+                    result,
+                }
+            }
+            tui::DashboardEffect::CancelExecution(execution_id) => {
+                let result = cancel_dashboard_execution(&client, &execution_id);
+                tui::DashboardEvent::OperationCompleted(result)
+            }
+            tui::DashboardEffect::OpenScheduledExecution {
+                execution_id,
+                shell_id,
+                run_id,
+            } => {
+                let result = open_dashboard_execution(
+                    &client,
+                    &execution_id,
+                    &shell_id,
+                    &run_id,
+                    terminal.as_deref(),
+                );
+                tui::DashboardEvent::OperationCompleted(result)
+            }
+            tui::DashboardEffect::OpenAgentSession { session_id } => {
+                let result =
+                    open_dashboard_agent_session(&client, &session_id, terminal.as_deref());
+                tui::DashboardEvent::OperationCompleted(result)
+            }
+            tui::DashboardEffect::RemoveSchedule(schedule_id) => {
+                let name = refresh
+                    .snapshot()
+                    .workspaces
+                    .iter()
+                    .flat_map(|workspace| &workspace.schedules)
+                    .find(|schedule| schedule.id == schedule_id)
+                    .map_or_else(|| "schedule".into(), |schedule| schedule.name.clone());
+                let result = client
+                    .remove_agent_schedule(&schedule_id)
+                    .map(|()| {
+                        format!(
+                            "Removed schedule {name}, its persisted prompt, and retained history"
+                        )
+                    })
+                    .map_err(|error| error.to_string());
+                tui::DashboardEvent::OperationCompleted(result)
+            }
+            tui::DashboardEffect::LoadScheduleHistory { schedule_id, limit } => {
+                let result = refresh
+                    .load_schedule_history(&client, &schedule_id, limit)
+                    .map(|(_, truncated)| {
+                        let schedules = dashboard_projection::project_schedules(
+                            refresh.snapshot(),
+                            &refresh.executions(),
+                            refresh.history_truncated,
+                            &refresh.scoped_history,
+                        );
+                        let executions = schedules
+                            .into_iter()
+                            .find(|schedule| schedule.id == schedule_id)
+                            .map_or_else(Vec::new, |schedule| schedule.executions);
+                        (executions, truncated)
+                    })
+                    .map_err(|error| error.to_string());
+                tui::DashboardEvent::ScheduleHistoryCompleted {
+                    schedule_id,
+                    result,
+                }
             }
             tui::DashboardEffect::ReadTerminalPreview {
                 shell_id,
@@ -1574,6 +1838,71 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
         },
     )?;
     Ok(())
+}
+
+fn dashboard_state(
+    snapshot: Snapshot,
+    refresh: &DashboardRefresh,
+    git_cache: &mut git::Cache,
+    title_cache: &mut host_session_titles::Cache,
+    reset_focus_revision: bool,
+) -> tui::DashboardState {
+    let schedules_supported = protocol::ProtocolFeature::ScheduledExecutionObservation
+        .is_supported_by(refresh.negotiated_protocol);
+    let mut workspaces = dashboard_views_with_catalog(&snapshot.workspaces, git_cache, title_cache);
+    if !schedules_supported {
+        for workspace in &mut workspaces {
+            workspace
+                .items
+                .retain(|item| !matches!(item, tui::WorkspaceItemView::Schedule(_)));
+        }
+    }
+    enrich_session_titles(&mut workspaces, title_cache);
+    let scheduling = if !schedules_supported {
+        tui::SchedulingView::Unsupported {
+            required_protocol: protocol::ProtocolFeature::ScheduledExecutionObservation
+                .minimum_version(),
+            negotiated: refresh.negotiated_protocol,
+        }
+    } else {
+        match snapshot.scheduler.as_ref() {
+            Some(health) => match health.state {
+                protocol::SchedulerState::Active => tui::SchedulingView::Active {
+                    active: health.active_executions,
+                    maximum: health.max_concurrent,
+                },
+                protocol::SchedulerState::Offline => tui::SchedulingView::Offline {
+                    active: health.active_executions,
+                    maximum: health.max_concurrent,
+                },
+            },
+            None => tui::SchedulingView::Offline {
+                active: 0,
+                maximum: 0,
+            },
+        }
+    };
+    let schedules = if schedules_supported {
+        dashboard_projection::project_schedules(
+            &snapshot,
+            &refresh.executions(),
+            refresh.history_truncated,
+            &refresh.scoped_history,
+        )
+    } else {
+        Vec::new()
+    };
+    tui::DashboardState {
+        workspaces,
+        schedules,
+        scheduling,
+        exact_run_attachment: protocol::ProtocolFeature::ExactRunAttachment
+            .is_supported_by(refresh.negotiated_protocol),
+        schedule_editing: protocol::ProtocolFeature::AgentScheduleEditing
+            .is_supported_by(refresh.negotiated_protocol),
+        focused_terminal: snapshot.focused_terminal.map(focused_terminal_view),
+        reset_focus_revision,
+    }
 }
 
 fn focused_terminal_view(focused: protocol::FocusedTerminalSnapshot) -> tui::FocusedTerminalView {
@@ -1600,6 +1929,178 @@ where
             launcher_id,
         } => launch(workspace_id, launcher_id),
     }
+}
+
+fn run_dashboard_schedule(client: &client::Client, schedule_id: &str) -> Result<String, String> {
+    client
+        .run_agent_schedule(schedule_id, Uuid::new_v4().to_string())
+        .map(|execution| format!("Started scheduled execution {}", execution.id))
+        .map_err(|error| error.to_string())
+}
+
+fn cancel_dashboard_execution(
+    client: &client::Client,
+    execution_id: &str,
+) -> Result<String, String> {
+    let execution = client
+        .get_scheduled_execution(execution_id)
+        .map_err(|error| error.to_string())?;
+    if !matches!(
+        execution.state,
+        protocol::ScheduledExecutionState::Claimed
+            | protocol::ScheduledExecutionState::Starting
+            | protocol::ScheduledExecutionState::Active
+    ) {
+        return Err(format!(
+            "execution {} is no longer active; refresh before cancelling",
+            execution.id
+        ));
+    }
+    client
+        .cancel_scheduled_execution(execution_id)
+        .map(|execution| format!("Cancelled exact execution {}", execution.id))
+        .map_err(|error| error.to_string())
+}
+
+fn open_dashboard_execution(
+    client: &client::Client,
+    execution_id: &str,
+    shell_id: &str,
+    run_id: &str,
+    terminal: Option<&str>,
+) -> Result<String, String> {
+    if !client
+        .supports(protocol::ProtocolFeature::ExactRunAttachment)
+        .map_err(|error| error.to_string())?
+    {
+        return Err(
+            "Opening exact Scheduled Execution runs requires daemon protocol 26; upgrade and restart Boomux"
+                .into(),
+        );
+    }
+    let execution = client
+        .get_scheduled_execution(execution_id)
+        .map_err(|error| error.to_string())?;
+    let shell = client
+        .get_shell(shell_id)
+        .map_err(|error| error.to_string())?;
+    validate_dashboard_execution_open(&execution, &shell, shell_id, run_id)?;
+    let workspace = client
+        .get_workspace(&execution.workspace_id)
+        .map_err(|error| error.to_string())?;
+    terminal::open_exact_run(
+        terminal,
+        shell_id,
+        run_id,
+        &format!("{} - {}", workspace.name, shell.name),
+        true,
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(format!(
+        "Opened exact execution {} from schedule {}",
+        execution.id, execution.schedule_id
+    ))
+}
+
+fn validate_dashboard_execution_open(
+    execution: &ScheduledExecutionSnapshot,
+    shell: &ShellSnapshot,
+    shell_id: &str,
+    run_id: &str,
+) -> Result<(), String> {
+    if !matches!(
+        execution.state,
+        protocol::ScheduledExecutionState::Starting | protocol::ScheduledExecutionState::Active
+    ) {
+        return Err("selected scheduled execution is no longer openable".into());
+    }
+    if execution.shell_id.as_deref() != Some(shell_id)
+        || execution.run_id.as_deref() != Some(run_id)
+    {
+        return Err("scheduled execution links changed; refresh before opening".into());
+    }
+    if shell.id != shell_id
+        || shell.workspace_id != execution.workspace_id
+        || shell.owner
+            != (protocol::ShellOwner::Schedule {
+                schedule_id: execution.schedule_id.clone(),
+            })
+    {
+        return Err("scheduled execution shell ownership no longer matches".into());
+    }
+    if shell.status != ShellStatus::Running
+        || shell.run.as_ref().map(|run| run.id.as_str()) != Some(run_id)
+    {
+        return Err(
+            "scheduled execution shell has moved to a different run; refresh before opening".into(),
+        );
+    }
+    Ok(())
+}
+
+fn open_dashboard_agent_session(
+    client: &client::Client,
+    session_id: &str,
+    terminal: Option<&str>,
+) -> Result<String, String> {
+    let snapshot = client.snapshot().map_err(|error| error.to_string())?;
+    let catalog = discover_host_catalog(&snapshot.workspaces);
+    let sessions = session_projection::project_snapshot_with_catalog(&snapshot, Some(&catalog));
+    let session = session_projection::resolve_exact(&sessions, session_id).map_err(|error| {
+        format!("exact Agent Session is no longer available ({error:?}); refresh and try again")
+    })?;
+    let (cwd, command) = dashboard_session_resume_plan(session)?;
+    terminal::open_command(
+        terminal,
+        &cwd,
+        &format!(
+            "{} - {} session",
+            session.workspace_name, session.integration
+        ),
+        &command,
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(format!(
+        "Opened exact {} Agent Session in an external terminal for {}",
+        session.integration, session.workspace_name
+    ))
+}
+
+fn dashboard_session_resume_plan(
+    session: &session_projection::SessionProjection,
+) -> Result<(PathBuf, Vec<String>), String> {
+    if session.state_is_current {
+        return Err(
+            "Agent Session is already active in a managed shell; open that shell instead".into(),
+        );
+    }
+    if session.state == AgentState::Done {
+        return Err("Agent Session is permanently done and cannot be resumed".into());
+    }
+    let external_session_id = session
+        .external_session_id
+        .as_deref()
+        .ok_or("Agent Session has no canonical external session ID")?;
+    let descriptor = boomux::integrations::by_key(&session.integration)
+        .ok_or_else(|| format!("unknown Agent integration {}", session.integration))?;
+    let resume = descriptor.resume.ok_or_else(|| {
+        format!(
+            "{} does not support interactive session resume",
+            descriptor.display_name
+        )
+    })?;
+    let command = resume.command(&[], external_session_id).ok_or_else(|| {
+        format!(
+            "{} could not construct a session resume command",
+            descriptor.display_name
+        )
+    })?;
+    let cwd = session
+        .source_cwd
+        .as_deref()
+        .ok_or("Agent Session has no retained working directory")?;
+    let cwd = resolve_directory(cwd).map_err(|error| error.to_string())?;
+    Ok((cwd, command))
 }
 
 #[cfg(test)]
@@ -1754,7 +2255,7 @@ fn open_directory(
             terminal,
         )
     } else {
-        Ok(attach::run(&shell.id, true, false)?)
+        Ok(attach::run(&shell.id, true, false, None)?)
     };
     if let Err(open_error) = open_result {
         let rollback = if created_workspace {
@@ -2524,9 +3025,6 @@ fn capabilities(json: bool) -> Result<(), Box<dyn Error>> {
         "context_required",
         "ambiguous_target",
         "unsupported_integration",
-        "session_source_unavailable",
-        "session_source_invalid",
-        "session_source_too_large",
         "internal",
         "unknown",
     ];
@@ -2552,7 +3050,6 @@ fn capabilities(json: bool) -> Result<(), Box<dyn Error>> {
                 "json_schemas": [cli_output::SCHEMA],
                 "json_commands": json_commands,
                 "features": features,
-                "session_transcript_integrations": session_transcript::supported_integrations(),
                 "integration_hosts": integration_hosts,
                 "error_codes": error_codes,
             }),
@@ -2563,10 +3060,6 @@ fn capabilities(json: bool) -> Result<(), Box<dyn Error>> {
     println!("JSON SCHEMAS\t{}", cli_output::SCHEMA);
     println!("JSON COMMANDS\t{}", json_commands.join(","));
     println!("FEATURES\t{}", features.join(","));
-    println!(
-        "SESSION TRANSCRIPT INTEGRATIONS\t{}",
-        session_transcript::supported_integrations().join(",")
-    );
     println!(
         "INTEGRATION HOSTS\t{}",
         integration_management::IntegrationId::all()
@@ -2678,7 +3171,7 @@ fn workspace_command(
             println!(
                 "Opened {} launcher(s) and {} shell(s) for {}",
                 workspace.launchers.len(),
-                workspace.shells.len(),
+                workspace_user_shell_count(workspace),
                 workspace.name
             );
         }
@@ -3323,45 +3816,6 @@ fn session_command(command: SessionCommands, json: bool) -> Result<(), Box<dyn E
                 );
             }
             print_session(session);
-        }
-        SessionCommands::Read {
-            session_id,
-            before,
-            limit,
-            max_bytes,
-        } => {
-            let catalog = discover_host_catalog(&snapshot.workspaces);
-            let sessions =
-                session_projection::project_snapshot_with_catalog(&snapshot, Some(&catalog));
-            let session = match session_projection::resolve_exact(&sessions, &session_id) {
-                Ok(session) => session,
-                Err(session_projection::ResolveError::NotFound) => {
-                    return Err(cli_output::failure(
-                        "not_found",
-                        format!("session not found: {session_id}"),
-                    ));
-                }
-                Err(session_projection::ResolveError::DuplicateId) => {
-                    return Err(cli_output::failure(
-                        "internal",
-                        format!("duplicate projected session ID: {session_id}"),
-                    ));
-                }
-            };
-            let transcript = session_transcript::read(
-                session,
-                before.as_deref(),
-                limit.into(),
-                max_bytes as usize,
-            )
-            .map_err(|error| cli_output::failure(error.code, error.to_string()))?;
-            if json {
-                return print_json(
-                    CommandKey::SessionRead,
-                    serde_json::json!({ "transcript": transcript }),
-                );
-            }
-            print_transcript(&transcript);
         }
     }
     Ok(())
@@ -4255,7 +4709,23 @@ fn print_schedule_inspection(
 }
 
 fn escape_terminal_text(value: &str) -> String {
-    value.escape_debug().to_string()
+    value
+        .chars()
+        .flat_map(|character| {
+            if is_bidi_control(character) {
+                character.escape_unicode().collect::<Vec<_>>()
+            } else {
+                character.escape_debug().collect::<Vec<_>>()
+            }
+        })
+        .collect()
+}
+
+fn is_bidi_control(character: char) -> bool {
+    matches!(
+        character,
+        '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+    )
 }
 
 fn schedule_session_label(session: &AgentScheduleSession) -> String {
@@ -4447,63 +4917,6 @@ fn print_session(session: &session_projection::SessionProjection) {
             occurrence.observation.confidence
         );
         println!("OBSERVED AT MS\t{}", occurrence.observation.observed_at_ms);
-    }
-}
-
-fn print_transcript(transcript: &session_transcript::Transcript) {
-    println!("SESSION ID\t{}", transcript.session_id);
-    println!("INTEGRATION\t{}", transcript.integration);
-    println!("EXTERNAL SESSION ID\t{}", transcript.external_session_id);
-    println!(
-        "ENTRIES\t{} of {}",
-        transcript.returned_entries, transcript.total_entries
-    );
-    println!("CONTENT BYTES\t{}", transcript.content_bytes);
-    println!("HAS MORE\t{}", transcript.has_more);
-    println!(
-        "NEXT CURSOR\t{}",
-        transcript.next_cursor.as_deref().unwrap_or("-")
-    );
-    println!(
-        "TRUNCATED\t{}",
-        if transcript.truncated {
-            transcript.truncated_by.join(",")
-        } else {
-            "no".to_owned()
-        }
-    );
-    for entry in &transcript.entries {
-        println!();
-        match entry.kind {
-            "tool" => println!(
-                "TOOL\t{}\t{}",
-                entry.tool_name.as_deref().unwrap_or("unknown"),
-                entry.status.as_deref().unwrap_or("unknown")
-            ),
-            _ => println!(
-                "{}\t{}",
-                entry.kind.to_uppercase(),
-                entry.role.as_deref().unwrap_or("unknown")
-            ),
-        }
-        if let Some(timestamp_ms) = entry.timestamp_ms {
-            println!("TIMESTAMP MS\t{timestamp_ms}");
-        }
-        if let Some(call_id) = entry.tool_call_id.as_deref() {
-            println!("CALL ID\t{call_id}");
-        }
-        if let Some(text) = entry.text.as_deref() {
-            println!("{text}");
-        }
-        if let Some(input) = entry.input.as_deref() {
-            println!("INPUT\t{input}");
-        }
-        if let Some(output) = entry.output.as_deref() {
-            println!("OUTPUT\t{output}");
-        }
-        if entry.truncated {
-            println!("ENTRY TRUNCATED\ttrue");
-        }
     }
 }
 
@@ -5064,7 +5477,7 @@ fn open_workspace(
     workspace: &WorkspaceSnapshot,
     terminal: Option<&str>,
 ) -> Result<(), Box<dyn Error>> {
-    if workspace.shells.is_empty() && workspace.launchers.is_empty() {
+    if workspace_user_shell_count(workspace) == 0 && workspace.launchers.is_empty() {
         return Err(format!("workspace {} has no shells or launchers", workspace.name).into());
     }
     let mut failures = Vec::new();
@@ -5073,9 +5486,11 @@ fn open_workspace(
             failures.push(format!("launcher {}: {error}", launcher.name));
         }
     }
-    for shell in workspace.shells.iter().filter(|shell| {
-        matches!(shell.owner, protocol::ShellOwner::User) || shell.status == ShellStatus::Running
-    }) {
+    for shell in workspace
+        .shells
+        .iter()
+        .filter(|shell| matches!(shell.owner, protocol::ShellOwner::User))
+    {
         if let Err(error) = open_terminal(
             &shell.id,
             &format!("{} - {}", workspace.name, shell.name),
@@ -5094,6 +5509,14 @@ fn open_workspace(
         .into());
     }
     Ok(())
+}
+
+fn workspace_user_shell_count(workspace: &WorkspaceSnapshot) -> usize {
+    workspace
+        .shells
+        .iter()
+        .filter(|shell| matches!(shell.owner, protocol::ShellOwner::User))
+        .count()
 }
 
 fn invoke_workspace_launcher(
@@ -5675,6 +6098,35 @@ mod tests {
         }
     }
 
+    fn scheduled_execution(id: &str, schedule_id: &str) -> ScheduledExecutionSnapshot {
+        ScheduledExecutionSnapshot {
+            id: id.into(),
+            workspace_id: "w1".into(),
+            schedule_id: schedule_id.into(),
+            revision: 1,
+            state: protocol::ScheduledExecutionState::Active,
+            dispatch_kind: protocol::ScheduledExecutionDispatchKind::Manual,
+            dispatch_key: Uuid::new_v4().to_string(),
+            schedule_revision: 1,
+            prompt_revision: 1,
+            trigger_revision: 1,
+            requested_at_ms: 20,
+            scheduled_at_ms: None,
+            coalesced_through_ms: None,
+            started_at_ms: Some(21),
+            ended_at_ms: None,
+            cwd: "/tmp/project".into(),
+            integration: "opencode".into(),
+            session: AgentScheduleSession::Fresh,
+            reason: None,
+            outcome: None,
+            shell_id: Some("schedule-shell".into()),
+            run_id: Some("schedule-run".into()),
+            agent_id: None,
+            external_session_id: None,
+        }
+    }
+
     fn agent(id: &str, workspace_id: &str, shell_id: &str) -> AgentInstanceSnapshot {
         AgentInstanceSnapshot {
             id: id.into(),
@@ -5751,8 +6203,17 @@ mod tests {
                 for expected in [
                     "ping",
                     "baseline",
+                    "protocol_ping",
+                    "bounded_support_ping",
+                    "execution_seed",
                     "changed_poll",
                     "event_snapshot",
+                    "newer_poll",
+                    "newer_snapshot",
+                    "duplicate_poll",
+                    "duplicate_snapshot",
+                    "removed_poll",
+                    "removed_snapshot",
                     "idle_poll",
                     "fallback_snapshot",
                 ] {
@@ -5761,6 +6222,10 @@ mod tests {
                         protocol::read_message(&mut stream).unwrap();
                     let response = match (expected, request.message) {
                         ("ping", protocol::Request::Ping) => protocol::Response::Pong,
+                        ("protocol_ping", protocol::Request::Ping)
+                        | ("bounded_support_ping", protocol::Request::Ping) => {
+                            protocol::Response::Pong
+                        }
                         (
                             "baseline",
                             protocol::Request::Events {
@@ -5778,6 +6243,27 @@ mod tests {
                             events: Vec::new(),
                         },
                         (
+                            "execution_seed",
+                            protocol::Request::ListScheduledExecutions {
+                                workspace_id: None,
+                                schedule_id: None,
+                                limit: Some(DASHBOARD_EXECUTION_CACHE_LIMIT),
+                            },
+                        ) => {
+                            let mut execution =
+                                scheduled_execution("execution-event", "schedule-1");
+                            execution.revision = 3;
+                            protocol::Response::ScheduledExecutions {
+                                executions: vec![execution],
+                                limit: DASHBOARD_EXECUTION_CACHE_LIMIT,
+                                truncated: false,
+                                schedules: Vec::new(),
+                                schedule_limit:
+                                    protocol::MAX_SCHEDULED_EXECUTION_SCHEDULE_PROJECTIONS,
+                                schedules_truncated: false,
+                            }
+                        }
+                        (
                             "changed_poll",
                             protocol::Request::Events {
                                 after: Some(_),
@@ -5794,13 +6280,120 @@ mod tests {
                             events: vec![protocol::DaemonEvent {
                                 id: 1,
                                 at_ms: 1,
-                                kind: protocol::DaemonEventKind::WorkspaceRenamed {
+                                kind: protocol::DaemonEventKind::ScheduledExecutionChanged {
                                     workspace_id: "w1".into(),
-                                    name: "after-event".into(),
+                                    execution: {
+                                        let mut execution =
+                                            scheduled_execution("execution-event", "schedule-1");
+                                        execution.revision = 2;
+                                        execution
+                                    },
                                 },
                             }],
                         },
                         ("event_snapshot", protocol::Request::Snapshot) => {
+                            protocol::Response::Snapshot {
+                                snapshot: event_refreshed.clone(),
+                            }
+                        }
+                        (
+                            "newer_poll",
+                            protocol::Request::Events {
+                                after: Some(_),
+                                wait_ms: 0,
+                                ..
+                            },
+                        ) => protocol::Response::Events {
+                            stream_id: "stream-1".into(),
+                            cursor: EventCursor {
+                                stream_id: "stream-1".into(),
+                                event_id: 2,
+                            },
+                            snapshot: None,
+                            events: vec![protocol::DaemonEvent {
+                                id: 2,
+                                at_ms: 2,
+                                kind: protocol::DaemonEventKind::ScheduledExecutionChanged {
+                                    workspace_id: "w1".into(),
+                                    execution: {
+                                        let mut execution =
+                                            scheduled_execution("execution-event", "schedule-1");
+                                        execution.revision = 4;
+                                        execution.state =
+                                            protocol::ScheduledExecutionState::Starting;
+                                        execution
+                                    },
+                                },
+                            }],
+                        },
+                        ("newer_snapshot", protocol::Request::Snapshot) => {
+                            protocol::Response::Snapshot {
+                                snapshot: event_refreshed.clone(),
+                            }
+                        }
+                        (
+                            "duplicate_poll",
+                            protocol::Request::Events {
+                                after: Some(_),
+                                wait_ms: 0,
+                                ..
+                            },
+                        ) => protocol::Response::Events {
+                            stream_id: "stream-1".into(),
+                            cursor: EventCursor {
+                                stream_id: "stream-1".into(),
+                                event_id: 3,
+                            },
+                            snapshot: None,
+                            events: vec![protocol::DaemonEvent {
+                                id: 3,
+                                at_ms: 3,
+                                kind: protocol::DaemonEventKind::ScheduledExecutionChanged {
+                                    workspace_id: "w1".into(),
+                                    execution: {
+                                        let mut execution =
+                                            scheduled_execution("execution-event", "schedule-1");
+                                        execution.revision = 4;
+                                        execution.state =
+                                            protocol::ScheduledExecutionState::Cancelled;
+                                        execution.reason = Some(
+                                            protocol::ScheduledExecutionReason::CancelledByUser,
+                                        );
+                                        execution.ended_at_ms = Some(3);
+                                        execution
+                                    },
+                                },
+                            }],
+                        },
+                        ("duplicate_snapshot", protocol::Request::Snapshot) => {
+                            protocol::Response::Snapshot {
+                                snapshot: event_refreshed.clone(),
+                            }
+                        }
+                        (
+                            "removed_poll",
+                            protocol::Request::Events {
+                                after: Some(_),
+                                wait_ms: 0,
+                                ..
+                            },
+                        ) => protocol::Response::Events {
+                            stream_id: "stream-1".into(),
+                            cursor: EventCursor {
+                                stream_id: "stream-1".into(),
+                                event_id: 4,
+                            },
+                            snapshot: None,
+                            events: vec![protocol::DaemonEvent {
+                                id: 4,
+                                at_ms: 4,
+                                kind: protocol::DaemonEventKind::AgentScheduleRemoved {
+                                    workspace_id: "w1".into(),
+                                    schedule_id: "schedule-1".into(),
+                                },
+                            }],
+                        },
+                        ("removed_snapshot", protocol::Request::Snapshot) => {
                             protocol::Response::Snapshot {
                                 snapshot: event_refreshed.clone(),
                             }
@@ -5842,12 +6435,198 @@ mod tests {
         let (snapshot, stream_changed) = refresh.check(&client).unwrap().unwrap();
         assert_eq!(snapshot, event_refreshed);
         assert!(!stream_changed);
+        assert_eq!(refresh.executions().len(), 1);
+        assert_eq!(refresh.executions()[0].id, "execution-event");
+        assert_eq!(refresh.executions()[0].revision, 3);
+        assert_eq!(
+            refresh.executions()[0].state,
+            protocol::ScheduledExecutionState::Active
+        );
+
+        refresh.check(&client).unwrap().unwrap();
+        assert_eq!(refresh.executions()[0].revision, 4);
+        assert_eq!(
+            refresh.executions()[0].state,
+            protocol::ScheduledExecutionState::Starting
+        );
+
+        refresh.check(&client).unwrap().unwrap();
+        assert_eq!(refresh.executions()[0].revision, 4);
+        assert_eq!(
+            refresh.executions()[0].state,
+            protocol::ScheduledExecutionState::Starting
+        );
+
+        refresh.check(&client).unwrap().unwrap();
+        assert!(refresh.executions().is_empty());
 
         refresh.last_snapshot_at = Instant::now() - DASHBOARD_FALLBACK_REFRESH_INTERVAL;
         let (snapshot, stream_changed) = refresh.check(&client).unwrap().unwrap();
 
         assert_eq!(snapshot, fallback_refreshed);
         assert!(!stream_changed);
+        server.join().unwrap();
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn dashboard_protocol_23_and_24_do_not_request_unbounded_execution_history() {
+        for version in [23, 24] {
+            let directory = env::temp_dir().join(format!(
+                "boomux-dashboard-old-protocol-{version}-{}",
+                Uuid::new_v4()
+            ));
+            fs::create_dir_all(&directory).unwrap();
+            let socket = directory.join("daemon.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let snapshot = Snapshot {
+                workspaces: Vec::new(),
+                focused_terminal: None,
+                scheduler: None,
+            };
+            let server = thread::spawn(move || {
+                for phase in 0..2 {
+                    for requested_version in (version..=protocol::PROTOCOL_VERSION).rev() {
+                        let (mut stream, _) = listener.accept().unwrap();
+                        let request: protocol::Envelope<protocol::Request> =
+                            protocol::read_message(&mut stream).unwrap();
+                        assert_eq!(request.version, requested_version);
+                        assert!(matches!(request.message, protocol::Request::Ping));
+                        protocol::write_message(
+                            &mut stream,
+                            &protocol::Envelope::with_version(version, protocol::Response::Pong),
+                        )
+                        .unwrap();
+                    }
+                    if phase != 0 {
+                        continue;
+                    }
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let request: protocol::Envelope<protocol::Request> =
+                        protocol::read_message(&mut stream).unwrap();
+                    assert!(matches!(
+                        request.message,
+                        protocol::Request::Events {
+                            after: None,
+                            wait_ms: 0,
+                            ..
+                        }
+                    ));
+                    protocol::write_message(
+                        &mut stream,
+                        &protocol::Envelope::with_version(
+                            version,
+                            protocol::Response::Events {
+                                stream_id: format!("stream-{version}"),
+                                cursor: EventCursor {
+                                    stream_id: format!("stream-{version}"),
+                                    event_id: 0,
+                                },
+                                snapshot: Some(snapshot.clone()),
+                                events: Vec::new(),
+                            },
+                        ),
+                    )
+                    .unwrap();
+                }
+            });
+            let client = client::Client::from_socket_path(socket);
+            let refresh = DashboardRefresh::baseline(&client).unwrap();
+            assert_eq!(refresh.negotiated_protocol, version);
+            assert!(refresh.executions().is_empty());
+            server.join().unwrap();
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn failed_execution_reseed_preserves_cache_and_retries_on_next_check() {
+        let directory = env::temp_dir().join(format!("boomux-dashboard-reseed-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let socket = directory.join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let snapshot = Snapshot {
+            workspaces: Vec::new(),
+            focused_terminal: None,
+            scheduler: None,
+        };
+        let server = thread::spawn(move || {
+            for expected in [
+                "feature_ping",
+                "baseline",
+                "protocol_ping",
+                "seed_support",
+                "seed",
+                "failed_support",
+                "failed_seed",
+                "retry_support",
+                "retry_seed",
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request: protocol::Envelope<protocol::Request> =
+                    protocol::read_message(&mut stream).unwrap();
+                if expected == "failed_seed" {
+                    assert!(matches!(
+                        request.message,
+                        protocol::Request::ListScheduledExecutions { .. }
+                    ));
+                    drop(stream);
+                    continue;
+                }
+                let response = match (expected, request.message) {
+                    (
+                        "feature_ping" | "protocol_ping" | "seed_support" | "failed_support"
+                        | "retry_support",
+                        protocol::Request::Ping,
+                    ) => protocol::Response::Pong,
+                    (
+                        "baseline",
+                        protocol::Request::Events {
+                            after: None,
+                            wait_ms: 0,
+                            ..
+                        },
+                    ) => protocol::Response::Events {
+                        stream_id: "stream-reseed".into(),
+                        cursor: EventCursor {
+                            stream_id: "stream-reseed".into(),
+                            event_id: 0,
+                        },
+                        snapshot: Some(snapshot.clone()),
+                        events: Vec::new(),
+                    },
+                    ("seed" | "retry_seed", protocol::Request::ListScheduledExecutions { .. }) => {
+                        let mut execution = scheduled_execution("execution-1", "schedule-1");
+                        execution.revision = if expected == "seed" { 4 } else { 5 };
+                        protocol::Response::ScheduledExecutions {
+                            executions: vec![execution],
+                            limit: DASHBOARD_EXECUTION_CACHE_LIMIT,
+                            truncated: false,
+                            schedules: Vec::new(),
+                            schedule_limit: protocol::MAX_SCHEDULED_EXECUTION_SCHEDULE_PROJECTIONS,
+                            schedules_truncated: false,
+                        }
+                    }
+                    (_, request) => panic!("unexpected reseed request: {request:?}"),
+                };
+                protocol::write_message(
+                    &mut stream,
+                    &protocol::Envelope::with_version(request.version, response),
+                )
+                .unwrap();
+            }
+        });
+        let client = client::Client::from_socket_path(socket);
+        let mut refresh = DashboardRefresh::baseline(&client).unwrap();
+        assert_eq!(refresh.executions()[0].revision, 4);
+        refresh.needs_reseed = true;
+
+        assert!(refresh.check(&client).is_err());
+        assert!(refresh.needs_reseed);
+        assert_eq!(refresh.executions()[0].revision, 4);
+        assert!(refresh.check(&client).unwrap().is_some());
+        assert!(!refresh.needs_reseed);
+        assert_eq!(refresh.executions()[0].revision, 5);
         server.join().unwrap();
         fs::remove_dir_all(directory).unwrap();
     }
@@ -5869,6 +6648,23 @@ mod tests {
                 restart_exited: true,
                 ..
             })
+        ));
+        let cli = Cli::try_parse_from([
+            "boomux",
+            "__attach",
+            "s1",
+            "--takeover",
+            "--expected-run-id",
+            "r1",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Attach {
+                restart_exited: false,
+                expected_run_id: Some(run_id),
+                ..
+            }) if run_id == "r1"
         ));
     }
 
@@ -6426,36 +7222,7 @@ mod tests {
         assert_eq!(inspect.command_descriptor().key, "session.inspect");
         assert_eq!(inspect.command_descriptor().output, OutputMode::Json);
 
-        let read = Cli::try_parse_from([
-            "boomux",
-            "session",
-            "read",
-            "opaque",
-            "--before",
-            "v1.cursor",
-            "--limit",
-            "25",
-            "--max-bytes",
-            "4096",
-            "--json",
-        ])
-        .unwrap();
-        assert_eq!(read.command_descriptor().key, "session.read");
-        assert_eq!(read.command_descriptor().output, OutputMode::Json);
-        assert!(matches!(
-            read.command,
-            Some(Commands::Session {
-                command: SessionCommands::Read {
-                    session_id,
-                    before: Some(before),
-                    limit: 25,
-                    max_bytes: 4096,
-                }
-            }) if session_id == "opaque" && before == "v1.cursor"
-        ));
-        assert!(
-            Cli::try_parse_from(["boomux", "session", "read", "opaque", "--limit", "0"]).is_err()
-        );
+        assert!(Cli::try_parse_from(["boomux", "session", "read", "opaque"]).is_err());
     }
 
     #[test]
@@ -7145,10 +7912,228 @@ mod tests {
     }
 
     #[test]
+    fn dashboard_run_now_backend_generates_a_fresh_dispatch_key() {
+        let directory = env::temp_dir().join(format!("boomux-dashboard-run-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let socket = directory.join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            let mut keys = Vec::new();
+            for index in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request: protocol::Envelope<protocol::Request> =
+                    protocol::read_message(&mut stream).unwrap();
+                let protocol::Request::RunAgentSchedule {
+                    schedule_id,
+                    dispatch_key,
+                } = request.message
+                else {
+                    panic!("expected run schedule request");
+                };
+                assert_eq!(schedule_id, "schedule-1");
+                Uuid::parse_str(&dispatch_key).unwrap();
+                keys.push(dispatch_key.clone());
+                let mut execution =
+                    scheduled_execution(&format!("execution-{index}"), "schedule-1");
+                execution.dispatch_key = dispatch_key;
+                protocol::write_message(
+                    &mut stream,
+                    &protocol::Envelope::with_version(
+                        request.version,
+                        protocol::Response::ScheduledExecution {
+                            execution,
+                            next_occurrence: None,
+                        },
+                    ),
+                )
+                .unwrap();
+            }
+            keys
+        });
+        let client = client::Client::from_socket_path(socket);
+
+        assert!(
+            run_dashboard_schedule(&client, "schedule-1")
+                .unwrap()
+                .contains("execution-0")
+        );
+        assert!(
+            run_dashboard_schedule(&client, "schedule-1")
+                .unwrap()
+                .contains("execution-1")
+        );
+        let keys = server.join().unwrap();
+        assert_ne!(keys[0], keys[1]);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn dashboard_cancel_backend_revalidates_exact_execution_state() {
+        let directory = env::temp_dir().join(format!("boomux-dashboard-cancel-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let socket = directory.join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request: protocol::Envelope<protocol::Request> =
+                protocol::read_message(&mut stream).unwrap();
+            assert!(matches!(
+                request.message,
+                protocol::Request::GetScheduledExecution { ref execution_id }
+                    if execution_id == "execution-1"
+            ));
+            let mut execution = scheduled_execution("execution-1", "schedule-1");
+            execution.state = protocol::ScheduledExecutionState::Exited;
+            execution.ended_at_ms = Some(22);
+            execution.outcome = Some(ScheduledExecutionOutcome::ExitCode { code: 0 });
+            protocol::write_message(
+                &mut stream,
+                &protocol::Envelope::with_version(
+                    request.version,
+                    protocol::Response::ScheduledExecution {
+                        execution,
+                        next_occurrence: None,
+                    },
+                ),
+            )
+            .unwrap();
+        });
+        let client = client::Client::from_socket_path(socket);
+
+        let error = cancel_dashboard_execution(&client, "execution-1").unwrap_err();
+        assert!(error.contains("no longer active"));
+        server.join().unwrap();
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn restoring_empty_workspace_returns_actionable_error() {
         let error = open_workspace(&workspace("w1", "empty", Vec::new()), None).unwrap_err();
 
         assert!(error.to_string().contains("workspace empty has no shells"));
+    }
+
+    #[test]
+    fn workspace_restore_excludes_schedule_owned_shells_from_openability_and_counts() {
+        let mut scheduled = shell("schedule-shell", "w1", "scheduled");
+        scheduled.owner = protocol::ShellOwner::Schedule {
+            schedule_id: "schedule-1".into(),
+        };
+        let workspace = workspace("w1", "scheduled-only", vec![scheduled]);
+        assert_eq!(workspace_user_shell_count(&workspace), 0);
+        let error = open_workspace(&workspace, None).unwrap_err();
+        assert!(error.to_string().contains("has no shells or launchers"));
+    }
+
+    #[test]
+    fn dashboard_session_resume_plan_uses_exact_host_identity_and_rejects_current_work() {
+        let mut session = session_projection::SessionProjection {
+            id: "session-1".into(),
+            workspace_id: "w1".into(),
+            workspace_name: "project".into(),
+            integration: "opencode".into(),
+            external_session_id: Some("ses_exact".into()),
+            description: "review".into(),
+            state: AgentState::Inactive,
+            state_is_current: false,
+            started_at_ms: 1,
+            last_at_ms: 2,
+            source_cwd: Some(env::temp_dir()),
+            occurrences: Vec::new(),
+        };
+
+        let (_, command) = dashboard_session_resume_plan(&session).unwrap();
+        assert_eq!(command, ["opencode", "--session", "ses_exact"]);
+
+        session.state_is_current = true;
+        assert!(
+            dashboard_session_resume_plan(&session)
+                .unwrap_err()
+                .contains("already active")
+        );
+    }
+
+    #[test]
+    fn exact_execution_open_rejects_a_reused_schedule_shell_run() {
+        let mut execution = scheduled_execution("execution-1", "schedule-1");
+        execution.shell_id = Some("schedule-shell".into());
+        execution.run_id = Some("execution-run".into());
+        let mut shell = shell("schedule-shell", "w1", "scheduled");
+        shell.owner = protocol::ShellOwner::Schedule {
+            schedule_id: "schedule-1".into(),
+        };
+        shell.run.as_mut().unwrap().id = "execution-run".into();
+        assert!(
+            validate_dashboard_execution_open(
+                &execution,
+                &shell,
+                "schedule-shell",
+                "execution-run"
+            )
+            .is_ok()
+        );
+
+        shell.run.as_mut().unwrap().id = "later-run".into();
+        let error = validate_dashboard_execution_open(
+            &execution,
+            &shell,
+            "schedule-shell",
+            "execution-run",
+        )
+        .unwrap_err();
+        assert!(error.contains("different run"));
+    }
+
+    #[test]
+    fn protocol_25_rejects_exact_execution_open_before_backend_lookup_or_launch() {
+        let directory =
+            env::temp_dir().join(format!("boomux-dashboard-open-v25-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let socket = directory.join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            for expected_version in [27, 26, 25] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request: protocol::Envelope<protocol::Request> =
+                    protocol::read_message(&mut stream).unwrap();
+                assert_eq!(request.version, expected_version);
+                assert!(matches!(request.message, protocol::Request::Ping));
+                let response = if expected_version > 25 {
+                    protocol::Response::Error {
+                        message: format!(
+                            "protocol version {expected_version} is unsupported; expected 25"
+                        ),
+                        code: Some(protocol::ErrorCode::UnsupportedVersion),
+                    }
+                } else {
+                    protocol::Response::Pong
+                };
+                protocol::write_message(
+                    &mut stream,
+                    &protocol::Envelope::with_version(expected_version.min(25), response),
+                )
+                .unwrap();
+            }
+            listener.set_nonblocking(true).unwrap();
+            thread::sleep(Duration::from_millis(50));
+            assert!(
+                matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
+            );
+        });
+        let client = client::Client::from_socket_path(socket);
+
+        let error = open_dashboard_execution(
+            &client,
+            "execution-1",
+            "schedule-shell",
+            "schedule-run",
+            None,
+        )
+        .unwrap_err();
+        assert!(error.contains("protocol 26"));
+        assert!(error.contains("upgrade and restart"));
+        server.join().unwrap();
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -7768,7 +8753,7 @@ mod tests {
         ] {
             assert!(json_commands.contains(&command));
         }
-        for command in ["session.list", "session.inspect", "session.read"] {
+        for command in ["session.list", "session.inspect"] {
             assert!(json_commands.contains(&command));
         }
         for command in [
@@ -7798,8 +8783,6 @@ mod tests {
             "agent_authority_precedence",
             "opencode_lifecycle_plugin",
             "pi_lifecycle_extension",
-            "canonical_session_transcripts",
-            "transcript_pagination",
             "protocol_15",
             "protocol_16",
             "persistent_agent_attention",
@@ -7824,11 +8807,7 @@ mod tests {
                 .validated_version,
             "0.84.1"
         );
-        assert_eq!(
-            session_transcript::supported_integrations(),
-            ["opencode", "pi"]
-        );
-        assert_eq!(protocol::PROTOCOL_VERSION, 25);
+        assert_eq!(protocol::PROTOCOL_VERSION, 27);
     }
 
     #[test]
@@ -7870,7 +8849,6 @@ mod tests {
                 "integration.verify",
                 "session.list",
                 "session.inspect",
-                "session.read",
                 "schedule.create",
                 "schedule.list",
                 "schedule.inspect",
@@ -8075,7 +9053,6 @@ mod tests {
             "boomux notification test",
             "boomux session list",
             "boomux session inspect",
-            "boomux session read",
             "boomux integration list",
             "boomux integration status",
             "boomux integration install",

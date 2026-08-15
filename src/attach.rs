@@ -116,6 +116,7 @@ pub fn run(
     shell_id: &str,
     takeover: bool,
     restart_exited: bool,
+    expected_run_id: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut profile = terminal_profile()?;
     let mut size = (
@@ -125,7 +126,14 @@ pub fn run(
         profile.pixel_height,
     );
     let client = client::connect_or_start()?;
-    let mut attachment = attach_once(&client, shell_id, takeover, restart_exited, &profile)?;
+    let mut attachment = attach_once(
+        &client,
+        shell_id,
+        takeover,
+        restart_exited,
+        expected_run_id,
+        &profile,
+    )?;
     let _raw_mode = RawMode::enter()?;
     let mut stdin = io::stdin().lock();
     let mut stdout = io::stdout().lock();
@@ -174,7 +182,7 @@ pub fn run(
                 profile.pixel_width = pixel_width;
                 profile.pixel_height = pixel_height;
             }
-            attachment = reconnect(&client, shell_id, takeover, &profile)?;
+            attachment = reconnect(&client, shell_id, takeover, expected_run_id, &profile)?;
         }
     })();
     if focus_reporting {
@@ -192,12 +200,16 @@ fn reconnect(
     client: &client::Client,
     shell_id: &str,
     takeover: bool,
+    expected_run_id: Option<&str>,
     profile: &TerminalProfile,
 ) -> client::Result<client::Attachment> {
     let mut last_error = None;
     for _ in 0..RECONNECT_ATTEMPTS {
-        match attach_once(client, shell_id, takeover, false, profile) {
+        match attach_once(client, shell_id, takeover, false, expected_run_id, profile) {
             Ok(attachment) => return Ok(attachment),
+            Err(error) if exact_reconnect_error_is_permanent(expected_run_id, &error) => {
+                return Err(error);
+            }
             Err(error) => last_error = Some(error),
         }
         thread::sleep(RECONNECT_DELAY);
@@ -207,13 +219,36 @@ fn reconnect(
     ))
 }
 
+fn exact_reconnect_error_is_permanent(
+    expected_run_id: Option<&str>,
+    error: &client::ClientError,
+) -> bool {
+    expected_run_id.is_some()
+        && matches!(
+            error,
+            client::ClientError::Remote(client::RemoteError {
+                code: Some(crate::protocol::ErrorCode::RunChanged),
+                ..
+            })
+        )
+}
+
 fn attach_once(
     client: &client::Client,
     shell_id: &str,
     takeover: bool,
     restart_exited: bool,
+    expected_run_id: Option<&str>,
     profile: &TerminalProfile,
 ) -> client::Result<client::Attachment> {
+    if let Some(expected_run_id) = expected_run_id {
+        return client.attach_exact_run_with_client_environment(
+            shell_id,
+            expected_run_id,
+            takeover,
+            profile.clone(),
+        );
+    }
     let transfers_environment = client.supports(ProtocolFeature::ClientEnvironment)?;
     match (restart_exited, transfers_environment) {
         (true, true) => {
@@ -380,9 +415,70 @@ fn dimensions() -> io::Result<(u16, u16, u16, u16)> {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::net::UnixStream;
+    use std::fs;
+    use std::os::unix::net::{UnixListener, UnixStream};
+
+    use uuid::Uuid;
 
     use super::*;
+
+    #[test]
+    fn exact_reconnect_returns_run_changed_without_retrying() {
+        let directory = std::env::temp_dir().join(format!("boomux-reconnect-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let socket = directory.join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request: crate::protocol::Envelope<crate::protocol::Request> =
+                crate::protocol::read_message(&mut stream).unwrap();
+            assert!(matches!(
+                request.message,
+                crate::protocol::Request::Attach {
+                    expected_run_id: Some(ref run_id),
+                    ..
+                } if run_id == "run-1"
+            ));
+            crate::protocol::write_message(
+                &mut stream,
+                &crate::protocol::Envelope::with_version(
+                    request.version,
+                    crate::protocol::Response::Error {
+                        message: "run changed".into(),
+                        code: Some(crate::protocol::ErrorCode::RunChanged),
+                    },
+                ),
+            )
+            .unwrap();
+        });
+        let client = client::Client::from_socket_path(socket);
+        let error = reconnect(
+            &client,
+            "shell-1",
+            true,
+            Some("run-1"),
+            &TerminalProfile {
+                term: Some("xterm-256color".into()),
+                colorterm: None,
+                term_program: None,
+                term_program_version: None,
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            client::ClientError::Remote(client::RemoteError {
+                code: Some(crate::protocol::ErrorCode::RunChanged),
+                ..
+            })
+        ));
+        server.join().unwrap();
+        fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn reconnect_frame_finishes_current_pump_after_flushing_output() {

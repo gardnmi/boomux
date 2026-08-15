@@ -9,8 +9,6 @@ use super::normalize_absolute;
 
 pub(crate) const MAX_FILE_BYTES: u64 = 256 * 1024;
 const MAX_CATALOG_BYTES: u64 = 4 * 1024 * 1024;
-const MAX_TRANSCRIPT_SCAN_BYTES: u64 = 16 * 1024 * 1024;
-const MAX_TRANSCRIPT_SCAN_FILES: usize = 4096;
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Environment {
@@ -143,88 +141,6 @@ fn catalog_files(directory: &Path, max_files: usize) -> Option<Vec<PathBuf>> {
     });
     files.truncate(max_files);
     Some(files.into_iter().map(|(path, _)| path).collect())
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SessionFileError {
-    Unavailable,
-    ScanLimit,
-}
-
-pub(crate) fn session_file(
-    directory: &Path,
-    external_session_id: &str,
-    environment: &Environment,
-) -> Result<PathBuf, SessionFileError> {
-    let normalized_directory =
-        normalize_absolute(directory).ok_or(SessionFileError::Unavailable)?;
-    let catalog_directory = session_directory(&normalized_directory, environment)
-        .ok_or(SessionFileError::Unavailable)?;
-    let mut remaining_bytes = MAX_TRANSCRIPT_SCAN_BYTES;
-    let mut remaining_files = MAX_TRANSCRIPT_SCAN_FILES;
-    for filename_match in [true, false] {
-        let entries =
-            fs::read_dir(&catalog_directory).map_err(|_| SessionFileError::Unavailable)?;
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if session_filename_matches(&path, external_session_id) != filename_match
-                || path
-                    .extension()
-                    .is_none_or(|extension| extension != "jsonl")
-                || !fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_file())
-            {
-                continue;
-            }
-            if remaining_bytes == 0 || remaining_files == 0 {
-                return Err(SessionFileError::ScanLimit);
-            }
-            remaining_files -= 1;
-            let Some(prefix) = read_regular_file_prefix(&path, remaining_bytes.min(MAX_FILE_BYTES))
-            else {
-                continue;
-            };
-            remaining_bytes = remaining_bytes.saturating_sub(prefix.scanned_bytes);
-            if header_matches(&prefix.bytes, external_session_id, &normalized_directory) {
-                return Ok(path);
-            }
-        }
-    }
-    Err(SessionFileError::Unavailable)
-}
-
-fn header_matches(output: &[u8], external_session_id: &str, directory: &Path) -> bool {
-    let Some(header) = output
-        .split(|byte| *byte == b'\n')
-        .filter_map(|line| serde_json::from_slice::<serde_json::Value>(line).ok())
-        .next()
-    else {
-        return false;
-    };
-    header.get("type").and_then(serde_json::Value::as_str) == Some("session")
-        && header.get("id").and_then(serde_json::Value::as_str) == Some(external_session_id)
-        && header
-            .get("cwd")
-            .and_then(serde_json::Value::as_str)
-            .and_then(|cwd| normalize_absolute(Path::new(cwd)))
-            .is_some_and(|cwd| cwd == directory)
-}
-
-fn session_filename_matches(path: &Path, external_session_id: &str) -> bool {
-    if external_session_id.is_empty()
-        || path
-            .extension()
-            .is_none_or(|extension| extension != "jsonl")
-    {
-        return false;
-    }
-    path.file_stem()
-        .and_then(|stem| stem.to_str())
-        .is_some_and(|stem| {
-            stem == external_session_id
-                || stem
-                    .strip_suffix(external_session_id)
-                    .is_some_and(|prefix| prefix.ends_with('_'))
-        })
 }
 
 struct FilePrefix {

@@ -317,18 +317,33 @@ fn snapshot_watch_refreshes_on_events_and_recovers_after_cold_restart() {
     let mut daemon = TestDaemon::start();
     let mut watch = client::SnapshotWatch::baseline(&daemon.client).unwrap();
     assert!(watch.snapshot().workspaces.is_empty());
-    assert_eq!(watch.poll(&daemon.client).unwrap(), (false, false));
+    let idle = watch.poll(&daemon.client).unwrap();
+    assert!(!idle.changed);
+    assert!(idle.events.is_empty());
 
     daemon
         .client
         .create_workspace("watched", Vec::new())
         .unwrap();
-    assert_eq!(watch.poll(&daemon.client).unwrap(), (true, false));
+    let changed = watch.poll(&daemon.client).unwrap();
+    assert!(changed.changed);
+    assert!(!changed.stream_changed);
+    assert!(matches!(
+        changed.events.as_slice(),
+        [boomux::protocol::DaemonEvent {
+            kind: boomux::protocol::DaemonEventKind::WorkspaceCreated { .. },
+            ..
+        }]
+    ));
     assert_eq!(watch.snapshot().workspaces[0].name, "watched");
-    assert_eq!(watch.poll(&daemon.client).unwrap(), (false, false));
+    assert!(!watch.poll(&daemon.client).unwrap().changed);
 
     daemon.stop_with_cli();
     daemon.restart();
-    assert_eq!(watch.poll(&daemon.client).unwrap(), (true, true));
+    let replaced = watch.poll(&daemon.client).unwrap();
+    assert!(replaced.changed);
+    assert!(replaced.stream_changed);
+    assert!(replaced.baseline_replaced);
+    assert!(replaced.events.is_empty());
     assert_eq!(watch.snapshot().workspaces[0].name, "watched");
 }

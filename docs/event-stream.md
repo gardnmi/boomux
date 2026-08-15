@@ -34,6 +34,8 @@ Protocol 24 adds daemon-native timed decisions, skipped policy outcomes,
 deterministic next occurrences, and scheduler health.
 Protocol 25 adds positive durable execution revisions, bounded execution-list
 metadata, and exact revision-aware execution waits.
+Protocol 26 adds exact-run attachment, and protocol 27 adds optimistic paused
+schedule-definition updates with prompt-free update events.
 
 `boomux agent wait <id> --after-revision <revision>` is the preferred way to
 await one Agent. It returns on a newer accepted durable observation, returns
@@ -82,8 +84,8 @@ The event vocabulary is:
 - `run_started`, `output_changed`, `run_exited`
 - `agent_registered`, `agent_state_changed`, `agent_completed`,
   `agent_attention_acknowledged`
-- `agent_schedule_created`, `agent_schedule_paused`, `agent_schedule_resumed`,
-  `agent_schedule_removed`
+- `agent_schedule_created`, `agent_schedule_updated`, `agent_schedule_paused`,
+  `agent_schedule_resumed`, `agent_schedule_removed`
 - `scheduled_execution_created`, `scheduled_execution_changed`
 - `handoff_completed`
 
@@ -114,11 +116,11 @@ resulting Agent snapshot after the item is removed. The acknowledgment is
 conditional on its raising observation revision, persists before publication,
 and does not increment the lifecycle observation revision.
 
-Schedule create, pause, resume, and remove events never contain prompt content.
-Create and changed pause/resume operations publish the complete prompt-free
-schedule summary after persistence. Idempotent pause or resume emits no event and
-does not advance the schedule revision. Removing a schedule emits only its
-workspace and schedule identities.
+Schedule create, update, pause, resume, and remove events never contain prompt
+content. Create, changed update, and changed pause/resume operations publish the
+complete prompt-free schedule summary after persistence. Exact update no-ops and
+idempotent pause/resume emit no event and do not advance the schedule revision.
+Removing a schedule emits only its workspace and schedule identities.
 
 `scheduled_execution_created` publishes every persisted manual or timed claim or
 skip decision.
@@ -150,6 +152,9 @@ Protocol-21 and older clients receive workspace snapshots without schedules and
 do not receive schedule events. The returned cursor still advances across those
 filtered events, preserving the stream's total publication order. Schedule
 management requests require protocol 22.
+
+Protocol-26 and older clients do not receive `agent_schedule_updated`, but their
+cursor advances across it. Schedule update requests require protocol 27.
 
 Protocol-22 and older clients do not receive scheduled-execution events, but
 their cursor advances across them. Execution dispatch, list, exact inspect, and

@@ -1,10 +1,10 @@
 use std::env;
 use std::error::Error;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{self, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -39,6 +39,80 @@ pub(crate) fn open(
     title: &str,
     takeover: bool,
 ) -> Result<(), Box<dyn Error>> {
+    open_with_expected_run(desktop_entry, shell_id, title, takeover, None)
+}
+
+pub(crate) fn open_exact_run(
+    desktop_entry: Option<&str>,
+    shell_id: &str,
+    expected_run_id: &str,
+    title: &str,
+    takeover: bool,
+) -> Result<(), Box<dyn Error>> {
+    open_with_expected_run(
+        desktop_entry,
+        shell_id,
+        title,
+        takeover,
+        Some(expected_run_id),
+    )
+}
+
+pub(crate) fn open_command(
+    desktop_entry: Option<&str>,
+    cwd: &Path,
+    title: &str,
+    command: &[String],
+) -> Result<(), Box<dyn Error>> {
+    let (program, arguments) =
+        terminal_command_arguments(command).ok_or("terminal command cannot be empty")?;
+    launch(
+        desktop_entry,
+        title,
+        Some(cwd),
+        OsStr::new(program),
+        &arguments,
+    )
+}
+
+fn terminal_command_arguments(command: &[String]) -> Option<(&OsStr, Vec<OsString>)> {
+    let (program, arguments) = command.split_first()?;
+    (!program.is_empty()).then(|| {
+        (
+            OsStr::new(program),
+            arguments.iter().map(OsString::from).collect(),
+        )
+    })
+}
+
+fn open_with_expected_run(
+    desktop_entry: Option<&str>,
+    shell_id: &str,
+    title: &str,
+    takeover: bool,
+    expected_run_id: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
+    let executable = attachment_executable()?;
+    let mut arguments = attachment_arguments(shell_id, expected_run_id);
+    if takeover {
+        arguments.push("--takeover".into());
+    }
+    launch(
+        desktop_entry,
+        title,
+        None,
+        executable.as_os_str(),
+        &arguments,
+    )
+}
+
+fn launch(
+    desktop_entry: Option<&str>,
+    title: &str,
+    cwd: Option<&Path>,
+    program: &OsStr,
+    arguments: &[OsString],
+) -> Result<(), Box<dyn Error>> {
     let preference = desktop_entry.map(TemporaryPreference::new).transpose()?;
     let selected = selected_with_preference(desktop_entry, preference.as_ref())?;
     let mut resolver = configured_command(preference.as_ref());
@@ -46,10 +120,10 @@ pub(crate) fn open(
         .arg(r"--print-cmd=\0")
         .arg(format!("--title={title}"))
         .arg("--")
-        .arg(attachment_executable()?)
-        .args(["__attach", shell_id, "--restart-exited"]);
-    if takeover {
-        resolver.arg("--takeover");
+        .arg(program)
+        .args(arguments);
+    if let Some(cwd) = cwd {
+        resolver.current_dir(cwd);
     }
     let output = resolver.output()?;
     if !output.status.success() {
@@ -66,6 +140,9 @@ pub(crate) fn open(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
     // The child has not executed user code yet; `setsid` detaches the terminal
     // window from the dashboard process and its controlling terminal.
     unsafe {
@@ -81,6 +158,16 @@ pub(crate) fn open(
         .spawn()
         .map_err(|error| format!("could not launch {selected}: {error}"))?;
     Ok(())
+}
+
+fn attachment_arguments(shell_id: &str, expected_run_id: Option<&str>) -> Vec<OsString> {
+    let mut arguments = vec!["__attach".into(), shell_id.into()];
+    if let Some(expected_run_id) = expected_run_id {
+        arguments.extend(["--expected-run-id".into(), expected_run_id.into()]);
+    } else {
+        arguments.push("--restart-exited".into());
+    }
+    arguments
 }
 
 fn attachment_executable() -> io::Result<PathBuf> {
@@ -221,6 +308,38 @@ mod tests {
                 .map(OsStr::new)
                 .map(OsStr::to_owned)
         );
+    }
+
+    #[test]
+    fn exact_run_attachment_arguments_never_enable_restart() {
+        assert_eq!(
+            attachment_arguments("shell-1", Some("run-1")),
+            ["__attach", "shell-1", "--expected-run-id", "run-1"]
+                .map(OsStr::new)
+                .map(OsStr::to_owned)
+        );
+        assert_eq!(
+            attachment_arguments("shell-1", None),
+            ["__attach", "shell-1", "--restart-exited"]
+                .map(OsStr::new)
+                .map(OsStr::to_owned)
+        );
+    }
+
+    #[test]
+    fn external_terminal_command_preserves_exact_arguments() {
+        let command = ["opencode", "--session", "ses_exact; rm -rf /"].map(str::to_owned);
+        let (program, arguments) = terminal_command_arguments(&command).unwrap();
+
+        assert_eq!(program, OsStr::new("opencode"));
+        assert_eq!(
+            arguments,
+            ["--session", "ses_exact; rm -rf /"]
+                .map(OsStr::new)
+                .map(OsStr::to_owned)
+        );
+        assert!(terminal_command_arguments(&[]).is_none());
+        assert!(terminal_command_arguments(&[String::new()]).is_none());
     }
 
     #[test]

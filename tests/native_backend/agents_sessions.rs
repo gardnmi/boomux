@@ -1,5 +1,4 @@
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs;
 use std::os::unix::net::UnixStream;
 use std::thread;
 use std::time::Duration;
@@ -558,185 +557,6 @@ fn agent_runtime_is_revisioned_durable_and_version_compatible() {
         shell_id
     );
 
-    let unsupported_read = daemon
-        .command()
-        .args(["session", "read", session_id, "--json"])
-        .output()
-        .unwrap();
-    assert!(!unsupported_read.status.success());
-    let unsupported_read: serde_json::Value =
-        serde_json::from_slice(&unsupported_read.stderr).unwrap();
-    assert_eq!(unsupported_read["command"], "session.read");
-    assert_eq!(unsupported_read["error"]["code"], "unsupported_integration");
-
-    let pi_ensure = daemon
-        .command()
-        .args([
-            "agent",
-            "ensure",
-            "pi-agent",
-            "--integration",
-            "pi",
-            "--external-session-id",
-            "pi-session",
-            "--shell-id",
-            &shell_id,
-            "--run-id",
-            &run_id,
-            "--state",
-            "idle",
-            "--authority",
-            "lifecycle-integration",
-            "--evidence",
-            "pi fixture",
-            "--confidence",
-            "100",
-            "--json",
-        ])
-        .output()
-        .unwrap();
-    assert!(pi_ensure.status.success());
-    let pi_directory = daemon.runtime_dir.join("pi-sessions");
-    fs::create_dir(&pi_directory).unwrap();
-    fs::write(
-        pi_directory.join("pi-session.jsonl"),
-        format!(
-            "{{\"type\":\"session\",\"version\":3,\"id\":\"pi-session\",\"cwd\":\"{}\"}}\n\
-             {{\"type\":\"message\",\"id\":\"user\",\"parentId\":null,\"timestamp\":\"x\",\"message\":{{\"role\":\"user\",\"content\":\"inspect this\",\"timestamp\":10}}}}\n\
-             {{\"type\":\"message\",\"id\":\"call\",\"parentId\":\"user\",\"timestamp\":\"x\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"toolCall\",\"id\":\"tc1\",\"name\":\"read\",\"arguments\":{{\"path\":\"README.md\"}}}}],\"timestamp\":11}}}}\n\
-             {{\"type\":\"message\",\"id\":\"result\",\"parentId\":\"call\",\"timestamp\":\"x\",\"message\":{{\"role\":\"toolResult\",\"toolCallId\":\"tc1\",\"toolName\":\"read\",\"content\":[{{\"type\":\"text\",\"text\":\"fixture output\"}}],\"isError\":false,\"timestamp\":12}}}}\n",
-            std::env::temp_dir().display()
-        ),
-    )
-    .unwrap();
-    let pi_sessions = daemon
-        .command()
-        .args(["session", "list", "--json"])
-        .env("PATH", &host_bin)
-        .output()
-        .unwrap();
-    let pi_sessions: serde_json::Value = serde_json::from_slice(&pi_sessions.stdout).unwrap();
-    let pi_session_id = pi_sessions["data"]["sessions"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|session| session["external_session_id"] == "pi-session")
-        .unwrap()["id"]
-        .as_str()
-        .unwrap();
-    let pi_read = daemon
-        .command()
-        .args([
-            "session",
-            "read",
-            pi_session_id,
-            "--limit",
-            "1",
-            "--max-bytes",
-            "4096",
-            "--json",
-        ])
-        .env("PI_CODING_AGENT_SESSION_DIR", &pi_directory)
-        .output()
-        .unwrap();
-    assert!(
-        pi_read.status.success(),
-        "{}",
-        String::from_utf8_lossy(&pi_read.stderr)
-    );
-    let pi_read: serde_json::Value = serde_json::from_slice(&pi_read.stdout).unwrap();
-    assert_eq!(pi_read["command"], "session.read");
-    assert_eq!(pi_read["data"]["transcript"]["total_entries"], 2);
-    assert_eq!(pi_read["data"]["transcript"]["returned_entries"], 1);
-    assert_eq!(pi_read["data"]["transcript"]["has_more"], true);
-    let next_cursor = pi_read["data"]["transcript"]["next_cursor"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    assert_eq!(
-        pi_read["data"]["transcript"]["entries"][0]["text"],
-        serde_json::Value::Null
-    );
-    assert_eq!(
-        pi_read["data"]["transcript"]["entries"][0]["output"],
-        "fixture output"
-    );
-    writeln!(
-        OpenOptions::new()
-            .append(true)
-            .open(pi_directory.join("pi-session.jsonl"))
-            .unwrap(),
-        "{{\"type\":\"message\",\"id\":\"later\",\"parentId\":\"result\",\"timestamp\":\"x\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"appended later\"}}],\"timestamp\":13}}}}"
-    )
-    .unwrap();
-    let older = daemon
-        .command()
-        .args([
-            "session",
-            "read",
-            pi_session_id,
-            "--before",
-            &next_cursor,
-            "--limit",
-            "1",
-            "--max-bytes",
-            "4096",
-            "--json",
-        ])
-        .env("PI_CODING_AGENT_SESSION_DIR", &pi_directory)
-        .output()
-        .unwrap();
-    assert!(older.status.success());
-    let older: serde_json::Value = serde_json::from_slice(&older.stdout).unwrap();
-    assert_eq!(older["data"]["transcript"]["total_entries"], 2);
-    assert_eq!(older["data"]["transcript"]["has_more"], false);
-    assert!(older["data"]["transcript"]["next_cursor"].is_null());
-    assert_eq!(
-        older["data"]["transcript"]["entries"][0]["text"],
-        "inspect this"
-    );
-    let malformed_cursor = daemon
-        .command()
-        .args([
-            "session",
-            "read",
-            pi_session_id,
-            "--before",
-            "not-a-cursor",
-            "--json",
-        ])
-        .env("PI_CODING_AGENT_SESSION_DIR", &pi_directory)
-        .output()
-        .unwrap();
-    assert!(!malformed_cursor.status.success());
-    let malformed_cursor: serde_json::Value =
-        serde_json::from_slice(&malformed_cursor.stderr).unwrap();
-    assert_eq!(malformed_cursor["command"], "session.read");
-    assert_eq!(malformed_cursor["error"]["code"], "invalid_argument");
-
-    let pi_path = pi_directory.join("pi-session.jsonl");
-    let changed = fs::read_to_string(&pi_path)
-        .unwrap()
-        .replace("inspect this", "changed baseline");
-    fs::write(&pi_path, changed).unwrap();
-    let expired_cursor = daemon
-        .command()
-        .args([
-            "session",
-            "read",
-            pi_session_id,
-            "--before",
-            &next_cursor,
-            "--json",
-        ])
-        .env("PI_CODING_AGENT_SESSION_DIR", &pi_directory)
-        .output()
-        .unwrap();
-    assert!(!expired_cursor.status.success());
-    let expired_cursor: serde_json::Value = serde_json::from_slice(&expired_cursor.stderr).unwrap();
-    assert_eq!(expired_cursor["command"], "session.read");
-    assert_eq!(expired_cursor["error"]["code"], "cursor_expired");
-
     let missing_session = daemon
         .command()
         .args(["session", "inspect", "session-1", "--json"])
@@ -951,7 +771,7 @@ fn unnamed_agent_registration_and_supervision_generate_names() {
 }
 
 #[test]
-fn session_source_context_survives_shell_removal_and_cold_restart() {
+fn session_context_survives_shell_removal_and_cold_restart() {
     let mut daemon = TestDaemon::start();
     let project = daemon.runtime_dir.join("durable-source-project");
     fs::create_dir(&project).unwrap();
@@ -985,19 +805,6 @@ fn session_source_context_survives_shell_removal_and_cold_restart() {
         .unwrap();
     assert_eq!(agent.cwd.as_deref(), Some(project.as_path()));
 
-    let pi_directory = daemon.runtime_dir.join("durable-pi-sessions");
-    fs::create_dir(&pi_directory).unwrap();
-    fs::write(
-        pi_directory.join("custom.jsonl"),
-        format!(
-            "{{\"type\":\"session\",\"version\":3,\"id\":\"durable-pi-session\",\"cwd\":\"{}\"}}\n\
-             {{\"type\":\"message\",\"id\":\"user\",\"parentId\":null,\"timestamp\":\"x\",\"message\":{{\"role\":\"user\",\"content\":\"survives cleanup\",\"timestamp\":10}}}}\n\
-             {{\"type\":\"message\",\"id\":\"assistant\",\"parentId\":\"user\",\"timestamp\":\"x\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"still readable\"}}],\"timestamp\":11}}}}\n",
-            project.display()
-        ),
-    )
-    .unwrap();
-
     daemon.client.close_shell(&shell_id).unwrap();
     drop(attachment);
     assert!(daemon.client.get_shell(&shell_id).is_err());
@@ -1023,23 +830,6 @@ fn session_source_context_survives_shell_removal_and_cold_restart() {
     assert!(occurrence["retained_shell_name"].is_null());
     assert!(occurrence["retained_shell_cwd"].is_null());
     assert_eq!(occurrence["source_cwd"], project.display().to_string());
-
-    let read = daemon
-        .command()
-        .args(["session", "read", session_id, "--json"])
-        .env("PI_CODING_AGENT_SESSION_DIR", &pi_directory)
-        .output()
-        .unwrap();
-    assert!(
-        read.status.success(),
-        "{}",
-        String::from_utf8_lossy(&read.stderr)
-    );
-    let read: serde_json::Value = serde_json::from_slice(&read.stdout).unwrap();
-    assert_eq!(
-        read["data"]["transcript"]["entries"][1]["text"],
-        "still readable"
-    );
 }
 
 #[test]
