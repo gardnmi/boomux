@@ -362,7 +362,7 @@ describe("root aggregation", () => {
     expect(calls[3][calls[3].indexOf("--state") + 1]).toBe("working");
   });
 
-  test("child deletion clears its latched error", async () => {
+  test("root work clears a latched child error", async () => {
     const calls = [];
     const lifecycle = createLifecycle({
       client: { session: { get: async () => {} } },
@@ -391,13 +391,88 @@ describe("root aggregation", () => {
       event("session.status", { sessionID: "root", status: "busy" }),
     );
     expect(calls).toHaveLength(2);
-    expect(calls[1][calls[1].indexOf("--state") + 1]).toBe("blocked");
+    expect(calls[1][calls[1].indexOf("--state") + 1]).toBe("working");
     await lifecycle.enqueue(
       event("session.deleted", { info: { id: "child", parentID: "root" } }),
     );
 
+    expect(calls).toHaveLength(2);
+  });
+
+  test("child deletion clears its latched error", async () => {
+    const calls = [];
+    const lifecycle = createLifecycle({
+      client: { session: { get: async () => {} } },
+      env,
+      run: async (argv) => {
+        calls.push(argv);
+        return successfulEnsure();
+      },
+      log: () => {},
+    });
+    await lifecycle.enqueue(event("session.created", { info: { id: "root" } }));
+    await lifecycle.enqueue(
+      event("session.created", { info: { id: "child", parentID: "root" } }),
+    );
+    calls.length = 0;
+
+    await lifecycle.enqueue(
+      event("session.error", {
+        sessionID: "child",
+        error: { message: "child failed" },
+      }),
+    );
+    await lifecycle.enqueue(
+      event("session.deleted", { info: { id: "child", parentID: "root" } }),
+    );
+
+    expect(calls).toHaveLength(2);
+    expect(calls[1][calls[1].indexOf("--state") + 1]).toBe("working");
+  });
+
+  test("root work clears errors without clearing an outstanding prompt", async () => {
+    const calls = [];
+    const lifecycle = createLifecycle({
+      client: { session: { get: async () => {} } },
+      env,
+      run: async (argv) => {
+        calls.push(argv);
+        return successfulEnsure();
+      },
+      log: () => {},
+    });
+    await lifecycle.enqueue(event("session.created", { info: { id: "root" } }));
+    await lifecycle.enqueue(
+      event("session.created", { info: { id: "child", parentID: "root" } }),
+    );
+    calls.length = 0;
+
+    await lifecycle.enqueue(
+      event("session.error", {
+        sessionID: "child",
+        error: { message: "child failed" },
+      }),
+    );
+    await lifecycle.enqueue(
+      event("permission.asked", {
+        sessionID: "child",
+        id: "permission-1",
+      }),
+    );
+    await lifecycle.enqueue(
+      event("session.status", { sessionID: "root", status: "busy" }),
+    );
+
     expect(calls).toHaveLength(3);
-    expect(calls[2][calls[2].indexOf("--state") + 1]).toBe("working");
+    expect(calls[2][calls[2].indexOf("--state") + 1]).toBe("blocked");
+    await lifecycle.enqueue(
+      event("permission.replied", {
+        sessionID: "child",
+        requestID: "permission-1",
+      }),
+    );
+    expect(calls).toHaveLength(4);
+    expect(calls[3][calls[3].indexOf("--state") + 1]).toBe("working");
   });
 });
 

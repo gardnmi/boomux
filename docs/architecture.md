@@ -664,7 +664,10 @@ ID as `external_session_id`; child and subagent events aggregate into that one
 root agent instance. Busy/active work, chat, tools, compaction, and resolved
 prompts map to `working`; outstanding permission or question requests and
 session errors map to `blocked`; only root idle maps to `idle`. Blockers are
-tracked as a set, and errors remain latched until later work is observed. Only
+tracked as a set. Errors remain latched until their session resumes or is
+deleted; later root work clears every root-aggregate error latch because it
+demonstrates aggregate recovery, but does not clear outstanding permission or
+question blockers. Only
 explicit root `session.deleted` maps to `done`: child deletion and process or
 shell exit do not complete the instance. Once the derived state is `working`,
 later chat, tool, and compaction evidence is coalesced until a meaningful state
