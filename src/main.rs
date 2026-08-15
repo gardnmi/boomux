@@ -376,6 +376,11 @@ enum Commands {
     },
     /// Close a shell by name or shell ID
     Close { target: String },
+    /// Discover configured projects
+    Project {
+        #[command(subcommand)]
+        command: ProjectCommands,
+    },
     /// Manage workspaces
     Workspace {
         #[command(subcommand)]
@@ -469,6 +474,12 @@ enum Commands {
     },
     #[command(name = "__scheduled-runner", hide = true)]
     ScheduledRunner { schedule_id: String },
+}
+
+#[derive(Subcommand)]
+enum ProjectCommands {
+    /// List projects discovered from configured roots
+    List,
 }
 
 #[derive(Subcommand)]
@@ -1018,6 +1029,7 @@ command_keys! {
     Read => ("read", Json),
     Events => ("events", Json),
     Close => ("close", HumanOnly),
+    ProjectList => ("project.list", Json),
     WorkspaceList => ("workspace.list", Json),
     WorkspaceInspect => ("workspace.inspect", Json),
     Workspace => ("workspace", HumanOnly),
@@ -1078,6 +1090,9 @@ impl Cli {
             Some(Commands::Shells) => CommandKey::Shells,
             Some(Commands::Read { .. }) => CommandKey::Read,
             Some(Commands::Events { .. }) => CommandKey::Events,
+            Some(Commands::Project {
+                command: ProjectCommands::List,
+            }) => CommandKey::ProjectList,
             Some(Commands::Workspace {
                 command: WorkspaceCommands::List,
             }) => CommandKey::WorkspaceList,
@@ -1403,6 +1418,9 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
             wait_ms,
         }) => read_events(after.as_deref(), limit, wait_ms, cli.json),
         Some(Commands::Close { target }) => close_shell(&target),
+        Some(Commands::Project {
+            command: ProjectCommands::List,
+        }) => list_projects(cli.json),
         Some(Commands::Workspace { command }) => {
             workspace_command(command, cli.json, cli.terminal.as_deref())
         }
@@ -3116,6 +3134,47 @@ fn capabilities(json: bool) -> Result<(), Box<dyn Error>> {
             .join(",")
     );
     println!("ERROR CODES\t{}", error_codes.join(","));
+    Ok(())
+}
+
+fn list_projects(json: bool) -> Result<(), Box<dyn Error>> {
+    let config = config::load()?;
+    let roots_configured = !config.projects.roots.is_empty();
+    let discovery = projects::discover(&config.projects);
+    if json {
+        let projects = discovery
+            .projects
+            .iter()
+            .map(cli_output::project)
+            .collect::<Vec<_>>();
+        return print_json(
+            CommandKey::ProjectList,
+            serde_json::json!({
+                "roots_configured": roots_configured,
+                "projects": projects,
+                "warnings": discovery.warnings,
+            }),
+        );
+    }
+
+    if !roots_configured {
+        println!("No project roots configured.");
+    } else if discovery.projects.is_empty() {
+        println!("No projects discovered.");
+    } else {
+        println!("GROUP\tNAME\tPATH");
+        for project in discovery.projects {
+            println!(
+                "{}\t{}\t{}",
+                project.group,
+                project.name,
+                project.path.display()
+            );
+        }
+    }
+    for warning in discovery.warnings {
+        eprintln!("warning: {warning}");
+    }
     Ok(())
 }
 
@@ -8875,6 +8934,7 @@ mod tests {
                 "shells",
                 "read",
                 "events",
+                "project.list",
                 "workspace.list",
                 "workspace.inspect",
                 "shell.inspect",
@@ -9072,6 +9132,7 @@ mod tests {
             "boomux events",
             "boomux close",
             "boomux open",
+            "boomux project list",
             "boomux workspace list",
             "boomux workspace create",
             "boomux workspace open",

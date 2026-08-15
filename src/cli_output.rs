@@ -13,6 +13,7 @@ use boomux::protocol::{
 };
 
 use crate::agent_attention_projection::AgentStateCounts;
+use crate::projects::Project;
 use crate::session_projection::{SessionOccurrence, SessionProjection};
 
 pub(crate) const SCHEMA: &str = "boomux.cli/v1";
@@ -90,6 +91,14 @@ pub(crate) struct WorkspaceSummary {
     pub(crate) agent_count: usize,
     pub(crate) agent_state_counts: AgentStateCounts,
     pub(crate) attention_count: usize,
+}
+
+#[derive(Serialize)]
+pub(crate) struct ProjectData {
+    pub(crate) name: String,
+    pub(crate) path: String,
+    pub(crate) group: String,
+    pub(crate) group_order: usize,
 }
 
 #[derive(Serialize)]
@@ -325,6 +334,15 @@ pub(crate) fn shell(shell: &ShellSnapshot, workspace_name: Option<&str>) -> Shel
                 environment_has_run_id: run.environment_has_run_id,
             }
         }),
+    }
+}
+
+pub(crate) fn project(project: &Project) -> ProjectData {
+    ProjectData {
+        name: project.name.clone(),
+        path: project.path.display().to_string(),
+        group: project.group.clone(),
+        group_order: project.group_order,
     }
 }
 
@@ -670,6 +688,27 @@ mod tests {
     use super::*;
     use boomux::client::RemoteError;
     use boomux::protocol::AgentObservationSnapshot;
+
+    #[test]
+    fn project_json_uses_the_stable_cli_shape() {
+        let value = serde_json::to_value(project(&Project {
+            name: "boomux".into(),
+            path: "/home/user/Projects/boomux".into(),
+            group: "Projects".into(),
+            group_order: 1,
+        }))
+        .unwrap();
+
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "name": "boomux",
+                "path": "/home/user/Projects/boomux",
+                "group": "Projects",
+                "group_order": 1,
+            })
+        );
+    }
 
     #[test]
     fn agent_json_uses_the_stable_cli_shape() {

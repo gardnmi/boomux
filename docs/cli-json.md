@@ -48,6 +48,7 @@ The following commands support `--json`:
 - `boomux shells`
 - `boomux read`
 - `boomux events`
+- `boomux project list`
 - `boomux workspace list`
 - `boomux workspace inspect`
 - `boomux shell inspect`
@@ -103,6 +104,9 @@ Command payloads are:
   arrays of schemas, commands, features, and error codes.
 - `list`: a `shells` array.
 - `shells`: workspace identity plus a `shells` array.
+- `project.list`: `roots_configured`, a `projects` array, and a `warnings`
+  array. This command reads local configuration and the filesystem without
+  starting or contacting the daemon.
 - `workspace.list`: a `workspaces` array of `id`, `name`, `shell_count`,
   `launcher_count`, `schedule_count`, `agent_count`, fixed `agent_state_counts`, and
   `attention_count`.
@@ -178,6 +182,16 @@ Command payloads are:
   `active_executions`. State is `active` only for a running worker whose latest
   evaluation and next-occurrence projection succeeded; otherwise it is
   `offline`.
+
+## Project Data
+
+`project.list` discovers the same configured project suggestions used by the
+dashboard. Each project contains `name`, its canonical absolute `path`, the
+configured-root `group`, and zero-based `group_order`. `roots_configured` is
+false when the merged configuration has no project roots, distinguishing that
+state from configured roots that currently discover no projects. Recoverable
+scan problems and resource-limit notices are returned as human-readable strings
+in `warnings`; integrations must not parse warning text.
 
 ## Integration Data
 
