@@ -216,7 +216,8 @@ function reduce(state, action, isRootEvent) {
       next = "blocked";
       break;
     case "working":
-      state.errors.delete(action.sessionID);
+      if (isRootEvent) state.errors.clear();
+      else state.errors.delete(action.sessionID);
       next = isBlocked(state) ? "blocked" : "working";
       break;
     case "idle":
