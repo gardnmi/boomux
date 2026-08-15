@@ -17,10 +17,10 @@ use crate::protocol::{
     self, AgentInstanceSnapshot, AgentRegistrationSpec, AgentReport, AgentScheduleInspection,
     AgentScheduleSnapshot, AgentScheduleSpec, DaemonEvent, Envelope, ErrorCode, EventCursor,
     FocusedTerminalSnapshot, NotificationDeliveryConfig, Request, Response,
-    ScheduledExecutionSnapshot, ScheduledRunnerResult, ShellSnapshot, ShellSpec, ShellStatus,
-    Snapshot, TerminalPreview, TerminalPreviewLine, TerminalPreviewSpan, TerminalProfile,
-    UnixEnvironment, UnixEnvironmentVariable, WorkspaceLauncherSnapshot, WorkspaceLauncherSpec,
-    WorkspaceSnapshot,
+    ScheduledExecutionScheduleProjection, ScheduledExecutionSnapshot, ScheduledOccurrence,
+    ScheduledRunnerResult, ShellSnapshot, ShellSpec, ShellStatus, Snapshot, TerminalPreview,
+    TerminalPreviewLine, TerminalPreviewSpan, TerminalProfile, UnixEnvironment,
+    UnixEnvironmentVariable, WorkspaceLauncherSnapshot, WorkspaceLauncherSpec, WorkspaceSnapshot,
 };
 
 const CONNECT_ATTEMPTS: usize = 40;
@@ -256,6 +256,28 @@ impl SnapshotWatch {
 pub struct AgentWait {
     pub agent: AgentInstanceSnapshot,
     pub changed: bool,
+}
+
+#[derive(Debug)]
+pub struct ScheduledExecutionWait {
+    pub execution: ScheduledExecutionSnapshot,
+    pub changed: bool,
+}
+
+#[derive(Debug)]
+pub struct ScheduledExecutionList {
+    pub executions: Vec<ScheduledExecutionSnapshot>,
+    pub limit: u16,
+    pub truncated: bool,
+    pub schedules: Vec<ScheduledExecutionScheduleProjection>,
+    pub schedule_limit: u16,
+    pub schedules_truncated: bool,
+}
+
+#[derive(Debug)]
+pub struct ScheduledExecutionInspection {
+    pub execution: ScheduledExecutionSnapshot,
+    pub next_occurrence: Option<ScheduledOccurrence>,
 }
 
 #[derive(Debug)]
@@ -515,6 +537,23 @@ impl Client {
                 ));
             }
         }
+        if (notifications.scheduled_dispatch_failed || notifications.scheduled_interrupted)
+            && !self.supports(protocol::ProtocolFeature::ScheduledExecutionObservation)?
+        {
+            let mut compatibility = notifications.clone();
+            compatibility.scheduled_dispatch_failed = false;
+            compatibility.scheduled_interrupted = false;
+            self.restart_request(Request::RestartWithNotificationConfig {
+                notifications: compatibility,
+                environment: Some(current_environment()),
+            })?;
+            self.probe_latest()?;
+            if !self.supports(protocol::ProtocolFeature::ScheduledExecutionObservation)? {
+                return Err(unsupported_version(
+                    "replacement daemon does not support scheduled execution notification settings",
+                ));
+            }
+        }
         self.restart_request(Request::RestartWithNotificationConfig {
             notifications,
             environment: Some(current_environment()),
@@ -686,7 +725,7 @@ impl Client {
             schedule_id: schedule_id.into(),
             dispatch_key: dispatch_key.into(),
         })? {
-            Response::ScheduledExecution { execution } => Ok(execution),
+            Response::ScheduledExecution { execution, .. } => Ok(execution),
             other => unexpected(other),
         }
     }
@@ -699,8 +738,80 @@ impl Client {
         match self.request(Request::ListScheduledExecutions {
             workspace_id,
             schedule_id,
+            limit: None,
         })? {
-            Response::ScheduledExecutions { executions } => Ok(executions),
+            Response::ScheduledExecutions { executions, .. } => Ok(executions),
+            other => unexpected(other),
+        }
+    }
+
+    pub fn scheduled_execution_page(
+        &self,
+        workspace_id: Option<String>,
+        schedule_id: Option<String>,
+        limit: u16,
+    ) -> Result<ScheduledExecutionList> {
+        let supports_bounded =
+            self.supports(protocol::ProtocolFeature::ScheduledExecutionObservation)?;
+        match self.request(Request::ListScheduledExecutions {
+            workspace_id,
+            schedule_id,
+            limit: Some(limit),
+        })? {
+            Response::ScheduledExecutions {
+                mut executions,
+                limit: response_limit,
+                truncated,
+                schedules,
+                schedule_limit,
+                schedules_truncated,
+            } => {
+                if supports_bounded {
+                    Ok(ScheduledExecutionList {
+                        executions,
+                        limit: response_limit,
+                        truncated,
+                        schedules,
+                        schedule_limit,
+                        schedules_truncated,
+                    })
+                } else {
+                    let limit = limit.clamp(1, protocol::MAX_SCHEDULED_EXECUTION_LIST_LIMIT);
+                    let truncated = executions.len() > usize::from(limit);
+                    executions.truncate(usize::from(limit));
+                    Ok(ScheduledExecutionList {
+                        executions,
+                        limit,
+                        truncated,
+                        schedules,
+                        schedule_limit: 0,
+                        schedules_truncated: false,
+                    })
+                }
+            }
+            other => unexpected(other),
+        }
+    }
+
+    pub fn wait_scheduled_execution(
+        &self,
+        execution_id: impl Into<String>,
+        after_revision: u64,
+        wait_ms: u32,
+    ) -> Result<ScheduledExecutionWait> {
+        if !self.supports(protocol::ProtocolFeature::ScheduledExecutionObservation)? {
+            return Err(unsupported_version(
+                "daemon does not support scheduled execution wait",
+            ));
+        }
+        match self.request(Request::WaitScheduledExecution {
+            execution_id: execution_id.into(),
+            after_revision,
+            wait_ms,
+        })? {
+            Response::ScheduledExecutionWait { execution, changed } => {
+                Ok(ScheduledExecutionWait { execution, changed })
+            }
             other => unexpected(other),
         }
     }
@@ -712,7 +823,25 @@ impl Client {
         match self.request(Request::GetScheduledExecution {
             execution_id: execution_id.into(),
         })? {
-            Response::ScheduledExecution { execution } => Ok(execution),
+            Response::ScheduledExecution { execution, .. } => Ok(execution),
+            other => unexpected(other),
+        }
+    }
+
+    pub fn inspect_scheduled_execution(
+        &self,
+        execution_id: impl Into<String>,
+    ) -> Result<ScheduledExecutionInspection> {
+        match self.request(Request::GetScheduledExecution {
+            execution_id: execution_id.into(),
+        })? {
+            Response::ScheduledExecution {
+                execution,
+                next_occurrence,
+            } => Ok(ScheduledExecutionInspection {
+                execution,
+                next_occurrence,
+            }),
             other => unexpected(other),
         }
     }
@@ -724,7 +853,7 @@ impl Client {
         match self.request(Request::CancelScheduledExecution {
             execution_id: execution_id.into(),
         })? {
-            Response::ScheduledExecution { execution } => Ok(execution),
+            Response::ScheduledExecution { execution, .. } => Ok(execution),
             other => unexpected(other),
         }
     }
@@ -762,7 +891,7 @@ impl Client {
             runner_token: protocol::ScheduledRunnerCapability::new(runner_token),
             result,
         })? {
-            Response::ScheduledExecution { execution } => Ok(execution),
+            Response::ScheduledExecution { execution, .. } => Ok(execution),
             other => unexpected(other),
         }
     }
@@ -1254,6 +1383,7 @@ mod tests {
             resume_agents: false,
             persist_terminal_history: true,
             max_scheduled_execution_concurrency: 1,
+            ..Default::default()
         };
         let expected_settings = settings.clone();
         let expected_environment = current_environment();
@@ -1325,13 +1455,13 @@ mod tests {
                             notifications,
                             environment: Some(environment),
                         } => {
-                            assert_eq!(request.version, 24);
+                            assert_eq!(request.version, protocol::PROTOCOL_VERSION);
                             assert_eq!(notifications, expected_settings);
                             assert_eq!(environment, expected_environment);
                             full_restart_seen = true;
                             protocol::write_message(
                                 &mut stream,
-                                &Envelope::with_version(24, Response::Ok),
+                                &Envelope::with_version(protocol::PROTOCOL_VERSION, Response::Ok),
                             )
                             .unwrap();
                         }
@@ -1368,6 +1498,101 @@ mod tests {
         }
     }
 
+    fn test_scheduled_execution(id: &str, requested_at_ms: u64) -> ScheduledExecutionSnapshot {
+        ScheduledExecutionSnapshot {
+            id: id.into(),
+            workspace_id: "workspace".into(),
+            schedule_id: "schedule".into(),
+            revision: 1,
+            state: protocol::ScheduledExecutionState::DispatchFailed,
+            dispatch_kind: protocol::ScheduledExecutionDispatchKind::Manual,
+            dispatch_key: format!("key-{id}"),
+            schedule_revision: 1,
+            prompt_revision: 1,
+            trigger_revision: 1,
+            requested_at_ms,
+            scheduled_at_ms: None,
+            coalesced_through_ms: None,
+            started_at_ms: None,
+            ended_at_ms: Some(requested_at_ms),
+            cwd: env::temp_dir(),
+            integration: "opencode".into(),
+            session: protocol::AgentScheduleSession::Fresh,
+            reason: Some(protocol::ScheduledExecutionReason::RunnerStartFailed),
+            outcome: None,
+            shell_id: None,
+            run_id: None,
+            agent_id: None,
+            external_session_id: None,
+        }
+    }
+
+    #[test]
+    fn current_client_bounds_unbounded_old_daemon_execution_lists() {
+        for old_version in [23, 24] {
+            let directory =
+                env::temp_dir().join(format!("boomux-old-list-{old_version}-{}", Uuid::new_v4()));
+            fs::create_dir_all(&directory).unwrap();
+            let socket = directory.join("daemon.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let server = thread::spawn(move || {
+                for attempted in ((old_version + 1)..=protocol::PROTOCOL_VERSION).rev() {
+                    reject_protocol(&listener, attempted, old_version);
+                }
+                let (mut stream, _) = listener.accept().unwrap();
+                let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+                assert_eq!(request.version, old_version);
+                assert!(matches!(request.message, Request::Ping));
+                protocol::write_message(
+                    &mut stream,
+                    &Envelope::with_version(old_version, Response::Pong),
+                )
+                .unwrap();
+
+                let (mut stream, _) = listener.accept().unwrap();
+                let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+                assert_eq!(request.version, old_version);
+                assert!(matches!(
+                    request.message,
+                    Request::ListScheduledExecutions { limit: Some(2), .. }
+                ));
+                protocol::write_message(
+                    &mut stream,
+                    &Envelope::with_version(
+                        old_version,
+                        Response::ScheduledExecutions {
+                            executions: vec![
+                                test_scheduled_execution("newest", 3),
+                                test_scheduled_execution("middle", 2),
+                                test_scheduled_execution("oldest", 1),
+                            ],
+                            limit: 0,
+                            truncated: false,
+                            schedules: Vec::new(),
+                            schedule_limit: 0,
+                            schedules_truncated: false,
+                        },
+                    ),
+                )
+                .unwrap();
+            });
+            let page = Client::from_socket_path(socket)
+                .scheduled_execution_page(None, None, 2)
+                .unwrap();
+            assert_eq!(page.limit, 2);
+            assert!(page.truncated);
+            assert_eq!(
+                page.executions
+                    .iter()
+                    .map(|execution| execution.id.as_str())
+                    .collect::<Vec<_>>(),
+                ["newest", "middle"]
+            );
+            server.join().unwrap();
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
     #[test]
     fn direct_client_negotiates_before_sending_agent_wait() {
         let directory = env::temp_dir().join(format!("boomux-client-{}", Uuid::new_v4()));
@@ -1375,6 +1600,7 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
+            reject_protocol(&listener, 25, 24);
             reject_protocol(&listener, 24, 23);
             reject_protocol(&listener, 23, 22);
             reject_protocol(&listener, 22, 21);
@@ -1557,7 +1783,7 @@ mod tests {
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
-            assert_eq!(request.version, 24);
+            assert_eq!(request.version, protocol::PROTOCOL_VERSION);
             let Request::Attach {
                 environment: Some(environment),
                 ..
@@ -1574,7 +1800,7 @@ mod tests {
             protocol::write_message(
                 &mut stream,
                 &Envelope::with_version(
-                    24,
+                    protocol::PROTOCOL_VERSION,
                     Response::Attached {
                         token: "token".into(),
                         reconstruction: Vec::new(),
@@ -1665,6 +1891,7 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
+            reject_protocol(&listener, 25, 24);
             reject_protocol(&listener, 24, 23);
             reject_protocol(&listener, 23, 22);
             reject_protocol(&listener, 22, 21);
@@ -1725,6 +1952,7 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
+            reject_protocol(&listener, 25, 24);
             reject_protocol(&listener, 24, 23);
             reject_protocol(&listener, 23, 22);
             reject_protocol(&listener, 22, 21);

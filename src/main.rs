@@ -570,9 +570,23 @@ enum ExecutionCommands {
         workspace: Option<String>,
         #[arg(long, value_name = "SCHEDULE_NAME_OR_ID")]
         schedule: Option<String>,
+        #[arg(
+            long,
+            default_value_t = protocol::DEFAULT_SCHEDULED_EXECUTION_LIST_LIMIT,
+            value_parser = clap::value_parser!(u16).range(1..=protocol::MAX_SCHEDULED_EXECUTION_LIST_LIMIT as i64)
+        )]
+        limit: u16,
     },
     /// Inspect one execution by exact ID
     Inspect { execution_id: String },
+    /// Wait for an exact execution revision to advance
+    Wait {
+        execution_id: String,
+        #[arg(long)]
+        after_revision: u64,
+        #[arg(long, default_value_t = 30_000)]
+        wait_ms: u32,
+    },
     /// Cancel one nonterminal execution by exact ID
     Cancel { execution_id: String },
 }
@@ -896,6 +910,7 @@ command_keys! {
     ScheduleRun => ("schedule.run", Json),
     ExecutionList => ("execution.list", Json),
     ExecutionInspect => ("execution.inspect", Json),
+    ExecutionWait => ("execution.wait", Json),
     ExecutionCancel => ("execution.cancel", Json),
     Skill => ("skill", HumanOnly),
     Opencode => ("opencode", HumanOnly),
@@ -1000,6 +1015,9 @@ impl Cli {
             Some(Commands::Execution {
                 command: ExecutionCommands::Inspect { .. },
             }) => CommandKey::ExecutionInspect,
+            Some(Commands::Execution {
+                command: ExecutionCommands::Wait { .. },
+            }) => CommandKey::ExecutionWait,
             Some(Commands::Execution {
                 command: ExecutionCommands::Cancel { .. },
             }) => CommandKey::ExecutionCancel,
@@ -3384,11 +3402,11 @@ fn schedule_command(command: ScheduleCommands, json: bool) -> Result<(), Box<dyn
                 );
             }
             println!(
-                "WORKSPACE\tNAME\tSCHEDULE ID\tSTATE\tINTEGRATION\tTRIGGER\tTIMEZONE\tSESSION"
+                "WORKSPACE\tNAME\tSCHEDULE ID\tSTATE\tINTEGRATION\tTRIGGER\tTIMEZONE\tSESSION\tNEXT OCCURRENCE MS"
             );
             for (schedule, workspace_name) in schedules {
                 println!(
-                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                     sanitize_table_cell(workspace_name),
                     sanitize_table_cell(&schedule.name),
                     sanitize_table_cell(&schedule.id),
@@ -3397,6 +3415,21 @@ fn schedule_command(command: ScheduleCommands, json: bool) -> Result<(), Box<dyn
                     sanitize_table_cell(&schedule.trigger.cron),
                     sanitize_table_cell(&schedule.trigger.timezone),
                     sanitize_table_cell(&schedule_session_label(&schedule.session)),
+                    schedule
+                        .next_occurrence
+                        .as_ref()
+                        .map(|occurrence| occurrence.scheduled_at_ms.to_string())
+                        .as_deref()
+                        .unwrap_or("-"),
+                );
+            }
+            if snapshot
+                .scheduler
+                .as_ref()
+                .is_some_and(|scheduler| scheduler.state == protocol::SchedulerState::Offline)
+            {
+                eprintln!(
+                    "Scheduler is offline: next occurrences are projections only. Run `boomux daemon status` and `boomux doctor`; fix configuration or environment and run `boomux daemon restart` before relying on timed dispatch."
                 );
             }
             Ok(())
@@ -3517,6 +3550,7 @@ fn execution_command(command: ExecutionCommands, json: bool) -> Result<(), Box<d
         ExecutionCommands::List {
             workspace,
             schedule,
+            limit,
         } => {
             let snapshot = client.snapshot()?;
             let workspace = workspace
@@ -3534,37 +3568,115 @@ fn execution_command(command: ExecutionCommands, json: bool) -> Result<(), Box<d
                     .map(|schedule| schedule.id.clone())
                 })
                 .transpose()?;
-            let executions = client.scheduled_executions(
+            let page = client.scheduled_execution_page(
                 workspace.map(|workspace| workspace.id.clone()),
                 schedule_id,
+                limit,
             )?;
             if json {
-                let executions = executions
+                let executions = page
+                    .executions
                     .iter()
                     .map(cli_output::execution)
                     .collect::<Vec<_>>();
                 return print_json(
                     CommandKey::ExecutionList,
-                    serde_json::json!({ "executions": executions }),
+                    serde_json::json!({
+                        "executions": executions,
+                        "limit": page.limit,
+                        "truncated": page.truncated,
+                        "schedule_limit": page.schedule_limit,
+                        "schedules_truncated": page.schedules_truncated,
+                        "schedules": page.schedules.iter().map(|projection| serde_json::json!({
+                            "schedule_id": projection.schedule_id,
+                            "next_occurrence": projection.next_occurrence,
+                        })).collect::<Vec<_>>(),
+                    }),
                 );
             }
-            println!("STATE\tEXECUTION ID\tSCHEDULE ID\tREQUESTED\tSHELL ID\tRUN ID");
-            for execution in executions {
+            println!(
+                "STATE\tREASON/OUTCOME\tEXECUTION ID\tSCHEDULE ID\tREQUESTED\tAGENT ID\tSHELL/RUN"
+            );
+            for execution in page.executions {
                 println!(
-                    "{}\t{}\t{}\t{}\t{}\t{}",
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}/{}",
                     execution_state(&execution),
+                    execution_result_label(&execution),
                     execution.id,
                     execution.schedule_id,
                     execution.requested_at_ms,
+                    execution.agent_id.as_deref().unwrap_or("-"),
                     execution.shell_id.as_deref().unwrap_or("-"),
                     execution.run_id.as_deref().unwrap_or("-"),
+                );
+                if let Some(action) = execution_action(&execution) {
+                    println!("ACTION {}\t{}", execution.id, action);
+                }
+            }
+            if page.truncated {
+                println!(
+                    "Showing newest {} executions; increase --limit to see more retained history.",
+                    page.limit
+                );
+            }
+            if page.schedules_truncated {
+                println!(
+                    "Showing {} schedule projections; narrow by workspace or schedule for the remainder.",
+                    page.schedule_limit
+                );
+            }
+            for projection in page.schedules {
+                println!(
+                    "Next occurrence for schedule {}: {}",
+                    projection.schedule_id,
+                    projection
+                        .next_occurrence
+                        .map(|occurrence| occurrence.scheduled_at_ms.to_string())
+                        .unwrap_or_else(
+                            || "none (paused or scheduler projection unavailable)".into()
+                        )
                 );
             }
             Ok(())
         }
         ExecutionCommands::Inspect { execution_id } => {
-            let execution = client.get_scheduled_execution(execution_id)?;
-            print_execution(CommandKey::ExecutionInspect, &execution, json)
+            let inspection = client.inspect_scheduled_execution(execution_id)?;
+            if json {
+                return print_json(
+                    CommandKey::ExecutionInspect,
+                    serde_json::json!({
+                        "execution": cli_output::execution(&inspection.execution),
+                        "next_occurrence": inspection.next_occurrence,
+                    }),
+                );
+            }
+            print_execution(CommandKey::ExecutionInspect, &inspection.execution, false)?;
+            println!(
+                "Next occurrence: {}",
+                inspection
+                    .next_occurrence
+                    .map(|occurrence| occurrence.scheduled_at_ms.to_string())
+                    .unwrap_or_else(|| "none (paused or scheduler projection unavailable)".into())
+            );
+            Ok(())
+        }
+        ExecutionCommands::Wait {
+            execution_id,
+            after_revision,
+            wait_ms,
+        } => {
+            let waited = client.wait_scheduled_execution(execution_id, after_revision, wait_ms)?;
+            if json {
+                return print_json(
+                    CommandKey::ExecutionWait,
+                    serde_json::json!({
+                        "changed": waited.changed,
+                        "execution": cli_output::execution(&waited.execution),
+                    }),
+                );
+            }
+            println!("Changed: {}", waited.changed);
+            print_execution(CommandKey::ExecutionWait, &waited.execution, false)
         }
         ExecutionCommands::Cancel { execution_id } => {
             let execution = client.cancel_scheduled_execution(execution_id)?;
@@ -3586,15 +3698,68 @@ fn print_execution(
     }
     println!("Execution {}", execution.id);
     println!("State: {}", execution_state(execution));
+    println!("Revision: {}", execution.revision);
     println!("Schedule: {}", execution.schedule_id);
     println!("Dispatch key: {}", execution.dispatch_key);
+    println!("Result: {}", execution_result_label(execution));
+    if let Some(action) = execution_action(execution) {
+        println!("Action: {action}");
+    }
+    println!("Requested at ms: {}", execution.requested_at_ms);
+    if let Some(started_at_ms) = execution.started_at_ms {
+        println!("Started at ms: {started_at_ms}");
+    }
+    if let Some(ended_at_ms) = execution.ended_at_ms {
+        println!("Ended at ms: {ended_at_ms}");
+    }
     if let Some(shell_id) = &execution.shell_id {
         println!("Shell: {shell_id}");
     }
     if let Some(run_id) = &execution.run_id {
         println!("Run: {run_id}");
     }
+    if let Some(agent_id) = &execution.agent_id {
+        println!("Agent: {agent_id} (inspect with `boomux agent inspect {agent_id}`)");
+    }
+    if execution.state == protocol::ScheduledExecutionState::Active {
+        println!("No automatic timeout; cancel explicitly if this work is blocked or hung.");
+    }
     Ok(())
+}
+
+fn execution_result_label(execution: &ScheduledExecutionSnapshot) -> String {
+    if let Some(reason) = execution.reason {
+        return format!("reason:{}", cli_output::execution_reason(reason));
+    }
+    match execution.outcome {
+        Some(ScheduledExecutionOutcome::ExitCode { code }) => format!("exit_code:{code}"),
+        Some(ScheduledExecutionOutcome::Signal { signal }) => format!("signal:{signal}"),
+        None => "-".into(),
+    }
+}
+
+fn execution_action(execution: &ScheduledExecutionSnapshot) -> Option<String> {
+    use protocol::ScheduledExecutionReason::*;
+    let action = match execution.reason? {
+        Overlap => format!(
+            "inspect active work with `boomux execution list --schedule {}` and cancel the exact execution if authorized",
+            execution.schedule_id
+        ),
+        ActiveSession => "inspect `boomux attention list` and the linked Agent/session before retrying with `boomux schedule run`".into(),
+        WorkspaceCapacity | GlobalCapacity => "run `boomux execution list` to find active work; cancel only an exact authorized execution before retrying".into(),
+        Missed => "timed work is not caught up; check `boomux daemon status` and use `boomux schedule run` only for an authorized manual replacement".into(),
+        PausedRace => "inspect the schedule and run `boomux schedule resume <schedule> --workspace <workspace>` if future timed work is authorized".into(),
+        InvalidTarget => format!(
+            "run `boomux integration status {}` and `boomux doctor`, then restart the daemon after fixing the target",
+            execution.integration
+        ),
+        RunnerStartFailed | HostSpawnFailed => "run `boomux doctor` and `boomux daemon status`; fix daemon startup environment or integration setup, then `boomux daemon restart`".into(),
+        ColdDaemonRecovery => "the prior process cannot be resumed automatically; inspect this execution and `boomux daemon status` before an authorized `boomux schedule run`".into(),
+        RunnerExitedWithoutReport => "inspect the retained shell/run and `boomux doctor` before retrying manually".into(),
+        CancelledByUser => "no retry is automatic; use `boomux schedule run` only if a new execution is authorized".into(),
+        DaemonShutdown => "restart the daemon and use `boomux schedule run` only if a replacement execution is authorized".into(),
+    };
+    Some(action)
 }
 
 fn execution_state(execution: &ScheduledExecutionSnapshot) -> &'static str {
@@ -4064,6 +4229,15 @@ fn print_schedule_inspection(
     println!("REVISION\t{}", schedule.revision);
     println!("PROMPT REVISION\t{}", schedule.prompt_revision);
     println!("TRIGGER REVISION\t{}", schedule.trigger_revision);
+    println!(
+        "NEXT OCCURRENCE MS\t{}",
+        schedule
+            .next_occurrence
+            .as_ref()
+            .map(|occurrence| occurrence.scheduled_at_ms.to_string())
+            .as_deref()
+            .unwrap_or("-")
+    );
     println!("CREATED AT MS\t{}", schedule.created_at_ms);
     println!("UPDATED AT MS\t{}", schedule.updated_at_ms);
     println!(
@@ -7654,7 +7828,7 @@ mod tests {
             session_transcript::supported_integrations(),
             ["opencode", "pi"]
         );
-        assert_eq!(protocol::PROTOCOL_VERSION, 24);
+        assert_eq!(protocol::PROTOCOL_VERSION, 25);
     }
 
     #[test]
@@ -7706,6 +7880,7 @@ mod tests {
                 "schedule.run",
                 "execution.list",
                 "execution.inspect",
+                "execution.wait",
                 "execution.cancel",
                 "daemon.status",
             ]

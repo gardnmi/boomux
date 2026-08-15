@@ -327,6 +327,36 @@ linked `blocked` observation uses existing durable Agent attention. A pre-spawn
 failure or skipped execution cannot fabricate an Agent Instance or attention
 revision.
 
+## Observation And Notifications
+
+Every Scheduled Execution has a durable revision beginning at 1. Each committed
+shell/run binding, runner state or outcome change, cancellation, interruption,
+or Agent link advances it. `execution wait <id> --after-revision <revision>`
+returns the complete current prompt-free record immediately when newer, returns
+the unchanged record after `--wait-ms`, and rejects a future revision with
+`revision_ahead`. Terminal process state does not make an equal-revision wait
+return early because the exact ShellRun may acquire its canonical Agent link
+later. Waiters are not persisted; `daemon_stopping` tells a caller to reconnect
+and repeat the same revision after replacement.
+
+Execution-created and execution-changed events carry the complete prompt-free
+record and its revision. They remain reconnectable through the ordinary event
+cursor; an execution wait does not consume or advance that cursor. Persistence
+commits before either event publication or waiter wakeup.
+
+`[notifications] scheduled_dispatch_failed` and `scheduled_interrupted` are
+independent opt-in categories and default to false. The first covers terminal
+runner-start and host-spawn failure; the second covers only newly committed
+`cold_daemon_recovery` interruption. Delivery contains bounded sanitized
+workspace and schedule names plus the exact execution ID, never prompt,
+environment, evidence, transcript, or tool content. Deduplication is by exact
+execution ID, execution revision, and reason. Delivery is bounded, at-most-once,
+and fail-open and neither acknowledges nor fabricates Agent attention.
+
+Cold startup persists all newly interrupted records before installing the sink
+and enqueueing their notifications. Already-terminal records are not replayed on
+later cold or graceful starts.
+
 ## User Control And Permissions
 
 The scheduler can create a process and deliver the schedule's initial prompt. It
@@ -359,10 +389,23 @@ including skips and dispatch failures. Offline gaps use the coalesced record
 defined above. Records include untrusted-safe reasons and exact identity links,
 but no prompt text, environment, transcript content, tool content, or credentials.
 
-Each schedule retains every nonterminal execution plus a bounded newest suffix of
-terminal execution records; pruning removes the oldest terminal records first.
-The exact suffix bound belongs to source and compatibility tests. Scheduler
-events use the existing bounded event-stream retention and cursor-expiry model.
+Each schedule retains every nonterminal execution plus the newest 100 terminal
+execution records. Pruning removes terminal records first by ascending
+`requested_at_ms`, then ascending execution ID, across normal terminalization,
+cold recovery, and shutdown; nonterminal records are never removed. Protocol-25
+global list responses default to 100 records, accept limits from 1 through 1,000,
+return `limit` and `truncated`, and order descending by `requested_at_ms`, then
+execution ID. The wire request limit is optional; protocol-23 and protocol-24
+requests ignore it and remain uncapped, with their visibility filter applied
+before listing. Current next occurrences are returned as separate schedule-keyed
+projections rather than execution revision state. Projection selection covers
+every schedule in the requested global, workspace, or exact-schedule scope,
+regardless of execution history or execution-page position. It is sorted by
+schedule ID, independently capped at 100, and reports `schedule_limit` and
+`schedules_truncated`. Scheduler events share the 8,192-event journal and
+256-event page bound; a
+cursor advances across version-filtered events and expires under the ordinary
+stream/cold-restart rules.
 Pruned dispatch keys remain represented by a bounded durable probabilistic set;
 a retry that matches it is rejected with `idempotency_expired` rather than
 creating duplicate work. A false positive is therefore a stable explicit

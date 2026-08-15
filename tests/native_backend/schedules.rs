@@ -131,7 +131,21 @@ fn schedule_management_is_durable_private_and_process_free() {
     );
 
     daemon.crash();
-    daemon.restart();
+    let restart_path = {
+        let mut paths = vec![daemon.runtime_dir.join("bin")];
+        paths.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        std::env::join_paths(paths).unwrap()
+    };
+    let restart_config = daemon.runtime_dir.join("cold-notifications.toml");
+    let notification_capture = daemon.runtime_dir.join("cold-notifications");
+    daemon.restart_with(|command| {
+        command
+            .env("PATH", &restart_path)
+            .env("BOOMUX_CONFIG", &restart_config)
+            .env("BOOMUX_NOTIFICATION_CAPTURE", &notification_capture);
+    });
     assert_eq!(
         daemon
             .client
@@ -529,6 +543,38 @@ fn manual_execution_succeeds_and_duplicate_key_never_spawns_twice() {
     assert!(
         created < run_started && run_started < active && active < run_exited && run_exited < exited
     );
+    let revisions = event_page
+        .events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            protocol::DaemonEventKind::ScheduledExecutionCreated { execution, .. }
+            | protocol::DaemonEventKind::ScheduledExecutionChanged { execution, .. }
+                if execution.id == first.id =>
+            {
+                Some(execution.clone())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        revisions
+            .iter()
+            .map(|execution| execution.revision)
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3, 4, 5, 6]
+    );
+    assert_eq!(revisions[0].state, ScheduledExecutionState::Claimed);
+    assert!(revisions[0].shell_id.is_none());
+    assert_eq!(revisions[1].state, ScheduledExecutionState::Claimed);
+    assert!(revisions[1].shell_id.is_some());
+    assert!(revisions[1].run_id.is_none());
+    assert_eq!(revisions[2].state, ScheduledExecutionState::Starting);
+    assert!(revisions[2].run_id.is_some());
+    assert_eq!(revisions[3].state, ScheduledExecutionState::Active);
+    assert!(revisions[3].outcome.is_none());
+    assert_eq!(revisions[4].state, ScheduledExecutionState::Active);
+    assert!(revisions[4].outcome.is_some());
+    assert_eq!(revisions[5].state, ScheduledExecutionState::Exited);
     let second = daemon
         .command()
         .args([
@@ -1091,8 +1137,26 @@ fn linked_agents_remain_authoritative_after_exit_and_late_ensure_repairs_links()
 
 #[test]
 fn host_spawn_failure_is_distinct_from_process_exit() {
-    let mut daemon = TestDaemon::start_with(|command, _| {
-        command.env("PATH", "/nonexistent");
+    let mut daemon = TestDaemon::start_with(|command, runtime_dir| {
+        let bin = runtime_dir.join("bin");
+        fs::create_dir(&bin).unwrap();
+        let notify = bin.join("notify-send");
+        fs::write(
+            &notify,
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$BOOMUX_NOTIFICATION_CAPTURE\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&notify, fs::Permissions::from_mode(0o755)).unwrap();
+        let config = runtime_dir.join("scheduled-notifications.toml");
+        fs::write(
+            &config,
+            "[notifications]\nenabled = true\nscheduled_dispatch_failed = true\n",
+        )
+        .unwrap();
+        command.env("PATH", bin).env("BOOMUX_CONFIG", config).env(
+            "BOOMUX_NOTIFICATION_CAPTURE",
+            runtime_dir.join("scheduled-notifications"),
+        );
     });
     let workspace = daemon
         .client
@@ -1114,6 +1178,62 @@ fn host_spawn_failure_is_distinct_from_process_exit() {
                 .is_ok_and(|execution| execution.state == ScheduledExecutionState::DispatchFailed)
         },
         "host spawn failure was not recorded",
+    );
+    let notification_capture = daemon.runtime_dir.join("scheduled-notifications");
+    wait_until(
+        || notification_capture.is_file(),
+        "dispatch failure notification was not delivered",
+    );
+    let notification = fs::read_to_string(notification_capture).unwrap();
+    assert_eq!(notification.lines().count(), 1);
+    assert!(notification.contains(&execution.id));
+    assert!(!notification.contains("private"));
+    let failed = daemon
+        .client
+        .get_scheduled_execution(&execution.id)
+        .unwrap();
+    let late = daemon
+        .client
+        .ensure_agent(
+            failed.shell_id.clone().unwrap(),
+            failed.run_id.clone().unwrap(),
+            AgentRegistrationSpec {
+                name: "late spawn-failure Agent".into(),
+                integration: "opencode".into(),
+                external_session_id: Some("late-spawn-failure-session".into()),
+                report: AgentReport {
+                    state: AgentState::Idle,
+                    authority: AgentAuthority::LifecycleIntegration,
+                    evidence: "late exact link".into(),
+                    confidence: 100,
+                },
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        daemon
+            .client
+            .get_scheduled_execution(&execution.id)
+            .unwrap()
+            .agent_id
+            .as_deref(),
+        Some(late.id.as_str())
+    );
+    assert_eq!(
+        daemon
+            .client
+            .run_agent_schedule(&schedule.id, &execution.dispatch_key)
+            .unwrap()
+            .id,
+        execution.id
+    );
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(
+        fs::read_to_string(daemon.runtime_dir.join("scheduled-notifications"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
     );
     daemon.stop_with_cli();
 }
@@ -1234,8 +1354,39 @@ fn execution_cli_json_shapes_are_stable_and_prompt_free() {
             assert_eq!(output["data"]["execution"]["reason"], "host_spawn_failed");
             assert!(output["data"]["execution"]["outcome"].is_null());
             assert!(output["data"]["execution"]["agent_id"].is_null());
+            assert!(output["data"]["execution"]["revision"].as_u64().unwrap() > 0);
+        } else if expected == "execution.list" {
+            assert_eq!(output["data"]["limit"], 100);
+            assert_eq!(output["data"]["truncated"], false);
+            assert_eq!(output["data"]["schedule_limit"], 100);
+            assert_eq!(output["data"]["schedules_truncated"], false);
+            assert_eq!(output["data"]["schedules"][0]["schedule_id"], schedule.id);
         }
     }
+    let revision = daemon
+        .client
+        .get_scheduled_execution(execution_id)
+        .unwrap()
+        .revision
+        .to_string();
+    let waited = daemon
+        .command()
+        .args([
+            "execution",
+            "wait",
+            execution_id,
+            "--after-revision",
+            &revision,
+            "--wait-ms",
+            "0",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(waited.status.success());
+    let waited: serde_json::Value = serde_json::from_slice(&waited.stdout).unwrap();
+    assert_eq!(waited["command"], "execution.wait");
+    assert_eq!(waited["data"]["changed"], false);
     daemon.stop_with_cli();
 }
 
@@ -1722,12 +1873,14 @@ fn cancellation_persistence_failure_keeps_dead_process_terminal_and_retries() {
 #[test]
 fn cancellation_stop_failure_leaves_live_exact_run_active() {
     let mut daemon = TestDaemon::start_with(|command, runtime_dir| {
+        let barrier = runtime_dir.join("cancel-failure-barrier");
+        fs::create_dir(&barrier).unwrap();
         let bin = runtime_dir.join("bin");
         fs::create_dir(&bin).unwrap();
         let host = bin.join("opencode");
         fs::write(
             &host,
-            "#!/bin/sh\nprintf '%s' \"$$\" > \"$BOOMUX_PID_CAPTURE\"\nsleep 30\n",
+            "#!/bin/sh\nprintf '%s' \"$$\" > \"$BOOMUX_PID_CAPTURE\"\nwhile [ ! -e \"$BOOMUX_OUTPUT_MARKER\" ]; do sleep 0.01; done\nprintf 'during-cancel-1\\n'\nsleep 0.02\nprintf 'during-cancel-2\\n'\nsleep 30\n",
         )
         .unwrap();
         fs::set_permissions(&host, fs::Permissions::from_mode(0o755)).unwrap();
@@ -1738,16 +1891,64 @@ fn cancellation_stop_failure_leaves_live_exact_run_active() {
         command
             .env("PATH", std::env::join_paths(paths).unwrap())
             .env("BOOMUX_PID_CAPTURE", runtime_dir.join("stop-failure-pid"))
-            .env("BOOMUX_NATIVE_TEST_CANCEL_STOP_FAILURE", "1");
+            .env("BOOMUX_OUTPUT_MARKER", runtime_dir.join("output-marker"))
+            .env("BOOMUX_NATIVE_TEST_CANCEL_STOP_FAILURE", "1")
+            .env("BOOMUX_NATIVE_TEST_CANCEL_FAILURE_BARRIER", barrier);
     });
     let (workspace_id, schedule_id, execution_id, pid) =
         start_long_running_execution(&daemon, "stop-failure");
+    let active = daemon
+        .client
+        .get_scheduled_execution(&execution_id)
+        .unwrap();
+    let shell_id = active.shell_id.clone().unwrap();
+    let cursor = daemon.client.events(None, 256, 0).unwrap().cursor;
+    let cancel_socket = daemon.client.socket_path().to_path_buf();
+    let cancel_execution_id = execution_id.clone();
+    let cancel = thread::spawn(move || {
+        Client::from_socket_path(cancel_socket).cancel_scheduled_execution(cancel_execution_id)
+    });
+    let barrier = daemon.runtime_dir.join("cancel-failure-barrier");
+    wait_until(
+        || barrier.join("reserved").is_file(),
+        "cancellation did not reserve lifecycle publication",
+    );
+    fs::write(daemon.runtime_dir.join("output-marker"), b"output").unwrap();
+    wait_until(
+        || {
+            String::from_utf8_lossy(&daemon.client.read_shell(&shell_id, 1024).unwrap())
+                .contains("during-cancel-2")
+        },
+        "concurrent cancellation output was not read",
+    );
     assert!(
         daemon
             .client
-            .cancel_scheduled_execution(&execution_id)
-            .is_err()
+            .events(Some(cursor.clone()), 256, 0)
+            .unwrap()
+            .events
+            .iter()
+            .all(|event| !matches!(event.kind, protocol::DaemonEventKind::OutputChanged { .. }))
     );
+    fs::write(barrier.join("release"), b"release").unwrap();
+    assert!(cancel.join().unwrap().is_err());
+    let output_revisions = daemon
+        .client
+        .events(Some(cursor), 256, 0)
+        .unwrap()
+        .events
+        .into_iter()
+        .filter_map(|event| match event.kind {
+            protocol::DaemonEventKind::OutputChanged {
+                shell_id: event_shell_id,
+                output_revision,
+                ..
+            } if event_shell_id == shell_id => Some(output_revision),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(output_revisions.len(), 1);
+    assert!(output_revisions.windows(2).all(|pair| pair[0] <= pair[1]));
     assert!(process_exists(pid));
     assert_eq!(
         daemon
@@ -2014,6 +2215,12 @@ fn transferred_active_executions_block_lower_global_limit_until_release() {
 #[test]
 fn cold_recovery_interrupts_active_execution_without_respawn() {
     let mut daemon = TestDaemon::start_with(|command, runtime_dir| {
+        let config = runtime_dir.join("cold-notifications.toml");
+        fs::write(
+            &config,
+            "[notifications]\nenabled = true\nscheduled_interrupted = true\n",
+        )
+        .unwrap();
         let bin = runtime_dir.join("bin");
         fs::create_dir(&bin).unwrap();
         let host = bin.join("opencode");
@@ -2023,14 +2230,26 @@ fn cold_recovery_interrupts_active_execution_without_respawn() {
         )
         .unwrap();
         fs::set_permissions(&host, fs::Permissions::from_mode(0o755)).unwrap();
+        let notify = bin.join("notify-send");
+        fs::write(
+            &notify,
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$BOOMUX_COLD_NOTIFICATION_CAPTURE\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&notify, fs::Permissions::from_mode(0o755)).unwrap();
         let mut paths = vec![bin];
         paths.extend(std::env::split_paths(
             &std::env::var_os("PATH").unwrap_or_default(),
         ));
         command
             .env("PATH", std::env::join_paths(paths).unwrap())
+            .env("BOOMUX_CONFIG", config)
             .env("BOOMUX_EXECUTION_CAPTURE", runtime_dir.join("executions"))
-            .env("BOOMUX_PID_CAPTURE", runtime_dir.join("pids"));
+            .env("BOOMUX_PID_CAPTURE", runtime_dir.join("pids"))
+            .env(
+                "BOOMUX_COLD_NOTIFICATION_CAPTURE",
+                runtime_dir.join("cold-notifications"),
+            );
     });
     let workspace = daemon.client.create_workspace("cold", Vec::new()).unwrap();
     let schedule = daemon
@@ -2059,7 +2278,19 @@ fn cold_recovery_interrupts_active_execution_without_respawn() {
         || !process_exists(old_pid),
         "cold-crashed host remained alive",
     );
-    daemon.restart();
+    let mut restart_paths = vec![daemon.runtime_dir.join("bin")];
+    restart_paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    let restart_path = std::env::join_paths(restart_paths).unwrap();
+    let restart_config = daemon.runtime_dir.join("cold-notifications.toml");
+    let restart_notifications = daemon.runtime_dir.join("cold-notifications");
+    daemon.restart_with(move |command| {
+        command
+            .env("PATH", restart_path)
+            .env("BOOMUX_CONFIG", restart_config)
+            .env("BOOMUX_COLD_NOTIFICATION_CAPTURE", restart_notifications);
+    });
     let recovered = daemon
         .client
         .get_scheduled_execution(&execution.id)
@@ -2072,6 +2303,15 @@ fn cold_recovery_interrupts_active_execution_without_respawn() {
     assert_eq!(recovered.outcome, None);
     assert_eq!(recovered.shell_id, active.shell_id);
     assert_eq!(recovered.run_id, active.run_id);
+    let notification_capture = daemon.runtime_dir.join("cold-notifications");
+    wait_until(
+        || notification_capture.is_file(),
+        "cold interruption notification was not delivered",
+    );
+    let notification = fs::read_to_string(&notification_capture).unwrap();
+    assert_eq!(notification.lines().count(), 1);
+    assert!(notification.contains(&execution.id));
+    assert!(!notification.contains("private"));
     assert_eq!(
         daemon
             .client
@@ -2088,12 +2328,25 @@ fn cold_recovery_interrupts_active_execution_without_respawn() {
     let restart = daemon
         .command()
         .args(["daemon", "restart"])
+        .env(
+            "BOOMUX_CONFIG",
+            daemon.runtime_dir.join("cold-notifications.toml"),
+        )
         .env("PATH", std::env::join_paths(paths).unwrap())
         .env("BOOMUX_EXECUTION_CAPTURE", &capture)
         .env("BOOMUX_PID_CAPTURE", daemon.runtime_dir.join("pids"))
         .output()
         .unwrap();
     assert!(restart.status.success());
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(
+        fs::read_to_string(&notification_capture)
+            .unwrap()
+            .lines()
+            .count(),
+        1,
+        "cold interruption notification replayed on graceful restart"
+    );
     let next = daemon
         .client
         .run_agent_schedule(&schedule.id, Uuid::new_v4().to_string())
@@ -2110,6 +2363,141 @@ fn cold_recovery_interrupts_active_execution_without_respawn() {
 }
 
 #[test]
+fn execution_wait_reconnects_and_terminal_execution_accepts_canonical_blocked_agent_link() {
+    let mut daemon = TestDaemon::start_with(|command, runtime_dir| {
+        let bin = runtime_dir.join("bin");
+        fs::create_dir(&bin).unwrap();
+        let host = bin.join("opencode");
+        fs::write(
+            &host,
+            "#!/bin/sh\nwhile [ ! -e \"$BOOMUX_RELEASE_EXECUTION\" ]; do sleep 0.02; done\n",
+        )
+        .unwrap();
+        fs::set_permissions(&host, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut paths = vec![bin];
+        paths.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        command
+            .env("PATH", std::env::join_paths(paths).unwrap())
+            .env(
+                "BOOMUX_RELEASE_EXECUTION",
+                runtime_dir.join("release-execution"),
+            );
+    });
+    let workspace = daemon
+        .client
+        .create_workspace("execution-wait", Vec::new())
+        .unwrap();
+    let schedule = daemon
+        .client
+        .create_agent_schedule(
+            &workspace.id,
+            schedule_spec(&daemon, "execution-wait", "private wait prompt"),
+        )
+        .unwrap();
+    let execution = daemon
+        .client
+        .run_agent_schedule(&schedule.id, Uuid::new_v4().to_string())
+        .unwrap();
+    let active = loop {
+        let current = daemon
+            .client
+            .get_scheduled_execution(&execution.id)
+            .unwrap();
+        if current.state == ScheduledExecutionState::Active {
+            break current;
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    assert!(
+        !daemon
+            .client
+            .wait_scheduled_execution(&active.id, active.revision, 0)
+            .unwrap()
+            .changed
+    );
+    let waiting_socket = daemon.client.socket_path().to_path_buf();
+    let execution_id = active.id.clone();
+    let revision = active.revision;
+    let waiter = thread::spawn(move || {
+        Client::from_socket_path(waiting_socket).wait_scheduled_execution(
+            execution_id,
+            revision,
+            10_000,
+        )
+    });
+    thread::sleep(Duration::from_millis(50));
+
+    let mut paths = vec![daemon.runtime_dir.join("bin")];
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    let restart = daemon
+        .command()
+        .env("PATH", std::env::join_paths(paths).unwrap())
+        .args(["daemon", "restart"])
+        .output()
+        .unwrap();
+    assert!(restart.status.success());
+    let error = waiter.join().unwrap().unwrap_err();
+    assert_remote_code(&error, protocol::ErrorCode::DaemonStopping);
+
+    let before_terminal = daemon
+        .client
+        .get_scheduled_execution(&execution.id)
+        .unwrap();
+    fs::write(daemon.runtime_dir.join("release-execution"), "release").unwrap();
+    let mut after_revision = before_terminal.revision;
+    let terminal = loop {
+        let waited = daemon
+            .client
+            .wait_scheduled_execution(&execution.id, after_revision, 1_000)
+            .unwrap();
+        assert!(waited.changed);
+        if waited.execution.state == ScheduledExecutionState::Exited {
+            break waited.execution;
+        }
+        after_revision = waited.execution.revision;
+    };
+
+    let agent = daemon
+        .client
+        .register_agent(
+            terminal.shell_id.clone().unwrap(),
+            terminal.run_id.clone().unwrap(),
+            AgentRegistrationSpec {
+                name: "blocked scheduled agent".into(),
+                integration: "opencode".into(),
+                external_session_id: Some("exact-blocked-session".into()),
+                report: AgentReport {
+                    state: AgentState::Blocked,
+                    authority: AgentAuthority::LifecycleIntegration,
+                    evidence: "permission required".into(),
+                    confidence: 100,
+                },
+            },
+        )
+        .unwrap();
+    let attention = agent.attention.as_ref().expect("blocked attention");
+    assert_eq!(attention.observation.revision, agent.observation.revision);
+    let linked = daemon
+        .client
+        .wait_scheduled_execution(&execution.id, terminal.revision, 1_000)
+        .unwrap();
+    assert!(linked.changed);
+    assert_eq!(
+        linked.execution.agent_id.as_deref(),
+        Some(agent.id.as_str())
+    );
+    assert_eq!(
+        linked.execution.external_session_id.as_deref(),
+        agent.external_session_id.as_deref()
+    );
+    daemon.stop_with_cli();
+}
+
+#[test]
 fn cold_recovery_clears_staged_outcome_and_survives_second_restart() {
     let mut daemon = TestDaemon::start_with(|command, runtime_dir| {
         let barrier = runtime_dir.join("outcome-barrier");
@@ -2119,13 +2507,31 @@ fn cold_recovery_clears_staged_outcome_and_survives_second_restart() {
         let host = bin.join("opencode");
         fs::write(&host, "#!/bin/sh\nexit 17\n").unwrap();
         fs::set_permissions(&host, fs::Permissions::from_mode(0o755)).unwrap();
+        let notify = bin.join("notify-send");
+        fs::write(
+            &notify,
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$BOOMUX_NOTIFICATION_CAPTURE\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&notify, fs::Permissions::from_mode(0o755)).unwrap();
+        let config = runtime_dir.join("cold-notifications.toml");
+        fs::write(
+            &config,
+            "[notifications]\nenabled = true\nscheduled_interrupted = true\n",
+        )
+        .unwrap();
         let mut paths = vec![bin];
         paths.extend(std::env::split_paths(
             &std::env::var_os("PATH").unwrap_or_default(),
         ));
         command
             .env("PATH", std::env::join_paths(paths).unwrap())
-            .env("BOOMUX_NATIVE_TEST_OUTCOME_BARRIER", &barrier);
+            .env("BOOMUX_NATIVE_TEST_OUTCOME_BARRIER", &barrier)
+            .env("BOOMUX_CONFIG", config)
+            .env(
+                "BOOMUX_NOTIFICATION_CAPTURE",
+                runtime_dir.join("cold-notifications"),
+            );
     });
     let workspace = daemon
         .client
@@ -2157,8 +2563,22 @@ fn cold_recovery_clears_staged_outcome_and_survives_second_restart() {
         Some(protocol::ScheduledExecutionOutcome::ExitCode { code: 17 })
     );
 
+    let restart_path = {
+        let mut paths = vec![daemon.runtime_dir.join("bin")];
+        paths.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        std::env::join_paths(paths).unwrap()
+    };
+    let restart_config = daemon.runtime_dir.join("cold-notifications.toml");
+    let notification_capture = daemon.runtime_dir.join("cold-notifications");
     daemon.crash();
-    daemon.restart();
+    daemon.restart_with(|command| {
+        command
+            .env("PATH", &restart_path)
+            .env("BOOMUX_CONFIG", &restart_config)
+            .env("BOOMUX_NOTIFICATION_CAPTURE", &notification_capture);
+    });
     let recovered = daemon
         .client
         .get_scheduled_execution(&execution.id)
@@ -2169,14 +2589,38 @@ fn cold_recovery_clears_staged_outcome_and_survives_second_restart() {
         Some(protocol::ScheduledExecutionReason::ColdDaemonRecovery)
     );
     assert_eq!(recovered.outcome, None);
+    wait_until(
+        || notification_capture.is_file(),
+        "cold interruption notification was not delivered",
+    );
+    assert_eq!(
+        fs::read_to_string(&notification_capture)
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
 
     daemon.crash();
-    daemon.restart();
+    daemon.restart_with(|command| {
+        command
+            .env("PATH", &restart_path)
+            .env("BOOMUX_CONFIG", &restart_config)
+            .env("BOOMUX_NOTIFICATION_CAPTURE", &notification_capture);
+    });
     let restored_again = daemon
         .client
         .get_scheduled_execution(&execution.id)
         .unwrap();
     assert_eq!(restored_again, recovered);
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(
+        fs::read_to_string(notification_capture)
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
     daemon.stop_with_cli();
 }
 
@@ -2294,12 +2738,13 @@ fn deterministic_clock_dispatches_due_work_and_protocol_23_hides_it() {
         .to_string()
     );
 
-    let protocol::Response::ScheduledExecutions { executions } = versioned_request(
+    let protocol::Response::ScheduledExecutions { executions, .. } = versioned_request(
         &daemon,
         23,
         protocol::Request::ListScheduledExecutions {
             workspace_id: None,
             schedule_id: Some(schedule.id.clone()),
+            limit: None,
         },
     ) else {
         panic!("expected protocol-23 execution list");

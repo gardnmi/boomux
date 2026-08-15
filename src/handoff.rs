@@ -477,6 +477,7 @@ mod tests {
                     resume_agents: true,
                     persist_terminal_history: false,
                     max_scheduled_execution_concurrency,
+                    ..Default::default()
                 }),
                 focused_terminal: None,
             };

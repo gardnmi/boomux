@@ -140,7 +140,7 @@ fn focused_attachment_is_exposed_in_daemon_snapshots() {
         .unwrap();
     let shell_id = workspace.shells[0].id.clone();
     let mut attachment = daemon.client.attach(&shell_id, false, profile()).unwrap();
-    assert_eq!(attachment.protocol_version, 24);
+    assert_eq!(attachment.protocol_version, protocol::PROTOCOL_VERSION);
 
     AttachFrame::FocusGained
         .write_to(&mut attachment.stream)

@@ -35,6 +35,8 @@ struct RawNotificationsConfig {
     enabled: Option<bool>,
     blocked: Option<bool>,
     completed: Option<bool>,
+    scheduled_dispatch_failed: Option<bool>,
+    scheduled_interrupted: Option<bool>,
     sound: Option<RawNotificationSoundConfig>,
 }
 
@@ -44,6 +46,8 @@ struct RawNotificationSoundConfig {
     enabled: Option<bool>,
     blocked: Option<String>,
     completed: Option<String>,
+    scheduled_dispatch_failed: Option<String>,
+    scheduled_interrupted: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -175,6 +179,12 @@ fn merge(base: &mut RawConfig, next: RawConfig) {
         if next_notifications.completed.is_some() {
             notifications.completed = next_notifications.completed;
         }
+        if next_notifications.scheduled_dispatch_failed.is_some() {
+            notifications.scheduled_dispatch_failed = next_notifications.scheduled_dispatch_failed;
+        }
+        if next_notifications.scheduled_interrupted.is_some() {
+            notifications.scheduled_interrupted = next_notifications.scheduled_interrupted;
+        }
         if let Some(next_sound) = next_notifications.sound {
             let sound = notifications.sound.get_or_insert_default();
             if next_sound.enabled.is_some() {
@@ -185,6 +195,12 @@ fn merge(base: &mut RawConfig, next: RawConfig) {
             }
             if next_sound.completed.is_some() {
                 sound.completed = next_sound.completed;
+            }
+            if next_sound.scheduled_dispatch_failed.is_some() {
+                sound.scheduled_dispatch_failed = next_sound.scheduled_dispatch_failed;
+            }
+            if next_sound.scheduled_interrupted.is_some() {
+                sound.scheduled_interrupted = next_sound.scheduled_interrupted;
             }
         }
     }
@@ -279,6 +295,8 @@ fn resolve_daemon_settings(
             enabled: raw.enabled.unwrap_or(false),
             blocked: raw.blocked.unwrap_or(true),
             completed: raw.completed.unwrap_or(true),
+            scheduled_dispatch_failed: raw.scheduled_dispatch_failed.unwrap_or(false),
+            scheduled_interrupted: raw.scheduled_interrupted.unwrap_or(false),
         },
         sound: raw.sound.map_or_else(Default::default, |sound| {
             boomux::daemon::NotificationSoundSettings {
@@ -287,6 +305,12 @@ fn resolve_daemon_settings(
                     .blocked
                     .unwrap_or_else(|| "message-new-instant".into()),
                 completed: sound.completed.unwrap_or_else(|| "complete".into()),
+                scheduled_dispatch_failed: sound
+                    .scheduled_dispatch_failed
+                    .unwrap_or_else(|| "dialog-warning".into()),
+                scheduled_interrupted: sound
+                    .scheduled_interrupted
+                    .unwrap_or_else(|| "dialog-warning".into()),
             }
         }),
         resume_agents: recovery.resume_agents.unwrap_or(true),
@@ -471,6 +495,8 @@ mod tests {
         assert!(settings.sound.enabled);
         assert_eq!(settings.sound.blocked, "dialog-warning");
         assert_eq!(settings.sound.completed, "complete");
+        assert!(!settings.desktop.scheduled_dispatch_failed);
+        assert!(!settings.desktop.scheduled_interrupted);
     }
 
     #[test]
@@ -511,17 +537,33 @@ mod tests {
                     enabled: true,
                     blocked: false,
                     completed: true,
+                    ..Default::default()
                 },
                 sound: boomux::daemon::NotificationSoundSettings {
                     enabled: true,
                     blocked: "message-new-instant".into(),
                     completed: "service-login".into(),
+                    ..Default::default()
                 },
                 resume_agents: true,
                 persist_terminal_history: false,
                 max_scheduled_execution_concurrency: 4,
             }
         );
+    }
+
+    #[test]
+    fn scheduled_notification_categories_are_independent_and_default_disabled() {
+        let raw: RawConfig = toml::from_str(
+            "[notifications]\nenabled = true\nscheduled_dispatch_failed = true\nscheduled_interrupted = false\n[notifications.sound]\nscheduled_interrupted = \"service-logout\"",
+        )
+        .unwrap();
+        let settings = resolve_notifications(raw.notifications);
+        assert!(settings.desktop.scheduled_dispatch_failed);
+        assert!(!settings.desktop.scheduled_interrupted);
+        assert!(settings.desktop.blocked);
+        assert!(settings.desktop.completed);
+        assert_eq!(settings.sound.scheduled_interrupted, "service-logout");
     }
 
     #[test]

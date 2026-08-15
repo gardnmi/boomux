@@ -266,8 +266,9 @@ boomux schedule inspect "<exact-id-or-contextual-name>" --workspace "<workspace-
 boomux schedule pause "<exact-id-or-contextual-name>" --workspace "<workspace-name-or-id>" --json
 boomux schedule resume "<exact-id-or-contextual-name>" --workspace "<workspace-name-or-id>" --json
 boomux schedule run "<exact-id-or-contextual-name>" --workspace "<workspace-name-or-id>" --json
-boomux execution list --workspace "<workspace-name-or-id>" --schedule "<schedule-name-or-id>" --json
+boomux execution list --workspace "<workspace-name-or-id>" --schedule "<schedule-name-or-id>" --limit 100 --json
 boomux execution inspect "<exact-execution-id>" --json
+boomux execution wait "<exact-execution-id>" --after-revision "<revision>" --wait-ms 30000 --json
 boomux execution cancel "<exact-execution-id>" --json
 boomux schedule remove "<exact-id-or-contextual-name>" --workspace "<workspace-name-or-id>" --json
 ```
@@ -302,6 +303,16 @@ before sending. Never retry with a new key when the intent is the same dispatch.
 Inspect the returned exact execution ID, and cancel only when process-tree
 termination is authorized. Execution exit or cancellation never means Agent
 `done`.
+
+Execution list responses are newest-first and contain `limit`, `truncated`, and
+prompt-free records. Limits are 1-1,000 and default to 100. Each execution has a
+positive durable `revision`. Wait with the exact last revision instead of polling
+lists: newer state or Agent linkage returns `changed: true`, timeout returns the
+same record with `changed: false`, and a future revision fails with
+`revision_ahead`. On `daemon_stopping`, reconnect and repeat the same revision.
+Do not stop waiting merely because process state is terminal; the canonical Agent
+link can arrive later, and its blocked attention remains under `agent inspect` or
+`attention list` with the exact Agent ID and observation revision.
 
 Enabled schedules are evaluated by the daemon in their stored timezone. Timed
 work runs only while the daemon and user session are active. Offline periods are
@@ -466,6 +477,10 @@ Boomux reads `$XDG_CONFIG_HOME/boomux/config.toml`, falling back to
 field-level override loaded last. Configuration controls terminal selection,
 project discovery roots and depth, dashboard focus following, schedule
 concurrency, and desktop and sound notifications. Unknown fields are rejected.
+Scheduled dispatch-failure and cold-interruption notification categories are
+configured independently as `[notifications] scheduled_dispatch_failed` and
+`scheduled_interrupted`; both default to false and never disclose schedule
+prompts or acknowledge Agent attention.
 Selecting a discovered project in the dashboard persists its canonical path as
 the workspace default cwd for later shells. Set
 `[dashboard] follow_focused_terminal = false` to disable the default

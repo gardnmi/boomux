@@ -299,8 +299,9 @@ boomux schedule inspect review --workspace my-project
 boomux schedule resume review --workspace my-project
 boomux schedule pause review --workspace my-project
 boomux schedule run review --workspace my-project
-boomux execution list --schedule review --workspace my-project
+boomux execution list --schedule review --workspace my-project --limit 100
 boomux execution inspect <exact-execution-id>
+boomux execution wait <exact-execution-id> --after-revision <revision>
 boomux execution cancel <exact-execution-id>
 boomux schedule remove review --workspace my-project
 ```
@@ -323,6 +324,9 @@ It creates a durable prompt-free execution claim before starting one exact host
 argv through a lazily created schedule-owned shell. Pass `--idempotency-key
 <uuid>` when retrying a request; the same schedule and key always return the same
 execution and never spawn twice. Execution inspection and events omit prompts.
+Execution lists are bounded newest-first and report truncation. Revision-aware
+wait returns on the next committed process or Agent-link change; reconnect with
+the same revision when daemon replacement reports `daemon_stopping`.
 
 Enabled schedules are evaluated by the daemon in their stored IANA timezone.
 DST gaps are skipped, repeated local minutes fire once, and persisted occurrence
@@ -387,11 +391,15 @@ persist_terminal_history = false
 enabled = false
 blocked = true
 completed = true
+scheduled_dispatch_failed = false
+scheduled_interrupted = false
 
 [notifications.sound]
 enabled = false
 blocked = "message-new-instant"
 completed = "complete"
+scheduled_dispatch_failed = "dialog-warning"
+scheduled_interrupted = "dialog-warning"
 ```
 
 Project roots provide workspace suggestions in the dashboard. Selecting one
@@ -427,7 +435,10 @@ delivery requires `canberra-gtk-play`; its `blocked` and `completed` values are
 freedesktop sound event IDs, not shell commands. Both channels use the top-level
 category filters. A completed notification is sent when an Agent finishes a
 unit of work and becomes idle, as well as when the Agent reaches its terminal
-done state.
+done state. Scheduled dispatch-failure and cold-interruption categories are
+independent and disabled by default; their bounded payload contains schedule,
+workspace, and execution identity but never the prompt. Delivery is fail-open,
+at-most-once, and does not acknowledge Agent attention.
 
 Test every configured, enabled channel with:
 
