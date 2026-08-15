@@ -1,12 +1,15 @@
 use std::error::Error;
 use std::fmt;
 
+use chrono::{Datelike, LocalResult, NaiveDate, TimeZone, Utc};
+
 pub const MAX_PROMPT_BYTES: usize = 65_536;
 pub const MAX_CRON_BYTES: usize = 256;
 pub const MAX_TIMEZONE_BYTES: usize = 256;
 pub const MAX_INTEGRATION_KEY_BYTES: usize = 256;
 pub const MAX_EXTERNAL_SESSION_ID_BYTES: usize = 256;
 pub const MAX_SCHEDULES_PER_WORKSPACE: usize = 64;
+const MAX_OCCURRENCE_SEARCH_DAYS: u32 = 146_097;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SchedulingError {
@@ -30,6 +33,8 @@ pub enum SchedulingError {
     },
     InvalidTimezone,
     SystemTimezoneUnavailable,
+    TimeOutOfRange,
+    OccurrenceSearchExhausted,
 }
 
 impl fmt::Display for SchedulingError {
@@ -56,6 +61,12 @@ impl fmt::Display for SchedulingError {
             Self::InvalidTimezone => formatter.write_str("timezone is not a valid IANA timezone"),
             Self::SystemTimezoneUnavailable => {
                 formatter.write_str("system IANA timezone could not be resolved")
+            }
+            Self::TimeOutOfRange => {
+                formatter.write_str("schedule time is outside the supported range")
+            }
+            Self::OccurrenceSearchExhausted => {
+                formatter.write_str("schedule has no occurrence within the bounded search range")
             }
         }
     }
@@ -85,6 +96,187 @@ pub fn canonicalize_cron(expression: &str) -> Result<String, SchedulingError> {
     }
 
     Ok(fields.join(" "))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CronSchedule {
+    minutes: Vec<u32>,
+    hours: Vec<u32>,
+    days_of_month: Vec<u32>,
+    months: Vec<u32>,
+    days_of_week: Vec<u32>,
+    any_day_of_month: bool,
+    any_day_of_week: bool,
+    timezone: chrono_tz::Tz,
+}
+
+impl CronSchedule {
+    pub fn compile(expression: &str, timezone: &str) -> Result<Self, SchedulingError> {
+        let expression = canonicalize_cron(expression)?;
+        let fields = expression.split_whitespace().collect::<Vec<_>>();
+        let timezone = canonicalize_timezone(timezone)?
+            .parse()
+            .map_err(|_| SchedulingError::InvalidTimezone)?;
+        Ok(Self {
+            minutes: compile_field(fields[0], 0, 59),
+            hours: compile_field(fields[1], 0, 23),
+            days_of_month: compile_field(fields[2], 1, 31),
+            months: compile_field(fields[3], 1, 12),
+            days_of_week: compile_field(fields[4], 0, 6),
+            any_day_of_month: wildcard_origin(fields[2]),
+            any_day_of_week: wildcard_origin(fields[4]),
+            timezone,
+        })
+    }
+
+    pub fn ensure_possible(&self) -> Result<(), SchedulingError> {
+        let mut date =
+            NaiveDate::from_ymd_opt(2000, 1, 1).ok_or(SchedulingError::TimeOutOfRange)?;
+        for _ in 0..MAX_OCCURRENCE_SEARCH_DAYS {
+            if self.date_matches(date)
+                && self.hours.iter().any(|hour| {
+                    self.minutes.iter().any(|minute| {
+                        date.and_hms_opt(*hour, *minute, 0)
+                            .and_then(|local| first_local_instant(self.timezone, local))
+                            .is_some()
+                    })
+                })
+            {
+                return Ok(());
+            }
+            date = date.succ_opt().ok_or(SchedulingError::TimeOutOfRange)?;
+        }
+        Err(SchedulingError::OccurrenceSearchExhausted)
+    }
+
+    pub fn next_after_ms(&self, frontier_ms: u64) -> Result<u64, SchedulingError> {
+        let frontier = utc_from_millis(frontier_ms)?;
+        let mut date = frontier.with_timezone(&self.timezone).date_naive();
+        for _ in 0..MAX_OCCURRENCE_SEARCH_DAYS {
+            if self.date_matches(date) {
+                for &hour in &self.hours {
+                    for &minute in &self.minutes {
+                        let local = date
+                            .and_hms_opt(hour, minute, 0)
+                            .ok_or(SchedulingError::TimeOutOfRange)?;
+                        if let Some(candidate) = first_local_instant(self.timezone, local) {
+                            let candidate_ms = millis_from_utc(candidate)?;
+                            if candidate_ms > frontier_ms {
+                                return Ok(candidate_ms);
+                            }
+                        }
+                    }
+                }
+            }
+            date = date.succ_opt().ok_or(SchedulingError::TimeOutOfRange)?;
+        }
+        Err(SchedulingError::OccurrenceSearchExhausted)
+    }
+
+    pub fn latest_at_or_before_ms(&self, ceiling_ms: u64) -> Result<u64, SchedulingError> {
+        let ceiling = utc_from_millis(ceiling_ms)?;
+        let mut date = ceiling.with_timezone(&self.timezone).date_naive();
+        for _ in 0..MAX_OCCURRENCE_SEARCH_DAYS {
+            if self.date_matches(date) {
+                for &hour in self.hours.iter().rev() {
+                    for &minute in self.minutes.iter().rev() {
+                        let local = date
+                            .and_hms_opt(hour, minute, 0)
+                            .ok_or(SchedulingError::TimeOutOfRange)?;
+                        if let Some(candidate) = first_local_instant(self.timezone, local) {
+                            let candidate_ms = millis_from_utc(candidate)?;
+                            if candidate_ms <= ceiling_ms {
+                                return Ok(candidate_ms);
+                            }
+                        }
+                    }
+                }
+            }
+            date = date.pred_opt().ok_or(SchedulingError::TimeOutOfRange)?;
+        }
+        Err(SchedulingError::OccurrenceSearchExhausted)
+    }
+
+    fn date_matches(&self, date: NaiveDate) -> bool {
+        if self.months.binary_search(&date.month()).is_err() {
+            return false;
+        }
+        let dom = self.days_of_month.binary_search(&date.day()).is_ok();
+        let dow = self
+            .days_of_week
+            .binary_search(&date.weekday().num_days_from_sunday())
+            .is_ok();
+        match (self.any_day_of_month, self.any_day_of_week) {
+            (true, true) => true,
+            (true, false) => dow,
+            (false, true) => dom,
+            (false, false) => dom || dow,
+        }
+    }
+}
+
+fn wildcard_origin(field: &str) -> bool {
+    field.split(',').any(|component| {
+        component
+            .split_once('/')
+            .map_or(component, |(base, _)| base)
+            == "*"
+    })
+}
+
+fn compile_field(field: &str, minimum: u32, maximum: u32) -> Vec<u32> {
+    let mut selected = vec![false; (maximum + 1) as usize];
+    for component in field.split(',') {
+        let (base, step) = component
+            .split_once('/')
+            .map_or((component, 1), |(base, step)| {
+                (base, step.parse::<u32>().expect("validated cron step"))
+            });
+        let (start, end) = if base == "*" {
+            (minimum, maximum)
+        } else if let Some((start, end)) = base.split_once('-') {
+            (
+                start.parse::<u32>().expect("validated cron range"),
+                end.parse::<u32>().expect("validated cron range"),
+            )
+        } else {
+            let value = base.parse::<u32>().expect("validated cron value");
+            (value, value)
+        };
+        for value in (start..=end).step_by(step as usize) {
+            selected[value as usize] = true;
+        }
+    }
+    (minimum..=maximum)
+        .filter(|value| selected[*value as usize])
+        .collect()
+}
+
+fn utc_from_millis(value: u64) -> Result<chrono::DateTime<Utc>, SchedulingError> {
+    let value = i64::try_from(value).map_err(|_| SchedulingError::TimeOutOfRange)?;
+    Utc.timestamp_millis_opt(value)
+        .single()
+        .ok_or(SchedulingError::TimeOutOfRange)
+}
+
+pub(crate) fn validate_timestamp_ms(value: u64) -> Result<(), SchedulingError> {
+    utc_from_millis(value).map(|_| ())
+}
+
+fn millis_from_utc(value: chrono::DateTime<chrono_tz::Tz>) -> Result<u64, SchedulingError> {
+    u64::try_from(value.with_timezone(&Utc).timestamp_millis())
+        .map_err(|_| SchedulingError::TimeOutOfRange)
+}
+
+fn first_local_instant(
+    timezone: chrono_tz::Tz,
+    local: chrono::NaiveDateTime,
+) -> Option<chrono::DateTime<chrono_tz::Tz>> {
+    match timezone.from_local_datetime(&local) {
+        LocalResult::None => None,
+        LocalResult::Single(value) => Some(value),
+        LocalResult::Ambiguous(first, second) => Some(first.min(second)),
+    }
 }
 
 pub fn every_minutes_cron(minutes: u8) -> Result<String, SchedulingError> {
@@ -279,6 +471,17 @@ fn validate_byte_bound(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
+
+    fn utc_ms(year: i32, month: u32, day: u32, hour: u32, minute: u32) -> u64 {
+        u64::try_from(
+            Utc.with_ymd_and_hms(year, month, day, hour, minute, 0)
+                .single()
+                .unwrap()
+                .timestamp_millis(),
+        )
+        .unwrap()
+    }
 
     #[test]
     fn cron_accepts_supported_grammar_and_normalizes_only_whitespace() {
@@ -412,6 +615,113 @@ mod tests {
         assert!(validate_external_session_id("session\u{1b}").is_err());
         assert!(
             validate_external_session_id(&"x".repeat(MAX_EXTERNAL_SESSION_ID_BYTES + 1)).is_err()
+        );
+    }
+
+    #[test]
+    fn compiled_cron_handles_fields_dom_dow_or_and_strict_frontiers() {
+        let cron = CronSchedule::compile("0,0,30 9-11/2 * * *", "UTC").unwrap();
+        assert_eq!(
+            cron.next_after_ms(utc_ms(2026, 1, 1, 9, 0)),
+            Ok(utc_ms(2026, 1, 1, 9, 30))
+        );
+        assert_eq!(
+            cron.next_after_ms(utc_ms(2026, 1, 1, 9, 30)),
+            Ok(utc_ms(2026, 1, 1, 11, 0))
+        );
+
+        let or = CronSchedule::compile("0 0 31 * 1", "UTC").unwrap();
+        assert_eq!(
+            or.next_after_ms(utc_ms(2026, 1, 4, 23, 59)),
+            Ok(utc_ms(2026, 1, 5, 0, 0))
+        );
+        assert_eq!(
+            or.latest_at_or_before_ms(utc_ms(2026, 1, 6, 0, 0)),
+            Ok(utc_ms(2026, 1, 5, 0, 0))
+        );
+
+        let candidate = utc_ms(2026, 1, 7, 9, 0);
+        assert_eq!(cron.next_after_ms(candidate - 1), Ok(candidate));
+        assert_eq!(
+            cron.latest_at_or_before_ms(candidate - 1),
+            Ok(utc_ms(2026, 1, 6, 11, 30))
+        );
+        assert_eq!(cron.latest_at_or_before_ms(candidate), Ok(candidate));
+        assert_eq!(cron.latest_at_or_before_ms(candidate + 1), Ok(candidate));
+    }
+
+    #[test]
+    fn wildcard_origin_controls_standard_dom_dow_semantics() {
+        let stepped_dom = CronSchedule::compile("0 0 */2 * 1", "UTC").unwrap();
+        assert_eq!(
+            stepped_dom.next_after_ms(utc_ms(2024, 1, 7, 0, 0)),
+            Ok(utc_ms(2024, 1, 8, 0, 0))
+        );
+        let full_dom_range = CronSchedule::compile("0 0 1-31 * 1", "UTC").unwrap();
+        assert_eq!(
+            full_dom_range.next_after_ms(utc_ms(2024, 1, 2, 0, 0) - 1),
+            Ok(utc_ms(2024, 1, 2, 0, 0))
+        );
+
+        let stepped_dow = CronSchedule::compile("0 0 15 */2 */2", "UTC").unwrap();
+        assert_eq!(
+            stepped_dow.next_after_ms(utc_ms(2024, 1, 14, 0, 0)),
+            Ok(utc_ms(2024, 1, 15, 0, 0))
+        );
+        let full_dow_range = CronSchedule::compile("0 0 31 */2 0-6", "UTC").unwrap();
+        assert_eq!(
+            full_dow_range.next_after_ms(utc_ms(2024, 1, 2, 0, 0) - 1),
+            Ok(utc_ms(2024, 1, 2, 0, 0))
+        );
+    }
+
+    #[test]
+    fn compiled_cron_skips_new_york_gap_and_uses_first_repeated_minute_only() {
+        let gap = CronSchedule::compile("30 2 * * *", "America/New_York").unwrap();
+        assert_eq!(
+            gap.next_after_ms(utc_ms(2024, 3, 9, 8, 0)),
+            Ok(utc_ms(2024, 3, 11, 6, 30))
+        );
+
+        let repeated = CronSchedule::compile("30 1 * * *", "America/New_York").unwrap();
+        let first = utc_ms(2024, 11, 3, 5, 30);
+        assert_eq!(repeated.next_after_ms(utc_ms(2024, 11, 3, 4, 0)), Ok(first));
+        assert_eq!(
+            repeated.next_after_ms(first),
+            Ok(utc_ms(2024, 11, 4, 6, 30))
+        );
+    }
+
+    #[test]
+    fn compiled_cron_handles_lord_howe_non_hour_gap_and_impossible_dates() {
+        let gap = CronSchedule::compile("15 2 * * *", "Australia/Lord_Howe").unwrap();
+        assert_eq!(
+            gap.next_after_ms(utc_ms(2024, 10, 5, 16, 0)),
+            Ok(utc_ms(2024, 10, 6, 15, 15))
+        );
+
+        let impossible = CronSchedule::compile("0 0 30 2 *", "UTC").unwrap();
+        assert_eq!(
+            impossible.next_after_ms(utc_ms(2024, 1, 1, 0, 0)),
+            Err(SchedulingError::OccurrenceSearchExhausted)
+        );
+        assert_eq!(
+            impossible.ensure_possible(),
+            Err(SchedulingError::OccurrenceSearchExhausted)
+        );
+        for _ in 0..MAX_SCHEDULES_PER_WORKSPACE {
+            assert_eq!(
+                impossible.ensure_possible(),
+                Err(SchedulingError::OccurrenceSearchExhausted)
+            );
+        }
+
+        let fold = CronSchedule::compile("45 1 * * *", "Australia/Lord_Howe").unwrap();
+        let first = utc_ms(2024, 4, 6, 14, 45);
+        assert_eq!(fold.next_after_ms(first - 1), Ok(first));
+        assert_eq!(
+            fold.latest_at_or_before_ms(utc_ms(2024, 4, 6, 15, 20)),
+            Ok(first)
         );
     }
 }

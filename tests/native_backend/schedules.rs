@@ -2,6 +2,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::thread;
+use std::time::{Duration, Instant};
 
 use boomux::client::Client;
 use boomux::protocol::{
@@ -27,6 +28,39 @@ fn schedule_spec(daemon: &TestDaemon, name: &str, prompt: &str) -> AgentSchedule
         state: AgentScheduleState::Paused,
         overlap_policy: AgentScheduleOverlapPolicy::Skip,
     }
+}
+
+fn write_scheduler_tick(clock: &std::path::Path, generation: u64, now_ms: u64) {
+    let tick = clock.join("tick");
+    fs::write(&tick, format!("{generation} {now_ms}")).unwrap();
+    fs::set_permissions(tick, fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+fn create_scheduler_clock(clock: &std::path::Path) {
+    fs::create_dir_all(clock.parent().unwrap()).unwrap();
+    fs::set_permissions(clock.parent().unwrap(), fs::Permissions::from_mode(0o700)).unwrap();
+    fs::create_dir(clock).unwrap();
+    fs::set_permissions(clock, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+fn wait_for_scheduler_tick(clock: &std::path::Path, generation: u64) {
+    wait_until(
+        || {
+            fs::read_to_string(clock.join("ack"))
+                .is_ok_and(|value| value.trim() == generation.to_string())
+        },
+        "scheduler did not acknowledge deterministic tick",
+    );
+}
+
+fn wait_for_scheduler_seen(clock: &std::path::Path, generation: u64) {
+    wait_until(
+        || {
+            fs::read_to_string(clock.join("seen"))
+                .is_ok_and(|value| value.trim() == generation.to_string())
+        },
+        "scheduler did not observe deterministic tick",
+    );
 }
 
 #[test]
@@ -395,6 +429,26 @@ fn manual_execution_succeeds_and_duplicate_key_never_spawns_twice() {
                 .is_ok_and(|execution| execution.state == ScheduledExecutionState::Exited)
         },
         "scheduled execution did not exit",
+    );
+    wait_until(
+        || {
+            daemon
+                .client
+                .events(Some(event_cursor.clone()), 256, 0)
+                .is_ok_and(|page| {
+                    page.events.iter().any(|event| {
+                        matches!(
+                            &event.kind,
+                            protocol::DaemonEventKind::ScheduledExecutionChanged {
+                                execution,
+                                ..
+                            } if execution.id == first.id
+                                && execution.state == ScheduledExecutionState::Exited
+                        )
+                    })
+                })
+        },
+        "scheduled execution exit event was not published",
     );
     assert_eq!(fs::read_to_string(&capture).unwrap(), "spawn\n");
     assert_eq!(
@@ -788,6 +842,151 @@ fn inactive_agent_does_not_block_exact_continuation_dispatch() {
 }
 
 #[test]
+fn continuation_registration_wins_before_atomic_eligibility_and_creates_no_phantom() {
+    let mut daemon = TestDaemon::start_with(|command, runtime_dir| {
+        let barrier = runtime_dir.join("continuation-pre-dispatch-barrier");
+        fs::create_dir(&barrier).unwrap();
+        let bin = runtime_dir.join("bin");
+        fs::create_dir(&bin).unwrap();
+        let host = bin.join("opencode");
+        fs::write(
+            &host,
+            "#!/bin/sh\n: > \"$BOOMUX_CONTINUATION_RACE_SPAWNED\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&host, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut paths = vec![bin];
+        paths.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        command
+            .env("PATH", std::env::join_paths(paths).unwrap())
+            .env("BOOMUX_NATIVE_TEST_PRE_DISPATCH_BARRIER", &barrier)
+            .env(
+                "BOOMUX_CONTINUATION_RACE_SPAWNED",
+                runtime_dir.join("continuation-race-spawned"),
+            );
+    });
+    let workspace = daemon
+        .client
+        .create_workspace(
+            "continuation-race",
+            vec![ShellSpec {
+                name: "user".into(),
+                cwd: daemon.runtime_dir.clone(),
+                command: vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
+            }],
+        )
+        .unwrap();
+    let attachment = daemon
+        .client
+        .attach(&workspace.shells[0].id, false, profile())
+        .unwrap();
+    let run_id = daemon
+        .client
+        .get_shell(&workspace.shells[0].id)
+        .unwrap()
+        .run
+        .unwrap()
+        .id;
+    let mut spec = schedule_spec(&daemon, "continuation-race", "must not run");
+    spec.session = AgentScheduleSession::Continue {
+        external_session_id: "exact-racing-session".into(),
+    };
+    let schedule = daemon
+        .client
+        .create_agent_schedule(&workspace.id, spec)
+        .unwrap();
+    let request_client = Client::from_socket_path(daemon.client.socket_path().to_path_buf());
+    let schedule_id = schedule.id.clone();
+    let request = thread::spawn(move || {
+        request_client.run_agent_schedule(schedule_id, Uuid::new_v4().to_string())
+    });
+    let barrier = daemon.runtime_dir.join("continuation-pre-dispatch-barrier");
+    wait_until(
+        || barrier.join("waiting").is_file(),
+        "continuation pre-dispatch barrier was not reached",
+    );
+    daemon
+        .client
+        .register_agent(
+            &workspace.shells[0].id,
+            run_id,
+            AgentRegistrationSpec {
+                name: "racing-active-agent".into(),
+                integration: "opencode".into(),
+                external_session_id: Some("exact-racing-session".into()),
+                report: AgentReport {
+                    state: AgentState::Working,
+                    authority: AgentAuthority::LifecycleIntegration,
+                    evidence: "became active after claim".into(),
+                    confidence: 100,
+                },
+            },
+        )
+        .unwrap();
+    let protocol::Response::Events {
+        cursor: old_cursor, ..
+    } = versioned_request(
+        &daemon,
+        23,
+        protocol::Request::Events {
+            after: None,
+            limit: 256,
+            wait_ms: 0,
+        },
+    )
+    else {
+        panic!("expected protocol-23 baseline");
+    };
+    fs::write(barrier.join("release"), b"release").unwrap();
+    let execution = request.join().unwrap().unwrap();
+    assert_eq!(execution.state, ScheduledExecutionState::Skipped);
+    assert_eq!(
+        execution.reason,
+        Some(protocol::ScheduledExecutionReason::ActiveSession)
+    );
+    assert!(execution.shell_id.is_none());
+    assert!(execution.run_id.is_none());
+    assert!(
+        daemon
+            .client
+            .get_agent_schedule(&schedule.id)
+            .unwrap()
+            .schedule
+            .execution_shell_id
+            .is_none()
+    );
+    assert!(
+        !daemon
+            .runtime_dir
+            .join("continuation-race-spawned")
+            .exists()
+    );
+    let old_events = versioned_request(
+        &daemon,
+        23,
+        protocol::Request::Events {
+            after: Some(old_cursor.clone()),
+            limit: 256,
+            wait_ms: 0,
+        },
+    );
+    let protocol::Response::Events { cursor, events, .. } = &old_events else {
+        panic!("expected protocol-23 event page");
+    };
+    assert!(cursor.event_id > old_cursor.event_id);
+    assert!(events.is_empty());
+    let frozen = serde_json::to_value(old_events).unwrap();
+    assert_eq!(frozen["events"], serde_json::json!([]));
+    assert!(!frozen.to_string().contains("claimed"));
+    assert!(!frozen.to_string().contains("skipped"));
+    drop(attachment.stream);
+    daemon.client.close_workspace(&workspace.id).unwrap();
+    daemon.stop_with_cli();
+}
+
+#[test]
 fn linked_agents_remain_authoritative_after_exit_and_late_ensure_repairs_links() {
     let mut daemon = TestDaemon::start_with(|command, runtime_dir| {
         let bin = runtime_dir.join("bin");
@@ -1116,12 +1315,30 @@ fn active_execution_cancellation_terminates_the_host_process_tree() {
             .unwrap()
             .contains("private")
     );
-    assert_remote_code(
-        &daemon
-            .client
-            .run_agent_schedule(&schedule.id, Uuid::new_v4().to_string())
-            .unwrap_err(),
-        protocol::ErrorCode::Busy,
+    let skipped = daemon
+        .client
+        .run_agent_schedule(&schedule.id, Uuid::new_v4().to_string())
+        .unwrap();
+    assert_eq!(skipped.state, ScheduledExecutionState::Skipped);
+    assert_eq!(
+        skipped.reason,
+        Some(protocol::ScheduledExecutionReason::Overlap)
+    );
+    let old_response = versioned_request(
+        &daemon,
+        23,
+        protocol::Request::RunAgentSchedule {
+            schedule_id: schedule.id.clone(),
+            dispatch_key: Uuid::new_v4().to_string(),
+        },
+    );
+    assert_eq!(
+        serde_json::to_value(old_response).unwrap(),
+        serde_json::json!({
+            "response": "error",
+            "message": "scheduled execution was skipped by the current concurrency policy",
+            "code": "busy"
+        })
     );
     let pids = fs::read_to_string(pids)
         .unwrap()
@@ -1677,6 +1894,124 @@ fn start_long_running_execution(
 }
 
 #[test]
+fn transferred_active_executions_block_lower_global_limit_until_release() {
+    let mut daemon = TestDaemon::start_with(|command, runtime_dir| {
+        let config = runtime_dir.join("max-two.toml");
+        fs::write(&config, "[scheduling]\nmax_concurrent = 2\n").unwrap();
+        let bin = runtime_dir.join("bin");
+        fs::create_dir(&bin).unwrap();
+        let host = bin.join("opencode");
+        fs::write(
+            &host,
+            "#!/bin/sh\nprintf '%s\n' \"$$\" >> \"$BOOMUX_BOUND_PIDS\"\nsleep 30\n",
+        )
+        .unwrap();
+        fs::set_permissions(&host, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut paths = vec![bin];
+        paths.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        command
+            .env("BOOMUX_CONFIG", config)
+            .env("PATH", std::env::join_paths(paths).unwrap())
+            .env("BOOMUX_BOUND_PIDS", runtime_dir.join("bound-pids"));
+    });
+    let mut schedules = Vec::new();
+    for index in 1..=3 {
+        let workspace = daemon
+            .client
+            .create_workspace(format!("bound-{index}"), Vec::new())
+            .unwrap();
+        let schedule = daemon
+            .client
+            .create_agent_schedule(
+                &workspace.id,
+                schedule_spec(&daemon, &format!("bound-{index}"), "private"),
+            )
+            .unwrap();
+        schedules.push((workspace, schedule));
+    }
+    let mut active = Vec::new();
+    for (_, schedule) in &schedules[..2] {
+        let execution = daemon
+            .client
+            .run_agent_schedule(&schedule.id, Uuid::new_v4().to_string())
+            .unwrap();
+        wait_until(
+            || {
+                daemon
+                    .client
+                    .get_scheduled_execution(&execution.id)
+                    .is_ok_and(|current| current.state == ScheduledExecutionState::Active)
+            },
+            "bounded execution did not become active",
+        );
+        active.push(execution.id);
+    }
+    let mut same_workspace_spec = schedule_spec(&daemon, "same-workspace", "private");
+    same_workspace_spec.name = "same-workspace".into();
+    let same_workspace = daemon
+        .client
+        .create_agent_schedule(&schedules[0].0.id, same_workspace_spec)
+        .unwrap();
+    let skipped = daemon
+        .client
+        .run_agent_schedule(&same_workspace.id, Uuid::new_v4().to_string())
+        .unwrap();
+    assert_eq!(
+        skipped.reason,
+        Some(protocol::ScheduledExecutionReason::WorkspaceCapacity)
+    );
+
+    let config = daemon.runtime_dir.join("max-one.toml");
+    fs::write(&config, "[scheduling]\nmax_concurrent = 1\n").unwrap();
+    let mut paths = vec![daemon.runtime_dir.join("bin")];
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    let restart = daemon
+        .command()
+        .env("BOOMUX_CONFIG", &config)
+        .env("PATH", std::env::join_paths(paths).unwrap())
+        .env("BOOMUX_BOUND_PIDS", daemon.runtime_dir.join("bound-pids"))
+        .args(["daemon", "restart"])
+        .output()
+        .unwrap();
+    assert!(restart.status.success());
+    let health = daemon.client.snapshot().unwrap().scheduler.unwrap();
+    assert_eq!(health.max_concurrent, 1);
+    assert_eq!(health.active_executions, 2);
+    let blocked = daemon
+        .client
+        .run_agent_schedule(&schedules[2].1.id, Uuid::new_v4().to_string())
+        .unwrap();
+    assert_eq!(
+        blocked.reason,
+        Some(protocol::ScheduledExecutionReason::GlobalCapacity)
+    );
+
+    for execution_id in &active {
+        daemon
+            .client
+            .cancel_scheduled_execution(execution_id)
+            .unwrap();
+    }
+    let admitted = daemon
+        .client
+        .run_agent_schedule(&schedules[2].1.id, Uuid::new_v4().to_string())
+        .unwrap();
+    assert_ne!(admitted.state, ScheduledExecutionState::Skipped);
+    daemon
+        .client
+        .cancel_scheduled_execution(&admitted.id)
+        .unwrap();
+    for (workspace, _) in schedules {
+        daemon.client.close_workspace(&workspace.id).unwrap();
+    }
+    daemon.stop_with_cli();
+}
+
+#[test]
 fn cold_recovery_interrupts_active_execution_without_respawn() {
     let mut daemon = TestDaemon::start_with(|command, runtime_dir| {
         let bin = runtime_dir.join("bin");
@@ -1843,6 +2178,669 @@ fn cold_recovery_clears_staged_outcome_and_survives_second_restart() {
         .unwrap();
     assert_eq!(restored_again, recovered);
     daemon.stop_with_cli();
+}
+
+#[test]
+fn deterministic_clock_dispatches_due_work_and_protocol_23_hides_it() {
+    const BASE_MS: u64 = 1_767_225_600_000;
+    let mut daemon = TestDaemon::start_with(|command, runtime_dir| {
+        let clock = runtime_dir.join("boomux/scheduler-clock");
+        create_scheduler_clock(&clock);
+        write_scheduler_tick(&clock, 1, BASE_MS);
+        let bin = runtime_dir.join("bin");
+        fs::create_dir(&bin).unwrap();
+        let host = bin.join("opencode");
+        fs::write(
+            &host,
+            "#!/bin/sh\nprintf 'spawn\\n' >> \"$BOOMUX_TIMED_CAPTURE\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&host, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut paths = vec![bin];
+        paths.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        command
+            .env("PATH", std::env::join_paths(paths).unwrap())
+            .env("BOOMUX_NATIVE_TEST_CLOCK", &clock)
+            .env("BOOMUX_TIMED_CAPTURE", runtime_dir.join("timed-spawns"));
+    });
+    let clock = daemon.runtime_dir.join("boomux/scheduler-clock");
+    wait_for_scheduler_tick(&clock, 1);
+    let workspace = daemon
+        .client
+        .create_workspace("timed-native", Vec::new())
+        .unwrap();
+    let mut spec = schedule_spec(&daemon, "timed-native", "private");
+    spec.trigger.cron = "* * * * *".into();
+    spec.state = AgentScheduleState::Enabled;
+    let schedule = daemon
+        .client
+        .create_agent_schedule(&workspace.id, spec)
+        .unwrap();
+    assert_eq!(
+        schedule
+            .next_occurrence
+            .as_ref()
+            .map(|occurrence| occurrence.scheduled_at_ms),
+        Some(BASE_MS + 60_000)
+    );
+    let protocol::Response::Events {
+        cursor: old_cursor, ..
+    } = versioned_request(
+        &daemon,
+        23,
+        protocol::Request::Events {
+            after: None,
+            limit: 256,
+            wait_ms: 0,
+        },
+    )
+    else {
+        panic!("expected protocol-23 baseline");
+    };
+
+    write_scheduler_tick(&clock, 2, BASE_MS + 60_000);
+    wait_for_scheduler_tick(&clock, 2);
+    wait_until(
+        || {
+            daemon
+                .client
+                .scheduled_executions(None, Some(schedule.id.clone()))
+                .is_ok_and(|executions| {
+                    executions.len() == 1 && executions[0].state == ScheduledExecutionState::Exited
+                })
+        },
+        "timed execution did not complete",
+    );
+    assert_eq!(
+        fs::read_to_string(daemon.runtime_dir.join("timed-spawns")).unwrap(),
+        "spawn\n"
+    );
+    let execution = daemon
+        .client
+        .scheduled_executions(None, Some(schedule.id.clone()))
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(
+        execution.dispatch_kind,
+        protocol::ScheduledExecutionDispatchKind::Timed
+    );
+    assert_eq!(execution.scheduled_at_ms, Some(BASE_MS + 60_000));
+    assert_eq!(
+        daemon
+            .client
+            .get_agent_schedule(&schedule.id)
+            .unwrap()
+            .schedule
+            .next_occurrence
+            .unwrap()
+            .scheduled_at_ms,
+        BASE_MS + 120_000
+    );
+    assert_eq!(
+        execution.id,
+        Uuid::new_v5(
+            &Uuid::NAMESPACE_OID,
+            format!(
+                "boomux:timed-execution:{}:{}:{}",
+                schedule.id,
+                schedule.trigger_revision,
+                BASE_MS + 60_000
+            )
+            .as_bytes(),
+        )
+        .to_string()
+    );
+
+    let protocol::Response::ScheduledExecutions { executions } = versioned_request(
+        &daemon,
+        23,
+        protocol::Request::ListScheduledExecutions {
+            workspace_id: None,
+            schedule_id: Some(schedule.id.clone()),
+        },
+    ) else {
+        panic!("expected protocol-23 execution list");
+    };
+    assert!(executions.is_empty());
+    assert!(matches!(
+        versioned_request(
+            &daemon,
+            23,
+            protocol::Request::GetScheduledExecution {
+                execution_id: execution.id.clone(),
+            }
+        ),
+        protocol::Response::Error {
+            code: Some(protocol::ErrorCode::NotFound),
+            ..
+        }
+    ));
+    let protocol::Response::Events { cursor, events, .. } = versioned_request(
+        &daemon,
+        23,
+        protocol::Request::Events {
+            after: Some(old_cursor.clone()),
+            limit: 256,
+            wait_ms: 0,
+        },
+    ) else {
+        panic!("expected protocol-23 event page");
+    };
+    assert!(cursor.event_id > old_cursor.event_id);
+    assert!(!events.iter().any(|event| matches!(
+        event.kind,
+        protocol::DaemonEventKind::ScheduledExecutionCreated { .. }
+            | protocol::DaemonEventKind::ScheduledExecutionChanged { .. }
+    )));
+    let protocol::Response::Snapshot { snapshot } =
+        versioned_request(&daemon, 23, protocol::Request::Snapshot)
+    else {
+        panic!("expected protocol-23 snapshot");
+    };
+    assert!(snapshot.scheduler.is_none());
+    assert!(
+        snapshot.workspaces[0].schedules[0]
+            .next_occurrence
+            .is_none()
+    );
+    daemon.stop_with_cli();
+}
+
+#[test]
+fn paused_time_is_not_caught_up_after_resume() {
+    const BASE_MS: u64 = 1_767_225_600_000;
+    let mut daemon = TestDaemon::start_with(|command, runtime_dir| {
+        let clock = runtime_dir.join("boomux/paused-scheduler-clock");
+        create_scheduler_clock(&clock);
+        write_scheduler_tick(&clock, 1, BASE_MS);
+        let bin = runtime_dir.join("bin");
+        fs::create_dir(&bin).unwrap();
+        let host = bin.join("opencode");
+        fs::write(&host, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&host, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut paths = vec![bin];
+        paths.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        command
+            .env("PATH", std::env::join_paths(paths).unwrap())
+            .env("BOOMUX_NATIVE_TEST_CLOCK", &clock);
+    });
+    let clock = daemon.runtime_dir.join("boomux/paused-scheduler-clock");
+    wait_for_scheduler_tick(&clock, 1);
+    let workspace = daemon
+        .client
+        .create_workspace("paused-timed", Vec::new())
+        .unwrap();
+    let mut spec = schedule_spec(&daemon, "paused-timed", "private");
+    spec.trigger.cron = "* * * * *".into();
+    let schedule = daemon
+        .client
+        .create_agent_schedule(&workspace.id, spec)
+        .unwrap();
+
+    write_scheduler_tick(&clock, 2, BASE_MS + 180_000);
+    wait_for_scheduler_tick(&clock, 2);
+    assert!(
+        daemon
+            .client
+            .scheduled_executions(None, Some(schedule.id.clone()))
+            .unwrap()
+            .is_empty()
+    );
+    daemon.client.resume_agent_schedule(&schedule.id).unwrap();
+    assert_eq!(
+        daemon
+            .client
+            .get_agent_schedule(&schedule.id)
+            .unwrap()
+            .schedule
+            .next_occurrence
+            .unwrap()
+            .scheduled_at_ms,
+        BASE_MS + 240_000
+    );
+    write_scheduler_tick(&clock, 3, BASE_MS + 240_000);
+    wait_for_scheduler_tick(&clock, 3);
+    wait_until(
+        || {
+            daemon
+                .client
+                .scheduled_executions(None, Some(schedule.id.clone()))
+                .is_ok_and(|executions| {
+                    executions.len() == 1 && executions[0].state == ScheduledExecutionState::Exited
+                })
+        },
+        "first post-resume occurrence did not finish",
+    );
+    let execution = daemon
+        .client
+        .scheduled_executions(None, Some(schedule.id))
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(execution.scheduled_at_ms, Some(BASE_MS + 240_000));
+    assert_eq!(execution.coalesced_through_ms, None);
+    assert_eq!(
+        daemon
+            .client
+            .get_agent_schedule(&execution.schedule_id)
+            .unwrap()
+            .schedule
+            .next_occurrence
+            .unwrap()
+            .scheduled_at_ms,
+        BASE_MS + 300_000
+    );
+    daemon.stop_with_cli();
+}
+
+#[test]
+fn cold_downtime_coalesces_missed_occurrences_without_spawning_and_is_stable() {
+    const BASE_MS: u64 = 1_767_225_600_000;
+    let mut daemon = TestDaemon::start_with(|command, runtime_dir| {
+        let clock = runtime_dir.join("boomux/cold-scheduler-clock");
+        create_scheduler_clock(&clock);
+        write_scheduler_tick(&clock, 1, BASE_MS);
+        command.env("BOOMUX_NATIVE_TEST_CLOCK", &clock).env(
+            "BOOMUX_TIMED_CAPTURE",
+            runtime_dir.join("cold-timed-spawns"),
+        );
+    });
+    let clock = daemon.runtime_dir.join("boomux/cold-scheduler-clock");
+    wait_for_scheduler_tick(&clock, 1);
+    let workspace = daemon
+        .client
+        .create_workspace("cold-timed", Vec::new())
+        .unwrap();
+    let mut spec = schedule_spec(&daemon, "cold-timed", "private");
+    spec.trigger.cron = "* * * * *".into();
+    spec.state = AgentScheduleState::Enabled;
+    let schedule = daemon
+        .client
+        .create_agent_schedule(&workspace.id, spec)
+        .unwrap();
+    daemon.crash();
+
+    write_scheduler_tick(&clock, 2, BASE_MS + 180_000);
+    let clock_for_restart = clock.clone();
+    daemon.restart_with(|command| {
+        command.env("BOOMUX_NATIVE_TEST_CLOCK", clock_for_restart);
+    });
+    wait_for_scheduler_tick(&clock, 2);
+    let executions = daemon
+        .client
+        .scheduled_executions(None, Some(schedule.id.clone()))
+        .unwrap();
+    assert_eq!(executions.len(), 1);
+    assert_eq!(executions[0].state, ScheduledExecutionState::Skipped);
+    assert_eq!(
+        executions[0].reason,
+        Some(protocol::ScheduledExecutionReason::Missed)
+    );
+    assert_eq!(executions[0].scheduled_at_ms, Some(BASE_MS + 60_000));
+    assert_eq!(executions[0].coalesced_through_ms, Some(BASE_MS + 180_000));
+    assert_eq!(
+        daemon
+            .client
+            .get_agent_schedule(&schedule.id)
+            .unwrap()
+            .schedule
+            .next_occurrence
+            .unwrap()
+            .scheduled_at_ms,
+        BASE_MS + 240_000
+    );
+    assert!(!daemon.runtime_dir.join("cold-timed-spawns").exists());
+
+    daemon.crash();
+    let clock_for_restart = clock.clone();
+    daemon.restart_with(|command| {
+        command.env("BOOMUX_NATIVE_TEST_CLOCK", clock_for_restart);
+    });
+    assert_eq!(
+        daemon
+            .client
+            .scheduled_executions(None, Some(schedule.id))
+            .unwrap(),
+        executions
+    );
+    daemon.stop_with_cli();
+}
+
+#[test]
+fn graceful_handoff_replacement_evaluates_due_boundary_only_after_finalize() {
+    const BASE_MS: u64 = 1_767_225_600_000;
+    let mut daemon = TestDaemon::start_with(|command, runtime_dir| {
+        let clock = runtime_dir.join("boomux/handoff-scheduler-clock");
+        create_scheduler_clock(&clock);
+        write_scheduler_tick(&clock, 1, BASE_MS);
+        let replacement_clock = runtime_dir.join("boomux/handoff-replacement-clock");
+        create_scheduler_clock(&replacement_clock);
+        write_scheduler_tick(&replacement_clock, 2, BASE_MS + 60_000);
+        let bin = runtime_dir.join("bin");
+        fs::create_dir(&bin).unwrap();
+        let host = bin.join("opencode");
+        fs::write(
+            &host,
+            "#!/bin/sh\nprintf 'spawn\\n' >> \"$BOOMUX_TIMED_CAPTURE\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&host, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut paths = vec![bin];
+        paths.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        command
+            .env("PATH", std::env::join_paths(paths).unwrap())
+            .env("BOOMUX_NATIVE_TEST_CLOCK", &clock)
+            .env(
+                "BOOMUX_TIMED_CAPTURE",
+                runtime_dir.join("handoff-timed-spawns"),
+            );
+    });
+    let clock = daemon.runtime_dir.join("boomux/handoff-scheduler-clock");
+    wait_for_scheduler_tick(&clock, 1);
+    let workspace = daemon
+        .client
+        .create_workspace("handoff-timed", Vec::new())
+        .unwrap();
+    let mut spec = schedule_spec(&daemon, "handoff-timed", "private");
+    spec.trigger.cron = "* * * * *".into();
+    spec.state = AgentScheduleState::Enabled;
+    let schedule = daemon
+        .client
+        .create_agent_schedule(&workspace.id, spec)
+        .unwrap();
+
+    let replacement_clock = daemon.runtime_dir.join("boomux/handoff-replacement-clock");
+    let mut paths = vec![daemon.runtime_dir.join("bin")];
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    let restart = daemon
+        .command()
+        .args(["daemon", "restart"])
+        .env("PATH", std::env::join_paths(paths).unwrap())
+        .env("BOOMUX_NATIVE_TEST_CLOCK", &replacement_clock)
+        .env(
+            "BOOMUX_TIMED_CAPTURE",
+            daemon.runtime_dir.join("handoff-timed-spawns"),
+        )
+        .output()
+        .unwrap();
+    assert!(restart.status.success());
+    wait_for_scheduler_tick(&replacement_clock, 2);
+    wait_until(
+        || {
+            daemon
+                .client
+                .scheduled_executions(None, Some(schedule.id.clone()))
+                .is_ok_and(|executions| {
+                    executions.len() == 1 && executions[0].state == ScheduledExecutionState::Exited
+                })
+        },
+        "handoff due occurrence did not finish",
+    );
+    assert_eq!(
+        fs::read_to_string(daemon.runtime_dir.join("handoff-timed-spawns")).unwrap(),
+        "spawn\n"
+    );
+    daemon.stop_with_cli();
+}
+
+#[test]
+fn graceful_handoff_transfers_an_old_daemon_due_boundary_claim_without_duplicate() {
+    const BASE_MS: u64 = 1_767_225_600_000;
+    let mut daemon = TestDaemon::start_with(|command, runtime_dir| {
+        let clock = runtime_dir.join("boomux/handoff-old-claim-clock");
+        create_scheduler_clock(&clock);
+        write_scheduler_tick(&clock, 1, BASE_MS);
+        let barrier = runtime_dir.join("handoff-old-claim-barrier");
+        fs::create_dir(&barrier).unwrap();
+        let bin = runtime_dir.join("bin");
+        fs::create_dir(&bin).unwrap();
+        let host = bin.join("opencode");
+        fs::write(
+            &host,
+            "#!/bin/sh\nprintf 'spawn\n' >> \"$BOOMUX_TIMED_CAPTURE\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&host, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut paths = vec![bin];
+        paths.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        command
+            .env("PATH", std::env::join_paths(paths).unwrap())
+            .env("BOOMUX_NATIVE_TEST_CLOCK", &clock)
+            .env("BOOMUX_NATIVE_TEST_CLAIM_BARRIER", &barrier)
+            .env(
+                "BOOMUX_TIMED_CAPTURE",
+                runtime_dir.join("handoff-old-claim-spawns"),
+            );
+    });
+    let clock = daemon.runtime_dir.join("boomux/handoff-old-claim-clock");
+    wait_for_scheduler_tick(&clock, 1);
+    let workspace = daemon
+        .client
+        .create_workspace("handoff-old-claim", Vec::new())
+        .unwrap();
+    let mut spec = schedule_spec(&daemon, "handoff-old-claim", "private");
+    spec.trigger.cron = "* * * * *".into();
+    spec.state = AgentScheduleState::Enabled;
+    let schedule = daemon
+        .client
+        .create_agent_schedule(&workspace.id, spec)
+        .unwrap();
+
+    write_scheduler_tick(&clock, 2, BASE_MS + 60_000);
+    let barrier = daemon.runtime_dir.join("handoff-old-claim-barrier");
+    wait_until(
+        || barrier.join("claimed").is_file(),
+        "old daemon did not commit the due-boundary claim",
+    );
+    let mut paths = vec![daemon.runtime_dir.join("bin")];
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    let mut restart = daemon.command();
+    restart
+        .args(["daemon", "restart"])
+        .env("PATH", std::env::join_paths(paths).unwrap())
+        .env("BOOMUX_NATIVE_TEST_CLOCK", &clock)
+        .env("BOOMUX_NATIVE_TEST_CLAIM_BARRIER", &barrier)
+        .env(
+            "BOOMUX_TIMED_CAPTURE",
+            daemon.runtime_dir.join("handoff-old-claim-spawns"),
+        );
+    let restart = thread::spawn(move || restart.output().unwrap());
+    fs::write(barrier.join("release"), b"release").unwrap();
+    let restart = restart.join().unwrap();
+    assert!(restart.status.success());
+    wait_until(
+        || {
+            daemon
+                .client
+                .scheduled_executions(None, Some(schedule.id.clone()))
+                .is_ok_and(|executions| {
+                    executions.len() == 1 && executions[0].state == ScheduledExecutionState::Exited
+                })
+        },
+        "transferred due-boundary claim did not finish",
+    );
+    assert_eq!(
+        fs::read_to_string(daemon.runtime_dir.join("handoff-old-claim-spawns")).unwrap(),
+        "spawn\n"
+    );
+    daemon.stop_with_cli();
+}
+
+#[test]
+fn timed_persistence_failure_retries_the_same_occurrence_once() {
+    const BASE_MS: u64 = 1_767_225_600_000;
+    let mut daemon = TestDaemon::start_with(|command, runtime_dir| {
+        let clock = runtime_dir.join("boomux/retry-scheduler-clock");
+        create_scheduler_clock(&clock);
+        write_scheduler_tick(&clock, 1, BASE_MS);
+        command.env("BOOMUX_NATIVE_TEST_CLOCK", &clock);
+    });
+    let clock = daemon.runtime_dir.join("boomux/retry-scheduler-clock");
+    wait_for_scheduler_tick(&clock, 1);
+    let workspace = daemon
+        .client
+        .create_workspace("retry-timed", Vec::new())
+        .unwrap();
+    let mut spec = schedule_spec(&daemon, "retry-timed", "private");
+    spec.trigger.cron = "* * * * *".into();
+    spec.state = AgentScheduleState::Enabled;
+    let schedule = daemon
+        .client
+        .create_agent_schedule(&workspace.id, spec)
+        .unwrap();
+    let state_directory = daemon.runtime_dir.join("state/boomux");
+    let saved_directory = daemon.runtime_dir.join("saved-timed-retry-state");
+    fs::rename(&state_directory, &saved_directory).unwrap();
+    fs::write(&state_directory, b"not a directory").unwrap();
+
+    write_scheduler_tick(&clock, 2, BASE_MS + 180_000);
+    wait_for_scheduler_seen(&clock, 2);
+    assert!(!fs::read_to_string(clock.join("ack")).is_ok_and(|value| value.trim() == "2"));
+
+    fs::remove_file(&state_directory).unwrap();
+    fs::rename(&saved_directory, &state_directory).unwrap();
+    wait_for_scheduler_tick(&clock, 2);
+    let executions = daemon
+        .client
+        .scheduled_executions(None, Some(schedule.id))
+        .unwrap();
+    assert_eq!(executions.len(), 2);
+    assert_eq!(
+        executions
+            .iter()
+            .filter(|execution| execution.scheduled_at_ms == Some(BASE_MS + 60_000))
+            .count(),
+        1
+    );
+    let missed = executions
+        .iter()
+        .find(|execution| execution.scheduled_at_ms == Some(BASE_MS + 60_000))
+        .unwrap();
+    assert_eq!(missed.state, ScheduledExecutionState::Skipped);
+    assert_eq!(missed.coalesced_through_ms, Some(BASE_MS + 120_000));
+    assert_eq!(
+        executions
+            .iter()
+            .filter(|execution| execution.scheduled_at_ms == Some(BASE_MS + 180_000))
+            .count(),
+        1
+    );
+    daemon.stop_with_cli();
+}
+
+#[test]
+fn persistent_scheduler_failure_backs_off_and_stop_interrupts_the_wait() {
+    const BASE_MS: u64 = 1_767_225_600_000;
+    let mut daemon = TestDaemon::start_with(|command, runtime_dir| {
+        let clock = runtime_dir.join("boomux/persistent-failure-clock");
+        create_scheduler_clock(&clock);
+        write_scheduler_tick(&clock, 1, BASE_MS);
+        command.env("BOOMUX_NATIVE_TEST_CLOCK", &clock);
+    });
+    let clock = daemon.runtime_dir.join("boomux/persistent-failure-clock");
+    wait_for_scheduler_tick(&clock, 1);
+    let workspace = daemon
+        .client
+        .create_workspace("persistent-scheduler-failure", Vec::new())
+        .unwrap();
+    let mut spec = schedule_spec(&daemon, "persistent-scheduler-failure", "private");
+    spec.trigger.cron = "* * * * *".into();
+    spec.state = AgentScheduleState::Enabled;
+    daemon
+        .client
+        .create_agent_schedule(&workspace.id, spec)
+        .unwrap();
+    let baseline_attempts = fs::read_to_string(clock.join("attempts"))
+        .unwrap()
+        .trim()
+        .parse::<u64>()
+        .unwrap();
+    let state_directory = daemon.runtime_dir.join("state/boomux");
+    let saved_directory = daemon.runtime_dir.join("saved-persistent-failure-state");
+    fs::rename(&state_directory, &saved_directory).unwrap();
+    fs::write(&state_directory, b"not a directory").unwrap();
+
+    write_scheduler_tick(&clock, 2, BASE_MS + 60_000);
+    wait_for_scheduler_seen(&clock, 2);
+    for index in 0..20 {
+        let output = if index % 5 == 0 {
+            daemon.command().arg("doctor").output().unwrap()
+        } else {
+            daemon
+                .command()
+                .args(["daemon", "status"])
+                .output()
+                .unwrap()
+        };
+        if index % 5 != 0 {
+            assert!(output.status.success());
+        }
+    }
+    let attempts_after_polling = fs::read_to_string(clock.join("attempts"))
+        .unwrap()
+        .trim()
+        .parse::<u64>()
+        .unwrap();
+    assert!(attempts_after_polling <= baseline_attempts + 7);
+    wait_until(
+        || {
+            fs::read_to_string(clock.join("attempts"))
+                .ok()
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .is_some_and(|attempts| attempts >= baseline_attempts + 3)
+        },
+        "scheduler did not perform bounded retries",
+    );
+    let attempts = fs::read_to_string(clock.join("attempts"))
+        .unwrap()
+        .trim()
+        .parse::<u64>()
+        .unwrap();
+    assert!(
+        attempts <= baseline_attempts + 7,
+        "retry loop spun: {attempts}"
+    );
+    assert_eq!(
+        fs::read_to_string(clock.join("diagnostics"))
+            .unwrap()
+            .trim(),
+        "1"
+    );
+    assert!(!fs::read_to_string(clock.join("ack")).is_ok_and(|value| value.trim() == "2"));
+    assert_eq!(
+        daemon.client.snapshot().unwrap().scheduler.unwrap().state,
+        protocol::SchedulerState::Offline
+    );
+    let status = daemon
+        .command()
+        .args(["daemon", "status"])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&status.stdout).contains("scheduler offline"));
+    let doctor = daemon.command().arg("doctor").output().unwrap();
+    assert!(
+        String::from_utf8_lossy(&doctor.stderr)
+            .contains("err scheduler: offline; timed schedules are not being evaluated")
+    );
+
+    fs::remove_file(&state_directory).unwrap();
+    fs::rename(&saved_directory, &state_directory).unwrap();
+    let started = Instant::now();
+    daemon.stop_with_cli();
+    assert!(started.elapsed() < Duration::from_secs(1));
 }
 
 #[test]

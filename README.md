@@ -324,11 +324,32 @@ argv through a lazily created schedule-owned shell. Pass `--idempotency-key
 <uuid>` when retrying a request; the same schedule and key always return the same
 execution and never spawn twice. Execution inspection and events omit prompts.
 
+Enabled schedules are evaluated by the daemon in their stored IANA timezone.
+DST gaps are skipped, repeated local minutes fire once, and persisted occurrence
+frontiers prevent duplicates after clock rollback, restart, or graceful handoff.
+Offline periods produce one coalesced missed record rather than catch-up work;
+resuming a paused schedule starts with future occurrences only.
+
+For day-of-month/day-of-week matching, `*` and `*/n` are wildcard-origin. Numeric
+lists and ranges, including full ranges, are restricted; two restricted day
+fields use standard cron OR behavior. Triggers with no occurrence in a full
+Gregorian 400-year cycle are rejected.
+
+Manual and timed decisions skip rather than queue when their schedule, workspace,
+exact continuation session, or daemon-wide capacity is occupied. Configure the
+last bound, from 1 through 64, and apply changes with a graceful restart:
+
+```toml
+[scheduling]
+max_concurrent = 4
+```
+
 OpenCode receives the prompt as the final argument after `--`; Pi receives the
 exact prompt on stdin. Process exit, dispatch failure, cancellation, and cold
-interruption are execution outcomes and never report an Agent as done. This
-release does not evaluate cron triggers or run timers; enabling records consent
-for future timed dispatch but does not itself start work.
+interruption are execution outcomes and never report an Agent as done. Timed
+work runs only while the Boomux daemon and user session are active; inspect
+`boomux daemon status` and `boomux doctor` for scheduler health and sampled
+configuration.
 
 ### Agent Skill
 

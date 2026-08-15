@@ -233,6 +233,15 @@ fn validate_pidfd(descriptor: &OwnedFd, expected_pid: u32) -> io::Result<()> {
 }
 
 fn validate_manifest(manifest: &Manifest) -> io::Result<()> {
+    if manifest.notifications.as_ref().is_some_and(|settings| {
+        !(1..=crate::daemon::MAX_SCHEDULED_EXECUTION_CONCURRENCY)
+            .contains(&settings.max_scheduled_execution_concurrency)
+    }) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "handoff manifest contains an invalid scheduling concurrency limit",
+        ));
+    }
     if manifest
         .runtimes
         .len()
@@ -449,5 +458,32 @@ mod tests {
             serde_json::from_value(serde_json::to_value(manifest).unwrap()).unwrap();
 
         assert_eq!(decoded.focused_terminal, Some(focused_terminal));
+    }
+
+    #[test]
+    fn manifest_rejects_invalid_scheduler_concurrency() {
+        for max_scheduled_execution_concurrency in [0, 65, u16::MAX] {
+            let manifest = Manifest {
+                runtimes: Vec::new(),
+                exited: Vec::new(),
+                event_stream: event_stream(),
+                notifications: Some(NotificationDeliveryConfig {
+                    desktop_enabled: false,
+                    sound_enabled: false,
+                    blocked: true,
+                    completed: true,
+                    blocked_sound: "blocked".into(),
+                    completed_sound: "completed".into(),
+                    resume_agents: true,
+                    persist_terminal_history: false,
+                    max_scheduled_execution_concurrency,
+                }),
+                focused_terminal: None,
+            };
+            assert_eq!(
+                validate_manifest(&manifest).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
     }
 }

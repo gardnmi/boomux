@@ -8,6 +8,8 @@ use serde::Deserialize;
 
 const DEFAULT_PROJECT_SEARCH_DEPTH: usize = 3;
 const MAX_PROJECT_SEARCH_DEPTH: usize = 10;
+const DEFAULT_MAX_SCHEDULED_EXECUTION_CONCURRENCY: u16 = 4;
+const MAX_SCHEDULED_EXECUTION_CONCURRENCY: i64 = 64;
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -17,6 +19,7 @@ struct RawConfig {
     notifications: Option<RawNotificationsConfig>,
     dashboard: Option<RawDashboardConfig>,
     recovery: Option<RawRecoveryConfig>,
+    scheduling: Option<RawSchedulingConfig>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -54,6 +57,12 @@ struct RawDashboardConfig {
 struct RawRecoveryConfig {
     resume_agents: Option<bool>,
     persist_terminal_history: Option<bool>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RawSchedulingConfig {
+    max_concurrent: Option<i64>,
 }
 
 #[derive(Debug)]
@@ -95,7 +104,7 @@ pub(crate) fn load() -> Result<Config, Box<dyn Error>> {
 pub(crate) fn load_notification_settings()
 -> Result<boomux::daemon::NotificationDeliverySettings, Box<dyn Error>> {
     let (raw, _) = load_raw()?;
-    Ok(resolve_daemon_settings(raw.notifications, raw.recovery))
+    resolve_daemon_settings(raw.notifications, raw.recovery, raw.scheduling)
 }
 
 fn load_raw() -> Result<(RawConfig, Option<PathBuf>), Box<dyn Error>> {
@@ -194,6 +203,12 @@ fn merge(base: &mut RawConfig, next: RawConfig) {
             recovery.persist_terminal_history = next_recovery.persist_terminal_history;
         }
     }
+    if let Some(next_scheduling) = next.scheduling {
+        let scheduling = base.scheduling.get_or_insert_default();
+        if next_scheduling.max_concurrent.is_some() {
+            scheduling.max_concurrent = next_scheduling.max_concurrent;
+        }
+    }
 }
 
 fn resolve(raw: RawConfig, path: Option<PathBuf>) -> Result<Config, Box<dyn Error>> {
@@ -224,7 +239,7 @@ fn resolve(raw: RawConfig, path: Option<PathBuf>) -> Result<Config, Box<dyn Erro
         terminal,
         projects: ProjectsConfig { roots, max_depth },
         path,
-        notifications: resolve_daemon_settings(raw.notifications, raw.recovery),
+        notifications: resolve_daemon_settings(raw.notifications, raw.recovery, raw.scheduling)?,
         dashboard: DashboardConfig {
             follow_focused_terminal: raw
                 .dashboard
@@ -239,16 +254,27 @@ fn resolve(raw: RawConfig, path: Option<PathBuf>) -> Result<Config, Box<dyn Erro
 fn resolve_notifications(
     raw: Option<RawNotificationsConfig>,
 ) -> boomux::daemon::NotificationDeliverySettings {
-    resolve_daemon_settings(raw, None)
+    resolve_daemon_settings(raw, None, None).expect("default scheduling config is valid")
 }
 
 fn resolve_daemon_settings(
     notifications: Option<RawNotificationsConfig>,
     recovery: Option<RawRecoveryConfig>,
-) -> boomux::daemon::NotificationDeliverySettings {
+    scheduling: Option<RawSchedulingConfig>,
+) -> Result<boomux::daemon::NotificationDeliverySettings, Box<dyn Error>> {
     let raw = notifications.unwrap_or_default();
     let recovery = recovery.unwrap_or_default();
-    boomux::daemon::NotificationDeliverySettings {
+    let max_concurrent = scheduling
+        .unwrap_or_default()
+        .max_concurrent
+        .unwrap_or(i64::from(DEFAULT_MAX_SCHEDULED_EXECUTION_CONCURRENCY));
+    if !(1..=MAX_SCHEDULED_EXECUTION_CONCURRENCY).contains(&max_concurrent) {
+        return Err(ConfigError(format!(
+            "scheduling.max_concurrent must be between 1 and {MAX_SCHEDULED_EXECUTION_CONCURRENCY}"
+        ))
+        .into());
+    }
+    Ok(boomux::daemon::NotificationDeliverySettings {
         desktop: boomux::daemon::NotificationSettings {
             enabled: raw.enabled.unwrap_or(false),
             blocked: raw.blocked.unwrap_or(true),
@@ -265,7 +291,8 @@ fn resolve_daemon_settings(
         }),
         resume_agents: recovery.resume_agents.unwrap_or(true),
         persist_terminal_history: recovery.persist_terminal_history.unwrap_or(false),
-    }
+        max_scheduled_execution_concurrency: max_concurrent as u16,
+    })
 }
 
 fn expand_root(root: &str) -> Result<PathBuf, Box<dyn Error>> {
@@ -448,7 +475,7 @@ mod tests {
 
     #[test]
     fn recovery_settings_default_and_merge_per_field() {
-        let defaults = resolve_daemon_settings(None, None);
+        let defaults = resolve_daemon_settings(None, None, None).unwrap();
         assert!(defaults.resume_agents);
         assert!(!defaults.persist_terminal_history);
 
@@ -458,7 +485,8 @@ mod tests {
         let next: RawConfig = toml::from_str("[recovery]\nresume_agents = true").unwrap();
         merge(&mut base, next);
 
-        let settings = resolve_daemon_settings(base.notifications, base.recovery);
+        let settings =
+            resolve_daemon_settings(base.notifications, base.recovery, base.scheduling).unwrap();
         assert!(settings.resume_agents);
         assert!(settings.persist_terminal_history);
         assert!(toml::from_str::<RawConfig>("[recovery]\nunknown = true").is_err());
@@ -491,6 +519,7 @@ mod tests {
                 },
                 resume_agents: true,
                 persist_terminal_history: false,
+                max_scheduled_execution_concurrency: 4,
             }
         );
     }
@@ -509,5 +538,32 @@ mod tests {
         .unwrap();
         assert!(resolve(raw.clone(), None).is_err());
         assert!(resolve_notifications(raw.notifications).desktop.enabled);
+    }
+
+    #[test]
+    fn scheduling_concurrency_defaults_layers_and_rejects_invalid_values() {
+        assert_eq!(
+            resolve(RawConfig::default(), None)
+                .unwrap()
+                .notifications
+                .max_scheduled_execution_concurrency,
+            4
+        );
+        let mut base: RawConfig = toml::from_str("[scheduling]\nmax_concurrent = 2").unwrap();
+        let next: RawConfig = toml::from_str("[scheduling]\nmax_concurrent = 9").unwrap();
+        merge(&mut base, next);
+        assert_eq!(
+            resolve(base, None)
+                .unwrap()
+                .notifications
+                .max_scheduled_execution_concurrency,
+            9
+        );
+        for value in [0, -1, 65] {
+            let raw: RawConfig =
+                toml::from_str(&format!("[scheduling]\nmax_concurrent = {value}")).unwrap();
+            assert!(resolve(raw, None).is_err());
+        }
+        assert!(toml::from_str::<RawConfig>("[scheduling]\nunknown = 1").is_err());
     }
 }

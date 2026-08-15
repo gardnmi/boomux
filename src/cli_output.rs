@@ -123,6 +123,13 @@ pub(crate) struct ScheduleData {
     pub(crate) updated_at_ms: u64,
     pub(crate) evaluation_frontier_ms: u64,
     pub(crate) execution_shell_id: Option<String>,
+    pub(crate) next_occurrence: Option<ScheduledOccurrenceData>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct ScheduledOccurrenceData {
+    pub(crate) trigger_revision: u64,
+    pub(crate) scheduled_at_ms: u64,
 }
 
 #[derive(Serialize)]
@@ -144,6 +151,8 @@ pub(crate) struct ExecutionData {
     pub(crate) prompt_revision: u64,
     pub(crate) trigger_revision: u64,
     pub(crate) requested_at_ms: u64,
+    pub(crate) scheduled_at_ms: Option<u64>,
+    pub(crate) coalesced_through_ms: Option<u64>,
     pub(crate) started_at_ms: Option<u64>,
     pub(crate) ended_at_ms: Option<u64>,
     pub(crate) cwd: String,
@@ -338,6 +347,7 @@ pub(crate) fn execution(execution: &ScheduledExecutionSnapshot) -> ExecutionData
         workspace_id: execution.workspace_id.clone(),
         schedule_id: execution.schedule_id.clone(),
         state: match execution.state {
+            boomux::protocol::ScheduledExecutionState::Skipped => "skipped",
             boomux::protocol::ScheduledExecutionState::Claimed => "claimed",
             boomux::protocol::ScheduledExecutionState::Starting => "starting",
             boomux::protocol::ScheduledExecutionState::Active => "active",
@@ -346,18 +356,30 @@ pub(crate) fn execution(execution: &ScheduledExecutionSnapshot) -> ExecutionData
             boomux::protocol::ScheduledExecutionState::Cancelled => "cancelled",
             boomux::protocol::ScheduledExecutionState::Interrupted => "interrupted",
         },
-        dispatch_kind: "manual",
+        dispatch_kind: match execution.dispatch_kind {
+            boomux::protocol::ScheduledExecutionDispatchKind::Manual => "manual",
+            boomux::protocol::ScheduledExecutionDispatchKind::Timed => "timed",
+        },
         dispatch_key: execution.dispatch_key.clone(),
         schedule_revision: execution.schedule_revision,
         prompt_revision: execution.prompt_revision,
         trigger_revision: execution.trigger_revision,
         requested_at_ms: execution.requested_at_ms,
+        scheduled_at_ms: execution.scheduled_at_ms,
+        coalesced_through_ms: execution.coalesced_through_ms,
         started_at_ms: execution.started_at_ms,
         ended_at_ms: execution.ended_at_ms,
         cwd: execution.cwd.display().to_string(),
         integration: execution.integration.clone(),
         session: execution.session.clone(),
         reason: execution.reason.map(|reason| match reason {
+            ScheduledExecutionReason::Overlap => "overlap",
+            ScheduledExecutionReason::ActiveSession => "active_session",
+            ScheduledExecutionReason::WorkspaceCapacity => "workspace_capacity",
+            ScheduledExecutionReason::GlobalCapacity => "global_capacity",
+            ScheduledExecutionReason::Missed => "missed",
+            ScheduledExecutionReason::PausedRace => "paused_race",
+            ScheduledExecutionReason::InvalidTarget => "invalid_target",
             ScheduledExecutionReason::RunnerStartFailed => "runner_start_failed",
             ScheduledExecutionReason::HostSpawnFailed => "host_spawn_failed",
             ScheduledExecutionReason::CancelledByUser => "cancelled_by_user",
@@ -412,6 +434,12 @@ pub(crate) fn schedule(
         updated_at_ms: schedule.updated_at_ms,
         evaluation_frontier_ms: schedule.evaluation_frontier_ms,
         execution_shell_id: schedule.execution_shell_id.clone(),
+        next_occurrence: schedule.next_occurrence.as_ref().map(|occurrence| {
+            ScheduledOccurrenceData {
+                trigger_revision: occurrence.trigger_revision,
+                scheduled_at_ms: occurrence.scheduled_at_ms,
+            }
+        }),
     }
 }
 
@@ -751,6 +779,7 @@ mod tests {
             updated_at_ms: 11,
             evaluation_frontier_ms: 11,
             execution_shell_id: None,
+            next_occurrence: None,
         };
         let private = "private prompt contents\n";
 
