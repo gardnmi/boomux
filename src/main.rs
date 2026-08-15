@@ -729,6 +729,8 @@ enum ExecutionCommands {
         #[arg(long, default_value_t = 30_000)]
         wait_ms: u32,
     },
+    /// Open an execution's exact active run or linked Agent Session
+    Open { execution_id: String },
     /// Cancel one nonterminal execution by exact ID
     Cancel { execution_id: String },
 }
@@ -1052,6 +1054,7 @@ command_keys! {
     ExecutionList => ("execution.list", Json),
     ExecutionInspect => ("execution.inspect", Json),
     ExecutionWait => ("execution.wait", Json),
+    ExecutionOpen => ("execution.open", Json),
     ExecutionCancel => ("execution.cancel", Json),
     Skill => ("skill", HumanOnly),
     Opencode => ("opencode", HumanOnly),
@@ -1156,6 +1159,9 @@ impl Cli {
             Some(Commands::Execution {
                 command: ExecutionCommands::Wait { .. },
             }) => CommandKey::ExecutionWait,
+            Some(Commands::Execution {
+                command: ExecutionCommands::Open { .. },
+            }) => CommandKey::ExecutionOpen,
             Some(Commands::Execution {
                 command: ExecutionCommands::Cancel { .. },
             }) => CommandKey::ExecutionCancel,
@@ -1412,7 +1418,9 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
         }) => test_notification(reason),
         Some(Commands::Session { command }) => session_command(command, cli.json),
         Some(Commands::Schedule { command }) => schedule_command(command, cli.json),
-        Some(Commands::Execution { command }) => execution_command(command, cli.json),
+        Some(Commands::Execution { command }) => {
+            execution_command(command, cli.json, cli.terminal.as_deref())
+        }
         Some(Commands::Integration { command }) => integration_command(command, cli.json),
         Some(Commands::Skill {
             command: SkillCommands::Install { force },
@@ -1764,23 +1772,10 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
                 let result = cancel_dashboard_execution(&client, &execution_id);
                 tui::DashboardEvent::OperationCompleted(result)
             }
-            tui::DashboardEffect::OpenScheduledExecution {
-                execution_id,
-                shell_id,
-                run_id,
-            } => {
-                let result = open_dashboard_execution(
-                    &client,
-                    &execution_id,
-                    &shell_id,
-                    &run_id,
-                    terminal.as_deref(),
-                );
-                tui::DashboardEvent::OperationCompleted(result)
-            }
-            tui::DashboardEffect::OpenAgentSession { session_id } => {
-                let result =
-                    open_dashboard_agent_session(&client, &session_id, terminal.as_deref());
+            tui::DashboardEffect::OpenScheduledExecution { execution_id } => {
+                let result = open_scheduled_execution(&client, &execution_id, terminal.as_deref())
+                    .map(|opened| opened.message)
+                    .map_err(|error| error.to_string());
                 tui::DashboardEvent::OperationCompleted(result)
             }
             tui::DashboardEffect::RemoveSchedule(schedule_id) => {
@@ -1962,44 +1957,121 @@ fn cancel_dashboard_execution(
         .map_err(|error| error.to_string())
 }
 
-fn open_dashboard_execution(
+struct OpenedScheduledExecution {
+    execution: ScheduledExecutionSnapshot,
+    target: &'static str,
+    message: String,
+}
+
+#[derive(Debug)]
+enum ScheduledExecutionOpenTarget<'a> {
+    Run { shell_id: &'a str, run_id: &'a str },
+    Session { agent_id: &'a str },
+}
+
+fn scheduled_execution_open_target(
+    execution: &ScheduledExecutionSnapshot,
+) -> Result<ScheduledExecutionOpenTarget<'_>, (&'static str, &'static str)> {
+    if matches!(
+        execution.state,
+        protocol::ScheduledExecutionState::Starting | protocol::ScheduledExecutionState::Active
+    ) {
+        let shell_id = execution
+            .shell_id
+            .as_deref()
+            .ok_or(("busy", "scheduled execution has no exact retained shell"))?;
+        let run_id = execution
+            .run_id
+            .as_deref()
+            .ok_or(("busy", "scheduled execution has no exact retained run"))?;
+        return Ok(ScheduledExecutionOpenTarget::Run { shell_id, run_id });
+    }
+    execution
+        .agent_id
+        .as_deref()
+        .map(|agent_id| ScheduledExecutionOpenTarget::Session { agent_id })
+        .ok_or((
+            "not_found",
+            "scheduled execution has no exact linked Agent Session to open",
+        ))
+}
+
+fn open_scheduled_execution(
     client: &client::Client,
     execution_id: &str,
-    shell_id: &str,
-    run_id: &str,
     terminal: Option<&str>,
-) -> Result<String, String> {
-    if !client
-        .supports(protocol::ProtocolFeature::ExactRunAttachment)
-        .map_err(|error| error.to_string())?
-    {
-        return Err(
-            "Opening exact Scheduled Execution runs requires daemon protocol 26; upgrade and restart Boomux"
-                .into(),
-        );
+) -> Result<OpenedScheduledExecution, Box<dyn Error>> {
+    let execution = client.get_scheduled_execution(execution_id)?;
+    let target = scheduled_execution_open_target(&execution)
+        .map_err(|(code, message)| cli_output::failure(code, message))?;
+    if let ScheduledExecutionOpenTarget::Run { shell_id, run_id } = target {
+        if !client.supports(protocol::ProtocolFeature::ExactRunAttachment)? {
+            return Err(cli_output::failure(
+                "unsupported_version",
+                "opening exact Scheduled Execution runs requires daemon protocol 26; upgrade and restart Boomux",
+            ));
+        }
+        let shell = client.get_shell(shell_id)?;
+        validate_dashboard_execution_open(&execution, &shell, shell_id, run_id)
+            .map_err(|message| cli_output::failure("busy", message))?;
+        let workspace = client.get_workspace(&execution.workspace_id)?;
+        terminal::open_exact_run(
+            terminal,
+            shell_id,
+            run_id,
+            &format!("{} - {}", workspace.name, shell.name),
+            true,
+        )?;
+        return Ok(OpenedScheduledExecution {
+            message: format!(
+                "Opened exact execution {} from schedule {}",
+                execution.id, execution.schedule_id
+            ),
+            execution,
+            target: "run",
+        });
     }
-    let execution = client
-        .get_scheduled_execution(execution_id)
-        .map_err(|error| error.to_string())?;
-    let shell = client
-        .get_shell(shell_id)
-        .map_err(|error| error.to_string())?;
-    validate_dashboard_execution_open(&execution, &shell, shell_id, run_id)?;
-    let workspace = client
-        .get_workspace(&execution.workspace_id)
-        .map_err(|error| error.to_string())?;
-    terminal::open_exact_run(
+
+    let ScheduledExecutionOpenTarget::Session { agent_id } = target else {
+        unreachable!("run targets return after opening")
+    };
+    let snapshot = client.snapshot()?;
+    let catalog = discover_host_catalog(&snapshot.workspaces);
+    let sessions = session_projection::project_snapshot_with_catalog(&snapshot, Some(&catalog));
+    let session = sessions
+        .iter()
+        .find(|session| {
+            session.workspace_id == execution.workspace_id
+                && session
+                    .occurrences
+                    .iter()
+                    .any(|occurrence| occurrence.agent_id == agent_id)
+        })
+        .ok_or_else(|| {
+            cli_output::failure(
+                "not_found",
+                "scheduled execution's exact linked Agent Session is no longer available",
+            )
+        })?;
+    let (cwd, command) = dashboard_session_resume_plan(session)
+        .map_err(|message| cli_output::failure("invalid_argument", message))?;
+    terminal::open_command(
         terminal,
-        shell_id,
-        run_id,
-        &format!("{} - {}", workspace.name, shell.name),
-        true,
-    )
-    .map_err(|error| error.to_string())?;
-    Ok(format!(
-        "Opened exact execution {} from schedule {}",
-        execution.id, execution.schedule_id
-    ))
+        &cwd,
+        &format!(
+            "{} - {} session",
+            session.workspace_name, session.integration
+        ),
+        &command,
+    )?;
+    Ok(OpenedScheduledExecution {
+        message: format!(
+            "Opened exact {} Agent Session for execution {}",
+            session.integration, execution.id
+        ),
+        execution,
+        target: "session",
+    })
 }
 
 fn validate_dashboard_execution_open(
@@ -2036,34 +2108,6 @@ fn validate_dashboard_execution_open(
         );
     }
     Ok(())
-}
-
-fn open_dashboard_agent_session(
-    client: &client::Client,
-    session_id: &str,
-    terminal: Option<&str>,
-) -> Result<String, String> {
-    let snapshot = client.snapshot().map_err(|error| error.to_string())?;
-    let catalog = discover_host_catalog(&snapshot.workspaces);
-    let sessions = session_projection::project_snapshot_with_catalog(&snapshot, Some(&catalog));
-    let session = session_projection::resolve_exact(&sessions, session_id).map_err(|error| {
-        format!("exact Agent Session is no longer available ({error:?}); refresh and try again")
-    })?;
-    let (cwd, command) = dashboard_session_resume_plan(session)?;
-    terminal::open_command(
-        terminal,
-        &cwd,
-        &format!(
-            "{} - {} session",
-            session.workspace_name, session.integration
-        ),
-        &command,
-    )
-    .map_err(|error| error.to_string())?;
-    Ok(format!(
-        "Opened exact {} Agent Session in an external terminal for {}",
-        session.integration, session.workspace_name
-    ))
 }
 
 fn dashboard_session_resume_plan(
@@ -3988,7 +4032,11 @@ fn schedule_command(command: ScheduleCommands, json: bool) -> Result<(), Box<dyn
     }
 }
 
-fn execution_command(command: ExecutionCommands, json: bool) -> Result<(), Box<dyn Error>> {
+fn execution_command(
+    command: ExecutionCommands,
+    json: bool,
+    terminal: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
     let client = client::connect_or_start()?;
     let feature = protocol::ProtocolFeature::ScheduledExecutions;
     if !feature.is_supported_by(client.protocol_version()?) {
@@ -4131,6 +4179,20 @@ fn execution_command(command: ExecutionCommands, json: bool) -> Result<(), Box<d
             }
             println!("Changed: {}", waited.changed);
             print_execution(CommandKey::ExecutionWait, &waited.execution, false)
+        }
+        ExecutionCommands::Open { execution_id } => {
+            let opened = open_scheduled_execution(&client, &execution_id, terminal)?;
+            if json {
+                return print_json(
+                    CommandKey::ExecutionOpen,
+                    serde_json::json!({
+                        "execution": cli_output::execution(&opened.execution),
+                        "target": opened.target,
+                    }),
+                );
+            }
+            println!("{}", opened.message);
+            Ok(())
         }
         ExecutionCommands::Cancel { execution_id } => {
             let execution = client.cancel_scheduled_execution(execution_id)?;
@@ -8085,55 +8147,38 @@ mod tests {
     }
 
     #[test]
-    fn protocol_25_rejects_exact_execution_open_before_backend_lookup_or_launch() {
-        let directory =
-            env::temp_dir().join(format!("boomux-dashboard-open-v25-{}", Uuid::new_v4()));
-        fs::create_dir_all(&directory).unwrap();
-        let socket = directory.join("daemon.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
-        let server = thread::spawn(move || {
-            for expected_version in [27, 26, 25] {
-                let (mut stream, _) = listener.accept().unwrap();
-                let request: protocol::Envelope<protocol::Request> =
-                    protocol::read_message(&mut stream).unwrap();
-                assert_eq!(request.version, expected_version);
-                assert!(matches!(request.message, protocol::Request::Ping));
-                let response = if expected_version > 25 {
-                    protocol::Response::Error {
-                        message: format!(
-                            "protocol version {expected_version} is unsupported; expected 25"
-                        ),
-                        code: Some(protocol::ErrorCode::UnsupportedVersion),
-                    }
-                } else {
-                    protocol::Response::Pong
-                };
-                protocol::write_message(
-                    &mut stream,
-                    &protocol::Envelope::with_version(expected_version.min(25), response),
-                )
-                .unwrap();
-            }
-            listener.set_nonblocking(true).unwrap();
-            thread::sleep(Duration::from_millis(50));
-            assert!(
-                matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
-            );
-        });
-        let client = client::Client::from_socket_path(socket);
+    fn execution_open_target_uses_exact_run_or_linked_agent_identity() {
+        let mut execution = scheduled_execution("execution-1", "schedule-1");
+        execution.shell_id = Some("schedule-shell".into());
+        execution.run_id = Some("schedule-run".into());
+        assert!(matches!(
+            scheduled_execution_open_target(&execution),
+            Ok(ScheduledExecutionOpenTarget::Run {
+                shell_id: "schedule-shell",
+                run_id: "schedule-run"
+            })
+        ));
 
-        let error = open_dashboard_execution(
-            &client,
-            "execution-1",
-            "schedule-shell",
-            "schedule-run",
-            None,
-        )
-        .unwrap_err();
-        assert!(error.contains("protocol 26"));
-        assert!(error.contains("upgrade and restart"));
-        server.join().unwrap();
-        fs::remove_dir_all(directory).unwrap();
+        execution.run_id = None;
+        assert_eq!(
+            scheduled_execution_open_target(&execution).unwrap_err().0,
+            "busy"
+        );
+
+        execution.state = protocol::ScheduledExecutionState::Exited;
+        execution.agent_id = Some("agent-1".into());
+        assert!(matches!(
+            scheduled_execution_open_target(&execution),
+            Ok(ScheduledExecutionOpenTarget::Session {
+                agent_id: "agent-1"
+            })
+        ));
+
+        execution.agent_id = None;
+        assert_eq!(
+            scheduled_execution_open_target(&execution).unwrap_err().0,
+            "not_found"
+        );
     }
 
     #[test]
@@ -8592,6 +8637,7 @@ mod tests {
             vec!["boomux", "schedule", "pause", "id", "--json"],
             vec!["boomux", "schedule", "resume", "id", "--json"],
             vec!["boomux", "schedule", "remove", "id", "--json"],
+            vec!["boomux", "execution", "open", "execution-id", "--json"],
         ] {
             assert_eq!(
                 Cli::try_parse_from(arguments)
@@ -8859,6 +8905,7 @@ mod tests {
                 "execution.list",
                 "execution.inspect",
                 "execution.wait",
+                "execution.open",
                 "execution.cancel",
                 "daemon.status",
             ]

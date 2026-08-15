@@ -408,7 +408,9 @@ launches the integration's exact interactive resume argv in an unmanaged native
 terminal at its retained working directory. It does not create an ordinary
 workspace shell or reuse the schedule-owned shell. An already-current managed
 session, permanently Done session, missing working directory, or unsupported
-integration is rejected.
+integration is rejected. The dashboard and external clients share this exact-ID
+operation through `boomux execution open <execution-id>`; callers never supply
+or infer runner-shell, run, Agent, or external-session IDs.
 Cancel requires confirmation and backend revalidation. Removal also requires
 confirmation.
 Protocol-25 dashboards retain schedule controls and bounded history but disable
