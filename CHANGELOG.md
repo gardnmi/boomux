@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.15.0](https://github.com/gardnmi/boomux/compare/v0.14.2...v0.15.0) (2026-08-15)
+
+
+### Features
+
+* generate names for unnamed shells and agents ([#162](https://github.com/gardnmi/boomux/issues/162)) ([9dc1b42](https://github.com/gardnmi/boomux/commit/9dc1b421ddbbd18ec584e7270cae59b60e971f11))
+* **tui:** add animated bomb intro ([#159](https://github.com/gardnmi/boomux/issues/159)) ([85f3d4c](https://github.com/gardnmi/boomux/commit/85f3d4cb2e30b7f72425bad556bbfdcb57df3fa9))
+
 ## [0.14.2](https://github.com/gardnmi/boomux/compare/v0.14.1...v0.14.2) (2026-08-14)
 
 
