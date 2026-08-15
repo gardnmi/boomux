@@ -6,7 +6,9 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
+use ratatui::widgets::canvas::{Canvas, Circle, Line as CanvasLine};
 use ratatui::widgets::{
     Block, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState, Wrap,
 };
@@ -24,6 +26,21 @@ const GREEN: Color = Color::Green;
 const YELLOW: Color = Color::Yellow;
 const RED: Color = Color::Red;
 const UPDATE_CHECK_INTERVAL: Duration = Duration::from_millis(250);
+const INTRO_POLL_INTERVAL: Duration = Duration::from_millis(16);
+const FUSE_FRAME_DURATION: Duration = Duration::from_millis(40);
+const EXPLOSION_FRAME_DURATION: Duration = Duration::from_millis(40);
+const HOP_FRAME_COUNT: usize = 24;
+const FUSE_FRAME_COUNT: usize = 51;
+const EXPLOSION_FRAME_COUNT: usize = 60;
+const FIREBALL_FRAME_COUNT: usize = 10;
+const WORD_DISPERSE_START: usize = 48;
+const BOOMUX_SMOKE: [&str; 5] = [
+    "####. .###. .###. #...# #...# #...#",
+    "#...# #...# #...# ##.## #...# .#.#.",
+    "####. #...# #...# #.#.# #...# ..#..",
+    "#...# #...# #...# #...# #...# .#.#.",
+    "####. .###. .###. #...# .###. #...#",
+];
 const TERMINAL_PREVIEW_ROWS: usize = 16;
 const TERMINAL_PREVIEW_SCROLL_STEP: usize = 12;
 const PREVIEW_RESERVED_ITEM_HEIGHT: u16 = 6;
@@ -47,6 +64,76 @@ const SHELL_TABLE_HEADERS: [&str; 8] = [
     "WORKTREE",
 ];
 const ITEM_TABLE_HEADERS: [&str; 6] = ["KIND", "STATUS", "NAME", "ACTIVITY", "BRANCH", "WORKTREE"];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BombAnimationFrame {
+    Fuse(usize),
+    Explosion(usize),
+    Finished,
+}
+
+fn bomb_animation_frame(elapsed: Duration) -> BombAnimationFrame {
+    let fuse_duration = FUSE_FRAME_DURATION * FUSE_FRAME_COUNT as u32;
+    if elapsed < fuse_duration {
+        return BombAnimationFrame::Fuse(
+            (elapsed.as_millis() / FUSE_FRAME_DURATION.as_millis()) as usize,
+        );
+    }
+
+    let explosion_elapsed = elapsed - fuse_duration;
+    let explosion = (explosion_elapsed.as_millis() / EXPLOSION_FRAME_DURATION.as_millis()) as usize;
+    if explosion < EXPLOSION_FRAME_COUNT {
+        BombAnimationFrame::Explosion(explosion)
+    } else {
+        BombAnimationFrame::Finished
+    }
+}
+
+fn fuse_burn_progress(stage: usize) -> f64 {
+    stage.saturating_sub(HOP_FRAME_COUNT).min(26) as f64 / 26.0
+}
+
+fn hop_height(progress: f64) -> f64 {
+    if progress < 0.55 {
+        (progress / 0.55 * std::f64::consts::PI).sin() * 7.0
+    } else {
+        ((progress - 0.55) / 0.45 * std::f64::consts::PI).sin() * 3.5
+    }
+}
+
+fn smoke_word_lines(stage: usize) -> Vec<Line<'static>> {
+    let disperse = stage
+        .saturating_sub(WORD_DISPERSE_START)
+        .min(EXPLOSION_FRAME_COUNT - WORD_DISPERSE_START) as f64
+        / (EXPLOSION_FRAME_COUNT - WORD_DISPERSE_START) as f64;
+    BOOMUX_SMOKE
+        .iter()
+        .enumerate()
+        .map(|(row, line)| {
+            let text = line
+                .chars()
+                .enumerate()
+                .map(|(column, cell)| {
+                    if cell != '#' {
+                        return ' ';
+                    }
+                    let vanishes_at = 0.35 + ((row * 17 + column * 11) % 60) as f64 / 100.0;
+                    if disperse > vanishes_at {
+                        ' '
+                    } else if (row + column + stage / 3).is_multiple_of(4) {
+                        '▒'
+                    } else {
+                        '▓'
+                    }
+                })
+                .collect::<String>();
+            Line::styled(
+                text,
+                Style::new().fg(Color::Gray).add_modifier(Modifier::BOLD),
+            )
+        })
+        .collect()
+}
 
 pub(crate) struct WorkspaceView {
     pub(crate) id: String,
@@ -1840,6 +1927,7 @@ pub(crate) fn run<B: DashboardBackend>(
     state: DashboardState,
     follow_focused_terminal: bool,
     project_context: ProjectContext,
+    play_intro: bool,
     backend: B,
 ) -> io::Result<()> {
     let mut terminal = ratatui::init();
@@ -1847,9 +1935,30 @@ pub(crate) fn run<B: DashboardBackend>(
     if follow_focused_terminal {
         app.enable_focus_following(state.focused_terminal.as_ref());
     }
-    let result = run_loop(&mut terminal, app, backend);
+    let result = if play_intro {
+        play_bomb_animation(&mut terminal).and_then(|()| run_loop(&mut terminal, app, backend))
+    } else {
+        run_loop(&mut terminal, app, backend)
+    };
     ratatui::restore();
     result
+}
+
+fn play_bomb_animation(terminal: &mut ratatui::DefaultTerminal) -> io::Result<()> {
+    let started = Instant::now();
+    loop {
+        let animation_frame = bomb_animation_frame(started.elapsed());
+        if animation_frame == BombAnimationFrame::Finished {
+            return Ok(());
+        }
+        terminal.draw(|frame| render_bomb_animation(frame, animation_frame))?;
+
+        if event::poll(INTRO_POLL_INTERVAL)?
+            && matches!(event::read()?, Event::Key(key) if key.kind == KeyEventKind::Press)
+        {
+            return Ok(());
+        }
+    }
 }
 
 fn run_loop<B: DashboardBackend>(
@@ -2176,6 +2285,258 @@ fn render(frame: &mut Frame, app: &mut App) {
         Mode::Palette(palette) => render_command_palette(frame, area, palette),
         Mode::Help => render_help_overlay(frame, area, app),
         Mode::Normal | Mode::Rename { .. } => {}
+    }
+}
+
+fn render_bomb_animation(frame: &mut Frame, animation_frame: BombAnimationFrame) {
+    let area = frame.area();
+    frame.render_widget(Block::new().style(Style::new().bg(BASE)), area);
+
+    let width = area.width.min(72);
+    let height = area.height.min(30);
+    let animation_area = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    let canvas_height = height.saturating_sub(1);
+    let canvas_area = Rect::new(
+        animation_area.x,
+        animation_area.y,
+        animation_area.width,
+        canvas_height,
+    );
+    match animation_frame {
+        BombAnimationFrame::Fuse(stage) => render_lit_bomb(frame, canvas_area, stage),
+        BombAnimationFrame::Explosion(stage) => render_explosion(frame, canvas_area, stage),
+        BombAnimationFrame::Finished => {}
+    }
+    if height > 0 {
+        let footer_area = Rect::new(
+            animation_area.x,
+            animation_area.y + canvas_height,
+            animation_area.width,
+            1,
+        );
+        frame.render_widget(
+            Paragraph::new("press any key to skip")
+                .style(Style::new().fg(SUBTEXT))
+                .centered(),
+            footer_area,
+        );
+    }
+}
+
+fn render_lit_bomb(frame: &mut Frame, area: Rect, stage: usize) {
+    let progress = fuse_burn_progress(stage);
+    let hopping = stage < HOP_FRAME_COUNT;
+    let hop_progress = stage.min(HOP_FRAME_COUNT - 1) as f64 / (HOP_FRAME_COUNT - 1) as f64;
+    let canvas = Canvas::default()
+        .marker(Marker::Braille)
+        .x_bounds([-45.0, 45.0])
+        .y_bounds([-30.0, 35.0])
+        .paint(move |ctx| {
+            let wave = (progress * std::f64::consts::TAU * 1.45).sin();
+            let body_x = if hopping {
+                43.0 * (1.0 - hop_progress)
+            } else {
+                wave * 2.8 * (1.0 - progress * 0.45)
+            };
+            let bob = if !hopping {
+                wave.abs()
+            } else {
+                hop_height(hop_progress)
+            };
+            let swallow = ((progress - 0.82) / 0.18).clamp(0.0, 1.0);
+            let squeeze = swallow * swallow;
+            let radius_x = 12.5 + squeeze * 1.8;
+            let radius_y = 12.5 - squeeze * 2.8;
+            let center_y = -10.0 + bob - squeeze;
+            let rotation = if hopping { 0.0 } else { wave * 0.12 };
+            let rotate = |x: f64, y: f64| {
+                (
+                    body_x + x * rotation.cos() - y * rotation.sin(),
+                    center_y + x * rotation.sin() + y * rotation.cos(),
+                )
+            };
+
+            let outline = (0..=64)
+                .map(|index| {
+                    let angle = index as f64 / 64.0 * std::f64::consts::TAU;
+                    (
+                        body_x + angle.cos() * radius_x,
+                        center_y + angle.sin() * radius_y,
+                    )
+                })
+                .collect::<Vec<_>>();
+            for points in outline.windows(2) {
+                ctx.draw(&CanvasLine::new(
+                    points[0].0,
+                    points[0].1,
+                    points[1].0,
+                    points[1].1,
+                    TEAL,
+                ));
+            }
+            for points in outline.windows(2) {
+                let inset = |point: (f64, f64)| {
+                    (
+                        body_x + (point.0 - body_x) * 0.94,
+                        center_y + (point.1 - center_y) * 0.94,
+                    )
+                };
+                let first = inset(points[0]);
+                let second = inset(points[1]);
+                ctx.draw(&CanvasLine::new(first.0, first.1, second.0, second.1, TEAL));
+            }
+
+            let cap = [
+                rotate(-4.0, radius_y - 1.0),
+                rotate(-3.6, radius_y + 3.2),
+                rotate(3.6, radius_y + 3.2),
+                rotate(4.0, radius_y - 1.0),
+                rotate(-4.0, radius_y - 1.0),
+            ];
+            for points in cap.windows(2) {
+                ctx.draw(&CanvasLine::new(
+                    points[0].0,
+                    points[0].1,
+                    points[1].0,
+                    points[1].1,
+                    TEAL,
+                ));
+            }
+
+            let fuse_start = rotate(0.0, radius_y + 3.2);
+            let curve = |t: f64| {
+                let one_minus_t = 1.0 - t;
+                rotate(
+                    2.0 * one_minus_t * t * -5.0 + t * t * -3.0,
+                    radius_y + 3.2 + 2.0 * one_minus_t * t * 6.0 + t * t * 11.0,
+                )
+            };
+            let fuse_end = (1.0 - progress / 0.82).clamp(0.0, 1.0);
+            let mut spark = fuse_start;
+            if progress < 0.82 {
+                let fuse = (0..=16)
+                    .map(|index| curve(fuse_end * index as f64 / 16.0))
+                    .collect::<Vec<_>>();
+                for points in fuse.windows(2) {
+                    ctx.draw(&CanvasLine::new(
+                        points[0].0,
+                        points[0].1,
+                        points[1].0,
+                        points[1].1,
+                        TEAL,
+                    ));
+                }
+                spark = curve(fuse_end);
+            } else if swallow < 1.0 {
+                spark = (body_x, fuse_start.1 + (center_y - fuse_start.1) * swallow);
+            }
+
+            if swallow < 1.0 {
+                let pulse = if stage.is_multiple_of(2) { 2.4 } else { 1.7 };
+                ctx.draw(&Circle {
+                    x: spark.0,
+                    y: spark.1,
+                    radius: pulse,
+                    color: YELLOW,
+                });
+                for angle in [0.0_f64, 0.8, 1.6, 2.4] {
+                    ctx.draw(&CanvasLine::new(
+                        spark.0 + angle.cos() * 1.5,
+                        spark.1 + angle.sin() * 1.5,
+                        spark.0 + angle.cos() * 3.5,
+                        spark.1 + angle.sin() * 3.5,
+                        YELLOW,
+                    ));
+                }
+            }
+
+            let shadow = (0..=30)
+                .map(|index| {
+                    let angle = index as f64 / 30.0 * std::f64::consts::TAU;
+                    (body_x + angle.cos() * 11.0, -23.5 + angle.sin() * 0.9)
+                })
+                .collect::<Vec<_>>();
+            for points in shadow.windows(2) {
+                ctx.draw(&CanvasLine::new(
+                    points[0].0,
+                    points[0].1,
+                    points[1].0,
+                    points[1].1,
+                    SUBTEXT,
+                ));
+            }
+            ctx.layer();
+            for (x, y) in [rotate(-3.0, 3.0), rotate(3.0, 3.0)] {
+                ctx.print(
+                    x,
+                    y,
+                    Span::styled("•", Style::new().fg(TEAL).add_modifier(Modifier::BOLD)),
+                );
+            }
+        });
+    frame.render_widget(canvas, area);
+}
+
+fn render_explosion(frame: &mut Frame, area: Rect, stage: usize) {
+    let canvas = Canvas::default()
+        .marker(Marker::Braille)
+        .x_bounds([-45.0, 45.0])
+        .y_bounds([-30.0, 35.0])
+        .paint(move |ctx| {
+            if !(3..FIREBALL_FRAME_COUNT).contains(&stage) {
+                return;
+            }
+            let cloud = [
+                (-18.0, -4.0, 10.0),
+                (-13.0, 8.0, 12.0),
+                (-4.0, -10.0, 13.0),
+                (-2.0, 3.0, 16.0),
+                (7.0, -8.0, 12.0),
+                (11.0, 5.0, 14.0),
+                (19.0, -1.0, 9.0),
+                (2.0, 15.0, 11.0),
+                (-15.0, 16.0, 8.0),
+                (16.0, 16.0, 7.0),
+            ];
+            let progress = (stage - 2) as f64 / (FIREBALL_FRAME_COUNT - 3) as f64;
+            let scale = 1.0 - (1.0 - progress).powi(3);
+            for (index, (x, y, radius)) in cloud.into_iter().enumerate() {
+                ctx.draw(&Circle {
+                    x: x * scale,
+                    y: y * scale,
+                    radius: radius * scale,
+                    color: if index.is_multiple_of(3) {
+                        YELLOW
+                    } else if index.is_multiple_of(2) {
+                        RED
+                    } else {
+                        Color::Gray
+                    },
+                });
+            }
+        });
+    frame.render_widget(canvas, area);
+
+    if stage >= FIREBALL_FRAME_COUNT {
+        let disperse = stage.saturating_sub(WORD_DISPERSE_START) as f64
+            / (EXPLOSION_FRAME_COUNT - WORD_DISPERSE_START) as f64;
+        let rise = (disperse.clamp(0.0, 1.0) * 3.0) as u16;
+        let word_y = area.y + area.height.saturating_sub(5) / 2;
+        let word_area = Rect::new(
+            area.x,
+            word_y.saturating_sub(rise),
+            area.width,
+            5.min(area.height),
+        );
+        frame.render_widget(
+            Paragraph::new(smoke_word_lines(stage)).centered(),
+            word_area,
+        );
     }
 }
 
@@ -3806,6 +4167,170 @@ mod tests {
 
     fn app() -> App {
         App::new(vec![workspace("w1", "boomux")], project_context())
+    }
+
+    #[test]
+    fn bomb_animation_advances_through_fuse_and_explosion_frames() {
+        assert_eq!(
+            bomb_animation_frame(Duration::ZERO),
+            BombAnimationFrame::Fuse(0)
+        );
+        assert_eq!(
+            bomb_animation_frame(FUSE_FRAME_DURATION - Duration::from_millis(1)),
+            BombAnimationFrame::Fuse(0)
+        );
+        assert_eq!(
+            bomb_animation_frame(FUSE_FRAME_DURATION),
+            BombAnimationFrame::Fuse(1)
+        );
+        assert_eq!(
+            bomb_animation_frame(FUSE_FRAME_DURATION * 13),
+            BombAnimationFrame::Fuse(13)
+        );
+
+        let fuse_duration = FUSE_FRAME_DURATION * FUSE_FRAME_COUNT as u32;
+        assert_eq!(
+            bomb_animation_frame(fuse_duration),
+            BombAnimationFrame::Explosion(0)
+        );
+        assert_eq!(
+            bomb_animation_frame(fuse_duration + EXPLOSION_FRAME_DURATION * 10),
+            BombAnimationFrame::Explosion(10)
+        );
+        assert_eq!(
+            bomb_animation_frame(
+                fuse_duration + EXPLOSION_FRAME_DURATION * EXPLOSION_FRAME_COUNT as u32
+            ),
+            BombAnimationFrame::Finished
+        );
+    }
+
+    #[test]
+    fn fuse_burns_along_its_path_toward_the_bomb() {
+        assert_eq!(fuse_burn_progress(0), 0.0);
+        assert_eq!(fuse_burn_progress(HOP_FRAME_COUNT - 1), 0.0);
+        assert_eq!(fuse_burn_progress(FUSE_FRAME_COUNT - 1), 1.0);
+        assert!(fuse_burn_progress(30) < fuse_burn_progress(45));
+    }
+
+    #[test]
+    fn entrance_uses_two_upright_diminishing_hops() {
+        assert!(hop_height(0.275) > hop_height(0.775));
+        assert!(hop_height(0.275) > 6.5);
+        assert!(hop_height(0.775) > 3.0);
+        assert!(hop_height(0.0).abs() < 1e-12);
+        assert!(hop_height(1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn smoke_wordmark_is_a_clear_filled_five_row_glyph() {
+        let lines = smoke_word_lines(FIREBALL_FRAME_COUNT);
+        let text = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert_eq!(lines.len(), BOOMUX_SMOKE.len());
+        assert!(
+            text.chars()
+                .filter(|cell| matches!(cell, '▓' | '▒'))
+                .count()
+                > 60
+        );
+        assert!(!text.contains('○'));
+    }
+
+    #[test]
+    fn bomb_animation_now_lasts_long_enough_to_read() {
+        let duration = FUSE_FRAME_DURATION * FUSE_FRAME_COUNT as u32
+            + EXPLOSION_FRAME_DURATION * EXPLOSION_FRAME_COUNT as u32;
+        assert!(duration >= Duration::from_secs(4));
+    }
+
+    #[test]
+    fn bomb_animation_renders_centered_at_common_terminal_size() {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+        terminal
+            .draw(|frame| render_bomb_animation(frame, BombAnimationFrame::Fuse(HOP_FRAME_COUNT)))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let text: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
+        assert_eq!(text.matches('•').count(), 2);
+        assert!(text.contains("press any key to skip"));
+        let non_blank_cells = buffer
+            .content()
+            .iter()
+            .filter(|cell| cell.symbol() != " ")
+            .count();
+        assert!(
+            non_blank_cells > 60,
+            "bomb should remain visible without dominating the terminal"
+        );
+    }
+
+    #[test]
+    fn explosion_renders_blast_then_smoke() {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+        terminal
+            .draw(|frame| render_bomb_animation(frame, BombAnimationFrame::Explosion(8)))
+            .unwrap();
+        let blast_cells = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .filter(|cell| cell.symbol() != " ")
+            .count();
+
+        terminal
+            .draw(|frame| render_bomb_animation(frame, BombAnimationFrame::Explosion(20)))
+            .unwrap();
+        let smoke_cells = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .filter(|cell| cell.symbol() != " ")
+            .count();
+
+        terminal
+            .draw(|frame| render_bomb_animation(frame, BombAnimationFrame::Explosion(59)))
+            .unwrap();
+        let dispersed_cells = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .filter(|cell| cell.symbol() != " ")
+            .count();
+
+        assert!(blast_cells > 70);
+        assert!(smoke_cells > 70);
+        assert!(dispersed_cells < smoke_cells);
+    }
+
+    #[test]
+    fn fireball_cuts_directly_to_the_smoke_wordmark() {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+        terminal
+            .draw(|frame| {
+                render_bomb_animation(frame, BombAnimationFrame::Explosion(FIREBALL_FRAME_COUNT))
+            })
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+
+        assert!(text.contains('▓'));
     }
 
     fn project_context() -> ProjectContext {
