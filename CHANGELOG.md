@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.17.0](https://github.com/gardnmi/boomux/compare/v0.16.0...v0.17.0) (2026-08-15)
+
+
+### Features
+
+* **cli:** expose discovered projects ([#170](https://github.com/gardnmi/boomux/issues/170)) ([8018f9d](https://github.com/gardnmi/boomux/commit/8018f9d35fff63ea484c32b3776cd35006cf8e0e))
+* **cli:** open scheduled executions exactly ([#168](https://github.com/gardnmi/boomux/issues/168)) ([66f3cfc](https://github.com/gardnmi/boomux/commit/66f3cfc0f93b8464a7e279be1238552f109c27c2))
+
 ## [0.16.0](https://github.com/gardnmi/boomux/compare/v0.15.0...v0.16.0) (2026-08-15)
 
 
