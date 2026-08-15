@@ -13,7 +13,7 @@ mod pi;
 #[cfg(test)]
 use crate::host_session_source::pi::{
     Environment as PiEnvironment, MAX_FILE_BYTES as MAX_PI_FILE_BYTES,
-    session_directory_for_test as pi_session_directory, session_file as pi_session_file,
+    session_directory_for_test as pi_session_directory,
 };
 #[cfg(test)]
 use opencode::{
@@ -572,40 +572,6 @@ mod tests {
         assert_eq!(titles.len(), MAX_SESSIONS);
         assert!(titles.contains_key("pi-100"));
         assert!(!titles.contains_key("pi-000"));
-    }
-
-    #[test]
-    fn exact_pi_file_lookup_is_not_limited_to_the_newest_catalog_entries() {
-        let test = TestDirectory::new();
-        let exact = test.write(
-            "2026-01-01_external.jsonl",
-            &format!("{}\n", pi_header("external", "/repo")),
-        );
-        for index in 0..MAX_SESSIONS + 1 {
-            test.write(
-                &format!("2026-02-{index:03}_other-{index}.jsonl"),
-                &format!("{}\n", pi_header(&format!("other-{index}"), "/repo")),
-            );
-        }
-
-        assert_eq!(
-            pi_session_file(Path::new("/repo"), "external", &test.environment()),
-            Ok(exact)
-        );
-    }
-
-    #[test]
-    fn exact_pi_file_lookup_accepts_noncanonical_filenames_by_header_identity() {
-        let test = TestDirectory::new();
-        let exact = test.write(
-            "custom.jsonl",
-            &format!("{}\n", pi_header("external", "/repo")),
-        );
-
-        assert_eq!(
-            pi_session_file(Path::new("/repo"), "external", &test.environment()),
-            Ok(exact)
-        );
     }
 
     #[test]

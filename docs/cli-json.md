@@ -28,12 +28,10 @@ each bundled integration host under `integration_hosts`. Validated versions are
 compatibility test points, not runtime pins or minimum-version guarantees.
 Integration ordering and host metadata come from the same capability descriptor
 registry used by installation, foreground recognition, recovery, titles, and
-transcripts.
+session resume.
 Protocol-backed feature names are derived from the same typed registry as
 request gating and negotiated client feature checks, so each name has one
 minimum protocol version authority.
-`session_transcript_integrations` lists the integration keys whose descriptors
-declare canonical transcript support.
 The `desktop_notifications` feature means this binary supports daemon-owned
 notification delivery; it does not imply notifications are enabled or that
 `notify-send` and a desktop notification service are available. Configuration is
@@ -65,7 +63,6 @@ The following commands support `--json`:
 - `boomux attention acknowledge`
 - `boomux session list`
 - `boomux session inspect`
-- `boomux session read`
 - `boomux schedule create`
 - `boomux schedule list`
 - `boomux schedule inspect`
@@ -126,8 +123,6 @@ Command payloads are:
 - `session.list`: a globally newest-first `sessions` array, optionally limited
   by exact workspace name or ID.
 - `session.inspect`: one projected `session` object selected only by exact
-  opaque session ID.
-- `session.read`: one bounded canonical `transcript` selected only by exact
   opaque session ID.
 - `schedule.create`, `schedule.pause`, and `schedule.resume`: one prompt-free
   `schedule` summary. New schedules default to `fresh` and `paused`; resume
@@ -195,6 +190,10 @@ Protocol 25 adds `protocol_25`, `revision_aware_scheduled_execution_wait`,
 `scheduled_execution_notifications`.
 Protocol 26 adds `protocol_26` and `exact_run_attachment` for the internal
 additive expected-run attachment handshake used by Scheduled Execution opens.
+Protocol 27 adds `protocol_27` and `agent_schedule_editing` for paused,
+revision-conditional schedule-definition updates. Update responses and events
+remain prompt-free; exact inspection is still the only response that discloses
+the current prompt.
 
 ## Execution Data
 
@@ -374,9 +373,9 @@ contains `agent_id`, the original `shell_id` even if that shell was removed,
 `started_at_ms`, `ended_at_ms`, `is_current`, and the full stable Agent
 `observation` shape. Retained shell fields are null after shell removal.
 `source_cwd` is the registration-time Agent working directory under protocol 13
-and can remain available for canonical transcript lookup. Protocol-12 snapshots
-fall back to a currently retained shell directory. State and authority use the
-same spellings documented for Agent observations.
+and can remain available for exact interactive session resume. Protocol-12
+snapshots fall back to a currently retained shell directory. State and authority
+use the same spellings documented for Agent observations.
 
 Projection groups Agent instances only when workspace, integration, and external
 session ID match. An Agent without an external session ID forms its own session.
@@ -394,45 +393,9 @@ versioned, length-prefixed encoding of workspace ID, integration, and grouping
 identity (`external:<id>` or `instance:<agent-id>`). This algorithm is frozen to
 keep emitted IDs stable, not exposed for callers to reproduce or guess. Only an
 exact ID returned by `session.list` resolves; external IDs, descriptions, shell
-IDs, and Agent IDs never resolve through `session.inspect` or `session.read`.
+IDs, and Agent IDs never resolve through `session.inspect`.
 All session commands require a negotiated daemon protocol of at least 12 and return
 `unsupported_version` before projection against an older daemon.
-
-`session.read` supports OpenCode and Pi sessions with a canonical external
-session ID and a retained working directory. It reads OpenCode's export and Pi's
-project JSONL rather than terminal scrollback. Pi projection follows the current
-leaf parent chain and excludes abandoned branches. Tool-result messages are
-combined with their tool calls.
-
-The transcript contains `session_id`, `integration`, `external_session_id`,
-`entries`, `returned_entries`, `total_entries`, `content_bytes`, `truncated`,
-`truncated_by`, `has_more`, and `next_cursor`. Entries are a newest suffix
-returned in chronological order.
-Their `type` is `message`, `reasoning`, or `tool`; common fields are `source_id`,
-`timestamp_ms`, and `truncated`. Message and reasoning entries add `role` and
-`text`. Tool entries add `tool_name`, `tool_call_id`, `status`, `input`, and
-`output`; input is compact host JSON encoded as a string. Inapplicable fields are
-omitted except `source_id` and `timestamp_ms`, which are JSON `null` when the host
-does not provide them.
-
-`--limit` defaults to 100 and accepts 1 through 1,000 entries. `--max-bytes`
-defaults to 1 MiB and accepts 1 byte through 4 MiB. `content_bytes` counts UTF-8
-bytes in returned text, input, and output fields. `truncated_by` contains `limit`
-and/or `max_bytes`; a partially clipped entry also has `truncated: true`. Boomux
-does not redact canonical host content. Raw host source inspection is separately
-capped at 16 MiB.
-
-When `has_more` is true, `next_cursor` is a non-null opaque string for
-`session read --before <cursor>`; otherwise it is JSON `null`. Continuation moves
-toward older logical entries, and bounds may change between requests. The cursor
-binds the projected session, adapter normalization, retained source context, and
-initial normalized transcript. Entries appended after the first page are ignored
-only when the normalized baseline remains an exact prefix. Existing-entry edits,
-tool-result updates, removals, reordering, Pi branch changes, source-context
-changes, and adapter-normalization changes return
-`cursor_expired`; callers discard the cursor and request a fresh newest page.
-Malformed, oversized, or cross-session cursors return `invalid_argument`.
-Pagination remains client-side and does not create daemon cursor state.
 
 ## Schedule Data
 

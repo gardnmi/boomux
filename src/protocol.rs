@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 26;
+pub const PROTOCOL_VERSION: u32 = 27;
 pub const MIN_PROTOCOL_VERSION: u32 = 6;
 pub const MAX_CONTROL_FRAME: usize = 8 * 1024 * 1024;
 pub const MAX_ATTACH_FRAME: usize = 1024 * 1024;
@@ -104,6 +104,10 @@ define_protocol_features! {
     ExactRunAttachment => (26, "exact run attachment", [
         "protocol_26",
         "exact_run_attachment",
+    ]),
+    AgentScheduleEditing => (27, "agent schedule editing", [
+        "protocol_27",
+        "agent_schedule_editing",
     ]),
 }
 
@@ -292,6 +296,25 @@ impl std::fmt::Debug for AgentScheduleSpec {
             .field("trigger", &self.trigger)
             .field("state", &self.state)
             .field("overlap_policy", &self.overlap_policy)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentScheduleUpdate {
+    pub name: String,
+    pub prompt: String,
+    pub trigger: AgentScheduleTrigger,
+}
+
+impl std::fmt::Debug for AgentScheduleUpdate {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AgentScheduleUpdate")
+            .field("name", &self.name)
+            .field("prompt", &"<redacted>")
+            .field("trigger", &self.trigger)
             .finish()
     }
 }
@@ -756,6 +779,10 @@ pub enum DaemonEventKind {
         workspace_id: String,
         schedule: AgentScheduleSnapshot,
     },
+    AgentScheduleUpdated {
+        workspace_id: String,
+        schedule: AgentScheduleSnapshot,
+    },
     AgentScheduleRemoved {
         workspace_id: String,
         schedule_id: String,
@@ -960,6 +987,11 @@ pub enum Request {
         workspace_id: String,
         spec: AgentScheduleSpec,
     },
+    UpdateAgentSchedule {
+        schedule_id: String,
+        expected_revision: u64,
+        update: AgentScheduleUpdate,
+    },
     RunAgentSchedule {
         schedule_id: String,
         dispatch_key: String,
@@ -1084,6 +1116,7 @@ impl Request {
             | Self::CancelScheduledExecution { .. }
             | Self::ResolveScheduledExecutionClaim { .. }
             | Self::ReportScheduledRunner { .. } => Some(ProtocolFeature::ScheduledExecutions),
+            Self::UpdateAgentSchedule { .. } => Some(ProtocolFeature::AgentScheduleEditing),
             Self::CreateAgentSchedule { .. }
             | Self::GetAgentSchedule { .. }
             | Self::PauseAgentSchedule { .. }
@@ -1754,8 +1787,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_twenty_six_with_minimum_six() {
-        assert_eq!(PROTOCOL_VERSION, 26);
+    fn protocol_version_is_twenty_seven_with_minimum_six() {
+        assert_eq!(PROTOCOL_VERSION, 27);
         assert_eq!(MIN_PROTOCOL_VERSION, 6);
     }
 
@@ -1813,6 +1846,14 @@ mod tests {
             state: AgentScheduleState::Paused,
             overlap_policy: AgentScheduleOverlapPolicy::Skip,
         };
+        let update = AgentScheduleUpdate {
+            name: "updated review".into(),
+            prompt: "private updated prompt".into(),
+            trigger: AgentScheduleTrigger {
+                cron: "30 10 * * 1-5".into(),
+                timezone: "America/New_York".into(),
+            },
+        };
         let requests = [
             Request::CreateAgentSchedule {
                 workspace_id: "w1".into(),
@@ -1820,6 +1861,11 @@ mod tests {
             },
             Request::GetAgentSchedule {
                 schedule_id: "schedule-1".into(),
+            },
+            Request::UpdateAgentSchedule {
+                schedule_id: "schedule-1".into(),
+                expected_revision: 3,
+                update: update.clone(),
             },
             Request::PauseAgentSchedule {
                 schedule_id: "schedule-1".into(),
@@ -1835,6 +1881,16 @@ mod tests {
             let encoded = serde_json::to_value(&request).unwrap();
             assert_eq!(serde_json::from_value::<Request>(encoded).unwrap(), request);
         }
+        assert_eq!(
+            Request::UpdateAgentSchedule {
+                schedule_id: "schedule-1".into(),
+                expected_revision: 3,
+                update: update.clone(),
+            }
+            .required_feature(),
+            Some(ProtocolFeature::AgentScheduleEditing)
+        );
+        assert!(!format!("{update:?}").contains("private updated prompt"));
 
         let schedule = test_schedule();
         for response in [
@@ -1956,6 +2012,10 @@ mod tests {
                 schedule: schedule.clone(),
             },
             DaemonEventKind::AgentScheduleResumed {
+                workspace_id: "w1".into(),
+                schedule: schedule.clone(),
+            },
+            DaemonEventKind::AgentScheduleUpdated {
                 workspace_id: "w1".into(),
                 schedule: schedule.clone(),
             },
@@ -2327,6 +2387,21 @@ mod tests {
                     environment: None,
                 }],
             ),
+            (
+                27,
+                vec![Request::UpdateAgentSchedule {
+                    schedule_id: "schedule-1".into(),
+                    expected_revision: 1,
+                    update: AgentScheduleUpdate {
+                        name: "review".into(),
+                        prompt: "private prompt".into(),
+                        trigger: AgentScheduleTrigger {
+                            cron: "0 9 * * *".into(),
+                            timezone: "UTC".into(),
+                        },
+                    },
+                }],
+            ),
         ];
 
         for (expected, requests) in groups {
@@ -2423,6 +2498,7 @@ mod tests {
                 ][..],
             ),
             (26, &["protocol_26", "exact_run_attachment"][..]),
+            (27, &["protocol_27", "agent_schedule_editing"][..]),
         ];
 
         let actual = ProtocolFeature::ALL

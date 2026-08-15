@@ -168,10 +168,12 @@ explicit `--workspace`.
 ## Dashboard
 
 The dashboard has four primary views: Workspaces, Agents, Shells, and Schedules. The
-Workspaces view combines the selected workspace's Agents, shells, commands, and
-launchers in one item table. Its `ACTIVITY` column shows an Agent task, shell
-foreground process, stored command, or launcher command; branch and worktree
-columns keep repository context visible without repeating full paths.
+Workspaces view combines the selected workspace's Agents, shells, commands,
+launchers, and schedule definitions in one item table. A `schedule` row represents
+the durable definition, opens its specialized history and controls, and never
+represents an execution process. Its `ACTIVITY` column shows an Agent task, shell
+foreground process, stored command, launcher command, or schedule trigger; branch
+and worktree columns keep repository context visible without repeating full paths.
 
 The Agents view shows lifecycle status and recency, owning workspace and shell,
 root-session task, branch, and worktree. The Shells view distinguishes login
@@ -183,10 +185,11 @@ follow state without allowing input from the dashboard.
 
 The Schedules view shows friendly triggers, next occurrences, last outcomes,
 active/paused state, workspace, integration, scheduler health, and bounded
-execution history. Its detail panel shows prompt revision, never prompt text.
-Schedule-owned shells do not appear as ordinary shell rows. Transcript and tool
-content is loaded only when `t` is pressed on an exact linked canonical session;
-it is not read for rendering, search, notices, or diagnostics.
+execution history in a dedicated selectable pane. Boomux retains the newest 100
+terminal records per schedule plus all nonterminal records, preventing history
+from growing without limit. The schedule and history panes render side by side,
+then stack when the terminal is narrow. Schedule-owned execution shells do not
+appear as ordinary shell rows; only the owning schedule definition does.
 
 The workspace overview includes item and Agent-state counts plus its most urgent
 outstanding attention item.
@@ -204,17 +207,21 @@ outstanding attention item.
 | `x`, then `y` | Confirm closing or removing the selection. |
 | `q` or `Esc` | Quit from normal mode. |
 
-In Schedules, `j`/`k` select schedules, `[`/`]` select retained executions by
-exact execution ID, and `Enter` opens a selected exact Starting or Active run or
-navigates to its exact blocked Agent. `u` runs now with a fresh dispatch key,
-and `p` pauses or resumes. `c` then `y` confirms
-cancellation of the selected exact active execution, `h` explicitly loads
-bounded scoped history, `t` explicitly reads bounded linked transcript/tool
-content, and `x` then `y` removes the schedule and persisted prompt. The
-transcript opens at its newest rows; arrows or `j`/`k`, Page Up/Page Down, and
-Home/End navigate it. `a` shows the schedule
+In Schedules, Left/Right changes between the schedule and history panes, `j`/`k`
+navigates the focused pane, and `[`/`]` also selects retained executions by exact
+execution ID. `Enter` attaches a selected exact Starting or Active run. For a
+completed execution with a canonical session, it resumes that exact session with
+OpenCode or Pi in an unmanaged native terminal, without adding a workspace row.
+`e` opens the private definition editor for a paused schedule; it supports name,
+prompt, trigger presets or custom cron, and a searchable IANA timezone selector.
+Type to filter timezone names and use the arrow keys to choose a valid match.
+`Ctrl-S` saves only at the exact loaded revision. Trigger edits begin future evaluation at save time.
+Active executions retain their captured definition. `u` runs now with a fresh
+dispatch key, and `p` pauses or resumes. `c` then `y` confirms cancellation of the selected exact active execution, and `x` then `y` removes the schedule and
+persisted prompt. Selecting a schedule automatically loads its bounded retained
+history. `a` shows the schedule
 creation CLI help path. Protocol 25 has no skip-next control and the dashboard
-does not emulate one with pause/resume. Exact Scheduled Execution terminal Open
+does not emulate one with pause/resume. Exact active Scheduled Execution attachment
 requires protocol 26; protocol-25 dashboards retain schedule controls and
 history while showing upgrade-and-restart guidance for Open.
 
@@ -279,7 +286,7 @@ The validated host versions and test evidence are documented in
 [`docs/lifecycle-validation.md`](docs/lifecycle-validation.md). They are
 compatibility test points, not runtime pins.
 
-### Agent Sessions and Transcripts
+### Agent Sessions
 
 Boomux projects canonical OpenCode and Pi sessions into each matching workspace.
 A projected session groups every Boomux Agent occurrence for the same external
@@ -293,21 +300,7 @@ Discover and inspect sessions with exact IDs returned by `session list`:
 ```console
 boomux session list --workspace my-project
 boomux session inspect <session-id>
-boomux session read <session-id> --limit 100
 ```
-
-`session read` returns a bounded, normalized suffix of canonical messages,
-reasoning, and tool activity rather than terminal scrollback. OpenCode is read
-through its session export and Pi through its project session file. Source reads
-are capped at 16 MiB and may time out; response entry count and content bytes
-have separate caller-selected bounds. Boomux does not cache or persist the
-transcript. OpenCode capture uses an unlinked private temporary file that exists
-only for the duration of the read.
-
-Boomux does not redact host transcript content. Use transcript commands only
-when reading that session's content is appropriate. Opaque continuation cursors
-can request older pages; discard one and start a fresh read if Boomux reports
-that it expired.
 
 ### Agent Schedules
 

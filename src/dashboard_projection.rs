@@ -14,9 +14,9 @@ use crate::session_projection::{self, SessionProjection};
 use crate::tui::{
     AgentAuthorityDisplay, AgentDisplayState, AgentSessionRunView, AgentSessionView,
     AgentShellView, AgentView, AttentionReason, ExecutionDisplayState, ExecutionOutcomeDisplay,
-    ExecutionReasonDisplay, ExecutionView, LauncherView, ScheduleDisplayState, ScheduleView,
-    TerminalKind, TerminalRunView, TerminalView, WorkspaceAttentionView, WorkspaceItemView,
-    WorkspaceView,
+    ExecutionReasonDisplay, ExecutionView, LauncherView, ScheduleDisplayState, ScheduleItemView,
+    ScheduleView, TerminalKind, TerminalRunView, TerminalView, WorkspaceAttentionView,
+    WorkspaceItemView, WorkspaceView,
 };
 
 #[cfg(test)]
@@ -62,19 +62,15 @@ pub(crate) fn project_schedules(
                     workspace: workspace.name.clone(),
                     name: schedule.name.clone(),
                     integration: schedule.integration.clone(),
-                    cwd: schedule.cwd.display().to_string(),
                     state: match schedule.state {
                         AgentScheduleState::Paused => ScheduleDisplayState::Paused,
                         AgentScheduleState::Enabled => ScheduleDisplayState::Enabled,
                     },
                     friendly_trigger: friendly_trigger(&schedule.trigger.cron),
-                    exact_trigger: schedule.trigger.cron.clone(),
-                    timezone: schedule.trigger.timezone.clone(),
                     next_occurrence_ms: schedule
                         .next_occurrence
                         .as_ref()
                         .map(|occurrence| occurrence.scheduled_at_ms),
-                    prompt_revision: schedule.prompt_revision,
                     executions: history,
                     history_truncated: scoped_history
                         .get(&schedule.id)
@@ -160,15 +156,11 @@ fn execution_view(
             }
         }),
         requested_at_ms: execution.requested_at_ms,
-        prompt_revision: execution.prompt_revision,
         shell_id: execution.shell_id.clone(),
         run_id: execution.run_id.clone(),
         agent_id: execution.agent_id.clone(),
         agent_state: agent.map(|agent| agent.observation.state.into()),
         session_id: session.map(|session| session.id.clone()),
-        transcript_available: session.is_some()
-            && boomux::integrations::by_key(&execution.integration)
-                .is_some_and(|descriptor| descriptor.transcript.is_some()),
     }
 }
 
@@ -419,6 +411,18 @@ fn project_workspace(
             argv: launcher.command.clone(),
         })
     });
+    let schedules = workspace.schedules.iter().map(|schedule| {
+        WorkspaceItemView::Schedule(ScheduleItemView {
+            id: schedule.id.clone(),
+            name: schedule.name.clone(),
+            integration: schedule.integration.clone(),
+            state: match schedule.state {
+                AgentScheduleState::Paused => ScheduleDisplayState::Paused,
+                AgentScheduleState::Enabled => ScheduleDisplayState::Enabled,
+            },
+            friendly_trigger: friendly_trigger(&schedule.trigger.cron),
+        })
+    });
     WorkspaceView {
         id: workspace.id.clone(),
         name: workspace.name.clone(),
@@ -426,7 +430,11 @@ fn project_workspace(
             .default_cwd
             .as_ref()
             .map(|cwd| cwd.display().to_string()),
-        items: shells.into_iter().chain(launchers).collect(),
+        items: shells
+            .into_iter()
+            .chain(launchers)
+            .chain(schedules)
+            .collect(),
         sessions: session_views,
         agent_state_counts: agent_summary.states,
         attention_count: agent_summary.attention_count,
@@ -740,7 +748,7 @@ mod tests {
     }
 
     #[test]
-    fn schedule_owned_shells_are_not_projected_as_ordinary_items() {
+    fn schedule_definition_projects_once_while_its_owned_shell_stays_hidden() {
         let mut workspace = workspace(Vec::new());
         workspace.shells[0].owner = ShellOwner::Schedule {
             schedule_id: "schedule-1".into(),
@@ -748,7 +756,13 @@ mod tests {
         workspace.schedules.push(schedule());
 
         let views = project(&[workspace], &mut git::Cache::default());
-        assert!(views[0].items.is_empty());
+        let [WorkspaceItemView::Schedule(schedule)] = views[0].items.as_slice() else {
+            panic!("expected one schedule definition row");
+        };
+        assert_eq!(schedule.id, "schedule-1");
+        assert_eq!(schedule.name, "review");
+        assert_eq!(schedule.state, ScheduleDisplayState::Enabled);
+        assert_eq!(schedule.friendly_trigger, "weekdays 09:30");
     }
 
     #[test]
@@ -781,8 +795,12 @@ mod tests {
         });
 
         let views = project(&[workspace], &mut git::Cache::default());
-        let [WorkspaceItemView::AgentShell(agent)] = views[0].items.as_slice() else {
-            panic!("expected exact schedule-owned Agent projection");
+        let [
+            WorkspaceItemView::AgentShell(agent),
+            WorkspaceItemView::Schedule(schedule),
+        ] = views[0].items.as_slice()
+        else {
+            panic!("expected exact schedule Agent and one schedule definition row");
         };
         assert_eq!(agent.schedule_id.as_deref(), Some("schedule-1"));
         assert_eq!(
@@ -790,6 +808,7 @@ mod tests {
             Some("scheduled-agent")
         );
         assert_eq!(agent.state(), AgentDisplayState::Blocked);
+        assert_eq!(schedule.id, "schedule-1");
     }
 
     #[test]
@@ -967,12 +986,10 @@ mod tests {
             })
             .unwrap();
         assert_eq!(view.session_id.as_deref(), Some(exact_session.id.as_str()));
-        assert!(view.transcript_available);
 
         execution.agent_id = Some("missing-agent".into());
         let missing = execution_view(&workspace, &sessions, &execution);
         assert_eq!(missing.agent_state, None);
         assert_eq!(missing.session_id, None);
-        assert!(!missing.transcript_available);
     }
 }

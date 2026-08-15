@@ -7,6 +7,16 @@ This record separates observed host behavior from reducer fixtures and intended
 semantics. Host compatibility is not inferred from process names, terminal
 output, or database recency.
 
+## 2026-08-14
+
+OpenCode `1.18.18` was validated for exact canonical transcript reading from a
+completed scheduled execution. The PATH-resolved wrapper and OpenCode CLI wrote
+bounded informational preamble lines before the export JSON. Boomux accepted
+the preamble, revalidated the exported session identity, and returned 13
+structured entries through `session read` without exposing content during the
+compatibility check. Canonical transcript reading was subsequently removed from
+Boomux; this remains historical compatibility evidence only.
+
 ## 2026-08-07
 
 The repository and installed integration assets were byte-for-byte identical.

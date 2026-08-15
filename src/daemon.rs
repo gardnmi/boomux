@@ -32,8 +32,8 @@ use crate::protocol::{
     self, AgentAttentionReason, AgentAttentionSnapshot, AgentAuthority, AgentInstanceSnapshot,
     AgentObservationSnapshot, AgentRegistrationSpec, AgentReport, AgentScheduleInspection,
     AgentScheduleOverlapPolicy, AgentScheduleSession, AgentScheduleSnapshot, AgentScheduleSpec,
-    AgentScheduleState, AgentScheduleTrigger, AgentState, AttachFrame, DaemonEvent,
-    DaemonEventKind, Envelope, ErrorCode, EventCursor, FocusedTerminalSnapshot,
+    AgentScheduleState, AgentScheduleTrigger, AgentScheduleUpdate, AgentState, AttachFrame,
+    DaemonEvent, DaemonEventKind, Envelope, ErrorCode, EventCursor, FocusedTerminalSnapshot,
     NotificationDeliveryConfig, Request, Response, ScheduledExecutionDispatchKind,
     ScheduledExecutionOutcome, ScheduledExecutionReason, ScheduledExecutionScheduleProjection,
     ScheduledExecutionSnapshot, ScheduledExecutionState, ScheduledOccurrence,
@@ -1179,6 +1179,11 @@ fn response_for_version_with_schedule_shells(
     if !protocol::ProtocolFeature::AgentSchedules.is_supported_by(version) {
         remove_agent_schedules(&mut response);
     }
+    if !protocol::ProtocolFeature::AgentScheduleEditing.is_supported_by(version)
+        && let Response::Events { events, .. } = &mut response
+    {
+        events.retain(|event| !matches!(event.kind, DaemonEventKind::AgentScheduleUpdated { .. }));
+    }
     if !protocol::ProtocolFeature::WorkspaceDefaultCwd.is_supported_by(version) {
         remove_workspace_default_cwds(&mut response);
     }
@@ -1345,6 +1350,7 @@ fn remove_agent_schedules(response: &mut Response) {
                     DaemonEventKind::AgentScheduleCreated { .. }
                         | DaemonEventKind::AgentSchedulePaused { .. }
                         | DaemonEventKind::AgentScheduleResumed { .. }
+                        | DaemonEventKind::AgentScheduleUpdated { .. }
                         | DaemonEventKind::AgentScheduleRemoved { .. }
                 )
             });
@@ -2688,7 +2694,11 @@ impl DurableRegistry {
             ScheduledExecutionState::Claimed
         };
         let id = if let Some(scheduled_at_ms) = scheduled_at_ms {
-            timed_execution_id(&schedule.id, schedule.trigger_revision, scheduled_at_ms)
+            timed_execution_id(
+                &schedule.id,
+                schedule_state.trigger_revision,
+                scheduled_at_ms,
+            )
         } else {
             Uuid::new_v4().to_string()
         };
@@ -2699,15 +2709,15 @@ impl DurableRegistry {
             dispatch_kind,
             dispatch_key: dispatch_key.clone(),
             schedule_revision: schedule_state.revision,
-            prompt_revision: schedule.prompt_revision,
-            trigger_revision: schedule.trigger_revision,
+            prompt_revision: schedule_state.prompt_revision,
+            trigger_revision: schedule_state.trigger_revision,
             requested_at_ms,
             scheduled_at_ms,
             coalesced_through_ms,
             cwd: schedule.cwd.clone(),
             integration: schedule.integration.clone(),
             session: schedule.session.clone(),
-            prompt: schedule.prompt.clone(),
+            prompt: schedule_state.prompt.clone(),
             runner_token: Uuid::new_v4().to_string(),
             state: Mutex::new(ScheduledExecutionMutableState {
                 revision: 1,
@@ -2943,7 +2953,7 @@ impl DurableRegistry {
         let schedule = state
             .schedules
             .get(schedule_id)
-            .map(|schedule| schedule.name.clone())
+            .and_then(|schedule| schedule.state.lock().ok().map(|state| state.name.clone()))
             .unwrap_or_else(|| "removed".into());
         (workspace, schedule)
     }
@@ -3218,17 +3228,17 @@ impl DurableRegistry {
         let schedule = Arc::new(AgentSchedule {
             id: Uuid::new_v4().to_string(),
             workspace_id: workspace_id.into(),
-            name: spec.name,
             cwd: spec.cwd,
             integration: spec.integration,
-            prompt: spec.prompt,
             session: spec.session,
-            trigger: spec.trigger,
             overlap_policy: spec.overlap_policy,
-            prompt_revision: 1,
-            trigger_revision: 1,
             created_at_ms: now,
             state: Mutex::new(AgentScheduleMutableState {
+                name: spec.name,
+                prompt: spec.prompt,
+                trigger: spec.trigger,
+                prompt_revision: 1,
+                trigger_revision: 1,
                 state: spec.state,
                 revision: 1,
                 updated_at_ms: now,
@@ -3261,6 +3271,7 @@ impl DurableRegistry {
             state
                 .schedules
                 .get(id)
+                .and_then(|existing| existing.state.lock().ok())
                 .is_some_and(|existing| existing.name == snapshot.name)
         }) {
             return Err(io::Error::new(
@@ -3290,20 +3301,20 @@ impl DurableRegistry {
         requested_at_ms: u64,
     ) -> io::Result<(AgentScheduleSnapshot, Option<DurableUndo>)> {
         let schedule = self.schedule(schedule_id)?;
+        let mut state = lock(&schedule.state)?;
+        if state.state == next {
+            return Ok((schedule.snapshot_from(&state)?, None));
+        }
         let mut compiled_trigger = None;
         if next == AgentScheduleState::Enabled {
             let cron = crate::scheduling::CronSchedule::compile(
-                &schedule.trigger.cron,
-                &schedule.trigger.timezone,
+                &state.trigger.cron,
+                &state.trigger.timezone,
             )
             .map_err(schedule_validation_error)?;
             cron.ensure_possible().map_err(schedule_validation_error)?;
             compiled_trigger = Some(cron);
             validate_schedule_capability(&schedule.integration, &schedule.session)?;
-        }
-        let mut state = lock(&schedule.state)?;
-        if state.state == next {
-            return Ok((schedule.snapshot_from(&state)?, None));
         }
         let previous = state.clone();
         let now = requested_at_ms.max(state.updated_at_ms.saturating_add(1));
@@ -3319,7 +3330,117 @@ impl DurableRegistry {
         state.updated_at_ms = now;
         if next == AgentScheduleState::Enabled {
             state.evaluation_frontier_ms = now.max(state.evaluation_frontier_ms);
-            state.evaluation_frontier_trigger_revision = schedule.trigger_revision;
+            state.evaluation_frontier_trigger_revision = state.trigger_revision;
+        }
+        let snapshot = schedule.snapshot_from(&state)?;
+        drop(state);
+        Ok((
+            snapshot,
+            Some(DurableUndo::ScheduleState { schedule, previous }),
+        ))
+    }
+
+    fn update_schedule_at(
+        &self,
+        schedule_id: &str,
+        expected_revision: u64,
+        mut update: AgentScheduleUpdate,
+        requested_at_ms: u64,
+    ) -> DaemonResult<(AgentScheduleSnapshot, Option<DurableUndo>)> {
+        validate_name(&update.name)?;
+        crate::scheduling::validate_prompt(&update.prompt).map_err(schedule_validation_error)?;
+        update.trigger.cron = crate::scheduling::canonicalize_cron(&update.trigger.cron)
+            .map_err(schedule_validation_error)?;
+        update.trigger.timezone =
+            crate::scheduling::canonicalize_timezone(&update.trigger.timezone)
+                .map_err(schedule_validation_error)?;
+        crate::scheduling::CronSchedule::compile(&update.trigger.cron, &update.trigger.timezone)
+            .and_then(|cron| cron.ensure_possible())
+            .map_err(schedule_validation_error)?;
+
+        let schedule = self.schedule(schedule_id)?;
+        {
+            let state = lock(&schedule.state)?;
+            if state.revision != expected_revision {
+                return Err(DaemonError::lifecycle(
+                    ErrorCode::RevisionAhead,
+                    format!(
+                        "agent schedule revision is {}; update supplied {}",
+                        state.revision, expected_revision
+                    ),
+                ));
+            }
+            if state.state != AgentScheduleState::Paused {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "agent schedule must be paused before editing",
+                )
+                .into());
+            }
+            if state.name == update.name
+                && state.prompt == update.prompt
+                && state.trigger == update.trigger
+            {
+                return Ok((schedule.snapshot_from(&state)?, None));
+            }
+        }
+
+        let workspace = self.workspace(&schedule.workspace_id)?;
+        let durable = lock(&self.state)?;
+        let schedule_ids = lock(&workspace.schedule_ids)?;
+        if schedule_ids
+            .iter()
+            .filter(|id| id.as_str() != schedule_id)
+            .any(|id| {
+                durable
+                    .schedules
+                    .get(id)
+                    .and_then(|existing| existing.state.lock().ok())
+                    .is_some_and(|state| state.name == update.name)
+            })
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("agent schedule name already exists: {}", update.name),
+            )
+            .into());
+        }
+        drop(schedule_ids);
+        drop(durable);
+
+        let mut state = lock(&schedule.state)?;
+        if state.revision != expected_revision {
+            return Err(DaemonError::lifecycle(
+                ErrorCode::RevisionAhead,
+                "agent schedule changed while preparing the update",
+            ));
+        }
+        if state.state != AgentScheduleState::Paused {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "agent schedule must be paused before editing",
+            )
+            .into());
+        }
+        let previous = state.clone();
+        let revision = state
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("agent schedule revision exhausted"))?;
+        let prompt_changed = state.prompt != update.prompt;
+        let trigger_changed = state.trigger != update.trigger;
+        state.name = update.name;
+        state.prompt = update.prompt;
+        state.trigger = update.trigger;
+        state.revision = revision;
+        state.updated_at_ms = requested_at_ms.max(state.updated_at_ms.saturating_add(1));
+        if prompt_changed {
+            state.prompt_revision = revision;
+        }
+        if trigger_changed {
+            state.trigger_revision = revision;
+            state.evaluation_frontier_ms = state.updated_at_ms;
+            state.evaluation_frontier_trigger_revision = revision;
         }
         let snapshot = schedule.snapshot_from(&state)?;
         drop(state);
@@ -4761,15 +4882,10 @@ struct Workspace {
 struct AgentSchedule {
     id: String,
     workspace_id: String,
-    name: String,
     cwd: PathBuf,
     integration: String,
-    prompt: String,
     session: AgentScheduleSession,
-    trigger: AgentScheduleTrigger,
     overlap_policy: AgentScheduleOverlapPolicy,
-    prompt_revision: u64,
-    trigger_revision: u64,
     created_at_ms: u64,
     state: Mutex<AgentScheduleMutableState>,
     executions: Mutex<Vec<Arc<ScheduledExecution>>>,
@@ -4821,6 +4937,11 @@ struct ScheduleDecision {
 
 #[derive(Clone)]
 struct AgentScheduleMutableState {
+    name: String,
+    prompt: String,
+    trigger: AgentScheduleTrigger,
+    prompt_revision: u64,
+    trigger_revision: u64,
     state: AgentScheduleState,
     revision: u64,
     updated_at_ms: u64,
@@ -5652,9 +5773,10 @@ impl DaemonService {
             if state.state != AgentScheduleState::Enabled {
                 continue;
             }
+            let sampled_trigger_revision = state.trigger_revision;
             let cron = crate::scheduling::CronSchedule::compile(
-                &schedule.trigger.cron,
-                &schedule.trigger.timezone,
+                &state.trigger.cron,
+                &state.trigger.timezone,
             )
             .map_err(|error| DaemonError::Internal(io::Error::other(error.to_string())))?;
             let first_due = cron
@@ -5678,7 +5800,8 @@ impl DaemonService {
             let response = self.durable_mutation_outcome(|undo| {
                 let schedule = self.durable.schedule(&schedule_id)?;
                 let current = lock(&schedule.state)?.clone();
-                if current.evaluation_frontier_trigger_revision != schedule.trigger_revision
+                if current.trigger_revision != sampled_trigger_revision
+                    || current.evaluation_frontier_trigger_revision != sampled_trigger_revision
                     || current.evaluation_frontier_ms >= latest_due
                 {
                     return Ok(DurableMutation::Unchanged(Vec::new()));
@@ -5714,11 +5837,8 @@ impl DaemonService {
                 for (scheduled_at_ms, coalesced_through_ms, default_reason) in decisions {
                     let is_current =
                         !cold_recovery && !paused_race && scheduled_at_ms == latest_due;
-                    let dispatch_key = timed_dispatch_key(
-                        &schedule.id,
-                        schedule.trigger_revision,
-                        scheduled_at_ms,
-                    );
+                    let dispatch_key =
+                        timed_dispatch_key(&schedule.id, current.trigger_revision, scheduled_at_ms);
                     let (execution, record, claimed) = self.durable.decide_schedule_execution(
                         &schedule.id,
                         ScheduleDecision {
@@ -5743,7 +5863,8 @@ impl DaemonService {
                 let mut schedule_state = lock(&schedule.state)?;
                 let previous = schedule_state.clone();
                 schedule_state.evaluation_frontier_ms = latest_due;
-                schedule_state.evaluation_frontier_trigger_revision = schedule.trigger_revision;
+                schedule_state.evaluation_frontier_trigger_revision =
+                    schedule_state.trigger_revision;
                 drop(schedule_state);
                 undo.record(DurableUndo::ScheduleState { schedule, previous });
                 let events = snapshots
@@ -5784,8 +5905,8 @@ impl DaemonService {
                 continue;
             }
             let cron = crate::scheduling::CronSchedule::compile(
-                &schedule.trigger.cron,
-                &schedule.trigger.timezone,
+                &state.trigger.cron,
+                &state.trigger.timezone,
             )
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
             let candidate = cron
@@ -6921,6 +7042,33 @@ impl DaemonService {
                     schedule: schedule.clone(),
                 };
                 Ok((Response::AgentSchedule { schedule }, vec![event]))
+            }),
+            Request::UpdateAgentSchedule {
+                schedule_id,
+                expected_revision,
+                update,
+            } => self.durable_mutation_outcome(|undo| {
+                let (schedule, record) = self.durable.update_schedule_at(
+                    &schedule_id,
+                    expected_revision,
+                    update,
+                    self.clock_now_ms(),
+                )?;
+                let Some(record) = record else {
+                    return Ok(DurableMutation::Unchanged(Response::AgentSchedule {
+                        schedule,
+                    }));
+                };
+                undo.record(record);
+                Ok(DurableMutation::Changed(
+                    Response::AgentSchedule {
+                        schedule: schedule.clone(),
+                    },
+                    vec![DaemonEventKind::AgentScheduleUpdated {
+                        workspace_id: schedule.workspace_id.clone(),
+                        schedule,
+                    }],
+                ))
             }),
             Request::RunAgentSchedule { .. } => {
                 unreachable!("schedule run is handled with the service Arc")
@@ -9430,17 +9578,17 @@ impl AgentSchedule {
         Self {
             id: saved.id,
             workspace_id: workspace_id.into(),
-            name: saved.name,
             cwd: saved.cwd,
             integration: saved.integration,
-            prompt: saved.prompt,
             session: saved.session,
-            trigger: saved.trigger,
             overlap_policy: saved.overlap_policy,
-            prompt_revision: saved.prompt_revision,
-            trigger_revision: saved.trigger_revision,
             created_at_ms: saved.created_at_ms,
             state: Mutex::new(AgentScheduleMutableState {
+                name: saved.name,
+                prompt: saved.prompt,
+                trigger: saved.trigger,
+                prompt_revision: saved.prompt_revision,
+                trigger_revision: saved.trigger_revision,
                 state: saved.state,
                 revision: saved.revision,
                 updated_at_ms: saved.updated_at_ms,
@@ -9476,13 +9624,13 @@ impl AgentSchedule {
     ) -> io::Result<AgentScheduleSnapshot> {
         let next_occurrence = if state.state == AgentScheduleState::Enabled {
             let scheduled_at_ms = crate::scheduling::CronSchedule::compile(
-                &self.trigger.cron,
-                &self.trigger.timezone,
+                &state.trigger.cron,
+                &state.trigger.timezone,
             )
             .and_then(|cron| cron.next_after_ms(state.evaluation_frontier_ms))
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
             Some(ScheduledOccurrence {
-                trigger_revision: self.trigger_revision,
+                trigger_revision: state.trigger_revision,
                 scheduled_at_ms,
             })
         } else {
@@ -9491,16 +9639,16 @@ impl AgentSchedule {
         Ok(AgentScheduleSnapshot {
             id: self.id.clone(),
             workspace_id: self.workspace_id.clone(),
-            name: self.name.clone(),
+            name: state.name.clone(),
             cwd: self.cwd.clone(),
             integration: self.integration.clone(),
             session: self.session.clone(),
-            trigger: self.trigger.clone(),
+            trigger: state.trigger.clone(),
             state: state.state,
             overlap_policy: self.overlap_policy,
             revision: state.revision,
-            prompt_revision: self.prompt_revision,
-            trigger_revision: self.trigger_revision,
+            prompt_revision: state.prompt_revision,
+            trigger_revision: state.trigger_revision,
             created_at_ms: self.created_at_ms,
             updated_at_ms: state.updated_at_ms,
             evaluation_frontier_ms: state.evaluation_frontier_ms,
@@ -9510,15 +9658,17 @@ impl AgentSchedule {
     }
 
     fn inspection(&self) -> io::Result<AgentScheduleInspection> {
+        let state = lock(&self.state)?;
         Ok(AgentScheduleInspection {
-            schedule: self.snapshot()?,
-            prompt: self.prompt.clone(),
+            schedule: self.snapshot_from(&state)?,
+            prompt: state.prompt.clone(),
         })
     }
 
     fn persisted(&self) -> io::Result<PersistedAgentSchedule> {
         let state = lock(&self.state)?;
         let snapshot = self.snapshot_from(&state)?;
+        let prompt = state.prompt.clone();
         let evaluation_frontier_trigger_revision = state.evaluation_frontier_trigger_revision;
         drop(state);
         let executions = lock(&self.executions)?
@@ -9531,7 +9681,7 @@ impl AgentSchedule {
             name: snapshot.name,
             cwd: snapshot.cwd,
             integration: snapshot.integration,
-            prompt: self.prompt.clone(),
+            prompt,
             session: snapshot.session,
             trigger: snapshot.trigger,
             state: snapshot.state,
@@ -12514,6 +12664,17 @@ mod tests {
         }
     }
 
+    fn schedule_update(name: &str, prompt: &str, cron: &str) -> AgentScheduleUpdate {
+        AgentScheduleUpdate {
+            name: name.into(),
+            prompt: prompt.into(),
+            trigger: AgentScheduleTrigger {
+                cron: cron.into(),
+                timezone: "UTC".into(),
+            },
+        }
+    }
+
     #[test]
     fn restored_enabled_schedule_records_a_removed_dispatch_capability_as_invalid_target() {
         let schedule = PersistedAgentSchedule {
@@ -12891,6 +13052,314 @@ mod tests {
                 .expect("malformed continuation state was accepted")
                 .kind(),
             io::ErrorKind::InvalidData
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn schedule_update_changes_all_fields_and_preserves_execution_snapshots() {
+        let registry = DaemonService::default();
+        set_scheduler_time(&registry, 100);
+        let workspace = registry
+            .create_workspace("schedule-update".into(), Vec::new())
+            .unwrap();
+        let Response::AgentSchedule { schedule } = registry
+            .dispatch(Request::CreateAgentSchedule {
+                workspace_id: workspace.id,
+                spec: schedule_spec("original private prompt"),
+            })
+            .unwrap()
+        else {
+            panic!("expected schedule");
+        };
+        let (execution, _) = registry
+            .durable
+            .claim_schedule_execution(&schedule.id, &Uuid::new_v4().to_string())
+            .unwrap();
+        set_scheduler_time(&registry, 200);
+
+        let Response::AgentSchedule { schedule: updated } = registry
+            .dispatch(Request::UpdateAgentSchedule {
+                schedule_id: schedule.id.clone(),
+                expected_revision: schedule.revision,
+                update: schedule_update(
+                    "morning review",
+                    "updated private prompt",
+                    " 30  9 * * 1-5 ",
+                ),
+            })
+            .unwrap()
+        else {
+            panic!("expected updated schedule");
+        };
+
+        assert_eq!(updated.name, "morning review");
+        assert_eq!(updated.trigger.cron, "30 9 * * 1-5");
+        assert_eq!(updated.revision, 2);
+        assert_eq!(updated.prompt_revision, 2);
+        assert_eq!(updated.trigger_revision, 2);
+        assert_eq!(updated.updated_at_ms, 200);
+        assert_eq!(updated.evaluation_frontier_ms, 200);
+        let inspection = registry
+            .schedule(&schedule.id)
+            .unwrap()
+            .inspection()
+            .unwrap();
+        assert_eq!(inspection.prompt, "updated private prompt");
+        let retained = registry.durable.execution(&execution.id).unwrap();
+        assert_eq!(retained.prompt, "original private prompt");
+        assert_eq!(retained.schedule_revision, 1);
+        assert_eq!(retained.prompt_revision, 1);
+        assert_eq!(retained.trigger_revision, 1);
+    }
+
+    #[test]
+    fn schedule_update_tracks_component_revisions_and_exact_noops() {
+        let directory = env::temp_dir().join(format!("boomux-update-noop-{}", Uuid::new_v4()));
+        let registry = DaemonService::restore(
+            StateStore::at(directory.join("state/state.json")),
+            false,
+            None,
+        )
+        .unwrap();
+        set_scheduler_time(&registry, 100);
+        let workspace = registry
+            .create_workspace("schedule-components".into(), Vec::new())
+            .unwrap();
+        let Response::AgentSchedule { schedule } = registry
+            .dispatch(Request::CreateAgentSchedule {
+                workspace_id: workspace.id,
+                spec: schedule_spec("first prompt"),
+            })
+            .unwrap()
+        else {
+            panic!("expected schedule");
+        };
+        let original_frontier = schedule.evaluation_frontier_ms;
+
+        set_scheduler_time(&registry, 200);
+        let Response::AgentSchedule { schedule: renamed } = registry
+            .dispatch(Request::UpdateAgentSchedule {
+                schedule_id: schedule.id.clone(),
+                expected_revision: 1,
+                update: schedule_update("renamed", "first prompt", "0 2 * * *"),
+            })
+            .unwrap()
+        else {
+            panic!("expected renamed schedule");
+        };
+        assert_eq!(
+            (
+                renamed.revision,
+                renamed.prompt_revision,
+                renamed.trigger_revision
+            ),
+            (2, 1, 1)
+        );
+        assert_eq!(renamed.evaluation_frontier_ms, original_frontier);
+        let event_id = lock(&registry.events.state).unwrap().latest_id;
+        registry.fail_next_persistence();
+        let Response::AgentSchedule {
+            schedule: unchanged,
+        } = registry
+            .dispatch(Request::UpdateAgentSchedule {
+                schedule_id: schedule.id.clone(),
+                expected_revision: 2,
+                update: schedule_update("renamed", "first prompt", " 0  2 * * * "),
+            })
+            .unwrap()
+        else {
+            panic!("expected unchanged schedule");
+        };
+        assert_eq!(unchanged, renamed);
+        assert_eq!(lock(&registry.events.state).unwrap().latest_id, event_id);
+
+        set_scheduler_time(&registry, 300);
+        assert!(
+            registry
+                .dispatch(Request::UpdateAgentSchedule {
+                    schedule_id: schedule.id.clone(),
+                    expected_revision: 2,
+                    update: schedule_update("renamed", "second prompt", "0 2 * * *"),
+                })
+                .is_err(),
+            "the no-op must not consume the injected persistence failure"
+        );
+        registry.flush_pending().unwrap();
+        let Response::AgentSchedule { schedule: prompted } = registry
+            .dispatch(Request::UpdateAgentSchedule {
+                schedule_id: schedule.id.clone(),
+                expected_revision: 2,
+                update: schedule_update("renamed", "second prompt", "0 2 * * *"),
+            })
+            .unwrap()
+        else {
+            panic!("expected prompt update");
+        };
+        assert_eq!(
+            (
+                prompted.revision,
+                prompted.prompt_revision,
+                prompted.trigger_revision
+            ),
+            (3, 3, 1)
+        );
+        assert_eq!(prompted.evaluation_frontier_ms, original_frontier);
+
+        set_scheduler_time(&registry, 400);
+        let Response::AgentSchedule {
+            schedule: triggered,
+        } = registry
+            .dispatch(Request::UpdateAgentSchedule {
+                schedule_id: schedule.id,
+                expected_revision: 3,
+                update: schedule_update("renamed", "second prompt", "15 3 * * *"),
+            })
+            .unwrap()
+        else {
+            panic!("expected trigger update");
+        };
+        assert_eq!(
+            (
+                triggered.revision,
+                triggered.prompt_revision,
+                triggered.trigger_revision
+            ),
+            (4, 3, 4)
+        );
+        assert_eq!(triggered.evaluation_frontier_ms, 400);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn schedule_update_requires_paused_exact_revision_and_valid_unique_definition() {
+        let registry = DaemonService::default();
+        let workspace = registry
+            .create_workspace("schedule-validation".into(), Vec::new())
+            .unwrap();
+        let Response::AgentSchedule { schedule } = registry
+            .dispatch(Request::CreateAgentSchedule {
+                workspace_id: workspace.id.clone(),
+                spec: schedule_spec("private"),
+            })
+            .unwrap()
+        else {
+            panic!("expected schedule");
+        };
+        let mut second = schedule_spec("other private");
+        second.name = "other".into();
+        registry
+            .dispatch(Request::CreateAgentSchedule {
+                workspace_id: workspace.id,
+                spec: second,
+            })
+            .unwrap();
+        let Response::AgentSchedule { schedule: enabled } = registry
+            .dispatch(Request::ResumeAgentSchedule {
+                schedule_id: schedule.id.clone(),
+            })
+            .unwrap()
+        else {
+            panic!("expected enabled schedule");
+        };
+        let busy = registry
+            .dispatch(Request::UpdateAgentSchedule {
+                schedule_id: schedule.id.clone(),
+                expected_revision: enabled.revision,
+                update: schedule_update("changed", "changed", "0 3 * * *"),
+            })
+            .unwrap_err();
+        assert_eq!(busy.wire_code(), ErrorCode::Busy);
+        let Response::AgentSchedule { schedule: paused } = registry
+            .dispatch(Request::PauseAgentSchedule {
+                schedule_id: schedule.id.clone(),
+            })
+            .unwrap()
+        else {
+            panic!("expected paused schedule");
+        };
+        let stale = registry
+            .dispatch(Request::UpdateAgentSchedule {
+                schedule_id: schedule.id.clone(),
+                expected_revision: enabled.revision,
+                update: schedule_update("changed", "changed", "0 3 * * *"),
+            })
+            .unwrap_err();
+        assert_eq!(stale.wire_code(), ErrorCode::RevisionAhead);
+        let duplicate = registry
+            .dispatch(Request::UpdateAgentSchedule {
+                schedule_id: schedule.id.clone(),
+                expected_revision: paused.revision,
+                update: schedule_update("other", "changed", "0 3 * * *"),
+            })
+            .unwrap_err();
+        assert_eq!(duplicate.wire_code(), ErrorCode::AlreadyExists);
+        let invalid = registry
+            .dispatch(Request::UpdateAgentSchedule {
+                schedule_id: schedule.id,
+                expected_revision: paused.revision,
+                update: schedule_update("changed", "changed", "not a cron"),
+            })
+            .unwrap_err();
+        assert_eq!(invalid.wire_code(), ErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn schedule_update_rolls_back_persistence_and_publishes_prompt_free_event() {
+        let directory = env::temp_dir().join(format!("boomux-update-rollback-{}", Uuid::new_v4()));
+        let registry = DaemonService::restore(
+            StateStore::at(directory.join("state/state.json")),
+            false,
+            None,
+        )
+        .unwrap();
+        let workspace = registry
+            .create_workspace("schedule-rollback".into(), Vec::new())
+            .unwrap();
+        let Response::AgentSchedule { schedule } = registry
+            .dispatch(Request::CreateAgentSchedule {
+                workspace_id: workspace.id,
+                spec: schedule_spec("original private"),
+            })
+            .unwrap()
+        else {
+            panic!("expected schedule");
+        };
+        let event_id = lock(&registry.events.state).unwrap().latest_id;
+        registry.fail_next_persistence();
+        assert!(
+            registry
+                .dispatch(Request::UpdateAgentSchedule {
+                    schedule_id: schedule.id.clone(),
+                    expected_revision: 1,
+                    update: schedule_update("updated", "NEW PRIVATE PROMPT", "0 3 * * *"),
+                })
+                .is_err()
+        );
+        assert_eq!(
+            registry.schedule(&schedule.id).unwrap().snapshot().unwrap(),
+            schedule
+        );
+        assert_eq!(lock(&registry.events.state).unwrap().latest_id, event_id);
+        registry.flush_pending().unwrap();
+
+        registry
+            .dispatch(Request::UpdateAgentSchedule {
+                schedule_id: schedule.id,
+                expected_revision: 1,
+                update: schedule_update("updated", "NEW PRIVATE PROMPT", "0 3 * * *"),
+            })
+            .unwrap();
+        let events = lock(&registry.events.state).unwrap().events.clone();
+        let event = events.back().unwrap();
+        assert!(matches!(
+            event.kind,
+            DaemonEventKind::AgentScheduleUpdated { .. }
+        ));
+        assert!(
+            !serde_json::to_string(event)
+                .unwrap()
+                .contains("NEW PRIVATE PROMPT")
         );
         fs::remove_dir_all(directory).unwrap();
     }
@@ -14056,6 +14525,58 @@ mod tests {
             panic!("expected filtered events");
         };
         assert_eq!(filtered_cursor, cursor);
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn protocol_twenty_six_filters_schedule_updates_without_rewinding_cursor() {
+        let registry = DaemonService::default();
+        let workspace = registry
+            .create_workspace("schedule-edit-filter".into(), Vec::new())
+            .unwrap();
+        let Response::AgentSchedule { schedule } = registry
+            .dispatch(Request::CreateAgentSchedule {
+                workspace_id: workspace.id,
+                spec: schedule_spec("private prompt"),
+            })
+            .unwrap()
+        else {
+            panic!("expected schedule");
+        };
+        let Response::Events {
+            cursor: baseline, ..
+        } = registry.read_events(None, 256, 0).unwrap()
+        else {
+            panic!("expected event baseline");
+        };
+        registry
+            .dispatch(Request::UpdateAgentSchedule {
+                schedule_id: schedule.id,
+                expected_revision: 1,
+                update: schedule_update("updated", "new private prompt", "0 3 * * *"),
+            })
+            .unwrap();
+        let current = registry.read_events(Some(&baseline), 256, 0).unwrap();
+        let Response::Events {
+            cursor: current_cursor,
+            events: current_events,
+            ..
+        } = current.clone()
+        else {
+            panic!("expected current events");
+        };
+        assert!(matches!(
+            current_events.as_slice(),
+            [DaemonEvent {
+                kind: DaemonEventKind::AgentScheduleUpdated { .. },
+                ..
+            }]
+        ));
+
+        let Response::Events { cursor, events, .. } = response_for_version(current, 26) else {
+            panic!("expected filtered events");
+        };
+        assert_eq!(cursor, current_cursor);
         assert!(events.is_empty());
     }
 

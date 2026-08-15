@@ -15,8 +15,8 @@ use std::time::Duration;
 
 use crate::protocol::{
     self, AgentInstanceSnapshot, AgentRegistrationSpec, AgentReport, AgentScheduleInspection,
-    AgentScheduleSnapshot, AgentScheduleSpec, DaemonEvent, Envelope, ErrorCode, EventCursor,
-    FocusedTerminalSnapshot, NotificationDeliveryConfig, Request, Response,
+    AgentScheduleSnapshot, AgentScheduleSpec, AgentScheduleUpdate, DaemonEvent, Envelope,
+    ErrorCode, EventCursor, FocusedTerminalSnapshot, NotificationDeliveryConfig, Request, Response,
     ScheduledExecutionScheduleProjection, ScheduledExecutionSnapshot, ScheduledOccurrence,
     ScheduledRunnerResult, ShellSnapshot, ShellSpec, ShellStatus, Snapshot, TerminalPreview,
     TerminalPreviewLine, TerminalPreviewSpan, TerminalProfile, UnixEnvironment,
@@ -743,6 +743,22 @@ impl Client {
         match self.request(Request::CreateAgentSchedule {
             workspace_id: workspace_id.into(),
             spec,
+        })? {
+            Response::AgentSchedule { schedule } => Ok(schedule),
+            other => unexpected(other),
+        }
+    }
+
+    pub fn update_agent_schedule(
+        &self,
+        schedule_id: impl Into<String>,
+        expected_revision: u64,
+        update: AgentScheduleUpdate,
+    ) -> Result<AgentScheduleSnapshot> {
+        match self.request(Request::UpdateAgentSchedule {
+            schedule_id: schedule_id.into(),
+            expected_revision,
+            update,
         })? {
             Response::AgentSchedule { schedule } => Ok(schedule),
             other => unexpected(other),
@@ -1552,6 +1568,79 @@ mod tests {
         }
     }
 
+    #[test]
+    fn update_agent_schedule_sends_revisioned_private_definition() {
+        let directory = env::temp_dir().join(format!("boomux-client-update-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let socket = directory.join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+            assert_eq!(request.version, 27);
+            let Request::UpdateAgentSchedule {
+                schedule_id,
+                expected_revision,
+                update,
+            } = request.message
+            else {
+                panic!("expected schedule update");
+            };
+            assert_eq!(schedule_id, "schedule-1");
+            assert_eq!(expected_revision, 4);
+            assert_eq!(update.prompt, "private prompt");
+            protocol::write_message(
+                &mut stream,
+                &Envelope::with_version(
+                    27,
+                    Response::AgentSchedule {
+                        schedule: AgentScheduleSnapshot {
+                            id: schedule_id,
+                            workspace_id: "workspace-1".into(),
+                            name: update.name,
+                            cwd: env::temp_dir(),
+                            integration: "opencode".into(),
+                            session: protocol::AgentScheduleSession::Fresh,
+                            trigger: update.trigger,
+                            state: protocol::AgentScheduleState::Paused,
+                            overlap_policy: protocol::AgentScheduleOverlapPolicy::Skip,
+                            revision: 5,
+                            prompt_revision: 5,
+                            trigger_revision: 5,
+                            created_at_ms: 1,
+                            updated_at_ms: 2,
+                            evaluation_frontier_ms: 2,
+                            execution_shell_id: None,
+                            next_occurrence: None,
+                        },
+                    },
+                ),
+            )
+            .unwrap();
+        });
+        let client = Client::from_socket_path(socket);
+
+        let updated = client
+            .update_agent_schedule(
+                "schedule-1",
+                4,
+                AgentScheduleUpdate {
+                    name: "updated".into(),
+                    prompt: "private prompt".into(),
+                    trigger: protocol::AgentScheduleTrigger {
+                        cron: "0 3 * * *".into(),
+                        timezone: "UTC".into(),
+                    },
+                },
+            )
+            .unwrap();
+
+        assert_eq!(updated.revision, 5);
+        assert_eq!(updated.name, "updated");
+        server.join().unwrap();
+        fs::remove_dir_all(directory).unwrap();
+    }
+
     fn test_scheduled_execution(id: &str, requested_at_ms: u64) -> ScheduledExecutionSnapshot {
         ScheduledExecutionSnapshot {
             id: id.into(),
@@ -1654,6 +1743,7 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
+            reject_protocol(&listener, 27, 26);
             reject_protocol(&listener, 26, 25);
             reject_protocol(&listener, 25, 24);
             reject_protocol(&listener, 24, 23);
@@ -1946,6 +2036,7 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
+            reject_protocol(&listener, 27, 26);
             reject_protocol(&listener, 26, 25);
             reject_protocol(&listener, 25, 24);
             reject_protocol(&listener, 24, 23);
@@ -2008,6 +2099,7 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
+            reject_protocol(&listener, 27, 26);
             reject_protocol(&listener, 26, 25);
             reject_protocol(&listener, 25, 24);
             reject_protocol(&listener, 24, 23);

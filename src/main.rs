@@ -19,9 +19,10 @@ use uuid::Uuid;
 use boomux::protocol::{
     AgentAuthority, AgentInstanceSnapshot, AgentRegistrationSpec, AgentReport,
     AgentScheduleOverlapPolicy, AgentScheduleSession, AgentScheduleSnapshot, AgentScheduleSpec,
-    AgentScheduleState, AgentScheduleTrigger, AgentState, EventCursor, ScheduledExecutionOutcome,
-    ScheduledExecutionSnapshot, ScheduledRunnerResult, ShellSnapshot, ShellSpec, ShellStatus,
-    Snapshot, WorkspaceLauncherSnapshot, WorkspaceLauncherSpec, WorkspaceSnapshot,
+    AgentScheduleState, AgentScheduleTrigger, AgentScheduleUpdate, AgentState, EventCursor,
+    ScheduledExecutionOutcome, ScheduledExecutionSnapshot, ScheduledRunnerResult, ShellSnapshot,
+    ShellSpec, ShellStatus, Snapshot, WorkspaceLauncherSnapshot, WorkspaceLauncherSpec,
+    WorkspaceSnapshot,
 };
 use boomux::{attach, client, daemon, protocol};
 
@@ -42,7 +43,6 @@ mod integration_management;
 mod process_adapter;
 mod projects;
 mod session_projection;
-mod session_transcript;
 mod terminal;
 mod tui;
 
@@ -259,8 +259,6 @@ const NON_PROTOCOL_FEATURES: &[&str] = &[
     "opencode_lifecycle_plugin",
     "pi_lifecycle_extension",
     "process_adapters",
-    "canonical_session_transcripts",
-    "transcript_pagination",
     "desktop_notifications",
     "sound_notifications",
     "integration_management",
@@ -661,16 +659,6 @@ enum SessionCommands {
     /// Show a projected session by exact opaque ID
     #[command(alias = "get")]
     Inspect { session_id: String },
-    /// Read canonical messages and tool activity by exact opaque ID
-    Read {
-        session_id: String,
-        #[arg(long)]
-        before: Option<String>,
-        #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u16).range(1..=1000))]
-        limit: u16,
-        #[arg(long, default_value_t = 1024 * 1024, value_parser = clap::value_parser!(u32).range(1..=4 * 1024 * 1024))]
-        max_bytes: u32,
-    },
 }
 
 #[derive(Subcommand)]
@@ -1054,7 +1042,6 @@ command_keys! {
     IntegrationVerify => ("integration.verify", Json),
     SessionList => ("session.list", Json),
     SessionInspect => ("session.inspect", Json),
-    SessionRead => ("session.read", Json),
     ScheduleCreate => ("schedule.create", Json),
     ScheduleList => ("schedule.list", Json),
     ScheduleInspect => ("schedule.inspect", Json),
@@ -1139,9 +1126,6 @@ impl Cli {
             Some(Commands::Session {
                 command: SessionCommands::Inspect { .. },
             }) => CommandKey::SessionInspect,
-            Some(Commands::Session {
-                command: SessionCommands::Read { .. },
-            }) => CommandKey::SessionRead,
             Some(Commands::Schedule {
                 command: ScheduleCommands::Create(..),
             }) => CommandKey::ScheduleCreate,
@@ -1733,6 +1717,49 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
                     .map_err(|error| error.to_string());
                 tui::DashboardEvent::OperationCompleted(result)
             }
+            tui::DashboardEffect::LoadScheduleEditor { schedule_id } => {
+                let result = client
+                    .get_agent_schedule(&schedule_id)
+                    .map(|inspection| tui::ScheduleEditInspection {
+                        schedule_id: inspection.schedule.id,
+                        name: inspection.schedule.name,
+                        cron: inspection.schedule.trigger.cron,
+                        timezone: inspection.schedule.trigger.timezone,
+                        prompt: inspection.prompt,
+                        revision: inspection.schedule.revision,
+                        paused: inspection.schedule.state == AgentScheduleState::Paused,
+                    })
+                    .map_err(|error| error.to_string());
+                tui::DashboardEvent::ScheduleEditorLoaded {
+                    schedule_id,
+                    result,
+                }
+            }
+            tui::DashboardEffect::UpdateSchedule {
+                schedule_id,
+                expected_revision,
+                update,
+            } => {
+                let result = client
+                    .update_agent_schedule(
+                        &schedule_id,
+                        expected_revision,
+                        AgentScheduleUpdate {
+                            name: update.name,
+                            prompt: update.prompt,
+                            trigger: AgentScheduleTrigger {
+                                cron: update.cron,
+                                timezone: update.timezone,
+                            },
+                        },
+                    )
+                    .map(|schedule| format!("Updated schedule {}", schedule.name))
+                    .map_err(|error| error.to_string());
+                tui::DashboardEvent::ScheduleEditorSaved {
+                    schedule_id,
+                    result,
+                }
+            }
             tui::DashboardEffect::CancelExecution(execution_id) => {
                 let result = cancel_dashboard_execution(&client, &execution_id);
                 tui::DashboardEvent::OperationCompleted(result)
@@ -1749,6 +1776,11 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
                     &run_id,
                     terminal.as_deref(),
                 );
+                tui::DashboardEvent::OperationCompleted(result)
+            }
+            tui::DashboardEffect::OpenAgentSession { session_id } => {
+                let result =
+                    open_dashboard_agent_session(&client, &session_id, terminal.as_deref());
                 tui::DashboardEvent::OperationCompleted(result)
             }
             tui::DashboardEffect::RemoveSchedule(schedule_id) => {
@@ -1791,15 +1823,6 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
                     result,
                 }
             }
-            tui::DashboardEffect::ReadExecutionTranscript {
-                session_id,
-                execution_id,
-            } => tui::DashboardEvent::TranscriptCompleted(read_dashboard_transcript(
-                &client,
-                refresh.snapshot(),
-                &session_id,
-                &execution_id,
-            )),
             tui::DashboardEffect::ReadTerminalPreview {
                 shell_id,
                 run_id,
@@ -1824,10 +1847,17 @@ fn dashboard_state(
     title_cache: &mut host_session_titles::Cache,
     reset_focus_revision: bool,
 ) -> tui::DashboardState {
-    let mut workspaces = dashboard_views_with_catalog(&snapshot.workspaces, git_cache, title_cache);
-    enrich_session_titles(&mut workspaces, title_cache);
     let schedules_supported = protocol::ProtocolFeature::ScheduledExecutionObservation
         .is_supported_by(refresh.negotiated_protocol);
+    let mut workspaces = dashboard_views_with_catalog(&snapshot.workspaces, git_cache, title_cache);
+    if !schedules_supported {
+        for workspace in &mut workspaces {
+            workspace
+                .items
+                .retain(|item| !matches!(item, tui::WorkspaceItemView::Schedule(_)));
+        }
+    }
+    enrich_session_titles(&mut workspaces, title_cache);
     let scheduling = if !schedules_supported {
         tui::SchedulingView::Unsupported {
             required_protocol: protocol::ProtocolFeature::ScheduledExecutionObservation
@@ -1868,57 +1898,11 @@ fn dashboard_state(
         scheduling,
         exact_run_attachment: protocol::ProtocolFeature::ExactRunAttachment
             .is_supported_by(refresh.negotiated_protocol),
+        schedule_editing: protocol::ProtocolFeature::AgentScheduleEditing
+            .is_supported_by(refresh.negotiated_protocol),
         focused_terminal: snapshot.focused_terminal.map(focused_terminal_view),
         reset_focus_revision,
     }
-}
-
-fn read_dashboard_transcript(
-    client: &client::Client,
-    snapshot: &Snapshot,
-    session_id: &str,
-    execution_id: &str,
-) -> Result<tui::TranscriptView, String> {
-    let execution = client
-        .get_scheduled_execution(execution_id)
-        .map_err(|error| error.to_string())?;
-    let agent_id = execution
-        .agent_id
-        .as_deref()
-        .ok_or_else(|| "selected execution has no exact linked Agent".to_owned())?;
-    let sessions = session_projection::project_workspaces_with_catalog(&snapshot.workspaces, None);
-    let session = session_projection::resolve_exact(&sessions, session_id)
-        .map_err(|error| format!("could not resolve exact linked session: {error:?}"))?;
-    if !session
-        .occurrences
-        .iter()
-        .any(|occurrence| occurrence.agent_id == agent_id)
-    {
-        return Err("selected execution no longer links to the requested canonical session".into());
-    }
-    let transcript = session_transcript::read(session, None, 32, 64 * 1024)
-        .map_err(|error| error.to_string())?;
-    let mut lines = Vec::new();
-    for entry in transcript.entries {
-        lines.push(transcript_heading(
-            entry.kind,
-            entry.tool_name.as_deref(),
-            entry.status.as_deref(),
-            entry.role.as_deref(),
-        ));
-        for value in [entry.text, entry.input, entry.output]
-            .into_iter()
-            .flatten()
-        {
-            lines.push(format!("  {}", escape_terminal_text(&value)));
-        }
-    }
-    Ok(tui::TranscriptView {
-        execution_id: execution_id.to_owned(),
-        session_id: transcript.session_id,
-        lines,
-        truncated: transcript.truncated,
-    })
 }
 
 fn focused_terminal_view(focused: protocol::FocusedTerminalSnapshot) -> tui::FocusedTerminalView {
@@ -2052,6 +2036,71 @@ fn validate_dashboard_execution_open(
         );
     }
     Ok(())
+}
+
+fn open_dashboard_agent_session(
+    client: &client::Client,
+    session_id: &str,
+    terminal: Option<&str>,
+) -> Result<String, String> {
+    let snapshot = client.snapshot().map_err(|error| error.to_string())?;
+    let catalog = discover_host_catalog(&snapshot.workspaces);
+    let sessions = session_projection::project_snapshot_with_catalog(&snapshot, Some(&catalog));
+    let session = session_projection::resolve_exact(&sessions, session_id).map_err(|error| {
+        format!("exact Agent Session is no longer available ({error:?}); refresh and try again")
+    })?;
+    let (cwd, command) = dashboard_session_resume_plan(session)?;
+    terminal::open_command(
+        terminal,
+        &cwd,
+        &format!(
+            "{} - {} session",
+            session.workspace_name, session.integration
+        ),
+        &command,
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(format!(
+        "Opened exact {} Agent Session in an external terminal for {}",
+        session.integration, session.workspace_name
+    ))
+}
+
+fn dashboard_session_resume_plan(
+    session: &session_projection::SessionProjection,
+) -> Result<(PathBuf, Vec<String>), String> {
+    if session.state_is_current {
+        return Err(
+            "Agent Session is already active in a managed shell; open that shell instead".into(),
+        );
+    }
+    if session.state == AgentState::Done {
+        return Err("Agent Session is permanently done and cannot be resumed".into());
+    }
+    let external_session_id = session
+        .external_session_id
+        .as_deref()
+        .ok_or("Agent Session has no canonical external session ID")?;
+    let descriptor = boomux::integrations::by_key(&session.integration)
+        .ok_or_else(|| format!("unknown Agent integration {}", session.integration))?;
+    let resume = descriptor.resume.ok_or_else(|| {
+        format!(
+            "{} does not support interactive session resume",
+            descriptor.display_name
+        )
+    })?;
+    let command = resume.command(&[], external_session_id).ok_or_else(|| {
+        format!(
+            "{} could not construct a session resume command",
+            descriptor.display_name
+        )
+    })?;
+    let cwd = session
+        .source_cwd
+        .as_deref()
+        .ok_or("Agent Session has no retained working directory")?;
+    let cwd = resolve_directory(cwd).map_err(|error| error.to_string())?;
+    Ok((cwd, command))
 }
 
 #[cfg(test)]
@@ -2976,9 +3025,6 @@ fn capabilities(json: bool) -> Result<(), Box<dyn Error>> {
         "context_required",
         "ambiguous_target",
         "unsupported_integration",
-        "session_source_unavailable",
-        "session_source_invalid",
-        "session_source_too_large",
         "internal",
         "unknown",
     ];
@@ -3004,7 +3050,6 @@ fn capabilities(json: bool) -> Result<(), Box<dyn Error>> {
                 "json_schemas": [cli_output::SCHEMA],
                 "json_commands": json_commands,
                 "features": features,
-                "session_transcript_integrations": session_transcript::supported_integrations(),
                 "integration_hosts": integration_hosts,
                 "error_codes": error_codes,
             }),
@@ -3015,10 +3060,6 @@ fn capabilities(json: bool) -> Result<(), Box<dyn Error>> {
     println!("JSON SCHEMAS\t{}", cli_output::SCHEMA);
     println!("JSON COMMANDS\t{}", json_commands.join(","));
     println!("FEATURES\t{}", features.join(","));
-    println!(
-        "SESSION TRANSCRIPT INTEGRATIONS\t{}",
-        session_transcript::supported_integrations().join(",")
-    );
     println!(
         "INTEGRATION HOSTS\t{}",
         integration_management::IntegrationId::all()
@@ -3775,45 +3816,6 @@ fn session_command(command: SessionCommands, json: bool) -> Result<(), Box<dyn E
                 );
             }
             print_session(session);
-        }
-        SessionCommands::Read {
-            session_id,
-            before,
-            limit,
-            max_bytes,
-        } => {
-            let catalog = discover_host_catalog(&snapshot.workspaces);
-            let sessions =
-                session_projection::project_snapshot_with_catalog(&snapshot, Some(&catalog));
-            let session = match session_projection::resolve_exact(&sessions, &session_id) {
-                Ok(session) => session,
-                Err(session_projection::ResolveError::NotFound) => {
-                    return Err(cli_output::failure(
-                        "not_found",
-                        format!("session not found: {session_id}"),
-                    ));
-                }
-                Err(session_projection::ResolveError::DuplicateId) => {
-                    return Err(cli_output::failure(
-                        "internal",
-                        format!("duplicate projected session ID: {session_id}"),
-                    ));
-                }
-            };
-            let transcript = session_transcript::read(
-                session,
-                before.as_deref(),
-                limit.into(),
-                max_bytes as usize,
-            )
-            .map_err(|error| cli_output::failure(error.code, error.to_string()))?;
-            if json {
-                return print_json(
-                    CommandKey::SessionRead,
-                    serde_json::json!({ "transcript": transcript }),
-                );
-            }
-            print_transcript(&transcript);
         }
     }
     Ok(())
@@ -4726,27 +4728,6 @@ fn is_bidi_control(character: char) -> bool {
     )
 }
 
-fn transcript_heading(
-    kind: &str,
-    tool_name: Option<&str>,
-    status: Option<&str>,
-    role: Option<&str>,
-) -> String {
-    if kind == "tool" {
-        format!(
-            "TOOL {} [{}]",
-            escape_terminal_text(tool_name.unwrap_or("unknown")),
-            escape_terminal_text(status.unwrap_or("unknown"))
-        )
-    } else {
-        format!(
-            "{} {}",
-            escape_terminal_text(&kind.to_uppercase()),
-            escape_terminal_text(role.unwrap_or(""))
-        )
-    }
-}
-
 fn schedule_session_label(session: &AgentScheduleSession) -> String {
     match session {
         AgentScheduleSession::Fresh => "fresh".into(),
@@ -4936,63 +4917,6 @@ fn print_session(session: &session_projection::SessionProjection) {
             occurrence.observation.confidence
         );
         println!("OBSERVED AT MS\t{}", occurrence.observation.observed_at_ms);
-    }
-}
-
-fn print_transcript(transcript: &session_transcript::Transcript) {
-    println!("SESSION ID\t{}", transcript.session_id);
-    println!("INTEGRATION\t{}", transcript.integration);
-    println!("EXTERNAL SESSION ID\t{}", transcript.external_session_id);
-    println!(
-        "ENTRIES\t{} of {}",
-        transcript.returned_entries, transcript.total_entries
-    );
-    println!("CONTENT BYTES\t{}", transcript.content_bytes);
-    println!("HAS MORE\t{}", transcript.has_more);
-    println!(
-        "NEXT CURSOR\t{}",
-        transcript.next_cursor.as_deref().unwrap_or("-")
-    );
-    println!(
-        "TRUNCATED\t{}",
-        if transcript.truncated {
-            transcript.truncated_by.join(",")
-        } else {
-            "no".to_owned()
-        }
-    );
-    for entry in &transcript.entries {
-        println!();
-        match entry.kind {
-            "tool" => println!(
-                "TOOL\t{}\t{}",
-                entry.tool_name.as_deref().unwrap_or("unknown"),
-                entry.status.as_deref().unwrap_or("unknown")
-            ),
-            _ => println!(
-                "{}\t{}",
-                entry.kind.to_uppercase(),
-                entry.role.as_deref().unwrap_or("unknown")
-            ),
-        }
-        if let Some(timestamp_ms) = entry.timestamp_ms {
-            println!("TIMESTAMP MS\t{timestamp_ms}");
-        }
-        if let Some(call_id) = entry.tool_call_id.as_deref() {
-            println!("CALL ID\t{call_id}");
-        }
-        if let Some(text) = entry.text.as_deref() {
-            println!("{text}");
-        }
-        if let Some(input) = entry.input.as_deref() {
-            println!("INPUT\t{input}");
-        }
-        if let Some(output) = entry.output.as_deref() {
-            println!("OUTPUT\t{output}");
-        }
-        if entry.truncated {
-            println!("ENTRY TRUNCATED\ttrue");
-        }
     }
 }
 
@@ -7298,36 +7222,7 @@ mod tests {
         assert_eq!(inspect.command_descriptor().key, "session.inspect");
         assert_eq!(inspect.command_descriptor().output, OutputMode::Json);
 
-        let read = Cli::try_parse_from([
-            "boomux",
-            "session",
-            "read",
-            "opaque",
-            "--before",
-            "v1.cursor",
-            "--limit",
-            "25",
-            "--max-bytes",
-            "4096",
-            "--json",
-        ])
-        .unwrap();
-        assert_eq!(read.command_descriptor().key, "session.read");
-        assert_eq!(read.command_descriptor().output, OutputMode::Json);
-        assert!(matches!(
-            read.command,
-            Some(Commands::Session {
-                command: SessionCommands::Read {
-                    session_id,
-                    before: Some(before),
-                    limit: 25,
-                    max_bytes: 4096,
-                }
-            }) if session_id == "opaque" && before == "v1.cursor"
-        ));
-        assert!(
-            Cli::try_parse_from(["boomux", "session", "read", "opaque", "--limit", "0"]).is_err()
-        );
+        assert!(Cli::try_parse_from(["boomux", "session", "read", "opaque"]).is_err());
     }
 
     #[test]
@@ -8131,6 +8026,34 @@ mod tests {
     }
 
     #[test]
+    fn dashboard_session_resume_plan_uses_exact_host_identity_and_rejects_current_work() {
+        let mut session = session_projection::SessionProjection {
+            id: "session-1".into(),
+            workspace_id: "w1".into(),
+            workspace_name: "project".into(),
+            integration: "opencode".into(),
+            external_session_id: Some("ses_exact".into()),
+            description: "review".into(),
+            state: AgentState::Inactive,
+            state_is_current: false,
+            started_at_ms: 1,
+            last_at_ms: 2,
+            source_cwd: Some(env::temp_dir()),
+            occurrences: Vec::new(),
+        };
+
+        let (_, command) = dashboard_session_resume_plan(&session).unwrap();
+        assert_eq!(command, ["opencode", "--session", "ses_exact"]);
+
+        session.state_is_current = true;
+        assert!(
+            dashboard_session_resume_plan(&session)
+                .unwrap_err()
+                .contains("already active")
+        );
+    }
+
+    #[test]
     fn exact_execution_open_rejects_a_reused_schedule_shell_run() {
         let mut execution = scheduled_execution("execution-1", "schedule-1");
         execution.shell_id = Some("schedule-shell".into());
@@ -8169,15 +8092,17 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
-            for expected_version in [26, 25] {
+            for expected_version in [27, 26, 25] {
                 let (mut stream, _) = listener.accept().unwrap();
                 let request: protocol::Envelope<protocol::Request> =
                     protocol::read_message(&mut stream).unwrap();
                 assert_eq!(request.version, expected_version);
                 assert!(matches!(request.message, protocol::Request::Ping));
-                let response = if expected_version == 26 {
+                let response = if expected_version > 25 {
                     protocol::Response::Error {
-                        message: "protocol version 26 is unsupported; expected 25".into(),
+                        message: format!(
+                            "protocol version {expected_version} is unsupported; expected 25"
+                        ),
                         code: Some(protocol::ErrorCode::UnsupportedVersion),
                     }
                 } else {
@@ -8785,19 +8710,6 @@ mod tests {
             escape_terminal_text("line one\nsecret\u{1b}]52;c;payload\u{7}"),
             "line one\\nsecret\\u{1b}]52;c;payload\\u{7}"
         );
-        assert_eq!(
-            transcript_heading(
-                "tool",
-                Some("cargo\u{1b}]52;c;payload\u{7}"),
-                Some("done\u{202e}hidden"),
-                None,
-            ),
-            "TOOL cargo\\u{1b}]52;c;payload\\u{7} [done\\u{202e}hidden]"
-        );
-        assert_eq!(
-            transcript_heading("message", None, None, Some("user\n\u{2066}spoof")),
-            "MESSAGE user\\n\\u{2066}spoof"
-        );
         fs::write(&path, vec![b'x'; boomux::scheduling::MAX_PROMPT_BYTES + 1]).unwrap();
         let error = schedule_prompt(None, Some(&path)).unwrap_err().to_string();
         assert!(!error.contains(&"x".repeat(100)));
@@ -8841,7 +8753,7 @@ mod tests {
         ] {
             assert!(json_commands.contains(&command));
         }
-        for command in ["session.list", "session.inspect", "session.read"] {
+        for command in ["session.list", "session.inspect"] {
             assert!(json_commands.contains(&command));
         }
         for command in [
@@ -8871,8 +8783,6 @@ mod tests {
             "agent_authority_precedence",
             "opencode_lifecycle_plugin",
             "pi_lifecycle_extension",
-            "canonical_session_transcripts",
-            "transcript_pagination",
             "protocol_15",
             "protocol_16",
             "persistent_agent_attention",
@@ -8897,11 +8807,7 @@ mod tests {
                 .validated_version,
             "0.84.1"
         );
-        assert_eq!(
-            session_transcript::supported_integrations(),
-            ["opencode", "pi"]
-        );
-        assert_eq!(protocol::PROTOCOL_VERSION, 26);
+        assert_eq!(protocol::PROTOCOL_VERSION, 27);
     }
 
     #[test]
@@ -8943,7 +8849,6 @@ mod tests {
                 "integration.verify",
                 "session.list",
                 "session.inspect",
-                "session.read",
                 "schedule.create",
                 "schedule.list",
                 "schedule.inspect",
@@ -9148,7 +9053,6 @@ mod tests {
             "boomux notification test",
             "boomux session list",
             "boomux session inspect",
-            "boomux session read",
             "boomux integration list",
             "boomux integration status",
             "boomux integration install",
