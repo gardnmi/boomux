@@ -1,10 +1,10 @@
 ---
 name: boomux
-description: Inspect and manage Boomux persistent terminal workspaces, launchers, shells, run-scoped agent instances, attention, projected sessions, notifications, process supervision, and integrations. Use when asked to discover shells, agents, or sessions, read terminal output, supervise an explicitly identified external session, report agent lifecycle state, configure or test notifications, install or remove the OpenCode or Pi integration, create or open workspaces and shells, inspect status, rename or close targets, or manage the Boomux daemon.
-compatibility: Requires boomux on PATH. Some name operations require Boomux workspace context or an explicit --workspace; agent mutation and supervision require exact shell-run context, and supervision requires a caller-supplied canonical external session ID.
+description: Inspect and manage Boomux persistent terminal workspaces, launchers, shells, run-scoped agent instances, attention, projected sessions, recurring Agent schedules, notifications, process supervision, and integrations. Use when asked to discover shells, agents, sessions, or schedules, read terminal output, manage explicitly authorized recurring Agent prompts, supervise an explicitly identified external session, report agent lifecycle state, configure or test notifications, install or remove the OpenCode or Pi integration, create or open workspaces and shells, inspect status, rename or close targets, or manage the Boomux daemon.
+compatibility: Requires boomux on PATH. Some name operations require Boomux workspace context or an explicit --workspace; schedule names require BOOMUX_WORKSPACE_ID or explicit --workspace; agent mutation and supervision require exact shell-run context, and continuation schedules or supervision require caller-supplied exact canonical session identity.
 metadata:
   author: boomux
-  version: "9"
+  version: "10"
 ---
 
 # Boomux
@@ -50,12 +50,12 @@ boomux capabilities --json
 
 Parse `data` on success and `error.code` on a nonzero exit; do not parse human
 tables or `error.message`. JSON mutation support includes Agent register,
-ensure, and report; attention acknowledgment; and integration installation and
-uninstallation.
+ensure, and report; attention acknowledgment; schedule create, pause, resume,
+and remove; and integration installation and uninstallation.
 
 Most daemon-backed inspection commands automatically start Boomux when it is
 not running. This includes `list`, `shells`, `read`, `events`, workspace, shell,
-and launcher inspection, Agent, attention, and session inspection, and
+and launcher inspection, Agent, attention, session, and schedule inspection, and
 `doctor`. Use `boomux daemon status` first when starting the daemon would be an
 unwanted side effect. `capabilities`, `integration list`, and `integration
 status` do not start it.
@@ -249,6 +249,52 @@ When `has_more` is true, prepend older pages by passing the exact opaque
 cursor and start a fresh read on `cursor_expired`. Do not decode, edit, or reuse
 a cursor for another projected session.
 
+## Manage Agent Schedules
+
+Schedule prompts are durable private content. Require authorization before
+creating one or using `schedule inspect`, because inspect is the only management
+surface that discloses the prompt. Enabling a schedule authorizes future
+unattended Agent process and tool activity; never pass `--enabled` or run
+`schedule resume` without explicit authorization for that continuing effect.
+
+```console
+boomux schedule create "<name>" --workspace "<workspace-name-or-id>" --cwd "/absolute/project/path" --integration opencode --prompt-file "/path/to/prompt.txt" --weekdays 09:00 --json
+boomux schedule list --json
+boomux schedule list --workspace "<workspace-name-or-id>" --json
+boomux schedule inspect "<exact-id-or-contextual-name>" --workspace "<workspace-name-or-id>" --json
+boomux schedule pause "<exact-id-or-contextual-name>" --workspace "<workspace-name-or-id>" --json
+boomux schedule resume "<exact-id-or-contextual-name>" --workspace "<workspace-name-or-id>" --json
+boomux schedule remove "<exact-id-or-contextual-name>" --workspace "<workspace-name-or-id>" --json
+```
+
+Create requires explicit workspace, cwd, integration, exactly one prompt source,
+and exactly one trigger source. `--prompt` preserves the accepted bytes;
+`--prompt-file` snapshots exact UTF-8, including a final newline, and does not
+track later file changes. Use `--cron '<five fields>'`, `--every Nm|Nh`, `--daily
+HH:MM`, `--weekdays HH:MM`, or `--weekly DAY@HH:MM`. Omitted `--timezone`
+snapshots the system IANA timezone. New schedules default to fresh, paused, and
+skip-overlap policy. `--fresh` conflicts with `--continue`; `--paused` conflicts
+with `--enabled`.
+
+For continuation, first obtain the exact opaque projected session ID from
+`session list --workspace ... --json`, then pass it as `--continue`. It must
+resolve in that workspace, expose a canonical external session ID, and match the
+selected integration. Never substitute a description, external ID, latest
+session, Agent ID, or shell ID.
+
+List, create, pause, resume, and remove responses are prompt-free. Inspect
+returns the private prompt under `data.schedule.prompt`; do not log or repeat it
+unless needed for the authorized request. Exact schedule IDs resolve globally.
+Names resolve only with explicit `--workspace` or `BOOMUX_WORKSPACE_ID`.
+Removing a schedule removes its persisted prompt. Workspace close removes every
+owned schedule and persisted prompt and must be confirmed with that full scope.
+
+This version is the schedule management surface. Dispatch arrives in later
+scheduler and integration stack layers; do not claim that enabling immediately
+executes timed work. Capabilities advertise durable schedule management only;
+dispatch modes and prompt transport are not public capabilities until the
+dispatcher ships.
+
 Exact shell IDs resolve globally. Shell names resolve in the current workspace,
 or through `--workspace` for `shell inspect`, `shell rename`, and `shell close`.
 `boomux read` and top-level `boomux close` require an exact shell ID outside a
@@ -395,11 +441,12 @@ and catch up to the currently focused terminal.
 Boomux reads `$XDG_CONFIG_HOME/boomux/config.toml`, falling back to
 `~/.config/boomux/config.toml`. `BOOMUX_CONFIG` points to an additional
 field-level override loaded last. Configuration controls terminal selection,
-project discovery roots and depth, dashboard focus following, and desktop and
-sound notifications. Unknown fields are rejected. Selecting a discovered
-project in the dashboard persists its canonical path as the workspace default
-cwd for later shells. Set `[dashboard] follow_focused_terminal = false` to
-disable the default focus-following behavior.
+project discovery roots and depth, dashboard focus following, schedule
+concurrency, and desktop and sound notifications. Unknown fields are rejected.
+Selecting a discovered project in the dashboard persists its canonical path as
+the workspace default cwd for later shells. Set
+`[dashboard] follow_focused_terminal = false` to disable the default
+focus-following behavior.
 
 ## Manage Workspaces
 
@@ -416,12 +463,12 @@ boomux workspace close "<name-or-id>"
 `workspace create` creates an empty workspace. `--cwd` stores an optional
 default used by dashboard shells and `shell create` when no explicit cwd is
 given. The default does not prevent individual shells from using other paths.
-`workspace close` terminates
-every running shell process session and removes the workspace, all shell and
-launcher definitions, retained terminal state, and all durable Agent and
-attention records associated with it. Canonical OpenCode or Pi host data is not
-deleted. A workspace cannot close itself from one of its own shells. Confirm
-the exact target and full removal scope first.
+`workspace close` terminates every running shell process session and removes the
+workspace, all shell and launcher definitions, schedules and persisted prompts,
+retained terminal state, and all durable Agent and attention records associated
+with it. Canonical OpenCode or Pi host data is not deleted. A workspace cannot
+close itself from one of its own shells. Confirm the exact target and full
+removal scope first.
 
 `workspace open` is an active, non-transactional restore operation. It invokes
 every launcher in creation order and attempts to open every shell even if an

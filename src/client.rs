@@ -14,11 +14,12 @@ use std::thread;
 use std::time::Duration;
 
 use crate::protocol::{
-    self, AgentInstanceSnapshot, AgentRegistrationSpec, AgentReport, DaemonEvent, Envelope,
-    ErrorCode, EventCursor, FocusedTerminalSnapshot, NotificationDeliveryConfig, Request, Response,
-    ShellSnapshot, ShellSpec, ShellStatus, Snapshot, TerminalPreview, TerminalPreviewLine,
-    TerminalPreviewSpan, TerminalProfile, UnixEnvironment, UnixEnvironmentVariable,
-    WorkspaceLauncherSnapshot, WorkspaceLauncherSpec, WorkspaceSnapshot,
+    self, AgentInstanceSnapshot, AgentRegistrationSpec, AgentReport, AgentScheduleInspection,
+    AgentScheduleSnapshot, AgentScheduleSpec, DaemonEvent, Envelope, ErrorCode, EventCursor,
+    FocusedTerminalSnapshot, NotificationDeliveryConfig, Request, Response, ShellSnapshot,
+    ShellSpec, ShellStatus, Snapshot, TerminalPreview, TerminalPreviewLine, TerminalPreviewSpan,
+    TerminalProfile, UnixEnvironment, UnixEnvironmentVariable, WorkspaceLauncherSnapshot,
+    WorkspaceLauncherSpec, WorkspaceSnapshot,
 };
 
 const CONNECT_ATTEMPTS: usize = 40;
@@ -564,6 +565,18 @@ impl Client {
         }
     }
 
+    pub fn get_agent_schedule(
+        &self,
+        schedule_id: impl Into<String>,
+    ) -> Result<AgentScheduleInspection> {
+        match self.request(Request::GetAgentSchedule {
+            schedule_id: schedule_id.into(),
+        })? {
+            Response::AgentScheduleInspection { inspection } => Ok(inspection),
+            other => unexpected(other),
+        }
+    }
+
     pub fn create_workspace(
         &self,
         name: impl Into<String>,
@@ -622,6 +635,20 @@ impl Client {
             spec,
         })? {
             Response::Launcher { launcher } => Ok(launcher),
+            other => unexpected(other),
+        }
+    }
+
+    pub fn create_agent_schedule(
+        &self,
+        workspace_id: impl Into<String>,
+        spec: AgentScheduleSpec,
+    ) -> Result<AgentScheduleSnapshot> {
+        match self.request(Request::CreateAgentSchedule {
+            workspace_id: workspace_id.into(),
+            spec,
+        })? {
+            Response::AgentSchedule { schedule } => Ok(schedule),
             other => unexpected(other),
         }
     }
@@ -859,6 +886,39 @@ impl Client {
         )
     }
 
+    pub fn pause_agent_schedule(
+        &self,
+        schedule_id: impl Into<String>,
+    ) -> Result<AgentScheduleSnapshot> {
+        match self.request(Request::PauseAgentSchedule {
+            schedule_id: schedule_id.into(),
+        })? {
+            Response::AgentSchedule { schedule } => Ok(schedule),
+            other => unexpected(other),
+        }
+    }
+
+    pub fn resume_agent_schedule(
+        &self,
+        schedule_id: impl Into<String>,
+    ) -> Result<AgentScheduleSnapshot> {
+        match self.request(Request::ResumeAgentSchedule {
+            schedule_id: schedule_id.into(),
+        })? {
+            Response::AgentSchedule { schedule } => Ok(schedule),
+            other => unexpected(other),
+        }
+    }
+
+    pub fn remove_agent_schedule(&self, schedule_id: impl Into<String>) -> Result<()> {
+        expect_ok(
+            self.request(Request::RemoveAgentSchedule {
+                schedule_id: schedule_id.into(),
+            })?,
+            Response::Ok,
+        )
+    }
+
     pub fn close_workspace(&self, workspace_id: impl Into<String>) -> Result<()> {
         expect_ok(
             self.request(Request::CloseWorkspace {
@@ -1085,6 +1145,7 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
+            reject_protocol(&listener, 22, 21);
             reject_protocol(&listener, 21, 20);
             let (mut stream, _) = listener.accept().unwrap();
             let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
@@ -1264,7 +1325,7 @@ mod tests {
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
-            assert_eq!(request.version, 21);
+            assert_eq!(request.version, 22);
             let Request::Attach {
                 environment: Some(environment),
                 ..
@@ -1281,7 +1342,7 @@ mod tests {
             protocol::write_message(
                 &mut stream,
                 &Envelope::with_version(
-                    21,
+                    22,
                     Response::Attached {
                         token: "token".into(),
                         reconstruction: Vec::new(),
@@ -1309,80 +1370,52 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
-            reject_protocol(&listener, 21, 20);
-            reject_protocol(&listener, 21, 20);
-
-            let (mut stream, _) = listener.accept().unwrap();
-            let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
-            assert_eq!(request.version, 20);
-            assert!(matches!(request.message, Request::Ping));
-            protocol::write_message(
-                &mut stream,
-                &Envelope::with_version(
-                    19,
-                    Response::Error {
-                        message: "protocol 20 unsupported".into(),
-                        code: Some(ErrorCode::UnsupportedVersion),
-                    },
-                ),
-            )
-            .unwrap();
-
-            let (mut stream, _) = listener.accept().unwrap();
-            let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
-            assert_eq!(request.version, 19);
-            assert!(matches!(request.message, Request::Ping));
-            protocol::write_message(
-                &mut stream,
-                &Envelope::with_version(
-                    18,
-                    Response::Error {
-                        message: "protocol 19 unsupported".into(),
-                        code: Some(ErrorCode::UnsupportedVersion),
-                    },
-                ),
-            )
-            .unwrap();
-
-            let (mut stream, _) = listener.accept().unwrap();
-            let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
-            assert_eq!(request.version, 18);
-            assert!(matches!(request.message, Request::Ping));
-            protocol::write_message(
-                &mut stream,
-                &Envelope::with_version(
-                    17,
-                    Response::Error {
-                        message: "protocol 18 unsupported".into(),
-                        code: Some(ErrorCode::UnsupportedVersion),
-                    },
-                ),
-            )
-            .unwrap();
-
-            let (mut stream, _) = listener.accept().unwrap();
-            let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
-            assert_eq!(request.version, 17);
-            assert!(matches!(request.message, Request::Ping));
-            protocol::write_message(&mut stream, &Envelope::with_version(17, Response::Pong))
-                .unwrap();
-
-            let (mut stream, _) = listener.accept().unwrap();
-            let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
-            assert_eq!(request.version, 17);
-            assert!(matches!(request.message, Request::Attach { .. }));
-            protocol::write_message(
-                &mut stream,
-                &Envelope::with_version(
-                    17,
-                    Response::Attached {
-                        token: "token".into(),
-                        reconstruction: Vec::new(),
-                        warning: None,
-                    },
-                ),
-            )
-            .unwrap();
+            loop {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+                if request.version > 17 {
+                    assert!(matches!(
+                        request.message,
+                        Request::Ping | Request::Attach { .. }
+                    ));
+                    protocol::write_message(
+                        &mut stream,
+                        &Envelope::with_version(
+                            request.version - 1,
+                            Response::Error {
+                                message: format!("protocol {} unsupported", request.version),
+                                code: Some(ErrorCode::UnsupportedVersion),
+                            },
+                        ),
+                    )
+                    .unwrap();
+                    continue;
+                }
+                assert_eq!(request.version, 17);
+                match request.message {
+                    Request::Ping => protocol::write_message(
+                        &mut stream,
+                        &Envelope::with_version(17, Response::Pong),
+                    )
+                    .unwrap(),
+                    Request::Attach { .. } => {
+                        protocol::write_message(
+                            &mut stream,
+                            &Envelope::with_version(
+                                17,
+                                Response::Attached {
+                                    token: "token".into(),
+                                    reconstruction: Vec::new(),
+                                    warning: None,
+                                },
+                            ),
+                        )
+                        .unwrap();
+                        break;
+                    }
+                    request => panic!("unexpected request: {request:?}"),
+                }
+            }
         });
         let client = Client::from_socket_path(socket);
 
@@ -1400,6 +1433,7 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
+            reject_protocol(&listener, 22, 21);
             reject_protocol(&listener, 21, 20);
             let (mut stream, _) = listener.accept().unwrap();
             let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
@@ -1457,6 +1491,7 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
+            reject_protocol(&listener, 22, 21);
             reject_protocol(&listener, 21, 20);
             let (mut stream, _) = listener.accept().unwrap();
             let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();

@@ -337,6 +337,7 @@ mod tests {
                 foreground_process: None,
             }],
             launchers: Vec::new(),
+            schedules: Vec::new(),
             agents: Vec::new(),
         }
     }

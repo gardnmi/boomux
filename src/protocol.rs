@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 21;
+pub const PROTOCOL_VERSION: u32 = 22;
 pub const MIN_PROTOCOL_VERSION: u32 = 6;
 pub const MAX_CONTROL_FRAME: usize = 8 * 1024 * 1024;
 pub const MAX_ATTACH_FRAME: usize = 1024 * 1024;
@@ -78,6 +78,11 @@ define_protocol_features! {
     WorkspaceDefaultCwd => (19, "request", ["protocol_19", "workspace_default_cwd"]),
     StructuredTerminalPreview => (20, "request", ["protocol_20", "structured_terminal_previews"]),
     FocusedTerminalRead => (21, "request", ["protocol_21", "focused_terminal_read"]),
+    AgentSchedules => (22, "agent schedule management", [
+        "protocol_22",
+        "agent_schedule_management",
+        "durable_agent_schedules",
+    ]),
 }
 
 pub fn protocol_capabilities() -> impl Iterator<Item = &'static str> {
@@ -182,6 +187,111 @@ pub struct WorkspaceSnapshot {
     pub launchers: Vec<WorkspaceLauncherSnapshot>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub agents: Vec<AgentInstanceSnapshot>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub schedules: Vec<AgentScheduleSnapshot>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentScheduleState {
+    #[default]
+    Paused,
+    Enabled,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum AgentScheduleSession {
+    #[default]
+    Fresh,
+    Continue {
+        external_session_id: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentScheduleOverlapPolicy {
+    #[default]
+    Skip,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentScheduleTrigger {
+    pub cron: String,
+    pub timezone: String,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentScheduleSpec {
+    pub name: String,
+    pub cwd: PathBuf,
+    pub integration: String,
+    pub prompt: String,
+    #[serde(default)]
+    pub session: AgentScheduleSession,
+    pub trigger: AgentScheduleTrigger,
+    #[serde(default)]
+    pub state: AgentScheduleState,
+    #[serde(default)]
+    pub overlap_policy: AgentScheduleOverlapPolicy,
+}
+
+impl std::fmt::Debug for AgentScheduleSpec {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AgentScheduleSpec")
+            .field("name", &self.name)
+            .field("cwd", &self.cwd)
+            .field("integration", &self.integration)
+            .field("prompt", &"<redacted>")
+            .field("session", &self.session)
+            .field("trigger", &self.trigger)
+            .field("state", &self.state)
+            .field("overlap_policy", &self.overlap_policy)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentScheduleSnapshot {
+    pub id: String,
+    pub workspace_id: String,
+    pub name: String,
+    pub cwd: PathBuf,
+    pub integration: String,
+    #[serde(default)]
+    pub session: AgentScheduleSession,
+    pub trigger: AgentScheduleTrigger,
+    #[serde(default)]
+    pub state: AgentScheduleState,
+    #[serde(default)]
+    pub overlap_policy: AgentScheduleOverlapPolicy,
+    pub revision: u64,
+    pub prompt_revision: u64,
+    pub trigger_revision: u64,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+    pub evaluation_frontier_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_shell_id: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentScheduleInspection {
+    pub schedule: AgentScheduleSnapshot,
+    pub prompt: String,
+}
+
+impl std::fmt::Debug for AgentScheduleInspection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AgentScheduleInspection")
+            .field("schedule", &self.schedule)
+            .field("prompt", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -431,6 +541,22 @@ pub enum DaemonEventKind {
         shell_id: String,
         agent: AgentInstanceSnapshot,
     },
+    AgentScheduleCreated {
+        workspace_id: String,
+        schedule: AgentScheduleSnapshot,
+    },
+    AgentSchedulePaused {
+        workspace_id: String,
+        schedule: AgentScheduleSnapshot,
+    },
+    AgentScheduleResumed {
+        workspace_id: String,
+        schedule: AgentScheduleSnapshot,
+    },
+    AgentScheduleRemoved {
+        workspace_id: String,
+        schedule_id: String,
+    },
     HandoffCompleted,
 }
 
@@ -534,6 +660,9 @@ pub enum Request {
     GetAgent {
         agent_id: String,
     },
+    GetAgentSchedule {
+        schedule_id: String,
+    },
     WaitAgent {
         agent_id: String,
         after_revision: u64,
@@ -554,6 +683,10 @@ pub enum Request {
     CreateLauncher {
         workspace_id: String,
         spec: WorkspaceLauncherSpec,
+    },
+    CreateAgentSchedule {
+        workspace_id: String,
+        spec: AgentScheduleSpec,
     },
     RegisterAgent {
         shell_id: String,
@@ -625,6 +758,15 @@ pub enum Request {
     RemoveLauncher {
         launcher_id: String,
     },
+    PauseAgentSchedule {
+        schedule_id: String,
+    },
+    ResumeAgentSchedule {
+        schedule_id: String,
+    },
+    RemoveAgentSchedule {
+        schedule_id: String,
+    },
     Attach {
         shell_id: String,
         takeover: bool,
@@ -639,6 +781,11 @@ pub enum Request {
 impl Request {
     pub fn required_feature(&self) -> Option<ProtocolFeature> {
         match self {
+            Self::CreateAgentSchedule { .. }
+            | Self::GetAgentSchedule { .. }
+            | Self::PauseAgentSchedule { .. }
+            | Self::ResumeAgentSchedule { .. }
+            | Self::RemoveAgentSchedule { .. } => Some(ProtocolFeature::AgentSchedules),
             Self::ReadShellPreview { .. } => Some(ProtocolFeature::StructuredTerminalPreview),
             Self::GetFocusedTerminal => Some(ProtocolFeature::FocusedTerminalRead),
             Self::CreateWorkspace {
@@ -722,6 +869,12 @@ pub enum Response {
     },
     Agent {
         agent: AgentInstanceSnapshot,
+    },
+    AgentSchedule {
+        schedule: AgentScheduleSnapshot,
+    },
+    AgentScheduleInspection {
+        inspection: AgentScheduleInspection,
     },
     AgentWait {
         agent: AgentInstanceSnapshot,
@@ -922,6 +1075,32 @@ mod tests {
         }
     }
 
+    fn test_schedule() -> AgentScheduleSnapshot {
+        AgentScheduleSnapshot {
+            id: "schedule-1".into(),
+            workspace_id: "w1".into(),
+            name: "morning review".into(),
+            cwd: "/tmp/project".into(),
+            integration: "opencode".into(),
+            session: AgentScheduleSession::Continue {
+                external_session_id: "session-1".into(),
+            },
+            trigger: AgentScheduleTrigger {
+                cron: "0 9 * * 1-5".into(),
+                timezone: "America/New_York".into(),
+            },
+            state: AgentScheduleState::Enabled,
+            overlap_policy: AgentScheduleOverlapPolicy::Skip,
+            revision: 3,
+            prompt_revision: 2,
+            trigger_revision: 1,
+            created_at_ms: 10,
+            updated_at_ms: 20,
+            evaluation_frontier_ms: 30,
+            execution_shell_id: Some("shell-1".into()),
+        }
+    }
+
     #[derive(Deserialize)]
     struct ProtocolSixShellSnapshot {
         id: String,
@@ -1049,7 +1228,14 @@ mod tests {
 
         assert!(snapshot.launchers.is_empty());
         assert!(snapshot.agents.is_empty());
+        assert!(snapshot.schedules.is_empty());
         assert!(snapshot.default_cwd.is_none());
+        assert!(
+            serde_json::to_value(snapshot)
+                .unwrap()
+                .get("schedules")
+                .is_none()
+        );
     }
 
     #[test]
@@ -1131,9 +1317,171 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_twenty_one_with_minimum_six() {
-        assert_eq!(PROTOCOL_VERSION, 21);
+    fn protocol_version_is_twenty_two_with_minimum_six() {
+        assert_eq!(PROTOCOL_VERSION, 22);
         assert_eq!(MIN_PROTOCOL_VERSION, 6);
+    }
+
+    #[test]
+    fn agent_schedule_defaults_and_snake_case_are_stable() {
+        assert_eq!(AgentScheduleSession::default(), AgentScheduleSession::Fresh);
+        assert_eq!(AgentScheduleState::default(), AgentScheduleState::Paused);
+        assert_eq!(
+            AgentScheduleOverlapPolicy::default(),
+            AgentScheduleOverlapPolicy::Skip
+        );
+
+        let spec: AgentScheduleSpec = serde_json::from_value(serde_json::json!({
+            "name": "review",
+            "cwd": "/tmp/project",
+            "integration": "opencode",
+            "prompt": "review the changes",
+            "trigger": {"cron": "0 9 * * 1-5", "timezone": "UTC"}
+        }))
+        .unwrap();
+        assert_eq!(spec.session, AgentScheduleSession::Fresh);
+        assert_eq!(spec.state, AgentScheduleState::Paused);
+        assert_eq!(spec.overlap_policy, AgentScheduleOverlapPolicy::Skip);
+
+        let continued = serde_json::to_value(AgentScheduleSession::Continue {
+            external_session_id: "session-1".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            continued,
+            serde_json::json!({"continue": {"external_session_id": "session-1"}})
+        );
+        assert_eq!(
+            serde_json::to_value(AgentScheduleState::Enabled).unwrap(),
+            "enabled"
+        );
+        assert_eq!(
+            serde_json::to_value(AgentScheduleOverlapPolicy::Skip).unwrap(),
+            "skip"
+        );
+    }
+
+    #[test]
+    fn agent_schedule_messages_round_trip() {
+        let spec = AgentScheduleSpec {
+            name: "review".into(),
+            cwd: "/tmp/project".into(),
+            integration: "opencode".into(),
+            prompt: "review the changes".into(),
+            session: AgentScheduleSession::Fresh,
+            trigger: AgentScheduleTrigger {
+                cron: "0 9 * * 1-5".into(),
+                timezone: "UTC".into(),
+            },
+            state: AgentScheduleState::Paused,
+            overlap_policy: AgentScheduleOverlapPolicy::Skip,
+        };
+        let requests = [
+            Request::CreateAgentSchedule {
+                workspace_id: "w1".into(),
+                spec,
+            },
+            Request::GetAgentSchedule {
+                schedule_id: "schedule-1".into(),
+            },
+            Request::PauseAgentSchedule {
+                schedule_id: "schedule-1".into(),
+            },
+            Request::ResumeAgentSchedule {
+                schedule_id: "schedule-1".into(),
+            },
+            Request::RemoveAgentSchedule {
+                schedule_id: "schedule-1".into(),
+            },
+        ];
+        for request in requests {
+            let encoded = serde_json::to_value(&request).unwrap();
+            assert_eq!(serde_json::from_value::<Request>(encoded).unwrap(), request);
+        }
+
+        let schedule = test_schedule();
+        for response in [
+            Response::AgentSchedule {
+                schedule: schedule.clone(),
+            },
+            Response::AgentScheduleInspection {
+                inspection: AgentScheduleInspection {
+                    schedule,
+                    prompt: "private prompt".into(),
+                },
+            },
+        ] {
+            let encoded = serde_json::to_value(&response).unwrap();
+            assert_eq!(
+                serde_json::from_value::<Response>(encoded).unwrap(),
+                response
+            );
+        }
+    }
+
+    #[test]
+    fn schedule_summaries_and_events_never_expose_prompts() {
+        let private_prompt = "private prompt contents";
+        let schedule = test_schedule();
+        let request = Request::CreateAgentSchedule {
+            workspace_id: "w1".into(),
+            spec: AgentScheduleSpec {
+                name: "review".into(),
+                cwd: "/tmp/project".into(),
+                integration: "opencode".into(),
+                prompt: private_prompt.into(),
+                session: AgentScheduleSession::Fresh,
+                trigger: schedule.trigger.clone(),
+                state: AgentScheduleState::Paused,
+                overlap_policy: AgentScheduleOverlapPolicy::Skip,
+            },
+        };
+        let request_debug = format!("{request:?}");
+        assert!(!request_debug.contains(private_prompt));
+        assert!(request_debug.contains("redacted"));
+
+        let summary = serde_json::to_value(&schedule).unwrap();
+        assert!(summary.get("prompt").is_none());
+        assert!(!summary.to_string().contains(private_prompt));
+
+        let events = [
+            DaemonEventKind::AgentScheduleCreated {
+                workspace_id: "w1".into(),
+                schedule: schedule.clone(),
+            },
+            DaemonEventKind::AgentSchedulePaused {
+                workspace_id: "w1".into(),
+                schedule: schedule.clone(),
+            },
+            DaemonEventKind::AgentScheduleResumed {
+                workspace_id: "w1".into(),
+                schedule: schedule.clone(),
+            },
+            DaemonEventKind::AgentScheduleRemoved {
+                workspace_id: "w1".into(),
+                schedule_id: schedule.id.clone(),
+            },
+        ];
+        for event in events {
+            let encoded = serde_json::to_value(&event).unwrap();
+            assert!(!encoded.to_string().contains(private_prompt));
+            assert_eq!(
+                serde_json::from_value::<DaemonEventKind>(encoded).unwrap(),
+                event
+            );
+        }
+
+        let inspection = AgentScheduleInspection {
+            schedule,
+            prompt: private_prompt.into(),
+        };
+        let debug = format!("{inspection:?}");
+        assert!(!debug.contains(private_prompt));
+        assert!(debug.contains("redacted"));
+        assert_eq!(
+            serde_json::to_value(inspection).unwrap()["prompt"],
+            private_prompt
+        );
     }
 
     #[test]
@@ -1204,6 +1552,39 @@ mod tests {
     #[test]
     fn request_feature_requirements_cover_all_groups() {
         let groups = vec![
+            (
+                22,
+                vec![
+                    Request::CreateAgentSchedule {
+                        workspace_id: "w1".into(),
+                        spec: AgentScheduleSpec {
+                            name: "review".into(),
+                            cwd: "/tmp".into(),
+                            integration: "opencode".into(),
+                            prompt: "review".into(),
+                            session: AgentScheduleSession::Fresh,
+                            trigger: AgentScheduleTrigger {
+                                cron: "0 9 * * *".into(),
+                                timezone: "UTC".into(),
+                            },
+                            state: AgentScheduleState::Paused,
+                            overlap_policy: AgentScheduleOverlapPolicy::Skip,
+                        },
+                    },
+                    Request::GetAgentSchedule {
+                        schedule_id: "schedule-1".into(),
+                    },
+                    Request::PauseAgentSchedule {
+                        schedule_id: "schedule-1".into(),
+                    },
+                    Request::ResumeAgentSchedule {
+                        schedule_id: "schedule-1".into(),
+                    },
+                    Request::RemoveAgentSchedule {
+                        schedule_id: "schedule-1".into(),
+                    },
+                ],
+            ),
             (21, vec![Request::GetFocusedTerminal]),
             (
                 20,
@@ -1479,6 +1860,14 @@ mod tests {
             (19, &["protocol_19", "workspace_default_cwd"][..]),
             (20, &["protocol_20", "structured_terminal_previews"][..]),
             (21, &["protocol_21", "focused_terminal_read"][..]),
+            (
+                22,
+                &[
+                    "protocol_22",
+                    "agent_schedule_management",
+                    "durable_agent_schedules",
+                ][..],
+            ),
         ];
 
         let actual = ProtocolFeature::ALL
@@ -1487,6 +1876,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(actual, expected);
         assert!(ProtocolFeature::StructuredTerminalPreview.is_supported_by(PROTOCOL_VERSION));
+        assert!(ProtocolFeature::AgentSchedules.is_supported_by(PROTOCOL_VERSION));
         assert_eq!(
             protocol_capabilities().collect::<Vec<_>>(),
             expected

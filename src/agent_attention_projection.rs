@@ -182,6 +182,7 @@ mod tests {
                 foreground_process: None,
             }],
             launchers: Vec::<WorkspaceLauncherSnapshot>::new(),
+            schedules: Vec::new(),
             agents,
         }
     }

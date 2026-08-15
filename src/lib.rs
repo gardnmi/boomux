@@ -6,6 +6,7 @@ mod fd_transfer;
 mod handoff;
 pub mod integrations;
 pub mod protocol;
+pub mod scheduling;
 mod state_store;
 mod terminal_focus;
 mod terminal_state;

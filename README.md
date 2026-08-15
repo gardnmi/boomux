@@ -110,6 +110,7 @@ boomux . --name my-project --new -- sh -lc 'cargo test | tee test.log'
 | **Managed shell** | A persistent terminal session, usually running your login shell. |
 | **Command** | A managed terminal session that runs one command instead of a login shell. |
 | **Launcher** | A desktop command run when its workspace opens. Boomux does not retain its output or process. |
+| **Agent schedule** | A durable workspace-owned recurring Agent prompt. New schedules are paused until explicitly enabled. |
 
 ### What Keeps Running
 
@@ -118,7 +119,7 @@ boomux . --name my-project --new -- sh -lc 'cargo test | tee test.log'
 | Close a terminal window | The managed process keeps running. |
 | Quit the dashboard | All managed processes keep running. |
 | Close a shell in Boomux | That shell's process is terminated. |
-| Close a workspace in Boomux | Its shells are terminated and its metadata is removed. |
+| Close a workspace in Boomux | Its shells are terminated; schedules, persisted prompts, and workspace metadata are removed. |
 | Run `boomux daemon restart` | Live shells are handed to the replacement daemon. |
 | System reboot or unexpected daemon loss | Live processes are lost; workspace and shell definitions remain, and reopening them starts new processes. |
 
@@ -135,6 +136,7 @@ boomux . --name my-project --new -- sh -lc 'cargo test | tee test.log'
 | Choose a terminal | `boomux . --terminal Alacritty.desktop` |
 | Open the dashboard | `boomux` or `boomux ui` |
 | Inspect daemon health | `boomux doctor` |
+| List recurring Agent work | `boomux schedule list --workspace feature-x` |
 
 Without `--name`, Boomux creates the next `workspace-N` and stores the selected
 path as its default for later shells. With `--name`, it adds a shell to an
@@ -195,9 +197,10 @@ outstanding attention item.
 | `x`, then `y` | Confirm closing or removing the selection. |
 | `q` or `Esc` | Quit from normal mode. |
 
-Closing a workspace terminates its managed shells. Closing a shell or command
-terminates its managed process. Removing a launcher affects future workspace
-opens only. Press `?` in the dashboard for context-specific controls.
+Closing a workspace terminates its managed shells and removes its schedules and
+persisted prompts. Closing a shell or command terminates its managed process.
+Removing a launcher affects future workspace opens only. Press `?` in the
+dashboard for context-specific controls.
 
 ## Omarchy Plugin
 
@@ -284,6 +287,36 @@ Boomux does not redact host transcript content. Use transcript commands only
 when reading that session's content is appropriate. Opaque continuation cursors
 can request older pages; discard one and start a fresh read if Boomux reports
 that it expired.
+
+### Agent Schedules
+
+Create and manage a recurring Agent prompt in one workspace:
+
+```console
+boomux schedule create review --workspace my-project --cwd . --integration opencode --prompt-file ./review-prompt.txt --weekdays 09:00
+boomux schedule list --workspace my-project
+boomux schedule inspect review --workspace my-project
+boomux schedule resume review --workspace my-project
+boomux schedule pause review --workspace my-project
+boomux schedule remove review --workspace my-project
+```
+
+Creation snapshots the exact UTF-8 prompt file, including its trailing newline,
+canonicalizes the working directory, trigger, and IANA timezone, and defaults to
+a fresh, paused schedule with overlap skipped. Use `--enabled` only when future
+unattended Agent process and tool activity is authorized. `--continue
+<projected-session-id>` pins the exact canonical session returned by `session
+list`; it never means latest and never falls back to fresh.
+
+List, create, pause, resume, and remove outputs do not disclose prompt text.
+`schedule inspect` is the only prompt disclosure command and should be used only
+when reading the stored private instructions is authorized. Removing a schedule
+deletes its persisted prompt. Closing the workspace removes every owned schedule
+and persisted prompt.
+
+This release provides the durable management surface. Timed dispatch is added by
+later scheduler and integration stack layers; enabling now records consent state
+but does not by itself make this CLI layer dispatch work.
 
 ### Agent Skill
 
@@ -392,6 +425,7 @@ boomux launcher --help
 boomux agent --help
 boomux attention --help
 boomux session --help
+boomux schedule --help
 boomux notification --help
 boomux integration --help
 ```

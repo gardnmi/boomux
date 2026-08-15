@@ -29,15 +29,17 @@ use crate::fd_transfer::send_descriptor;
 use crate::handoff;
 use crate::protocol::{
     self, AgentAttentionReason, AgentAttentionSnapshot, AgentAuthority, AgentInstanceSnapshot,
-    AgentObservationSnapshot, AgentRegistrationSpec, AgentReport, AgentState, AttachFrame,
-    DaemonEvent, DaemonEventKind, Envelope, ErrorCode, EventCursor, FocusedTerminalSnapshot,
+    AgentObservationSnapshot, AgentRegistrationSpec, AgentReport, AgentScheduleInspection,
+    AgentScheduleOverlapPolicy, AgentScheduleSession, AgentScheduleSnapshot, AgentScheduleSpec,
+    AgentScheduleState, AgentScheduleTrigger, AgentState, AttachFrame, DaemonEvent,
+    DaemonEventKind, Envelope, ErrorCode, EventCursor, FocusedTerminalSnapshot,
     NotificationDeliveryConfig, Request, Response, ShellRunExitReason, ShellRunSnapshot,
     ShellSnapshot, ShellSpec, ShellStatus, Snapshot, TerminalPreview, TerminalProfile,
     UnixEnvironment, WorkspaceLauncherSnapshot, WorkspaceLauncherSpec, WorkspaceSnapshot,
 };
 use crate::state_store::{
-    PersistedAgentInstance, PersistedShell, PersistedShellRun, PersistedState, PersistedWorkspace,
-    PersistedWorkspaceLauncher, StateStore,
+    PersistedAgentInstance, PersistedAgentSchedule, PersistedShell, PersistedShellRun,
+    PersistedState, PersistedWorkspace, PersistedWorkspaceLauncher, StateStore,
 };
 use crate::terminal_state::TerminalState;
 
@@ -966,6 +968,9 @@ fn unsupported_request_message(feature: protocol::ProtocolFeature) -> String {
 
 fn response_for_version(response: Response, version: u32) -> Response {
     let mut response = response;
+    if !protocol::ProtocolFeature::AgentSchedules.is_supported_by(version) {
+        remove_agent_schedules(&mut response);
+    }
     if !protocol::ProtocolFeature::WorkspaceDefaultCwd.is_supported_by(version) {
         remove_workspace_default_cwds(&mut response);
     }
@@ -1036,6 +1041,36 @@ fn response_for_version(response: Response, version: u32) -> Response {
             }
         }
         response => response,
+    }
+}
+
+fn remove_agent_schedules(response: &mut Response) {
+    match response {
+        Response::Snapshot { snapshot } => {
+            for workspace in &mut snapshot.workspaces {
+                workspace.schedules.clear();
+            }
+        }
+        Response::Workspace { workspace } => workspace.schedules.clear(),
+        Response::Events {
+            snapshot, events, ..
+        } => {
+            if let Some(snapshot) = snapshot {
+                for workspace in &mut snapshot.workspaces {
+                    workspace.schedules.clear();
+                }
+            }
+            events.retain(|event| {
+                !matches!(
+                    event.kind,
+                    DaemonEventKind::AgentScheduleCreated { .. }
+                        | DaemonEventKind::AgentSchedulePaused { .. }
+                        | DaemonEventKind::AgentScheduleResumed { .. }
+                        | DaemonEventKind::AgentScheduleRemoved { .. }
+                )
+            });
+        }
+        _ => {}
     }
 }
 
@@ -1247,6 +1282,10 @@ enum DurableUndo {
         workspace: Arc<Workspace>,
         launcher: Arc<WorkspaceLauncher>,
     },
+    CreatedSchedule {
+        workspace: Arc<Workspace>,
+        schedule: Arc<AgentSchedule>,
+    },
     RegisteredAgent {
         workspace: Arc<Workspace>,
         agent: Arc<AgentInstance>,
@@ -1267,9 +1306,18 @@ enum DurableUndo {
         agent: Arc<AgentInstance>,
         previous: AgentInstanceState,
     },
+    ScheduleState {
+        schedule: Arc<AgentSchedule>,
+        previous: AgentScheduleMutableState,
+    },
     RemovedLauncher {
         workspace: Arc<Workspace>,
         launcher: Arc<WorkspaceLauncher>,
+        index: usize,
+    },
+    RemovedSchedule {
+        workspace: Arc<Workspace>,
+        schedule: Arc<AgentSchedule>,
         index: usize,
     },
     RemovedShell {
@@ -1282,6 +1330,7 @@ enum DurableUndo {
         shells: Vec<Arc<Shell>>,
         launchers: Vec<Arc<WorkspaceLauncher>>,
         agents: Vec<Arc<AgentInstance>>,
+        schedules: Vec<Arc<AgentSchedule>>,
     },
 }
 
@@ -1798,6 +1847,14 @@ impl DurableRegistry {
             .ok_or_else(|| not_found("agent instance", id))
     }
 
+    fn schedule(&self, id: &str) -> io::Result<Arc<AgentSchedule>> {
+        lock(&self.state)?
+            .schedules
+            .get(id)
+            .cloned()
+            .ok_or_else(|| not_found("agent schedule", id))
+    }
+
     fn contains_shell(&self, shell: &Arc<Shell>) -> io::Result<bool> {
         Ok(lock(&self.state)?
             .shells
@@ -1908,6 +1965,7 @@ impl DurableRegistry {
             shell_ids: Mutex::new(shells.iter().map(|shell| shell.id.clone()).collect()),
             launcher_ids: Mutex::new(Vec::new()),
             agent_ids: Mutex::new(Vec::new()),
+            schedule_ids: Mutex::new(Vec::new()),
         });
         let snapshot = WorkspaceSnapshot {
             id: workspace_id.clone(),
@@ -1919,6 +1977,7 @@ impl DurableRegistry {
                 .collect::<io::Result<_>>()?,
             launchers: Vec::new(),
             agents: Vec::new(),
+            schedules: Vec::new(),
         };
         let mut state = lock(&self.state)?;
         if state
@@ -2049,6 +2108,118 @@ impl DurableRegistry {
                 workspace,
                 launcher,
             },
+        ))
+    }
+
+    fn create_schedule(
+        &self,
+        workspace_id: &str,
+        mut spec: AgentScheduleSpec,
+    ) -> io::Result<(AgentScheduleSnapshot, DurableUndo)> {
+        validate_name(&spec.name)?;
+        validate_cwd(&spec.cwd)?;
+        validate_schedule_spec(&spec)?;
+        spec.trigger.cron = crate::scheduling::canonicalize_cron(&spec.trigger.cron)
+            .map_err(schedule_validation_error)?;
+        spec.trigger.timezone = crate::scheduling::canonicalize_timezone(&spec.trigger.timezone)
+            .map_err(schedule_validation_error)?;
+        validate_schedule_capability(&spec.integration, &spec.session)?;
+        let workspace = self.workspace(workspace_id)?;
+        let now = unix_time_ms();
+        let schedule = Arc::new(AgentSchedule {
+            id: Uuid::new_v4().to_string(),
+            workspace_id: workspace_id.into(),
+            name: spec.name,
+            cwd: spec.cwd,
+            integration: spec.integration,
+            prompt: spec.prompt,
+            session: spec.session,
+            trigger: spec.trigger,
+            overlap_policy: spec.overlap_policy,
+            prompt_revision: 1,
+            trigger_revision: 1,
+            created_at_ms: now,
+            state: Mutex::new(AgentScheduleMutableState {
+                state: spec.state,
+                revision: 1,
+                updated_at_ms: now,
+                evaluation_frontier_ms: now,
+                execution_shell_id: None,
+            }),
+        });
+        let snapshot = schedule.snapshot()?;
+        let mut state = lock(&self.state)?;
+        let Some(current) = state.workspaces.get(workspace_id) else {
+            return Err(not_found("workspace", workspace_id));
+        };
+        if !Arc::ptr_eq(current, &workspace) {
+            return Err(not_found("workspace", workspace_id));
+        }
+        let mut schedule_ids = lock(&workspace.schedule_ids)?;
+        if schedule_ids.len() >= crate::scheduling::MAX_SCHEDULES_PER_WORKSPACE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "workspace may contain at most {} agent schedules",
+                    crate::scheduling::MAX_SCHEDULES_PER_WORKSPACE
+                ),
+            ));
+        }
+        if schedule_ids.iter().any(|id| {
+            state
+                .schedules
+                .get(id)
+                .is_some_and(|existing| existing.name == snapshot.name)
+        }) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("agent schedule name already exists: {}", snapshot.name),
+            ));
+        }
+        state
+            .schedules
+            .insert(schedule.id.clone(), Arc::clone(&schedule));
+        schedule_ids.push(schedule.id.clone());
+        drop(schedule_ids);
+        drop(state);
+        Ok((
+            snapshot,
+            DurableUndo::CreatedSchedule {
+                workspace,
+                schedule,
+            },
+        ))
+    }
+
+    fn set_schedule_state(
+        &self,
+        schedule_id: &str,
+        next: AgentScheduleState,
+    ) -> io::Result<(AgentScheduleSnapshot, Option<DurableUndo>)> {
+        let schedule = self.schedule(schedule_id)?;
+        if next == AgentScheduleState::Enabled {
+            validate_schedule_capability(&schedule.integration, &schedule.session)?;
+        }
+        let mut state = lock(&schedule.state)?;
+        if state.state == next {
+            return Ok((schedule.snapshot_from(&state), None));
+        }
+        let previous = state.clone();
+        let now = unix_time_ms().max(state.updated_at_ms.saturating_add(1));
+        state.state = next;
+        state.revision = state
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("agent schedule revision exhausted"))?;
+        state.updated_at_ms = now;
+        if next == AgentScheduleState::Enabled {
+            state.evaluation_frontier_ms = now.max(state.evaluation_frontier_ms);
+        }
+        let snapshot = schedule.snapshot_from(&state);
+        drop(state);
+        Ok((
+            snapshot,
+            Some(DurableUndo::ScheduleState { schedule, previous }),
         ))
     }
 
@@ -2450,6 +2621,20 @@ impl DurableRegistry {
                 }
                 lock(&workspace.launcher_ids)?.retain(|id| id != &launcher.id);
             }
+            DurableUndo::CreatedSchedule {
+                workspace,
+                schedule,
+            } => {
+                let mut state = lock(&self.state)?;
+                if state
+                    .schedules
+                    .get(&schedule.id)
+                    .is_some_and(|current| Arc::ptr_eq(current, &schedule))
+                {
+                    state.schedules.remove(&schedule.id);
+                }
+                lock(&workspace.schedule_ids)?.retain(|id| id != &schedule.id);
+            }
             DurableUndo::RegisteredAgent { workspace, agent } => {
                 let mut state = lock(&self.state)?;
                 if state
@@ -2474,6 +2659,9 @@ impl DurableRegistry {
             DurableUndo::AgentState { agent, previous } => {
                 *lock(&agent.state)? = previous;
             }
+            DurableUndo::ScheduleState { schedule, previous } => {
+                *lock(&schedule.state)? = previous;
+            }
             DurableUndo::RemovedLauncher {
                 workspace,
                 launcher,
@@ -2483,6 +2671,16 @@ impl DurableRegistry {
                     .launchers
                     .insert(launcher.id.clone(), Arc::clone(&launcher));
                 lock(&workspace.launcher_ids)?.insert(index, launcher.id.clone());
+            }
+            DurableUndo::RemovedSchedule {
+                workspace,
+                schedule,
+                index,
+            } => {
+                lock(&self.state)?
+                    .schedules
+                    .insert(schedule.id.clone(), Arc::clone(&schedule));
+                lock(&workspace.schedule_ids)?.insert(index, schedule.id.clone());
             }
             DurableUndo::RemovedShell {
                 workspace,
@@ -2499,6 +2697,7 @@ impl DurableRegistry {
                 shells,
                 launchers,
                 agents,
+                schedules,
             } => {
                 let mut state = lock(&self.state)?;
                 for shell in shells {
@@ -2509,6 +2708,9 @@ impl DurableRegistry {
                 }
                 for agent in agents {
                     state.agents.insert(agent.id.clone(), agent);
+                }
+                for schedule in schedules {
+                    state.schedules.insert(schedule.id.clone(), schedule);
                 }
                 state.workspaces.insert(workspace.id.clone(), workspace);
             }
@@ -2585,6 +2787,14 @@ impl DurableRegistry {
                 };
                 agents.push(agent.persisted()?);
             }
+            let ids = lock(&workspace.schedule_ids)?.clone();
+            let mut schedules = Vec::with_capacity(ids.len());
+            for id in ids {
+                let Some(schedule) = state.schedules.get(&id) else {
+                    continue;
+                };
+                schedules.push(schedule.persisted()?);
+            }
             saved.workspaces.push(PersistedWorkspace {
                 id: workspace.id.clone(),
                 name: lock(&workspace.name)?.clone(),
@@ -2592,6 +2802,7 @@ impl DurableRegistry {
                 shells,
                 launchers,
                 agents,
+                schedules,
             });
         }
         Ok(PersistenceGeneration {
@@ -3283,6 +3494,7 @@ struct DurableState {
     shells: HashMap<String, Arc<Shell>>,
     launchers: HashMap<String, Arc<WorkspaceLauncher>>,
     agents: HashMap<String, Arc<AgentInstance>>,
+    schedules: HashMap<String, Arc<AgentSchedule>>,
 }
 
 impl Default for DaemonService {
@@ -3317,6 +3529,32 @@ struct Workspace {
     shell_ids: Mutex<Vec<String>>,
     launcher_ids: Mutex<Vec<String>>,
     agent_ids: Mutex<Vec<String>>,
+    schedule_ids: Mutex<Vec<String>>,
+}
+
+struct AgentSchedule {
+    id: String,
+    workspace_id: String,
+    name: String,
+    cwd: PathBuf,
+    integration: String,
+    prompt: String,
+    session: AgentScheduleSession,
+    trigger: AgentScheduleTrigger,
+    overlap_policy: AgentScheduleOverlapPolicy,
+    prompt_revision: u64,
+    trigger_revision: u64,
+    created_at_ms: u64,
+    state: Mutex<AgentScheduleMutableState>,
+}
+
+#[derive(Clone)]
+struct AgentScheduleMutableState {
+    state: AgentScheduleState,
+    revision: u64,
+    updated_at_ms: u64,
+    evaluation_frontier_ms: u64,
+    execution_shell_id: Option<String>,
 }
 
 struct AgentInstance {
@@ -3973,6 +4211,12 @@ impl DaemonService {
             Request::GetAgent { agent_id } => Ok(Response::Agent {
                 agent: self.agent(&agent_id)?.snapshot()?,
             }),
+            Request::GetAgentSchedule { schedule_id } => {
+                let schedule = self.schedule(&schedule_id)?;
+                Ok(Response::AgentScheduleInspection {
+                    inspection: schedule.inspection()?,
+                })
+            }
             Request::WaitAgent {
                 agent_id,
                 after_revision,
@@ -4040,6 +4284,14 @@ impl DaemonService {
                     name: launcher.name.clone(),
                 };
                 Ok((Response::Launcher { launcher }, vec![event]))
+            }),
+            Request::CreateAgentSchedule { workspace_id, spec } => self.durable_mutation(|undo| {
+                let schedule = self.create_schedule_mutation(undo, &workspace_id, spec)?;
+                let event = DaemonEventKind::AgentScheduleCreated {
+                    workspace_id,
+                    schedule: schedule.clone(),
+                };
+                Ok((Response::AgentSchedule { schedule }, vec![event]))
             }),
             Request::RegisterAgent {
                 shell_id,
@@ -4187,6 +4439,22 @@ impl DaemonService {
                     }],
                 ))
             }),
+            Request::PauseAgentSchedule { schedule_id } => {
+                self.change_schedule_state(&schedule_id, AgentScheduleState::Paused)
+            }
+            Request::ResumeAgentSchedule { schedule_id } => {
+                self.change_schedule_state(&schedule_id, AgentScheduleState::Enabled)
+            }
+            Request::RemoveAgentSchedule { schedule_id } => self.durable_mutation(|undo| {
+                let schedule = self.remove_schedule_mutation(undo, &schedule_id)?;
+                Ok((
+                    Response::Ok,
+                    vec![DaemonEventKind::AgentScheduleRemoved {
+                        workspace_id: schedule.workspace_id.clone(),
+                        schedule_id,
+                    }],
+                ))
+            }),
             Request::Attach { .. } => unreachable!("attach is handled before dispatch"),
         }
     }
@@ -4232,6 +4500,7 @@ impl DaemonService {
         let mut workspace_names = HashSet::new();
         let mut run_ids = HashSet::new();
         let mut agent_ids = HashSet::new();
+        let mut schedule_ids = HashSet::new();
         let mut recovered_interrupted_run = false;
         for saved_workspace in persisted.workspaces {
             validate_id("workspace", &saved_workspace.id)?;
@@ -4344,6 +4613,32 @@ impl DaemonService {
                 workspace_agent_ids.push(agent.id.clone());
                 state.agents.insert(agent.id.clone(), agent);
             }
+            if saved_workspace.schedules.len() > crate::scheduling::MAX_SCHEDULES_PER_WORKSPACE {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Boomux state contains too many agent schedules in a workspace",
+                ));
+            }
+            let mut schedule_names = HashSet::new();
+            let mut workspace_schedule_ids = Vec::with_capacity(saved_workspace.schedules.len());
+            for saved_schedule in saved_workspace.schedules {
+                validate_id("agent schedule", &saved_schedule.id)?;
+                validate_persisted_schedule(&saved_schedule)?;
+                if !schedule_ids.insert(saved_schedule.id.clone())
+                    || !schedule_names.insert(saved_schedule.name.clone())
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Boomux state contains a duplicate agent schedule",
+                    ));
+                }
+                let schedule = Arc::new(AgentSchedule::from_persisted(
+                    &saved_workspace.id,
+                    saved_schedule,
+                ));
+                workspace_schedule_ids.push(schedule.id.clone());
+                state.schedules.insert(schedule.id.clone(), schedule);
+            }
             let workspace = Arc::new(Workspace {
                 id: saved_workspace.id.clone(),
                 name: Mutex::new(saved_workspace.name),
@@ -4351,6 +4646,7 @@ impl DaemonService {
                 shell_ids: Mutex::new(shell_ids),
                 launcher_ids: Mutex::new(launcher_ids),
                 agent_ids: Mutex::new(workspace_agent_ids),
+                schedule_ids: Mutex::new(workspace_schedule_ids),
             });
             state.workspaces.insert(saved_workspace.id, workspace);
         }
@@ -5291,6 +5587,10 @@ impl DaemonService {
         self.durable.agent(id)
     }
 
+    fn schedule(&self, id: &str) -> io::Result<Arc<AgentSchedule>> {
+        self.durable.schedule(id)
+    }
+
     fn contains_shell(&self, shell: &Arc<Shell>) -> io::Result<bool> {
         self.durable.contains_shell(shell)
     }
@@ -5365,6 +5665,47 @@ impl DaemonService {
         let (snapshot, record) = self.durable.create_launcher(workspace_id, spec)?;
         undo.record(record);
         Ok(snapshot)
+    }
+
+    fn create_schedule_mutation(
+        &self,
+        undo: &mut DurableUndoLog,
+        workspace_id: &str,
+        spec: AgentScheduleSpec,
+    ) -> io::Result<AgentScheduleSnapshot> {
+        let (snapshot, record) = self.durable.create_schedule(workspace_id, spec)?;
+        undo.record(record);
+        Ok(snapshot)
+    }
+
+    fn change_schedule_state(
+        &self,
+        schedule_id: &str,
+        next: AgentScheduleState,
+    ) -> DaemonResult<Response> {
+        self.durable_mutation_outcome(|undo| {
+            let (schedule, record) = self.durable.set_schedule_state(schedule_id, next)?;
+            let Some(record) = record else {
+                return Ok(DurableMutation::Unchanged(Response::AgentSchedule {
+                    schedule,
+                }));
+            };
+            undo.record(record);
+            let event = match next {
+                AgentScheduleState::Paused => DaemonEventKind::AgentSchedulePaused {
+                    workspace_id: schedule.workspace_id.clone(),
+                    schedule: schedule.clone(),
+                },
+                AgentScheduleState::Enabled => DaemonEventKind::AgentScheduleResumed {
+                    workspace_id: schedule.workspace_id.clone(),
+                    schedule: schedule.clone(),
+                },
+            };
+            Ok(DurableMutation::Changed(
+                Response::AgentSchedule { schedule },
+                vec![event],
+            ))
+        })
     }
 
     #[cfg(test)]
@@ -5560,6 +5901,40 @@ impl DaemonService {
         Ok(result)
     }
 
+    fn remove_schedule_mutation(
+        &self,
+        undo: &mut DurableUndoLog,
+        schedule_id: &str,
+    ) -> io::Result<Arc<AgentSchedule>> {
+        let mut state = lock(&self.durable.state)?;
+        let schedule = state
+            .schedules
+            .get(schedule_id)
+            .cloned()
+            .ok_or_else(|| not_found("agent schedule", schedule_id))?;
+        let workspace = state
+            .workspaces
+            .get(&schedule.workspace_id)
+            .cloned()
+            .ok_or_else(|| not_found("workspace", &schedule.workspace_id))?;
+        let mut schedule_ids = lock(&workspace.schedule_ids)?;
+        let index = schedule_ids
+            .iter()
+            .position(|id| id == schedule_id)
+            .ok_or_else(|| not_found("agent schedule", schedule_id))?;
+        state.schedules.remove(schedule_id);
+        schedule_ids.remove(index);
+        drop(schedule_ids);
+        drop(state);
+        let result = Arc::clone(&schedule);
+        undo.record(DurableUndo::RemovedSchedule {
+            workspace,
+            schedule,
+            index,
+        });
+        Ok(result)
+    }
+
     fn read_shell(&self, shell_id: &str, max_bytes: usize) -> io::Result<Vec<u8>> {
         let shell = self.shell(shell_id)?;
         self.runtimes.read_shell(&shell, max_bytes)
@@ -5667,6 +6042,7 @@ impl DaemonService {
         let shell_ids = lock(&workspace.shell_ids)?.clone();
         let launcher_ids = lock(&workspace.launcher_ids)?.clone();
         let agent_ids = lock(&workspace.agent_ids)?.clone();
+        let schedule_ids = lock(&workspace.schedule_ids)?.clone();
         let shells = shell_ids
             .iter()
             .filter_map(|id| state.shells.get(id).cloned())
@@ -5679,6 +6055,10 @@ impl DaemonService {
             .iter()
             .filter_map(|id| state.agents.get(id).cloned())
             .collect();
+        let schedules = schedule_ids
+            .iter()
+            .filter_map(|id| state.schedules.get(id).cloned())
+            .collect();
         state.workspaces.remove(workspace_id);
         for id in shell_ids {
             state.shells.remove(&id);
@@ -5689,12 +6069,16 @@ impl DaemonService {
         for id in agent_ids {
             state.agents.remove(&id);
         }
+        for id in schedule_ids {
+            state.schedules.remove(&id);
+        }
         drop(state);
         Ok(DurableUndo::RemovedWorkspace {
             workspace,
             shells,
             launchers,
             agents,
+            schedules,
         })
     }
 
@@ -5760,7 +6144,7 @@ impl DaemonService {
 
 impl Workspace {
     fn snapshot(&self, registry: &DurableRegistry) -> io::Result<WorkspaceSnapshot> {
-        let (shells, launchers, agents) = {
+        let (shells, launchers, agents, schedules) = {
             let state = lock(&registry.state)?;
             let shell_ids = lock(&self.shell_ids)?;
             let shells = shell_ids
@@ -5777,7 +6161,12 @@ impl Workspace {
                 .iter()
                 .filter_map(|id| state.agents.get(id).cloned())
                 .collect::<Vec<_>>();
-            (shells, launchers, agents)
+            let schedule_ids = lock(&self.schedule_ids)?;
+            let schedules = schedule_ids
+                .iter()
+                .filter_map(|id| state.schedules.get(id).cloned())
+                .collect::<Vec<_>>();
+            (shells, launchers, agents, schedules)
         };
         let shells = shells
             .iter()
@@ -5791,6 +6180,10 @@ impl Workspace {
             .iter()
             .map(|agent| agent.snapshot())
             .collect::<io::Result<_>>()?;
+        let schedules = schedules
+            .iter()
+            .map(|schedule| schedule.snapshot())
+            .collect::<io::Result<_>>()?;
         Ok(WorkspaceSnapshot {
             id: self.id.clone(),
             name: lock(&self.name)?.clone(),
@@ -5798,6 +6191,88 @@ impl Workspace {
             shells,
             launchers,
             agents,
+            schedules,
+        })
+    }
+}
+
+impl AgentSchedule {
+    fn from_persisted(workspace_id: &str, saved: PersistedAgentSchedule) -> Self {
+        Self {
+            id: saved.id,
+            workspace_id: workspace_id.into(),
+            name: saved.name,
+            cwd: saved.cwd,
+            integration: saved.integration,
+            prompt: saved.prompt,
+            session: saved.session,
+            trigger: saved.trigger,
+            overlap_policy: saved.overlap_policy,
+            prompt_revision: saved.prompt_revision,
+            trigger_revision: saved.trigger_revision,
+            created_at_ms: saved.created_at_ms,
+            state: Mutex::new(AgentScheduleMutableState {
+                state: saved.state,
+                revision: saved.revision,
+                updated_at_ms: saved.updated_at_ms,
+                evaluation_frontier_ms: saved.evaluation_frontier_ms,
+                execution_shell_id: saved.execution_shell_id,
+            }),
+        }
+    }
+
+    fn snapshot(&self) -> io::Result<AgentScheduleSnapshot> {
+        let state = lock(&self.state)?;
+        Ok(self.snapshot_from(&state))
+    }
+
+    fn snapshot_from(&self, state: &AgentScheduleMutableState) -> AgentScheduleSnapshot {
+        AgentScheduleSnapshot {
+            id: self.id.clone(),
+            workspace_id: self.workspace_id.clone(),
+            name: self.name.clone(),
+            cwd: self.cwd.clone(),
+            integration: self.integration.clone(),
+            session: self.session.clone(),
+            trigger: self.trigger.clone(),
+            state: state.state,
+            overlap_policy: self.overlap_policy,
+            revision: state.revision,
+            prompt_revision: self.prompt_revision,
+            trigger_revision: self.trigger_revision,
+            created_at_ms: self.created_at_ms,
+            updated_at_ms: state.updated_at_ms,
+            evaluation_frontier_ms: state.evaluation_frontier_ms,
+            execution_shell_id: state.execution_shell_id.clone(),
+        }
+    }
+
+    fn inspection(&self) -> io::Result<AgentScheduleInspection> {
+        Ok(AgentScheduleInspection {
+            schedule: self.snapshot()?,
+            prompt: self.prompt.clone(),
+        })
+    }
+
+    fn persisted(&self) -> io::Result<PersistedAgentSchedule> {
+        let snapshot = self.snapshot()?;
+        Ok(PersistedAgentSchedule {
+            id: snapshot.id,
+            name: snapshot.name,
+            cwd: snapshot.cwd,
+            integration: snapshot.integration,
+            prompt: self.prompt.clone(),
+            session: snapshot.session,
+            trigger: snapshot.trigger,
+            state: snapshot.state,
+            overlap_policy: snapshot.overlap_policy,
+            revision: snapshot.revision,
+            prompt_revision: snapshot.prompt_revision,
+            trigger_revision: snapshot.trigger_revision,
+            created_at_ms: snapshot.created_at_ms,
+            updated_at_ms: snapshot.updated_at_ms,
+            evaluation_frontier_ms: snapshot.evaluation_frontier_ms,
+            execution_shell_id: snapshot.execution_shell_id,
         })
     }
 }
@@ -7172,6 +7647,99 @@ fn validate_persisted_cwd(cwd: &Path) -> io::Result<()> {
     }
 }
 
+fn schedule_validation_error(error: crate::scheduling::SchedulingError) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, error.to_string())
+}
+
+fn validate_schedule_spec(spec: &AgentScheduleSpec) -> io::Result<()> {
+    crate::scheduling::validate_prompt(&spec.prompt).map_err(schedule_validation_error)?;
+    crate::scheduling::validate_integration_key(&spec.integration)
+        .map_err(schedule_validation_error)?;
+    if let AgentScheduleSession::Continue {
+        external_session_id,
+    } = &spec.session
+    {
+        crate::scheduling::validate_external_session_id(external_session_id)
+            .map_err(schedule_validation_error)?;
+    }
+    if spec.overlap_policy != AgentScheduleOverlapPolicy::Skip {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "agent schedule overlap policy must be skip",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_schedule_capability(
+    integration: &str,
+    session: &AgentScheduleSession,
+) -> io::Result<()> {
+    let capability = crate::integrations::by_key(integration)
+        .and_then(|descriptor| descriptor.schedule_dispatch)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "integration does not support scheduled dispatch",
+            )
+        })?;
+    let supported = match session {
+        AgentScheduleSession::Fresh => capability.fresh,
+        AgentScheduleSession::Continue { .. } => capability.continuation,
+    };
+    if !supported {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "integration does not support the requested scheduled session mode",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_persisted_schedule(schedule: &PersistedAgentSchedule) -> io::Result<()> {
+    validate_name(&schedule.name)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+    validate_persisted_cwd(&schedule.cwd)?;
+    crate::scheduling::validate_prompt(&schedule.prompt)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+    crate::scheduling::validate_integration_key(&schedule.integration)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+    if let AgentScheduleSession::Continue {
+        external_session_id,
+    } = &schedule.session
+    {
+        crate::scheduling::validate_external_session_id(external_session_id)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+    }
+    if schedule.state == AgentScheduleState::Enabled {
+        validate_schedule_capability(&schedule.integration, &schedule.session)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+    }
+    let cron = crate::scheduling::canonicalize_cron(&schedule.trigger.cron)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+    let timezone = crate::scheduling::canonicalize_timezone(&schedule.trigger.timezone)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+    if cron != schedule.trigger.cron
+        || timezone != schedule.trigger.timezone
+        || schedule.overlap_policy != AgentScheduleOverlapPolicy::Skip
+        || schedule.revision == 0
+        || schedule.prompt_revision == 0
+        || schedule.trigger_revision == 0
+        || schedule.prompt_revision > schedule.revision
+        || schedule.trigger_revision > schedule.revision
+        || schedule.updated_at_ms < schedule.created_at_ms
+        || schedule.evaluation_frontier_ms < schedule.created_at_ms
+        || schedule.evaluation_frontier_ms > schedule.updated_at_ms
+        || schedule.execution_shell_id.is_some()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Boomux state contains an invalid agent schedule",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_id(kind: &str, id: &str) -> io::Result<()> {
     Uuid::parse_str(id).map(|_| ()).map_err(|_| {
         io::Error::new(
@@ -8052,6 +8620,322 @@ mod tests {
             io::ErrorKind::InvalidInput
         );
         assert!(validate_persisted_name("real\nlegacy row").is_ok());
+    }
+
+    fn schedule_spec(prompt: &str) -> AgentScheduleSpec {
+        AgentScheduleSpec {
+            name: "nightly".into(),
+            cwd: env::temp_dir(),
+            integration: "opencode".into(),
+            prompt: prompt.into(),
+            session: AgentScheduleSession::Fresh,
+            trigger: AgentScheduleTrigger {
+                cron: " 0  2 * * * ".into(),
+                timezone: "UTC".into(),
+            },
+            state: AgentScheduleState::Paused,
+            overlap_policy: AgentScheduleOverlapPolicy::Skip,
+        }
+    }
+
+    #[test]
+    fn restored_enabled_schedules_require_current_dispatch_capability() {
+        let mut schedule = PersistedAgentSchedule {
+            id: Uuid::new_v4().to_string(),
+            name: "nightly".into(),
+            cwd: env::temp_dir(),
+            integration: "unsupported".into(),
+            prompt: "review changes".into(),
+            session: AgentScheduleSession::Fresh,
+            trigger: AgentScheduleTrigger {
+                cron: "0 2 * * *".into(),
+                timezone: "UTC".into(),
+            },
+            state: AgentScheduleState::Enabled,
+            overlap_policy: AgentScheduleOverlapPolicy::Skip,
+            revision: 1,
+            prompt_revision: 1,
+            trigger_revision: 1,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            evaluation_frontier_ms: 1,
+            execution_shell_id: None,
+        };
+
+        assert_eq!(
+            validate_persisted_schedule(&schedule).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        schedule.state = AgentScheduleState::Paused;
+        assert!(validate_persisted_schedule(&schedule).is_ok());
+    }
+
+    #[test]
+    fn schedule_management_is_prompt_private_and_idempotent() {
+        let registry = DaemonService::default();
+        let workspace = registry
+            .create_workspace("scheduled".into(), Vec::new())
+            .unwrap();
+        let prompt = "private schedule instructions";
+        let Response::AgentSchedule { schedule } = registry
+            .dispatch(Request::CreateAgentSchedule {
+                workspace_id: workspace.id.clone(),
+                spec: schedule_spec(prompt),
+            })
+            .unwrap()
+        else {
+            panic!("expected schedule response");
+        };
+        assert_eq!(schedule.trigger.cron, "0 2 * * *");
+        assert_eq!(schedule.revision, 1);
+        assert!(schedule.execution_shell_id.is_none());
+        assert_eq!(
+            registry.snapshot().unwrap().workspaces[0].schedules,
+            std::slice::from_ref(&schedule)
+        );
+        assert!(
+            !serde_json::to_string(&registry.snapshot().unwrap())
+                .unwrap()
+                .contains(prompt)
+        );
+
+        let Response::AgentScheduleInspection { inspection } = registry
+            .dispatch(Request::GetAgentSchedule {
+                schedule_id: schedule.id.clone(),
+            })
+            .unwrap()
+        else {
+            panic!("expected schedule inspection");
+        };
+        assert_eq!(inspection.prompt, prompt);
+
+        let Response::AgentSchedule { schedule: paused } = registry
+            .dispatch(Request::PauseAgentSchedule {
+                schedule_id: schedule.id.clone(),
+            })
+            .unwrap()
+        else {
+            panic!("expected paused schedule");
+        };
+        assert_eq!(paused.revision, 1);
+        let Response::AgentSchedule { schedule: resumed } = registry
+            .dispatch(Request::ResumeAgentSchedule {
+                schedule_id: schedule.id.clone(),
+            })
+            .unwrap()
+        else {
+            panic!("expected resumed schedule");
+        };
+        assert_eq!(resumed.revision, 2);
+        assert!(resumed.evaluation_frontier_ms >= schedule.evaluation_frontier_ms);
+        let Response::AgentSchedule { schedule: repeated } = registry
+            .dispatch(Request::ResumeAgentSchedule {
+                schedule_id: schedule.id.clone(),
+            })
+            .unwrap()
+        else {
+            panic!("expected resumed schedule");
+        };
+        assert_eq!(repeated, resumed);
+
+        let events = lock(&registry.events.state).unwrap().events.clone();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event.kind,
+                    DaemonEventKind::AgentScheduleCreated { .. }
+                        | DaemonEventKind::AgentSchedulePaused { .. }
+                        | DaemonEventKind::AgentScheduleResumed { .. }
+                ))
+                .count(),
+            2
+        );
+        assert!(!serde_json::to_string(&events).unwrap().contains(prompt));
+    }
+
+    #[test]
+    fn schedules_restore_remove_with_workspace_and_rollback_on_failure() {
+        let directory = env::temp_dir().join(format!("boomux-schedules-{}", Uuid::new_v4()));
+        let path = directory.join("state/state.json");
+        let registry = DaemonService::restore(StateStore::at(path.clone()), false, None).unwrap();
+        let Response::Workspace { workspace } = registry
+            .dispatch(Request::CreateWorkspace {
+                name: "scheduled".into(),
+                default_cwd: None,
+                shells: Vec::new(),
+            })
+            .unwrap()
+        else {
+            panic!("expected workspace");
+        };
+        registry.fail_after_next_mutation();
+        assert!(
+            registry
+                .dispatch(Request::CreateAgentSchedule {
+                    workspace_id: workspace.id.clone(),
+                    spec: schedule_spec("rolled back prompt"),
+                })
+                .is_err()
+        );
+        assert!(
+            registry.snapshot().unwrap().workspaces[0]
+                .schedules
+                .is_empty()
+        );
+        let Response::AgentSchedule { schedule } = registry
+            .dispatch(Request::CreateAgentSchedule {
+                workspace_id: workspace.id.clone(),
+                spec: schedule_spec("persisted private prompt"),
+            })
+            .unwrap()
+        else {
+            panic!("expected schedule");
+        };
+        drop(registry);
+
+        let registry = DaemonService::restore(StateStore::at(path), false, None).unwrap();
+        let restored = registry
+            .dispatch(Request::GetAgentSchedule {
+                schedule_id: schedule.id.clone(),
+            })
+            .unwrap();
+        let Response::AgentScheduleInspection { inspection } = restored else {
+            panic!("expected inspection");
+        };
+        assert_eq!(inspection.prompt, "persisted private prompt");
+
+        registry.fail_after_next_mutation();
+        assert!(
+            registry
+                .dispatch(Request::ResumeAgentSchedule {
+                    schedule_id: schedule.id.clone(),
+                })
+                .is_err()
+        );
+        assert_eq!(
+            registry.schedule(&schedule.id).unwrap().snapshot().unwrap(),
+            schedule
+        );
+
+        registry.fail_after_next_mutation();
+        assert!(
+            registry
+                .dispatch(Request::RemoveAgentSchedule {
+                    schedule_id: schedule.id.clone(),
+                })
+                .is_err()
+        );
+        assert!(registry.schedule(&schedule.id).is_ok());
+
+        registry.close_workspace(&workspace.id).unwrap();
+        assert!(registry.schedule(&schedule.id).is_err());
+        let events = lock(&registry.events.state).unwrap();
+        assert_eq!(
+            events
+                .events
+                .iter()
+                .filter(|event| matches!(event.kind, DaemonEventKind::WorkspaceClosed { .. }))
+                .count(),
+            1
+        );
+        assert!(
+            !events
+                .events
+                .iter()
+                .any(|event| matches!(event.kind, DaemonEventKind::AgentScheduleRemoved { .. }))
+        );
+        drop(events);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn invalid_schedule_input_does_not_mutate_or_disclose_prompt() {
+        let registry = DaemonService::default();
+        let workspace = registry
+            .create_workspace("scheduled".into(), Vec::new())
+            .unwrap();
+        let prompt = "private invalid prompt";
+        let mut spec = schedule_spec(prompt);
+        spec.trigger.cron = "not a cron expression".into();
+        let error = registry
+            .dispatch(Request::CreateAgentSchedule {
+                workspace_id: workspace.id,
+                spec,
+            })
+            .unwrap_err();
+        assert!(!error.to_string().contains(prompt));
+        assert!(
+            registry.snapshot().unwrap().workspaces[0]
+                .schedules
+                .is_empty()
+        );
+        assert!(lock(&registry.events.state).unwrap().events.is_empty());
+    }
+
+    #[test]
+    fn protocol_twenty_one_filters_schedules_without_rewinding_cursor() {
+        let registry = DaemonService::default();
+        let workspace = registry
+            .create_workspace("scheduled".into(), Vec::new())
+            .unwrap();
+        registry
+            .dispatch(Request::CreateAgentSchedule {
+                workspace_id: workspace.id,
+                spec: schedule_spec("private prompt"),
+            })
+            .unwrap();
+        let Response::Events {
+            stream_id,
+            cursor,
+            snapshot,
+            events,
+        } = registry.read_events(None, 256, 0).unwrap()
+        else {
+            panic!("expected event baseline");
+        };
+        let response = response_for_version(
+            Response::Events {
+                stream_id,
+                cursor: cursor.clone(),
+                snapshot,
+                events,
+            },
+            21,
+        );
+        let Response::Events {
+            cursor: filtered_cursor,
+            snapshot: Some(snapshot),
+            events,
+            ..
+        } = response
+        else {
+            panic!("expected filtered baseline");
+        };
+        assert_eq!(filtered_cursor, cursor);
+        assert!(snapshot.workspaces[0].schedules.is_empty());
+        assert!(events.is_empty());
+
+        let retained = lock(&registry.events.state).unwrap().events.clone();
+        let response = response_for_version(
+            Response::Events {
+                stream_id: cursor.stream_id.clone(),
+                cursor: cursor.clone(),
+                snapshot: None,
+                events: retained.into(),
+            },
+            21,
+        );
+        let Response::Events {
+            cursor: filtered_cursor,
+            events,
+            ..
+        } = response
+        else {
+            panic!("expected filtered events");
+        };
+        assert_eq!(filtered_cursor, cursor);
+        assert!(events.is_empty());
     }
 
     #[test]
@@ -10099,6 +10983,7 @@ mod tests {
             shells: Vec::new(),
             launchers: Vec::new(),
             agents: vec![agent.clone()],
+            schedules: Vec::new(),
         };
         let response = Response::Events {
             stream_id: "stream".into(),
@@ -10235,6 +11120,7 @@ mod tests {
             shells: Vec::new(),
             launchers: Vec::new(),
             agents: vec![agent.clone()],
+            schedules: Vec::new(),
         };
         let Response::Workspace {
             workspace: downgraded_workspace,
@@ -10334,6 +11220,7 @@ mod tests {
                     shells: Vec::new(),
                     launchers: Vec::new(),
                     agents: vec![agent.clone()],
+                    schedules: Vec::new(),
                 }],
                 focused_terminal: None,
             }),
@@ -10618,6 +11505,7 @@ mod tests {
             shells: Vec::new(),
             launchers: Vec::new(),
             agents: Vec::new(),
+            schedules: Vec::new(),
         };
 
         let Response::Workspace { workspace } = response_for_version(

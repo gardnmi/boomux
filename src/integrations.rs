@@ -46,6 +46,18 @@ pub struct ResumeCapability {
     pub session_argument: &'static str,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PromptTransport {
+    Argument,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScheduleDispatchCapability {
+    pub fresh: bool,
+    pub continuation: bool,
+    pub prompt_transport: PromptTransport,
+}
+
 impl ResumeCapability {
     pub fn command(
         self,
@@ -85,6 +97,7 @@ pub struct IntegrationDescriptor {
     pub titles: Option<TitleCapability>,
     pub transcript: Option<TranscriptCapability>,
     pub resume: Option<ResumeCapability>,
+    pub schedule_dispatch: Option<ScheduleDispatchCapability>,
     pub foreground: Option<ForegroundCapability>,
 }
 
@@ -110,6 +123,11 @@ pub const OPENCODE: IntegrationDescriptor = IntegrationDescriptor {
     resume: Some(ResumeCapability {
         executable: "opencode",
         session_argument: "--session",
+    }),
+    schedule_dispatch: Some(ScheduleDispatchCapability {
+        fresh: true,
+        continuation: true,
+        prompt_transport: PromptTransport::Argument,
     }),
     foreground: Some(ForegroundCapability {
         process_name: "opencode",
@@ -138,6 +156,11 @@ pub const PI: IntegrationDescriptor = IntegrationDescriptor {
     resume: Some(ResumeCapability {
         executable: "pi",
         session_argument: "--session",
+    }),
+    schedule_dispatch: Some(ScheduleDispatchCapability {
+        fresh: true,
+        continuation: true,
+        prompt_transport: PromptTransport::Argument,
     }),
     foreground: Some(ForegroundCapability { process_name: "pi" }),
 };
@@ -202,6 +225,7 @@ mod tests {
             }),
             transcript: None,
             resume: None,
+            schedule_dispatch: None,
             foreground: Some(ForegroundCapability {
                 process_name: "partial-agent",
             }),
@@ -214,6 +238,7 @@ mod tests {
         assert!(descriptor.titles.is_some());
         assert!(descriptor.transcript.is_none());
         assert!(descriptor.resume.is_none());
+        assert!(descriptor.schedule_dispatch.is_none());
         assert_eq!(
             descriptor
                 .foreground
@@ -252,6 +277,39 @@ mod tests {
                 );
             }
         }
+
+        for descriptor in ALL {
+            assert_eq!(by_key(descriptor.key), Some(descriptor));
+            assert_eq!(display_name(descriptor.key), descriptor.display_name);
+            assert_eq!(
+                descriptor.schedule_dispatch,
+                Some(ScheduleDispatchCapability {
+                    fresh: true,
+                    continuation: true,
+                    prompt_transport: PromptTransport::Argument,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn resume_capability_does_not_imply_schedule_dispatch() {
+        const RESUME_ONLY: IntegrationDescriptor = IntegrationDescriptor {
+            key: "resume-only",
+            display_name: "Resume Only",
+            installation: None,
+            titles: None,
+            transcript: None,
+            resume: Some(ResumeCapability {
+                executable: "resume-only",
+                session_argument: "--session",
+            }),
+            schedule_dispatch: None,
+            foreground: None,
+        };
+
+        assert!(RESUME_ONLY.resume.is_some());
+        assert!(RESUME_ONLY.schedule_dispatch.is_none());
     }
 
     #[test]
