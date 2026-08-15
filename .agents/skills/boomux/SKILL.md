@@ -565,6 +565,7 @@ workspace context or `--workspace`.
 ## Manage Shells
 
 ```console
+boomux shell suggest-name "<workspace-name-or-id>" --json
 boomux shell create "<workspace-name-or-id>"
 boomux shell create "<workspace-name-or-id>" --name "<name>" --cwd "/path"
 boomux shell create "<workspace-name-or-id>" --name "<name>" -- command arg
@@ -580,6 +581,12 @@ generate a unique lowercase `adjective-noun` shell name. A shell cannot close it
 Closing one shell terminates its process session and removes its retained
 terminal state, but durable Agent records remain in the workspace as historical
 occurrences.
+
+`shell suggest-name` returns `boomux.cli/v1` command `shell.suggest-name` with
+exact `workspace_id` and nonempty `name`, without creating or reserving a shell.
+Use it only as a UI suggestion. Creation can still fail with typed
+`already_exists` if another operation claims the name first; request another
+suggestion rather than changing or inferring a name.
 
 The contextual close shorthand is:
 

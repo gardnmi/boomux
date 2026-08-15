@@ -18,3 +18,5 @@ mod protocol_control;
 mod schedules;
 #[path = "native_backend/shell_lifecycle.rs"]
 mod shell_lifecycle;
+#[path = "native_backend/shell_name_suggestion.rs"]
+mod shell_name_suggestion;
