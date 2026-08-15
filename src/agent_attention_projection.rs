@@ -164,6 +164,7 @@ mod tests {
             name: "project".into(),
             default_cwd: None,
             shells: vec![boomux::protocol::ShellSnapshot {
+                owner: boomux::protocol::ShellOwner::User,
                 id: "s1".into(),
                 workspace_id: "w1".into(),
                 name: "shell".into(),

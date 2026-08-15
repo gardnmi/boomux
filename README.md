@@ -298,6 +298,10 @@ boomux schedule list --workspace my-project
 boomux schedule inspect review --workspace my-project
 boomux schedule resume review --workspace my-project
 boomux schedule pause review --workspace my-project
+boomux schedule run review --workspace my-project
+boomux execution list --schedule review --workspace my-project
+boomux execution inspect <exact-execution-id>
+boomux execution cancel <exact-execution-id>
 boomux schedule remove review --workspace my-project
 ```
 
@@ -314,9 +318,17 @@ when reading the stored private instructions is authorized. Removing a schedule
 deletes its persisted prompt. Closing the workspace removes every owned schedule
 and persisted prompt.
 
-This release provides the durable management surface. Timed dispatch is added by
-later scheduler and integration stack layers; enabling now records consent state
-but does not by itself make this CLI layer dispatch work.
+`schedule run` is an explicit run-now action and remains available while paused.
+It creates a durable prompt-free execution claim before starting one exact host
+argv through a lazily created schedule-owned shell. Pass `--idempotency-key
+<uuid>` when retrying a request; the same schedule and key always return the same
+execution and never spawn twice. Execution inspection and events omit prompts.
+
+OpenCode receives the prompt as the final argument after `--`; Pi receives the
+exact prompt on stdin. Process exit, dispatch failure, cancellation, and cold
+interruption are execution outcomes and never report an Agent as done. This
+release does not evaluate cron triggers or run timers; enabling records consent
+for future timed dispatch but does not itself start work.
 
 ### Agent Skill
 

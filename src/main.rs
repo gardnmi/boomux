@@ -6,7 +6,7 @@ use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Read};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::os::unix::process::CommandExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::thread;
@@ -19,8 +19,9 @@ use uuid::Uuid;
 use boomux::protocol::{
     AgentAuthority, AgentInstanceSnapshot, AgentRegistrationSpec, AgentReport,
     AgentScheduleOverlapPolicy, AgentScheduleSession, AgentScheduleSnapshot, AgentScheduleSpec,
-    AgentScheduleState, AgentScheduleTrigger, AgentState, EventCursor, ShellSnapshot, ShellSpec,
-    ShellStatus, Snapshot, WorkspaceLauncherSnapshot, WorkspaceLauncherSpec, WorkspaceSnapshot,
+    AgentScheduleState, AgentScheduleTrigger, AgentState, EventCursor, ScheduledExecutionOutcome,
+    ScheduledExecutionSnapshot, ScheduledRunnerResult, ShellSnapshot, ShellSpec, ShellStatus,
+    Snapshot, WorkspaceLauncherSnapshot, WorkspaceLauncherSpec, WorkspaceSnapshot,
 };
 use boomux::{attach, client, daemon, protocol};
 
@@ -265,6 +266,11 @@ enum Commands {
         #[command(subcommand)]
         command: ScheduleCommands,
     },
+    /// Inspect and cancel scheduled execution records
+    Execution {
+        #[command(subcommand)]
+        command: ExecutionCommands,
+    },
     /// Inspect and install supported harness integrations
     Integration {
         #[command(subcommand)]
@@ -309,6 +315,8 @@ enum Commands {
         #[arg(long)]
         restart_exited: bool,
     },
+    #[command(name = "__scheduled-runner", hide = true)]
+    ScheduledRunner { schedule_id: String },
 }
 
 #[derive(Subcommand)]
@@ -532,7 +540,7 @@ enum ScheduleCommands {
         #[arg(long, value_name = "NAME_OR_ID")]
         workspace: Option<String>,
     },
-    /// Mark a schedule enabled for a later dispatcher
+    /// Enable future timed dispatch; run-now is independent
     Resume {
         target: String,
         #[arg(long, value_name = "NAME_OR_ID")]
@@ -544,6 +552,29 @@ enum ScheduleCommands {
         #[arg(long, value_name = "NAME_OR_ID")]
         workspace: Option<String>,
     },
+    /// Dispatch one execution now, including while paused
+    Run {
+        target: String,
+        #[arg(long, value_name = "NAME_OR_ID")]
+        workspace: Option<String>,
+        #[arg(long, value_name = "UUID")]
+        idempotency_key: Option<Uuid>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ExecutionCommands {
+    /// List prompt-free execution records
+    List {
+        #[arg(long, value_name = "NAME_OR_ID")]
+        workspace: Option<String>,
+        #[arg(long, value_name = "SCHEDULE_NAME_OR_ID")]
+        schedule: Option<String>,
+    },
+    /// Inspect one execution by exact ID
+    Inspect { execution_id: String },
+    /// Cancel one nonterminal execution by exact ID
+    Cancel { execution_id: String },
 }
 
 #[derive(Args)]
@@ -611,7 +642,7 @@ struct ScheduleCreateArgs {
     /// Create paused, which is the default
     #[arg(long)]
     paused: bool,
-    /// Record consent for a later dispatcher; this layer does not run work
+    /// Record consent for future timed dispatch
     #[arg(long)]
     enabled: bool,
 }
@@ -862,6 +893,10 @@ command_keys! {
     SchedulePause => ("schedule.pause", Json),
     ScheduleResume => ("schedule.resume", Json),
     ScheduleRemove => ("schedule.remove", Json),
+    ScheduleRun => ("schedule.run", Json),
+    ExecutionList => ("execution.list", Json),
+    ExecutionInspect => ("execution.inspect", Json),
+    ExecutionCancel => ("execution.cancel", Json),
     Skill => ("skill", HumanOnly),
     Opencode => ("opencode", HumanOnly),
     Pi => ("pi", HumanOnly),
@@ -956,6 +991,18 @@ impl Cli {
             Some(Commands::Schedule {
                 command: ScheduleCommands::Remove { .. },
             }) => CommandKey::ScheduleRemove,
+            Some(Commands::Schedule {
+                command: ScheduleCommands::Run { .. },
+            }) => CommandKey::ScheduleRun,
+            Some(Commands::Execution {
+                command: ExecutionCommands::List { .. },
+            }) => CommandKey::ExecutionList,
+            Some(Commands::Execution {
+                command: ExecutionCommands::Inspect { .. },
+            }) => CommandKey::ExecutionInspect,
+            Some(Commands::Execution {
+                command: ExecutionCommands::Cancel { .. },
+            }) => CommandKey::ExecutionCancel,
             Some(Commands::Integration {
                 command: IntegrationCommands::List,
             }) => CommandKey::IntegrationList,
@@ -1019,6 +1066,7 @@ impl Cli {
             Some(Commands::Open { .. }) => CommandKey::Open,
             Some(Commands::Prompt) => CommandKey::Prompt,
             Some(Commands::Attach { .. }) => CommandKey::Attach,
+            Some(Commands::ScheduledRunner { .. }) => CommandKey::Attach,
         }
     }
 }
@@ -1136,6 +1184,9 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
             attach::run(shell_id, *takeover, *restart_exited)?;
             return Ok(CliExit::Success);
         }
+        Some(Commands::ScheduledRunner { schedule_id }) => {
+            return scheduled_runner(schedule_id).map(CliExit::Child);
+        }
         _ => {}
     }
 
@@ -1199,6 +1250,7 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
         }) => test_notification(reason),
         Some(Commands::Session { command }) => session_command(command, cli.json),
         Some(Commands::Schedule { command }) => schedule_command(command, cli.json),
+        Some(Commands::Execution { command }) => execution_command(command, cli.json),
         Some(Commands::Integration { command }) => integration_command(command, cli.json),
         Some(Commands::Skill {
             command: SkillCommands::Install { force },
@@ -1220,6 +1272,7 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
         Some(Commands::Prompt) => print_prompt_label(),
         Some(Commands::Daemon { command }) => daemon_control(command, cli.json),
         Some(Commands::Attach { .. }) => unreachable!(),
+        Some(Commands::ScheduledRunner { .. }) => unreachable!(),
         None => dashboard(cli.terminal.as_deref()),
     };
     result?;
@@ -2426,6 +2479,7 @@ fn capabilities(json: bool) -> Result<(), Box<dyn Error>> {
         "cursor_expired",
         "run_changed",
         "revision_ahead",
+        "idempotency_expired",
         "context_required",
         "ambiguous_target",
         "unsupported_integration",
@@ -3373,7 +3427,7 @@ fn schedule_command(command: ScheduleCommands, json: bool) -> Result<(), Box<dyn
             )?;
             if !json {
                 println!(
-                    "Enabled schedule {} in durable management state; scheduled dispatch is not available yet",
+                    "Enabled schedule {} for future timed dispatch; use schedule run for explicit run-now work",
                     sanitize_table_cell(&schedule.name)
                 );
             }
@@ -3398,6 +3452,273 @@ fn schedule_command(command: ScheduleCommands, json: bool) -> Result<(), Box<dyn
             );
             Ok(())
         }
+        ScheduleCommands::Run {
+            target,
+            workspace,
+            idempotency_key,
+        } => {
+            let feature = protocol::ProtocolFeature::ScheduledExecutions;
+            if !feature.is_supported_by(client.protocol_version()?) {
+                return Err(cli_output::failure(
+                    "unsupported_version",
+                    format!(
+                        "scheduled execution dispatch requires daemon protocol {}",
+                        feature.minimum_version()
+                    ),
+                ));
+            }
+            let snapshot = client.snapshot()?;
+            let schedule = resolve_cli_schedule(&snapshot, &target, workspace.as_deref())?;
+            let execution = client.run_agent_schedule(
+                &schedule.id,
+                idempotency_key.unwrap_or_else(Uuid::new_v4).to_string(),
+            )?;
+            print_execution(CommandKey::ScheduleRun, &execution, json)
+        }
+    }
+}
+
+fn execution_command(command: ExecutionCommands, json: bool) -> Result<(), Box<dyn Error>> {
+    let client = client::connect_or_start()?;
+    let feature = protocol::ProtocolFeature::ScheduledExecutions;
+    if !feature.is_supported_by(client.protocol_version()?) {
+        return Err(cli_output::failure(
+            "unsupported_version",
+            format!(
+                "scheduled execution inspection requires daemon protocol {}",
+                feature.minimum_version()
+            ),
+        ));
+    }
+    match command {
+        ExecutionCommands::List {
+            workspace,
+            schedule,
+        } => {
+            let snapshot = client.snapshot()?;
+            let workspace = workspace
+                .as_deref()
+                .map(|target| resolve_workspace_target(&snapshot.workspaces, target))
+                .transpose()?;
+            let schedule_id = schedule
+                .as_deref()
+                .map(|target| {
+                    resolve_cli_schedule(
+                        &snapshot,
+                        target,
+                        workspace.map(|workspace| workspace.id.as_str()),
+                    )
+                    .map(|schedule| schedule.id.clone())
+                })
+                .transpose()?;
+            let executions = client.scheduled_executions(
+                workspace.map(|workspace| workspace.id.clone()),
+                schedule_id,
+            )?;
+            if json {
+                let executions = executions
+                    .iter()
+                    .map(cli_output::execution)
+                    .collect::<Vec<_>>();
+                return print_json(
+                    CommandKey::ExecutionList,
+                    serde_json::json!({ "executions": executions }),
+                );
+            }
+            println!("STATE\tEXECUTION ID\tSCHEDULE ID\tREQUESTED\tSHELL ID\tRUN ID");
+            for execution in executions {
+                println!(
+                    "{}\t{}\t{}\t{}\t{}\t{}",
+                    execution_state(&execution),
+                    execution.id,
+                    execution.schedule_id,
+                    execution.requested_at_ms,
+                    execution.shell_id.as_deref().unwrap_or("-"),
+                    execution.run_id.as_deref().unwrap_or("-"),
+                );
+            }
+            Ok(())
+        }
+        ExecutionCommands::Inspect { execution_id } => {
+            let execution = client.get_scheduled_execution(execution_id)?;
+            print_execution(CommandKey::ExecutionInspect, &execution, json)
+        }
+        ExecutionCommands::Cancel { execution_id } => {
+            let execution = client.cancel_scheduled_execution(execution_id)?;
+            print_execution(CommandKey::ExecutionCancel, &execution, json)
+        }
+    }
+}
+
+fn print_execution(
+    command: CommandKey,
+    execution: &ScheduledExecutionSnapshot,
+    json: bool,
+) -> Result<(), Box<dyn Error>> {
+    if json {
+        return print_json(
+            command,
+            serde_json::json!({ "execution": cli_output::execution(execution) }),
+        );
+    }
+    println!("Execution {}", execution.id);
+    println!("State: {}", execution_state(execution));
+    println!("Schedule: {}", execution.schedule_id);
+    println!("Dispatch key: {}", execution.dispatch_key);
+    if let Some(shell_id) = &execution.shell_id {
+        println!("Shell: {shell_id}");
+    }
+    if let Some(run_id) = &execution.run_id {
+        println!("Run: {run_id}");
+    }
+    Ok(())
+}
+
+fn execution_state(execution: &ScheduledExecutionSnapshot) -> &'static str {
+    use protocol::ScheduledExecutionState::*;
+    match execution.state {
+        Claimed => "claimed",
+        Starting => "starting",
+        Active => "active",
+        DispatchFailed => "dispatch_failed",
+        Exited => "exited",
+        Cancelled => "cancelled",
+        Interrupted => "interrupted",
+    }
+}
+
+fn scheduled_runner(schedule_id: &str) -> Result<process_adapter::ProcessExit, Box<dyn Error>> {
+    let shell_id = env::var("BOOMUX_SHELL_ID")
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "BOOMUX_SHELL_ID is required"))?;
+    let run_id = env::var("BOOMUX_RUN_ID")
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "BOOMUX_RUN_ID is required"))?;
+    let runner_token = env::var("BOOMUX_SCHEDULE_RUNNER_TOKEN").map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "BOOMUX_SCHEDULE_RUNNER_TOKEN is required",
+        )
+    })?;
+    let claim = retry_runner_request(|client| {
+        client.resolve_scheduled_execution_claim(schedule_id, &shell_id, &run_id, &runner_token)
+    })?;
+    let descriptor = boomux::integrations::by_key(&claim.execution.integration)
+        .and_then(|descriptor| descriptor.schedule_dispatch)
+        .ok_or_else(|| io::Error::other("scheduled integration dispatch is unavailable"))?;
+    let dispatch = descriptor
+        .command(
+            &claim.execution.integration,
+            &claim.execution.session,
+            &claim.prompt,
+        )
+        .ok_or_else(|| io::Error::other("scheduled integration mode is unavailable"))?;
+    let mut command = Command::new(&dispatch.argv[0]);
+    command
+        .args(&dispatch.argv[1..])
+        .current_dir(&claim.execution.cwd)
+        .env_remove("BOOMUX_SCHEDULE_RUNNER_TOKEN")
+        .stdin(if dispatch.stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::inherit()
+        })
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = retry_runner_request(|client| {
+                client.report_scheduled_runner(
+                    &claim.execution.id,
+                    &shell_id,
+                    &run_id,
+                    &runner_token,
+                    ScheduledRunnerResult::SpawnFailed,
+                )
+            });
+            return Err(io::Error::new(
+                error.kind(),
+                format!("could not start scheduled host: {error}"),
+            )
+            .into());
+        }
+    };
+    if let Some(bytes) = dispatch.stdin {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| io::Error::other("scheduled host stdin is unavailable"))?;
+        if let Err(error) = std::io::Write::write_all(&mut stdin, &bytes) {
+            drop(stdin);
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = retry_runner_request(|client| {
+                client.report_scheduled_runner(
+                    &claim.execution.id,
+                    &shell_id,
+                    &run_id,
+                    &runner_token,
+                    ScheduledRunnerResult::SpawnFailed,
+                )
+            });
+            return Err(io::Error::new(
+                error.kind(),
+                format!("could not write scheduled host prompt: {error}"),
+            )
+            .into());
+        }
+        drop(stdin);
+    }
+    if let Err(error) = retry_runner_request(|client| {
+        client.report_scheduled_runner(
+            &claim.execution.id,
+            &shell_id,
+            &run_id,
+            &runner_token,
+            ScheduledRunnerResult::Active,
+        )
+    }) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
+    let status = child.wait()?;
+    let (exit, outcome) = if let Some(code) = status.code() {
+        (
+            process_adapter::ProcessExit::Code(code),
+            ScheduledExecutionOutcome::ExitCode { code },
+        )
+    } else {
+        let signal = status.signal().unwrap_or(0);
+        (
+            process_adapter::ProcessExit::Signal(signal),
+            ScheduledExecutionOutcome::Signal { signal },
+        )
+    };
+    retry_runner_request(|client| {
+        client.report_scheduled_runner(
+            &claim.execution.id,
+            &shell_id,
+            &run_id,
+            &runner_token,
+            ScheduledRunnerResult::Exited {
+                outcome: outcome.clone(),
+            },
+        )
+    })?;
+    Ok(exit)
+}
+
+fn retry_runner_request<T>(
+    mut request: impl FnMut(&client::Client) -> client::Result<T>,
+) -> Result<T, Box<dyn Error>> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match client::connect().and_then(|client| request(&client)) {
+            Ok(value) => return Ok(value),
+            Err(error) if Instant::now() >= deadline => return Err(Box::new(error)),
+            Err(_) => {}
+        }
+        thread::sleep(Duration::from_millis(25));
     }
 }
 
@@ -3534,7 +3855,7 @@ fn create_schedule(
         sanitize_table_cell(&schedule.id)
     );
     if schedule.state == AgentScheduleState::Enabled {
-        println!("Scheduled dispatch is not available yet; only consent state was recorded");
+        println!("Timed dispatch is not available yet; use schedule run for explicit run-now work");
     }
     Ok(())
 }
@@ -4522,6 +4843,15 @@ fn open_dashboard_shell(
     terminal: Option<&str>,
 ) -> Result<String, Box<dyn Error>> {
     let shell = client.get_shell(shell_id)?;
+    if matches!(shell.owner, protocol::ShellOwner::Schedule { .. })
+        && shell.status != ShellStatus::Running
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "schedule-owned shell is attachable only while its execution is active",
+        )
+        .into());
+    }
     let workspace = client.get_workspace(&shell.workspace_id)?;
     open_terminal(
         shell_id,
@@ -4545,7 +4875,9 @@ fn open_workspace(
             failures.push(format!("launcher {}: {error}", launcher.name));
         }
     }
-    for shell in &workspace.shells {
+    for shell in workspace.shells.iter().filter(|shell| {
+        matches!(shell.owner, protocol::ShellOwner::User) || shell.status == ShellStatus::Running
+    }) {
         if let Err(error) = open_terminal(
             &shell.id,
             &format!("{} - {}", workspace.name, shell.name),
@@ -4617,6 +4949,15 @@ fn open_shell(
 ) -> Result<(), Box<dyn Error>> {
     let client = client::connect_or_start()?;
     let shell = client.get_shell(shell_id)?;
+    if matches!(shell.owner, protocol::ShellOwner::Schedule { .. })
+        && shell.status != ShellStatus::Running
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "schedule-owned shell is attachable only while its execution is active",
+        )
+        .into());
+    }
     let title = title.map(str::to_owned).unwrap_or_else(|| {
         client
             .get_workspace(&shell.workspace_id)
@@ -5046,6 +5387,7 @@ mod tests {
 
     fn shell(id: &str, workspace_id: &str, name: &str) -> ShellSnapshot {
         ShellSnapshot {
+            owner: boomux::protocol::ShellOwner::User,
             id: id.into(),
             workspace_id: workspace_id.into(),
             name: name.into(),
@@ -7246,7 +7588,7 @@ mod tests {
             session_transcript::supported_integrations(),
             ["opencode", "pi"]
         );
-        assert_eq!(protocol::PROTOCOL_VERSION, 22);
+        assert_eq!(protocol::PROTOCOL_VERSION, 23);
     }
 
     #[test]
@@ -7295,6 +7637,10 @@ mod tests {
                 "schedule.pause",
                 "schedule.resume",
                 "schedule.remove",
+                "schedule.run",
+                "execution.list",
+                "execution.inspect",
+                "execution.cancel",
                 "daemon.status",
             ]
         );

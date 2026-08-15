@@ -18,6 +18,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::client;
@@ -33,13 +34,16 @@ use crate::protocol::{
     AgentScheduleOverlapPolicy, AgentScheduleSession, AgentScheduleSnapshot, AgentScheduleSpec,
     AgentScheduleState, AgentScheduleTrigger, AgentState, AttachFrame, DaemonEvent,
     DaemonEventKind, Envelope, ErrorCode, EventCursor, FocusedTerminalSnapshot,
-    NotificationDeliveryConfig, Request, Response, ShellRunExitReason, ShellRunSnapshot,
-    ShellSnapshot, ShellSpec, ShellStatus, Snapshot, TerminalPreview, TerminalProfile,
-    UnixEnvironment, WorkspaceLauncherSnapshot, WorkspaceLauncherSpec, WorkspaceSnapshot,
+    NotificationDeliveryConfig, Request, Response, ScheduledExecutionDispatchKind,
+    ScheduledExecutionOutcome, ScheduledExecutionReason, ScheduledExecutionSnapshot,
+    ScheduledExecutionState, ScheduledRunnerResult, ShellOwner, ShellRunExitReason,
+    ShellRunSnapshot, ShellSnapshot, ShellSpec, ShellStatus, Snapshot, TerminalPreview,
+    TerminalProfile, UnixEnvironment, UnixEnvironmentVariable, WorkspaceLauncherSnapshot,
+    WorkspaceLauncherSpec, WorkspaceSnapshot,
 };
 use crate::state_store::{
-    PersistedAgentInstance, PersistedAgentSchedule, PersistedShell, PersistedShellRun,
-    PersistedState, PersistedWorkspace, PersistedWorkspaceLauncher, StateStore,
+    PersistedAgentInstance, PersistedAgentSchedule, PersistedScheduledExecution, PersistedShell,
+    PersistedShellRun, PersistedState, PersistedWorkspace, PersistedWorkspaceLauncher, StateStore,
 };
 use crate::terminal_state::TerminalState;
 
@@ -66,6 +70,8 @@ const MAX_TERMINAL_CELLS: usize = 1_000_000;
 const MAX_SHELL_READ_BYTES: usize = 1024 * 1024;
 const MAX_FOREGROUND_PROCESS_BYTES: usize = 64;
 const MAX_RETAINED_EVENTS: usize = 8_192;
+const MAX_TERMINAL_EXECUTIONS_PER_SCHEDULE: usize = 100;
+const DISPATCH_KEY_FILTER_BYTES: usize = 2048;
 const MAX_EVENT_BATCH: u16 = 256;
 const MAX_EVENT_WAIT: Duration = Duration::from_secs(30);
 const TRANSITION_IDLE: u8 = 0;
@@ -222,7 +228,7 @@ pub fn receive_handoff_with_notification_delivery(
                 TransferredState {
                     runtimes,
                     exited,
-                    events: Some(event_stream),
+                    events: Some(*event_stream),
                     focused_terminal: focused_terminal.map(|focused| *focused),
                 },
                 Some(&mut channel),
@@ -292,6 +298,7 @@ fn run_daemon(
     notification_settings: NotificationDeliverySettings,
 ) -> io::Result<()> {
     let mut registry = DaemonService::restore(store, committed.is_some(), transferred.events)?;
+    registry.startup_environment = capture_current_environment();
     registry.notification_settings = notification_settings.clone();
     if !registry.notification_settings.persist_terminal_history {
         registry.clear_terminal_histories()?;
@@ -329,6 +336,7 @@ fn run_daemon(
                 for runtime in gated_readers {
                     registry.runtimes.resume_reader(&runtime)?;
                 }
+                registry.resume_claimed_schedule_executions();
                 // FINALIZE is the irreversible ownership boundary. Failure to
                 // report COMMITTED must not make the old daemon resume.
                 let _ = channel.write_all(&[handoff::COMMITTED]);
@@ -377,6 +385,7 @@ fn run_daemon(
                     &daemon_lock,
                     &registry,
                     request.notification_settings,
+                    request.startup_environment,
                 );
                 if result.is_ok() {
                     handed_off = true;
@@ -448,6 +457,7 @@ fn run_daemon(
 struct RestartRequest {
     reply: SyncSender<DaemonResult<()>>,
     notification_settings: Option<NotificationDeliverySettings>,
+    startup_environment: Option<UnixEnvironment>,
 }
 
 #[derive(Debug)]
@@ -603,6 +613,17 @@ fn secure_runtime_dir(path: &Path) -> io::Result<()> {
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))
 }
 
+fn capture_current_environment() -> UnixEnvironment {
+    UnixEnvironment {
+        variables: env::vars_os()
+            .map(|(name, value)| protocol::UnixEnvironmentVariable {
+                name: name.into_vec(),
+                value: value.into_vec(),
+            })
+            .collect(),
+    }
+}
+
 fn acquire_daemon_lock(runtime_dir: &Path) -> io::Result<File> {
     let lock_file = OpenOptions::new()
         .read(true)
@@ -629,6 +650,7 @@ fn launch_replacement(
     daemon_lock: &File,
     registry: &DaemonService,
     notification_settings: Option<NotificationDeliverySettings>,
+    startup_environment: Option<UnixEnvironment>,
 ) -> DaemonResult<()> {
     let _mutation = lock(&registry.mutation_lock)?;
     registry.ensure_running()?;
@@ -659,6 +681,7 @@ fn launch_replacement(
             ReplacementOptions {
                 focused_terminal,
                 notification_settings,
+                startup_environment,
             },
         )
         .map_err(DaemonError::from)
@@ -675,6 +698,7 @@ fn launch_replacement(
 struct ReplacementOptions {
     focused_terminal: Option<FocusedTerminalSnapshot>,
     notification_settings: Option<NotificationDeliverySettings>,
+    startup_environment: Option<UnixEnvironment>,
 }
 
 fn launch_replacement_process(
@@ -689,10 +713,20 @@ fn launch_replacement_process(
     let ReplacementOptions {
         focused_terminal,
         notification_settings,
+        startup_environment,
     } = options;
     let (mut channel, child_channel) = UnixStream::pair()?;
     let child_channel_fd = child_channel.as_raw_fd();
     let mut command = Command::new(replacement_executable()?);
+    if let Some(environment) = startup_environment {
+        command.env_clear();
+        for variable in environment.variables {
+            command.env(
+                std::ffi::OsString::from_vec(variable.name),
+                std::ffi::OsString::from_vec(variable.value),
+            );
+        }
+    }
     command
         .args([
             "daemon",
@@ -897,14 +931,26 @@ fn handle_connection(
             }
         };
     }
-    let restart_notification_settings = match &request.message {
-        Request::Restart => Some(None),
-        Request::RestartWithNotificationConfig { notifications } => {
-            Some(Some(notifications.clone().into()))
+    let restart_settings = match &request.message {
+        Request::Restart => Some((None, None)),
+        Request::RestartWithNotificationConfig {
+            notifications,
+            environment,
+        } => {
+            if let Some(environment) = environment
+                && let Err(error) = validate_unix_environment(environment)
+            {
+                return send_response(
+                    &mut stream,
+                    response_version,
+                    DaemonError::from(error).into_response(),
+                );
+            }
+            Some((Some(notifications.clone().into()), environment.clone()))
         }
         _ => None,
     };
-    if let Some(notification_settings) = restart_notification_settings {
+    if let Some((notification_settings, startup_environment)) = restart_settings {
         if transition
             .compare_exchange(
                 TRANSITION_IDLE,
@@ -926,6 +972,7 @@ fn handle_connection(
             .send(RestartRequest {
                 reply,
                 notification_settings,
+                startup_environment,
             })
             .is_err()
         {
@@ -947,14 +994,20 @@ fn handle_connection(
         };
     }
 
-    let response = match registry.dispatch(request.message) {
+    let response = match registry.dispatch_arc(request.message) {
         Ok(response) => response,
         Err(error) => error.into_response(),
     };
     send_response(
         &mut stream,
         response_version,
-        response_for_version(response, response_version),
+        response_for_version_with_schedule_shells(
+            response,
+            response_version,
+            &registry
+                .schedule_shell_ids_for_downgrade()
+                .unwrap_or_default(),
+        ),
     )
 }
 
@@ -966,8 +1019,62 @@ fn unsupported_request_message(feature: protocol::ProtocolFeature) -> String {
     )
 }
 
+#[cfg(test)]
 fn response_for_version(response: Response, version: u32) -> Response {
+    response_for_version_with_schedule_shells(response, version, &HashSet::new())
+}
+
+fn response_for_version_with_schedule_shells(
+    response: Response,
+    version: u32,
+    schedule_shell_ids: &HashSet<String>,
+) -> Response {
     let mut response = response;
+    if !protocol::ProtocolFeature::ScheduledExecutions.is_supported_by(version) {
+        if let Response::Events { events, .. } = &mut response {
+            events.retain(|event| {
+                !matches!(
+                    &event.kind,
+                    DaemonEventKind::ScheduledExecutionCreated { .. }
+                        | DaemonEventKind::ScheduledExecutionChanged { .. }
+                ) && !event_shell_id(&event.kind)
+                    .is_some_and(|shell_id| schedule_shell_ids.contains(shell_id))
+            });
+        }
+        let hide_schedule_shells = |workspace: &mut WorkspaceSnapshot| {
+            workspace
+                .shells
+                .retain(|shell| matches!(shell.owner, ShellOwner::User));
+            for schedule in &mut workspace.schedules {
+                schedule.execution_shell_id = None;
+            }
+        };
+        match &mut response {
+            Response::Snapshot { snapshot } => {
+                for workspace in &mut snapshot.workspaces {
+                    hide_schedule_shells(workspace);
+                }
+            }
+            Response::Workspace { workspace } => {
+                hide_schedule_shells(workspace);
+            }
+            Response::Shell { shell } if !matches!(shell.owner, ShellOwner::User) => {
+                response = Response::Error {
+                    code: Some(ErrorCode::NotFound),
+                    message: format!("shell not found: {}", shell.id),
+                };
+            }
+            Response::Events {
+                snapshot: Some(snapshot),
+                ..
+            } => {
+                for workspace in &mut snapshot.workspaces {
+                    hide_schedule_shells(workspace);
+                }
+            }
+            _ => {}
+        }
+    }
     if !protocol::ProtocolFeature::AgentSchedules.is_supported_by(version) {
         remove_agent_schedules(&mut response);
     }
@@ -1041,6 +1148,22 @@ fn response_for_version(response: Response, version: u32) -> Response {
             }
         }
         response => response,
+    }
+}
+
+fn event_shell_id(event: &DaemonEventKind) -> Option<&str> {
+    match event {
+        DaemonEventKind::ShellCreated { shell_id, .. }
+        | DaemonEventKind::ShellRenamed { shell_id, .. }
+        | DaemonEventKind::ShellClosed { shell_id, .. }
+        | DaemonEventKind::RunStarted { shell_id, .. }
+        | DaemonEventKind::OutputChanged { shell_id, .. }
+        | DaemonEventKind::RunExited { shell_id, .. }
+        | DaemonEventKind::AgentRegistered { shell_id, .. }
+        | DaemonEventKind::AgentStateChanged { shell_id, .. }
+        | DaemonEventKind::AgentCompleted { shell_id, .. }
+        | DaemonEventKind::AgentAttentionAcknowledged { shell_id, .. } => Some(shell_id),
+        _ => None,
     }
 }
 
@@ -1194,6 +1317,7 @@ struct DaemonService {
     mutation_lock: Mutex<()>,
     notification_settings: NotificationDeliverySettings,
     notification_sink: Arc<dyn NotificationSink>,
+    startup_environment: UnixEnvironment,
     #[cfg(test)]
     fail_after_mutation: AtomicBool,
 }
@@ -1309,6 +1433,12 @@ enum DurableUndo {
     ScheduleState {
         schedule: Arc<AgentSchedule>,
         previous: AgentScheduleMutableState,
+    },
+    ScheduleExecutions {
+        schedule: Arc<AgentSchedule>,
+        previous: Vec<Arc<ScheduledExecution>>,
+        previous_dispatch_key_filter: Vec<u8>,
+        execution: Option<(Arc<ScheduledExecution>, ScheduledExecutionMutableState)>,
     },
     RemovedLauncher {
         workspace: Arc<Workspace>,
@@ -1471,6 +1601,7 @@ struct EventStreamState {
     stream_id: String,
     latest_id: u64,
     events: VecDeque<DaemonEvent>,
+    schedule_shell_ids: HashSet<String>,
 }
 
 struct EventTransaction<'a> {
@@ -1598,6 +1729,7 @@ impl EventStream {
                 stream_id: Uuid::new_v4().to_string(),
                 latest_id: 0,
                 events: VecDeque::new(),
+                schedule_shell_ids: HashSet::new(),
             }),
             transitions: Mutex::new(TransitionState::default()),
             changed: Condvar::new(),
@@ -1611,11 +1743,29 @@ impl EventStream {
                 stream_id: Uuid::new_v4().to_string(),
                 latest_id: 0,
                 events: VecDeque::new(),
+                schedule_shell_ids: HashSet::new(),
             },
-            |transfer| EventStreamState {
-                stream_id: transfer.stream_id,
-                latest_id: transfer.latest_id,
-                events: transfer.events.into(),
+            |transfer| {
+                let mut schedule_shell_ids = transfer
+                    .schedule_shell_ids
+                    .into_iter()
+                    .collect::<HashSet<_>>();
+                for event in &transfer.events {
+                    if let DaemonEventKind::ScheduledExecutionCreated { execution, .. }
+                    | DaemonEventKind::ScheduledExecutionChanged { execution, .. } = &event.kind
+                        && let Some(shell_id) = &execution.shell_id
+                    {
+                        schedule_shell_ids.insert(shell_id.clone());
+                    }
+                }
+                let mut state = EventStreamState {
+                    stream_id: transfer.stream_id,
+                    latest_id: transfer.latest_id,
+                    events: transfer.events.into(),
+                    schedule_shell_ids,
+                };
+                Self::retain_referenced_schedule_shell_ids(&mut state);
+                state
             },
         );
         Self {
@@ -1648,7 +1798,12 @@ impl EventStream {
             stream_id: state.stream_id.clone(),
             latest_id: state.latest_id,
             events: state.events.iter().cloned().collect(),
+            schedule_shell_ids: state.schedule_shell_ids.iter().cloned().collect(),
         })
+    }
+
+    fn schedule_shell_ids(&self) -> io::Result<HashSet<String>> {
+        Ok(lock(&self.state)?.schedule_shell_ids.clone())
     }
 
     fn wait_for<T>(
@@ -1687,6 +1842,12 @@ impl EventStream {
         debug_assert!(Self::ensure_capacity(state, kinds.len()).is_ok());
         let mut appended = Vec::with_capacity(kinds.len());
         for kind in kinds {
+            if let DaemonEventKind::ScheduledExecutionCreated { execution, .. }
+            | DaemonEventKind::ScheduledExecutionChanged { execution, .. } = &kind
+                && let Some(shell_id) = &execution.shell_id
+            {
+                state.schedule_shell_ids.insert(shell_id.clone());
+            }
             state.latest_id += 1;
             let event = DaemonEvent {
                 id: state.latest_id,
@@ -1700,7 +1861,19 @@ impl EventStream {
             let remove = state.events.len() - MAX_RETAINED_EVENTS;
             state.events.drain(..remove);
         }
+        Self::retain_referenced_schedule_shell_ids(state);
         appended
+    }
+
+    fn retain_referenced_schedule_shell_ids(state: &mut EventStreamState) {
+        let referenced_shell_ids = state
+            .events
+            .iter()
+            .filter_map(|event| event_shell_id(&event.kind).map(str::to_owned))
+            .collect::<HashSet<_>>();
+        state
+            .schedule_shell_ids
+            .retain(|shell_id| referenced_shell_ids.contains(shell_id));
     }
 
     #[cfg(test)]
@@ -1853,6 +2026,190 @@ impl DurableRegistry {
             .get(id)
             .cloned()
             .ok_or_else(|| not_found("agent schedule", id))
+    }
+
+    fn execution(&self, id: &str) -> io::Result<Arc<ScheduledExecution>> {
+        let schedules = lock(&self.state)?
+            .schedules
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for schedule in schedules {
+            if let Some(execution) = lock(&schedule.executions)?
+                .iter()
+                .find(|execution| execution.id == id)
+            {
+                return Ok(Arc::clone(execution));
+            }
+        }
+        Err(not_found("scheduled execution", id))
+    }
+
+    fn scheduled_executions(
+        &self,
+        workspace_id: Option<&str>,
+        schedule_id: Option<&str>,
+    ) -> io::Result<Vec<ScheduledExecutionSnapshot>> {
+        let schedules = lock(&self.state)?
+            .schedules
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut snapshots = Vec::new();
+        for schedule in schedules {
+            if workspace_id.is_some_and(|id| id != schedule.workspace_id)
+                || schedule_id.is_some_and(|id| id != schedule.id)
+            {
+                continue;
+            }
+            let executions = lock(&schedule.executions)?.clone();
+            for execution in executions {
+                snapshots.push(execution.snapshot()?);
+            }
+        }
+        snapshots.sort_by(|left, right| {
+            right
+                .requested_at_ms
+                .cmp(&left.requested_at_ms)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        Ok(snapshots)
+    }
+
+    fn claim_schedule_execution(
+        &self,
+        schedule_id: &str,
+        dispatch_key: &str,
+    ) -> DaemonResult<(ScheduledExecutionSnapshot, Option<DurableUndo>)> {
+        validate_id("dispatch idempotency key", dispatch_key)?;
+        let schedule = self.schedule(schedule_id)?;
+        let existing = lock(&schedule.executions)?
+            .iter()
+            .find(|execution| execution.dispatch_key == dispatch_key)
+            .cloned();
+        if let Some(existing) = existing {
+            return Ok((existing.snapshot()?, None));
+        }
+        let execution_shell_id = lock(&schedule.state)?.execution_shell_id.clone();
+        if let Some(shell_id) = execution_shell_id {
+            let shell = self.shell(&shell_id)?;
+            if matches!(*lock(&shell.lifecycle)?, ShellLifecycle::Running { .. }) {
+                return Err(DaemonError::lifecycle(
+                    ErrorCode::Busy,
+                    "agent schedule runner shell is still running",
+                ));
+            }
+        }
+        if self.continuation_session_is_active(&schedule)? {
+            return Err(DaemonError::lifecycle(
+                ErrorCode::Busy,
+                "continued Agent session is active in a current shell run",
+            ));
+        }
+        let schedule_state = lock(&schedule.state)?.clone();
+        let mut executions = lock(&schedule.executions)?;
+        let mut dispatch_key_filter = lock(&schedule.dispatch_key_filter)?;
+        if dispatch_key_was_seen(&dispatch_key_filter, dispatch_key) {
+            return Err(DaemonError::lifecycle(
+                ErrorCode::IdempotencyExpired,
+                "dispatch idempotency key was used by a pruned execution",
+            ));
+        }
+        for execution in executions.iter() {
+            if !lock(&execution.state)?.state.is_terminal() {
+                return Err(DaemonError::lifecycle(
+                    ErrorCode::Busy,
+                    "agent schedule already has a nonterminal execution",
+                ));
+            }
+        }
+        let now = unix_time_ms();
+        let execution = Arc::new(ScheduledExecution {
+            id: Uuid::new_v4().to_string(),
+            workspace_id: schedule.workspace_id.clone(),
+            schedule_id: schedule.id.clone(),
+            dispatch_kind: ScheduledExecutionDispatchKind::Manual,
+            dispatch_key: dispatch_key.into(),
+            schedule_revision: schedule_state.revision,
+            prompt_revision: schedule.prompt_revision,
+            trigger_revision: schedule.trigger_revision,
+            requested_at_ms: now,
+            cwd: schedule.cwd.clone(),
+            integration: schedule.integration.clone(),
+            session: schedule.session.clone(),
+            prompt: schedule.prompt.clone(),
+            runner_token: Uuid::new_v4().to_string(),
+            state: Mutex::new(ScheduledExecutionMutableState {
+                state: ScheduledExecutionState::Claimed,
+                started_at_ms: None,
+                ended_at_ms: None,
+                reason: None,
+                outcome: None,
+                shell_id: None,
+                run_id: None,
+                agent_id: None,
+                external_session_id: None,
+            }),
+        });
+        let snapshot = execution.snapshot()?;
+        let previous = executions.clone();
+        let previous_dispatch_key_filter = dispatch_key_filter.clone();
+        remember_dispatch_key(&mut dispatch_key_filter, dispatch_key);
+        executions.push(execution);
+        drop(dispatch_key_filter);
+        drop(executions);
+        Ok((
+            snapshot,
+            Some(DurableUndo::ScheduleExecutions {
+                schedule,
+                previous,
+                previous_dispatch_key_filter,
+                execution: None,
+            }),
+        ))
+    }
+
+    fn continuation_session_is_active(&self, schedule: &AgentSchedule) -> io::Result<bool> {
+        let AgentScheduleSession::Continue {
+            external_session_id,
+        } = &schedule.session
+        else {
+            return Ok(false);
+        };
+        let candidates = {
+            let state = lock(&self.state)?;
+            state
+                .agents
+                .values()
+                .filter(|agent| {
+                    agent.integration == schedule.integration
+                        && agent.external_session_id.as_deref()
+                            == Some(external_session_id.as_str())
+                })
+                .filter_map(|agent| {
+                    state
+                        .shells
+                        .get(&agent.shell_id)
+                        .map(|shell| (Arc::clone(agent), Arc::clone(shell)))
+                })
+                .collect::<Vec<_>>()
+        };
+        for (agent, shell) in candidates {
+            let agent_state = lock(&agent.state)?;
+            if agent_state.ended_at_ms.is_none()
+                && !matches!(
+                    agent_state.observation.state,
+                    AgentState::Inactive | AgentState::Done
+                )
+                && matches!(
+                    &*lock(&shell.lifecycle)?,
+                    ShellLifecycle::Running { run, .. } if run.id == agent.run_id
+                )
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn contains_shell(&self, shell: &Arc<Shell>) -> io::Result<bool> {
@@ -2037,6 +2394,95 @@ impl DurableRegistry {
         Ok((snapshot, DurableUndo::CreatedShell { workspace, shell }))
     }
 
+    fn create_schedule_shell(
+        &self,
+        schedule: &Arc<AgentSchedule>,
+        command: Vec<String>,
+    ) -> io::Result<(Arc<Shell>, DurableUndo)> {
+        let workspace = self.workspace(&schedule.workspace_id)?;
+        let shell = Arc::new(Shell {
+            id: Uuid::new_v4().to_string(),
+            workspace_id: schedule.workspace_id.clone(),
+            name: Mutex::new(format!("schedule-{}", &schedule.id[..8])),
+            cwd: schedule.cwd.clone(),
+            command,
+            owner: ShellOwner::Schedule {
+                schedule_id: schedule.id.clone(),
+            },
+            last_run: Mutex::new(None),
+            lifecycle: Mutex::new(ShellLifecycle::Pending),
+            foreground_process_cache: Mutex::new(None),
+        });
+        let mut state = lock(&self.state)?;
+        let mut shell_ids = lock(&workspace.shell_ids)?;
+        state.shells.insert(shell.id.clone(), Arc::clone(&shell));
+        shell_ids.push(shell.id.clone());
+        drop(shell_ids);
+        drop(state);
+        Ok((
+            shell.clone(),
+            DurableUndo::CreatedShell { workspace, shell },
+        ))
+    }
+
+    fn mutate_execution(
+        &self,
+        execution: &Arc<ScheduledExecution>,
+        mutate: impl FnOnce(&mut ScheduledExecutionMutableState) -> io::Result<()>,
+    ) -> io::Result<(ScheduledExecutionSnapshot, DurableUndo)> {
+        let schedule = self.schedule(&execution.schedule_id)?;
+        let mut executions = lock(&schedule.executions)?;
+        if !executions
+            .iter()
+            .any(|current| Arc::ptr_eq(current, execution))
+        {
+            return Err(not_found("scheduled execution", &execution.id));
+        }
+        let previous = executions.clone();
+        let previous_dispatch_key_filter = lock(&schedule.dispatch_key_filter)?.clone();
+        let mut state = lock(&execution.state)?;
+        let previous_state = state.clone();
+        mutate(&mut state)?;
+        let snapshot = execution.snapshot_from(&state);
+        let became_terminal = state.state.is_terminal();
+        drop(state);
+        if became_terminal {
+            let mut terminal = executions
+                .iter()
+                .enumerate()
+                .filter_map(|(index, candidate)| {
+                    lock(&candidate.state)
+                        .ok()
+                        .filter(|state| state.state.is_terminal())
+                        .map(|_| (index, candidate.requested_at_ms))
+                })
+                .collect::<Vec<_>>();
+            terminal.sort_by_key(|(_, requested)| *requested);
+            let remove = terminal
+                .len()
+                .saturating_sub(MAX_TERMINAL_EXECUTIONS_PER_SCHEDULE);
+            let mut remove = terminal
+                .into_iter()
+                .take(remove)
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            remove.sort_unstable_by(|left, right| right.cmp(left));
+            for index in remove {
+                executions.remove(index);
+            }
+        }
+        drop(executions);
+        Ok((
+            snapshot,
+            DurableUndo::ScheduleExecutions {
+                schedule,
+                previous,
+                previous_dispatch_key_filter,
+                execution: Some((Arc::clone(execution), previous_state)),
+            },
+        ))
+    }
+
     fn create_shell_with_workspace(
         &self,
         spec: ShellSpec,
@@ -2146,6 +2592,8 @@ impl DurableRegistry {
                 evaluation_frontier_ms: now,
                 execution_shell_id: None,
             }),
+            executions: Mutex::new(Vec::new()),
+            dispatch_key_filter: Mutex::new(vec![0; DISPATCH_KEY_FILTER_BYTES]),
         });
         let snapshot = schedule.snapshot()?;
         let mut state = lock(&self.state)?;
@@ -2244,6 +2692,12 @@ impl DurableRegistry {
     fn rename_shell(&self, shell_id: &str, name: String) -> io::Result<Option<DurableUndo>> {
         validate_name(&name)?;
         let shell = self.shell(shell_id)?;
+        if !matches!(shell.owner, ShellOwner::User) {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "schedule-owned shells cannot be renamed",
+            ));
+        }
         let workspace = self.workspace(&shell.workspace_id)?;
         let state = lock(&self.state)?;
         let shell_ids = lock(&workspace.shell_ids)?;
@@ -2384,6 +2838,8 @@ impl DurableRegistry {
         let lifecycle = lock(&shell.lifecycle)?;
         match &*lifecycle {
             ShellLifecycle::Running { run, .. } if run.id == run_id => {}
+            ShellLifecycle::Exited { run, .. }
+                if run.id == run_id && matches!(shell.owner, ShellOwner::Schedule { .. }) => {}
             ShellLifecycle::Running { .. }
             | ShellLifecycle::Exited { .. }
             | ShellLifecycle::Pending => {
@@ -2561,6 +3017,63 @@ impl DurableRegistry {
         ))
     }
 
+    fn link_agent_execution(
+        &self,
+        agent: &AgentInstanceSnapshot,
+    ) -> io::Result<Option<(ScheduledExecutionSnapshot, DurableUndo)>> {
+        let shell = self.shell(&agent.shell_id)?;
+        let ShellOwner::Schedule { schedule_id } = &shell.owner else {
+            return Ok(None);
+        };
+        let schedule = self.schedule(schedule_id)?;
+        if schedule.integration != agent.integration {
+            return Ok(None);
+        }
+        let execution = lock(&schedule.executions)?
+            .iter()
+            .find(|execution| {
+                lock(&execution.state).is_ok_and(|state| {
+                    state.shell_id.as_deref() == Some(agent.shell_id.as_str())
+                        && state.run_id.as_deref() == Some(agent.run_id.as_str())
+                })
+            })
+            .cloned();
+        let Some(execution) = execution else {
+            return Ok(None);
+        };
+        match &execution.session {
+            AgentScheduleSession::Fresh => {
+                if agent.external_session_id.is_none() {
+                    return Ok(None);
+                }
+            }
+            AgentScheduleSession::Continue {
+                external_session_id,
+            } if agent.external_session_id.as_deref() != Some(external_session_id.as_str()) => {
+                return Ok(None);
+            }
+            AgentScheduleSession::Continue { .. } => {}
+        }
+        let current = execution.snapshot()?;
+        if current.agent_id.as_deref() == Some(agent.id.as_str())
+            && current.external_session_id == agent.external_session_id
+        {
+            return Ok(None);
+        }
+        if current.agent_id.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "scheduled execution is already linked to a different Agent",
+            ));
+        }
+        let (snapshot, undo) = self.mutate_execution(&execution, |state| {
+            state.agent_id = Some(agent.id.clone());
+            state.external_session_id = agent.external_session_id.clone();
+            Ok(())
+        })?;
+        Ok(Some((snapshot, undo)))
+    }
+
     fn workspace_shells(&self, workspace: &Arc<Workspace>) -> io::Result<Vec<Arc<Shell>>> {
         let state = lock(&self.state)?;
         let Some(current) = state.workspaces.get(&workspace.id) else {
@@ -2662,6 +3175,18 @@ impl DurableRegistry {
             DurableUndo::ScheduleState { schedule, previous } => {
                 *lock(&schedule.state)? = previous;
             }
+            DurableUndo::ScheduleExecutions {
+                schedule,
+                previous,
+                previous_dispatch_key_filter,
+                execution,
+            } => {
+                if let Some((execution, state)) = execution {
+                    *lock(&execution.state)? = state;
+                }
+                *lock(&schedule.executions)? = previous;
+                *lock(&schedule.dispatch_key_filter)? = previous_dispatch_key_filter;
+            }
             DurableUndo::RemovedLauncher {
                 workspace,
                 launcher,
@@ -2746,16 +3271,39 @@ impl DurableRegistry {
         Ok(lock(&self.state)?.shells.values().cloned().collect())
     }
 
+    fn schedule_shell_ids(&self) -> io::Result<HashSet<String>> {
+        let schedules = lock(&self.state)?
+            .schedules
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut ids = HashSet::new();
+        for schedule in schedules {
+            if let Some(shell_id) = lock(&schedule.state)?.execution_shell_id.clone() {
+                ids.insert(shell_id);
+            }
+        }
+        Ok(ids)
+    }
+
     fn capture_persisted_state(&self) -> io::Result<PersistenceGeneration> {
-        let state = lock(&self.state)?;
-        let mut workspaces = state.workspaces.values().cloned().collect::<Vec<_>>();
+        let (mut workspaces, shells_by_id, launchers_by_id, agents_by_id, schedules_by_id) = {
+            let state = lock(&self.state)?;
+            (
+                state.workspaces.values().cloned().collect::<Vec<_>>(),
+                state.shells.clone(),
+                state.launchers.clone(),
+                state.agents.clone(),
+                state.schedules.clone(),
+            )
+        };
         workspaces.sort_by(|left, right| left.id.cmp(&right.id));
         let mut saved = PersistedState::default();
         for workspace in workspaces {
             let ids = lock(&workspace.shell_ids)?.clone();
             let mut shells = Vec::with_capacity(ids.len());
             for id in ids {
-                let Some(shell) = state.shells.get(&id) else {
+                let Some(shell) = shells_by_id.get(&id) else {
                     continue;
                 };
                 shells.push(PersistedShell {
@@ -2763,13 +3311,14 @@ impl DurableRegistry {
                     name: lock(&shell.name)?.clone(),
                     cwd: shell.cwd.clone(),
                     command: shell.command.clone(),
+                    owner: shell.owner.clone(),
                     last_run: lock(&shell.last_run)?.clone(),
                 });
             }
             let ids = lock(&workspace.launcher_ids)?.clone();
             let mut launchers = Vec::with_capacity(ids.len());
             for id in ids {
-                let Some(launcher) = state.launchers.get(&id) else {
+                let Some(launcher) = launchers_by_id.get(&id) else {
                     continue;
                 };
                 launchers.push(PersistedWorkspaceLauncher {
@@ -2782,7 +3331,7 @@ impl DurableRegistry {
             let ids = lock(&workspace.agent_ids)?.clone();
             let mut agents = Vec::with_capacity(ids.len());
             for id in ids {
-                let Some(agent) = state.agents.get(&id) else {
+                let Some(agent) = agents_by_id.get(&id) else {
                     continue;
                 };
                 agents.push(agent.persisted()?);
@@ -2790,7 +3339,7 @@ impl DurableRegistry {
             let ids = lock(&workspace.schedule_ids)?.clone();
             let mut schedules = Vec::with_capacity(ids.len());
             for id in ids {
-                let Some(schedule) = state.schedules.get(&id) else {
+                let Some(schedule) = schedules_by_id.get(&id) else {
                     continue;
                 };
                 schedules.push(schedule.persisted()?);
@@ -3301,14 +3850,25 @@ impl ShellRuntimeManager {
     }
 
     fn kill(&self, shell: &Shell) -> io::Result<()> {
+        self.kill_with_event(shell).map(|_| ())
+    }
+
+    fn kill_with_event(&self, shell: &Shell) -> io::Result<Option<DaemonEventKind>> {
         match self.stop_runtime(shell) {
             Ok(()) => {
-                let _ = self.finalize_stop(shell)?;
-                Ok(())
+                let rollback = self.finalize_stop(shell)?;
+                Ok(rollback.event)
             }
             Err(error) => {
                 if error.stopped {
-                    let _ = self.finalize_stop(shell)?;
+                    let rollback = self.finalize_stop(shell)?;
+                    return match rollback.event {
+                        Some(_event) => Err(io::Error::new(
+                            error.source.kind(),
+                            format!("{}; run exit was finalized", error.source),
+                        )),
+                        None => Err(error.source),
+                    };
                 }
                 Err(error.source)
             }
@@ -3516,6 +4076,7 @@ impl Default for DaemonService {
             mutation_lock: Mutex::new(()),
             notification_settings: NotificationDeliverySettings::default(),
             notification_sink: Arc::new(DisabledNotificationSink),
+            startup_environment: capture_current_environment(),
             #[cfg(test)]
             fail_after_mutation: AtomicBool::new(false),
         }
@@ -3546,6 +4107,39 @@ struct AgentSchedule {
     trigger_revision: u64,
     created_at_ms: u64,
     state: Mutex<AgentScheduleMutableState>,
+    executions: Mutex<Vec<Arc<ScheduledExecution>>>,
+    dispatch_key_filter: Mutex<Vec<u8>>,
+}
+
+struct ScheduledExecution {
+    id: String,
+    workspace_id: String,
+    schedule_id: String,
+    dispatch_kind: ScheduledExecutionDispatchKind,
+    dispatch_key: String,
+    schedule_revision: u64,
+    prompt_revision: u64,
+    trigger_revision: u64,
+    requested_at_ms: u64,
+    cwd: PathBuf,
+    integration: String,
+    session: AgentScheduleSession,
+    prompt: String,
+    runner_token: String,
+    state: Mutex<ScheduledExecutionMutableState>,
+}
+
+#[derive(Clone)]
+struct ScheduledExecutionMutableState {
+    state: ScheduledExecutionState,
+    started_at_ms: Option<u64>,
+    ended_at_ms: Option<u64>,
+    reason: Option<ScheduledExecutionReason>,
+    outcome: Option<ScheduledExecutionOutcome>,
+    shell_id: Option<String>,
+    run_id: Option<String>,
+    agent_id: Option<String>,
+    external_session_id: Option<String>,
 }
 
 #[derive(Clone)]
@@ -3591,6 +4185,7 @@ struct Shell {
     name: Mutex<String>,
     cwd: PathBuf,
     command: Vec<String>,
+    owner: ShellOwner,
     last_run: Mutex<Option<PersistedShellRun>>,
     lifecycle: Mutex<ShellLifecycle>,
     foreground_process_cache: Mutex<Option<(String, Instant, Option<String>)>>,
@@ -4163,12 +4758,139 @@ fn resume_identity(
 }
 
 impl DaemonService {
+    fn dispatch_arc(self: &Arc<Self>, request: Request) -> DaemonResult<Response> {
+        if let Request::RunAgentSchedule {
+            schedule_id,
+            dispatch_key,
+        } = request
+        {
+            let response = self.durable_mutation_outcome(|undo| {
+                let (execution, record) = self
+                    .durable
+                    .claim_schedule_execution(&schedule_id, &dispatch_key)?;
+                let Some(record) = record else {
+                    return Ok(DurableMutation::Unchanged(Response::ScheduledExecution {
+                        execution,
+                    }));
+                };
+                undo.record(record);
+                Ok(DurableMutation::Changed(
+                    Response::ScheduledExecution {
+                        execution: execution.clone(),
+                    },
+                    vec![DaemonEventKind::ScheduledExecutionCreated {
+                        workspace_id: execution.workspace_id.clone(),
+                        execution,
+                    }],
+                ))
+            })?;
+            let Response::ScheduledExecution { execution } = response else {
+                unreachable!("claim returns an execution")
+            };
+            self.wait_for_native_claim_barrier();
+            let execution = self.durable.execution(&execution.id)?;
+            return match self.dispatch_schedule_execution(Arc::clone(&execution)) {
+                Ok(execution) => Ok(Response::ScheduledExecution { execution }),
+                Err(error) => {
+                    let current = execution.snapshot()?;
+                    if current.state == ScheduledExecutionState::Claimed {
+                        self.terminalize_dispatch_failure(&execution)
+                        .map_err(|transition| {
+                            DaemonError::Internal(io::Error::other(format!(
+                                "scheduled dispatch failed: {error}; could not record failure: {transition}"
+                            )))
+                        })?;
+                    }
+                    Err(error)
+                }
+            };
+        }
+        self.dispatch(request)
+    }
+
     fn clear_terminal_histories(&self) -> io::Result<()> {
         if self.durable.clear_terminal_histories()? {
             self.mark_persistence_dirty();
         }
         Ok(())
     }
+
+    #[cfg(debug_assertions)]
+    fn native_test_hooks_enabled(&self) -> bool {
+        self.startup_environment
+            .variables
+            .iter()
+            .any(|variable| variable.name == b"BOOMUX_NATIVE_TEST_HOOKS" && variable.value == b"1")
+    }
+
+    #[cfg(debug_assertions)]
+    fn wait_for_native_claim_barrier(&self) {
+        if !self.native_test_hooks_enabled() {
+            return;
+        }
+        let Some(variable) = self
+            .startup_environment
+            .variables
+            .iter()
+            .find(|variable| variable.name == b"BOOMUX_NATIVE_TEST_CLAIM_BARRIER")
+        else {
+            return;
+        };
+        let directory = PathBuf::from(std::ffi::OsString::from_vec(variable.value.clone()));
+        let _ = fs::write(directory.join("claimed"), b"claimed");
+        while !directory.join("release").exists() && !self.runtimes.is_stopping() {
+            thread::sleep(IO_RETRY_DELAY);
+        }
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn wait_for_native_claim_barrier(&self) {}
+
+    #[cfg(debug_assertions)]
+    fn wait_for_native_start_barrier(&self) {
+        if !self.native_test_hooks_enabled() {
+            return;
+        }
+        let Some(variable) = self
+            .startup_environment
+            .variables
+            .iter()
+            .find(|variable| variable.name == b"BOOMUX_NATIVE_TEST_START_BARRIER")
+        else {
+            return;
+        };
+        let directory = PathBuf::from(std::ffi::OsString::from_vec(variable.value.clone()));
+        let _ = fs::write(directory.join("started"), b"started");
+        while !directory.join("release").exists() && !self.runtimes.is_stopping() {
+            thread::sleep(IO_RETRY_DELAY);
+        }
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn wait_for_native_start_barrier(&self) {}
+
+    #[cfg(debug_assertions)]
+    fn wait_for_native_outcome_barrier(&self) {
+        if !self.native_test_hooks_enabled() {
+            return;
+        }
+        let Some(variable) = self
+            .startup_environment
+            .variables
+            .iter()
+            .find(|variable| variable.name == b"BOOMUX_NATIVE_TEST_OUTCOME_BARRIER")
+        else {
+            return;
+        };
+        let directory = PathBuf::from(std::ffi::OsString::from_vec(variable.value.clone()));
+        let _ = fs::write(directory.join("outcome"), b"outcome");
+        while !directory.join("release").exists() && !self.runtimes.is_stopping() {
+            thread::sleep(IO_RETRY_DELAY);
+        }
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn wait_for_native_outcome_barrier(&self) {}
 
     fn agent_resume_command(
         &self,
@@ -4184,6 +4906,672 @@ impl DaemonService {
             return Ok(None);
         };
         self.durable.agent_resume_command(shell, previous_run)
+    }
+
+    fn change_execution(
+        &self,
+        execution: &Arc<ScheduledExecution>,
+        mutate: impl FnOnce(&mut ScheduledExecutionMutableState) -> io::Result<()>,
+    ) -> DaemonResult<ScheduledExecutionSnapshot> {
+        self.durable_mutation(|undo| {
+            let (snapshot, record) = self.durable.mutate_execution(execution, mutate)?;
+            undo.record(record);
+            Ok((
+                Response::ScheduledExecution {
+                    execution: snapshot.clone(),
+                },
+                vec![DaemonEventKind::ScheduledExecutionChanged {
+                    workspace_id: snapshot.workspace_id.clone(),
+                    execution: snapshot.clone(),
+                }],
+            ))
+        })
+        .and_then(|response| match response {
+            Response::ScheduledExecution { execution } => Ok(execution),
+            _ => Err(DaemonError::Internal(io::Error::other(
+                "execution mutation returned an unexpected response",
+            ))),
+        })
+    }
+
+    fn terminalize_dispatch_failure(
+        &self,
+        execution: &Arc<ScheduledExecution>,
+    ) -> DaemonResult<ScheduledExecutionSnapshot> {
+        let _mutation = lock(&self.mutation_lock)?;
+        self.ensure_running()?;
+        let current = execution.snapshot()?;
+        if current.state.is_terminal() {
+            return Ok(current);
+        }
+        let _persistence = lock(&self.durable.persist_lock)?;
+        let mut transaction = self.events.transaction()?;
+        transaction.reserve_with_pending(1)?;
+        let (failed, _) = self.durable.mutate_execution(execution, |state| {
+            if !state.state.is_terminal() {
+                state.state = ScheduledExecutionState::DispatchFailed;
+                state.ended_at_ms = Some(unix_time_ms().max(execution.requested_at_ms));
+                state.reason = Some(ScheduledExecutionReason::RunnerStartFailed);
+                state.outcome = None;
+            }
+            Ok(())
+        })?;
+        let events = vec![DaemonEventKind::ScheduledExecutionChanged {
+            workspace_id: failed.workspace_id.clone(),
+            execution: failed.clone(),
+        }];
+        let saved = self.capture_persisted_state()?;
+        transaction.begin_persistence(events.len());
+        drop(transaction);
+        if let Err(error) = self.write_persisted_state(saved) {
+            let mut transaction = self.events.transaction()?;
+            transaction.finish_persistence();
+            self.queue_durable_batch_locked(events, &mut transaction);
+            drop(transaction);
+            self.events.notify();
+            return Err(DaemonError::persistence(error));
+        }
+        let mut transaction = self.events.transaction()?;
+        transaction.append_batch(events);
+        transaction.finish_persistence();
+        drop(transaction);
+        self.events.notify();
+        Ok(failed)
+    }
+
+    fn prepare_schedule_shell(
+        &self,
+        execution: &Arc<ScheduledExecution>,
+    ) -> DaemonResult<Arc<Shell>> {
+        let execution_id = execution.id.clone();
+        let response = self.durable_mutation(|undo| {
+            let schedule = self.schedule(&execution.schedule_id)?;
+            let (execution_status, execution_shell_id) = {
+                let execution_state = lock(&execution.state)?;
+                (execution_state.state, execution_state.shell_id.clone())
+            };
+            if execution_status != ScheduledExecutionState::Claimed {
+                return Ok((
+                    Response::ScheduledExecution {
+                        execution: execution.snapshot()?,
+                    },
+                    Vec::new(),
+                ));
+            }
+            if let Some(shell_id) = &execution_shell_id {
+                return Ok((
+                    Response::Shell {
+                        shell: self.shell(shell_id)?.snapshot()?,
+                    },
+                    Vec::new(),
+                ));
+            }
+            let existing_shell_id = lock(&schedule.state)?.execution_shell_id.clone();
+            let (shell, shell_created) = if let Some(shell_id) = &existing_shell_id {
+                (self.shell(shell_id)?, false)
+            } else {
+                let executable = replacement_executable()?;
+                let command = vec![
+                    executable.to_string_lossy().into_owned(),
+                    "__scheduled-runner".into(),
+                    schedule.id.clone(),
+                ];
+                let (shell, record) = self.durable.create_schedule_shell(&schedule, command)?;
+                undo.record(record);
+                let mut schedule_state = lock(&schedule.state)?;
+                if schedule_state.execution_shell_id.is_some() {
+                    return Err(DaemonError::lifecycle(
+                        ErrorCode::RunChanged,
+                        "schedule execution shell changed during preparation",
+                    ));
+                }
+                let previous = schedule_state.clone();
+                schedule_state.execution_shell_id = Some(shell.id.clone());
+                undo.record(DurableUndo::ScheduleState {
+                    schedule: Arc::clone(&schedule),
+                    previous,
+                });
+                (shell, true)
+            };
+            if shell.workspace_id != execution.workspace_id
+                || shell.owner
+                    != (ShellOwner::Schedule {
+                        schedule_id: schedule.id.clone(),
+                    })
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "schedule-owned shell does not match its schedule",
+                )
+                .into());
+            }
+            let previous_executions = lock(&schedule.executions)?.clone();
+            let previous_dispatch_key_filter = lock(&schedule.dispatch_key_filter)?.clone();
+            let mut execution_state = lock(&execution.state)?;
+            if execution_state.state != ScheduledExecutionState::Claimed
+                || execution_state.shell_id.is_some()
+            {
+                return Err(DaemonError::lifecycle(
+                    ErrorCode::RunChanged,
+                    "scheduled execution claim changed during shell preparation",
+                ));
+            }
+            let previous_state = execution_state.clone();
+            execution_state.shell_id = Some(shell.id.clone());
+            let snapshot = execution.snapshot_from(&execution_state);
+            undo.record(DurableUndo::ScheduleExecutions {
+                schedule: Arc::clone(&schedule),
+                previous: previous_executions,
+                previous_dispatch_key_filter,
+                execution: Some((Arc::clone(execution), previous_state)),
+            });
+            let mut events = Vec::new();
+            if shell_created {
+                events.push(DaemonEventKind::ShellCreated {
+                    workspace_id: shell.workspace_id.clone(),
+                    shell_id: shell.id.clone(),
+                    name: lock(&shell.name)?.clone(),
+                });
+            }
+            events.push(DaemonEventKind::ScheduledExecutionChanged {
+                workspace_id: snapshot.workspace_id.clone(),
+                execution: snapshot,
+            });
+            Ok((
+                Response::Shell {
+                    shell: shell.snapshot()?,
+                },
+                events,
+            ))
+        })?;
+        match response {
+            Response::Shell { shell } => self.shell(&shell.id).map_err(Into::into),
+            Response::ScheduledExecution { .. } => Err(DaemonError::lifecycle(
+                ErrorCode::RunChanged,
+                format!("scheduled execution is no longer claimed: {execution_id}"),
+            )),
+            _ => Err(DaemonError::Internal(io::Error::other(
+                "schedule shell preparation returned an unexpected response",
+            ))),
+        }
+    }
+
+    fn dispatch_schedule_execution(
+        self: &Arc<Self>,
+        execution: Arc<ScheduledExecution>,
+    ) -> DaemonResult<ScheduledExecutionSnapshot> {
+        if execution.snapshot()?.state != ScheduledExecutionState::Claimed {
+            return Ok(execution.snapshot()?);
+        }
+        let shell = self.prepare_schedule_shell(&execution)?;
+        let _mutation = lock(&self.mutation_lock)?;
+        self.ensure_running()?;
+        {
+            let state = lock(&execution.state)?;
+            if state.state != ScheduledExecutionState::Claimed
+                || state.shell_id.as_deref() != Some(shell.id.as_str())
+            {
+                return Ok(execution.snapshot_from(&state));
+            }
+        }
+        let old_runtime = match &*lock(&shell.lifecycle)? {
+            ShellLifecycle::Exited { runtime, .. } => runtime.clone(),
+            ShellLifecycle::Pending => None,
+            ShellLifecycle::Running { .. } => {
+                return Err(DaemonError::lifecycle(
+                    ErrorCode::Busy,
+                    "schedule-owned shell is already running",
+                ));
+            }
+            ShellLifecycle::Closed => return Err(not_found("shell", &shell.id).into()),
+        };
+        if let Some(runtime) = old_runtime {
+            self.runtimes.stop_reader(&runtime)?;
+            *lock(&shell.lifecycle)? = ShellLifecycle::Pending;
+        }
+        self.flush_pending()?;
+        let _persistence = lock(&self.durable.persist_lock)?;
+        let mut transaction = self.events.transaction()?;
+        transaction.reserve(2)?;
+        let workspace = self.workspace(&shell.workspace_id)?;
+        let workspace_name = lock(&workspace.name)?.clone();
+        let shell_name = lock(&shell.name)?.clone();
+        let profile = TerminalProfile {
+            term: Some("xterm-256color".into()),
+            colorterm: None,
+            term_program: Some("boomux-scheduled".into()),
+            term_program_version: None,
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        let previous_run = lock(&shell.last_run)?.clone();
+        let generation = previous_run.as_ref().map_or(Ok(1), |run| {
+            run.generation
+                .checked_add(1)
+                .ok_or_else(|| io::Error::other("shell run generation exhausted"))
+        })?;
+        let run = Arc::new(ShellRun::new(generation));
+        let mut runner_environment = self.startup_environment.clone();
+        runner_environment
+            .variables
+            .retain(|variable| !variable.name.starts_with(b"BOOMUX_NATIVE_TEST_"));
+        runner_environment.variables.push(UnixEnvironmentVariable {
+            name: b"BOOMUX_SCHEDULE_RUNNER_TOKEN".to_vec(),
+            value: execution.runner_token.as_bytes().to_vec(),
+        });
+        let (runtime, reader) = match self.runtimes.spawn_runtime(
+            &shell,
+            &run,
+            RuntimeStart {
+                workspace_name: &workspace_name,
+                shell_name: &shell_name,
+                profile: &profile,
+                environment: Some(&runner_environment),
+                recovery: RuntimeRecovery::default(),
+            },
+        ) {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                drop(transaction);
+                drop(_persistence);
+                drop(_mutation);
+                return self.terminalize_dispatch_failure(&execution).map_err(|transition| DaemonError::Internal(io::Error::other(format!(
+                    "could not start scheduled runner: {error}; could not record failure: {transition}"
+                ))));
+            }
+        };
+        *lock(&shell.lifecycle)? = ShellLifecycle::Running {
+            profile: profile.clone(),
+            run: Arc::clone(&run),
+            runtime: Arc::clone(&runtime),
+        };
+        *lock(&shell.last_run)? = Some(run.persisted(profile)?);
+        if let Err(error) = self.runtimes.start_pty_reader(
+            Arc::downgrade(self),
+            Arc::clone(&shell),
+            Arc::clone(&run),
+            Arc::clone(&runtime),
+            reader,
+            true,
+        ) {
+            let cleanup = self.runtimes.kill(&shell);
+            let _ = self.runtimes.reset_pending(&shell);
+            drop(transaction);
+            drop(_persistence);
+            drop(_mutation);
+            return self
+                .terminalize_dispatch_failure(&execution)
+                .map_err(|transition| {
+                    DaemonError::Internal(io::Error::other(format!(
+                        "could not start scheduled runner reader: {error}; cleanup: {}; could not record failure: {transition}",
+                        cleanup
+                            .err()
+                            .map_or_else(|| "ok".into(), |error| error.to_string())
+                    )))
+                });
+        }
+        let binding = self.durable.mutate_execution(&execution, |state| {
+            if state.state != ScheduledExecutionState::Claimed
+                || state.shell_id.as_deref() != Some(shell.id.as_str())
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "scheduled execution claim was revoked before runner binding",
+                ));
+            }
+            state.state = ScheduledExecutionState::Starting;
+            state.run_id = Some(run.id.clone());
+            Ok(())
+        });
+        let (starting, _undo) = match binding {
+            Ok(binding) => binding,
+            Err(error) => {
+                let run_event = self.runtimes.kill_with_event(&shell);
+                let _ = self.runtimes.reset_pending(&shell);
+                let failed = self
+                    .durable
+                    .mutate_execution(&execution, |state| {
+                        if !state.state.is_terminal() {
+                            state.state = ScheduledExecutionState::DispatchFailed;
+                            state.run_id.get_or_insert_with(|| run.id.clone());
+                            state.ended_at_ms = Some(unix_time_ms().max(execution.requested_at_ms));
+                            state.reason = Some(ScheduledExecutionReason::RunnerStartFailed);
+                            state.outcome = None;
+                        }
+                        Ok(())
+                    })
+                    .map(|(snapshot, _)| snapshot);
+                let mut events = Vec::new();
+                if let Ok(Some(event)) = run_event {
+                    events.push(event);
+                }
+                if let Ok(snapshot) = failed {
+                    events.push(DaemonEventKind::ScheduledExecutionChanged {
+                        workspace_id: snapshot.workspace_id.clone(),
+                        execution: snapshot,
+                    });
+                }
+                self.queue_durable_batch_locked(events, &mut transaction);
+                drop(transaction);
+                drop(_persistence);
+                drop(_mutation);
+                self.events.notify();
+                return Err(error.into());
+            }
+        };
+        self.wait_for_native_start_barrier();
+        let saved = match self.capture_persisted_state() {
+            Ok(saved) => saved,
+            Err(error) => {
+                let run_event = self.runtimes.kill_with_event(&shell);
+                let _ = self.runtimes.reset_pending(&shell);
+                let failed = self
+                    .durable
+                    .mutate_execution(&execution, |state| {
+                        state.state = ScheduledExecutionState::DispatchFailed;
+                        state.ended_at_ms = Some(unix_time_ms().max(execution.requested_at_ms));
+                        state.reason = Some(ScheduledExecutionReason::RunnerStartFailed);
+                        state.outcome = None;
+                        Ok(())
+                    })
+                    .map(|(snapshot, _)| snapshot);
+                let mut events = Vec::new();
+                if let Ok(Some(event)) = run_event {
+                    events.push(event);
+                }
+                if let Ok(snapshot) = failed {
+                    events.push(DaemonEventKind::ScheduledExecutionChanged {
+                        workspace_id: snapshot.workspace_id.clone(),
+                        execution: snapshot,
+                    });
+                }
+                self.queue_durable_batch_locked(events, &mut transaction);
+                drop(transaction);
+                drop(_persistence);
+                drop(_mutation);
+                self.events.notify();
+                return Err(error.into());
+            }
+        };
+        transaction.begin_persistence(2);
+        drop(transaction);
+        if let Err(error) = self.write_persisted_state(saved) {
+            let run_event = self.runtimes.kill_with_event(&shell);
+            let _ = self.runtimes.reset_pending(&shell);
+            let failed = self
+                .durable
+                .mutate_execution(&execution, |state| {
+                    state.state = ScheduledExecutionState::DispatchFailed;
+                    state.ended_at_ms = Some(unix_time_ms().max(execution.requested_at_ms));
+                    state.reason = Some(ScheduledExecutionReason::RunnerStartFailed);
+                    state.outcome = None;
+                    Ok(())
+                })
+                .map(|(snapshot, _)| snapshot);
+            let mut transaction = self.events.transaction()?;
+            transaction.finish_persistence();
+            let mut events = Vec::new();
+            if let Ok(Some(event)) = &run_event {
+                events.push(event.clone());
+            }
+            if let Ok(snapshot) = &failed {
+                events.push(DaemonEventKind::ScheduledExecutionChanged {
+                    workspace_id: snapshot.workspace_id.clone(),
+                    execution: snapshot.clone(),
+                });
+            }
+            self.queue_durable_batch_locked(events, &mut transaction);
+            drop(transaction);
+            drop(_persistence);
+            drop(_mutation);
+            self.events.notify();
+            return Err(DaemonError::persistence_context(
+                error,
+                run_event.map_or_else(
+                    |cleanup| {
+                        format!(
+                            "could not persist scheduled runner start; cleanup failed: {cleanup}"
+                        )
+                    },
+                    |_| {
+                        failed.map_or_else(
+                            |failure| {
+                                format!(
+                                    "could not persist scheduled runner start; could not record dispatch failure: {failure}"
+                                )
+                            },
+                            |_| "could not persist scheduled runner start".into(),
+                        )
+                    },
+                ),
+            ));
+        }
+        let mut transaction = self.events.transaction()?;
+        transaction.append_batch(vec![
+            DaemonEventKind::RunStarted {
+                workspace_id: shell.workspace_id.clone(),
+                shell_id: shell.id.clone(),
+                run: run.snapshot()?,
+            },
+            DaemonEventKind::ScheduledExecutionChanged {
+                workspace_id: starting.workspace_id.clone(),
+                execution: starting,
+            },
+        ]);
+        transaction.finish_persistence();
+        drop(transaction);
+        drop(_persistence);
+        drop(_mutation);
+        self.events.notify();
+        self.runtimes.resume_reader(&runtime)?;
+        Ok(execution.snapshot()?)
+    }
+
+    fn cancel_scheduled_execution(&self, execution_id: &str) -> DaemonResult<Response> {
+        let _mutation = lock(&self.mutation_lock)?;
+        self.ensure_running()?;
+        self.flush_pending()?;
+        let execution = self.durable.execution(execution_id)?;
+        let current = execution.snapshot()?;
+        if current.state.is_terminal() {
+            return Ok(Response::ScheduledExecution { execution: current });
+        }
+
+        let bound_shell = match current.state {
+            ScheduledExecutionState::Claimed => {
+                if current.run_id.is_some() {
+                    return Err(DaemonError::Internal(io::Error::other(
+                        "claimed scheduled execution has a run binding",
+                    )));
+                }
+                None
+            }
+            ScheduledExecutionState::Starting | ScheduledExecutionState::Active => {
+                let shell_id = current.shell_id.as_deref().ok_or_else(|| {
+                    DaemonError::Internal(io::Error::other(
+                        "started scheduled execution has no shell binding",
+                    ))
+                })?;
+                let run_id = current.run_id.as_deref().ok_or_else(|| {
+                    DaemonError::Internal(io::Error::other(
+                        "started scheduled execution has no run binding",
+                    ))
+                })?;
+                let shell = self.shell(shell_id)?;
+                if !matches!(
+                    &*lock(&shell.lifecycle)?,
+                    ShellLifecycle::Running { run, .. } if run.id == run_id
+                ) {
+                    return Err(DaemonError::lifecycle(
+                        ErrorCode::RunChanged,
+                        "scheduled execution no longer owns the exact shell run",
+                    ));
+                }
+                Some(shell)
+            }
+            _ => unreachable!("terminal execution returned above"),
+        };
+
+        let event_capacity = 1 + usize::from(bound_shell.is_some());
+        let mut transaction = self.events.transaction()?;
+        transaction.reserve_with_pending(event_capacity)?;
+        transaction.begin_lifecycle_reservation(event_capacity);
+        drop(transaction);
+        let _lifecycle_activity = LifecycleActivity::begin(&self.events.lifecycle_active);
+
+        let mut stop_failure = None;
+        let mut run_event = None;
+        if let Some(shell) = &bound_shell {
+            #[cfg(debug_assertions)]
+            if self.native_test_hooks_enabled()
+                && self.startup_environment.variables.iter().any(|variable| {
+                    variable.name == b"BOOMUX_NATIVE_TEST_CANCEL_STOP_FAILURE"
+                        && variable.value == b"1"
+                })
+            {
+                let mut transaction = self.events.transaction()?;
+                transaction.finish_lifecycle_reservation();
+                return Err(DaemonError::Internal(io::Error::other(
+                    "injected scheduled cancellation stop failure",
+                )));
+            }
+            if let Err(error) = self.runtimes.stop_runtime(shell) {
+                if !error.stopped {
+                    let mut transaction = self.events.transaction()?;
+                    transaction.finish_lifecycle_reservation();
+                    return Err(error.source.into());
+                }
+                stop_failure = Some(error.source);
+            }
+            match self.runtimes.finalize_stop(shell) {
+                Ok(rollback) => run_event = rollback.event,
+                Err(error) => {
+                    stop_failure.get_or_insert(error);
+                }
+            }
+            if let Err(error) = self.runtimes.reset_pending(shell) {
+                stop_failure.get_or_insert(error);
+            }
+        }
+
+        let terminal_state = if stop_failure.is_some() {
+            ScheduledExecutionState::Interrupted
+        } else {
+            ScheduledExecutionState::Cancelled
+        };
+        let terminal_reason = if stop_failure.is_some() {
+            ScheduledExecutionReason::RunnerExitedWithoutReport
+        } else {
+            ScheduledExecutionReason::CancelledByUser
+        };
+        let (cancelled, undo) = self.durable.mutate_execution(&execution, |state| {
+            state.state = terminal_state;
+            state.ended_at_ms = Some(unix_time_ms().max(execution.requested_at_ms));
+            state.reason = Some(terminal_reason);
+            state.outcome = None;
+            Ok(())
+        })?;
+        let mut events = Vec::with_capacity(event_capacity);
+        if let Some(event) = run_event {
+            events.push(event);
+        }
+        events.push(DaemonEventKind::ScheduledExecutionChanged {
+            workspace_id: cancelled.workspace_id.clone(),
+            execution: cancelled.clone(),
+        });
+
+        let persistence = lock(&self.durable.persist_lock)?;
+        let saved = match self.capture_persisted_state() {
+            Ok(saved) => saved,
+            Err(error) => {
+                let mut transaction = self.events.transaction()?;
+                if bound_shell.is_none() {
+                    let rollback = self.durable.rollback(undo);
+                    transaction.finish_lifecycle_reservation();
+                    return Err(Self::lifecycle_failure(error.into(), rollback));
+                }
+                self.queue_durable_batch_locked(events, &mut transaction);
+                transaction.finish_lifecycle_reservation();
+                return Err(error.into());
+            }
+        };
+        let mut transaction = self.events.transaction()?;
+        transaction.finish_lifecycle_reservation();
+        transaction.begin_persistence(events.len());
+        drop(transaction);
+        if let Err(error) = self.write_persisted_state(saved) {
+            let mut transaction = self.events.transaction()?;
+            transaction.finish_persistence();
+            if bound_shell.is_none() {
+                let rollback = self.durable.rollback(undo);
+                return Err(Self::lifecycle_failure(
+                    DaemonError::persistence(error),
+                    rollback,
+                ));
+            }
+            self.queue_durable_batch_locked(events, &mut transaction);
+            drop(transaction);
+            drop(persistence);
+            self.events.notify();
+            return Err(DaemonError::persistence(error));
+        }
+        let mut transaction = self.events.transaction()?;
+        transaction.append_batch(events);
+        transaction.finish_persistence();
+        drop(transaction);
+        drop(persistence);
+        self.events.notify();
+        if let Some(error) = stop_failure {
+            return Err(DaemonError::Internal(error));
+        }
+        Ok(Response::ScheduledExecution {
+            execution: cancelled,
+        })
+    }
+
+    fn resume_claimed_schedule_executions(self: &Arc<Self>) {
+        let schedules = match lock(&self.durable.state) {
+            Ok(state) => state.schedules.values().cloned().collect::<Vec<_>>(),
+            Err(error) => {
+                eprintln!("boomux: could not inspect claimed scheduled executions: {error}");
+                return;
+            }
+        };
+        let mut claimed = Vec::new();
+        for schedule in schedules {
+            let executions = match lock(&schedule.executions) {
+                Ok(executions) => executions.clone(),
+                Err(error) => {
+                    eprintln!(
+                        "boomux: could not inspect schedule {}: {error}",
+                        schedule.id
+                    );
+                    continue;
+                }
+            };
+            claimed.extend(executions.into_iter().filter(|execution| {
+                lock(&execution.state)
+                    .is_ok_and(|state| state.state == ScheduledExecutionState::Claimed)
+            }));
+        }
+        for execution in claimed {
+            if let Err(error) = self.dispatch_schedule_execution(Arc::clone(&execution)) {
+                eprintln!(
+                    "boomux: could not resume scheduled execution {} after handoff: {error}",
+                    execution.id
+                );
+                let _ = self.change_execution(&execution, |state| {
+                    if state.state == ScheduledExecutionState::Claimed {
+                        state.state = ScheduledExecutionState::DispatchFailed;
+                        state.ended_at_ms = Some(unix_time_ms().max(execution.requested_at_ms));
+                        state.reason = Some(ScheduledExecutionReason::RunnerStartFailed);
+                    }
+                    Ok(())
+                });
+            }
+        }
     }
 
     fn dispatch(&self, request: Request) -> DaemonResult<Response> {
@@ -4217,6 +5605,17 @@ impl DaemonService {
                     inspection: schedule.inspection()?,
                 })
             }
+            Request::ListScheduledExecutions {
+                workspace_id,
+                schedule_id,
+            } => Ok(Response::ScheduledExecutions {
+                executions: self
+                    .durable
+                    .scheduled_executions(workspace_id.as_deref(), schedule_id.as_deref())?,
+            }),
+            Request::GetScheduledExecution { execution_id } => Ok(Response::ScheduledExecution {
+                execution: self.durable.execution(&execution_id)?.snapshot()?,
+            }),
             Request::WaitAgent {
                 agent_id,
                 after_revision,
@@ -4293,6 +5692,104 @@ impl DaemonService {
                 };
                 Ok((Response::AgentSchedule { schedule }, vec![event]))
             }),
+            Request::RunAgentSchedule { .. } => {
+                unreachable!("schedule run is handled with the service Arc")
+            }
+            Request::CancelScheduledExecution { execution_id } => {
+                self.cancel_scheduled_execution(&execution_id)
+            }
+            Request::ResolveScheduledExecutionClaim {
+                schedule_id,
+                shell_id,
+                run_id,
+                runner_token,
+            } => {
+                let schedule = self.schedule(&schedule_id)?;
+                let execution = lock(&schedule.executions)?
+                    .iter()
+                    .find(|execution| {
+                        lock(&execution.state).is_ok_and(|state| {
+                            matches!(
+                                state.state,
+                                ScheduledExecutionState::Starting | ScheduledExecutionState::Active
+                            ) && state.shell_id.as_deref() == Some(shell_id.as_str())
+                                && state.run_id.as_deref() == Some(run_id.as_str())
+                                && execution.runner_token == runner_token.as_str()
+                        })
+                    })
+                    .cloned()
+                    .ok_or_else(|| {
+                        DaemonError::lifecycle(
+                            ErrorCode::RunChanged,
+                            "no scheduled execution matches the exact runner claim",
+                        )
+                    })?;
+                Ok(Response::ScheduledExecutionClaim {
+                    claim: protocol::ScheduledExecutionClaim {
+                        execution: execution.snapshot()?,
+                        prompt: execution.prompt.clone(),
+                    },
+                })
+            }
+            Request::ReportScheduledRunner {
+                execution_id,
+                shell_id,
+                run_id,
+                runner_token,
+                result,
+            } => {
+                let staged_outcome = matches!(result, ScheduledRunnerResult::Exited { .. });
+                let response = self.durable_mutation_outcome(|undo| {
+                    let execution = self.durable.execution(&execution_id)?;
+                    let current = execution.snapshot()?;
+                    if current.shell_id.as_deref() != Some(shell_id.as_str())
+                        || current.run_id.as_deref() != Some(run_id.as_str())
+                        || execution.runner_token != runner_token.as_str()
+                    {
+                        return Err(DaemonError::lifecycle(
+                            ErrorCode::RunChanged,
+                            "scheduled runner report does not match the exact execution run",
+                        ));
+                    }
+                    if current.state.is_terminal() {
+                        return Ok(DurableMutation::Unchanged(Response::ScheduledExecution {
+                            execution: current,
+                        }));
+                    }
+                    let now = unix_time_ms().max(execution.requested_at_ms);
+                    let (snapshot, record) =
+                        self.durable.mutate_execution(&execution, |state| {
+                            match result {
+                                ScheduledRunnerResult::Active => {
+                                    state.state = ScheduledExecutionState::Active;
+                                    state.started_at_ms.get_or_insert(now);
+                                }
+                                ScheduledRunnerResult::SpawnFailed => {
+                                    state.reason = Some(ScheduledExecutionReason::HostSpawnFailed);
+                                }
+                                ScheduledRunnerResult::Exited { ref outcome } => {
+                                    state.started_at_ms.get_or_insert(now);
+                                    state.outcome = Some(outcome.clone());
+                                }
+                            }
+                            Ok(())
+                        })?;
+                    undo.record(record);
+                    Ok(DurableMutation::Changed(
+                        Response::ScheduledExecution {
+                            execution: snapshot.clone(),
+                        },
+                        vec![DaemonEventKind::ScheduledExecutionChanged {
+                            workspace_id: snapshot.workspace_id.clone(),
+                            execution: snapshot,
+                        }],
+                    ))
+                })?;
+                if staged_outcome {
+                    self.wait_for_native_outcome_barrier();
+                }
+                Ok(response)
+            }
             Request::RegisterAgent {
                 shell_id,
                 run_id,
@@ -4311,6 +5808,13 @@ impl DaemonService {
                         agent: agent.clone(),
                     });
                 }
+                if let Some((execution, record)) = self.durable.link_agent_execution(&agent)? {
+                    undo.record(record);
+                    events.push(DaemonEventKind::ScheduledExecutionChanged {
+                        workspace_id: execution.workspace_id.clone(),
+                        execution,
+                    });
+                }
                 Ok((Response::Agent { agent }, events))
             }),
             Request::EnsureAgent {
@@ -4323,22 +5827,33 @@ impl DaemonService {
                 if let Some(record) = record {
                     undo.record(record);
                 }
-                if !created {
-                    return Ok(DurableMutation::Unchanged(Response::Agent { agent }));
-                }
-                let mut events = vec![DaemonEventKind::AgentRegistered {
-                    workspace_id: agent.workspace_id.clone(),
-                    shell_id: agent.shell_id.clone(),
-                    agent: agent.clone(),
-                }];
-                if agent.ended_at_ms.is_some() {
-                    events.push(DaemonEventKind::AgentCompleted {
+                let mut events = Vec::new();
+                if created {
+                    events.push(DaemonEventKind::AgentRegistered {
                         workspace_id: agent.workspace_id.clone(),
                         shell_id: agent.shell_id.clone(),
                         agent: agent.clone(),
                     });
+                    if agent.ended_at_ms.is_some() {
+                        events.push(DaemonEventKind::AgentCompleted {
+                            workspace_id: agent.workspace_id.clone(),
+                            shell_id: agent.shell_id.clone(),
+                            agent: agent.clone(),
+                        });
+                    }
                 }
-                Ok(DurableMutation::Changed(Response::Agent { agent }, events))
+                if let Some((execution, record)) = self.durable.link_agent_execution(&agent)? {
+                    undo.record(record);
+                    events.push(DaemonEventKind::ScheduledExecutionChanged {
+                        workspace_id: execution.workspace_id.clone(),
+                        execution,
+                    });
+                }
+                if events.is_empty() {
+                    Ok(DurableMutation::Unchanged(Response::Agent { agent }))
+                } else {
+                    Ok(DurableMutation::Changed(Response::Agent { agent }, events))
+                }
             }),
             Request::ReportAgent {
                 agent_id,
@@ -4501,6 +6016,8 @@ impl DaemonService {
         let mut run_ids = HashSet::new();
         let mut agent_ids = HashSet::new();
         let mut schedule_ids = HashSet::new();
+        let mut execution_ids = HashSet::new();
+        let mut linked_agent_ids = HashSet::new();
         let mut recovered_interrupted_run = false;
         for saved_workspace in persisted.workspaces {
             validate_id("workspace", &saved_workspace.id)?;
@@ -4557,6 +6074,7 @@ impl DaemonService {
                     name: Mutex::new(saved_shell.name),
                     cwd: saved_shell.cwd,
                     command: saved_shell.command,
+                    owner: saved_shell.owner,
                     last_run: Mutex::new(saved_shell.last_run),
                     lifecycle: Mutex::new(ShellLifecycle::Pending),
                     foreground_process_cache: Mutex::new(None),
@@ -4636,8 +6154,120 @@ impl DaemonService {
                     &saved_workspace.id,
                     saved_schedule,
                 ));
+                if !live_handoff {
+                    for execution in lock(&schedule.executions)?.iter() {
+                        let mut execution_state = lock(&execution.state)?;
+                        if !execution_state.state.is_terminal() {
+                            execution_state.state = ScheduledExecutionState::Interrupted;
+                            execution_state.ended_at_ms =
+                                Some(unix_time_ms().max(execution.requested_at_ms));
+                            execution_state.reason =
+                                Some(ScheduledExecutionReason::ColdDaemonRecovery);
+                            execution_state.outcome = None;
+                            recovered_interrupted_run = true;
+                        }
+                    }
+                }
                 workspace_schedule_ids.push(schedule.id.clone());
                 state.schedules.insert(schedule.id.clone(), schedule);
+            }
+            for shell_id in &shell_ids {
+                let shell = state
+                    .shells
+                    .get(shell_id)
+                    .expect("workspace shell was inserted");
+                if let ShellOwner::Schedule { schedule_id } = &shell.owner {
+                    let schedule = state.schedules.get(schedule_id).ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "schedule-owned shell references a missing schedule",
+                        )
+                    })?;
+                    if schedule.workspace_id != saved_workspace.id
+                        || lock(&schedule.state)?.execution_shell_id.as_deref()
+                            != Some(shell.id.as_str())
+                    {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "schedule-owned shell does not match its persisted schedule",
+                        ));
+                    }
+                }
+            }
+            for schedule_id in &workspace_schedule_ids {
+                let schedule = state
+                    .schedules
+                    .get(schedule_id)
+                    .expect("workspace schedule was inserted");
+                if let Some(shell_id) = &lock(&schedule.state)?.execution_shell_id {
+                    let shell = state.shells.get(shell_id).ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "agent schedule references a missing execution shell",
+                        )
+                    })?;
+                    if shell.owner
+                        != (ShellOwner::Schedule {
+                            schedule_id: schedule.id.clone(),
+                        })
+                    {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "agent schedule references a shell with the wrong owner",
+                        ));
+                    }
+                }
+                let schedule_shell_id = lock(&schedule.state)?.execution_shell_id.clone();
+                let executions = lock(&schedule.executions)?.clone();
+                for execution in executions {
+                    if !execution_ids.insert(execution.id.clone()) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "Boomux state contains a duplicate scheduled execution",
+                        ));
+                    }
+                    let execution_state = lock(&execution.state)?;
+                    if let Some(shell_id) = &execution_state.shell_id
+                        && schedule_shell_id.as_deref() != Some(shell_id.as_str())
+                    {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "scheduled execution references a shell outside its schedule",
+                        ));
+                    }
+                    if let Some(agent_id) = &execution_state.agent_id {
+                        let agent = state.agents.get(agent_id).ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "scheduled execution references a missing Agent",
+                            )
+                        })?;
+                        if !linked_agent_ids.insert(agent_id.clone())
+                            || execution_state.shell_id.as_deref() != Some(agent.shell_id.as_str())
+                            || execution_state.run_id.as_deref() != Some(agent.run_id.as_str())
+                            || execution.integration != agent.integration
+                            || execution_state.external_session_id != agent.external_session_id
+                            || matches!(
+                                &execution.session,
+                                AgentScheduleSession::Continue { external_session_id }
+                                    if execution_state.external_session_id.as_deref()
+                                        != Some(external_session_id.as_str())
+                                        || agent.external_session_id.as_deref()
+                                            != Some(external_session_id.as_str())
+                            )
+                        {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "scheduled execution has an invalid Agent link",
+                            ));
+                        }
+                    } else if execution_state.external_session_id.is_some() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "scheduled execution has a session link without an Agent",
+                        ));
+                    }
+                }
             }
             let workspace = Arc::new(Workspace {
                 id: saved_workspace.id.clone(),
@@ -4669,6 +6299,7 @@ impl DaemonService {
             mutation_lock: Mutex::new(()),
             notification_settings: NotificationDeliverySettings::default(),
             notification_sink: Arc::new(DisabledNotificationSink),
+            startup_environment: capture_current_environment(),
             #[cfg(test)]
             fail_after_mutation: AtomicBool::new(false),
         };
@@ -5105,6 +6736,9 @@ impl DaemonService {
                 Err(error) if failure.is_none() => failure = Some(error),
                 Err(_) => {}
             }
+            if let Ok(Some(event)) = self.reconcile_irreversibly_stopped_execution(shell) {
+                batch.push(event);
+            }
         }
         self.queue_durable_batch_locked(batch, transition);
         failure.map_or(Ok(()), Err)
@@ -5126,9 +6760,51 @@ impl DaemonService {
             {
                 failure = Some(error);
             }
+            if let Ok(Some(event)) = self.reconcile_irreversibly_stopped_execution(&shell) {
+                batch.push(event);
+            }
         }
         self.queue_durable_batch_locked(batch, transition);
         failure.map_or(Ok(()), Err)
+    }
+
+    fn reconcile_irreversibly_stopped_execution(
+        &self,
+        shell: &Arc<Shell>,
+    ) -> io::Result<Option<DaemonEventKind>> {
+        let ShellOwner::Schedule { schedule_id } = &shell.owner else {
+            return Ok(None);
+        };
+        let run_id = lock(&shell.last_run)?.as_ref().map(|run| run.id.clone());
+        let Some(run_id) = run_id else {
+            return Ok(None);
+        };
+        let schedule = self.schedule(schedule_id)?;
+        let executions = lock(&schedule.executions)?.clone();
+        let execution = executions.into_iter().find(|execution| {
+            lock(&execution.state).is_ok_and(|state| {
+                matches!(
+                    state.state,
+                    ScheduledExecutionState::Starting | ScheduledExecutionState::Active
+                ) && state.shell_id.as_deref() == Some(shell.id.as_str())
+                    && state.run_id.as_deref() == Some(run_id.as_str())
+            })
+        });
+        let Some(execution) = execution else {
+            return Ok(None);
+        };
+        let now = unix_time_ms().max(execution.requested_at_ms);
+        let (snapshot, _) = self.durable.mutate_execution(&execution, |state| {
+            state.state = ScheduledExecutionState::Interrupted;
+            state.ended_at_ms = Some(now);
+            state.reason = Some(ScheduledExecutionReason::RunnerExitedWithoutReport);
+            state.outcome = None;
+            Ok(())
+        })?;
+        Ok(Some(DaemonEventKind::ScheduledExecutionChanged {
+            workspace_id: snapshot.workspace_id.clone(),
+            execution: snapshot,
+        }))
     }
 
     fn lifecycle_failure(primary: DaemonError, compensation: io::Result<()>) -> DaemonError {
@@ -5211,6 +6887,13 @@ impl DaemonService {
         runtime: &Arc<ShellRuntime>,
         code: Option<u32>,
     ) -> io::Result<RunExitRecord> {
+        let _mutation = match self.mutation_lock.try_lock() {
+            Ok(mutation) => mutation,
+            Err(TryLockError::WouldBlock) => return Ok(RunExitRecord::Deferred),
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(io::Error::other("daemon mutation lock poisoned"));
+            }
+        };
         if !self.runtimes.run_exit_is_current(shell, run, runtime)? {
             return Ok(RunExitRecord::Unchanged);
         }
@@ -5226,9 +6909,25 @@ impl DaemonService {
                 return Err(io::Error::other("daemon state lock poisoned"));
             }
         };
+        let execution = if let ShellOwner::Schedule { schedule_id } = &shell.owner {
+            let schedule = self.schedule(schedule_id)?;
+            let executions = lock(&schedule.executions)?.clone();
+            executions.into_iter().find(|execution| {
+                lock(&execution.state).is_ok_and(|state| {
+                    matches!(
+                        state.state,
+                        ScheduledExecutionState::Starting | ScheduledExecutionState::Active
+                    ) && state.shell_id.as_deref() == Some(shell.id.as_str())
+                        && state.run_id.as_deref() == Some(run.id.as_str())
+                })
+            })
+        } else {
+            None
+        };
+        let reserve = 1 + usize::from(execution.is_some());
         let mut transaction = self.events.transaction()?;
-        if let Err(error) = transaction.reserve_with_pending(1) {
-            if transaction.capacity_is_blocked_only_by_lifecycle_reservation(1) {
+        if let Err(error) = transaction.reserve_with_pending(reserve) {
+            if transaction.capacity_is_blocked_only_by_lifecycle_reservation(reserve) {
                 return Ok(RunExitRecord::Deferred);
             }
             return Err(error);
@@ -5238,6 +6937,31 @@ impl DaemonService {
         };
         let mut batch = transaction.drain_runtime_events();
         batch.push(exit_event);
+        if let Some(execution) = execution {
+            let now = unix_time_ms().max(execution.requested_at_ms);
+            let (snapshot, _) = self.durable.mutate_execution(&execution, |state| {
+                if matches!(
+                    state.state,
+                    ScheduledExecutionState::Starting | ScheduledExecutionState::Active
+                ) {
+                    state.ended_at_ms = Some(now);
+                    if state.outcome.is_some() {
+                        state.state = ScheduledExecutionState::Exited;
+                        state.reason = None;
+                    } else if state.reason == Some(ScheduledExecutionReason::HostSpawnFailed) {
+                        state.state = ScheduledExecutionState::DispatchFailed;
+                    } else {
+                        state.state = ScheduledExecutionState::Interrupted;
+                        state.reason = Some(ScheduledExecutionReason::RunnerExitedWithoutReport);
+                    }
+                }
+                Ok(())
+            })?;
+            batch.push(DaemonEventKind::ScheduledExecutionChanged {
+                workspace_id: snapshot.workspace_id.clone(),
+                execution: snapshot,
+            });
+        }
         let pending_count =
             transaction.pending_durable_event_count(transaction.pending_durable_batch_count());
         let event_count = pending_count.saturating_add(batch.len());
@@ -5298,6 +7022,12 @@ impl DaemonService {
 
     fn snapshot(&self) -> io::Result<Snapshot> {
         self.durable.snapshot(self.focused_terminal()?)
+    }
+
+    fn schedule_shell_ids_for_downgrade(&self) -> io::Result<HashSet<String>> {
+        let mut ids = self.events.schedule_shell_ids()?;
+        ids.extend(self.durable.schedule_shell_ids()?);
+        Ok(ids)
     }
 
     fn focused_terminal(&self) -> io::Result<Option<FocusedTerminalSnapshot>> {
@@ -5566,7 +7296,23 @@ impl DaemonService {
         self.lifecycle_transaction(
             true,
             || Ok(self.durable.shells()?),
-            || Ok(None),
+            || {
+                let executions = self.durable.scheduled_executions(None, None)?;
+                for snapshot in executions {
+                    if snapshot.state.is_terminal() {
+                        continue;
+                    }
+                    let execution = self.durable.execution(&snapshot.id)?;
+                    self.durable.mutate_execution(&execution, |state| {
+                        state.state = ScheduledExecutionState::Cancelled;
+                        state.ended_at_ms = Some(unix_time_ms().max(execution.requested_at_ms));
+                        state.reason = Some(ScheduledExecutionReason::DaemonShutdown);
+                        state.outcome = None;
+                        Ok(())
+                    })?;
+                }
+                Ok(None)
+            },
             |_| Vec::new(),
         )
     }
@@ -5906,6 +7652,26 @@ impl DaemonService {
         undo: &mut DurableUndoLog,
         schedule_id: &str,
     ) -> io::Result<Arc<AgentSchedule>> {
+        let schedule = self.schedule(schedule_id)?;
+        if lock(&schedule.executions)?
+            .iter()
+            .any(|execution| lock(&execution.state).is_ok_and(|state| !state.state.is_terminal()))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "agent schedule has a nonterminal execution",
+            ));
+        }
+        if let Some(shell_id) = lock(&schedule.state)?.execution_shell_id.clone() {
+            let shell = self.shell(&shell_id)?;
+            if matches!(*lock(&shell.lifecycle)?, ShellLifecycle::Running { .. }) {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "agent schedule runner shell is still active",
+                ));
+            }
+            undo.record(self.remove_shell_mutation(&shell_id)?);
+        }
         let mut state = lock(&self.durable.state)?;
         let schedule = state
             .schedules
@@ -6083,6 +7849,12 @@ impl DaemonService {
     }
 
     fn close_shell(&self, shell_id: &str) -> DaemonResult<()> {
+        if !matches!(self.shell(shell_id)?.owner, ShellOwner::User) {
+            return Err(DaemonError::lifecycle(
+                ErrorCode::Busy,
+                "schedule-owned shells cannot be closed directly",
+            ));
+        }
         self.lifecycle_transaction(
             false,
             || Ok(vec![self.shell(shell_id)?]),
@@ -6116,6 +7888,12 @@ impl DaemonService {
         let _mutation = lock(&self.mutation_lock)?;
         self.ensure_running()?;
         let shell = self.shell(shell_id)?;
+        if !matches!(shell.owner, ShellOwner::User) {
+            return Err(DaemonError::lifecycle(
+                ErrorCode::Busy,
+                "schedule-owned shells cannot be restarted directly",
+            ));
+        }
         let old_runtime = {
             let mut lifecycle = lock(&shell.lifecycle)?;
             let old_runtime = match &*lifecycle {
@@ -6198,6 +7976,7 @@ impl Workspace {
 
 impl AgentSchedule {
     fn from_persisted(workspace_id: &str, saved: PersistedAgentSchedule) -> Self {
+        let schedule_id = saved.id.clone();
         Self {
             id: saved.id,
             workspace_id: workspace_id.into(),
@@ -6218,6 +7997,20 @@ impl AgentSchedule {
                 evaluation_frontier_ms: saved.evaluation_frontier_ms,
                 execution_shell_id: saved.execution_shell_id,
             }),
+            executions: Mutex::new(
+                saved
+                    .executions
+                    .into_iter()
+                    .map(|execution| {
+                        Arc::new(ScheduledExecution::from_persisted(
+                            workspace_id,
+                            &schedule_id,
+                            execution,
+                        ))
+                    })
+                    .collect(),
+            ),
+            dispatch_key_filter: Mutex::new(saved.dispatch_key_filter),
         }
     }
 
@@ -6256,6 +8049,11 @@ impl AgentSchedule {
 
     fn persisted(&self) -> io::Result<PersistedAgentSchedule> {
         let snapshot = self.snapshot()?;
+        let executions = lock(&self.executions)?
+            .iter()
+            .map(|execution| execution.persisted())
+            .collect::<io::Result<_>>()?;
+        let dispatch_key_filter = lock(&self.dispatch_key_filter)?.clone();
         Ok(PersistedAgentSchedule {
             id: snapshot.id,
             name: snapshot.name,
@@ -6273,6 +8071,102 @@ impl AgentSchedule {
             updated_at_ms: snapshot.updated_at_ms,
             evaluation_frontier_ms: snapshot.evaluation_frontier_ms,
             execution_shell_id: snapshot.execution_shell_id,
+            dispatch_key_filter,
+            executions,
+        })
+    }
+}
+
+impl ScheduledExecution {
+    fn from_persisted(
+        workspace_id: &str,
+        schedule_id: &str,
+        saved: PersistedScheduledExecution,
+    ) -> Self {
+        Self {
+            id: saved.id,
+            workspace_id: workspace_id.into(),
+            schedule_id: schedule_id.into(),
+            dispatch_kind: saved.dispatch_kind,
+            dispatch_key: saved.dispatch_key,
+            schedule_revision: saved.schedule_revision,
+            prompt_revision: saved.prompt_revision,
+            trigger_revision: saved.trigger_revision,
+            requested_at_ms: saved.requested_at_ms,
+            cwd: saved.cwd,
+            integration: saved.integration,
+            session: saved.session,
+            prompt: saved.prompt,
+            runner_token: saved.runner_token,
+            state: Mutex::new(ScheduledExecutionMutableState {
+                state: saved.state,
+                started_at_ms: saved.started_at_ms,
+                ended_at_ms: saved.ended_at_ms,
+                reason: saved.reason,
+                outcome: saved.outcome,
+                shell_id: saved.shell_id,
+                run_id: saved.run_id,
+                agent_id: saved.agent_id,
+                external_session_id: saved.external_session_id,
+            }),
+        }
+    }
+
+    fn snapshot(&self) -> io::Result<ScheduledExecutionSnapshot> {
+        let state = lock(&self.state)?;
+        Ok(self.snapshot_from(&state))
+    }
+
+    fn snapshot_from(&self, state: &ScheduledExecutionMutableState) -> ScheduledExecutionSnapshot {
+        ScheduledExecutionSnapshot {
+            id: self.id.clone(),
+            workspace_id: self.workspace_id.clone(),
+            schedule_id: self.schedule_id.clone(),
+            state: state.state,
+            dispatch_kind: self.dispatch_kind,
+            dispatch_key: self.dispatch_key.clone(),
+            schedule_revision: self.schedule_revision,
+            prompt_revision: self.prompt_revision,
+            trigger_revision: self.trigger_revision,
+            requested_at_ms: self.requested_at_ms,
+            started_at_ms: state.started_at_ms,
+            ended_at_ms: state.ended_at_ms,
+            cwd: self.cwd.clone(),
+            integration: self.integration.clone(),
+            session: self.session.clone(),
+            reason: state.reason,
+            outcome: state.outcome.clone(),
+            shell_id: state.shell_id.clone(),
+            run_id: state.run_id.clone(),
+            agent_id: state.agent_id.clone(),
+            external_session_id: state.external_session_id.clone(),
+        }
+    }
+
+    fn persisted(&self) -> io::Result<PersistedScheduledExecution> {
+        let state = lock(&self.state)?;
+        Ok(PersistedScheduledExecution {
+            id: self.id.clone(),
+            state: state.state,
+            dispatch_kind: self.dispatch_kind,
+            dispatch_key: self.dispatch_key.clone(),
+            schedule_revision: self.schedule_revision,
+            prompt_revision: self.prompt_revision,
+            trigger_revision: self.trigger_revision,
+            requested_at_ms: self.requested_at_ms,
+            started_at_ms: state.started_at_ms,
+            ended_at_ms: state.ended_at_ms,
+            cwd: self.cwd.clone(),
+            integration: self.integration.clone(),
+            session: self.session.clone(),
+            prompt: self.prompt.clone(),
+            runner_token: self.runner_token.clone(),
+            reason: state.reason,
+            outcome: state.outcome.clone(),
+            shell_id: state.shell_id.clone(),
+            run_id: state.run_id.clone(),
+            agent_id: state.agent_id.clone(),
+            external_session_id: state.external_session_id.clone(),
         })
     }
 }
@@ -6377,6 +8271,7 @@ impl Shell {
             name: lock(&self.name)?.clone(),
             cwd: self.cwd.clone(),
             command: self.command.clone(),
+            owner: self.owner.clone(),
             status,
             run,
             foreground_process,
@@ -6393,6 +8288,7 @@ fn create_pending_shell(workspace_id: &str, spec: ShellSpec) -> io::Result<Arc<S
         name: Mutex::new(spec.name),
         cwd: spec.cwd,
         command: spec.command,
+        owner: ShellOwner::User,
         last_run: Mutex::new(None),
         lifecycle: Mutex::new(ShellLifecycle::Pending),
         foreground_process_cache: Mutex::new(None),
@@ -6897,6 +8793,19 @@ impl ShellRuntimeManager {
                 return send_daemon_error(&mut stream, response_version, error.into());
             }
         };
+        if !matches!(shell.owner, ShellOwner::User)
+            && (restart_exited || matches!(*lock(&shell.lifecycle)?, ShellLifecycle::Pending))
+        {
+            return send_response(
+                &mut stream,
+                response_version,
+                DaemonError::lifecycle(
+                    ErrorCode::Busy,
+                    "schedule-owned shells start only through schedule dispatch",
+                )
+                .into_response(),
+            );
+        }
         let mutation = lock(&registry.mutation_lock)?;
         if registry.runtimes.is_stopping() {
             return send_response(
@@ -7730,11 +9639,158 @@ fn validate_persisted_schedule(schedule: &PersistedAgentSchedule) -> io::Result<
         || schedule.updated_at_ms < schedule.created_at_ms
         || schedule.evaluation_frontier_ms < schedule.created_at_ms
         || schedule.evaluation_frontier_ms > schedule.updated_at_ms
-        || schedule.execution_shell_id.is_some()
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "Boomux state contains an invalid agent schedule",
+        ));
+    }
+    if schedule.dispatch_key_filter.len() != DISPATCH_KEY_FILTER_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Boomux state contains an invalid dispatch idempotency filter",
+        ));
+    }
+    if let Some(shell_id) = &schedule.execution_shell_id {
+        validate_id("schedule execution shell", shell_id)?;
+    }
+    let mut execution_ids = HashSet::new();
+    let mut dispatch_keys = HashSet::new();
+    let mut nonterminal_count = 0;
+    for execution in &schedule.executions {
+        validate_id("scheduled execution", &execution.id)?;
+        validate_id("scheduled execution dispatch key", &execution.dispatch_key)?;
+        validate_id("scheduled execution runner token", &execution.runner_token)?;
+        validate_persisted_cwd(&execution.cwd)?;
+        crate::scheduling::validate_prompt(&execution.prompt)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+        if !execution_ids.insert(&execution.id)
+            || !dispatch_keys.insert(&execution.dispatch_key)
+            || !dispatch_key_was_seen(&schedule.dispatch_key_filter, &execution.dispatch_key)
+            || execution.schedule_revision == 0
+            || execution.prompt_revision == 0
+            || execution.trigger_revision == 0
+            || execution.prompt_revision > execution.schedule_revision
+            || execution.trigger_revision > execution.schedule_revision
+            || execution.schedule_revision > schedule.revision
+            || execution.prompt_revision > schedule.prompt_revision
+            || execution.trigger_revision > schedule.trigger_revision
+            || execution.cwd != schedule.cwd
+            || execution.integration != schedule.integration
+            || execution.session != schedule.session
+            || execution
+                .started_at_ms
+                .is_some_and(|time| time < execution.requested_at_ms)
+            || execution
+                .ended_at_ms
+                .is_some_and(|time| time < execution.requested_at_ms)
+            || execution
+                .started_at_ms
+                .zip(execution.ended_at_ms)
+                .is_some_and(|(started, ended)| ended < started)
+            || execution.shell_id.is_some() != execution.run_id.is_some()
+                && execution.run_id.is_some()
+            || execution.agent_id.is_some() != execution.external_session_id.is_some()
+            || matches!(
+                &execution.session,
+                AgentScheduleSession::Continue { external_session_id }
+                    if execution
+                        .external_session_id
+                        .as_deref()
+                        .is_some_and(|linked| linked != external_session_id)
+            )
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Boomux state contains an invalid scheduled execution",
+            ));
+        }
+        if let Some(shell_id) = &execution.shell_id {
+            validate_id("scheduled execution shell", shell_id)?;
+        }
+        if let Some(run_id) = &execution.run_id {
+            validate_id("scheduled execution run", run_id)?;
+        }
+        if let Some(agent_id) = &execution.agent_id {
+            validate_id("scheduled execution agent", agent_id)?;
+        }
+        let valid_state = match execution.state {
+            ScheduledExecutionState::Claimed => {
+                execution.started_at_ms.is_none()
+                    && execution.ended_at_ms.is_none()
+                    && execution.run_id.is_none()
+                    && execution.reason.is_none()
+                    && execution.outcome.is_none()
+                    && execution.agent_id.is_none()
+            }
+            ScheduledExecutionState::Starting => {
+                execution.run_id.is_some()
+                    && execution.started_at_ms.is_none()
+                    && execution.ended_at_ms.is_none()
+                    && execution.outcome.is_none()
+                    && matches!(
+                        execution.reason,
+                        None | Some(ScheduledExecutionReason::HostSpawnFailed)
+                    )
+            }
+            ScheduledExecutionState::Active => {
+                execution.run_id.is_some()
+                    && execution.started_at_ms.is_some()
+                    && execution.ended_at_ms.is_none()
+                    && execution.reason.is_none()
+            }
+            ScheduledExecutionState::DispatchFailed => {
+                execution.ended_at_ms.is_some()
+                    && execution.outcome.is_none()
+                    && matches!(
+                        execution.reason,
+                        Some(
+                            ScheduledExecutionReason::RunnerStartFailed
+                                | ScheduledExecutionReason::HostSpawnFailed
+                        )
+                    )
+            }
+            ScheduledExecutionState::Exited => {
+                execution.started_at_ms.is_some()
+                    && execution.ended_at_ms.is_some()
+                    && execution.outcome.is_some()
+                    && execution.reason.is_none()
+            }
+            ScheduledExecutionState::Cancelled => {
+                execution.ended_at_ms.is_some()
+                    && execution.outcome.is_none()
+                    && matches!(
+                        execution.reason,
+                        Some(
+                            ScheduledExecutionReason::CancelledByUser
+                                | ScheduledExecutionReason::DaemonShutdown
+                        )
+                    )
+            }
+            ScheduledExecutionState::Interrupted => {
+                execution.ended_at_ms.is_some()
+                    && execution.outcome.is_none()
+                    && matches!(
+                        execution.reason,
+                        Some(
+                            ScheduledExecutionReason::ColdDaemonRecovery
+                                | ScheduledExecutionReason::RunnerExitedWithoutReport
+                        )
+                    )
+            }
+        };
+        if !valid_state {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Boomux state contains an invalid scheduled execution state",
+            ));
+        }
+        nonterminal_count += usize::from(!execution.state.is_terminal());
+    }
+    if nonterminal_count > 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Boomux state contains overlapping scheduled executions",
         ));
     }
     Ok(())
@@ -7747,6 +9803,34 @@ fn validate_id(kind: &str, id: &str) -> io::Result<()> {
             format!("persisted {kind} ID is invalid: {id}"),
         )
     })
+}
+
+fn dispatch_key_positions(key: &str, bit_count: usize) -> [usize; 3] {
+    let digest = Sha256::digest(key.as_bytes());
+    std::array::from_fn(|index| {
+        let offset = index * 8;
+        let value = u64::from_be_bytes(
+            digest[offset..offset + 8]
+                .try_into()
+                .expect("SHA-256 position is eight bytes"),
+        );
+        usize::try_from(value % bit_count as u64).unwrap_or(0)
+    })
+}
+
+fn dispatch_key_was_seen(filter: &[u8], key: &str) -> bool {
+    let bit_count = filter.len().saturating_mul(8);
+    bit_count != 0
+        && dispatch_key_positions(key, bit_count)
+            .into_iter()
+            .all(|position| filter[position / 8] & (1 << (position % 8)) != 0)
+}
+
+fn remember_dispatch_key(filter: &mut [u8], key: &str) {
+    let bit_count = filter.len().saturating_mul(8);
+    for position in dispatch_key_positions(key, bit_count) {
+        filter[position / 8] |= 1 << (position % 8);
+    }
 }
 
 fn validate_agent_registration(spec: &AgentRegistrationSpec) -> io::Result<()> {
@@ -8463,6 +10547,83 @@ mod tests {
     }
 
     #[test]
+    fn schedule_shell_filter_ownership_tracks_retained_event_lifetime() {
+        let stream = EventStream::new();
+        let workspace_id = Uuid::new_v4().to_string();
+        let mut batch = Vec::with_capacity((MAX_RETAINED_EVENTS + 1) * 2);
+        for index in 0..=MAX_RETAINED_EVENTS {
+            let shell_id = Uuid::from_u128(index as u128 + 1).to_string();
+            batch.push(DaemonEventKind::ScheduledExecutionChanged {
+                workspace_id: workspace_id.clone(),
+                execution: ScheduledExecutionSnapshot {
+                    id: Uuid::new_v4().to_string(),
+                    workspace_id: workspace_id.clone(),
+                    schedule_id: Uuid::new_v4().to_string(),
+                    state: ScheduledExecutionState::Starting,
+                    dispatch_kind: ScheduledExecutionDispatchKind::Manual,
+                    dispatch_key: Uuid::new_v4().to_string(),
+                    schedule_revision: 1,
+                    prompt_revision: 1,
+                    trigger_revision: 1,
+                    requested_at_ms: 1,
+                    started_at_ms: None,
+                    ended_at_ms: None,
+                    cwd: env::temp_dir(),
+                    integration: "opencode".into(),
+                    session: AgentScheduleSession::Fresh,
+                    reason: None,
+                    outcome: None,
+                    shell_id: Some(shell_id.clone()),
+                    run_id: Some(Uuid::new_v4().to_string()),
+                    agent_id: None,
+                    external_session_id: None,
+                },
+            });
+            batch.push(DaemonEventKind::ShellCreated {
+                workspace_id: workspace_id.clone(),
+                shell_id,
+                name: format!("schedule-shell-{index}"),
+            });
+        }
+
+        let (events, cursor, schedule_shell_ids) = {
+            let mut state = lock(&stream.state).unwrap();
+            EventStream::append_batch_locked(&mut state, batch);
+            let retained_generic_ids = state
+                .events
+                .iter()
+                .filter_map(|event| event_shell_id(&event.kind).map(str::to_owned))
+                .collect::<HashSet<_>>();
+            assert_eq!(state.events.len(), MAX_RETAINED_EVENTS);
+            assert_eq!(state.schedule_shell_ids, retained_generic_ids);
+            assert!(state.schedule_shell_ids.len() < MAX_RETAINED_EVENTS);
+            (
+                state.events.iter().cloned().collect::<Vec<_>>(),
+                EventCursor {
+                    stream_id: state.stream_id.clone(),
+                    event_id: state.latest_id,
+                },
+                state.schedule_shell_ids.clone(),
+            )
+        };
+        let latest_id = cursor.event_id;
+        let Response::Events { cursor, events, .. } = response_for_version_with_schedule_shells(
+            Response::Events {
+                stream_id: cursor.stream_id.clone(),
+                cursor,
+                snapshot: None,
+                events,
+            },
+            22,
+            &schedule_shell_ids,
+        ) else {
+            panic!("expected downgraded events");
+        };
+        assert_eq!(cursor.event_id, latest_id);
+        assert!(events.is_empty());
+    }
+
+    #[test]
     fn blocked_publication_coalesces_output_by_shell_run() {
         let mut transition = TransitionState {
             persistence_in_flight: true,
@@ -8660,6 +10821,8 @@ mod tests {
             updated_at_ms: 1,
             evaluation_frontier_ms: 1,
             execution_shell_id: None,
+            dispatch_key_filter: vec![0; DISPATCH_KEY_FILTER_BYTES],
+            executions: Vec::new(),
         };
 
         assert_eq!(
@@ -8668,6 +10831,195 @@ mod tests {
         );
         schedule.state = AgentScheduleState::Paused;
         assert!(validate_persisted_schedule(&schedule).is_ok());
+    }
+
+    #[test]
+    fn state_ten_execution_validation_enforces_exact_state_shapes_and_revisions() {
+        let dispatch_key = Uuid::new_v4().to_string();
+        let mut filter = vec![0; DISPATCH_KEY_FILTER_BYTES];
+        remember_dispatch_key(&mut filter, &dispatch_key);
+        let execution = PersistedScheduledExecution {
+            id: Uuid::new_v4().to_string(),
+            state: ScheduledExecutionState::Claimed,
+            dispatch_kind: ScheduledExecutionDispatchKind::Manual,
+            dispatch_key,
+            schedule_revision: 2,
+            prompt_revision: 1,
+            trigger_revision: 1,
+            requested_at_ms: 10,
+            started_at_ms: None,
+            ended_at_ms: None,
+            cwd: env::temp_dir(),
+            integration: "opencode".into(),
+            session: AgentScheduleSession::Fresh,
+            prompt: "private".into(),
+            runner_token: Uuid::new_v4().to_string(),
+            reason: None,
+            outcome: None,
+            shell_id: None,
+            run_id: None,
+            agent_id: None,
+            external_session_id: None,
+        };
+        let mut schedule = PersistedAgentSchedule {
+            id: Uuid::new_v4().to_string(),
+            name: "valid".into(),
+            cwd: env::temp_dir(),
+            integration: "opencode".into(),
+            prompt: "private".into(),
+            session: AgentScheduleSession::Fresh,
+            trigger: AgentScheduleTrigger {
+                cron: "0 2 * * *".into(),
+                timezone: "UTC".into(),
+            },
+            state: AgentScheduleState::Paused,
+            overlap_policy: AgentScheduleOverlapPolicy::Skip,
+            revision: 2,
+            prompt_revision: 1,
+            trigger_revision: 1,
+            created_at_ms: 1,
+            updated_at_ms: 2,
+            evaluation_frontier_ms: 1,
+            execution_shell_id: None,
+            dispatch_key_filter: filter,
+            executions: vec![execution],
+        };
+        assert!(validate_persisted_schedule(&schedule).is_ok());
+
+        schedule.executions[0].started_at_ms = Some(10);
+        assert!(validate_persisted_schedule(&schedule).is_err());
+        schedule.executions[0].started_at_ms = None;
+        schedule.executions[0].schedule_revision = 3;
+        assert!(validate_persisted_schedule(&schedule).is_err());
+        schedule.executions[0].schedule_revision = 2;
+        schedule.executions[0].state = ScheduledExecutionState::Active;
+        schedule.executions[0].shell_id = Some(Uuid::new_v4().to_string());
+        schedule.executions[0].run_id = Some(Uuid::new_v4().to_string());
+        schedule.executions[0].started_at_ms = Some(10);
+        schedule.executions[0].reason = Some(ScheduledExecutionReason::HostSpawnFailed);
+        assert!(validate_persisted_schedule(&schedule).is_err());
+    }
+
+    #[test]
+    fn malformed_current_state_rejects_linked_continuation_identity_mismatch() {
+        let directory = env::temp_dir().join(format!(
+            "boomux-invalid-continuation-link-{}",
+            Uuid::new_v4()
+        ));
+        let store = StateStore::at(directory.join("state/state.json"));
+        let workspace_id = Uuid::new_v4().to_string();
+        let schedule_id = Uuid::new_v4().to_string();
+        let shell_id = Uuid::new_v4().to_string();
+        let run_id = Uuid::new_v4().to_string();
+        let agent_id = Uuid::new_v4().to_string();
+        let dispatch_key = Uuid::new_v4().to_string();
+        let mut filter = vec![0; DISPATCH_KEY_FILTER_BYTES];
+        remember_dispatch_key(&mut filter, &dispatch_key);
+        let expected_session_id = "exact-continuation".to_owned();
+        let mismatched_session_id = "different-session".to_owned();
+        let session = AgentScheduleSession::Continue {
+            external_session_id: expected_session_id,
+        };
+        let schedule = PersistedAgentSchedule {
+            id: schedule_id.clone(),
+            name: "continued".into(),
+            cwd: env::temp_dir(),
+            integration: "opencode".into(),
+            prompt: "private".into(),
+            session: session.clone(),
+            trigger: AgentScheduleTrigger {
+                cron: "0 2 * * *".into(),
+                timezone: "UTC".into(),
+            },
+            state: AgentScheduleState::Paused,
+            overlap_policy: AgentScheduleOverlapPolicy::Skip,
+            revision: 1,
+            prompt_revision: 1,
+            trigger_revision: 1,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            evaluation_frontier_ms: 1,
+            execution_shell_id: Some(shell_id.clone()),
+            dispatch_key_filter: filter,
+            executions: vec![PersistedScheduledExecution {
+                id: Uuid::new_v4().to_string(),
+                state: ScheduledExecutionState::Active,
+                dispatch_kind: ScheduledExecutionDispatchKind::Manual,
+                dispatch_key,
+                schedule_revision: 1,
+                prompt_revision: 1,
+                trigger_revision: 1,
+                requested_at_ms: 1,
+                started_at_ms: Some(1),
+                ended_at_ms: None,
+                cwd: env::temp_dir(),
+                integration: "opencode".into(),
+                session,
+                prompt: "private".into(),
+                runner_token: Uuid::new_v4().to_string(),
+                reason: None,
+                outcome: None,
+                shell_id: Some(shell_id.clone()),
+                run_id: Some(run_id.clone()),
+                agent_id: Some(agent_id.clone()),
+                external_session_id: Some(mismatched_session_id.clone()),
+            }],
+        };
+        let mut persisted = PersistedState::default();
+        persisted.workspaces = vec![PersistedWorkspace {
+            id: workspace_id,
+            name: "continued".into(),
+            default_cwd: None,
+            shells: vec![PersistedShell {
+                id: shell_id.clone(),
+                name: "scheduled".into(),
+                cwd: env::temp_dir(),
+                command: vec!["boomux".into()],
+                owner: ShellOwner::Schedule { schedule_id },
+                last_run: Some(PersistedShellRun {
+                    id: run_id.clone(),
+                    generation: 1,
+                    started_at_ms: 1,
+                    ended_at_ms: None,
+                    exit_reason: None,
+                    output_revision: 0,
+                    environment_has_run_id: true,
+                    profile: profile(),
+                    terminal_history: None,
+                }),
+            }],
+            launchers: Vec::new(),
+            agents: vec![PersistedAgentInstance {
+                id: agent_id,
+                shell_id,
+                run_id,
+                name: "continued".into(),
+                integration: "opencode".into(),
+                external_session_id: Some(mismatched_session_id),
+                cwd: Some(env::temp_dir()),
+                started_at_ms: 1,
+                ended_at_ms: None,
+                observation: AgentObservationSnapshot {
+                    revision: 1,
+                    state: AgentState::Idle,
+                    authority: AgentAuthority::LifecycleIntegration,
+                    evidence: "registered".into(),
+                    confidence: 100,
+                    observed_at_ms: 1,
+                },
+                attention: None,
+            }],
+            schedules: vec![schedule],
+        }];
+        store.save(&persisted).unwrap();
+        assert_eq!(
+            DaemonService::restore(store, true, None)
+                .err()
+                .expect("malformed continuation state was accepted")
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -8752,6 +11104,46 @@ mod tests {
             2
         );
         assert!(!serde_json::to_string(&events).unwrap().contains(prompt));
+    }
+
+    #[test]
+    fn pruned_dispatch_keys_remain_explicitly_rejected() {
+        let registry = DaemonService::default();
+        let workspace = registry
+            .create_workspace("scheduled".into(), Vec::new())
+            .unwrap();
+        let (schedule, _) = registry
+            .durable
+            .create_schedule(&workspace.id, schedule_spec("private"))
+            .unwrap();
+        let first_key = Uuid::from_u128(1).to_string();
+
+        for value in 1..=MAX_TERMINAL_EXECUTIONS_PER_SCHEDULE + 1 {
+            let key = Uuid::from_u128(value as u128).to_string();
+            let (snapshot, _) = registry
+                .durable
+                .claim_schedule_execution(&schedule.id, &key)
+                .unwrap();
+            let execution = registry.durable.execution(&snapshot.id).unwrap();
+            registry
+                .durable
+                .mutate_execution(&execution, |state| {
+                    state.state = ScheduledExecutionState::DispatchFailed;
+                    state.ended_at_ms = Some(unix_time_ms().max(execution.requested_at_ms));
+                    state.reason = Some(ScheduledExecutionReason::RunnerStartFailed);
+                    Ok(())
+                })
+                .unwrap();
+        }
+
+        let error = match registry
+            .durable
+            .claim_schedule_execution(&schedule.id, &first_key)
+        {
+            Err(error) => error,
+            Ok(_) => panic!("pruned dispatch key was accepted"),
+        };
+        assert_eq!(error.wire_code(), ErrorCode::IdempotencyExpired);
     }
 
     #[test]

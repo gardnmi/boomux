@@ -145,9 +145,19 @@ fn desktop_notifications_are_deduplicated_private_and_survive_handoff() {
     )
     .unwrap();
     drop(attachment.stream);
+    let mut restart_paths = vec![notify_send.parent().unwrap().to_path_buf()];
+    restart_paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
     let restart = daemon
         .command()
         .env("BOOMUX_CONFIG", replacement_config)
+        .env("BOOMUX_NOTIFICATION_CAPTURE", &capture)
+        .env("BOOMUX_SOUND_CAPTURE", &sound_capture)
+        .env("BOOMUX_NOTIFICATION_HANG", &hang)
+        .env("BOOMUX_NOTIFICATION_PID", &notification_pid)
+        .env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/nonexistent")
+        .env("PATH", std::env::join_paths(restart_paths).unwrap())
         .args(["daemon", "restart"])
         .output()
         .unwrap();

@@ -4,7 +4,7 @@ description: Inspect and manage Boomux persistent terminal workspaces, launchers
 compatibility: Requires boomux on PATH. Some name operations require Boomux workspace context or an explicit --workspace; schedule names require BOOMUX_WORKSPACE_ID or explicit --workspace; agent mutation and supervision require exact shell-run context, and continuation schedules or supervision require caller-supplied exact canonical session identity.
 metadata:
   author: boomux
-  version: "10"
+  version: "11"
 ---
 
 # Boomux
@@ -51,7 +51,8 @@ boomux capabilities --json
 Parse `data` on success and `error.code` on a nonzero exit; do not parse human
 tables or `error.message`. JSON mutation support includes Agent register,
 ensure, and report; attention acknowledgment; schedule create, pause, resume,
-and remove; and integration installation and uninstallation.
+remove, and run; execution cancellation; and integration installation and
+uninstallation.
 
 Most daemon-backed inspection commands automatically start Boomux when it is
 not running. This includes `list`, `shells`, `read`, `events`, workspace, shell,
@@ -264,6 +265,10 @@ boomux schedule list --workspace "<workspace-name-or-id>" --json
 boomux schedule inspect "<exact-id-or-contextual-name>" --workspace "<workspace-name-or-id>" --json
 boomux schedule pause "<exact-id-or-contextual-name>" --workspace "<workspace-name-or-id>" --json
 boomux schedule resume "<exact-id-or-contextual-name>" --workspace "<workspace-name-or-id>" --json
+boomux schedule run "<exact-id-or-contextual-name>" --workspace "<workspace-name-or-id>" --json
+boomux execution list --workspace "<workspace-name-or-id>" --schedule "<schedule-name-or-id>" --json
+boomux execution inspect "<exact-execution-id>" --json
+boomux execution cancel "<exact-execution-id>" --json
 boomux schedule remove "<exact-id-or-contextual-name>" --workspace "<workspace-name-or-id>" --json
 ```
 
@@ -282,18 +287,26 @@ resolve in that workspace, expose a canonical external session ID, and match the
 selected integration. Never substitute a description, external ID, latest
 session, Agent ID, or shell ID.
 
-List, create, pause, resume, and remove responses are prompt-free. Inspect
+List, create, pause, resume, remove, run, and all execution responses are
+prompt-free. Inspect
 returns the private prompt under `data.schedule.prompt`; do not log or repeat it
 unless needed for the authorized request. Exact schedule IDs resolve globally.
 Names resolve only with explicit `--workspace` or `BOOMUX_WORKSPACE_ID`.
 Removing a schedule removes its persisted prompt. Workspace close removes every
 owned schedule and persisted prompt and must be confirmed with that full scope.
 
-This version is the schedule management surface. Dispatch arrives in later
-scheduler and integration stack layers; do not claim that enabling immediately
-executes timed work. Capabilities advertise durable schedule management only;
-dispatch modes and prompt transport are not public capabilities until the
-dispatcher ships.
+`schedule run` is an explicit process-starting action and requires authorization
+for that one execution. It remains available while paused. Use
+`--idempotency-key <uuid>` for request retry; otherwise the CLI creates a UUID
+before sending. Never retry with a new key when the intent is the same dispatch.
+Inspect the returned exact execution ID, and cancel only when process-tree
+termination is authorized. Execution exit or cancellation never means Agent
+`done`.
+
+This version does not evaluate cron triggers or run a timer. Enabling records
+future timed-work consent but does not itself dispatch. Do not claim workspace
+or global scheduled concurrency limits, skipped timer decisions, or
+`[scheduling]` configuration are active.
 
 Exact shell IDs resolve globally. Shell names resolve in the current workspace,
 or through `--workspace` for `shell inspect`, `shell rename`, and `shell close`.

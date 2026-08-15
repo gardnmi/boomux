@@ -25,7 +25,7 @@ fn native_daemon_lifecycle() {
     let capabilities: serde_json::Value = serde_json::from_slice(&capabilities.stdout).unwrap();
     assert_eq!(capabilities["schema"], "boomux.cli/v1");
     assert_eq!(capabilities["command"], "capabilities");
-    assert_eq!(capabilities["data"]["daemon_protocol_version"], 22);
+    assert_eq!(capabilities["data"]["daemon_protocol_version"], 23);
     assert_eq!(
         capabilities["data"]["session_transcript_integrations"],
         serde_json::json!(["opencode", "pi"])
@@ -88,6 +88,7 @@ fn native_daemon_lifecycle() {
         "protocol_20",
         "protocol_21",
         "protocol_22",
+        "protocol_23",
         "agent_schedule_management",
         "durable_agent_schedules",
         "workspace_default_cwd",
@@ -114,7 +115,7 @@ fn native_daemon_lifecycle() {
         .output()
         .unwrap();
     assert!(status.status.success());
-    assert!(String::from_utf8_lossy(&status.stdout).contains("running (protocol 22"));
+    assert!(String::from_utf8_lossy(&status.stdout).contains("running (protocol 23"));
     let status = daemon
         .command()
         .args(["daemon", "status", "--json"])

@@ -16,10 +16,11 @@ use std::time::Duration;
 use crate::protocol::{
     self, AgentInstanceSnapshot, AgentRegistrationSpec, AgentReport, AgentScheduleInspection,
     AgentScheduleSnapshot, AgentScheduleSpec, DaemonEvent, Envelope, ErrorCode, EventCursor,
-    FocusedTerminalSnapshot, NotificationDeliveryConfig, Request, Response, ShellSnapshot,
-    ShellSpec, ShellStatus, Snapshot, TerminalPreview, TerminalPreviewLine, TerminalPreviewSpan,
-    TerminalProfile, UnixEnvironment, UnixEnvironmentVariable, WorkspaceLauncherSnapshot,
-    WorkspaceLauncherSpec, WorkspaceSnapshot,
+    FocusedTerminalSnapshot, NotificationDeliveryConfig, Request, Response,
+    ScheduledExecutionSnapshot, ScheduledRunnerResult, ShellSnapshot, ShellSpec, ShellStatus,
+    Snapshot, TerminalPreview, TerminalPreviewLine, TerminalPreviewSpan, TerminalProfile,
+    UnixEnvironment, UnixEnvironmentVariable, WorkspaceLauncherSnapshot, WorkspaceLauncherSpec,
+    WorkspaceSnapshot,
 };
 
 const CONNECT_ATTEMPTS: usize = 40;
@@ -491,10 +492,20 @@ impl Client {
         &self,
         notifications: NotificationDeliveryConfig,
     ) -> Result<()> {
-        if !self.supports(protocol::ProtocolFeature::RestartNotificationConfig)? {
-            self.restart_request(Request::Restart)?;
+        if !self.supports(protocol::ProtocolFeature::ScheduledExecutions)? {
+            if self.supports(protocol::ProtocolFeature::RestartNotificationConfig)? {
+                self.restart_request(Request::RestartWithNotificationConfig {
+                    notifications: notifications.clone(),
+                    environment: None,
+                })?;
+            } else {
+                self.restart_request(Request::Restart)?;
+            }
         }
-        self.restart_request(Request::RestartWithNotificationConfig { notifications })
+        self.restart_request(Request::RestartWithNotificationConfig {
+            notifications,
+            environment: Some(current_environment()),
+        })
     }
 
     fn restart_request(&self, request: Request) -> Result<()> {
@@ -649,6 +660,96 @@ impl Client {
             spec,
         })? {
             Response::AgentSchedule { schedule } => Ok(schedule),
+            other => unexpected(other),
+        }
+    }
+
+    pub fn run_agent_schedule(
+        &self,
+        schedule_id: impl Into<String>,
+        dispatch_key: impl Into<String>,
+    ) -> Result<ScheduledExecutionSnapshot> {
+        match self.request(Request::RunAgentSchedule {
+            schedule_id: schedule_id.into(),
+            dispatch_key: dispatch_key.into(),
+        })? {
+            Response::ScheduledExecution { execution } => Ok(execution),
+            other => unexpected(other),
+        }
+    }
+
+    pub fn scheduled_executions(
+        &self,
+        workspace_id: Option<String>,
+        schedule_id: Option<String>,
+    ) -> Result<Vec<ScheduledExecutionSnapshot>> {
+        match self.request(Request::ListScheduledExecutions {
+            workspace_id,
+            schedule_id,
+        })? {
+            Response::ScheduledExecutions { executions } => Ok(executions),
+            other => unexpected(other),
+        }
+    }
+
+    pub fn get_scheduled_execution(
+        &self,
+        execution_id: impl Into<String>,
+    ) -> Result<ScheduledExecutionSnapshot> {
+        match self.request(Request::GetScheduledExecution {
+            execution_id: execution_id.into(),
+        })? {
+            Response::ScheduledExecution { execution } => Ok(execution),
+            other => unexpected(other),
+        }
+    }
+
+    pub fn cancel_scheduled_execution(
+        &self,
+        execution_id: impl Into<String>,
+    ) -> Result<ScheduledExecutionSnapshot> {
+        match self.request(Request::CancelScheduledExecution {
+            execution_id: execution_id.into(),
+        })? {
+            Response::ScheduledExecution { execution } => Ok(execution),
+            other => unexpected(other),
+        }
+    }
+
+    pub fn resolve_scheduled_execution_claim(
+        &self,
+        schedule_id: impl Into<String>,
+        shell_id: impl Into<String>,
+        run_id: impl Into<String>,
+        runner_token: impl Into<String>,
+    ) -> Result<protocol::ScheduledExecutionClaim> {
+        match self.request(Request::ResolveScheduledExecutionClaim {
+            schedule_id: schedule_id.into(),
+            shell_id: shell_id.into(),
+            run_id: run_id.into(),
+            runner_token: protocol::ScheduledRunnerCapability::new(runner_token),
+        })? {
+            Response::ScheduledExecutionClaim { claim } => Ok(claim),
+            other => unexpected(other),
+        }
+    }
+
+    pub fn report_scheduled_runner(
+        &self,
+        execution_id: impl Into<String>,
+        shell_id: impl Into<String>,
+        run_id: impl Into<String>,
+        runner_token: impl Into<String>,
+        result: ScheduledRunnerResult,
+    ) -> Result<ScheduledExecutionSnapshot> {
+        match self.request(Request::ReportScheduledRunner {
+            execution_id: execution_id.into(),
+            shell_id: shell_id.into(),
+            run_id: run_id.into(),
+            runner_token: protocol::ScheduledRunnerCapability::new(runner_token),
+            result,
+        })? {
+            Response::ScheduledExecution { execution } => Ok(execution),
             other => unexpected(other),
         }
     }
@@ -1145,6 +1246,7 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
+            reject_protocol(&listener, 23, 22);
             reject_protocol(&listener, 22, 21);
             reject_protocol(&listener, 21, 20);
             let (mut stream, _) = listener.accept().unwrap();
@@ -1325,7 +1427,7 @@ mod tests {
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
-            assert_eq!(request.version, 22);
+            assert_eq!(request.version, 23);
             let Request::Attach {
                 environment: Some(environment),
                 ..
@@ -1342,7 +1444,7 @@ mod tests {
             protocol::write_message(
                 &mut stream,
                 &Envelope::with_version(
-                    22,
+                    23,
                     Response::Attached {
                         token: "token".into(),
                         reconstruction: Vec::new(),
@@ -1433,6 +1535,7 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
+            reject_protocol(&listener, 23, 22);
             reject_protocol(&listener, 22, 21);
             reject_protocol(&listener, 21, 20);
             let (mut stream, _) = listener.accept().unwrap();
@@ -1491,6 +1594,7 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
+            reject_protocol(&listener, 23, 22);
             reject_protocol(&listener, 22, 21);
             reject_protocol(&listener, 21, 20);
             let (mut stream, _) = listener.accept().unwrap();

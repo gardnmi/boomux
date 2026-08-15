@@ -319,6 +319,7 @@ mod tests {
             name: "project".into(),
             default_cwd: Some(PathBuf::from("/tmp/project")),
             shells: vec![ShellSnapshot {
+                owner: boomux::protocol::ShellOwner::User,
                 id: "shell-1".into(),
                 workspace_id: "workspace-1".into(),
                 name: "main".into(),

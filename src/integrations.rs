@@ -49,6 +49,7 @@ pub struct ResumeCapability {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PromptTransport {
     Argument,
+    Stdin,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,6 +57,65 @@ pub struct ScheduleDispatchCapability {
     pub fresh: bool,
     pub continuation: bool,
     pub prompt_transport: PromptTransport,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduleDispatchCommand {
+    pub argv: Vec<String>,
+    pub stdin: Option<Vec<u8>>,
+}
+
+impl ScheduleDispatchCapability {
+    pub fn command(
+        self,
+        integration: &str,
+        session: &crate::protocol::AgentScheduleSession,
+        prompt: &str,
+    ) -> Option<ScheduleDispatchCommand> {
+        use crate::protocol::AgentScheduleSession;
+
+        let mut argv = vec![integration.to_owned()];
+        match (integration, session) {
+            ("opencode", AgentScheduleSession::Fresh) if self.fresh => {
+                argv.extend(["run".into(), "--".into(), prompt.into()]);
+            }
+            (
+                "opencode",
+                AgentScheduleSession::Continue {
+                    external_session_id,
+                },
+            ) if self.continuation => {
+                argv.extend([
+                    "run".into(),
+                    "--session".into(),
+                    external_session_id.clone(),
+                    "--".into(),
+                    prompt.into(),
+                ]);
+            }
+            ("pi", AgentScheduleSession::Fresh) if self.fresh => {
+                argv.push("--print".into());
+            }
+            (
+                "pi",
+                AgentScheduleSession::Continue {
+                    external_session_id,
+                },
+            ) if self.continuation => {
+                argv.extend([
+                    "--session".into(),
+                    external_session_id.clone(),
+                    "--print".into(),
+                ]);
+            }
+            _ => return None,
+        }
+        Some(ScheduleDispatchCommand {
+            argv,
+            stdin: (self.prompt_transport == PromptTransport::Stdin)
+                .then(|| prompt.as_bytes().to_vec()),
+        })
+    }
 }
 
 impl ResumeCapability {
@@ -160,7 +220,7 @@ pub const PI: IntegrationDescriptor = IntegrationDescriptor {
     schedule_dispatch: Some(ScheduleDispatchCapability {
         fresh: true,
         continuation: true,
-        prompt_transport: PromptTransport::Argument,
+        prompt_transport: PromptTransport::Stdin,
     }),
     foreground: Some(ForegroundCapability { process_name: "pi" }),
 };
@@ -281,14 +341,9 @@ mod tests {
         for descriptor in ALL {
             assert_eq!(by_key(descriptor.key), Some(descriptor));
             assert_eq!(display_name(descriptor.key), descriptor.display_name);
-            assert_eq!(
-                descriptor.schedule_dispatch,
-                Some(ScheduleDispatchCapability {
-                    fresh: true,
-                    continuation: true,
-                    prompt_transport: PromptTransport::Argument,
-                })
-            );
+            let dispatch = descriptor.schedule_dispatch.expect("dispatch capability");
+            assert!(dispatch.fresh);
+            assert!(dispatch.continuation);
         }
     }
 
@@ -327,6 +382,45 @@ mod tests {
             resume
                 .command(&["opencode".into(), "--continue".into()], "session-1")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn scheduled_dispatch_builds_exact_host_argv_and_private_transport() {
+        use crate::protocol::AgentScheduleSession;
+
+        let prompt = "-private @prompt";
+        assert_eq!(
+            OPENCODE
+                .schedule_dispatch
+                .unwrap()
+                .command("opencode", &AgentScheduleSession::Fresh, prompt)
+                .unwrap(),
+            ScheduleDispatchCommand {
+                argv: vec!["opencode".into(), "run".into(), "--".into(), prompt.into()],
+                stdin: None,
+            }
+        );
+        assert_eq!(
+            PI.schedule_dispatch
+                .unwrap()
+                .command(
+                    "pi",
+                    &AgentScheduleSession::Continue {
+                        external_session_id: "exact-full-id".into(),
+                    },
+                    prompt,
+                )
+                .unwrap(),
+            ScheduleDispatchCommand {
+                argv: vec![
+                    "pi".into(),
+                    "--session".into(),
+                    "exact-full-id".into(),
+                    "--print".into(),
+                ],
+                stdin: Some(prompt.as_bytes().to_vec()),
+            }
         );
     }
 }

@@ -7,7 +7,8 @@ use boomux::client::{ClientError, LifecycleError, ProtocolError};
 use boomux::protocol::{
     AgentAttentionReason, AgentAuthority, AgentInstanceSnapshot, AgentObservationSnapshot,
     AgentScheduleOverlapPolicy, AgentScheduleSession, AgentScheduleSnapshot, AgentScheduleState,
-    AgentState, ErrorCode, ShellRunExitReason, ShellSnapshot, ShellStatus,
+    AgentState, ErrorCode, ScheduledExecutionOutcome, ScheduledExecutionReason,
+    ScheduledExecutionSnapshot, ShellRunExitReason, ShellSnapshot, ShellStatus,
     WorkspaceLauncherSnapshot,
 };
 
@@ -59,6 +60,8 @@ pub(crate) struct ShellData {
     pub(crate) cwd: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) command: Vec<String>,
+    pub(crate) owner: &'static str,
+    pub(crate) owner_schedule_id: Option<String>,
     pub(crate) status: &'static str,
     pub(crate) exit_code: Option<u32>,
     pub(crate) foreground_process: Option<String>,
@@ -127,6 +130,38 @@ pub(crate) struct ScheduleInspectionData {
     #[serde(flatten)]
     pub(crate) schedule: ScheduleData,
     pub(crate) prompt: String,
+}
+
+#[derive(Serialize)]
+pub(crate) struct ExecutionData {
+    pub(crate) id: String,
+    pub(crate) workspace_id: String,
+    pub(crate) schedule_id: String,
+    pub(crate) state: &'static str,
+    pub(crate) dispatch_kind: &'static str,
+    pub(crate) dispatch_key: String,
+    pub(crate) schedule_revision: u64,
+    pub(crate) prompt_revision: u64,
+    pub(crate) trigger_revision: u64,
+    pub(crate) requested_at_ms: u64,
+    pub(crate) started_at_ms: Option<u64>,
+    pub(crate) ended_at_ms: Option<u64>,
+    pub(crate) cwd: String,
+    pub(crate) integration: String,
+    pub(crate) session: AgentScheduleSession,
+    pub(crate) reason: Option<&'static str>,
+    pub(crate) outcome: Option<ExecutionOutcomeData>,
+    pub(crate) shell_id: Option<String>,
+    pub(crate) run_id: Option<String>,
+    pub(crate) agent_id: Option<String>,
+    pub(crate) external_session_id: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum ExecutionOutcomeData {
+    ExitCode { code: i32 },
+    Signal { signal: i32 },
 }
 
 #[derive(Serialize)]
@@ -251,6 +286,14 @@ pub(crate) fn shell(shell: &ShellSnapshot, workspace_name: Option<&str>) -> Shel
         name: shell.name.clone(),
         cwd: shell.cwd.display().to_string(),
         command: shell.command.clone(),
+        owner: match &shell.owner {
+            boomux::protocol::ShellOwner::User => "user",
+            boomux::protocol::ShellOwner::Schedule { .. } => "schedule",
+        },
+        owner_schedule_id: match &shell.owner {
+            boomux::protocol::ShellOwner::User => None,
+            boomux::protocol::ShellOwner::Schedule { schedule_id } => Some(schedule_id.clone()),
+        },
         status,
         exit_code,
         foreground_process: shell.foreground_process.clone(),
@@ -286,6 +329,54 @@ pub(crate) fn launcher(
         name: launcher.name.clone(),
         cwd: launcher.cwd.display().to_string(),
         command: launcher.command.clone(),
+    }
+}
+
+pub(crate) fn execution(execution: &ScheduledExecutionSnapshot) -> ExecutionData {
+    ExecutionData {
+        id: execution.id.clone(),
+        workspace_id: execution.workspace_id.clone(),
+        schedule_id: execution.schedule_id.clone(),
+        state: match execution.state {
+            boomux::protocol::ScheduledExecutionState::Claimed => "claimed",
+            boomux::protocol::ScheduledExecutionState::Starting => "starting",
+            boomux::protocol::ScheduledExecutionState::Active => "active",
+            boomux::protocol::ScheduledExecutionState::DispatchFailed => "dispatch_failed",
+            boomux::protocol::ScheduledExecutionState::Exited => "exited",
+            boomux::protocol::ScheduledExecutionState::Cancelled => "cancelled",
+            boomux::protocol::ScheduledExecutionState::Interrupted => "interrupted",
+        },
+        dispatch_kind: "manual",
+        dispatch_key: execution.dispatch_key.clone(),
+        schedule_revision: execution.schedule_revision,
+        prompt_revision: execution.prompt_revision,
+        trigger_revision: execution.trigger_revision,
+        requested_at_ms: execution.requested_at_ms,
+        started_at_ms: execution.started_at_ms,
+        ended_at_ms: execution.ended_at_ms,
+        cwd: execution.cwd.display().to_string(),
+        integration: execution.integration.clone(),
+        session: execution.session.clone(),
+        reason: execution.reason.map(|reason| match reason {
+            ScheduledExecutionReason::RunnerStartFailed => "runner_start_failed",
+            ScheduledExecutionReason::HostSpawnFailed => "host_spawn_failed",
+            ScheduledExecutionReason::CancelledByUser => "cancelled_by_user",
+            ScheduledExecutionReason::ColdDaemonRecovery => "cold_daemon_recovery",
+            ScheduledExecutionReason::RunnerExitedWithoutReport => "runner_exited_without_report",
+            ScheduledExecutionReason::DaemonShutdown => "daemon_shutdown",
+        }),
+        outcome: execution.outcome.as_ref().map(|outcome| match outcome {
+            ScheduledExecutionOutcome::ExitCode { code } => {
+                ExecutionOutcomeData::ExitCode { code: *code }
+            }
+            ScheduledExecutionOutcome::Signal { signal } => {
+                ExecutionOutcomeData::Signal { signal: *signal }
+            }
+        }),
+        shell_id: execution.shell_id.clone(),
+        run_id: execution.run_id.clone(),
+        agent_id: execution.agent_id.clone(),
+        external_session_id: execution.external_session_id.clone(),
     }
 }
 
@@ -534,6 +625,7 @@ fn protocol_error_code(code: ErrorCode) -> &'static str {
         ErrorCode::CursorExpired => "cursor_expired",
         ErrorCode::RunChanged => "run_changed",
         ErrorCode::RevisionAhead => "revision_ahead",
+        ErrorCode::IdempotencyExpired => "idempotency_expired",
         ErrorCode::Internal => "internal",
         ErrorCode::Unknown => "unknown",
     }
