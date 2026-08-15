@@ -51,6 +51,7 @@ The following commands support `--json`:
 - `boomux project list`
 - `boomux workspace list`
 - `boomux workspace inspect`
+- `boomux shell suggest-name <workspace-name-or-id>`
 - `boomux shell inspect`
 - `boomux launcher list`
 - `boomux launcher inspect`
@@ -113,6 +114,9 @@ Command payloads are:
 - `workspace.inspect`: one `workspace` object containing `id`, `name`, nullable
   `default_cwd`, and prompt-free `shells`, `launchers`, `schedules`, and `agents`
   arrays.
+- `shell.suggest-name`: exact resolved `workspace_id` plus a nonempty generated
+  `name` that does not match any shell name in that workspace at observation
+  time.
 - `shell.inspect`: one `shell` object.
 - `launcher.list`: workspace identity plus a `launchers` array.
 - `launcher.inspect`: one `launcher` object.
@@ -192,6 +196,16 @@ false when the merged configuration has no project roots, distinguishing that
 state from configured roots that currently discover no projects. Recoverable
 scan problems and resource-limit notices are returned as human-readable strings
 in `warnings`; integrations must not parse warning text.
+
+## Shell Name Suggestions
+
+`boomux shell suggest-name <workspace-name-or-id> --json` returns a lowercase
+`adjective-noun` suggestion using the same catalog and collision-exclusion
+algorithm as generated shell creation. The suggestion is not reserved. Another
+operation can claim it before creation, so a later explicit `shell create
+--name <suggestion>` can still fail with `already_exists`; callers must handle
+that typed error rather than assume the suggestion grants ownership. If every
+generated name is currently in use, suggestion fails with `already_exists`.
 
 ## Integration Data
 

@@ -548,6 +548,8 @@ enum LauncherCommands {
 
 #[derive(Subcommand)]
 enum ShellCommands {
+    /// Suggest an unused generated name without reserving it
+    SuggestName { workspace: String },
     /// Create a pending shell in a workspace
     Create {
         workspace: String,
@@ -1033,6 +1035,7 @@ command_keys! {
     WorkspaceList => ("workspace.list", Json),
     WorkspaceInspect => ("workspace.inspect", Json),
     Workspace => ("workspace", HumanOnly),
+    ShellSuggestName => ("shell.suggest-name", Json),
     ShellInspect => ("shell.inspect", Json),
     Shell => ("shell", HumanOnly),
     LauncherList => ("launcher.list", Json),
@@ -1099,6 +1102,9 @@ impl Cli {
             Some(Commands::Workspace {
                 command: WorkspaceCommands::Inspect { .. },
             }) => CommandKey::WorkspaceInspect,
+            Some(Commands::Shell {
+                command: ShellCommands::SuggestName { .. },
+            }) => CommandKey::ShellSuggestName,
             Some(Commands::Shell {
                 command: ShellCommands::Inspect { .. },
             }) => CommandKey::ShellInspect,
@@ -2455,19 +2461,13 @@ fn create_generated_shell(
     let mut rejected = BTreeSet::new();
     loop {
         let workspace = client.get_workspace(workspace_id)?;
-        let name = generated_names::random_excluding(
+        let name = generated_shell_name(
             workspace
                 .shells
                 .iter()
                 .map(|shell| shell.name.as_str())
                 .chain(rejected.iter().map(String::as_str)),
-        )
-        .ok_or_else(|| {
-            cli_output::failure(
-                "already_exists",
-                "all generated shell names are already in use",
-            )
-        })?;
+        )?;
         match client.create_shell(workspace_id, shell_spec(&name, cwd, command)) {
             Ok(shell) => return Ok(shell),
             Err(client::ClientError::Remote(error))
@@ -2478,6 +2478,17 @@ fn create_generated_shell(
             Err(error) => return Err(error.into()),
         }
     }
+}
+
+fn generated_shell_name<'a>(
+    unavailable: impl IntoIterator<Item = &'a str>,
+) -> Result<String, Box<dyn Error>> {
+    generated_names::random_excluding(unavailable).ok_or_else(|| {
+        cli_output::failure(
+            "already_exists",
+            "all generated shell names are already in use",
+        )
+    })
 }
 
 fn integration_command(command: IntegrationCommands, json: bool) -> Result<(), Box<dyn Error>> {
@@ -3413,6 +3424,28 @@ fn workspace_command(
 fn shell_command(command: ShellCommands, json: bool) -> Result<(), Box<dyn Error>> {
     let client = client::connect_or_start()?;
     match command {
+        ShellCommands::SuggestName { workspace } => {
+            let snapshot = client.snapshot()?;
+            let workspace = resolve_workspace_target(&snapshot.workspaces, &workspace)?;
+            let name =
+                generated_shell_name(workspace.shells.iter().map(|shell| shell.name.as_str()))?;
+            if json {
+                return print_json(
+                    CommandKey::ShellSuggestName,
+                    serde_json::json!({
+                        "workspace_id": workspace.id,
+                        "name": name,
+                    }),
+                );
+            }
+            println!(
+                "Suggested shell name {name} for {} ({})",
+                workspace.name, workspace.id
+            );
+            println!(
+                "This suggestion is not reserved; shell creation can still fail if the name is already in use."
+            );
+        }
         ShellCommands::Create {
             workspace,
             name,
@@ -6814,6 +6847,7 @@ mod tests {
             vec!["boomux", "--json", "capabilities"],
             vec!["boomux", "list", "--json"],
             vec!["boomux", "workspace", "list", "--json"],
+            vec!["boomux", "shell", "suggest-name", "project", "--json"],
             vec![
                 "boomux",
                 "launcher",
@@ -6988,6 +7022,14 @@ mod tests {
                 && name == "tests"
                 && cwd.as_deref() == Some(Path::new("/tmp"))
                 && command == ["cargo", "test"]
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["boomux", "shell", "suggest-name", "project"])
+                .unwrap()
+                .command,
+            Some(Commands::Shell {
+                command: ShellCommands::SuggestName { workspace }
+            }) if workspace == "project"
         ));
         assert!(matches!(
             Cli::try_parse_from(["boomux", "shell", "create", "project"])
@@ -7451,6 +7493,20 @@ mod tests {
         let (adjective, noun) = generated.split_once('-').unwrap();
         assert!(adjective.bytes().all(|byte| byte.is_ascii_lowercase()));
         assert!(noun.bytes().all(|byte| byte.is_ascii_lowercase()));
+    }
+
+    #[test]
+    fn generated_shell_name_exhaustion_is_typed() {
+        let mut names = Vec::new();
+        while let Some(name) = generated_names::random_excluding(names.iter().map(String::as_str)) {
+            names.push(name);
+        }
+
+        let error = generated_shell_name(names.iter().map(String::as_str)).unwrap_err();
+        assert_eq!(
+            cli_output::classify_for_test("shell.suggest-name", error.as_ref()),
+            "already_exists"
+        );
     }
 
     #[test]
@@ -8848,6 +8904,7 @@ mod tests {
     #[test]
     fn capabilities_advertise_phase_two_agent_integration_surface() {
         let json_commands = json_commands().collect::<Vec<_>>();
+        assert!(json_commands.contains(&"shell.suggest-name"));
         for command in [
             "agent.register",
             "agent.ensure",
@@ -8937,6 +8994,7 @@ mod tests {
                 "project.list",
                 "workspace.list",
                 "workspace.inspect",
+                "shell.suggest-name",
                 "shell.inspect",
                 "launcher.list",
                 "launcher.inspect",
