@@ -283,16 +283,6 @@ impl ExecutionDisplayState {
     }
 }
 
-impl ExecutionView {
-    fn is_openable(&self) -> bool {
-        matches!(
-            self.state,
-            ExecutionDisplayState::Starting | ExecutionDisplayState::Active
-        ) && self.shell_id.is_some()
-            && self.run_id.is_some()
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ExecutionReasonDisplay {
     Overlap,
@@ -720,11 +710,6 @@ pub(crate) enum DashboardEffect {
     CancelExecution(String),
     OpenScheduledExecution {
         execution_id: String,
-        shell_id: String,
-        run_id: String,
-    },
-    OpenAgentSession {
-        session_id: String,
     },
     RemoveSchedule(String),
     LoadScheduleHistory {
@@ -2980,22 +2965,7 @@ impl App {
 
     fn open_selected_schedule_link(&mut self) -> Option<DashboardEffect> {
         let execution = self.selected_execution()?.clone();
-        if execution.state.is_active() {
-            return self.open_selected_execution_run();
-        }
-        if let Some(session_id) = execution.session_id {
-            return Some(DashboardEffect::OpenAgentSession { session_id });
-        }
-        self.message = Some(Message {
-            text: "Selected execution has no exact linked Agent Session to open".into(),
-            error: false,
-        });
-        None
-    }
-
-    fn open_selected_execution_run(&mut self) -> Option<DashboardEffect> {
-        let execution = self.selected_execution()?.clone();
-        if !self.exact_run_attachment {
+        if execution.state.is_active() && !self.exact_run_attachment {
             self.message = Some(Message {
                 text: "Opening exact Scheduled Execution runs requires daemon protocol 26; upgrade and restart Boomux"
                     .into(),
@@ -3003,27 +2973,9 @@ impl App {
             });
             return None;
         }
-        if !execution.is_openable() {
-            self.message = Some(Message {
-                text: "Selected execution is not a Starting or Active exact shell run".into(),
-                error: false,
-            });
-            return None;
-        }
-        match (execution.shell_id, execution.run_id) {
-            (Some(shell_id), Some(run_id)) => Some(DashboardEffect::OpenScheduledExecution {
-                execution_id: execution.id,
-                shell_id,
-                run_id,
-            }),
-            _ => {
-                self.message = Some(Message {
-                    text: "Selected execution has no exact retained shell run to open".into(),
-                    error: false,
-                });
-                None
-            }
-        }
+        Some(DashboardEffect::OpenScheduledExecution {
+            execution_id: execution.id,
+        })
     }
 
     fn select_agent_id(&mut self, agent_id: &str) -> bool {
@@ -9736,8 +9688,6 @@ mod tests {
             }),
             vec![DashboardEffect::OpenScheduledExecution {
                 execution_id: "execution-2".into(),
-                shell_id: "schedule-shell".into(),
-                run_id: "schedule-run".into(),
             }]
         );
         let mut reordered = app.schedules[0].clone();
@@ -9800,44 +9750,27 @@ mod tests {
     }
 
     #[test]
-    fn open_execution_attaches_active_runs_and_resumes_completed_sessions() {
-        for state in [
-            ExecutionDisplayState::Skipped,
-            ExecutionDisplayState::Claimed,
-            ExecutionDisplayState::DispatchFailed,
-            ExecutionDisplayState::Exited,
-            ExecutionDisplayState::Cancelled,
-            ExecutionDisplayState::Interrupted,
-        ] {
-            let mut app = schedule_app();
-            app.schedules[0].executions[0].state = state;
-            app.schedules[0].executions[0].session_id = None;
-            assert!(
-                app.open_selected_schedule_link().is_none(),
-                "state {state:?}"
-            );
-        }
-
+    fn open_execution_delegates_exact_id_for_run_or_session_resolution() {
         for state in [
             ExecutionDisplayState::Starting,
             ExecutionDisplayState::Active,
         ] {
             let mut app = schedule_app();
             app.schedules[0].executions[0].state = state;
-            assert!(matches!(
+            assert_eq!(
                 app.open_selected_schedule_link(),
-                Some(DashboardEffect::OpenScheduledExecution { .. })
-            ));
-            app.schedules[0].executions[0].run_id = None;
-            assert!(app.open_selected_schedule_link().is_none());
+                Some(DashboardEffect::OpenScheduledExecution {
+                    execution_id: "execution-1".into()
+                })
+            );
         }
 
         let mut app = schedule_app();
         app.schedules[0].executions[0].state = ExecutionDisplayState::Exited;
         assert_eq!(
             app.open_selected_schedule_link(),
-            Some(DashboardEffect::OpenAgentSession {
-                session_id: "schedule-session".into()
+            Some(DashboardEffect::OpenScheduledExecution {
+                execution_id: "execution-1".into()
             })
         );
     }
@@ -9867,8 +9800,6 @@ mod tests {
             }),
             vec![DashboardEffect::OpenScheduledExecution {
                 execution_id: "execution-1".into(),
-                shell_id: "schedule-shell".into(),
-                run_id: "schedule-run".into(),
             }]
         );
     }

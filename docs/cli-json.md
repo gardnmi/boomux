@@ -73,6 +73,7 @@ The following commands support `--json`:
 - `boomux execution list`
 - `boomux execution inspect`
 - `boomux execution wait`
+- `boomux execution open`
 - `boomux execution cancel`
 - `boomux integration list`
 - `boomux integration status [opencode|pi]`
@@ -85,7 +86,7 @@ The following commands support `--json`:
 
 JSON mutations are deliberately narrow. Agent register, ensure, and report;
 attention acknowledgment; schedule create, pause, resume, remove, and run;
-execution cancellation; and
+execution open and cancellation; and
 integration install and uninstall support the contract. Other mutation commands
 retain human output. Passing `--json` to an unsupported command fails with
 `invalid_argument` before performing the operation.
@@ -141,6 +142,10 @@ Command payloads are:
   `--schedule`.
 - `execution.inspect`: one prompt-free `execution` selected only by exact
   execution ID plus its separate nullable `next_occurrence` projection.
+- `execution.open`: the exact prompt-free `execution` plus `target`, either
+  `run` for a starting or active exact-run attachment or `session` for an
+  external resume of the execution's exact linked Agent Session. It never
+  restarts the reusable Schedule runner shell or substitutes a later run.
 - `execution.cancel`: one prompt-free `execution` selected only by exact
   execution ID.
 - `execution.wait`: `changed` plus one prompt-free exact `execution` after a
