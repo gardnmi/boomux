@@ -237,6 +237,13 @@ satisfied, so retained history does not extend PTY-writer lock hold time.
 boomux __attach <shell-id> --takeover --restart-exited
 ```
 
+Scheduled Execution opens instead launch `__attach` with the selected exact run
+ID and without `--restart-exited`. Protocol 26 carries that expected run through
+the attachment handshake. While holding the ordinary attachment mutation and
+shell lifecycle boundary, the daemon returns `run_changed` unless the shell is
+currently running that exact run. It cannot restart or take over a later run.
+Ordinary shell attachments retain their existing restart behavior.
+
 No emulator-specific adapter or compositor window ID is required.
 Spawned terminal windows start in independent process sessions with null
 standard streams, so exiting the dashboard cannot close their attachments.
@@ -258,7 +265,20 @@ shell directories and cached. A default cwd does not create workspace-level Git
 identity, and mixed-directory workspaces remain valid.
 
 The dashboard establishes an atomic event-stream baseline and treats later
-events as invalidation signals for authoritative snapshot reprojection. Idle
+events as invalidation signals for authoritative snapshot reprojection. It also
+preserves complete Scheduled Execution event payloads in one client-side cache
+bounded to 1,000 records. The cache is seeded once with a protocol-25 global
+page only when Scheduled Execution Observation is supported. Protocol-23 and
+protocol-24 dashboards render scheduling as unsupported and never request their
+uncapped execution history. Complete execution-created and execution-changed
+records replace cached records only at a higher durable revision; stale and
+duplicate revisions are ignored, and schedule removal clears all matching
+records. Cursor expiration, stream replacement, and explicit refresh reseed
+once. A failed reseed preserves the prior cache, keeps a retry requirement, and
+retries before the next event check. Idle checks and unrelated events never
+list executions. An explicit selected-schedule history action replaces that
+schedule's cache entries with a bounded exact-scope page and retains its
+truncation metadata. Idle
 checks advance only the event cursor. Once per second, event-stream dashboards
 refresh one authoritative snapshot while retaining the advanced cursor. This
 keeps ephemeral focus and foreground-process hints current without serial
@@ -295,6 +315,34 @@ partial panel when the full preview and a usable item table cannot both fit.
 Command previews expose argv and run metadata without reading terminal output.
 Launcher previews never imply retained invocation state because launcher
 processes remain ephemeral.
+
+Schedules are a specialized fourth top-level view rather than shell item kinds.
+Typed schedule and execution projections show friendly and exact triggers,
+next occurrence, scheduler health, no-timeout policy, prompt revision without
+prompt content, current action, and bounded history. Schedule-owned shells are
+excluded from ordinary workspace and shell presentation, counts, restore, and
+actions. Their exact linked Agents remain selectable in the Agents view but
+expose no ordinary shell actions. The schedule view retains a selected execution
+ID across refresh and reorder and always renders it in a selected-containing
+history window or compact status/action strip. Open, cancellation, transcript,
+and execution-palette actions all use that exact selection. Open is available
+only for Starting or Active records with exact shell and run IDs. Opening
+re-fetches and validates the execution and ownership before terminal launch,
+then uses the protocol-26 exact-run attachment handshake to close the
+post-launch race.
+Protocol-25 dashboards retain schedule controls and bounded history but disable
+exact terminal Open with upgrade-and-restart guidance.
+Cancellation requires confirmation and re-fetches the exact execution before
+mutation. Blocked work navigates only through its exact linked Agent ID.
+Canonical session links are derived from exact Agent occurrences, never latest
+or nearby identities. Transcript and tool content is absent from routine
+projection, palettes, notices, and diagnostics and is read through the existing
+bounded canonical transcript adapter only after an explicit dashboard action.
+The overlay starts at the newest bounded rows and supports explicit scrolling;
+all content and heading metadata are terminal-safe escaped, including bidi
+controls.
+Protocol 25 has no skip-next action, and the dashboard does not emulate one by
+pausing and resuming.
 
 Agent sessions are a client-side projection, not a sixth durable daemon
 identity. The projection groups stored Agent instances by workspace,
@@ -436,6 +484,9 @@ batches, and lifecycle event reservations therefore cannot expose revisions that
 may roll back. A deadline still returns the last committed exact snapshot without
 waiting for blocked storage, and equal terminal process revisions continue
 waiting because a canonical Agent link may arrive later.
+Protocol 26 adds additive exact-run attachment. `Attach.expected_run_id`
+is optional and defaults absent for older clients. When present it requires the
+`exact_run_attachment` capability and disables exited-shell restart.
 Protocol-25 lists are daemon-bounded, newest-first pages with explicit limit and
 truncation. The request limit is optional on the wire; protocol 25 defaults it to
 100 and clamps it to 1 through 1,000, while protocol-23 and protocol-24 requests
@@ -758,6 +809,10 @@ wait, bounded execution list metadata, and independently configured execution
 notifications. Protocol-23 and protocol-24 execution visibility remains
 unchanged. State schema 12 explicitly assigns revision 1 to every schema-11
 execution while retaining all prior fields and data.
+
+Protocol 26 adds the optional exact-run attachment expectation used by Scheduled
+Execution terminal opens. Protocol-25 peers retain all observation, history,
+and non-Open schedule dashboard behavior.
 
 Cron day matching preserves syntactic wildcard origin: `*/n` is wildcard-origin,
 while numeric lists and ranges remain restricted even when they cover the full

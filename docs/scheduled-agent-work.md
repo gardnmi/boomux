@@ -357,6 +357,62 @@ Cold startup persists all newly interrupted records before installing the sink
 and enqueueing their notifications. Already-terminal records are not replayed on
 later cold or graceful starts.
 
+## Dashboard Projection
+
+The dashboard has a specialized Schedules view. Agent Schedules and Scheduled
+Executions remain typed projections and are not represented as shell item kinds.
+Schedule-owned shells are hidden from ordinary workspace restore, counts, shell
+presentation, rename, restart, and close. An exact linked Agent remains
+selectable in the Agents view without acquiring ordinary shell actions. The
+view shows friendly trigger, next occurrence, last outcome, active state,
+workspace, and integration as width permits. Its
+detail panel shows prompt revision but never prompt content, exact trigger,
+timezone, no-timeout policy, scheduler health, a typed current explanation, and
+bounded recent history.
+
+The initial execution cache is one bounded protocol-25 global page and is not
+requested from protocol-23 or protocol-24 peers. Complete execution event
+payloads replace cached records only at a higher revision; stale and duplicate
+records are ignored, while schedule removal clears that schedule's entries.
+Cursor expiration, event-stream replacement, and explicit refresh reseed once.
+A failed reseed leaves the prior cache visible and retries before the next event
+check. Idle checks, unrelated events, and the existing one-second
+snapshot fallback do not issue execution-list requests. Selected-schedule
+history is a separate explicit bounded exact-scope load and reports page
+truncation. Empty unscoped truncated history is unknown, not evidence that a
+schedule never ran; only complete global history or a complete exact-schedule
+page can establish never-run. A full terminal-history boundary is also
+identified as a possible durable pruning boundary because older retained
+records cannot be inferred.
+
+Run now creates a fresh dispatch key. Pause and resume affect future timed work.
+Execution selection is retained by execution ID across refresh and reorder and
+remains visible in a selected-containing history window or compact status/action
+strip. Open, cancel, transcript, and palette actions target only that selection.
+Open is offered only for Starting or Active records with exact shell and run
+IDs. It carries those IDs through terminal launch into a protocol-26 exact-run
+attachment request. The daemon checks the expected run while holding the
+attachment mutation/lifecycle boundary, returns `run_changed` if the shell
+moved, and never restarts into or takes over a later run. Cancel requires
+confirmation and backend revalidation. Removal also requires confirmation.
+Protocol-25 dashboards retain schedule controls and bounded history but disable
+exact terminal Open with actionable upgrade-and-restart guidance.
+Protocol 25 has no skip-next operation; clients must not emulate
+one with pause and resume. Creation remains discoverable through `boomux
+schedule create --help` rather than disclosing or collecting prompt content in
+the dashboard.
+
+Execution links are used only when their exact retained IDs are present. A
+blocked execution navigates to its exact linked Agent ID and does not select a
+newest or nearby Agent; durable Agent attention remains independent. Canonical
+session and transcript capability require the exact linked Agent occurrence.
+Transcript and tool content is never loaded automatically and stays out of
+general diagnostics, notices, and the command palette. An explicit bounded read
+uses the existing canonical session transcript boundary. Heading metadata and
+content are terminal-safe escaped, including bidi controls. The overlay starts
+at its newest rows and supports up/down, page, oldest, and newest navigation
+without increasing the read bounds.
+
 ## User Control And Permissions
 
 The scheduler can create a process and deliver the schedule's initial prompt. It

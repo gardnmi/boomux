@@ -181,6 +181,14 @@ pub struct SnapshotWatch {
     snapshot: Snapshot,
 }
 
+#[derive(Debug)]
+pub struct SnapshotWatchPoll {
+    pub changed: bool,
+    pub stream_changed: bool,
+    pub baseline_replaced: bool,
+    pub events: Vec<DaemonEvent>,
+}
+
 impl SnapshotWatch {
     pub fn baseline(client: &Client) -> Result<Self> {
         if !client.supports(protocol::ProtocolFeature::AtomicOutputReads)? {
@@ -211,29 +219,49 @@ impl SnapshotWatch {
         self.cursor.is_some()
     }
 
-    pub fn poll(&mut self, client: &Client) -> Result<(bool, bool)> {
+    pub fn poll(&mut self, client: &Client) -> Result<SnapshotWatchPoll> {
         let Some(cursor) = self.cursor.clone() else {
-            return Ok((false, false));
+            return Ok(SnapshotWatchPoll {
+                changed: false,
+                stream_changed: false,
+                baseline_replaced: false,
+                events: Vec::new(),
+            });
         };
         let stream_id = cursor.stream_id.clone();
         match client.events(Some(cursor), 256, 0) {
             Ok(batch) => {
                 if batch.events.is_empty() {
                     self.cursor = Some(batch.cursor);
-                    return Ok((false, false));
+                    return Ok(SnapshotWatchPoll {
+                        changed: false,
+                        stream_changed: false,
+                        baseline_replaced: false,
+                        events: Vec::new(),
+                    });
                 }
                 let stream_changed = batch.stream_id != stream_id;
                 let snapshot = client.snapshot()?;
                 self.cursor = Some(batch.cursor);
                 self.snapshot = snapshot;
-                Ok((true, stream_changed))
+                Ok(SnapshotWatchPoll {
+                    changed: true,
+                    stream_changed,
+                    baseline_replaced: false,
+                    events: batch.events,
+                })
             }
             Err(ClientError::Remote(RemoteError {
                 code: Some(ErrorCode::CursorExpired),
                 ..
             })) => {
                 *self = Self::baseline(client)?;
-                Ok((true, self.stream_id() != Some(stream_id.as_str())))
+                Ok(SnapshotWatchPoll {
+                    changed: true,
+                    stream_changed: self.stream_id() != Some(stream_id.as_str()),
+                    baseline_replaced: true,
+                    events: Vec::new(),
+                })
             }
             Err(ClientError::Remote(RemoteError {
                 code: Some(ErrorCode::UnsupportedVersion),
@@ -241,7 +269,12 @@ impl SnapshotWatch {
             }))
             | Err(ClientError::Protocol(ProtocolError::UnsupportedVersion(_))) => {
                 *self = Self::baseline(client)?;
-                Ok((true, self.stream_id() != Some(stream_id.as_str())))
+                Ok(SnapshotWatchPoll {
+                    changed: true,
+                    stream_changed: self.stream_id() != Some(stream_id.as_str()),
+                    baseline_replaced: true,
+                    events: Vec::new(),
+                })
             }
             Err(error) => Err(error),
         }
@@ -1195,7 +1228,7 @@ impl Client {
         takeover: bool,
         profile: TerminalProfile,
     ) -> Result<Attachment> {
-        self.attach_with_restart(shell_id.into(), takeover, false, profile, None)
+        self.attach_with_restart(shell_id.into(), takeover, false, None, profile, None)
     }
 
     pub fn attach_with_client_environment(
@@ -1208,6 +1241,7 @@ impl Client {
             shell_id.into(),
             takeover,
             false,
+            None,
             profile,
             Some(current_environment()),
         )
@@ -1219,7 +1253,7 @@ impl Client {
         takeover: bool,
         profile: TerminalProfile,
     ) -> Result<Attachment> {
-        self.attach_with_restart(shell_id.into(), takeover, true, profile, None)
+        self.attach_with_restart(shell_id.into(), takeover, true, None, profile, None)
     }
 
     pub fn attach_restarting_with_client_environment(
@@ -1232,6 +1266,24 @@ impl Client {
             shell_id.into(),
             takeover,
             true,
+            None,
+            profile,
+            Some(current_environment()),
+        )
+    }
+
+    pub fn attach_exact_run_with_client_environment(
+        &self,
+        shell_id: impl Into<String>,
+        expected_run_id: impl Into<String>,
+        takeover: bool,
+        profile: TerminalProfile,
+    ) -> Result<Attachment> {
+        self.attach_with_restart(
+            shell_id.into(),
+            takeover,
+            false,
+            Some(expected_run_id.into()),
             profile,
             Some(current_environment()),
         )
@@ -1242,6 +1294,7 @@ impl Client {
         shell_id: String,
         takeover: bool,
         restart_exited: bool,
+        expected_run_id: Option<String>,
         profile: TerminalProfile,
         environment: Option<UnixEnvironment>,
     ) -> Result<Attachment> {
@@ -1249,6 +1302,7 @@ impl Client {
             shell_id,
             takeover,
             restart_exited,
+            expected_run_id,
             profile,
             environment,
         })?;
@@ -1600,6 +1654,7 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
+            reject_protocol(&listener, 26, 25);
             reject_protocol(&listener, 25, 24);
             reject_protocol(&listener, 24, 23);
             reject_protocol(&listener, 23, 22);
@@ -1891,6 +1946,7 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
+            reject_protocol(&listener, 26, 25);
             reject_protocol(&listener, 25, 24);
             reject_protocol(&listener, 24, 23);
             reject_protocol(&listener, 23, 22);
@@ -1952,6 +2008,7 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
+            reject_protocol(&listener, 26, 25);
             reject_protocol(&listener, 25, 24);
             reject_protocol(&listener, 24, 23);
             reject_protocol(&listener, 23, 22);

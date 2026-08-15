@@ -912,6 +912,7 @@ fn handle_connection(
         shell_id,
         takeover,
         restart_exited,
+        expected_run_id,
         profile,
         environment,
     } = request.message
@@ -924,6 +925,7 @@ fn handle_connection(
             AttachRequestOptions {
                 takeover,
                 restart_exited,
+                expected_run_id,
                 profile,
                 environment,
             },
@@ -10240,6 +10242,7 @@ impl ShellRuntimeManager {
 struct AttachRequestOptions {
     takeover: bool,
     restart_exited: bool,
+    expected_run_id: Option<String>,
     profile: TerminalProfile,
     environment: Option<UnixEnvironment>,
 }
@@ -10256,6 +10259,7 @@ impl ShellRuntimeManager {
         let AttachRequestOptions {
             takeover,
             restart_exited,
+            expected_run_id,
             profile,
             environment,
         } = options;
@@ -10309,6 +10313,31 @@ impl ShellRuntimeManager {
         let workspace = registry.workspace(&shell.workspace_id)?;
         let workspace_name = lock(&workspace.name)?.clone();
         let shell_name = lock(&shell.name)?.clone();
+        if expected_run_id.is_some() && restart_exited {
+            return send_response(
+                &mut stream,
+                response_version,
+                DaemonError::validation("exact run attachment cannot restart an exited shell")
+                    .into_response(),
+            );
+        }
+        if let Some(expected_run_id) = expected_run_id.as_deref() {
+            let lifecycle = lock(&shell.lifecycle)?;
+            if !matches!(
+                &*lifecycle,
+                ShellLifecycle::Running { run, .. } if run.id == expected_run_id
+            ) {
+                return send_response(
+                    &mut stream,
+                    response_version,
+                    DaemonError::lifecycle(
+                        ErrorCode::RunChanged,
+                        "shell is no longer running the expected scheduled execution run",
+                    )
+                    .into_response(),
+                );
+            }
+        }
         if restart_exited {
             let old_runtime = match &*lock(&shell.lifecycle)? {
                 ShellLifecycle::Exited { runtime, .. } => runtime.clone(),

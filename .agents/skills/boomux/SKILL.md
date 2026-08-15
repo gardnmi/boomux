@@ -4,7 +4,7 @@ description: Inspect and manage Boomux persistent terminal workspaces, launchers
 compatibility: Requires boomux on PATH. Some name operations require Boomux workspace context or an explicit --workspace; schedule names require BOOMUX_WORKSPACE_ID or explicit --workspace; agent mutation and supervision require exact shell-run context, and continuation schedules or supervision require caller-supplied exact canonical session identity.
 metadata:
   author: boomux
-  version: "11"
+  version: "14"
 ---
 
 # Boomux
@@ -459,7 +459,7 @@ boomux doctor
 `boomux` and `boomux ui` must run from a fresh host terminal; they are rejected
 when `BOOMUX_SHELL_ID` is set. `boomux doctor` can run in either context.
 
-The dashboard has workspace, Agent, launcher, shell, and command views. `/` or
+The dashboard has Workspaces, Agents, Shells, and Schedules views. `/` or
 `:` opens its action and search palette, `?` shows contextual help, `Enter`
 restores the selected workspace or opens the selected entry, and `x` followed
 by `y` confirms close or removal. Shell previews are bounded and read-only.
@@ -469,6 +469,26 @@ managed terminal selects its owning workspace and shell or Agent row once;
 manual navigation remains until another focus change. Press `Space` to pin the
 current dashboard selection and pause focus following; press it again to unpin
 and catch up to the currently focused terminal.
+
+In Schedules, `j`/`k` select schedules and `[`/`]` select retained executions by
+exact execution ID. `Enter` opens only a selected exact Starting or Active run,
+or navigates to its exact blocked Agent. `u` runs now with a fresh dispatch key,
+`p` pauses or resumes future timed work, `c` then
+`y` confirms cancellation of the selected exact active execution, `h`
+explicitly loads bounded exact-schedule history, `t` explicitly reads bounded
+transcript and tool content for the selected exact linked canonical session, and
+`x` then `y` confirms removal. `a` shows `boomux schedule create --help`. Prompt
+text is never shown. Schedule-owned shells are excluded from ordinary rows and
+workspace restore; their exact Agents remain selectable without ordinary shell
+actions. Blocked navigation uses the exact linked Agent ID and does not
+acknowledge durable attention. Protocol 25
+has no skip-next operation; never emulate one with pause and resume.
+Open is available only for Starting or Active executions with exact shell/run
+links and uses a protocol-26 exact-run attachment that cannot restart into a
+later run. Protocol-25 dashboards retain schedule controls and history but
+disable exact Open with upgrade-and-restart guidance.
+The transcript overlay starts at its newest bounded rows; arrows or `j`/`k`,
+Page Up/Page Down, and Home/End scroll it.
 
 ## Configuration
 

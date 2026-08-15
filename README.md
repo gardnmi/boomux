@@ -167,7 +167,7 @@ explicit `--workspace`.
 
 ## Dashboard
 
-The dashboard has three primary views: Workspaces, Agents, and Shells. The
+The dashboard has four primary views: Workspaces, Agents, Shells, and Schedules. The
 Workspaces view combines the selected workspace's Agents, shells, commands, and
 launchers in one item table. Its `ACTIVITY` column shows an Agent task, shell
 foreground process, stored command, or launcher command; branch and worktree
@@ -181,12 +181,19 @@ Git, run, lifecycle, or launcher information that does not fit cleanly in a
 table. Shell output previews retain terminal colors and expose viewport and
 follow state without allowing input from the dashboard.
 
+The Schedules view shows friendly triggers, next occurrences, last outcomes,
+active/paused state, workspace, integration, scheduler health, and bounded
+execution history. Its detail panel shows prompt revision, never prompt text.
+Schedule-owned shells do not appear as ordinary shell rows. Transcript and tool
+content is loaded only when `t` is pressed on an exact linked canonical session;
+it is not read for rendering, search, notices, or diagnostics.
+
 The workspace overview includes item and Agent-state counts plus its most urgent
 outstanding attention item.
 
 | Key | Action |
 | --- | --- |
-| `Tab`, `Shift-Tab`, `1`-`3` | Change view. |
+| `Tab`, `Shift-Tab`, `1`-`4` | Change view. |
 | `/` or `:` | Search actions, workspaces, and entries. |
 | `?` | Explain keys plus the selected kind and state. |
 | `h`, `l`, left, right | Move between workspace and entry tables. |
@@ -196,6 +203,20 @@ outstanding attention item.
 | `e` | Rename the selection. |
 | `x`, then `y` | Confirm closing or removing the selection. |
 | `q` or `Esc` | Quit from normal mode. |
+
+In Schedules, `j`/`k` select schedules, `[`/`]` select retained executions by
+exact execution ID, and `Enter` opens a selected exact Starting or Active run or
+navigates to its exact blocked Agent. `u` runs now with a fresh dispatch key,
+and `p` pauses or resumes. `c` then `y` confirms
+cancellation of the selected exact active execution, `h` explicitly loads
+bounded scoped history, `t` explicitly reads bounded linked transcript/tool
+content, and `x` then `y` removes the schedule and persisted prompt. The
+transcript opens at its newest rows; arrows or `j`/`k`, Page Up/Page Down, and
+Home/End navigate it. `a` shows the schedule
+creation CLI help path. Protocol 25 has no skip-next control and the dashboard
+does not emulate one with pause/resume. Exact Scheduled Execution terminal Open
+requires protocol 26; protocol-25 dashboards retain schedule controls and
+history while showing upgrade-and-restart guidance for Open.
 
 Closing a workspace terminates its managed shells and removes its schedules and
 persisted prompts. Closing a shell or command terminates its managed process.
@@ -327,6 +348,10 @@ execution and never spawn twice. Execution inspection and events omit prompts.
 Execution lists are bounded newest-first and report truncation. Revision-aware
 wait returns on the next committed process or Agent-link change; reconnect with
 the same revision when daemon replacement reports `daemon_stopping`.
+
+The dashboard's Schedules tab exposes the same typed controls and bounded
+history without showing prompt text. Blocked execution navigation uses only the
+exact linked Agent ID and preserves durable Agent attention semantics.
 
 Enabled schedules are evaluated by the daemon in their stored IANA timezone.
 DST gaps are skipped, repeated local minutes fire once, and persisted occurrence

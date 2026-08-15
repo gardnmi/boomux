@@ -193,6 +193,8 @@ Protocol 22 advertises `protocol_22`, `agent_schedule_management`, and
 Protocol 25 adds `protocol_25`, `revision_aware_scheduled_execution_wait`,
 `bounded_scheduled_execution_history`, and
 `scheduled_execution_notifications`.
+Protocol 26 adds `protocol_26` and `exact_run_attachment` for the internal
+additive expected-run attachment handshake used by Scheduled Execution opens.
 
 ## Execution Data
 

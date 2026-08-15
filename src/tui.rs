@@ -148,8 +148,171 @@ pub(crate) struct WorkspaceView {
 
 pub(crate) struct DashboardState {
     pub(crate) workspaces: Vec<WorkspaceView>,
+    pub(crate) schedules: Vec<ScheduleView>,
+    pub(crate) scheduling: SchedulingView,
+    pub(crate) exact_run_attachment: bool,
     pub(crate) focused_terminal: Option<FocusedTerminalView>,
     pub(crate) reset_focus_revision: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SchedulingView {
+    Unsupported {
+        required_protocol: u32,
+        negotiated: u32,
+    },
+    Active {
+        active: u16,
+        maximum: u16,
+    },
+    Offline {
+        active: u16,
+        maximum: u16,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ScheduleView {
+    pub(crate) id: String,
+    pub(crate) workspace_id: String,
+    pub(crate) workspace: String,
+    pub(crate) name: String,
+    pub(crate) integration: String,
+    pub(crate) cwd: String,
+    pub(crate) state: ScheduleDisplayState,
+    pub(crate) friendly_trigger: String,
+    pub(crate) exact_trigger: String,
+    pub(crate) timezone: String,
+    pub(crate) next_occurrence_ms: Option<u64>,
+    pub(crate) prompt_revision: u64,
+    pub(crate) executions: Vec<ExecutionView>,
+    pub(crate) history_truncated: bool,
+    pub(crate) possible_pruning_boundary: bool,
+    pub(crate) history_scoped: bool,
+    pub(crate) history_complete: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ScheduleDisplayState {
+    Paused,
+    Enabled,
+}
+
+impl ScheduleDisplayState {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Paused => "paused",
+            Self::Enabled => "enabled",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ExecutionView {
+    pub(crate) id: String,
+    pub(crate) state: ExecutionDisplayState,
+    pub(crate) reason: Option<ExecutionReasonDisplay>,
+    pub(crate) outcome: Option<ExecutionOutcomeDisplay>,
+    pub(crate) requested_at_ms: u64,
+    pub(crate) prompt_revision: u64,
+    pub(crate) shell_id: Option<String>,
+    pub(crate) run_id: Option<String>,
+    pub(crate) agent_id: Option<String>,
+    pub(crate) agent_state: Option<AgentDisplayState>,
+    pub(crate) session_id: Option<String>,
+    pub(crate) transcript_available: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExecutionDisplayState {
+    Skipped,
+    Claimed,
+    Starting,
+    Active,
+    DispatchFailed,
+    Exited,
+    Cancelled,
+    Interrupted,
+}
+
+impl ExecutionDisplayState {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Skipped => "skipped",
+            Self::Claimed => "claimed",
+            Self::Starting => "starting",
+            Self::Active => "active",
+            Self::DispatchFailed => "failed",
+            Self::Exited => "exited",
+            Self::Cancelled => "cancelled",
+            Self::Interrupted => "interrupted",
+        }
+    }
+
+    pub(crate) const fn is_active(self) -> bool {
+        matches!(self, Self::Claimed | Self::Starting | Self::Active)
+    }
+}
+
+impl ExecutionView {
+    fn is_openable(&self) -> bool {
+        matches!(
+            self.state,
+            ExecutionDisplayState::Starting | ExecutionDisplayState::Active
+        ) && self.shell_id.is_some()
+            && self.run_id.is_some()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExecutionReasonDisplay {
+    Overlap,
+    ActiveSession,
+    WorkspaceCapacity,
+    GlobalCapacity,
+    Missed,
+    PausedRace,
+    InvalidTarget,
+    RunnerStartFailed,
+    HostSpawnFailed,
+    CancelledByUser,
+    ColdDaemonRecovery,
+    RunnerExitedWithoutReport,
+    DaemonShutdown,
+}
+
+impl ExecutionReasonDisplay {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Overlap => "overlap",
+            Self::ActiveSession => "active session",
+            Self::WorkspaceCapacity => "workspace capacity",
+            Self::GlobalCapacity => "global capacity",
+            Self::Missed => "missed",
+            Self::PausedRace => "paused race",
+            Self::InvalidTarget => "invalid target",
+            Self::RunnerStartFailed => "runner start failed",
+            Self::HostSpawnFailed => "host spawn failed",
+            Self::CancelledByUser => "cancelled by user",
+            Self::ColdDaemonRecovery => "cold daemon recovery",
+            Self::RunnerExitedWithoutReport => "runner exited without report",
+            Self::DaemonShutdown => "daemon shutdown",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExecutionOutcomeDisplay {
+    ExitCode(i32),
+    Signal(i32),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TranscriptView {
+    pub(crate) execution_id: String,
+    pub(crate) session_id: String,
+    pub(crate) lines: Vec<String>,
+    pub(crate) truncated: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -160,6 +323,7 @@ pub(crate) struct FocusedTerminalView {
 }
 
 pub(crate) struct WorkspaceAttentionView {
+    pub(crate) agent_id: String,
     pub(crate) shell_id: String,
     pub(crate) agent_name: String,
     pub(crate) reason: AttentionReason,
@@ -195,6 +359,7 @@ pub(crate) enum WorkspaceItemView {
 pub(crate) struct AgentShellView {
     pub(crate) shell: TerminalView,
     pub(crate) agent: Option<AgentView>,
+    pub(crate) schedule_id: Option<String>,
 }
 
 impl AgentShellView {
@@ -303,35 +468,44 @@ impl WorkspaceView {
     fn shell_count(&self) -> usize {
         self.items
             .iter()
-            .filter(|item| item.kind() == ItemKind::Shell)
+            .filter(|item| item.ordinary_visible() && item.kind() == ItemKind::Shell)
             .count()
     }
 
     fn command_count(&self) -> usize {
         self.items
             .iter()
-            .filter(|item| item.kind() == ItemKind::Command)
+            .filter(|item| item.ordinary_visible() && item.kind() == ItemKind::Command)
             .count()
     }
 
     fn launcher_count(&self) -> usize {
         self.items
             .iter()
-            .filter(|item| item.kind() == ItemKind::Launcher)
+            .filter(|item| item.ordinary_visible() && item.kind() == ItemKind::Launcher)
             .count()
     }
 
     fn agent_count(&self) -> usize {
         self.items
             .iter()
-            .filter(|item| item.kind() == ItemKind::Agent)
+            .filter(|item| item.ordinary_visible() && item.kind() == ItemKind::Agent)
             .count()
     }
 
     fn process_count(&self) -> usize {
         self.items
             .iter()
-            .filter(|item| !matches!(item, WorkspaceItemView::Launcher(_)))
+            .filter(|item| {
+                item.ordinary_visible() && !matches!(item, WorkspaceItemView::Launcher(_))
+            })
+            .count()
+    }
+
+    fn ordinary_item_count(&self) -> usize {
+        self.items
+            .iter()
+            .filter(|item| item.ordinary_visible())
             .count()
     }
 }
@@ -345,6 +519,10 @@ pub(crate) enum ItemKind {
 }
 
 impl WorkspaceItemView {
+    fn ordinary_visible(&self) -> bool {
+        !matches!(self, Self::AgentShell(agent) if agent.schedule_id.is_some())
+    }
+
     fn kind(&self) -> ItemKind {
         match self {
             Self::AgentShell(_) => ItemKind::Agent,
@@ -489,6 +667,24 @@ pub(crate) enum DashboardEffect {
     },
     CheckForUpdates,
     Refresh,
+    RunSchedule(String),
+    PauseSchedule(String),
+    ResumeSchedule(String),
+    CancelExecution(String),
+    OpenScheduledExecution {
+        execution_id: String,
+        shell_id: String,
+        run_id: String,
+    },
+    RemoveSchedule(String),
+    LoadScheduleHistory {
+        schedule_id: String,
+        limit: u16,
+    },
+    ReadExecutionTranscript {
+        session_id: String,
+        execution_id: String,
+    },
     ReadTerminalPreview {
         shell_id: String,
         run_id: Option<String>,
@@ -506,6 +702,11 @@ pub(crate) enum DashboardEvent {
     UpdateCheckCompleted,
     OperationCompleted(Result<String, String>),
     RefreshCompleted(Result<DashboardState, String>),
+    ScheduleHistoryCompleted {
+        schedule_id: String,
+        result: Result<(Vec<ExecutionView>, bool), String>,
+    },
+    TranscriptCompleted(Result<TranscriptView, String>),
     TerminalPreviewCompleted {
         shell_id: String,
         run_id: Option<String>,
@@ -529,6 +730,10 @@ where
 
 struct App {
     workspaces: Vec<WorkspaceView>,
+    schedules: Vec<ScheduleView>,
+    scheduling: SchedulingView,
+    exact_run_attachment: bool,
+    selected_execution_id: Option<String>,
     workspace_state: TableState,
     item_state: TableState,
     global_state: TableState,
@@ -539,6 +744,8 @@ struct App {
     pending_close: Option<PendingClose>,
     project_context: ProjectContext,
     terminal_preview: Option<TerminalPreviewState>,
+    transcript: Option<TranscriptView>,
+    transcript_scroll_from_bottom: usize,
     follow_focused_terminal: bool,
     selection_pinned: bool,
     observed_focus_revision: Option<u64>,
@@ -563,16 +770,23 @@ enum PrimaryTab {
     Workspaces,
     Agents,
     Shells,
+    Schedules,
 }
 
 impl PrimaryTab {
-    const ALL: [Self; 3] = [Self::Workspaces, Self::Agents, Self::Shells];
+    const ALL: [Self; 4] = [
+        Self::Workspaces,
+        Self::Agents,
+        Self::Shells,
+        Self::Schedules,
+    ];
 
     fn kind(self) -> Option<ItemKind> {
         match self {
             Self::Workspaces => None,
             Self::Agents => Some(ItemKind::Agent),
             Self::Shells => Some(ItemKind::Shell),
+            Self::Schedules => None,
         }
     }
 
@@ -581,6 +795,7 @@ impl PrimaryTab {
             Self::Workspaces => "WORKSPACES",
             Self::Agents => "AGENTS",
             Self::Shells => "SHELLS",
+            Self::Schedules => "SCHEDULES",
         }
     }
 }
@@ -619,6 +834,8 @@ pub(crate) enum CloseTarget {
     Workspace(String),
     Shell(String),
     Launcher(String),
+    Schedule(String),
+    Execution(String),
 }
 
 impl RenameTarget {
@@ -636,6 +853,7 @@ enum Mode {
     PickProject(ProjectPicker),
     Palette(CommandPalette),
     Help,
+    Transcript,
     Rename { target: RenameTarget, input: String },
 }
 
@@ -680,6 +898,7 @@ enum PaletteActionGroup {
     Create,
     Rename,
     Close,
+    Manage,
     Help,
 }
 
@@ -692,6 +911,7 @@ impl PaletteActionGroup {
             Self::Create => "CREATE",
             Self::Rename => "RENAME",
             Self::Close => "CLOSE",
+            Self::Manage => "MANAGE",
             Self::Help => "HELP",
         }
     }
@@ -706,6 +926,9 @@ enum PaletteKindGroup {
     Shells,
     Commands,
     Launchers,
+    Schedules,
+    Executions,
+    ScheduleNotices,
     Dashboard,
 }
 
@@ -719,6 +942,9 @@ impl PaletteKindGroup {
             Self::Shells => "SHELLS",
             Self::Commands => "COMMANDS",
             Self::Launchers => "LAUNCHERS",
+            Self::Schedules => "SCHEDULES",
+            Self::Executions => "EXECUTIONS",
+            Self::ScheduleNotices => "SCHEDULE NOTICES",
             Self::Dashboard => "DASHBOARD",
         }
     }
@@ -739,6 +965,11 @@ enum PaletteCommand {
     Attention {
         workspace_id: String,
         shell_id: String,
+        agent_id: String,
+    },
+    Schedule {
+        schedule_id: String,
+        action: SchedulePaletteAction,
     },
 }
 
@@ -757,6 +988,18 @@ enum ItemPaletteAction {
     Open,
     Rename,
     Close,
+}
+
+#[derive(Clone)]
+enum SchedulePaletteAction {
+    GoTo,
+    Run,
+    PauseResume,
+    CancelExecution(String),
+    SelectExecution(String),
+    OpenExecution(String),
+    LoadHistory,
+    Remove,
 }
 
 struct Message {
@@ -867,7 +1110,25 @@ impl ProjectPicker {
 }
 
 impl CommandPalette {
+    #[cfg(test)]
     fn new(workspaces: &[WorkspaceView]) -> Self {
+        Self::new_with_schedules(
+            workspaces,
+            &[],
+            &SchedulingView::Unsupported {
+                required_protocol: 25,
+                negotiated: 0,
+            },
+            false,
+        )
+    }
+
+    fn new_with_schedules(
+        workspaces: &[WorkspaceView],
+        schedules: &[ScheduleView],
+        scheduling: &SchedulingView,
+        exact_run_attachment: bool,
+    ) -> Self {
         let mut entries = vec![
             PaletteEntry {
                 action_group: PaletteActionGroup::Create,
@@ -910,7 +1171,7 @@ impl CommandPalette {
                     },
                     detail: format!(
                         "{} items, {} attention",
-                        workspace.items.len(),
+                        workspace.ordinary_item_count(),
                         workspace.attention_count
                     ),
                     keywords: workspace_keywords.clone(),
@@ -922,6 +1183,9 @@ impl CommandPalette {
             }
 
             for item in &workspace.items {
+                if !item.ordinary_visible() {
+                    continue;
+                }
                 let kind = item.kind();
                 let identity = ItemIdentity {
                     workspace_id: workspace.id.clone(),
@@ -998,6 +1262,7 @@ impl CommandPalette {
                         command: PaletteCommand::Attention {
                             workspace_id: workspace.id.clone(),
                             shell_id: attention.shell_id.clone(),
+                            agent_id: attention.agent_id.clone(),
                         },
                     },
                 ));
@@ -1011,6 +1276,153 @@ impl CommandPalette {
                 .then_with(|| left.3.cmp(&right.3))
         });
         entries.extend(attention_entries.into_iter().map(|entry| entry.4));
+
+        for schedule in schedules {
+            let keywords = format!(
+                "schedule {} {} {} {} {}",
+                schedule.name,
+                schedule.id,
+                schedule.workspace,
+                schedule.integration,
+                schedule.state.label()
+            );
+            for (action, action_group, detail) in [
+                (
+                    SchedulePaletteAction::GoTo,
+                    PaletteActionGroup::GoTo,
+                    "inspect",
+                ),
+                (
+                    SchedulePaletteAction::Run,
+                    PaletteActionGroup::Manage,
+                    "run now",
+                ),
+                (
+                    SchedulePaletteAction::PauseResume,
+                    PaletteActionGroup::Manage,
+                    if schedule.state == ScheduleDisplayState::Paused {
+                        "resume"
+                    } else {
+                        "pause"
+                    },
+                ),
+                (
+                    SchedulePaletteAction::LoadHistory,
+                    PaletteActionGroup::Manage,
+                    "load scoped history",
+                ),
+                (
+                    SchedulePaletteAction::Remove,
+                    PaletteActionGroup::Close,
+                    "remove with confirmation",
+                ),
+            ] {
+                entries.push(PaletteEntry {
+                    action_group,
+                    kind_group: PaletteKindGroup::Schedules,
+                    label: format!("{} / {}", schedule.workspace, schedule.name),
+                    detail: detail.into(),
+                    keywords: keywords.clone(),
+                    command: PaletteCommand::Schedule {
+                        schedule_id: schedule.id.clone(),
+                        action,
+                    },
+                });
+            }
+            for execution in schedule.executions.iter().take(5) {
+                entries.push(PaletteEntry {
+                    action_group: PaletteActionGroup::GoTo,
+                    kind_group: PaletteKindGroup::Executions,
+                    label: format!(
+                        "{} / {} / {}",
+                        schedule.workspace,
+                        schedule.name,
+                        short_id(&execution.id)
+                    ),
+                    detail: execution_summary(execution),
+                    keywords: format!(
+                        "execution {} {} {keywords}",
+                        execution.id,
+                        execution.state.label()
+                    ),
+                    command: PaletteCommand::Schedule {
+                        schedule_id: schedule.id.clone(),
+                        action: SchedulePaletteAction::SelectExecution(execution.id.clone()),
+                    },
+                });
+                if exact_run_attachment && execution.is_openable() {
+                    entries.push(PaletteEntry {
+                        action_group: PaletteActionGroup::Open,
+                        kind_group: PaletteKindGroup::Executions,
+                        label: format!(
+                            "Open {} / {} / {}",
+                            schedule.workspace,
+                            schedule.name,
+                            short_id(&execution.id)
+                        ),
+                        detail: "open exact retained execution run".into(),
+                        keywords: format!("open execution {} {keywords}", execution.id),
+                        command: PaletteCommand::Schedule {
+                            schedule_id: schedule.id.clone(),
+                            action: SchedulePaletteAction::OpenExecution(execution.id.clone()),
+                        },
+                    });
+                }
+                if execution.state.is_active() {
+                    entries.push(PaletteEntry {
+                        action_group: PaletteActionGroup::Manage,
+                        kind_group: PaletteKindGroup::Executions,
+                        label: format!(
+                            "Cancel {} / {} / {}",
+                            schedule.workspace,
+                            schedule.name,
+                            short_id(&execution.id)
+                        ),
+                        detail: "confirm cancellation of this exact execution".into(),
+                        keywords: format!("execution active cancel {} {keywords}", execution.id),
+                        command: PaletteCommand::Schedule {
+                            schedule_id: schedule.id.clone(),
+                            action: SchedulePaletteAction::CancelExecution(execution.id.clone()),
+                        },
+                    });
+                }
+            }
+            if let Some(execution) = schedule.executions.first()
+                && (execution.state == ExecutionDisplayState::DispatchFailed
+                    || execution.state == ExecutionDisplayState::Interrupted
+                    || execution.state == ExecutionDisplayState::Skipped
+                    || execution.agent_state == Some(AgentDisplayState::Blocked))
+            {
+                entries.push(PaletteEntry {
+                    action_group: PaletteActionGroup::QuickAccess,
+                    kind_group: PaletteKindGroup::ScheduleNotices,
+                    label: format!("{} / {}", schedule.workspace, schedule.name),
+                    detail: execution_summary(execution),
+                    keywords: format!("schedule notice failed skipped missed blocked {keywords}"),
+                    command: PaletteCommand::Schedule {
+                        schedule_id: schedule.id.clone(),
+                        action: SchedulePaletteAction::SelectExecution(execution.id.clone()),
+                    },
+                });
+            }
+        }
+        if matches!(scheduling, SchedulingView::Offline { .. }) {
+            entries.push(PaletteEntry {
+                action_group: PaletteActionGroup::QuickAccess,
+                kind_group: PaletteKindGroup::ScheduleNotices,
+                label: "Scheduler offline".into(),
+                detail: "timed dispatch is not reliable; inspect daemon status and doctor".into(),
+                keywords: "schedule scheduler offline daemon doctor restart".into(),
+                command: schedules
+                    .first()
+                    .map_or(PaletteCommand::ShowHelp, |schedule| {
+                        PaletteCommand::Schedule {
+                            schedule_id: schedule.id.clone(),
+                            action: SchedulePaletteAction::GoTo,
+                        }
+                    }),
+            });
+        }
 
         let mut palette = Self {
             entries,
@@ -1147,6 +1559,13 @@ impl App {
         }
         Self {
             workspaces,
+            schedules: Vec::new(),
+            scheduling: SchedulingView::Unsupported {
+                required_protocol: 22,
+                negotiated: 0,
+            },
+            exact_run_attachment: false,
+            selected_execution_id: None,
             workspace_state,
             item_state,
             global_state: TableState::default(),
@@ -1157,6 +1576,8 @@ impl App {
             pending_close: None,
             project_context,
             terminal_preview: None,
+            transcript: None,
+            transcript_scroll_from_bottom: 0,
             follow_focused_terminal: false,
             selection_pinned: false,
             observed_focus_revision: None,
@@ -1196,7 +1617,9 @@ impl App {
             .items
             .iter()
             .position(|item| {
-                !matches!(item, WorkspaceItemView::Launcher(_)) && item.id() == focused.shell_id
+                !matches!(item, WorkspaceItemView::Launcher(_))
+                    && item.id() == focused.shell_id
+                    && (self.primary_tab != PrimaryTab::Workspaces || item.ordinary_visible())
             })
         else {
             return;
@@ -1210,7 +1633,15 @@ impl App {
         self.observed_focus_revision = Some(focused.revision);
         if self.primary_tab == PrimaryTab::Workspaces {
             self.workspace_state.select(Some(workspace_index));
-            self.item_state.select(Some(item_index));
+            self.item_state.select(
+                self.workspaces[workspace_index]
+                    .items
+                    .iter()
+                    .take(item_index + 1)
+                    .filter(|item| item.ordinary_visible())
+                    .count()
+                    .checked_sub(1),
+            );
         } else {
             let identity = item_identity(&self.workspaces[workspace_index], item);
             self.global_state
@@ -1243,12 +1674,112 @@ impl App {
             .and_then(|(workspace, item)| self.workspaces.get(workspace)?.items.get(item))
     }
 
+    fn selected_schedule(&self) -> Option<&ScheduleView> {
+        (self.primary_tab == PrimaryTab::Schedules)
+            .then(|| self.global_state.selected())
+            .flatten()
+            .and_then(|index| self.schedules.get(index))
+    }
+
+    fn selected_execution(&self) -> Option<&ExecutionView> {
+        let schedule = self.selected_schedule()?;
+        let id = self.selected_execution_id.as_deref()?;
+        schedule
+            .executions
+            .iter()
+            .find(|execution| execution.id == id)
+    }
+
+    fn sync_selected_execution(&mut self) {
+        let retained = self.selected_schedule().is_some_and(|schedule| {
+            self.selected_execution_id.as_deref().is_some_and(|id| {
+                schedule
+                    .executions
+                    .iter()
+                    .any(|execution| execution.id == id)
+            })
+        });
+        if !retained {
+            self.selected_execution_id = self
+                .selected_schedule()
+                .and_then(|schedule| schedule.executions.first())
+                .map(|execution| execution.id.clone());
+        }
+    }
+
+    fn cycle_execution(&mut self, older: bool) {
+        let Some(schedule) = self.selected_schedule() else {
+            return;
+        };
+        if schedule.executions.is_empty() {
+            self.selected_execution_id = None;
+            return;
+        }
+        let current = self
+            .selected_execution_id
+            .as_deref()
+            .and_then(|id| {
+                schedule
+                    .executions
+                    .iter()
+                    .position(|execution| execution.id == id)
+            })
+            .unwrap_or(0);
+        let next = if older {
+            (current + 1) % schedule.executions.len()
+        } else if current == 0 {
+            schedule.executions.len() - 1
+        } else {
+            current - 1
+        };
+        self.selected_execution_id = Some(schedule.executions[next].id.clone());
+        self.message = None;
+    }
+
+    fn transcript_max_scroll(&self) -> usize {
+        self.transcript.as_ref().map_or(0, |transcript| {
+            transcript
+                .lines
+                .iter()
+                .map(String::len)
+                .sum::<usize>()
+                .saturating_add(transcript.lines.len())
+        })
+    }
+
+    fn scroll_transcript_up(&mut self, lines: usize) {
+        self.transcript_scroll_from_bottom = self
+            .transcript_scroll_from_bottom
+            .saturating_add(lines)
+            .min(self.transcript_max_scroll());
+    }
+
+    fn scroll_transcript_down(&mut self, lines: usize) {
+        self.transcript_scroll_from_bottom =
+            self.transcript_scroll_from_bottom.saturating_sub(lines);
+    }
+
+    fn scroll_transcript_to_start(&mut self) {
+        self.transcript_scroll_from_bottom = self.transcript_max_scroll();
+    }
+
     fn selected_item_location(&self) -> Option<(usize, usize)> {
+        if self.primary_tab == PrimaryTab::Schedules {
+            return None;
+        }
         if self.primary_tab == PrimaryTab::Workspaces {
-            return Some((
-                self.workspace_state.selected()?,
-                self.item_state.selected()?,
-            ));
+            let workspace_index = self.workspace_state.selected()?;
+            let ordinal = self.item_state.selected()?;
+            let item_index = self
+                .workspaces
+                .get(workspace_index)?
+                .items
+                .iter()
+                .enumerate()
+                .filter(|(_, item)| item.ordinary_visible())
+                .nth(ordinal)?
+                .0;
+            return Some((workspace_index, item_index));
         }
         self.global_item_location(self.global_state.selected()?)
     }
@@ -1275,6 +1806,9 @@ impl App {
     }
 
     fn global_item_count(&self) -> usize {
+        if self.primary_tab == PrimaryTab::Schedules {
+            return self.schedules.len();
+        }
         let Some(kind) = self.primary_tab.kind() else {
             return 0;
         };
@@ -1294,6 +1828,9 @@ impl App {
         self.focus = Focus::Items;
         self.global_state
             .select((self.global_item_count() > 0).then_some(0));
+        if tab == PrimaryTab::Schedules {
+            self.sync_selected_execution();
+        }
         self.message = None;
     }
 
@@ -1321,6 +1858,9 @@ impl App {
                 self.global_state.select(Some(next));
             }
             self.message = None;
+            if self.primary_tab == PrimaryTab::Schedules {
+                self.sync_selected_execution();
+            }
             return;
         }
         match self.focus {
@@ -1335,7 +1875,9 @@ impl App {
                 self.select_first_details();
             }
             Focus::Items => {
-                let item_count = self.selected().map_or(0, |workspace| workspace.items.len());
+                let item_count = self
+                    .selected()
+                    .map_or(0, WorkspaceView::ordinary_item_count);
                 if item_count == 0 {
                     return;
                 }
@@ -1363,6 +1905,9 @@ impl App {
                 self.global_state.select(Some(previous));
             }
             self.message = None;
+            if self.primary_tab == PrimaryTab::Schedules {
+                self.sync_selected_execution();
+            }
             return;
         }
         match self.focus {
@@ -1381,7 +1926,9 @@ impl App {
                 self.select_first_details();
             }
             Focus::Items => {
-                let item_count = self.selected().map_or(0, |workspace| workspace.items.len());
+                let item_count = self
+                    .selected()
+                    .map_or(0, WorkspaceView::ordinary_item_count);
                 if item_count == 0 {
                     return;
                 }
@@ -1404,7 +1951,12 @@ impl App {
     }
 
     fn open_palette(&mut self) {
-        self.mode = Mode::Palette(CommandPalette::new(&self.workspaces));
+        self.mode = Mode::Palette(CommandPalette::new_with_schedules(
+            &self.workspaces,
+            &self.schedules,
+            &self.scheduling,
+            self.exact_run_attachment,
+        ));
         self.message = None;
     }
 
@@ -1458,6 +2010,43 @@ impl App {
         true
     }
 
+    fn select_schedule_id(&mut self, schedule_id: &str) -> bool {
+        let Some(index) = self
+            .schedules
+            .iter()
+            .position(|schedule| schedule.id == schedule_id)
+        else {
+            self.message = Some(Message {
+                text: "schedule is no longer available".into(),
+                error: true,
+            });
+            return false;
+        };
+        self.select_tab(PrimaryTab::Schedules);
+        self.global_state.select(Some(index));
+        self.sync_selected_execution();
+        true
+    }
+
+    fn select_execution_id(&mut self, execution_id: &str) -> bool {
+        let Some(schedule) = self.selected_schedule() else {
+            return false;
+        };
+        if !schedule
+            .executions
+            .iter()
+            .any(|execution| execution.id == execution_id)
+        {
+            self.message = Some(Message {
+                text: "execution is no longer retained in this schedule history".into(),
+                error: true,
+            });
+            return false;
+        }
+        self.selected_execution_id = Some(execution_id.to_owned());
+        true
+    }
+
     fn handle_focus_key(&mut self, key: KeyCode) -> bool {
         if self.primary_tab != PrimaryTab::Workspaces {
             return false;
@@ -1474,20 +2063,32 @@ impl App {
     fn select_first_details(&mut self) {
         self.item_state.select(
             self.selected()
-                .is_some_and(|workspace| !workspace.items.is_empty())
+                .is_some_and(|workspace| workspace.ordinary_item_count() > 0)
                 .then_some(0),
         );
     }
 
     fn request_rename(&mut self) {
+        if self.primary_tab == PrimaryTab::Schedules {
+            self.message = Some(Message {
+                text: "Schedule editing is not available; remove and recreate it with `boomux schedule create --help`".into(),
+                error: false,
+            });
+            return;
+        }
         let target = if self.primary_tab != PrimaryTab::Workspaces {
-            self.selected_item().map(item_rename_target)
+            self.selected_item()
+                .filter(|item| item.ordinary_visible())
+                .map(item_rename_target)
         } else {
             match self.focus {
                 Focus::Workspaces => self
                     .selected()
                     .map(|workspace| RenameTarget::Workspace(workspace.id.clone())),
-                Focus::Items => self.selected_item().map(item_rename_target),
+                Focus::Items => self
+                    .selected_item()
+                    .filter(|item| item.ordinary_visible())
+                    .map(item_rename_target),
             }
         };
         if let Some(target) = target {
@@ -1500,6 +2101,13 @@ impl App {
     }
 
     fn request_add(&mut self) -> Option<DashboardEffect> {
+        if self.primary_tab == PrimaryTab::Schedules {
+            self.message = Some(Message {
+                text: "Create schedules with `boomux schedule create --help` (new schedules are paused by default)".into(),
+                error: false,
+            });
+            return None;
+        }
         if self.primary_tab != PrimaryTab::Workspaces {
             return None;
         }
@@ -1538,6 +2146,10 @@ impl App {
     }
 
     fn open_selected_item(&self) -> Option<DashboardEffect> {
+        if matches!(self.selected_item(), Some(WorkspaceItemView::AgentShell(agent)) if agent.schedule_id.is_some())
+        {
+            return None;
+        }
         let workspace_id = self
             .selected_item_workspace()
             .map(|workspace| workspace.id.clone())?;
@@ -1555,8 +2167,19 @@ impl App {
     }
 
     fn request_close(&mut self) {
+        if self.primary_tab == PrimaryTab::Schedules {
+            self.pending_close = self.selected_schedule().map(|schedule| PendingClose {
+                target: CloseTarget::Schedule(schedule.id.clone()),
+                name: schedule.name.clone(),
+                shell_count: 0,
+                launcher_count: 0,
+            });
+            return;
+        }
         self.pending_close = if self.primary_tab != PrimaryTab::Workspaces {
-            self.selected_item().map(item_pending_close)
+            self.selected_item()
+                .filter(|item| item.ordinary_visible())
+                .map(item_pending_close)
         } else {
             match self.focus {
                 Focus::Workspaces => self.selected().map(|workspace| PendingClose {
@@ -1565,7 +2188,10 @@ impl App {
                     shell_count: workspace.process_count(),
                     launcher_count: workspace.launcher_count(),
                 }),
-                Focus::Items => self.selected_item().map(item_pending_close),
+                Focus::Items => self
+                    .selected_item()
+                    .filter(|item| item.ordinary_visible())
+                    .map(item_pending_close),
             }
         };
     }
@@ -1576,7 +2202,20 @@ impl App {
 
     fn confirm_close(&mut self) -> Option<DashboardEffect> {
         let pending = self.pending_close.take()?;
-        Some(DashboardEffect::Close(pending.target))
+        match pending.target {
+            CloseTarget::Schedule(id) => Some(DashboardEffect::RemoveSchedule(id)),
+            CloseTarget::Execution(id) => Some(DashboardEffect::CancelExecution(id)),
+            target => Some(DashboardEffect::Close(target)),
+        }
+    }
+
+    fn request_cancel_execution(&mut self, execution_id: String, label: String) {
+        self.pending_close = Some(PendingClose {
+            target: CloseTarget::Execution(execution_id),
+            name: label,
+            shell_count: 0,
+            launcher_count: 0,
+        });
     }
 
     fn update(&mut self, event: DashboardEvent) -> Vec<DashboardEffect> {
@@ -1594,6 +2233,37 @@ impl App {
                 return vec![DashboardEffect::Refresh];
             }
             DashboardEvent::RefreshCompleted(result) => self.apply_refresh(result),
+            DashboardEvent::ScheduleHistoryCompleted {
+                schedule_id,
+                result,
+            } => match result {
+                Ok((executions, truncated)) => {
+                    if let Some(schedule) = self
+                        .schedules
+                        .iter_mut()
+                        .find(|schedule| schedule.id == schedule_id)
+                    {
+                        schedule.executions = executions;
+                        schedule.history_truncated = truncated;
+                        schedule.history_scoped = true;
+                        schedule.history_complete = !truncated;
+                        self.message = Some(Message {
+                            text: "Loaded bounded history for the selected schedule".into(),
+                            error: false,
+                        });
+                        self.sync_selected_execution();
+                    }
+                }
+                Err(text) => self.message = Some(Message { text, error: true }),
+            },
+            DashboardEvent::TranscriptCompleted(result) => match result {
+                Ok(transcript) => {
+                    self.transcript = Some(transcript);
+                    self.transcript_scroll_from_bottom = 0;
+                    self.mode = Mode::Transcript;
+                }
+                Err(text) => self.message = Some(Message { text, error: true }),
+            },
             DashboardEvent::TerminalPreviewCompleted {
                 shell_id,
                 run_id,
@@ -1625,6 +2295,24 @@ impl App {
             handle_help_key(self, code, modifiers);
             return None;
         }
+        if matches!(self.mode, Mode::Transcript) {
+            if modifiers.difference(KeyModifiers::SHIFT).is_empty() {
+                match code {
+                    KeyCode::Esc | KeyCode::Char('q' | 't') => {
+                        self.mode = Mode::Normal;
+                        self.transcript = None;
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => self.scroll_transcript_up(1),
+                    KeyCode::Down | KeyCode::Char('j') => self.scroll_transcript_down(1),
+                    KeyCode::PageUp => self.scroll_transcript_up(10),
+                    KeyCode::PageDown => self.scroll_transcript_down(10),
+                    KeyCode::Home => self.scroll_transcript_to_start(),
+                    KeyCode::End => self.transcript_scroll_from_bottom = 0,
+                    _ => {}
+                }
+            }
+            return None;
+        }
         if matches!(self.mode, Mode::Palette(_)) {
             return handle_palette_key(self, code, modifiers)
                 .and_then(|command| execute_palette_command(self, command));
@@ -1644,6 +2332,9 @@ impl App {
             KeyCode::Home => self.scroll_terminal_preview_to_start(),
             KeyCode::End => self.scroll_terminal_preview_to_end(),
             KeyCode::Enter => {
+                if self.primary_tab == PrimaryTab::Schedules {
+                    return self.open_selected_schedule_link();
+                }
                 return if self.primary_tab != PrimaryTab::Workspaces {
                     self.open_selected_item()
                 } else {
@@ -1654,6 +2345,64 @@ impl App {
                 };
             }
             KeyCode::Char('r') => return Some(DashboardEffect::Refresh),
+            KeyCode::Char('[') if self.primary_tab == PrimaryTab::Schedules => {
+                self.cycle_execution(false);
+            }
+            KeyCode::Char(']') if self.primary_tab == PrimaryTab::Schedules => {
+                self.cycle_execution(true);
+            }
+            KeyCode::Char('u') if self.primary_tab == PrimaryTab::Schedules => {
+                return self
+                    .selected_schedule()
+                    .map(|schedule| DashboardEffect::RunSchedule(schedule.id.clone()));
+            }
+            KeyCode::Char('p') if self.primary_tab == PrimaryTab::Schedules => {
+                return self
+                    .selected_schedule()
+                    .map(|schedule| match schedule.state {
+                        ScheduleDisplayState::Paused => {
+                            DashboardEffect::ResumeSchedule(schedule.id.clone())
+                        }
+                        ScheduleDisplayState::Enabled => {
+                            DashboardEffect::PauseSchedule(schedule.id.clone())
+                        }
+                    });
+            }
+            KeyCode::Char('c') if self.primary_tab == PrimaryTab::Schedules => {
+                if let Some(execution) = self
+                    .selected_execution()
+                    .filter(|execution| execution.state.is_active())
+                    .cloned()
+                {
+                    self.request_cancel_execution(
+                        execution.id.clone(),
+                        format!("execution {}", short_id(&execution.id)),
+                    );
+                }
+                return None;
+            }
+            KeyCode::Char('h') if self.primary_tab == PrimaryTab::Schedules => {
+                return self.selected_schedule().map(|schedule| {
+                    DashboardEffect::LoadScheduleHistory {
+                        schedule_id: schedule.id.clone(),
+                        limit: 100,
+                    }
+                });
+            }
+            KeyCode::Char('t') if self.primary_tab == PrimaryTab::Schedules => {
+                return self
+                    .selected_execution()
+                    .filter(|execution| {
+                        execution.transcript_available && execution.session_id.is_some()
+                    })
+                    .map(|execution| DashboardEffect::ReadExecutionTranscript {
+                        session_id: execution
+                            .session_id
+                            .clone()
+                            .expect("transcript-capable execution has a session"),
+                        execution_id: execution.id.clone(),
+                    });
+            }
             KeyCode::Char('x') => self.request_close(),
             KeyCode::Char('a') => return self.request_add(),
             KeyCode::Char('e') => self.request_rename(),
@@ -1675,6 +2424,9 @@ impl App {
         match result {
             Ok(state) => {
                 self.replace_workspaces(state.workspaces);
+                self.replace_schedules(state.schedules);
+                self.scheduling = state.scheduling;
+                self.exact_run_attachment = state.exact_run_attachment;
                 if state.reset_focus_revision {
                     self.observed_focus_revision = None;
                 }
@@ -1822,9 +2574,10 @@ impl App {
                     workspace
                         .items
                         .iter()
+                        .filter(|item| item.ordinary_visible())
                         .position(|item| item_matches(item, &target))
                 })
-                .or_else(|| (!workspace.items.is_empty()).then_some(0))
+                .or_else(|| (workspace.ordinary_item_count() > 0).then_some(0))
         });
         self.item_state.select(item_index);
         if self.primary_tab != PrimaryTab::Workspaces {
@@ -1836,6 +2589,96 @@ impl App {
         if self.workspaces.is_empty() {
             self.focus = Focus::Workspaces;
         }
+    }
+
+    fn replace_schedules(&mut self, schedules: Vec<ScheduleView>) {
+        let selected = self.selected_schedule().map(|schedule| schedule.id.clone());
+        let previous = self.global_state.selected().unwrap_or(0);
+        self.schedules = schedules;
+        if self.primary_tab == PrimaryTab::Schedules {
+            self.global_state.select(
+                selected
+                    .and_then(|id| self.schedules.iter().position(|schedule| schedule.id == id))
+                    .or_else(|| {
+                        (!self.schedules.is_empty())
+                            .then_some(previous.min(self.schedules.len() - 1))
+                    }),
+            );
+            self.sync_selected_execution();
+        }
+    }
+
+    fn open_selected_schedule_link(&mut self) -> Option<DashboardEffect> {
+        let execution = self.selected_execution()?.clone();
+        if execution.agent_state == Some(AgentDisplayState::Blocked) {
+            if let Some(agent_id) = execution.agent_id.as_deref()
+                && self.select_agent_id(agent_id)
+            {
+                return None;
+            }
+            self.message = Some(Message {
+                text: format!(
+                    "Exact linked Agent {} is not a current dashboard row; inspect it with `boomux agent inspect {}`",
+                    execution.agent_id.as_deref().unwrap_or("-"),
+                    execution.agent_id.as_deref().unwrap_or("-")
+                ),
+                error: false,
+            });
+            return None;
+        }
+        self.open_selected_execution_run()
+    }
+
+    fn open_selected_execution_run(&mut self) -> Option<DashboardEffect> {
+        let execution = self.selected_execution()?.clone();
+        if !self.exact_run_attachment {
+            self.message = Some(Message {
+                text: "Opening exact Scheduled Execution runs requires daemon protocol 26; upgrade and restart Boomux"
+                    .into(),
+                error: false,
+            });
+            return None;
+        }
+        if !execution.is_openable() {
+            self.message = Some(Message {
+                text: "Selected execution is not a Starting or Active exact shell run".into(),
+                error: false,
+            });
+            return None;
+        }
+        match (execution.shell_id, execution.run_id) {
+            (Some(shell_id), Some(run_id)) => Some(DashboardEffect::OpenScheduledExecution {
+                execution_id: execution.id,
+                shell_id,
+                run_id,
+            }),
+            _ => {
+                self.message = Some(Message {
+                    text: "Selected execution has no exact retained shell run to open".into(),
+                    error: false,
+                });
+                None
+            }
+        }
+    }
+
+    fn select_agent_id(&mut self, agent_id: &str) -> bool {
+        let Some((workspace_index, item_index)) = self.workspaces.iter().enumerate().find_map(|(workspace_index, workspace)| {
+            workspace.items.iter().enumerate().find_map(|(item_index, item)| {
+                matches!(item, WorkspaceItemView::AgentShell(agent) if agent.agent.as_ref().is_some_and(|agent| agent.id == agent_id))
+                    .then_some((workspace_index, item_index))
+            })
+        }) else {
+            return false;
+        };
+        self.select_tab(PrimaryTab::Agents);
+        let identity = item_identity(
+            &self.workspaces[workspace_index],
+            &self.workspaces[workspace_index].items[item_index],
+        );
+        self.global_state
+            .select(self.global_item_position(&identity));
+        true
     }
 
     fn workspace_item_identity(&self) -> Option<ItemIdentity> {
@@ -1932,6 +2775,9 @@ pub(crate) fn run<B: DashboardBackend>(
 ) -> io::Result<()> {
     let mut terminal = ratatui::init();
     let mut app = App::new(state.workspaces, project_context);
+    app.schedules = state.schedules;
+    app.scheduling = state.scheduling;
+    app.exact_run_attachment = state.exact_run_attachment;
     if follow_focused_terminal {
         app.enable_focus_following(state.focused_terminal.as_ref());
     }
@@ -2072,7 +2918,11 @@ fn execute_palette_command(app: &mut App, command: PaletteCommand) -> Option<Das
         PaletteCommand::Attention {
             workspace_id,
             shell_id,
+            agent_id,
         } => {
+            if app.select_agent_id(&agent_id) {
+                return None;
+            }
             let identity = ItemIdentity {
                 workspace_id: workspace_id.clone(),
                 item_id: shell_id,
@@ -2094,6 +2944,61 @@ fn execute_palette_command(app: &mut App, command: PaletteCommand) -> Option<Das
                 }
             }
             None
+        }
+        PaletteCommand::Schedule {
+            schedule_id,
+            action,
+        } => {
+            if !app.select_schedule_id(&schedule_id) {
+                return None;
+            }
+            match action {
+                SchedulePaletteAction::GoTo => None,
+                SchedulePaletteAction::Run => Some(DashboardEffect::RunSchedule(schedule_id)),
+                SchedulePaletteAction::PauseResume => {
+                    app.selected_schedule()
+                        .map(|schedule| match schedule.state {
+                            ScheduleDisplayState::Paused => {
+                                DashboardEffect::ResumeSchedule(schedule_id)
+                            }
+                            ScheduleDisplayState::Enabled => {
+                                DashboardEffect::PauseSchedule(schedule_id)
+                            }
+                        })
+                }
+                SchedulePaletteAction::SelectExecution(execution_id) => {
+                    app.select_execution_id(&execution_id);
+                    None
+                }
+                SchedulePaletteAction::OpenExecution(execution_id) => {
+                    if !app.select_execution_id(&execution_id) {
+                        return None;
+                    }
+                    app.open_selected_execution_run()
+                }
+                SchedulePaletteAction::CancelExecution(execution_id) => {
+                    if !app.select_execution_id(&execution_id) {
+                        return None;
+                    }
+                    let execution = app
+                        .selected_execution()
+                        .filter(|execution| execution.state.is_active())
+                        .cloned()?;
+                    app.request_cancel_execution(
+                        execution.id.clone(),
+                        format!("execution {}", short_id(&execution.id)),
+                    );
+                    None
+                }
+                SchedulePaletteAction::LoadHistory => Some(DashboardEffect::LoadScheduleHistory {
+                    schedule_id,
+                    limit: 100,
+                }),
+                SchedulePaletteAction::Remove => {
+                    app.request_close();
+                    None
+                }
+            }
         }
     }
 }
@@ -2176,7 +3081,7 @@ fn handle_mode_key(
     }
     match mode {
         Mode::Normal => None,
-        Mode::Palette(_) | Mode::Help => None,
+        Mode::Palette(_) | Mode::Help | Mode::Transcript => None,
         Mode::PickProject(mut picker) => match key {
             KeyCode::Enter
                 if picker.mode == WorkspaceCreationMode::ByName
@@ -2265,7 +3170,9 @@ fn render(frame: &mut Frame, app: &mut App) {
     .areas(area);
 
     render_tabs(frame, tabs_area, app);
-    if app.primary_tab != PrimaryTab::Workspaces {
+    if app.primary_tab == PrimaryTab::Schedules {
+        render_schedules(frame, dashboard_area, app);
+    } else if app.primary_tab != PrimaryTab::Workspaces {
         render_global_items(frame, dashboard_area, app);
     } else if dashboard_area.width >= 114 {
         let [workspace_area, terminal_area] =
@@ -2284,6 +3191,7 @@ fn render(frame: &mut Frame, app: &mut App) {
         Mode::PickProject(picker) => render_project_picker(frame, area, picker),
         Mode::Palette(palette) => render_command_palette(frame, area, palette),
         Mode::Help => render_help_overlay(frame, area, app),
+        Mode::Transcript => render_transcript(frame, area, app),
         Mode::Normal | Mode::Rename { .. } => {}
     }
 }
@@ -2839,7 +3747,7 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
         Line::from("  attention filter palette results to outstanding durable attention"),
         Line::from("  Enter    restore a workspace, open a shell, or invoke a launcher"),
         Line::from("  a/e/x    add, rename, or request confirmed close/remove"),
-        Line::from("  Tab/1-3 change view; h/l change pane; j/k navigate"),
+        Line::from("  Tab/1-4 change view; h/l change pane; j/k navigate"),
         Line::from(""),
         Line::from(Span::styled(
             "SELECTED CONTEXT",
@@ -2856,7 +3764,22 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
             }),
         );
     }
-    if app.primary_tab == PrimaryTab::Workspaces && app.focus == Focus::Workspaces {
+    if app.primary_tab == PrimaryTab::Schedules {
+        if let Some(schedule) = app.selected_schedule() {
+            lines.extend([
+                Line::from(format!("  schedule: {} / {}", schedule.workspace, schedule.name)),
+                Line::from("  u runs now; p pauses/resumes; c cancels only its exact active execution."),
+                Line::from("  [ and ] select newer/older retained executions by exact execution ID."),
+                Line::from("  h explicitly loads scoped bounded history; t explicitly reads linked host content."),
+                Line::from("  Enter opens an exact retained shell or navigates to the exact blocked Agent."),
+                Line::from("  No skip-next action exists in protocol 25."),
+            ]);
+        } else {
+            lines.push(Line::from(
+                "  No schedule selected. Use `boomux schedule create --help`.",
+            ));
+        }
+    } else if app.primary_tab == PrimaryTab::Workspaces && app.focus == Focus::Workspaces {
         if let Some(workspace) = app.selected() {
             lines.extend([
                 Line::from(format!("  workspace: {}", workspace.name)),
@@ -2873,6 +3796,19 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
             lines.push(Line::from("  No workspace selected."));
         }
     } else if let Some(item) = app.selected_item() {
+        if matches!(item, WorkspaceItemView::AgentShell(agent) if agent.schedule_id.is_some()) {
+            lines.extend([
+                Line::from(format!("  agent: {}", item.name())),
+                Line::from("  This exact Agent belongs to a scheduled execution."),
+                Line::from(
+                    "  Ordinary shell open, rename, restart, and close actions are disabled.",
+                ),
+                Line::from(
+                    "  Use the Schedules view to open or cancel the exact linked execution.",
+                ),
+            ]);
+            return lines;
+        }
         let (summary, exit) = match item.kind() {
             ItemKind::Shell => (
                 "A shell is a durable login-shell PTY slot.",
@@ -2936,6 +3872,25 @@ fn centered_rect(area: Rect, width_percent: u16, height_percent: u16) -> Rect {
 }
 
 fn render_tabs(frame: &mut Frame, area: Rect, app: &App) {
+    if area.width < 100 {
+        let spans = PrimaryTab::ALL
+            .iter()
+            .enumerate()
+            .flat_map(|(index, tab)| {
+                let style = if *tab == app.primary_tab {
+                    Style::new().fg(BASE).bg(BLUE).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::new().fg(SUBTEXT)
+                };
+                [
+                    Span::styled(format!(" {} {} ", index + 1, tab.label()), style),
+                    Span::raw(" "),
+                ]
+            })
+            .collect::<Vec<_>>();
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+        return;
+    }
     let workspace_style = if app.primary_tab == PrimaryTab::Workspaces {
         Style::new().fg(BASE).bg(TEAL).add_modifier(Modifier::BOLD)
     } else {
@@ -2959,12 +3914,16 @@ fn render_tabs(frame: &mut Frame, area: Rect, app: &App) {
             .skip(1)
             .flat_map(|(index, tab)| {
                 let count: usize = match tab {
-                    PrimaryTab::Agents => {
-                        app.workspaces.iter().map(WorkspaceView::agent_count).sum()
-                    }
+                    PrimaryTab::Agents => app
+                        .workspaces
+                        .iter()
+                        .flat_map(|workspace| &workspace.items)
+                        .filter(|item| item.kind() == ItemKind::Agent)
+                        .count(),
                     PrimaryTab::Shells => {
                         app.workspaces.iter().map(WorkspaceView::shell_count).sum()
                     }
+                    PrimaryTab::Schedules => app.schedules.len(),
                     PrimaryTab::Workspaces => unreachable!("workspace tab is rendered separately"),
                 };
                 let style = if *tab == app.primary_tab {
@@ -3026,6 +3985,486 @@ fn render_workspaces(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut A
     if let (Some(preview), Some(preview_area)) = (preview, preview_area) {
         render_contextual_preview(frame, preview_area, preview);
     }
+}
+
+fn render_schedules(frame: &mut Frame, area: Rect, app: &mut App) {
+    let detail_height = if area.height >= 18 && app.selected_schedule().is_some() {
+        11.min(area.height.saturating_sub(6))
+    } else if area.height >= 4 && app.selected_schedule().is_some() {
+        3
+    } else {
+        0
+    };
+    let [table_area, detail_area] =
+        Layout::vertical([Constraint::Fill(1), Constraint::Length(detail_height)]).areas(area);
+    let (headers, widths): (Vec<&str>, Vec<Constraint>) = if area.width >= 140 {
+        (
+            vec![
+                "NAME",
+                "TRIGGER",
+                "NEXT",
+                "LAST",
+                "STATE",
+                "WORKSPACE",
+                "INTEGRATION",
+            ],
+            vec![
+                Constraint::Length(22),
+                Constraint::Length(25),
+                Constraint::Length(13),
+                Constraint::Length(18),
+                Constraint::Length(9),
+                Constraint::Length(20),
+                Constraint::Min(10),
+            ],
+        )
+    } else if area.width >= 114 {
+        (
+            vec!["NAME", "TRIGGER", "NEXT", "LAST", "STATE", "WORKSPACE"],
+            vec![
+                Constraint::Length(19),
+                Constraint::Length(23),
+                Constraint::Length(12),
+                Constraint::Length(17),
+                Constraint::Length(9),
+                Constraint::Min(14),
+            ],
+        )
+    } else if area.width >= 80 {
+        (
+            vec!["NAME", "TRIGGER", "NEXT", "LAST", "STATE"],
+            vec![
+                Constraint::Length(17),
+                Constraint::Length(20),
+                Constraint::Length(11),
+                Constraint::Length(16),
+                Constraint::Min(8),
+            ],
+        )
+    } else {
+        (
+            vec!["NAME", "NEXT", "LAST", "STATE"],
+            vec![
+                Constraint::Length(16),
+                Constraint::Length(10),
+                Constraint::Length(15),
+                Constraint::Min(8),
+            ],
+        )
+    };
+    if app.schedules.is_empty() {
+        let message = match app.scheduling {
+            SchedulingView::Unsupported {
+                required_protocol,
+                negotiated,
+            } => format!(
+                "Schedules require daemon protocol {required_protocol}; negotiated {negotiated}. Upgrade and restart Boomux."
+            ),
+            SchedulingView::Active { .. } | SchedulingView::Offline { .. } => {
+                "No schedules. Run `boomux schedule create --help` to create a paused schedule."
+                    .into()
+            }
+        };
+        let block = Block::bordered()
+            .title(" Schedules (0) ")
+            .border_style(Style::new().fg(TEAL));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        frame.render_widget(
+            Paragraph::new(message)
+                .style(Style::new().fg(SUBTEXT))
+                .wrap(Wrap { trim: false }),
+            inner,
+        );
+        return;
+    }
+    let rows: Vec<_> = {
+        app.schedules
+            .iter()
+            .map(|schedule| {
+                let last = schedule.executions.first().map_or_else(
+                    || {
+                        if schedule.history_complete {
+                            "never run".into()
+                        } else {
+                            "history unknown".into()
+                        }
+                    },
+                    execution_summary,
+                );
+                let next = schedule.next_occurrence_ms.map_or_else(
+                    || {
+                        if schedule.state == ScheduleDisplayState::Paused {
+                            "paused".into()
+                        } else {
+                            "unavailable".into()
+                        }
+                    },
+                    occurrence_recency,
+                );
+                let mut values = vec![schedule.name.clone()];
+                if area.width >= 80 {
+                    values.push(schedule.friendly_trigger.clone());
+                }
+                values.extend([next, last, schedule.state.label().into()]);
+                if area.width >= 114 {
+                    values.push(schedule.workspace.clone());
+                }
+                if area.width >= 140 {
+                    values.push(schedule.integration.clone());
+                }
+                Row::new(values.into_iter().enumerate().map(|(index, value)| {
+                    let styled = if headers.get(index) == Some(&"LAST")
+                        || headers.get(index) == Some(&"STATE")
+                    {
+                        Span::styled(value.clone(), Style::new().fg(status_color(&value)))
+                    } else {
+                        Span::raw(value)
+                    };
+                    Cell::from(styled)
+                }))
+            })
+            .collect()
+    };
+    let health = match app.scheduling {
+        SchedulingView::Unsupported { .. } => "unsupported".into(),
+        SchedulingView::Active { active, maximum } => format!("active {active}/{maximum}"),
+        SchedulingView::Offline { active, maximum } => format!("offline {active}/{maximum}"),
+    };
+    let table = Table::new(rows, widths)
+        .header(Row::new(headers).style(Style::new().fg(BLUE).add_modifier(Modifier::BOLD)))
+        .column_spacing(1)
+        .block(
+            Block::bordered()
+                .title(format!(
+                    " Schedules ({}) · scheduler {health} ",
+                    app.schedules.len()
+                ))
+                .border_style(Style::new().fg(TEAL)),
+        )
+        .row_highlight_style(
+            Style::new()
+                .fg(TEXT)
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED),
+        )
+        .highlight_symbol("> ");
+    frame.render_stateful_widget(table, table_area, &mut app.global_state);
+
+    if detail_height > 0
+        && let Some(schedule) = app.selected_schedule()
+    {
+        render_schedule_detail(
+            frame,
+            detail_area,
+            schedule,
+            &app.scheduling,
+            app.selected_execution_id.as_deref(),
+            app.exact_run_attachment,
+        );
+    }
+}
+
+fn render_schedule_detail(
+    frame: &mut Frame,
+    area: Rect,
+    schedule: &ScheduleView,
+    scheduling: &SchedulingView,
+    selected_execution_id: Option<&str>,
+    exact_run_attachment: bool,
+) {
+    if area.height <= 4 {
+        let line = selected_execution_id
+            .and_then(|id| {
+                schedule
+                    .executions
+                    .iter()
+                    .find(|execution| execution.id == id)
+            })
+            .map_or_else(
+                || "No retained execution selected · h history".into(),
+                |execution| {
+                    let mut actions = Vec::new();
+                    if exact_run_attachment && execution.is_openable() {
+                        actions.push("Enter open");
+                    }
+                    if execution.state.is_active() {
+                        actions.push("c cancel");
+                    }
+                    if execution.transcript_available && execution.session_id.is_some() {
+                        actions.push("t transcript");
+                    }
+                    if actions.is_empty() {
+                        actions.push("no execution action");
+                    }
+                    format!(
+                        "> {}  {}  ·  {}",
+                        short_id(&execution.id),
+                        execution_summary(execution),
+                        actions.join(" · ")
+                    )
+                },
+            );
+        frame.render_widget(
+            Paragraph::new(line).block(
+                Block::bordered()
+                    .title(format!(" {} · selected execution ", schedule.name))
+                    .border_style(Style::new().fg(OVERLAY)),
+            ),
+            area,
+        );
+        return;
+    }
+    let health = match scheduling {
+        SchedulingView::Unsupported { .. } => "unsupported".to_owned(),
+        SchedulingView::Active { active, maximum } => format!("active ({active}/{maximum})"),
+        SchedulingView::Offline { active, maximum } => {
+            format!("offline ({active}/{maximum}); timed dispatch is not reliable")
+        }
+    };
+    let mut lines = vec![
+        preview_field("PROMPT REV", schedule.prompt_revision.to_string()),
+        preview_field(
+            "TRIGGER",
+            format!("{}  ·  {}", schedule.exact_trigger, schedule.timezone),
+        ),
+        preview_field(
+            "POLICY",
+            "skip overlap  ·  no automatic retry  ·  no timeout",
+        ),
+        preview_field("SCHEDULER", health),
+    ];
+    if let Some(execution) = selected_execution_id.and_then(|id| {
+        schedule
+            .executions
+            .iter()
+            .find(|execution| execution.id == id)
+    }) {
+        lines.push(preview_field("ACTION", execution_explanation(execution)));
+    } else if schedule.history_complete {
+        lines.push(preview_field(
+            "ACTION",
+            if schedule.state == ScheduleDisplayState::Paused {
+                "Never run; press u for one authorized run or p to enable future timed work"
+            } else {
+                "Never run; waiting for the next occurrence, or press u for an authorized run now"
+            },
+        ));
+    } else {
+        lines.push(preview_field(
+            "ACTION",
+            "Execution history is incomplete; press h to load exact scoped history",
+        ));
+    }
+    let history_label = if schedule.history_truncated {
+        "newest page is truncated; press h for exact scoped history"
+    } else if schedule.possible_pruning_boundary {
+        "oldest retained record may be a pruning boundary"
+    } else if schedule.history_scoped {
+        "scoped bounded history"
+    } else {
+        "recent bounded history"
+    };
+    lines.push(preview_field("HISTORY", history_label));
+    for execution in selected_execution_window(&schedule.executions, selected_execution_id, 3) {
+        let links = [
+            execution
+                .shell_id
+                .as_deref()
+                .map(|id| format!("shell {}", short_id(id))),
+            execution
+                .agent_id
+                .as_deref()
+                .map(|id| format!("Agent {}", short_id(id))),
+            execution
+                .session_id
+                .as_deref()
+                .map(|id| format!("session {}", short_id(id))),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" · ");
+        lines.push(Line::from(format!(
+            "{} {}  {:<16} {}{}",
+            if selected_execution_id == Some(execution.id.as_str()) {
+                ">"
+            } else {
+                " "
+            },
+            compact_recency(execution.requested_at_ms),
+            execution_summary(execution),
+            short_id(&execution.id),
+            if links.is_empty() {
+                String::new()
+            } else {
+                format!("  ·  {links}")
+            }
+        )));
+    }
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .title(format!(" {} · {} ", schedule.workspace, schedule.name))
+                .border_style(Style::new().fg(OVERLAY)),
+        ),
+        area,
+    );
+}
+
+fn selected_execution_window<'a>(
+    executions: &'a [ExecutionView],
+    selected_execution_id: Option<&str>,
+    limit: usize,
+) -> &'a [ExecutionView] {
+    if executions.is_empty() || limit == 0 {
+        return &[];
+    }
+    let length = limit.min(executions.len());
+    let selected = selected_execution_id
+        .and_then(|id| executions.iter().position(|execution| execution.id == id))
+        .unwrap_or(0);
+    let start = selected
+        .saturating_sub(length / 2)
+        .min(executions.len() - length);
+    &executions[start..start + length]
+}
+
+fn execution_summary(execution: &ExecutionView) -> String {
+    if let Some(reason) = execution.reason {
+        return if reason == ExecutionReasonDisplay::Missed {
+            "missed".into()
+        } else {
+            format!("{}: {}", execution.state.label(), reason.label())
+        };
+    }
+    match execution.outcome {
+        Some(ExecutionOutcomeDisplay::ExitCode(0)) => "exited: 0".into(),
+        Some(ExecutionOutcomeDisplay::ExitCode(code)) => format!("failed: exit {code}"),
+        Some(ExecutionOutcomeDisplay::Signal(signal)) => format!("failed: signal {signal}"),
+        None => execution.state.label().into(),
+    }
+}
+
+fn execution_explanation(execution: &ExecutionView) -> String {
+    if execution.agent_state == Some(AgentDisplayState::Blocked) {
+        return format!(
+            "Blocked Agent {}; Enter navigates only to that exact linked Agent",
+            execution
+                .agent_id
+                .as_deref()
+                .map(short_id)
+                .unwrap_or_else(|| "-".into())
+        );
+    }
+    match execution.reason {
+        Some(ExecutionReasonDisplay::Overlap) => "Skipped because this schedule already had active work; cancel only the exact active execution".into(),
+        Some(ExecutionReasonDisplay::ActiveSession) => "Skipped because the exact continuation session was active; inspect its linked Agent/session".into(),
+        Some(ExecutionReasonDisplay::WorkspaceCapacity) => "Skipped because another execution occupied this workspace".into(),
+        Some(ExecutionReasonDisplay::GlobalCapacity) => "Skipped at the daemon concurrency limit".into(),
+        Some(ExecutionReasonDisplay::Missed) => "Missed while the scheduler was unavailable; no catch-up or retry is automatic".into(),
+        Some(ExecutionReasonDisplay::PausedRace) => "Pause won during evaluation; resume only to authorize future occurrences".into(),
+        Some(ExecutionReasonDisplay::InvalidTarget) => "Target is invalid; inspect integration status and daemon diagnostics".into(),
+        Some(ExecutionReasonDisplay::RunnerStartFailed | ExecutionReasonDisplay::HostSpawnFailed) => "Dispatch failed; inspect daemon and integration health before a new manual run".into(),
+        Some(ExecutionReasonDisplay::CancelledByUser) => "Cancelled explicitly; no replacement run is automatic".into(),
+        Some(ExecutionReasonDisplay::ColdDaemonRecovery | ExecutionReasonDisplay::RunnerExitedWithoutReport | ExecutionReasonDisplay::DaemonShutdown) => "Execution was interrupted; inspect the exact retained links before retrying".into(),
+        None if execution.state.is_active() => "Active with no automatic timeout; press c to cancel this exact execution".into(),
+        None => "No action required; press h for bounded scoped history".into(),
+    }
+}
+
+fn occurrence_recency(timestamp_ms: u64) -> String {
+    let seconds = timestamp_ms.saturating_sub(current_time_ms()) / 1_000;
+    match seconds {
+        0..=59 => "<1m".into(),
+        60..=3_599 => format!("in {}m", seconds / 60),
+        3_600..=86_399 => format!("in {}h", seconds / 3_600),
+        _ => format!("in {}d", seconds / 86_400),
+    }
+}
+
+fn render_transcript(frame: &mut Frame, area: Rect, app: &mut App) {
+    let Some(transcript) = app.transcript.as_ref() else {
+        return;
+    };
+    let popup = if area.width < 100 || area.height < 30 {
+        area
+    } else {
+        centered_rect(area, 86, 82)
+    };
+    frame.render_widget(Clear, popup);
+    let block = Block::bordered()
+        .title(" Transcript and tool activity ")
+        .border_style(Style::new().fg(TEAL));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let [header_area, body_area, help_area] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Fill(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!(
+                "Explicit bounded read · execution {} · session {}",
+                short_id(&transcript.execution_id),
+                short_id(&transcript.session_id)
+            ),
+            Style::new().fg(SUBTEXT),
+        ))),
+        header_area,
+    );
+    let mut lines = transcript
+        .lines
+        .iter()
+        .cloned()
+        .map(Line::from)
+        .collect::<Vec<_>>();
+    if transcript.truncated {
+        lines.push(Line::from(Span::styled(
+            "Content is truncated by dashboard bounds",
+            Style::new().fg(YELLOW),
+        )));
+    }
+    let total_rows = wrapped_line_count(&lines, body_area.width);
+    let content = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let visible_rows = body_area.height as usize;
+    let max_scroll = total_rows.saturating_sub(visible_rows);
+    app.transcript_scroll_from_bottom = app.transcript_scroll_from_bottom.min(max_scroll);
+    let offset = max_scroll.saturating_sub(app.transcript_scroll_from_bottom);
+    frame.render_widget(
+        content.scroll((offset.min(u16::MAX as usize) as u16, 0)),
+        body_area,
+    );
+    let end = (offset + visible_rows).min(total_rows);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                format!(
+                    " rows {}-{end}/{total_rows}  ",
+                    offset.saturating_add(1).min(end)
+                ),
+                Style::new().fg(if offset == max_scroll { GREEN } else { YELLOW }),
+            ),
+            Span::styled("↑/↓", Style::new().fg(TEAL)),
+            Span::styled(" scroll  ", Style::new().fg(SUBTEXT)),
+            Span::styled("pgup/pgdn", Style::new().fg(TEAL)),
+            Span::styled(" page  ", Style::new().fg(SUBTEXT)),
+            Span::styled("home/end", Style::new().fg(TEAL)),
+            Span::styled(" oldest/newest  ", Style::new().fg(SUBTEXT)),
+            Span::styled("q/esc/t", Style::new().fg(RED)),
+            Span::styled(" close", Style::new().fg(SUBTEXT)),
+        ])),
+        help_area,
+    );
+}
+
+fn wrapped_line_count(lines: &[Line<'_>], width: u16) -> usize {
+    let width = usize::from(width.max(1));
+    lines
+        .iter()
+        .map(|line| line.width().max(1).div_ceil(width))
+        .sum()
 }
 
 fn render_global_items(frame: &mut Frame, area: Rect, app: &mut App) {
@@ -3245,7 +4684,13 @@ fn render_items(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
         .and_then(|index| app.workspaces.get(index));
     let title = selected.map_or_else(
         || " Items ".to_owned(),
-        |workspace| format!(" Items: {} ({}) ", workspace.name, workspace.items.len()),
+        |workspace| {
+            format!(
+                " Items: {} ({}) ",
+                workspace.name,
+                workspace.ordinary_item_count()
+            )
+        },
     );
     let block = Block::bordered().title(title).border_style(Style::new().fg(
         if app.focus == Focus::Items {
@@ -3274,53 +4719,57 @@ fn render_items(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
     let values: Vec<[String; 6]> = selected
         .into_iter()
         .flat_map(|workspace| {
-            workspace.items.iter().map(|item| match item {
-                WorkspaceItemView::Shell(terminal) => [
-                    terminal.kind.label().into(),
-                    terminal.table_status(),
-                    terminal.name.clone(),
-                    terminal.process().into(),
-                    terminal.branch.clone(),
-                    terminal.worktree.clone(),
-                ],
-                WorkspaceItemView::AgentShell(agent_shell) => {
-                    let (activity, branch, worktree) = agent_shell.agent.as_ref().map_or_else(
-                        || {
-                            (
-                                agent_shell.shell.process().to_owned(),
-                                agent_shell.shell.branch.clone(),
-                                agent_shell.shell.worktree.clone(),
-                            )
-                        },
-                        |agent| {
-                            (
-                                matched_agent_session(workspace, agent_shell)
-                                    .and_then(session_task_label)
-                                    .unwrap_or(&agent.integration)
-                                    .to_owned(),
-                                agent.root_branch.clone(),
-                                agent.root_worktree.clone(),
-                            )
-                        },
-                    );
-                    [
-                        "agent".into(),
-                        agent_shell.state().label().into(),
-                        agent_shell.shell.name.clone(),
-                        activity,
-                        branch,
-                        worktree,
-                    ]
-                }
-                WorkspaceItemView::Launcher(launcher) => [
-                    "launcher".into(),
-                    "ready".into(),
-                    launcher.name.clone(),
-                    launcher.command.clone(),
-                    launcher.branch.clone(),
-                    launcher.worktree.clone(),
-                ],
-            })
+            workspace
+                .items
+                .iter()
+                .filter(|item| item.ordinary_visible())
+                .map(|item| match item {
+                    WorkspaceItemView::Shell(terminal) => [
+                        terminal.kind.label().into(),
+                        terminal.table_status(),
+                        terminal.name.clone(),
+                        terminal.process().into(),
+                        terminal.branch.clone(),
+                        terminal.worktree.clone(),
+                    ],
+                    WorkspaceItemView::AgentShell(agent_shell) => {
+                        let (activity, branch, worktree) = agent_shell.agent.as_ref().map_or_else(
+                            || {
+                                (
+                                    agent_shell.shell.process().to_owned(),
+                                    agent_shell.shell.branch.clone(),
+                                    agent_shell.shell.worktree.clone(),
+                                )
+                            },
+                            |agent| {
+                                (
+                                    matched_agent_session(workspace, agent_shell)
+                                        .and_then(session_task_label)
+                                        .unwrap_or(&agent.integration)
+                                        .to_owned(),
+                                    agent.root_branch.clone(),
+                                    agent.root_worktree.clone(),
+                                )
+                            },
+                        );
+                        [
+                            "agent".into(),
+                            agent_shell.state().label().into(),
+                            agent_shell.shell.name.clone(),
+                            activity,
+                            branch,
+                            worktree,
+                        ]
+                    }
+                    WorkspaceItemView::Launcher(launcher) => [
+                        "launcher".into(),
+                        "ready".into(),
+                        launcher.name.clone(),
+                        launcher.command.clone(),
+                        launcher.branch.clone(),
+                        launcher.worktree.clone(),
+                    ],
+                })
         })
         .collect();
     let widths = item_column_widths(items_inner.width, &values);
@@ -4011,6 +5460,14 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
             CloseTarget::Launcher(_) => {
                 format!(" Remove launcher '{}'?  ", pending.name)
             }
+            CloseTarget::Schedule(_) => format!(
+                " Remove schedule '{}' and its persisted prompt and retained execution history?  ",
+                pending.name
+            ),
+            CloseTarget::Execution(_) => format!(
+                " Cancel '{}' and terminate its exact managed process tree?  ",
+                pending.name
+            ),
         };
         Line::from(vec![
             Span::styled(prompt, Style::new().fg(YELLOW).add_modifier(Modifier::BOLD)),
@@ -4038,13 +5495,71 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
         ))
     } else {
         let launcher_selected = matches!(app.selected_item(), Some(WorkspaceItemView::Launcher(_)));
+        if app.primary_tab == PrimaryTab::Schedules {
+            let paused = app
+                .selected_schedule()
+                .is_some_and(|schedule| schedule.state == ScheduleDisplayState::Paused);
+            let active = app
+                .selected_execution()
+                .is_some_and(|execution| execution.state.is_active());
+            let transcript = app
+                .selected_execution()
+                .is_some_and(|execution| execution.transcript_available);
+            let line = Line::from(vec![
+                Span::styled(" j/k", Style::new().fg(TEAL)),
+                Span::styled(" schedule  ", Style::new().fg(SUBTEXT)),
+                Span::styled("[/]", Style::new().fg(TEAL)),
+                Span::styled(" execution  ", Style::new().fg(SUBTEXT)),
+                Span::styled("u", Style::new().fg(GREEN)),
+                Span::styled(" run now  ", Style::new().fg(SUBTEXT)),
+                Span::styled("p", Style::new().fg(YELLOW)),
+                Span::styled(
+                    if paused { " resume  " } else { " pause  " },
+                    Style::new().fg(SUBTEXT),
+                ),
+                Span::styled(if active { "c" } else { "-" }, Style::new().fg(RED)),
+                Span::styled(" cancel active  ", Style::new().fg(SUBTEXT)),
+                Span::styled("h", Style::new().fg(BLUE)),
+                Span::styled(" history  ", Style::new().fg(SUBTEXT)),
+                Span::styled(if transcript { "t" } else { "-" }, Style::new().fg(TEAL)),
+                Span::styled(" transcript  ", Style::new().fg(SUBTEXT)),
+                Span::styled("a", Style::new().fg(GREEN)),
+                Span::styled(" create help  ", Style::new().fg(SUBTEXT)),
+                Span::styled("x", Style::new().fg(RED)),
+                Span::styled(" remove  ", Style::new().fg(SUBTEXT)),
+                Span::styled("q", Style::new().fg(RED)),
+                Span::styled(" quit", Style::new().fg(SUBTEXT)),
+            ]);
+            frame.render_widget(Paragraph::new(line), area);
+            return;
+        }
+        if matches!(app.selected_item(), Some(WorkspaceItemView::AgentShell(agent)) if agent.schedule_id.is_some())
+        {
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(" j/k", Style::new().fg(TEAL)),
+                    Span::styled(" navigate  ", Style::new().fg(SUBTEXT)),
+                    Span::styled("schedule-owned Agent", Style::new().fg(YELLOW)),
+                    Span::styled(
+                        "; use Schedules for exact open/cancel  ",
+                        Style::new().fg(SUBTEXT),
+                    ),
+                    Span::styled("/", Style::new().fg(TEAL)),
+                    Span::styled(" palette  ", Style::new().fg(SUBTEXT)),
+                    Span::styled("q", Style::new().fg(RED)),
+                    Span::styled(" quit", Style::new().fg(SUBTEXT)),
+                ])),
+                area,
+            );
+            return;
+        }
         let mut spans = vec![
             Span::styled(" j/k", Style::new().fg(TEAL)),
             Span::styled(
                 if app.primary_tab == PrimaryTab::Workspaces {
                     " navigate  tab/shift-tab views  h/l panes  "
                 } else {
-                    " navigate  tab/shift-tab views  1-5 select view  "
+                    " navigate  tab/shift-tab views  1-4 select view  "
                 },
                 Style::new().fg(SUBTEXT),
             ),
@@ -4423,6 +5938,7 @@ mod tests {
                 run: None,
             },
             agent: Some(agent()),
+            schedule_id: None,
         }
     }
 
@@ -4442,6 +5958,69 @@ mod tests {
                 directory: Some("/tmp/boomux".into()),
             }],
         }
+    }
+
+    fn execution(id: &str, state: ExecutionDisplayState) -> ExecutionView {
+        ExecutionView {
+            id: id.into(),
+            state,
+            reason: None,
+            outcome: None,
+            requested_at_ms: current_time_ms(),
+            prompt_revision: 3,
+            shell_id: Some("schedule-shell".into()),
+            run_id: Some("schedule-run".into()),
+            agent_id: Some("schedule-agent".into()),
+            agent_state: Some(AgentDisplayState::Working),
+            session_id: Some("schedule-session".into()),
+            transcript_available: true,
+        }
+    }
+
+    fn schedule_view() -> ScheduleView {
+        ScheduleView {
+            id: "schedule-1".into(),
+            workspace_id: "w1".into(),
+            workspace: "boomux".into(),
+            name: "nightly review".into(),
+            integration: "opencode".into(),
+            cwd: "/tmp/boomux".into(),
+            state: ScheduleDisplayState::Paused,
+            friendly_trigger: "weekdays 09:30".into(),
+            exact_trigger: "30 9 * * 1-5".into(),
+            timezone: "America/New_York".into(),
+            next_occurrence_ms: None,
+            prompt_revision: 3,
+            executions: vec![execution("execution-1", ExecutionDisplayState::Active)],
+            history_truncated: false,
+            possible_pruning_boundary: false,
+            history_scoped: false,
+            history_complete: true,
+        }
+    }
+
+    fn schedule_app() -> App {
+        let mut app = app();
+        app.schedules = vec![schedule_view()];
+        app.scheduling = SchedulingView::Active {
+            active: 1,
+            maximum: 4,
+        };
+        app.exact_run_attachment = true;
+        app.select_tab(PrimaryTab::Schedules);
+        app
+    }
+
+    fn rendered_text(app: &mut App, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| render(frame, app)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
     }
 
     fn focus_items(app: &mut App) {
@@ -4733,6 +6312,7 @@ mod tests {
                 run: None,
             },
             agent: None,
+            schedule_id: None,
         }
     }
 
@@ -4988,11 +6568,11 @@ mod tests {
     #[test]
     fn numeric_shortcuts_match_primary_tab_order() {
         assert_eq!(
-            ('1'..='3').filter_map(shortcut_tab).collect::<Vec<_>>(),
+            ('1'..='4').filter_map(shortcut_tab).collect::<Vec<_>>(),
             PrimaryTab::ALL
         );
         assert_eq!(shortcut_tab('0'), None);
-        assert_eq!(shortcut_tab('4'), None);
+        assert_eq!(shortcut_tab('5'), None);
     }
 
     #[test]
@@ -5357,6 +6937,7 @@ mod tests {
         agent.agent.as_mut().unwrap().state = AgentDisplayState::Blocked;
         workspace.items[0] = WorkspaceItemView::AgentShell(agent);
         workspace.attention = vec![WorkspaceAttentionView {
+            agent_id: "agent-active".into(),
             shell_id: "term_1".into(),
             agent_name: "review-agent".into(),
             reason: AttentionReason::Blocked,
@@ -5402,6 +6983,7 @@ mod tests {
     fn command_palette_orders_attention_by_global_urgency() {
         let mut completed = workspace("w1", "first");
         completed.attention = vec![WorkspaceAttentionView {
+            agent_id: "completed-agent-id".into(),
             shell_id: "completed-shell".into(),
             agent_name: "completed-agent".into(),
             reason: AttentionReason::Completed,
@@ -5410,6 +6992,7 @@ mod tests {
         }];
         let mut blocked = workspace("w2", "second");
         blocked.attention = vec![WorkspaceAttentionView {
+            agent_id: "blocked-agent-id".into(),
             shell_id: "blocked-shell".into(),
             agent_name: "blocked-agent".into(),
             reason: AttentionReason::Blocked,
@@ -5540,6 +7123,7 @@ mod tests {
             PaletteCommand::Attention {
                 workspace_id: "w1".into(),
                 shell_id: "removed".into(),
+                agent_id: "removed-agent".into(),
             },
         );
         assert_eq!(app.focus, Focus::Workspaces);
@@ -5557,6 +7141,7 @@ mod tests {
             PaletteCommand::Attention {
                 workspace_id: "removed".into(),
                 shell_id: "removed".into(),
+                agent_id: "removed-agent".into(),
             },
         );
 
@@ -6984,6 +8569,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         let mut workspace = workspace("w1", "review");
         workspace.attention = vec![WorkspaceAttentionView {
+            agent_id: "agent-active".into(),
             shell_id: "term_1".into(),
             agent_name: "review-agent".into(),
             reason: AttentionReason::Blocked,
@@ -7131,5 +8717,575 @@ mod tests {
         assert!(text.contains("FROM PROJECT"));
         assert!(text.contains("Create a workspace by name"));
         assert!(text.contains("alpha"));
+    }
+
+    #[test]
+    fn schedule_tab_dispatches_only_typed_valid_actions() {
+        let mut app = schedule_app();
+        assert_eq!(
+            app.update(DashboardEvent::KeyPressed {
+                code: KeyCode::Char('u'),
+                modifiers: KeyModifiers::NONE
+            }),
+            vec![DashboardEffect::RunSchedule("schedule-1".into())]
+        );
+        assert_eq!(
+            app.update(DashboardEvent::KeyPressed {
+                code: KeyCode::Char('p'),
+                modifiers: KeyModifiers::NONE
+            }),
+            vec![DashboardEffect::ResumeSchedule("schedule-1".into())]
+        );
+        app.schedules[0].state = ScheduleDisplayState::Enabled;
+        assert_eq!(
+            app.update(DashboardEvent::KeyPressed {
+                code: KeyCode::Char('p'),
+                modifiers: KeyModifiers::NONE
+            }),
+            vec![DashboardEffect::PauseSchedule("schedule-1".into())]
+        );
+        assert!(
+            app.update(DashboardEvent::KeyPressed {
+                code: KeyCode::Char('c'),
+                modifiers: KeyModifiers::NONE
+            })
+            .is_empty()
+        );
+        assert!(matches!(
+            app.pending_close,
+            Some(PendingClose { target: CloseTarget::Execution(ref id), .. }) if id == "execution-1"
+        ));
+        assert_eq!(
+            app.update(DashboardEvent::KeyPressed {
+                code: KeyCode::Char('y'),
+                modifiers: KeyModifiers::NONE
+            }),
+            vec![DashboardEffect::CancelExecution("execution-1".into())]
+        );
+        assert_eq!(
+            app.update(DashboardEvent::KeyPressed {
+                code: KeyCode::Char('h'),
+                modifiers: KeyModifiers::NONE
+            }),
+            vec![DashboardEffect::LoadScheduleHistory {
+                schedule_id: "schedule-1".into(),
+                limit: 100
+            }]
+        );
+        assert_eq!(
+            app.update(DashboardEvent::KeyPressed {
+                code: KeyCode::Char('t'),
+                modifiers: KeyModifiers::NONE
+            }),
+            vec![DashboardEffect::ReadExecutionTranscript {
+                session_id: "schedule-session".into(),
+                execution_id: "execution-1".into()
+            }]
+        );
+        assert!(
+            app.update(DashboardEvent::KeyPressed {
+                code: KeyCode::Char('s'),
+                modifiers: KeyModifiers::NONE
+            })
+            .is_empty()
+        );
+
+        app.update(DashboardEvent::KeyPressed {
+            code: KeyCode::Char('x'),
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(
+            matches!(app.pending_close, Some(PendingClose { target: CloseTarget::Schedule(ref id), .. }) if id == "schedule-1")
+        );
+        assert_eq!(
+            app.update(DashboardEvent::KeyPressed {
+                code: KeyCode::Char('y'),
+                modifiers: KeyModifiers::NONE
+            }),
+            vec![DashboardEffect::RemoveSchedule("schedule-1".into())]
+        );
+    }
+
+    #[test]
+    fn schedule_creation_is_actionable_cli_help_without_fabricating_a_form() {
+        let mut app = schedule_app();
+        assert!(
+            app.update(DashboardEvent::KeyPressed {
+                code: KeyCode::Char('a'),
+                modifiers: KeyModifiers::NONE
+            })
+            .is_empty()
+        );
+        assert!(
+            app.message
+                .as_ref()
+                .is_some_and(|message| message.text.contains("boomux schedule create --help"))
+        );
+    }
+
+    #[test]
+    fn execution_selection_is_exact_and_stable_across_history_reorder() {
+        let mut app = schedule_app();
+        app.schedules[0]
+            .executions
+            .push(execution("execution-2", ExecutionDisplayState::Active));
+        app.sync_selected_execution();
+        assert_eq!(
+            app.selected_execution()
+                .map(|execution| execution.id.as_str()),
+            Some("execution-1")
+        );
+
+        app.update(DashboardEvent::KeyPressed {
+            code: KeyCode::Char(']'),
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(
+            app.selected_execution()
+                .map(|execution| execution.id.as_str()),
+            Some("execution-2")
+        );
+        assert_eq!(
+            app.update(DashboardEvent::KeyPressed {
+                code: KeyCode::Enter,
+                modifiers: KeyModifiers::NONE,
+            }),
+            vec![DashboardEffect::OpenScheduledExecution {
+                execution_id: "execution-2".into(),
+                shell_id: "schedule-shell".into(),
+                run_id: "schedule-run".into(),
+            }]
+        );
+        assert_eq!(
+            app.update(DashboardEvent::KeyPressed {
+                code: KeyCode::Char('t'),
+                modifiers: KeyModifiers::NONE,
+            }),
+            vec![DashboardEffect::ReadExecutionTranscript {
+                session_id: "schedule-session".into(),
+                execution_id: "execution-2".into(),
+            }]
+        );
+
+        let mut reordered = app.schedules[0].clone();
+        reordered.executions.swap(0, 1);
+        app.replace_schedules(vec![reordered]);
+        assert_eq!(
+            app.selected_execution()
+                .map(|execution| execution.id.as_str()),
+            Some("execution-2")
+        );
+
+        app.update(DashboardEvent::KeyPressed {
+            code: KeyCode::Char('c'),
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(matches!(
+            app.pending_close,
+            Some(PendingClose { target: CloseTarget::Execution(ref id), .. }) if id == "execution-2"
+        ));
+    }
+
+    #[test]
+    fn execution_palette_commands_carry_and_select_exact_execution_ids() {
+        let mut app = schedule_app();
+        app.schedules[0]
+            .executions
+            .push(execution("execution-2", ExecutionDisplayState::Active));
+        let palette = CommandPalette::new_with_schedules(
+            &app.workspaces,
+            &app.schedules,
+            &app.scheduling,
+            app.exact_run_attachment,
+        );
+        let select = palette
+            .entries
+            .iter()
+            .find_map(|entry| match &entry.command {
+                PaletteCommand::Schedule {
+                    schedule_id,
+                    action: SchedulePaletteAction::SelectExecution(execution_id),
+                } if execution_id == "execution-2" => {
+                    Some((schedule_id.clone(), execution_id.clone()))
+                }
+                _ => None,
+            });
+        assert_eq!(select, Some(("schedule-1".into(), "execution-2".into())));
+
+        assert!(
+            execute_palette_command(
+                &mut app,
+                PaletteCommand::Schedule {
+                    schedule_id: "schedule-1".into(),
+                    action: SchedulePaletteAction::CancelExecution("execution-2".into()),
+                },
+            )
+            .is_none()
+        );
+        assert_eq!(app.selected_execution_id.as_deref(), Some("execution-2"));
+        assert!(matches!(
+            app.pending_close,
+            Some(PendingClose { target: CloseTarget::Execution(ref id), .. }) if id == "execution-2"
+        ));
+    }
+
+    #[test]
+    fn selected_execution_is_visible_in_full_and_compact_schedule_layouts() {
+        let mut app = schedule_app();
+        app.schedules[0].executions = (0..7)
+            .map(|index| {
+                execution(
+                    &format!("selected-{index}-execution"),
+                    ExecutionDisplayState::Exited,
+                )
+            })
+            .collect();
+        assert!(
+            execute_palette_command(
+                &mut app,
+                PaletteCommand::Schedule {
+                    schedule_id: "schedule-1".into(),
+                    action: SchedulePaletteAction::SelectExecution("selected-5-execution".into(),),
+                },
+            )
+            .is_none()
+        );
+
+        for (width, height) in [(80, 20), (60, 16)] {
+            let text = rendered_text(&mut app, width, height);
+            assert!(
+                text.contains("selected"),
+                "selected execution is not represented at {width}x{height}"
+            );
+            assert!(
+                text.contains("exited"),
+                "selected execution status is not visible at {width}x{height}"
+            );
+        }
+        assert!(
+            selected_execution_window(
+                &app.schedules[0].executions,
+                Some("selected-5-execution"),
+                3,
+            )
+            .iter()
+            .any(|execution| execution.id == "selected-5-execution")
+        );
+    }
+
+    #[test]
+    fn open_execution_requires_starting_or_active_state_and_exact_run_links() {
+        for state in [
+            ExecutionDisplayState::Skipped,
+            ExecutionDisplayState::Claimed,
+            ExecutionDisplayState::DispatchFailed,
+            ExecutionDisplayState::Exited,
+            ExecutionDisplayState::Cancelled,
+            ExecutionDisplayState::Interrupted,
+        ] {
+            let mut app = schedule_app();
+            app.schedules[0].executions[0].state = state;
+            assert!(
+                app.open_selected_schedule_link().is_none(),
+                "state {state:?}"
+            );
+            let palette = CommandPalette::new_with_schedules(
+                &app.workspaces,
+                &app.schedules,
+                &app.scheduling,
+                app.exact_run_attachment,
+            );
+            assert!(!palette.entries.iter().any(|entry| matches!(
+                entry.command,
+                PaletteCommand::Schedule {
+                    action: SchedulePaletteAction::OpenExecution(_),
+                    ..
+                }
+            )));
+        }
+
+        for state in [
+            ExecutionDisplayState::Starting,
+            ExecutionDisplayState::Active,
+        ] {
+            let mut app = schedule_app();
+            app.schedules[0].executions[0].state = state;
+            assert!(matches!(
+                app.open_selected_schedule_link(),
+                Some(DashboardEffect::OpenScheduledExecution { .. })
+            ));
+            app.schedules[0].executions[0].run_id = None;
+            assert!(app.open_selected_schedule_link().is_none());
+        }
+    }
+
+    #[test]
+    fn protocol_25_keeps_schedules_usable_but_disables_exact_open() {
+        let mut app = schedule_app();
+        app.exact_run_attachment = false;
+
+        assert!(app.open_selected_schedule_link().is_none());
+        assert!(app.message.as_ref().is_some_and(|message| {
+            message.text.contains("protocol 26") && message.text.contains("upgrade and restart")
+        }));
+        assert_eq!(
+            app.update(DashboardEvent::KeyPressed {
+                code: KeyCode::Char('h'),
+                modifiers: KeyModifiers::NONE,
+            }),
+            vec![DashboardEffect::LoadScheduleHistory {
+                schedule_id: "schedule-1".into(),
+                limit: 100,
+            }]
+        );
+        let palette = CommandPalette::new_with_schedules(
+            &app.workspaces,
+            &app.schedules,
+            &app.scheduling,
+            app.exact_run_attachment,
+        );
+        assert!(!palette.entries.iter().any(|entry| matches!(
+            entry.command,
+            PaletteCommand::Schedule {
+                action: SchedulePaletteAction::OpenExecution(_),
+                ..
+            }
+        )));
+        let compact = rendered_text(&mut app, 60, 16);
+        assert!(compact.contains("execution"));
+        assert!(!compact.contains("Enter open"));
+    }
+
+    #[test]
+    fn blocked_schedule_navigation_uses_the_exact_linked_agent_id() {
+        let mut wrong = workspace("w1", "wrong");
+        wrong.items[0] = WorkspaceItemView::AgentShell(agent_shell());
+        let mut right = workspace("w2", "right");
+        let mut exact = agent_shell();
+        exact.agent.as_mut().unwrap().id = "schedule-agent".into();
+        exact.agent.as_mut().unwrap().state = AgentDisplayState::Blocked;
+        exact.schedule_id = Some("schedule-1".into());
+        right.items[0] = WorkspaceItemView::AgentShell(exact);
+        let mut app = App::new(vec![wrong, right], project_context());
+        let mut schedule = schedule_view();
+        schedule.executions[0].agent_state = Some(AgentDisplayState::Blocked);
+        app.schedules = vec![schedule];
+        app.select_tab(PrimaryTab::Schedules);
+
+        assert!(
+            app.update(DashboardEvent::KeyPressed {
+                code: KeyCode::Enter,
+                modifiers: KeyModifiers::NONE
+            })
+            .is_empty()
+        );
+        assert_eq!(app.primary_tab, PrimaryTab::Agents);
+        assert!(
+            matches!(app.selected_item(), Some(WorkspaceItemView::AgentShell(agent)) if agent.agent.as_ref().is_some_and(|agent| agent.id == "schedule-agent"))
+        );
+    }
+
+    #[test]
+    fn schedule_agent_is_visible_for_exact_agent_navigation_but_has_no_ordinary_actions() {
+        let mut workspace = workspace("w1", "scheduled");
+        let mut scheduled_agent = agent_shell();
+        scheduled_agent.shell.id = "schedule-shell".into();
+        scheduled_agent.shell.name = "scheduled-runner".into();
+        scheduled_agent.agent.as_mut().unwrap().id = "schedule-agent".into();
+        scheduled_agent.schedule_id = Some("schedule-1".into());
+        workspace.items = vec![WorkspaceItemView::AgentShell(scheduled_agent)];
+        let mut app = App::new(vec![workspace], project_context());
+
+        let workspaces = rendered_text(&mut app, 114, 24);
+        assert!(!workspaces.contains("scheduled-runner"));
+        assert_eq!(app.workspaces[0].ordinary_item_count(), 0);
+
+        app.select_tab(PrimaryTab::Agents);
+        let agents = rendered_text(&mut app, 114, 24);
+        assert!(agents.contains("scheduled"));
+        assert!(app.open_selected_item().is_none());
+        app.request_rename();
+        assert!(matches!(app.mode, Mode::Normal));
+        app.request_close();
+        assert!(app.pending_close.is_none());
+    }
+
+    #[test]
+    fn schedule_history_and_transcript_are_applied_only_by_explicit_completion_events() {
+        let mut app = schedule_app();
+        let history = vec![execution(
+            "history-execution",
+            ExecutionDisplayState::Exited,
+        )];
+        app.update(DashboardEvent::ScheduleHistoryCompleted {
+            schedule_id: "schedule-1".into(),
+            result: Ok((history, true)),
+        });
+        assert_eq!(app.schedules[0].executions[0].id, "history-execution");
+        assert!(app.schedules[0].history_scoped);
+        assert!(app.schedules[0].history_truncated);
+        assert!(app.transcript.is_none());
+
+        app.update(DashboardEvent::TranscriptCompleted(Ok(TranscriptView {
+            execution_id: "history-execution".into(),
+            session_id: "schedule-session".into(),
+            lines: vec!["TOOL cargo [completed]".into()],
+            truncated: true,
+        })));
+        assert!(matches!(app.mode, Mode::Transcript));
+        assert!(rendered_text(&mut app, 80, 24).contains("TOOL cargo"));
+    }
+
+    #[test]
+    fn transcript_overlay_starts_at_newest_and_supports_scroll_navigation() {
+        let mut app = schedule_app();
+        app.update(DashboardEvent::TranscriptCompleted(Ok(TranscriptView {
+            execution_id: "execution-1".into(),
+            session_id: "schedule-session".into(),
+            lines: (0..40)
+                .map(|index| format!("transcript-line-{index:02}"))
+                .collect(),
+            truncated: false,
+        })));
+
+        let newest = rendered_text(&mut app, 60, 16);
+        assert!(newest.contains("transcript-line-39"));
+        assert!(!newest.contains("transcript-line-00"));
+        assert!(newest.contains("rows"));
+        assert!(newest.contains("pgup/pgdn"));
+
+        app.update(DashboardEvent::KeyPressed {
+            code: KeyCode::Home,
+            modifiers: KeyModifiers::NONE,
+        });
+        let oldest = rendered_text(&mut app, 60, 16);
+        assert!(oldest.contains("transcript-line-00"));
+        assert!(!oldest.contains("transcript-line-39"));
+
+        app.update(DashboardEvent::KeyPressed {
+            code: KeyCode::PageDown,
+            modifiers: KeyModifiers::NONE,
+        });
+        let paged = rendered_text(&mut app, 60, 16);
+        assert!(!paged.contains("transcript-line-00"));
+        app.update(DashboardEvent::KeyPressed {
+            code: KeyCode::End,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(rendered_text(&mut app, 60, 16).contains("transcript-line-39"));
+    }
+
+    #[test]
+    fn schedule_palette_has_schedule_execution_and_notice_actions_but_no_content() {
+        let mut schedule = schedule_view();
+        schedule.executions[0].state = ExecutionDisplayState::DispatchFailed;
+        schedule.executions[0].reason = Some(ExecutionReasonDisplay::HostSpawnFailed);
+        let mut palette = CommandPalette::new_with_schedules(
+            &[workspace("w1", "boomux")],
+            &[schedule],
+            &SchedulingView::Offline {
+                active: 0,
+                maximum: 4,
+            },
+            true,
+        );
+        for (query, group) in [
+            ("schedule nightly", PaletteKindGroup::Schedules),
+            ("execution failed", PaletteKindGroup::Executions),
+            ("notice failed", PaletteKindGroup::ScheduleNotices),
+        ] {
+            palette.query = query.into();
+            palette.update_matches();
+            assert!(
+                palette
+                    .matches
+                    .iter()
+                    .any(|index| palette.entries[*index].kind_group == group)
+            );
+        }
+        assert!(
+            palette
+                .entries
+                .iter()
+                .all(|entry| !entry.keywords.contains("transcript content"))
+        );
+    }
+
+    #[test]
+    fn schedule_rendering_preserves_wide_common_breakpoints_and_compact_layouts() {
+        for (width, height) in [(180, 34), (114, 24), (113, 24), (80, 24), (60, 16)] {
+            let mut app = schedule_app();
+            let text = rendered_text(&mut app, width, height);
+            assert!(
+                text.contains("SCHEDULES"),
+                "missing tab at {width}x{height}"
+            );
+            assert!(
+                text.contains("nightly review"),
+                "missing row at {width}x{height}"
+            );
+            assert!(
+                text.contains("never") || text.contains("active"),
+                "missing outcome at {width}x{height}"
+            );
+            assert!(
+                !text.contains("schedule-shell"),
+                "leaked full shell ID at {width}x{height}"
+            );
+            if width == 80 && height == 24 {
+                assert!(text.contains("[/]"), "missing execution navigation help");
+            }
+        }
+        let mut wide = schedule_app();
+        let wide = rendered_text(&mut wide, 180, 34);
+        for column in [
+            "TRIGGER",
+            "NEXT",
+            "LAST",
+            "STATE",
+            "WORKSPACE",
+            "INTEGRATION",
+        ] {
+            assert!(wide.contains(column));
+        }
+        assert!(wide.contains("PROMPT REV"));
+        assert!(wide.contains("no timeout"));
+        assert!(wide.contains("America/New_York"));
+    }
+
+    #[test]
+    fn schedule_empty_unsupported_offline_and_history_boundaries_are_truthful() {
+        let mut app = App::new(Vec::new(), project_context());
+        app.select_tab(PrimaryTab::Schedules);
+        let unsupported = rendered_text(&mut app, 80, 24);
+        assert!(unsupported.contains("require daemon protocol"));
+
+        app.scheduling = SchedulingView::Offline {
+            active: 0,
+            maximum: 4,
+        };
+        let empty = rendered_text(&mut app, 80, 24);
+        assert!(empty.contains("schedule create --help"));
+
+        app.schedules = vec![schedule_view()];
+        app.select_tab(PrimaryTab::Schedules);
+        app.schedules[0].history_truncated = true;
+        let truncated = rendered_text(&mut app, 114, 24);
+        assert!(truncated.contains("page is truncated"));
+        app.schedules[0].history_truncated = false;
+        app.schedules[0].possible_pruning_boundary = true;
+        let pruned = rendered_text(&mut app, 114, 24);
+        assert!(pruned.contains("pruning boundary"));
+
+        app.schedules[0].executions.clear();
+        app.schedules[0].history_complete = false;
+        app.sync_selected_execution();
+        let unknown = rendered_text(&mut app, 114, 24);
+        assert!(unknown.contains("history unknown"));
+        assert!(!unknown.contains("never run"));
+        app.schedules[0].history_scoped = true;
+        app.schedules[0].history_complete = true;
+        let complete = rendered_text(&mut app, 114, 24);
+        assert!(complete.contains("never run"));
     }
 }

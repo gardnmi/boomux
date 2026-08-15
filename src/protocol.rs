@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 25;
+pub const PROTOCOL_VERSION: u32 = 26;
 pub const MIN_PROTOCOL_VERSION: u32 = 6;
 pub const MAX_CONTROL_FRAME: usize = 8 * 1024 * 1024;
 pub const MAX_ATTACH_FRAME: usize = 1024 * 1024;
@@ -100,6 +100,10 @@ define_protocol_features! {
         "revision_aware_scheduled_execution_wait",
         "bounded_scheduled_execution_history",
         "scheduled_execution_notifications",
+    ]),
+    ExactRunAttachment => (26, "exact run attachment", [
+        "protocol_26",
+        "exact_run_attachment",
     ]),
 }
 
@@ -1060,6 +1064,8 @@ pub enum Request {
         takeover: bool,
         #[serde(default)]
         restart_exited: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_run_id: Option<String>,
         profile: TerminalProfile,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         environment: Option<UnixEnvironment>,
@@ -1110,6 +1116,10 @@ impl Request {
             Self::RestartWithNotificationConfig { .. } => {
                 Some(ProtocolFeature::RestartNotificationConfig)
             }
+            Self::Attach {
+                expected_run_id: Some(_),
+                ..
+            } => Some(ProtocolFeature::ExactRunAttachment),
             Self::Attach {
                 environment: Some(_),
                 ..
@@ -1542,6 +1552,7 @@ mod tests {
             shell_id: "s1".into(),
             takeover: false,
             restart_exited: true,
+            expected_run_id: None,
             profile: TerminalProfile {
                 term: Some("xterm-256color".into()),
                 colorterm: Some("truecolor".into()),
@@ -1743,8 +1754,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_twenty_five_with_minimum_six() {
-        assert_eq!(PROTOCOL_VERSION, 25);
+    fn protocol_version_is_twenty_six_with_minimum_six() {
+        assert_eq!(PROTOCOL_VERSION, 26);
         assert_eq!(MIN_PROTOCOL_VERSION, 6);
     }
 
@@ -2169,6 +2180,7 @@ mod tests {
                         shell_id: "s1".into(),
                         takeover: false,
                         restart_exited: false,
+                        expected_run_id: None,
                         profile: test_profile(),
                         environment: None,
                     },
@@ -2250,6 +2262,7 @@ mod tests {
                         shell_id: "s1".into(),
                         takeover: false,
                         restart_exited: true,
+                        expected_run_id: None,
                         profile: test_profile(),
                         environment: None,
                     },
@@ -2296,10 +2309,22 @@ mod tests {
                     shell_id: "s1".into(),
                     takeover: false,
                     restart_exited: true,
+                    expected_run_id: None,
                     profile: test_profile(),
                     environment: Some(UnixEnvironment {
                         variables: Vec::new(),
                     }),
+                }],
+            ),
+            (
+                26,
+                vec![Request::Attach {
+                    shell_id: "s1".into(),
+                    takeover: true,
+                    restart_exited: false,
+                    expected_run_id: Some("r1".into()),
+                    profile: test_profile(),
+                    environment: None,
                 }],
             ),
         ];
@@ -2397,6 +2422,7 @@ mod tests {
                     "scheduled_execution_notifications",
                 ][..],
             ),
+            (26, &["protocol_26", "exact_run_attachment"][..]),
         ];
 
         let actual = ProtocolFeature::ALL
@@ -2423,6 +2449,7 @@ mod tests {
             request,
             Request::Attach {
                 environment: None,
+                expected_run_id: None,
                 ..
             }
         ));

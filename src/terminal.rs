@@ -39,6 +39,32 @@ pub(crate) fn open(
     title: &str,
     takeover: bool,
 ) -> Result<(), Box<dyn Error>> {
+    open_with_expected_run(desktop_entry, shell_id, title, takeover, None)
+}
+
+pub(crate) fn open_exact_run(
+    desktop_entry: Option<&str>,
+    shell_id: &str,
+    expected_run_id: &str,
+    title: &str,
+    takeover: bool,
+) -> Result<(), Box<dyn Error>> {
+    open_with_expected_run(
+        desktop_entry,
+        shell_id,
+        title,
+        takeover,
+        Some(expected_run_id),
+    )
+}
+
+fn open_with_expected_run(
+    desktop_entry: Option<&str>,
+    shell_id: &str,
+    title: &str,
+    takeover: bool,
+    expected_run_id: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
     let preference = desktop_entry.map(TemporaryPreference::new).transpose()?;
     let selected = selected_with_preference(desktop_entry, preference.as_ref())?;
     let mut resolver = configured_command(preference.as_ref());
@@ -47,7 +73,7 @@ pub(crate) fn open(
         .arg(format!("--title={title}"))
         .arg("--")
         .arg(attachment_executable()?)
-        .args(["__attach", shell_id, "--restart-exited"]);
+        .args(attachment_arguments(shell_id, expected_run_id));
     if takeover {
         resolver.arg("--takeover");
     }
@@ -81,6 +107,16 @@ pub(crate) fn open(
         .spawn()
         .map_err(|error| format!("could not launch {selected}: {error}"))?;
     Ok(())
+}
+
+fn attachment_arguments(shell_id: &str, expected_run_id: Option<&str>) -> Vec<OsString> {
+    let mut arguments = vec!["__attach".into(), shell_id.into()];
+    if let Some(expected_run_id) = expected_run_id {
+        arguments.extend(["--expected-run-id".into(), expected_run_id.into()]);
+    } else {
+        arguments.push("--restart-exited".into());
+    }
+    arguments
 }
 
 fn attachment_executable() -> io::Result<PathBuf> {
@@ -218,6 +254,22 @@ mod tests {
         assert_eq!(
             arguments,
             ["alacritty", "-e", "boomux", "__attach"]
+                .map(OsStr::new)
+                .map(OsStr::to_owned)
+        );
+    }
+
+    #[test]
+    fn exact_run_attachment_arguments_never_enable_restart() {
+        assert_eq!(
+            attachment_arguments("shell-1", Some("run-1")),
+            ["__attach", "shell-1", "--expected-run-id", "run-1"]
+                .map(OsStr::new)
+                .map(OsStr::to_owned)
+        );
+        assert_eq!(
+            attachment_arguments("shell-1", None),
+            ["__attach", "shell-1", "--restart-exited"]
                 .map(OsStr::new)
                 .map(OsStr::to_owned)
         );
