@@ -48,6 +48,9 @@
 - **Exact argument vectors:** workspace launchers, process adapters, terminal
   launch, and integration management execute argv directly without shell
   interpretation.
+- **Scheduled Agent authority:** [`scheduled-agent-work.md`](scheduled-agent-work.md)
+  defines the accepted, not-yet-implemented boundary between scheduling,
+  process outcome, and authoritative Agent lifecycle.
 
 ## Product Boundary
 
@@ -354,6 +357,60 @@ advertises supported commands, features, schemas, and error codes without
 requiring a daemon. Protocol 6 error responses carry an additive optional code;
 clients expose it as `ClientError::Remote(RemoteError)`, while mixed-version
 peers retain message compatibility.
+
+### Scheduled Agent Work (Accepted, Not Yet Implemented)
+
+Agent scheduling will add two durable identities without changing ShellRun,
+Agent Instance, or projected Agent Session semantics. An Agent Schedule belongs
+to exactly one workspace and snapshots a bounded prompt revision, explicit
+working directory, integration, session policy, canonical five-field cron
+expression, IANA timezone, and dispatch policy. A Scheduled Execution records
+one manual or timed decision against exact schedule and prompt revisions. An
+execution that binds the internal runner acquires a shell run, even when the
+external host later fails to launch. The first such execution lazily creates one
+schedule-owned durable shell that later executions reuse for distinct runs;
+ordinary shell or workspace open never starts or restarts it. Lifecycle
+integration may bind an Agent Instance to the exact execution run under the
+existing authority rules.
+
+The schedule-owned shell stores a stable internal runner argument vector rather
+than a host prompt. Each persisted execution claim snapshots its working
+directory and dispatch inputs; the runner resolves that exact claim and invokes
+the integration adapter without shell interpretation. Schedule updates while a
+run is active affect only later claims. A durable per-schedule evaluation
+frontier and occurrence key prevent clock rollback, history pruning, restart,
+or graceful handoff from dispatching one timed occurrence twice. The frontier,
+occurrence decision, and execution record commit as one durable mutation before
+event publication.
+
+Scheduling is process orchestration, not lifecycle observation. Spawn failure,
+process exit, cancellation, and cold-daemon interruption are Scheduled Execution
+outcomes and never imply Agent `working`, `idle`, `blocked`, or `done`. Existing
+Agent attention remains the authority when a linked Agent reports `blocked`.
+The scheduler does not parse terminal output, answer guarded prompts, inject
+input into an active session, or infer a canonical external session.
+
+Fresh is the default session mode and starts a new external Agent Session for
+each dispatched execution. Continuation schedules pin one exact existing
+integration and external session identity; they never select the latest session
+or fall back to fresh work. An occurrence is skipped while a continuation lease,
+an exact current daemon Agent occurrence, the schedule, or the workspace is
+active. Boomux cannot prove inactivity in an unmanaged host process without an
+integration-provided lease and does not substitute heuristics. Daemon-wide
+scheduled concurrency defaults to four and is configurable within a positive
+bound.
+
+New schedules are paused by default. Timed work skips overlap and offline
+occurrences rather than queueing or catching up, and automatic retries are not
+part of the initial contract. The initial release also has no automatic timeout:
+an execution remains active until its process exits, the user cancels it, or a
+cold daemon loss interrupts it. Future scheduled starts use the daemon's
+startup environment as ephemeral input; it is never persisted, and environment
+changes require daemon restart. Scheduled-work support extends graceful restart
+so the invoking client's validated environment becomes the replacement daemon's
+startup environment without entering durable state or the handoff manifest.
+These limitations and scheduler health must be visible to clients. See
+[`scheduled-agent-work.md`](scheduled-agent-work.md) and [ADR 0002](adr/0002-separate-agent-schedules-from-runtime-identity.md).
 
 Protocol 7 adds a bounded in-memory daemon event journal and atomic output-state
 reads. Clients reconnect through stream UUID/event-ID cursors and recover from
