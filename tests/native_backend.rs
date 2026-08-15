@@ -10,6 +10,8 @@ mod handoff;
 mod launchers_integrations;
 #[path = "native_backend/notifications.rs"]
 mod notifications;
+#[path = "native_backend/project_discovery.rs"]
+mod project_discovery;
 #[path = "native_backend/protocol_control.rs"]
 mod protocol_control;
 #[path = "native_backend/schedules.rs"]

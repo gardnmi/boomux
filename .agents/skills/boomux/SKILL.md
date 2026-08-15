@@ -58,8 +58,8 @@ Most daemon-backed inspection commands automatically start Boomux when it is
 not running. This includes `list`, `shells`, `read`, `events`, workspace, shell,
 and launcher inspection, Agent, attention, session, and schedule inspection, and
 `doctor`. Use `boomux daemon status` first when starting the daemon would be an
-unwanted side effect. `capabilities`, `integration list`, and `integration
-status` do not start it.
+unwanted side effect. `capabilities`, `project list`, `integration list`, and
+`integration status` do not start it.
 
 Inspect bundled lifecycle integrations with:
 
@@ -504,6 +504,16 @@ Selecting a discovered project in the dashboard persists its canonical path as
 the workspace default cwd for later shells. Set
 `[dashboard] follow_focused_terminal = false` to disable the default
 focus-following behavior.
+
+Discover the same configured projects locally without starting the daemon:
+
+```console
+boomux project list --json
+```
+
+Use the canonical `path` returned for workspace creation. An empty list with
+`roots_configured: false` means no roots are configured; inspect `warnings` when
+configured roots cannot be scanned.
 
 ## Manage Workspaces
 

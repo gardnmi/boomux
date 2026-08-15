@@ -71,6 +71,7 @@ fn native_daemon_lifecycle() {
     let json_commands = capabilities["data"]["json_commands"].as_array().unwrap();
     for command in [
         "events",
+        "project.list",
         "agent.register",
         "agent.ensure",
         "agent.report",

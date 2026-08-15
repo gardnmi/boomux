@@ -425,6 +425,16 @@ stores its path as the workspace default for shells added later. Free-text and
 legacy workspaces without a default continue to use the directory where the
 dashboard was opened. An explicit shell cwd always takes precedence.
 
+List the same discovered projects without starting the daemon:
+
+```console
+boomux project list
+boomux project list --json
+```
+
+JSON output uses the stable `boomux.cli/v1` contract and includes canonical
+paths, root groups and ordering, warnings, and whether any roots are configured.
+
 The dashboard follows the most recently focused Boomux terminal by default,
 selecting its workspace and shell or Agent row. Manual dashboard navigation is
 preserved until another managed terminal gains focus. Press `Space` to pin the
