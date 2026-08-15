@@ -270,13 +270,14 @@ Use these mutation commands only for a lifecycle integration that directly
 observes the external agent session:
 
 ```console
-boomux agent register "<name>" --integration "<integration>" --external-session-id "<id>" --shell-id "<shell-id>" --run-id "<run-id>" --state working --authority lifecycle-integration --evidence "<direct evidence>" --confidence 100 --json
-boomux agent ensure "<name>" --integration "<integration>" --external-session-id "<id>" --shell-id "<shell-id>" --run-id "<run-id>" --state working --authority lifecycle-integration --evidence "<direct evidence>" --confidence 100 --json
+boomux agent register [<name>] --integration "<integration>" --external-session-id "<id>" --shell-id "<shell-id>" --run-id "<run-id>" --state working --authority lifecycle-integration --evidence "<direct evidence>" --confidence 100 --json
+boomux agent ensure [<name>] --integration "<integration>" --external-session-id "<id>" --shell-id "<shell-id>" --run-id "<run-id>" --state working --authority lifecycle-integration --evidence "<direct evidence>" --confidence 100 --json
 boomux agent report "<exact-agent-id>" --shell-id "<same-shell-id>" --run-id "<original-run-id>" --state blocked --authority lifecycle-integration --evidence "<direct evidence>" --confidence 100 --json
 boomux agent report "<exact-agent-id>" --shell-id "<same-shell-id>" --run-id "<original-run-id>" --state done --authority lifecycle-integration --evidence "<completion evidence>" --confidence 100 --json
 ```
 
-`--external-session-id` is optional for `register` and required for `ensure`.
+Omitting the descriptive Agent name generates a random lowercase
+`adjective-noun` name. `--external-session-id` is optional for `register` and required for `ensure`.
 Use `ensure` when an integration needs idempotent identity recovery after a
 reload. Its key is integration, external session ID, shell ID, and run ID; a
 match returns the existing durable snapshot without applying the supplied name
@@ -308,7 +309,7 @@ Use the process adapter only when the caller already knows the canonical root
 external session ID:
 
 ```console
-boomux agent supervise "<name>" --integration "<integration>" --external-session-id "<canonical-root-id>" --shell-id "<shell-id>" --run-id "<run-id>" -- command arg
+boomux agent supervise [<name>] --integration "<integration>" --external-session-id "<canonical-root-id>" --shell-id "<shell-id>" --run-id "<run-id>" -- command arg
 ```
 
 Inside the target managed process, `--shell-id` and `--run-id` default to
@@ -461,7 +462,7 @@ boomux shell close "<name-or-id>" --workspace "<workspace-name-or-id>"
 `shell create` records a pending shell. Without `--cwd`, it uses the workspace
 default when present and otherwise the current directory. An unavailable stored
 default is an error rather than a silent fallback. Omit `--name` to let Boomux
-generate a unique shell name. A shell cannot close itself through the CLI.
+generate a unique lowercase `adjective-noun` shell name. A shell cannot close itself through the CLI.
 Closing one shell terminates its process session and removes its retained
 terminal state, but durable Agent records remain in the workspace as historical
 occurrences.

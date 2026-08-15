@@ -8,8 +8,8 @@ use boomux::protocol::{self, AttachFrame, ErrorCode, ShellRunExitReason, ShellSp
 use uuid::Uuid;
 
 use crate::support::{
-    TestDaemon, acknowledge_reconnect, assert_remote_code, contains, parse_pid, process_exists,
-    profile, read_until, wait_for_attach_with_profile, wait_until,
+    TestDaemon, acknowledge_reconnect, assert_generated_name, assert_remote_code, contains,
+    parse_pid, process_exists, profile, read_until, wait_for_attach_with_profile, wait_until,
 };
 
 #[test]
@@ -309,6 +309,27 @@ fn native_daemon_lifecycle() {
     assert_eq!(output["command"], "shell.inspect");
     assert_eq!(output["data"]["shell"]["status"], "pending");
     assert!(output["data"]["shell"]["run"].is_null());
+    let output = daemon
+        .command()
+        .args(["shell", "create", "cli-renamed", "--cwd"])
+        .arg(std::env::temp_dir())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "unnamed shell create failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let generated = daemon
+        .client
+        .get_workspace(&cli_workspace.id)
+        .unwrap()
+        .shells
+        .into_iter()
+        .find(|shell| shell.name != "checks")
+        .expect("unnamed shell was not created");
+    assert_generated_name(&generated.name);
+    assert_eq!(generated.status, ShellStatus::Pending);
     let output = daemon
         .command()
         .args([

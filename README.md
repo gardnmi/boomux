@@ -129,6 +129,7 @@ boomux . --name my-project --new -- sh -lc 'cargo test | tee test.log'
 | Create a generated workspace | `boomux .` |
 | Create or add to a named workspace | `boomux . --name feature-x` |
 | Create an empty workspace with a default directory | `boomux workspace create feature-x --cwd .` |
+| Add a randomly named shell | `boomux shell create feature-x` |
 | Open the new shell in another terminal | `boomux . --name feature-x --new` |
 | Run one command | `boomux . --name feature-x --new -- lazygit` |
 | Choose a terminal | `boomux . --terminal Alacritty.desktop` |
@@ -138,6 +139,9 @@ boomux . --name my-project --new -- sh -lc 'cargo test | tee test.log'
 Without `--name`, Boomux creates the next `workspace-N` and stores the selected
 path as its default for later shells. With `--name`, it adds a shell to an
 existing exact-name workspace or creates a workspace with that default.
+Shells created without an explicit shell name receive a memorable lowercase
+`adjective-noun` name such as `quiet-otter`; that concrete name is retained like
+any explicit name.
 `--terminal` implies `--new`. Terminal selection uses the CLI override, then
 Boomux configuration, then the normal `xdg-terminal-exec` policy.
 
