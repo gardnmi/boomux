@@ -28,7 +28,7 @@ use crate::desktop_notifications::{
 };
 use crate::fd_transfer::send_descriptor;
 use crate::handoff;
-use crate::node_identity::NodeIdentity;
+use crate::node_identity::{NodeIdentityLease, NodeIdentityManager};
 use crate::protocol::{
     self, AgentAttentionReason, AgentAttentionSnapshot, AgentAuthority, AgentInstanceSnapshot,
     AgentObservationSnapshot, AgentRegistrationSpec, AgentReport, AgentScheduleInspection,
@@ -82,6 +82,8 @@ const MAX_EVENT_WAIT: Duration = Duration::from_secs(30);
 const TRANSITION_IDLE: u8 = 0;
 const TRANSITION_RESTART: u8 = 1;
 const TRANSITION_SHUTDOWN: u8 = 2;
+const TRANSITION_REKEY: u8 = 3;
+const NODE_REKEY_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NotificationSettings {
@@ -325,7 +327,7 @@ fn run_daemon(
     validate_notification_delivery_settings(&notification_settings)?;
     let live_handoff = committed.is_some();
     let mut registry = DaemonService::restore(store, live_handoff, transferred.events)?;
-    registry.node_identity = match NodeIdentity::load_or_create_from_environment() {
+    registry.node_identity = match NodeIdentityManager::load_or_create_from_environment() {
         Ok(identity) => Some(identity),
         Err(error) => {
             eprintln!("boomux: federation disabled: {error}");
@@ -890,7 +892,15 @@ fn handle_connection(
     transition: Arc<AtomicU8>,
     restart_sender: mpsc::Sender<RestartRequest>,
 ) -> io::Result<()> {
-    handle_connection_inner(stream, registry, shutdown, transition, restart_sender, true)
+    handle_connection_inner(
+        stream,
+        registry,
+        shutdown,
+        transition,
+        restart_sender,
+        true,
+        None,
+    )
 }
 
 fn handle_connection_inner(
@@ -900,6 +910,7 @@ fn handle_connection_inner(
     transition: Arc<AtomicU8>,
     restart_sender: mpsc::Sender<RestartRequest>,
     allow_federation_upgrade: bool,
+    federation_lease: Option<NodeIdentityLease>,
 ) -> io::Result<()> {
     stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
     let request: Envelope<Request> = protocol::read_message(&mut stream)?;
@@ -946,11 +957,22 @@ fn handle_connection_inner(
                 .into_response(),
             );
         };
+        let lease = match identity.admit() {
+            Ok(lease) => lease,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                return send_response(
+                    &mut stream,
+                    response_version,
+                    DaemonError::from(error).into_response(),
+                );
+            }
+            Err(error) => return Err(error),
+        };
         send_response(
             &mut stream,
             response_version,
             Response::FederationChannel {
-                node_id: identity.id().to_owned(),
+                node_id: identity.id()?,
             },
         )?;
         stream.set_write_timeout(None)?;
@@ -961,7 +983,56 @@ fn handle_connection_inner(
             transition,
             restart_sender,
             false,
+            Some(lease),
         );
+    }
+
+    let _federation_lease = federation_lease;
+
+    if let Request::RekeyNode { expected_node_id } = &request.message {
+        if _federation_lease.is_some() {
+            return send_response(
+                &mut stream,
+                response_version,
+                DaemonError::validation("Node rekey cannot use a federation channel")
+                    .into_response(),
+            );
+        }
+        if transition
+            .compare_exchange(
+                TRANSITION_IDLE,
+                TRANSITION_REKEY,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return send_response(
+                &mut stream,
+                response_version,
+                DaemonError::lifecycle(
+                    ErrorCode::Busy,
+                    "another daemon transition is already in progress",
+                )
+                .into_response(),
+            );
+        }
+        let response = match registry.node_identity.as_ref() {
+            Some(identity) => match identity.rekey(expected_node_id, NODE_REKEY_DRAIN_TIMEOUT) {
+                Ok(node_id) => Response::NodeIdentity { node_id },
+                Err(error) if error.kind() == io::ErrorKind::TimedOut => {
+                    DaemonError::lifecycle(ErrorCode::Busy, error.to_string()).into_response()
+                }
+                Err(error) => DaemonError::from(error).into_response(),
+            },
+            None => DaemonError::lifecycle(
+                ErrorCode::NodeIdentityUnavailable,
+                "Boomux Node identity is unavailable",
+            )
+            .into_response(),
+        };
+        transition.store(TRANSITION_IDLE, Ordering::Release);
+        return send_response(&mut stream, response_version, response);
     }
 
     if let Request::Attach {
@@ -1547,7 +1618,7 @@ fn scheduled_execution_response(
 }
 
 struct DaemonService {
-    node_identity: Option<NodeIdentity>,
+    node_identity: Option<Arc<NodeIdentityManager>>,
     durable: DurableRegistry,
     events: EventStream,
     runtimes: ShellRuntimeManager,
@@ -6965,18 +7036,19 @@ impl DaemonService {
             Request::GetNodeIdentity => self
                 .node_identity
                 .as_ref()
-                .map(|identity| Response::NodeIdentity {
-                    node_id: identity.id().to_owned(),
-                })
                 .ok_or_else(|| {
                     DaemonError::lifecycle(
                         ErrorCode::NodeIdentityUnavailable,
                         "Boomux Node identity is unavailable",
                     )
-                }),
+                })?
+                .id()
+                .map(|node_id| Response::NodeIdentity { node_id })
+                .map_err(DaemonError::from),
             Request::OpenFederationChannel => {
                 unreachable!("federation channel is handled before dispatch")
             }
+            Request::RekeyNode { .. } => unreachable!("Node rekey is handled before dispatch"),
             Request::Restart | Request::RestartWithNotificationConfig { .. } => {
                 unreachable!("restart is handled before dispatch")
             }

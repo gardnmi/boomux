@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 29;
+pub const PROTOCOL_VERSION: u32 = 30;
 pub const MIN_PROTOCOL_VERSION: u32 = 6;
 pub const MAX_CONTROL_FRAME: usize = 8 * 1024 * 1024;
 pub const MAX_ATTACH_FRAME: usize = 1024 * 1024;
@@ -117,6 +117,7 @@ define_protocol_features! {
         "protocol_29",
         "federation_daemon_channel",
     ]),
+    NodeRekey => (30, "Node rekey", ["protocol_30", "node_rekey"]),
 }
 
 pub const DEFAULT_SCHEDULED_EXECUTION_LIST_LIMIT: u16 = 100;
@@ -932,6 +933,9 @@ pub enum Request {
     Ping,
     GetNodeIdentity,
     OpenFederationChannel,
+    RekeyNode {
+        expected_node_id: String,
+    },
     Restart,
     RestartWithNotificationConfig {
         notifications: NotificationDeliveryConfig,
@@ -1120,6 +1124,7 @@ impl Request {
         match self {
             Self::GetNodeIdentity => Some(ProtocolFeature::NodeIdentity),
             Self::OpenFederationChannel => Some(ProtocolFeature::FederationChannel),
+            Self::RekeyNode { .. } => Some(ProtocolFeature::NodeRekey),
             Self::WaitScheduledExecution { .. } => {
                 Some(ProtocolFeature::ScheduledExecutionObservation)
             }
@@ -1806,8 +1811,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_twenty_nine_with_minimum_six() {
-        assert_eq!(PROTOCOL_VERSION, 29);
+    fn protocol_version_is_thirty_with_minimum_six() {
+        assert_eq!(PROTOCOL_VERSION, 30);
         assert_eq!(MIN_PROTOCOL_VERSION, 6);
     }
 
@@ -1841,6 +1846,13 @@ mod tests {
             serde_json::from_value::<Response>(encoded).unwrap(),
             response
         );
+
+        let request = Request::RekeyNode {
+            expected_node_id: "550e8400-e29b-41d4-a716-446655440000".into(),
+        };
+        let encoded = serde_json::to_value(&request).unwrap();
+        assert_eq!(encoded["request"], "rekey_node");
+        assert_eq!(serde_json::from_value::<Request>(encoded).unwrap(), request);
     }
 
     #[test]
@@ -2165,6 +2177,12 @@ mod tests {
     #[test]
     fn request_feature_requirements_cover_all_groups() {
         let groups = vec![
+            (
+                30,
+                vec![Request::RekeyNode {
+                    expected_node_id: "550e8400-e29b-41d4-a716-446655440000".into(),
+                }],
+            ),
             (29, vec![Request::OpenFederationChannel]),
             (28, vec![Request::GetNodeIdentity]),
             (
@@ -2554,6 +2572,7 @@ mod tests {
             (27, &["protocol_27", "agent_schedule_editing"][..]),
             (28, &["protocol_28", "stable_node_identity"][..]),
             (29, &["protocol_29", "federation_daemon_channel"][..]),
+            (30, &["protocol_30", "node_rekey"][..]),
         ];
 
         let actual = ProtocolFeature::ALL
