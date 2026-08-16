@@ -1387,7 +1387,7 @@ fn run_bounded_command(mut command: Command, timeout: Duration) -> io::Result<Ss
     }
     if !status.expect("checked above").success() {
         return Err(io::Error::other(
-            "SSH probe failed; verify target resolution, the SSH service, authentication, and remote shell support",
+            "SSH probe failed; verify target resolution, the SSH service, credentials, and remote shell support",
         ));
     }
     Ok(SshProbeOutput { stdout, stderr })
@@ -1829,7 +1829,7 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::Other);
         assert_eq!(
             error.to_string(),
-            "SSH probe failed; verify target resolution, the SSH service, authentication, and remote shell support"
+            "SSH probe failed; verify target resolution, the SSH service, credentials, and remote shell support"
         );
     }
 
