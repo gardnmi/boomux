@@ -150,8 +150,6 @@ pub(crate) struct NodeView {
     pub(crate) health: NodeProjectionHealthCode,
     pub(crate) current: bool,
     pub(crate) stale: bool,
-    pub(crate) observed_at_ms: u64,
-    pub(crate) observed_protocol_version: Option<u32>,
     pub(crate) observed_capabilities: Vec<String>,
     pub(crate) scheduler: SchedulerHealth,
 }
@@ -771,6 +769,7 @@ impl AttentionReason {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum DashboardEffect {
     Quit,
+    AddNode,
     RestoreWorkspace(QualifiedIdentity),
     Open(OpenTarget),
     Close(CloseTarget),
@@ -1348,6 +1347,7 @@ impl PaletteActionGroup {
 enum PaletteKindGroup {
     BlockedAgents,
     Attention,
+    Nodes,
     Workspaces,
     Agents,
     Shells,
@@ -1363,6 +1363,7 @@ impl PaletteKindGroup {
         match self {
             Self::BlockedAgents => "BLOCKED AGENTS",
             Self::Attention => "ATTENTION",
+            Self::Nodes => "NODES",
             Self::Workspaces => "WORKSPACES",
             Self::Agents => "AGENTS",
             Self::Shells => "SHELLS",
@@ -1377,6 +1378,7 @@ impl PaletteKindGroup {
 
 #[derive(Clone)]
 enum PaletteCommand {
+    AddNode,
     CreateWorkspace,
     ShowHelp,
     Workspace {
@@ -1550,6 +1552,14 @@ impl CommandPalette {
         scheduling: &SchedulingView,
     ) -> Self {
         let mut entries = vec![
+            PaletteEntry {
+                action_group: PaletteActionGroup::Create,
+                kind_group: PaletteKindGroup::Nodes,
+                label: "Add remote Node".into(),
+                detail: "open guided SSH setup in a new terminal".into(),
+                keywords: "connect register ssh machine host".into(),
+                command: PaletteCommand::AddNode,
+            },
             PaletteEntry {
                 action_group: PaletteActionGroup::Create,
                 kind_group: PaletteKindGroup::Workspaces,
@@ -3442,6 +3452,7 @@ fn execute_effects(
 
 fn execute_palette_command(app: &mut App, command: PaletteCommand) -> Option<DashboardEffect> {
     match command {
+        PaletteCommand::AddNode => Some(DashboardEffect::AddNode),
         PaletteCommand::CreateWorkspace => {
             app.mode = Mode::PickProject(ProjectPicker::new(&app.project_context));
             None
@@ -4747,7 +4758,7 @@ fn workspace_display_name(workspace: &WorkspaceView) -> String {
     if workspace.node.local {
         return workspace.name.clone();
     }
-    let health = format!("{:?}", workspace.node.health).to_ascii_lowercase();
+    let health = node_health_label(workspace.node.health);
     let freshness = if workspace.node.stale || !workspace.node.current {
         " stale"
     } else {
@@ -4757,6 +4768,20 @@ fn workspace_display_name(workspace: &WorkspaceView) -> String {
         "[{} {health}{freshness}] {}",
         workspace.node.alias, workspace.name
     )
+}
+
+fn node_health_label(health: NodeProjectionHealthCode) -> &'static str {
+    match health {
+        NodeProjectionHealthCode::Unobserved => "unobserved",
+        NodeProjectionHealthCode::Online => "online",
+        NodeProjectionHealthCode::Reconnecting => "reconnecting",
+        NodeProjectionHealthCode::Stale => "stale",
+        NodeProjectionHealthCode::Unreachable => "unreachable",
+        NodeProjectionHealthCode::AuthenticationRequired => "auth required",
+        NodeProjectionHealthCode::IdentityChanged => "identity changed",
+        NodeProjectionHealthCode::IdentityConflict => "identity conflict",
+        NodeProjectionHealthCode::Unsupported => "unsupported",
+    }
 }
 
 fn render_tabs(frame: &mut Frame, area: Rect, app: &App) {
@@ -4776,17 +4801,8 @@ fn render_tabs(frame: &mut Frame, area: Rect, app: &App) {
                 ]
             })
             .collect::<Vec<_>>();
-        let filter = app.node_filter.as_ref().map_or("all", |id| {
-            app.nodes
-                .iter()
-                .find(|node| &node.id == id)
-                .map_or("unknown", |node| node.alias.as_str())
-        });
         let mut spans = spans;
-        spans.push(Span::styled(
-            format!(" NODE:{filter}"),
-            Style::new().fg(YELLOW),
-        ));
+        append_node_filter(&mut spans, app);
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
         return;
     }
@@ -4804,7 +4820,7 @@ fn render_tabs(frame: &mut Frame, area: Rect, app: &App) {
             format!(" 1 WORKSPACES {} ", app.workspaces.len()),
             workspace_style,
         ),
-        Span::styled("      ALL: ", Style::new().fg(SUBTEXT)),
+        Span::raw("      "),
     ];
     spans.extend(
         PrimaryTab::ALL
@@ -4836,26 +4852,24 @@ fn render_tabs(frame: &mut Frame, area: Rect, app: &App) {
                 ]
             }),
     );
-    spans.push(Span::styled(" NODES: ", Style::new().fg(SUBTEXT)));
-    for node in &app.nodes {
-        spans.push(Span::styled(
-            format!(
-                "{}({}) {}/{} sched:{}/{} p{} obs:{} caps:{}  ",
-                node.alias,
-                if node.local { "local" } else { "remote" },
-                format!("{:?}", node.health).to_ascii_lowercase(),
-                if node.stale { "stale" } else { "current" },
-                format!("{:?}", node.scheduler.state).to_ascii_lowercase(),
-                node.scheduler.active_executions,
-                node.observed_protocol_version
-                    .map_or_else(|| "?".into(), |version| version.to_string()),
-                node.observed_at_ms,
-                node.observed_capabilities.len(),
-            ),
-            Style::new().fg(if node.stale { YELLOW } else { GREEN }),
-        ));
-    }
+    append_node_filter(&mut spans, app);
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn append_node_filter<'a>(spans: &mut Vec<Span<'a>>, app: &'a App) {
+    if app.nodes.len() <= 1 && app.node_filter.is_none() {
+        return;
+    }
+    let filter = app.node_filter.as_ref().map_or("all", |id| {
+        app.nodes
+            .iter()
+            .find(|node| &node.id == id)
+            .map_or("unknown", |node| node.alias.as_str())
+    });
+    spans.push(Span::styled(
+        format!(" NODE:{filter}"),
+        Style::new().fg(YELLOW),
+    ));
 }
 
 fn render_workspaces(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
@@ -6713,8 +6727,6 @@ mod tests {
                 health: NodeProjectionHealthCode::Online,
                 current: true,
                 stale: false,
-                observed_at_ms: 0,
-                observed_protocol_version: None,
                 observed_capabilities: Vec::new(),
                 scheduler: SchedulerHealth {
                     state: crate::protocol::SchedulerState::Active,
@@ -6907,11 +6919,11 @@ mod tests {
             remote.node.stale = health != NodeProjectionHealthCode::Online;
             let mut wide = App::new(vec![remote.clone()], project_context());
             let mut compact = App::new(vec![remote], project_context());
-            let label = format!("{:?}", health).to_ascii_lowercase();
+            let label = node_health_label(health);
             let wide = rendered_text(&mut wide, 180, 24);
             let compact = rendered_text(&mut compact, 60, 20);
             assert!(
-                wide.contains(&format!("work(remote) {label}")),
+                wide.contains(&format!("[work {label}")),
                 "{health:?}: {wide}"
             );
             assert!(
@@ -7648,9 +7660,10 @@ mod tests {
         assert!(!text.contains("COMMANDS 1"));
         assert!(!text.contains("active agents"));
         let workspace_tab = text.find("WORKSPACES 1").expect("workspace tab");
-        let aggregate_label = text.find("ALL:").expect("aggregate label");
         let agent_tab = text.find("AGENTS 1").expect("agent tab");
-        assert!(workspace_tab < aggregate_label && aggregate_label < agent_tab);
+        assert!(workspace_tab < agent_tab);
+        assert!(!text.contains("NODES:"));
+        assert!(!text.contains("NODE:all"));
         assert!(lines.iter().any(|line| line.contains("> mixed")));
 
         app.select_tab(PrimaryTab::Agents);
@@ -7942,6 +7955,22 @@ mod tests {
             palette.selected_command(),
             Some(PaletteCommand::Attention { ref shell_id, .. }) if shell_id == "term_1"
         ));
+    }
+
+    #[test]
+    fn command_palette_opens_guided_node_setup() {
+        let mut palette = CommandPalette::new(&[]);
+        palette.query = "add remote node".into();
+        palette.update_matches();
+        assert!(matches!(
+            palette.selected_command(),
+            Some(PaletteCommand::AddNode)
+        ));
+        let mut app = App::new(Vec::new(), project_context());
+        assert_eq!(
+            execute_palette_command(&mut app, PaletteCommand::AddNode),
+            Some(DashboardEffect::AddNode)
+        );
     }
 
     #[test]

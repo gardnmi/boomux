@@ -27,8 +27,6 @@ fn local_node_placeholder() -> NodeView {
         health: boomux::protocol::NodeProjectionHealthCode::Online,
         current: true,
         stale: false,
-        observed_at_ms: 0,
-        observed_protocol_version: None,
         observed_capabilities: Vec::new(),
         scheduler: boomux::protocol::SchedulerHealth {
             state: boomux::protocol::SchedulerState::Offline,
@@ -340,8 +338,6 @@ pub(crate) fn project_remote_node(
         health: node.health,
         current: node.current,
         stale: node.stale,
-        observed_at_ms: node.observed_at_ms,
-        observed_protocol_version: node.observed_protocol_version,
         observed_capabilities: node.observed_capabilities.clone(),
         scheduler: node.scheduler.clone(),
     };
