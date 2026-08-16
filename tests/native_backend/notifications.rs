@@ -10,6 +10,15 @@ use uuid::Uuid;
 
 use crate::support::{TestDaemon, process_exists, profile, wait_until};
 
+struct RemoteSubscriber {
+    daemon: TestDaemon,
+    capture: PathBuf,
+    sound_capture: PathBuf,
+    sound_player: PathBuf,
+    config: PathBuf,
+    path: std::ffi::OsString,
+}
+
 #[test]
 fn desktop_notifications_are_deduplicated_private_and_survive_handoff() {
     let (daemon, capture, notify_send, sound_capture) = start_with_notifications();
@@ -313,6 +322,255 @@ fn notification_test_command_plays_the_configured_sound() {
     fs::remove_dir_all(directory).unwrap();
 }
 
+#[test]
+fn full_notification_queue_is_fail_open_for_agent_lifecycle() {
+    let (daemon, _capture, _notify_send, _sound_capture) = start_with_notifications();
+    let workspace = daemon
+        .client
+        .create_workspace(
+            "queue-workspace",
+            vec![ShellSpec::login("queue-shell", std::env::temp_dir())],
+        )
+        .unwrap();
+    let shell_id = workspace.shells[0].id.clone();
+    let attachment = daemon.client.attach(&shell_id, false, profile()).unwrap();
+    let run_id = daemon.client.get_shell(&shell_id).unwrap().run.unwrap().id;
+    fs::write(daemon.runtime_dir.join("notification-hang"), b"").unwrap();
+
+    for index in 0..40 {
+        let agent = daemon
+            .client
+            .register_agent(
+                &shell_id,
+                &run_id,
+                AgentRegistrationSpec {
+                    name: format!("queued-agent-{index}"),
+                    integration: "native-test".into(),
+                    external_session_id: Some(format!("queued-session-{index}")),
+                    report: AgentReport {
+                        state: AgentState::Blocked,
+                        authority: AgentAuthority::LifecycleIntegration,
+                        evidence: "queue saturation must fail open".into(),
+                        confidence: 90,
+                    },
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            daemon
+                .client
+                .get_agent(&agent.id)
+                .unwrap()
+                .observation
+                .state,
+            AgentState::Blocked
+        );
+    }
+    drop(attachment.stream);
+}
+
+#[test]
+fn remote_notifications_are_independent_digest_once_and_survive_restart() {
+    let owner = TestDaemon::start();
+    let owner_id = owner.client.node_identity().unwrap();
+    let workspace = owner
+        .client
+        .create_workspace(
+            "remote-notification-workspace",
+            vec![ShellSpec::login("remote-shell", std::env::temp_dir())],
+        )
+        .unwrap();
+    let shell_id = workspace.shells[0].id.clone();
+    let attachment = owner.client.attach(&shell_id, false, profile()).unwrap();
+    let run_id = owner.client.get_shell(&shell_id).unwrap().run.unwrap().id;
+    let mut first = start_remote_subscriber(&owner);
+    let second = start_remote_subscriber(&owner);
+    for subscriber in [&first, &second] {
+        subscriber
+            .daemon
+            .client
+            .add_node_registration("owner", "fake-owner", &owner_id)
+            .unwrap();
+        wait_until(
+            || {
+                subscriber
+                    .daemon
+                    .client
+                    .combined_node_snapshot(Some(owner_id.clone()))
+                    .is_ok_and(|snapshot| snapshot.nodes[0].current)
+            },
+            "remote notification subscriber did not establish its baseline",
+        );
+        assert_eq!(captured_notification_count(&subscriber.capture), 0);
+    }
+
+    let agent = owner
+        .client
+        .register_agent(
+            &shell_id,
+            &run_id,
+            AgentRegistrationSpec {
+                name: "remote-agent".into(),
+                integration: "native-test".into(),
+                external_session_id: Some("PRIVATE-REMOTE-SESSION".into()),
+                report: AgentReport {
+                    state: AgentState::Blocked,
+                    authority: AgentAuthority::LifecycleIntegration,
+                    evidence: "PRIVATE-REMOTE-EVIDENCE".into(),
+                    confidence: 90,
+                },
+            },
+        )
+        .unwrap();
+    for subscriber in [&first, &second] {
+        wait_until(
+            || captured_notification_count(&subscriber.capture) == 1,
+            "independent subscriber did not deliver live remote attention",
+        );
+        wait_until(
+            || captured_notification_count(&subscriber.sound_capture) == 1,
+            "independent subscriber did not deliver live remote sound",
+        );
+        let captured = fs::read(&subscriber.capture).unwrap();
+        assert!(!String::from_utf8_lossy(&captured).contains("PRIVATE-REMOTE"));
+        assert!(String::from_utf8_lossy(&captured).contains("owner"));
+        assert!(String::from_utf8_lossy(&captured).contains(&owner_id));
+    }
+
+    owner
+        .client
+        .report_agent(
+            &agent.id,
+            &run_id,
+            AgentReport {
+                state: AgentState::Working,
+                authority: AgentAuthority::LifecycleIntegration,
+                evidence: "resumed".into(),
+                confidence: 90,
+            },
+        )
+        .unwrap();
+    let failed_ssh = fs::read(first.daemon.runtime_dir.join("ssh")).unwrap();
+    fs::write(first.daemon.runtime_dir.join("ssh"), "#!/bin/sh\nexit 64\n").unwrap();
+    wait_until(
+        || {
+            first
+                .daemon
+                .client
+                .combined_node_snapshot(Some(owner_id.clone()))
+                .is_ok_and(|snapshot| !snapshot.nodes[0].current)
+        },
+        "subscriber did not become disconnected",
+    );
+    let offline_agent = owner
+        .client
+        .register_agent(
+            &shell_id,
+            &run_id,
+            AgentRegistrationSpec {
+                name: "offline-agent".into(),
+                integration: "native-test".into(),
+                external_session_id: Some("private-offline-session".into()),
+                report: AgentReport {
+                    state: AgentState::Blocked,
+                    authority: AgentAuthority::LifecycleIntegration,
+                    evidence: "private offline blocker".into(),
+                    confidence: 90,
+                },
+            },
+        )
+        .unwrap();
+    owner
+        .client
+        .report_agent(
+            &agent.id,
+            &run_id,
+            AgentReport {
+                state: AgentState::Done,
+                authority: AgentAuthority::LifecycleIntegration,
+                evidence: "private completion".into(),
+                confidence: 90,
+            },
+        )
+        .unwrap();
+    fs::write(first.daemon.runtime_dir.join("ssh"), failed_ssh).unwrap();
+    wait_until(
+        || captured_notification_count(&first.capture) == 2,
+        "valid-cursor reconnect did not deliver one digest",
+    );
+    thread::sleep(Duration::from_millis(1200));
+    assert_eq!(captured_notification_count(&first.capture), 2);
+    assert!(
+        String::from_utf8_lossy(&fs::read(&first.capture).unwrap()).contains("remote activity")
+    );
+    wait_until(
+        || captured_notification_count(&second.capture) == 3,
+        "online subscriber did not receive individual remote transitions",
+    );
+
+    let before_restart = captured_notification_count(&first.capture);
+    first.daemon.crash();
+    configure_remote_subscriber_restart(&mut first);
+    thread::sleep(Duration::from_millis(1200));
+    assert_eq!(captured_notification_count(&first.capture), before_restart);
+
+    let before_handoff = captured_notification_count(&second.capture);
+    let restart = second
+        .daemon
+        .command()
+        .env("BOOMUX_CONFIG", &second.config)
+        .env("BOOMUX_NOTIFICATION_CAPTURE", &second.capture)
+        .env("BOOMUX_SOUND_CAPTURE", &second.sound_capture)
+        .env("PATH", &second.path)
+        .args(["daemon", "restart"])
+        .output()
+        .unwrap();
+    assert!(
+        restart.status.success(),
+        "{}",
+        String::from_utf8_lossy(&restart.stderr)
+    );
+    thread::sleep(Duration::from_millis(1200));
+    assert_eq!(captured_notification_count(&second.capture), before_handoff);
+
+    fs::remove_file(&first.sound_player).unwrap();
+    owner
+        .client
+        .report_agent(
+            &offline_agent.id,
+            &run_id,
+            AgentReport {
+                state: AgentState::Done,
+                authority: AgentAuthority::LifecycleIntegration,
+                evidence: "private done after sound failure".into(),
+                confidence: 90,
+            },
+        )
+        .unwrap();
+    wait_until(
+        || captured_notification_count(&first.capture) == before_restart + 1,
+        "desktop notification did not survive remote sound failure",
+    );
+    assert_eq!(
+        owner
+            .client
+            .get_agent(&offline_agent.id)
+            .unwrap()
+            .observation
+            .state,
+        AgentState::Done
+    );
+    let cache = fs::read(
+        first
+            .daemon
+            .runtime_dir
+            .join("state/boomux/node-cache.json"),
+    )
+    .unwrap();
+    assert!(!String::from_utf8_lossy(&cache).contains("private"));
+    drop(attachment.stream);
+}
+
 fn start_with_notifications() -> (TestDaemon, PathBuf, PathBuf, PathBuf) {
     let mut capture = None;
     let mut notify_send = None;
@@ -370,6 +628,93 @@ fn start_with_notifications() -> (TestDaemon, PathBuf, PathBuf, PathBuf) {
         notify_send.unwrap(),
         sound_capture.unwrap(),
     )
+}
+
+fn start_remote_subscriber(owner: &TestDaemon) -> RemoteSubscriber {
+    let mut capture = None;
+    let mut sound_capture = None;
+    let mut sound_player = None;
+    let mut config = None;
+    let mut path = None;
+    let daemon = TestDaemon::start_with(|command, runtime_dir| {
+        let ssh = runtime_dir.join("ssh");
+        fs::write(
+            &ssh,
+            format!(
+                "#!/bin/sh\nlast=\nfor arg do last=$arg; done\ncase \"$last\" in\n  *boomux-platform-v1*) printf 'boomux-platform-v1\\0Linux\\0x86_64\\0' ;;\n  *boomux-executables-v1*) printf 'boomux-executables-v1\\0{}\\0' ;;\n  *boomux-install-destination-v1*) printf 'boomux-install-destination-v1\\0{}\\0' ;;\n  *__federation-stdio*) exec env XDG_RUNTIME_DIR='{}' XDG_STATE_HOME='{}' '{}' __federation-stdio ;;\n  *) exit 64 ;;\nesac\n",
+                owner.executable.display(),
+                owner.executable.display(),
+                owner.runtime_dir.display(),
+                owner.runtime_dir.join("state").display(),
+                owner.executable.display(),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+        let bin = runtime_dir.join("bin");
+        fs::create_dir(&bin).unwrap();
+        let notifier = bin.join("notify-send");
+        let player = bin.join("canberra-gtk-play");
+        let notifications = runtime_dir.join("remote-notifications");
+        let sounds = runtime_dir.join("remote-sounds");
+        fs::write(
+            &notifier,
+            "#!/bin/sh\nprintf '%s\\0' \"$@\" >> \"$BOOMUX_NOTIFICATION_CAPTURE\"\n",
+        )
+        .unwrap();
+        fs::write(
+            &player,
+            "#!/bin/sh\nprintf '%s\\0' \"$@\" >> \"$BOOMUX_SOUND_CAPTURE\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&notifier, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&player, fs::Permissions::from_mode(0o700)).unwrap();
+        let configuration = runtime_dir.join("remote-notifications.toml");
+        fs::write(
+            &configuration,
+            "[notifications]\nenabled = true\nblocked = true\ncompleted = true\nscheduled_dispatch_failed = true\nscheduled_interrupted = true\n[notifications.sound]\nenabled = true\n",
+        )
+        .unwrap();
+        let paths = std::env::join_paths([
+            runtime_dir.to_path_buf(),
+            bin,
+            PathBuf::from("/usr/bin"),
+            PathBuf::from("/bin"),
+        ])
+        .unwrap();
+        command
+            .env("BOOMUX_CONFIG", &configuration)
+            .env("BOOMUX_NOTIFICATION_CAPTURE", &notifications)
+            .env("BOOMUX_SOUND_CAPTURE", &sounds)
+            .env("PATH", &paths);
+        capture = Some(notifications);
+        sound_capture = Some(sounds);
+        sound_player = Some(player);
+        config = Some(configuration);
+        path = Some(paths);
+    });
+    RemoteSubscriber {
+        daemon,
+        capture: capture.unwrap(),
+        sound_capture: sound_capture.unwrap(),
+        sound_player: sound_player.unwrap(),
+        config: config.unwrap(),
+        path: path.unwrap(),
+    }
+}
+
+fn configure_remote_subscriber_restart(subscriber: &mut RemoteSubscriber) {
+    let config = subscriber.config.clone();
+    let capture = subscriber.capture.clone();
+    let sound_capture = subscriber.sound_capture.clone();
+    let path = subscriber.path.clone();
+    subscriber.daemon.restart_with(|command| {
+        command
+            .env("BOOMUX_CONFIG", config)
+            .env("BOOMUX_NOTIFICATION_CAPTURE", capture)
+            .env("BOOMUX_SOUND_CAPTURE", sound_capture)
+            .env("PATH", path);
+    });
 }
 
 fn captured_notification_count(path: &Path) -> usize {

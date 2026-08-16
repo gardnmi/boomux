@@ -113,6 +113,10 @@ Protocol 36 adds closed typed Node host services and owner-executed exact Agent
 Session resume.
 Protocol 37 adds Node-qualified remote Agent Schedule creation and bounded
 Scheduled Execution observation without adding local scheduler authority.
+Remote notification presentation reuses protocol-32 atomic reduced transitions,
+so the core protocol remains 37. Node-cache schema 2 adds bounded local
+at-most-once individual and reconnect-digest claims with an explicit schema-1
+migration.
 
 ## Components
 
@@ -650,6 +654,19 @@ actually published, including after a failed first write and later pending flush
 The prior committed execution snapshot must be nonqualifying, so late Agent links
 and other revisions that retain the same terminal state and reason do not notify
 again.
+
+Registered remote Nodes use the same local desktop/sound sink only as presentation.
+After a protocol-32 projection and cursor are atomically persisted, the coordinator
+matches reduced Agent and execution transitions to exact revisions in that same
+cut. While continuously online, qualifying blocked/Done attention and enabled
+dispatch-failure/interruption categories enqueue individual requests with local
+Node alias and stable Node ID context. After a disconnect with a resumable cursor,
+all rows update but qualifying transitions become one bounded per-Node digest.
+Baseline reseeds never notify. Node-cache schema 2 persists at most 512 individual
+and 128 digest claims per Node before enqueue; crash and graceful replacement keep
+those frontiers but create a fresh notifier worker. Delivery, queue saturation,
+and sound/desktop failures remain fail-open and never acknowledge owner attention
+or infer lifecycle from transport, process, or output state.
 
 Protocol 7 adds a bounded in-memory daemon event journal and atomic output-state
 reads. Clients reconnect through stream UUID/event-ID cursors and recover from

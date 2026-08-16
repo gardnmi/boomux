@@ -41,6 +41,9 @@ Protocol 32 adds owner-side reduced Node projection cuts and the local
 Protocol 37 adds remote Schedule management and execution observation without a
 new event kind: owner events remain owner-local and the presenting Node receives
 only its existing projection invalidation.
+Remote notification presentation adds no protocol or event kind. It consumes the
+protocol-32 reduced transition batch at the projection-cache boundary and never
+copies owner events into the presenting Node's domain journal.
 
 `boomux agent wait <id> --after-revision <revision>` is the preferred way to
 await one Agent. It returns on a newer accepted durable observation, returns
@@ -81,8 +84,8 @@ the durable registry remains the cold-recovery authority.
 
 ### Accepted Federation Rules
 
-Remote Node federation is not yet implemented, but its event boundary is fixed
-by [`remote-nodes.md`](remote-nodes.md). Each Node retains its own stream UUID,
+Remote Node federation keeps the event boundary defined by
+[`remote-nodes.md`](remote-nodes.md). Each Node retains its own stream UUID,
 event IDs, retention, baseline, and cursor authority. There is no cross-Node
 event order, and timestamps cannot be used to fabricate one.
 
@@ -100,6 +103,14 @@ baselines update presentation but emit neither historical notifications nor a
 reconnect digest because the expired stream cannot prove which transitions were
 unseen. Older clients remain local-only and do not receive federation
 invalidations when the future capability is filtered.
+
+For a resumable cursor, the presenting Node persists the complete reduced cut and
+then uses exact transition revisions only to claim local notification
+presentation. Continuous live synchronization can enqueue individual requests;
+recovery from stale health can enqueue one per-Node digest. Both paths persist
+bounded Node-cache schema-2 claims before enqueue. Cursor expiry, stream
+replacement, first baselines, and stale or duplicate revisions enqueue nothing.
+The resulting local `node_projection_changed` remains the only journal event.
 
 ## Events
 

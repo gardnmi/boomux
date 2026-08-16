@@ -23,14 +23,17 @@ use uuid::Uuid;
 
 use crate::client;
 use crate::desktop_notifications::{
-    DesktopNotificationSink, DisabledNotificationSink, NotificationReason, NotificationRequest,
-    NotificationSink, category_enabled, test_delivery,
+    DesktopNotificationSink, DisabledNotificationSink, NotificationDigest, NotificationNodeContext,
+    NotificationReason, NotificationRequest, NotificationSink, category_enabled, test_delivery,
 };
 use crate::fd_transfer::send_descriptor;
 use crate::handoff;
 use crate::host_services::{self, PreparedIntegrationMutation};
 use crate::node_identity::{NodeIdentityLease, NodeIdentityManager};
-use crate::node_projection::NodeProjectionCache;
+use crate::node_projection::{
+    NodeProjectionCache, ProjectionCommit, RemoteDigestClaim, RemoteNotificationCategory,
+    RemoteNotificationClaim,
+};
 use crate::node_registration::NodeRegistrationManager;
 use crate::protocol::{
     self, AgentAttentionReason, AgentAttentionSnapshot, AgentAuthority, AgentInstanceSnapshot,
@@ -6608,6 +6611,7 @@ fn node_projection_worker(service: Weak<DaemonService>, node_id: String) {
         let attempt_at_ms = unix_time_ms();
         let result = fetch_node_projection(&registration, after);
         let mut published_generation = None;
+        let mut remote_notifications = Vec::new();
         match result {
             Ok((sync, capabilities)) => {
                 let commit = service.node_registrations().and_then(|registrations| {
@@ -6622,17 +6626,65 @@ fn node_projection_worker(service: Weak<DaemonService>, node_id: String) {
                                 .commit_projection(
                                     &registration,
                                     expected_generation,
-                                    sync.cursor,
-                                    sync.projection,
+                                    sync.cursor.clone(),
+                                    sync.projection.clone(),
                                     capabilities,
                                     attempt_at_ms,
                                 )
                         })
                         .map_err(node_registration_error)
                 });
-                if let Ok(Some(Some(generation))) = commit {
-                    published_generation = Some(generation);
+                if let Ok(Some(Some(commit))) = commit {
+                    published_generation = Some(commit.generation);
                     failures = 0;
+                    let (candidates, digest) = remote_notification_candidates(
+                        &registration,
+                        &sync,
+                        &commit,
+                        &service.notification_settings,
+                    );
+                    if !candidates.is_empty() || digest.is_some() {
+                        let claims = candidates
+                            .iter()
+                            .map(|candidate| candidate.claim.clone())
+                            .collect::<Vec<_>>();
+                        let claimed = service.node_registrations().and_then(|registrations| {
+                            registrations
+                                .with_current(&registration, || {
+                                    service
+                                        .node_projection_cache
+                                        .as_ref()
+                                        .ok_or_else(|| {
+                                            io::Error::other("Node projection cache unavailable")
+                                        })?
+                                        .claim_notifications(
+                                            &registration,
+                                            commit.generation,
+                                            &claims,
+                                            digest.as_ref().map(|digest| &digest.claim),
+                                        )
+                                })
+                                .map_err(node_registration_error)
+                        });
+                        match claimed {
+                            Ok(Some(Some((accepted, digest_accepted)))) => {
+                                remote_notifications.extend(
+                                    candidates.into_iter().zip(accepted).filter_map(
+                                        |(candidate, accepted)| {
+                                            accepted.then_some(candidate.request)
+                                        },
+                                    ),
+                                );
+                                if digest_accepted && let Some(digest) = digest {
+                                    remote_notifications.push(digest.request);
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(error) => {
+                                eprintln!("boomux: could not claim remote notification: {error}");
+                            }
+                        }
+                    }
                 } else if let Err(error) = commit {
                     eprintln!("boomux: could not commit Node projection: {error}");
                 }
@@ -6686,6 +6738,9 @@ fn node_projection_worker(service: Weak<DaemonService>, node_id: String) {
                 },
             ]);
         }
+        for notification in remote_notifications {
+            service.notification_sink.notify(notification);
+        }
         let delay = if failures == 0 {
             Duration::from_secs(1)
         } else {
@@ -6702,6 +6757,236 @@ fn node_projection_worker(service: Weak<DaemonService>, node_id: String) {
         if interruptible_node_sleep(&service, delay) {
             return;
         }
+    }
+}
+
+struct RemoteNotificationCandidate {
+    claim: RemoteNotificationClaim,
+    request: NotificationRequest,
+}
+
+struct RemoteDigestCandidate {
+    claim: RemoteDigestClaim,
+    request: NotificationRequest,
+}
+
+fn remote_notification_candidates(
+    registration: &crate::protocol::NodeRegistrationSnapshot,
+    sync: &NodeProjectionSync,
+    commit: &ProjectionCommit,
+    settings: &NotificationDeliverySettings,
+) -> (
+    Vec<RemoteNotificationCandidate>,
+    Option<RemoteDigestCandidate>,
+) {
+    if sync.mode != NodeProjectionSyncMode::Resumed {
+        return (Vec::new(), None);
+    }
+    let Some(prior) = commit.previous_cursor.as_ref().filter(|prior| {
+        prior.stream_id == sync.cursor.stream_id && prior.event_id <= sync.cursor.event_id
+    }) else {
+        return (Vec::new(), None);
+    };
+    let node = NotificationNodeContext {
+        alias: registration.alias.clone(),
+        node_id: registration.node_id.clone(),
+    };
+    let workspaces = sync
+        .projection
+        .workspaces
+        .iter()
+        .map(|workspace| (workspace.id.as_str(), workspace.name.as_str()))
+        .collect::<HashMap<_, _>>();
+    let shells = sync
+        .projection
+        .shells
+        .iter()
+        .map(|shell| (shell.id.as_str(), shell.name.as_str()))
+        .collect::<HashMap<_, _>>();
+    let schedules = sync
+        .projection
+        .schedules
+        .iter()
+        .map(|schedule| (schedule.id.as_str(), schedule.name.as_str()))
+        .collect::<HashMap<_, _>>();
+    let mut seen = HashSet::new();
+    let mut candidates = Vec::new();
+    for transition in &sync.transitions {
+        let candidate = match &transition.kind {
+            NodeProjectionTransitionKind::Agent {
+                workspace_id,
+                agent_id,
+                revision,
+            } => sync
+                .projection
+                .agents
+                .iter()
+                .find(|agent| agent.id == *agent_id && agent.observation_revision == *revision)
+                .and_then(|agent| {
+                    let attention = agent
+                        .attention
+                        .as_ref()
+                        .filter(|attention| attention.observation_revision == *revision)?;
+                    let category = match (agent.state, attention.reason) {
+                        (AgentState::Blocked, AgentAttentionReason::Blocked) => {
+                            RemoteNotificationCategory::AgentBlocked
+                        }
+                        (AgentState::Done, AgentAttentionReason::Completed) => {
+                            RemoteNotificationCategory::AgentCompleted
+                        }
+                        _ => return None,
+                    };
+                    let reason = remote_notification_reason(category);
+                    category_enabled(settings, reason).then(|| RemoteNotificationCandidate {
+                        claim: RemoteNotificationClaim {
+                            stream_id: sync.cursor.stream_id.clone(),
+                            entity_id: agent.id.clone(),
+                            revision: *revision,
+                            category,
+                            reason: remote_notification_reason_key(category).into(),
+                        },
+                        request: NotificationRequest {
+                            reason,
+                            agent: agent.name.clone(),
+                            workspace: workspaces
+                                .get(workspace_id.as_str())
+                                .copied()
+                                .unwrap_or(workspace_id)
+                                .into(),
+                            shell: shells
+                                .get(agent.shell_id.as_str())
+                                .copied()
+                                .unwrap_or(&agent.shell_id)
+                                .into(),
+                            node: Some(node.clone()),
+                            digest: None,
+                        },
+                    })
+                }),
+            NodeProjectionTransitionKind::Execution {
+                workspace_id,
+                execution_id,
+                revision,
+            } => sync
+                .projection
+                .executions
+                .iter()
+                .find(|execution| execution.id == *execution_id && execution.revision == *revision)
+                .and_then(|execution| {
+                    let category = match (execution.state, execution.reason) {
+                        (
+                            ScheduledExecutionState::DispatchFailed,
+                            Some(
+                                ScheduledExecutionReason::RunnerStartFailed
+                                | ScheduledExecutionReason::HostSpawnFailed,
+                            ),
+                        ) => RemoteNotificationCategory::ScheduledDispatchFailed,
+                        (
+                            ScheduledExecutionState::Interrupted,
+                            Some(ScheduledExecutionReason::ColdDaemonRecovery),
+                        ) => RemoteNotificationCategory::ScheduledInterrupted,
+                        _ => return None,
+                    };
+                    let reason = remote_notification_reason(category);
+                    category_enabled(settings, reason).then(|| RemoteNotificationCandidate {
+                        claim: RemoteNotificationClaim {
+                            stream_id: sync.cursor.stream_id.clone(),
+                            entity_id: execution.id.clone(),
+                            revision: *revision,
+                            category,
+                            reason: remote_notification_reason_key(category).into(),
+                        },
+                        request: NotificationRequest {
+                            reason,
+                            agent: schedules
+                                .get(execution.schedule_id.as_str())
+                                .copied()
+                                .unwrap_or(&execution.schedule_id)
+                                .into(),
+                            workspace: workspaces
+                                .get(workspace_id.as_str())
+                                .copied()
+                                .unwrap_or(workspace_id)
+                                .into(),
+                            shell: execution.id.clone(),
+                            node: Some(node.clone()),
+                            digest: None,
+                        },
+                    })
+                }),
+            _ => None,
+        };
+        if let Some(candidate) = candidate
+            && seen.insert(candidate.claim.clone())
+        {
+            candidates.push(candidate);
+        }
+    }
+    if commit.previous_health == Some(crate::protocol::NodeProjectionHealthCode::Online) {
+        return (candidates, None);
+    }
+    let mut enabled_categories = candidates
+        .iter()
+        .map(|candidate| candidate.claim.category)
+        .collect::<Vec<_>>();
+    enabled_categories.sort_unstable();
+    enabled_categories.dedup();
+    if enabled_categories.is_empty() {
+        return (Vec::new(), None);
+    }
+    let mut counts = NotificationDigest::default();
+    for candidate in &candidates {
+        let count = match candidate.claim.category {
+            RemoteNotificationCategory::AgentBlocked => &mut counts.blocked,
+            RemoteNotificationCategory::AgentCompleted => &mut counts.completed,
+            RemoteNotificationCategory::ScheduledDispatchFailed => {
+                &mut counts.scheduled_dispatch_failed
+            }
+            RemoteNotificationCategory::ScheduledInterrupted => &mut counts.scheduled_interrupted,
+        };
+        *count = count.saturating_add(1);
+    }
+    let reason = remote_notification_reason(enabled_categories[0]);
+    (
+        Vec::new(),
+        Some(RemoteDigestCandidate {
+            claim: RemoteDigestClaim {
+                stream_id: sync.cursor.stream_id.clone(),
+                prior_cursor: prior.event_id,
+                through_cursor: sync.cursor.event_id,
+                enabled_categories,
+            },
+            request: NotificationRequest {
+                reason,
+                agent: String::new(),
+                workspace: String::new(),
+                shell: String::new(),
+                node: Some(node),
+                digest: Some(counts),
+            },
+        }),
+    )
+}
+
+fn remote_notification_reason(category: RemoteNotificationCategory) -> NotificationReason {
+    match category {
+        RemoteNotificationCategory::AgentBlocked => NotificationReason::Blocked,
+        RemoteNotificationCategory::AgentCompleted => NotificationReason::Completed,
+        RemoteNotificationCategory::ScheduledDispatchFailed => {
+            NotificationReason::ScheduledDispatchFailed
+        }
+        RemoteNotificationCategory::ScheduledInterrupted => {
+            NotificationReason::ScheduledInterrupted
+        }
+    }
+}
+
+fn remote_notification_reason_key(category: RemoteNotificationCategory) -> &'static str {
+    match category {
+        RemoteNotificationCategory::AgentBlocked => "blocked",
+        RemoteNotificationCategory::AgentCompleted => "completed",
+        RemoteNotificationCategory::ScheduledDispatchFailed => "runner_or_host_spawn_failed",
+        RemoteNotificationCategory::ScheduledInterrupted => "cold_daemon_recovery",
     }
 }
 
@@ -10624,6 +10909,8 @@ impl DaemonService {
                 agent: agent.name.clone(),
                 workspace,
                 shell,
+                node: None,
+                digest: None,
             });
         }
         requests.extend(self.execution_notification_requests(kinds, committed_executions));
@@ -10671,6 +10958,8 @@ impl DaemonService {
                 agent: schedule,
                 workspace,
                 shell: execution.id.clone(),
+                node: None,
+                digest: None,
             });
         }
         requests
@@ -10716,6 +11005,8 @@ impl DaemonService {
                 agent: schedule,
                 workspace,
                 shell: execution.id,
+                node: None,
+                digest: None,
             });
         }
     }
@@ -17422,6 +17713,278 @@ mod tests {
             projection_transitions(&transaction.events, Some(&expired), &through);
         assert_eq!(mode, NodeProjectionSyncMode::Baseline);
         assert!(transitions.is_empty());
+    }
+
+    fn remote_notification_test_settings() -> NotificationDeliverySettings {
+        NotificationDeliverySettings {
+            desktop: NotificationSettings {
+                enabled: true,
+                blocked: true,
+                completed: true,
+                scheduled_dispatch_failed: true,
+                scheduled_interrupted: true,
+            },
+            ..Default::default()
+        }
+    }
+
+    fn remote_notification_projection(node_id: &str) -> NodeProjectionSnapshot {
+        NodeProjectionSnapshot {
+            node_id: node_id.into(),
+            workspaces: vec![NodeProjectionWorkspace {
+                id: "workspace-1".into(),
+                name: "project".into(),
+                item_count: 4,
+                attention_count: 2,
+            }],
+            shells: vec![NodeProjectionShell {
+                id: "shell-1".into(),
+                workspace_id: "workspace-1".into(),
+                name: "agent-shell".into(),
+                owner: ShellOwner::User,
+                status: ShellStatus::Running,
+                run_id: Some("run-1".into()),
+                generation: Some(1),
+                started_at_ms: Some(1),
+                ended_at_ms: None,
+            }],
+            launchers: Vec::new(),
+            agents: vec![
+                NodeProjectionAgent {
+                    id: "agent-blocked".into(),
+                    workspace_id: "workspace-1".into(),
+                    shell_id: "shell-1".into(),
+                    run_id: "run-1".into(),
+                    name: "blocked-agent".into(),
+                    integration: "test".into(),
+                    state: AgentState::Blocked,
+                    observation_revision: 2,
+                    observed_at_ms: 2,
+                    started_at_ms: 1,
+                    ended_at_ms: None,
+                    attention: Some(NodeProjectionAttention {
+                        reason: AgentAttentionReason::Blocked,
+                        observation_revision: 2,
+                        observed_at_ms: 2,
+                    }),
+                },
+                NodeProjectionAgent {
+                    id: "agent-done".into(),
+                    workspace_id: "workspace-1".into(),
+                    shell_id: "shell-1".into(),
+                    run_id: "run-1".into(),
+                    name: "done-agent".into(),
+                    integration: "test".into(),
+                    state: AgentState::Done,
+                    observation_revision: 4,
+                    observed_at_ms: 4,
+                    started_at_ms: 1,
+                    ended_at_ms: Some(4),
+                    attention: Some(NodeProjectionAttention {
+                        reason: AgentAttentionReason::Completed,
+                        observation_revision: 4,
+                        observed_at_ms: 4,
+                    }),
+                },
+            ],
+            schedules: vec![NodeProjectionSchedule {
+                id: "schedule-1".into(),
+                workspace_id: "workspace-1".into(),
+                name: "nightly".into(),
+                integration: "test".into(),
+                state: AgentScheduleState::Paused,
+                trigger: AgentScheduleTrigger {
+                    cron: "0 2 * * *".into(),
+                    timezone: "UTC".into(),
+                },
+                revision: 1,
+                prompt_revision: 1,
+                trigger_revision: 1,
+                created_at_ms: 1,
+                updated_at_ms: 1,
+                next_occurrence: None,
+            }],
+            executions: vec![NodeProjectionExecution {
+                id: "execution-1".into(),
+                workspace_id: "workspace-1".into(),
+                schedule_id: "schedule-1".into(),
+                revision: 3,
+                state: ScheduledExecutionState::DispatchFailed,
+                dispatch_kind: ScheduledExecutionDispatchKind::Manual,
+                schedule_revision: 1,
+                prompt_revision: 1,
+                trigger_revision: 1,
+                requested_at_ms: 1,
+                scheduled_at_ms: None,
+                started_at_ms: None,
+                ended_at_ms: Some(3),
+                reason: Some(ScheduledExecutionReason::HostSpawnFailed),
+                outcome: None,
+                shell_id: None,
+                run_id: None,
+                agent_id: None,
+            }],
+            executions_truncated: false,
+            scheduler: SchedulerHealth {
+                state: SchedulerState::Active,
+                max_concurrent: 4,
+                active_executions: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn reduced_remote_transitions_classify_live_attention_and_one_reconnect_digest() {
+        let node_id = Uuid::from_u128(2).to_string();
+        let stream_id = Uuid::from_u128(3).to_string();
+        let registration = crate::protocol::NodeRegistrationSnapshot {
+            alias: "work".into(),
+            target: "work.example".into(),
+            node_id: node_id.clone(),
+            revision: 1,
+            tombstone_epoch: 0,
+        };
+        let sync = NodeProjectionSync {
+            mode: NodeProjectionSyncMode::Resumed,
+            cursor: EventCursor {
+                stream_id: stream_id.clone(),
+                event_id: 13,
+            },
+            projection: remote_notification_projection(&node_id),
+            transitions: vec![
+                NodeProjectionTransition {
+                    event_id: 11,
+                    at_ms: 11,
+                    kind: NodeProjectionTransitionKind::Agent {
+                        workspace_id: "workspace-1".into(),
+                        agent_id: "agent-blocked".into(),
+                        revision: 2,
+                    },
+                },
+                NodeProjectionTransition {
+                    event_id: 12,
+                    at_ms: 12,
+                    kind: NodeProjectionTransitionKind::Agent {
+                        workspace_id: "workspace-1".into(),
+                        agent_id: "agent-done".into(),
+                        revision: 4,
+                    },
+                },
+                NodeProjectionTransition {
+                    event_id: 13,
+                    at_ms: 13,
+                    kind: NodeProjectionTransitionKind::Execution {
+                        workspace_id: "workspace-1".into(),
+                        execution_id: "execution-1".into(),
+                        revision: 3,
+                    },
+                },
+            ],
+        };
+        let live = ProjectionCommit {
+            generation: 2,
+            previous_health: Some(crate::protocol::NodeProjectionHealthCode::Online),
+            previous_cursor: Some(EventCursor {
+                stream_id: stream_id.clone(),
+                event_id: 10,
+            }),
+        };
+        let (requests, digest) = remote_notification_candidates(
+            &registration,
+            &sync,
+            &live,
+            &remote_notification_test_settings(),
+        );
+        assert_eq!(requests.len(), 3);
+        assert!(digest.is_none());
+        assert_eq!(requests[0].request.reason, NotificationReason::Blocked);
+        assert_eq!(requests[1].request.reason, NotificationReason::Completed);
+        assert_eq!(
+            requests[2].request.reason,
+            NotificationReason::ScheduledDispatchFailed
+        );
+        assert_eq!(requests[0].request.node.as_ref().unwrap().alias, "work");
+
+        let reconnect = ProjectionCommit {
+            previous_health: Some(crate::protocol::NodeProjectionHealthCode::Stale),
+            ..live
+        };
+        let (requests, digest) = remote_notification_candidates(
+            &registration,
+            &sync,
+            &reconnect,
+            &remote_notification_test_settings(),
+        );
+        assert!(requests.is_empty());
+        let digest = digest.unwrap();
+        assert_eq!(digest.claim.prior_cursor, 10);
+        assert_eq!(digest.claim.through_cursor, 13);
+        assert_eq!(digest.request.digest.as_ref().unwrap().blocked, 1);
+        assert_eq!(digest.request.digest.as_ref().unwrap().completed, 1);
+        assert_eq!(
+            digest
+                .request
+                .digest
+                .as_ref()
+                .unwrap()
+                .scheduled_dispatch_failed,
+            1
+        );
+    }
+
+    #[test]
+    fn baseline_and_stale_reduced_revisions_do_not_notify() {
+        let node_id = Uuid::from_u128(2).to_string();
+        let stream_id = Uuid::from_u128(3).to_string();
+        let registration = crate::protocol::NodeRegistrationSnapshot {
+            alias: "work".into(),
+            target: "work.example".into(),
+            node_id: node_id.clone(),
+            revision: 1,
+            tombstone_epoch: 0,
+        };
+        let mut sync = NodeProjectionSync {
+            mode: NodeProjectionSyncMode::Baseline,
+            cursor: EventCursor {
+                stream_id: stream_id.clone(),
+                event_id: 8,
+            },
+            projection: remote_notification_projection(&node_id),
+            transitions: Vec::new(),
+        };
+        let commit = ProjectionCommit {
+            generation: 2,
+            previous_health: Some(crate::protocol::NodeProjectionHealthCode::Stale),
+            previous_cursor: Some(EventCursor {
+                stream_id,
+                event_id: 7,
+            }),
+        };
+        let result = remote_notification_candidates(
+            &registration,
+            &sync,
+            &commit,
+            &remote_notification_test_settings(),
+        );
+        assert!(result.0.is_empty() && result.1.is_none());
+
+        sync.mode = NodeProjectionSyncMode::Resumed;
+        sync.transitions.push(NodeProjectionTransition {
+            event_id: 8,
+            at_ms: 8,
+            kind: NodeProjectionTransitionKind::Agent {
+                workspace_id: "workspace-1".into(),
+                agent_id: "agent-blocked".into(),
+                revision: 1,
+            },
+        });
+        let result = remote_notification_candidates(
+            &registration,
+            &sync,
+            &commit,
+            &remote_notification_test_settings(),
+        );
+        assert!(result.0.is_empty() && result.1.is_none());
     }
 
     #[test]
