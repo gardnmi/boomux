@@ -16,7 +16,7 @@
 | `src/state_store.rs` | Versioned durable schemas, validation, atomic state storage, and migrations |
 | `src/node_identity.rs` | Stable Node identity persistence, federation admission leases, and bounded rekey drain |
 | `src/federation.rs` | Independently versioned federation handshake and verified stdio daemon bridging |
-| `src/ssh_bootstrap.rs` | Validated SSH targets, fixed helper command construction, and private invocation configuration |
+| `src/ssh_bootstrap.rs` | Validated SSH targets, private invocation configuration, and bounded fixed remote discovery probes |
 | `src/handoff.rs`, `src/fd_transfer.rs` | Graceful daemon replacement records and Unix descriptor transfer |
 | `src/attach.rs` | Terminal-side raw mode, control frames, live input/output, resize, focus, and reconnect handling |
 | `src/terminal.rs` | Selection and launch of native terminal windows through `xdg-terminal-exec` |
