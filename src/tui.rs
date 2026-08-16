@@ -530,6 +530,17 @@ impl WorkspaceView {
     }
 
     fn actionable(&self) -> bool {
+        self.node.current
+            && !self.node.stale
+            && (self.node.local
+                || self
+                    .node
+                    .observed_capabilities
+                    .iter()
+                    .any(|capability| capability == "guarded_remote_management"))
+    }
+
+    fn local_actionable(&self) -> bool {
         self.node.local && self.node.current && !self.node.stale
     }
 
@@ -2561,7 +2572,7 @@ impl App {
             Focus::Items => {
                 let workspace_id = self
                     .selected()
-                    .filter(|workspace| workspace.actionable())
+                    .filter(|workspace| workspace.local_actionable())
                     .map(|workspace| workspace.qualify(&workspace.id))?;
                 Some(DashboardEffect::CreateShell(workspace_id))
             }
@@ -2586,7 +2597,7 @@ impl App {
             return None;
         }
         self.selected()
-            .filter(|workspace| workspace.actionable())
+            .filter(|workspace| workspace.local_actionable())
             .map(|workspace| DashboardEffect::RestoreWorkspace(workspace.qualify(&workspace.id)))
     }
 
@@ -2597,7 +2608,7 @@ impl App {
         }
         let workspace = self
             .selected_item_workspace()
-            .filter(|workspace| workspace.actionable())?;
+            .filter(|workspace| workspace.local_actionable())?;
         let workspace_id = workspace.qualify(&workspace.id);
         let target = self.selected_item().and_then(|item| match item {
             WorkspaceItemView::Shell(shell) => {

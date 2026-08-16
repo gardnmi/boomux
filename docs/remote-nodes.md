@@ -12,8 +12,9 @@
 > implement explicit identity-pinned registration management. Protocol 32 and
 > Node-cache schema 1 implement bounded background reduced projections. Public
 > Protocol 33 adds the local-daemon combined Node snapshot and federated
-> dashboard. Public `boomux --remote TARGET` remains ad hoc; routed resource
-> operations are not yet implemented.
+> dashboard. Protocol 34 and state schema 13 implement typed exact-Node private
+> reads and guarded management operations. Public `boomux --remote TARGET`
+> remains ad hoc.
 
 ## Purpose
 
@@ -282,6 +283,32 @@ federation and event lock is released.
 
 ## Reads, Mutations, And Failure
 
+Protocol 34 routes one closed `RoutedOperation` union. It is not an arbitrary
+daemon-request envelope: creation, daemon stop/restart, Node rekey, integration
+mutation, launcher execution, attachment/session resume, and every unlisted
+request cannot be represented. The coordinator reserves the exact registration
+revision, verifies the pinned identity and protocol capability before sending
+the owner request, performs SSH I/O outside locks, and revalidates the
+registration before returning. Routed responses never update projection cache.
+
+| Operation | Owner guard | Automatic retry | Ambiguity read and exact postcondition |
+| --- | --- | --- | --- |
+| Workspace/Shell/launcher/Agent/Schedule/execution inspect | Exact ID on a fresh verified channel | Yes; read-only | Not applicable |
+| Rename Workspace/Shell/launcher | Durable resource revision | No | Exact inspect proves requested name and a later revision |
+| Close Workspace/Shell; remove launcher/Schedule | Durable resource or Schedule revision | No | Exact inspect returns typed `not_found` |
+| Restart exited Shell | Durable Shell revision and exact run ID | No | Exact inspect proves pending state, unchanged definition revision, and the confirmed retained run |
+| Pause/resume Schedule | Exact Schedule revision | No | Exact inspect proves requested state and a later revision |
+| Update paused Schedule | Exact Schedule revision | No | Private inspect proves the complete requested name, prompt, trigger, and later revision |
+| Run Schedule now | Durable dispatch key | Yes, with the same key | Dispatch-key record returns the same execution/run IDs |
+| Cancel execution | Exact execution revision and exact active run binding | No | Exact inspect proves a later `cancelled_by_user` revision |
+| Acknowledge attention | Exact raising observation revision; empty is idempotent | Yes, with the same revision | Returned Agent retains lifecycle revision and has no matching outstanding item |
+
+Any unproved ambiguous write returns `outcome_unknown`; conditional revisions
+alone never authorize blind replay. Workspace revisions also act as membership
+generations and advance when owned Shell, launcher, Agent, or Schedule membership
+changes. Schema 13 persists positive Workspace, Shell, and launcher revisions;
+the explicit schema-12 migration initializes each to 1.
+
 New explicitly Node-aware read-only views can use persisted remote projections
 and must expose their observation time and stale state. Existing commands and
 JSON methods retain their local-only result sets; federation does not append
@@ -293,7 +320,8 @@ authoritative local projection and reduced remote projections with structurally
 qualified resource identities. The dashboard consumes the same request, keeps
 stale rows visible, exposes all-Node and exact-Node filtering, and never passes
 remote records to local Git, host-session catalog, path, terminal-preview, or
-mutation code. Remote actions remain disabled in this slice.
+mutation code. Only tabled protocol-34 actions are enabled for a current,
+non-stale Node; local-only execution and presentation paths remain disabled.
 After successful ad hoc `--remote TARGET` verification, Boomux focuses the
 matching Node in the local dashboard when that Node is already registered and
 the local daemon supports the combined view; otherwise the ad hoc connection

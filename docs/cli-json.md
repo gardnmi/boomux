@@ -52,6 +52,14 @@ Protocol 33 advertises the separately named `node.snapshot` combined read. It
 contacts only the local daemon and never changes the local-only meaning of any
 existing snapshot or list operation.
 
+Protocol 34 advertises `typed_exact_node_routing` and
+`guarded_remote_management`. Dashboard effects carry structured Node-qualified
+identities, freshly inspect the owner before destructive confirmation, and use
+the resource revision, membership generation, run ID, Schedule/execution
+revision, observation revision, or dispatch key required by the operation.
+Stale Nodes and Nodes without the capability remain non-actionable. Existing
+unqualified CLI methods preserve local-only semantics.
+
 That passive command advertises only what the installed local CLI can speak and
 never reports negotiated state for a registered Node. Implemented `node.list`
 and `node.inspect` return registration data only. Future combined projection data
@@ -296,6 +304,8 @@ the current prompt.
 Protocol 32 adds `protocol_32`, `node_projection_sync`, and
 `bounded_remote_node_projections`. Protocol 33 adds `protocol_33`,
 `combined_node_snapshot`, and `node_qualified_dashboard`.
+Protocol 34 adds `protocol_34`, `typed_exact_node_routing`, and
+`guarded_remote_management`.
 
 Node snapshot health is `unobserved`, `online`, `reconnecting`, `stale`,
 `unreachable`, `authentication_required`, `identity_changed`,

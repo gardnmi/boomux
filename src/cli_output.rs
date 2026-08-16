@@ -683,6 +683,7 @@ fn protocol_error_code(code: ErrorCode) -> &'static str {
         ErrorCode::NodeIdentityChanged => "node_identity_changed",
         ErrorCode::AmbiguousTarget => "ambiguous_target",
         ErrorCode::RevisionChanged => "revision_changed",
+        ErrorCode::OutcomeUnknown => "outcome_unknown",
         ErrorCode::Internal => "internal",
         ErrorCode::Unknown => "unknown",
     }

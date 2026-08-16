@@ -520,7 +520,12 @@ pub(crate) fn project_remote_node(
             ScheduleView {
                 node_id: node.node_id.clone(),
                 node_alias: node.alias.clone(),
-                actionable: false,
+                actionable: node.current
+                    && !node.stale
+                    && node
+                        .observed_capabilities
+                        .iter()
+                        .any(|capability| capability == "guarded_remote_management"),
                 id: schedule.id.clone(),
                 workspace_id: schedule.workspace_id.clone(),
                 workspace: workspace.into(),
@@ -880,11 +885,13 @@ mod tests {
     fn workspace(command: Vec<String>) -> WorkspaceSnapshot {
         WorkspaceSnapshot {
             id: "workspace-1".into(),
+            revision: 1,
             name: "project".into(),
             default_cwd: Some(PathBuf::from("/tmp/project")),
             shells: vec![ShellSnapshot {
                 owner: boomux::protocol::ShellOwner::User,
                 id: "shell-1".into(),
+                revision: 1,
                 workspace_id: "workspace-1".into(),
                 name: "main".into(),
                 cwd: PathBuf::from("/tmp/project"),

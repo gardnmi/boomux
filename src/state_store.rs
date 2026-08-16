@@ -18,7 +18,8 @@ use crate::protocol::{
     ShellRunExitReason, TerminalProfile,
 };
 
-const STATE_VERSION: u32 = 12;
+const STATE_VERSION: u32 = 13;
+const VERSION_TWELVE_STATE_VERSION: u32 = 12;
 const VERSION_ELEVEN_STATE_VERSION: u32 = 11;
 const VERSION_TEN_STATE_VERSION: u32 = 10;
 const VERSION_NINE_STATE_VERSION: u32 = 9;
@@ -32,6 +33,10 @@ const VERSION_TWO_STATE_VERSION: u32 = 2;
 const LEGACY_STATE_VERSION: u32 = 1;
 const MAX_STATE_BYTES: u64 = 8 * 1024 * 1024;
 const DISPATCH_KEY_FILTER_BYTES: usize = 2048;
+
+const fn initial_revision() -> u64 {
+    1
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -53,6 +58,8 @@ impl Default for PersistedState {
 #[serde(deny_unknown_fields)]
 pub(crate) struct PersistedWorkspace {
     pub(crate) id: String,
+    #[serde(default = "initial_revision")]
+    pub(crate) revision: u64,
     pub(crate) name: String,
     pub(crate) default_cwd: Option<PathBuf>,
     pub(crate) shells: Vec<PersistedShell>,
@@ -171,6 +178,8 @@ pub(crate) struct PersistedAgentInstance {
 #[serde(deny_unknown_fields)]
 pub(crate) struct PersistedWorkspaceLauncher {
     pub(crate) id: String,
+    #[serde(default = "initial_revision")]
+    pub(crate) revision: u64,
     pub(crate) name: String,
     pub(crate) cwd: PathBuf,
     pub(crate) command: Vec<String>,
@@ -180,6 +189,8 @@ pub(crate) struct PersistedWorkspaceLauncher {
 #[serde(deny_unknown_fields)]
 pub(crate) struct PersistedShell {
     pub(crate) id: String,
+    #[serde(default = "initial_revision")]
+    pub(crate) revision: u64,
     pub(crate) name: String,
     pub(crate) cwd: PathBuf,
     pub(crate) command: Vec<String>,
@@ -586,7 +597,10 @@ impl StateStore {
             )
         })?;
         let (state, migrated) = match version.version {
-            STATE_VERSION => (parse_state(&bytes, &self.path)?, false),
+            STATE_VERSION => (parse_current_state(&bytes, &self.path)?, false),
+            VERSION_TWELVE_STATE_VERSION => {
+                (migrate_version_twelve_state(&bytes, &self.path)?, true)
+            }
             VERSION_ELEVEN_STATE_VERSION => {
                 (migrate_version_eleven_state(&bytes, &self.path)?, true)
             }
@@ -675,6 +689,32 @@ impl StateStore {
     }
 }
 
+fn migrate_version_twelve_state(bytes: &[u8], path: &Path) -> io::Result<PersistedState> {
+    let mut previous: serde_json::Value = parse_state(bytes, path)?;
+    previous["version"] = serde_json::Value::from(STATE_VERSION);
+    if let Some(workspaces) = previous["workspaces"].as_array_mut() {
+        for workspace in workspaces {
+            workspace["revision"] = serde_json::Value::from(1);
+            if let Some(shells) = workspace["shells"].as_array_mut() {
+                for shell in shells {
+                    shell["revision"] = serde_json::Value::from(1);
+                }
+            }
+            if let Some(launchers) = workspace["launchers"].as_array_mut() {
+                for launcher in launchers {
+                    launcher["revision"] = serde_json::Value::from(1);
+                }
+            }
+        }
+    }
+    serde_json::from_value(previous).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("could not migrate {}: {error}", path.display()),
+        )
+    })
+}
+
 fn migrate_version_eleven_state(bytes: &[u8], path: &Path) -> io::Result<PersistedState> {
     let mut previous: serde_json::Value = parse_state(bytes, path)?;
     previous["version"] = serde_json::Value::from(STATE_VERSION);
@@ -737,6 +777,59 @@ fn parse_state<T: for<'de> Deserialize<'de>>(bytes: &[u8], path: &Path) -> io::R
     })
 }
 
+fn parse_current_state(bytes: &[u8], path: &Path) -> io::Result<PersistedState> {
+    let value: serde_json::Value = parse_state(bytes, path)?;
+    let workspaces = value
+        .get("workspaces")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Boomux state has no workspace array",
+            )
+        })?;
+    for workspace in workspaces {
+        require_positive_revision(workspace, "workspace")?;
+        for shell in workspace
+            .get("shells")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            require_positive_revision(shell, "shell")?;
+        }
+        for launcher in workspace
+            .get("launchers")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            require_positive_revision(launcher, "workspace launcher")?;
+        }
+    }
+    serde_json::from_value(value).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("could not parse {}: {error}", path.display()),
+        )
+    })
+}
+
+fn require_positive_revision(value: &serde_json::Value, resource: &str) -> io::Result<()> {
+    if value
+        .get("revision")
+        .and_then(serde_json::Value::as_u64)
+        .is_some_and(|revision| revision > 0)
+    {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Boomux state contains a {resource} without a positive revision"),
+        ))
+    }
+}
+
 fn migrate_legacy_state(legacy: LegacyPersistedState) -> PersistedState {
     debug_assert_eq!(legacy.version, LEGACY_STATE_VERSION);
     let migrated_at_ms = unix_time_ms();
@@ -747,6 +840,7 @@ fn migrate_legacy_state(legacy: LegacyPersistedState) -> PersistedState {
             .into_iter()
             .map(|workspace| PersistedWorkspace {
                 id: workspace.id,
+                revision: 1,
                 name: workspace.name,
                 default_cwd: None,
                 shells: workspace
@@ -754,6 +848,7 @@ fn migrate_legacy_state(legacy: LegacyPersistedState) -> PersistedState {
                     .into_iter()
                     .map(|shell| PersistedShell {
                         id: shell.id,
+                        revision: 1,
                         name: shell.name,
                         cwd: shell.cwd,
                         command: shell.command,
@@ -788,6 +883,7 @@ fn migrate_version_nine_state(previous: VersionNinePersistedState) -> PersistedS
             .into_iter()
             .map(|workspace| PersistedWorkspace {
                 id: workspace.id,
+                revision: 1,
                 name: workspace.name,
                 default_cwd: workspace.default_cwd,
                 shells: workspace
@@ -795,6 +891,7 @@ fn migrate_version_nine_state(previous: VersionNinePersistedState) -> PersistedS
                     .into_iter()
                     .map(|shell| PersistedShell {
                         id: shell.id,
+                        revision: 1,
                         name: shell.name,
                         cwd: shell.cwd,
                         command: shell.command,
@@ -837,6 +934,7 @@ fn migrate_version_nine_state(previous: VersionNinePersistedState) -> PersistedS
 fn migrate_pre_ownership_shell(shell: PreOwnershipPersistedShell) -> PersistedShell {
     PersistedShell {
         id: shell.id,
+        revision: 1,
         name: shell.name,
         cwd: shell.cwd,
         command: shell.command,
@@ -854,6 +952,7 @@ fn migrate_version_eight_state(previous: VersionEightPersistedState) -> Persiste
             .into_iter()
             .map(|workspace| PersistedWorkspace {
                 id: workspace.id,
+                revision: 1,
                 name: workspace.name,
                 default_cwd: workspace.default_cwd,
                 shells: workspace
@@ -878,6 +977,7 @@ fn migrate_version_seven_state(previous: VersionSevenPersistedState) -> Persiste
             .into_iter()
             .map(|workspace| PersistedWorkspace {
                 id: workspace.id,
+                revision: 1,
                 name: workspace.name,
                 default_cwd: workspace.default_cwd,
                 shells: workspace
@@ -885,6 +985,7 @@ fn migrate_version_seven_state(previous: VersionSevenPersistedState) -> Persiste
                     .into_iter()
                     .map(|shell| PersistedShell {
                         id: shell.id,
+                        revision: 1,
                         name: shell.name,
                         cwd: shell.cwd,
                         command: shell.command,
@@ -919,6 +1020,7 @@ fn migrate_previous_state(previous: PreviousPersistedState) -> PersistedState {
             .into_iter()
             .map(|workspace| PersistedWorkspace {
                 id: workspace.id,
+                revision: 1,
                 name: workspace.name,
                 default_cwd: None,
                 shells: workspace
@@ -943,6 +1045,7 @@ fn migrate_version_five_state(previous: VersionFivePersistedState) -> PersistedS
             .into_iter()
             .map(|workspace| PersistedWorkspace {
                 id: workspace.id,
+                revision: 1,
                 name: workspace.name,
                 default_cwd: None,
                 shells: workspace
@@ -989,6 +1092,7 @@ fn migrate_version_four_state(previous: VersionFourPersistedState) -> PersistedS
                     .collect::<std::collections::HashMap<_, _>>();
                 PersistedWorkspace {
                     id: workspace.id,
+                    revision: 1,
                     name: workspace.name,
                     default_cwd: None,
                     shells: workspace
@@ -1030,6 +1134,7 @@ fn migrate_version_three_state(previous: VersionThreePersistedState) -> Persiste
             .into_iter()
             .map(|workspace| PersistedWorkspace {
                 id: workspace.id,
+                revision: 1,
                 name: workspace.name,
                 default_cwd: None,
                 shells: workspace
@@ -1054,6 +1159,7 @@ fn migrate_version_two_state(previous: VersionTwoPersistedState) -> PersistedSta
             .into_iter()
             .map(|workspace| PersistedWorkspace {
                 id: workspace.id,
+                revision: 1,
                 name: workspace.name,
                 default_cwd: None,
                 shells: workspace
@@ -1130,10 +1236,12 @@ mod tests {
             version: STATE_VERSION,
             workspaces: vec![PersistedWorkspace {
                 id: Uuid::new_v4().to_string(),
+                revision: 1,
                 name: "saved".into(),
                 default_cwd: Some("/tmp/project".into()),
                 shells: vec![PersistedShell {
                     id: "shell-1".into(),
+                    revision: 1,
                     name: "agent".into(),
                     cwd: "/tmp/project".into(),
                     command: vec!["opencode".into()],
@@ -1162,12 +1270,14 @@ mod tests {
                 launchers: vec![
                     PersistedWorkspaceLauncher {
                         id: "launcher-1".into(),
+                        revision: 1,
                         name: "editor".into(),
                         cwd: "/tmp/project".into(),
                         command: vec!["editor".into(), "".into(), "two words".into()],
                     },
                     PersistedWorkspaceLauncher {
                         id: "launcher-2".into(),
+                        revision: 1,
                         name: "server".into(),
                         cwd: "/tmp/project/server".into(),
                         command: vec!["server".into()],
@@ -1410,7 +1520,7 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .contains("\"version\": 12")
+                .contains("\"version\": 13")
         );
         fs::remove_dir_all(directory).unwrap();
     }
@@ -1447,7 +1557,7 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .contains("\"version\": 12")
+                .contains("\"version\": 13")
         );
         fs::remove_dir_all(directory).unwrap();
     }
@@ -1460,6 +1570,7 @@ mod tests {
         let mut state = PersistedState::default();
         state.workspaces.push(PersistedWorkspace {
             id: Uuid::new_v4().to_string(),
+            revision: 1,
             name: "saved".into(),
             default_cwd: None,
             shells: Vec::new(),
@@ -1540,7 +1651,7 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .contains("\"version\": 12")
+                .contains("\"version\": 13")
         );
 
         let mut version_eleven = serde_json::to_value(&migrated).unwrap();
@@ -1554,6 +1665,66 @@ mod tests {
         assert_eq!(
             migrated_eleven.workspaces[0].schedules[0].executions[0].revision,
             1
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn migrates_version_twelve_resource_revisions() {
+        let directory = env::temp_dir().join(format!("boomux-state-{}", Uuid::new_v4()));
+        let path = directory.join("boomux/state.json");
+        let state = PersistedState {
+            version: STATE_VERSION,
+            workspaces: vec![PersistedWorkspace {
+                id: "workspace".into(),
+                revision: 9,
+                name: "saved".into(),
+                default_cwd: None,
+                shells: vec![PersistedShell {
+                    id: "shell".into(),
+                    revision: 8,
+                    name: "main".into(),
+                    cwd: "/tmp".into(),
+                    command: Vec::new(),
+                    owner: ShellOwner::User,
+                    last_run: None,
+                }],
+                launchers: vec![PersistedWorkspaceLauncher {
+                    id: "launcher".into(),
+                    revision: 7,
+                    name: "build".into(),
+                    cwd: "/tmp".into(),
+                    command: vec!["true".into()],
+                }],
+                agents: Vec::new(),
+                schedules: Vec::new(),
+            }],
+        };
+        let mut value = serde_json::to_value(state).unwrap();
+        value["version"] = serde_json::Value::from(12);
+        value["workspaces"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("revision");
+        value["workspaces"][0]["shells"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("revision");
+        value["workspaces"][0]["launchers"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("revision");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+
+        let migrated = StateStore::at(path.clone()).load().unwrap().unwrap();
+        assert_eq!(migrated.workspaces[0].revision, 1);
+        assert_eq!(migrated.workspaces[0].shells[0].revision, 1);
+        assert_eq!(migrated.workspaces[0].launchers[0].revision, 1);
+        assert!(
+            fs::read_to_string(path)
+                .unwrap()
+                .contains("\"version\": 13")
         );
         fs::remove_dir_all(directory).unwrap();
     }
@@ -1652,7 +1823,7 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .contains("\"version\": 12")
+                .contains("\"version\": 13")
         );
         fs::remove_dir_all(directory).unwrap();
     }
@@ -1708,7 +1879,7 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .contains("\"version\": 12")
+                .contains("\"version\": 13")
         );
         assert!(migrated.workspaces[0].launchers.is_empty());
         assert!(migrated.workspaces[0].agents.is_empty());
@@ -1759,7 +1930,7 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .contains("\"version\": 12")
+                .contains("\"version\": 13")
         );
         assert!(migrated.workspaces[0].agents.is_empty());
         assert!(migrated.workspaces[0].schedules.is_empty());
@@ -1799,7 +1970,7 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .contains("\"version\": 12")
+                .contains("\"version\": 13")
         );
         fs::remove_dir_all(directory).unwrap();
     }
@@ -1876,7 +2047,7 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .contains("\"version\": 12")
+                .contains("\"version\": 13")
         );
         fs::remove_dir_all(directory).unwrap();
     }
@@ -1912,7 +2083,7 @@ mod tests {
         assert!(migrated.workspaces[0].agents[0].attention.is_none());
         assert!(migrated.workspaces[0].schedules.is_empty());
         let saved = fs::read_to_string(&path).unwrap();
-        assert!(saved.contains("\"version\": 12"));
+        assert!(saved.contains("\"version\": 13"));
         assert!(saved.contains("\"attention\": null"));
         fs::remove_dir_all(directory).unwrap();
     }
@@ -1945,7 +2116,7 @@ mod tests {
         assert!(!original.contains("default_cwd"));
         store.save(&migrated).unwrap();
         let saved = fs::read_to_string(&path).unwrap();
-        assert!(saved.contains("\"version\": 12"));
+        assert!(saved.contains("\"version\": 13"));
         assert!(saved.contains("\"default_cwd\": null"));
         fs::remove_dir_all(directory).unwrap();
     }

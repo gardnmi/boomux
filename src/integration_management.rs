@@ -1322,6 +1322,7 @@ mod tests {
         let shell = ShellSnapshot {
             owner: boomux::protocol::ShellOwner::User,
             id: "s1".into(),
+            revision: 1,
             workspace_id: "w1".into(),
             name: "shell".into(),
             cwd: "/repo".into(),
@@ -1340,6 +1341,7 @@ mod tests {
         };
         let mut workspace = WorkspaceSnapshot {
             id: "w1".into(),
+            revision: 1,
             name: "workspace".into(),
             default_cwd: None,
             shells: vec![shell],

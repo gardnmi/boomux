@@ -103,10 +103,10 @@ discovers and verifies a compatible helper, or interactively installs one before
 opening and pinging a daemon-bound stdio channel. Explicit `boomux node add
 ALIAS TARGET` and revision-conditional registration management persist an
 identity-pinned route separately. A registration starts one noninteractive
-projection worker; routed dashboard and resource-management operations are not
-yet implemented. Protocol 33 exposes cached projections through the separately
+projection worker. Protocol 33 exposes cached projections through the separately
 named combined Node snapshot and dashboard while existing snapshot and list
-operations remain local-only; remote mutation remains unavailable.
+operations remain local-only. Protocol 34 adds closed typed exact-Node private
+reads and guarded management; unclassified mutation remains unavailable.
 
 ## Components
 
@@ -564,6 +564,18 @@ protocol capabilities, and per-Node scheduler health. Dashboard model identity
 and effects use `(node_id, inner_id)`; remote rows never enter local Git, host
 catalog, path, preview, or mutation paths. Protocol-32 and older clients cannot
 request this response and retain local-only behavior.
+Protocol 34 and state schema 13 add typed exact-Node routing. Workspace, Shell,
+and launcher snapshots carry positive durable revisions, and Workspace revision
+also guards membership. Schema 12 migrates explicitly by assigning revision 1.
+The routed operation union contains only fresh private exact reads, guarded
+rename/close/restart/remove, guarded Schedule pause/resume/update/remove,
+idempotent run-now, revision-guarded execution cancellation, and exact attention
+acknowledgment. Registration admission is revision-pinned across lock-free SSH
+I/O, identity and protocol are verified before owner request bytes, and routed
+responses never mutate projection cache. Only read-only operations and mutations
+with an owner-side durable idempotency key are retried; every other transport
+ambiguity performs an authoritative postcondition read and otherwise returns
+`outcome_unknown`.
 Protocol-25 lists are daemon-bounded, newest-first pages with explicit limit and
 truncation. The request limit is optional on the wire; protocol 25 defaults it to
 100 and clamps it to 1 through 1,000, while protocol-23 and protocol-24 requests

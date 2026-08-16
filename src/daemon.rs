@@ -40,13 +40,13 @@ use crate::protocol::{
     NodeProjectionAgent, NodeProjectionAttention, NodeProjectionExecution, NodeProjectionLauncher,
     NodeProjectionSchedule, NodeProjectionShell, NodeProjectionSnapshot, NodeProjectionSync,
     NodeProjectionSyncMode, NodeProjectionTransition, NodeProjectionTransitionKind,
-    NodeProjectionWorkspace, NotificationDeliveryConfig, Request, Response,
-    ScheduledExecutionDispatchKind, ScheduledExecutionOutcome, ScheduledExecutionReason,
-    ScheduledExecutionScheduleProjection, ScheduledExecutionSnapshot, ScheduledExecutionState,
-    ScheduledOccurrence, ScheduledRunnerResult, SchedulerHealth, SchedulerState, ShellOwner,
-    ShellRunExitReason, ShellRunSnapshot, ShellSnapshot, ShellSpec, ShellStatus, Snapshot,
-    TerminalPreview, TerminalProfile, UnixEnvironment, UnixEnvironmentVariable,
-    WorkspaceLauncherSnapshot, WorkspaceLauncherSpec, WorkspaceSnapshot,
+    NodeProjectionWorkspace, NotificationDeliveryConfig, Request, Response, RoutedOperation,
+    RoutedOperationResult, ScheduledExecutionDispatchKind, ScheduledExecutionOutcome,
+    ScheduledExecutionReason, ScheduledExecutionScheduleProjection, ScheduledExecutionSnapshot,
+    ScheduledExecutionState, ScheduledOccurrence, ScheduledRunnerResult, SchedulerHealth,
+    SchedulerState, ShellOwner, ShellRunExitReason, ShellRunSnapshot, ShellSnapshot, ShellSpec,
+    ShellStatus, Snapshot, TerminalPreview, TerminalProfile, UnixEnvironment,
+    UnixEnvironmentVariable, WorkspaceLauncherSnapshot, WorkspaceLauncherSpec, WorkspaceSnapshot,
 };
 use crate::ssh_bootstrap::{self, RemoteBootstrapPlan, SshAuthenticationMode, SshTarget};
 use crate::state_store::{
@@ -1199,6 +1199,9 @@ fn handle_connection_inner(
             | Request::PauseAgentSchedule { .. }
             | Request::ResumeAgentSchedule { .. }
             | Request::RemoveAgentSchedule { .. }
+            | Request::GuardedPauseAgentSchedule { .. }
+            | Request::GuardedResumeAgentSchedule { .. }
+            | Request::GuardedRemoveAgentSchedule { .. }
     );
     let response = match registry.dispatch_arc(request.message, response_version) {
         Ok(response) => response,
@@ -1649,6 +1652,238 @@ fn error_response(code: ErrorCode, message: impl Into<String>) -> Response {
     }
 }
 
+fn operation_is_read(operation: &RoutedOperation) -> bool {
+    matches!(
+        operation,
+        RoutedOperation::GetWorkspace { .. }
+            | RoutedOperation::GetShell { .. }
+            | RoutedOperation::GetLauncher { .. }
+            | RoutedOperation::GetAgent { .. }
+            | RoutedOperation::GetAgentSchedule { .. }
+            | RoutedOperation::GetScheduledExecution { .. }
+    )
+}
+
+fn routed_result(response: Response) -> Result<RoutedOperationResult, Box<Response>> {
+    match response {
+        Response::Workspace { workspace } => Ok(RoutedOperationResult::Workspace { workspace }),
+        Response::Shell { shell } => Ok(RoutedOperationResult::Shell { shell }),
+        Response::Launcher { launcher } => Ok(RoutedOperationResult::Launcher { launcher }),
+        Response::Agent { agent } => Ok(RoutedOperationResult::Agent { agent }),
+        Response::AgentSchedule { schedule } => {
+            Ok(RoutedOperationResult::AgentSchedule { schedule })
+        }
+        Response::AgentScheduleInspection { inspection } => {
+            Ok(RoutedOperationResult::AgentScheduleInspection { inspection })
+        }
+        Response::ScheduledExecution {
+            execution,
+            next_occurrence,
+        } => Ok(RoutedOperationResult::ScheduledExecution {
+            execution,
+            next_occurrence,
+        }),
+        Response::AgentAttentionAcknowledged { agent, changed } => {
+            Ok(RoutedOperationResult::AgentAttentionAcknowledged { agent, changed })
+        }
+        Response::Ok => Ok(RoutedOperationResult::Ok),
+        Response::Error { .. } => Err(Box::new(response)),
+        _ => Err(Box::new(error_response(
+            ErrorCode::Internal,
+            "remote Node returned an unexpected typed response",
+        ))),
+    }
+}
+
+fn routed_postcondition(operation: &RoutedOperation, response: &Response) -> bool {
+    match (operation, response) {
+        (
+            RoutedOperation::RenameWorkspace {
+                name,
+                expected_revision,
+                ..
+            },
+            Response::Workspace { workspace },
+        ) => workspace.name == *name && workspace.revision > *expected_revision,
+        (
+            RoutedOperation::RenameShell {
+                name,
+                expected_revision,
+                ..
+            },
+            Response::Shell { shell },
+        ) => shell.name == *name && shell.revision > *expected_revision,
+        (
+            RoutedOperation::RenameLauncher {
+                name,
+                expected_revision,
+                ..
+            },
+            Response::Launcher { launcher },
+        ) => launcher.name == *name && launcher.revision > *expected_revision,
+        (
+            RoutedOperation::CloseWorkspace { .. }
+            | RoutedOperation::CloseShell { .. }
+            | RoutedOperation::RemoveLauncher { .. }
+            | RoutedOperation::RemoveAgentSchedule { .. },
+            Response::Error {
+                code: Some(ErrorCode::NotFound),
+                ..
+            },
+        ) => true,
+        (
+            RoutedOperation::RestartShell {
+                expected_revision,
+                expected_run_id,
+                ..
+            },
+            Response::Shell { shell },
+        ) => {
+            shell.revision == *expected_revision
+                && shell.status == ShellStatus::Pending
+                && shell
+                    .run
+                    .as_ref()
+                    .is_some_and(|run| run.id == *expected_run_id)
+        }
+        (
+            RoutedOperation::PauseAgentSchedule {
+                expected_revision, ..
+            },
+            Response::AgentScheduleInspection { inspection },
+        ) => {
+            inspection.schedule.revision > *expected_revision
+                && inspection.schedule.state == AgentScheduleState::Paused
+        }
+        (
+            RoutedOperation::ResumeAgentSchedule {
+                expected_revision, ..
+            },
+            Response::AgentScheduleInspection { inspection },
+        ) => {
+            inspection.schedule.revision > *expected_revision
+                && inspection.schedule.state == AgentScheduleState::Enabled
+        }
+        (
+            RoutedOperation::UpdateAgentSchedule {
+                expected_revision,
+                update,
+                ..
+            },
+            Response::AgentScheduleInspection { inspection },
+        ) => {
+            inspection.schedule.revision > *expected_revision
+                && inspection.schedule.name == update.name
+                && inspection.schedule.trigger == update.trigger
+                && inspection.prompt == update.prompt
+        }
+        (
+            RoutedOperation::CancelScheduledExecution {
+                expected_revision, ..
+            },
+            Response::ScheduledExecution { execution, .. },
+        ) => {
+            execution.revision > *expected_revision
+                && execution.state == ScheduledExecutionState::Cancelled
+                && execution.reason == Some(ScheduledExecutionReason::CancelledByUser)
+        }
+        _ => false,
+    }
+}
+
+fn proven_routed_result(
+    operation: &RoutedOperation,
+    response: Response,
+) -> Option<RoutedOperationResult> {
+    if !routed_postcondition(operation, &response) {
+        return None;
+    }
+    match (operation, response) {
+        (
+            RoutedOperation::CloseWorkspace { .. }
+            | RoutedOperation::CloseShell { .. }
+            | RoutedOperation::RemoveLauncher { .. }
+            | RoutedOperation::RemoveAgentSchedule { .. },
+            Response::Error { .. },
+        ) => Some(RoutedOperationResult::Ok),
+        (
+            RoutedOperation::PauseAgentSchedule { .. }
+            | RoutedOperation::ResumeAgentSchedule { .. }
+            | RoutedOperation::UpdateAgentSchedule { .. },
+            Response::AgentScheduleInspection { inspection },
+        ) => Some(RoutedOperationResult::AgentSchedule {
+            schedule: inspection.schedule,
+        }),
+        (_, response) => routed_result(response).ok(),
+    }
+}
+
+fn send_registered_node_request(
+    registration: &crate::protocol::NodeRegistrationSnapshot,
+    request: Request,
+) -> io::Result<Response> {
+    let target = SshTarget::parse(registration.target.clone())?;
+    let helper = match ssh_bootstrap::plan_remote_bootstrap(
+        target.clone(),
+        SshAuthenticationMode::Batch,
+        Duration::from_secs(2),
+    )? {
+        RemoteBootstrapPlan::Ready(helper) => helper,
+        RemoteBootstrapPlan::Install(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "remote helper requires installation",
+            ));
+        }
+    };
+    if helper.handshake.node_id != registration.node_id {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "remote Node identity changed",
+        ));
+    }
+    if !protocol::ProtocolFeature::GuardedNodeRouting
+        .is_supported_by(helper.handshake.core_protocol_version)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "remote Node does not support guarded routing",
+        ));
+    }
+    let mut remote = ssh_bootstrap::connect_remote(
+        target,
+        helper,
+        SshAuthenticationMode::Batch,
+        Duration::from_secs(2),
+    )?;
+    remote.request(request, Duration::from_secs(2))
+}
+
+fn require_guard(actual: u64, expected: u64, resource: &str) -> DaemonResult<()> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(DaemonError::lifecycle(
+            ErrorCode::RevisionAhead,
+            format!("{resource} revision is {actual}; guarded operation supplied {expected}"),
+        ))
+    }
+}
+
+fn bump_revision(revision: &Mutex<u64>, resource: &str) -> io::Result<()> {
+    let mut revision = lock(revision)?;
+    *revision = revision
+        .checked_add(1)
+        .ok_or_else(|| io::Error::other(format!("{resource} revision exhausted")))?;
+    Ok(())
+}
+
+fn rollback_bump(revision: &Mutex<u64>) -> io::Result<()> {
+    let mut revision = lock(revision)?;
+    *revision = revision.saturating_sub(1).max(1);
+    Ok(())
+}
+
 fn scheduled_execution_response(
     execution: ScheduledExecutionSnapshot,
     response_version: u32,
@@ -1955,14 +2190,17 @@ enum DurableUndo {
     RenamedWorkspace {
         workspace: Arc<Workspace>,
         previous: String,
+        previous_revision: u64,
     },
     RenamedShell {
         shell: Arc<Shell>,
         previous: String,
+        previous_revision: u64,
     },
     RenamedLauncher {
         launcher: Arc<WorkspaceLauncher>,
         previous: String,
+        previous_revision: u64,
     },
     AgentState {
         agent: Arc<AgentInstance>,
@@ -3334,6 +3572,7 @@ impl DurableRegistry {
             .collect::<io::Result<Vec<_>>>()?;
         let workspace = Arc::new(Workspace {
             id: workspace_id.clone(),
+            revision: Mutex::new(1),
             name: Mutex::new(name.clone()),
             default_cwd,
             shell_ids: Mutex::new(shells.iter().map(|shell| shell.id.clone()).collect()),
@@ -3343,6 +3582,7 @@ impl DurableRegistry {
         });
         let snapshot = WorkspaceSnapshot {
             id: workspace_id.clone(),
+            revision: 1,
             name: name.clone(),
             default_cwd: workspace.default_cwd.clone(),
             shells: shells
@@ -3406,6 +3646,7 @@ impl DurableRegistry {
         }
         state.shells.insert(shell.id.clone(), Arc::clone(&shell));
         shell_ids.push(shell.id.clone());
+        bump_revision(&workspace.revision, "workspace")?;
         drop(shell_ids);
         drop(state);
         Ok((snapshot, DurableUndo::CreatedShell { workspace, shell }))
@@ -3419,6 +3660,7 @@ impl DurableRegistry {
         let workspace = self.workspace(&schedule.workspace_id)?;
         let shell = Arc::new(Shell {
             id: Uuid::new_v4().to_string(),
+            revision: Mutex::new(1),
             workspace_id: schedule.workspace_id.clone(),
             name: Mutex::new(format!("schedule-{}", &schedule.id[..8])),
             cwd: schedule.cwd.clone(),
@@ -3434,6 +3676,7 @@ impl DurableRegistry {
         let mut shell_ids = lock(&workspace.shell_ids)?;
         state.shells.insert(shell.id.clone(), Arc::clone(&shell));
         shell_ids.push(shell.id.clone());
+        bump_revision(&workspace.revision, "workspace")?;
         drop(shell_ids);
         drop(state);
         Ok((
@@ -3515,6 +3758,7 @@ impl DurableRegistry {
         let workspace = self.workspace(workspace_id)?;
         let launcher = Arc::new(WorkspaceLauncher {
             id: Uuid::new_v4().to_string(),
+            revision: Mutex::new(1),
             workspace_id: workspace_id.into(),
             name: Mutex::new(spec.name),
             cwd: spec.cwd,
@@ -3545,6 +3789,7 @@ impl DurableRegistry {
             .launchers
             .insert(launcher.id.clone(), Arc::clone(&launcher));
         launcher_ids.push(launcher.id.clone());
+        bump_revision(&workspace.revision, "workspace")?;
         drop(launcher_ids);
         drop(state);
         Ok((
@@ -3641,6 +3886,7 @@ impl DurableRegistry {
             .schedules
             .insert(schedule.id.clone(), Arc::clone(&schedule));
         schedule_ids.push(schedule.id.clone());
+        bump_revision(&workspace.revision, "workspace")?;
         drop(schedule_ids);
         drop(state);
         Ok((
@@ -3656,10 +3902,14 @@ impl DurableRegistry {
         &self,
         schedule_id: &str,
         next: AgentScheduleState,
+        expected_revision: Option<u64>,
         requested_at_ms: u64,
-    ) -> io::Result<(AgentScheduleSnapshot, Option<DurableUndo>)> {
+    ) -> DaemonResult<(AgentScheduleSnapshot, Option<DurableUndo>)> {
         let schedule = self.schedule(schedule_id)?;
         let mut state = lock(&schedule.state)?;
+        if let Some(expected) = expected_revision {
+            require_guard(state.revision, expected, "agent schedule")?;
+        }
         if state.state == next {
             return Ok((schedule.snapshot_from(&state)?, None));
         }
@@ -3854,13 +4104,23 @@ impl DurableRegistry {
                 format!("shell name already exists: {name}"),
             ));
         }
+        let mut revision = lock(&shell.revision)?;
         let mut current_name = lock(&shell.name)?;
         if *current_name == name {
             return Ok(None);
         }
+        let previous_revision = *revision;
+        *revision = revision
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("shell revision exhausted"))?;
         let previous = std::mem::replace(&mut *current_name, name);
         drop(current_name);
-        Ok(Some(DurableUndo::RenamedShell { shell, previous }))
+        drop(revision);
+        Ok(Some(DurableUndo::RenamedShell {
+            shell,
+            previous,
+            previous_revision,
+        }))
     }
 
     fn rename_launcher(&self, launcher_id: &str, name: String) -> io::Result<Option<DurableUndo>> {
@@ -3885,13 +4145,23 @@ impl DurableRegistry {
                 format!("workspace launcher name already exists: {name}"),
             ));
         }
+        let mut revision = lock(&launcher.revision)?;
         let mut current_name = lock(&launcher.name)?;
         if *current_name == name {
             return Ok(None);
         }
+        let previous_revision = *revision;
+        *revision = revision
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("workspace launcher revision exhausted"))?;
         let previous = std::mem::replace(&mut *current_name, name);
         drop(current_name);
-        Ok(Some(DurableUndo::RenamedLauncher { launcher, previous }))
+        drop(revision);
+        Ok(Some(DurableUndo::RenamedLauncher {
+            launcher,
+            previous,
+            previous_revision,
+        }))
     }
 
     fn rename_workspace(
@@ -3910,15 +4180,22 @@ impl DurableRegistry {
                 ));
             }
         }
+        let mut revision = lock(&workspace.revision)?;
         let mut current_name = lock(&workspace.name)?;
         if *current_name == name {
             return Ok(None);
         }
+        let previous_revision = *revision;
+        *revision = revision
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("workspace revision exhausted"))?;
         let previous = std::mem::replace(&mut *current_name, name);
         drop(current_name);
+        drop(revision);
         Ok(Some(DurableUndo::RenamedWorkspace {
             workspace,
             previous,
+            previous_revision,
         }))
     }
 
@@ -3990,6 +4267,7 @@ impl DurableRegistry {
         let mut agent_ids = lock(&workspace.agent_ids)?;
         state.agents.insert(agent.id.clone(), Arc::clone(&agent));
         agent_ids.push(agent.id.clone());
+        bump_revision(&workspace.revision, "workspace")?;
         drop(agent_ids);
         drop(lifecycle);
         drop(state);
@@ -4256,6 +4534,7 @@ impl DurableRegistry {
                     state.shells.remove(&shell.id);
                 }
                 lock(&workspace.shell_ids)?.retain(|id| id != &shell.id);
+                rollback_bump(&workspace.revision)?;
             }
             DurableUndo::CreatedLauncher {
                 workspace,
@@ -4270,6 +4549,7 @@ impl DurableRegistry {
                     state.launchers.remove(&launcher.id);
                 }
                 lock(&workspace.launcher_ids)?.retain(|id| id != &launcher.id);
+                rollback_bump(&workspace.revision)?;
             }
             DurableUndo::CreatedSchedule {
                 workspace,
@@ -4284,6 +4564,7 @@ impl DurableRegistry {
                     state.schedules.remove(&schedule.id);
                 }
                 lock(&workspace.schedule_ids)?.retain(|id| id != &schedule.id);
+                rollback_bump(&workspace.revision)?;
             }
             DurableUndo::RegisteredAgent { workspace, agent } => {
                 let mut state = lock(&self.state)?;
@@ -4295,16 +4576,31 @@ impl DurableRegistry {
                     state.agents.remove(&agent.id);
                 }
                 lock(&workspace.agent_ids)?.retain(|id| id != &agent.id);
+                rollback_bump(&workspace.revision)?;
             }
             DurableUndo::RenamedWorkspace {
                 workspace,
                 previous,
-            } => *lock(&workspace.name)? = previous,
-            DurableUndo::RenamedShell { shell, previous } => {
-                *lock(&shell.name)? = previous;
+                previous_revision,
+            } => {
+                *lock(&workspace.name)? = previous;
+                *lock(&workspace.revision)? = previous_revision;
             }
-            DurableUndo::RenamedLauncher { launcher, previous } => {
+            DurableUndo::RenamedShell {
+                shell,
+                previous,
+                previous_revision,
+            } => {
+                *lock(&shell.name)? = previous;
+                *lock(&shell.revision)? = previous_revision;
+            }
+            DurableUndo::RenamedLauncher {
+                launcher,
+                previous,
+                previous_revision,
+            } => {
                 *lock(&launcher.name)? = previous;
+                *lock(&launcher.revision)? = previous_revision;
             }
             DurableUndo::AgentState { agent, previous } => {
                 *lock(&agent.state)? = previous;
@@ -4333,6 +4629,7 @@ impl DurableRegistry {
                     .launchers
                     .insert(launcher.id.clone(), Arc::clone(&launcher));
                 lock(&workspace.launcher_ids)?.insert(index, launcher.id.clone());
+                rollback_bump(&workspace.revision)?;
             }
             DurableUndo::RemovedSchedule {
                 workspace,
@@ -4343,6 +4640,7 @@ impl DurableRegistry {
                     .schedules
                     .insert(schedule.id.clone(), Arc::clone(&schedule));
                 lock(&workspace.schedule_ids)?.insert(index, schedule.id.clone());
+                rollback_bump(&workspace.revision)?;
             }
             DurableUndo::RemovedShell {
                 workspace,
@@ -4353,6 +4651,7 @@ impl DurableRegistry {
                     .shells
                     .insert(shell.id.clone(), Arc::clone(&shell));
                 lock(&workspace.shell_ids)?.insert(index, shell.id.clone());
+                rollback_bump(&workspace.revision)?;
             }
             DurableUndo::RemovedWorkspace {
                 workspace,
@@ -4535,6 +4834,7 @@ impl DurableRegistry {
                 };
                 shells.push(PersistedShell {
                     id: shell.id.clone(),
+                    revision: *lock(&shell.revision)?,
                     name: lock(&shell.name)?.clone(),
                     cwd: shell.cwd.clone(),
                     command: shell.command.clone(),
@@ -4550,6 +4850,7 @@ impl DurableRegistry {
                 };
                 launchers.push(PersistedWorkspaceLauncher {
                     id: launcher.id.clone(),
+                    revision: *lock(&launcher.revision)?,
                     name: lock(&launcher.name)?.clone(),
                     cwd: launcher.cwd.clone(),
                     command: launcher.command.clone(),
@@ -4573,6 +4874,7 @@ impl DurableRegistry {
             }
             saved.workspaces.push(PersistedWorkspace {
                 id: workspace.id.clone(),
+                revision: *lock(&workspace.revision)?,
                 name: lock(&workspace.name)?.clone(),
                 default_cwd: workspace.default_cwd.clone(),
                 shells,
@@ -5321,6 +5623,7 @@ impl Default for DaemonService {
 
 struct Workspace {
     id: String,
+    revision: Mutex<u64>,
     name: Mutex<String>,
     default_cwd: Option<PathBuf>,
     shell_ids: Mutex<Vec<String>>,
@@ -5422,6 +5725,7 @@ struct AgentInstanceState {
 
 struct WorkspaceLauncher {
     id: String,
+    revision: Mutex<u64>,
     workspace_id: String,
     name: Mutex<String>,
     cwd: PathBuf,
@@ -5430,6 +5734,7 @@ struct WorkspaceLauncher {
 
 struct Shell {
     id: String,
+    revision: Mutex<u64>,
     workspace_id: String,
     name: Mutex<String>,
     cwd: PathBuf,
@@ -6417,6 +6722,86 @@ impl DaemonService {
                 "Boomux Node projection cache is unavailable",
             )
         })
+    }
+
+    fn route_node_operation(&self, node_id: &str, operation: RoutedOperation) -> Response {
+        let registrations = match self.node_registrations() {
+            Ok(registrations) => registrations,
+            Err(error) => return error.into_response(),
+        };
+        let registration = match registrations.inspect(node_id) {
+            Ok(registration) if registration.node_id == node_id => registration,
+            Ok(_) => {
+                return error_response(ErrorCode::NotFound, "exact Node registration not found");
+            }
+            Err(error) => return node_registration_error(error).into_response(),
+        };
+        match registrations.admit(&registration) {
+            Ok(true) => {}
+            Ok(false) => {
+                return error_response(
+                    ErrorCode::RevisionChanged,
+                    "Node registration changed before routing",
+                );
+            }
+            Err(error) => return node_registration_error(error).into_response(),
+        }
+        let mut result = send_registered_node_request(&registration, operation.owner_request());
+        if result.is_err() && operation.is_retryable() {
+            result = send_registered_node_request(&registration, operation.owner_request());
+        }
+        let proven = if result.is_err() && !operation.is_retryable() {
+            operation.ambiguity_probe().and_then(|probe| {
+                send_registered_node_request(&registration, probe)
+                    .ok()
+                    .and_then(|response| proven_routed_result(&operation, response))
+            })
+        } else {
+            None
+        };
+        registrations.release(&registration);
+        let response = match result {
+            Ok(response) => response,
+            Err(_) if proven.is_some() => Response::Ok,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                return error_response(ErrorCode::NodeIdentityChanged, error.to_string());
+            }
+            Err(error) if error.kind() == io::ErrorKind::Unsupported => {
+                return error_response(ErrorCode::UnsupportedVersion, error.to_string());
+            }
+            Err(error) => {
+                let code = if operation_is_read(&operation) {
+                    ErrorCode::Timeout
+                } else {
+                    ErrorCode::OutcomeUnknown
+                };
+                return error_response(
+                    code,
+                    format!("routed operation lost its verified channel: {error}"),
+                );
+            }
+        };
+        let current = registrations
+            .with_current(&registration, || Ok(()))
+            .unwrap_or(None)
+            .is_some();
+        if !current {
+            return error_response(
+                if operation_is_read(&operation) {
+                    ErrorCode::RevisionChanged
+                } else {
+                    ErrorCode::OutcomeUnknown
+                },
+                "Node registration changed while the routed operation was in flight",
+            );
+        }
+        if let Some(result) = proven {
+            return Response::RoutedNodeOperation { result };
+        }
+        match routed_result(response) {
+            Ok(result) => Response::RoutedNodeOperation { result },
+            Err(response) => *response,
+        }
     }
 
     fn combined_node_snapshot(
@@ -7584,12 +7969,19 @@ impl DaemonService {
         Ok(execution.snapshot()?)
     }
 
-    fn cancel_scheduled_execution(&self, execution_id: &str) -> DaemonResult<Response> {
+    fn cancel_scheduled_execution(
+        &self,
+        execution_id: &str,
+        expected_revision: Option<u64>,
+    ) -> DaemonResult<Response> {
         let _mutation = lock(&self.mutation_lock)?;
         self.ensure_running()?;
         self.flush_pending()?;
         let execution = self.durable.execution(execution_id)?;
         let current = execution.snapshot()?;
+        if let Some(expected) = expected_revision {
+            require_guard(current.revision, expected, "scheduled execution")?;
+        }
         if current.state.is_terminal() {
             return Ok(Response::ScheduledExecution {
                 execution: current,
@@ -7918,6 +8310,9 @@ impl DaemonService {
             Request::GetCombinedNodeSnapshot { selector } => Ok(Response::CombinedNodeSnapshot {
                 snapshot: self.combined_node_snapshot(selector.as_deref())?,
             }),
+            Request::RouteNodeOperation { node_id, operation } => {
+                Ok(self.route_node_operation(&node_id, operation))
+            }
             Request::Restart | Request::RestartWithNotificationConfig { .. } => {
                 unreachable!("restart is handled before dispatch")
             }
@@ -8088,8 +8483,12 @@ impl DaemonService {
                 unreachable!("schedule run is handled with the service Arc")
             }
             Request::CancelScheduledExecution { execution_id } => {
-                self.cancel_scheduled_execution(&execution_id)
+                self.cancel_scheduled_execution(&execution_id, None)
             }
+            Request::GuardedCancelScheduledExecution {
+                execution_id,
+                expected_revision,
+            } => self.cancel_scheduled_execution(&execution_id, Some(expected_revision)),
             Request::ResolveScheduledExecutionClaim {
                 schedule_id,
                 shell_id,
@@ -8333,10 +8732,32 @@ impl DaemonService {
                         .map(|()| Response::Ok))
                 })
             }
+            Request::GuardedRenameWorkspace {
+                workspace_id,
+                name,
+                expected_revision,
+            } => self.durable_mutation_outcome(|undo| {
+                let workspace = self.workspace(&workspace_id)?;
+                require_guard(*lock(&workspace.revision)?, expected_revision, "workspace")?;
+                let mutation = self.rename_workspace_mutation(undo, &workspace_id, name)?;
+                let workspace = self.workspace(&workspace_id)?.snapshot(&self.durable)?;
+                Ok(mutation.map(|()| Response::Workspace { workspace }))
+            }),
             Request::RenameShell { shell_id, name } => self.durable_mutation_outcome(|undo| {
                 Ok(self
                     .rename_shell_mutation(undo, &shell_id, name)?
                     .map(|()| Response::Ok))
+            }),
+            Request::GuardedRenameShell {
+                shell_id,
+                name,
+                expected_revision,
+            } => self.durable_mutation_outcome(|undo| {
+                let shell = self.shell(&shell_id)?;
+                require_guard(*lock(&shell.revision)?, expected_revision, "shell")?;
+                let mutation = self.rename_shell_mutation(undo, &shell_id, name)?;
+                let shell = self.shell(&shell_id)?.snapshot()?;
+                Ok(mutation.map(|()| Response::Shell { shell }))
             }),
             Request::RenameLauncher { launcher_id, name } => {
                 self.durable_mutation_outcome(|undo| {
@@ -8345,18 +8766,76 @@ impl DaemonService {
                         .map(|()| Response::Ok))
                 })
             }
+            Request::GuardedRenameLauncher {
+                launcher_id,
+                name,
+                expected_revision,
+            } => self.durable_mutation_outcome(|undo| {
+                let launcher = self.launcher(&launcher_id)?;
+                require_guard(
+                    *lock(&launcher.revision)?,
+                    expected_revision,
+                    "workspace launcher",
+                )?;
+                let mutation = self.rename_launcher_mutation(undo, &launcher_id, name)?;
+                let launcher = self.launcher(&launcher_id)?.snapshot()?;
+                Ok(mutation.map(|()| Response::Launcher { launcher }))
+            }),
             Request::CloseWorkspace { workspace_id } => {
                 self.close_workspace(&workspace_id)?;
+                Ok(Response::Ok)
+            }
+            Request::GuardedCloseWorkspace {
+                workspace_id,
+                expected_revision,
+            } => {
+                self.close_workspace_guarded(&workspace_id, Some(expected_revision))?;
                 Ok(Response::Ok)
             }
             Request::CloseShell { shell_id } => {
                 self.close_shell(&shell_id)?;
                 Ok(Response::Ok)
             }
+            Request::GuardedCloseShell {
+                shell_id,
+                expected_revision,
+            } => {
+                self.close_shell_guarded(&shell_id, Some(expected_revision))?;
+                Ok(Response::Ok)
+            }
             Request::RestartShell { shell_id } => Ok(Response::Shell {
                 shell: self.restart_shell(&shell_id)?,
             }),
+            Request::GuardedRestartShell {
+                shell_id,
+                expected_revision,
+                expected_run_id,
+            } => Ok(Response::Shell {
+                shell: self.restart_shell_guarded(
+                    &shell_id,
+                    Some((expected_revision, &expected_run_id)),
+                )?,
+            }),
             Request::RemoveLauncher { launcher_id } => self.durable_mutation(|undo| {
+                let launcher = self.remove_launcher_mutation(undo, &launcher_id)?;
+                Ok((
+                    Response::Ok,
+                    vec![DaemonEventKind::LauncherRemoved {
+                        workspace_id: launcher.workspace_id.clone(),
+                        launcher_id,
+                    }],
+                ))
+            }),
+            Request::GuardedRemoveLauncher {
+                launcher_id,
+                expected_revision,
+            } => self.durable_mutation(|undo| {
+                let launcher = self.launcher(&launcher_id)?;
+                require_guard(
+                    *lock(&launcher.revision)?,
+                    expected_revision,
+                    "workspace launcher",
+                )?;
                 let launcher = self.remove_launcher_mutation(undo, &launcher_id)?;
                 Ok((
                     Response::Ok,
@@ -8372,7 +8851,42 @@ impl DaemonService {
             Request::ResumeAgentSchedule { schedule_id } => {
                 self.change_schedule_state(&schedule_id, AgentScheduleState::Enabled)
             }
+            Request::GuardedPauseAgentSchedule {
+                schedule_id,
+                expected_revision,
+            } => self.change_schedule_state_guarded(
+                &schedule_id,
+                AgentScheduleState::Paused,
+                Some(expected_revision),
+            ),
+            Request::GuardedResumeAgentSchedule {
+                schedule_id,
+                expected_revision,
+            } => self.change_schedule_state_guarded(
+                &schedule_id,
+                AgentScheduleState::Enabled,
+                Some(expected_revision),
+            ),
             Request::RemoveAgentSchedule { schedule_id } => self.durable_mutation(|undo| {
+                let schedule = self.remove_schedule_mutation(undo, &schedule_id)?;
+                Ok((
+                    Response::Ok,
+                    vec![DaemonEventKind::AgentScheduleRemoved {
+                        workspace_id: schedule.workspace_id.clone(),
+                        schedule_id,
+                    }],
+                ))
+            }),
+            Request::GuardedRemoveAgentSchedule {
+                schedule_id,
+                expected_revision,
+            } => self.durable_mutation(|undo| {
+                let schedule = self.schedule(&schedule_id)?;
+                require_guard(
+                    schedule.snapshot()?.revision,
+                    expected_revision,
+                    "agent schedule",
+                )?;
                 let schedule = self.remove_schedule_mutation(undo, &schedule_id)?;
                 Ok((
                     Response::Ok,
@@ -8484,6 +8998,7 @@ impl DaemonService {
                 }
                 let shell = Arc::new(Shell {
                     id: saved_shell.id,
+                    revision: Mutex::new(saved_shell.revision),
                     workspace_id: saved_workspace.id.clone(),
                     name: Mutex::new(saved_shell.name),
                     cwd: saved_shell.cwd,
@@ -8518,6 +9033,7 @@ impl DaemonService {
                 }
                 let launcher = Arc::new(WorkspaceLauncher {
                     id: saved_launcher.id,
+                    revision: Mutex::new(saved_launcher.revision),
                     workspace_id: saved_workspace.id.clone(),
                     name: Mutex::new(saved_launcher.name),
                     cwd: saved_launcher.cwd,
@@ -8698,6 +9214,7 @@ impl DaemonService {
             }
             let workspace = Arc::new(Workspace {
                 id: saved_workspace.id.clone(),
+                revision: Mutex::new(saved_workspace.revision),
                 name: Mutex::new(saved_workspace.name),
                 default_cwd: saved_workspace.default_cwd,
                 shell_ids: Mutex::new(shell_ids),
@@ -10083,10 +10600,22 @@ impl DaemonService {
         schedule_id: &str,
         next: AgentScheduleState,
     ) -> DaemonResult<Response> {
+        self.change_schedule_state_guarded(schedule_id, next, None)
+    }
+
+    fn change_schedule_state_guarded(
+        &self,
+        schedule_id: &str,
+        next: AgentScheduleState,
+        expected_revision: Option<u64>,
+    ) -> DaemonResult<Response> {
         self.durable_mutation_outcome(|undo| {
-            let (schedule, record) =
-                self.durable
-                    .set_schedule_state_at(schedule_id, next, self.clock_now_ms())?;
+            let (schedule, record) = self.durable.set_schedule_state_at(
+                schedule_id,
+                next,
+                expected_revision,
+                self.clock_now_ms(),
+            )?;
             let Some(record) = record else {
                 return Ok(DurableMutation::Unchanged(Response::AgentSchedule {
                     schedule,
@@ -10292,6 +10821,7 @@ impl DaemonService {
             .ok_or_else(|| not_found("workspace launcher", launcher_id))?;
         state.launchers.remove(launcher_id);
         launcher_ids.remove(index);
+        bump_revision(&workspace.revision, "workspace")?;
         drop(launcher_ids);
         drop(state);
         let result = Arc::clone(&launcher);
@@ -10346,6 +10876,7 @@ impl DaemonService {
             .ok_or_else(|| not_found("agent schedule", schedule_id))?;
         state.schedules.remove(schedule_id);
         schedule_ids.remove(index);
+        bump_revision(&workspace.revision, "workspace")?;
         drop(schedule_ids);
         drop(state);
         let result = Arc::clone(&schedule);
@@ -10457,6 +10988,7 @@ impl DaemonService {
             .ok_or_else(|| not_found("shell", shell_id))?;
         state.shells.remove(shell_id);
         shell_ids.remove(index);
+        bump_revision(&workspace.revision, "workspace")?;
         drop(shell_ids);
         drop(state);
         Ok(DurableUndo::RemovedShell {
@@ -10517,6 +11049,14 @@ impl DaemonService {
     }
 
     fn close_shell(&self, shell_id: &str) -> DaemonResult<()> {
+        self.close_shell_guarded(shell_id, None)
+    }
+
+    fn close_shell_guarded(
+        &self,
+        shell_id: &str,
+        expected_revision: Option<u64>,
+    ) -> DaemonResult<()> {
         if !matches!(self.shell(shell_id)?.owner, ShellOwner::User) {
             return Err(DaemonError::lifecycle(
                 ErrorCode::Busy,
@@ -10525,7 +11065,13 @@ impl DaemonService {
         }
         self.lifecycle_transaction(
             false,
-            || Ok(vec![self.shell(shell_id)?]),
+            || {
+                let shell = self.shell(shell_id)?;
+                if let Some(expected) = expected_revision {
+                    require_guard(*lock(&shell.revision)?, expected, "shell")?;
+                }
+                Ok(vec![shell])
+            },
             |undo| {
                 undo.record(self.remove_shell_mutation(shell_id)?);
                 Ok(())
@@ -10540,10 +11086,21 @@ impl DaemonService {
     }
 
     fn close_workspace(&self, workspace_id: &str) -> DaemonResult<()> {
+        self.close_workspace_guarded(workspace_id, None)
+    }
+
+    fn close_workspace_guarded(
+        &self,
+        workspace_id: &str,
+        expected_revision: Option<u64>,
+    ) -> DaemonResult<()> {
         self.lifecycle_transaction(
             false,
             || {
                 let workspace = self.workspace(workspace_id)?;
+                if let Some(expected) = expected_revision {
+                    require_guard(*lock(&workspace.revision)?, expected, "workspace")?;
+                }
                 Ok(self.durable.workspace_shells(&workspace)?)
             },
             |undo| {
@@ -10559,9 +11116,27 @@ impl DaemonService {
     }
 
     fn restart_shell(&self, shell_id: &str) -> DaemonResult<ShellSnapshot> {
+        self.restart_shell_guarded(shell_id, None)
+    }
+
+    fn restart_shell_guarded(
+        &self,
+        shell_id: &str,
+        guard: Option<(u64, &str)>,
+    ) -> DaemonResult<ShellSnapshot> {
         let _mutation = lock(&self.mutation_lock)?;
         self.ensure_running()?;
         let shell = self.shell(shell_id)?;
+        if let Some((expected_revision, expected_run_id)) = guard {
+            require_guard(*lock(&shell.revision)?, expected_revision, "shell")?;
+            let current_run = shell.snapshot()?.run.map(|run| run.id);
+            if current_run.as_deref() != Some(expected_run_id) {
+                return Err(DaemonError::lifecycle(
+                    ErrorCode::RunChanged,
+                    "shell no longer has the confirmed run",
+                ));
+            }
+        }
         if !matches!(shell.owner, ShellOwner::User) {
             return Err(DaemonError::lifecycle(
                 ErrorCode::Busy,
@@ -10638,6 +11213,7 @@ impl Workspace {
             .collect::<io::Result<_>>()?;
         Ok(WorkspaceSnapshot {
             id: self.id.clone(),
+            revision: *lock(&self.revision)?,
             name: lock(&self.name)?.clone(),
             default_cwd: self.default_cwd.clone(),
             shells,
@@ -10946,6 +11522,7 @@ impl WorkspaceLauncher {
     fn snapshot(&self) -> io::Result<WorkspaceLauncherSnapshot> {
         Ok(WorkspaceLauncherSnapshot {
             id: self.id.clone(),
+            revision: *lock(&self.revision)?,
             workspace_id: self.workspace_id.clone(),
             name: lock(&self.name)?.clone(),
             command: self.command.clone(),
@@ -11096,6 +11673,7 @@ impl Shell {
         };
         Ok(ShellSnapshot {
             id: self.id.clone(),
+            revision: *lock(&self.revision)?,
             workspace_id: self.workspace_id.clone(),
             name: lock(&self.name)?.clone(),
             cwd: self.cwd.clone(),
@@ -11113,6 +11691,7 @@ fn create_pending_shell(workspace_id: &str, spec: ShellSpec) -> io::Result<Arc<S
     validate_cwd(&spec.cwd)?;
     Ok(Arc::new(Shell {
         id: Uuid::new_v4().to_string(),
+        revision: Mutex::new(1),
         workspace_id: workspace_id.to_owned(),
         name: Mutex::new(spec.name),
         cwd: spec.cwd,
@@ -14199,10 +14778,12 @@ mod tests {
         let mut persisted = PersistedState::default();
         persisted.workspaces = vec![PersistedWorkspace {
             id: workspace_id,
+            revision: 1,
             name: "continued".into(),
             default_cwd: None,
             shells: vec![PersistedShell {
                 id: shell_id.clone(),
+                revision: 1,
                 name: "scheduled".into(),
                 cwd: env::temp_dir(),
                 command: vec!["boomux".into()],
@@ -17999,6 +18580,7 @@ mod tests {
         };
         let workspace = WorkspaceSnapshot {
             id: "w1".into(),
+            revision: 1,
             name: "workspace".into(),
             default_cwd: None,
             shells: Vec::new(),
@@ -18138,6 +18720,7 @@ mod tests {
 
         let workspace = WorkspaceSnapshot {
             id: "w1".into(),
+            revision: 1,
             name: "workspace".into(),
             default_cwd: None,
             shells: Vec::new(),
@@ -18239,6 +18822,7 @@ mod tests {
             snapshot: Some(Snapshot {
                 workspaces: vec![WorkspaceSnapshot {
                     id: "w1".into(),
+                    revision: 1,
                     name: "workspace".into(),
                     default_cwd: None,
                     shells: Vec::new(),
@@ -18510,6 +19094,45 @@ mod tests {
     }
 
     #[test]
+    fn guarded_resource_mutations_reject_stale_revisions_without_changing_legacy_semantics() {
+        let registry = DaemonService::default();
+        let workspace = registry
+            .create_workspace("guarded".into(), Vec::new())
+            .unwrap();
+        let stale = registry
+            .dispatch(Request::GuardedRenameWorkspace {
+                workspace_id: workspace.id.clone(),
+                name: "stale".into(),
+                expected_revision: workspace.revision + 1,
+            })
+            .unwrap_err();
+        assert_eq!(stale.wire_code(), ErrorCode::RevisionAhead);
+        assert_eq!(
+            registry
+                .workspace(&workspace.id)
+                .unwrap()
+                .snapshot(&registry.durable)
+                .unwrap()
+                .name,
+            "guarded"
+        );
+
+        registry
+            .dispatch(Request::RenameWorkspace {
+                workspace_id: workspace.id.clone(),
+                name: "legacy".into(),
+            })
+            .unwrap();
+        let current = registry
+            .workspace(&workspace.id)
+            .unwrap()
+            .snapshot(&registry.durable)
+            .unwrap();
+        assert_eq!(current.name, "legacy");
+        assert_eq!(current.revision, workspace.revision + 1);
+    }
+
+    #[test]
     fn workspace_snapshot_retains_default_cwd() {
         let registry = DaemonService::default();
         let cwd = env::temp_dir();
@@ -18525,6 +19148,7 @@ mod tests {
     fn protocol_eighteen_responses_hide_workspace_default_cwd() {
         let source_workspace = WorkspaceSnapshot {
             id: "w1".into(),
+            revision: 1,
             name: "project".into(),
             default_cwd: Some("/tmp/project".into()),
             shells: Vec::new(),
