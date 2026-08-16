@@ -15,6 +15,7 @@
 | `src/daemon.rs` | `DaemonService` coordination over durable registry, event-stream, shell-runtime, persistence, and handoff owners |
 | `src/state_store.rs` | Versioned durable schemas, validation, atomic state storage, and migrations |
 | `src/node_identity.rs` | Independent stable Node identity creation, validation, and atomic persistence |
+| `src/federation.rs` | Independently versioned federation handshake and verified stdio daemon bridging |
 | `src/handoff.rs`, `src/fd_transfer.rs` | Graceful daemon replacement records and Unix descriptor transfer |
 | `src/attach.rs` | Terminal-side raw mode, control frames, live input/output, resize, focus, and reconnect handling |
 | `src/terminal.rs` | Selection and launch of native terminal windows through `xdg-terminal-exec` |
@@ -813,16 +814,20 @@ prompt-free `agent_schedule_updated` events. Protocol-26 peers filter those
 events while advancing their cursor. State schema remains 12.
 
 Protocol 28 and Node identity schema 1 establish the stable local Node ID used by
-future federation. The daemon creates owner-only `node.json` independently from
+federation. The daemon creates owner-only `node.json` independently from
 authoritative `state.json`, preserves malformed or future identity files while
-disabling federation, and exposes the identity through the version-gated
-`GetNodeIdentity` request. Cold restart and graceful handoff read the same file;
-the identity is not transferred in the handoff manifest. State schema remains 12.
-Protocol-27 peers remain local-only and cannot query Node identity.
+disabling federation, and exposes the identity through a version-gated query.
+Cold restart and graceful handoff read the same file; the identity is not
+transferred in the handoff manifest. State schema remains 12. Protocol-27 peers
+remain local-only and cannot query Node identity.
 
-The SSH federation handshake, transport, registration, and projection protocols
-remain unimplemented under #173. Their separately versioned schemas and protocol
-history entries are added only when the corresponding source versions land.
+Protocol 29 adds the same-socket `OpenFederationChannel` request. Federation
+handshake version 1 is emitted by the hidden `__federation-stdio` helper only
+after the helper's state-root identity matches the identity returned on the exact
+daemon socket subsequently used for inner protocol bytes. Protocol-28 peers keep
+stable identity queries but cannot open that channel. The SSH launcher/bootstrap,
+rekey admission, registration, and projection protocols remain unimplemented
+under #173.
 
 Cron day matching preserves syntactic wildcard origin: `*/n` is wildcard-origin,
 while numeric lists and ranges remain restricted even when they cover the full

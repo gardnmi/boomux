@@ -884,11 +884,22 @@ fn select_replacement_executable(current: PathBuf, argument_zero: Option<PathBuf
 }
 
 fn handle_connection(
+    stream: UnixStream,
+    registry: Arc<DaemonService>,
+    shutdown: Arc<AtomicBool>,
+    transition: Arc<AtomicU8>,
+    restart_sender: mpsc::Sender<RestartRequest>,
+) -> io::Result<()> {
+    handle_connection_inner(stream, registry, shutdown, transition, restart_sender, true)
+}
+
+fn handle_connection_inner(
     mut stream: UnixStream,
     registry: Arc<DaemonService>,
     shutdown: Arc<AtomicBool>,
     transition: Arc<AtomicU8>,
     restart_sender: mpsc::Sender<RestartRequest>,
+    allow_federation_upgrade: bool,
 ) -> io::Result<()> {
     stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
     let request: Envelope<Request> = protocol::read_message(&mut stream)?;
@@ -913,6 +924,43 @@ fn handle_connection(
             &mut stream,
             response_version,
             DaemonError::protocol(unsupported_request_message(feature)).into_response(),
+        );
+    }
+
+    if matches!(&request.message, Request::OpenFederationChannel) {
+        if !allow_federation_upgrade {
+            return send_response(
+                &mut stream,
+                response_version,
+                DaemonError::validation("federation channel is already open").into_response(),
+            );
+        }
+        let Some(identity) = registry.node_identity.as_ref() else {
+            return send_response(
+                &mut stream,
+                response_version,
+                DaemonError::lifecycle(
+                    ErrorCode::NodeIdentityUnavailable,
+                    "Boomux Node identity is unavailable",
+                )
+                .into_response(),
+            );
+        };
+        send_response(
+            &mut stream,
+            response_version,
+            Response::FederationChannel {
+                node_id: identity.id().to_owned(),
+            },
+        )?;
+        stream.set_write_timeout(None)?;
+        return handle_connection_inner(
+            stream,
+            registry,
+            shutdown,
+            transition,
+            restart_sender,
+            false,
         );
     }
 
@@ -6926,6 +6974,9 @@ impl DaemonService {
                         "Boomux Node identity is unavailable",
                     )
                 }),
+            Request::OpenFederationChannel => {
+                unreachable!("federation channel is handled before dispatch")
+            }
             Request::Restart | Request::RestartWithNotificationConfig { .. } => {
                 unreachable!("restart is handled before dispatch")
             }

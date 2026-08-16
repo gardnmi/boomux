@@ -5,8 +5,10 @@
 > delivered by [#174](https://github.com/gardnmi/boomux/issues/174) under tracking
 > epic [#173](https://github.com/gardnmi/boomux/issues/173). Current source and
 > compatibility tests remain authoritative for shipped behavior. Protocol 28
-> implements only stable local Node identity and its daemon query; no remote Node
-> command, SSH transport, registration, or projection is implemented yet.
+> implements stable local Node identity; protocol 29, handshake version 1, and
+> the hidden stdio helper establish the verified same-socket bridge boundary. No
+> public remote Node command, SSH bootstrap, registration, or projection is
+> implemented yet.
 
 ## Purpose
 
