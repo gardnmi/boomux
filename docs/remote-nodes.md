@@ -11,8 +11,9 @@
 > with exact interactive confirmation. Protocol 31 and registration schema 1
 > implement explicit identity-pinned registration management. Protocol 32 and
 > Node-cache schema 1 implement bounded background reduced projections. Public
-> `boomux --remote TARGET` remains ad hoc; routed resource operations are not yet
-> implemented.
+> Protocol 33 adds the local-daemon combined Node snapshot and federated
+> dashboard. Public `boomux --remote TARGET` remains ad hoc; routed resource
+> operations are not yet implemented.
 
 ## Purpose
 
@@ -287,6 +288,17 @@ JSON methods retain their local-only result sets; federation does not append
 remote rows to a legacy array. Exact private reads, terminal reads, waits, and
 every mutation require a live verified channel to the owning Node.
 
+The implemented surface is `boomux node snapshot [SELECTOR]`. It emits a rich
+authoritative local projection and reduced remote projections with structurally
+qualified resource identities. The dashboard consumes the same request, keeps
+stale rows visible, exposes all-Node and exact-Node filtering, and never passes
+remote records to local Git, host-session catalog, path, terminal-preview, or
+mutation code. Remote actions remain disabled in this slice.
+After successful ad hoc `--remote TARGET` verification, Boomux focuses the
+matching Node in the local dashboard when that Node is already registered and
+the local daemon supports the combined view; otherwise the ad hoc connection
+retains its existing connection-only result.
+
 Boomux never queues an offline mutation. Before forwarding, it resolves explicit
 Node context, verifies the pinned identity, negotiates the remote core protocol,
 and revalidates the exact target where the operation requires it. Exact IDs,
@@ -412,6 +424,11 @@ and mutate only local resources; unsupported Node fields and projection events
 are filtered while their ordinary local cursors retain current semantics. CLI
 JSON additions remain capability-gated, node-qualified, and additive within the
 stable schema. A client never infers federation support from a version string.
+
+Protocol-32 and older clients cannot request the combined snapshot and continue
+to receive only local resources from every legacy surface. Protocol 33 adds no
+new event kind; protocol-31 filtering of `node_projection_changed` remains the
+event compatibility boundary.
 
 Federation has three independent compatibility boundaries:
 

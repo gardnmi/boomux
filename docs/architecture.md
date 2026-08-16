@@ -104,7 +104,9 @@ opening and pinging a daemon-bound stdio channel. Explicit `boomux node add
 ALIAS TARGET` and revision-conditional registration management persist an
 identity-pinned route separately. A registration starts one noninteractive
 projection worker; routed dashboard and resource-management operations are not
-yet implemented.
+yet implemented. Protocol 33 exposes cached projections through the separately
+named combined Node snapshot and dashboard while existing snapshot and list
+operations remain local-only; remote mutation remains unavailable.
 
 ## Components
 
@@ -555,6 +557,13 @@ executions (all nonterminal records first), a remote stream cursor, and at most
 a baseline with no historical transition evidence. Protocol-31 and older event
 readers filter local `node_projection_changed` invalidations while retaining the
 unfiltered cursor. The authoritative state schema remains 12.
+Protocol 33 adds one local-daemon combined snapshot request. It returns the rich
+authoritative local snapshot and bounded reduced registered-Node projections
+with alias, ownership, stable health, freshness, observation time, observed
+protocol capabilities, and per-Node scheduler health. Dashboard model identity
+and effects use `(node_id, inner_id)`; remote rows never enter local Git, host
+catalog, path, preview, or mutation paths. Protocol-32 and older clients cannot
+request this response and retain local-only behavior.
 Protocol-25 lists are daemon-bounded, newest-first pages with explicit limit and
 truncation. The request limit is optional on the wire; protocol 25 defaults it to
 100 and clamps it to 1 through 1,000, while protocol-23 and protocol-24 requests

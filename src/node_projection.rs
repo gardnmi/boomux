@@ -12,6 +12,12 @@ use crate::protocol::{
     EventCursor, NodeProjectionHealth, NodeProjectionHealthCode, NodeProjectionSnapshot,
     NodeRegistrationSnapshot,
 };
+
+#[derive(Clone)]
+pub(crate) struct NodeProjectionView {
+    pub(crate) health: NodeProjectionHealth,
+    pub(crate) projection: Option<NodeProjectionSnapshot>,
+}
 use crate::state_store::{effective_uid, secure_state_dir, state_directory_from_environment};
 
 const NODE_CACHE_VERSION: u32 = 1;
@@ -102,6 +108,26 @@ impl NodeProjectionCache {
             .filter(|node| node.tombstone_epoch == registration.tombstone_epoch)
             .map(CachedNode::health_snapshot)
             .unwrap_or_else(unobserved_health))
+    }
+
+    pub(crate) fn view(
+        &self,
+        registration: &NodeRegistrationSnapshot,
+    ) -> io::Result<NodeProjectionView> {
+        let state = self.lock()?;
+        Ok(state
+            .nodes
+            .iter()
+            .find(|node| node.node_id == registration.node_id)
+            .filter(|node| node.tombstone_epoch == registration.tombstone_epoch)
+            .map(|node| NodeProjectionView {
+                health: node.health_snapshot(),
+                projection: node.projection.clone(),
+            })
+            .unwrap_or_else(|| NodeProjectionView {
+                health: unobserved_health(),
+                projection: None,
+            }))
     }
 
     pub(crate) fn cursor_and_generation(
@@ -542,6 +568,42 @@ mod tests {
                 .to_string_lossy()
                 .starts_with("node-cache.corrupt-")
         }));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cache_view_preserves_every_stable_health_code() {
+        let root = std::env::temp_dir().join(format!("boomux-node-health-{}", Uuid::new_v4()));
+        let path = root.join("boomux/node-cache.json");
+        let registration = NodeRegistrationSnapshot {
+            alias: "work".into(),
+            target: "work.example".into(),
+            node_id: Uuid::from_u128(2).to_string(),
+            revision: 1,
+            tombstone_epoch: 0,
+        };
+        let cache = NodeProjectionCache::load_at(path);
+        let mut generation = 0;
+        for code in [
+            NodeProjectionHealthCode::Unobserved,
+            NodeProjectionHealthCode::Online,
+            NodeProjectionHealthCode::Reconnecting,
+            NodeProjectionHealthCode::Stale,
+            NodeProjectionHealthCode::Unreachable,
+            NodeProjectionHealthCode::AuthenticationRequired,
+            NodeProjectionHealthCode::IdentityChanged,
+            NodeProjectionHealthCode::IdentityConflict,
+            NodeProjectionHealthCode::Unsupported,
+        ] {
+            generation = cache
+                .mark_health(&registration, generation, code, generation + 1, None)
+                .unwrap()
+                .unwrap();
+            let view = cache.view(&registration).unwrap();
+            assert_eq!(view.health.code, code);
+            assert_eq!(view.health.stale, code != NodeProjectionHealthCode::Online);
+            assert!(view.projection.is_none());
+        }
         fs::remove_dir_all(root).unwrap();
     }
 }

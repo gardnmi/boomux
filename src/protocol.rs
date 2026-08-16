@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 32;
+pub const PROTOCOL_VERSION: u32 = 33;
 pub const MIN_PROTOCOL_VERSION: u32 = 6;
 pub const MAX_CONTROL_FRAME: usize = 8 * 1024 * 1024;
 pub const MAX_ATTACH_FRAME: usize = 1024 * 1024;
@@ -128,6 +128,11 @@ define_protocol_features! {
         "node_projection_sync",
         "bounded_remote_node_projections",
     ]),
+    CombinedNodeSnapshot => (33, "combined Node snapshot", [
+        "protocol_33",
+        "combined_node_snapshot",
+        "node_qualified_dashboard",
+    ]),
 }
 
 pub const DEFAULT_SCHEDULED_EXECUTION_LIST_LIMIT: u16 = 100;
@@ -250,6 +255,40 @@ pub struct NodeRegistrationSnapshot {
     pub node_id: String,
     pub revision: u64,
     pub tombstone_epoch: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QualifiedIdentity {
+    pub node_id: String,
+    pub inner_id: String,
+}
+
+impl QualifiedIdentity {
+    pub fn new(node_id: impl Into<String>, inner_id: impl Into<String>) -> Self {
+        Self {
+            node_id: node_id.into(),
+            inner_id: inner_id.into(),
+        }
+    }
+}
+
+impl From<&str> for QualifiedIdentity {
+    fn from(inner_id: &str) -> Self {
+        Self::new("", inner_id)
+    }
+}
+
+impl PartialEq<str> for QualifiedIdentity {
+    fn eq(&self, other: &str) -> bool {
+        self.inner_id == other
+    }
+}
+
+impl PartialEq<&str> for QualifiedIdentity {
+    fn eq(&self, other: &&str) -> bool {
+        self.inner_id == *other
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -465,6 +504,33 @@ pub struct NodeProjectionSync {
     pub cursor: EventCursor,
     pub projection: NodeProjectionSnapshot,
     pub transitions: Vec<NodeProjectionTransition>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CombinedNodeSnapshot {
+    pub nodes: Vec<CombinedNode>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CombinedNode {
+    pub node_id: String,
+    pub alias: String,
+    pub local: bool,
+    pub health: NodeProjectionHealthCode,
+    pub current: bool,
+    pub stale: bool,
+    pub observed_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_protocol_version: Option<u32>,
+    #[serde(default)]
+    pub observed_capabilities: Vec<String>,
+    pub scheduler: SchedulerHealth,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_snapshot: Option<Snapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_projection: Option<NodeProjectionSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -918,6 +984,7 @@ pub enum ErrorCode {
     NodeIdentityUnavailable,
     NodeRegistrationUnavailable,
     NodeIdentityChanged,
+    AmbiguousTarget,
     RevisionChanged,
     Internal,
     #[serde(other)]
@@ -1211,6 +1278,10 @@ pub enum Request {
     GetNodeProjectionHealth {
         selector: String,
     },
+    GetCombinedNodeSnapshot {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selector: Option<String>,
+    },
     Restart,
     RestartWithNotificationConfig {
         notifications: NotificationDeliveryConfig,
@@ -1409,6 +1480,7 @@ impl Request {
             Self::SyncNodeProjection { .. } | Self::GetNodeProjectionHealth { .. } => {
                 Some(ProtocolFeature::NodeProjectionSync)
             }
+            Self::GetCombinedNodeSnapshot { .. } => Some(ProtocolFeature::CombinedNodeSnapshot),
             Self::WaitScheduledExecution { .. } => {
                 Some(ProtocolFeature::ScheduledExecutionObservation)
             }
@@ -1526,6 +1598,9 @@ pub enum Response {
     },
     NodeProjectionHealth {
         health: NodeProjectionHealth,
+    },
+    CombinedNodeSnapshot {
+        snapshot: CombinedNodeSnapshot,
     },
     Snapshot {
         snapshot: Snapshot,
@@ -2107,8 +2182,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_thirty_two_with_minimum_six() {
-        assert_eq!(PROTOCOL_VERSION, 32);
+    fn protocol_version_is_thirty_three_with_minimum_six() {
+        assert_eq!(PROTOCOL_VERSION, 33);
         assert_eq!(MIN_PROTOCOL_VERSION, 6);
     }
 
@@ -2260,6 +2335,33 @@ mod tests {
             .unwrap()
             .insert("prompt".into(), serde_json::json!("private"));
         assert!(serde_json::from_value::<NodeProjectionSnapshot>(encoded).is_err());
+    }
+
+    #[test]
+    fn combined_node_snapshot_is_protocol_thirty_three_and_round_trips() {
+        let request = Request::GetCombinedNodeSnapshot {
+            selector: Some("work".into()),
+        };
+        assert_eq!(
+            request.required_feature(),
+            Some(ProtocolFeature::CombinedNodeSnapshot)
+        );
+        assert_eq!(
+            serde_json::from_value::<Request>(serde_json::to_value(&request).unwrap()).unwrap(),
+            request
+        );
+        let response = Response::CombinedNodeSnapshot {
+            snapshot: CombinedNodeSnapshot { nodes: Vec::new() },
+        };
+        assert_eq!(
+            serde_json::from_value::<Response>(serde_json::to_value(&response).unwrap()).unwrap(),
+            response
+        );
+        let identity = QualifiedIdentity::new("node", "resource");
+        assert_eq!(
+            serde_json::to_value(identity).unwrap(),
+            serde_json::json!({"node_id": "node", "inner_id": "resource"})
+        );
     }
 
     #[test]
@@ -2584,6 +2686,10 @@ mod tests {
     #[test]
     fn request_feature_requirements_cover_all_groups() {
         let groups = vec![
+            (
+                33,
+                vec![Request::GetCombinedNodeSnapshot { selector: None }],
+            ),
             (
                 31,
                 vec![
@@ -3022,6 +3128,14 @@ mod tests {
                     "protocol_32",
                     "node_projection_sync",
                     "bounded_remote_node_projections",
+                ][..],
+            ),
+            (
+                33,
+                &[
+                    "protocol_33",
+                    "combined_node_snapshot",
+                    "node_qualified_dashboard",
                 ][..],
             ),
         ];

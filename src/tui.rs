@@ -18,7 +18,10 @@ use ratatui::widgets::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::agent_attention_projection::AgentStateCounts;
-use crate::protocol::{TerminalColor, TerminalPreview, TerminalPreviewLine, TerminalStyle};
+use crate::protocol::{
+    NodeProjectionHealthCode, QualifiedIdentity, SchedulerHealth, TerminalColor, TerminalPreview,
+    TerminalPreviewLine, TerminalStyle,
+};
 
 const BASE: Color = Color::Reset;
 const OVERLAY: Color = Color::DarkGray;
@@ -139,7 +142,23 @@ fn smoke_word_lines(stage: usize) -> Vec<Line<'static>> {
         .collect()
 }
 
+#[derive(Clone)]
+pub(crate) struct NodeView {
+    pub(crate) id: String,
+    pub(crate) alias: String,
+    pub(crate) local: bool,
+    pub(crate) health: NodeProjectionHealthCode,
+    pub(crate) current: bool,
+    pub(crate) stale: bool,
+    pub(crate) observed_at_ms: u64,
+    pub(crate) observed_protocol_version: Option<u32>,
+    pub(crate) observed_capabilities: Vec<String>,
+    pub(crate) scheduler: SchedulerHealth,
+}
+
+#[derive(Clone)]
 pub(crate) struct WorkspaceView {
+    pub(crate) node: NodeView,
     pub(crate) id: String,
     pub(crate) name: String,
     pub(crate) default_cwd: Option<String>,
@@ -151,6 +170,7 @@ pub(crate) struct WorkspaceView {
 }
 
 pub(crate) struct DashboardState {
+    pub(crate) nodes: Vec<NodeView>,
     pub(crate) workspaces: Vec<WorkspaceView>,
     pub(crate) schedules: Vec<ScheduleView>,
     pub(crate) scheduling: SchedulingView,
@@ -158,10 +178,11 @@ pub(crate) struct DashboardState {
     pub(crate) schedule_editing: bool,
     pub(crate) focused_terminal: Option<FocusedTerminalView>,
     pub(crate) reset_focus_revision: bool,
+    pub(crate) initial_node_filter: Option<String>,
 }
 
 pub(crate) struct ScheduleEditInspection {
-    pub(crate) schedule_id: String,
+    pub(crate) schedule_id: QualifiedIdentity,
     pub(crate) name: String,
     pub(crate) cron: String,
     pub(crate) timezone: String,
@@ -208,6 +229,9 @@ pub(crate) enum SchedulingView {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ScheduleView {
+    pub(crate) node_id: String,
+    pub(crate) node_alias: String,
+    pub(crate) actionable: bool,
     pub(crate) id: String,
     pub(crate) workspace_id: String,
     pub(crate) workspace: String,
@@ -221,6 +245,12 @@ pub(crate) struct ScheduleView {
     pub(crate) possible_pruning_boundary: bool,
     pub(crate) history_scoped: bool,
     pub(crate) history_complete: bool,
+}
+
+impl ScheduleView {
+    fn qualify(&self, inner_id: impl Into<String>) -> QualifiedIdentity {
+        QualifiedIdentity::new(self.node_id.clone(), inner_id)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -333,6 +363,7 @@ pub(crate) struct FocusedTerminalView {
     pub(crate) shell_id: String,
 }
 
+#[derive(Clone)]
 pub(crate) struct WorkspaceAttentionView {
     pub(crate) agent_id: String,
     pub(crate) shell_id: String,
@@ -342,6 +373,7 @@ pub(crate) struct WorkspaceAttentionView {
     pub(crate) observed_at_ms: u64,
 }
 
+#[derive(Clone)]
 pub(crate) struct AgentSessionView {
     pub(crate) id: String,
     pub(crate) label: String,
@@ -354,12 +386,14 @@ pub(crate) struct AgentSessionView {
     pub(crate) runs: Vec<AgentSessionRunView>,
 }
 
+#[derive(Clone)]
 pub(crate) struct AgentSessionRunView {
     pub(crate) agent_id: String,
     pub(crate) shell_name: Option<String>,
     pub(crate) directory: Option<PathBuf>,
 }
 
+#[derive(Clone)]
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum WorkspaceItemView {
     Shell(TerminalView),
@@ -368,6 +402,7 @@ pub(crate) enum WorkspaceItemView {
     Schedule(ScheduleItemView),
 }
 
+#[derive(Clone)]
 pub(crate) struct ScheduleItemView {
     pub(crate) id: String,
     pub(crate) name: String,
@@ -376,6 +411,7 @@ pub(crate) struct ScheduleItemView {
     pub(crate) friendly_trigger: String,
 }
 
+#[derive(Clone)]
 pub(crate) struct AgentShellView {
     pub(crate) shell: TerminalView,
     pub(crate) agent: Option<AgentView>,
@@ -390,6 +426,7 @@ impl AgentShellView {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct AgentView {
     pub(crate) id: String,
     pub(crate) state: AgentDisplayState,
@@ -403,6 +440,7 @@ pub(crate) struct AgentView {
     pub(crate) root_worktree: String,
 }
 
+#[derive(Clone)]
 pub(crate) struct LauncherView {
     pub(crate) id: String,
     pub(crate) name: String,
@@ -430,6 +468,7 @@ pub(crate) struct ProjectContext {
     pub(crate) roots_configured: bool,
 }
 
+#[derive(Clone)]
 pub(crate) struct TerminalView {
     pub(crate) id: String,
     pub(crate) name: String,
@@ -446,6 +485,7 @@ pub(crate) struct TerminalView {
     pub(crate) run: Option<TerminalRunView>,
 }
 
+#[derive(Clone)]
 pub(crate) struct TerminalRunView {
     pub(crate) id: String,
     pub(crate) generation: u64,
@@ -485,6 +525,14 @@ impl TerminalView {
 }
 
 impl WorkspaceView {
+    fn qualify(&self, inner_id: impl Into<String>) -> QualifiedIdentity {
+        QualifiedIdentity::new(self.node.id.clone(), inner_id)
+    }
+
+    fn actionable(&self) -> bool {
+        self.node.local && self.node.current && !self.node.stale
+    }
+
     fn shell_count(&self) -> usize {
         self.items
             .iter()
@@ -690,42 +738,42 @@ impl AttentionReason {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum DashboardEffect {
     Quit,
-    RestoreWorkspace(String),
+    RestoreWorkspace(QualifiedIdentity),
     Open(OpenTarget),
     Close(CloseTarget),
     CreateWorkspace {
         name: String,
         default_cwd: Option<PathBuf>,
     },
-    CreateShell(String),
+    CreateShell(QualifiedIdentity),
     Rename {
         target: RenameTarget,
         name: String,
     },
     CheckForUpdates,
     Refresh,
-    RunSchedule(String),
-    PauseSchedule(String),
-    ResumeSchedule(String),
-    CancelExecution(String),
+    RunSchedule(QualifiedIdentity),
+    PauseSchedule(QualifiedIdentity),
+    ResumeSchedule(QualifiedIdentity),
+    CancelExecution(QualifiedIdentity),
     OpenScheduledExecution {
-        execution_id: String,
+        execution_id: QualifiedIdentity,
     },
-    RemoveSchedule(String),
+    RemoveSchedule(QualifiedIdentity),
     LoadScheduleHistory {
-        schedule_id: String,
+        schedule_id: QualifiedIdentity,
         limit: u16,
     },
     LoadScheduleEditor {
-        schedule_id: String,
+        schedule_id: QualifiedIdentity,
     },
     UpdateSchedule {
-        schedule_id: String,
+        schedule_id: QualifiedIdentity,
         expected_revision: u64,
         update: ScheduleEditUpdate,
     },
     ReadTerminalPreview {
-        shell_id: String,
+        shell_id: QualifiedIdentity,
         run_id: Option<String>,
         output_revision: u64,
     },
@@ -742,15 +790,15 @@ pub(crate) enum DashboardEvent {
     OperationCompleted(Result<String, String>),
     RefreshCompleted(Result<DashboardState, String>),
     ScheduleHistoryCompleted {
-        schedule_id: String,
+        schedule_id: QualifiedIdentity,
         result: Result<(Vec<ExecutionView>, bool), String>,
     },
     ScheduleEditorLoaded {
-        schedule_id: String,
+        schedule_id: QualifiedIdentity,
         result: Result<ScheduleEditInspection, String>,
     },
     ScheduleEditorSaved {
-        schedule_id: String,
+        schedule_id: QualifiedIdentity,
         result: Result<String, String>,
     },
     TextPasted(String),
@@ -776,7 +824,10 @@ where
 }
 
 struct App {
+    nodes: Vec<NodeView>,
+    all_workspaces: Vec<WorkspaceView>,
     workspaces: Vec<WorkspaceView>,
+    all_schedules: Vec<ScheduleView>,
     schedules: Vec<ScheduleView>,
     scheduling: SchedulingView,
     exact_run_attachment: bool,
@@ -796,6 +847,7 @@ struct App {
     follow_focused_terminal: bool,
     selection_pinned: bool,
     observed_focus_revision: Option<u64>,
+    node_filter: Option<String>,
 }
 
 struct TerminalPreviewState {
@@ -855,8 +907,8 @@ fn shortcut_tab(key: char) -> Option<PrimaryTab> {
 
 #[derive(Clone)]
 struct ItemIdentity {
-    workspace_id: String,
-    item_id: String,
+    workspace_id: QualifiedIdentity,
+    item_id: QualifiedIdentity,
     kind: ItemIdentityKind,
 }
 
@@ -869,27 +921,27 @@ enum ItemIdentityKind {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum OpenTarget {
-    Shell(String),
+    Shell(QualifiedIdentity),
     Launcher {
-        workspace_id: String,
-        launcher_id: String,
+        workspace_id: QualifiedIdentity,
+        launcher_id: QualifiedIdentity,
     },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RenameTarget {
-    Workspace(String),
-    Shell(String),
-    Launcher(String),
+    Workspace(QualifiedIdentity),
+    Shell(QualifiedIdentity),
+    Launcher(QualifiedIdentity),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum CloseTarget {
-    Workspace(String),
-    Shell(String),
-    Launcher(String),
-    Schedule(String),
-    Execution(String),
+    Workspace(QualifiedIdentity),
+    Shell(QualifiedIdentity),
+    Launcher(QualifiedIdentity),
+    Schedule(QualifiedIdentity),
+    Execution(QualifiedIdentity),
 }
 
 impl RenameTarget {
@@ -912,7 +964,7 @@ enum Mode {
 }
 
 struct ScheduleEditor {
-    schedule_id: String,
+    schedule_id: QualifiedIdentity,
     expected_revision: u64,
     field: ScheduleEditorField,
     preset: ScheduleTriggerPreset,
@@ -1295,7 +1347,7 @@ enum PaletteCommand {
     CreateWorkspace,
     ShowHelp,
     Workspace {
-        workspace_id: String,
+        workspace_id: QualifiedIdentity,
         action: WorkspacePaletteAction,
     },
     Item {
@@ -1303,12 +1355,12 @@ enum PaletteCommand {
         action: ItemPaletteAction,
     },
     Attention {
-        workspace_id: String,
-        shell_id: String,
-        agent_id: String,
+        workspace_id: QualifiedIdentity,
+        shell_id: QualifiedIdentity,
+        agent_id: QualifiedIdentity,
     },
     Schedule {
-        schedule_id: String,
+        schedule_id: QualifiedIdentity,
         action: SchedulePaletteAction,
     },
 }
@@ -1492,6 +1544,9 @@ impl CommandPalette {
                 (WorkspacePaletteAction::Rename, PaletteActionGroup::Rename),
                 (WorkspacePaletteAction::Close, PaletteActionGroup::Close),
             ] {
+                if !workspace.actionable() && !matches!(action, WorkspacePaletteAction::GoTo) {
+                    continue;
+                }
                 entries.push(PaletteEntry {
                     action_group,
                     kind_group: if matches!(action, WorkspacePaletteAction::AddShell) {
@@ -1511,7 +1566,7 @@ impl CommandPalette {
                     ),
                     keywords: workspace_keywords.clone(),
                     command: PaletteCommand::Workspace {
-                        workspace_id: workspace.id.clone(),
+                        workspace_id: workspace.qualify(&workspace.id),
                         action,
                     },
                 });
@@ -1526,8 +1581,8 @@ impl CommandPalette {
                     continue;
                 }
                 let identity = ItemIdentity {
-                    workspace_id: workspace.id.clone(),
-                    item_id: item.id().to_owned(),
+                    workspace_id: workspace.qualify(&workspace.id),
+                    item_id: workspace.qualify(item.id()),
                     kind: if kind == ItemKind::Launcher {
                         ItemIdentityKind::Launcher
                     } else {
@@ -1556,6 +1611,9 @@ impl CommandPalette {
                     (ItemPaletteAction::Rename, PaletteActionGroup::Rename),
                     (ItemPaletteAction::Close, PaletteActionGroup::Close),
                 ] {
+                    if !workspace.actionable() && !matches!(action, ItemPaletteAction::GoTo) {
+                        continue;
+                    }
                     entries.push(PaletteEntry {
                         action_group,
                         kind_group,
@@ -1603,9 +1661,9 @@ impl CommandPalette {
                             attention.shell_id
                         ),
                         command: PaletteCommand::Attention {
-                            workspace_id: workspace.id.clone(),
-                            shell_id: attention.shell_id.clone(),
-                            agent_id: attention.agent_id.clone(),
+                            workspace_id: workspace.qualify(&workspace.id),
+                            shell_id: workspace.qualify(&attention.shell_id),
+                            agent_id: workspace.qualify(&attention.agent_id),
                         },
                     },
                 ));
@@ -1655,6 +1713,9 @@ impl CommandPalette {
                     "remove with confirmation",
                 ),
             ] {
+                if !schedule.actionable && !matches!(action, SchedulePaletteAction::GoTo) {
+                    continue;
+                }
                 entries.push(PaletteEntry {
                     action_group,
                     kind_group: PaletteKindGroup::Schedules,
@@ -1662,7 +1723,7 @@ impl CommandPalette {
                     detail: detail.into(),
                     keywords: keywords.clone(),
                     command: PaletteCommand::Schedule {
-                        schedule_id: schedule.id.clone(),
+                        schedule_id: schedule.qualify(&schedule.id),
                         action,
                     },
                 });
@@ -1680,7 +1741,7 @@ impl CommandPalette {
                     detail: execution_summary(execution),
                     keywords: format!("schedule notice failed skipped missed blocked {keywords}"),
                     command: PaletteCommand::Schedule {
-                        schedule_id: schedule.id.clone(),
+                        schedule_id: schedule.qualify(&schedule.id),
                         action: SchedulePaletteAction::SelectExecution(execution.id.clone()),
                     },
                 });
@@ -1697,7 +1758,7 @@ impl CommandPalette {
                     .first()
                     .map_or(PaletteCommand::ShowHelp, |schedule| {
                         PaletteCommand::Schedule {
-                            schedule_id: schedule.id.clone(),
+                            schedule_id: schedule.qualify(&schedule.id),
                             action: SchedulePaletteAction::GoTo,
                         }
                     }),
@@ -1837,8 +1898,20 @@ impl App {
                 item_state.select(Some(0));
             }
         }
+        let nodes = workspaces.iter().fold(Vec::new(), |mut nodes, workspace| {
+            if !nodes
+                .iter()
+                .any(|node: &NodeView| node.id == workspace.node.id)
+            {
+                nodes.push(workspace.node.clone());
+            }
+            nodes
+        });
         Self {
+            nodes,
+            all_workspaces: workspaces.clone(),
             workspaces,
+            all_schedules: Vec::new(),
             schedules: Vec::new(),
             scheduling: SchedulingView::Unsupported {
                 required_protocol: 22,
@@ -1861,7 +1934,63 @@ impl App {
             follow_focused_terminal: false,
             selection_pinned: false,
             observed_focus_revision: None,
+            node_filter: None,
         }
+    }
+
+    fn cycle_node_filter(&mut self) {
+        if self.nodes.is_empty() {
+            return;
+        }
+        let filter = match self
+            .node_filter
+            .as_ref()
+            .and_then(|id| self.nodes.iter().position(|node| &node.id == id))
+        {
+            None => Some(self.nodes[0].id.clone()),
+            Some(index) if index + 1 < self.nodes.len() => Some(self.nodes[index + 1].id.clone()),
+            Some(_) => None,
+        };
+        self.set_node_filter(filter);
+    }
+
+    fn set_node_filter(&mut self, filter: Option<String>) {
+        self.node_filter = filter.filter(|id| self.nodes.iter().any(|node| &node.id == id));
+        let workspaces = self
+            .all_workspaces
+            .iter()
+            .filter(|workspace| {
+                self.node_filter
+                    .as_ref()
+                    .is_none_or(|node_id| workspace.node.id == *node_id)
+            })
+            .cloned()
+            .collect();
+        let schedules = self
+            .all_schedules
+            .iter()
+            .filter(|schedule| {
+                self.node_filter
+                    .as_ref()
+                    .is_none_or(|node_id| schedule.node_id == *node_id)
+            })
+            .cloned()
+            .collect();
+        self.replace_workspaces(workspaces);
+        self.replace_schedules(schedules);
+        self.message = Some(Message {
+            text: self.node_filter.as_ref().map_or_else(
+                || "Showing all Nodes".into(),
+                |id| {
+                    let node = self.nodes.iter().find(|node| &node.id == id);
+                    format!(
+                        "Showing Node {}",
+                        node.map_or(id.as_str(), |node| &node.alias)
+                    )
+                },
+            ),
+            error: false,
+        });
     }
 
     fn enable_focus_following(&mut self, focused_terminal: Option<&FocusedTerminalView>) {
@@ -1889,7 +2018,7 @@ impl App {
         let Some(workspace_index) = self
             .workspaces
             .iter()
-            .position(|workspace| workspace.id == focused.workspace_id)
+            .position(|workspace| workspace.node.local && workspace.id == focused.workspace_id)
         else {
             return;
         };
@@ -1974,7 +2103,7 @@ impl App {
         self.selected_schedule()
             .filter(|schedule| !schedule.history_scoped)
             .map(|schedule| DashboardEffect::LoadScheduleHistory {
-                schedule_id: schedule.id.clone(),
+                schedule_id: schedule.qualify(&schedule.id),
                 limit: 100,
             })
     }
@@ -2243,12 +2372,10 @@ impl App {
         self.message = None;
     }
 
-    fn select_workspace(&mut self, workspace_id: &str, focus: Focus) -> bool {
-        let Some(index) = self
-            .workspaces
-            .iter()
-            .position(|workspace| workspace.id == workspace_id)
-        else {
+    fn select_workspace(&mut self, workspace_id: &QualifiedIdentity, focus: Focus) -> bool {
+        let Some(index) = self.workspaces.iter().position(|workspace| {
+            workspace.node.id == workspace_id.node_id && workspace.id == workspace_id.inner_id
+        }) else {
             self.message = Some(Message {
                 text: "workspace is no longer available".into(),
                 error: true,
@@ -2263,11 +2390,10 @@ impl App {
     }
 
     fn select_item_identity(&mut self, identity: &ItemIdentity) -> bool {
-        let Some(workspace_index) = self
-            .workspaces
-            .iter()
-            .position(|workspace| workspace.id == identity.workspace_id)
-        else {
+        let Some(workspace_index) = self.workspaces.iter().position(|workspace| {
+            workspace.node.id == identity.workspace_id.node_id
+                && workspace.id == identity.workspace_id.inner_id
+        }) else {
             self.message = Some(Message {
                 text: "item workspace is no longer available".into(),
                 error: true,
@@ -2294,12 +2420,10 @@ impl App {
         true
     }
 
-    fn select_schedule_id(&mut self, schedule_id: &str) -> bool {
-        let Some(index) = self
-            .schedules
-            .iter()
-            .position(|schedule| schedule.id == schedule_id)
-        else {
+    fn select_schedule_id(&mut self, schedule_id: &QualifiedIdentity) -> bool {
+        let Some(index) = self.schedules.iter().position(|schedule| {
+            schedule.node_id == schedule_id.node_id && schedule.id == schedule_id.inner_id
+        }) else {
             self.message = Some(Message {
                 text: "schedule is no longer available".into(),
                 error: true,
@@ -2356,10 +2480,13 @@ impl App {
 
     fn request_rename(&mut self) -> Option<DashboardEffect> {
         let schedule_id = if self.primary_tab == PrimaryTab::Schedules {
-            self.selected_schedule().map(|schedule| schedule.id.clone())
+            self.selected_schedule()
+                .map(|schedule| schedule.qualify(&schedule.id))
         } else {
             match self.selected_item() {
-                Some(WorkspaceItemView::Schedule(schedule)) => Some(schedule.id.clone()),
+                Some(WorkspaceItemView::Schedule(schedule)) => self
+                    .selected_item_workspace()
+                    .map(|workspace| workspace.qualify(&schedule.id)),
                 _ => None,
             }
         };
@@ -2387,18 +2514,21 @@ impl App {
             return None;
         }
         let target = if self.primary_tab != PrimaryTab::Workspaces {
-            self.selected_item()
-                .filter(|item| item.ordinary_visible())
-                .and_then(item_rename_target)
+            self.selected_item_workspace()
+                .filter(|workspace| workspace.actionable())
+                .zip(self.selected_item().filter(|item| item.ordinary_visible()))
+                .and_then(|(workspace, item)| item_rename_target(workspace, item))
         } else {
             match self.focus {
                 Focus::Workspaces => self
                     .selected()
-                    .map(|workspace| RenameTarget::Workspace(workspace.id.clone())),
+                    .filter(|workspace| workspace.actionable())
+                    .map(|workspace| RenameTarget::Workspace(workspace.qualify(&workspace.id))),
                 Focus::Items => self
-                    .selected_item()
-                    .filter(|item| item.ordinary_visible())
-                    .and_then(item_rename_target),
+                    .selected()
+                    .filter(|workspace| workspace.actionable())
+                    .zip(self.selected_item().filter(|item| item.ordinary_visible()))
+                    .and_then(|(workspace, item)| item_rename_target(workspace, item)),
             }
         };
         if let Some(target) = target {
@@ -2429,7 +2559,10 @@ impl App {
                 None
             }
             Focus::Items => {
-                let workspace_id = self.selected().map(|workspace| workspace.id.clone())?;
+                let workspace_id = self
+                    .selected()
+                    .filter(|workspace| workspace.actionable())
+                    .map(|workspace| workspace.qualify(&workspace.id))?;
                 Some(DashboardEffect::CreateShell(workspace_id))
             }
         }
@@ -2453,7 +2586,8 @@ impl App {
             return None;
         }
         self.selected()
-            .map(|workspace| DashboardEffect::RestoreWorkspace(workspace.id.clone()))
+            .filter(|workspace| workspace.actionable())
+            .map(|workspace| DashboardEffect::RestoreWorkspace(workspace.qualify(&workspace.id)))
     }
 
     fn open_selected_item(&self) -> Option<DashboardEffect> {
@@ -2461,17 +2595,20 @@ impl App {
         {
             return None;
         }
-        let workspace_id = self
+        let workspace = self
             .selected_item_workspace()
-            .map(|workspace| workspace.id.clone())?;
+            .filter(|workspace| workspace.actionable())?;
+        let workspace_id = workspace.qualify(&workspace.id);
         let target = self.selected_item().and_then(|item| match item {
-            WorkspaceItemView::Shell(shell) => Some(OpenTarget::Shell(shell.id.clone())),
+            WorkspaceItemView::Shell(shell) => {
+                Some(OpenTarget::Shell(workspace.qualify(&shell.id)))
+            }
             WorkspaceItemView::AgentShell(agent_shell) => {
-                Some(OpenTarget::Shell(agent_shell.shell.id.clone()))
+                Some(OpenTarget::Shell(workspace.qualify(&agent_shell.shell.id)))
             }
             WorkspaceItemView::Launcher(launcher) => Some(OpenTarget::Launcher {
                 workspace_id,
-                launcher_id: launcher.id.clone(),
+                launcher_id: workspace.qualify(&launcher.id),
             }),
             WorkspaceItemView::Schedule(_) => None,
         })?;
@@ -2480,7 +2617,9 @@ impl App {
 
     fn activate_selected_item(&mut self) -> Option<DashboardEffect> {
         let schedule_id = match self.selected_item() {
-            Some(WorkspaceItemView::Schedule(schedule)) => Some(schedule.id.clone()),
+            Some(WorkspaceItemView::Schedule(schedule)) => self
+                .selected_item_workspace()
+                .map(|workspace| workspace.qualify(&schedule.id)),
             _ => None,
         };
         if let Some(schedule_id) = schedule_id {
@@ -2494,30 +2633,38 @@ impl App {
 
     fn request_close(&mut self) {
         if self.primary_tab == PrimaryTab::Schedules {
-            self.pending_close = self.selected_schedule().map(|schedule| PendingClose {
-                target: CloseTarget::Schedule(schedule.id.clone()),
-                name: schedule.name.clone(),
-                shell_count: 0,
-                launcher_count: 0,
-            });
+            self.pending_close = self
+                .selected_schedule()
+                .filter(|schedule| schedule.actionable)
+                .map(|schedule| PendingClose {
+                    target: CloseTarget::Schedule(schedule.qualify(&schedule.id)),
+                    name: schedule.name.clone(),
+                    shell_count: 0,
+                    launcher_count: 0,
+                });
             return;
         }
         self.pending_close = if self.primary_tab != PrimaryTab::Workspaces {
-            self.selected_item()
-                .filter(|item| item.ordinary_visible())
-                .map(item_pending_close)
+            self.selected_item_workspace()
+                .filter(|workspace| workspace.actionable())
+                .zip(self.selected_item().filter(|item| item.ordinary_visible()))
+                .map(|(workspace, item)| item_pending_close(workspace, item))
         } else {
             match self.focus {
-                Focus::Workspaces => self.selected().map(|workspace| PendingClose {
-                    target: CloseTarget::Workspace(workspace.id.clone()),
-                    name: workspace.name.clone(),
-                    shell_count: workspace.process_count(),
-                    launcher_count: workspace.launcher_count(),
-                }),
+                Focus::Workspaces => self
+                    .selected()
+                    .filter(|workspace| workspace.actionable())
+                    .map(|workspace| PendingClose {
+                        target: CloseTarget::Workspace(workspace.qualify(&workspace.id)),
+                        name: workspace.name.clone(),
+                        shell_count: workspace.process_count(),
+                        launcher_count: workspace.launcher_count(),
+                    }),
                 Focus::Items => self
-                    .selected_item()
-                    .filter(|item| item.ordinary_visible())
-                    .map(item_pending_close),
+                    .selected()
+                    .filter(|workspace| workspace.actionable())
+                    .zip(self.selected_item().filter(|item| item.ordinary_visible()))
+                    .map(|(workspace, item)| item_pending_close(workspace, item)),
             }
         };
     }
@@ -2535,7 +2682,7 @@ impl App {
         }
     }
 
-    fn request_cancel_execution(&mut self, execution_id: String, label: String) {
+    fn request_cancel_execution(&mut self, execution_id: QualifiedIdentity, label: String) {
         self.pending_close = Some(PendingClose {
             target: CloseTarget::Execution(execution_id),
             name: label,
@@ -2573,11 +2720,10 @@ impl App {
                 result,
             } => match result {
                 Ok((executions, truncated)) => {
-                    if let Some(schedule) = self
-                        .schedules
-                        .iter_mut()
-                        .find(|schedule| schedule.id == schedule_id)
-                    {
+                    if let Some(schedule) = self.schedules.iter_mut().find(|schedule| {
+                        schedule.node_id == schedule_id.node_id
+                            && schedule.id == schedule_id.inner_id
+                    }) {
                         schedule.executions = executions;
                         schedule.history_truncated = truncated;
                         schedule.history_scoped = true;
@@ -2713,6 +2859,7 @@ impl App {
                 };
             }
             KeyCode::Char('r') => return Some(DashboardEffect::Refresh),
+            KeyCode::Char('n') => self.cycle_node_filter(),
             KeyCode::Char('[') if self.primary_tab == PrimaryTab::Schedules => {
                 self.cycle_execution(false);
             }
@@ -2722,17 +2869,19 @@ impl App {
             KeyCode::Char('u') if self.primary_tab == PrimaryTab::Schedules => {
                 return self
                     .selected_schedule()
-                    .map(|schedule| DashboardEffect::RunSchedule(schedule.id.clone()));
+                    .filter(|schedule| schedule.actionable)
+                    .map(|schedule| DashboardEffect::RunSchedule(schedule.qualify(&schedule.id)));
             }
             KeyCode::Char('p') if self.primary_tab == PrimaryTab::Schedules => {
                 return self
                     .selected_schedule()
+                    .filter(|schedule| schedule.actionable)
                     .map(|schedule| match schedule.state {
                         ScheduleDisplayState::Paused => {
-                            DashboardEffect::ResumeSchedule(schedule.id.clone())
+                            DashboardEffect::ResumeSchedule(schedule.qualify(&schedule.id))
                         }
                         ScheduleDisplayState::Enabled => {
-                            DashboardEffect::PauseSchedule(schedule.id.clone())
+                            DashboardEffect::PauseSchedule(schedule.qualify(&schedule.id))
                         }
                     });
             }
@@ -2742,8 +2891,11 @@ impl App {
                     .filter(|execution| execution.state.is_active())
                     .cloned()
                 {
+                    let node_id = self
+                        .selected_schedule()
+                        .map(|schedule| schedule.node_id.clone())?;
                     self.request_cancel_execution(
-                        execution.id.clone(),
+                        QualifiedIdentity::new(node_id, &execution.id),
                         format!("execution {}", short_id(&execution.id)),
                     );
                 }
@@ -2776,8 +2928,31 @@ impl App {
     fn apply_refresh(&mut self, result: Result<DashboardState, String>) {
         match result {
             Ok(state) => {
-                self.replace_workspaces(state.workspaces);
-                self.replace_schedules(state.schedules);
+                self.nodes = state.nodes;
+                self.all_workspaces = state.workspaces;
+                self.all_schedules = state.schedules;
+                let workspaces = self
+                    .all_workspaces
+                    .iter()
+                    .filter(|workspace| {
+                        self.node_filter
+                            .as_ref()
+                            .is_none_or(|node_id| workspace.node.id == *node_id)
+                    })
+                    .cloned()
+                    .collect();
+                let schedules = self
+                    .all_schedules
+                    .iter()
+                    .filter(|schedule| {
+                        self.node_filter
+                            .as_ref()
+                            .is_none_or(|node_id| schedule.node_id == *node_id)
+                    })
+                    .cloned()
+                    .collect();
+                self.replace_workspaces(workspaces);
+                self.replace_schedules(schedules);
                 self.scheduling = state.scheduling;
                 self.exact_run_attachment = state.exact_run_attachment;
                 self.schedule_editing = state.schedule_editing;
@@ -2794,9 +2969,12 @@ impl App {
         let selected = if self.primary_tab == PrimaryTab::Workspaces && self.focus != Focus::Items {
             None
         } else {
+            let workspace = self
+                .selected_item_workspace()
+                .filter(|workspace| workspace.actionable())?;
             self.selected_item().and_then(|item| match item {
                 WorkspaceItemView::Shell(shell) if shell.kind == TerminalKind::Shell => Some((
-                    shell.id.clone(),
+                    workspace.qualify(&shell.id),
                     shell.run.as_ref().map(|run| run.id.clone()),
                     shell.run.as_ref().map_or(0, |run| run.output_revision),
                 )),
@@ -2811,7 +2989,7 @@ impl App {
             return None;
         };
         if self.terminal_preview.as_ref().is_some_and(|preview| {
-            preview.shell_id == shell_id
+            preview.shell_id == shell_id.inner_id
                 && preview.run_id == run_id
                 && preview.output_revision == output_revision
                 && preview.output.is_ok()
@@ -2913,12 +3091,18 @@ impl App {
     }
 
     fn replace_workspaces(&mut self, workspaces: Vec<WorkspaceView>) {
-        let selected_id = self.selected().map(|workspace| workspace.id.clone());
+        let selected_id = self
+            .selected()
+            .map(|workspace| workspace.qualify(&workspace.id));
         let selected_item = self.workspace_item_identity();
         let selected_global_item = self.global_item_identity();
         let previous_index = self.selected_index().unwrap_or(0);
         let selected_index = selected_id
-            .and_then(|id| workspaces.iter().position(|workspace| workspace.id == id))
+            .and_then(|id| {
+                workspaces.iter().position(|workspace| {
+                    workspace.node.id == id.node_id && workspace.id == id.inner_id
+                })
+            })
             .or_else(|| (!workspaces.is_empty()).then(|| previous_index.min(workspaces.len() - 1)));
 
         self.workspaces = workspaces;
@@ -2947,13 +3131,19 @@ impl App {
     }
 
     fn replace_schedules(&mut self, schedules: Vec<ScheduleView>) {
-        let selected = self.selected_schedule().map(|schedule| schedule.id.clone());
+        let selected = self
+            .selected_schedule()
+            .map(|schedule| schedule.qualify(&schedule.id));
         let previous = self.global_state.selected().unwrap_or(0);
         self.schedules = schedules;
         if self.primary_tab == PrimaryTab::Schedules {
             self.global_state.select(
                 selected
-                    .and_then(|id| self.schedules.iter().position(|schedule| schedule.id == id))
+                    .and_then(|id| {
+                        self.schedules.iter().position(|schedule| {
+                            schedule.node_id == id.node_id && schedule.id == id.inner_id
+                        })
+                    })
                     .or_else(|| {
                         (!self.schedules.is_empty())
                             .then_some(previous.min(self.schedules.len() - 1))
@@ -2964,6 +3154,10 @@ impl App {
     }
 
     fn open_selected_schedule_link(&mut self) -> Option<DashboardEffect> {
+        let node_id = self
+            .selected_schedule()
+            .filter(|schedule| schedule.actionable)
+            .map(|schedule| schedule.node_id.clone())?;
         let execution = self.selected_execution()?.clone();
         if execution.state.is_active() && !self.exact_run_attachment {
             self.message = Some(Message {
@@ -2974,14 +3168,17 @@ impl App {
             return None;
         }
         Some(DashboardEffect::OpenScheduledExecution {
-            execution_id: execution.id,
+            execution_id: QualifiedIdentity::new(node_id, execution.id),
         })
     }
 
-    fn select_agent_id(&mut self, agent_id: &str) -> bool {
+    fn select_agent_id(&mut self, agent_id: &QualifiedIdentity) -> bool {
         let Some((workspace_index, item_index)) = self.workspaces.iter().enumerate().find_map(|(workspace_index, workspace)| {
+            if workspace.node.id != agent_id.node_id {
+                return None;
+            }
             workspace.items.iter().enumerate().find_map(|(item_index, item)| {
-                matches!(item, WorkspaceItemView::AgentShell(agent) if agent.agent.as_ref().is_some_and(|agent| agent.id == agent_id))
+                matches!(item, WorkspaceItemView::AgentShell(agent) if agent.agent.as_ref().is_some_and(|agent| agent.id == agent_id.inner_id))
                     .then_some((workspace_index, item_index))
             })
         }) else {
@@ -3020,7 +3217,8 @@ impl App {
                 .is_some_and(|(workspace, item)| {
                     let workspace = &self.workspaces[workspace];
                     item_matches(&workspace.items[item], identity)
-                        && workspace.id == identity.workspace_id
+                        && workspace.node.id == identity.workspace_id.node_id
+                        && workspace.id == identity.workspace_id.inner_id
                 })
         })
     }
@@ -3034,8 +3232,8 @@ fn item_identity(workspace: &WorkspaceView, item: &WorkspaceItemView) -> ItemIde
         WorkspaceItemView::Schedule(schedule) => (schedule.id.clone(), ItemIdentityKind::Schedule),
     };
     ItemIdentity {
-        workspace_id: workspace.id.clone(),
-        item_id,
+        workspace_id: workspace.qualify(&workspace.id),
+        item_id: workspace.qualify(item_id),
         kind,
     }
 }
@@ -3043,51 +3241,55 @@ fn item_identity(workspace: &WorkspaceView, item: &WorkspaceItemView) -> ItemIde
 fn item_matches(item: &WorkspaceItemView, identity: &ItemIdentity) -> bool {
     match item {
         WorkspaceItemView::Shell(shell) => {
-            identity.kind == ItemIdentityKind::Shell && shell.id == identity.item_id
+            identity.kind == ItemIdentityKind::Shell && shell.id == identity.item_id.inner_id
         }
         WorkspaceItemView::AgentShell(agent) => {
-            identity.kind == ItemIdentityKind::Shell && agent.shell.id == identity.item_id
+            identity.kind == ItemIdentityKind::Shell && agent.shell.id == identity.item_id.inner_id
         }
         WorkspaceItemView::Launcher(launcher) => {
-            identity.kind == ItemIdentityKind::Launcher && launcher.id == identity.item_id
+            identity.kind == ItemIdentityKind::Launcher && launcher.id == identity.item_id.inner_id
         }
         WorkspaceItemView::Schedule(schedule) => {
-            identity.kind == ItemIdentityKind::Schedule && schedule.id == identity.item_id
+            identity.kind == ItemIdentityKind::Schedule && schedule.id == identity.item_id.inner_id
         }
     }
 }
 
-fn item_rename_target(item: &WorkspaceItemView) -> Option<RenameTarget> {
+fn item_rename_target(workspace: &WorkspaceView, item: &WorkspaceItemView) -> Option<RenameTarget> {
     match item {
-        WorkspaceItemView::Shell(shell) => Some(RenameTarget::Shell(shell.id.clone())),
-        WorkspaceItemView::AgentShell(agent) => Some(RenameTarget::Shell(agent.shell.id.clone())),
-        WorkspaceItemView::Launcher(launcher) => Some(RenameTarget::Launcher(launcher.id.clone())),
+        WorkspaceItemView::Shell(shell) => Some(RenameTarget::Shell(workspace.qualify(&shell.id))),
+        WorkspaceItemView::AgentShell(agent) => {
+            Some(RenameTarget::Shell(workspace.qualify(&agent.shell.id)))
+        }
+        WorkspaceItemView::Launcher(launcher) => {
+            Some(RenameTarget::Launcher(workspace.qualify(&launcher.id)))
+        }
         WorkspaceItemView::Schedule(_) => None,
     }
 }
 
-fn item_pending_close(item: &WorkspaceItemView) -> PendingClose {
+fn item_pending_close(workspace: &WorkspaceView, item: &WorkspaceItemView) -> PendingClose {
     match item {
         WorkspaceItemView::Shell(shell) => PendingClose {
-            target: CloseTarget::Shell(shell.id.clone()),
+            target: CloseTarget::Shell(workspace.qualify(&shell.id)),
             name: shell.name.clone(),
             shell_count: 1,
             launcher_count: 0,
         },
         WorkspaceItemView::AgentShell(agent) => PendingClose {
-            target: CloseTarget::Shell(agent.shell.id.clone()),
+            target: CloseTarget::Shell(workspace.qualify(&agent.shell.id)),
             name: agent.shell.name.clone(),
             shell_count: 1,
             launcher_count: 0,
         },
         WorkspaceItemView::Launcher(launcher) => PendingClose {
-            target: CloseTarget::Launcher(launcher.id.clone()),
+            target: CloseTarget::Launcher(workspace.qualify(&launcher.id)),
             name: launcher.name.clone(),
             shell_count: 0,
             launcher_count: 1,
         },
         WorkspaceItemView::Schedule(schedule) => PendingClose {
-            target: CloseTarget::Schedule(schedule.id.clone()),
+            target: CloseTarget::Schedule(workspace.qualify(&schedule.id)),
             name: schedule.name.clone(),
             shell_count: 0,
             launcher_count: 0,
@@ -3108,7 +3310,12 @@ pub(crate) fn run<B: DashboardBackend>(
         return Err(error);
     }
     let mut app = App::new(state.workspaces, project_context);
+    app.nodes = state.nodes;
+    app.all_schedules = state.schedules.clone();
     app.schedules = state.schedules;
+    if state.initial_node_filter.is_some() {
+        app.set_node_filter(state.initial_node_filter);
+    }
     app.scheduling = state.scheduling;
     app.exact_run_attachment = state.exact_run_attachment;
     app.schedule_editing = state.schedule_editing;
@@ -4501,6 +4708,22 @@ fn centered_rect(area: Rect, width_percent: u16, height_percent: u16) -> Rect {
     horizontal
 }
 
+fn workspace_display_name(workspace: &WorkspaceView) -> String {
+    if workspace.node.local {
+        return workspace.name.clone();
+    }
+    let health = format!("{:?}", workspace.node.health).to_ascii_lowercase();
+    let freshness = if workspace.node.stale || !workspace.node.current {
+        " stale"
+    } else {
+        ""
+    };
+    format!(
+        "[{} {health}{freshness}] {}",
+        workspace.node.alias, workspace.name
+    )
+}
+
 fn render_tabs(frame: &mut Frame, area: Rect, app: &App) {
     if area.width < 100 {
         let spans = PrimaryTab::ALL
@@ -4518,6 +4741,17 @@ fn render_tabs(frame: &mut Frame, area: Rect, app: &App) {
                 ]
             })
             .collect::<Vec<_>>();
+        let filter = app.node_filter.as_ref().map_or("all", |id| {
+            app.nodes
+                .iter()
+                .find(|node| &node.id == id)
+                .map_or("unknown", |node| node.alias.as_str())
+        });
+        let mut spans = spans;
+        spans.push(Span::styled(
+            format!(" NODE:{filter}"),
+            Style::new().fg(YELLOW),
+        ));
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
         return;
     }
@@ -4567,6 +4801,25 @@ fn render_tabs(frame: &mut Frame, area: Rect, app: &App) {
                 ]
             }),
     );
+    spans.push(Span::styled(" NODES: ", Style::new().fg(SUBTEXT)));
+    for node in &app.nodes {
+        spans.push(Span::styled(
+            format!(
+                "{}({}) {}/{} sched:{}/{} p{} obs:{} caps:{}  ",
+                node.alias,
+                if node.local { "local" } else { "remote" },
+                format!("{:?}", node.health).to_ascii_lowercase(),
+                if node.stale { "stale" } else { "current" },
+                format!("{:?}", node.scheduler.state).to_ascii_lowercase(),
+                node.scheduler.active_executions,
+                node.observed_protocol_version
+                    .map_or_else(|| "?".into(), |version| version.to_string()),
+                node.observed_at_ms,
+                node.observed_capabilities.len(),
+            ),
+            Style::new().fg(if node.stale { YELLOW } else { GREEN }),
+        ));
+    }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
@@ -4590,7 +4843,7 @@ fn render_workspaces(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut A
     } else {
         app.workspaces
             .iter()
-            .map(|workspace| Row::new([Cell::from(workspace.name.as_str())]))
+            .map(|workspace| Row::new([Cell::from(workspace_display_name(workspace))]))
             .collect()
     };
     let table = Table::new(rows, [Constraint::Min(8)])
@@ -4697,13 +4950,21 @@ fn render_schedules(frame: &mut Frame, area: Rect, app: &mut App) {
                     },
                     occurrence_recency,
                 );
-                let mut values = vec![schedule.name.clone()];
+                let mut values = vec![if schedule.node_alias == "local" {
+                    schedule.name.clone()
+                } else {
+                    format!("[{}] {}", schedule.node_alias, schedule.name)
+                }];
                 if show_trigger {
                     values.push(schedule.friendly_trigger.clone());
                 }
                 values.extend([next, last, schedule.state.label().into()]);
                 if show_workspace {
-                    values.push(schedule.workspace.clone());
+                    values.push(if schedule.node_alias == "local" {
+                        schedule.workspace.clone()
+                    } else {
+                        format!("[{}] {}", schedule.node_alias, schedule.workspace)
+                    });
                 }
                 if show_integration {
                     values.push(schedule.integration.clone());
@@ -4916,7 +5177,7 @@ fn render_global_items(frame: &mut Frame, area: Rect, app: &mut App) {
                     Some([
                         agent.state().label().to_owned(),
                         updated,
-                        workspace.name.clone(),
+                        workspace_display_name(workspace),
                         agent.shell.name.clone(),
                         task.to_owned(),
                         branch,
@@ -4961,7 +5222,7 @@ fn render_global_items(frame: &mut Frame, area: Rect, app: &mut App) {
                             .run
                             .as_ref()
                             .map_or_else(|| "-".into(), |run| format!("#{}", run.generation)),
-                        workspace.name.clone(),
+                        workspace_display_name(workspace),
                         shell.name.clone(),
                         shell.kind.label().into(),
                         shell.process().into(),
@@ -5013,7 +5274,7 @@ fn render_global_items(frame: &mut Frame, area: Rect, app: &mut App) {
                     .iter()
                     .filter(move |item| item.kind() == kind)
                     .map(move |item| {
-                        let mut cells = vec![Cell::from(workspace.name.clone())];
+                        let mut cells = vec![Cell::from(workspace_display_name(workspace))];
                         match item {
                             WorkspaceItemView::Shell(shell) => cells.extend([
                                 Cell::from(shell.name.clone()),
@@ -6391,6 +6652,22 @@ mod tests {
 
     fn workspace(id: &str, name: &str) -> WorkspaceView {
         WorkspaceView {
+            node: NodeView {
+                id: String::new(),
+                alias: "local".into(),
+                local: true,
+                health: NodeProjectionHealthCode::Online,
+                current: true,
+                stale: false,
+                observed_at_ms: 0,
+                observed_protocol_version: None,
+                observed_capabilities: Vec::new(),
+                scheduler: SchedulerHealth {
+                    state: crate::protocol::SchedulerState::Active,
+                    max_concurrent: 4,
+                    active_executions: 0,
+                },
+            },
             id: id.into(),
             name: name.into(),
             default_cwd: None,
@@ -6498,6 +6775,9 @@ mod tests {
 
     fn schedule_view() -> ScheduleView {
         ScheduleView {
+            node_id: String::new(),
+            node_alias: "local".into(),
+            actionable: true,
             id: "schedule-1".into(),
             workspace_id: "w1".into(),
             workspace: "boomux".into(),
@@ -6511,6 +6791,79 @@ mod tests {
             possible_pruning_boundary: false,
             history_scoped: false,
             history_complete: true,
+        }
+    }
+
+    #[test]
+    fn qualified_selection_and_actions_do_not_cross_colliding_nodes() {
+        let mut local = workspace("same-workspace", "same");
+        local.node.id = "00000000-0000-0000-0000-000000000001".into();
+        let mut remote = local.clone();
+        remote.node.id = "00000000-0000-0000-0000-000000000002".into();
+        remote.node.alias = "work".into();
+        remote.node.local = false;
+        remote.node.current = false;
+        remote.node.stale = true;
+        remote.node.health = NodeProjectionHealthCode::Stale;
+        let mut app = App::new(vec![local.clone(), remote.clone()], project_context());
+        app.workspace_state.select(Some(1));
+        app.item_state.select(Some(0));
+
+        app.replace_workspaces(vec![remote, local]);
+
+        assert_eq!(
+            app.selected().unwrap().node.id,
+            "00000000-0000-0000-0000-000000000002"
+        );
+        assert_eq!(app.selected_item().unwrap().id(), "term_1");
+        assert_eq!(app.restore_selected(), None);
+        assert_eq!(app.open_selected_item(), None);
+        app.request_close();
+        assert!(app.pending_close.is_none());
+
+        app.cycle_node_filter();
+        assert_eq!(app.workspaces.len(), 1);
+        assert_eq!(app.workspaces[0].node.alias, "local");
+        app.cycle_node_filter();
+        assert_eq!(app.workspaces.len(), 1);
+        assert_eq!(app.workspaces[0].node.alias, "work");
+        app.cycle_node_filter();
+        assert_eq!(app.workspaces.len(), 2);
+    }
+
+    #[test]
+    fn every_remote_health_code_is_unmistakable_wide_and_compact() {
+        for health in [
+            NodeProjectionHealthCode::Unobserved,
+            NodeProjectionHealthCode::Online,
+            NodeProjectionHealthCode::Reconnecting,
+            NodeProjectionHealthCode::Stale,
+            NodeProjectionHealthCode::Unreachable,
+            NodeProjectionHealthCode::AuthenticationRequired,
+            NodeProjectionHealthCode::IdentityChanged,
+            NodeProjectionHealthCode::IdentityConflict,
+            NodeProjectionHealthCode::Unsupported,
+        ] {
+            let mut remote = workspace("same-workspace", "same");
+            remote.node.id = "00000000-0000-0000-0000-000000000002".into();
+            remote.node.alias = "work".into();
+            remote.node.local = false;
+            remote.node.health = health;
+            remote.node.current = health == NodeProjectionHealthCode::Online;
+            remote.node.stale = health != NodeProjectionHealthCode::Online;
+            let mut wide = App::new(vec![remote.clone()], project_context());
+            let mut compact = App::new(vec![remote], project_context());
+            let label = format!("{:?}", health).to_ascii_lowercase();
+            let wide = rendered_text(&mut wide, 180, 24);
+            let compact = rendered_text(&mut compact, 60, 20);
+            assert!(
+                wide.contains(&format!("work(remote) {label}")),
+                "{health:?}: {wide}"
+            );
+            assert!(
+                compact.contains(&format!("[work {label}")),
+                "{health:?}: {compact}"
+            );
         }
     }
 
@@ -6583,9 +6936,9 @@ mod tests {
         else {
             return;
         };
-        let output = read(&shell_id);
+        let output = read(&shell_id.inner_id);
         app.update(DashboardEvent::TerminalPreviewCompleted {
-            shell_id,
+            shell_id: shell_id.inner_id,
             run_id,
             output_revision,
             output,
