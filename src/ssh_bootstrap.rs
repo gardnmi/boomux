@@ -1386,7 +1386,9 @@ fn run_bounded_command(mut command: Command, timeout: Duration) -> io::Result<Ss
         return Err(invalid_probe("SSH probe output exceeds the size limit"));
     }
     if !status.expect("checked above").success() {
-        return Err(io::Error::other("SSH probe exited unsuccessfully"));
+        return Err(io::Error::other(
+            "SSH probe failed; verify target resolution, the SSH service, authentication, and remote shell support",
+        ));
     }
     Ok(SshProbeOutput { stdout, stderr })
 }
@@ -1823,11 +1825,11 @@ mod tests {
 
         let mut command = Command::new("sh");
         command.args(["-c", "exit 7"]);
+        let error = run_bounded_command(command, Duration::from_secs(1)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
         assert_eq!(
-            run_bounded_command(command, Duration::from_secs(1))
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::Other
+            error.to_string(),
+            "SSH probe failed; verify target resolution, the SSH service, authentication, and remote shell support"
         );
     }
 
