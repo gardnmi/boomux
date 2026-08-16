@@ -5,18 +5,50 @@
 
 ## Boomux Node
 
-A durable authority for the Workspaces and runtime identities it owns. A Node is
+A durable authority for the runtime identities and host-local services it owns. A Node is
 identified independently from any hostname, SSH destination, network address,
 or other route used to reach it. A route changing does not change Node identity,
 and a route resolving to a different Node does not transfer ownership.
 
-Every Workspace belongs to exactly one Node. Resource identity across Nodes is
-the pair of owning Node identity and the resource's unchanged Node-local
-identity. The Node is an outer name-resolution scope: Workspace names are unique
-within a Node, while Shell, launcher, Agent Schedule, and other names retain
-their existing Workspace or identity-specific scopes. A projection of another
-Node can be stale or unavailable, but never becomes authoritative and cannot
-establish lifecycle completion or authorize mutation.
+Every Node-owned resource retains its owning Node identity. Resource identity
+across Nodes is the pair of owning Node identity and the resource's unchanged
+Node-local identity. A projection of another Node can be stale or unavailable,
+but never becomes authoritative and cannot establish lifecycle completion or
+authorize mutation.
+
+## Workspace
+
+A durable coordinator-owned place where a user organizes Shells, Agent
+Instances, launchers, and Agent Schedules that may execute on multiple Nodes.
+The Workspace coordinator owns its identity, name, and membership, but is not an
+execution placement and does not imply a default Node. Each Node-hosted resource
+in a Workspace retains its own Node authority and exact qualified identity.
+
+Creating Node-hosted work uses the sole eligible Node without an extra choice.
+When multiple Nodes are available, creation has no default and requires an
+explicit Node selection. A Workspace can remain useful while one member Node is
+stale or unavailable; that condition affects only work owned by that Node and
+does not transfer its authority to the coordinator or another Node.
+
+Filesystem context is placement-specific. A Workspace can retain a separate
+default working directory for each Node, and every path is interpreted and
+validated only by that Node. No path's existence or meaning is inferred from a
+different Node.
+
+A Node becomes a Workspace placement when the first Node-hosted resource is
+created there. Registering a Node does not add it to every Workspace, and an
+empty placement is not created as a side effect of discovery alone.
+
+A discovered Node-local Workspace can be presented before it belongs to a
+coordinator-owned Workspace. Adoption as a new Workspace or linking as a
+placement is explicit. Equal names never establish membership or merge
+authority by themselves.
+
+Opening a Workspace is one explicit request to open every currently available
+placement. Unavailable placements remain visible and produce per-Node results;
+an ambiguous start is never replayed automatically. Closing a Workspace retains
+its metadata and unresolved membership until every owning Node has confirmed
+the guarded removal of its resources.
 
 ## Workspace Launcher
 
