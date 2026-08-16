@@ -1,6 +1,6 @@
 # Remote Node Federation
 
-> **Status: Accepted design contract; implementation pending.** This document
+> **Status: Accepted design contract; implementation in progress.** This document
 > defines the authority, identity, privacy, compatibility, and failure semantics
 > delivered by [#174](https://github.com/gardnmi/boomux/issues/174) under tracking
 > epic [#173](https://github.com/gardnmi/boomux/issues/173). Current source and
@@ -8,8 +8,10 @@
 > implements stable local Node identity; protocol 29, handshake version 1, and
 > the hidden stdio helper establish the verified same-socket bridge boundary.
 > Protocol 30 and local `boomux node rekey` implement bounded expected-ID rekey
-> with exact interactive confirmation. No public remote access command, SSH
-> bootstrap, registration, or projection is implemented yet.
+> with exact interactive confirmation. Public `boomux --remote TARGET` now
+> provides ad hoc SSH discovery, consent-gated bootstrap, and verified protocol
+> connectivity. Registration, projection, and routed operations are not yet
+> implemented.
 
 ## Purpose
 

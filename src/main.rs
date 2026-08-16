@@ -24,7 +24,7 @@ use boomux::protocol::{
     ShellSpec, ShellStatus, Snapshot, WorkspaceLauncherSnapshot, WorkspaceLauncherSpec,
     WorkspaceSnapshot,
 };
-use boomux::{attach, client, daemon, federation, protocol};
+use boomux::{attach, client, daemon, federation, protocol, ssh_bootstrap};
 
 use crate::integration_management::{
     InstallOutcome, ensure_safe_directory, install_asset_at, regular_file_matches,
@@ -316,6 +316,10 @@ struct Cli {
     /// Emit the stable boomux.cli/v1 JSON envelope
     #[arg(long, global = true)]
     json: bool,
+
+    /// Connect ad hoc to one Boomux Node through OpenSSH
+    #[arg(long, value_name = "TARGET")]
+    remote: Option<String>,
 
     /// Open or create a persistent terminal in this directory
     #[arg(value_name = "PATH")]
@@ -1361,6 +1365,23 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
         )
         .into());
     }
+    if let Some(target) = cli.remote.as_deref() {
+        if cli.json
+            || cli.path.is_some()
+            || cli.command.is_some()
+            || cli.name.is_some()
+            || cli.new_window
+            || !cli.startup_command.is_empty()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--remote currently accepts only an SSH target; remote management and dashboard routing are delivered separately",
+            )
+            .into());
+        }
+        remote_connect(target)?;
+        return Ok(CliExit::Success);
+    }
     match cli.command.as_ref() {
         Some(Commands::Daemon {
             command: DaemonCommands::Run,
@@ -1495,6 +1516,60 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
     };
     result?;
     Ok(CliExit::Success)
+}
+
+fn remote_connect(target: &str) -> Result<(), Box<dyn Error>> {
+    const TIMEOUT: Duration = Duration::from_secs(120);
+
+    let target = ssh_bootstrap::SshTarget::parse(target)?;
+    let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
+    let authentication = if interactive {
+        ssh_bootstrap::SshAuthenticationMode::Interactive
+    } else {
+        ssh_bootstrap::SshAuthenticationMode::Batch
+    };
+    let helper = match ssh_bootstrap::plan_remote_bootstrap(
+        target.clone(),
+        authentication,
+        TIMEOUT,
+    )? {
+        ssh_bootstrap::RemoteBootstrapPlan::Ready(helper) => helper,
+        ssh_bootstrap::RemoteBootstrapPlan::Install(_plan) if !interactive => {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "remote Boomux installation is required, but noninteractive --remote never modifies remote software",
+            )
+            .into());
+        }
+        ssh_bootstrap::RemoteBootstrapPlan::Install(plan) => {
+            println!("Remote target: {}", plan.target.as_str());
+            println!("Install source: {}", plan.source.description());
+            println!("Install destination: {}", plan.destination.as_str());
+            println!(
+                "Process impact: {}",
+                if plan.may_restart_daemon {
+                    "the daemon may be gracefully restarted only if the installed helper cannot connect to the running daemon"
+                } else {
+                    "a detached daemon may be started; no running daemon will be restarted for a release-version difference"
+                }
+            );
+            if !confirm_setup("Install Boomux on this remote target?")? {
+                println!("No changes made.");
+                return Ok(());
+            }
+            ssh_bootstrap::install_remote(&plan, authentication, TIMEOUT)?
+        }
+    };
+    let mut connection = ssh_bootstrap::connect_remote(target, helper, authentication, TIMEOUT)?;
+    connection.ping()?;
+    println!(
+        "Connected to Boomux Node {} (protocol {}, helper {}, {})",
+        connection.handshake.node_id,
+        connection.handshake.core_protocol_version,
+        connection.handshake.helper_version,
+        connection.executable.as_str(),
+    );
+    Ok(())
 }
 
 fn node_command(command: NodeCommands) -> Result<(), Box<dyn Error>> {

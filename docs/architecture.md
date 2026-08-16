@@ -57,7 +57,8 @@
 - **Remote Node authority:** [`remote-nodes.md`](remote-nodes.md) defines the
   accepted federation boundary: one owning Node remains authoritative, SSH is a
   route, and local cached projections never authorize mutation or lifecycle
-  inference. Implementation is tracked by #173 and is not yet shipped.
+  inference. Ad hoc bootstrap and verified transport are implemented; durable
+  registration, projection, and routed management remain tracked by #173.
 
 ## Product Boundary
 
@@ -80,8 +81,8 @@ persistence across attachment disconnects, naming, grouping, and orchestration.
 
 ### Accepted Federation Boundary
 
-Remote Node federation is an accepted but not yet implemented extension of this
-product boundary. A remote daemon, not a local SSH process, owns its remote PTYs,
+Remote Node federation extends this product boundary incrementally. A remote
+daemon, not a local SSH process, owns its remote PTYs,
 processes, Workspaces, and runtime identities. The local daemon can later retain
 a bounded prompt-free projection for its TUI, CLI integrations, and desktop
 presentation, but that projection remains separate from the authoritative local
@@ -93,6 +94,11 @@ ordinary negotiated daemon protocol stream to the remote Unix socket. It does
 not expose a TCP listener or the local daemon socket. Remote work continues when
 the SSH bridge or local presentation disconnects. The complete accepted contract
 and deferred behavior are in [`remote-nodes.md`](remote-nodes.md).
+
+Public `boomux --remote TARGET` currently performs ad hoc bootstrap only. It
+discovers and verifies a compatible helper, or interactively installs one before
+opening and pinging a daemon-bound stdio channel. It creates no registration or
+projection and does not yet route dashboard or management operations.
 
 ## Components
 

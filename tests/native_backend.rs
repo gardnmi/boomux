@@ -14,6 +14,8 @@ mod notifications;
 mod project_discovery;
 #[path = "native_backend/protocol_control.rs"]
 mod protocol_control;
+#[path = "native_backend/remote_bootstrap.rs"]
+mod remote_bootstrap;
 #[path = "native_backend/schedules.rs"]
 mod schedules;
 #[path = "native_backend/shell_lifecycle.rs"]
