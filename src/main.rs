@@ -4,7 +4,7 @@ use std::error::Error;
 use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, IsTerminal, Read};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
@@ -386,6 +386,11 @@ enum Commands {
         #[command(subcommand)]
         command: WorkspaceCommands,
     },
+    /// Manage this Boomux Node identity
+    Node {
+        #[command(subcommand)]
+        command: NodeCommands,
+    },
     /// Manage shells
     Shell {
         #[command(subcommand)]
@@ -482,6 +487,12 @@ enum Commands {
 enum ProjectCommands {
     /// List projects discovered from configured roots
     List,
+}
+
+#[derive(Subcommand)]
+enum NodeCommands {
+    /// Assign this authority a new Node ID after exact confirmation
+    Rekey,
 }
 
 #[derive(Subcommand)]
@@ -1037,6 +1048,7 @@ command_keys! {
     WorkspaceList => ("workspace.list", Json),
     WorkspaceInspect => ("workspace.inspect", Json),
     Workspace => ("workspace", HumanOnly),
+    NodeRekey => ("node.rekey", HumanOnly),
     ShellSuggestName => ("shell.suggest-name", Json),
     ShellInspect => ("shell.inspect", Json),
     Shell => ("shell", HumanOnly),
@@ -1104,6 +1116,9 @@ impl Cli {
             Some(Commands::Workspace {
                 command: WorkspaceCommands::Inspect { .. },
             }) => CommandKey::WorkspaceInspect,
+            Some(Commands::Node {
+                command: NodeCommands::Rekey,
+            }) => CommandKey::NodeRekey,
             Some(Commands::Shell {
                 command: ShellCommands::SuggestName { .. },
             }) => CommandKey::ShellSuggestName,
@@ -1437,6 +1452,7 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
         Some(Commands::Workspace { command }) => {
             workspace_command(command, cli.json, cli.terminal.as_deref())
         }
+        Some(Commands::Node { command }) => node_command(command),
         Some(Commands::Shell { command }) => shell_command(command, cli.json),
         Some(Commands::Launcher { command }) => launcher_command(command, cli.json),
         Some(Commands::Agent {
@@ -1479,6 +1495,46 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
     };
     result?;
     Ok(CliExit::Success)
+}
+
+fn node_command(command: NodeCommands) -> Result<(), Box<dyn Error>> {
+    match command {
+        NodeCommands::Rekey => rekey_node(),
+    }
+}
+
+fn rekey_node() -> Result<(), Box<dyn Error>> {
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "node rekey requires an interactive terminal",
+        )
+        .into());
+    }
+    let client = client::connect()?;
+    let current = client.node_identity()?;
+    println!("Current Node ID: {current}");
+    println!("Rekey changes the federated identity of every resource owned by this Node.");
+    print!("Type the current Node ID to continue: ");
+    io::Write::flush(&mut io::stdout())?;
+    let mut confirmation = String::new();
+    io::stdin().read_line(&mut confirmation)?;
+    validate_rekey_confirmation(&current, &confirmation)?;
+    let replacement = client.rekey_node(&current)?;
+    println!("Rekeyed Boomux Node: {current} -> {replacement}");
+    println!("Existing remote registrations must forget and add this Node again.");
+    Ok(())
+}
+
+fn validate_rekey_confirmation(expected: &str, confirmation: &str) -> io::Result<()> {
+    if confirmation.trim_end_matches(['\r', '\n']) == expected {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Node rekey confirmation did not match the current Node ID",
+        ))
+    }
 }
 
 fn daemon_control(command: DaemonCommands, json: bool) -> Result<(), Box<dyn Error>> {
@@ -6828,6 +6884,27 @@ mod tests {
                 ..
             }) if run_id == "r1"
         ));
+    }
+
+    #[test]
+    fn parses_node_rekey_and_requires_exact_confirmation() {
+        let cli = Cli::try_parse_from(["boomux", "node", "rekey"]).unwrap();
+        assert!(matches!(
+            cli.command.as_ref(),
+            Some(Commands::Node {
+                command: NodeCommands::Rekey
+            })
+        ));
+        assert_eq!(cli.command_descriptor().key, "node.rekey");
+
+        let node_id = "550e8400-e29b-41d4-a716-446655440000";
+        validate_rekey_confirmation(node_id, &format!("{node_id}\n")).unwrap();
+        assert_eq!(
+            validate_rekey_confirmation(node_id, "550e8400-e29b-41d4-a716-446655440001\n")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
     }
 
     #[test]
