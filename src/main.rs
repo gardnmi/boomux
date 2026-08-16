@@ -766,30 +766,45 @@ enum ScheduleCommands {
     List {
         #[arg(long, value_name = "NAME_OR_ID")]
         workspace: Option<String>,
+        /// Exact registered Node alias or Node ID
+        #[arg(long)]
+        node: Option<String>,
     },
     /// Inspect a schedule, including its private prompt
     Inspect {
         target: String,
         #[arg(long, value_name = "NAME_OR_ID")]
         workspace: Option<String>,
+        /// Exact registered Node alias or Node ID
+        #[arg(long)]
+        node: Option<String>,
     },
     /// Mark a schedule paused in durable management state
     Pause {
         target: String,
         #[arg(long, value_name = "NAME_OR_ID")]
         workspace: Option<String>,
+        /// Exact registered Node alias or Node ID
+        #[arg(long)]
+        node: Option<String>,
     },
     /// Enable future timed dispatch; run-now is independent
     Resume {
         target: String,
         #[arg(long, value_name = "NAME_OR_ID")]
         workspace: Option<String>,
+        /// Exact registered Node alias or Node ID
+        #[arg(long)]
+        node: Option<String>,
     },
     /// Remove an inactive schedule and its persisted prompt
     Remove {
         target: String,
         #[arg(long, value_name = "NAME_OR_ID")]
         workspace: Option<String>,
+        /// Exact registered Node alias or Node ID
+        #[arg(long)]
+        node: Option<String>,
     },
     /// Dispatch one execution now, including while paused
     Run {
@@ -798,7 +813,24 @@ enum ScheduleCommands {
         workspace: Option<String>,
         #[arg(long, value_name = "UUID")]
         idempotency_key: Option<Uuid>,
+        /// Exact registered Node alias or Node ID
+        #[arg(long)]
+        node: Option<String>,
     },
+}
+
+impl ScheduleCommands {
+    fn node(&self) -> Option<&str> {
+        match self {
+            Self::Create(arguments) => arguments.node.as_deref(),
+            Self::List { node, .. }
+            | Self::Inspect { node, .. }
+            | Self::Pause { node, .. }
+            | Self::Resume { node, .. }
+            | Self::Remove { node, .. }
+            | Self::Run { node, .. } => node.as_deref(),
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -815,9 +847,17 @@ enum ExecutionCommands {
             value_parser = clap::value_parser!(u16).range(1..=protocol::MAX_SCHEDULED_EXECUTION_LIST_LIMIT as i64)
         )]
         limit: u16,
+        /// Exact registered Node alias or Node ID
+        #[arg(long)]
+        node: Option<String>,
     },
     /// Inspect one execution by exact ID
-    Inspect { execution_id: String },
+    Inspect {
+        execution_id: String,
+        /// Exact registered Node alias or Node ID
+        #[arg(long)]
+        node: Option<String>,
+    },
     /// Wait for an exact execution revision to advance
     Wait {
         execution_id: String,
@@ -825,11 +865,36 @@ enum ExecutionCommands {
         after_revision: u64,
         #[arg(long, default_value_t = 30_000)]
         wait_ms: u32,
+        /// Exact registered Node alias or Node ID
+        #[arg(long)]
+        node: Option<String>,
     },
     /// Open an execution's exact active run or linked Agent Session
-    Open { execution_id: String },
+    Open {
+        execution_id: String,
+        /// Exact registered Node alias or Node ID
+        #[arg(long)]
+        node: Option<String>,
+    },
     /// Cancel one nonterminal execution by exact ID
-    Cancel { execution_id: String },
+    Cancel {
+        execution_id: String,
+        /// Exact registered Node alias or Node ID
+        #[arg(long)]
+        node: Option<String>,
+    },
+}
+
+impl ExecutionCommands {
+    fn node(&self) -> Option<&str> {
+        match self {
+            Self::List { node, .. }
+            | Self::Inspect { node, .. }
+            | Self::Wait { node, .. }
+            | Self::Open { node, .. }
+            | Self::Cancel { node, .. } => node.as_deref(),
+        }
+    }
 }
 
 #[derive(Args)]
@@ -900,6 +965,9 @@ struct ScheduleCreateArgs {
     /// Record consent for future timed dispatch
     #[arg(long)]
     enabled: bool,
+    /// Exact registered Node alias or Node ID
+    #[arg(long)]
+    node: Option<String>,
 }
 
 #[derive(Args)]
@@ -2598,6 +2666,7 @@ fn dashboard(
                         .map_err(|error| error.to_string())
                 } else {
                     open_remote_scheduled_execution(&client, &execution_id, terminal.as_deref())
+                        .map(|opened| opened.message)
                         .map_err(|error| error.to_string())
                 };
                 tui::DashboardEvent::OperationCompleted(result)
@@ -2641,24 +2710,50 @@ fn dashboard(
                 tui::DashboardEvent::OperationCompleted(result)
             }
             tui::DashboardEffect::LoadScheduleHistory { schedule_id, limit } => {
-                let result = local_dashboard_inner(&schedule_id, &local_node_id).and_then(|id| {
-                    refresh
-                        .load_schedule_history(&client, id, limit)
-                        .map(|(_, truncated)| {
-                            let schedules = dashboard_projection::project_schedules(
-                                refresh.snapshot(),
-                                &refresh.executions(),
-                                refresh.history_truncated,
-                                &refresh.scoped_history,
-                            );
-                            let executions = schedules
-                                .into_iter()
-                                .find(|schedule| schedule.id == schedule_id.inner_id)
-                                .map_or_else(Vec::new, |schedule| schedule.executions);
-                            (executions, truncated)
-                        })
-                        .map_err(|error| error.to_string())
-                });
+                let result =
+                    if schedule_id.node_id == local_node_id || schedule_id.node_id.is_empty() {
+                        refresh
+                            .load_schedule_history(&client, &schedule_id.inner_id, limit)
+                            .map(|(_, truncated)| {
+                                let schedules = dashboard_projection::project_schedules(
+                                    refresh.snapshot(),
+                                    &refresh.executions(),
+                                    refresh.history_truncated,
+                                    &refresh.scoped_history,
+                                );
+                                let executions = schedules
+                                    .into_iter()
+                                    .find(|schedule| schedule.id == schedule_id.inner_id)
+                                    .map_or_else(Vec::new, |schedule| schedule.executions);
+                                (executions, truncated)
+                            })
+                            .map_err(|error| error.to_string())
+                    } else {
+                        client
+                            .route_node_operation(
+                                &schedule_id.node_id,
+                                protocol::RoutedOperation::ListScheduledExecutions {
+                                    workspace_id: None,
+                                    schedule_id: Some(schedule_id.inner_id.clone()),
+                                    limit,
+                                },
+                            )
+                            .map_err(|error| error.to_string())
+                            .and_then(|result| match result {
+                                protocol::RoutedOperationResult::ScheduledExecutions {
+                                    executions,
+                                    truncated,
+                                    ..
+                                } => Ok((
+                                    dashboard_projection::project_remote_executions(&executions),
+                                    truncated,
+                                )),
+                                _ => Err(
+                                    "remote Node returned an unexpected execution history response"
+                                        .into(),
+                                ),
+                            })
+                    };
                 tui::DashboardEvent::ScheduleHistoryCompleted {
                     schedule_id,
                     result,
@@ -3148,7 +3243,7 @@ fn open_remote_scheduled_execution(
     client: &client::Client,
     execution_id: &protocol::QualifiedIdentity,
     terminal: Option<&str>,
-) -> Result<String, Box<dyn Error>> {
+) -> Result<OpenedScheduledExecution, Box<dyn Error>> {
     let execution =
         routed_dashboard_execution(client, execution_id, "").map_err(io::Error::other)?;
     let target = scheduled_execution_open_target(&execution)
@@ -3174,10 +3269,14 @@ fn open_remote_scheduled_execution(
                 registration.alias, session.workspace_name, session.integration,
             ),
         )?;
-        return Ok(format!(
-            "Opened exact {} Agent Session for execution {} on Node {}",
-            session.integration, execution.id, registration.alias,
-        ));
+        return Ok(OpenedScheduledExecution {
+            message: format!(
+                "Opened exact {} Agent Session for execution {} on Node {}",
+                session.integration, execution.id, registration.alias,
+            ),
+            execution,
+            target: "session",
+        });
     }
     let ScheduledExecutionOpenTarget::Run { shell_id, run_id } = target else {
         unreachable!("session targets return after opening")
@@ -3207,10 +3306,14 @@ fn open_remote_scheduled_execution(
         ),
         true,
     )?;
-    Ok(format!(
-        "Opened exact execution {} from schedule {} on Node {}",
-        execution.id, execution.schedule_id, registration.alias
-    ))
+    Ok(OpenedScheduledExecution {
+        message: format!(
+            "Opened exact execution {} from schedule {} on Node {}",
+            execution.id, execution.schedule_id, registration.alias
+        ),
+        execution,
+        target: "run",
+    })
 }
 
 fn validate_dashboard_execution_open(
@@ -5682,10 +5785,13 @@ fn remote_session_command(
 
 fn schedule_command(command: ScheduleCommands, json: bool) -> Result<(), Box<dyn Error>> {
     let client = client::connect_or_start()?;
+    if let Some(node) = command.node().map(str::to_owned) {
+        return remote_schedule_command(&client, command, &node, json);
+    }
     validate_schedule_protocol(client.protocol_version()?)?;
     match command {
         ScheduleCommands::Create(arguments) => create_schedule(&client, *arguments, json),
-        ScheduleCommands::List { workspace } => {
+        ScheduleCommands::List { workspace, .. } => {
             let snapshot = client.snapshot()?;
             let selected = workspace
                 .as_deref()
@@ -5747,7 +5853,9 @@ fn schedule_command(command: ScheduleCommands, json: bool) -> Result<(), Box<dyn
             }
             Ok(())
         }
-        ScheduleCommands::Inspect { target, workspace } => {
+        ScheduleCommands::Inspect {
+            target, workspace, ..
+        } => {
             let snapshot = client.snapshot()?;
             let schedule = resolve_cli_schedule(&snapshot, &target, workspace.as_deref())?;
             let workspace_name = schedule_workspace_name(&snapshot, schedule);
@@ -5767,7 +5875,9 @@ fn schedule_command(command: ScheduleCommands, json: bool) -> Result<(), Box<dyn
             print_schedule_inspection(&inspection.schedule, workspace_name, &inspection.prompt);
             Ok(())
         }
-        ScheduleCommands::Pause { target, workspace } => {
+        ScheduleCommands::Pause {
+            target, workspace, ..
+        } => {
             let snapshot = client.snapshot()?;
             let schedule = resolve_cli_schedule(&snapshot, &target, workspace.as_deref())?;
             let workspace_name = schedule_workspace_name(&snapshot, schedule).map(str::to_owned);
@@ -5783,7 +5893,9 @@ fn schedule_command(command: ScheduleCommands, json: bool) -> Result<(), Box<dyn
             }
             Ok(())
         }
-        ScheduleCommands::Resume { target, workspace } => {
+        ScheduleCommands::Resume {
+            target, workspace, ..
+        } => {
             let snapshot = client.snapshot()?;
             let schedule = resolve_cli_schedule(&snapshot, &target, workspace.as_deref())?;
             let workspace_name = schedule_workspace_name(&snapshot, schedule).map(str::to_owned);
@@ -5802,7 +5914,9 @@ fn schedule_command(command: ScheduleCommands, json: bool) -> Result<(), Box<dyn
             }
             Ok(())
         }
-        ScheduleCommands::Remove { target, workspace } => {
+        ScheduleCommands::Remove {
+            target, workspace, ..
+        } => {
             let snapshot = client.snapshot()?;
             let schedule = resolve_cli_schedule(&snapshot, &target, workspace.as_deref())?;
             let removed =
@@ -5825,6 +5939,7 @@ fn schedule_command(command: ScheduleCommands, json: bool) -> Result<(), Box<dyn
             target,
             workspace,
             idempotency_key,
+            ..
         } => {
             let feature = protocol::ProtocolFeature::ScheduledExecutions;
             if !feature.is_supported_by(client.protocol_version()?) {
@@ -5847,12 +5962,444 @@ fn schedule_command(command: ScheduleCommands, json: bool) -> Result<(), Box<dyn
     }
 }
 
+fn remote_node_projection(
+    client: &client::Client,
+    selector: &str,
+) -> Result<(protocol::NodeRegistrationSnapshot, protocol::CombinedNode), Box<dyn Error>> {
+    let registration = client.node_registration(selector)?;
+    let mut nodes = client
+        .combined_node_snapshot(Some(registration.node_id.clone()))?
+        .nodes;
+    let node = nodes.pop().ok_or_else(|| {
+        cli_output::failure(
+            "not_found",
+            "registered Node has no combined projection entry",
+        )
+    })?;
+    Ok((registration, node))
+}
+
+fn remote_workspace_from_projection(
+    client: &client::Client,
+    node: &protocol::CombinedNode,
+    target: &str,
+) -> Result<protocol::WorkspaceSnapshot, Box<dyn Error>> {
+    let projection = node.remote_projection.as_ref().ok_or_else(|| {
+        cli_output::failure("not_found", "remote Node has no projected workspace state")
+    })?;
+    let matches = projection
+        .workspaces
+        .iter()
+        .filter(|workspace| workspace.id == target || workspace.name == target)
+        .collect::<Vec<_>>();
+    let [workspace] = matches.as_slice() else {
+        return Err(cli_output::failure(
+            if matches.is_empty() {
+                "not_found"
+            } else {
+                "ambiguous_target"
+            },
+            format!("remote workspace target did not resolve uniquely: {target}"),
+        ));
+    };
+    match client.route_node_operation(
+        &node.node_id,
+        protocol::RoutedOperation::GetWorkspace {
+            workspace_id: workspace.id.clone(),
+        },
+    )? {
+        protocol::RoutedOperationResult::Workspace { workspace } => Ok(workspace),
+        _ => Err("remote Node returned an unexpected workspace response".into()),
+    }
+}
+
+fn remote_schedule_inspection(
+    client: &client::Client,
+    node: &protocol::CombinedNode,
+    target: &str,
+    workspace: Option<&str>,
+) -> Result<protocol::AgentScheduleInspection, Box<dyn Error>> {
+    let schedule_id = if uuid::Uuid::parse_str(target).is_ok() {
+        target.to_owned()
+    } else {
+        let workspace = workspace.ok_or_else(|| {
+            cli_output::failure(
+                "invalid_argument",
+                "remote schedule names require --workspace; exact schedule IDs do not",
+            )
+        })?;
+        let workspace = remote_workspace_from_projection(client, node, workspace)?;
+        let matches = workspace
+            .schedules
+            .iter()
+            .filter(|schedule| schedule.name == target)
+            .collect::<Vec<_>>();
+        let [schedule] = matches.as_slice() else {
+            return Err(cli_output::failure(
+                if matches.is_empty() {
+                    "not_found"
+                } else {
+                    "ambiguous_target"
+                },
+                format!("remote schedule target did not resolve uniquely: {target}"),
+            ));
+        };
+        schedule.id.clone()
+    };
+    match client.route_node_operation(
+        &node.node_id,
+        protocol::RoutedOperation::GetAgentSchedule { schedule_id },
+    )? {
+        protocol::RoutedOperationResult::AgentScheduleInspection { inspection } => Ok(inspection),
+        _ => Err("remote Node returned an unexpected schedule response".into()),
+    }
+}
+
+fn remote_schedule_command(
+    client: &client::Client,
+    command: ScheduleCommands,
+    selector: &str,
+    json: bool,
+) -> Result<(), Box<dyn Error>> {
+    let feature = protocol::ProtocolFeature::RemoteSchedules;
+    if !client.supports(feature)? {
+        return Err(cli_output::failure(
+            "unsupported_version",
+            format!(
+                "remote Schedule management requires local daemon protocol {}",
+                feature.minimum_version()
+            ),
+        ));
+    }
+    let (registration, node) = remote_node_projection(client, selector)?;
+    match command {
+        ScheduleCommands::List { workspace, .. } => {
+            let projection = node.remote_projection.as_ref().ok_or_else(|| {
+                cli_output::failure("not_found", "remote Node has no projected Schedule state")
+            })?;
+            let workspace_id = workspace
+                .as_deref()
+                .map(|target| remote_workspace_from_projection(client, &node, target))
+                .transpose()?
+                .map(|workspace| workspace.id);
+            let schedules = projection
+                .schedules
+                .iter()
+                .filter(|schedule| {
+                    workspace_id
+                        .as_deref()
+                        .is_none_or(|workspace_id| schedule.workspace_id == workspace_id)
+                })
+                .map(|schedule| {
+                    let workspace_name = projection
+                        .workspaces
+                        .iter()
+                        .find(|workspace| workspace.id == schedule.workspace_id)
+                        .map(|workspace| workspace.name.as_str());
+                    serde_json::json!({
+                        "node_id": node.node_id,
+                        "id": schedule.id,
+                        "workspace_id": schedule.workspace_id,
+                        "workspace_name": workspace_name,
+                        "name": schedule.name,
+                        "integration": schedule.integration,
+                        "cron": schedule.trigger.cron,
+                        "timezone": schedule.trigger.timezone,
+                        "state": cli_output::schedule_state(schedule.state),
+                        "revision": schedule.revision,
+                        "prompt_revision": schedule.prompt_revision,
+                        "trigger_revision": schedule.trigger_revision,
+                        "created_at_ms": schedule.created_at_ms,
+                        "updated_at_ms": schedule.updated_at_ms,
+                        "next_occurrence": schedule.next_occurrence,
+                    })
+                })
+                .collect::<Vec<_>>();
+            if json {
+                return print_json(
+                    CommandKey::ScheduleList,
+                    serde_json::json!({
+                        "node_id": registration.node_id,
+                        "node_alias": registration.alias,
+                        "health": node.health,
+                        "current": node.current,
+                        "stale": node.stale,
+                        "observed_at_ms": node.observed_at_ms,
+                        "scheduler": node.scheduler,
+                        "schedules": schedules,
+                    }),
+                );
+            }
+            println!(
+                "NODE\tWORKSPACE\tNAME\tSCHEDULE ID\tSTATE\tINTEGRATION\tTRIGGER\tTIMEZONE\tNEXT OCCURRENCE MS"
+            );
+            for schedule in &projection.schedules {
+                if workspace_id
+                    .as_deref()
+                    .is_some_and(|workspace_id| schedule.workspace_id != workspace_id)
+                {
+                    continue;
+                }
+                let workspace_name = projection
+                    .workspaces
+                    .iter()
+                    .find(|workspace| workspace.id == schedule.workspace_id)
+                    .map_or("unknown", |workspace| workspace.name.as_str());
+                println!(
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    registration.alias,
+                    workspace_name,
+                    schedule.name,
+                    schedule.id,
+                    cli_output::schedule_state(schedule.state),
+                    schedule.integration,
+                    schedule.trigger.cron,
+                    schedule.trigger.timezone,
+                    schedule
+                        .next_occurrence
+                        .as_ref()
+                        .map(|value| value.scheduled_at_ms.to_string())
+                        .unwrap_or_else(|| "-".into()),
+                );
+            }
+            println!(
+                "Node {} is {:?}; scheduler {:?} ({}/{} active)",
+                registration.alias,
+                node.health,
+                node.scheduler.state,
+                node.scheduler.active_executions,
+                node.scheduler.max_concurrent
+            );
+            Ok(())
+        }
+        ScheduleCommands::Create(arguments) => {
+            let workspace = remote_workspace_from_projection(client, &node, &arguments.workspace)?;
+            let name = cli_name(arguments.name, "schedule")?;
+            let resolved = client.route_node_host_service(
+                &node.node_id,
+                protocol::HostServiceOperation::ResolveDirectory {
+                    path: arguments.cwd,
+                },
+            )?;
+            let protocol::HostServiceResult::Directory { path: cwd } = resolved else {
+                return Err("remote Node returned an unexpected directory response".into());
+            };
+            let prompt = schedule_prompt(arguments.prompt, arguments.prompt_file.as_deref())?;
+            let cron = schedule_cron(
+                arguments.cron.as_deref(),
+                arguments.every.as_deref(),
+                arguments.daily.as_deref(),
+                arguments.weekdays.as_deref(),
+                arguments.weekly.as_deref(),
+            )?;
+            let timezone = arguments
+                .timezone
+                .as_deref()
+                .map(boomux::scheduling::canonicalize_timezone)
+                .transpose()?
+                .map_or_else(boomux::scheduling::resolve_system_timezone, Ok)?;
+            let integration = schedule_integration(&arguments.integration)?;
+            let session = if let Some(session_id) = arguments.continue_session.as_deref() {
+                let result = client.route_node_host_service(
+                    &node.node_id,
+                    protocol::HostServiceOperation::InspectAgentSession {
+                        session_id: session_id.to_owned(),
+                    },
+                )?;
+                let protocol::HostServiceResult::AgentSession { session } = result else {
+                    return Err("remote Node returned an unexpected Agent Session response".into());
+                };
+                if session.summary.workspace_id != workspace.id
+                    || session.summary.integration != integration.key
+                {
+                    return Err(cli_output::failure(
+                        "invalid_argument",
+                        "continued session must belong to the selected owner Workspace and integration",
+                    ));
+                }
+                let external_session_id = session.summary.external_session_id.ok_or_else(|| {
+                    cli_output::failure(
+                        "invalid_argument",
+                        "continued projected session has no canonical external session ID",
+                    )
+                })?;
+                boomux::scheduling::validate_external_session_id(&external_session_id)?;
+                AgentScheduleSession::Continue {
+                    external_session_id,
+                }
+            } else {
+                AgentScheduleSession::Fresh
+            };
+            let spec = AgentScheduleSpec {
+                name,
+                cwd,
+                integration: integration.key.into(),
+                prompt,
+                session,
+                trigger: AgentScheduleTrigger { cron, timezone },
+                state: if arguments.enabled {
+                    AgentScheduleState::Enabled
+                } else {
+                    AgentScheduleState::Paused
+                },
+                overlap_policy: AgentScheduleOverlapPolicy::Skip,
+            };
+            let schedule = match client.route_node_operation(
+                &node.node_id,
+                protocol::RoutedOperation::CreateAgentSchedule {
+                    workspace_id: workspace.id.clone(),
+                    spec,
+                },
+            )? {
+                protocol::RoutedOperationResult::AgentSchedule { schedule } => schedule,
+                _ => return Err("remote Node returned an unexpected create response".into()),
+            };
+            if json {
+                return print_json(
+                    CommandKey::ScheduleCreate,
+                    serde_json::json!({
+                        "node_id": registration.node_id,
+                        "schedule": cli_output::schedule(&schedule, Some(&workspace.name)),
+                    }),
+                );
+            }
+            println!(
+                "Created {} schedule {} ({}) on Node {}",
+                cli_output::schedule_state(schedule.state),
+                schedule.name,
+                schedule.id,
+                registration.alias
+            );
+            Ok(())
+        }
+        ScheduleCommands::Inspect {
+            target, workspace, ..
+        } => {
+            let inspection =
+                remote_schedule_inspection(client, &node, &target, workspace.as_deref())?;
+            if json {
+                return print_json(
+                    CommandKey::ScheduleInspect,
+                    serde_json::json!({
+                        "node_id": registration.node_id,
+                        "schedule": cli_output::schedule_inspection(
+                            &inspection.schedule,
+                            None,
+                            &inspection.prompt,
+                        ),
+                    }),
+                );
+            }
+            println!("Node: {}", registration.alias);
+            print_schedule_inspection(&inspection.schedule, None, &inspection.prompt);
+            Ok(())
+        }
+        ScheduleCommands::Pause {
+            ref target,
+            ref workspace,
+            ..
+        }
+        | ScheduleCommands::Resume {
+            ref target,
+            ref workspace,
+            ..
+        }
+        | ScheduleCommands::Remove {
+            ref target,
+            ref workspace,
+            ..
+        }
+        | ScheduleCommands::Run {
+            ref target,
+            ref workspace,
+            ..
+        } => {
+            let inspection =
+                remote_schedule_inspection(client, &node, target, workspace.as_deref())?;
+            let (key, operation) = match command {
+                ScheduleCommands::Pause { .. } => (
+                    CommandKey::SchedulePause,
+                    protocol::RoutedOperation::PauseAgentSchedule {
+                        schedule_id: inspection.schedule.id.clone(),
+                        expected_revision: inspection.schedule.revision,
+                    },
+                ),
+                ScheduleCommands::Resume { .. } => (
+                    CommandKey::ScheduleResume,
+                    protocol::RoutedOperation::ResumeAgentSchedule {
+                        schedule_id: inspection.schedule.id.clone(),
+                        expected_revision: inspection.schedule.revision,
+                    },
+                ),
+                ScheduleCommands::Remove { .. } => (
+                    CommandKey::ScheduleRemove,
+                    protocol::RoutedOperation::RemoveAgentSchedule {
+                        schedule_id: inspection.schedule.id.clone(),
+                        expected_revision: inspection.schedule.revision,
+                    },
+                ),
+                ScheduleCommands::Run {
+                    idempotency_key, ..
+                } => (
+                    CommandKey::ScheduleRun,
+                    protocol::RoutedOperation::RunAgentSchedule {
+                        schedule_id: inspection.schedule.id.clone(),
+                        dispatch_key: idempotency_key.unwrap_or_else(Uuid::new_v4).to_string(),
+                    },
+                ),
+                _ => unreachable!(),
+            };
+            let result = client.route_node_operation(&node.node_id, operation)?;
+            match result {
+                protocol::RoutedOperationResult::AgentSchedule { schedule } => {
+                    print_schedule_mutation(key, &schedule, None, json)
+                }
+                protocol::RoutedOperationResult::ScheduledExecution { execution, .. } => {
+                    if json {
+                        print_json(
+                            key,
+                            serde_json::json!({
+                                "node_id": registration.node_id,
+                                "execution": cli_output::execution(&execution),
+                            }),
+                        )
+                    } else {
+                        print_execution(key, &execution, false)
+                    }
+                }
+                protocol::RoutedOperationResult::Ok if key == CommandKey::ScheduleRemove => {
+                    if json {
+                        print_json(
+                            key,
+                            serde_json::json!({
+                                "node_id": registration.node_id,
+                                "removed": true,
+                                "schedule": cli_output::schedule(&inspection.schedule, None),
+                            }),
+                        )
+                    } else {
+                        println!(
+                            "Removed schedule {} on Node {}",
+                            inspection.schedule.name, registration.alias
+                        );
+                        Ok(())
+                    }
+                }
+                _ => Err("remote Node returned an unexpected Schedule response".into()),
+            }
+        }
+    }
+}
+
 fn execution_command(
     command: ExecutionCommands,
     json: bool,
     terminal: Option<&str>,
 ) -> Result<(), Box<dyn Error>> {
     let client = client::connect_or_start()?;
+    if let Some(node) = command.node().map(str::to_owned) {
+        return remote_execution_command(&client, command, &node, json, terminal);
+    }
     let feature = protocol::ProtocolFeature::ScheduledExecutions;
     if !feature.is_supported_by(client.protocol_version()?) {
         return Err(cli_output::failure(
@@ -5868,6 +6415,7 @@ fn execution_command(
             workspace,
             schedule,
             limit,
+            ..
         } => {
             let snapshot = client.snapshot()?;
             let workspace = workspace
@@ -5956,7 +6504,7 @@ fn execution_command(
             }
             Ok(())
         }
-        ExecutionCommands::Inspect { execution_id } => {
+        ExecutionCommands::Inspect { execution_id, .. } => {
             let inspection = client.inspect_scheduled_execution(execution_id)?;
             if json {
                 return print_json(
@@ -5981,6 +6529,7 @@ fn execution_command(
             execution_id,
             after_revision,
             wait_ms,
+            ..
         } => {
             let waited = client.wait_scheduled_execution(execution_id, after_revision, wait_ms)?;
             if json {
@@ -5995,7 +6544,7 @@ fn execution_command(
             println!("Changed: {}", waited.changed);
             print_execution(CommandKey::ExecutionWait, &waited.execution, false)
         }
-        ExecutionCommands::Open { execution_id } => {
+        ExecutionCommands::Open { execution_id, .. } => {
             let opened = open_scheduled_execution(&client, &execution_id, terminal)?;
             if json {
                 return print_json(
@@ -6009,10 +6558,213 @@ fn execution_command(
             println!("{}", opened.message);
             Ok(())
         }
-        ExecutionCommands::Cancel { execution_id } => {
+        ExecutionCommands::Cancel { execution_id, .. } => {
             let execution = client.cancel_scheduled_execution(execution_id)?;
             print_execution(CommandKey::ExecutionCancel, &execution, json)
         }
+    }
+}
+
+fn remote_execution_command(
+    client: &client::Client,
+    command: ExecutionCommands,
+    selector: &str,
+    json: bool,
+    terminal: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
+    let feature = protocol::ProtocolFeature::RemoteSchedules;
+    if !client.supports(feature)? {
+        return Err(cli_output::failure(
+            "unsupported_version",
+            format!(
+                "remote Scheduled Execution management requires local daemon protocol {}",
+                feature.minimum_version()
+            ),
+        ));
+    }
+    let (registration, node) = remote_node_projection(client, selector)?;
+    match command {
+        ExecutionCommands::List {
+            workspace,
+            schedule,
+            limit,
+            ..
+        } => {
+            let workspace = workspace
+                .as_deref()
+                .map(|target| remote_workspace_from_projection(client, &node, target))
+                .transpose()?;
+            let schedule_id = schedule
+                .as_deref()
+                .map(|target| {
+                    remote_schedule_inspection(
+                        client,
+                        &node,
+                        target,
+                        workspace.as_ref().map(|workspace| workspace.id.as_str()),
+                    )
+                    .map(|inspection| inspection.schedule.id)
+                })
+                .transpose()?;
+            let result = client.route_node_operation(
+                &node.node_id,
+                protocol::RoutedOperation::ListScheduledExecutions {
+                    workspace_id: workspace.map(|workspace| workspace.id),
+                    schedule_id,
+                    limit,
+                },
+            )?;
+            let protocol::RoutedOperationResult::ScheduledExecutions {
+                executions,
+                limit,
+                truncated,
+                schedules,
+                schedule_limit,
+                schedules_truncated,
+            } = result
+            else {
+                return Err("remote Node returned an unexpected execution list response".into());
+            };
+            if json {
+                return print_json(
+                    CommandKey::ExecutionList,
+                    serde_json::json!({
+                        "node_id": registration.node_id,
+                        "executions": executions.iter().map(cli_output::execution).collect::<Vec<_>>(),
+                        "limit": limit,
+                        "truncated": truncated,
+                        "schedule_limit": schedule_limit,
+                        "schedules_truncated": schedules_truncated,
+                        "schedules": schedules,
+                    }),
+                );
+            }
+            println!(
+                "NODE\tSTATE\tREASON/OUTCOME\tEXECUTION ID\tSCHEDULE ID\tREQUESTED\tAGENT ID\tSHELL/RUN"
+            );
+            for execution in executions {
+                println!(
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}/{}",
+                    registration.alias,
+                    execution_state(&execution),
+                    execution_result_label(&execution),
+                    execution.id,
+                    execution.schedule_id,
+                    execution.requested_at_ms,
+                    execution.agent_id.as_deref().unwrap_or("-"),
+                    execution.shell_id.as_deref().unwrap_or("-"),
+                    execution.run_id.as_deref().unwrap_or("-"),
+                );
+            }
+            Ok(())
+        }
+        ExecutionCommands::Inspect { execution_id, .. } => {
+            let execution = routed_remote_execution(client, &node.node_id, &execution_id)?;
+            if json {
+                return print_json(
+                    CommandKey::ExecutionInspect,
+                    serde_json::json!({
+                        "node_id": registration.node_id,
+                        "execution": cli_output::execution(&execution),
+                    }),
+                );
+            }
+            println!("Node: {}", registration.alias);
+            print_execution(CommandKey::ExecutionInspect, &execution, false)
+        }
+        ExecutionCommands::Wait {
+            execution_id,
+            after_revision,
+            wait_ms,
+            ..
+        } => {
+            let result = client.route_node_operation(
+                &node.node_id,
+                protocol::RoutedOperation::WaitScheduledExecution {
+                    execution_id,
+                    after_revision,
+                    wait_ms,
+                },
+            )?;
+            let protocol::RoutedOperationResult::ScheduledExecutionWait { execution, changed } =
+                result
+            else {
+                return Err("remote Node returned an unexpected execution wait response".into());
+            };
+            if json {
+                return print_json(
+                    CommandKey::ExecutionWait,
+                    serde_json::json!({
+                        "node_id": registration.node_id,
+                        "changed": changed,
+                        "execution": cli_output::execution(&execution),
+                    }),
+                );
+            }
+            println!("Node: {}", registration.alias);
+            println!("Changed: {changed}");
+            print_execution(CommandKey::ExecutionWait, &execution, false)
+        }
+        ExecutionCommands::Cancel { execution_id, .. } => {
+            let execution = routed_remote_execution(client, &node.node_id, &execution_id)?;
+            let result = client.route_node_operation(
+                &node.node_id,
+                protocol::RoutedOperation::CancelScheduledExecution {
+                    execution_id,
+                    expected_revision: execution.revision,
+                },
+            )?;
+            let protocol::RoutedOperationResult::ScheduledExecution { execution, .. } = result
+            else {
+                return Err("remote Node returned an unexpected cancellation response".into());
+            };
+            if json {
+                return print_json(
+                    CommandKey::ExecutionCancel,
+                    serde_json::json!({
+                        "node_id": registration.node_id,
+                        "execution": cli_output::execution(&execution),
+                    }),
+                );
+            }
+            println!("Node: {}", registration.alias);
+            print_execution(CommandKey::ExecutionCancel, &execution, false)
+        }
+        ExecutionCommands::Open { execution_id, .. } => {
+            let opened = open_remote_scheduled_execution(
+                client,
+                &protocol::QualifiedIdentity::new(&node.node_id, execution_id),
+                terminal,
+            )?;
+            if json {
+                return print_json(
+                    CommandKey::ExecutionOpen,
+                    serde_json::json!({
+                        "node_id": registration.node_id,
+                        "execution": cli_output::execution(&opened.execution),
+                        "target": opened.target,
+                    }),
+                );
+            }
+            println!("{}", opened.message);
+            Ok(())
+        }
+    }
+}
+
+fn routed_remote_execution(
+    client: &client::Client,
+    node_id: &str,
+    execution_id: &str,
+) -> Result<ScheduledExecutionSnapshot, Box<dyn Error>> {
+    match client.route_node_operation(
+        node_id,
+        protocol::RoutedOperation::GetScheduledExecution {
+            execution_id: execution_id.to_owned(),
+        },
+    )? {
+        protocol::RoutedOperationResult::ScheduledExecution { execution, .. } => Ok(execution),
+        _ => Err("remote Node returned an unexpected execution response".into()),
     }
 }
 
@@ -10847,7 +11599,7 @@ mod tests {
                 .validated_version,
             "0.84.1"
         );
-        assert_eq!(protocol::PROTOCOL_VERSION, 36);
+        assert_eq!(protocol::PROTOCOL_VERSION, 37);
     }
 
     #[test]

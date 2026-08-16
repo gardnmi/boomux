@@ -16,6 +16,8 @@
 > reads and guarded management operations. Protocol 35 implements Node-qualified
 > native-terminal PTY attachment and owner-environment remote startup. Protocol
 > 36 implements closed typed owner host services and exact Agent Session resume.
+> Protocol 37 implements Node-qualified remote Schedule creation, management,
+> execution observation, and presentation.
 > Public `boomux --remote TARGET`
 > remains ad hoc.
 
@@ -443,6 +445,21 @@ when it recovers and projects the resulting durable decision. Another Node canno
 substitute its context or continue an external Agent Session implicitly. Future
 failover requires a separate explicit placement and portability contract; the
 initial model neither promises nor emulates it.
+
+Protocol 37 exposes prompt-free projected Schedule and bounded execution state
+only for presentation. Exact inspection, creation, editing, run-now, pause,
+resume, removal, execution list/inspect/wait/cancel, and Open all use a fresh
+identity-verified owner channel. Remote creation validates cwd and an optional
+opaque continuation Session on the owner before committing. Prompt content is
+transient routing input and is never added to the Node cache, projection events,
+notifications, or routing diagnostics. A lost create response is
+`outcome_unknown`; only run-now retries, with its exact durable dispatch key.
+
+Starting and Active Open re-fetches the exact execution, Shell, run, and
+ownership links before launching protocol-35 Node attachment with the
+protocol-26 expected run. Terminal Open freshly resolves the exact linked Agent
+occurrence and uses protocol-36 owner Session resume. Neither path restarts the
+schedule-owned Shell or chooses a later run or Session.
 
 ## Attention And Notifications
 

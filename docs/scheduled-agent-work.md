@@ -51,7 +51,8 @@ The identities remain separate:
 
 ### Accepted Remote Node Ownership
 
-Remote Node federation is not yet implemented. When it ships, a Schedule belongs
+Remote Node federation is implemented for Schedule presentation and management.
+A Schedule belongs
 to the same Node as its owning Workspace and only that Node evaluates its
 trigger, advances its occurrence frontier, admits concurrency, resolves its
 filesystem and integration, or starts its Scheduled Executions. Local projection
@@ -64,6 +65,15 @@ missed-occurrence policy after recovery and reports the durable result; another
 Node cannot synthesize that decision, substitute its environment, or continue
 its external Agent Session. Any future failover requires a separate explicit
 placement and portability contract. See [`remote-nodes.md`](remote-nodes.md).
+
+Protocol 37 routes exact remote Schedule and Scheduled Execution operations to
+the owner. Reduced projected state remains presentation-only. Remote creation
+uses owner-side path and continuation Session validation; prompt content crosses
+only the explicit transient request and never enters the presenting Node cache,
+events, notifications, or diagnostics. Starting and Active Open attaches to the
+freshly revalidated exact run, while terminal Open resumes the freshly resolved
+exact owner Session. Neither operation restarts the reusable schedule Shell or
+selects a newer identity.
 
 ## Schedule-Owned Shell
 

@@ -38,6 +38,9 @@ Protocol 26 adds exact-run attachment, and protocol 27 adds optimistic paused
 schedule-definition updates with prompt-free update events.
 Protocol 32 adds owner-side reduced Node projection cuts and the local
 `node_projection_changed` cache invalidation event.
+Protocol 37 adds remote Schedule management and execution observation without a
+new event kind: owner events remain owner-local and the presenting Node receives
+only its existing projection invalidation.
 
 `boomux agent wait <id> --after-revision <revision>` is the preferred way to
 await one Agent. It returns on a newer accepted durable observation, returns
