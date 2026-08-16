@@ -111,6 +111,26 @@ pub(crate) fn open_command(
     )
 }
 
+pub(crate) fn open_agent_session(
+    desktop_entry: Option<&str>,
+    node_id: Option<&str>,
+    session_id: &str,
+    title: &str,
+) -> Result<(), Box<dyn Error>> {
+    let executable = attachment_executable()?;
+    let mut arguments = vec!["__resume-session".into(), session_id.into()];
+    if let Some(node_id) = node_id {
+        arguments.extend(["--node".into(), node_id.into()]);
+    }
+    launch(
+        desktop_entry,
+        title,
+        None,
+        executable.as_os_str(),
+        &arguments,
+    )
+}
+
 fn terminal_command_arguments(command: &[String]) -> Option<(&OsStr, Vec<OsString>)> {
     let (program, arguments) = command.split_first()?;
     (!program.is_empty()).then(|| {

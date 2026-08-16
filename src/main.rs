@@ -488,6 +488,12 @@ enum Commands {
     },
     #[command(name = "__scheduled-runner", hide = true)]
     ScheduledRunner { schedule_id: String },
+    #[command(name = "__resume-session", hide = true)]
+    ResumeSession {
+        session_id: String,
+        #[arg(long)]
+        node: Option<String>,
+    },
     #[command(name = "__federation-stdio", hide = true)]
     FederationStdio,
 }
@@ -495,7 +501,11 @@ enum Commands {
 #[derive(Subcommand)]
 enum ProjectCommands {
     /// List projects discovered from configured roots
-    List,
+    List {
+        /// Exact registered Node alias or Node ID
+        #[arg(long)]
+        node: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -539,7 +549,12 @@ enum WorkspaceCommands {
         cwd: Option<PathBuf>,
     },
     /// Open terminal windows and invoke launchers
-    Open { target: String },
+    Open {
+        target: String,
+        /// Exact registered Node alias or Node ID
+        #[arg(long)]
+        node: Option<String>,
+    },
     /// Show a workspace and its shells
     Inspect { target: String },
     /// Rename a workspace
@@ -576,6 +591,9 @@ enum LauncherCommands {
         target: String,
         #[arg(long, value_name = "NAME_OR_ID")]
         workspace: Option<String>,
+        /// Exact registered Node alias or Node ID
+        #[arg(long)]
+        node: Option<String>,
     },
     /// Rename a launcher
     Rename {
@@ -595,7 +613,12 @@ enum LauncherCommands {
 #[derive(Subcommand)]
 enum ShellCommands {
     /// Suggest an unused generated name without reserving it
-    SuggestName { workspace: String },
+    SuggestName {
+        workspace: String,
+        /// Exact registered Node alias or Node ID
+        #[arg(long)]
+        node: Option<String>,
+    },
     /// Create a pending shell in a workspace
     Create {
         workspace: String,
@@ -714,10 +737,25 @@ enum SessionCommands {
     List {
         #[arg(long, value_name = "NAME_OR_ID")]
         workspace: Option<String>,
+        /// Exact registered Node alias or Node ID
+        #[arg(long)]
+        node: Option<String>,
     },
     /// Show a projected session by exact opaque ID
     #[command(alias = "get")]
-    Inspect { session_id: String },
+    Inspect {
+        session_id: String,
+        /// Exact registered Node alias or Node ID
+        #[arg(long)]
+        node: Option<String>,
+    },
+    /// Resume one exact projected session in a native terminal
+    Resume {
+        session_id: String,
+        /// Exact registered Node alias or Node ID
+        #[arg(long)]
+        node: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -974,6 +1012,8 @@ enum IntegrationCommands {
     /// Inspect host, asset, and runtime reporting status
     Status {
         integration: Option<integration_management::IntegrationId>,
+        #[arg(long)]
+        node: Option<String>,
     },
     /// Install one integration or every bundled integration
     Install {
@@ -985,6 +1025,8 @@ enum IntegrationCommands {
         force: bool,
         #[arg(long)]
         dry_run: bool,
+        #[arg(long)]
+        node: Option<String>,
     },
     /// Remove one integration or every bundled integration
     Uninstall {
@@ -994,6 +1036,8 @@ enum IntegrationCommands {
         all: bool,
         #[arg(long)]
         force: bool,
+        #[arg(long)]
+        node: Option<String>,
     },
     /// Inspect, install, and explain verification for one integration
     Setup {
@@ -1004,6 +1048,8 @@ enum IntegrationCommands {
         /// Allow replacement of a modified integration asset
         #[arg(long)]
         force: bool,
+        #[arg(long)]
+        node: Option<String>,
     },
     /// Verify authoritative lifecycle reporting in a running host shell
     Verify {
@@ -1012,6 +1058,8 @@ enum IntegrationCommands {
         shell: Option<String>,
         #[arg(long, default_value_t = 30_000)]
         wait_ms: u32,
+        #[arg(long)]
+        node: Option<String>,
     },
 }
 
@@ -1113,6 +1161,7 @@ command_keys! {
     IntegrationVerify => ("integration.verify", Json),
     SessionList => ("session.list", Json),
     SessionInspect => ("session.inspect", Json),
+    SessionResume => ("session.resume", HumanOnly),
     ScheduleCreate => ("schedule.create", Json),
     ScheduleList => ("schedule.list", Json),
     ScheduleInspect => ("schedule.inspect", Json),
@@ -1133,6 +1182,7 @@ command_keys! {
     DaemonStatus => ("daemon.status", Json),
     Daemon => ("daemon", HumanOnly),
     Attach => ("attach", HumanOnly),
+    ResumeSessionInternal => ("resume-session-internal", HumanOnly),
 }
 
 impl Cli {
@@ -1148,7 +1198,7 @@ impl Cli {
             Some(Commands::Read { .. }) => CommandKey::Read,
             Some(Commands::Events { .. }) => CommandKey::Events,
             Some(Commands::Project {
-                command: ProjectCommands::List,
+                command: ProjectCommands::List { .. },
             }) => CommandKey::ProjectList,
             Some(Commands::Workspace {
                 command: WorkspaceCommands::List,
@@ -1228,6 +1278,9 @@ impl Cli {
             Some(Commands::Session {
                 command: SessionCommands::Inspect { .. },
             }) => CommandKey::SessionInspect,
+            Some(Commands::Session {
+                command: SessionCommands::Resume { .. },
+            }) => CommandKey::SessionResume,
             Some(Commands::Schedule {
                 command: ScheduleCommands::Create(..),
             }) => CommandKey::ScheduleCreate,
@@ -1327,6 +1380,7 @@ impl Cli {
             Some(Commands::Open { .. }) => CommandKey::Open,
             Some(Commands::Prompt) => CommandKey::Prompt,
             Some(Commands::Attach { .. }) => CommandKey::Attach,
+            Some(Commands::ResumeSession { .. }) => CommandKey::ResumeSessionInternal,
             Some(Commands::ScheduledRunner { .. }) => CommandKey::Attach,
             Some(Commands::FederationStdio) => CommandKey::Attach,
         }
@@ -1474,6 +1528,10 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
         Some(Commands::ScheduledRunner { schedule_id }) => {
             return scheduled_runner(schedule_id).map(CliExit::Child);
         }
+        Some(Commands::ResumeSession { session_id, node }) => {
+            attach::run_agent_session(session_id, node.as_deref())?;
+            return Ok(CliExit::Success);
+        }
         Some(Commands::FederationStdio) => {
             federation::run_stdio_helper()?;
             return Ok(CliExit::Success);
@@ -1527,8 +1585,8 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
         }) => read_events(after.as_deref(), limit, wait_ms, cli.json),
         Some(Commands::Close { target }) => close_shell(&target),
         Some(Commands::Project {
-            command: ProjectCommands::List,
-        }) => list_projects(cli.json),
+            command: ProjectCommands::List { node },
+        }) => list_projects(cli.json, node.as_deref()),
         Some(Commands::Workspace { command }) => {
             workspace_command(command, cli.json, cli.terminal.as_deref())
         }
@@ -1576,6 +1634,7 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
         Some(Commands::Prompt) => print_prompt_label(),
         Some(Commands::Daemon { command }) => daemon_control(command, cli.json),
         Some(Commands::Attach { .. }) => unreachable!(),
+        Some(Commands::ResumeSession { .. }) => unreachable!(),
         Some(Commands::ScheduledRunner { .. }) => unreachable!(),
         Some(Commands::FederationStdio) => unreachable!(),
         None => dashboard(cli.terminal.as_deref(), None),
@@ -2134,14 +2193,30 @@ fn dashboard(
                         }
                     },
                     |workspace_id, launcher_id| {
-                        let workspace = client
-                            .get_workspace(workspace_id)
-                            .map_err(|error| error.to_string())?;
-                        let launcher = client
-                            .get_launcher(launcher_id)
-                            .map_err(|error| error.to_string())?;
-                        invoke_workspace_launcher(&workspace, &launcher)
-                            .map_err(|error| error.to_string())?;
+                        let workspace =
+                            routed_dashboard_workspace(&client, workspace_id, &local_node_id)?;
+                        let launcher =
+                            routed_dashboard_launcher(&client, launcher_id, &local_node_id)?;
+                        if launcher.workspace_id != workspace.id {
+                            return Err(
+                                "launcher ownership changed; refresh before invoking".into()
+                            );
+                        }
+                        if workspace_id.node_id == local_node_id || workspace_id.node_id.is_empty()
+                        {
+                            invoke_workspace_launcher(&workspace, &launcher)
+                                .map_err(|error| error.to_string())?;
+                        } else {
+                            client
+                                .route_node_host_service(
+                                    &workspace_id.node_id,
+                                    protocol::HostServiceOperation::InvokeLauncher {
+                                        workspace_id: workspace.id.clone(),
+                                        launcher_id: launcher.id.clone(),
+                                    },
+                                )
+                                .map_err(|error| error.to_string())?;
+                        }
                         Ok(format!(
                             "Launched {} from {}",
                             launcher.name, workspace.name
@@ -2751,23 +2826,25 @@ fn focused_terminal_view(focused: protocol::FocusedTerminalSnapshot) -> tui::Foc
 
 fn dispatch_dashboard_open<S, L>(
     target: &tui::OpenTarget,
-    local_node_id: &str,
+    _local_node_id: &str,
     mut open_shell: S,
     mut launch: L,
 ) -> Result<String, String>
 where
     S: FnMut(&protocol::QualifiedIdentity) -> Result<String, String>,
-    L: FnMut(&str, &str) -> Result<String, String>,
+    L: FnMut(&protocol::QualifiedIdentity, &protocol::QualifiedIdentity) -> Result<String, String>,
 {
     match target {
         tui::OpenTarget::Shell(shell_id) => open_shell(shell_id),
         tui::OpenTarget::Launcher {
             workspace_id,
             launcher_id,
-        } => launch(
-            local_dashboard_inner(workspace_id, local_node_id)?,
-            local_dashboard_inner(launcher_id, local_node_id)?,
-        ),
+        } => {
+            if workspace_id.node_id != launcher_id.node_id {
+                return Err("workspace and launcher belong to different Nodes".into());
+            }
+            launch(workspace_id, launcher_id)
+        }
     }
 }
 
@@ -3074,14 +3151,36 @@ fn open_remote_scheduled_execution(
 ) -> Result<String, Box<dyn Error>> {
     let execution =
         routed_dashboard_execution(client, execution_id, "").map_err(io::Error::other)?;
-    let ScheduledExecutionOpenTarget::Run { shell_id, run_id } =
-        scheduled_execution_open_target(&execution)
-            .map_err(|(code, message)| cli_output::failure(code, message))?
-    else {
-        return Err(cli_output::failure(
-            "unsupported_version",
-            "remote Scheduled Execution session resume is unavailable; only active exact runs can attach",
+    let target = scheduled_execution_open_target(&execution)
+        .map_err(|(code, message)| cli_output::failure(code, message))?;
+    if let ScheduledExecutionOpenTarget::Session { agent_id } = target {
+        let result = client.route_node_host_service(
+            &execution_id.node_id,
+            protocol::HostServiceOperation::ResolveAgentSession {
+                workspace_id: execution.workspace_id.clone(),
+                agent_id: agent_id.to_owned(),
+            },
+        )?;
+        let protocol::HostServiceResult::ResolvedAgentSession { session } = result else {
+            return Err("remote Node returned an unexpected Agent Session response".into());
+        };
+        let registration = client.node_registration(&execution_id.node_id)?;
+        terminal::open_agent_session(
+            terminal,
+            Some(&execution_id.node_id),
+            &session.id,
+            &format!(
+                "[{}] {} - {} session",
+                registration.alias, session.workspace_name, session.integration,
+            ),
+        )?;
+        return Ok(format!(
+            "Opened exact {} Agent Session for execution {} on Node {}",
+            session.integration, execution.id, registration.alias,
         ));
+    }
+    let ScheduledExecutionOpenTarget::Run { shell_id, run_id } = target else {
+        unreachable!("session targets return after opening")
     };
     let shell_identity = protocol::QualifiedIdentity::new(&execution_id.node_id, shell_id);
     let shell = routed_dashboard_shell(client, &shell_identity, "").map_err(io::Error::other)?;
@@ -3508,14 +3607,28 @@ fn generated_shell_name<'a>(
 }
 
 fn integration_command(command: IntegrationCommands, json: bool) -> Result<(), Box<dyn Error>> {
+    let node = match &command {
+        IntegrationCommands::List => None,
+        IntegrationCommands::Status { node, .. }
+        | IntegrationCommands::Install { node, .. }
+        | IntegrationCommands::Uninstall { node, .. }
+        | IntegrationCommands::Setup { node, .. }
+        | IntegrationCommands::Verify { node, .. } => node.as_deref(),
+    };
+    if let Some(node) = node {
+        let client = client::connect_or_start()?;
+        let registration = client.node_registration(node)?;
+        return remote_integration_command(&client, &registration, command, json);
+    }
     match command {
         IntegrationCommands::List => list_integrations(json),
-        IntegrationCommands::Status { integration } => integration_status(integration, json),
+        IntegrationCommands::Status { integration, .. } => integration_status(integration, json),
         IntegrationCommands::Install {
             integration,
             all,
             force,
             dry_run,
+            ..
         } => {
             let integrations = if all {
                 integration_management::IntegrationId::all().collect()
@@ -3533,6 +3646,7 @@ fn integration_command(command: IntegrationCommands, json: bool) -> Result<(), B
             integration,
             all,
             force,
+            ..
         } => {
             let integrations = if all {
                 integration_management::IntegrationId::all().collect()
@@ -3550,12 +3664,287 @@ fn integration_command(command: IntegrationCommands, json: bool) -> Result<(), B
             integration,
             yes,
             force,
+            ..
         } => setup_integration(integration, yes, force),
         IntegrationCommands::Verify {
             integration,
             shell,
             wait_ms,
+            ..
         } => verify_integration(integration, shell.as_deref(), wait_ms, json),
+    }
+}
+
+fn remote_integration_command(
+    client: &client::Client,
+    registration: &protocol::NodeRegistrationSnapshot,
+    command: IntegrationCommands,
+    json: bool,
+) -> Result<(), Box<dyn Error>> {
+    let names = |integration: Option<integration_management::IntegrationId>, all: bool| {
+        if all {
+            integration_management::IntegrationId::all()
+                .map(|id| id.spec().key.to_owned())
+                .collect::<Vec<_>>()
+        } else {
+            integration
+                .map(|id| vec![id.spec().key.to_owned()])
+                .unwrap_or_default()
+        }
+    };
+    match command {
+        IntegrationCommands::List => unreachable!(),
+        IntegrationCommands::Status { integration, .. } => {
+            let result = client.route_node_host_service(
+                &registration.node_id,
+                protocol::HostServiceOperation::IntegrationStatus {
+                    integration: integration.map(|id| id.spec().key.to_owned()),
+                },
+            )?;
+            let protocol::HostServiceResult::IntegrationStatus { integrations } = result else {
+                return Err("remote Node returned an unexpected integration status".into());
+            };
+            if json {
+                let integrations = integrations
+                    .into_iter()
+                    .map(|status| serde_json::json!({
+                        "name": status.name,
+                        "display_name": status.display_name,
+                        "package": status.package,
+                        "validated_version": status.validated_version,
+                        "host": { "state": status.host_state, "executable": status.executable, "version": status.version, "compatibility": status.compatibility, "error": status.host_error },
+                        "asset": { "state": status.asset_state, "path": status.path, "error": status.asset_error },
+                        "runtime": { "state": status.runtime_state, "running_processes": status.running_processes, "tracked_processes": status.tracked_processes, "untracked_processes": status.untracked_processes },
+                        "recommended_action": status.recommended_action,
+                    }))
+                    .collect::<Vec<_>>();
+                return print_json(
+                    CommandKey::IntegrationStatus,
+                    serde_json::json!({ "node_id": registration.node_id, "integrations": integrations }),
+                );
+            }
+            println!("Integration status on Node {}", registration.alias);
+            for status in integrations {
+                println!(
+                    "{}\t{}\t{}\t{}",
+                    status.display_name,
+                    status.host_state,
+                    status.asset_state,
+                    status.runtime_state
+                );
+            }
+        }
+        IntegrationCommands::Install {
+            integration,
+            all,
+            force,
+            dry_run,
+            ..
+        } => {
+            let requested = names(integration, all);
+            if requested.is_empty() {
+                return Err(cli_output::failure(
+                    "invalid_argument",
+                    "integration install requires a name or --all",
+                ));
+            }
+            let preview = remote_integration_preview(
+                client,
+                registration,
+                protocol::HostServiceIntegrationAction::Install,
+                requested,
+                force,
+            )?;
+            if dry_run {
+                if json {
+                    return print_json(
+                        CommandKey::IntegrationInstall,
+                        serde_json::json!({ "node_id": registration.node_id, "dry_run": true, "integrations": preview.plans }),
+                    );
+                }
+                for plan in preview.plans {
+                    println!("Plan: {} {}", plan.action, plan.path);
+                }
+            } else {
+                remote_integration_commit(
+                    client,
+                    registration,
+                    preview.token,
+                    CommandKey::IntegrationInstall,
+                    json,
+                )?;
+            }
+        }
+        IntegrationCommands::Uninstall {
+            integration,
+            all,
+            force,
+            ..
+        } => {
+            let requested = names(integration, all);
+            if requested.is_empty() {
+                return Err(cli_output::failure(
+                    "invalid_argument",
+                    "integration uninstall requires a name or --all",
+                ));
+            }
+            let preview = remote_integration_preview(
+                client,
+                registration,
+                protocol::HostServiceIntegrationAction::Uninstall,
+                requested,
+                force,
+            )?;
+            remote_integration_commit(
+                client,
+                registration,
+                preview.token,
+                CommandKey::IntegrationUninstall,
+                json,
+            )?;
+        }
+        IntegrationCommands::Setup {
+            integration,
+            yes,
+            force,
+            ..
+        } => {
+            let preview = remote_integration_preview(
+                client,
+                registration,
+                protocol::HostServiceIntegrationAction::Install,
+                vec![integration.spec().key.to_owned()],
+                force,
+            )?;
+            for plan in &preview.plans {
+                println!("Node: {}", registration.alias);
+                println!("Plan: {} {}", plan.action, plan.path);
+            }
+            if !yes && !confirm_setup("Apply this integration plan on the selected Node?")? {
+                println!("No changes made.");
+                return Ok(());
+            }
+            remote_integration_commit(
+                client,
+                registration,
+                preview.token,
+                CommandKey::IntegrationInstall,
+                false,
+            )?;
+        }
+        IntegrationCommands::Verify {
+            integration,
+            shell,
+            wait_ms,
+            ..
+        } => {
+            let shell_id = shell.ok_or_else(|| {
+                cli_output::failure(
+                    "context_required",
+                    "remote integration verify requires --shell with an exact ID",
+                )
+            })?;
+            let shell = match client.route_node_operation(
+                &registration.node_id,
+                protocol::RoutedOperation::GetShell {
+                    shell_id: shell_id.clone(),
+                },
+            )? {
+                protocol::RoutedOperationResult::Shell { shell } => shell,
+                _ => return Err("remote Node returned an unexpected shell response".into()),
+            };
+            let run_id = shell
+                .run
+                .as_ref()
+                .map(|run| run.id.clone())
+                .ok_or_else(|| {
+                    cli_output::failure("not_found", "remote integration shell has no active run")
+                })?;
+            let deadline = Instant::now() + Duration::from_millis(u64::from(wait_ms));
+            let agents = loop {
+                match client.route_node_host_service(
+                    &registration.node_id,
+                    protocol::HostServiceOperation::VerifyIntegration {
+                        integration: integration.spec().key.to_owned(),
+                        shell_id: shell_id.clone(),
+                        run_id: run_id.clone(),
+                    },
+                ) {
+                    Ok(protocol::HostServiceResult::IntegrationVerified { agents, .. }) => {
+                        break agents;
+                    }
+                    Ok(_) => {
+                        return Err(
+                            "remote Node returned an unexpected verification response".into()
+                        );
+                    }
+                    Err(_error) if Instant::now() < deadline => {
+                        thread::sleep(Duration::from_millis(100))
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            };
+            if json {
+                return print_json(
+                    CommandKey::IntegrationVerify,
+                    serde_json::json!({ "node_id": registration.node_id, "integration": integration.spec().key, "verified": true, "shell_id": shell_id, "run_id": run_id, "agents": agents }),
+                );
+            }
+            println!(
+                "Verified {} on Node {}",
+                integration.spec().display_name,
+                registration.alias
+            );
+        }
+    }
+    Ok(())
+}
+
+fn remote_integration_preview(
+    client: &client::Client,
+    registration: &protocol::NodeRegistrationSnapshot,
+    action: protocol::HostServiceIntegrationAction,
+    integrations: Vec<String>,
+    force: bool,
+) -> Result<protocol::HostIntegrationMutationPreview, Box<dyn Error>> {
+    let result = client.route_node_host_service(
+        &registration.node_id,
+        protocol::HostServiceOperation::PreviewIntegrationMutation {
+            action,
+            integrations,
+            force,
+        },
+    )?;
+    match result {
+        protocol::HostServiceResult::IntegrationMutationPreview { preview } => Ok(preview),
+        _ => Err("remote Node returned an unexpected integration preview".into()),
+    }
+}
+
+fn remote_integration_commit(
+    client: &client::Client,
+    registration: &protocol::NodeRegistrationSnapshot,
+    preview_token: String,
+    command: CommandKey,
+    json: bool,
+) -> Result<(), Box<dyn Error>> {
+    let result = client.route_node_host_service(
+        &registration.node_id,
+        protocol::HostServiceOperation::CommitIntegrationMutation { preview_token },
+    )?;
+    let protocol::HostServiceResult::IntegrationMutation { integrations } = result else {
+        return Err("remote Node returned an unexpected integration mutation".into());
+    };
+    if json {
+        print_json(
+            command,
+            serde_json::json!({ "node_id": registration.node_id, "integrations": integrations }),
+        )
+    } else {
+        for result in integrations {
+            println!("{}: {} {}", result.name, result.result, result.path);
+        }
+        Ok(())
     }
 }
 
@@ -4168,7 +4557,51 @@ fn capabilities(json: bool) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn list_projects(json: bool) -> Result<(), Box<dyn Error>> {
+fn list_projects(json: bool, node: Option<&str>) -> Result<(), Box<dyn Error>> {
+    if let Some(node) = node {
+        let client = client::connect_or_start()?;
+        let registration = client.node_registration(node)?;
+        let protocol::HostServiceResult::Projects { discovery } = client.route_node_host_service(
+            &registration.node_id,
+            protocol::HostServiceOperation::DiscoverProjects,
+        )?
+        else {
+            return Err("remote Node returned an unexpected project response".into());
+        };
+        if json {
+            return print_json(
+                CommandKey::ProjectList,
+                serde_json::json!({
+                    "node_id": registration.node_id,
+                    "roots_configured": discovery.roots_configured,
+                    "projects": discovery.projects,
+                    "warnings": discovery.warnings,
+                }),
+            );
+        }
+        if !discovery.roots_configured {
+            println!(
+                "No project roots configured on Node {}.",
+                registration.alias
+            );
+        } else if discovery.projects.is_empty() {
+            println!("No projects discovered on Node {}.", registration.alias);
+        } else {
+            println!("GROUP\tNAME\tPATH");
+            for project in discovery.projects {
+                println!(
+                    "{}\t{}\t{}",
+                    project.group,
+                    project.name,
+                    project.path.display()
+                );
+            }
+        }
+        for warning in discovery.warnings {
+            eprintln!("warning: {warning}");
+        }
+        return Ok(());
+    }
     let config = config::load()?;
     let roots_configured = !config.projects.roots.is_empty();
     let discovery = projects::discover(&config.projects);
@@ -4297,7 +4730,65 @@ fn workspace_command(
                 client.create_workspace_with_default_cwd(name, default_cwd, Vec::new())?;
             println!("Created workspace {} ({})", workspace.name, workspace.id);
         }
-        WorkspaceCommands::Open { target } => {
+        WorkspaceCommands::Open { target, node } => {
+            if let Some(node) = node {
+                let registration = client.node_registration(node)?;
+                let workspace = match client.route_node_operation(
+                    &registration.node_id,
+                    protocol::RoutedOperation::GetWorkspace {
+                        workspace_id: target.clone(),
+                    },
+                )? {
+                    protocol::RoutedOperationResult::Workspace { workspace } => workspace,
+                    _ => return Err("remote Node returned an unexpected workspace response".into()),
+                };
+                let terminal = effective_terminal(terminal_override)?;
+                let mut failures = Vec::new();
+                for launcher in &workspace.launchers {
+                    if let Err(error) = client.route_node_host_service(
+                        &registration.node_id,
+                        protocol::HostServiceOperation::InvokeLauncher {
+                            workspace_id: workspace.id.clone(),
+                            launcher_id: launcher.id.clone(),
+                        },
+                    ) {
+                        failures.push(format!("launcher {}: {error}", launcher.name));
+                    }
+                }
+                for shell in workspace
+                    .shells
+                    .iter()
+                    .filter(|shell| matches!(shell.owner, protocol::ShellOwner::User))
+                {
+                    if let Err(error) = terminal::open_remote(
+                        terminal.as_deref(),
+                        &registration.node_id,
+                        &shell.id,
+                        &format!(
+                            "[{}] {} - {}",
+                            registration.alias, workspace.name, shell.name
+                        ),
+                        true,
+                    ) {
+                        failures.push(format!("shell {}: {error}", shell.name));
+                    }
+                }
+                if !failures.is_empty() {
+                    return Err(io::Error::other(format!(
+                        "remote workspace opened with failures: {}",
+                        failures.join("; ")
+                    ))
+                    .into());
+                }
+                println!(
+                    "Opened {} launcher(s) and {} shell(s) for {} on Node {}",
+                    workspace.launchers.len(),
+                    workspace_user_shell_count(&workspace),
+                    workspace.name,
+                    registration.alias,
+                );
+                return Ok(());
+            }
             let snapshot = client.snapshot()?;
             let workspace = resolve_workspace_target(&snapshot.workspaces, &target)?;
             let terminal = effective_terminal(terminal_override)?;
@@ -4444,7 +4935,37 @@ fn workspace_command(
 fn shell_command(command: ShellCommands, json: bool) -> Result<(), Box<dyn Error>> {
     let client = client::connect_or_start()?;
     match command {
-        ShellCommands::SuggestName { workspace } => {
+        ShellCommands::SuggestName { workspace, node } => {
+            if let Some(node) = node {
+                let registration = client.node_registration(node)?;
+                let result = client.route_node_host_service(
+                    &registration.node_id,
+                    protocol::HostServiceOperation::SuggestShellName {
+                        workspace_id: workspace.clone(),
+                    },
+                )?;
+                let protocol::HostServiceResult::ShellName { workspace_id, name } = result else {
+                    return Err("remote Node returned an unexpected shell-name response".into());
+                };
+                if json {
+                    return print_json(
+                        CommandKey::ShellSuggestName,
+                        serde_json::json!({
+                            "node_id": registration.node_id,
+                            "workspace_id": workspace_id,
+                            "name": name,
+                        }),
+                    );
+                }
+                println!(
+                    "Suggested shell name {name} for {workspace_id} on Node {}",
+                    registration.alias
+                );
+                println!(
+                    "This suggestion is not reserved; shell creation can still fail if the name is already in use."
+                );
+                return Ok(());
+            }
             let snapshot = client.snapshot()?;
             let workspace = resolve_workspace_target(&snapshot.workspaces, &workspace)?;
             let name =
@@ -4627,7 +5148,52 @@ fn launcher_command(command: LauncherCommands, json: bool) -> Result<(), Box<dyn
             println!("CWD\t{}", launcher.cwd.display());
             println!("COMMAND\t{}", launcher.command.join(" "));
         }
-        LauncherCommands::Invoke { target, workspace } => {
+        LauncherCommands::Invoke {
+            target,
+            workspace,
+            node,
+        } => {
+            if let Some(node) = node {
+                let registration = client.node_registration(node)?;
+                let launcher = match client.route_node_operation(
+                    &registration.node_id,
+                    protocol::RoutedOperation::GetLauncher {
+                        launcher_id: target.clone(),
+                    },
+                )? {
+                    protocol::RoutedOperationResult::Launcher { launcher } => launcher,
+                    _ => return Err("remote Node returned an unexpected launcher response".into()),
+                };
+                if let Some(workspace) = workspace.as_deref()
+                    && workspace != launcher.workspace_id
+                {
+                    return Err(cli_output::failure(
+                        "invalid_argument",
+                        "launcher is not owned by the requested workspace",
+                    ));
+                }
+                let workspace_snapshot = match client.route_node_operation(
+                    &registration.node_id,
+                    protocol::RoutedOperation::GetWorkspace {
+                        workspace_id: launcher.workspace_id.clone(),
+                    },
+                )? {
+                    protocol::RoutedOperationResult::Workspace { workspace } => workspace,
+                    _ => return Err("remote Node returned an unexpected workspace response".into()),
+                };
+                client.route_node_host_service(
+                    &registration.node_id,
+                    protocol::HostServiceOperation::InvokeLauncher {
+                        workspace_id: launcher.workspace_id.clone(),
+                        launcher_id: launcher.id.clone(),
+                    },
+                )?;
+                println!(
+                    "Launched {} from {} on Node {}",
+                    launcher.name, workspace_snapshot.name, registration.alias
+                );
+                return Ok(());
+            }
             let snapshot = client.snapshot()?;
             let launcher = resolve_cli_launcher(&snapshot, &target, workspace.as_deref())?;
             let workspace = snapshot
@@ -4895,9 +5461,18 @@ fn attention_command(command: AttentionCommands, json: bool) -> Result<(), Box<d
 fn session_command(command: SessionCommands, json: bool) -> Result<(), Box<dyn Error>> {
     let client = client::connect_or_start()?;
     validate_session_protocol(client.protocol_version()?)?;
+    let selected_node = match &command {
+        SessionCommands::List { node, .. }
+        | SessionCommands::Inspect { node, .. }
+        | SessionCommands::Resume { node, .. } => node.as_deref(),
+    };
+    if let Some(node) = selected_node {
+        let registration = client.node_registration(node)?;
+        return remote_session_command(&client, &registration, command, json);
+    }
     let snapshot = client.snapshot()?;
     match command {
-        SessionCommands::List { workspace } => {
+        SessionCommands::List { workspace, .. } => {
             let selected_workspace = workspace
                 .as_deref()
                 .map(|target| resolve_workspace_target(&snapshot.workspaces, target))
@@ -4946,7 +5521,7 @@ fn session_command(command: SessionCommands, json: bool) -> Result<(), Box<dyn E
                 );
             }
         }
-        SessionCommands::Inspect { session_id } => {
+        SessionCommands::Inspect { session_id, .. } => {
             let catalog = discover_host_catalog(&snapshot.workspaces);
             let sessions =
                 session_projection::project_snapshot_with_catalog(&snapshot, Some(&catalog));
@@ -4972,6 +5547,134 @@ fn session_command(command: SessionCommands, json: bool) -> Result<(), Box<dyn E
                 );
             }
             print_session(session);
+        }
+        SessionCommands::Resume { session_id, .. } => {
+            let catalog = discover_host_catalog(&snapshot.workspaces);
+            let sessions =
+                session_projection::project_snapshot_with_catalog(&snapshot, Some(&catalog));
+            let session =
+                session_projection::resolve_exact(&sessions, &session_id).map_err(|_| {
+                    cli_output::failure("not_found", format!("session not found: {session_id}"))
+                })?;
+            let (cwd, command) = dashboard_session_resume_plan(session)
+                .map_err(|message| cli_output::failure("invalid_argument", message))?;
+            let terminal = effective_terminal(None)?;
+            terminal::open_command(
+                terminal.as_deref(),
+                &cwd,
+                &format!(
+                    "{} - {} session",
+                    session.workspace_name, session.integration
+                ),
+                &command,
+            )?;
+            println!("Opened exact {} Agent Session", session.integration);
+        }
+    }
+    Ok(())
+}
+
+fn remote_session_command(
+    client: &client::Client,
+    registration: &protocol::NodeRegistrationSnapshot,
+    command: SessionCommands,
+    json: bool,
+) -> Result<(), Box<dyn Error>> {
+    match command {
+        SessionCommands::List { workspace, .. } => {
+            let result = client.route_node_host_service(
+                &registration.node_id,
+                protocol::HostServiceOperation::ListAgentSessions {
+                    workspace_id: workspace,
+                },
+            )?;
+            let protocol::HostServiceResult::AgentSessions { sessions } = result else {
+                return Err("remote Node returned an unexpected session-list response".into());
+            };
+            if json {
+                return print_json(
+                    CommandKey::SessionList,
+                    serde_json::json!({ "node_id": registration.node_id, "sessions": sessions }),
+                );
+            }
+            println!(
+                "WORKSPACE\tDESCRIPTION\tSESSION ID\tINTEGRATION\tSTATE\tLAST ACTIVITY MS\tOCCURRENCES"
+            );
+            for session in sessions {
+                println!(
+                    "{}\t{}\t{}\t{}\t{} ({})\t{}\t{}",
+                    session.workspace_name,
+                    session.description,
+                    session.id,
+                    session.integration,
+                    cli_output::agent_state(session.state),
+                    if session.state_is_current {
+                        "current"
+                    } else {
+                        "last-known"
+                    },
+                    session.last_at_ms,
+                    session.occurrence_count,
+                );
+            }
+        }
+        SessionCommands::Inspect { session_id, .. } => {
+            let result = client.route_node_host_service(
+                &registration.node_id,
+                protocol::HostServiceOperation::InspectAgentSession { session_id },
+            )?;
+            let protocol::HostServiceResult::AgentSession { session } = result else {
+                return Err("remote Node returned an unexpected session response".into());
+            };
+            if json {
+                let mut value = serde_json::to_value(&session.summary)?;
+                let object = value
+                    .as_object_mut()
+                    .expect("session summary serializes as object");
+                object.insert(
+                    "source_cwd".into(),
+                    serde_json::to_value(&session.source_cwd)?,
+                );
+                object.insert(
+                    "occurrences".into(),
+                    serde_json::to_value(&session.occurrences)?,
+                );
+                return print_json(
+                    CommandKey::SessionInspect,
+                    serde_json::json!({ "node_id": registration.node_id, "session": value }),
+                );
+            }
+            println!("NODE\t{}", registration.alias);
+            println!("ID\t{}", session.summary.id);
+            println!("WORKSPACE\t{}", session.summary.workspace_name);
+            println!("DESCRIPTION\t{}", session.summary.description);
+            println!("INTEGRATION\t{}", session.summary.integration);
+            println!("OCCURRENCES\t{}", session.summary.occurrence_count);
+        }
+        SessionCommands::Resume { session_id, .. } => {
+            let result = client.route_node_host_service(
+                &registration.node_id,
+                protocol::HostServiceOperation::InspectAgentSession {
+                    session_id: session_id.clone(),
+                },
+            )?;
+            let protocol::HostServiceResult::AgentSession { session } = result else {
+                return Err("remote Node returned an unexpected session response".into());
+            };
+            let terminal = effective_terminal(None)?;
+            terminal::open_agent_session(
+                terminal.as_deref(),
+                Some(&registration.node_id),
+                &session_id,
+                &format!(
+                    "[{}] {} - {} session",
+                    registration.alias, session.summary.workspace_name, session.summary.integration,
+                ),
+            )?;
+            println!(
+                "Opened exact {} Agent Session on Node {}",
+                session.summary.integration, registration.alias
+            );
         }
     }
     Ok(())
@@ -8138,6 +8841,7 @@ mod tests {
                 command: LauncherCommands::Invoke {
                     target,
                     workspace: Some(workspace),
+                    ..
                 }
             }) if target == "editor" && workspace == "project"
         ));
@@ -8146,7 +8850,7 @@ mod tests {
                 .unwrap()
                 .command,
             Some(Commands::Workspace {
-                command: WorkspaceCommands::Open { target }
+                command: WorkspaceCommands::Open { target, .. }
             }) if target == "project"
         ));
         let cli = Cli::try_parse_from([
@@ -8173,7 +8877,7 @@ mod tests {
                 .unwrap()
                 .command,
             Some(Commands::Shell {
-                command: ShellCommands::SuggestName { workspace }
+                command: ShellCommands::SuggestName { workspace, .. }
             }) if workspace == "project"
         ));
         assert!(matches!(
@@ -8520,7 +9224,8 @@ mod tests {
             list.command,
             Some(Commands::Session {
                 command: SessionCommands::List {
-                    workspace: Some(workspace)
+                    workspace: Some(workspace),
+                    ..
                 }
             }) if workspace == "project"
         ));
@@ -9579,7 +10284,8 @@ mod tests {
             status.command,
             Some(Commands::Integration {
                 command: IntegrationCommands::Status {
-                    integration: Some(integration_management::IntegrationId::Pi)
+                    integration: Some(integration_management::IntegrationId::Pi),
+                    ..
                 }
             })
         ));
@@ -9596,6 +10302,7 @@ mod tests {
                     all: false,
                     force: true,
                     dry_run: false,
+                    ..
                 }
             })
         ));
@@ -9618,6 +10325,7 @@ mod tests {
                     all: false,
                     force: false,
                     dry_run: true,
+                    ..
                 }
             })
         ));
@@ -9639,6 +10347,7 @@ mod tests {
                     integration: Some(integration_management::IntegrationId::Opencode),
                     all: false,
                     force: true,
+                    ..
                 }
             })
         ));
@@ -9655,6 +10364,7 @@ mod tests {
                     integration: integration_management::IntegrationId::Pi,
                     yes: true,
                     force: true,
+                    ..
                 }
             })
         ));
@@ -9684,6 +10394,7 @@ mod tests {
                     integration: integration_management::IntegrationId::Opencode,
                     shell: Some(ref shell),
                     wait_ms: 0,
+                    ..
                 }
             }) if shell == "s1"
         ));
@@ -10136,7 +10847,7 @@ mod tests {
                 .validated_version,
             "0.84.1"
         );
-        assert_eq!(protocol::PROTOCOL_VERSION, 35);
+        assert_eq!(protocol::PROTOCOL_VERSION, 36);
     }
 
     #[test]

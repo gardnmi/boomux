@@ -28,6 +28,7 @@ use crate::desktop_notifications::{
 };
 use crate::fd_transfer::send_descriptor;
 use crate::handoff;
+use crate::host_services::{self, PreparedIntegrationMutation};
 use crate::node_identity::{NodeIdentityLease, NodeIdentityManager};
 use crate::node_projection::NodeProjectionCache;
 use crate::node_registration::NodeRegistrationManager;
@@ -37,7 +38,8 @@ use crate::protocol::{
     AgentScheduleOverlapPolicy, AgentScheduleSession, AgentScheduleSnapshot, AgentScheduleSpec,
     AgentScheduleState, AgentScheduleTrigger, AgentScheduleUpdate, AgentState, AttachFrame,
     DaemonEvent, DaemonEventKind, Envelope, ErrorCode, EventCursor, FocusedTerminalSnapshot,
-    NodeProjectionAgent, NodeProjectionAttention, NodeProjectionExecution, NodeProjectionLauncher,
+    HostIntegrationMutationPreview, HostServiceOperation, HostServiceResult, NodeProjectionAgent,
+    NodeProjectionAttention, NodeProjectionExecution, NodeProjectionLauncher,
     NodeProjectionSchedule, NodeProjectionShell, NodeProjectionSnapshot, NodeProjectionSync,
     NodeProjectionSyncMode, NodeProjectionTransition, NodeProjectionTransitionKind,
     NodeProjectionWorkspace, NotificationDeliveryConfig, Request, Response, RoutedOperation,
@@ -72,6 +74,8 @@ const MAX_TERMINAL_HISTORY_BYTES: usize = 256 * 1024;
 const MAX_TERMINAL_ENV_VALUE: usize = 256;
 const MAX_NAME_BYTES: usize = 256;
 const MAX_AGENT_EVIDENCE_BYTES: usize = 4 * 1024;
+const MAX_HOST_SERVICE_PREVIEWS: usize = 64;
+const HOST_SERVICE_PREVIEW_TTL: Duration = Duration::from_secs(300);
 const MAX_TERMINAL_ROWS: u16 = 1_000;
 pub const MAX_SCHEDULED_EXECUTION_CONCURRENCY: u16 = 64;
 const MAX_TERMINAL_COLS: u16 = 1_000;
@@ -1072,6 +1076,29 @@ fn handle_connection_inner(
         );
     }
 
+    if let Request::ResumeNodeAgentSession {
+        node_id,
+        session_id,
+        profile,
+    } = request.message
+    {
+        return registry.handle_remote_session_resume(
+            stream,
+            response_version,
+            &node_id,
+            &session_id,
+            profile,
+        );
+    }
+
+    if let Request::ResumeAgentSession {
+        session_id,
+        profile,
+    } = request.message
+    {
+        return registry.handle_session_resume(stream, response_version, &session_id, profile);
+    }
+
     if let Request::Attach {
         shell_id,
         takeover,
@@ -1864,12 +1891,12 @@ fn send_registered_node_request(
             "remote Node identity changed",
         ));
     }
-    if !protocol::ProtocolFeature::GuardedNodeRouting
-        .is_supported_by(helper.handshake.core_protocol_version)
+    if let Some(feature) = request.required_feature()
+        && !feature.is_supported_by(helper.handshake.core_protocol_version)
     {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "remote Node does not support guarded routing",
+            format!("remote Node does not support {}", feature.requirement()),
         ));
     }
     let mut remote = ssh_bootstrap::connect_remote(
@@ -1932,6 +1959,7 @@ struct DaemonService {
     events: EventStream,
     runtimes: ShellRuntimeManager,
     remote_attachments: RemoteAttachmentManager,
+    host_service_previews: Mutex<HashMap<String, HostServicePreview>>,
     mutation_lock: Mutex<()>,
     schedule_dispatch_lock: Mutex<()>,
     notification_settings: NotificationDeliverySettings,
@@ -1943,6 +1971,11 @@ struct DaemonService {
     clock: Mutex<Arc<dyn SchedulerClock>>,
     #[cfg(test)]
     fail_after_mutation: AtomicBool,
+}
+
+struct HostServicePreview {
+    created_at: Instant,
+    prepared: PreparedIntegrationMutation,
 }
 
 #[derive(Default)]
@@ -5698,6 +5731,7 @@ impl Default for DaemonService {
                 stopping: AtomicBool::new(false),
             },
             remote_attachments: RemoteAttachmentManager::default(),
+            host_service_previews: Mutex::new(HashMap::new()),
             mutation_lock: Mutex::new(()),
             schedule_dispatch_lock: Mutex::new(()),
             notification_settings: NotificationDeliverySettings::default(),
@@ -6816,6 +6850,315 @@ impl DaemonService {
         })
     }
 
+    fn handle_session_resume(
+        &self,
+        mut stream: UnixStream,
+        response_version: u32,
+        session_id: &str,
+        profile: TerminalProfile,
+    ) -> io::Result<()> {
+        if let Err(error) = validate_terminal_profile(&profile) {
+            return send_response(
+                &mut stream,
+                response_version,
+                DaemonError::from(error).into_response(),
+            );
+        }
+        let snapshot = match self.snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return send_response(
+                    &mut stream,
+                    response_version,
+                    DaemonError::from(error).into_response(),
+                );
+            }
+        };
+        let plan = match host_services::prepare_session_resume(&snapshot, session_id) {
+            Ok(plan) => plan,
+            Err(error) => {
+                return send_response(
+                    &mut stream,
+                    response_version,
+                    DaemonError::from(error).into_response(),
+                );
+            }
+        };
+        let (executable, arguments) = plan.argv.split_first().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "session resume argv is empty")
+        })?;
+        let pty = native_pty_system()
+            .openpty(PtySize {
+                rows: profile.rows,
+                cols: profile.cols,
+                pixel_width: profile.pixel_width,
+                pixel_height: profile.pixel_height,
+            })
+            .map_err(io::Error::other)?;
+        let master = Arc::new(PtyMaster::duplicate(pty.master.as_ref())?);
+        let mut reader = master.try_clone_reader()?;
+        let mut command = CommandBuilder::new(executable);
+        command.args(arguments);
+        command.cwd(&plan.cwd);
+        for name in ["TERM", "COLORTERM", "TERM_PROGRAM", "TERM_PROGRAM_VERSION"] {
+            command.env_remove(name);
+        }
+        for (name, value) in [
+            ("TERM", profile.term.as_deref()),
+            ("COLORTERM", profile.colorterm.as_deref()),
+            ("TERM_PROGRAM", profile.term_program.as_deref()),
+            (
+                "TERM_PROGRAM_VERSION",
+                profile.term_program_version.as_deref(),
+            ),
+        ] {
+            if let Some(value) = value {
+                command.env(name, value);
+            }
+        }
+        for name in [
+            "BOOMUX_WORKSPACE_ID",
+            "BOOMUX_WORKSPACE",
+            "BOOMUX_SHELL_ID",
+            "BOOMUX_SHELL_NAME",
+            "BOOMUX_RUN_ID",
+        ] {
+            command.env_remove(name);
+        }
+        let mut child = pty.slave.spawn_command(command).map_err(io::Error::other)?;
+        drop(pty.slave);
+        drop(pty.master);
+        send_response(
+            &mut stream,
+            response_version,
+            Response::Attached {
+                token: Uuid::new_v4().to_string(),
+                reconstruction: Vec::new(),
+                warning: None,
+            },
+        )?;
+        let mut output_stream = stream.try_clone()?;
+        output_stream.set_write_timeout(Some(RESPONSE_WRITE_TIMEOUT))?;
+        let output = thread::Builder::new()
+            .name(format!("session-resume-output-{session_id}"))
+            .spawn(move || -> io::Result<()> {
+                let mut bytes = vec![0; 16 * 1024];
+                loop {
+                    match reader.read(&mut bytes) {
+                        Ok(0) => break,
+                        Ok(count) => AttachFrame::Output(bytes[..count].to_vec())
+                            .write_to(&mut output_stream)?,
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            thread::sleep(IO_RETRY_DELAY)
+                        }
+                        Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
+                        Err(error) => return Err(error),
+                    }
+                }
+                let _ = AttachFrame::Detached.write_to(&mut output_stream);
+                let _ = output_stream.shutdown(std::net::Shutdown::Both);
+                Ok(())
+            })?;
+        let input_result = 'input: loop {
+            match AttachFrame::read_from(&mut stream) {
+                Ok(AttachFrame::Input(bytes)) => {
+                    let mut remaining = bytes.as_slice();
+                    while !remaining.is_empty() {
+                        match master.write(remaining) {
+                            Ok(0) => break,
+                            Ok(count) => remaining = &remaining[count..],
+                            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                                thread::sleep(IO_RETRY_DELAY)
+                            }
+                            Err(error) => break 'input Err(error),
+                        }
+                    }
+                }
+                Ok(AttachFrame::Resize {
+                    rows,
+                    cols,
+                    pixel_width,
+                    pixel_height,
+                }) => master.resize(PtySize {
+                    rows,
+                    cols,
+                    pixel_width,
+                    pixel_height,
+                })?,
+                Ok(AttachFrame::FocusGained) => {}
+                Ok(AttachFrame::Detached | AttachFrame::ReconnectAck) => break Ok(()),
+                Ok(AttachFrame::Output(_) | AttachFrame::Reconnect) => {
+                    break Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid client frame during Agent Session resume",
+                    ));
+                }
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break Ok(()),
+                Err(error) => break Err(error),
+            }
+        };
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+        let output_result = output
+            .join()
+            .map_err(|_| io::Error::other("session resume output thread panicked"))?;
+        input_result?;
+        output_result
+    }
+
+    fn handle_remote_session_resume(
+        &self,
+        mut stream: UnixStream,
+        response_version: u32,
+        node_id: &str,
+        session_id: &str,
+        profile: TerminalProfile,
+    ) -> io::Result<()> {
+        let registrations = match self.node_registrations() {
+            Ok(registrations) => registrations,
+            Err(error) => {
+                return send_response(&mut stream, response_version, error.into_response());
+            }
+        };
+        let registration = match registrations.inspect(node_id) {
+            Ok(registration) if registration.node_id == node_id => registration,
+            Ok(_) => {
+                return send_response(
+                    &mut stream,
+                    response_version,
+                    error_response(ErrorCode::NotFound, "exact Node registration not found"),
+                );
+            }
+            Err(error) => {
+                return send_response(
+                    &mut stream,
+                    response_version,
+                    node_registration_error(error).into_response(),
+                );
+            }
+        };
+        if !registrations.admit(&registration).unwrap_or(false) {
+            return send_response(
+                &mut stream,
+                response_version,
+                error_response(
+                    ErrorCode::RevisionChanged,
+                    "Node registration changed before session resume",
+                ),
+            );
+        }
+        let result = self.bridge_remote_session_resume(
+            &mut stream,
+            response_version,
+            &registration,
+            session_id,
+            profile,
+        );
+        registrations.release(&registration);
+        result
+    }
+
+    fn bridge_remote_session_resume(
+        &self,
+        stream: &mut UnixStream,
+        response_version: u32,
+        registration: &crate::protocol::NodeRegistrationSnapshot,
+        session_id: &str,
+        profile: TerminalProfile,
+    ) -> io::Result<()> {
+        let target = SshTarget::parse(registration.target.clone())?;
+        let helper = match ssh_bootstrap::plan_remote_bootstrap(
+            target.clone(),
+            SshAuthenticationMode::Batch,
+            HANDSHAKE_TIMEOUT,
+        )? {
+            RemoteBootstrapPlan::Ready(helper) => helper,
+            RemoteBootstrapPlan::Install(_) => {
+                return send_response(
+                    stream,
+                    response_version,
+                    error_response(
+                        ErrorCode::UnsupportedVersion,
+                        "remote helper requires installation",
+                    ),
+                );
+            }
+        };
+        if helper.handshake.node_id != registration.node_id {
+            return send_response(
+                stream,
+                response_version,
+                error_response(
+                    ErrorCode::NodeIdentityChanged,
+                    "remote Node identity changed",
+                ),
+            );
+        }
+        if !protocol::ProtocolFeature::NodeHostServices
+            .is_supported_by(helper.handshake.core_protocol_version)
+        {
+            return send_response(
+                stream,
+                response_version,
+                error_response(
+                    ErrorCode::UnsupportedVersion,
+                    "remote Node does not support exact Agent Session resume",
+                ),
+            );
+        }
+        let remote = ssh_bootstrap::connect_remote(
+            target,
+            helper,
+            SshAuthenticationMode::Batch,
+            HANDSHAKE_TIMEOUT,
+        )?;
+        let (response, mut remote_reader, mut remote_writer) = remote.open_attachment(
+            Request::ResumeAgentSession {
+                session_id: session_id.to_owned(),
+                profile,
+            },
+            HANDSHAKE_TIMEOUT,
+        )?;
+        if !matches!(response, Response::Attached { .. }) {
+            return send_response(stream, response_version, response);
+        }
+        send_response(stream, response_version, response)?;
+        let mut output_connection = stream.try_clone()?;
+        output_connection.set_write_timeout(Some(RESPONSE_WRITE_TIMEOUT))?;
+        let output = thread::Builder::new()
+            .name(format!("remote-session-resume-{session_id}"))
+            .spawn(move || -> io::Result<()> {
+                while let Ok(frame) = remote_reader.read_frame() {
+                    frame.write_to(&mut output_connection)?;
+                    if matches!(frame, AttachFrame::Detached) {
+                        break;
+                    }
+                }
+                let _ = output_connection.shutdown(std::net::Shutdown::Both);
+                Ok(())
+            })?;
+        let input_result = loop {
+            let frame = match AttachFrame::read_from(stream) {
+                Ok(frame) => frame,
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break Ok(()),
+                Err(error) => break Err(error),
+            };
+            let closes = matches!(frame, AttachFrame::Detached);
+            remote_writer.write_frame(&frame, RESPONSE_WRITE_TIMEOUT)?;
+            if closes {
+                break Ok(());
+            }
+        };
+        drop(remote_writer);
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+        let output_result = output
+            .join()
+            .map_err(|_| io::Error::other("remote session output thread panicked"))?;
+        input_result?;
+        output_result
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn handle_remote_attach(
         &self,
@@ -7139,6 +7482,236 @@ impl DaemonService {
         match routed_result(response) {
             Ok(result) => Response::RoutedNodeOperation { result },
             Err(response) => *response,
+        }
+    }
+
+    fn host_service(&self, operation: HostServiceOperation) -> DaemonResult<HostServiceResult> {
+        match operation {
+            HostServiceOperation::DiscoverProjects => Ok(HostServiceResult::Projects {
+                discovery: host_services::discover_projects().map_err(DaemonError::from)?,
+            }),
+            HostServiceOperation::ResolveDirectory { path } => Ok(HostServiceResult::Directory {
+                path: host_services::resolve_directory(&path).map_err(DaemonError::from)?,
+            }),
+            HostServiceOperation::SuggestShellName { workspace_id } => {
+                let workspace = self.workspace(&workspace_id)?.snapshot(&self.durable)?;
+                let name =
+                    host_services::suggest_shell_name(&workspace).map_err(DaemonError::from)?;
+                Ok(HostServiceResult::ShellName { workspace_id, name })
+            }
+            HostServiceOperation::InvokeLauncher {
+                workspace_id,
+                launcher_id,
+            } => {
+                let workspace = self.workspace(&workspace_id)?.snapshot(&self.durable)?;
+                let launcher = self.launcher(&launcher_id)?.snapshot()?;
+                host_services::invoke_launcher(&workspace, &launcher).map_err(DaemonError::from)?;
+                Ok(HostServiceResult::LauncherInvoked {
+                    workspace_id,
+                    launcher_id,
+                })
+            }
+            HostServiceOperation::IntegrationStatus { integration } => {
+                Ok(HostServiceResult::IntegrationStatus {
+                    integrations: host_services::integration_status(
+                        integration.as_deref(),
+                        &self.snapshot()?,
+                    )
+                    .map_err(DaemonError::from)?,
+                })
+            }
+            HostServiceOperation::PreviewIntegrationMutation {
+                action,
+                integrations,
+                force,
+            } => {
+                let prepared =
+                    host_services::prepare_integration_mutation(action, &integrations, force)
+                        .map_err(DaemonError::from)?;
+                let token = Uuid::new_v4().to_string();
+                let mut previews = lock(&self.host_service_previews)?;
+                previews
+                    .retain(|_, preview| preview.created_at.elapsed() < HOST_SERVICE_PREVIEW_TTL);
+                if previews.len() >= MAX_HOST_SERVICE_PREVIEWS {
+                    return Err(DaemonError::lifecycle(
+                        ErrorCode::Busy,
+                        "too many uncommitted integration previews",
+                    ));
+                }
+                previews.insert(
+                    token.clone(),
+                    HostServicePreview {
+                        created_at: Instant::now(),
+                        prepared: prepared.clone(),
+                    },
+                );
+                Ok(HostServiceResult::IntegrationMutationPreview {
+                    preview: HostIntegrationMutationPreview {
+                        token,
+                        action,
+                        force,
+                        plans: prepared.plans,
+                    },
+                })
+            }
+            HostServiceOperation::CommitIntegrationMutation { preview_token } => {
+                let preview = lock(&self.host_service_previews)?.remove(&preview_token);
+                let preview = preview.ok_or_else(|| {
+                    DaemonError::lifecycle(
+                        ErrorCode::NotFound,
+                        "integration preview is missing, expired, or already committed",
+                    )
+                })?;
+                if preview.created_at.elapsed() >= HOST_SERVICE_PREVIEW_TTL {
+                    return Err(DaemonError::lifecycle(
+                        ErrorCode::NotFound,
+                        "integration preview expired",
+                    ));
+                }
+                Ok(HostServiceResult::IntegrationMutation {
+                    integrations: host_services::commit_integration_mutation(&preview.prepared)
+                        .map_err(DaemonError::from)?,
+                })
+            }
+            HostServiceOperation::VerifyIntegration {
+                integration,
+                shell_id,
+                run_id,
+            } => Ok(HostServiceResult::IntegrationVerified {
+                agents: host_services::verify_integration(
+                    &self.snapshot()?,
+                    &integration,
+                    &shell_id,
+                    &run_id,
+                )
+                .map_err(DaemonError::from)?,
+                integration,
+                shell_id,
+                run_id,
+            }),
+            HostServiceOperation::ListAgentSessions { workspace_id } => {
+                let sessions = host_services::sessions(&self.snapshot()?)
+                    .into_iter()
+                    .filter(|session| {
+                        workspace_id
+                            .as_deref()
+                            .is_none_or(|workspace_id| session.workspace_id == workspace_id)
+                    })
+                    .map(|session| host_services::session_summary(&session))
+                    .collect();
+                Ok(HostServiceResult::AgentSessions { sessions })
+            }
+            HostServiceOperation::InspectAgentSession { session_id } => {
+                Ok(HostServiceResult::AgentSession {
+                    session: host_services::inspect_session(&self.snapshot()?, &session_id)
+                        .map_err(DaemonError::from)?,
+                })
+            }
+            HostServiceOperation::ResolveAgentSession {
+                workspace_id,
+                agent_id,
+            } => {
+                let matches = host_services::sessions(&self.snapshot()?)
+                    .into_iter()
+                    .filter(|session| {
+                        session.workspace_id == workspace_id
+                            && session
+                                .occurrences
+                                .iter()
+                                .any(|occurrence| occurrence.agent_id == agent_id)
+                    })
+                    .collect::<Vec<_>>();
+                let [session] = matches.as_slice() else {
+                    return Err(DaemonError::lifecycle(
+                        if matches.is_empty() {
+                            ErrorCode::NotFound
+                        } else {
+                            ErrorCode::AmbiguousTarget
+                        },
+                        "exact Agent occurrence did not resolve to one Agent Session",
+                    ));
+                };
+                Ok(HostServiceResult::ResolvedAgentSession {
+                    session: host_services::session_summary(session),
+                })
+            }
+        }
+    }
+
+    fn route_node_host_service(&self, node_id: &str, operation: HostServiceOperation) -> Response {
+        let registrations = match self.node_registrations() {
+            Ok(registrations) => registrations,
+            Err(error) => return error.into_response(),
+        };
+        let registration = match registrations.inspect(node_id) {
+            Ok(registration) if registration.node_id == node_id => registration,
+            Ok(_) => {
+                return error_response(ErrorCode::NotFound, "exact Node registration not found");
+            }
+            Err(error) => return node_registration_error(error).into_response(),
+        };
+        match registrations.admit(&registration) {
+            Ok(true) => {}
+            Ok(false) => {
+                return error_response(
+                    ErrorCode::RevisionChanged,
+                    "Node registration changed before routing",
+                );
+            }
+            Err(error) => return node_registration_error(error).into_response(),
+        }
+        let mutation = matches!(
+            operation,
+            HostServiceOperation::InvokeLauncher { .. }
+                | HostServiceOperation::CommitIntegrationMutation { .. }
+        );
+        let response = send_registered_node_request(
+            &registration,
+            Request::HostService {
+                operation: operation.clone(),
+            },
+        );
+        registrations.release(&registration);
+        let response = match response {
+            Ok(response) => response,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                return error_response(ErrorCode::NodeIdentityChanged, error.to_string());
+            }
+            Err(error) if error.kind() == io::ErrorKind::Unsupported => {
+                return error_response(ErrorCode::UnsupportedVersion, error.to_string());
+            }
+            Err(error) => {
+                return error_response(
+                    if mutation {
+                        ErrorCode::OutcomeUnknown
+                    } else {
+                        ErrorCode::Timeout
+                    },
+                    format!("Node host service lost its verified channel: {error}"),
+                );
+            }
+        };
+        let current = registrations
+            .with_current(&registration, || Ok(()))
+            .unwrap_or(None)
+            .is_some();
+        if !current {
+            return error_response(
+                if mutation {
+                    ErrorCode::OutcomeUnknown
+                } else {
+                    ErrorCode::RevisionChanged
+                },
+                "Node registration changed while the host service was in flight",
+            );
+        }
+        match response {
+            Response::HostService { result } => Response::HostService { result },
+            Response::Error { .. } => response,
+            _ => error_response(
+                ErrorCode::Internal,
+                "remote Node returned an unexpected host-service response",
+            ),
         }
     }
 
@@ -8651,6 +9224,12 @@ impl DaemonService {
             Request::RouteNodeOperation { node_id, operation } => {
                 Ok(self.route_node_operation(&node_id, operation))
             }
+            Request::HostService { operation } => Ok(Response::HostService {
+                result: self.host_service(operation)?,
+            }),
+            Request::RouteNodeHostService { node_id, operation } => {
+                Ok(self.route_node_host_service(&node_id, operation))
+            }
             Request::Restart | Request::RestartWithNotificationConfig { .. } => {
                 unreachable!("restart is handled before dispatch")
             }
@@ -9234,7 +9813,10 @@ impl DaemonService {
                     }],
                 ))
             }),
-            Request::Attach { .. } | Request::AttachNode { .. } => {
+            Request::Attach { .. }
+            | Request::AttachNode { .. }
+            | Request::ResumeAgentSession { .. }
+            | Request::ResumeNodeAgentSession { .. } => {
                 unreachable!("attach is handled before dispatch")
             }
         }
@@ -9584,6 +10166,7 @@ impl DaemonService {
                 stopping: AtomicBool::new(false),
             },
             remote_attachments: RemoteAttachmentManager::default(),
+            host_service_previews: Mutex::new(HashMap::new()),
             mutation_lock: Mutex::new(()),
             schedule_dispatch_lock: Mutex::new(()),
             notification_settings: NotificationDeliverySettings::default(),
