@@ -13,7 +13,8 @@
 > Node-cache schema 1 implement bounded background reduced projections. Public
 > Protocol 33 adds the local-daemon combined Node snapshot and federated
 > dashboard. Protocol 34 and state schema 13 implement typed exact-Node private
-> reads and guarded management operations. Public `boomux --remote TARGET`
+> reads and guarded management operations. Protocol 35 implements Node-qualified
+> native-terminal PTY attachment and owner-environment remote startup. Public `boomux --remote TARGET`
 > remains ad hoc.
 
 ## Purpose
@@ -381,6 +382,15 @@ trusting the bridge to strip fields. Without the capability, a running remote
 Shell can remain attachable where otherwise compatible, but federation refuses
 to start or restart it and never sends the local attachment environment.
 
+Protocol 35 advertises `remote_pty_attachment` and
+`owner_environment_attachment`. `AttachNode` carries an exact
+`QualifiedIdentity`; the inner `Attach.owner_environment` flag defaults false
+for old peers and is rejected when an arbitrary `UnixEnvironment` is also
+present. Public `open --node SELECTOR` resolves through the local registration
+and launches local presentation with a Node-qualified title. The dashboard opens
+current remote Shell rows and active exact Scheduled Execution runs only when
+the observed owner capabilities include remote attachment.
+
 Remote graceful handoff sends its existing reconnect boundary through the
 bridge. Local graceful handoff asks the local attachment to reconnect and opens
 a fresh SSH stream after finalization. No remote PTY descriptor, process handle,
@@ -480,6 +490,12 @@ versions differ. Handshake round trips, old/new helper pairs, current/minimum
 federation-capable remote daemons, old local clients, response filtering, and
 cursor advancement all require mixed-version tests before capability
 advertisement.
+
+Protocol-34 owners are the attachment compatibility floor for registered
+running Shells because the coordinator performs a fresh exact Shell preflight
+through guarded routing. Starting a pending Shell or restarting an exited Shell
+requires protocol 35. Release-version differences never authorize restarting a
+compatible remote daemon.
 
 Node identity, registrations, and projections use explicit independent schemas.
 Introducing them cannot silently reinterpret authoritative `state.json`. If a

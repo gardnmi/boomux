@@ -4,10 +4,14 @@ use std::path::PathBuf;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 34;
+pub const PROTOCOL_VERSION: u32 = 35;
 pub const MIN_PROTOCOL_VERSION: u32 = 6;
 pub const MAX_CONTROL_FRAME: usize = 8 * 1024 * 1024;
 pub const MAX_ATTACH_FRAME: usize = 1024 * 1024;
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
 
 macro_rules! define_protocol_features {
     ($($variant:ident => ($version:literal, $requirement:literal, [$($capability:literal),* $(,)?])),* $(,)?) => {
@@ -137,6 +141,11 @@ define_protocol_features! {
         "protocol_34",
         "typed_exact_node_routing",
         "guarded_remote_management",
+    ]),
+    RemotePtyAttachment => (35, "remote PTY attachment", [
+        "protocol_35",
+        "remote_pty_attachment",
+        "owner_environment_attachment",
     ]),
 }
 
@@ -1845,6 +1854,17 @@ pub enum Request {
         profile: TerminalProfile,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         environment: Option<UnixEnvironment>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        owner_environment: bool,
+    },
+    AttachNode {
+        identity: QualifiedIdentity,
+        takeover: bool,
+        #[serde(default)]
+        restart_exited: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_run_id: Option<String>,
+        profile: TerminalProfile,
     },
 }
 
@@ -1876,6 +1896,11 @@ impl Request {
             | Self::GuardedPauseAgentSchedule { .. }
             | Self::GuardedResumeAgentSchedule { .. }
             | Self::GuardedRemoveAgentSchedule { .. } => Some(ProtocolFeature::GuardedNodeRouting),
+            Self::AttachNode { .. }
+            | Self::Attach {
+                owner_environment: true,
+                ..
+            } => Some(ProtocolFeature::RemotePtyAttachment),
             Self::WaitScheduledExecution { .. } => {
                 Some(ProtocolFeature::ScheduledExecutionObservation)
             }
@@ -2428,6 +2453,7 @@ mod tests {
                     value: vec![0xff, 0xfe],
                 }],
             }),
+            owner_environment: false,
         });
         let mut bytes = Vec::new();
         write_message(&mut bytes, &value).unwrap();
@@ -2613,8 +2639,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_thirty_three_with_minimum_six() {
-        assert_eq!(PROTOCOL_VERSION, 34);
+    fn protocol_version_is_thirty_five_with_minimum_six() {
+        assert_eq!(PROTOCOL_VERSION, 35);
         assert_eq!(MIN_PROTOCOL_VERSION, 6);
     }
 
@@ -3322,6 +3348,7 @@ mod tests {
                         expected_run_id: None,
                         profile: test_profile(),
                         environment: None,
+                        owner_environment: false,
                     },
                 ],
             ),
@@ -3404,6 +3431,7 @@ mod tests {
                         expected_run_id: None,
                         profile: test_profile(),
                         environment: None,
+                        owner_environment: false,
                     },
                 ],
             ),
@@ -3453,6 +3481,7 @@ mod tests {
                     environment: Some(UnixEnvironment {
                         variables: Vec::new(),
                     }),
+                    owner_environment: false,
                 }],
             ),
             (
@@ -3464,6 +3493,7 @@ mod tests {
                     expected_run_id: Some("r1".into()),
                     profile: test_profile(),
                     environment: None,
+                    owner_environment: false,
                 }],
             ),
             (
@@ -3480,6 +3510,27 @@ mod tests {
                         },
                     },
                 }],
+            ),
+            (
+                35,
+                vec![
+                    Request::Attach {
+                        shell_id: "s1".into(),
+                        takeover: true,
+                        restart_exited: true,
+                        expected_run_id: None,
+                        profile: test_profile(),
+                        environment: None,
+                        owner_environment: true,
+                    },
+                    Request::AttachNode {
+                        identity: QualifiedIdentity::new("node-1", "s1"),
+                        takeover: true,
+                        restart_exited: true,
+                        expected_run_id: None,
+                        profile: test_profile(),
+                    },
+                ],
             ),
         ];
 
@@ -3611,6 +3662,14 @@ mod tests {
                     "protocol_34",
                     "typed_exact_node_routing",
                     "guarded_remote_management",
+                ][..],
+            ),
+            (
+                35,
+                &[
+                    "protocol_35",
+                    "remote_pty_attachment",
+                    "owner_environment_attachment",
                 ][..],
             ),
         ];

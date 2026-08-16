@@ -458,6 +458,9 @@ enum Commands {
     /// Open a shell in a new terminal window
     Open {
         shell_id: String,
+        /// Exact registered Node alias or Node ID
+        #[arg(long)]
+        node: Option<String>,
         #[arg(long)]
         title: Option<String>,
         #[arg(long)]
@@ -474,6 +477,8 @@ enum Commands {
     #[command(name = "__attach", hide = true)]
     Attach {
         shell_id: String,
+        #[arg(long)]
+        node: Option<String>,
         #[arg(long)]
         takeover: bool,
         #[arg(long)]
@@ -1452,12 +1457,14 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
         }
         Some(Commands::Attach {
             shell_id,
+            node,
             takeover,
             restart_exited,
             expected_run_id,
         }) => {
             attach::run(
                 shell_id,
+                node.as_deref(),
                 *takeover,
                 *restart_exited,
                 expected_run_id.as_deref(),
@@ -1553,11 +1560,18 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
         }) => install_pi(force),
         Some(Commands::Open {
             shell_id,
+            node,
             title,
             takeover,
         }) => {
             let terminal = effective_terminal(cli.terminal.as_deref())?;
-            open_shell(&shell_id, title.as_deref(), takeover, terminal.as_deref())
+            open_shell(
+                &shell_id,
+                node.as_deref(),
+                title.as_deref(),
+                takeover,
+                terminal.as_deref(),
+            )
         }
         Some(Commands::Prompt) => print_prompt_label(),
         Some(Commands::Daemon { command }) => daemon_control(command, cli.json),
@@ -2111,8 +2125,13 @@ fn dashboard(
                     &target,
                     &local_node_id,
                     |shell_id| {
-                        open_dashboard_shell(&client, shell_id, terminal.as_deref())
-                            .map_err(|error| error.to_string())
+                        if shell_id.node_id == local_node_id || shell_id.node_id.is_empty() {
+                            open_dashboard_shell(&client, &shell_id.inner_id, terminal.as_deref())
+                                .map_err(|error| error.to_string())
+                        } else {
+                            open_dashboard_remote_shell(&client, shell_id, terminal.as_deref())
+                                .map_err(|error| error.to_string())
+                        }
                     },
                     |workspace_id, launcher_id| {
                         let workspace = client
@@ -2496,11 +2515,16 @@ fn dashboard(
                 tui::DashboardEvent::OperationCompleted(result)
             }
             tui::DashboardEffect::OpenScheduledExecution { execution_id } => {
-                let result = local_dashboard_inner(&execution_id, &local_node_id).and_then(|id| {
-                    open_scheduled_execution(&client, id, terminal.as_deref())
+                let result = if execution_id.node_id == local_node_id
+                    || execution_id.node_id.is_empty()
+                {
+                    open_scheduled_execution(&client, &execution_id.inner_id, terminal.as_deref())
                         .map(|opened| opened.message)
                         .map_err(|error| error.to_string())
-                });
+                } else {
+                    open_remote_scheduled_execution(&client, &execution_id, terminal.as_deref())
+                        .map_err(|error| error.to_string())
+                };
                 tui::DashboardEvent::OperationCompleted(result)
             }
             tui::DashboardEffect::RemoveSchedule(schedule_id) => {
@@ -2732,13 +2756,11 @@ fn dispatch_dashboard_open<S, L>(
     mut launch: L,
 ) -> Result<String, String>
 where
-    S: FnMut(&str) -> Result<String, String>,
+    S: FnMut(&protocol::QualifiedIdentity) -> Result<String, String>,
     L: FnMut(&str, &str) -> Result<String, String>,
 {
     match target {
-        tui::OpenTarget::Shell(shell_id) => {
-            open_shell(local_dashboard_inner(shell_id, local_node_id)?)
-        }
+        tui::OpenTarget::Shell(shell_id) => open_shell(shell_id),
         tui::OpenTarget::Launcher {
             workspace_id,
             launcher_id,
@@ -3045,6 +3067,53 @@ fn open_scheduled_execution(
     })
 }
 
+fn open_remote_scheduled_execution(
+    client: &client::Client,
+    execution_id: &protocol::QualifiedIdentity,
+    terminal: Option<&str>,
+) -> Result<String, Box<dyn Error>> {
+    let execution =
+        routed_dashboard_execution(client, execution_id, "").map_err(io::Error::other)?;
+    let ScheduledExecutionOpenTarget::Run { shell_id, run_id } =
+        scheduled_execution_open_target(&execution)
+            .map_err(|(code, message)| cli_output::failure(code, message))?
+    else {
+        return Err(cli_output::failure(
+            "unsupported_version",
+            "remote Scheduled Execution session resume is unavailable; only active exact runs can attach",
+        ));
+    };
+    let shell_identity = protocol::QualifiedIdentity::new(&execution_id.node_id, shell_id);
+    let shell = routed_dashboard_shell(client, &shell_identity, "").map_err(io::Error::other)?;
+    validate_dashboard_execution_open(&execution, &shell, shell_id, run_id)
+        .map_err(|message| cli_output::failure("busy", message))?;
+    let workspace = match client.route_node_operation(
+        &execution_id.node_id,
+        protocol::RoutedOperation::GetWorkspace {
+            workspace_id: execution.workspace_id.clone(),
+        },
+    )? {
+        protocol::RoutedOperationResult::Workspace { workspace } => workspace,
+        _ => return Err("remote Node returned an unexpected workspace response".into()),
+    };
+    let registration = client.node_registration(&execution_id.node_id)?;
+    terminal::open_remote_exact_run(
+        terminal,
+        &execution_id.node_id,
+        shell_id,
+        run_id,
+        &format!(
+            "[{}] {} - {}",
+            registration.alias, workspace.name, shell.name
+        ),
+        true,
+    )?;
+    Ok(format!(
+        "Opened exact execution {} from schedule {} on Node {}",
+        execution.id, execution.schedule_id, registration.alias
+    ))
+}
+
 fn validate_dashboard_execution_open(
     execution: &ScheduledExecutionSnapshot,
     shell: &ShellSnapshot,
@@ -3270,7 +3339,7 @@ fn open_directory(
             terminal,
         )
     } else {
-        Ok(attach::run(&shell.id, true, false, None)?)
+        Ok(attach::run(&shell.id, None, true, false, None)?)
     };
     if let Err(open_error) = open_result {
         let rollback = if created_workspace {
@@ -6578,6 +6647,47 @@ fn open_dashboard_shell(
     Ok(format!("Opened {} from {}", shell.name, workspace.name))
 }
 
+fn open_dashboard_remote_shell(
+    client: &client::Client,
+    identity: &protocol::QualifiedIdentity,
+    terminal: Option<&str>,
+) -> Result<String, Box<dyn Error>> {
+    let registration = client.node_registration(&identity.node_id)?;
+    let shell = routed_dashboard_shell(client, identity, "").map_err(io::Error::other)?;
+    if matches!(shell.owner, protocol::ShellOwner::Schedule { .. })
+        && shell.status != ShellStatus::Running
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "schedule-owned shell is attachable only while its execution is active",
+        )
+        .into());
+    }
+    let workspace = match client.route_node_operation(
+        &identity.node_id,
+        protocol::RoutedOperation::GetWorkspace {
+            workspace_id: shell.workspace_id.clone(),
+        },
+    )? {
+        protocol::RoutedOperationResult::Workspace { workspace } => workspace,
+        _ => return Err("remote Node returned an unexpected workspace response".into()),
+    };
+    terminal::open_remote(
+        terminal,
+        &identity.node_id,
+        &identity.inner_id,
+        &format!(
+            "[{}] {} - {}",
+            registration.alias, workspace.name, shell.name
+        ),
+        true,
+    )?;
+    Ok(format!(
+        "Opened {} from {} on Node {}",
+        shell.name, workspace.name, registration.alias
+    ))
+}
+
 fn open_workspace(
     workspace: &WorkspaceSnapshot,
     terminal: Option<&str>,
@@ -6669,11 +6779,42 @@ fn invoke_workspace_launcher(
 
 fn open_shell(
     shell_id: &str,
+    node: Option<&str>,
     title: Option<&str>,
     takeover: bool,
     terminal: Option<&str>,
 ) -> Result<(), Box<dyn Error>> {
     let client = client::connect_or_start()?;
+    if let Some(selector) = node {
+        let registration = client.node_registration(selector)?;
+        let identity = protocol::QualifiedIdentity::new(&registration.node_id, shell_id);
+        let shell = routed_dashboard_shell(&client, &identity, "").map_err(io::Error::other)?;
+        if matches!(shell.owner, protocol::ShellOwner::Schedule { .. })
+            && shell.status != ShellStatus::Running
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "schedule-owned shell is attachable only while its execution is active",
+            )
+            .into());
+        }
+        let workspace = match client.route_node_operation(
+            &registration.node_id,
+            protocol::RoutedOperation::GetWorkspace {
+                workspace_id: shell.workspace_id.clone(),
+            },
+        )? {
+            protocol::RoutedOperationResult::Workspace { workspace } => workspace,
+            _ => return Err("remote Node returned an unexpected workspace response".into()),
+        };
+        let title = title.map(str::to_owned).unwrap_or_else(|| {
+            format!(
+                "[{}] {} - {}",
+                registration.alias, workspace.name, shell.name
+            )
+        });
+        return terminal::open_remote(terminal, &registration.node_id, shell_id, &title, takeover);
+    }
     let shell = client.get_shell(shell_id)?;
     if matches!(shell.owner, protocol::ShellOwner::Schedule { .. })
         && shell.status != ShellStatus::Running
@@ -9995,7 +10136,7 @@ mod tests {
                 .validated_version,
             "0.84.1"
         );
-        assert_eq!(protocol::PROTOCOL_VERSION, 34);
+        assert_eq!(protocol::PROTOCOL_VERSION, 35);
     }
 
     #[test]

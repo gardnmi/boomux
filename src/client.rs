@@ -1447,6 +1447,24 @@ impl Client {
         )
     }
 
+    pub fn attach_node(
+        &self,
+        identity: protocol::QualifiedIdentity,
+        takeover: bool,
+        restart_exited: bool,
+        expected_run_id: Option<String>,
+        profile: TerminalProfile,
+    ) -> Result<Attachment> {
+        let (stream, protocol_version, response) = self.send(Request::AttachNode {
+            identity,
+            takeover,
+            restart_exited,
+            expected_run_id,
+            profile,
+        })?;
+        attachment_from_response(stream, protocol_version, response)
+    }
+
     fn attach_with_restart(
         &self,
         shell_id: String,
@@ -1463,21 +1481,30 @@ impl Client {
             expected_run_id,
             profile,
             environment,
+            owner_environment: false,
         })?;
-        match response {
-            Response::Attached {
-                token,
-                reconstruction,
-                warning,
-            } => Ok(Attachment {
-                stream,
-                protocol_version,
-                token,
-                reconstruction,
-                warning,
-            }),
-            other => unexpected(other),
-        }
+        attachment_from_response(stream, protocol_version, response)
+    }
+}
+
+fn attachment_from_response(
+    stream: UnixStream,
+    protocol_version: u32,
+    response: Response,
+) -> Result<Attachment> {
+    match response {
+        Response::Attached {
+            token,
+            reconstruction,
+            warning,
+        } => Ok(Attachment {
+            stream,
+            protocol_version,
+            token,
+            reconstruction,
+            warning,
+        }),
+        other => unexpected(other),
     }
 }
 
@@ -1885,6 +1912,7 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
+            reject_protocol(&listener, 35, 34);
             reject_protocol(&listener, 34, 33);
             reject_protocol(&listener, 33, 32);
             reject_protocol(&listener, 32, 31);
@@ -2040,7 +2068,7 @@ mod tests {
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
-            assert_eq!(request.version, 34);
+            assert_eq!(request.version, 35);
             assert_eq!(request.message, Request::GetNodeIdentity);
             protocol::write_message(
                 &mut stream,
@@ -2054,6 +2082,7 @@ mod tests {
             )
             .unwrap();
 
+            reject_protocol(&listener, 35, 34);
             reject_protocol(&listener, 34, 33);
             reject_protocol(&listener, 33, 32);
             reject_protocol(&listener, 32, 31);
@@ -2103,7 +2132,7 @@ mod tests {
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
-            assert_eq!(request.version, 34);
+            assert_eq!(request.version, 35);
             assert_eq!(request.message, Request::OpenFederationChannel);
             protocol::write_message(
                 &mut stream,
@@ -2117,6 +2146,7 @@ mod tests {
             )
             .unwrap();
 
+            reject_protocol(&listener, 35, 34);
             reject_protocol(&listener, 34, 33);
             reject_protocol(&listener, 33, 32);
             reject_protocol(&listener, 32, 31);
@@ -2149,7 +2179,7 @@ mod tests {
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
-            assert_eq!(request.version, 34);
+            assert_eq!(request.version, 35);
             assert_eq!(request.message, Request::ListNodeRegistrations);
             protocol::write_message(
                 &mut stream,
@@ -2162,6 +2192,7 @@ mod tests {
                 ),
             )
             .unwrap();
+            reject_protocol(&listener, 35, 34);
             reject_protocol(&listener, 34, 33);
             reject_protocol(&listener, 33, 32);
             reject_protocol(&listener, 32, 31);
@@ -2337,6 +2368,7 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
+            reject_protocol(&listener, 35, 34);
             reject_protocol(&listener, 34, 33);
             reject_protocol(&listener, 33, 32);
             reject_protocol(&listener, 32, 31);
@@ -2407,6 +2439,7 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
+            reject_protocol(&listener, 35, 34);
             reject_protocol(&listener, 34, 33);
             reject_protocol(&listener, 33, 32);
             reject_protocol(&listener, 32, 31);

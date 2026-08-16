@@ -107,6 +107,8 @@ projection worker. Protocol 33 exposes cached projections through the separately
 named combined Node snapshot and dashboard while existing snapshot and list
 operations remain local-only. Protocol 34 adds closed typed exact-Node private
 reads and guarded management; unclassified mutation remains unavailable.
+Protocol 35 adds Node-qualified native-terminal attachment and owner-environment
+startup for remote pending and exited Shells.
 
 ## Components
 
@@ -244,6 +246,14 @@ available `workspace-N` name and publishes the generated workspace and shell as
 one operation. Concurrent requests retry name allocation rather than exposing
 an ungrouped shell.
 
+Protocol-35 owner-environment attachment is a mutually exclusive alternative to
+the client Unix environment. The owning daemon constructs startup from its own
+captured environment, then applies the validated terminal profile and
+authoritative Boomux identity. Node-qualified attachment never sends the
+presenting Node's environment. A protocol-34 owner can attach only an
+authoritatively preflighted running Shell; it cannot start or restart one
+remotely.
+
 ### Attachment
 
 `src/attach.rs` runs inside the selected terminal emulator. It enables raw mode,
@@ -287,6 +297,14 @@ the attachment handshake. While holding the ordinary attachment mutation and
 shell lifecycle boundary, the daemon returns `run_changed` unless the shell is
 currently running that exact run. It cannot restart or take over a later run.
 Ordinary shell attachments retain their existing restart behavior.
+
+Node-qualified opens still launch local `xdg-terminal-exec` presentation. Their
+hidden `__attach` command carries the exact owner Node ID and unchanged inner
+Shell ID. The local daemon opens one identity-verified SSH helper channel and
+relays bounded `AttachFrame` values; the remote daemon retains PTY, controller,
+focus, takeover, resize, reconstruction, and exact-run authority. Remote
+transport loss closes only the local attachment and does not synthesize Shell,
+Agent, or Scheduled Execution completion.
 
 No emulator-specific adapter or compositor window ID is required.
 Spawned terminal windows start in independent process sessions with null
@@ -576,6 +594,13 @@ responses never mutate projection cache. Only read-only operations and mutations
 with an owner-side durable idempotency key are retried; every other transport
 ambiguity performs an authoritative postcondition read and otherwise returns
 `outcome_unknown`.
+Protocol 35 adds `AttachNode` as a separate Node-qualified streaming request and
+adds the inner `Attach.owner_environment` mode. The mode is incompatible with an
+arbitrary `UnixEnvironment`; old wire values default it off. Remote handoff
+`Reconnect` frames pass through unchanged. Local handoff reconnects the local
+attachment and drops the old SSH bridge; the replacement discovers and verifies
+a fresh helper channel. No SSH child, remote PTY descriptor, process, cursor, or
+reconstruction state enters the handoff manifest.
 Protocol-25 lists are daemon-bounded, newest-first pages with explicit limit and
 truncation. The request limit is optional on the wire; protocol 25 defaults it to
 100 and clamps it to 1 through 1,000, while protocol-23 and protocol-24 requests
