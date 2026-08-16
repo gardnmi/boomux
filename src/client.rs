@@ -16,11 +16,12 @@ use std::time::Duration;
 use crate::protocol::{
     self, AgentInstanceSnapshot, AgentRegistrationSpec, AgentReport, AgentScheduleInspection,
     AgentScheduleSnapshot, AgentScheduleSpec, AgentScheduleUpdate, DaemonEvent, Envelope,
-    ErrorCode, EventCursor, FocusedTerminalSnapshot, NotificationDeliveryConfig, Request, Response,
-    ScheduledExecutionScheduleProjection, ScheduledExecutionSnapshot, ScheduledOccurrence,
-    ScheduledRunnerResult, ShellSnapshot, ShellSpec, ShellStatus, Snapshot, TerminalPreview,
-    TerminalPreviewLine, TerminalPreviewSpan, TerminalProfile, UnixEnvironment,
-    UnixEnvironmentVariable, WorkspaceLauncherSnapshot, WorkspaceLauncherSpec, WorkspaceSnapshot,
+    ErrorCode, EventCursor, FocusedTerminalSnapshot, NodeRegistrationSnapshot,
+    NotificationDeliveryConfig, Request, Response, ScheduledExecutionScheduleProjection,
+    ScheduledExecutionSnapshot, ScheduledOccurrence, ScheduledRunnerResult, ShellSnapshot,
+    ShellSpec, ShellStatus, Snapshot, TerminalPreview, TerminalPreviewLine, TerminalPreviewSpan,
+    TerminalProfile, UnixEnvironment, UnixEnvironmentVariable, WorkspaceLauncherSnapshot,
+    WorkspaceLauncherSpec, WorkspaceSnapshot,
 };
 
 const CONNECT_ATTEMPTS: usize = 40;
@@ -559,6 +560,79 @@ impl Client {
             expected_node_id: expected_node_id.into(),
         })? {
             Response::NodeIdentity { node_id } => Ok(node_id),
+            response => unexpected(response),
+        }
+    }
+
+    pub fn add_node_registration(
+        &self,
+        alias: impl Into<String>,
+        target: impl Into<String>,
+        node_id: impl Into<String>,
+    ) -> Result<NodeRegistrationSnapshot> {
+        self.node_registration_response(Request::AddNodeRegistration {
+            alias: alias.into(),
+            target: target.into(),
+            node_id: node_id.into(),
+        })
+    }
+
+    pub fn node_registrations(&self) -> Result<Vec<NodeRegistrationSnapshot>> {
+        match self.request(Request::ListNodeRegistrations)? {
+            Response::NodeRegistrations { registrations } => Ok(registrations),
+            response => unexpected(response),
+        }
+    }
+
+    pub fn node_registration(
+        &self,
+        selector: impl Into<String>,
+    ) -> Result<NodeRegistrationSnapshot> {
+        self.node_registration_response(Request::GetNodeRegistration {
+            selector: selector.into(),
+        })
+    }
+
+    pub fn rename_node_registration(
+        &self,
+        selector: impl Into<String>,
+        alias: impl Into<String>,
+        expected_revision: u64,
+    ) -> Result<NodeRegistrationSnapshot> {
+        self.node_registration_response(Request::RenameNodeRegistration {
+            selector: selector.into(),
+            alias: alias.into(),
+            expected_revision,
+        })
+    }
+
+    pub fn retarget_node_registration(
+        &self,
+        selector: impl Into<String>,
+        target: impl Into<String>,
+        node_id: impl Into<String>,
+        expected_revision: u64,
+    ) -> Result<NodeRegistrationSnapshot> {
+        self.node_registration_response(Request::RetargetNodeRegistration {
+            selector: selector.into(),
+            target: target.into(),
+            node_id: node_id.into(),
+            expected_revision,
+        })
+    }
+
+    pub fn forget_node_registration(
+        &self,
+        selector: impl Into<String>,
+    ) -> Result<NodeRegistrationSnapshot> {
+        self.node_registration_response(Request::ForgetNodeRegistration {
+            selector: selector.into(),
+        })
+    }
+
+    fn node_registration_response(&self, request: Request) -> Result<NodeRegistrationSnapshot> {
+        match self.request(request)? {
+            Response::NodeRegistration { registration } => Ok(registration),
             response => unexpected(response),
         }
     }
@@ -1778,6 +1852,7 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
+            reject_protocol(&listener, 31, 30);
             reject_protocol(&listener, 30, 29);
             reject_protocol(&listener, 29, 28);
             reject_protocol(&listener, 28, 27);
@@ -1929,7 +2004,7 @@ mod tests {
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
-            assert_eq!(request.version, 30);
+            assert_eq!(request.version, 31);
             assert_eq!(request.message, Request::GetNodeIdentity);
             protocol::write_message(
                 &mut stream,
@@ -1943,6 +2018,7 @@ mod tests {
             )
             .unwrap();
 
+            reject_protocol(&listener, 31, 30);
             reject_protocol(&listener, 30, 29);
             reject_protocol(&listener, 29, 27);
 
@@ -1988,7 +2064,7 @@ mod tests {
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
-            assert_eq!(request.version, 30);
+            assert_eq!(request.version, 31);
             assert_eq!(request.message, Request::OpenFederationChannel);
             protocol::write_message(
                 &mut stream,
@@ -2002,6 +2078,7 @@ mod tests {
             )
             .unwrap();
 
+            reject_protocol(&listener, 31, 30);
             reject_protocol(&listener, 30, 29);
             reject_protocol(&listener, 29, 28);
             let (mut stream, _) = listener.accept().unwrap();
@@ -2015,6 +2092,46 @@ mod tests {
         let client = Client::from_socket_path(socket);
         assert!(matches!(
             client.open_federation_channel(),
+            Err(ClientError::Protocol(ProtocolError::UnsupportedVersion(_)))
+        ));
+        server.join().unwrap();
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn node_registration_requires_protocol_thirty_one() {
+        let directory = env::temp_dir().join(format!("boomux-client-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let socket = directory.join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+            assert_eq!(request.version, 31);
+            assert_eq!(request.message, Request::ListNodeRegistrations);
+            protocol::write_message(
+                &mut stream,
+                &Envelope::with_version(
+                    30,
+                    Response::Error {
+                        message: "Node registration management requires protocol 31".into(),
+                        code: Some(ErrorCode::UnsupportedVersion),
+                    },
+                ),
+            )
+            .unwrap();
+            reject_protocol(&listener, 31, 30);
+            let (mut stream, _) = listener.accept().unwrap();
+            let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+            assert_eq!(request.version, 30);
+            assert_eq!(request.message, Request::Ping);
+            protocol::write_message(&mut stream, &Envelope::with_version(30, Response::Pong))
+                .unwrap();
+        });
+
+        let client = Client::from_socket_path(socket);
+        assert!(matches!(
+            client.node_registrations(),
             Err(ClientError::Protocol(ProtocolError::UnsupportedVersion(_)))
         ));
         server.join().unwrap();
@@ -2175,6 +2292,7 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
+            reject_protocol(&listener, 31, 30);
             reject_protocol(&listener, 30, 29);
             reject_protocol(&listener, 29, 28);
             reject_protocol(&listener, 28, 27);
@@ -2241,6 +2359,7 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
+            reject_protocol(&listener, 31, 30);
             reject_protocol(&listener, 30, 29);
             reject_protocol(&listener, 29, 28);
             reject_protocol(&listener, 28, 27);

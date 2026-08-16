@@ -8,10 +8,10 @@
 > implements stable local Node identity; protocol 29, handshake version 1, and
 > the hidden stdio helper establish the verified same-socket bridge boundary.
 > Protocol 30 and local `boomux node rekey` implement bounded expected-ID rekey
-> with exact interactive confirmation. Public `boomux --remote TARGET` now
-> provides ad hoc SSH discovery, consent-gated bootstrap, and verified protocol
-> connectivity. Registration, projection, and routed operations are not yet
-> implemented.
+> with exact interactive confirmation. Protocol 31 and registration schema 1
+> implement explicit identity-pinned registration management. Public `boomux
+> --remote TARGET` remains ad hoc; projection and routed resource operations are
+> not yet implemented.
 
 ## Purpose
 
@@ -97,6 +97,14 @@ projection storage. Registration alone is read-only authority: process starts,
 destructive changes, integration installation, Schedule enablement, and remote
 daemon management retain their existing explicit user authorization. Boomux
 never scans SSH configuration and automatically connects to every alias.
+
+The implemented registration CLI is `boomux node add ALIAS TARGET`, `node list`,
+`node inspect`, revision-conditional `node rename` and `node retarget`, and `node
+forget`. Add and retarget complete verified bootstrap before submitting a
+registration mutation to the local daemon. The selected helper path is
+connection-local and is rediscovered on every later connection; it is not a
+registration field. The federation handshake's current `ad_hoc` mode remains a
+transport property and is not reinterpreted as registration persistence.
 
 Interactive setup can use normal OpenSSH authentication and confirmation. It can
 discover or install a compatible remote Boomux binary only after showing the
@@ -418,6 +426,12 @@ Introducing them cannot silently reinterpret authoritative `state.json`. If a
 later implementation places any Node field in that durable representation, it
 must bump `STATE_VERSION` and provide the ordinary explicit migration and cold
 recovery evidence.
+
+Registration schema 1 is stored in owner-only `node_registrations.json` beside,
+but independently from, `state.json` and `node.json`. It stores only alias,
+target, pinned Node ID, registration revision, and tombstone epoch. Atomic
+replacement fsyncs the new file before rename; records, aliases, targets, and
+file size are bounded and list order is deterministic by alias then Node ID.
 
 Every durable federation schema retains its immediately previous representation
 and migrates it explicitly under the appropriate owner lock before advertising

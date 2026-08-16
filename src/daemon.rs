@@ -29,6 +29,7 @@ use crate::desktop_notifications::{
 use crate::fd_transfer::send_descriptor;
 use crate::handoff;
 use crate::node_identity::{NodeIdentityLease, NodeIdentityManager};
+use crate::node_registration::NodeRegistrationManager;
 use crate::protocol::{
     self, AgentAttentionReason, AgentAttentionSnapshot, AgentAuthority, AgentInstanceSnapshot,
     AgentObservationSnapshot, AgentRegistrationSpec, AgentReport, AgentScheduleInspection,
@@ -84,6 +85,7 @@ const TRANSITION_RESTART: u8 = 1;
 const TRANSITION_SHUTDOWN: u8 = 2;
 const TRANSITION_REKEY: u8 = 3;
 const NODE_REKEY_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
+const NODE_REGISTRATION_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NotificationSettings {
@@ -334,6 +336,11 @@ fn run_daemon(
             None
         }
     };
+    let registrations = NodeRegistrationManager::load_from_environment();
+    if let Some(reason) = registrations.unavailable_reason()? {
+        eprintln!("boomux: Node registration routing disabled: {reason}");
+    }
+    registry.node_registrations = Some(registrations);
     registry.startup_environment = capture_current_environment();
     registry.configure_scheduler_clock()?;
     registry.notification_settings = notification_settings.clone();
@@ -1226,6 +1233,32 @@ fn unsupported_request_message(feature: protocol::ProtocolFeature) -> String {
     )
 }
 
+fn node_registration_error(error: io::Error) -> DaemonError {
+    if error.kind() == io::ErrorKind::Unsupported {
+        return DaemonError::lifecycle(ErrorCode::NodeRegistrationUnavailable, error.to_string());
+    }
+    if error.kind() == io::ErrorKind::PermissionDenied
+        && error.to_string().contains("different Boomux Node identity")
+    {
+        return DaemonError::lifecycle(ErrorCode::NodeIdentityChanged, error.to_string());
+    }
+    if error.kind() == io::ErrorKind::InvalidInput
+        && error.to_string().contains("registration revision changed")
+    {
+        return DaemonError::lifecycle(ErrorCode::RevisionChanged, error.to_string());
+    }
+    if error.kind() == io::ErrorKind::TimedOut {
+        return DaemonError::lifecycle(ErrorCode::Busy, error.to_string());
+    }
+    if matches!(
+        error.kind(),
+        io::ErrorKind::PermissionDenied | io::ErrorKind::Other
+    ) {
+        return DaemonError::persistence(error);
+    }
+    DaemonError::from(error)
+}
+
 #[cfg(test)]
 fn response_for_version(response: Response, version: u32) -> Response {
     response_for_version_with_schedule_shells(response, version, &HashSet::new())
@@ -1619,6 +1652,7 @@ fn scheduled_execution_response(
 
 struct DaemonService {
     node_identity: Option<Arc<NodeIdentityManager>>,
+    node_registrations: Option<NodeRegistrationManager>,
     durable: DurableRegistry,
     events: EventStream,
     runtimes: ShellRuntimeManager,
@@ -4971,6 +5005,7 @@ impl Default for DaemonService {
     fn default() -> Self {
         Self {
             node_identity: None,
+            node_registrations: None,
             durable: DurableRegistry {
                 state: Mutex::new(DurableState::default()),
                 store: None,
@@ -5798,6 +5833,24 @@ fn resume_identity(
 }
 
 impl DaemonService {
+    fn node_identity(&self) -> DaemonResult<&Arc<NodeIdentityManager>> {
+        self.node_identity.as_ref().ok_or_else(|| {
+            DaemonError::lifecycle(
+                ErrorCode::NodeIdentityUnavailable,
+                "Boomux Node identity is unavailable",
+            )
+        })
+    }
+
+    fn node_registrations(&self) -> DaemonResult<&NodeRegistrationManager> {
+        self.node_registrations.as_ref().ok_or_else(|| {
+            DaemonError::lifecycle(
+                ErrorCode::NodeRegistrationUnavailable,
+                "Boomux Node registrations are unavailable",
+            )
+        })
+    }
+
     fn clock_now_ms(&self) -> u64 {
         lock(&self.clock)
             .map(|clock| clock.now_ms())
@@ -7049,6 +7102,57 @@ impl DaemonService {
                 unreachable!("federation channel is handled before dispatch")
             }
             Request::RekeyNode { .. } => unreachable!("Node rekey is handled before dispatch"),
+            Request::AddNodeRegistration {
+                alias,
+                target,
+                node_id,
+            } => {
+                let local_node_id = self.node_identity()?.id()?;
+                self.node_registrations()?
+                    .add(alias, target, node_id, &local_node_id)
+                    .map(|registration| Response::NodeRegistration { registration })
+                    .map_err(node_registration_error)
+            }
+            Request::ListNodeRegistrations => self
+                .node_registrations()?
+                .list()
+                .map(|registrations| Response::NodeRegistrations { registrations })
+                .map_err(node_registration_error),
+            Request::GetNodeRegistration { selector } => self
+                .node_registrations()?
+                .inspect(&selector)
+                .map(|registration| Response::NodeRegistration { registration })
+                .map_err(node_registration_error),
+            Request::RenameNodeRegistration {
+                selector,
+                alias,
+                expected_revision,
+            } => self
+                .node_registrations()?
+                .rename(&selector, alias, expected_revision)
+                .map(|registration| Response::NodeRegistration { registration })
+                .map_err(node_registration_error),
+            Request::RetargetNodeRegistration {
+                selector,
+                target,
+                node_id,
+                expected_revision,
+            } => self
+                .node_registrations()?
+                .retarget(
+                    &selector,
+                    target,
+                    &node_id,
+                    expected_revision,
+                    NODE_REGISTRATION_DRAIN_TIMEOUT,
+                )
+                .map(|registration| Response::NodeRegistration { registration })
+                .map_err(node_registration_error),
+            Request::ForgetNodeRegistration { selector } => self
+                .node_registrations()?
+                .forget(&selector, NODE_REGISTRATION_DRAIN_TIMEOUT)
+                .map(|registration| Response::NodeRegistration { registration })
+                .map_err(node_registration_error),
             Request::Restart | Request::RestartWithNotificationConfig { .. } => {
                 unreachable!("restart is handled before dispatch")
             }
@@ -7842,6 +7946,7 @@ impl DaemonService {
         let persistence_writer = PersistenceWriter::start(Arc::clone(&store));
         let registry = Self {
             node_identity: None,
+            node_registrations: None,
             durable: DurableRegistry {
                 state: Mutex::new(state),
                 store: Some(store),

@@ -495,6 +495,28 @@ enum ProjectCommands {
 
 #[derive(Subcommand)]
 enum NodeCommands {
+    /// Verify and persist a remote Boomux Node route
+    Add { alias: String, target: String },
+    /// List registered remote Nodes
+    List,
+    /// Inspect a registered remote Node by alias or exact Node ID
+    Inspect { selector: String },
+    /// Rename a registered remote Node alias at an exact revision
+    Rename {
+        selector: String,
+        alias: String,
+        #[arg(long)]
+        revision: u64,
+    },
+    /// Verify and replace a registered SSH route at an exact revision
+    Retarget {
+        selector: String,
+        target: String,
+        #[arg(long)]
+        revision: u64,
+    },
+    /// Forget a registration without contacting the remote Node
+    Forget { selector: String },
     /// Assign this authority a new Node ID after exact confirmation
     Rekey,
 }
@@ -1052,6 +1074,12 @@ command_keys! {
     WorkspaceList => ("workspace.list", Json),
     WorkspaceInspect => ("workspace.inspect", Json),
     Workspace => ("workspace", HumanOnly),
+    NodeAdd => ("node.add", Json),
+    NodeList => ("node.list", Json),
+    NodeInspect => ("node.inspect", Json),
+    NodeRename => ("node.rename", Json),
+    NodeRetarget => ("node.retarget", Json),
+    NodeForget => ("node.forget", Json),
     NodeRekey => ("node.rekey", HumanOnly),
     ShellSuggestName => ("shell.suggest-name", Json),
     ShellInspect => ("shell.inspect", Json),
@@ -1120,6 +1148,24 @@ impl Cli {
             Some(Commands::Workspace {
                 command: WorkspaceCommands::Inspect { .. },
             }) => CommandKey::WorkspaceInspect,
+            Some(Commands::Node {
+                command: NodeCommands::Add { .. },
+            }) => CommandKey::NodeAdd,
+            Some(Commands::Node {
+                command: NodeCommands::List,
+            }) => CommandKey::NodeList,
+            Some(Commands::Node {
+                command: NodeCommands::Inspect { .. },
+            }) => CommandKey::NodeInspect,
+            Some(Commands::Node {
+                command: NodeCommands::Rename { .. },
+            }) => CommandKey::NodeRename,
+            Some(Commands::Node {
+                command: NodeCommands::Retarget { .. },
+            }) => CommandKey::NodeRetarget,
+            Some(Commands::Node {
+                command: NodeCommands::Forget { .. },
+            }) => CommandKey::NodeForget,
             Some(Commands::Node {
                 command: NodeCommands::Rekey,
             }) => CommandKey::NodeRekey,
@@ -1473,7 +1519,7 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
         Some(Commands::Workspace { command }) => {
             workspace_command(command, cli.json, cli.terminal.as_deref())
         }
-        Some(Commands::Node { command }) => node_command(command),
+        Some(Commands::Node { command }) => node_command(command, cli.json),
         Some(Commands::Shell { command }) => shell_command(command, cli.json),
         Some(Commands::Launcher { command }) => launcher_command(command, cli.json),
         Some(Commands::Agent {
@@ -1519,10 +1565,27 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
 }
 
 fn remote_connect(target: &str) -> Result<(), Box<dyn Error>> {
+    let mut connection = verified_remote_connection(target, true)?;
+    connection.ping()?;
+    println!(
+        "Connected to Boomux Node {} (protocol {}, helper {}, {})",
+        connection.handshake.node_id,
+        connection.handshake.core_protocol_version,
+        connection.handshake.helper_version,
+        connection.executable.as_str(),
+    );
+    Ok(())
+}
+
+fn verified_remote_connection(
+    target: &str,
+    allow_interactive_install: bool,
+) -> Result<ssh_bootstrap::RemoteConnection, Box<dyn Error>> {
     const TIMEOUT: Duration = Duration::from_secs(120);
 
     let target = ssh_bootstrap::SshTarget::parse(target)?;
-    let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
+    let interactive =
+        allow_interactive_install && io::stdin().is_terminal() && io::stdout().is_terminal();
     let authentication = if interactive {
         ssh_bootstrap::SshAuthenticationMode::Interactive
     } else {
@@ -1554,27 +1617,114 @@ fn remote_connect(target: &str) -> Result<(), Box<dyn Error>> {
                 }
             );
             if !confirm_setup("Install Boomux on this remote target?")? {
-                println!("No changes made.");
-                return Ok(());
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "remote Boomux installation was not authorized",
+                )
+                .into());
             }
             ssh_bootstrap::install_remote(&plan, authentication, TIMEOUT)?
         }
     };
-    let mut connection = ssh_bootstrap::connect_remote(target, helper, authentication, TIMEOUT)?;
-    connection.ping()?;
-    println!(
-        "Connected to Boomux Node {} (protocol {}, helper {}, {})",
-        connection.handshake.node_id,
-        connection.handshake.core_protocol_version,
-        connection.handshake.helper_version,
-        connection.executable.as_str(),
-    );
-    Ok(())
+    Ok(ssh_bootstrap::connect_remote(
+        target,
+        helper,
+        authentication,
+        TIMEOUT,
+    )?)
 }
 
-fn node_command(command: NodeCommands) -> Result<(), Box<dyn Error>> {
+fn node_command(command: NodeCommands, json: bool) -> Result<(), Box<dyn Error>> {
     match command {
+        NodeCommands::Add { alias, target } => {
+            let mut remote = verified_remote_connection(&target, !json)?;
+            remote.ping()?;
+            let registration = client::connect_or_start()?.add_node_registration(
+                alias,
+                target,
+                remote.handshake.node_id.clone(),
+            )?;
+            print_node_registration(CommandKey::NodeAdd, &registration, json)
+        }
+        NodeCommands::List => {
+            let registrations = client::connect_or_start()?.node_registrations()?;
+            if json {
+                print_json(CommandKey::NodeList, serde_json::to_value(registrations)?)
+            } else {
+                println!("ALIAS\tTARGET\tNODE ID\tREVISION");
+                for registration in registrations {
+                    println!(
+                        "{}\t{}\t{}\t{}",
+                        registration.alias,
+                        registration.target,
+                        registration.node_id,
+                        registration.revision
+                    );
+                }
+                Ok(())
+            }
+        }
+        NodeCommands::Inspect { selector } => {
+            let registration = client::connect_or_start()?.node_registration(selector)?;
+            print_node_registration(CommandKey::NodeInspect, &registration, json)
+        }
+        NodeCommands::Rename {
+            selector,
+            alias,
+            revision,
+        } => {
+            let registration =
+                client::connect_or_start()?.rename_node_registration(selector, alias, revision)?;
+            print_node_registration(CommandKey::NodeRename, &registration, json)
+        }
+        NodeCommands::Retarget {
+            selector,
+            target,
+            revision,
+        } => {
+            let local = client::connect_or_start()?;
+            let current = local.node_registration(&selector)?;
+            if current.revision != revision {
+                return Err(cli_output::failure(
+                    "revision_changed",
+                    format!(
+                        "Node registration revision changed: expected {revision}, current {}",
+                        current.revision
+                    ),
+                ));
+            }
+            let mut remote = verified_remote_connection(&target, !json)?;
+            remote.ping()?;
+            let registration = local.retarget_node_registration(
+                selector,
+                target,
+                remote.handshake.node_id.clone(),
+                revision,
+            )?;
+            print_node_registration(CommandKey::NodeRetarget, &registration, json)
+        }
+        NodeCommands::Forget { selector } => {
+            let registration = client::connect_or_start()?.forget_node_registration(selector)?;
+            print_node_registration(CommandKey::NodeForget, &registration, json)
+        }
         NodeCommands::Rekey => rekey_node(),
+    }
+}
+
+fn print_node_registration(
+    command: CommandKey,
+    registration: &protocol::NodeRegistrationSnapshot,
+    json: bool,
+) -> Result<(), Box<dyn Error>> {
+    if json {
+        print_json(command, serde_json::to_value(registration)?)
+    } else {
+        println!("Alias: {}", registration.alias);
+        println!("Target: {}", registration.target);
+        println!("Node ID: {}", registration.node_id);
+        println!("Revision: {}", registration.revision);
+        println!("Tombstone epoch: {}", registration.tombstone_epoch);
+        Ok(())
     }
 }
 
@@ -3234,6 +3384,10 @@ fn capabilities(json: bool) -> Result<(), Box<dyn Error>> {
         "run_changed",
         "revision_ahead",
         "idempotency_expired",
+        "node_identity_unavailable",
+        "node_registration_unavailable",
+        "node_identity_changed",
+        "revision_changed",
         "context_required",
         "ambiguous_target",
         "unsupported_integration",
@@ -9111,6 +9265,9 @@ mod tests {
             "desktop_notifications",
             "sound_notifications",
             "integration_management",
+            "protocol_31",
+            "node_registration_management",
+            "pinned_node_identity",
         ] {
             assert!(
                 NON_PROTOCOL_FEATURES.contains(&feature)
@@ -9129,7 +9286,7 @@ mod tests {
                 .validated_version,
             "0.84.1"
         );
-        assert_eq!(protocol::PROTOCOL_VERSION, 30);
+        assert_eq!(protocol::PROTOCOL_VERSION, 31);
     }
 
     #[test]
@@ -9154,6 +9311,12 @@ mod tests {
                 "project.list",
                 "workspace.list",
                 "workspace.inspect",
+                "node.add",
+                "node.list",
+                "node.inspect",
+                "node.rename",
+                "node.retarget",
+                "node.forget",
                 "shell.suggest-name",
                 "shell.inspect",
                 "launcher.list",

@@ -15,6 +15,7 @@
 | `src/daemon.rs` | `DaemonService` coordination over durable registry, event-stream, shell-runtime, persistence, and handoff owners |
 | `src/state_store.rs` | Versioned durable schemas, validation, atomic state storage, and migrations |
 | `src/node_identity.rs` | Stable Node identity persistence, federation admission leases, and bounded rekey drain |
+| `src/node_registration.rs` | Independently versioned remote Node registrations, identity pinning, admission drain, validation, and atomic storage |
 | `src/federation.rs` | Independently versioned federation handshake and verified stdio daemon bridging |
 | `src/ssh_bootstrap.rs` | Validated SSH targets, private invocation configuration, deadline-bound remote discovery, and helper compatibility selection |
 | `src/handoff.rs`, `src/fd_transfer.rs` | Graceful daemon replacement records and Unix descriptor transfer |
@@ -58,7 +59,8 @@
   accepted federation boundary: one owning Node remains authoritative, SSH is a
   route, and local cached projections never authorize mutation or lifecycle
   inference. Ad hoc bootstrap and verified transport are implemented; durable
-  registration, projection, and routed management remain tracked by #173.
+  durable registration is implemented; projection and routed management remain
+  tracked by #173.
 
 ## Product Boundary
 
@@ -95,10 +97,12 @@ not expose a TCP listener or the local daemon socket. Remote work continues when
 the SSH bridge or local presentation disconnects. The complete accepted contract
 and deferred behavior are in [`remote-nodes.md`](remote-nodes.md).
 
-Public `boomux --remote TARGET` currently performs ad hoc bootstrap only. It
+Public `boomux --remote TARGET` performs ad hoc bootstrap only. It
 discovers and verifies a compatible helper, or interactively installs one before
-opening and pinging a daemon-bound stdio channel. It creates no registration or
-projection and does not yet route dashboard or management operations.
+opening and pinging a daemon-bound stdio channel. Explicit `boomux node add
+ALIAS TARGET` and revision-conditional registration management persist an
+identity-pinned route separately; neither mode creates a projection or routes
+dashboard or resource-management operations yet.
 
 ## Components
 
@@ -844,6 +848,20 @@ local human-only workflow: it refuses noninteractive input and requires the
 operator to type the exact current Node ID before sending the conditional
 request.
 
+Protocol 31 and Node registration schema 1 add explicit `node add`, `list`,
+`inspect`, `rename`, `retarget`, and `forget`. Registration records contain only
+the bounded local alias, exact SSH target, pinned Node ID, monotonic registration
+revision, and tombstone epoch in owner-only `node_registrations.json`; discovered
+helper paths and credentials are never persisted. Add and retarget use the
+authenticated protocol-29 bootstrap before commit. Retarget must prove the
+existing pinned identity and rename/retarget require the exact current revision.
+Forget performs only a local prepare/drain/commit and cannot contact or stop the
+remote authority. Malformed, future-version, oversized, or insecure registration
+files are preserved and disable registration routing while the local durable
+registry remains available. State schema remains 12, and the federation
+handshake continues to describe its transport as `ad_hoc` without assigning that
+field durable registration semantics.
+
 Cron day matching preserves syntactic wildcard origin: `*/n` is wildcard-origin,
 while numeric lists and ranges remain restricted even when they cover the full
 field. Trigger acceptance proves at least one occurrence across a Gregorian
@@ -907,15 +925,16 @@ by PTY readers. Shell close, workspace close, and shutdown use one lifecycle
 transaction policy: prepare every runtime stop, finalize visible lifecycle
 changes, apply the operation-specific durable removal, persist, then publish.
 
-The accepted remote federation coordinator remains outside this core durable
+The remote federation coordinator remains outside this core durable
 order. Its order is daemon transition, Node mutation gate, Node persistence gate,
 local `EventStream` transition frontier, then Node registry/cache state. It never
 acquires core durable, shell lifecycle, runtime, or terminal locks and never
 retains a federation lock during SSH I/O. A copied registration revision is
 revalidated only after network work and before an atomic cache or registration
-commit. Notification qualification and delivery occur after every federation and
-event lock is released. This is an accepted future invariant; each federation
-delivery issue must preserve the applicable part as the coordinator is built.
+commit. Registration changes atomically persist before replacing their in-memory
+generation. Notification qualification and delivery occur after every federation
+and event lock is released. Later federation delivery issues must preserve the
+applicable order as the coordinator is extended.
 
 Failure at any stage restores removed entities and exhaustively compensates every
 stopped shell. Already-running processes cannot be resurrected, so their
