@@ -94,6 +94,10 @@ New, separately named combined read-only surfaces can expose Node identity,
 health, observation time, and stale state, while every actionable resource is
 identified structurally by both its owning Node ID and unchanged resource ID.
 Names are resolved only within an explicit Node context when they are not local.
+`workspace open TARGET --node NODE` accepts the local Node only by exact Node ID,
+never by its display alias `local`, so an unlinked local owner Workspace cannot
+be confused with a same-ID global Workspace. Registered remote Nodes retain
+documented exact-ID or alias resolution.
 
 Cached remote projections can satisfy only documented prompt-free summary reads.
 Exact private inspection, terminal output, revision waits, and all mutations
@@ -123,6 +127,7 @@ The following commands support `--json`:
 - `boomux project list`
 - `boomux workspace list`
 - `boomux workspace inspect`
+- `boomux workspace create-project`
 - `boomux node add`
 - `boomux node list`
 - `boomux node inspect`
@@ -165,8 +170,8 @@ The following commands support `--json`:
 - `boomux integration verify <opencode|pi>`
 - `boomux daemon status`
 
-JSON mutations are deliberately narrow. Node registration add, rename, retarget,
-and forget; Agent register, ensure, and report;
+JSON mutations are deliberately narrow. Atomic global Workspace project creation;
+Node registration add, rename, retarget, and forget; Agent register, ensure, and report;
 attention acknowledgment; schedule create, pause, resume, remove, and run;
 execution open and cancellation; and
 integration install and uninstall support the contract. Other mutation commands
@@ -197,6 +202,12 @@ Command payloads are:
 - `workspace.inspect`: on protocol 38, a global target returns coordinator
   `id`, `revision`, `name`, `closing`, and explicit placements. External or
   older local targets retain the owner Workspace inspection shape.
+- `workspace.create-project`: protocol-38-only atomic creation of one global
+  Workspace, its selected Node placement, and its first generated Shell. It
+  requires `--cwd`; `--node` is optional only when exactly one owner is eligible.
+  The response contains exact `node_id`, coordinator `workspace`, and owner
+  `shell` snapshots. The operation uses the same durable prepared request as the
+  dashboard and never exposes an intermediate empty Workspace.
 - `node.list`: an alias-then-Node-ID ordered array of registration objects.
 - `node.add`, `node.inspect`, `node.rename`, `node.retarget`, and `node.forget`:
   one registration object with `alias`, exact `target`, pinned `node_id`,
@@ -223,7 +234,8 @@ Command payloads are:
   Protocol-37 and older responses omit both additive arrays.
 - `shell.suggest-name`: exact resolved `workspace_id` plus a nonempty generated
   `name` that does not match any shell name in that workspace at observation
-  time.
+  time. Protocol-38 responses also include exact `node_id` for local and routed
+  owners; older local responses omit it.
 - `shell.inspect`: one `shell` object.
 - `launcher.list`: workspace identity plus a `launchers` array.
 - `launcher.inspect`: one `launcher` object.
@@ -361,6 +373,10 @@ selection error listing disabled health reasons. The owner-local cwd is resolved
 on that Node. Exact argv arrays and private Schedule prompts are unchanged by
 coordination. `workspace open`, `close`, `rename`, `list`, and `inspect` resolve
 global IDs or names before considering external local records.
+`workspace create-project NAME --cwd PATH [--node NODE]` performs the dashboard's
+single prepared global Workspace plus first-Shell operation and returns their
+exact identities under `--json`; it is not equivalent to `workspace create`
+followed by `shell create`.
 `workspace adopt TARGET --node NODE`, `workspace link GLOBAL OWNER --node NODE`,
 and `workspace retry GLOBAL` expose guarded adoption, linking, and unresolved
 close retry without requiring the TUI. Repeating `workspace close` for a closing

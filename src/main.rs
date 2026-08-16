@@ -551,6 +551,15 @@ enum WorkspaceCommands {
         #[arg(long)]
         cwd: Option<PathBuf>,
     },
+    /// Create a global Workspace and its first Shell atomically
+    CreateProject {
+        name: String,
+        #[arg(long)]
+        cwd: PathBuf,
+        /// Exact eligible Node alias or Node ID
+        #[arg(long)]
+        node: Option<String>,
+    },
     /// Open terminal windows and invoke launchers
     Open {
         target: String,
@@ -1220,6 +1229,7 @@ command_keys! {
     ProjectList => ("project.list", Json),
     WorkspaceList => ("workspace.list", Json),
     WorkspaceInspect => ("workspace.inspect", Json),
+    WorkspaceCreateProject => ("workspace.create-project", Json),
     Workspace => ("workspace", HumanOnly),
     NodeAdd => ("node.add", Json),
     NodeList => ("node.list", Json),
@@ -1298,6 +1308,9 @@ impl Cli {
             Some(Commands::Workspace {
                 command: WorkspaceCommands::Inspect { .. },
             }) => CommandKey::WorkspaceInspect,
+            Some(Commands::Workspace {
+                command: WorkspaceCommands::CreateProject { .. },
+            }) => CommandKey::WorkspaceCreateProject,
             Some(Commands::Node {
                 command: NodeCommands::Add { .. },
             }) => CommandKey::NodeAdd,
@@ -4235,6 +4248,27 @@ fn resolve_combined_node<'a>(
     }
 }
 
+fn resolve_workspace_open_node<'a>(
+    nodes: &'a [protocol::CombinedNode],
+    selector: &str,
+) -> Result<&'a protocol::CombinedNode, Box<dyn Error>> {
+    let matches = nodes
+        .iter()
+        .filter(|node| node.node_id == selector || (!node.local && node.alias == selector))
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [node] => Ok(*node),
+        [] => Err(cli_output::failure(
+            "not_found",
+            format!("Node not found: {selector}"),
+        )),
+        _ => Err(cli_output::failure(
+            "ambiguous_target",
+            format!("Node selector is ambiguous: {selector}"),
+        )),
+    }
+}
+
 fn resolve_external_workspace<'a>(
     workspaces: &'a [protocol::ExternalWorkspaceSnapshot],
     node_id: &str,
@@ -4252,6 +4286,85 @@ fn resolve_external_workspace<'a>(
                 format!("unlinked owner Workspace not found: {target}"),
             )
         })
+}
+
+fn select_eligible_workspace_owner(
+    nodes: &[protocol::CombinedNode],
+    node_selector: Option<&str>,
+) -> Result<protocol::CombinedNode, Box<dyn Error>> {
+    if let Some(selector) = node_selector {
+        let node = resolve_combined_node(nodes, selector)?;
+        if !node.workspace_owner_eligible {
+            return Err(cli_output::failure(
+                "busy",
+                format!(
+                    "Node {} is unavailable for Workspace placement: {}",
+                    node.alias,
+                    node.workspace_owner_unavailable_reason
+                        .as_deref()
+                        .unwrap_or("unavailable")
+                ),
+            ));
+        }
+        return Ok(node.clone());
+    }
+    let eligible = nodes
+        .iter()
+        .filter(|node| node.workspace_owner_eligible)
+        .collect::<Vec<_>>();
+    let [node] = eligible.as_slice() else {
+        let status = nodes
+            .iter()
+            .map(|node| {
+                format!(
+                    "{} ({})",
+                    node.alias,
+                    if node.workspace_owner_eligible {
+                        "eligible"
+                    } else {
+                        node.workspace_owner_unavailable_reason
+                            .as_deref()
+                            .unwrap_or("unavailable")
+                    }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(cli_output::failure(
+            "ambiguous_target",
+            format!(
+                "Workspace resource placement requires --node when zero or multiple eligible Nodes exist; Nodes: {status}"
+            ),
+        ));
+    };
+    Ok((*node).clone())
+}
+
+fn workspace_create_project_json(
+    workspace: &protocol::GlobalWorkspaceSnapshot,
+    node_id: &str,
+    shell: &protocol::ShellSnapshot,
+) -> serde_json::Value {
+    serde_json::json!({
+        "workspace": workspace,
+        "node_id": node_id,
+        "shell": cli_output::shell(shell, Some(&workspace.name)),
+    })
+}
+
+fn shell_suggestion_json(
+    workspace_id: &str,
+    name: &str,
+    node_id: Option<&str>,
+) -> serde_json::Value {
+    let mut data = serde_json::json!({
+        "workspace_id": workspace_id,
+        "name": name,
+    });
+    if let Some(node_id) = node_id {
+        data["node_id"] = serde_json::Value::String(node_id.to_owned());
+    }
+    data
 }
 
 struct CoordinatedOwnerSelection {
@@ -4275,69 +4388,7 @@ fn select_coordinated_owner(
     else {
         return Ok(None);
     };
-    let node = if let Some(selector) = node_selector {
-        let matches = combined
-            .nodes
-            .iter()
-            .filter(|node| node.node_id == selector || node.alias == selector)
-            .collect::<Vec<_>>();
-        let [node] = matches.as_slice() else {
-            return Err(cli_output::failure(
-                if matches.is_empty() {
-                    "not_found"
-                } else {
-                    "ambiguous_target"
-                },
-                format!("Node selector did not resolve uniquely: {selector}"),
-            ));
-        };
-        if !node.workspace_owner_eligible {
-            return Err(cli_output::failure(
-                "busy",
-                format!(
-                    "Node {} is unavailable for Workspace placement: {}",
-                    node.alias,
-                    node.workspace_owner_unavailable_reason
-                        .as_deref()
-                        .unwrap_or("unavailable")
-                ),
-            ));
-        }
-        (*node).clone()
-    } else {
-        let eligible = combined
-            .nodes
-            .iter()
-            .filter(|node| node.workspace_owner_eligible)
-            .collect::<Vec<_>>();
-        let [node] = eligible.as_slice() else {
-            let status = combined
-                .nodes
-                .iter()
-                .map(|node| {
-                    format!(
-                        "{} ({})",
-                        node.alias,
-                        if node.workspace_owner_eligible {
-                            "eligible"
-                        } else {
-                            node.workspace_owner_unavailable_reason
-                                .as_deref()
-                                .unwrap_or("unavailable")
-                        }
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            return Err(cli_output::failure(
-                "ambiguous_target",
-                format!(
-                    "Workspace resource placement requires --node when zero or multiple eligible Nodes exist; Nodes: {status}"
-                ),
-            ));
-        };
-        (*node).clone()
-    };
+    let node = select_eligible_workspace_owner(&combined.nodes, node_selector)?;
     let placement = workspace
         .placements
         .iter()
@@ -5742,9 +5793,58 @@ fn workspace_command(
                 client.create_workspace_with_default_cwd(name, default_cwd, Vec::new())?;
             println!("Created workspace {} ({})", workspace.name, workspace.id);
         }
+        WorkspaceCommands::CreateProject { name, cwd, node } => {
+            if !client.supports(protocol::ProtocolFeature::GlobalWorkspaces)? {
+                return Err(cli_output::failure(
+                    "unsupported_version",
+                    "global Workspace project creation requires daemon protocol 38 or newer",
+                ));
+            }
+            let name = cli_name(name, "workspace")?;
+            let combined = client.combined_node_snapshot(None)?;
+            let node = select_eligible_workspace_owner(&combined.nodes, node.as_deref())?;
+            let cwd = resolve_owner_directory(&client, &node, cwd)?;
+            let shell_name = generated_shell_name(std::iter::empty())?;
+            let (workspace, shell) = client.create_global_workspace_with_shell(
+                Uuid::new_v4().to_string(),
+                Uuid::new_v4().to_string(),
+                &name,
+                &node.node_id,
+                Uuid::new_v4().to_string(),
+                cwd.clone(),
+                Uuid::new_v4().to_string(),
+                shell_spec(shell_name, &cwd, &[]),
+            )?;
+            if json {
+                return print_json(
+                    CommandKey::WorkspaceCreateProject,
+                    workspace_create_project_json(&workspace, &node.node_id, &shell),
+                );
+            }
+            println!(
+                "Created workspace {} ({}) with shell {} ({}) on Node {}",
+                workspace.name, workspace.id, shell.name, shell.id, node.alias
+            );
+        }
         WorkspaceCommands::Open { target, node } => {
-            if let Some(node) = node {
-                let registration = client.node_registration(node)?;
+            if let Some(node_selector) = node {
+                let combined = client.combined_node_snapshot(None)?;
+                let selected_node = resolve_workspace_open_node(&combined.nodes, &node_selector)?;
+                if selected_node.local {
+                    let snapshot = client.snapshot()?;
+                    let workspace = resolve_workspace_target(&snapshot.workspaces, &target)?;
+                    let terminal = effective_terminal(terminal_override)?;
+                    open_workspace(workspace, terminal.as_deref())?;
+                    println!(
+                        "Opened {} launcher(s) and {} shell(s) for {} on Node {}",
+                        workspace.launchers.len(),
+                        workspace_user_shell_count(workspace),
+                        workspace.name,
+                        selected_node.alias,
+                    );
+                    return Ok(());
+                }
+                let registration = client.node_registration(&selected_node.node_id)?;
                 let workspace = match client.route_node_operation(
                     &registration.node_id,
                     protocol::RoutedOperation::GetWorkspace {
@@ -6206,12 +6306,27 @@ fn shell_command(command: ShellCommands, json: bool) -> Result<(), Box<dyn Error
             let name =
                 generated_shell_name(workspace.shells.iter().map(|shell| shell.name.as_str()))?;
             if json {
+                let node_id = if client.supports(protocol::ProtocolFeature::GlobalWorkspaces)? {
+                    Some(
+                        client
+                            .combined_node_snapshot(None)?
+                            .nodes
+                            .into_iter()
+                            .find(|node| node.local)
+                            .map(|node| node.node_id)
+                            .ok_or_else(|| {
+                                cli_output::failure(
+                                    "internal",
+                                    "local Node identity is unavailable",
+                                )
+                            })?,
+                    )
+                } else {
+                    None
+                };
                 return print_json(
                     CommandKey::ShellSuggestName,
-                    serde_json::json!({
-                        "workspace_id": workspace.id,
-                        "name": name,
-                    }),
+                    shell_suggestion_json(&workspace.id, &name, node_id.as_deref()),
                 );
             }
             println!(
@@ -10121,6 +10236,31 @@ mod tests {
         }
     }
 
+    fn combined_node(id: &str, alias: &str, eligible: bool) -> protocol::CombinedNode {
+        protocol::CombinedNode {
+            node_id: id.into(),
+            alias: alias.into(),
+            local: alias == "local",
+            route: None,
+            registration_revision: None,
+            health: protocol::NodeProjectionHealthCode::Online,
+            current: true,
+            stale: false,
+            observed_at_ms: 1,
+            observed_protocol_version: Some(protocol::PROTOCOL_VERSION),
+            observed_capabilities: vec!["global_workspaces".into()],
+            workspace_owner_eligible: eligible,
+            workspace_owner_unavailable_reason: (!eligible).then(|| "unavailable".into()),
+            scheduler: protocol::SchedulerHealth {
+                state: protocol::SchedulerState::Active,
+                active_executions: 0,
+                max_concurrent: 4,
+            },
+            local_snapshot: None,
+            remote_projection: None,
+        }
+    }
+
     #[test]
     fn global_workspace_grouping_uses_exact_placements_and_keeps_equal_name_external() {
         let first = workspace("owner-1", "same", vec![shell("shell-1", "owner-1", "one")]);
@@ -10994,6 +11134,99 @@ mod tests {
                 command: WorkspaceCommands::Retry { target }
             }) if target == "global"
         ));
+    }
+
+    #[test]
+    fn parses_json_workspace_project_creation_without_splitting_arguments() {
+        let cli = Cli::try_parse_from([
+            "boomux",
+            "workspace",
+            "create-project",
+            "release; touch /tmp/nope",
+            "--cwd",
+            "/tmp/project $(false)",
+            "--node",
+            "node-id",
+            "--json",
+        ])
+        .unwrap();
+        assert_eq!(cli.command_descriptor().key, "workspace.create-project");
+        assert_eq!(cli.command_descriptor().output, OutputMode::Json);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Workspace {
+                command: WorkspaceCommands::CreateProject { name, cwd, node }
+            }) if name == "release; touch /tmp/nope"
+                && cwd == Path::new("/tmp/project $(false)")
+                && node.as_deref() == Some("node-id")
+        ));
+    }
+
+    #[test]
+    fn workspace_project_owner_selection_delegates_sole_and_requires_ambiguous_choice() {
+        let local = combined_node("local-id", "local", true);
+        let remote = combined_node("remote-id", "work", true);
+        assert_eq!(
+            select_eligible_workspace_owner(std::slice::from_ref(&local), None)
+                .unwrap()
+                .node_id,
+            "local-id"
+        );
+        assert!(select_eligible_workspace_owner(&[local.clone(), remote.clone()], None).is_err());
+        assert_eq!(
+            select_eligible_workspace_owner(&[local, remote], Some("remote-id"))
+                .unwrap()
+                .node_id,
+            "remote-id"
+        );
+    }
+
+    #[test]
+    fn workspace_open_node_resolution_requires_exact_local_identity() {
+        let local = combined_node("local-id", "local", true);
+        let remote = combined_node("remote-id", "work", true);
+        let nodes = [local, remote];
+        assert!(resolve_workspace_open_node(&nodes, "local").is_err());
+        let selected = resolve_workspace_open_node(&nodes, "local-id").unwrap();
+        assert!(selected.local);
+        assert_eq!(selected.node_id, "local-id");
+        assert_eq!(
+            resolve_workspace_open_node(&nodes, "work").unwrap().node_id,
+            "remote-id"
+        );
+    }
+
+    #[test]
+    fn workspace_project_json_returns_exact_global_owner_and_shell_ids() {
+        let global = protocol::GlobalWorkspaceSnapshot {
+            id: "global-id".into(),
+            revision: 1,
+            name: "release".into(),
+            closing: false,
+            placements: vec![protocol::WorkspacePlacementSnapshot {
+                node_id: "node-id".into(),
+                workspace_id: "owner-id".into(),
+                owner_workspace_name: Some("release".into()),
+                owner_revision: 1,
+                default_cwd: Some("/tmp/project".into()),
+                state: protocol::WorkspacePlacementState::Active,
+            }],
+        };
+        let shell = shell("shell-id", "owner-id", "first");
+        let value = workspace_create_project_json(&global, "node-id", &shell);
+        assert_eq!(value["workspace"]["id"], "global-id");
+        assert_eq!(value["node_id"], "node-id");
+        assert_eq!(value["shell"]["id"], "shell-id");
+        assert_eq!(value["shell"]["workspace_id"], "owner-id");
+    }
+
+    #[test]
+    fn protocol_thirty_eight_shell_suggestion_identifies_its_exact_local_node() {
+        let current = shell_suggestion_json("owner-id", "first", Some("local-node-id"));
+        assert_eq!(current["node_id"], "local-node-id");
+        assert_eq!(current["workspace_id"], "owner-id");
+        let legacy = shell_suggestion_json("owner-id", "first", None);
+        assert!(legacy.get("node_id").is_none());
     }
 
     #[test]
@@ -13190,6 +13423,7 @@ mod tests {
                 "project.list",
                 "workspace.list",
                 "workspace.inspect",
+                "workspace.create-project",
                 "node.add",
                 "node.list",
                 "node.inspect",
