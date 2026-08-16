@@ -4,8 +4,9 @@
 > defines the authority, identity, privacy, compatibility, and failure semantics
 > delivered by [#174](https://github.com/gardnmi/boomux/issues/174) under tracking
 > epic [#173](https://github.com/gardnmi/boomux/issues/173). Current source and
-> compatibility tests remain authoritative for shipped behavior. No remote Node
-> command or protocol capability is implemented until its delivery issue lands.
+> compatibility tests remain authoritative for shipped behavior. Protocol 28
+> implements only stable local Node identity and its daemon query; no remote Node
+> command, SSH transport, registration, or projection is implemented yet.
 
 ## Purpose
 

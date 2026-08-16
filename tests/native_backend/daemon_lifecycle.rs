@@ -1,5 +1,5 @@
 use std::fs;
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::os::unix::net::UnixStream;
 use std::process::{Command, Stdio};
 use std::thread;
@@ -46,7 +46,7 @@ fn native_daemon_lifecycle() {
     let capabilities: serde_json::Value = serde_json::from_slice(&capabilities.stdout).unwrap();
     assert_eq!(capabilities["schema"], "boomux.cli/v1");
     assert_eq!(capabilities["command"], "capabilities");
-    assert_eq!(capabilities["data"]["daemon_protocol_version"], 27);
+    assert_eq!(capabilities["data"]["daemon_protocol_version"], 28);
     assert!(
         capabilities["data"]
             .get("session_transcript_integrations")
@@ -115,7 +115,10 @@ fn native_daemon_lifecycle() {
         "protocol_24",
         "protocol_25",
         "protocol_26",
+        "protocol_27",
+        "protocol_28",
         "exact_run_attachment",
+        "stable_node_identity",
         "revision_aware_scheduled_execution_wait",
         "bounded_scheduled_execution_history",
         "scheduled_execution_notifications",
@@ -148,7 +151,7 @@ fn native_daemon_lifecycle() {
         .unwrap();
     assert!(status.status.success());
     let status_text = String::from_utf8_lossy(&status.stdout);
-    assert!(status_text.contains("running (protocol 27"));
+    assert!(status_text.contains("running (protocol 28"));
     assert!(status_text.contains("scheduler active (0/4 active executions)"));
     let status = daemon
         .command()
@@ -807,6 +810,58 @@ fn native_daemon_lifecycle() {
     assert!(daemon.client.snapshot().unwrap().workspaces.is_empty());
 
     daemon.stop_with_cli();
+}
+
+#[test]
+fn node_identity_is_owner_only_and_survives_cold_and_graceful_restart() {
+    let mut daemon = TestDaemon::start();
+    let node_id = daemon.client.node_identity().unwrap();
+    assert_eq!(Uuid::parse_str(&node_id).unwrap().to_string(), node_id);
+
+    let path = daemon.runtime_dir.join("state/boomux/node.json");
+    let metadata = fs::symlink_metadata(&path).unwrap();
+    assert!(metadata.is_file());
+    assert_eq!(metadata.mode() & 0o777, 0o600);
+
+    let restart = daemon
+        .command()
+        .args(["daemon", "restart"])
+        .output()
+        .unwrap();
+    assert!(
+        restart.status.success(),
+        "daemon restart failed: {}",
+        String::from_utf8_lossy(&restart.stderr)
+    );
+    assert_eq!(daemon.client.node_identity().unwrap(), node_id);
+
+    daemon.stop_with_cli();
+    daemon.restart();
+    assert_eq!(daemon.client.node_identity().unwrap(), node_id);
+}
+
+#[test]
+fn malformed_node_identity_disables_federation_without_blocking_local_daemon() {
+    let daemon = TestDaemon::start_with(|_, runtime_dir| {
+        let directory = runtime_dir.join("state/boomux");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("node.json"), b"not-json").unwrap();
+        fs::set_permissions(
+            directory.join("node.json"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+    });
+
+    daemon.client.ping().unwrap();
+    assert_remote_code(
+        &daemon.client.node_identity().unwrap_err(),
+        ErrorCode::NodeIdentityUnavailable,
+    );
+    assert_eq!(
+        fs::read(daemon.runtime_dir.join("state/boomux/node.json")).unwrap(),
+        b"not-json"
+    );
 }
 
 #[test]

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 27;
+pub const PROTOCOL_VERSION: u32 = 28;
 pub const MIN_PROTOCOL_VERSION: u32 = 6;
 pub const MAX_CONTROL_FRAME: usize = 8 * 1024 * 1024;
 pub const MAX_ATTACH_FRAME: usize = 1024 * 1024;
@@ -108,6 +108,10 @@ define_protocol_features! {
     AgentScheduleEditing => (27, "agent schedule editing", [
         "protocol_27",
         "agent_schedule_editing",
+    ]),
+    NodeIdentity => (28, "Node identity", [
+        "protocol_28",
+        "stable_node_identity",
     ]),
 }
 
@@ -670,6 +674,7 @@ pub enum ErrorCode {
     RunChanged,
     RevisionAhead,
     IdempotencyExpired,
+    NodeIdentityUnavailable,
     Internal,
     #[serde(other)]
     Unknown,
@@ -921,6 +926,7 @@ impl ShellSpec {
 #[serde(tag = "request", rename_all = "snake_case")]
 pub enum Request {
     Ping,
+    GetNodeIdentity,
     Restart,
     RestartWithNotificationConfig {
         notifications: NotificationDeliveryConfig,
@@ -1107,6 +1113,7 @@ pub enum Request {
 impl Request {
     pub fn required_feature(&self) -> Option<ProtocolFeature> {
         match self {
+            Self::GetNodeIdentity => Some(ProtocolFeature::NodeIdentity),
             Self::WaitScheduledExecution { .. } => {
                 Some(ProtocolFeature::ScheduledExecutionObservation)
             }
@@ -1207,6 +1214,9 @@ impl Request {
 #[serde(tag = "response", rename_all = "snake_case")]
 pub enum Response {
     Pong,
+    NodeIdentity {
+        node_id: String,
+    },
     Snapshot {
         snapshot: Snapshot,
     },
@@ -1787,9 +1797,29 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_twenty_seven_with_minimum_six() {
-        assert_eq!(PROTOCOL_VERSION, 27);
+    fn protocol_version_is_twenty_eight_with_minimum_six() {
+        assert_eq!(PROTOCOL_VERSION, 28);
         assert_eq!(MIN_PROTOCOL_VERSION, 6);
+    }
+
+    #[test]
+    fn node_identity_messages_round_trip() {
+        let request = serde_json::to_value(Request::GetNodeIdentity).unwrap();
+        assert_eq!(request["request"], "get_node_identity");
+        assert_eq!(
+            serde_json::from_value::<Request>(request).unwrap(),
+            Request::GetNodeIdentity
+        );
+
+        let response = Response::NodeIdentity {
+            node_id: "550e8400-e29b-41d4-a716-446655440000".into(),
+        };
+        let encoded = serde_json::to_value(&response).unwrap();
+        assert_eq!(encoded["response"], "node_identity");
+        assert_eq!(
+            serde_json::from_value::<Response>(encoded).unwrap(),
+            response
+        );
     }
 
     #[test]
@@ -2114,6 +2144,7 @@ mod tests {
     #[test]
     fn request_feature_requirements_cover_all_groups() {
         let groups = vec![
+            (28, vec![Request::GetNodeIdentity]),
             (
                 25,
                 vec![Request::WaitScheduledExecution {
@@ -2499,6 +2530,7 @@ mod tests {
             ),
             (26, &["protocol_26", "exact_run_attachment"][..]),
             (27, &["protocol_27", "agent_schedule_editing"][..]),
+            (28, &["protocol_28", "stable_node_identity"][..]),
         ];
 
         let actual = ProtocolFeature::ALL
