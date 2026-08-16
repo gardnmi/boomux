@@ -9,6 +9,7 @@ pub mod integrations;
 mod node_identity;
 pub mod protocol;
 pub mod scheduling;
+pub mod ssh_bootstrap;
 mod state_store;
 mod terminal_focus;
 mod terminal_state;
