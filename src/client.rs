@@ -16,12 +16,12 @@ use std::time::Duration;
 use crate::protocol::{
     self, AgentInstanceSnapshot, AgentRegistrationSpec, AgentReport, AgentScheduleInspection,
     AgentScheduleSnapshot, AgentScheduleSpec, AgentScheduleUpdate, DaemonEvent, Envelope,
-    ErrorCode, EventCursor, FocusedTerminalSnapshot, NodeRegistrationSnapshot,
-    NotificationDeliveryConfig, Request, Response, ScheduledExecutionScheduleProjection,
-    ScheduledExecutionSnapshot, ScheduledOccurrence, ScheduledRunnerResult, ShellSnapshot,
-    ShellSpec, ShellStatus, Snapshot, TerminalPreview, TerminalPreviewLine, TerminalPreviewSpan,
-    TerminalProfile, UnixEnvironment, UnixEnvironmentVariable, WorkspaceLauncherSnapshot,
-    WorkspaceLauncherSpec, WorkspaceSnapshot,
+    ErrorCode, EventCursor, FocusedTerminalSnapshot, NodeProjectionHealth,
+    NodeRegistrationSnapshot, NotificationDeliveryConfig, Request, Response,
+    ScheduledExecutionScheduleProjection, ScheduledExecutionSnapshot, ScheduledOccurrence,
+    ScheduledRunnerResult, ShellSnapshot, ShellSpec, ShellStatus, Snapshot, TerminalPreview,
+    TerminalPreviewLine, TerminalPreviewSpan, TerminalProfile, UnixEnvironment,
+    UnixEnvironmentVariable, WorkspaceLauncherSnapshot, WorkspaceLauncherSpec, WorkspaceSnapshot,
 };
 
 const CONNECT_ATTEMPTS: usize = 40;
@@ -591,6 +591,18 @@ impl Client {
         self.node_registration_response(Request::GetNodeRegistration {
             selector: selector.into(),
         })
+    }
+
+    pub fn node_projection_health(
+        &self,
+        selector: impl Into<String>,
+    ) -> Result<NodeProjectionHealth> {
+        match self.request(Request::GetNodeProjectionHealth {
+            selector: selector.into(),
+        })? {
+            Response::NodeProjectionHealth { health } => Ok(health),
+            response => unexpected(response),
+        }
     }
 
     pub fn rename_node_registration(
@@ -1852,6 +1864,7 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
+            reject_protocol(&listener, 32, 31);
             reject_protocol(&listener, 31, 30);
             reject_protocol(&listener, 30, 29);
             reject_protocol(&listener, 29, 28);
@@ -2004,7 +2017,7 @@ mod tests {
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
-            assert_eq!(request.version, 31);
+            assert_eq!(request.version, 32);
             assert_eq!(request.message, Request::GetNodeIdentity);
             protocol::write_message(
                 &mut stream,
@@ -2018,6 +2031,7 @@ mod tests {
             )
             .unwrap();
 
+            reject_protocol(&listener, 32, 31);
             reject_protocol(&listener, 31, 30);
             reject_protocol(&listener, 30, 29);
             reject_protocol(&listener, 29, 27);
@@ -2064,7 +2078,7 @@ mod tests {
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
-            assert_eq!(request.version, 31);
+            assert_eq!(request.version, 32);
             assert_eq!(request.message, Request::OpenFederationChannel);
             protocol::write_message(
                 &mut stream,
@@ -2078,6 +2092,7 @@ mod tests {
             )
             .unwrap();
 
+            reject_protocol(&listener, 32, 31);
             reject_protocol(&listener, 31, 30);
             reject_protocol(&listener, 30, 29);
             reject_protocol(&listener, 29, 28);
@@ -2107,7 +2122,7 @@ mod tests {
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
-            assert_eq!(request.version, 31);
+            assert_eq!(request.version, 32);
             assert_eq!(request.message, Request::ListNodeRegistrations);
             protocol::write_message(
                 &mut stream,
@@ -2120,6 +2135,7 @@ mod tests {
                 ),
             )
             .unwrap();
+            reject_protocol(&listener, 32, 31);
             reject_protocol(&listener, 31, 30);
             let (mut stream, _) = listener.accept().unwrap();
             let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
@@ -2292,6 +2308,7 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
+            reject_protocol(&listener, 32, 31);
             reject_protocol(&listener, 31, 30);
             reject_protocol(&listener, 30, 29);
             reject_protocol(&listener, 29, 28);
@@ -2359,6 +2376,7 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
+            reject_protocol(&listener, 32, 31);
             reject_protocol(&listener, 31, 30);
             reject_protocol(&listener, 30, 29);
             reject_protocol(&listener, 29, 28);

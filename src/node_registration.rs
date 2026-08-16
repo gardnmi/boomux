@@ -120,6 +120,67 @@ impl NodeRegistrationManager {
         Ok(find(state, selector)?.snapshot.clone())
     }
 
+    pub(crate) fn with_current<T>(
+        &self,
+        expected: &NodeRegistrationSnapshot,
+        operation: impl FnOnce() -> io::Result<T>,
+    ) -> io::Result<Option<T>> {
+        let state = self.lock_state()?;
+        let state = available(&state)?;
+        let Some(registration) = state
+            .registrations
+            .iter()
+            .find(|registration| registration.snapshot.node_id == expected.node_id)
+        else {
+            return Ok(None);
+        };
+        if registration.snapshot.revision != expected.revision
+            || registration.snapshot.tombstone_epoch != expected.tombstone_epoch
+            || registration.snapshot.target != expected.target
+            || !registration.admission_open
+        {
+            return Ok(None);
+        }
+        operation().map(Some)
+    }
+
+    pub(crate) fn admit(&self, expected: &NodeRegistrationSnapshot) -> io::Result<bool> {
+        let mut state = self.lock_state()?;
+        let state = available_mut(&mut state)?;
+        let Some(registration) = state
+            .registrations
+            .iter_mut()
+            .find(|registration| registration.snapshot.node_id == expected.node_id)
+        else {
+            return Ok(false);
+        };
+        if registration.snapshot.revision != expected.revision
+            || registration.snapshot.tombstone_epoch != expected.tombstone_epoch
+            || !registration.admission_open
+        {
+            return Ok(false);
+        }
+        registration.admitted = registration
+            .admitted
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("Node registration admission exhausted"))?;
+        Ok(true)
+    }
+
+    pub(crate) fn release(&self, expected: &NodeRegistrationSnapshot) {
+        if let Ok(mut state) = self.state.lock()
+            && let Ok(state) = available_mut(&mut state)
+            && let Some(registration) = state
+                .registrations
+                .iter_mut()
+                .find(|registration| registration.snapshot.node_id == expected.node_id)
+            && registration.snapshot.revision == expected.revision
+        {
+            registration.admitted = registration.admitted.saturating_sub(1);
+            self.changed.notify_all();
+        }
+    }
+
     pub(crate) fn add(
         &self,
         alias: String,

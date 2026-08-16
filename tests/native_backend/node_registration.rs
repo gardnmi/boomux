@@ -2,6 +2,8 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
+use std::thread;
+use std::time::Duration;
 
 use boomux::client::{ClientError, RemoteError};
 use boomux::protocol::ErrorCode;
@@ -11,6 +13,18 @@ use crate::support::TestDaemon;
 
 fn node_id(value: u128) -> String {
     Uuid::from_u128(value).to_string()
+}
+
+fn contains_json_key(value: &serde_json::Value, key: &str) -> bool {
+    match value {
+        serde_json::Value::Object(values) => {
+            values.contains_key(key) || values.values().any(|value| contains_json_key(value, key))
+        }
+        serde_json::Value::Array(values) => {
+            values.iter().any(|value| contains_json_key(value, key))
+        }
+        _ => false,
+    }
 }
 
 #[test]
@@ -76,7 +90,10 @@ fn fake_ssh(directory: &Path) {
     use boomux::federation::{
         FEDERATION_VERSION, FederationConnectionMode, FederationHandshake, write_handshake,
     };
-    use boomux::protocol::{self, Envelope, Request, Response};
+    use boomux::protocol::{
+        self, Envelope, EventCursor, NodeProjectionSnapshot, NodeProjectionSync,
+        NodeProjectionSyncMode, Response, SchedulerHealth, SchedulerState,
+    };
 
     let handshake = FederationHandshake {
         version: FEDERATION_VERSION,
@@ -87,26 +104,55 @@ fn fake_ssh(directory: &Path) {
     };
     let mut handshake_bytes = Vec::new();
     write_handshake(&mut handshake_bytes, &handshake).unwrap();
-    let mut request = Vec::new();
+    let mut ping = Vec::new();
     protocol::write_message(
-        &mut request,
-        &Envelope::with_version(protocol::PROTOCOL_VERSION, Request::Ping),
-    )
-    .unwrap();
-    let mut response = Vec::new();
-    protocol::write_message(
-        &mut response,
+        &mut ping,
         &Envelope::with_version(protocol::PROTOCOL_VERSION, Response::Pong),
     )
     .unwrap();
+    let mut sync = Vec::new();
+    protocol::write_message(
+        &mut sync,
+        &Envelope::with_version(
+            protocol::PROTOCOL_VERSION,
+            Response::NodeProjectionSync {
+                sync: NodeProjectionSync {
+                    mode: NodeProjectionSyncMode::Baseline,
+                    cursor: EventCursor {
+                        stream_id: Uuid::from_u128(20).to_string(),
+                        event_id: 0,
+                    },
+                    projection: NodeProjectionSnapshot {
+                        node_id: node_id(2),
+                        workspaces: Vec::new(),
+                        shells: Vec::new(),
+                        launchers: Vec::new(),
+                        agents: Vec::new(),
+                        schedules: Vec::new(),
+                        executions: Vec::new(),
+                        executions_truncated: false,
+                        scheduler: SchedulerHealth {
+                            state: SchedulerState::Active,
+                            max_concurrent: 4,
+                            active_executions: 0,
+                        },
+                    },
+                    transitions: Vec::new(),
+                },
+            },
+        ),
+    )
+    .unwrap();
+    fs::write(directory.join("pong.bin"), ping).unwrap();
+    fs::write(directory.join("sync.bin"), sync).unwrap();
     let ssh = directory.join("ssh");
     fs::write(
         &ssh,
         format!(
-            "#!/bin/sh\nlast=\nfor arg do last=$arg; done\ncase \"$last\" in\n  *boomux-platform-v1*) printf 'boomux-platform-v1\\0Linux\\0x86_64\\0' ;;\n  *boomux-executables-v1*) printf 'boomux-executables-v1\\0/remote/boomux\\0' ;;\n  *boomux-install-destination-v1*) printf 'boomux-install-destination-v1\\0/home/remote/.local/bin/boomux\\0' ;;\n  \"'/remote/boomux' __federation-stdio\") {}; dd bs=1 count={} of=/dev/null 2>/dev/null; {} ;;\n  *) exit 64 ;;\nesac\n",
+            "#!/bin/sh\nlast=\nfor arg do last=$arg; done\ncase \"$last\" in\n  *boomux-platform-v1*) printf 'boomux-platform-v1\\0Linux\\0x86_64\\0' ;;\n  *boomux-executables-v1*) printf 'boomux-executables-v1\\0/remote/boomux\\0' ;;\n  *boomux-install-destination-v1*) printf 'boomux-install-destination-v1\\0/home/remote/.local/bin/boomux\\0' ;;\n  \"'/remote/boomux' __federation-stdio\") {}; python3 -c 'import json,struct,sys; data=sys.stdin.buffer.read(struct.unpack(\">I\",sys.stdin.buffer.read(4))[0]); request=json.loads(data)[\"message\"][\"request\"]; path=sys.argv[1] if request==\"ping\" else sys.argv[2]; sys.stdout.buffer.write(open(path,\"rb\").read())' \"{}\" \"{}\" ;;\n  *) exit 64 ;;\nesac\n",
             shell_printf(&handshake_bytes),
-            request.len(),
-            shell_printf(&response),
+            directory.join("pong.bin").display(),
+            directory.join("sync.bin").display(),
         ),
     )
     .unwrap();
@@ -149,6 +195,40 @@ fn cli_add_and_retarget_pin_verified_identity_without_persisting_helper_path() {
     assert_eq!(list["data"][0]["node_id"], node_id(2));
     let revision = list["data"][0]["revision"].as_u64().unwrap();
 
+    let mut online = None;
+    let mut last_inspect = None;
+    for _ in 0..200 {
+        let inspect = command(&directory)
+            .args(["node", "inspect", "work", "--json"])
+            .output()
+            .unwrap();
+        assert!(inspect.status.success());
+        let inspect: serde_json::Value = serde_json::from_slice(&inspect.stdout).unwrap();
+        if inspect["data"]["projection"]["code"] == "online" {
+            online = Some(inspect);
+            break;
+        }
+        last_inspect = Some(inspect);
+        thread::sleep(Duration::from_millis(25));
+    }
+    let online = online
+        .unwrap_or_else(|| panic!("background projection did not become online: {last_inspect:?}"));
+    assert_eq!(online["data"]["projection"]["cursor"], 0);
+    let cache: serde_json::Value =
+        serde_json::from_slice(&fs::read(directory.join("state/boomux/node-cache.json")).unwrap())
+            .unwrap();
+    for private in [
+        "cwd",
+        "command",
+        "prompt",
+        "evidence",
+        "environment",
+        "external_session_id",
+        "runner_token",
+    ] {
+        assert!(!contains_json_key(&cache, private));
+    }
+
     let retarget = command(&directory)
         .args([
             "node",
@@ -169,6 +249,23 @@ fn cli_add_and_retarget_pin_verified_identity_without_persisting_helper_path() {
         fs::read_to_string(directory.join("state/boomux/node_registrations.json")).unwrap();
     assert!(persisted.contains("otherbox"));
     assert!(!persisted.contains("/remote/boomux"));
+
+    let restart = command(&directory)
+        .args(["daemon", "restart"])
+        .output()
+        .unwrap();
+    assert!(restart.status.success());
+    let inspect = command(&directory)
+        .args(["node", "inspect", "work", "--json"])
+        .output()
+        .unwrap();
+    assert!(inspect.status.success());
+    let inspect: serde_json::Value = serde_json::from_slice(&inspect.stdout).unwrap();
+    assert!(
+        inspect["data"]["projection"]["cache_generation"]
+            .as_u64()
+            .is_some_and(|generation| generation > 0)
+    );
 
     let stop = command(&directory)
         .args(["daemon", "stop"])

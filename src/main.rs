@@ -1647,26 +1647,81 @@ fn node_command(command: NodeCommands, json: bool) -> Result<(), Box<dyn Error>>
             print_node_registration(CommandKey::NodeAdd, &registration, json)
         }
         NodeCommands::List => {
-            let registrations = client::connect_or_start()?.node_registrations()?;
+            let client = client::connect_or_start()?;
+            let registrations = client.node_registrations()?;
+            let projection_supported =
+                client.supports(protocol::ProtocolFeature::NodeProjectionSync)?;
             if json {
-                print_json(CommandKey::NodeList, serde_json::to_value(registrations)?)
+                let rows = registrations
+                    .into_iter()
+                    .map(|registration| {
+                        let mut value = serde_json::to_value(registration)?;
+                        if projection_supported {
+                            let health = client.node_projection_health(
+                                value["node_id"].as_str().expect("Node ID is a string"),
+                            )?;
+                            value
+                                .as_object_mut()
+                                .expect("registration serializes as an object")
+                                .insert("projection".into(), serde_json::to_value(health)?);
+                        }
+                        Ok::<_, Box<dyn Error>>(value)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                print_json(CommandKey::NodeList, serde_json::to_value(rows)?)
             } else {
-                println!("ALIAS\tTARGET\tNODE ID\tREVISION");
+                println!("ALIAS\tTARGET\tNODE ID\tREVISION\tPROJECTION");
                 for registration in registrations {
+                    let health = projection_supported
+                        .then(|| client.node_projection_health(&registration.node_id))
+                        .transpose()?;
                     println!(
-                        "{}\t{}\t{}\t{}",
+                        "{}\t{}\t{}\t{}\t{}",
                         registration.alias,
                         registration.target,
                         registration.node_id,
-                        registration.revision
+                        registration.revision,
+                        health
+                            .map(|health| format!("{:?}", health.code).to_ascii_lowercase())
+                            .unwrap_or_else(|| "unsupported".into()),
                     );
                 }
                 Ok(())
             }
         }
         NodeCommands::Inspect { selector } => {
-            let registration = client::connect_or_start()?.node_registration(selector)?;
-            print_node_registration(CommandKey::NodeInspect, &registration, json)
+            let client = client::connect_or_start()?;
+            let registration = client.node_registration(selector)?;
+            let health = client
+                .supports(protocol::ProtocolFeature::NodeProjectionSync)?
+                .then(|| client.node_projection_health(&registration.node_id))
+                .transpose()?;
+            if json {
+                let mut value = serde_json::to_value(&registration)?;
+                if let Some(health) = health {
+                    value
+                        .as_object_mut()
+                        .expect("registration serializes as an object")
+                        .insert("projection".into(), serde_json::to_value(health)?);
+                }
+                print_json(CommandKey::NodeInspect, value)
+            } else {
+                print_node_registration(CommandKey::NodeInspect, &registration, false)?;
+                if let Some(health) = health {
+                    println!(
+                        "Projection: {}",
+                        format!("{:?}", health.code).to_ascii_lowercase()
+                    );
+                    println!("Projection stale: {}", health.stale);
+                    println!("Cache generation: {}", health.cache_generation);
+                    if let (Some(stream_id), Some(cursor)) = (health.stream_id, health.cursor) {
+                        println!("Remote cursor: {stream_id}:{cursor}");
+                    }
+                } else {
+                    println!("Projection: unsupported");
+                }
+                Ok(())
+            }
         }
         NodeCommands::Rename {
             selector,
@@ -9286,7 +9341,7 @@ mod tests {
                 .validated_version,
             "0.84.1"
         );
-        assert_eq!(protocol::PROTOCOL_VERSION, 31);
+        assert_eq!(protocol::PROTOCOL_VERSION, 32);
     }
 
     #[test]

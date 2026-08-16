@@ -9,9 +9,10 @@
 > the hidden stdio helper establish the verified same-socket bridge boundary.
 > Protocol 30 and local `boomux node rekey` implement bounded expected-ID rekey
 > with exact interactive confirmation. Protocol 31 and registration schema 1
-> implement explicit identity-pinned registration management. Public `boomux
-> --remote TARGET` remains ad hoc; projection and routed resource operations are
-> not yet implemented.
+> implement explicit identity-pinned registration management. Protocol 32 and
+> Node-cache schema 1 implement bounded background reduced projections. Public
+> `boomux --remote TARGET` remains ad hoc; routed resource operations are not yet
+> implemented.
 
 ## Purpose
 
@@ -206,6 +207,15 @@ state from loading or persisting. Node identity, registrations, and cache each
 use owner-only directories, bounded schemas, atomic replacement, and explicit
 validation.
 
+Node-cache schema 1 is `node-cache.json` beside, but independent from,
+`state.json`, `node.json`, and `node_registrations.json`. It is owner-only,
+atomically replaced, and capped at 4 MiB and 128 Nodes. Per Node it accepts at
+most 1,024 Workspaces, 4,096 Shells, 4,096 launchers, 4,096 Agents, 1,024
+Schedules, 1,000 executions, and 96 capability identifiers of at most 128 bytes.
+Names and identifiers in reduced collections are capped at 256 bytes. An invalid
+cache is renamed to `node-cache.corrupt-<uuid>.json` when possible and otherwise
+discarded in memory; it never blocks authoritative state startup.
+
 ## Synchronization And Events
 
 The local coordinator maintains at most one synchronization writer and one
@@ -254,6 +264,11 @@ reconnects and revalidates identity.
 Background connection retries are bounded and use backoff with jitter.
 Authentication, identity, and unsupported-version failures stop aggressive
 retry and remain actionable Node health rather than generic Agent failure.
+The implementation uses two-second bounded discovery and handshake operations,
+a two-second projection-response deadline, one-second event-wakeup waits,
+and exponential retry from one through sixty seconds plus deterministic
+sub-second jitter. Authentication, identity, and unsupported states retry no
+faster than sixty seconds plus jitter.
 
 The federation lock order is: daemon transition, Node mutation gate, Node
 persistence gate, local event-stream transition frontier, then Node

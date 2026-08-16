@@ -16,6 +16,7 @@
 | `src/state_store.rs` | Versioned durable schemas, validation, atomic state storage, and migrations |
 | `src/node_identity.rs` | Stable Node identity persistence, federation admission leases, and bounded rekey drain |
 | `src/node_registration.rs` | Independently versioned remote Node registrations, identity pinning, admission drain, validation, and atomic storage |
+| `src/node_projection.rs` | Disposable owner-only remote projection cache, deterministic bounds, health, generation CAS, quarantine, and atomic storage |
 | `src/federation.rs` | Independently versioned federation handshake and verified stdio daemon bridging |
 | `src/ssh_bootstrap.rs` | Validated SSH targets, private invocation configuration, deadline-bound remote discovery, and helper compatibility selection |
 | `src/handoff.rs`, `src/fd_transfer.rs` | Graceful daemon replacement records and Unix descriptor transfer |
@@ -59,8 +60,8 @@
   accepted federation boundary: one owning Node remains authoritative, SSH is a
   route, and local cached projections never authorize mutation or lifecycle
   inference. Ad hoc bootstrap and verified transport are implemented; durable
-  durable registration is implemented; projection and routed management remain
-  tracked by #173.
+  registration and background reduced projection synchronization are
+  implemented; routed management remains tracked by #173.
 
 ## Product Boundary
 
@@ -101,8 +102,9 @@ Public `boomux --remote TARGET` performs ad hoc bootstrap only. It
 discovers and verifies a compatible helper, or interactively installs one before
 opening and pinging a daemon-bound stdio channel. Explicit `boomux node add
 ALIAS TARGET` and revision-conditional registration management persist an
-identity-pinned route separately; neither mode creates a projection or routes
-dashboard or resource-management operations yet.
+identity-pinned route separately. A registration starts one noninteractive
+projection worker; routed dashboard and resource-management operations are not
+yet implemented.
 
 ## Components
 
@@ -546,6 +548,13 @@ changes reset the evaluation frontier to commit time. Exact no-ops do not persis
 or publish, active executions retain captured revisions, and update events remain
 prompt-free. Protocol-26 peers filter update events without rewinding cursors.
 The durable representation is unchanged, so state schema remains 12.
+Protocol 32 adds owner projection synchronization. One transition-frontier cut
+returns an explicitly reduced snapshot, scheduler health, at most 1,000 newest
+executions (all nonterminal records first), a remote stream cursor, and at most
+256 reduced resumable transitions. Expired, replaced, or overlong cursors return
+a baseline with no historical transition evidence. Protocol-31 and older event
+readers filter local `node_projection_changed` invalidations while retaining the
+unfiltered cursor. The authoritative state schema remains 12.
 Protocol-25 lists are daemon-bounded, newest-first pages with explicit limit and
 truncation. The request limit is optional on the wire; protocol 25 defaults it to
 100 and clamps it to 1 through 1,000, while protocol-23 and protocol-24 requests
