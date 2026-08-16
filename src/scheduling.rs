@@ -340,6 +340,7 @@ pub fn canonicalize_timezone(timezone: &str) -> Result<String, SchedulingError> 
         return Err(SchedulingError::EmptyValue { field: "timezone" });
     }
     timezone
+        .trim()
         .parse::<chrono_tz::Tz>()
         .map(|timezone| timezone.to_string())
         .map_err(|_| SchedulingError::InvalidTimezone)
@@ -586,6 +587,7 @@ mod tests {
             "America/New_York"
         );
         assert_eq!(canonicalize_timezone("UTC").unwrap(), "UTC");
+        assert_eq!(canonicalize_timezone(" \tUTC\n").unwrap(), "UTC");
         assert!(canonicalize_timezone("Not/A_Private_Zone").is_err());
         assert!(canonicalize_timezone("").is_err());
 

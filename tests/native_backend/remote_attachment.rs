@@ -3,6 +3,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::process::Stdio;
 
 use boomux::protocol::{AttachFrame, QualifiedIdentity, ShellSpec};
+use uuid::Uuid;
 
 use crate::support::{TestDaemon, contains, parse_pid, profile, read_until, wait_until};
 
@@ -26,6 +27,224 @@ fn install_fake_ssh(
     )
     .unwrap();
     fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+#[test]
+fn two_daemon_workspace_coordination_adopts_links_places_and_retries_close() {
+    let remote = TestDaemon::start();
+    let adopted_owner = remote
+        .client
+        .create_workspace("remote-adopt", Vec::new())
+        .unwrap();
+    let linked_owner = remote
+        .client
+        .create_workspace("remote-link", Vec::new())
+        .unwrap();
+    let remote_node = remote.client.node_identity().unwrap();
+    let executable = remote.executable.clone();
+    let mut local = TestDaemon::start_with(|command, directory| {
+        install_fake_ssh(directory, &executable, &remote);
+        command.env("PATH", format!("{}:/usr/bin:/bin", directory.display()));
+    });
+    local
+        .client
+        .add_node_registration("work", "fake-target", &remote_node)
+        .unwrap();
+    wait_until(
+        || {
+            local
+                .client
+                .combined_node_snapshot(None)
+                .ok()
+                .and_then(|snapshot| {
+                    snapshot
+                        .nodes
+                        .into_iter()
+                        .find(|node| node.node_id == remote_node)
+                })
+                .is_some_and(|node| node.workspace_owner_eligible)
+        },
+        "remote Node did not become eligible for Workspace placement",
+    );
+
+    let adopt = local
+        .command()
+        .args(["workspace", "adopt", &adopted_owner.id, "--node", "work"])
+        .output()
+        .unwrap();
+    assert!(
+        adopt.status.success(),
+        "CLI remote adopt failed: {}",
+        String::from_utf8_lossy(&adopt.stderr)
+    );
+    let adopted = local
+        .client
+        .combined_node_snapshot(None)
+        .unwrap()
+        .workspaces
+        .into_iter()
+        .find(|workspace| workspace.name == "remote-adopt")
+        .unwrap();
+    assert_eq!(adopted.placements[0].workspace_id, adopted_owner.id);
+
+    let linked = local
+        .client
+        .create_global_workspace("linked-global")
+        .unwrap();
+    let link = local
+        .command()
+        .args([
+            "workspace",
+            "link",
+            &linked.id,
+            &linked_owner.id,
+            "--node",
+            "work",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        link.status.success(),
+        "CLI remote link failed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+    let linked = local
+        .client
+        .combined_node_snapshot(None)
+        .unwrap()
+        .workspaces
+        .into_iter()
+        .find(|workspace| workspace.id == linked.id)
+        .unwrap();
+    assert_eq!(linked.placements[0].workspace_id, linked_owner.id);
+
+    let ssh = local.runtime_dir.join("ssh");
+    let disabled_ssh = local.runtime_dir.join("ssh.disabled");
+    fs::rename(&ssh, &disabled_ssh).unwrap();
+    assert!(
+        local
+            .client
+            .create_global_workspace_with_shell(
+                Uuid::new_v4().to_string(),
+                Uuid::new_v4().to_string(),
+                "restart-project",
+                &remote_node,
+                Uuid::new_v4().to_string(),
+                "/tmp".into(),
+                Uuid::new_v4().to_string(),
+                ShellSpec {
+                    name: "restart-project".into(),
+                    cwd: "/tmp".into(),
+                    command: Vec::new(),
+                },
+            )
+            .is_err()
+    );
+    assert!(
+        local
+            .client
+            .combined_node_snapshot(None)
+            .unwrap()
+            .workspaces
+            .iter()
+            .all(|workspace| workspace.name != "restart-project"),
+        "preflight route failure must not persist empty global metadata"
+    );
+    local.crash();
+    fs::rename(&disabled_ssh, &ssh).unwrap();
+    let local_path = format!("{}:/usr/bin:/bin", local.runtime_dir.display());
+    local.restart_with(|command| {
+        command.env("PATH", local_path);
+    });
+    wait_until(
+        || {
+            local
+                .client
+                .combined_node_snapshot(None)
+                .ok()
+                .and_then(|snapshot| {
+                    snapshot
+                        .nodes
+                        .into_iter()
+                        .find(|node| node.node_id == remote_node)
+                })
+                .is_some_and(|node| node.workspace_owner_eligible)
+        },
+        "remote Node did not recover placement eligibility",
+    );
+    let (recovered_project, recovered_shell) = local
+        .client
+        .create_global_workspace_with_shell(
+            Uuid::new_v4().to_string(),
+            Uuid::new_v4().to_string(),
+            "restart-project",
+            &remote_node,
+            Uuid::new_v4().to_string(),
+            "/tmp".into(),
+            Uuid::new_v4().to_string(),
+            ShellSpec {
+                name: "restart-project".into(),
+                cwd: "/tmp".into(),
+                command: Vec::new(),
+            },
+        )
+        .unwrap();
+    assert_eq!(recovered_project.placements.len(), 1);
+    assert_eq!(recovered_shell.name, "restart-project");
+
+    let placed = local
+        .client
+        .create_global_workspace("remote-placed")
+        .unwrap();
+    let owner_workspace_id = Uuid::new_v4().to_string();
+    let (placed, shell) = local
+        .client
+        .create_global_workspace_shell(
+            Uuid::new_v4().to_string(),
+            &placed.id,
+            placed.revision,
+            &remote_node,
+            &owner_workspace_id,
+            Some("/tmp".into()),
+            Uuid::new_v4().to_string(),
+            ShellSpec {
+                name: "remote-first".into(),
+                cwd: "/tmp".into(),
+                command: vec!["/bin/sh".into(), "-c".into(), "true".into()],
+            },
+        )
+        .unwrap();
+    assert_eq!(shell.workspace_id, owner_workspace_id);
+    let opened = local
+        .client
+        .open_global_workspace(&placed.id, placed.revision)
+        .unwrap();
+    assert_eq!(opened.placements[0].status, "available");
+
+    let ssh = local.runtime_dir.join("ssh");
+    let disabled_ssh = local.runtime_dir.join("ssh.disabled");
+    fs::rename(&ssh, &disabled_ssh).unwrap();
+    let partial = local
+        .client
+        .close_global_workspace(&placed.id, placed.revision)
+        .unwrap();
+    assert_eq!(partial.placements[0].status, "unresolved");
+    assert!(partial.workspace.closing);
+    fs::rename(&disabled_ssh, &ssh).unwrap();
+    let completed = local
+        .client
+        .retry_global_workspace_close(&placed.id)
+        .unwrap();
+    assert_eq!(completed.placements[0].status, "closed");
+    assert!(
+        local
+            .client
+            .combined_node_snapshot(None)
+            .unwrap()
+            .workspaces
+            .iter()
+            .all(|workspace| workspace.id != placed.id)
+    );
 }
 
 #[test]

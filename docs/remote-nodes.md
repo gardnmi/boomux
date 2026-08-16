@@ -20,6 +20,9 @@
 > 36 implements closed typed owner host services and exact Agent Session resume.
 > Protocol 37 implements Node-qualified remote Schedule creation, management,
 > execution observation, and presentation.
+> Protocol 38 implements coordinator-owned Workspace metadata, explicit
+> Node-owned placements, guarded adoption and linking, and resumable close
+> progress. Node-local runtime state remains authoritative on each owner.
 > Public `boomux --remote TARGET`
 > remains ad hoc.
 
@@ -33,6 +36,57 @@ Omarchy panel should nevertheless behave as native local presentation.
 
 Federation is not shared runtime ownership. Each Node remains a complete Boomux
 authority, and SSH is a replaceable transport between authorities and clients.
+
+The coordinating Node separately owns global Workspace identity, name,
+membership, and operation progress. A placement is always an explicit pair of
+stable Node ID and owner-local Workspace ID. It may retain an owner-local default
+working directory, but paths are never copied to or inferred for another Node.
+Equal Workspace names on different Nodes remain unrelated unless the user links
+the exact owner identity under revision guards.
+
+Placement eligibility requires a current identity-verified projection and the
+protocol-38 `global_workspaces` capability. Selection never defaults when more
+than one owner is eligible. Dashboard and CLI selectors show unavailable Nodes
+disabled with their health reason. Resource coordination durably prepares stable
+operation, requested and canonical owner Workspace, and resource UUIDs before
+owner mutation, validates the resulting owner metadata, and persists membership
+before success. After an ambiguous channel or coordinator write, the next exact
+request reads the prepared owner resource and completes coordinator metadata. A
+read that finds no resource retains the pending operation because it may have
+raced an in-flight owner mutation. Completed success is replayed from the
+coordinator's bounded durable outcome ledger even when the request's original
+revision is now stale; no prompt,
+attachment environment, or shell-interpolated command enters coordinator state.
+Preparation reserves enough physical store capacity for a conservative upper
+bound of the completed response, evicting oldest outcomes if necessary. A request
+that cannot reserve within 1 MiB fails before any owner mutation. Concurrent
+distinct placements atomically enlarge all related pending reservations for the
+additional future placement before either new owner dispatch proceeds.
+
+The dashboard has a dedicated Nodes tab rather than a Node filter. Inspection is
+read-only; alias rename and route retarget use registration revisions, retarget
+verifies the pinned identity before mutation, and forget requires confirmation
+and removes only the local route. Projection refresh wakes the selected Node's
+existing observer without starting an overlapping worker or changing remote
+authority.
+Prepared operations are isolated and serialized by operation UUID, so concurrent
+identical handlers return one durable result and cancellation cannot consume an
+in-flight or completed success. Distinct first-placement requests retain their
+requested owner UUIDs while sharing the canonical owner selected by the first
+prepared request. The completed ledger retains at most the newest 256 successes
+and may retain fewer to preserve the 1 MiB coordinator-store limit; replay is not
+guaranteed after oldest-first eviction. Adoption and linking require a fresh
+identity-pinned protocol-38 combined local snapshot under the admitted route.
+That live snapshot must advertise runtime `global_workspaces` eligibility and
+contains the fresh exact owner revision used for commit. Cached projection
+eligibility alone cannot authorize either mutation. Project creation performs
+the same live capability preflight before persisting empty metadata; definitive
+pre-owner rejection cancels only an existing exact preparation durably marked as
+never attempted. Immediately before owner mutation the coordinator persists an
+attempted phase. Once set, later capability, registration, identity, owner-error,
+or exact-absence results retain the pending operation and project name because
+they cannot disprove an earlier transport-ambiguous mutation. Ambiguous or
+network outcomes likewise retain any already-prepared recovery state.
 
 ## Identity And Ownership
 

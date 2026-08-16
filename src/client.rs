@@ -450,6 +450,37 @@ impl Client {
         self.send(request).map(|(_, _, response)| response)
     }
 
+    fn workspace_resource_request(&self, request: Request) -> Result<Response> {
+        match self.request(request.clone()) {
+            Err(ClientError::Remote(error))
+                if matches!(
+                    error.code,
+                    Some(
+                        ErrorCode::PersistenceFailed
+                            | ErrorCode::OutcomeUnknown
+                            | ErrorCode::Timeout
+                    )
+                ) =>
+            {
+                self.request(request)
+            }
+            Err(ClientError::Transport(error))
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::ConnectionReset
+                        | io::ErrorKind::BrokenPipe
+                        | io::ErrorKind::ConnectionAborted
+                        | io::ErrorKind::NotConnected
+                        | io::ErrorKind::TimedOut
+                        | io::ErrorKind::UnexpectedEof
+                ) =>
+            {
+                self.request(request)
+            }
+            result => result,
+        }
+    }
+
     fn send(&self, request: Request) -> Result<(UnixStream, u32, Response)> {
         let mut version = self.protocol_version.load(Ordering::Acquire);
         if request
@@ -605,9 +636,245 @@ impl Client {
         }
     }
 
+    pub fn force_node_projection_refresh(
+        &self,
+        selector: impl Into<String>,
+    ) -> Result<NodeProjectionHealth> {
+        match self.request(Request::ForceNodeProjectionRefresh {
+            selector: selector.into(),
+        })? {
+            Response::NodeProjectionHealth { health } => Ok(health),
+            response => unexpected(response),
+        }
+    }
+
     pub fn combined_node_snapshot(&self, selector: Option<String>) -> Result<CombinedNodeSnapshot> {
         match self.request(Request::GetCombinedNodeSnapshot { selector })? {
             Response::CombinedNodeSnapshot { snapshot } => Ok(snapshot),
+            response => unexpected(response),
+        }
+    }
+
+    pub fn create_global_workspace(
+        &self,
+        name: impl Into<String>,
+    ) -> Result<crate::protocol::GlobalWorkspaceSnapshot> {
+        match self.request(Request::CreateGlobalWorkspace { name: name.into() })? {
+            Response::GlobalWorkspace { workspace } => Ok(workspace),
+            response => unexpected(response),
+        }
+    }
+
+    pub fn adopt_node_workspace(
+        &self,
+        identity: crate::protocol::QualifiedIdentity,
+        expected_revision: u64,
+    ) -> Result<crate::protocol::GlobalWorkspaceSnapshot> {
+        match self.request(Request::AdoptNodeWorkspace {
+            identity,
+            expected_revision,
+        })? {
+            Response::GlobalWorkspace { workspace } => Ok(workspace),
+            response => unexpected(response),
+        }
+    }
+
+    pub fn link_node_workspace(
+        &self,
+        global_workspace_id: impl Into<String>,
+        expected_global_revision: u64,
+        identity: crate::protocol::QualifiedIdentity,
+        expected_owner_revision: u64,
+    ) -> Result<crate::protocol::GlobalWorkspaceSnapshot> {
+        match self.request(Request::LinkNodeWorkspace {
+            global_workspace_id: global_workspace_id.into(),
+            expected_global_revision,
+            identity,
+            expected_owner_revision,
+        })? {
+            Response::GlobalWorkspace { workspace } => Ok(workspace),
+            response => unexpected(response),
+        }
+    }
+
+    pub fn rename_global_workspace(
+        &self,
+        workspace_id: impl Into<String>,
+        expected_revision: u64,
+        name: impl Into<String>,
+    ) -> Result<crate::protocol::GlobalWorkspaceSnapshot> {
+        match self.request(Request::RenameGlobalWorkspace {
+            workspace_id: workspace_id.into(),
+            expected_revision,
+            name: name.into(),
+        })? {
+            Response::GlobalWorkspace { workspace } => Ok(workspace),
+            response => unexpected(response),
+        }
+    }
+
+    pub fn open_global_workspace(
+        &self,
+        workspace_id: impl Into<String>,
+        expected_revision: u64,
+    ) -> Result<crate::protocol::GlobalWorkspaceOperationResult> {
+        match self.request(Request::OpenGlobalWorkspace {
+            workspace_id: workspace_id.into(),
+            expected_revision,
+        })? {
+            Response::GlobalWorkspaceOperation { result } => Ok(result),
+            response => unexpected(response),
+        }
+    }
+
+    pub fn close_global_workspace(
+        &self,
+        workspace_id: impl Into<String>,
+        expected_revision: u64,
+    ) -> Result<crate::protocol::GlobalWorkspaceOperationResult> {
+        match self.request(Request::CloseGlobalWorkspace {
+            workspace_id: workspace_id.into(),
+            expected_revision,
+        })? {
+            Response::GlobalWorkspaceOperation { result } => Ok(result),
+            response => unexpected(response),
+        }
+    }
+
+    pub fn retry_global_workspace_close(
+        &self,
+        workspace_id: impl Into<String>,
+    ) -> Result<crate::protocol::GlobalWorkspaceOperationResult> {
+        match self.request(Request::RetryGlobalWorkspaceClose {
+            workspace_id: workspace_id.into(),
+        })? {
+            Response::GlobalWorkspaceOperation { result } => Ok(result),
+            response => unexpected(response),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_global_workspace_shell(
+        &self,
+        operation_id: impl Into<String>,
+        global_workspace_id: impl Into<String>,
+        expected_global_revision: u64,
+        node_id: impl Into<String>,
+        owner_workspace_id: impl Into<String>,
+        default_cwd: Option<PathBuf>,
+        shell_id: impl Into<String>,
+        shell: ShellSpec,
+    ) -> Result<(crate::protocol::GlobalWorkspaceSnapshot, ShellSnapshot)> {
+        match self.workspace_resource_request(Request::CreateGlobalWorkspaceShell {
+            operation_id: operation_id.into(),
+            global_workspace_id: global_workspace_id.into(),
+            expected_global_revision,
+            node_id: node_id.into(),
+            owner_workspace_id: owner_workspace_id.into(),
+            default_cwd,
+            shell_id: shell_id.into(),
+            shell,
+        })? {
+            Response::GlobalWorkspaceResource {
+                workspace,
+                resource: RoutedOperationResult::Shell { shell },
+            } => Ok((workspace, shell)),
+            response => unexpected(response),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_global_workspace_with_shell(
+        &self,
+        operation_id: impl Into<String>,
+        global_workspace_id: impl Into<String>,
+        name: impl Into<String>,
+        node_id: impl Into<String>,
+        owner_workspace_id: impl Into<String>,
+        default_cwd: PathBuf,
+        shell_id: impl Into<String>,
+        shell: ShellSpec,
+    ) -> Result<(crate::protocol::GlobalWorkspaceSnapshot, ShellSnapshot)> {
+        match self.workspace_resource_request(Request::CreateGlobalWorkspaceWithShell {
+            operation_id: operation_id.into(),
+            global_workspace_id: global_workspace_id.into(),
+            name: name.into(),
+            node_id: node_id.into(),
+            owner_workspace_id: owner_workspace_id.into(),
+            default_cwd,
+            shell_id: shell_id.into(),
+            shell,
+        })? {
+            Response::GlobalWorkspaceResource {
+                workspace,
+                resource: RoutedOperationResult::Shell { shell },
+            } => Ok((workspace, shell)),
+            response => unexpected(response),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_global_workspace_launcher(
+        &self,
+        operation_id: impl Into<String>,
+        global_workspace_id: impl Into<String>,
+        expected_global_revision: u64,
+        node_id: impl Into<String>,
+        owner_workspace_id: impl Into<String>,
+        default_cwd: Option<PathBuf>,
+        launcher_id: impl Into<String>,
+        spec: WorkspaceLauncherSpec,
+    ) -> Result<(
+        crate::protocol::GlobalWorkspaceSnapshot,
+        WorkspaceLauncherSnapshot,
+    )> {
+        match self.workspace_resource_request(Request::CreateGlobalWorkspaceLauncher {
+            operation_id: operation_id.into(),
+            global_workspace_id: global_workspace_id.into(),
+            expected_global_revision,
+            node_id: node_id.into(),
+            owner_workspace_id: owner_workspace_id.into(),
+            default_cwd,
+            launcher_id: launcher_id.into(),
+            spec,
+        })? {
+            Response::GlobalWorkspaceResource {
+                workspace,
+                resource: RoutedOperationResult::Launcher { launcher },
+            } => Ok((workspace, launcher)),
+            response => unexpected(response),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_global_workspace_agent_schedule(
+        &self,
+        operation_id: impl Into<String>,
+        global_workspace_id: impl Into<String>,
+        expected_global_revision: u64,
+        node_id: impl Into<String>,
+        owner_workspace_id: impl Into<String>,
+        default_cwd: Option<PathBuf>,
+        schedule_id: impl Into<String>,
+        spec: AgentScheduleSpec,
+    ) -> Result<(
+        crate::protocol::GlobalWorkspaceSnapshot,
+        AgentScheduleSnapshot,
+    )> {
+        match self.workspace_resource_request(Request::CreateGlobalWorkspaceAgentSchedule {
+            operation_id: operation_id.into(),
+            global_workspace_id: global_workspace_id.into(),
+            expected_global_revision,
+            node_id: node_id.into(),
+            owner_workspace_id: owner_workspace_id.into(),
+            default_cwd,
+            schedule_id: schedule_id.into(),
+            spec,
+        })? {
+            Response::GlobalWorkspaceResource {
+                workspace,
+                resource: RoutedOperationResult::AgentSchedule { schedule },
+            } => Ok((workspace, schedule)),
             response => unexpected(response),
         }
     }
@@ -1653,6 +1920,78 @@ mod tests {
         .unwrap();
     }
 
+    #[test]
+    fn workspace_resource_retries_the_identical_request_after_response_loss() {
+        let directory = env::temp_dir().join(format!("boomux-client-workspace-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let socket = directory.join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let workspace_id = Uuid::from_u128(1).to_string();
+        let shell_id = Uuid::from_u128(2).to_string();
+        let server_workspace_id = workspace_id.clone();
+        let server_shell_id = shell_id.clone();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let first: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+            drop(stream);
+
+            let (mut stream, _) = listener.accept().unwrap();
+            let second: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+            assert_eq!(second, first);
+            protocol::write_message(
+                &mut stream,
+                &Envelope::with_version(
+                    protocol::PROTOCOL_VERSION,
+                    Response::GlobalWorkspaceResource {
+                        workspace: protocol::GlobalWorkspaceSnapshot {
+                            id: server_workspace_id.clone(),
+                            revision: 2,
+                            name: "retry".into(),
+                            closing: false,
+                            placements: Vec::new(),
+                        },
+                        resource: RoutedOperationResult::Shell {
+                            shell: ShellSnapshot {
+                                id: server_shell_id,
+                                revision: 1,
+                                workspace_id: server_workspace_id,
+                                name: "retry".into(),
+                                cwd: "/tmp".into(),
+                                command: Vec::new(),
+                                owner: protocol::ShellOwner::User,
+                                status: protocol::ShellStatus::Pending,
+                                run: None,
+                                foreground_process: None,
+                            },
+                        },
+                    },
+                ),
+            )
+            .unwrap();
+        });
+        let client = Client::from_socket_path(socket);
+        let (workspace, shell) = client
+            .create_global_workspace_shell(
+                Uuid::from_u128(3).to_string(),
+                &workspace_id,
+                1,
+                Uuid::from_u128(4).to_string(),
+                Uuid::from_u128(5).to_string(),
+                Some("/tmp".into()),
+                &shell_id,
+                ShellSpec {
+                    name: "retry".into(),
+                    cwd: "/tmp".into(),
+                    command: Vec::new(),
+                },
+            )
+            .unwrap();
+        assert_eq!(workspace.id, workspace_id);
+        assert_eq!(shell.id, shell_id);
+        server.join().unwrap();
+        fs::remove_dir_all(directory).unwrap();
+    }
+
     fn assert_two_stage_restart_from(old_version: u32) {
         let directory = env::temp_dir().join(format!("boomux-client-restart-{}", Uuid::new_v4()));
         fs::create_dir_all(&directory).unwrap();
@@ -1958,7 +2297,8 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
-            reject_protocol(&listener, protocol::PROTOCOL_VERSION, 36);
+            reject_protocol(&listener, protocol::PROTOCOL_VERSION, 37);
+            reject_protocol(&listener, 37, 36);
             reject_protocol(&listener, 36, 35);
             reject_protocol(&listener, 35, 34);
             reject_protocol(&listener, 34, 33);
@@ -2130,7 +2470,8 @@ mod tests {
             )
             .unwrap();
 
-            reject_protocol(&listener, protocol::PROTOCOL_VERSION, 36);
+            reject_protocol(&listener, protocol::PROTOCOL_VERSION, 37);
+            reject_protocol(&listener, 37, 36);
             reject_protocol(&listener, 36, 35);
             reject_protocol(&listener, 35, 34);
             reject_protocol(&listener, 34, 33);
@@ -2196,7 +2537,8 @@ mod tests {
             )
             .unwrap();
 
-            reject_protocol(&listener, protocol::PROTOCOL_VERSION, 36);
+            reject_protocol(&listener, protocol::PROTOCOL_VERSION, 37);
+            reject_protocol(&listener, 37, 36);
             reject_protocol(&listener, 36, 35);
             reject_protocol(&listener, 35, 34);
             reject_protocol(&listener, 34, 33);
@@ -2244,7 +2586,8 @@ mod tests {
                 ),
             )
             .unwrap();
-            reject_protocol(&listener, protocol::PROTOCOL_VERSION, 36);
+            reject_protocol(&listener, protocol::PROTOCOL_VERSION, 37);
+            reject_protocol(&listener, 37, 36);
             reject_protocol(&listener, 36, 35);
             reject_protocol(&listener, 35, 34);
             reject_protocol(&listener, 34, 33);
@@ -2422,7 +2765,8 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
-            reject_protocol(&listener, protocol::PROTOCOL_VERSION, 36);
+            reject_protocol(&listener, protocol::PROTOCOL_VERSION, 37);
+            reject_protocol(&listener, 37, 36);
             reject_protocol(&listener, 36, 35);
             reject_protocol(&listener, 35, 34);
             reject_protocol(&listener, 34, 33);
@@ -2495,7 +2839,8 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
-            reject_protocol(&listener, protocol::PROTOCOL_VERSION, 36);
+            reject_protocol(&listener, protocol::PROTOCOL_VERSION, 37);
+            reject_protocol(&listener, 37, 36);
             reject_protocol(&listener, 36, 35);
             reject_protocol(&listener, 35, 34);
             reject_protocol(&listener, 34, 33);

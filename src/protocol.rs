@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 37;
+pub const PROTOCOL_VERSION: u32 = 38;
 pub const MIN_PROTOCOL_VERSION: u32 = 6;
 pub const MAX_CONTROL_FRAME: usize = 8 * 1024 * 1024;
 pub const MAX_ATTACH_FRAME: usize = 1024 * 1024;
@@ -160,6 +160,13 @@ define_protocol_features! {
         "protocol_37",
         "remote_agent_schedule_management",
         "remote_scheduled_execution_observation",
+    ]),
+    GlobalWorkspaces => (38, "coordinated multi-Node Workspaces", [
+        "protocol_38",
+        "global_workspaces",
+        "multi_node_workspace_placements",
+        "guarded_workspace_adoption",
+        "resumable_workspace_close",
     ]),
 }
 
@@ -722,12 +729,77 @@ pub struct NodeProjectionSync {
     pub cursor: EventCursor,
     pub projection: NodeProjectionSnapshot,
     pub transitions: Vec<NodeProjectionTransition>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CombinedNodeSnapshot {
     pub nodes: Vec<CombinedNode>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workspaces: Vec<GlobalWorkspaceSnapshot>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub external_workspaces: Vec<ExternalWorkspaceSnapshot>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspacePlacementState {
+    Active,
+    ClosePending,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspacePlacementSnapshot {
+    pub node_id: String,
+    pub workspace_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_workspace_name: Option<String>,
+    pub owner_revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_cwd: Option<PathBuf>,
+    pub state: WorkspacePlacementState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GlobalWorkspaceSnapshot {
+    pub id: String,
+    pub revision: u64,
+    pub name: String,
+    pub closing: bool,
+    pub placements: Vec<WorkspacePlacementSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalWorkspaceSnapshot {
+    pub identity: QualifiedIdentity,
+    pub revision: u64,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_cwd: Option<PathBuf>,
+    pub available: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspacePlacementResult {
+    pub node_id: String,
+    pub workspace_id: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GlobalWorkspaceOperationResult {
+    pub workspace: GlobalWorkspaceSnapshot,
+    pub placements: Vec<WorkspacePlacementResult>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -736,6 +808,10 @@ pub struct CombinedNode {
     pub node_id: String,
     pub alias: String,
     pub local: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registration_revision: Option<u64>,
     pub health: NodeProjectionHealthCode,
     pub current: bool,
     pub stale: bool,
@@ -744,6 +820,10 @@ pub struct CombinedNode {
     pub observed_protocol_version: Option<u32>,
     #[serde(default)]
     pub observed_capabilities: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub workspace_owner_eligible: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_owner_unavailable_reason: Option<String>,
     pub scheduler: SchedulerHealth,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_snapshot: Option<Snapshot>,
@@ -1219,6 +1299,30 @@ pub enum ErrorCode {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RoutedOperation {
+    CreateWorkspaceShell {
+        workspace_id: String,
+        workspace_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        default_cwd: Option<PathBuf>,
+        shell_id: String,
+        shell: ShellSpec,
+    },
+    CreateWorkspaceLauncher {
+        workspace_id: String,
+        workspace_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        default_cwd: Option<PathBuf>,
+        launcher_id: String,
+        spec: WorkspaceLauncherSpec,
+    },
+    CreateWorkspaceAgentSchedule {
+        workspace_id: String,
+        workspace_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        default_cwd: Option<PathBuf>,
+        schedule_id: String,
+        spec: AgentScheduleSpec,
+    },
     CreateAgentSchedule {
         workspace_id: String,
         spec: AgentScheduleSpec,
@@ -1349,6 +1453,12 @@ impl RoutedOperation {
             ResourceRevision, ResourceRevisionAndRun, ScheduleRevision,
         };
         match self {
+            Self::CreateWorkspaceShell { .. }
+            | Self::CreateWorkspaceLauncher { .. }
+            | Self::CreateWorkspaceAgentSchedule { .. } => RoutedOperationClass {
+                guard: ExactId,
+                ambiguity: RetrySameRequest,
+            },
             Self::CreateAgentSchedule { .. } => RoutedOperationClass {
                 guard: None,
                 ambiguity: ReadAndProve,
@@ -1408,6 +1518,9 @@ impl RoutedOperation {
 
     pub fn ambiguity_probe(&self) -> Option<Request> {
         match self {
+            Self::CreateWorkspaceShell { .. }
+            | Self::CreateWorkspaceLauncher { .. }
+            | Self::CreateWorkspaceAgentSchedule { .. } => None,
             Self::RenameWorkspace { workspace_id, .. }
             | Self::CloseWorkspace { workspace_id, .. } => Some(Request::GetWorkspace {
                 workspace_id: workspace_id.clone(),
@@ -1439,6 +1552,45 @@ impl RoutedOperation {
 
     pub fn owner_request(&self) -> Request {
         match self.clone() {
+            Self::CreateWorkspaceShell {
+                workspace_id,
+                workspace_name,
+                default_cwd,
+                shell_id,
+                shell,
+            } => Request::CreateWorkspaceShell {
+                workspace_id,
+                workspace_name,
+                default_cwd,
+                shell_id,
+                shell,
+            },
+            Self::CreateWorkspaceLauncher {
+                workspace_id,
+                workspace_name,
+                default_cwd,
+                launcher_id,
+                spec,
+            } => Request::CreateWorkspaceLauncher {
+                workspace_id,
+                workspace_name,
+                default_cwd,
+                launcher_id,
+                spec,
+            },
+            Self::CreateWorkspaceAgentSchedule {
+                workspace_id,
+                workspace_name,
+                default_cwd,
+                schedule_id,
+                spec,
+            } => Request::CreateWorkspaceAgentSchedule {
+                workspace_id,
+                workspace_name,
+                default_cwd,
+                schedule_id,
+                spec,
+            },
             Self::CreateAgentSchedule { workspace_id, spec } => {
                 Request::CreateAgentSchedule { workspace_id, spec }
             }
@@ -1867,9 +2019,84 @@ pub enum Request {
     GetNodeProjectionHealth {
         selector: String,
     },
+    ForceNodeProjectionRefresh {
+        selector: String,
+    },
     GetCombinedNodeSnapshot {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         selector: Option<String>,
+    },
+    CreateGlobalWorkspace {
+        name: String,
+    },
+    AdoptNodeWorkspace {
+        identity: QualifiedIdentity,
+        expected_revision: u64,
+    },
+    LinkNodeWorkspace {
+        global_workspace_id: String,
+        expected_global_revision: u64,
+        identity: QualifiedIdentity,
+        expected_owner_revision: u64,
+    },
+    RenameGlobalWorkspace {
+        workspace_id: String,
+        expected_revision: u64,
+        name: String,
+    },
+    OpenGlobalWorkspace {
+        workspace_id: String,
+        expected_revision: u64,
+    },
+    CloseGlobalWorkspace {
+        workspace_id: String,
+        expected_revision: u64,
+    },
+    RetryGlobalWorkspaceClose {
+        workspace_id: String,
+    },
+    CreateGlobalWorkspaceShell {
+        operation_id: String,
+        global_workspace_id: String,
+        expected_global_revision: u64,
+        node_id: String,
+        owner_workspace_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        default_cwd: Option<PathBuf>,
+        shell_id: String,
+        shell: ShellSpec,
+    },
+    CreateGlobalWorkspaceWithShell {
+        operation_id: String,
+        global_workspace_id: String,
+        name: String,
+        node_id: String,
+        owner_workspace_id: String,
+        default_cwd: PathBuf,
+        shell_id: String,
+        shell: ShellSpec,
+    },
+    CreateGlobalWorkspaceLauncher {
+        operation_id: String,
+        global_workspace_id: String,
+        expected_global_revision: u64,
+        node_id: String,
+        owner_workspace_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        default_cwd: Option<PathBuf>,
+        launcher_id: String,
+        spec: WorkspaceLauncherSpec,
+    },
+    CreateGlobalWorkspaceAgentSchedule {
+        operation_id: String,
+        global_workspace_id: String,
+        expected_global_revision: u64,
+        node_id: String,
+        owner_workspace_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        default_cwd: Option<PathBuf>,
+        schedule_id: String,
+        spec: AgentScheduleSpec,
     },
     RouteNodeOperation {
         node_id: String,
@@ -1934,6 +2161,30 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         default_cwd: Option<PathBuf>,
         shells: Vec<ShellSpec>,
+    },
+    CreateWorkspaceShell {
+        workspace_id: String,
+        workspace_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        default_cwd: Option<PathBuf>,
+        shell_id: String,
+        shell: ShellSpec,
+    },
+    CreateWorkspaceLauncher {
+        workspace_id: String,
+        workspace_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        default_cwd: Option<PathBuf>,
+        launcher_id: String,
+        spec: WorkspaceLauncherSpec,
+    },
+    CreateWorkspaceAgentSchedule {
+        workspace_id: String,
+        workspace_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        default_cwd: Option<PathBuf>,
+        schedule_id: String,
+        spec: AgentScheduleSpec,
     },
     CreateShell {
         #[serde(default)]
@@ -2149,6 +2400,30 @@ impl Request {
                 Some(ProtocolFeature::NodeProjectionSync)
             }
             Self::GetCombinedNodeSnapshot { .. } => Some(ProtocolFeature::CombinedNodeSnapshot),
+            Self::ForceNodeProjectionRefresh { .. } => Some(ProtocolFeature::GlobalWorkspaces),
+            Self::CreateGlobalWorkspace { .. }
+            | Self::AdoptNodeWorkspace { .. }
+            | Self::LinkNodeWorkspace { .. }
+            | Self::RenameGlobalWorkspace { .. }
+            | Self::OpenGlobalWorkspace { .. }
+            | Self::CloseGlobalWorkspace { .. }
+            | Self::RetryGlobalWorkspaceClose { .. }
+            | Self::CreateGlobalWorkspaceShell { .. }
+            | Self::CreateGlobalWorkspaceWithShell { .. }
+            | Self::CreateGlobalWorkspaceLauncher { .. }
+            | Self::CreateGlobalWorkspaceAgentSchedule { .. } => {
+                Some(ProtocolFeature::GlobalWorkspaces)
+            }
+            Self::CreateWorkspaceShell { .. }
+            | Self::CreateWorkspaceLauncher { .. }
+            | Self::CreateWorkspaceAgentSchedule { .. }
+            | Self::RouteNodeOperation {
+                operation:
+                    RoutedOperation::CreateWorkspaceShell { .. }
+                    | RoutedOperation::CreateWorkspaceLauncher { .. }
+                    | RoutedOperation::CreateWorkspaceAgentSchedule { .. },
+                ..
+            } => Some(ProtocolFeature::GlobalWorkspaces),
             Self::RouteNodeOperation {
                 operation:
                     RoutedOperation::CreateAgentSchedule { .. }
@@ -2297,6 +2572,16 @@ pub enum Response {
     },
     CombinedNodeSnapshot {
         snapshot: CombinedNodeSnapshot,
+    },
+    GlobalWorkspace {
+        workspace: GlobalWorkspaceSnapshot,
+    },
+    GlobalWorkspaceOperation {
+        result: GlobalWorkspaceOperationResult,
+    },
+    GlobalWorkspaceResource {
+        workspace: GlobalWorkspaceSnapshot,
+        resource: RoutedOperationResult,
     },
     RoutedNodeOperation {
         result: RoutedOperationResult,
@@ -2930,8 +3215,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_thirty_seven_with_minimum_six() {
-        assert_eq!(PROTOCOL_VERSION, 37);
+    fn protocol_version_is_thirty_eight_with_minimum_six() {
+        assert_eq!(PROTOCOL_VERSION, 38);
         assert_eq!(MIN_PROTOCOL_VERSION, 6);
     }
 
@@ -3099,7 +3384,11 @@ mod tests {
             request
         );
         let response = Response::CombinedNodeSnapshot {
-            snapshot: CombinedNodeSnapshot { nodes: Vec::new() },
+            snapshot: CombinedNodeSnapshot {
+                nodes: Vec::new(),
+                workspaces: Vec::new(),
+                external_workspaces: Vec::new(),
+            },
         };
         assert_eq!(
             serde_json::from_value::<Response>(serde_json::to_value(&response).unwrap()).unwrap(),
@@ -3202,6 +3491,130 @@ mod tests {
                 expected_revision: 4,
             }
             .is_retryable()
+        );
+    }
+
+    #[test]
+    fn protocol_thirty_eight_coordinates_workspaces_and_exact_owner_creation() {
+        let node_id = uuid::Uuid::from_u128(1).to_string();
+        let workspace_id = uuid::Uuid::from_u128(2).to_string();
+        let requests = vec![
+            Request::CreateGlobalWorkspace {
+                name: "work".into(),
+            },
+            Request::AdoptNodeWorkspace {
+                identity: QualifiedIdentity::new(&node_id, &workspace_id),
+                expected_revision: 3,
+            },
+            Request::LinkNodeWorkspace {
+                global_workspace_id: uuid::Uuid::from_u128(3).to_string(),
+                expected_global_revision: 4,
+                identity: QualifiedIdentity::new(&node_id, &workspace_id),
+                expected_owner_revision: 3,
+            },
+            Request::OpenGlobalWorkspace {
+                workspace_id: workspace_id.clone(),
+                expected_revision: 4,
+            },
+            Request::CloseGlobalWorkspace {
+                workspace_id: workspace_id.clone(),
+                expected_revision: 4,
+            },
+            Request::RetryGlobalWorkspaceClose {
+                workspace_id: workspace_id.clone(),
+            },
+            Request::CreateGlobalWorkspaceWithShell {
+                operation_id: uuid::Uuid::from_u128(11).to_string(),
+                global_workspace_id: uuid::Uuid::from_u128(12).to_string(),
+                name: "project".into(),
+                node_id: node_id.clone(),
+                owner_workspace_id: uuid::Uuid::from_u128(13).to_string(),
+                default_cwd: "/owner/project".into(),
+                shell_id: uuid::Uuid::from_u128(14).to_string(),
+                shell: ShellSpec {
+                    name: "project".into(),
+                    cwd: "/owner/project".into(),
+                    command: Vec::new(),
+                },
+            },
+        ];
+        for request in requests {
+            assert_eq!(
+                request.required_feature(),
+                Some(ProtocolFeature::GlobalWorkspaces)
+            );
+            assert_eq!(
+                serde_json::from_value::<Request>(serde_json::to_value(&request).unwrap()).unwrap(),
+                request
+            );
+        }
+
+        let operation = RoutedOperation::CreateWorkspaceShell {
+            workspace_id: workspace_id.clone(),
+            workspace_name: "work".into(),
+            default_cwd: Some("/owner/work".into()),
+            shell_id: uuid::Uuid::from_u128(4).to_string(),
+            shell: ShellSpec {
+                name: "shell".into(),
+                cwd: "/owner/work".into(),
+                command: vec!["bash".into(), "-lc".into(), "printf %s safe".into()],
+            },
+        };
+        assert!(operation.is_retryable());
+        assert_eq!(operation.classification().guard, RoutedGuard::ExactId);
+        assert!(matches!(
+            operation.owner_request(),
+            Request::CreateWorkspaceShell { .. }
+        ));
+        let request = Request::RouteNodeOperation { node_id, operation };
+        assert_eq!(
+            request.required_feature(),
+            Some(ProtocolFeature::GlobalWorkspaces)
+        );
+
+        let schedule = RoutedOperation::CreateWorkspaceAgentSchedule {
+            workspace_id,
+            workspace_name: "work".into(),
+            default_cwd: Some("/owner/work".into()),
+            schedule_id: uuid::Uuid::from_u128(5).to_string(),
+            spec: AgentScheduleSpec {
+                name: "review".into(),
+                cwd: "/owner/work".into(),
+                integration: "opencode".into(),
+                prompt: "PRIVATE WORKSPACE PROMPT".into(),
+                session: AgentScheduleSession::Fresh,
+                trigger: AgentScheduleTrigger {
+                    cron: "0 2 * * *".into(),
+                    timezone: "UTC".into(),
+                },
+                state: AgentScheduleState::Paused,
+                overlap_policy: AgentScheduleOverlapPolicy::Skip,
+            },
+        };
+        assert!(!format!("{schedule:?}").contains("PRIVATE WORKSPACE PROMPT"));
+        assert!(format!("{schedule:?}").contains("<redacted>"));
+
+        let request = Request::CreateGlobalWorkspaceAgentSchedule {
+            operation_id: uuid::Uuid::from_u128(10).to_string(),
+            global_workspace_id: uuid::Uuid::from_u128(6).to_string(),
+            expected_global_revision: 1,
+            node_id: uuid::Uuid::from_u128(7).to_string(),
+            owner_workspace_id: uuid::Uuid::from_u128(8).to_string(),
+            default_cwd: Some("/owner/work".into()),
+            schedule_id: uuid::Uuid::from_u128(9).to_string(),
+            spec: match schedule {
+                RoutedOperation::CreateWorkspaceAgentSchedule { spec, .. } => spec,
+                _ => unreachable!(),
+            },
+        };
+        assert_eq!(
+            request.required_feature(),
+            Some(ProtocolFeature::GlobalWorkspaces)
+        );
+        assert!(!format!("{request:?}").contains("PRIVATE WORKSPACE PROMPT"));
+        assert_eq!(
+            serde_json::from_value::<Request>(serde_json::to_value(&request).unwrap()).unwrap(),
+            request
         );
     }
 
@@ -4070,6 +4483,16 @@ mod tests {
                     "protocol_37",
                     "remote_agent_schedule_management",
                     "remote_scheduled_execution_observation",
+                ][..],
+            ),
+            (
+                38,
+                &[
+                    "protocol_38",
+                    "global_workspaces",
+                    "multi_node_workspace_placements",
+                    "guarded_workspace_adoption",
+                    "resumable_workspace_close",
                 ][..],
             ),
         ];

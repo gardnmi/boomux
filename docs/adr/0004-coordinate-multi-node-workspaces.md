@@ -1,6 +1,6 @@
 # Coordinate Multi-Node Workspaces
 
-Status: Accepted; implementation pending
+Status: Accepted; implemented
 
 A Workspace is the coordinator-owned place where a user organizes Shells,
 Agent Instances, launchers, and Agent Schedules across one or more Nodes. The
@@ -18,6 +18,17 @@ or linked explicitly, and equal names never merge membership.
 Opening a Workspace fans out to every available placement and reports per-Node
 results without replaying ambiguous starts. Closing retains coordinator metadata
 and unresolved membership until guarded removal is confirmed by every owner.
+Resource creation durably prepares exact operation and request identity before
+owner mutation. Absence during reconciliation is inconclusive, while an observed
+exact resource completes placement. A bounded durable success ledger makes
+response-loss retry idempotent; concurrent identical handlers share that result,
+and concurrent first-placement requests preserve caller identity while using one
+canonical owner Workspace. Adoption and linking revalidate the live owner
+protocol, runtime capability, and revision rather than trusting cached projection
+eligibility. Preparation reserves durable completion capacity before owner
+mutation, and project eligibility preflight precedes empty metadata creation. A
+durable dispatch phase prevents later absence or route failure from being
+misread as proof that an ambiguous owner mutation never happened.
 This costs coordinator persistence, placement-aware protocols, and partial
 operation tracking, but preserves a task-first user model without distributed
 process ownership or consensus between runtime authorities.

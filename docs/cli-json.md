@@ -190,12 +190,13 @@ Command payloads are:
   filesystem without starting or contacting the daemon. With `--node`, the same
   bounded discovery runs on the verified owner and contacts the local routing
   daemon.
-- `workspace.list`: a `workspaces` array of `id`, `name`, `shell_count`,
-  `launcher_count`, `schedule_count`, `agent_count`, fixed `agent_state_counts`, and
-  `attention_count`.
-- `workspace.inspect`: one `workspace` object containing `id`, `name`, nullable
-  `default_cwd`, and prompt-free `shells`, `launchers`, `schedules`, and `agents`
-  arrays.
+- `workspace.list`: on protocol 38, `workspaces` contains coordinator Workspace
+  snapshots and `external_workspaces` contains unlinked qualified owner
+  singletons. On older protocols it retains the local summary array of `id`,
+  `name`, resource counts, fixed `agent_state_counts`, and `attention_count`.
+- `workspace.inspect`: on protocol 38, a global target returns coordinator
+  `id`, `revision`, `name`, `closing`, and explicit placements. External or
+  older local targets retain the owner Workspace inspection shape.
 - `node.list`: an alias-then-Node-ID ordered array of registration objects.
 - `node.add`, `node.inspect`, `node.rename`, `node.retarget`, and `node.forget`:
   one registration object with `alias`, exact `target`, pinned `node_id`,
@@ -206,11 +207,20 @@ Command payloads are:
   local alias; omission returns the all-Node overview. The local Node has alias
   `local`. A selector matching both that alias and a registration returns typed
   `ambiguous_target`; exact Node IDs disambiguate. Entries contain `node_id`,
-  `alias`, `local`, `health`, `current`, `stale`, `observed_at_ms`, nullable
+  `alias`, `local`, nullable `route`, nullable `registration_revision`, `health`,
+  `current`, `stale`, `observed_at_ms`, nullable
   `observed_protocol_version`, `observed_capabilities`, `scheduler`, and nullable
-  `local_snapshot` and `remote_projection` payloads. Every resource `id` and
+  `workspace_owner_eligible`, nullable `workspace_owner_unavailable_reason`,
+  `local_snapshot`, and `remote_projection` payloads. Every resource `id` and
   relationship ID in those payloads is `{ "node_id": "...", "inner_id":
   "..." }`; inner IDs are unchanged and must not be routed without their Node.
+  Protocol 38 also adds `workspaces` and `external_workspaces` arrays.
+  `workspaces` contains coordinator-owned `id`, `revision`, `name`, `closing`,
+  and explicit placements with Node ID, owner Workspace ID, observed owner
+  revision, nullable owner-local Workspace name, nullable owner-local `default_cwd`, and `active`, `close_pending`, or
+  `unavailable` state. `external_workspaces` contains unlinked qualified owner
+  identity, revision, name, nullable owner-local default cwd, and availability.
+  Protocol-37 and older responses omit both additive arrays.
 - `shell.suggest-name`: exact resolved `workspace_id` plus a nonempty generated
   `name` that does not match any shell name in that workspace at observation
   time.
@@ -337,6 +347,47 @@ Protocol 36 adds `protocol_36`, `typed_node_host_services`,
 `remote_exact_session_resume`.
 Protocol 37 adds `protocol_37`, `remote_agent_schedule_management`, and
 `remote_scheduled_execution_observation`.
+Protocol 38 adds `protocol_38`, `global_workspaces`,
+`multi_node_workspace_placements`, `guarded_workspace_adoption`, and
+`resumable_workspace_close`.
+
+Protocol-38 `workspace create` without `--cwd` creates coordinator metadata
+without a default Node or cwd. The compatibility form with `--cwd` continues to
+create an unlinked local owner Workspace, visible as an external singleton until
+explicit adoption or linking. First global `shell create`, `launcher create`, or `schedule create`
+resolves `--node` against eligible owners. If exactly one owner is eligible it
+may be used without `--node`; zero or multiple eligible owners return a typed
+selection error listing disabled health reasons. The owner-local cwd is resolved
+on that Node. Exact argv arrays and private Schedule prompts are unchanged by
+coordination. `workspace open`, `close`, `rename`, `list`, and `inspect` resolve
+global IDs or names before considering external local records.
+`workspace adopt TARGET --node NODE`, `workspace link GLOBAL OWNER --node NODE`,
+and `workspace retry GLOBAL` expose guarded adoption, linking, and unresolved
+close retry without requiring the TUI. Repeating `workspace close` for a closing
+global Workspace also uses the retry operation. Dashboard project selections
+use the same sole-owner or explicit no-default Node choice as first-resource
+creation, resolve the path on that owner, and create the global Workspace's first
+Shell and placement together. The path is never attached to empty coordinator
+metadata.
+Prepared resource requests carry one caller-stable operation UUID. The client
+retries the exact request once after a lost connection, timeout, unknown outcome,
+or coordinator persistence failure. The coordinator returns the durable prior
+success before evaluating a now-stale revision guard. This replay guarantee lasts
+while the success remains among at most the newest 256 completed operations and
+within the 1 MiB coordinator-store bound; oldest-first eviction ends the
+guarantee. Project creation additionally resumes or replays a same-name request
+only when its Node, cwd, and Shell definition match. It verifies cached and live
+owner eligibility before persisting new metadata, so a missing or capability-
+disabled Node does not reserve the project name. Prepared requests reserve their
+completed-response footprint within the 1 MiB store and fail before owner
+mutation when capacity is unavailable. The coordinator durably marks owner
+dispatch before mutation; after that boundary, later capability, registration,
+identity, owner-error, or `not_found` results retain the pending project and name
+for exact recovery rather than allowing different semantics to reuse it.
+Adoption and linking fetch a fresh
+protocol-38 combined local snapshot over the admitted identity-pinned route and
+require its runtime `global_workspaces` capability before using the owner revision;
+cached eligibility cannot authorize them.
 
 Node snapshot health is `unobserved`, `online`, `reconnecting`, `stale`,
 `unreachable`, `authentication_required`, `identity_changed`,
