@@ -150,6 +150,13 @@ pub struct Client {
     protocol_version: Arc<AtomicU32>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DaemonPeerCredentials {
+    pub pid: u32,
+    pub uid: u32,
+    pub protocol_version: u32,
+}
+
 #[derive(Debug)]
 pub struct Attachment {
     pub stream: UnixStream,
@@ -565,6 +572,47 @@ impl Client {
 
     pub fn ping(&self) -> Result<()> {
         expect_ok(self.request(Request::Ping)?, Response::Pong)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn daemon_peer_credentials(&self) -> Result<DaemonPeerCredentials> {
+        let (stream, protocol_version, response) = self.send(Request::Ping)?;
+        expect_ok(response, Response::Pong)?;
+        let mut credentials = libc::ucred {
+            pid: 0,
+            uid: 0,
+            gid: 0,
+        };
+        let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        let result = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                std::ptr::from_mut(&mut credentials).cast(),
+                &mut length,
+            )
+        };
+        if result == -1 || length as usize != std::mem::size_of::<libc::ucred>() {
+            return Err(ClientError::Transport(io::Error::last_os_error()));
+        }
+        let pid = u32::try_from(credentials.pid).map_err(|_| {
+            ClientError::Transport(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "daemon socket peer returned an invalid PID",
+            ))
+        })?;
+        if pid == 0 {
+            return Err(ClientError::Transport(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "daemon socket peer returned an invalid PID",
+            )));
+        }
+        Ok(DaemonPeerCredentials {
+            pid,
+            uid: credentials.uid,
+            protocol_version,
+        })
     }
 
     pub fn node_identity(&self) -> Result<String> {

@@ -1949,11 +1949,12 @@ fn send_registered_node_request_with_timeout(
     route_feature: Option<protocol::ProtocolFeature>,
 ) -> io::Result<Response> {
     let target = SshTarget::parse(registration.target.clone())?;
-    let helper = match ssh_bootstrap::plan_remote_bootstrap(
-        target.clone(),
+    let mut bootstrap = ssh_bootstrap::BootstrapSession::open(
+        target,
         SshAuthenticationMode::Batch,
         Duration::from_secs(2),
-    )? {
+    )?;
+    let helper = match bootstrap.plan(Duration::from_secs(2))? {
         RemoteBootstrapPlan::Ready(helper) => helper,
         RemoteBootstrapPlan::Install(_) => {
             return Err(io::Error::new(
@@ -1976,12 +1977,7 @@ fn send_registered_node_request_with_timeout(
             format!("remote Node does not support {}", feature.requirement()),
         ));
     }
-    let mut remote = ssh_bootstrap::connect_remote(
-        target,
-        helper,
-        SshAuthenticationMode::Batch,
-        Duration::from_secs(2),
-    )?;
+    let mut remote = bootstrap.connect(helper, Duration::from_secs(2))?;
     remote.request(request, response_timeout)
 }
 
@@ -7329,11 +7325,13 @@ fn fetch_node_projection(
     use crate::protocol::NodeProjectionHealthCode;
     let target = SshTarget::parse(registration.target.clone())
         .map_err(|error| (NodeProjectionHealthCode::Unreachable, error))?;
-    let helper = match ssh_bootstrap::plan_remote_bootstrap(
-        target.clone(),
+    let mut bootstrap = ssh_bootstrap::BootstrapSession::open(
+        target,
         SshAuthenticationMode::Batch,
         Duration::from_secs(2),
-    ) {
+    )
+    .map_err(|error| (classify_node_sync_error(&error), error))?;
+    let helper = match bootstrap.plan(Duration::from_secs(2)) {
         Ok(RemoteBootstrapPlan::Ready(helper)) => helper,
         Ok(RemoteBootstrapPlan::Install(_)) => {
             return Err((
@@ -7365,13 +7363,9 @@ fn fetch_node_projection(
             ),
         ));
     }
-    let mut remote = ssh_bootstrap::connect_remote(
-        target,
-        helper,
-        SshAuthenticationMode::Batch,
-        Duration::from_secs(2),
-    )
-    .map_err(|error| (classify_node_sync_error(&error), error))?;
+    let mut remote = bootstrap
+        .connect(helper, Duration::from_secs(2))
+        .map_err(|error| (classify_node_sync_error(&error), error))?;
     let sync = remote
         .node_projection_sync(after, Duration::from_secs(2))
         .map_err(|error| (classify_node_sync_error(&error), error))?;
@@ -7751,11 +7745,12 @@ impl DaemonService {
         profile: TerminalProfile,
     ) -> io::Result<()> {
         let target = SshTarget::parse(registration.target.clone())?;
-        let helper = match ssh_bootstrap::plan_remote_bootstrap(
-            target.clone(),
+        let mut bootstrap = ssh_bootstrap::BootstrapSession::open(
+            target,
             SshAuthenticationMode::Batch,
             HANDSHAKE_TIMEOUT,
-        )? {
+        )?;
+        let helper = match bootstrap.plan(HANDSHAKE_TIMEOUT)? {
             RemoteBootstrapPlan::Ready(helper) => helper,
             RemoteBootstrapPlan::Install(_) => {
                 return send_response(
@@ -7790,12 +7785,7 @@ impl DaemonService {
                 ),
             );
         }
-        let remote = ssh_bootstrap::connect_remote(
-            target,
-            helper,
-            SshAuthenticationMode::Batch,
-            HANDSHAKE_TIMEOUT,
-        )?;
+        let remote = bootstrap.connect(helper, HANDSHAKE_TIMEOUT)?;
         let (response, mut remote_reader, mut remote_writer) = remote.open_attachment(
             Request::ResumeAgentSession {
                 session_id: session_id.to_owned(),
@@ -7936,11 +7926,12 @@ impl DaemonService {
         profile: TerminalProfile,
     ) -> io::Result<()> {
         let target = SshTarget::parse(registration.target.clone())?;
-        let helper = match ssh_bootstrap::plan_remote_bootstrap(
-            target.clone(),
+        let mut bootstrap = ssh_bootstrap::BootstrapSession::open(
+            target,
             SshAuthenticationMode::Batch,
             HANDSHAKE_TIMEOUT,
-        )? {
+        )?;
+        let helper = match bootstrap.plan(HANDSHAKE_TIMEOUT)? {
             RemoteBootstrapPlan::Ready(helper) => helper,
             RemoteBootstrapPlan::Install(_) => {
                 return send_response(
@@ -8007,12 +7998,7 @@ impl DaemonService {
                 );
             }
         }
-        let remote = ssh_bootstrap::connect_remote(
-            target,
-            helper,
-            SshAuthenticationMode::Batch,
-            HANDSHAKE_TIMEOUT,
-        )?;
+        let remote = bootstrap.connect(helper, HANDSHAKE_TIMEOUT)?;
         let request = Request::Attach {
             shell_id: shell_id.to_owned(),
             takeover,

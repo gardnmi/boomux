@@ -19,7 +19,7 @@
 | `src/node_registration.rs` | Independently versioned remote Node registrations, identity pinning, admission drain, validation, and atomic storage |
 | `src/node_projection.rs` | Disposable owner-only remote projection cache, deterministic bounds, health, generation CAS, quarantine, and atomic storage |
 | `src/federation.rs` | Independently versioned federation handshake and verified stdio daemon bridging |
-| `src/ssh_bootstrap.rs` | Validated SSH targets, private invocation configuration, deadline-bound remote discovery, and helper compatibility selection |
+| `src/ssh_bootstrap.rs` | Validated SSH targets, private invocation configuration, bounded interactive authentication presentation, deadline-bound remote discovery, and helper compatibility selection |
 | `src/handoff.rs`, `src/fd_transfer.rs` | Graceful daemon replacement records and Unix descriptor transfer |
 | `src/attach.rs` | Terminal-side raw mode, control frames, live input/output, resize, focus, and reconnect handling |
 | `src/terminal.rs` | Selection and launch of native terminal windows through `xdg-terminal-exec` |
@@ -101,7 +101,15 @@ and deferred behavior are in [`remote-nodes.md`](remote-nodes.md).
 
 Public `boomux --remote TARGET` performs ad hoc bootstrap only. It
 discovers and verifies a compatible helper, or interactively installs one before
-opening and pinging a daemon-bound stdio channel. Explicit `boomux node add
+opening a daemon-bound stdio channel. The verified-connection boundary performs
+exactly one live ping: after connecting a Ready helper, or before transaction
+commit for an installed helper. Callers consume that verified result without a
+second channel write. One private owned OpenSSH
+master binds discovery, authorization, optional transactional replacement and
+owner/PID/start-identity claim recovery, process-neutral missing-install rollback,
+proof-bound daemon activation, daemon restart, final identity verification, protocol
+ping, and marker-only commit to the same
+authenticated endpoint. Explicit `boomux node add
 ALIAS TARGET` and revision-conditional registration management persist an
 identity-pinned route separately. A registration starts one noninteractive
 projection worker. Protocol 33 exposes cached projections through the separately

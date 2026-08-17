@@ -178,6 +178,189 @@ exact target, source, destination, and process impact. Noninteractive setup neve
 installs, replaces, or stops remote software. Routine background synchronization
 is noninteractive and never opens a hidden password, MFA, hardware-token, or
 host-key prompt.
+The interactive OpenSSH master's stderr is teed byte-for-byte to the invoking
+terminal while the same bounded prefix is retained in memory for failure
+classification. This is the only raw authentication-output presentation: it is
+not decoded, logged, persisted, included in diagnostics, or exposed to JSON and
+background operation. Password and confirmation prompts continue to use
+OpenSSH's `/dev/tty` handling. Batch setup captures the same bounded prefix
+silently. If master stderr exceeds 16 KiB, setup kills and reaps the private
+master process group and reports a fixed bounded transport failure instead of
+continuing with truncated authentication context. Guided terminal setup reports
+its outcome and waits for Enter before closing.
+
+One setup owns one explicit OpenSSH master from initial authentication through
+discovery, candidate checks, authorization, installation, daemon status and
+restart, final identity-pinned handshake, and live channel creation. Every
+command is a slave of that private owner-only control socket; an observation from
+one endpoint or account can never authorize mutation through another connection.
+The private configuration terminates any trailing `Match` scope inherited from
+the included user configuration before clearing `SendEnv`, so even an included
+file ending in a nonmatching block cannot retain environment forwarding.
+Every fixed command that contacts the remote daemon resolves its runtime
+environment on that authenticated host. It never forwards or persists the local
+environment. An existing remote `XDG_RUNTIME_DIR` must be a bounded safe absolute
+path. When it is absent on Linux, Boomux derives `/run/user/<numeric id -u>`;
+macOS retains the requirement for an explicit runtime directory. The selected
+directory must be a non-symlink directory owned by that numeric user with mode
+`0700`, and is exported only for that remote command. These rules cover helper
+probes, live federation and host-service channels, daemon status and restart,
+and rollback/watchdog daemon restoration. Missing, malformed, unsupported, or
+unsafe runtime discovery returns `bootstrap_runtime_unavailable` without
+including the path or raw remote stderr.
+Slave argv also installs a deliberately failing direct-connection fallback, so a
+missing control socket cannot make OpenSSH resolve or connect to the target
+again. Master disappearance at any stage is therefore a transport failure, not a
+route retry.
+Ordinary host-key checking remains enabled. Completion, refusal, timeout, and
+error terminate and reap the master and remove its private control directory.
+
+Discovery checks every bounded absolute executable candidate. A verified helper
+whose daemon identity and negotiated protocol are federation-compatible is used
+unchanged, even when another candidate is old. No candidates produces an install
+plan; candidates whose strict published version metadata all predates the
+federation protocol floor produce an upgrade plan. An inaccessible candidate,
+malformed handshake, unsupported newer protocol, conflicting Node identity, or
+indeterminate transport/authentication failure is not version evidence and fails
+without an install plan. Interactive install or upgrade presents one plan and
+asks once. JSON and other noninteractive invocation returns `install_required`
+or `upgrade_required` and performs no remote mutation.
+After authorization, Boomux acquires the remote transaction lock and uploads the
+pinned bytes only to the private transaction `new` path. It validates and marks
+that executable and starts the rollback watchdog without replacing the discovered
+destination. The uploaded current binary then runs `daemon status --json` as a
+client of the existing daemon; status does not start a missing daemon. This lets
+an old released installed helper participate even when its own CLI predates the
+additive process-identity fields. On Linux, the provisional client obtains the
+socket peer PID with `SO_PEERCRED`, validates same-user `/proc` ownership,
+resolves the bounded absolute `/proc/<pid>/exe` path after normalizing the
+kernel's ` (deleted)` suffix, and records the socket device and inode. Automatic
+upgrade requires that proven process executable to equal the install destination
+exactly. Immediately before rename, the provisional binary opens one negotiated
+daemon connection and binds activation to the exact PID, executable, protocol,
+and socket device/inode fingerprint while that connection remains open.
+Candidate equality or an earlier unbound status result is not evidence. Missing,
+changed, malformed, macOS, or otherwise unprovable identity returns
+`upgrade_required` without activating the upload.
+
+When discovery finds no helper, a separate fixed runtime probe must prove that
+the daemon socket path is absent before upload. Guarded activation repeats that
+check while holding the transaction claim. A socket that appears between checks,
+symlink, stale socket, malformed result, or failed probe returns
+`install_required` for manual daemon recovery without destination replacement or
+stop. Only a missing helper plus both absence checks may activate and be treated
+as having no pre-existing daemon.
+
+An install source is either the invoking binary for a matching OS/architecture
+or a checksum-verified asset from an explicit published release/protocol matrix.
+Matching OS/architecture is not ABI proof. Before showing a current-development
+binary plan, Boomux opens the source without following symlinks, rejects special,
+empty, changing, or oversized files, compares device, inode, length, mtime, and
+ctime metadata before and after the bounded read, and pins the retained bytes and
+their SHA-256.
+Authorization displays that digest, and installation uses those retained bytes
+rather than reopening a mutable executable path. A
+published asset must overlap both the federation floor and the invoking local
+wire range. If none does, setup fails before authorization or remote mutation
+and directs development users to build for the remote target and manually stream
+that current build.
+
+Authorized upload first acquires one atomic remote bootstrap lock. A locally
+generated unique validated transaction ID names its private upload, backup,
+captured pre-install daemon protocol or absence, activation marker,
+daemon-contact marker, renewable lease, and watchdog state;
+no backup name is shared between transactions. Concurrent
+setup fails `busy` before touching the destination. The replacement remains
+provisional under a bounded remote lease until explicit ID-matched commit.
+An existing destination is accepted only when it is a nonempty, bounded,
+owner-owned, non-symlink regular executable. Symlinks, special files,
+non-executable files, unsupported ownership, and ambiguous metadata fail at the
+fixed backup stage before the destination is changed. The installer copies the
+old bytes and preserved mode, owner, group, and timestamps into the private
+backup, then rechecks source metadata and compares the complete copy. A failed or
+out-of-space copy leaves the old destination inode untouched. On Linux the
+completed backup and later destination replacement are synced before progress is
+published.
+After proof, an idempotent activation command acquires the same claim, validates
+the transaction and destination, copies and verifies the backup, records
+activation intent, and atomically renames `new` over the destination. It never
+renames the running old executable into the transaction.
+Consequently Linux exposes the old daemon's executable as the deleted prior
+destination, and graceful restart's installed-path fallback selects the new
+destination rather than the protocol-old backup.
+Before returning the upload transaction ID, the uploader requires a readiness marker
+from the detached rollback watchdog and records its PID. A failure at any fixed
+filesystem, streaming, activation, or watchdog stage emits only a bounded
+non-secret stage marker and deterministic exit code. The client maps that marker
+to actionable `bootstrap_install_failed` detail; arbitrary remote stderr is never
+included in CLI diagnostics.
+Post-upload failures similarly name the fixed identity-proof, activation, graceful-restart,
+helper-verification, live-handshake, or protocol-ping stage without exposing raw
+remote output.
+Every bounded post-install stage first atomically replaces the lease value. The
+watchdog rolls back only after one complete 180-second interval without a new
+value. At expiry it acquires the claim and rereads the lease while renewal is
+excluded; a changed token releases the claim and begins a fresh interval. Commit,
+explicit rollback, renewal, and watchdog expiry coordinate through the
+transaction lock and claim directory. Each claim records a unique owner token,
+PID, process-start identity, and heartbeat. A contender may reclaim it only after
+a complete unrenewed 180-second lease and proof that the recorded PID/start owner
+is gone; an active owner remains protected. Before commit, master or local-process
+loss therefore lets the watchdog restore it automatically even when a healthy
+transaction spans several lease intervals. ABI/exec failure and every daemon-status, restart, helper,
+identity, live-handshake, or protocol-ping failure request rollback; a failed
+first installation removes only the destination activated by that transaction.
+Rollback never stops a daemon when the pre-install state was absent; an
+independently started runtime process survives and may require explicit operator
+recovery after filesystem restoration. If a provisional upgrade restarted the daemon,
+rollback atomically renames the complete backup over the provisional destination.
+When a daemon existed before activation and provisional helper work could have
+affected it, rollback gracefully restarts through the restored helper regardless
+of later status observations. The explicit
+rollback and detached watchdog share the same complete-backup and
+activation-intent markers, so a partial backup is never installed.
+An uploaded-only transaction has no activation intent, so explicit rollback or
+watchdog expiry removes only private transaction state and cannot touch the
+destination. Upload and activation acknowledgments are keyed by the caller's
+transaction ID; exact retry returns the existing uploaded or activated state.
+
+Commit is attempted only after a fresh helper handshake, final live identity
+verification, and an actual protocol ping all succeed. It atomically renames the
+complete transaction beneath the lock as a durable committed marker and returns
+a framed result. It is idempotent while that marker remains and does not delete
+the backup, transaction, or lock. The watchdog interprets the moved transaction
+as committed and eventually removes all of them; bounded stale-claim recovery
+also guarantees eventual lock cleanup after a commit process is killed. A lost
+or malformed commit acknowledgment is therefore
+`bootstrap_commit_outcome_unknown`, not a rollback promise: the marker may or may
+not have committed, and Boomux must not undo a replacement after its verified
+live channel was accepted. Retrying the exact bootstrap rediscovers the
+compatible installed helper and succeeds without another installation. While an
+uncommitted marker is absent, discovery suppresses only the provisional install
+destination so a retry cannot accept a helper that the watchdog will later roll
+back. Before the atomic marker the watchdog rolls back; after it the watchdog
+cleans up, so transport loss at no commit step can produce a partially finalized
+state.
+Every verified-bootstrap result has passed exactly one live protocol ping. A
+previously Ready helper is connected and pinged before the result is returned. An
+installed or upgraded helper is already pinged inside the transaction before
+commit, so registration, retarget, ad hoc connection, and dashboard consumers do
+not ping that returned handoff-era channel again. The remote may close the channel
+immediately after the successful verification ping without invalidating the
+verified handshake identity or a completed commit. A Ready helper that cannot
+answer its one required ping still fails before any registration mutation.
+An
+upgrade may use the existing graceful daemon restart command only when the new
+helper has verified provisionally and a separate runtime-aware status check shows
+that the running daemon protocol is outside the supported federation range. This
+status check runs for every upgrade, including when the provisional helper
+handshake itself looks compatible. The transaction is marked restarted before
+one graceful restart, the helper is inspected again afterward, and the final
+live channel must still pass its protocol ping. An absent daemon is not restarted
+and can start only through ordinary helper behavior. Pre-install presence and
+protocol are recorded durably before helper contact, so rollback and watchdog
+recovery do not depend on later socket, status, or daemon-generation races. An
+already-compatible daemon is never restarted for a release-version difference.
 
 The remote bridge command uses a fixed template. No prompt, resource ID,
 integration command, or user argument is interpolated into it. Its only variable
@@ -187,6 +370,10 @@ one documented shell-quoting function. SSH options belong to the user's SSH
 configuration, the target is passed as one validated argument, and a target
 beginning with `-` is invalid. The bridge opens no remote TCP listener and never
 exposes the local daemon socket to the remote machine.
+
+Framed executable candidates and install destinations that are relative,
+oversized, or contain control characters are malformed helper output and return
+`bootstrap_malformed_helper`; they are not transport evidence.
 
 Every registration carries a monotonic local registration revision.
 Synchronization and routed requests reserve admission and copy that revision

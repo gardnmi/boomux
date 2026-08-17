@@ -77,6 +77,12 @@ owned by the remote daemon and never enter a local handoff manifest. Remote
 daemon replacement uses this existing descriptor-transfer protocol on the
 remote machine, and its attachment reconnect frames pass unchanged through the
 SSH bridge.
+Remote transactional upgrade copies the old executable into private rollback
+state before atomically replacing its installed pathname. It does not rename the
+live executable to the backup path: on Linux the old daemon therefore observes a
+deleted installed path and selects the replacement at that path for graceful
+handoff. Rollback performs the inverse atomic replacement before asking the
+provisional daemon to hand off to the restored executable.
 
 Local daemon replacement instead closes federation admission, drains admitted
 Node requests and projection commits to known outcome boundaries, stops

@@ -4,8 +4,10 @@ use std::error::Error;
 use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::fs;
-use std::io::{self, IsTerminal, Read};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::io::{self, BufRead, IsTerminal, Read};
+use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
@@ -496,6 +498,17 @@ enum Commands {
     },
     #[command(name = "__federation-stdio", hide = true)]
     FederationStdio,
+    #[command(name = "__guided-node-add", hide = true)]
+    GuidedNodeAdd,
+    #[command(name = "__bootstrap-activate", hide = true)]
+    BootstrapActivate {
+        transaction: String,
+        expected_pid: u32,
+        expected_protocol: u32,
+        expected_executable: String,
+        expected_socket_device: u64,
+        expected_socket_inode: u64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1491,6 +1504,8 @@ impl Cli {
             Some(Commands::ResumeSession { .. }) => CommandKey::ResumeSessionInternal,
             Some(Commands::ScheduledRunner { .. }) => CommandKey::Attach,
             Some(Commands::FederationStdio) => CommandKey::Attach,
+            Some(Commands::GuidedNodeAdd) => CommandKey::NodeAdd,
+            Some(Commands::BootstrapActivate { .. }) => CommandKey::Daemon,
         }
     }
 }
@@ -1527,6 +1542,12 @@ impl CliExit {
 }
 
 fn main() -> ExitCode {
+    if env::var_os("BOOMUX_INTERNAL_GUIDED_STOP").as_deref() == Some(std::ffi::OsStr::new("1")) {
+        unsafe {
+            env::remove_var("BOOMUX_INTERNAL_GUIDED_STOP");
+            libc::raise(libc::SIGSTOP);
+        }
+    }
     let json_requested = requests_json(env::args_os().skip(1));
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
@@ -1644,6 +1665,27 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
             federation::run_stdio_helper()?;
             return Ok(CliExit::Success);
         }
+        Some(Commands::GuidedNodeAdd) => {
+            return guided_node_add().map(CliExit::Child);
+        }
+        Some(Commands::BootstrapActivate {
+            transaction,
+            expected_pid,
+            expected_protocol,
+            expected_executable,
+            expected_socket_device,
+            expected_socket_inode,
+        }) => {
+            bootstrap_activate(
+                transaction,
+                *expected_pid,
+                *expected_protocol,
+                expected_executable,
+                *expected_socket_device,
+                *expected_socket_inode,
+            )?;
+            return Ok(CliExit::Success);
+        }
         _ => {}
     }
 
@@ -1745,6 +1787,8 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
         Some(Commands::ResumeSession { .. }) => unreachable!(),
         Some(Commands::ScheduledRunner { .. }) => unreachable!(),
         Some(Commands::FederationStdio) => unreachable!(),
+        Some(Commands::GuidedNodeAdd) => unreachable!(),
+        Some(Commands::BootstrapActivate { .. }) => unreachable!(),
         None => dashboard(cli.terminal.as_deref()),
     };
     result?;
@@ -1752,8 +1796,7 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
 }
 
 fn remote_connect(target: &str, terminal: Option<&str>) -> Result<(), Box<dyn Error>> {
-    let mut connection = verified_remote_connection(target, true)?;
-    connection.ping()?;
+    let connection = verified_remote_connection(target, true)?;
     println!(
         "Connected to Boomux Node {} (protocol {}, helper {}, {})",
         connection.handshake.node_id,
@@ -1792,18 +1835,23 @@ fn verified_remote_connection(
     } else {
         ssh_bootstrap::SshAuthenticationMode::Batch
     };
-    let helper = match ssh_bootstrap::plan_remote_bootstrap(
-        target.clone(),
-        authentication,
-        TIMEOUT,
-    )? {
-        ssh_bootstrap::RemoteBootstrapPlan::Ready(helper) => helper,
-        ssh_bootstrap::RemoteBootstrapPlan::Install(_plan) if !interactive => {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "remote Boomux installation is required, but noninteractive --remote never modifies remote software",
-            )
-            .into());
+    let mut session = ssh_bootstrap::BootstrapSession::open(target, authentication, TIMEOUT)
+        .map_err(bootstrap_cli_failure)?;
+    // Both branches return a channel verified by exactly one protocol ping. An
+    // installed channel is pinged before commit inside install_and_connect.
+    match session.plan(TIMEOUT).map_err(bootstrap_cli_failure)? {
+        ssh_bootstrap::RemoteBootstrapPlan::Ready(helper) => {
+            let mut connection = session
+                .connect(helper, TIMEOUT)
+                .map_err(bootstrap_cli_failure)?;
+            connection.ping().map_err(bootstrap_cli_failure)?;
+            Ok(connection)
+        }
+        ssh_bootstrap::RemoteBootstrapPlan::Install(plan) if !interactive => {
+            Err(cli_output::failure(
+                plan.reason.error_code(),
+                plan.reason.noninteractive_message(),
+            ))
         }
         ssh_bootstrap::RemoteBootstrapPlan::Install(plan) => {
             println!("Remote target: {}", plan.target.as_str());
@@ -1811,10 +1859,10 @@ fn verified_remote_connection(
             println!("Install destination: {}", plan.destination.as_str());
             println!(
                 "Process impact: {}",
-                if plan.may_restart_daemon {
-                    "the daemon may be gracefully restarted only if the installed helper cannot connect to the running daemon"
+                if plan.reason == ssh_bootstrap::RemoteInstallReason::Upgrade {
+                    "the pinned binary is uploaded privately first; activation occurs only if that provisional client proves the running daemon executable is this destination, then the previous executable is retained for rollback and an incompatible daemon is gracefully restarted"
                 } else {
-                    "a detached daemon may be started; no running daemon will be restarted for a release-version difference"
+                    "the pinned binary is uploaded privately first; the runtime socket must remain absent through guarded activation, and rollback removes only a destination activated by this transaction"
                 }
             );
             if !confirm_setup("Install Boomux on this remote target?")? {
@@ -1824,23 +1872,22 @@ fn verified_remote_connection(
                 )
                 .into());
             }
-            ssh_bootstrap::install_remote(&plan, authentication, TIMEOUT)?
+            session
+                .install_and_connect(&plan, TIMEOUT)
+                .map_err(bootstrap_cli_failure)
         }
-    };
-    Ok(ssh_bootstrap::connect_remote(
-        target,
-        helper,
-        authentication,
-        TIMEOUT,
-    )?)
+    }
+}
+
+fn bootstrap_cli_failure(error: io::Error) -> Box<dyn Error> {
+    cli_output::failure(ssh_bootstrap::error_code(&error), error.to_string())
 }
 
 fn node_command(command: NodeCommands, json: bool) -> Result<(), Box<dyn Error>> {
     match command {
         NodeCommands::Add { alias, target } => {
             let (alias, target) = resolve_node_add_inputs(alias, target, json)?;
-            let mut remote = verified_remote_connection(&target, !json)?;
-            remote.ping()?;
+            let remote = verified_remote_connection(&target, !json)?;
             let registration = client::connect_or_start()?.add_node_registration(
                 alias,
                 target,
@@ -2042,8 +2089,7 @@ fn node_command(command: NodeCommands, json: bool) -> Result<(), Box<dyn Error>>
                     ),
                 ));
             }
-            let mut remote = verified_remote_connection(&target, !json)?;
-            remote.ping()?;
+            let remote = verified_remote_connection(&target, !json)?;
             let registration = local.retarget_node_registration(
                 selector,
                 target,
@@ -2058,6 +2104,157 @@ fn node_command(command: NodeCommands, json: bool) -> Result<(), Box<dyn Error>>
         }
         NodeCommands::Rekey => rekey_node(),
     }
+}
+
+fn guided_node_add() -> Result<process_adapter::ProcessExit, Box<dyn Error>> {
+    let executable = env::current_exe()?;
+    let stdin = io::stdin();
+    let interactive = stdin.is_terminal() && io::stdout().is_terminal();
+    let mut input = stdin.lock();
+    let mut output = io::stdout().lock();
+    guided_node_add_with(
+        &executable,
+        &mut input,
+        &mut output,
+        interactive,
+        interactive.then(|| stdin.as_raw_fd()),
+    )
+}
+
+fn restore_terminal_foreground(fd: i32, foreground: i32) {
+    unsafe {
+        let previous = libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+        let _ = libc::tcsetpgrp(fd, foreground);
+        libc::signal(libc::SIGTTOU, previous);
+    }
+}
+
+fn guided_node_add_with(
+    executable: &Path,
+    input: &mut impl BufRead,
+    output: &mut impl io::Write,
+    wait_for_newline: bool,
+    terminal_fd: Option<i32>,
+) -> Result<process_adapter::ProcessExit, Box<dyn Error>> {
+    let mut command = Command::new(executable);
+    command.args(["node", "add"]);
+    if terminal_fd.is_some() {
+        command.env("BOOMUX_INTERNAL_GUIDED_STOP", "1");
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) == -1 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+    }
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            writeln!(output, "\nNode setup failed to start: {error}")?;
+            hold_guided_result(input, output, wait_for_newline)?;
+            return Ok(process_adapter::ProcessExit::Code(1));
+        }
+    };
+
+    let original_foreground = if let Some(fd) = terminal_fd {
+        let foreground = unsafe { libc::tcgetpgrp(fd) };
+        let child_group = i32::try_from(child.id()).unwrap_or(i32::MAX);
+        let mut stopped_status = 0;
+        let stopped = unsafe { libc::waitpid(child_group, &mut stopped_status, libc::WUNTRACED) };
+        if foreground == -1
+            || stopped != child_group
+            || !libc::WIFSTOPPED(stopped_status)
+            || unsafe { libc::tcsetpgrp(fd, child_group) } == -1
+        {
+            let error = io::Error::last_os_error();
+            unsafe {
+                libc::kill(-child_group, libc::SIGKILL);
+            }
+            let _ = child.wait();
+            writeln!(
+                output,
+                "\nNode setup failed to acquire the terminal: {error}"
+            )?;
+            hold_guided_result(input, output, wait_for_newline)?;
+            return Ok(process_adapter::ProcessExit::Code(1));
+        }
+        let continued = if cfg!(test) && env::var_os("BOOMUX_TEST_GUIDED_SIGCONT_FAILURE").is_some()
+        {
+            Err(io::Error::other("injected SIGCONT failure"))
+        } else if unsafe { libc::kill(-child_group, libc::SIGCONT) } == -1 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        };
+        if let Err(error) = continued {
+            unsafe {
+                libc::kill(-child_group, libc::SIGKILL);
+            }
+            restore_terminal_foreground(fd, foreground);
+            let _ = child.wait();
+            writeln!(output, "\nNode setup failed to continue: {error}")?;
+            hold_guided_result(input, output, wait_for_newline)?;
+            return Ok(process_adapter::ProcessExit::Code(1));
+        }
+        Some((fd, foreground))
+    } else {
+        None
+    };
+    let status = child.wait();
+    if let Some((fd, foreground)) = original_foreground {
+        restore_terminal_foreground(fd, foreground);
+    }
+    let status = match status {
+        Ok(status) => status,
+        Err(error) => {
+            writeln!(output, "\nNode setup status could not be read: {error}")?;
+            hold_guided_result(input, output, wait_for_newline)?;
+            return Ok(process_adapter::ProcessExit::Code(1));
+        }
+    };
+    writeln!(
+        output,
+        "\nNode setup {} ({}).",
+        if status.success() {
+            "finished"
+        } else {
+            "failed"
+        },
+        match status.code() {
+            Some(code) => format!("exit {code}"),
+            None => format!("signal {}", status.signal().unwrap_or(0)),
+        }
+    )?;
+    hold_guided_result(input, output, wait_for_newline)?;
+    Ok(match status.code() {
+        Some(code) => process_adapter::ProcessExit::Code(code),
+        None => process_adapter::ProcessExit::Signal(status.signal().unwrap_or(0)),
+    })
+}
+
+fn hold_guided_result(
+    input: &mut impl BufRead,
+    output: &mut impl io::Write,
+    wait_for_newline: bool,
+) -> io::Result<()> {
+    if !wait_for_newline {
+        writeln!(
+            output,
+            "No interactive terminal is available; closing without waiting."
+        )?;
+        return Ok(());
+    }
+    write!(output, "Press Enter to close. ")?;
+    output.flush()?;
+    let mut bytes = Vec::new();
+    let count = input.read_until(b'\n', &mut bytes)?;
+    if count == 0 || bytes.last() != Some(&b'\n') {
+        writeln!(output, "\nInput closed before a newline; closing now.")?;
+    }
+    Ok(())
 }
 
 fn resolve_node_add_inputs(
@@ -2246,14 +2443,22 @@ fn daemon_control(command: DaemonCommands, json: bool) -> Result<(), Box<dyn Err
     let client = client::connect()?;
     match command {
         DaemonCommands::Status if json => {
-            let protocol_version = client.protocol_version()?;
             let scheduler = client.snapshot()?.scheduler;
+            let identity = daemon_process_identity(&client);
+            let protocol_version = identity.as_ref().map_or_else(
+                || client.protocol_version(),
+                |identity| Ok(identity.protocol_version),
+            )?;
             print_json(
                 CommandKey::DaemonStatus,
                 serde_json::json!({
                     "status": "running",
                     "protocol_version": protocol_version,
                     "socket_path": client.socket_path().display().to_string(),
+                    "pid": identity.as_ref().map(|identity| identity.pid),
+                    "executable": identity.as_ref().and_then(|identity| identity.executable.as_deref()),
+                    "socket_device": identity.as_ref().map(|identity| identity.socket_device),
+                    "socket_inode": identity.as_ref().map(|identity| identity.socket_inode),
                     "scheduler": scheduler.map(|health| serde_json::json!({
                         "state": match health.state {
                             protocol::SchedulerState::Active => "active",
@@ -2296,6 +2501,146 @@ fn daemon_control(command: DaemonCommands, json: bool) -> Result<(), Box<dyn Err
         DaemonCommands::Run | DaemonCommands::ReceiveHandoff { .. } => unreachable!(),
     }
     Ok(())
+}
+
+struct DaemonProcessIdentity {
+    pid: u32,
+    protocol_version: u32,
+    executable: Option<String>,
+    socket_device: u64,
+    socket_inode: u64,
+}
+
+#[cfg(target_os = "linux")]
+fn daemon_process_identity(client: &client::Client) -> Option<DaemonProcessIdentity> {
+    let socket_before = fs::metadata(client.socket_path()).ok()?;
+    let credentials = match client.daemon_peer_credentials() {
+        Ok(credentials) if credentials.uid == unsafe { libc::geteuid() } => credentials,
+        _ => return None,
+    };
+    let socket_after = fs::metadata(client.socket_path()).ok()?;
+    if socket_before.dev() != socket_after.dev() || socket_before.ino() != socket_after.ino() {
+        return None;
+    }
+    let process_directory = PathBuf::from(format!("/proc/{}", credentials.pid));
+    if fs::metadata(&process_directory).map_or(true, |metadata| {
+        metadata.uid() != credentials.uid || !metadata.is_dir()
+    }) {
+        return None;
+    }
+    let executable = fs::read_link(process_directory.join("exe"))
+        .ok()
+        .and_then(|executable| normalize_daemon_executable(executable.as_os_str().as_bytes()));
+    Some(DaemonProcessIdentity {
+        pid: credentials.pid,
+        protocol_version: credentials.protocol_version,
+        executable,
+        socket_device: socket_after.dev(),
+        socket_inode: socket_after.ino(),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn normalize_daemon_executable(path: &[u8]) -> Option<String> {
+    const MAX_EXECUTABLE_PATH: usize = 4096;
+    let mut bytes = path;
+    if let Some(path) = bytes.strip_suffix(b" (deleted)") {
+        bytes = path;
+    }
+    if bytes.is_empty()
+        || bytes.len() > MAX_EXECUTABLE_PATH
+        || bytes.iter().any(u8::is_ascii_control)
+    {
+        return None;
+    }
+    let executable = match String::from_utf8(bytes.to_vec()) {
+        Ok(executable) => executable,
+        Err(_) => return None,
+    };
+    let executable_path = Path::new(&executable);
+    if !executable_path.is_absolute() {
+        return None;
+    }
+    Some(executable)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn daemon_process_identity(_client: &client::Client) -> Option<DaemonProcessIdentity> {
+    None
+}
+
+fn bootstrap_activate(
+    transaction: &str,
+    expected_pid: u32,
+    expected_protocol: u32,
+    expected_executable: &str,
+    expected_socket_device: u64,
+    expected_socket_inode: u64,
+) -> io::Result<()> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (
+            transaction,
+            expected_pid,
+            expected_protocol,
+            expected_executable,
+            expected_socket_device,
+            expected_socket_inode,
+        );
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "proof-bound bootstrap activation is unsupported on this platform",
+        ));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let suffix = transaction
+            .strip_prefix(".boomux.bootstrap.")
+            .filter(|suffix| {
+                suffix.len() == 8 && suffix.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            })
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "invalid bootstrap transaction")
+            })?;
+        let _ = suffix;
+        let home = env::var_os("HOME")
+            .map(PathBuf::from)
+            .filter(|home| home.is_absolute())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "HOME must be absolute"))?;
+        let directory = home.join(".local/bin");
+        let destination = directory.join("boomux");
+        if destination.as_os_str().as_bytes() != expected_executable.as_bytes() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "bootstrap destination does not match the daemon proof",
+            ));
+        }
+        let provisional = directory.join(transaction).join("new");
+        let socket = client::socket_path()?;
+        let daemon_client = client::Client::from_socket_path(socket);
+        let identity = daemon_process_identity(&daemon_client).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "the daemon identity could not be bound to activation",
+            )
+        })?;
+        if identity.pid != expected_pid
+            || identity.protocol_version != expected_protocol
+            || identity.executable.as_deref() != Some(expected_executable)
+            || identity.socket_device != expected_socket_device
+            || identity.socket_inode != expected_socket_inode
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "the daemon identity changed before activation",
+            ));
+        }
+        fs::rename(&provisional, &destination)?;
+        fs::File::open(&destination)?.sync_all()?;
+        fs::File::create(directory.join(transaction).join("activated"))?.sync_all()?;
+        fs::File::open(&directory)?.sync_all()?;
+        Ok(())
+    }
 }
 
 fn should_open_new_window(new_window: bool, terminal: Option<&str>) -> bool {
@@ -2742,9 +3087,8 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
                 route,
             } => {
                 let result = (|| {
-                    let mut remote = verified_remote_connection(&route, true)
+                    let remote = verified_remote_connection(&route, true)
                         .map_err(|error| error.to_string())?;
-                    remote.ping().map_err(|error| error.to_string())?;
                     if remote.handshake.node_id != node_id {
                         return Err("retargeted route reached a different Node identity".into());
                     }
@@ -5398,7 +5742,7 @@ fn capabilities(json: bool) -> Result<(), Box<dyn Error>> {
         .copied()
         .chain(protocol::protocol_capabilities())
         .collect::<Vec<_>>();
-    let error_codes = [
+    let error_codes: &[&str] = &[
         "invalid_argument",
         "not_found",
         "already_exists",
@@ -5409,6 +5753,16 @@ fn capabilities(json: bool) -> Result<(), Box<dyn Error>> {
         "persistence_failed",
         "timeout",
         "unsupported_version",
+        "install_required",
+        "upgrade_required",
+        "bootstrap_authentication_failed",
+        "bootstrap_transport_failed",
+        "bootstrap_malformed_helper",
+        "bootstrap_unsupported_platform",
+        "bootstrap_install_failed",
+        "bootstrap_commit_outcome_unknown",
+        "bootstrap_runtime_unavailable",
+        "node_identity_conflict",
         "cursor_expired",
         "run_changed",
         "revision_ahead",
@@ -10200,6 +10554,18 @@ mod tests {
     use crate::integration_management::{opencode_config_root, pi_config_root};
     use std::os::unix::net::UnixListener;
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn daemon_executable_normalization_is_exact_and_bounded() {
+        assert_eq!(
+            normalize_daemon_executable(b"/custom/path with spaces/boomux (deleted)"),
+            Some("/custom/path with spaces/boomux".into())
+        );
+        assert_eq!(normalize_daemon_executable(b"relative/boomux"), None);
+        assert_eq!(normalize_daemon_executable(b"/bad\npath"), None);
+        assert_eq!(normalize_daemon_executable(&vec![b'x'; 4097]), None);
+    }
+
     fn shell(id: &str, workspace_id: &str, name: &str) -> ShellSnapshot {
         ShellSnapshot {
             owner: boomux::protocol::ShellOwner::User,
@@ -11056,6 +11422,280 @@ mod tests {
         );
         assert!(resolve_node_add_inputs(Some("work".into()), None, false).is_err());
         assert!(resolve_node_add_inputs(None, None, true).is_err());
+
+        let held = Cli::try_parse_from(["boomux", "__guided-node-add"]).unwrap();
+        assert!(matches!(held.command, Some(Commands::GuidedNodeAdd)));
+        assert_eq!(held.command_descriptor().key, "node.add");
+    }
+
+    #[test]
+    fn guided_node_add_preserves_failure_status_and_distinguishes_newline_from_eof() {
+        let directory = env::temp_dir().join(format!("boomux-guided-{}", Uuid::new_v4()));
+        fs::create_dir(&directory).unwrap();
+        let child = directory.join("child");
+        let child_output = directory.join("child-output");
+        fs::write(
+            &child,
+            format!(
+                "#!/bin/sh\nprintf 'child failed\\n'\nprintf 'child failed\\n' > '{}'\nexit 7\n",
+                child_output.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&child, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let mut newline = io::Cursor::new(b"\n");
+        let mut output = Vec::new();
+        assert_eq!(
+            guided_node_add_with(&child, &mut newline, &mut output, true, None).unwrap(),
+            process_adapter::ProcessExit::Code(7)
+        );
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(fs::read_to_string(&child_output).unwrap(), "child failed\n");
+        assert!(output.contains("Node setup failed (exit 7)."));
+        assert!(output.contains("Press Enter to close."));
+        assert!(!output.contains("Input closed before a newline"));
+
+        let mut eof = io::Cursor::new(b"partial");
+        let mut output = Vec::new();
+        assert_eq!(
+            guided_node_add_with(&child, &mut eof, &mut output, true, None).unwrap(),
+            process_adapter::ProcessExit::Code(7)
+        );
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .contains("Input closed before a newline")
+        );
+
+        let mut eof = io::Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+        assert_eq!(
+            guided_node_add_with(
+                &directory.join("missing"),
+                &mut eof,
+                &mut output,
+                true,
+                None,
+            )
+            .unwrap(),
+            process_adapter::ProcessExit::Code(1)
+        );
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("failed to start"));
+        assert!(output.contains("Press Enter to close."));
+        assert!(output.contains("Input closed before a newline"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn guided_pty_helper_process() {
+        let Some(executable) = env::var_os("BOOMUX_TEST_GUIDED_EXECUTABLE") else {
+            return;
+        };
+        let stdin = io::stdin();
+        let mut input = stdin.lock();
+        let mut output = io::stdout().lock();
+        let outcome = guided_node_add_with(
+            Path::new(&executable),
+            &mut input,
+            &mut output,
+            true,
+            Some(stdin.as_raw_fd()),
+        )
+        .unwrap();
+        std::process::exit(match outcome {
+            process_adapter::ProcessExit::Code(code) => code,
+            process_adapter::ProcessExit::Signal(signal) => 128 + signal,
+        });
+    }
+
+    #[test]
+    fn guided_node_add_pty_interrupts_child_and_holds_for_newline() {
+        use std::os::fd::{FromRawFd, OwnedFd};
+
+        let directory = env::temp_dir().join(format!("boomux-guided-pty-{}", Uuid::new_v4()));
+        fs::create_dir(&directory).unwrap();
+        let child = directory.join("child");
+        fs::write(
+            &child,
+            "#!/bin/sh\nkill -STOP $$\nprintf 'child-ready\\n'\nread line\nexit 7\n",
+        )
+        .unwrap();
+        fs::set_permissions(&child, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let mut master = 0;
+        let mut slave = 0;
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            },
+            0
+        );
+        let master = unsafe { OwnedFd::from_raw_fd(master) };
+        let slave = unsafe { OwnedFd::from_raw_fd(slave) };
+        let stdin = Stdio::from(slave.try_clone().unwrap());
+        let stdout = Stdio::from(slave.try_clone().unwrap());
+        let stderr = Stdio::from(slave);
+        let mut command = Command::new(env::current_exe().unwrap());
+        command
+            .args(["--exact", "tests::guided_pty_helper_process", "--nocapture"])
+            .env("BOOMUX_TEST_GUIDED_EXECUTABLE", &child)
+            .stdin(stdin)
+            .stdout(stdout)
+            .stderr(stderr);
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY, 0) == -1 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+        let mut wrapper = command.spawn().unwrap();
+        let mut master = std::fs::File::from(master);
+        let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
+        assert_ne!(flags, -1);
+        assert_ne!(
+            unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK,) },
+            -1
+        );
+        let mut output = Vec::new();
+        read_pty_until(
+            &mut master,
+            &mut output,
+            b"child-ready",
+            Duration::from_secs(3),
+        );
+        io::Write::write_all(&mut master, &[3]).unwrap();
+        read_pty_until(
+            &mut master,
+            &mut output,
+            b"Press Enter to close.",
+            Duration::from_secs(3),
+        );
+        assert!(wrapper.try_wait().unwrap().is_none());
+        io::Write::write_all(&mut master, b"\n").unwrap();
+        let status = wrapper.wait().unwrap();
+        assert_eq!(status.code(), Some(130));
+        let output = String::from_utf8_lossy(&output);
+        assert!(output.contains("Node setup failed (signal 2)."));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn guided_node_add_pty_restores_foreground_and_kills_group_after_sigcont_failure() {
+        use std::os::fd::{FromRawFd, OwnedFd};
+
+        let directory = env::temp_dir().join(format!("boomux-guided-cont-{}", Uuid::new_v4()));
+        fs::create_dir(&directory).unwrap();
+        let child = directory.join("child");
+        let resumed = directory.join("resumed");
+        fs::write(
+            &child,
+            format!(
+                "#!/bin/sh\nkill -STOP $$\nprintf resumed > '{}'\nsleep 30\n",
+                resumed.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&child, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let mut master = 0;
+        let mut slave = 0;
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            },
+            0
+        );
+        let master = unsafe { OwnedFd::from_raw_fd(master) };
+        let slave = unsafe { OwnedFd::from_raw_fd(slave) };
+        let mut command = Command::new(env::current_exe().unwrap());
+        command
+            .args(["--exact", "tests::guided_pty_helper_process", "--nocapture"])
+            .env("BOOMUX_TEST_GUIDED_EXECUTABLE", &child)
+            .env("BOOMUX_TEST_GUIDED_SIGCONT_FAILURE", "1")
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave));
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY, 0) == -1 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+        let mut wrapper = command.spawn().unwrap();
+        let mut master = std::fs::File::from(master);
+        let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
+        assert_ne!(flags, -1);
+        assert_ne!(
+            unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            -1
+        );
+        let mut output = Vec::new();
+        read_pty_until(
+            &mut master,
+            &mut output,
+            b"Node setup failed to continue",
+            Duration::from_secs(3),
+        );
+        read_pty_until(
+            &mut master,
+            &mut output,
+            b"Press Enter to close.",
+            Duration::from_secs(3),
+        );
+        assert!(wrapper.try_wait().unwrap().is_none());
+        assert!(!resumed.exists());
+        io::Write::write_all(&mut master, b"\n").unwrap();
+        assert_eq!(wrapper.wait().unwrap().code(), Some(1));
+        assert!(!resumed.exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn read_pty_until(
+        master: &mut fs::File,
+        output: &mut Vec<u8>,
+        expected: &[u8],
+        timeout: Duration,
+    ) {
+        let deadline = Instant::now() + timeout;
+        let mut bytes = [0_u8; 1024];
+        while !output
+            .windows(expected.len())
+            .any(|window| window == expected)
+        {
+            match master.read(&mut bytes) {
+                Ok(0) => panic!("PTY closed before {:?}", String::from_utf8_lossy(expected)),
+                Ok(count) => output.extend_from_slice(&bytes[..count]),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "PTY output: {}",
+                        String::from_utf8_lossy(output)
+                    );
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("PTY read failed: {error}"),
+            }
+        }
     }
 
     #[test]

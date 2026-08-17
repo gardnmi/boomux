@@ -11,6 +11,7 @@ use boomux::protocol::{AttachFrame, ErrorCode, TerminalProfile};
 use uuid::Uuid;
 
 pub(crate) const TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const CONTROL_MASTER_PREFIX: &str = "control=; previous=; master=false; check=false; for arg do case \"$previous\" in -S) control=$arg ;; -O) [ \"$arg\" = check ] && check=true ;; esac; case \"$arg\" in ControlPath=*) control=${arg#ControlPath=} ;; -N) master=true ;; esac; previous=$arg; done; if $master; then : > \"$control.ready\"; trap 'rm -f \"$control.ready\"' EXIT HUP INT TERM; while :; do sleep 60; done; fi; if $check; then [ -e \"$control.ready\" ]; exit; fi";
 
 pub(crate) fn assert_generated_name(name: &str) {
     let Some((adjective, noun)) = name.split_once('-') else {

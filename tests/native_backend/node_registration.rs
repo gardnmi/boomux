@@ -14,7 +14,7 @@ use boomux::protocol::{
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::support::TestDaemon;
+use crate::support::{CONTROL_MASTER_PREFIX, TestDaemon};
 
 fn node_id(value: u128) -> String {
     Uuid::from_u128(value).to_string()
@@ -823,6 +823,16 @@ fn write_fake_handshake(directory: &Path, core_protocol_version: u32) {
     let mut handshake_bytes = Vec::new();
     write_handshake(&mut handshake_bytes, &handshake).unwrap();
     fs::write(directory.join("handshake.bin"), handshake_bytes).unwrap();
+    let mut pong = Vec::new();
+    boomux::protocol::write_message(
+        &mut pong,
+        &boomux::protocol::Envelope::with_version(
+            core_protocol_version,
+            boomux::protocol::Response::Pong,
+        ),
+    )
+    .unwrap();
+    fs::write(directory.join("pong.bin"), pong).unwrap();
 }
 
 fn write_fake_combined_snapshot(directory: &Path, workspace_owner_eligible: bool) {
@@ -982,7 +992,7 @@ fn fake_ssh(directory: &Path) {
     fs::write(
         &ssh,
         format!(
-            "#!/bin/sh\nlast=\nfor arg do last=$arg; done\ncase \"$last\" in\n  *boomux-platform-v1*) printf 'boomux-platform-v1\\0Linux\\0x86_64\\0' ;;\n  *boomux-executables-v1*) printf 'boomux-executables-v1\\0/remote/boomux\\0' ;;\n  *boomux-install-destination-v1*) printf 'boomux-install-destination-v1\\0/home/remote/.local/bin/boomux\\0' ;;\n  \"'/remote/boomux' __federation-stdio\") cat \"{}\"; python3 -c 'import json,struct,sys; data=sys.stdin.buffer.read(struct.unpack(\">I\",sys.stdin.buffer.read(4))[0]); request=json.loads(data)[\"message\"][\"request\"]; paths={{\"ping\":sys.argv[1],\"sync_node_projection\":sys.argv[2],\"get_workspace\":sys.argv[3],\"get_combined_node_snapshot\":sys.argv[4]}}; sys.stdout.buffer.write(open(paths[request],\"rb\").read())' \"{}\" \"{}\" \"{}\" \"{}\" ;;\n  *) exit 64 ;;\nesac\n",
+            "#!/bin/sh\n{CONTROL_MASTER_PREFIX}\nlast=\nfor arg do last=$arg; done\ncase \"$last\" in *'exec '*) last=${{last##*exec }} ;; esac\ncase \"$last\" in\n  *boomux-platform-v1*) printf 'boomux-platform-v1\\0Linux\\0x86_64\\0' ;;\n  *boomux-executables-v1*) printf 'boomux-executables-v1\\0/remote/boomux\\0' ;;\n  *boomux-install-destination-v1*) printf 'boomux-install-destination-v1\\0/home/remote/.local/bin/boomux\\0' ;;\n  \"'/remote/boomux' __federation-stdio\") cat \"{}\"; python3 -c 'import json,struct,sys; data=sys.stdin.buffer.read(struct.unpack(\">I\",sys.stdin.buffer.read(4))[0]); request=json.loads(data)[\"message\"][\"request\"]; paths={{\"ping\":sys.argv[1],\"sync_node_projection\":sys.argv[2],\"get_workspace\":sys.argv[3],\"get_combined_node_snapshot\":sys.argv[4]}}; sys.stdout.buffer.write(open(paths[request],\"rb\").read())' \"{}\" \"{}\" \"{}\" \"{}\" ;;\n  *) exit 64 ;;\nesac\n",
             directory.join("handshake.bin").display(),
             directory.join("pong.bin").display(),
             directory.join("sync.bin").display(),
@@ -1005,7 +1015,7 @@ fn command(directory: &Path) -> Command {
 }
 
 #[test]
-fn cli_add_and_retarget_pin_verified_identity_without_persisting_helper_path() {
+fn cli_add_and_retarget_use_once_verified_identity_without_persisting_helper_path() {
     let id = Uuid::new_v4().simple().to_string();
     let directory = std::env::temp_dir().join(format!("bx-n-{}-{}", std::process::id(), &id[..8]));
     fs::create_dir_all(directory.join("home/.ssh")).unwrap();
@@ -1108,13 +1118,16 @@ fn cli_add_and_retarget_pin_verified_identity_without_persisting_helper_path() {
             7,
         )
         .unwrap_err();
-    assert!(matches!(
-        adopt,
-        ClientError::Remote(RemoteError {
-            code: Some(ErrorCode::UnsupportedVersion),
-            ..
-        })
-    ));
+    assert!(
+        matches!(
+            &adopt,
+            ClientError::Remote(RemoteError {
+                code: Some(ErrorCode::UnsupportedVersion),
+                ..
+            })
+        ),
+        "unexpected adopt error: {adopt:?}"
+    );
     write_fake_handshake(&directory, boomux::protocol::PROTOCOL_VERSION);
     write_fake_combined_snapshot(&directory, false);
     let unavailable = client

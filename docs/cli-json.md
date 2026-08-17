@@ -108,6 +108,62 @@ the request. Identity change and unavailable-Node failures are also typed errors
 not message-parsed states.
 
 Node registration and SSH bootstrap are separately authorized operations.
+`node.add --json` never installs or replaces remote software. When discovery
+proves that Boomux is absent it returns `install_required`; when every discovered
+candidate is a known published build below the federation floor it returns
+`upgrade_required`. Both messages direct the operator to rerun the human command
+in an interactive terminal. Indeterminate executable, SSH, authentication,
+handshake, identity, and newer-version failures retain their own failure rather
+than being reported as either code, and no bootstrap mutation occurs.
+After authorization the pinned binary is uploaded to private transaction state,
+not the destination, and its current `daemon status --json` client proves the
+running daemon executable. Automatic upgrade requires that process executable,
+not merely the chosen old helper candidate, to exactly equal the install
+destination. Missing or unprovable process identity returns `upgrade_required`
+without activation. When no helper is discovered, a runtime probe must prove the
+socket path absent before upload and guarded activation repeats the check; an
+existing, racing, stale, or unprovable socket returns `install_required` without
+destination replacement or stop.
+On Linux, upgrade proof includes daemon PID, executable, negotiated protocol, and
+socket device/inode. The uploaded current binary revalidates that fingerprint on
+one open daemon connection immediately before activation; any race or unsupported
+proof boundary returns `upgrade_required` before destination mutation. Bootstrap
+platform preflight uses and verifies a fixed absolute command layout, so a
+poisoned `PATH` cannot select bootstrap tools; a missing layout is
+`bootstrap_unsupported_platform`.
+JSON and background bootstrap never mirror raw SSH master stderr. They retain
+only its bounded in-memory prefix for classification; overflow terminates the
+private master and returns a fixed transport failure.
+Bootstrap failures retain stable classes: `bootstrap_authentication_failed`,
+`bootstrap_transport_failed`, `bootstrap_malformed_helper`,
+`bootstrap_unsupported_platform`, `bootstrap_install_failed`, and
+`bootstrap_commit_outcome_unknown`. The last code is retryable and occurs only
+when the commit result is lost or malformed after successful installed-helper
+handshake and protocol ping; it does not promise rollback, and an exact retry
+rediscovers a compatible committed helper. Relative, oversized, or
+control-character-containing paths in framed discovery output are
+`bootstrap_malformed_helper`, not transport failures. A newer helper
+uses `unsupported_version`; changing or conflicting verified identities use
+`node_identity_changed` and `node_identity_conflict`. These classes contain only
+bounded diagnostics and are not collapsed into `invalid_argument` or `internal`.
+Install-stage failures identify a fixed non-secret stage such as stream, backup,
+activation, or watchdog readiness. They never include raw remote stderr, paths,
+shell startup output, or streamed bytes.
+The backup stage also covers rejection of an existing destination that is not an
+owner-owned bounded regular executable, metadata or byte-copy mismatch, and
+copy/fsync failure. These failures occur before atomic destination activation and
+leave the old executable pathname untouched.
+Bootstrap returns a connection only after exactly one live protocol ping. Ready
+helpers are pinged after connection; installed helpers use the pre-commit ping
+and are not pinged again by add, retarget, ad hoc, or dashboard callers. Failure
+of the required Ready ping remains a bootstrap failure before registration.
+`bootstrap_runtime_unavailable` identifies missing, malformed, unsupported, or
+unsafe remote daemon runtime discovery. Linux derives `/run/user/<numeric uid>`
+only when the remote environment omits `XDG_RUNTIME_DIR`; no local environment is
+forwarded. Post-install status, restart, helper verification, handshake, and ping
+failures identify that fixed stage without exposing remote stderr.
+An already-active remote bootstrap transaction returns the existing stable
+`busy` code before changing the destination.
 Per-Node observed capabilities must distinguish passive combined projection from
 process-starting, destructive, integration-management, Schedule, and
 exact-attachment support. The full compatibility and privacy rules are defined
@@ -300,8 +356,12 @@ Command payloads are:
 - `read`: shell/run identity, observed output revision, and rendered output.
 - `events`: stream identity, reconnect cursor, optional baseline snapshot, and a
   bounded event array.
-- `daemon.status`: `status`, `protocol_version`, `socket_path`, and nullable
-  `scheduler`. Scheduler data contains `state`, `max_concurrent`, and
+- `daemon.status`: `status`, `protocol_version`, `socket_path`, nullable `pid`,
+  `executable`, `socket_device`, and `socket_inode`, and nullable `scheduler`. On Linux, these identity fields
+  are populated only after same-user `SO_PEERCRED` and bounded absolute
+  `/proc/<pid>/exe` validation; the executable has a kernel ` (deleted)` suffix
+  removed. Other platforms or failed proof return null. Scheduler data contains
+  `state`, `max_concurrent`, and
   `active_executions`. State is `active` only for a running worker whose latest
   evaluation and next-occurrence projection succeeded; otherwise it is
   `offline`.

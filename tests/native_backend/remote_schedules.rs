@@ -9,14 +9,14 @@ use boomux::protocol::{
 };
 use uuid::Uuid;
 
-use crate::support::{TestDaemon, process_exists, profile, wait_until};
+use crate::support::{CONTROL_MASTER_PREFIX, TestDaemon, process_exists, profile, wait_until};
 
 fn install_fake_ssh(directory: &Path, owner: &TestDaemon) {
     let ssh = directory.join("ssh");
     fs::write(
         &ssh,
         format!(
-            "#!/bin/sh\nlast=\nfor arg do last=$arg; done\ncase \"$last\" in\n  *boomux-platform-v1*) printf 'boomux-platform-v1\\0Linux\\0x86_64\\0' ;;\n  *boomux-executables-v1*) printf 'boomux-executables-v1\\0{}\\0' ;;\n  *boomux-install-destination-v1*) printf 'boomux-install-destination-v1\\0{}\\0' ;;\n  *__federation-stdio*) exec env XDG_RUNTIME_DIR='{}' XDG_STATE_HOME='{}' '{}' __federation-stdio ;;\n  *) exit 64 ;;\nesac\n",
+            "#!/bin/sh\n{CONTROL_MASTER_PREFIX}\nlast=\nfor arg do last=$arg; done\ncase \"$last\" in\n  *boomux-platform-v1*) printf 'boomux-platform-v1\\0Linux\\0x86_64\\0' ;;\n  *boomux-executables-v1*) printf 'boomux-executables-v1\\0{}\\0' ;;\n  *boomux-install-destination-v1*) printf 'boomux-install-destination-v1\\0{}\\0' ;;\n  *__federation-stdio*) exec env XDG_RUNTIME_DIR='{}' XDG_STATE_HOME='{}' '{}' __federation-stdio ;;\n  *) exit 64 ;;\nesac\n",
             owner.executable.display(),
             owner.executable.display(),
             owner.runtime_dir.display(),

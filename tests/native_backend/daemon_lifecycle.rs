@@ -193,6 +193,11 @@ fn native_daemon_lifecycle() {
     let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
     assert_eq!(status["schema"], "boomux.cli/v1");
     assert_eq!(status["data"]["status"], "running");
+    assert_eq!(status["data"]["pid"], daemon.child.as_ref().unwrap().id());
+    assert_eq!(
+        status["data"]["executable"],
+        daemon.executable.display().to_string()
+    );
     assert_eq!(status["data"]["scheduler"]["state"], "active");
     assert_eq!(status["data"]["scheduler"]["active_executions"], 0);
     assert_eq!(status["data"]["scheduler"]["max_concurrent"], 4);
