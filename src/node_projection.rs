@@ -20,7 +20,7 @@ pub(crate) struct NodeProjectionView {
 }
 use crate::state_store::{effective_uid, secure_state_dir, state_directory_from_environment};
 
-const NODE_CACHE_VERSION: u32 = 1;
+const NODE_CACHE_VERSION: u32 = 2;
 const MAX_CACHE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_NODES: usize = 128;
 const MAX_WORKSPACES_PER_NODE: usize = 1_024;
@@ -31,10 +31,48 @@ const MAX_SCHEDULES_PER_NODE: usize = 1_024;
 const MAX_CAPABILITIES: usize = 96;
 const MAX_CAPABILITY_BYTES: usize = 128;
 const MAX_NAME_BYTES: usize = 256;
+const MAX_NOTIFICATION_CLAIMS_PER_NODE: usize = 512;
+const MAX_DIGEST_CLAIMS_PER_NODE: usize = 128;
+const MAX_NOTIFICATION_REASON_BYTES: usize = 64;
 
 pub(crate) struct NodeProjectionCache {
     path: PathBuf,
     state: Mutex<CacheState>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ProjectionCommit {
+    pub(crate) generation: u64,
+    pub(crate) previous_health: Option<NodeProjectionHealthCode>,
+    pub(crate) previous_cursor: Option<EventCursor>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Ord, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RemoteNotificationCategory {
+    AgentBlocked,
+    AgentCompleted,
+    ScheduledDispatchFailed,
+    ScheduledInterrupted,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RemoteNotificationClaim {
+    pub(crate) stream_id: String,
+    pub(crate) entity_id: String,
+    pub(crate) revision: u64,
+    pub(crate) category: RemoteNotificationCategory,
+    pub(crate) reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RemoteDigestClaim {
+    pub(crate) stream_id: String,
+    pub(crate) prior_cursor: u64,
+    pub(crate) through_cursor: u64,
+    pub(crate) enabled_categories: Vec<RemoteNotificationCategory>,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -58,6 +96,31 @@ struct CachedNode {
     capabilities: Vec<String>,
     cursor: Option<EventCursor>,
     projection: Option<NodeProjectionSnapshot>,
+    notification_claims: Vec<RemoteNotificationClaim>,
+    digest_claims: Vec<RemoteDigestClaim>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VersionOneCacheState {
+    version: u32,
+    nodes: Vec<VersionOneCachedNode>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VersionOneCachedNode {
+    node_id: String,
+    registration_revision: u64,
+    tombstone_epoch: u64,
+    generation: u64,
+    health: NodeProjectionHealthCode,
+    last_attempt_at_ms: Option<u64>,
+    last_success_at_ms: Option<u64>,
+    retry_at_ms: Option<u64>,
+    capabilities: Vec<String>,
+    cursor: Option<EventCursor>,
+    projection: Option<NodeProjectionSnapshot>,
 }
 
 impl NodeProjectionCache {
@@ -69,18 +132,18 @@ impl NodeProjectionCache {
     }
 
     fn load_at(path: PathBuf) -> Self {
-        let mut state = match load(&path) {
+        let (mut state, migrated) = match load(&path) {
             Ok(state) => state,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => empty_state(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => (empty_state(), false),
             Err(error) => {
                 if !path.as_os_str().is_empty() {
                     quarantine(&path);
                 }
                 eprintln!("boomux: discarded invalid disposable Node cache: {error}");
-                empty_state()
+                (empty_state(), false)
             }
         };
-        let mut changed = false;
+        let mut changed = migrated;
         for node in &mut state.nodes {
             if node.health == NodeProjectionHealthCode::Online {
                 node.health = NodeProjectionHealthCode::Stale;
@@ -154,7 +217,7 @@ impl NodeProjectionCache {
         projection: NodeProjectionSnapshot,
         capabilities: Vec<String>,
         now_ms: u64,
-    ) -> io::Result<Option<u64>> {
+    ) -> io::Result<Option<ProjectionCommit>> {
         validate_projection(&projection)?;
         validate_capabilities(&capabilities)?;
         if projection.node_id != registration.node_id {
@@ -177,6 +240,17 @@ impl NodeProjectionCache {
         let generation = expected_generation
             .checked_add(1)
             .ok_or_else(|| io::Error::other("Node cache generation exhausted"))?;
+        let (previous_health, previous_cursor, notification_claims, digest_claims) = current
+            .filter(|index| state.nodes[*index].tombstone_epoch == registration.tombstone_epoch)
+            .map_or((None, None, Vec::new(), Vec::new()), |index| {
+                let node = &state.nodes[index];
+                (
+                    Some(node.health),
+                    node.cursor.clone(),
+                    node.notification_claims.clone(),
+                    node.digest_claims.clone(),
+                )
+            });
         let replacement = CachedNode {
             node_id: registration.node_id.clone(),
             registration_revision: registration.revision,
@@ -189,6 +263,8 @@ impl NodeProjectionCache {
             capabilities,
             cursor: Some(cursor),
             projection: Some(projection),
+            notification_claims,
+            digest_claims,
         };
         let mut next = state.clone();
         match current {
@@ -204,7 +280,11 @@ impl NodeProjectionCache {
         sort_nodes(&mut next);
         save(&self.path, &next)?;
         *state = next;
-        Ok(Some(generation))
+        Ok(Some(ProjectionCommit {
+            generation,
+            previous_health,
+            previous_cursor,
+        }))
     }
 
     pub(crate) fn mark_health(
@@ -242,6 +322,8 @@ impl NodeProjectionCache {
                 capabilities: Vec::new(),
                 cursor: None,
                 projection: None,
+                notification_claims: Vec::new(),
+                digest_claims: Vec::new(),
             },
             |index| state.nodes[index].clone(),
         );
@@ -266,6 +348,63 @@ impl NodeProjectionCache {
         save(&self.path, &next)?;
         *state = next;
         Ok(Some(generation))
+    }
+
+    pub(crate) fn claim_notifications(
+        &self,
+        registration: &NodeRegistrationSnapshot,
+        expected_generation: u64,
+        claims: &[RemoteNotificationClaim],
+        digest: Option<&RemoteDigestClaim>,
+    ) -> io::Result<Option<(Vec<bool>, bool)>> {
+        for claim in claims {
+            validate_notification_claim(claim)?;
+        }
+        if let Some(digest) = digest {
+            validate_digest_claim(digest)?;
+        }
+        let mut state = self.lock()?;
+        let Some(index) = state.nodes.iter().position(|node| {
+            node.node_id == registration.node_id
+                && node.tombstone_epoch == registration.tombstone_epoch
+                && node.generation == expected_generation
+        }) else {
+            return Ok(None);
+        };
+        let mut replacement = state.nodes[index].clone();
+        let mut accepted = Vec::with_capacity(claims.len());
+        for claim in claims {
+            if replacement.notification_claims.contains(claim) {
+                accepted.push(false);
+                continue;
+            }
+            replacement.notification_claims.push(claim.clone());
+            accepted.push(true);
+        }
+        if replacement.notification_claims.len() > MAX_NOTIFICATION_CLAIMS_PER_NODE {
+            let remove = replacement.notification_claims.len() - MAX_NOTIFICATION_CLAIMS_PER_NODE;
+            replacement.notification_claims.drain(..remove);
+        }
+        let digest_accepted = digest.is_some_and(|digest| {
+            if replacement.digest_claims.contains(digest) {
+                false
+            } else {
+                replacement.digest_claims.push(digest.clone());
+                true
+            }
+        });
+        if replacement.digest_claims.len() > MAX_DIGEST_CLAIMS_PER_NODE {
+            let remove = replacement.digest_claims.len() - MAX_DIGEST_CLAIMS_PER_NODE;
+            replacement.digest_claims.drain(..remove);
+        }
+        if !accepted.iter().any(|accepted| *accepted) && !digest_accepted {
+            return Ok(Some((accepted, false)));
+        }
+        let mut next = state.clone();
+        next.nodes[index] = replacement;
+        save(&self.path, &next)?;
+        *state = next;
+        Ok(Some((accepted, digest_accepted)))
     }
 
     pub(crate) fn remove(&self, node_id: &str) -> io::Result<bool> {
@@ -382,7 +521,7 @@ fn validate_capabilities(capabilities: &[String]) -> io::Result<()> {
     Ok(())
 }
 
-fn load(path: &Path) -> io::Result<CacheState> {
+fn load(path: &Path) -> io::Result<(CacheState, bool)> {
     let mut file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
@@ -399,8 +538,50 @@ fn load(path: &Path) -> io::Result<CacheState> {
     }
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
     file.read_to_end(&mut bytes)?;
-    let state: CacheState =
-        serde_json::from_slice(&bytes).map_err(|error| invalid(error.to_string()))?;
+    let version = serde_json::from_slice::<serde_json::Value>(&bytes)
+        .map_err(|error| invalid(error.to_string()))?
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| invalid("Node cache version is missing"))?;
+    let (state, migrated) = match version {
+        1 => {
+            let old: VersionOneCacheState =
+                serde_json::from_slice(&bytes).map_err(|error| invalid(error.to_string()))?;
+            if old.version != 1 {
+                return Err(invalid("invalid Node cache version"));
+            }
+            (
+                CacheState {
+                    version: NODE_CACHE_VERSION,
+                    nodes: old
+                        .nodes
+                        .into_iter()
+                        .map(|node| CachedNode {
+                            node_id: node.node_id,
+                            registration_revision: node.registration_revision,
+                            tombstone_epoch: node.tombstone_epoch,
+                            generation: node.generation,
+                            health: node.health,
+                            last_attempt_at_ms: node.last_attempt_at_ms,
+                            last_success_at_ms: node.last_success_at_ms,
+                            retry_at_ms: node.retry_at_ms,
+                            capabilities: node.capabilities,
+                            cursor: node.cursor,
+                            projection: node.projection,
+                            notification_claims: Vec::new(),
+                            digest_claims: Vec::new(),
+                        })
+                        .collect(),
+                },
+                true,
+            )
+        }
+        2 => (
+            serde_json::from_slice(&bytes).map_err(|error| invalid(error.to_string()))?,
+            false,
+        ),
+        _ => return Err(invalid("unsupported Node cache version")),
+    };
     if state.version != NODE_CACHE_VERSION || state.nodes.len() > MAX_NODES {
         return Err(invalid("unsupported or oversized Node cache"));
     }
@@ -412,6 +593,17 @@ fn load(path: &Path) -> io::Result<CacheState> {
             ));
         }
         validate_capabilities(&node.capabilities)?;
+        if node.notification_claims.len() > MAX_NOTIFICATION_CLAIMS_PER_NODE
+            || node.digest_claims.len() > MAX_DIGEST_CLAIMS_PER_NODE
+        {
+            return Err(invalid("Node notification claims exceed their bounds"));
+        }
+        for claim in &node.notification_claims {
+            validate_notification_claim(claim)?;
+        }
+        for claim in &node.digest_claims {
+            validate_digest_claim(claim)?;
+        }
         if let Some(projection) = &node.projection {
             if projection.node_id != node.node_id {
                 return Err(invalid("Node cache projection identity mismatch"));
@@ -419,7 +611,35 @@ fn load(path: &Path) -> io::Result<CacheState> {
             validate_projection(projection)?;
         }
     }
-    Ok(state)
+    Ok((state, migrated))
+}
+
+fn validate_notification_claim(claim: &RemoteNotificationClaim) -> io::Result<()> {
+    if Uuid::parse_str(&claim.stream_id).is_err()
+        || claim.entity_id.is_empty()
+        || claim.entity_id.len() > MAX_NAME_BYTES
+        || claim.revision == 0
+        || claim.reason.is_empty()
+        || claim.reason.len() > MAX_NOTIFICATION_REASON_BYTES
+        || claim.reason.chars().any(char::is_control)
+    {
+        return Err(invalid("Node notification claim is invalid"));
+    }
+    Ok(())
+}
+
+fn validate_digest_claim(claim: &RemoteDigestClaim) -> io::Result<()> {
+    let mut categories = claim.enabled_categories.clone();
+    categories.sort_unstable();
+    categories.dedup();
+    if Uuid::parse_str(&claim.stream_id).is_err()
+        || claim.prior_cursor > claim.through_cursor
+        || categories.is_empty()
+        || categories != claim.enabled_categories
+    {
+        return Err(invalid("Node notification digest claim is invalid"));
+    }
+    Ok(())
 }
 
 fn save(path: &Path, state: &CacheState) -> io::Result<()> {
@@ -537,7 +757,8 @@ mod tests {
                     vec!["protocol_32".into()],
                     10,
                 )
-                .unwrap(),
+                .unwrap()
+                .map(|commit| commit.generation),
             Some(1)
         );
         assert_eq!(
@@ -604,6 +825,100 @@ mod tests {
             assert_eq!(view.health.stale, code != NodeProjectionHealthCode::Online);
             assert!(view.projection.is_none());
         }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn schema_one_migrates_explicitly_and_notification_claims_are_at_most_once() {
+        let root = std::env::temp_dir().join(format!("boomux-node-claims-{}", Uuid::new_v4()));
+        let path = root.join("boomux/node-cache.json");
+        let node_id = Uuid::from_u128(2).to_string();
+        let stream_id = Uuid::from_u128(3).to_string();
+        let registration = NodeRegistrationSnapshot {
+            alias: "work".into(),
+            target: "work.example".into(),
+            node_id: node_id.clone(),
+            revision: 1,
+            tombstone_epoch: 0,
+        };
+        let cache = NodeProjectionCache::load_at(path.clone());
+        let generation = cache
+            .commit_projection(
+                &registration,
+                0,
+                EventCursor {
+                    stream_id: stream_id.clone(),
+                    event_id: 7,
+                },
+                projection(node_id),
+                vec!["protocol_32".into()],
+                10,
+            )
+            .unwrap()
+            .unwrap()
+            .generation;
+        drop(cache);
+
+        let mut version_one: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        version_one["version"] = serde_json::json!(1);
+        version_one["nodes"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("notification_claims");
+        version_one["nodes"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("digest_claims");
+        fs::write(&path, serde_json::to_vec_pretty(&version_one).unwrap()).unwrap();
+        let cache = NodeProjectionCache::load_at(path.clone());
+        let migrated: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(migrated["version"], 2);
+        assert_eq!(
+            migrated["nodes"][0]["notification_claims"],
+            serde_json::json!([])
+        );
+        assert_eq!(migrated["nodes"][0]["digest_claims"], serde_json::json!([]));
+
+        let claim = RemoteNotificationClaim {
+            stream_id: stream_id.clone(),
+            entity_id: "agent-1".into(),
+            revision: 2,
+            category: RemoteNotificationCategory::AgentBlocked,
+            reason: "blocked".into(),
+        };
+        let digest = RemoteDigestClaim {
+            stream_id,
+            prior_cursor: 7,
+            through_cursor: 9,
+            enabled_categories: vec![RemoteNotificationCategory::AgentBlocked],
+        };
+        assert_eq!(
+            cache
+                .claim_notifications(
+                    &registration,
+                    generation,
+                    std::slice::from_ref(&claim),
+                    Some(&digest),
+                )
+                .unwrap(),
+            Some((vec![true], true))
+        );
+        assert_eq!(
+            cache
+                .claim_notifications(&registration, generation, &[claim], Some(&digest))
+                .unwrap(),
+            Some((vec![false], false))
+        );
+        drop(cache);
+        let cache = NodeProjectionCache::load_at(path);
+        assert_eq!(
+            cache
+                .claim_notifications(&registration, generation, &[], Some(&digest))
+                .unwrap(),
+            Some((Vec::new(), false))
+        );
         fs::remove_dir_all(root).unwrap();
     }
 }

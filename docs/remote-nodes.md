@@ -10,7 +10,9 @@
 > Protocol 30 and local `boomux node rekey` implement bounded expected-ID rekey
 > with exact interactive confirmation. Protocol 31 and registration schema 1
 > implement explicit identity-pinned registration management. Protocol 32 and
-> Node-cache schema 1 implement bounded background reduced projections. Public
+> Node-cache schema 1 implement bounded background reduced projections. Node-cache
+> schema 2 adds local remote-notification and reconnect-digest claims without a
+> remote protocol change. Public
 > Protocol 33 adds the local-daemon combined Node snapshot and federated
 > dashboard. Protocol 34 and state schema 13 implement typed exact-Node private
 > reads and guarded management operations. Protocol 35 implements Node-qualified
@@ -214,7 +216,7 @@ state from loading or persisting. Node identity, registrations, and cache each
 use owner-only directories, bounded schemas, atomic replacement, and explicit
 validation.
 
-Node-cache schema 1 is `node-cache.json` beside, but independent from,
+Node-cache schema 2 is `node-cache.json` beside, but independent from,
 `state.json`, `node.json`, and `node_registrations.json`. It is owner-only,
 atomically replaced, and capped at 4 MiB and 128 Nodes. Per Node it accepts at
 most 1,024 Workspaces, 4,096 Shells, 4,096 launchers, 4,096 Agents, 1,024
@@ -222,6 +224,15 @@ Schedules, 1,000 executions, and 96 capability identifiers of at most 128 bytes.
 Names and identifiers in reduced collections are capped at 256 bytes. An invalid
 cache is renamed to `node-cache.corrupt-<uuid>.json` when possible and otherwise
 discarded in memory; it never blocks authoritative state startup.
+
+Schema 2 explicitly migrates schema 1 by retaining every cached Node generation,
+projection, cursor, capability, and health field and initializing empty local
+notification frontiers. Each Node retains at most 512 individual claims and 128
+digest claims. Individual claims contain only stream UUID, entity ID, positive
+observation or execution revision, typed category, and bounded typed reason;
+digest claims contain stream UUID, prior and through cursor IDs, and the sorted
+enabled category set. Claims are local presentation state and are removed with
+their registered Node cache.
 
 ## Synchronization And Events
 
@@ -489,6 +500,25 @@ frontier without turning it into remote attention authority.
 
 Notification failure is fail-open and cannot change remote lifecycle, attention,
 Schedule, or execution state.
+
+Classification consumes only protocol-32 reduced transitions and the projection
+from that same owner-side cut. An Agent transition qualifies only when its exact
+observation revision is the current blocked or Done row with matching outstanding
+attention. An execution transition qualifies only when its exact revision is a
+configured dispatch failure or cold-recovery interruption. Stale revisions,
+acknowledgments, disconnects, process or output changes, and unrelated transitions
+do not qualify. Because this evidence already exists in protocol 32, remote
+notification presentation adds no protocol version or capability.
+
+The coordinator first persists the complete projection and cursor. After that
+cache lock is released it classifies the reduced transition batch, atomically
+persists previously unseen claims, and releases all federation/cache locks before
+enqueueing delivery. A previously online valid-cursor response produces
+individual requests. A valid-cursor response after stale or unreachable health
+instead replaces those requests with one digest containing bounded category
+counts. A baseline from first observation, cursor expiry, or stream replacement
+never produces a digest. Local crash and graceful handoff reload the same claim
+frontiers; the live notifier queue and worker are not transferred.
 
 ## Compatibility And Migration
 

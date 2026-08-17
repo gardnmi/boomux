@@ -26,6 +26,22 @@ pub(crate) struct NotificationRequest {
     pub(crate) agent: String,
     pub(crate) workspace: String,
     pub(crate) shell: String,
+    pub(crate) node: Option<NotificationNodeContext>,
+    pub(crate) digest: Option<NotificationDigest>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct NotificationNodeContext {
+    pub(crate) alias: String,
+    pub(crate) node_id: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct NotificationDigest {
+    pub(crate) blocked: u16,
+    pub(crate) completed: u16,
+    pub(crate) scheduled_dispatch_failed: u16,
+    pub(crate) scheduled_interrupted: u16,
 }
 
 pub(crate) trait NotificationSink: Send + Sync {
@@ -162,6 +178,8 @@ pub(crate) fn test_delivery(
         agent: "Test Agent".into(),
         workspace: "test-workspace".into(),
         shell: "test-shell".into(),
+        node: None,
+        digest: None,
     };
     let stopping = AtomicBool::new(false);
     let mut first_error = None;
@@ -211,46 +229,74 @@ fn sound_argv(settings: &NotificationDeliverySettings, reason: NotificationReaso
 }
 
 fn notify_send_argv(request: &NotificationRequest) -> Vec<String> {
-    let (title, body) = match request.reason {
-        NotificationReason::Blocked => (
-            "Boomux Agent blocked".into(),
+    let (title, mut body) = if let Some(digest) = &request.digest {
+        let node = request
+            .node
+            .as_ref()
+            .expect("remote notification digest requires Node context");
+        (
+            "Boomux remote activity".into(),
             format!(
-                "{} in workspace {}, shell {}. Open Boomux or run `boomux attention list`.",
-                sanitize(&request.agent),
-                sanitize(&request.workspace),
-                sanitize(&request.shell)
+                "Node {} ({}) reconnected: {} blocked, {} completed, {} dispatch failed, {} interrupted. Open Boomux to inspect.",
+                sanitize(&node.alias),
+                sanitize(&node.node_id),
+                digest.blocked,
+                digest.completed,
+                digest.scheduled_dispatch_failed,
+                digest.scheduled_interrupted,
             ),
-        ),
-        NotificationReason::Completed => (
-            "Boomux Agent completed".into(),
-            format!(
-                "{} in workspace {}, shell {}. Open Boomux or run `boomux attention list`.",
-                sanitize(&request.agent),
-                sanitize(&request.workspace),
-                sanitize(&request.shell)
+        )
+    } else {
+        match request.reason {
+            NotificationReason::Blocked => (
+                "Boomux Agent blocked".into(),
+                format!(
+                    "{} in workspace {}, shell {}. Open Boomux or run `boomux attention list`.",
+                    sanitize(&request.agent),
+                    sanitize(&request.workspace),
+                    sanitize(&request.shell)
+                ),
             ),
-        ),
-        NotificationReason::ScheduledDispatchFailed => (
-            "Boomux scheduled dispatch failed".into(),
-            format!(
-                "Schedule {} in workspace {} failed for execution {}. Run `boomux execution inspect {}`.",
-                sanitize(&request.agent),
-                sanitize(&request.workspace),
-                sanitize(&request.shell),
-                sanitize(&request.shell)
+            NotificationReason::Completed => (
+                "Boomux Agent completed".into(),
+                format!(
+                    "{} in workspace {}, shell {}. Open Boomux or run `boomux attention list`.",
+                    sanitize(&request.agent),
+                    sanitize(&request.workspace),
+                    sanitize(&request.shell)
+                ),
             ),
-        ),
-        NotificationReason::ScheduledInterrupted => (
-            "Boomux scheduled execution interrupted".into(),
-            format!(
-                "Schedule {} in workspace {} was interrupted for execution {}. Run `boomux execution inspect {}`.",
-                sanitize(&request.agent),
-                sanitize(&request.workspace),
-                sanitize(&request.shell),
-                sanitize(&request.shell)
+            NotificationReason::ScheduledDispatchFailed => (
+                "Boomux scheduled dispatch failed".into(),
+                format!(
+                    "Schedule {} in workspace {} failed for execution {}. Run `boomux execution inspect {}`.",
+                    sanitize(&request.agent),
+                    sanitize(&request.workspace),
+                    sanitize(&request.shell),
+                    sanitize(&request.shell)
+                ),
             ),
-        ),
+            NotificationReason::ScheduledInterrupted => (
+                "Boomux scheduled execution interrupted".into(),
+                format!(
+                    "Schedule {} in workspace {} was interrupted for execution {}. Run `boomux execution inspect {}`.",
+                    sanitize(&request.agent),
+                    sanitize(&request.workspace),
+                    sanitize(&request.shell),
+                    sanitize(&request.shell)
+                ),
+            ),
+        }
     };
+    if request.digest.is_none()
+        && let Some(node) = &request.node
+    {
+        body.push_str(&format!(
+            " Node {} ({}).",
+            sanitize(&node.alias),
+            sanitize(&node.node_id)
+        ));
+    }
     vec![
         "notify-send".into(),
         "--app-name".into(),
@@ -304,6 +350,8 @@ mod tests {
             agent: "OpenCode".into(),
             workspace: "boomux".into(),
             shell: "tests".into(),
+            node: None,
+            digest: None,
         }
     }
 
@@ -346,6 +394,35 @@ mod tests {
         ] {
             assert!(!arguments[4].contains(private));
         }
+    }
+
+    #[test]
+    fn remote_context_and_digest_are_bounded_and_prompt_free() {
+        let mut individual = request();
+        individual.node = Some(NotificationNodeContext {
+            alias: "work\nnode".into(),
+            node_id: "00000000-0000-0000-0000-000000000002".into(),
+        });
+        let arguments = notify_send_argv(&individual);
+        assert!(arguments[4].contains("Node work node (00000000-0000-0000-0000-000000000002)"));
+
+        let digest = NotificationRequest {
+            reason: NotificationReason::Blocked,
+            agent: String::new(),
+            workspace: String::new(),
+            shell: String::new(),
+            node: individual.node,
+            digest: Some(NotificationDigest {
+                blocked: 2,
+                completed: 3,
+                scheduled_dispatch_failed: 4,
+                scheduled_interrupted: 5,
+            }),
+        };
+        let arguments = notify_send_argv(&digest);
+        assert_eq!(arguments[3], "Boomux remote activity");
+        assert!(arguments[4].contains("2 blocked, 3 completed, 4 dispatch failed, 5 interrupted"));
+        assert!(!arguments[4].contains("prompt"));
     }
 
     #[test]
