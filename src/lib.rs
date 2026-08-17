@@ -7,6 +7,7 @@ pub mod federation;
 mod handoff;
 pub mod integrations;
 mod node_identity;
+mod node_projection;
 mod node_registration;
 pub mod protocol;
 pub mod scheduling;

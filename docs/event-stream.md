@@ -36,6 +36,8 @@ Protocol 25 adds positive durable execution revisions, bounded execution-list
 metadata, and exact revision-aware execution waits.
 Protocol 26 adds exact-run attachment, and protocol 27 adds optimistic paused
 schedule-definition updates with prompt-free update events.
+Protocol 32 adds owner-side reduced Node projection cuts and the local
+`node_projection_changed` cache invalidation event.
 
 `boomux agent wait <id> --after-revision <revision>` is the preferred way to
 await one Agent. It returns on a newer accepted durable observation, returns
@@ -109,6 +111,7 @@ The event vocabulary is:
 - `agent_schedule_created`, `agent_schedule_updated`, `agent_schedule_paused`,
   `agent_schedule_resumed`, `agent_schedule_removed`
 - `scheduled_execution_created`, `scheduled_execution_changed`
+- `node_projection_changed`
 - `handoff_completed`
 
 Output events carry run identity and the latest output revision, not raw PTY
@@ -195,6 +198,11 @@ replaying or stalling the stream.
 Protocol-24 and older clients ignore the additive execution revision and bounded
 list metadata. Their existing record/event filtering remains unchanged. In all
 versions the returned cursor advances across hidden execution events.
+
+Protocol-31 and older clients do not receive `node_projection_changed`; their
+cursor still advances across the invalidation. A projection cut resumes only
+when every remote event through its captured cursor fits within 256 records;
+otherwise it returns a fresh reduced baseline and no transition history.
 
 Manual final eligibility, claim creation, shell/run binding, and runner spawn are
 serialized against Agent activity mutations. A protocol-23 client therefore

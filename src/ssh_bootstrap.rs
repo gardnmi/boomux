@@ -5,6 +5,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::io::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -150,6 +151,120 @@ impl RemoteConnection {
             ))
         }
     }
+
+    pub(crate) fn node_projection_sync(
+        &mut self,
+        after: Option<protocol::EventCursor>,
+        timeout: Duration,
+    ) -> io::Result<protocol::NodeProjectionSync> {
+        let version = self.handshake.core_protocol_version;
+        if !protocol::ProtocolFeature::NodeProjectionSync.is_supported_by(version) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "remote Node does not support projection synchronization",
+            ));
+        }
+        let wait_ms = if after.is_some() { 1_000 } else { 0 };
+        protocol::write_message(
+            self.stdin.as_mut().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::BrokenPipe, "remote channel closed")
+            })?,
+            &Envelope::with_version(version, Request::SyncNodeProjection { after, wait_ms }),
+        )?;
+        let response: Envelope<Response> = read_message_with_deadline(&mut self.stdout, timeout)?;
+        if response.version != version {
+            return Err(invalid_probe("remote projection response version mismatch"));
+        }
+        match response.message {
+            Response::NodeProjectionSync { sync } => Ok(sync),
+            Response::Error { message, .. } => Err(io::Error::other(message)),
+            _ => Err(invalid_probe(
+                "remote helper returned an invalid projection response",
+            )),
+        }
+    }
+}
+
+fn read_message_with_deadline<T: serde::de::DeserializeOwned>(
+    reader: &mut (impl Read + AsRawFd),
+    timeout: Duration,
+) -> io::Result<T> {
+    if timeout.is_zero() || timeout > MAX_PROBE_TIMEOUT {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "response deadline is outside the supported bound",
+        ));
+    }
+    let fd = reader.as_raw_fd();
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let deadline = Instant::now() + timeout;
+    let result = (|| {
+        let mut length = [0_u8; 4];
+        read_exact_with_deadline(reader, fd, &mut length, deadline)?;
+        let length = u32::from_be_bytes(length) as usize;
+        if length > protocol::MAX_CONTROL_FRAME {
+            return Err(invalid_probe("remote control frame exceeds the size limit"));
+        }
+        let mut bytes = vec![0; length];
+        read_exact_with_deadline(reader, fd, &mut bytes, deadline)?;
+        serde_json::from_slice(&bytes).map_err(io::Error::other)
+    })();
+    let _ = unsafe { libc::fcntl(fd, libc::F_SETFL, flags) };
+    result
+}
+
+fn read_exact_with_deadline(
+    reader: &mut impl Read,
+    fd: i32,
+    mut bytes: &mut [u8],
+    deadline: Instant,
+) -> io::Result<()> {
+    while !bytes.is_empty() {
+        match reader.read(bytes) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "remote channel closed",
+                ));
+            }
+            Ok(count) => bytes = &mut bytes[count..],
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "remote response timed out",
+                    ));
+                }
+                let mut descriptor = libc::pollfd {
+                    fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let milliseconds =
+                    i32::try_from(remaining.as_millis().min(i32::MAX as u128)).unwrap_or(i32::MAX);
+                let status = unsafe { libc::poll(&mut descriptor, 1, milliseconds) };
+                if status == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "remote response timed out",
+                    ));
+                }
+                if status == -1 {
+                    let error = io::Error::last_os_error();
+                    if error.kind() != io::ErrorKind::Interrupted {
+                        return Err(error);
+                    }
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 impl Drop for RemoteConnection {

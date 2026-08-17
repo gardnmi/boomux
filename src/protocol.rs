@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 31;
+pub const PROTOCOL_VERSION: u32 = 32;
 pub const MIN_PROTOCOL_VERSION: u32 = 6;
 pub const MAX_CONTROL_FRAME: usize = 8 * 1024 * 1024;
 pub const MAX_ATTACH_FRAME: usize = 1024 * 1024;
@@ -123,11 +123,18 @@ define_protocol_features! {
         "node_registration_management",
         "pinned_node_identity",
     ]),
+    NodeProjectionSync => (32, "Node projection synchronization", [
+        "protocol_32",
+        "node_projection_sync",
+        "bounded_remote_node_projections",
+    ]),
 }
 
 pub const DEFAULT_SCHEDULED_EXECUTION_LIST_LIMIT: u16 = 100;
 pub const MAX_SCHEDULED_EXECUTION_LIST_LIMIT: u16 = 1_000;
 pub const MAX_SCHEDULED_EXECUTION_SCHEDULE_PROJECTIONS: u16 = 100;
+pub const MAX_NODE_PROJECTION_EXECUTIONS: u16 = 1_000;
+pub const MAX_NODE_PROJECTION_TRANSITIONS: u16 = 256;
 
 pub fn protocol_capabilities() -> impl Iterator<Item = &'static str> {
     ProtocolFeature::ALL
@@ -243,6 +250,221 @@ pub struct NodeRegistrationSnapshot {
     pub node_id: String,
     pub revision: u64,
     pub tombstone_epoch: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeProjectionHealthCode {
+    Unobserved,
+    Online,
+    Reconnecting,
+    Stale,
+    Unreachable,
+    AuthenticationRequired,
+    IdentityChanged,
+    IdentityConflict,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeProjectionHealth {
+    pub code: NodeProjectionHealthCode,
+    pub stale: bool,
+    pub cache_generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_attempt_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_success_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_at_ms: Option<u64>,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeProjectionWorkspace {
+    pub id: String,
+    pub name: String,
+    pub item_count: u32,
+    pub attention_count: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeProjectionShell {
+    pub id: String,
+    pub workspace_id: String,
+    pub name: String,
+    pub owner: ShellOwner,
+    pub status: ShellStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeProjectionLauncher {
+    pub id: String,
+    pub workspace_id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeProjectionAttention {
+    pub reason: AgentAttentionReason,
+    pub observation_revision: u64,
+    pub observed_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeProjectionAgent {
+    pub id: String,
+    pub workspace_id: String,
+    pub shell_id: String,
+    pub run_id: String,
+    pub name: String,
+    pub integration: String,
+    pub state: AgentState,
+    pub observation_revision: u64,
+    pub observed_at_ms: u64,
+    pub started_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention: Option<NodeProjectionAttention>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeProjectionSchedule {
+    pub id: String,
+    pub workspace_id: String,
+    pub name: String,
+    pub integration: String,
+    pub state: AgentScheduleState,
+    pub trigger: AgentScheduleTrigger,
+    pub revision: u64,
+    pub prompt_revision: u64,
+    pub trigger_revision: u64,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_occurrence: Option<ScheduledOccurrence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeProjectionExecution {
+    pub id: String,
+    pub workspace_id: String,
+    pub schedule_id: String,
+    pub revision: u64,
+    pub state: ScheduledExecutionState,
+    pub dispatch_kind: ScheduledExecutionDispatchKind,
+    pub schedule_revision: u64,
+    pub prompt_revision: u64,
+    pub trigger_revision: u64,
+    pub requested_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduled_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<ScheduledExecutionReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<ScheduledExecutionOutcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeProjectionSnapshot {
+    pub node_id: String,
+    pub workspaces: Vec<NodeProjectionWorkspace>,
+    pub shells: Vec<NodeProjectionShell>,
+    pub launchers: Vec<NodeProjectionLauncher>,
+    pub agents: Vec<NodeProjectionAgent>,
+    pub schedules: Vec<NodeProjectionSchedule>,
+    pub executions: Vec<NodeProjectionExecution>,
+    pub executions_truncated: bool,
+    pub scheduler: SchedulerHealth,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "transition", rename_all = "snake_case", deny_unknown_fields)]
+pub enum NodeProjectionTransitionKind {
+    Workspace {
+        workspace_id: String,
+    },
+    Shell {
+        workspace_id: String,
+        shell_id: String,
+    },
+    Launcher {
+        workspace_id: String,
+        launcher_id: String,
+    },
+    Agent {
+        workspace_id: String,
+        agent_id: String,
+        revision: u64,
+    },
+    Schedule {
+        workspace_id: String,
+        schedule_id: String,
+        revision: Option<u64>,
+    },
+    Execution {
+        workspace_id: String,
+        execution_id: String,
+        revision: u64,
+    },
+    HandoffCompleted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeProjectionTransition {
+    pub event_id: u64,
+    pub at_ms: u64,
+    pub kind: NodeProjectionTransitionKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeProjectionSyncMode {
+    Baseline,
+    Resumed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeProjectionSync {
+    pub mode: NodeProjectionSyncMode,
+    pub cursor: EventCursor,
+    pub projection: NodeProjectionSnapshot,
+    pub transitions: Vec<NodeProjectionTransition>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -822,6 +1044,10 @@ pub enum DaemonEventKind {
         workspace_id: String,
         execution: ScheduledExecutionSnapshot,
     },
+    NodeProjectionChanged {
+        node_id: String,
+        cache_generation: u64,
+    },
     HandoffCompleted,
 }
 
@@ -974,6 +1200,15 @@ pub enum Request {
         expected_revision: u64,
     },
     ForgetNodeRegistration {
+        selector: String,
+    },
+    SyncNodeProjection {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after: Option<EventCursor>,
+        #[serde(default)]
+        wait_ms: u32,
+    },
+    GetNodeProjectionHealth {
         selector: String,
     },
     Restart,
@@ -1171,6 +1406,9 @@ impl Request {
             | Self::RenameNodeRegistration { .. }
             | Self::RetargetNodeRegistration { .. }
             | Self::ForgetNodeRegistration { .. } => Some(ProtocolFeature::NodeRegistration),
+            Self::SyncNodeProjection { .. } | Self::GetNodeProjectionHealth { .. } => {
+                Some(ProtocolFeature::NodeProjectionSync)
+            }
             Self::WaitScheduledExecution { .. } => {
                 Some(ProtocolFeature::ScheduledExecutionObservation)
             }
@@ -1282,6 +1520,12 @@ pub enum Response {
     },
     NodeRegistrations {
         registrations: Vec<NodeRegistrationSnapshot>,
+    },
+    NodeProjectionSync {
+        sync: NodeProjectionSync,
+    },
+    NodeProjectionHealth {
+        health: NodeProjectionHealth,
     },
     Snapshot {
         snapshot: Snapshot,
@@ -1863,8 +2107,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_thirty_one_with_minimum_six() {
-        assert_eq!(PROTOCOL_VERSION, 31);
+    fn protocol_version_is_thirty_two_with_minimum_six() {
+        assert_eq!(PROTOCOL_VERSION, 32);
         assert_eq!(MIN_PROTOCOL_VERSION, 6);
     }
 
@@ -1962,6 +2206,60 @@ mod tests {
                 response
             );
         }
+    }
+
+    #[test]
+    fn node_projection_sync_is_protocol_thirty_two_and_privacy_allowlisted() {
+        let request = Request::SyncNodeProjection {
+            after: Some(EventCursor {
+                stream_id: "stream".into(),
+                event_id: 9,
+            }),
+            wait_ms: 1_000,
+        };
+        assert_eq!(
+            request.required_feature(),
+            Some(ProtocolFeature::NodeProjectionSync)
+        );
+        assert_eq!(
+            serde_json::from_value::<Request>(serde_json::to_value(&request).unwrap()).unwrap(),
+            request
+        );
+
+        let projection = NodeProjectionSnapshot {
+            node_id: uuid::Uuid::from_u128(2).to_string(),
+            workspaces: Vec::new(),
+            shells: Vec::new(),
+            launchers: Vec::new(),
+            agents: Vec::new(),
+            schedules: Vec::new(),
+            executions: Vec::new(),
+            executions_truncated: false,
+            scheduler: SchedulerHealth {
+                state: SchedulerState::Active,
+                max_concurrent: 4,
+                active_executions: 0,
+            },
+        };
+        let mut encoded = serde_json::to_value(projection).unwrap();
+        let serialized = encoded.to_string();
+        for private in [
+            "cwd",
+            "command",
+            "terminal",
+            "prompt",
+            "evidence",
+            "environment",
+            "external_session_id",
+            "runner_token",
+        ] {
+            assert!(!serialized.contains(private));
+        }
+        encoded
+            .as_object_mut()
+            .unwrap()
+            .insert("prompt".into(), serde_json::json!("private"));
+        assert!(serde_json::from_value::<NodeProjectionSnapshot>(encoded).is_err());
     }
 
     #[test]
@@ -2716,6 +3014,14 @@ mod tests {
                     "protocol_31",
                     "node_registration_management",
                     "pinned_node_identity",
+                ][..],
+            ),
+            (
+                32,
+                &[
+                    "protocol_32",
+                    "node_projection_sync",
+                    "bounded_remote_node_projections",
                 ][..],
             ),
         ];

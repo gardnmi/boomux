@@ -29,6 +29,7 @@ use crate::desktop_notifications::{
 use crate::fd_transfer::send_descriptor;
 use crate::handoff;
 use crate::node_identity::{NodeIdentityLease, NodeIdentityManager};
+use crate::node_projection::NodeProjectionCache;
 use crate::node_registration::NodeRegistrationManager;
 use crate::protocol::{
     self, AgentAttentionReason, AgentAttentionSnapshot, AgentAuthority, AgentInstanceSnapshot,
@@ -36,14 +37,18 @@ use crate::protocol::{
     AgentScheduleOverlapPolicy, AgentScheduleSession, AgentScheduleSnapshot, AgentScheduleSpec,
     AgentScheduleState, AgentScheduleTrigger, AgentScheduleUpdate, AgentState, AttachFrame,
     DaemonEvent, DaemonEventKind, Envelope, ErrorCode, EventCursor, FocusedTerminalSnapshot,
-    NotificationDeliveryConfig, Request, Response, ScheduledExecutionDispatchKind,
-    ScheduledExecutionOutcome, ScheduledExecutionReason, ScheduledExecutionScheduleProjection,
-    ScheduledExecutionSnapshot, ScheduledExecutionState, ScheduledOccurrence,
-    ScheduledRunnerResult, SchedulerHealth, SchedulerState, ShellOwner, ShellRunExitReason,
-    ShellRunSnapshot, ShellSnapshot, ShellSpec, ShellStatus, Snapshot, TerminalPreview,
-    TerminalProfile, UnixEnvironment, UnixEnvironmentVariable, WorkspaceLauncherSnapshot,
-    WorkspaceLauncherSpec, WorkspaceSnapshot,
+    NodeProjectionAgent, NodeProjectionAttention, NodeProjectionExecution, NodeProjectionLauncher,
+    NodeProjectionSchedule, NodeProjectionShell, NodeProjectionSnapshot, NodeProjectionSync,
+    NodeProjectionSyncMode, NodeProjectionTransition, NodeProjectionTransitionKind,
+    NodeProjectionWorkspace, NotificationDeliveryConfig, Request, Response,
+    ScheduledExecutionDispatchKind, ScheduledExecutionOutcome, ScheduledExecutionReason,
+    ScheduledExecutionScheduleProjection, ScheduledExecutionSnapshot, ScheduledExecutionState,
+    ScheduledOccurrence, ScheduledRunnerResult, SchedulerHealth, SchedulerState, ShellOwner,
+    ShellRunExitReason, ShellRunSnapshot, ShellSnapshot, ShellSpec, ShellStatus, Snapshot,
+    TerminalPreview, TerminalProfile, UnixEnvironment, UnixEnvironmentVariable,
+    WorkspaceLauncherSnapshot, WorkspaceLauncherSpec, WorkspaceSnapshot,
 };
+use crate::ssh_bootstrap::{self, RemoteBootstrapPlan, SshAuthenticationMode, SshTarget};
 use crate::state_store::{
     PersistedAgentInstance, PersistedAgentSchedule, PersistedScheduledExecution, PersistedShell,
     PersistedShellRun, PersistedState, PersistedWorkspace, PersistedWorkspaceLauncher, StateStore,
@@ -341,6 +346,7 @@ fn run_daemon(
         eprintln!("boomux: Node registration routing disabled: {reason}");
     }
     registry.node_registrations = Some(registrations);
+    registry.node_projection_cache = Some(NodeProjectionCache::load_from_environment());
     registry.startup_environment = capture_current_environment();
     registry.configure_scheduler_clock()?;
     registry.notification_settings = notification_settings.clone();
@@ -407,6 +413,7 @@ fn run_daemon(
             .map_err(|error| io::Error::other(error.to_string()))?;
     }
     registry.start_scheduler()?;
+    registry.start_node_projection_workers()?;
     let shutdown = Arc::new(AtomicBool::new(false));
     let transition = Arc::new(AtomicU8::new(TRANSITION_IDLE));
     let (restart_sender, restart_receiver) = mpsc::channel::<RestartRequest>();
@@ -432,6 +439,7 @@ fn run_daemon(
         match restart_receiver.try_recv() {
             Ok(request) => {
                 registry.stop_scheduler()?;
+                registry.stop_node_projection_workers()?;
                 let result = launch_replacement(
                     &listener,
                     &daemon_lock,
@@ -445,6 +453,7 @@ fn run_daemon(
                 } else {
                     transition.store(TRANSITION_IDLE, Ordering::Release);
                     registry.start_scheduler()?;
+                    registry.start_node_projection_workers()?;
                 }
                 let _ = request.reply.send(result);
                 continue;
@@ -489,6 +498,7 @@ fn run_daemon(
         let _ = handler.join();
     }
     registry.stop_scheduler()?;
+    registry.stop_node_projection_workers()?;
     let result = if handed_off {
         socket_cleanup.disarm();
         Ok(())
@@ -1086,6 +1096,7 @@ fn handle_connection_inner(
             );
         }
         registry.stop_scheduler()?;
+        registry.stop_node_projection_workers()?;
         return match registry.shutdown() {
             Ok(()) => {
                 shutdown.store(true, Ordering::Release);
@@ -1094,6 +1105,7 @@ fn handle_connection_inner(
             Err(error) => {
                 transition.store(TRANSITION_IDLE, Ordering::Release);
                 let _ = registry.start_scheduler();
+                let _ = registry.start_node_projection_workers();
                 send_response(
                     &mut stream,
                     response_version,
@@ -1270,6 +1282,11 @@ fn response_for_version_with_schedule_shells(
     schedule_shell_ids: &HashSet<String>,
 ) -> Response {
     let mut response = response;
+    if !protocol::ProtocolFeature::NodeProjectionSync.is_supported_by(version)
+        && let Response::Events { events, .. } = &mut response
+    {
+        events.retain(|event| !matches!(event.kind, DaemonEventKind::NodeProjectionChanged { .. }));
+    }
     if !protocol::ProtocolFeature::ScheduledExecutionObservation.is_supported_by(version) {
         match &mut response {
             Response::ScheduledExecution {
@@ -1653,6 +1670,7 @@ fn scheduled_execution_response(
 struct DaemonService {
     node_identity: Option<Arc<NodeIdentityManager>>,
     node_registrations: Option<NodeRegistrationManager>,
+    node_projection_cache: Option<NodeProjectionCache>,
     durable: DurableRegistry,
     events: EventStream,
     runtimes: ShellRuntimeManager,
@@ -1663,6 +1681,7 @@ struct DaemonService {
     cold_recovery_executions: Vec<ScheduledExecutionSnapshot>,
     startup_environment: UnixEnvironment,
     scheduler: SchedulerWorker,
+    node_projection_workers: NodeProjectionWorkers,
     clock: Mutex<Arc<dyn SchedulerClock>>,
     #[cfg(test)]
     fail_after_mutation: AtomicBool,
@@ -1833,6 +1852,12 @@ struct SchedulerWorkerState {
     running: bool,
     healthy: bool,
     handle: Option<thread::JoinHandle<()>>,
+}
+
+#[derive(Default)]
+struct NodeProjectionWorkers {
+    stop: Arc<AtomicBool>,
+    handles: Mutex<HashMap<String, thread::JoinHandle<()>>>,
 }
 
 struct DurableRegistry {
@@ -2601,6 +2626,177 @@ impl EventStream {
             Self::append_batch_locked(events, vec![kind]);
         }
     }
+}
+
+fn projection_transitions(
+    state: &EventStreamState,
+    after: Option<&EventCursor>,
+    through: &EventCursor,
+) -> (NodeProjectionSyncMode, Vec<NodeProjectionTransition>) {
+    let Some(after) = after else {
+        return (NodeProjectionSyncMode::Baseline, Vec::new());
+    };
+    let earliest = state
+        .events
+        .front()
+        .map_or(state.latest_id, |event| event.id.saturating_sub(1));
+    if after.stream_id != state.stream_id
+        || after.event_id < earliest
+        || after.event_id > through.event_id
+    {
+        return (NodeProjectionSyncMode::Baseline, Vec::new());
+    }
+    let events = state
+        .events
+        .iter()
+        .filter(|event| event.id > after.event_id && event.id <= through.event_id)
+        .collect::<Vec<_>>();
+    if events.len() > usize::from(protocol::MAX_NODE_PROJECTION_TRANSITIONS) {
+        return (NodeProjectionSyncMode::Baseline, Vec::new());
+    }
+    let transitions = events
+        .into_iter()
+        .filter_map(reduce_projection_transition)
+        .collect();
+    (NodeProjectionSyncMode::Resumed, transitions)
+}
+
+fn reduce_projection_transition(event: &DaemonEvent) -> Option<NodeProjectionTransition> {
+    let kind = match &event.kind {
+        DaemonEventKind::WorkspaceCreated { workspace_id, .. }
+        | DaemonEventKind::WorkspaceRenamed { workspace_id, .. }
+        | DaemonEventKind::WorkspaceClosed { workspace_id } => {
+            NodeProjectionTransitionKind::Workspace {
+                workspace_id: workspace_id.clone(),
+            }
+        }
+        DaemonEventKind::ShellCreated {
+            workspace_id,
+            shell_id,
+            ..
+        }
+        | DaemonEventKind::ShellRenamed {
+            workspace_id,
+            shell_id,
+            ..
+        }
+        | DaemonEventKind::RunStarted {
+            workspace_id,
+            shell_id,
+            ..
+        }
+        | DaemonEventKind::OutputChanged {
+            workspace_id,
+            shell_id,
+            ..
+        }
+        | DaemonEventKind::RunExited {
+            workspace_id,
+            shell_id,
+            ..
+        } => NodeProjectionTransitionKind::Shell {
+            workspace_id: workspace_id.clone(),
+            shell_id: shell_id.clone(),
+        },
+        DaemonEventKind::ShellClosed {
+            workspace_id: Some(workspace_id),
+            shell_id,
+        } => NodeProjectionTransitionKind::Shell {
+            workspace_id: workspace_id.clone(),
+            shell_id: shell_id.clone(),
+        },
+        DaemonEventKind::ShellClosed {
+            workspace_id: None, ..
+        } => return None,
+        DaemonEventKind::LauncherCreated {
+            workspace_id,
+            launcher_id,
+            ..
+        }
+        | DaemonEventKind::LauncherRenamed {
+            workspace_id,
+            launcher_id,
+            ..
+        }
+        | DaemonEventKind::LauncherRemoved {
+            workspace_id,
+            launcher_id,
+        } => NodeProjectionTransitionKind::Launcher {
+            workspace_id: workspace_id.clone(),
+            launcher_id: launcher_id.clone(),
+        },
+        DaemonEventKind::AgentRegistered {
+            workspace_id,
+            agent,
+            ..
+        }
+        | DaemonEventKind::AgentStateChanged {
+            workspace_id,
+            agent,
+            ..
+        }
+        | DaemonEventKind::AgentCompleted {
+            workspace_id,
+            agent,
+            ..
+        }
+        | DaemonEventKind::AgentAttentionAcknowledged {
+            workspace_id,
+            agent,
+            ..
+        } => NodeProjectionTransitionKind::Agent {
+            workspace_id: workspace_id.clone(),
+            agent_id: agent.id.clone(),
+            revision: agent.observation.revision,
+        },
+        DaemonEventKind::AgentScheduleCreated {
+            workspace_id,
+            schedule,
+        }
+        | DaemonEventKind::AgentSchedulePaused {
+            workspace_id,
+            schedule,
+        }
+        | DaemonEventKind::AgentScheduleResumed {
+            workspace_id,
+            schedule,
+        }
+        | DaemonEventKind::AgentScheduleUpdated {
+            workspace_id,
+            schedule,
+        } => NodeProjectionTransitionKind::Schedule {
+            workspace_id: workspace_id.clone(),
+            schedule_id: schedule.id.clone(),
+            revision: Some(schedule.revision),
+        },
+        DaemonEventKind::AgentScheduleRemoved {
+            workspace_id,
+            schedule_id,
+        } => NodeProjectionTransitionKind::Schedule {
+            workspace_id: workspace_id.clone(),
+            schedule_id: schedule_id.clone(),
+            revision: None,
+        },
+        DaemonEventKind::ScheduledExecutionCreated {
+            workspace_id,
+            execution,
+        }
+        | DaemonEventKind::ScheduledExecutionChanged {
+            workspace_id,
+            execution,
+        } => NodeProjectionTransitionKind::Execution {
+            workspace_id: workspace_id.clone(),
+            execution_id: execution.id.clone(),
+            revision: execution.revision,
+        },
+        DaemonEventKind::HandoffCompleted => NodeProjectionTransitionKind::HandoffCompleted,
+        DaemonEventKind::NodeProjectionChanged { .. } => return None,
+    };
+    Some(NodeProjectionTransition {
+        event_id: event.id,
+        at_ms: event.at_ms,
+        kind,
+    })
 }
 
 impl DurableRegistry {
@@ -4209,6 +4405,94 @@ impl DurableRegistry {
         })
     }
 
+    fn node_projection(
+        &self,
+        node_id: String,
+        scheduler: SchedulerHealth,
+    ) -> io::Result<NodeProjectionSnapshot> {
+        let (workspaces, shells, launchers, agents, schedules) = {
+            let state = lock(&self.state)?;
+            (
+                state.workspaces.values().cloned().collect::<Vec<_>>(),
+                state.shells.values().cloned().collect::<Vec<_>>(),
+                state.launchers.values().cloned().collect::<Vec<_>>(),
+                state.agents.values().cloned().collect::<Vec<_>>(),
+                state.schedules.values().cloned().collect::<Vec<_>>(),
+            )
+        };
+        let mut projected_workspaces = Vec::with_capacity(workspaces.len());
+        for workspace in workspaces {
+            let item_count = lock(&workspace.shell_ids)?.len()
+                + lock(&workspace.launcher_ids)?.len()
+                + lock(&workspace.schedule_ids)?.len();
+            let agent_ids = lock(&workspace.agent_ids)?.clone();
+            let attention_count = agents
+                .iter()
+                .filter(|agent| agent_ids.contains(&agent.id))
+                .filter_map(|agent| lock(&agent.state).ok())
+                .filter(|state| state.attention.is_some())
+                .count();
+            projected_workspaces.push(NodeProjectionWorkspace {
+                id: workspace.id.clone(),
+                name: lock(&workspace.name)?.clone(),
+                item_count: u32::try_from(item_count).unwrap_or(u32::MAX),
+                attention_count: u32::try_from(attention_count).unwrap_or(u32::MAX),
+            });
+        }
+        let mut projected_shells = shells
+            .iter()
+            .map(|shell| shell.node_projection())
+            .collect::<io::Result<Vec<_>>>()?;
+        let mut projected_launchers = launchers
+            .iter()
+            .map(|launcher| launcher.node_projection())
+            .collect::<io::Result<Vec<_>>>()?;
+        let mut projected_agents = agents
+            .iter()
+            .map(|agent| agent.node_projection())
+            .collect::<io::Result<Vec<_>>>()?;
+        let mut projected_schedules = schedules
+            .iter()
+            .map(|schedule| schedule.node_projection())
+            .collect::<io::Result<Vec<_>>>()?;
+        let mut executions = Vec::new();
+        for schedule in schedules {
+            for execution in lock(&schedule.executions)?.iter() {
+                executions.push(execution.node_projection()?);
+            }
+        }
+        executions.sort_by(|left, right| {
+            left.state
+                .is_terminal()
+                .cmp(&right.state.is_terminal())
+                .then_with(|| {
+                    right
+                        .requested_at_ms
+                        .cmp(&left.requested_at_ms)
+                        .then_with(|| left.id.cmp(&right.id))
+                })
+        });
+        let execution_limit = usize::from(protocol::MAX_NODE_PROJECTION_EXECUTIONS);
+        let executions_truncated = executions.len() > execution_limit;
+        executions.truncate(execution_limit);
+        projected_workspaces.sort_by(|left, right| left.id.cmp(&right.id));
+        projected_shells.sort_by(|left, right| left.id.cmp(&right.id));
+        projected_launchers.sort_by(|left, right| left.id.cmp(&right.id));
+        projected_agents.sort_by(|left, right| left.id.cmp(&right.id));
+        projected_schedules.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(NodeProjectionSnapshot {
+            node_id,
+            workspaces: projected_workspaces,
+            shells: projected_shells,
+            launchers: projected_launchers,
+            agents: projected_agents,
+            schedules: projected_schedules,
+            executions,
+            executions_truncated,
+            scheduler,
+        })
+    }
+
     fn shells(&self) -> io::Result<Vec<Arc<Shell>>> {
         Ok(lock(&self.state)?.shells.values().cloned().collect())
     }
@@ -5006,6 +5290,7 @@ impl Default for DaemonService {
         Self {
             node_identity: None,
             node_registrations: None,
+            node_projection_cache: None,
             durable: DurableRegistry {
                 state: Mutex::new(DurableState::default()),
                 store: None,
@@ -5026,6 +5311,7 @@ impl Default for DaemonService {
             cold_recovery_executions: Vec::new(),
             startup_environment: capture_current_environment(),
             scheduler: SchedulerWorker::default(),
+            node_projection_workers: NodeProjectionWorkers::default(),
             clock: Mutex::new(Arc::new(SystemSchedulerClock)),
             #[cfg(test)]
             fail_after_mutation: AtomicBool::new(false),
@@ -5798,6 +6084,279 @@ fn scheduler_retry_delay(consecutive_failures: u32) -> Duration {
         .min(SCHEDULER_RETRY_MAX)
 }
 
+fn node_projection_worker(service: Weak<DaemonService>, node_id: String) {
+    let mut failures = 0_u32;
+    loop {
+        let Some(service) = service.upgrade() else {
+            return;
+        };
+        if service.node_projection_workers.stop.load(Ordering::Acquire) {
+            return;
+        }
+        let registration = match service.node_registrations().and_then(|registrations| {
+            registrations
+                .inspect(&node_id)
+                .map_err(node_registration_error)
+        }) {
+            Ok(registration) => registration,
+            Err(_) => return,
+        };
+        let (after, expected_generation) = match service.node_projection_cache().and_then(|cache| {
+            cache
+                .cursor_and_generation(&registration)
+                .map_err(DaemonError::from)
+        }) {
+            Ok(value) => value,
+            Err(error) => {
+                eprintln!("boomux: could not inspect Node projection cache: {error}");
+                return;
+            }
+        };
+        let admitted = service
+            .node_registrations()
+            .and_then(|registrations| {
+                registrations
+                    .admit(&registration)
+                    .map_err(node_registration_error)
+            })
+            .unwrap_or(false);
+        if !admitted {
+            if interruptible_node_sleep(&service, Duration::from_millis(100)) {
+                return;
+            }
+            continue;
+        }
+        let attempt_at_ms = unix_time_ms();
+        let result = fetch_node_projection(&registration, after);
+        let mut published_generation = None;
+        match result {
+            Ok((sync, capabilities)) => {
+                let commit = service.node_registrations().and_then(|registrations| {
+                    registrations
+                        .with_current(&registration, || {
+                            service
+                                .node_projection_cache
+                                .as_ref()
+                                .ok_or_else(|| {
+                                    io::Error::other("Node projection cache unavailable")
+                                })?
+                                .commit_projection(
+                                    &registration,
+                                    expected_generation,
+                                    sync.cursor,
+                                    sync.projection,
+                                    capabilities,
+                                    attempt_at_ms,
+                                )
+                        })
+                        .map_err(node_registration_error)
+                });
+                if let Ok(Some(Some(generation))) = commit {
+                    published_generation = Some(generation);
+                    failures = 0;
+                } else if let Err(error) = commit {
+                    eprintln!("boomux: could not commit Node projection: {error}");
+                }
+            }
+            Err((health, error)) => {
+                failures = failures.saturating_add(1);
+                let delay = node_projection_retry_delay(&node_id, failures, health);
+                let retry_at_ms = attempt_at_ms
+                    .saturating_add(u64::try_from(delay.as_millis()).unwrap_or(u64::MAX));
+                let commit = service.node_registrations().and_then(|registrations| {
+                    registrations
+                        .with_current(&registration, || {
+                            service
+                                .node_projection_cache
+                                .as_ref()
+                                .ok_or_else(|| {
+                                    io::Error::other("Node projection cache unavailable")
+                                })?
+                                .mark_health(
+                                    &registration,
+                                    expected_generation,
+                                    health,
+                                    attempt_at_ms,
+                                    Some(retry_at_ms),
+                                )
+                        })
+                        .map_err(node_registration_error)
+                });
+                if let Ok(Some(Some(generation))) = commit {
+                    published_generation = Some(generation);
+                } else if let Err(error) = commit {
+                    eprintln!("boomux: could not commit Node projection health: {error}");
+                }
+                if failures == 1 {
+                    eprintln!(
+                        "boomux: Node projection sync for {} failed: {error}",
+                        registration.alias
+                    );
+                }
+            }
+        }
+        service
+            .node_registrations()
+            .map(|registrations| registrations.release(&registration))
+            .ok();
+        if let Some(cache_generation) = published_generation {
+            let _ = service.events.publish_runtime_batch(vec![
+                DaemonEventKind::NodeProjectionChanged {
+                    node_id: registration.node_id.clone(),
+                    cache_generation,
+                },
+            ]);
+        }
+        let delay = if failures == 0 {
+            Duration::from_secs(1)
+        } else {
+            node_projection_retry_delay(
+                &node_id,
+                failures,
+                service
+                    .node_projection_cache()
+                    .and_then(|cache| cache.health(&registration).map_err(DaemonError::from))
+                    .map(|health| health.code)
+                    .unwrap_or(crate::protocol::NodeProjectionHealthCode::Unreachable),
+            )
+        };
+        if interruptible_node_sleep(&service, delay) {
+            return;
+        }
+    }
+}
+
+fn fetch_node_projection(
+    registration: &crate::protocol::NodeRegistrationSnapshot,
+    after: Option<EventCursor>,
+) -> Result<(NodeProjectionSync, Vec<String>), (crate::protocol::NodeProjectionHealthCode, io::Error)>
+{
+    use crate::protocol::NodeProjectionHealthCode;
+    let target = SshTarget::parse(registration.target.clone())
+        .map_err(|error| (NodeProjectionHealthCode::Unreachable, error))?;
+    let helper = match ssh_bootstrap::plan_remote_bootstrap(
+        target.clone(),
+        SshAuthenticationMode::Batch,
+        Duration::from_secs(2),
+    ) {
+        Ok(RemoteBootstrapPlan::Ready(helper)) => helper,
+        Ok(RemoteBootstrapPlan::Install(_)) => {
+            return Err((
+                NodeProjectionHealthCode::Unsupported,
+                io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "remote helper requires installation",
+                ),
+            ));
+        }
+        Err(error) => return Err((classify_node_sync_error(&error), error)),
+    };
+    if helper.handshake.node_id != registration.node_id {
+        return Err((
+            NodeProjectionHealthCode::IdentityChanged,
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "remote Node identity changed",
+            ),
+        ));
+    }
+    let version = helper.handshake.core_protocol_version;
+    if !protocol::ProtocolFeature::NodeProjectionSync.is_supported_by(version) {
+        return Err((
+            NodeProjectionHealthCode::Unsupported,
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "remote Node does not support projection synchronization",
+            ),
+        ));
+    }
+    let mut remote = ssh_bootstrap::connect_remote(
+        target,
+        helper,
+        SshAuthenticationMode::Batch,
+        Duration::from_secs(2),
+    )
+    .map_err(|error| (classify_node_sync_error(&error), error))?;
+    let sync = remote
+        .node_projection_sync(after, Duration::from_secs(2))
+        .map_err(|error| (classify_node_sync_error(&error), error))?;
+    if sync.projection.node_id != registration.node_id {
+        return Err((
+            NodeProjectionHealthCode::IdentityChanged,
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "projection owner identity changed",
+            ),
+        ));
+    }
+    let capabilities = protocol::ProtocolFeature::ALL
+        .iter()
+        .copied()
+        .filter(|feature| feature.is_supported_by(version))
+        .flat_map(protocol::ProtocolFeature::capability_names)
+        .copied()
+        .map(str::to_owned)
+        .collect();
+    Ok((sync, capabilities))
+}
+
+fn classify_node_sync_error(error: &io::Error) -> crate::protocol::NodeProjectionHealthCode {
+    use crate::protocol::NodeProjectionHealthCode;
+    if error.kind() == io::ErrorKind::Unsupported {
+        NodeProjectionHealthCode::Unsupported
+    } else if error.kind() == io::ErrorKind::PermissionDenied
+        || error
+            .to_string()
+            .to_ascii_lowercase()
+            .contains("authentication")
+    {
+        NodeProjectionHealthCode::AuthenticationRequired
+    } else {
+        NodeProjectionHealthCode::Unreachable
+    }
+}
+
+fn node_projection_retry_delay(
+    node_id: &str,
+    failures: u32,
+    health: crate::protocol::NodeProjectionHealthCode,
+) -> Duration {
+    use crate::protocol::NodeProjectionHealthCode;
+    let base = if matches!(
+        health,
+        NodeProjectionHealthCode::AuthenticationRequired
+            | NodeProjectionHealthCode::IdentityChanged
+            | NodeProjectionHealthCode::IdentityConflict
+            | NodeProjectionHealthCode::Unsupported
+    ) {
+        60_u64
+    } else {
+        1_u64
+            .checked_shl(failures.saturating_sub(1).min(6))
+            .unwrap_or(60)
+            .min(60)
+    };
+    let jitter = node_id.bytes().fold(u64::from(failures), |value, byte| {
+        value.wrapping_mul(33).wrapping_add(u64::from(byte))
+    }) % 1_000;
+    Duration::from_millis(base.saturating_mul(1_000).saturating_add(jitter))
+}
+
+fn interruptible_node_sleep(service: &DaemonService, duration: Duration) -> bool {
+    let deadline = Instant::now() + duration;
+    while Instant::now() < deadline {
+        if service.node_projection_workers.stop.load(Ordering::Acquire) {
+            return true;
+        }
+        thread::sleep(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(100)),
+        );
+    }
+    false
+}
+
 fn resume_identity(
     agent: &AgentInstance,
     shell: &Shell,
@@ -5847,6 +6406,15 @@ impl DaemonService {
             DaemonError::lifecycle(
                 ErrorCode::NodeRegistrationUnavailable,
                 "Boomux Node registrations are unavailable",
+            )
+        })
+    }
+
+    fn node_projection_cache(&self) -> DaemonResult<&NodeProjectionCache> {
+        self.node_projection_cache.as_ref().ok_or_else(|| {
+            DaemonError::lifecycle(
+                ErrorCode::NodeRegistrationUnavailable,
+                "Boomux Node projection cache is unavailable",
             )
         })
     }
@@ -5914,6 +6482,66 @@ impl DaemonService {
                 .spawn(move || scheduler_worker(service))?,
         );
         self.scheduler.changed.notify_all();
+        Ok(())
+    }
+
+    fn start_node_projection_workers(self: &Arc<Self>) -> io::Result<()> {
+        self.node_projection_workers
+            .stop
+            .store(false, Ordering::Release);
+        let registrations = self
+            .node_registrations
+            .as_ref()
+            .ok_or_else(|| io::Error::other("Node registrations unavailable"))?;
+        let registrations = match registrations.list() {
+            Ok(registrations) => registrations,
+            Err(error) => {
+                eprintln!("boomux: Node projection synchronization disabled: {error}");
+                return Ok(());
+            }
+        };
+        for registration in registrations {
+            self.start_node_projection_worker(registration.node_id)?;
+        }
+        Ok(())
+    }
+
+    fn start_node_projection_worker(self: &Arc<Self>, node_id: String) -> io::Result<()> {
+        let mut handles = lock(&self.node_projection_workers.handles)?;
+        if handles
+            .get(&node_id)
+            .is_some_and(|handle| !handle.is_finished())
+        {
+            return Ok(());
+        }
+        if let Some(handle) = handles.remove(&node_id) {
+            let _ = handle.join();
+        }
+        let service = Arc::downgrade(self);
+        let worker_node_id = node_id.clone();
+        let handle = thread::Builder::new()
+            .name(format!("boomux-node-sync-{node_id}"))
+            .spawn(move || node_projection_worker(service, worker_node_id))?;
+        handles.insert(node_id, handle);
+        Ok(())
+    }
+
+    fn stop_node_projection_workers(&self) -> io::Result<()> {
+        self.node_projection_workers
+            .stop
+            .store(true, Ordering::Release);
+        let handles = {
+            let mut handles = lock(&self.node_projection_workers.handles)?;
+            handles
+                .drain()
+                .map(|(_, handle)| handle)
+                .collect::<Vec<_>>()
+        };
+        for handle in handles {
+            handle
+                .join()
+                .map_err(|_| io::Error::other("Node projection worker panicked"))?;
+        }
         Ok(())
     }
 
@@ -6104,6 +6732,13 @@ impl DaemonService {
         request: Request,
         response_version: u32,
     ) -> DaemonResult<Response> {
+        if matches!(request, Request::AddNodeRegistration { .. }) {
+            let response = self.dispatch(request)?;
+            if let Response::NodeRegistration { registration } = &response {
+                self.start_node_projection_worker(registration.node_id.clone())?;
+            }
+            return Ok(response);
+        }
         if let Request::ListScheduledExecutions {
             workspace_id,
             schedule_id,
@@ -7137,22 +7772,44 @@ impl DaemonService {
                 target,
                 node_id,
                 expected_revision,
-            } => self
-                .node_registrations()?
-                .retarget(
-                    &selector,
-                    target,
-                    &node_id,
-                    expected_revision,
-                    NODE_REGISTRATION_DRAIN_TIMEOUT,
-                )
-                .map(|registration| Response::NodeRegistration { registration })
-                .map_err(node_registration_error),
-            Request::ForgetNodeRegistration { selector } => self
-                .node_registrations()?
-                .forget(&selector, NODE_REGISTRATION_DRAIN_TIMEOUT)
-                .map(|registration| Response::NodeRegistration { registration })
-                .map_err(node_registration_error),
+            } => {
+                let registration = self
+                    .node_registrations()?
+                    .retarget(
+                        &selector,
+                        target,
+                        &node_id,
+                        expected_revision,
+                        NODE_REGISTRATION_DRAIN_TIMEOUT,
+                    )
+                    .map_err(node_registration_error)?;
+                if let Err(error) = self.node_projection_cache()?.remove(&registration.node_id) {
+                    eprintln!("boomux: could not remove disposable Node projection: {error}");
+                }
+                Ok(Response::NodeRegistration { registration })
+            }
+            Request::ForgetNodeRegistration { selector } => {
+                let registration = self
+                    .node_registrations()?
+                    .forget(&selector, NODE_REGISTRATION_DRAIN_TIMEOUT)
+                    .map_err(node_registration_error)?;
+                if let Err(error) = self.node_projection_cache()?.remove(&registration.node_id) {
+                    eprintln!("boomux: could not remove disposable Node projection: {error}");
+                }
+                Ok(Response::NodeRegistration { registration })
+            }
+            Request::SyncNodeProjection { after, wait_ms } => Ok(Response::NodeProjectionSync {
+                sync: self.node_projection_sync(after, wait_ms)?,
+            }),
+            Request::GetNodeProjectionHealth { selector } => {
+                let registration = self
+                    .node_registrations()?
+                    .inspect(&selector)
+                    .map_err(node_registration_error)?;
+                Ok(Response::NodeProjectionHealth {
+                    health: self.node_projection_cache()?.health(&registration)?,
+                })
+            }
             Request::Restart | Request::RestartWithNotificationConfig { .. } => {
                 unreachable!("restart is handled before dispatch")
             }
@@ -7947,6 +8604,7 @@ impl DaemonService {
         let registry = Self {
             node_identity: None,
             node_registrations: None,
+            node_projection_cache: None,
             durable: DurableRegistry {
                 state: Mutex::new(state),
                 store: Some(store),
@@ -7967,6 +8625,7 @@ impl DaemonService {
             cold_recovery_executions,
             startup_environment: capture_current_environment(),
             scheduler: SchedulerWorker::default(),
+            node_projection_workers: NodeProjectionWorkers::default(),
             clock: Mutex::new(Arc::new(SystemSchedulerClock)),
             #[cfg(test)]
             fail_after_mutation: AtomicBool::new(false),
@@ -8843,6 +9502,64 @@ impl DaemonService {
                 .unwrap_or(u16::MAX),
         });
         Ok(snapshot)
+    }
+
+    fn node_projection_sync(
+        &self,
+        after: Option<EventCursor>,
+        wait_ms: u32,
+    ) -> DaemonResult<NodeProjectionSync> {
+        if let Some(cursor) = &after
+            && wait_ms != 0
+        {
+            match self
+                .events
+                .read_after(cursor, 1, wait_ms, || self.runtimes.is_stopping())
+            {
+                Ok(_) => {}
+                Err(DaemonError::Lifecycle {
+                    code: ErrorCode::CursorExpired,
+                    ..
+                }) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        let transaction = self.events.transaction()?;
+        let cursor = transaction.cursor();
+        let (mode, transitions) =
+            projection_transitions(&transaction.events, after.as_ref(), &cursor);
+        let node_id = self.node_identity()?.id()?;
+        let scheduler = self.scheduler_health()?;
+        let projection = self.durable.node_projection(node_id, scheduler)?;
+        Ok(NodeProjectionSync {
+            mode,
+            cursor,
+            projection,
+            transitions,
+        })
+    }
+
+    fn scheduler_health(&self) -> io::Result<SchedulerHealth> {
+        let active = self.scheduler.state.lock().ok().is_some_and(|scheduler| {
+            scheduler.running
+                && scheduler.healthy
+                && scheduler
+                    .handle
+                    .as_ref()
+                    .is_some_and(|handle| !handle.is_finished())
+        });
+        Ok(SchedulerHealth {
+            state: if active {
+                SchedulerState::Active
+            } else {
+                SchedulerState::Offline
+            },
+            max_concurrent: self
+                .notification_settings
+                .max_scheduled_execution_concurrency,
+            active_executions: u16::try_from(self.durable.active_scheduled_execution_count()?)
+                .unwrap_or(u16::MAX),
+        })
     }
 
     fn schedule_shell_ids_for_downgrade(&self) -> io::Result<HashSet<String>> {
@@ -9824,6 +10541,37 @@ impl Workspace {
 }
 
 impl AgentSchedule {
+    fn node_projection(&self) -> io::Result<NodeProjectionSchedule> {
+        let state = lock(&self.state)?;
+        let next_occurrence = if state.state == AgentScheduleState::Enabled {
+            Some(ScheduledOccurrence {
+                trigger_revision: state.trigger_revision,
+                scheduled_at_ms: crate::scheduling::CronSchedule::compile(
+                    &state.trigger.cron,
+                    &state.trigger.timezone,
+                )
+                .and_then(|cron| cron.next_after_ms(state.evaluation_frontier_ms))
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?,
+            })
+        } else {
+            None
+        };
+        Ok(NodeProjectionSchedule {
+            id: self.id.clone(),
+            workspace_id: self.workspace_id.clone(),
+            name: state.name.clone(),
+            integration: self.integration.clone(),
+            state: state.state,
+            trigger: state.trigger.clone(),
+            revision: state.revision,
+            prompt_revision: state.prompt_revision,
+            trigger_revision: state.trigger_revision,
+            created_at_ms: self.created_at_ms,
+            updated_at_ms: state.updated_at_ms,
+            next_occurrence,
+        })
+    }
+
     fn from_persisted(workspace_id: &str, saved: PersistedAgentSchedule) -> Self {
         let schedule_id = saved.id.clone();
         Self {
@@ -9952,6 +10700,30 @@ impl AgentSchedule {
 }
 
 impl ScheduledExecution {
+    fn node_projection(&self) -> io::Result<NodeProjectionExecution> {
+        let state = lock(&self.state)?;
+        Ok(NodeProjectionExecution {
+            id: self.id.clone(),
+            workspace_id: self.workspace_id.clone(),
+            schedule_id: self.schedule_id.clone(),
+            revision: state.revision,
+            state: state.state,
+            dispatch_kind: self.dispatch_kind,
+            schedule_revision: self.schedule_revision,
+            prompt_revision: self.prompt_revision,
+            trigger_revision: self.trigger_revision,
+            requested_at_ms: self.requested_at_ms,
+            scheduled_at_ms: self.scheduled_at_ms,
+            started_at_ms: state.started_at_ms,
+            ended_at_ms: state.ended_at_ms,
+            reason: state.reason,
+            outcome: state.outcome.clone(),
+            shell_id: state.shell_id.clone(),
+            run_id: state.run_id.clone(),
+            agent_id: state.agent_id.clone(),
+        })
+    }
+
     fn from_persisted(
         workspace_id: &str,
         schedule_id: &str,
@@ -10055,6 +10827,14 @@ impl ScheduledExecution {
 }
 
 impl WorkspaceLauncher {
+    fn node_projection(&self) -> io::Result<NodeProjectionLauncher> {
+        Ok(NodeProjectionLauncher {
+            id: self.id.clone(),
+            workspace_id: self.workspace_id.clone(),
+            name: lock(&self.name)?.clone(),
+        })
+    }
+
     fn snapshot(&self) -> io::Result<WorkspaceLauncherSnapshot> {
         Ok(WorkspaceLauncherSnapshot {
             id: self.id.clone(),
@@ -10067,6 +10847,31 @@ impl WorkspaceLauncher {
 }
 
 impl AgentInstance {
+    fn node_projection(&self) -> io::Result<NodeProjectionAgent> {
+        let state = lock(&self.state)?;
+        Ok(NodeProjectionAgent {
+            id: self.id.clone(),
+            workspace_id: self.workspace_id.clone(),
+            shell_id: self.shell_id.clone(),
+            run_id: self.run_id.clone(),
+            name: self.name.clone(),
+            integration: self.integration.clone(),
+            state: state.observation.state,
+            observation_revision: state.observation.revision,
+            observed_at_ms: state.observation.observed_at_ms,
+            started_at_ms: self.started_at_ms,
+            ended_at_ms: state.ended_at_ms,
+            attention: state
+                .attention
+                .as_ref()
+                .map(|attention| NodeProjectionAttention {
+                    reason: attention.reason,
+                    observation_revision: attention.observation.revision,
+                    observed_at_ms: attention.observation.observed_at_ms,
+                }),
+        })
+    }
+
     fn from_persisted(workspace_id: &str, saved: PersistedAgentInstance) -> Self {
         Self {
             id: saved.id,
@@ -10127,6 +10932,39 @@ impl AgentInstance {
 }
 
 impl Shell {
+    fn node_projection(&self) -> io::Result<NodeProjectionShell> {
+        let (status, run_id, generation, started_at_ms, ended_at_ms) =
+            match &*lock(&self.lifecycle)? {
+                ShellLifecycle::Pending => (ShellStatus::Pending, None, None, None, None),
+                ShellLifecycle::Running { run, .. } => (
+                    ShellStatus::Running,
+                    Some(run.id.clone()),
+                    Some(run.generation),
+                    Some(run.started_at_ms),
+                    lock(&run.ended)?.as_ref().map(|end| end.ended_at_ms),
+                ),
+                ShellLifecycle::Exited { code, run, .. } => (
+                    ShellStatus::Exited { code: *code },
+                    Some(run.id.clone()),
+                    Some(run.generation),
+                    Some(run.started_at_ms),
+                    lock(&run.ended)?.as_ref().map(|end| end.ended_at_ms),
+                ),
+                ShellLifecycle::Closed => return Err(not_found("shell", &self.id)),
+            };
+        Ok(NodeProjectionShell {
+            id: self.id.clone(),
+            workspace_id: self.workspace_id.clone(),
+            name: lock(&self.name)?.clone(),
+            owner: self.owner.clone(),
+            status,
+            run_id,
+            generation,
+            started_at_ms,
+            ended_at_ms,
+        })
+    }
+
     fn snapshot(&self) -> io::Result<ShellSnapshot> {
         let (status, run, runtime) = match &*lock(&self.lifecycle)? {
             ShellLifecycle::Pending => (ShellStatus::Pending, None, None),
@@ -14829,6 +15667,72 @@ mod tests {
         };
         assert_eq!(cursor, current_cursor);
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn protocol_thirty_one_filters_projection_invalidation_without_rewinding_cursor() {
+        let cursor = EventCursor {
+            stream_id: Uuid::new_v4().to_string(),
+            event_id: 4,
+        };
+        let response = response_for_version(
+            Response::Events {
+                stream_id: cursor.stream_id.clone(),
+                cursor: cursor.clone(),
+                snapshot: None,
+                events: vec![DaemonEvent {
+                    id: 4,
+                    at_ms: 10,
+                    kind: DaemonEventKind::NodeProjectionChanged {
+                        node_id: Uuid::from_u128(2).to_string(),
+                        cache_generation: 3,
+                    },
+                }],
+            },
+            31,
+        );
+        let Response::Events {
+            cursor: filtered_cursor,
+            events,
+            ..
+        } = response
+        else {
+            panic!("expected events");
+        };
+        assert_eq!(filtered_cursor, cursor);
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn projection_cut_resumes_exactly_or_reseeds_on_stream_expiry() {
+        let events = EventStream::new();
+        let baseline = events.transaction().unwrap().cursor();
+        events
+            .publish(DaemonEventKind::WorkspaceCreated {
+                workspace_id: "workspace-1".into(),
+                name: "private-name-is-not-copied-into-transition".into(),
+            })
+            .unwrap();
+        let transaction = events.transaction().unwrap();
+        let through = transaction.cursor();
+        let (mode, transitions) =
+            projection_transitions(&transaction.events, Some(&baseline), &through);
+        assert_eq!(mode, NodeProjectionSyncMode::Resumed);
+        assert!(matches!(
+            transitions.as_slice(),
+            [NodeProjectionTransition {
+                kind: NodeProjectionTransitionKind::Workspace { workspace_id },
+                ..
+            }] if workspace_id == "workspace-1"
+        ));
+        let expired = EventCursor {
+            stream_id: Uuid::new_v4().to_string(),
+            event_id: baseline.event_id,
+        };
+        let (mode, transitions) =
+            projection_transitions(&transaction.events, Some(&expired), &through);
+        assert_eq!(mode, NodeProjectionSyncMode::Baseline);
+        assert!(transitions.is_empty());
     }
 
     #[test]
