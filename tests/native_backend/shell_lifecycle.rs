@@ -15,24 +15,17 @@ use crate::support::{
 };
 
 #[test]
-fn workspace_default_cwd_is_inherited_and_survives_handoff() {
+fn legacy_workspace_default_cwd_is_inherited_and_survives_handoff() {
     let mut daemon = TestDaemon::start();
     let project = daemon.runtime_dir.join("project");
     let other = daemon.runtime_dir.join("other");
     fs::create_dir(&project).unwrap();
     fs::create_dir(&other).unwrap();
 
-    let created = daemon
-        .command()
-        .args(["workspace", "create", "project", "--cwd"])
-        .arg(&project)
-        .output()
+    daemon
+        .client
+        .create_workspace_with_default_cwd("project", Some(project.clone()), Vec::new())
         .unwrap();
-    assert!(
-        created.status.success(),
-        "workspace create failed: {}",
-        String::from_utf8_lossy(&created.stderr)
-    );
     let inspected = daemon
         .command()
         .args(["workspace", "inspect", "project", "--json"])

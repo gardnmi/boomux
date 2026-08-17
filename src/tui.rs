@@ -1,5 +1,7 @@
 use std::io;
 use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossterm::event::{
@@ -845,12 +847,6 @@ pub(crate) enum DashboardEffect {
     Close(CloseTarget),
     CreateWorkspace {
         name: String,
-        default_cwd: Option<PathBuf>,
-    },
-    CreatePlacedWorkspace {
-        name: String,
-        default_cwd: PathBuf,
-        node_id: String,
     },
     CreateShell(QualifiedIdentity),
     CreateGlobalShell {
@@ -919,6 +915,21 @@ pub(crate) enum DashboardEffect {
     },
 }
 
+impl DashboardEffect {
+    fn must_finish_before_quit(&self) -> bool {
+        !matches!(
+            self,
+            Self::Quit
+                | Self::CheckForUpdates
+                | Self::RefreshNode(_)
+                | Self::Refresh
+                | Self::LoadScheduleHistory { .. }
+                | Self::LoadScheduleEditor { .. }
+                | Self::ReadTerminalPreview { .. }
+        )
+    }
+}
+
 pub(crate) enum DashboardEvent {
     KeyPressed {
         code: KeyCode,
@@ -928,6 +939,7 @@ pub(crate) enum DashboardEvent {
     PreviewRequested,
     UpdateCheckCompleted,
     OperationCompleted(Result<String, String>),
+    ShellCreationCompleted(Result<String, String>),
     RefreshCompleted(Result<DashboardState, String>),
     ScheduleHistoryCompleted {
         schedule_id: QualifiedIdentity,
@@ -963,6 +975,104 @@ where
     }
 }
 
+struct DashboardRuntime {
+    effects: Sender<DashboardEffect>,
+    completions: Receiver<(DashboardEffect, DashboardEvent)>,
+    update_check_in_flight: bool,
+    preview_in_flight: bool,
+    operations_in_flight: usize,
+}
+
+impl DashboardRuntime {
+    fn spawn(mut backend: impl DashboardBackend + Send + 'static) -> Self {
+        let (effect_sender, effect_receiver) = mpsc::channel::<DashboardEffect>();
+        let (completion_sender, completion_receiver) = mpsc::channel();
+        thread::spawn(move || {
+            while let Ok(effect) = effect_receiver.recv() {
+                let completed_effect = effect.clone();
+                let event = backend.execute(effect);
+                if completion_sender.send((completed_effect, event)).is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            effects: effect_sender,
+            completions: completion_receiver,
+            update_check_in_flight: false,
+            preview_in_flight: false,
+            operations_in_flight: 0,
+        }
+    }
+
+    fn dispatch(&mut self, effects: Vec<DashboardEffect>) -> io::Result<bool> {
+        for effect in effects {
+            if effect == DashboardEffect::Quit {
+                if self.can_quit() {
+                    return Ok(true);
+                }
+                continue;
+            }
+            if (effect == DashboardEffect::CheckForUpdates && self.update_check_in_flight)
+                || (matches!(effect, DashboardEffect::ReadTerminalPreview { .. })
+                    && self.preview_in_flight)
+            {
+                continue;
+            }
+            match &effect {
+                DashboardEffect::CheckForUpdates => self.update_check_in_flight = true,
+                DashboardEffect::ReadTerminalPreview { .. } => self.preview_in_flight = true,
+                _ => {}
+            }
+            if effect.must_finish_before_quit() {
+                self.operations_in_flight += 1;
+            }
+            self.effects.send(effect).map_err(|_| {
+                io::Error::new(io::ErrorKind::BrokenPipe, "dashboard backend stopped")
+            })?;
+        }
+        Ok(false)
+    }
+
+    fn drain(&mut self, app: &mut App) -> io::Result<bool> {
+        loop {
+            match self.completions.try_recv() {
+                Ok((effect, event)) => {
+                    match effect {
+                        DashboardEffect::CheckForUpdates => self.update_check_in_flight = false,
+                        DashboardEffect::ReadTerminalPreview { .. } => {
+                            self.preview_in_flight = false;
+                        }
+                        _ => {}
+                    }
+                    if effect.must_finish_before_quit() {
+                        self.operations_in_flight = self.operations_in_flight.saturating_sub(1);
+                    }
+                    let effects = app.update(event);
+                    if self.dispatch(effects)? {
+                        return Ok(true);
+                    }
+                }
+                Err(TryRecvError::Empty) => return Ok(false),
+                Err(TryRecvError::Disconnected) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "dashboard backend stopped",
+                    ));
+                }
+            }
+        }
+    }
+
+    fn has_in_flight_effect(&self) -> bool {
+        self.update_check_in_flight || self.preview_in_flight || self.operations_in_flight > 0
+    }
+
+    fn can_quit(&self) -> bool {
+        self.operations_in_flight == 0
+    }
+}
+
 struct App {
     nodes: Vec<NodeView>,
     all_workspaces: Vec<WorkspaceView>,
@@ -982,6 +1092,7 @@ struct App {
     focus: Focus,
     mode: Mode,
     message: Option<Message>,
+    pending_shell_creation: Option<String>,
     pending_close: Option<PendingClose>,
     project_context: ProjectContext,
     terminal_preview: Option<TerminalPreviewState>,
@@ -1147,7 +1258,6 @@ struct WorkspaceNodePicker {
     placements: Vec<WorkspacePlacementView>,
     nodes: Vec<NodeView>,
     selected: Option<usize>,
-    project: Option<(String, PathBuf)>,
 }
 
 impl WorkspaceNodePicker {
@@ -1180,13 +1290,6 @@ impl WorkspaceNodePicker {
         let node = self.nodes.get(self.selected?)?;
         if !node.workspace_owner_eligible {
             return None;
-        }
-        if let Some((name, default_cwd)) = &self.project {
-            return Some(DashboardEffect::CreatePlacedWorkspace {
-                name: name.clone(),
-                default_cwd: default_cwd.clone(),
-                node_id: node.id.clone(),
-            });
         }
         let placement = self
             .placements
@@ -2238,6 +2341,7 @@ impl App {
             focus: Focus::Workspaces,
             mode: Mode::Normal,
             message: None,
+            pending_shell_creation: None,
             pending_close: None,
             project_context,
             terminal_preview: None,
@@ -2911,6 +3015,9 @@ impl App {
                 None
             }
             Focus::Items => {
+                if self.pending_shell_creation.is_some() {
+                    return None;
+                }
                 let workspace = self.selected()?.clone();
                 if let WorkspaceCoordinationView::Global {
                     revision,
@@ -2925,6 +3032,7 @@ impl App {
                         .cloned()
                         .collect::<Vec<_>>();
                     if let [node] = eligible.as_slice() {
+                        self.begin_shell_creation(&workspace.name, &node.alias);
                         return Some(global_shell_effect(&workspace, *revision, placements, node));
                     }
                     self.mode = Mode::SelectWorkspaceNode(WorkspaceNodePicker {
@@ -2934,16 +3042,26 @@ impl App {
                         placements: placements.clone(),
                         nodes: self.nodes.clone(),
                         selected: None,
-                        project: None,
                     });
                     self.message = None;
                     return None;
                 }
-                workspace
+                let effect = workspace
                     .local_actionable()
-                    .then(|| DashboardEffect::CreateShell(workspace.qualify(&workspace.id)))
+                    .then(|| DashboardEffect::CreateShell(workspace.qualify(&workspace.id)));
+                if effect.is_some() {
+                    self.begin_shell_creation(&workspace.name, &workspace.node.alias);
+                }
+                effect
             }
         }
+    }
+
+    fn begin_shell_creation(&mut self, workspace_name: &str, node_alias: &str) {
+        self.message = None;
+        self.pending_shell_creation = Some(format!(
+            "Creating Shell in {workspace_name} on Node {node_alias}..."
+        ));
     }
 
     fn adopt_selected_external(&self) -> Option<DashboardEffect> {
@@ -3007,42 +3125,10 @@ impl App {
         self.message = None;
     }
 
-    fn create_workspace(
-        &mut self,
-        name: &str,
-        default_cwd: Option<PathBuf>,
-    ) -> Option<DashboardEffect> {
-        if let Some(default_cwd) = default_cwd {
-            let eligible = self
-                .nodes
-                .iter()
-                .filter(|node| node.workspace_owner_eligible)
-                .cloned()
-                .collect::<Vec<_>>();
-            if let [node] = eligible.as_slice() {
-                self.mode = Mode::Normal;
-                return Some(DashboardEffect::CreatePlacedWorkspace {
-                    name: name.to_owned(),
-                    default_cwd,
-                    node_id: node.id.clone(),
-                });
-            }
-            self.mode = Mode::SelectWorkspaceNode(WorkspaceNodePicker {
-                workspace_id: String::new(),
-                workspace_name: name.to_owned(),
-                expected_revision: 0,
-                placements: Vec::new(),
-                nodes: self.nodes.clone(),
-                selected: None,
-                project: Some((name.to_owned(), default_cwd)),
-            });
-            self.message = None;
-            return None;
-        }
+    fn create_workspace(&mut self, name: &str) -> Option<DashboardEffect> {
         self.mode = Mode::Normal;
         Some(DashboardEffect::CreateWorkspace {
             name: name.to_owned(),
-            default_cwd: None,
         })
     }
 
@@ -3264,6 +3350,11 @@ impl App {
             }
             DashboardEvent::UpdateCheckCompleted => {}
             DashboardEvent::OperationCompleted(result) => {
+                self.message = Some(Message::from_result(result));
+                return vec![DashboardEffect::Refresh];
+            }
+            DashboardEvent::ShellCreationCompleted(result) => {
+                self.pending_shell_creation = None;
                 self.message = Some(Message::from_result(result));
                 return vec![DashboardEffect::Refresh];
             }
@@ -3567,7 +3658,6 @@ impl App {
             preview.shell_id == shell_id.inner_id
                 && preview.run_id == run_id
                 && preview.output_revision == output_revision
-                && preview.output.is_ok()
         }) {
             return None;
         }
@@ -3914,16 +4004,21 @@ fn item_pending_close(
     }
 }
 
-pub(crate) fn run<B: DashboardBackend>(
+pub(crate) fn run<B: DashboardBackend + Send + 'static>(
     state: DashboardState,
     follow_focused_terminal: bool,
     project_context: ProjectContext,
     play_intro: bool,
     backend: B,
 ) -> io::Result<()> {
-    let mut terminal = ratatui::init();
+    let mut terminal = ratatui::try_init().map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("dashboard requires an interactive terminal: {error}"),
+        )
+    })?;
     if let Err(error) = execute!(io::stdout(), EnableBracketedPaste) {
-        ratatui::restore();
+        let _ = ratatui::try_restore();
         return Err(error);
     }
     let mut app = App::new(state.workspaces, project_context);
@@ -3943,8 +4038,9 @@ pub(crate) fn run<B: DashboardBackend>(
         run_loop(&mut terminal, app, backend)
     };
     let paste_result = execute!(io::stdout(), DisableBracketedPaste);
-    ratatui::restore();
+    let restore_result = ratatui::try_restore();
     paste_result?;
+    restore_result?;
     result
 }
 
@@ -3965,23 +4061,35 @@ fn play_bomb_animation(terminal: &mut ratatui::DefaultTerminal) -> io::Result<()
     }
 }
 
-fn run_loop<B: DashboardBackend>(
-    terminal: &mut ratatui::DefaultTerminal,
-    mut app: App,
-    mut backend: B,
-) -> io::Result<()> {
+fn run_loop<B>(terminal: &mut ratatui::DefaultTerminal, mut app: App, backend: B) -> io::Result<()>
+where
+    B: DashboardBackend + Send + 'static,
+{
+    let mut runtime = DashboardRuntime::spawn(backend);
     let mut last_refresh = Instant::now();
     loop {
+        if runtime.drain(&mut app)? {
+            return Ok(());
+        }
         if last_refresh.elapsed() >= UPDATE_CHECK_INTERVAL {
             let effects = app.update(DashboardEvent::RefreshElapsed);
-            execute_effects(&mut app, &mut backend, effects);
+            if runtime.dispatch(effects)? {
+                return Ok(());
+            }
             last_refresh = Instant::now();
         }
         let effects = app.update(DashboardEvent::PreviewRequested);
-        execute_effects(&mut app, &mut backend, effects);
+        if runtime.dispatch(effects)? {
+            return Ok(());
+        }
         terminal.draw(|frame| render(frame, &mut app))?;
 
-        if !event::poll(Duration::from_millis(250))? {
+        let poll_interval = if runtime.has_in_flight_effect() {
+            INTRO_POLL_INTERVAL
+        } else {
+            UPDATE_CHECK_INTERVAL
+        };
+        if !event::poll(poll_interval)? {
             continue;
         }
         let effects = match event::read()? {
@@ -3995,28 +4103,19 @@ fn run_loop<B: DashboardBackend>(
             _ => continue,
         };
         if effects.contains(&DashboardEffect::Quit) {
-            return Ok(());
-        }
-        if !effects.is_empty() {
-            execute_effects(&mut app, &mut backend, effects);
-        }
-        // Keep navigation responsive by waiting for an idle input window before
-        // performing the next synchronous background refresh.
-        last_refresh = Instant::now();
-    }
-}
-
-fn execute_effects(
-    app: &mut App,
-    backend: &mut impl DashboardBackend,
-    effects: Vec<DashboardEffect>,
-) {
-    let mut pending = effects;
-    while let Some(effect) = pending.pop() {
-        if effect == DashboardEffect::Quit {
+            if runtime.can_quit() {
+                return Ok(());
+            }
+            app.message = Some(Message {
+                text: "Wait for the current operation to finish before quitting".into(),
+                error: false,
+            });
             continue;
         }
-        pending.extend(app.update(backend.execute(effect)));
+        if !effects.is_empty() && runtime.dispatch(effects)? {
+            return Ok(());
+        }
+        last_refresh = Instant::now();
     }
 }
 
@@ -4227,11 +4326,11 @@ fn handle_mode_key(
                     .custom_name()
                     .expect("nonempty workspace name")
                     .to_owned();
-                app.create_workspace(&name, None)
+                app.create_workspace(&name)
             }
             KeyCode::Enter if picker.selected().is_some() => {
                 let project = picker.selected().expect("selected project").clone();
-                app.create_workspace(&project.name, Some(project.path))
+                app.create_workspace(&project.name)
             }
             KeyCode::Enter => {
                 app.mode = Mode::PickProject(picker);
@@ -4272,7 +4371,15 @@ fn handle_mode_key(
         },
         Mode::SelectWorkspaceNode(mut picker) => match key {
             KeyCode::Enter => match picker.effect() {
-                Some(effect) => Some(effect),
+                Some(effect) => {
+                    let node_alias = picker
+                        .selected
+                        .and_then(|selected| picker.nodes.get(selected))
+                        .map(|node| node.alias.clone())
+                        .expect("Shell creation requires a selected Node");
+                    app.begin_shell_creation(&picker.workspace_name, &node_alias);
+                    Some(effect)
+                }
                 None => {
                     app.mode = Mode::SelectWorkspaceNode(picker);
                     None
@@ -5645,6 +5752,26 @@ fn workspace_display_name(workspace: &WorkspaceView) -> String {
     )
 }
 
+fn workspace_table_display_name(workspace: &WorkspaceView, duplicate_name: bool) -> String {
+    if matches!(
+        workspace.coordination,
+        WorkspaceCoordinationView::Global { .. }
+    ) || (workspace.node.local && !duplicate_name)
+    {
+        return workspace.name.clone();
+    }
+    let health = node_health_label(workspace.node.health);
+    let freshness = if workspace.node.stale || !workspace.node.current {
+        " stale"
+    } else {
+        ""
+    };
+    format!(
+        "[{} {health}{freshness}] {}",
+        workspace.node.alias, workspace.name
+    )
+}
+
 fn node_health_label(health: NodeProjectionHealthCode) -> &'static str {
     match health {
         NodeProjectionHealthCode::Unobserved => "unobserved",
@@ -5799,7 +5926,6 @@ fn render_workspaces(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut A
             Layout::vertical([Constraint::Fill(1), Constraint::Length(preview_height)]).areas(area);
         (table_area, Some(preview_area))
     });
-    let show_node = app.nodes.len() > 1;
     let rows = if app.workspaces.is_empty() {
         vec![Row::new([Cell::from(Span::styled(
             "No workspaces. Press a to create one.",
@@ -5809,37 +5935,21 @@ fn render_workspaces(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut A
         app.workspaces
             .iter()
             .map(|workspace| {
-                let mut cells = vec![Cell::from(if show_node {
-                    workspace.name.clone()
-                } else {
-                    workspace_display_name(workspace)
-                })];
-                if show_node {
-                    cells.push(Cell::from(match &workspace.coordination {
-                        WorkspaceCoordinationView::Global { placements, .. } => placements
-                            .iter()
-                            .map(|placement| placement.node.alias.as_str())
-                            .collect::<Vec<_>>()
-                            .join(","),
-                        WorkspaceCoordinationView::External { .. } => workspace.node.alias.clone(),
-                    }));
-                }
-                Row::new(cells)
+                let duplicate_name = app
+                    .workspaces
+                    .iter()
+                    .filter(|candidate| candidate.name == workspace.name)
+                    .count()
+                    > 1;
+                Row::new([Cell::from(workspace_table_display_name(
+                    workspace,
+                    duplicate_name,
+                ))])
             })
             .collect()
     };
-    let widths = if show_node {
-        vec![Constraint::Min(8), Constraint::Length(12)]
-    } else {
-        vec![Constraint::Min(8)]
-    };
-    let headers = if show_node {
-        vec!["NAME", "NODE"]
-    } else {
-        vec!["NAME"]
-    };
-    let table = Table::new(rows, widths)
-        .header(Row::new(headers).style(Style::new().fg(BLUE).add_modifier(Modifier::BOLD)))
+    let table = Table::new(rows, [Constraint::Min(8)])
+        .header(Row::new(["NAME"]).style(Style::new().fg(BLUE).add_modifier(Modifier::BOLD)))
         .block(
             Block::bordered()
                 .title(format!(" Workspaces ({}) ", app.workspaces.len()))
@@ -7321,6 +7431,11 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
             Span::styled("esc", Style::new().fg(RED)),
             Span::raw(" cancel"),
         ])
+    } else if let Some(text) = &app.pending_shell_creation {
+        Line::from(Span::styled(
+            format!(" {text}"),
+            Style::new().fg(YELLOW).add_modifier(Modifier::BOLD),
+        ))
     } else if let Some(message) = &app.message {
         Line::from(Span::styled(
             format!(" {}", message.text),
@@ -7592,6 +7707,102 @@ mod tests {
 
     fn app() -> App {
         App::new(vec![workspace("w1", "boomux")], project_context())
+    }
+
+    #[test]
+    fn blocked_refresh_does_not_delay_navigation_and_remains_single_flight() {
+        let mut app = app();
+        let mut second = app.workspaces[0].items[0].clone();
+        let WorkspaceItemView::Shell(shell) = &mut second else {
+            unreachable!();
+        };
+        shell.id = "term_2".into();
+        shell.name = "second".into();
+        app.workspaces[0].items.push(second);
+        focus_items(&mut app);
+        assert_eq!(app.item_state.selected(), Some(0));
+
+        let (started_sender, started_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let mut runtime = DashboardRuntime::spawn(move |effect: DashboardEffect| {
+            started_sender.send(effect.clone()).unwrap();
+            release_receiver.recv().unwrap();
+            match effect {
+                DashboardEffect::CheckForUpdates => DashboardEvent::UpdateCheckCompleted,
+                effect => panic!("unexpected effect: {effect:?}"),
+            }
+        });
+
+        assert!(
+            !runtime
+                .dispatch(vec![DashboardEffect::CheckForUpdates])
+                .unwrap()
+        );
+        assert_eq!(
+            started_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+            DashboardEffect::CheckForUpdates
+        );
+        assert!(
+            !runtime
+                .dispatch(vec![DashboardEffect::CheckForUpdates])
+                .unwrap()
+        );
+
+        let effects = app.update(DashboardEvent::KeyPressed {
+            code: KeyCode::Down,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(effects.is_empty());
+        assert_eq!(app.item_state.selected(), Some(1));
+
+        release_sender.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while runtime.update_check_in_flight && Instant::now() < deadline {
+            runtime.drain(&mut app).unwrap();
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!runtime.update_check_in_flight);
+        assert!(matches!(
+            started_receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn mutation_must_finish_before_dashboard_can_quit() {
+        let mut app = app();
+        let (started_sender, started_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let mut runtime = DashboardRuntime::spawn(move |effect: DashboardEffect| match effect {
+            DashboardEffect::Rename { .. } => {
+                started_sender.send(()).unwrap();
+                release_receiver.recv().unwrap();
+                DashboardEvent::OperationCompleted(Ok("renamed".into()))
+            }
+            DashboardEffect::Refresh => DashboardEvent::RefreshCompleted(Err("ignored".into())),
+            effect => panic!("unexpected effect: {effect:?}"),
+        });
+
+        runtime
+            .dispatch(vec![DashboardEffect::Rename {
+                target: RenameTarget::Workspace("workspace".into()),
+                name: "renamed".into(),
+            }])
+            .unwrap();
+        started_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert!(!runtime.can_quit());
+
+        release_sender.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !runtime.can_quit() && Instant::now() < deadline {
+            runtime.drain(&mut app).unwrap();
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(runtime.can_quit());
     }
 
     #[test]
@@ -8063,20 +8274,37 @@ mod tests {
     }
 
     #[test]
-    fn multi_node_workspace_table_uses_an_explicit_node_column() {
-        let local = workspace("local-workspace", "local work");
+    fn multi_node_workspace_table_omits_node_column_and_qualifies_external_names() {
+        let mut local = workspace("global-workspace", "local work");
+        local.coordination = WorkspaceCoordinationView::Global {
+            revision: 1,
+            closing: false,
+            placements: Vec::new(),
+        };
+        let local_external = workspace("local-workspace", "local work");
         let mut remote = workspace("remote-workspace", "remote work");
         remote.node.id = "00000000-0000-0000-0000-000000000002".into();
         remote.node.alias = "work".into();
         remote.node.local = false;
-        let mut app = App::new(vec![local, remote], project_context());
+        let mut app = App::new(vec![local, local_external, remote], project_context());
+        focus_items(&mut app);
 
-        let rendered = rendered_text(&mut app, 180, 24);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| render_workspaces(frame, frame.area(), &mut app))
+            .unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
         assert!(rendered.contains("NAME"));
-        assert!(rendered.contains("NODE"));
+        assert!(!rendered.contains("NODE"));
         assert!(rendered.contains("local work"));
-        assert!(rendered.contains("remote work"));
-        assert!(rendered.contains("work"));
+        assert!(rendered.contains("[local online] local work"));
+        assert!(rendered.contains("[work online] remote work"));
     }
 
     #[test]
@@ -8116,9 +8344,18 @@ mod tests {
         assert!(rendered.contains("Node health is unreachable"));
 
         assert_eq!(app.update_key(KeyCode::Down, KeyModifiers::NONE), None);
+        assert_eq!(app.update_key(KeyCode::Down, KeyModifiers::NONE), None);
         let effect = app.update_key(KeyCode::Enter, KeyModifiers::NONE);
         assert!(
-            matches!(effect, Some(DashboardEffect::CreateGlobalShell { node_id, .. }) if node_id == "00000000-0000-0000-0000-000000000001")
+            matches!(effect, Some(DashboardEffect::CreateGlobalShell { node_id, .. }) if node_id == "00000000-0000-0000-0000-000000000002")
+        );
+        assert_eq!(
+            app.pending_shell_creation.as_deref(),
+            Some("Creating Shell in coordinated on Node work...")
+        );
+        assert!(
+            rendered_text(&mut app, 140, 36)
+                .contains("Creating Shell in coordinated on Node work...")
         );
     }
 
@@ -9150,25 +9387,7 @@ mod tests {
     }
 
     #[test]
-    fn project_suggestion_creates_first_placement_on_the_sole_eligible_node() {
-        let mut app = app();
-        assert!(app.request_add().is_none());
-        for character in "alp".chars() {
-            handle_mode_key(&mut app, KeyCode::Char(character), KeyModifiers::NONE);
-        }
-        assert_eq!(
-            handle_mode_key(&mut app, KeyCode::Enter, KeyModifiers::NONE),
-            Some(DashboardEffect::CreatePlacedWorkspace {
-                name: "alpha".into(),
-                default_cwd: "/tmp/alpha".into(),
-                node_id: String::new(),
-            })
-        );
-        assert!(matches!(app.mode, Mode::Normal));
-    }
-
-    #[test]
-    fn project_suggestion_requires_explicit_node_when_multiple_are_eligible() {
+    fn project_suggestion_creates_an_empty_workspace_regardless_of_nodes() {
         let mut app = app();
         let mut remote = app.nodes[0].clone();
         remote.id = "remote-node".into();
@@ -9181,23 +9400,11 @@ mod tests {
         }
         assert_eq!(
             handle_mode_key(&mut app, KeyCode::Enter, KeyModifiers::NONE),
-            None
+            Some(DashboardEffect::CreateWorkspace {
+                name: "alpha".into(),
+            })
         );
-        let Mode::SelectWorkspaceNode(picker) = &app.mode else {
-            panic!("expected explicit project owner picker");
-        };
-        assert_eq!(picker.selected, None);
-        assert_eq!(picker.project.as_ref().unwrap().0, "alpha");
-        assert_eq!(app.update_key(KeyCode::Down, KeyModifiers::NONE), None);
-        assert!(matches!(
-            app.update_key(KeyCode::Enter, KeyModifiers::NONE),
-            Some(DashboardEffect::CreatePlacedWorkspace {
-                name,
-                default_cwd,
-                ..
-            }) if name == "alpha"
-                && default_cwd.as_path() == std::path::Path::new("/tmp/alpha")
-        ));
+        assert!(matches!(app.mode, Mode::Normal));
     }
 
     #[test]
@@ -9214,7 +9421,6 @@ mod tests {
             handle_mode_key(&mut app, KeyCode::Enter, KeyModifiers::NONE),
             Some(DashboardEffect::CreateWorkspace {
                 name: "custom workspace".into(),
-                default_cwd: None,
             })
         );
     }
@@ -9235,7 +9441,6 @@ mod tests {
             handle_mode_key(&mut app, KeyCode::Enter, KeyModifiers::NONE),
             Some(DashboardEffect::CreateWorkspace {
                 name: "alpha".into(),
-                default_cwd: None,
             })
         );
     }
@@ -9658,6 +9863,29 @@ mod tests {
             Some(DashboardEffect::CreateShell("w1".into()))
         );
         assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(
+            app.pending_shell_creation.as_deref(),
+            Some("Creating Shell in boomux on Node local...")
+        );
+        assert_eq!(app.request_add(), None);
+    }
+
+    #[test]
+    fn shell_creation_completion_replaces_the_pending_indicator_and_refreshes() {
+        let mut app = app();
+        focus_items(&mut app);
+        app.request_add();
+
+        assert_eq!(
+            app.update(DashboardEvent::ShellCreationCompleted(Ok(
+                "Created first on Node local".into()
+            ))),
+            vec![DashboardEffect::Refresh]
+        );
+        assert!(app.pending_shell_creation.is_none());
+        assert!(app.message.as_ref().is_some_and(|message| {
+            !message.error && message.text == "Created first on Node local"
+        }));
     }
 
     #[test]
@@ -10787,6 +11015,29 @@ mod tests {
         assert!(text.contains("following"));
         assert!(text.contains("latest"));
         assert!(text.contains("pgup/dn"));
+    }
+
+    #[test]
+    fn failed_terminal_preview_is_not_retried_without_a_revision_change() {
+        let mut app = app();
+        focus_items(&mut app);
+        let effect = app.terminal_preview_effect().unwrap();
+        let DashboardEffect::ReadTerminalPreview {
+            shell_id,
+            run_id,
+            output_revision,
+        } = effect
+        else {
+            unreachable!();
+        };
+        app.apply_terminal_preview(
+            shell_id.inner_id,
+            run_id,
+            output_revision,
+            Err("preview unavailable".into()),
+        );
+
+        assert!(app.terminal_preview_effect().is_none());
     }
 
     #[test]

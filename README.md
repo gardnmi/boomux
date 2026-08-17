@@ -129,7 +129,7 @@ boomux . --name my-project --new -- sh -lc 'cargo test | tee test.log'
 | --- | --- |
 | Create a generated workspace | `boomux .` |
 | Create or add to a named workspace | `boomux . --name feature-x` |
-| Create an empty workspace with a default directory | `boomux workspace create feature-x --cwd .` |
+| Create an empty workspace | `boomux workspace create feature-x` |
 | Suggest an unused shell name | `boomux shell suggest-name feature-x` |
 | Add a randomly named shell | `boomux shell create feature-x` |
 | Open the new shell in another terminal | `boomux . --name feature-x --new` |

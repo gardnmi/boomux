@@ -577,20 +577,7 @@ enum WorkspaceCommands {
     /// List workspaces
     List,
     /// Create an empty workspace
-    Create {
-        name: String,
-        #[arg(long)]
-        cwd: Option<PathBuf>,
-    },
-    /// Create a global Workspace and its first Shell atomically
-    CreateProject {
-        name: String,
-        #[arg(long)]
-        cwd: PathBuf,
-        /// Exact eligible Node alias or Node ID
-        #[arg(long)]
-        node: Option<String>,
-    },
+    Create { name: String },
     /// Open terminal windows and invoke launchers
     Open {
         target: String,
@@ -1260,7 +1247,6 @@ command_keys! {
     ProjectList => ("project.list", Json),
     WorkspaceList => ("workspace.list", Json),
     WorkspaceInspect => ("workspace.inspect", Json),
-    WorkspaceCreateProject => ("workspace.create-project", Json),
     Workspace => ("workspace", HumanOnly),
     NodeAdd => ("node.add", Json),
     NodeList => ("node.list", Json),
@@ -1339,9 +1325,6 @@ impl Cli {
             Some(Commands::Workspace {
                 command: WorkspaceCommands::Inspect { .. },
             }) => CommandKey::WorkspaceInspect,
-            Some(Commands::Workspace {
-                command: WorkspaceCommands::CreateProject { .. },
-            }) => CommandKey::WorkspaceCreateProject,
             Some(Commands::Node {
                 command: NodeCommands::Add { .. },
             }) => CommandKey::NodeAdd,
@@ -2676,6 +2659,7 @@ fn effective_terminal(override_entry: Option<&str>) -> Result<Option<String>, Bo
 
 fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
     ensure_host_terminal()?;
+    validate_dashboard_terminal(io::stdin().is_terminal(), io::stdout().is_terminal())?;
     let launch_cwd = resolve_directory(Path::new("."))?;
     let client = client::connect_or_start()?;
     let local_node_id = client.node_identity()?;
@@ -2719,7 +2703,7 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
         config.dashboard.follow_focused_terminal,
         project_context,
         true,
-        |effect| match effect {
+        move |effect| match effect {
             tui::DashboardEffect::Quit => unreachable!("quit is handled by the dashboard runtime"),
             tui::DashboardEffect::AddNode => tui::DashboardEvent::OperationCompleted(
                 terminal::open_node_add(terminal.as_deref())
@@ -2959,57 +2943,13 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
                 })();
                 tui::DashboardEvent::OperationCompleted(result)
             }
-            tui::DashboardEffect::CreateWorkspace { name, default_cwd } => {
+            tui::DashboardEffect::CreateWorkspace { name } => {
                 tui::DashboardEvent::OperationCompleted(
-                    create_dashboard_workspace(&client, &name, default_cwd.as_ref())
-                        .map_err(|error| error.to_string()),
+                    create_dashboard_workspace(&client, &name).map_err(|error| error.to_string()),
                 )
             }
-            tui::DashboardEffect::CreatePlacedWorkspace {
-                name,
-                default_cwd,
-                node_id,
-            } => {
-                let result = (|| {
-                    let combined = client
-                        .combined_node_snapshot(Some(node_id.clone()))
-                        .map_err(|error| error.to_string())?;
-                    let node = combined
-                        .nodes
-                        .iter()
-                        .find(|node| node.node_id == node_id)
-                        .ok_or_else(|| "selected Node is no longer available".to_owned())?;
-                    if !node.workspace_owner_eligible {
-                        return Err(node
-                            .workspace_owner_unavailable_reason
-                            .clone()
-                            .unwrap_or_else(|| "selected Node is unavailable".into()));
-                    }
-                    let cwd = resolve_owner_directory(&client, node, default_cwd)
-                        .map_err(|error| error.to_string())?;
-                    let shell_name = generated_shell_name(std::iter::empty())
-                        .map_err(|error| error.to_string())?;
-                    let (workspace, shell) = client
-                        .create_global_workspace_with_shell(
-                            Uuid::new_v4().to_string(),
-                            Uuid::new_v4().to_string(),
-                            name,
-                            &node_id,
-                            Uuid::new_v4().to_string(),
-                            cwd.clone(),
-                            Uuid::new_v4().to_string(),
-                            shell_spec(shell_name, &cwd, &[]),
-                        )
-                        .map_err(|error| error.to_string())?;
-                    Ok(format!(
-                        "Created {} with {} on Node {}",
-                        workspace.name, shell.name, node.alias
-                    ))
-                })();
-                tui::DashboardEvent::OperationCompleted(result)
-            }
             tui::DashboardEffect::CreateShell(workspace_id) => {
-                tui::DashboardEvent::OperationCompleted(
+                tui::DashboardEvent::ShellCreationCompleted(
                     local_dashboard_inner(&workspace_id, &local_node_id).and_then(|workspace_id| {
                         create_dashboard_shell(&client, workspace_id, &launch_cwd)
                             .map_err(|error| error.to_string())
@@ -3054,7 +2994,7 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
                         .map_err(|error| error.to_string())?;
                     Ok(format!("Created {} on Node {}", shell.name, node.alias))
                 })();
-                tui::DashboardEvent::OperationCompleted(result)
+                tui::DashboardEvent::ShellCreationCompleted(result)
             }
             tui::DashboardEffect::AdoptExternalWorkspace {
                 identity,
@@ -4562,6 +4502,20 @@ fn ensure_host_terminal() -> Result<(), Box<dyn Error>> {
     }
 }
 
+fn validate_dashboard_terminal(
+    stdin_is_terminal: bool,
+    stdout_is_terminal: bool,
+) -> io::Result<()> {
+    if stdin_is_terminal && stdout_is_terminal {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "dashboard requires an interactive terminal",
+        ))
+    }
+}
+
 fn resolve_directory(path: &Path) -> Result<PathBuf, Box<dyn Error>> {
     let absolute = if path.is_absolute() {
         path.to_owned()
@@ -4735,18 +4689,6 @@ fn select_eligible_workspace_owner(
     Ok((*node).clone())
 }
 
-fn workspace_create_project_json(
-    workspace: &protocol::GlobalWorkspaceSnapshot,
-    node_id: &str,
-    shell: &protocol::ShellSnapshot,
-) -> serde_json::Value {
-    serde_json::json!({
-        "workspace": workspace,
-        "node_id": node_id,
-        "shell": cli_output::shell(shell, Some(&workspace.name)),
-    })
-}
-
 fn shell_suggestion_json(
     workspace_id: &str,
     name: &str,
@@ -4821,27 +4763,20 @@ fn resolve_owner_directory(
 fn create_dashboard_workspace(
     client: &client::Client,
     name: &str,
-    default_cwd: Option<&PathBuf>,
 ) -> Result<String, Box<dyn Error>> {
     let name = name.trim();
     if name.is_empty() {
         return Err("workspace name cannot be empty".into());
     }
-    if default_cwd.is_none() && client.supports(protocol::ProtocolFeature::GlobalWorkspaces)? {
+    if client.supports(protocol::ProtocolFeature::GlobalWorkspaces)? {
         let workspace = client.create_global_workspace(name)?;
         return Ok(format!(
             "Created empty workspace {} ({})",
             workspace.name, workspace.id
         ));
     }
-    client.create_workspace_with_default_cwd(name, default_cwd.cloned(), Vec::new())?;
-    Ok(if default_cwd.is_some() {
-        format!(
-            "Created unlinked local workspace {name} with its project path; adopt or link it explicitly"
-        )
-    } else {
-        format!("Created empty workspace {name}")
-    })
+    client.create_workspace_with_default_cwd(name, None, Vec::new())?;
+    Ok(format!("Created empty workspace {name}"))
 }
 
 fn create_dashboard_shell(
@@ -6186,50 +6121,15 @@ fn workspace_command(
                 );
             }
         }
-        WorkspaceCommands::Create { name, cwd } => {
+        WorkspaceCommands::Create { name } => {
             let name = cli_name(name, "workspace")?;
-            if cwd.is_none() && client.supports(protocol::ProtocolFeature::GlobalWorkspaces)? {
+            if client.supports(protocol::ProtocolFeature::GlobalWorkspaces)? {
                 let workspace = client.create_global_workspace(name)?;
                 println!("Created workspace {} ({})", workspace.name, workspace.id);
                 return Ok(());
             }
-            let default_cwd = cwd.as_deref().map(resolve_directory).transpose()?;
-            let workspace =
-                client.create_workspace_with_default_cwd(name, default_cwd, Vec::new())?;
+            let workspace = client.create_workspace_with_default_cwd(name, None, Vec::new())?;
             println!("Created workspace {} ({})", workspace.name, workspace.id);
-        }
-        WorkspaceCommands::CreateProject { name, cwd, node } => {
-            if !client.supports(protocol::ProtocolFeature::GlobalWorkspaces)? {
-                return Err(cli_output::failure(
-                    "unsupported_version",
-                    "global Workspace project creation requires daemon protocol 38 or newer",
-                ));
-            }
-            let name = cli_name(name, "workspace")?;
-            let combined = client.combined_node_snapshot(None)?;
-            let node = select_eligible_workspace_owner(&combined.nodes, node.as_deref())?;
-            let cwd = resolve_owner_directory(&client, &node, cwd)?;
-            let shell_name = generated_shell_name(std::iter::empty())?;
-            let (workspace, shell) = client.create_global_workspace_with_shell(
-                Uuid::new_v4().to_string(),
-                Uuid::new_v4().to_string(),
-                &name,
-                &node.node_id,
-                Uuid::new_v4().to_string(),
-                cwd.clone(),
-                Uuid::new_v4().to_string(),
-                shell_spec(shell_name, &cwd, &[]),
-            )?;
-            if json {
-                return print_json(
-                    CommandKey::WorkspaceCreateProject,
-                    workspace_create_project_json(&workspace, &node.node_id, &shell),
-                );
-            }
-            println!(
-                "Created workspace {} ({}) with shell {} ({}) on Node {}",
-                workspace.name, workspace.id, shell.name, shell.id, node.alias
-            );
         }
         WorkspaceCommands::Open { target, node } => {
             if let Some(node_selector) = node {
@@ -11425,6 +11325,19 @@ mod tests {
     }
 
     #[test]
+    fn dashboard_requires_terminal_input_and_output() {
+        validate_dashboard_terminal(true, true).unwrap();
+        assert_eq!(
+            validate_dashboard_terminal(false, true).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            validate_dashboard_terminal(true, false).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
     fn parses_node_rekey_and_requires_exact_confirmation() {
         let cli = Cli::try_parse_from(["boomux", "node", "rekey"]).unwrap();
         assert!(matches!(
@@ -11828,32 +11741,6 @@ mod tests {
     }
 
     #[test]
-    fn parses_json_workspace_project_creation_without_splitting_arguments() {
-        let cli = Cli::try_parse_from([
-            "boomux",
-            "workspace",
-            "create-project",
-            "release; touch /tmp/nope",
-            "--cwd",
-            "/tmp/project $(false)",
-            "--node",
-            "node-id",
-            "--json",
-        ])
-        .unwrap();
-        assert_eq!(cli.command_descriptor().key, "workspace.create-project");
-        assert_eq!(cli.command_descriptor().output, OutputMode::Json);
-        assert!(matches!(
-            cli.command,
-            Some(Commands::Workspace {
-                command: WorkspaceCommands::CreateProject { name, cwd, node }
-            }) if name == "release; touch /tmp/nope"
-                && cwd == Path::new("/tmp/project $(false)")
-                && node.as_deref() == Some("node-id")
-        ));
-    }
-
-    #[test]
     fn workspace_project_owner_selection_delegates_sole_and_requires_ambiguous_choice() {
         let local = combined_node("local-id", "local", true);
         let remote = combined_node("remote-id", "work", true);
@@ -11885,30 +11772,6 @@ mod tests {
             resolve_workspace_open_node(&nodes, "work").unwrap().node_id,
             "remote-id"
         );
-    }
-
-    #[test]
-    fn workspace_project_json_returns_exact_global_owner_and_shell_ids() {
-        let global = protocol::GlobalWorkspaceSnapshot {
-            id: "global-id".into(),
-            revision: 1,
-            name: "release".into(),
-            closing: false,
-            placements: vec![protocol::WorkspacePlacementSnapshot {
-                node_id: "node-id".into(),
-                workspace_id: "owner-id".into(),
-                owner_workspace_name: Some("release".into()),
-                owner_revision: 1,
-                default_cwd: Some("/tmp/project".into()),
-                state: protocol::WorkspacePlacementState::Active,
-            }],
-        };
-        let shell = shell("shell-id", "owner-id", "first");
-        let value = workspace_create_project_json(&global, "node-id", &shell);
-        assert_eq!(value["workspace"]["id"], "global-id");
-        assert_eq!(value["node_id"], "node-id");
-        assert_eq!(value["shell"]["id"], "shell-id");
-        assert_eq!(value["shell"]["workspace_id"], "owner-id");
     }
 
     #[test]
@@ -12007,27 +11870,13 @@ mod tests {
                 .unwrap()
                 .command,
             Some(Commands::Workspace {
-                command: WorkspaceCommands::Create { name, cwd: None }
+                command: WorkspaceCommands::Create { name }
             }) if name == "project"
         ));
-        assert!(matches!(
-            Cli::try_parse_from([
-                "boomux",
-                "workspace",
-                "create",
-                "project",
-                "--cwd",
-                "/tmp"
-            ])
-            .unwrap()
-            .command,
-            Some(Commands::Workspace {
-                command: WorkspaceCommands::Create {
-                    name,
-                    cwd: Some(cwd)
-                }
-            }) if name == "project" && cwd == Path::new("/tmp")
-        ));
+        assert!(
+            Cli::try_parse_from(["boomux", "workspace", "create", "project", "--cwd", "/tmp"])
+                .is_err()
+        );
         let cli = Cli::try_parse_from([
             "boomux",
             "launcher",
@@ -14144,7 +13993,6 @@ mod tests {
                 "project.list",
                 "workspace.list",
                 "workspace.inspect",
-                "workspace.create-project",
                 "node.add",
                 "node.list",
                 "node.inspect",

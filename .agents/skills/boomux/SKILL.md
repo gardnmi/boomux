@@ -500,8 +500,8 @@ Scheduled dispatch-failure and cold-interruption notification categories are
 configured independently as `[notifications] scheduled_dispatch_failed` and
 `scheduled_interrupted`; both default to false and never disclose schedule
 prompts or acknowledge Agent attention.
-Selecting a discovered project in the dashboard persists its canonical path as
-the workspace default cwd for later shells. Set
+Selecting a discovered project in the dashboard uses its name only and creates
+empty coordinator metadata. Set
 `[dashboard] follow_focused_terminal = false` to disable the default
 focus-following behavior.
 
@@ -511,25 +511,25 @@ Discover the same configured projects locally without starting the daemon:
 boomux project list --json
 ```
 
-Use the canonical `path` returned for workspace creation. An empty list with
-`roots_configured: false` means no roots are configured; inspect `warnings` when
-configured roots cannot be scanned.
+Use the canonical `path` returned when creating a Node-hosted item. An empty
+list with `roots_configured: false` means no roots are configured; inspect
+`warnings` when configured roots cannot be scanned.
 
 ## Manage Workspaces
 
 ```console
 boomux workspace list
 boomux workspace create "<name>"
-boomux workspace create "<name>" --cwd "/path/to/project"
 boomux workspace open "<name-or-id>"
 boomux workspace inspect "<name-or-id>"
 boomux workspace rename "<name-or-id>" "<new-name>"
 boomux workspace close "<name-or-id>"
 ```
 
-`workspace create` creates an empty workspace. `--cwd` stores an optional
-default used by dashboard shells and `shell create` when no explicit cwd is
-given. The default does not prevent individual shells from using other paths.
+On protocol 38 or newer, `workspace create` creates empty coordinator metadata.
+It does not select a Node or store a path; choose those when creating the first
+Shell, launcher, or schedule. Older daemons retain empty local Workspace
+creation.
 `workspace close` terminates every running shell process session and removes the
 workspace, all shell and launcher definitions, schedules and persisted prompts,
 retained terminal state, and all durable Agent and attention records associated

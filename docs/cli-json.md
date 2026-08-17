@@ -183,7 +183,6 @@ The following commands support `--json`:
 - `boomux project list`
 - `boomux workspace list`
 - `boomux workspace inspect`
-- `boomux workspace create-project`
 - `boomux node add`
 - `boomux node list`
 - `boomux node inspect`
@@ -226,8 +225,8 @@ The following commands support `--json`:
 - `boomux integration verify <opencode|pi>`
 - `boomux daemon status`
 
-JSON mutations are deliberately narrow. Atomic global Workspace project creation;
-Node registration add, rename, retarget, and forget; Agent register, ensure, and report;
+JSON mutations are deliberately narrow. Node registration add, rename, retarget,
+and forget; Agent register, ensure, and report;
 attention acknowledgment; schedule create, pause, resume, remove, and run;
 execution open and cancellation; and
 integration install and uninstall support the contract. Other mutation commands
@@ -258,12 +257,6 @@ Command payloads are:
 - `workspace.inspect`: on protocol 38, a global target returns coordinator
   `id`, `revision`, `name`, `closing`, and explicit placements. External or
   older local targets retain the owner Workspace inspection shape.
-- `workspace.create-project`: protocol-38-only atomic creation of one global
-  Workspace, its selected Node placement, and its first generated Shell. It
-  requires `--cwd`; `--node` is optional only when exactly one owner is eligible.
-  The response contains exact `node_id`, coordinator `workspace`, and owner
-  `shell` snapshots. The operation uses the same durable prepared request as the
-  dashboard and never exposes an intermediate empty Workspace.
 - `node.list`: an alias-then-Node-ID ordered array of registration objects.
 - `node.add`, `node.inspect`, `node.rename`, `node.retarget`, and `node.forget`:
   one registration object with `alias`, exact `target`, pinned `node_id`,
@@ -426,43 +419,30 @@ Protocol 38 adds `protocol_38`, `global_workspaces`,
 `resumable_workspace_close`.
 Protocol 39 adds `protocol_39` and `qualified_focused_terminal`.
 
-Protocol-38 `workspace create` without `--cwd` creates coordinator metadata
-without a default Node or cwd. The compatibility form with `--cwd` continues to
-create an unlinked local owner Workspace, visible as an external singleton until
-explicit adoption or linking. First global `shell create`, `launcher create`, or `schedule create`
-resolves `--node` against eligible owners. If exactly one owner is eligible it
-may be used without `--node`; zero or multiple eligible owners return a typed
-selection error listing disabled health reasons. The owner-local cwd is resolved
-on that Node. Exact argv arrays and private Schedule prompts are unchanged by
-coordination. `workspace open`, `close`, `rename`, `list`, and `inspect` resolve
-global IDs or names before considering external local records.
-`workspace create-project NAME --cwd PATH [--node NODE]` performs the dashboard's
-single prepared global Workspace plus first-Shell operation and returns their
-exact identities under `--json`; it is not equivalent to `workspace create`
-followed by `shell create`.
+Protocol-38 `workspace create` creates empty coordinator metadata without a
+default Node or cwd. First global `shell create`, `launcher create`, or
+`schedule create` resolves `--node` against eligible owners. If exactly one
+owner is eligible it may be used without `--node`; zero or multiple eligible
+owners return a typed selection error listing disabled health reasons. The
+owner-local cwd is resolved on that Node. Exact argv arrays and private Schedule
+prompts are unchanged by coordination. `workspace open`, `close`, `rename`,
+`list`, and `inspect` resolve global IDs or names before considering external
+local records.
 `workspace adopt TARGET --node NODE`, `workspace link GLOBAL OWNER --node NODE`,
 and `workspace retry GLOBAL` expose guarded adoption, linking, and unresolved
 close retry without requiring the TUI. Repeating `workspace close` for a closing
-global Workspace also uses the retry operation. Dashboard project selections
-use the same sole-owner or explicit no-default Node choice as first-resource
-creation, resolve the path on that owner, and create the global Workspace's first
-Shell and placement together. The path is never attached to empty coordinator
-metadata.
+global Workspace also uses the retry operation. Dashboard project suggestions
+contribute only the Workspace name; they create the same empty coordinator
+metadata as by-name creation. Node and path selection begins with first-resource
+creation.
 Prepared resource requests carry one caller-stable operation UUID. The client
 retries the exact request once after a lost connection, timeout, unknown outcome,
 or coordinator persistence failure. The coordinator returns the durable prior
 success before evaluating a now-stale revision guard. This replay guarantee lasts
 while the success remains among at most the newest 256 completed operations and
 within the 1 MiB coordinator-store bound; oldest-first eviction ends the
-guarantee. Project creation additionally resumes or replays a same-name request
-only when its Node, cwd, and Shell definition match. It verifies cached and live
-owner eligibility before persisting new metadata, so a missing or capability-
-disabled Node does not reserve the project name. Prepared requests reserve their
-completed-response footprint within the 1 MiB store and fail before owner
-mutation when capacity is unavailable. The coordinator durably marks owner
-dispatch before mutation; after that boundary, later capability, registration,
-identity, owner-error, or `not_found` results retain the pending project and name
-for exact recovery rather than allowing different semantics to reuse it.
+guarantee. Prepared requests reserve their completed-response footprint within
+the 1 MiB store and fail before owner mutation when capacity is unavailable.
 Adoption and linking fetch a fresh
 protocol-38 combined local snapshot over the admitted identity-pinned route and
 require its runtime `global_workspaces` capability before using the owner revision;

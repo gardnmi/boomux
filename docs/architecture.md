@@ -358,13 +358,17 @@ window has spawned, preserving retained output when terminal preparation fails.
 dashboard events and returns explicit external effects. The terminal runtime
 executes those effects through one backend interface and feeds typed completion
 events back into the model; model transitions do not call daemon or terminal
-callbacks directly. Rendering remains a function of typed model state. One
+callbacks directly. The backend runs effects serially off the terminal thread,
+so daemon, SSH, and preview latency cannot delay input or rendering; periodic
+refresh and preview reads are single-flight to keep stale work from accumulating.
+Rendering remains a function of typed model state. One
 daemon snapshot contains each workspace, its launchers, and its shells, avoiding
 races between separate list operations. Configured project roots provide
-workspace suggestions; selecting one persists its canonical path as the
-workspace's default cwd. Git information is still collected independently from
-shell directories and cached. A default cwd does not create workspace-level Git
-identity, and mixed-directory workspaces remain valid.
+Workspace-name suggestions; when global Workspaces are negotiated, selecting one
+creates empty coordinator metadata without retaining its path. Older peers
+retain empty local Workspace creation. Git information is still collected
+independently from item directories and cached. Paths do not create
+Workspace-level Git identity, and mixed-directory Workspaces remain valid.
 
 The dashboard establishes an atomic event-stream baseline and treats later
 events as invalidation signals for authoritative snapshot reprojection. It also
@@ -696,7 +700,8 @@ and process lifecycle. On first coordinator-store creation, existing local
 Workspaces are initialized once as global Workspaces with one local placement. Later
 unlinked local or projected remote Workspaces remain external until an explicit
 revision-guarded adoption or link; names are display metadata and never infer
-membership.
+membership. Creating a Workspace writes only empty coordinator metadata; Node
+and path selection begins when creating its first Node-hosted resource.
 
 The combined Node snapshot adds global and external Workspace arrays only for
 protocol-38 peers. Placement availability is projected from current Node health;

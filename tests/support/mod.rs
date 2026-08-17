@@ -54,6 +54,7 @@ impl TestDaemon {
         command
             .args(["daemon", "run"])
             .env("XDG_RUNTIME_DIR", &runtime_dir)
+            .env("XDG_CONFIG_HOME", runtime_dir.join("config"))
             .env("XDG_STATE_HOME", runtime_dir.join("state"))
             .env("SHELL", "/bin/sh")
             .env("BOOMUX_NATIVE_TEST_HOOKS", "1")
@@ -75,6 +76,7 @@ impl TestDaemon {
     pub(crate) fn command(&self) -> Command {
         let mut command = Command::new(&self.executable);
         command.env("XDG_RUNTIME_DIR", &self.runtime_dir);
+        command.env("XDG_CONFIG_HOME", self.runtime_dir.join("config"));
         command.env("XDG_STATE_HOME", self.runtime_dir.join("state"));
         command.env("BOOMUX_NATIVE_TEST_HOOKS", "1");
         command
