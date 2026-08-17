@@ -81,12 +81,13 @@ guaranteed after oldest-first eviction. Adoption and linking require a fresh
 identity-pinned protocol-38 combined local snapshot under the admitted route.
 That live snapshot must advertise runtime `global_workspaces` eligibility and
 contains the fresh exact owner revision used for commit. Cached projection
-eligibility alone cannot authorize either mutation. Project creation performs
-the same live capability preflight before persisting empty metadata; definitive
+eligibility alone cannot authorize either mutation. The retained internal
+compound first-placement request performs the same live capability preflight
+before persisting empty metadata; definitive
 pre-owner rejection cancels only an existing exact preparation durably marked as
 never attempted. Immediately before owner mutation the coordinator persists an
 attempted phase. Once set, later capability, registration, identity, owner-error,
-or exact-absence results retain the pending operation and project name because
+or exact-absence results retain the pending operation and Workspace name because
 they cannot disprove an earlier transport-ambiguous mutation. Ambiguous or
 network outcomes likewise retain any already-prepared recovery state.
 
@@ -112,8 +113,10 @@ The Node is an additional outer name-resolution scope, not a replacement for
 existing scopes. Workspace names are unique within one Node. Shell, launcher,
 and Agent Schedule names retain their Workspace scopes, and exact-only identities
 remain exact-only. A client resolving a name outside the local Node must supply
-explicit Node context. Existing unqualified operations retain local-Node meaning;
-federation never changes a legacy request into a remote mutation.
+explicit Node context. Legacy unqualified resource operations retain local-Node
+meaning; protocol-38 coordinated Workspace commands are the explicit exception
+and route only through persisted placement membership. Federation never changes
+a legacy request into an unqualified remote mutation.
 
 An SSH target is a route, not identity. Successful persistent registration pins
 the Node ID returned through an authenticated route. A later connection that

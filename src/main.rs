@@ -333,7 +333,7 @@ const READ_BYTES: usize = 1024 * 1024;
     subcommand_value_name = "SUBCOMMAND"
 )]
 struct Cli {
-    /// Emit the stable boomux.cli/v1 JSON envelope
+    /// Emit the stable boomux.cli/v1 envelope for commands advertised by capabilities
     #[arg(long, global = true)]
     json: bool,
 
@@ -580,6 +580,8 @@ enum WorkspaceCommands {
     Create { name: String },
     /// Open terminal windows and invoke launchers
     Open {
+        /// Coordinated Workspace name/ID, or exact owner Workspace ID with --node
+        #[arg(value_name = "WORKSPACE")]
         target: String,
         /// Exact registered Node alias or Node ID
         #[arg(long)]
@@ -591,21 +593,29 @@ enum WorkspaceCommands {
     Rename { target: String, name: String },
     /// Adopt an unlinked Node-local Workspace as a new coordinated Workspace
     Adopt {
+        #[arg(value_name = "EXTERNAL_WORKSPACE")]
         target: String,
+        /// Exact eligible Node alias or Node ID
         #[arg(long)]
         node: String,
     },
     /// Link an unlinked Node-local Workspace to a coordinated Workspace
     Link {
+        #[arg(value_name = "GLOBAL_WORKSPACE")]
         target: String,
+        #[arg(value_name = "OWNER_WORKSPACE")]
         owner: String,
+        /// Exact eligible Node alias or Node ID
         #[arg(long)]
         node: String,
     },
     /// Close a workspace and all of its shells
     Close { target: String },
     /// Retry unresolved placement removals for a closing Workspace
-    Retry { target: String },
+    Retry {
+        #[arg(value_name = "CLOSING_GLOBAL_WORKSPACE")]
+        target: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -618,7 +628,8 @@ enum LauncherCommands {
     /// Create a launcher in a workspace
     Create {
         name: String,
-        #[arg(long, value_name = "NAME_OR_ID")]
+        /// Coordinated Workspace name or ID when --node is used
+        #[arg(long, value_name = "WORKSPACE")]
         workspace: String,
         /// Exact eligible Node alias or Node ID
         #[arg(long)]
@@ -636,6 +647,8 @@ enum LauncherCommands {
     },
     /// Invoke a launcher as a detached process
     Invoke {
+        /// Launcher name/ID locally, or exact launcher ID with --node
+        #[arg(value_name = "LAUNCHER")]
         target: String,
         #[arg(long, value_name = "NAME_OR_ID")]
         workspace: Option<String>,
@@ -662,6 +675,8 @@ enum LauncherCommands {
 enum ShellCommands {
     /// Suggest an unused generated name without reserving it
     SuggestName {
+        /// Workspace name/ID locally, or exact owner Workspace ID with --node
+        #[arg(value_name = "WORKSPACE")]
         workspace: String,
         /// Exact registered Node alias or Node ID
         #[arg(long)]
@@ -669,6 +684,8 @@ enum ShellCommands {
     },
     /// Create a pending shell in a workspace
     Create {
+        /// Coordinated Workspace name or ID when --node is used
+        #[arg(value_name = "WORKSPACE")]
         workspace: String,
         /// Exact eligible Node alias or Node ID
         #[arg(long)]
@@ -4711,6 +4728,46 @@ struct CoordinatedOwnerSelection {
     default_cwd: Option<PathBuf>,
 }
 
+fn require_protocol_feature(
+    client: &client::Client,
+    feature: protocol::ProtocolFeature,
+) -> Result<(), Box<dyn Error>> {
+    if client.supports(feature)? {
+        return Ok(());
+    }
+    Err(cli_output::failure(
+        "unsupported_version",
+        format!(
+            "{} requires daemon protocol {} or newer",
+            feature.requirement(),
+            feature.minimum_version()
+        ),
+    ))
+}
+
+fn require_explicit_coordinated_owner<T>(
+    selection: Option<T>,
+    node_selector: Option<&str>,
+    global_workspaces_supported: bool,
+) -> Result<Option<T>, Box<dyn Error>> {
+    if selection.is_some() || node_selector.is_none() {
+        return Ok(selection);
+    }
+    if !global_workspaces_supported {
+        return Err(cli_output::failure(
+            "unsupported_version",
+            format!(
+                "explicit Workspace placement requires daemon protocol {} or newer",
+                protocol::ProtocolFeature::GlobalWorkspaces.minimum_version()
+            ),
+        ));
+    }
+    Err(cli_output::failure(
+        "invalid_argument",
+        "--node can create a Shell or launcher only in a coordinated Workspace; adopt or link an external Workspace first",
+    ))
+}
+
 fn select_coordinated_owner(
     client: &client::Client,
     workspace_target: &str,
@@ -6401,6 +6458,7 @@ fn workspace_command(
             println!("Renamed workspace {} to {name}", workspace.name);
         }
         WorkspaceCommands::Adopt { target, node } => {
+            require_protocol_feature(&client, protocol::ProtocolFeature::GlobalWorkspaces)?;
             let combined = client.combined_node_snapshot(None)?;
             let node = resolve_combined_node(&combined.nodes, &node)?;
             if !node.workspace_owner_eligible {
@@ -6436,6 +6494,7 @@ fn workspace_command(
             owner,
             node,
         } => {
+            require_protocol_feature(&client, protocol::ProtocolFeature::GlobalWorkspaces)?;
             let combined = client.combined_node_snapshot(None)?;
             let workspace = resolve_global_workspace_target(&combined.workspaces, &target)
                 .ok_or_else(|| {
@@ -6549,6 +6608,7 @@ fn workspace_command(
             );
         }
         WorkspaceCommands::Retry { target } => {
+            require_protocol_feature(&client, protocol::ProtocolFeature::GlobalWorkspaces)?;
             let combined = client.combined_node_snapshot(None)?;
             let workspace = resolve_global_workspace_target(&combined.workspaces, &target)
                 .ok_or_else(|| {
@@ -6649,8 +6709,14 @@ fn shell_command(command: ShellCommands, json: bool) -> Result<(), Box<dyn Error
             cwd,
             command,
         } => {
-            if let Some(selection) = select_coordinated_owner(&client, &workspace, node.as_deref())?
-            {
+            let global_workspaces_supported =
+                client.supports(protocol::ProtocolFeature::GlobalWorkspaces)?;
+            let selection = select_coordinated_owner(&client, &workspace, node.as_deref())?;
+            if let Some(selection) = require_explicit_coordinated_owner(
+                selection,
+                node.as_deref(),
+                global_workspaces_supported,
+            )? {
                 let requested_cwd = cwd
                     .or_else(|| selection.default_cwd.clone())
                     .unwrap_or_else(|| PathBuf::from("."));
@@ -6793,8 +6859,14 @@ fn launcher_command(command: LauncherCommands, json: bool) -> Result<(), Box<dyn
             command,
         } => {
             let name = cli_name(name, "workspace launcher")?;
-            if let Some(selection) = select_coordinated_owner(&client, &workspace, node.as_deref())?
-            {
+            let global_workspaces_supported =
+                client.supports(protocol::ProtocolFeature::GlobalWorkspaces)?;
+            let selection = select_coordinated_owner(&client, &workspace, node.as_deref())?;
+            if let Some(selection) = require_explicit_coordinated_owner(
+                selection,
+                node.as_deref(),
+                global_workspaces_supported,
+            )? {
                 let cwd = resolve_owner_directory(&client, &selection.node, cwd)?;
                 let owner_default_cwd = selection.default_cwd.clone().or_else(|| Some(cwd.clone()));
                 let (_, launcher) = client.create_global_workspace_launcher(
@@ -11741,7 +11813,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_project_owner_selection_delegates_sole_and_requires_ambiguous_choice() {
+    fn workspace_resource_owner_selection_delegates_sole_and_requires_ambiguous_choice() {
         let local = combined_node("local-id", "local", true);
         let remote = combined_node("remote-id", "work", true);
         assert_eq!(
@@ -11756,6 +11828,27 @@ mod tests {
                 .unwrap()
                 .node_id,
             "remote-id"
+        );
+    }
+
+    #[test]
+    fn explicit_node_placement_never_falls_back_to_local_creation() {
+        assert_eq!(
+            require_explicit_coordinated_owner(Some(7), Some("work"), true).unwrap(),
+            Some(7)
+        );
+        let external = require_explicit_coordinated_owner::<()>(None, Some("work"), true)
+            .unwrap_err()
+            .to_string();
+        assert!(external.contains("coordinated Workspace"));
+        let legacy = require_explicit_coordinated_owner::<()>(None, Some("work"), false)
+            .unwrap_err()
+            .to_string();
+        assert!(legacy.contains("protocol 38"));
+        assert!(
+            require_explicit_coordinated_owner::<()>(None, None, false)
+                .unwrap()
+                .is_none()
         );
     }
 
@@ -14197,12 +14290,24 @@ mod tests {
             "boomux close",
             "boomux open",
             "boomux project list",
+            "boomux node add",
+            "boomux node list",
+            "boomux node inspect",
+            "boomux node snapshot",
+            "boomux node rename",
+            "boomux node retarget",
+            "boomux node forget",
+            "boomux node rekey",
             "boomux workspace list",
             "boomux workspace create",
             "boomux workspace open",
             "boomux workspace inspect",
             "boomux workspace rename",
+            "boomux workspace adopt",
+            "boomux workspace link",
             "boomux workspace close",
+            "boomux workspace retry",
+            "boomux shell suggest-name",
             "boomux shell create",
             "boomux shell inspect",
             "boomux shell rename",
@@ -14225,6 +14330,19 @@ mod tests {
             "boomux notification test",
             "boomux session list",
             "boomux session inspect",
+            "boomux session resume",
+            "boomux schedule create",
+            "boomux schedule list",
+            "boomux schedule inspect",
+            "boomux schedule pause",
+            "boomux schedule resume",
+            "boomux schedule remove",
+            "boomux schedule run",
+            "boomux execution list",
+            "boomux execution inspect",
+            "boomux execution wait",
+            "boomux execution open",
+            "boomux execution cancel",
             "boomux integration list",
             "boomux integration status",
             "boomux integration install",
@@ -14250,7 +14368,11 @@ mod tests {
         }
         assert!(BOOMUX_SKILL.contains("BOOMUX_SHELL_ID"));
         assert!(BOOMUX_SKILL.contains("--workspace"));
+        assert!(BOOMUX_SKILL.contains("--node"));
+        assert!(BOOMUX_SKILL.contains("--revision"));
         assert!(BOOMUX_SKILL.contains("--terminal"));
+        assert!(!BOOMUX_SKILL.contains("boomux session read"));
+        assert!(!BOOMUX_SKILL.contains("workspace create \"<name>\" --cwd"));
     }
 
     #[test]

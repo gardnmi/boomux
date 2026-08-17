@@ -136,7 +136,7 @@ boomux . --name my-project --new -- sh -lc 'cargo test | tee test.log'
 | Add a shell on one Node | `boomux shell create feature-x --node laptop --cwd /path/to/project` |
 | Register a remote Node | `boomux node add laptop user@host` |
 | Adopt an external Workspace | `boomux workspace adopt <workspace-id> --node laptop` |
-| Link an external Workspace | `boomux workspace link <workspace-id> feature-x --node laptop` |
+| Link an external Workspace | `boomux workspace link feature-x <owner-workspace-id> --node laptop` |
 | Retry an incomplete close | `boomux workspace retry <workspace-id>` |
 | Suggest an unused shell name | `boomux shell suggest-name feature-x` |
 | Add a randomly named shell | `boomux shell create feature-x` |

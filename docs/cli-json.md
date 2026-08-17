@@ -49,16 +49,15 @@ from a CLI or daemon version string. Registration commands manage local routes
 only and do not imply projected reads or routed resource mutation.
 
 Protocol 33 advertises the separately named `node.snapshot` combined read. It
-contacts only the local daemon and never changes the local-only meaning of any
-existing snapshot or list operation.
+contacts only the local daemon and returns qualified local plus bounded cached
+remote projections. Legacy resource lists remain local-only.
 
 Protocol 34 advertises `typed_exact_node_routing` and
 `guarded_remote_management`. Dashboard effects carry structured Node-qualified
 identities, freshly inspect the owner before destructive confirmation, and use
 the resource revision, membership generation, run ID, Schedule/execution
 revision, observation revision, or dispatch key required by the operation.
-Stale Nodes and Nodes without the capability remain non-actionable. Existing
-unqualified CLI methods preserve local-only semantics.
+Stale Nodes and Nodes without the capability remain non-actionable.
 
 Protocol 35 advertises `remote_pty_attachment` and
 `owner_environment_attachment`. `boomux open SHELL --node SELECTOR` is a
@@ -81,19 +80,22 @@ Protocol 37 advertises `remote_agent_schedule_management` and
 prompt-free reduced projection and includes Node freshness, health, observation
 time, and scheduler health. Exact reads and all mutations are live owner-routed.
 
-That passive command advertises only what the installed local CLI can speak and
-never reports negotiated state for a registered Node. Implemented `node.list`
-and `node.inspect` return registration data only. Future combined projection data
-will carry each Node's observed protocol, capabilities, health, and observation
-time after contacting only the local daemon. Integrations must keep static CLI
-support, registration data, and per-Node runtime support distinct.
+`capabilities` advertises only what the installed local CLI can speak and never
+reports negotiated state for a registered Node. `node.list` and `node.inspect`
+return registration data only. `node.snapshot` carries each Node's observed
+protocol, capabilities, health, and observation time after contacting only the
+local daemon. Integrations must keep static CLI support, registration data, and
+per-Node runtime support distinct.
 
-Existing unqualified commands and JSON methods retain local-Node meaning and
-local-only result sets. Older clients continue to receive only local resources.
-New, separately named combined read-only surfaces can expose Node identity,
-health, observation time, and stale state, while every actionable resource is
-identified structurally by both its owning Node ID and unchanged resource ID.
-Names are resolved only within an explicit Node context when they are not local.
+Legacy resource commands and JSON methods retain local-Node meaning and
+local-only result sets. Protocol-38 unqualified Workspace list, inspect, open,
+rename, close, and resource creation resolve coordinated Workspaces first; older
+clients still receive only local resources. The separately named combined read
+exposes Node identity, health, observation time, and stale state, while every
+actionable resource is identified structurally by both its owning Node ID and
+unchanged resource ID. Routed commands that accept names resolve them only in an
+explicit Node context; `workspace open --node`, `shell suggest-name --node`, and
+`launcher invoke --node` require exact owner resource IDs.
 `workspace open TARGET --node NODE` accepts the local Node only by exact Node ID,
 never by its display alias `local`, so an unlinked local owner Workspace cannot
 be confused with a same-ID global Workspace. Registered remote Nodes retain
@@ -435,6 +437,11 @@ global Workspace also uses the retry operation. Dashboard project suggestions
 contribute only the Workspace name; they create the same empty coordinator
 metadata as by-name creation. Node and path selection begins with first-resource
 creation.
+An explicit `--node` on `shell create` or `launcher create` never falls back to
+local mutation. It fails with `unsupported_version` when global Workspaces are
+unavailable and with `invalid_argument` when the target is not coordinated.
+`workspace adopt`, `link`, and `retry` likewise fail with `unsupported_version`
+before target resolution on a pre-38 daemon.
 Prepared resource requests carry one caller-stable operation UUID. The client
 retries the exact request once after a lost connection, timeout, unknown outcome,
 or coordinator persistence failure. The coordinator returns the durable prior
@@ -705,11 +712,12 @@ selected workspace. The projection must have a canonical external session ID
 and its integration must equal `--integration`; descriptions, external IDs,
 latest-session selection, and names are never substitutes.
 
-Exact schedule IDs resolve globally for inspect, pause, resume, and remove.
-Schedule names resolve only with explicit `--workspace` or the exact current
-`BOOMUX_WORKSPACE_ID`. List is global unless `--workspace` is supplied. Removing
-a schedule removes its persisted prompt. Closing a workspace removes all owned
-schedules and persisted prompts along with the workspace.
+Exact Schedule IDs resolve globally only within the selected Node for inspect,
+pause, resume, and remove. Schedule names resolve only with explicit
+`--workspace` or the exact current `BOOMUX_WORKSPACE_ID`. List covers the
+selected Node unless `--workspace` narrows it. Removing a Schedule removes its
+persisted prompt. Closing a Workspace removes all owned Schedules and persisted
+prompts along with the Workspace.
 
 `read` returns `shell_id`, `run_id`, `output_revision`, `changed`, `status`, and
 `output`. Output is a JSON string containing the same bounded plain rendered text

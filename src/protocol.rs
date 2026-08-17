@@ -4343,6 +4343,49 @@ mod tests {
                     },
                 }],
             ),
+            (
+                38,
+                vec![
+                    Request::CreateGlobalWorkspace {
+                        name: "work".into(),
+                    },
+                    Request::AdoptNodeWorkspace {
+                        identity: QualifiedIdentity::new("node-1", "owner-1"),
+                        expected_revision: 1,
+                    },
+                    Request::LinkNodeWorkspace {
+                        global_workspace_id: "global-1".into(),
+                        expected_global_revision: 1,
+                        identity: QualifiedIdentity::new("node-1", "owner-1"),
+                        expected_owner_revision: 1,
+                    },
+                    Request::OpenGlobalWorkspace {
+                        workspace_id: "global-1".into(),
+                        expected_revision: 1,
+                    },
+                    Request::CloseGlobalWorkspace {
+                        workspace_id: "global-1".into(),
+                        expected_revision: 1,
+                    },
+                    Request::RetryGlobalWorkspaceClose {
+                        workspace_id: "global-1".into(),
+                    },
+                    Request::CreateGlobalWorkspaceShell {
+                        operation_id: "operation-1".into(),
+                        global_workspace_id: "global-1".into(),
+                        expected_global_revision: 1,
+                        node_id: "node-1".into(),
+                        owner_workspace_id: "owner-1".into(),
+                        default_cwd: Some("/owner/work".into()),
+                        shell_id: "shell-1".into(),
+                        shell: ShellSpec {
+                            name: "shell".into(),
+                            cwd: "/owner/work".into(),
+                            command: Vec::new(),
+                        },
+                    },
+                ],
+            ),
         ];
 
         for (expected, requests) in groups {

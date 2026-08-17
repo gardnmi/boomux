@@ -69,6 +69,39 @@ fn two_daemon_workspace_coordination_adopts_links_places_and_retries_close() {
         "remote Node did not become eligible for Workspace placement",
     );
 
+    let colliding_local_owner = local
+        .client
+        .create_workspace("remote-adopt", Vec::new())
+        .unwrap();
+
+    for arguments in [
+        vec!["shell", "create", "remote-adopt", "--node", "work"],
+        vec![
+            "launcher",
+            "create",
+            "unsafe",
+            "--workspace",
+            "remote-adopt",
+            "--node",
+            "work",
+            "--",
+            "true",
+        ],
+    ] {
+        let output = local.command().args(arguments).output().unwrap();
+        assert!(!output.status.success());
+        assert!(contains(&output.stderr, b"coordinated Workspace"));
+    }
+    let unchanged_owner = remote.client.get_workspace(&adopted_owner.id).unwrap();
+    assert!(unchanged_owner.shells.is_empty());
+    assert!(unchanged_owner.launchers.is_empty());
+    let unchanged_local_owner = local
+        .client
+        .get_workspace(&colliding_local_owner.id)
+        .unwrap();
+    assert!(unchanged_local_owner.shells.is_empty());
+    assert!(unchanged_local_owner.launchers.is_empty());
+
     let adopt = local
         .command()
         .args(["workspace", "adopt", &adopted_owner.id, "--node", "work"])

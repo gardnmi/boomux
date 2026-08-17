@@ -160,13 +160,16 @@ output, resize, and detach events. Old-peer response transforms remain isolated
 in the daemon compatibility boundary and use the same feature registry when
 deciding which fields, values, and events to downgrade.
 
-The implemented protocol has seven durable identities beneath its implicit
-local Node. Federation will qualify each existing identity with a stable owning
-Node without rewriting the inner ID:
+The protocol qualifies every Node-owned durable identity with a stable owning
+Node without rewriting its inner ID. A coordinator-owned global Workspace is a
+separate organizing identity whose placements reference exact Node-local
+Workspace identities:
 
-- A workspace is a globally named shell container with a UUID and an optional
-  default working directory for newly created shells. The default is creation
-  behavior, not workspace identity; individual shells may use other paths.
+- A global Workspace owns its UUID, name, revision, placement membership, and
+  close state, but no process or filesystem context.
+- A Node-local workspace is a shell container with a UUID and optional default
+  working directory. Its default applies only on that owning Node; individual
+  resources may use other paths.
 - A shell is a durable process slot with a name, startup command, explicit
   working directory, and workspace ID.
 - A shell run identifies one process incarnation beneath that durable shell. It
@@ -521,8 +524,9 @@ explicit install or restart guidance.
 The optional vendor-neutral `boomux` Agent Skill documents the complete public
 CLI for compatible clients, including discovery, inspection, output reads,
 lifecycle operations, native-terminal opening, and daemon management.
-`BOOMUX_SHELL_ID` provides current-shell context while exact shell IDs remain
-globally addressable within the daemon. The installer safely removes an
+`BOOMUX_SHELL_ID` provides current-shell context. Federated resource identity is
+the pair of owning Node ID and unchanged Node-local ID; exact IDs are global only
+within one Node. The installer safely removes an
 untouched legacy `boomux-shells` skill and preserves customized copies.
 
 Read-only CLI integrations use the separate `boomux.cli/v1` JSON envelope rather
@@ -745,15 +749,16 @@ view still contains that exact Shell, and adds no durable projection field. A
 payload-free focus-presentation invalidation wakes protocol-39 clients without
 placing identity in the event stream; protocol-38 responses filter it while
 advancing their cursor.
-Project creation prepares the new global Workspace metadata and first Shell in
-one coordinator-store replacement. An exact retry returns its stored success
+The retained internal compound first-placement request prepares new global
+Workspace metadata and its first Shell in one coordinator-store replacement. It
+is a wire/recovery primitive, not a public CLI or dashboard creation flow. An exact retry returns its stored success
 even after the original global revision becomes stale. A new project request by
 the same name resumes or replays only when Node, cwd, and Shell definition have
 the same semantic fingerprint; its newly requested UUIDs map to the canonical
 prepared or completed identities. Definitive owner rejection removes only that
 pending operation and removes still-empty global metadata only when no related
 operation remains.
-Before creating project metadata, the coordinator performs cached eligibility
+Before creating compound first-placement metadata, the coordinator performs cached eligibility
 and fresh live capability preflight for the selected Node. Missing, ineligible,
 or runtime-capability-disabled owners therefore leave no empty global record. A
 definitive pre-owner failure on an existing exact preparation atomically cancels
