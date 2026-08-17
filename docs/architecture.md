@@ -111,6 +111,8 @@ Protocol 35 adds Node-qualified native-terminal attachment and owner-environment
 startup for remote pending and exited Shells.
 Protocol 36 adds closed typed Node host services and owner-executed exact Agent
 Session resume.
+Protocol 37 adds Node-qualified remote Agent Schedule creation and bounded
+Scheduled Execution observation without adding local scheduler authority.
 
 ## Components
 
@@ -614,6 +616,14 @@ and observed asset states still match. Exact Session resume resolves the opaque
 projected ID and constructs cwd/argv on the owner, then relays bounded attachment
 frames to a local native terminal without creating a Workspace or Shell. Host
 service responses do not update Node projection cache or publish events.
+Protocol 37 extends the closed routed operation union with owner-side Schedule
+creation and bounded execution list/wait reads. Remote creation resolves the
+Workspace through a fresh owner read, validates cwd and any continuation Session
+through protocol-36 owner host services, and sends the prompt only in the
+transient owner mutation request. Creation is not retried after channel loss;
+run-now remains the only Schedule write retried, using the unchanged dispatch
+key. The local scheduler never evaluates, dispatches, or retries remote work.
+
 Protocol-25 lists are daemon-bounded, newest-first pages with explicit limit and
 truncation. The request limit is optional on the wire; protocol 25 defaults it to
 100 and clamps it to 1 through 1,000, while protocol-23 and protocol-24 requests

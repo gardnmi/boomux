@@ -116,6 +116,68 @@ pub(crate) fn project_schedules(
     schedules
 }
 
+pub(crate) fn project_remote_executions(
+    executions: &[ScheduledExecutionSnapshot],
+) -> Vec<ExecutionView> {
+    executions
+        .iter()
+        .map(|execution| ExecutionView {
+            id: execution.id.clone(),
+            state: match execution.state {
+                ScheduledExecutionState::Skipped => ExecutionDisplayState::Skipped,
+                ScheduledExecutionState::Claimed => ExecutionDisplayState::Claimed,
+                ScheduledExecutionState::Starting => ExecutionDisplayState::Starting,
+                ScheduledExecutionState::Active => ExecutionDisplayState::Active,
+                ScheduledExecutionState::DispatchFailed => ExecutionDisplayState::DispatchFailed,
+                ScheduledExecutionState::Exited => ExecutionDisplayState::Exited,
+                ScheduledExecutionState::Cancelled => ExecutionDisplayState::Cancelled,
+                ScheduledExecutionState::Interrupted => ExecutionDisplayState::Interrupted,
+            },
+            reason: execution.reason.map(|reason| match reason {
+                ScheduledExecutionReason::Overlap => ExecutionReasonDisplay::Overlap,
+                ScheduledExecutionReason::ActiveSession => ExecutionReasonDisplay::ActiveSession,
+                ScheduledExecutionReason::WorkspaceCapacity => {
+                    ExecutionReasonDisplay::WorkspaceCapacity
+                }
+                ScheduledExecutionReason::GlobalCapacity => ExecutionReasonDisplay::GlobalCapacity,
+                ScheduledExecutionReason::Missed => ExecutionReasonDisplay::Missed,
+                ScheduledExecutionReason::PausedRace => ExecutionReasonDisplay::PausedRace,
+                ScheduledExecutionReason::InvalidTarget => ExecutionReasonDisplay::InvalidTarget,
+                ScheduledExecutionReason::RunnerStartFailed => {
+                    ExecutionReasonDisplay::RunnerStartFailed
+                }
+                ScheduledExecutionReason::HostSpawnFailed => {
+                    ExecutionReasonDisplay::HostSpawnFailed
+                }
+                ScheduledExecutionReason::CancelledByUser => {
+                    ExecutionReasonDisplay::CancelledByUser
+                }
+                ScheduledExecutionReason::ColdDaemonRecovery => {
+                    ExecutionReasonDisplay::ColdDaemonRecovery
+                }
+                ScheduledExecutionReason::RunnerExitedWithoutReport => {
+                    ExecutionReasonDisplay::RunnerExitedWithoutReport
+                }
+                ScheduledExecutionReason::DaemonShutdown => ExecutionReasonDisplay::DaemonShutdown,
+            }),
+            outcome: execution.outcome.as_ref().map(|outcome| match outcome {
+                ScheduledExecutionOutcome::ExitCode { code } => {
+                    ExecutionOutcomeDisplay::ExitCode(*code)
+                }
+                ScheduledExecutionOutcome::Signal { signal } => {
+                    ExecutionOutcomeDisplay::Signal(*signal)
+                }
+            }),
+            requested_at_ms: execution.requested_at_ms,
+            shell_id: execution.shell_id.clone(),
+            run_id: execution.run_id.clone(),
+            agent_id: execution.agent_id.clone(),
+            agent_state: None,
+            session_id: None,
+        })
+        .collect()
+}
+
 fn execution_view(
     workspace: &WorkspaceSnapshot,
     sessions: &[SessionProjection],
@@ -525,7 +587,7 @@ pub(crate) fn project_remote_node(
                     && node
                         .observed_capabilities
                         .iter()
-                        .any(|capability| capability == "guarded_remote_management"),
+                        .any(|capability| capability == "remote_agent_schedule_management"),
                 id: schedule.id.clone(),
                 workspace_id: schedule.workspace_id.clone(),
                 workspace: workspace.into(),

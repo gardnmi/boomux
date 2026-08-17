@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 36;
+pub const PROTOCOL_VERSION: u32 = 37;
 pub const MIN_PROTOCOL_VERSION: u32 = 6;
 pub const MAX_CONTROL_FRAME: usize = 8 * 1024 * 1024;
 pub const MAX_ATTACH_FRAME: usize = 1024 * 1024;
@@ -155,6 +155,11 @@ define_protocol_features! {
         "remote_integration_management",
         "remote_agent_session_catalog",
         "remote_exact_session_resume",
+    ]),
+    RemoteSchedules => (37, "remote Schedule management", [
+        "protocol_37",
+        "remote_agent_schedule_management",
+        "remote_scheduled_execution_observation",
     ]),
 }
 
@@ -1214,6 +1219,10 @@ pub enum ErrorCode {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RoutedOperation {
+    CreateAgentSchedule {
+        workspace_id: String,
+        spec: AgentScheduleSpec,
+    },
     GetWorkspace {
         workspace_id: String,
     },
@@ -1231,6 +1240,19 @@ pub enum RoutedOperation {
     },
     GetScheduledExecution {
         execution_id: String,
+    },
+    ListScheduledExecutions {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        schedule_id: Option<String>,
+        limit: u16,
+    },
+    WaitScheduledExecution {
+        execution_id: String,
+        after_revision: u64,
+        #[serde(default)]
+        wait_ms: u32,
     },
     RenameWorkspace {
         workspace_id: String,
@@ -1297,6 +1319,7 @@ pub enum RoutedOperation {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoutedGuard {
+    None,
     ExactId,
     ResourceRevision,
     ResourceRevisionAndRun,
@@ -1322,16 +1345,22 @@ impl RoutedOperation {
     pub const fn classification(&self) -> RoutedOperationClass {
         use RoutedAmbiguity::{ReadAndProve, RetrySameRequest};
         use RoutedGuard::{
-            AttentionObservationRevision, DispatchKey, ExactId, ExecutionRevision,
+            AttentionObservationRevision, DispatchKey, ExactId, ExecutionRevision, None,
             ResourceRevision, ResourceRevisionAndRun, ScheduleRevision,
         };
         match self {
+            Self::CreateAgentSchedule { .. } => RoutedOperationClass {
+                guard: None,
+                ambiguity: ReadAndProve,
+            },
             Self::GetWorkspace { .. }
             | Self::GetShell { .. }
             | Self::GetLauncher { .. }
             | Self::GetAgent { .. }
             | Self::GetAgentSchedule { .. }
-            | Self::GetScheduledExecution { .. } => RoutedOperationClass {
+            | Self::GetScheduledExecution { .. }
+            | Self::ListScheduledExecutions { .. }
+            | Self::WaitScheduledExecution { .. } => RoutedOperationClass {
                 guard: ExactId,
                 ambiguity: RetrySameRequest,
             },
@@ -1410,6 +1439,9 @@ impl RoutedOperation {
 
     pub fn owner_request(&self) -> Request {
         match self.clone() {
+            Self::CreateAgentSchedule { workspace_id, spec } => {
+                Request::CreateAgentSchedule { workspace_id, spec }
+            }
             Self::GetWorkspace { workspace_id } => Request::GetWorkspace { workspace_id },
             Self::GetShell { shell_id } => Request::GetShell { shell_id },
             Self::GetLauncher { launcher_id } => Request::GetLauncher { launcher_id },
@@ -1418,6 +1450,24 @@ impl RoutedOperation {
             Self::GetScheduledExecution { execution_id } => {
                 Request::GetScheduledExecution { execution_id }
             }
+            Self::ListScheduledExecutions {
+                workspace_id,
+                schedule_id,
+                limit,
+            } => Request::ListScheduledExecutions {
+                workspace_id,
+                schedule_id,
+                limit: Some(limit),
+            },
+            Self::WaitScheduledExecution {
+                execution_id,
+                after_revision,
+                wait_ms,
+            } => Request::WaitScheduledExecution {
+                execution_id,
+                after_revision,
+                wait_ms,
+            },
             Self::RenameWorkspace {
                 workspace_id,
                 name,
@@ -2099,6 +2149,13 @@ impl Request {
                 Some(ProtocolFeature::NodeProjectionSync)
             }
             Self::GetCombinedNodeSnapshot { .. } => Some(ProtocolFeature::CombinedNodeSnapshot),
+            Self::RouteNodeOperation {
+                operation:
+                    RoutedOperation::CreateAgentSchedule { .. }
+                    | RoutedOperation::ListScheduledExecutions { .. }
+                    | RoutedOperation::WaitScheduledExecution { .. },
+                ..
+            } => Some(ProtocolFeature::RemoteSchedules),
             Self::RouteNodeOperation { .. }
             | Self::GuardedCancelScheduledExecution { .. }
             | Self::GuardedRenameWorkspace { .. }
@@ -2361,6 +2418,18 @@ pub enum RoutedOperationResult {
         execution: ScheduledExecutionSnapshot,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         next_occurrence: Option<ScheduledOccurrence>,
+    },
+    ScheduledExecutions {
+        executions: Vec<ScheduledExecutionSnapshot>,
+        limit: u16,
+        truncated: bool,
+        schedules: Vec<ScheduledExecutionScheduleProjection>,
+        schedule_limit: u16,
+        schedules_truncated: bool,
+    },
+    ScheduledExecutionWait {
+        execution: ScheduledExecutionSnapshot,
+        changed: bool,
     },
     AgentAttentionAcknowledged {
         agent: AgentInstanceSnapshot,
@@ -2861,8 +2930,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_thirty_six_with_minimum_six() {
-        assert_eq!(PROTOCOL_VERSION, 36);
+    fn protocol_version_is_thirty_seven_with_minimum_six() {
+        assert_eq!(PROTOCOL_VERSION, 37);
         assert_eq!(MIN_PROTOCOL_VERSION, 6);
     }
 
@@ -3076,6 +3145,63 @@ mod tests {
                 "operation": "shutdown"
             }))
             .is_err()
+        );
+    }
+
+    #[test]
+    fn protocol_thirty_seven_routes_remote_schedule_reads_without_broadening_retries() {
+        let create = RoutedOperation::CreateAgentSchedule {
+            workspace_id: "workspace-1".into(),
+            spec: AgentScheduleSpec {
+                name: "review".into(),
+                cwd: "/owner/work".into(),
+                integration: "opencode".into(),
+                prompt: "PRIVATE ROUTED PROMPT".into(),
+                session: AgentScheduleSession::Fresh,
+                trigger: AgentScheduleTrigger {
+                    cron: "0 2 * * *".into(),
+                    timezone: "UTC".into(),
+                },
+                state: AgentScheduleState::Paused,
+                overlap_policy: AgentScheduleOverlapPolicy::Skip,
+            },
+        };
+        let request = Request::RouteNodeOperation {
+            node_id: "node-1".into(),
+            operation: create.clone(),
+        };
+        assert_eq!(
+            request.required_feature(),
+            Some(ProtocolFeature::RemoteSchedules)
+        );
+        assert!(!create.is_retryable());
+        assert!(format!("{create:?}").contains("<redacted>"));
+        assert!(!format!("{create:?}").contains("PRIVATE ROUTED PROMPT"));
+
+        let list = RoutedOperation::ListScheduledExecutions {
+            workspace_id: None,
+            schedule_id: Some("schedule-1".into()),
+            limit: 100,
+        };
+        assert!(list.is_retryable());
+        assert_eq!(
+            serde_json::from_value::<RoutedOperation>(serde_json::to_value(&list).unwrap())
+                .unwrap(),
+            list
+        );
+        assert!(
+            RoutedOperation::RunAgentSchedule {
+                schedule_id: "schedule-1".into(),
+                dispatch_key: "dispatch-1".into(),
+            }
+            .is_retryable()
+        );
+        assert!(
+            !RoutedOperation::CancelScheduledExecution {
+                execution_id: "execution-1".into(),
+                expected_revision: 4,
+            }
+            .is_retryable()
         );
     }
 
@@ -3775,6 +3901,17 @@ mod tests {
                     },
                 ],
             ),
+            (
+                37,
+                vec![Request::RouteNodeOperation {
+                    node_id: "node-1".into(),
+                    operation: RoutedOperation::WaitScheduledExecution {
+                        execution_id: "execution-1".into(),
+                        after_revision: 1,
+                        wait_ms: 10,
+                    },
+                }],
+            ),
         ];
 
         for (expected, requests) in groups {
@@ -3925,6 +4062,14 @@ mod tests {
                     "remote_integration_management",
                     "remote_agent_session_catalog",
                     "remote_exact_session_resume",
+                ][..],
+            ),
+            (
+                37,
+                &[
+                    "protocol_37",
+                    "remote_agent_schedule_management",
+                    "remote_scheduled_execution_observation",
                 ][..],
             ),
         ];

@@ -75,6 +75,12 @@ unsupported owners fail visibly and are never emulated against local PATH,
 configuration, catalogs, or filesystems. Responses are live and transient and do
 not update the cached Node projection.
 
+Protocol 37 advertises `remote_agent_schedule_management` and
+`remote_scheduled_execution_observation`. Schedule and execution commands accept
+`--node SELECTOR`; their JSON adds exact `node_id`. Remote Schedule list is the
+prompt-free reduced projection and includes Node freshness, health, observation
+time, and scheduler health. Exact reads and all mutations are live owner-routed.
+
 That passive command advertises only what the installed local CLI can speak and
 never reports negotiated state for a registered Node. Implemented `node.list`
 and `node.inspect` return registration data only. Future combined projection data
@@ -329,6 +335,8 @@ Protocol 36 adds `protocol_36`, `typed_node_host_services`,
 `remote_project_discovery`, `remote_launcher_invocation`,
 `remote_integration_management`, `remote_agent_session_catalog`, and
 `remote_exact_session_resume`.
+Protocol 37 adds `protocol_37`, `remote_agent_schedule_management`, and
+`remote_scheduled_execution_observation`.
 
 Node snapshot health is `unobserved`, `online`, `reconnecting`, `stale`,
 `unreachable`, `authentication_required`, `identity_changed`,
@@ -560,6 +568,11 @@ Schedule management commands require negotiated daemon protocol 22. `schedule
 run` and every `execution` command require protocol 23. Unsupported commands
 return `unsupported_version` rather than presenting empty data.
 `execution wait` specifically requires protocol 25.
+Node-qualified Schedule and execution commands require protocol 37 on the local
+coordinator and owner. Remote JSON responses add exact `node_id`; remote list
+presentation also reports Node freshness and per-Node scheduler health. Remote
+create reads prompt files locally once, validates cwd and continuation Session on
+the owner, and never stores the prompt in the presenting Node's projection.
 
 Only `schedule.inspect` adds `prompt`. Prompts are intentionally absent from
 list, create, pause, resume, remove, run, execution records, capabilities,

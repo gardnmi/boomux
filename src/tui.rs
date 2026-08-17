@@ -5024,11 +5024,30 @@ fn render_schedules(frame: &mut Frame, area: Rect, app: &mut App) {
             }))
         })
         .collect();
-    let health = match app.scheduling {
-        SchedulingView::Unsupported { .. } => "unsupported".into(),
-        SchedulingView::Active { active, maximum } => format!("active {active}/{maximum}"),
-        SchedulingView::Offline { active, maximum } => format!("offline {active}/{maximum}"),
-    };
+    let health = app
+        .selected_schedule()
+        .and_then(|schedule| {
+            app.nodes
+                .iter()
+                .find(|node| node.id == schedule.node_id)
+                .map(|node| {
+                    format!(
+                        "{} {} {}/{}",
+                        node.alias,
+                        match node.scheduler.state {
+                            boomux::protocol::SchedulerState::Active => "active",
+                            boomux::protocol::SchedulerState::Offline => "offline",
+                        },
+                        node.scheduler.active_executions,
+                        node.scheduler.max_concurrent,
+                    )
+                })
+        })
+        .unwrap_or_else(|| match app.scheduling {
+            SchedulingView::Unsupported { .. } => "unsupported".into(),
+            SchedulingView::Active { active, maximum } => format!("active {active}/{maximum}"),
+            SchedulingView::Offline { active, maximum } => format!("offline {active}/{maximum}"),
+        });
     let table = Table::new(rows, widths)
         .header(Row::new(headers).style(Style::new().fg(BLUE).add_modifier(Modifier::BOLD)))
         .column_spacing(1)

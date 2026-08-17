@@ -1958,7 +1958,8 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
-            reject_protocol(&listener, 36, 34);
+            reject_protocol(&listener, protocol::PROTOCOL_VERSION, 36);
+            reject_protocol(&listener, 36, 35);
             reject_protocol(&listener, 35, 34);
             reject_protocol(&listener, 34, 33);
             reject_protocol(&listener, 33, 32);
@@ -2115,7 +2116,7 @@ mod tests {
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
-            assert_eq!(request.version, 36);
+            assert_eq!(request.version, protocol::PROTOCOL_VERSION);
             assert_eq!(request.message, Request::GetNodeIdentity);
             protocol::write_message(
                 &mut stream,
@@ -2129,7 +2130,8 @@ mod tests {
             )
             .unwrap();
 
-            reject_protocol(&listener, 36, 34);
+            reject_protocol(&listener, protocol::PROTOCOL_VERSION, 36);
+            reject_protocol(&listener, 36, 35);
             reject_protocol(&listener, 35, 34);
             reject_protocol(&listener, 34, 33);
             reject_protocol(&listener, 33, 32);
@@ -2180,7 +2182,7 @@ mod tests {
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
-            assert_eq!(request.version, 36);
+            assert_eq!(request.version, protocol::PROTOCOL_VERSION);
             assert_eq!(request.message, Request::OpenFederationChannel);
             protocol::write_message(
                 &mut stream,
@@ -2194,7 +2196,8 @@ mod tests {
             )
             .unwrap();
 
-            reject_protocol(&listener, 36, 34);
+            reject_protocol(&listener, protocol::PROTOCOL_VERSION, 36);
+            reject_protocol(&listener, 36, 35);
             reject_protocol(&listener, 35, 34);
             reject_protocol(&listener, 34, 33);
             reject_protocol(&listener, 33, 32);
@@ -2228,7 +2231,7 @@ mod tests {
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
-            assert_eq!(request.version, 36);
+            assert_eq!(request.version, protocol::PROTOCOL_VERSION);
             assert_eq!(request.message, Request::ListNodeRegistrations);
             protocol::write_message(
                 &mut stream,
@@ -2241,7 +2244,8 @@ mod tests {
                 ),
             )
             .unwrap();
-            reject_protocol(&listener, 36, 34);
+            reject_protocol(&listener, protocol::PROTOCOL_VERSION, 36);
+            reject_protocol(&listener, 36, 35);
             reject_protocol(&listener, 35, 34);
             reject_protocol(&listener, 34, 33);
             reject_protocol(&listener, 33, 32);
@@ -2418,7 +2422,8 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
-            reject_protocol(&listener, 36, 34);
+            reject_protocol(&listener, protocol::PROTOCOL_VERSION, 36);
+            reject_protocol(&listener, 36, 35);
             reject_protocol(&listener, 35, 34);
             reject_protocol(&listener, 34, 33);
             reject_protocol(&listener, 33, 32);
@@ -2490,7 +2495,8 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
-            reject_protocol(&listener, 36, 34);
+            reject_protocol(&listener, protocol::PROTOCOL_VERSION, 36);
+            reject_protocol(&listener, 36, 35);
             reject_protocol(&listener, 35, 34);
             reject_protocol(&listener, 34, 33);
             reject_protocol(&listener, 33, 32);

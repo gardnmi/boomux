@@ -1710,6 +1710,8 @@ fn operation_is_read(operation: &RoutedOperation) -> bool {
             | RoutedOperation::GetAgent { .. }
             | RoutedOperation::GetAgentSchedule { .. }
             | RoutedOperation::GetScheduledExecution { .. }
+            | RoutedOperation::ListScheduledExecutions { .. }
+            | RoutedOperation::WaitScheduledExecution { .. }
     )
 }
 
@@ -1732,6 +1734,24 @@ fn routed_result(response: Response) -> Result<RoutedOperationResult, Box<Respon
             execution,
             next_occurrence,
         }),
+        Response::ScheduledExecutions {
+            executions,
+            limit,
+            truncated,
+            schedules,
+            schedule_limit,
+            schedules_truncated,
+        } => Ok(RoutedOperationResult::ScheduledExecutions {
+            executions,
+            limit,
+            truncated,
+            schedules,
+            schedule_limit,
+            schedules_truncated,
+        }),
+        Response::ScheduledExecutionWait { execution, changed } => {
+            Ok(RoutedOperationResult::ScheduledExecutionWait { execution, changed })
+        }
         Response::AgentAttentionAcknowledged { agent, changed } => {
             Ok(RoutedOperationResult::AgentAttentionAcknowledged { agent, changed })
         }
@@ -1871,6 +1891,15 @@ fn send_registered_node_request(
     registration: &crate::protocol::NodeRegistrationSnapshot,
     request: Request,
 ) -> io::Result<Response> {
+    send_registered_node_request_with_timeout(registration, request, Duration::from_secs(2), None)
+}
+
+fn send_registered_node_request_with_timeout(
+    registration: &crate::protocol::NodeRegistrationSnapshot,
+    request: Request,
+    response_timeout: Duration,
+    route_feature: Option<protocol::ProtocolFeature>,
+) -> io::Result<Response> {
     let target = SshTarget::parse(registration.target.clone())?;
     let helper = match ssh_bootstrap::plan_remote_bootstrap(
         target.clone(),
@@ -1891,7 +1920,7 @@ fn send_registered_node_request(
             "remote Node identity changed",
         ));
     }
-    if let Some(feature) = request.required_feature()
+    if let Some(feature) = route_feature.or_else(|| request.required_feature())
         && !feature.is_supported_by(helper.handshake.core_protocol_version)
     {
         return Err(io::Error::new(
@@ -1905,7 +1934,26 @@ fn send_registered_node_request(
         SshAuthenticationMode::Batch,
         Duration::from_secs(2),
     )?;
-    remote.request(request, Duration::from_secs(2))
+    remote.request(request, response_timeout)
+}
+
+fn routed_response_timeout(operation: &RoutedOperation) -> Duration {
+    match operation {
+        RoutedOperation::WaitScheduledExecution { wait_ms, .. } => {
+            Duration::from_millis(u64::from(*wait_ms)).saturating_add(Duration::from_secs(2))
+        }
+        _ => Duration::from_secs(2),
+    }
+}
+
+fn routed_owner_feature(operation: &RoutedOperation) -> Option<protocol::ProtocolFeature> {
+    matches!(
+        operation,
+        RoutedOperation::CreateAgentSchedule { .. }
+            | RoutedOperation::ListScheduledExecutions { .. }
+            | RoutedOperation::WaitScheduledExecution { .. }
+    )
+    .then_some(protocol::ProtocolFeature::RemoteSchedules)
 }
 
 fn require_guard(actual: u64, expected: u64, resource: &str) -> DaemonResult<()> {
@@ -7427,9 +7475,21 @@ impl DaemonService {
             }
             Err(error) => return node_registration_error(error).into_response(),
         }
-        let mut result = send_registered_node_request(&registration, operation.owner_request());
+        let response_timeout = routed_response_timeout(&operation);
+        let owner_feature = routed_owner_feature(&operation);
+        let mut result = send_registered_node_request_with_timeout(
+            &registration,
+            operation.owner_request(),
+            response_timeout,
+            owner_feature,
+        );
         if result.is_err() && operation.is_retryable() {
-            result = send_registered_node_request(&registration, operation.owner_request());
+            result = send_registered_node_request_with_timeout(
+                &registration,
+                operation.owner_request(),
+                response_timeout,
+                owner_feature,
+            );
         }
         let proven = if result.is_err() && !operation.is_retryable() {
             operation.ambiguity_probe().and_then(|probe| {
