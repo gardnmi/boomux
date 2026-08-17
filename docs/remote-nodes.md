@@ -14,7 +14,9 @@
 > Protocol 33 adds the local-daemon combined Node snapshot and federated
 > dashboard. Protocol 34 and state schema 13 implement typed exact-Node private
 > reads and guarded management operations. Protocol 35 implements Node-qualified
-> native-terminal PTY attachment and owner-environment remote startup. Public `boomux --remote TARGET`
+> native-terminal PTY attachment and owner-environment remote startup. Protocol
+> 36 implements closed typed owner host services and exact Agent Session resume.
+> Public `boomux --remote TARGET`
 > remains ad hoc.
 
 ## Purpose
@@ -292,6 +294,22 @@ revision, verifies the pinned identity and protocol capability before sending
 the owner request, performs SSH I/O outside locks, and revalidates the
 registration before returning. Routed responses never update projection cache.
 
+Protocol 36 adds a separate closed host-service union. It routes bounded project
+discovery, directory validation/resolution, Shell-name suggestion, exact stored
+Workspace launcher invocation, integration status/preview/install/verify/remove,
+and bounded Agent Session list/inspect/resolve. It has no executable-and-arguments
+request and cannot run a caller-supplied command. Launchers are selected by exact
+Workspace and launcher IDs, then their stored cwd and argv execute directly on
+the owner. Integration commits consume an owner-held expiring preview token and
+fail if action, force policy, target path, or observed file state changed.
+
+Exact remote Agent Session resume is a distinct streaming request. The owner
+freshly resolves the opaque projected Session ID, validates owner cwd, builds the
+integration descriptor's exact argv, and owns the unmanaged PTY and child. The
+presenting Node launches only its native terminal and relays bounded attachment
+frames. No ordinary Workspace/Shell row, transcript, prompt, environment,
+credential, stderr capture, cache update, or event is created.
+
 | Operation | Owner guard | Automatic retry | Ambiguity read and exact postcondition |
 | --- | --- | --- | --- |
 | Workspace/Shell/launcher/Agent/Schedule/execution inspect | Exact ID on a fresh verified channel | Yes; read-only | Not applicable |
@@ -498,7 +516,9 @@ requires protocol 35. Release-version differences never authorize restarting a
 compatible remote daemon.
 
 Node identity, registrations, and projections use explicit independent schemas.
-Introducing them cannot silently reinterpret authoritative `state.json`. If a
+Introducing them cannot silently reinterpret authoritative `state.json`.
+Protocol-36 host-service previews and resumed unmanaged PTYs are transient and
+require no state or Node-cache schema change. If a
 later implementation places any Node field in that durable representation, it
 must bump `STATE_VERSION` and provide the ordinary explicit migration and cold
 recovery evidence.

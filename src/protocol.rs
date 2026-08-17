@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 35;
+pub const PROTOCOL_VERSION: u32 = 36;
 pub const MIN_PROTOCOL_VERSION: u32 = 6;
 pub const MAX_CONTROL_FRAME: usize = 8 * 1024 * 1024;
 pub const MAX_ATTACH_FRAME: usize = 1024 * 1024;
@@ -147,6 +147,15 @@ define_protocol_features! {
         "remote_pty_attachment",
         "owner_environment_attachment",
     ]),
+    NodeHostServices => (36, "Node host services", [
+        "protocol_36",
+        "typed_node_host_services",
+        "remote_project_discovery",
+        "remote_launcher_invocation",
+        "remote_integration_management",
+        "remote_agent_session_catalog",
+        "remote_exact_session_resume",
+    ]),
 }
 
 pub const DEFAULT_SCHEDULED_EXECUTION_LIST_LIMIT: u16 = 100;
@@ -154,6 +163,196 @@ pub const MAX_SCHEDULED_EXECUTION_LIST_LIMIT: u16 = 1_000;
 pub const MAX_SCHEDULED_EXECUTION_SCHEDULE_PROJECTIONS: u16 = 100;
 pub const MAX_NODE_PROJECTION_EXECUTIONS: u16 = 1_000;
 pub const MAX_NODE_PROJECTION_TRANSITIONS: u16 = 256;
+pub const MAX_HOST_SERVICE_PROJECTS: usize = 2_000;
+pub const MAX_HOST_SERVICE_WARNINGS: usize = 64;
+pub const MAX_HOST_SERVICE_SESSIONS: usize = 1_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostServiceIntegrationAction {
+    Install,
+    Uninstall,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+pub enum HostServiceOperation {
+    DiscoverProjects,
+    ResolveDirectory {
+        path: PathBuf,
+    },
+    SuggestShellName {
+        workspace_id: String,
+    },
+    InvokeLauncher {
+        workspace_id: String,
+        launcher_id: String,
+    },
+    IntegrationStatus {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        integration: Option<String>,
+    },
+    PreviewIntegrationMutation {
+        action: HostServiceIntegrationAction,
+        integrations: Vec<String>,
+        force: bool,
+    },
+    CommitIntegrationMutation {
+        preview_token: String,
+    },
+    VerifyIntegration {
+        integration: String,
+        shell_id: String,
+        run_id: String,
+    },
+    ListAgentSessions {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace_id: Option<String>,
+    },
+    InspectAgentSession {
+        session_id: String,
+    },
+    ResolveAgentSession {
+        workspace_id: String,
+        agent_id: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostProjectSnapshot {
+    pub name: String,
+    pub path: PathBuf,
+    pub group: String,
+    pub group_order: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostProjectDiscovery {
+    pub roots_configured: bool,
+    pub projects: Vec<HostProjectSnapshot>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostIntegrationStatus {
+    pub name: String,
+    pub display_name: String,
+    pub package: String,
+    pub validated_version: String,
+    pub host_state: String,
+    pub executable: Option<String>,
+    pub version: Option<String>,
+    pub compatibility: String,
+    pub host_error: Option<String>,
+    pub asset_state: String,
+    pub path: Option<String>,
+    pub asset_error: Option<String>,
+    pub runtime_state: String,
+    pub running_processes: usize,
+    pub tracked_processes: usize,
+    pub untracked_processes: usize,
+    pub recommended_action: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostIntegrationPlan {
+    pub name: String,
+    pub current_state: String,
+    pub action: String,
+    pub path: String,
+    pub restart_required: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostIntegrationMutationPreview {
+    pub token: String,
+    pub action: HostServiceIntegrationAction,
+    pub force: bool,
+    pub plans: Vec<HostIntegrationPlan>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostIntegrationMutationResult {
+    pub name: String,
+    pub result: String,
+    pub path: String,
+    pub restart_required: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostAgentSessionSummary {
+    pub id: String,
+    pub workspace_id: String,
+    pub workspace_name: String,
+    pub description: String,
+    pub integration: String,
+    pub external_session_id: Option<String>,
+    pub state: AgentState,
+    pub state_is_current: bool,
+    pub started_at_ms: u64,
+    pub last_at_ms: u64,
+    pub occurrence_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostAgentSessionInspection {
+    pub summary: HostAgentSessionSummary,
+    pub source_cwd: Option<PathBuf>,
+    pub occurrences: Vec<AgentInstanceSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostAgentSessionResumePlan {
+    pub session_id: String,
+    pub workspace_id: String,
+    pub workspace_name: String,
+    pub integration: String,
+    pub cwd: PathBuf,
+    pub argv: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
+pub enum HostServiceResult {
+    Projects {
+        discovery: HostProjectDiscovery,
+    },
+    Directory {
+        path: PathBuf,
+    },
+    ShellName {
+        workspace_id: String,
+        name: String,
+    },
+    LauncherInvoked {
+        workspace_id: String,
+        launcher_id: String,
+    },
+    IntegrationStatus {
+        integrations: Vec<HostIntegrationStatus>,
+    },
+    IntegrationMutationPreview {
+        preview: HostIntegrationMutationPreview,
+    },
+    IntegrationMutation {
+        integrations: Vec<HostIntegrationMutationResult>,
+    },
+    IntegrationVerified {
+        integration: String,
+        shell_id: String,
+        run_id: String,
+        agents: Vec<AgentInstanceSnapshot>,
+    },
+    AgentSessions {
+        sessions: Vec<HostAgentSessionSummary>,
+    },
+    AgentSession {
+        session: HostAgentSessionInspection,
+    },
+    ResolvedAgentSession {
+        session: HostAgentSessionSummary,
+    },
+}
 
 pub fn protocol_capabilities() -> impl Iterator<Item = &'static str> {
     ProtocolFeature::ALL
@@ -1626,6 +1825,13 @@ pub enum Request {
         node_id: String,
         operation: RoutedOperation,
     },
+    HostService {
+        operation: HostServiceOperation,
+    },
+    RouteNodeHostService {
+        node_id: String,
+        operation: HostServiceOperation,
+    },
     Restart,
     RestartWithNotificationConfig {
         notifications: NotificationDeliveryConfig,
@@ -1866,6 +2072,15 @@ pub enum Request {
         expected_run_id: Option<String>,
         profile: TerminalProfile,
     },
+    ResumeAgentSession {
+        session_id: String,
+        profile: TerminalProfile,
+    },
+    ResumeNodeAgentSession {
+        node_id: String,
+        session_id: String,
+        profile: TerminalProfile,
+    },
 }
 
 impl Request {
@@ -1896,6 +2111,10 @@ impl Request {
             | Self::GuardedPauseAgentSchedule { .. }
             | Self::GuardedResumeAgentSchedule { .. }
             | Self::GuardedRemoveAgentSchedule { .. } => Some(ProtocolFeature::GuardedNodeRouting),
+            Self::HostService { .. }
+            | Self::RouteNodeHostService { .. }
+            | Self::ResumeAgentSession { .. }
+            | Self::ResumeNodeAgentSession { .. } => Some(ProtocolFeature::NodeHostServices),
             Self::AttachNode { .. }
             | Self::Attach {
                 owner_environment: true,
@@ -2024,6 +2243,9 @@ pub enum Response {
     },
     RoutedNodeOperation {
         result: RoutedOperationResult,
+    },
+    HostService {
+        result: HostServiceResult,
     },
     Snapshot {
         snapshot: Snapshot,
@@ -2639,8 +2861,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_thirty_five_with_minimum_six() {
-        assert_eq!(PROTOCOL_VERSION, 35);
+    fn protocol_version_is_thirty_six_with_minimum_six() {
+        assert_eq!(PROTOCOL_VERSION, 36);
         assert_eq!(MIN_PROTOCOL_VERSION, 6);
     }
 
@@ -3532,6 +3754,27 @@ mod tests {
                     },
                 ],
             ),
+            (
+                36,
+                vec![
+                    Request::HostService {
+                        operation: HostServiceOperation::DiscoverProjects,
+                    },
+                    Request::RouteNodeHostService {
+                        node_id: "node-1".into(),
+                        operation: HostServiceOperation::DiscoverProjects,
+                    },
+                    Request::ResumeAgentSession {
+                        session_id: "session-1".into(),
+                        profile: test_profile(),
+                    },
+                    Request::ResumeNodeAgentSession {
+                        node_id: "node-1".into(),
+                        session_id: "session-1".into(),
+                        profile: test_profile(),
+                    },
+                ],
+            ),
         ];
 
         for (expected, requests) in groups {
@@ -3670,6 +3913,18 @@ mod tests {
                     "protocol_35",
                     "remote_pty_attachment",
                     "owner_environment_attachment",
+                ][..],
+            ),
+            (
+                36,
+                &[
+                    "protocol_36",
+                    "typed_node_host_services",
+                    "remote_project_discovery",
+                    "remote_launcher_invocation",
+                    "remote_integration_management",
+                    "remote_agent_session_catalog",
+                    "remote_exact_session_resume",
                 ][..],
             ),
         ];

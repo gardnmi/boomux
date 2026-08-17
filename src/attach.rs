@@ -205,6 +205,38 @@ pub fn run(
     result
 }
 
+pub fn run_agent_session(
+    session_id: &str,
+    node_id: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let profile = terminal_profile()?;
+    let mut size = (
+        profile.rows,
+        profile.cols,
+        profile.pixel_width,
+        profile.pixel_height,
+    );
+    let client = client::connect_or_start()?;
+    let attachment = client.resume_agent_session(node_id, session_id, profile)?;
+    let _raw_mode = RawMode::enter()?;
+    let mut stdin = io::stdin().lock();
+    let mut stdout = io::stdout().lock();
+    let mut input = [0; 16 * 1024];
+    let mut focus = FocusTracking::default();
+    stdout.write_all(&attachment.reconstruction)?;
+    stdout.flush()?;
+    let mut stream = attachment.stream;
+    let _ = pump_attachment(
+        &mut stream,
+        &mut stdin,
+        &mut stdout,
+        &mut input,
+        &mut size,
+        &mut focus,
+    )?;
+    Ok(())
+}
+
 fn reconnect(
     client: &client::Client,
     shell_id: &str,

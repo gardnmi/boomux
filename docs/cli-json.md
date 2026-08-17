@@ -67,6 +67,14 @@ registered Node, the title includes its alias, and the hidden attachment carries
 the exact qualified identity. It does not add a JSON method or change legacy
 unqualified `open` semantics.
 
+Protocol 36 advertises `typed_node_host_services` and separate capabilities for
+remote project discovery, launcher invocation, integration management, Agent
+Session catalogs, and exact Session resume. Commands with `--node SELECTOR`
+resolve one registered Node and require its live verified protocol-36 service;
+unsupported owners fail visibly and are never emulated against local PATH,
+configuration, catalogs, or filesystems. Responses are live and transient and do
+not update the cached Node projection.
+
 That passive command advertises only what the installed local CLI can speak and
 never reports negotiated state for a registered Node. Implemented `node.list`
 and `node.inspect` return registration data only. Future combined projection data
@@ -172,8 +180,10 @@ Command payloads are:
 - `list`: a `shells` array.
 - `shells`: workspace identity plus a `shells` array.
 - `project.list`: `roots_configured`, a `projects` array, and a `warnings`
-  array. This command reads local configuration and the filesystem without
-  starting or contacting the daemon.
+  array. Without `--node` this command reads local configuration and the
+  filesystem without starting or contacting the daemon. With `--node`, the same
+  bounded discovery runs on the verified owner and contacts the local routing
+  daemon.
 - `workspace.list`: a `workspaces` array of `id`, `name`, `shell_count`,
   `launcher_count`, `schedule_count`, `agent_count`, fixed `agent_state_counts`, and
   `attention_count`.
@@ -315,6 +325,10 @@ Protocol 34 adds `protocol_34`, `typed_exact_node_routing`, and
 `guarded_remote_management`.
 Protocol 35 adds `protocol_35`, `remote_pty_attachment`, and
 `owner_environment_attachment`.
+Protocol 36 adds `protocol_36`, `typed_node_host_services`,
+`remote_project_discovery`, `remote_launcher_invocation`,
+`remote_integration_management`, `remote_agent_session_catalog`, and
+`remote_exact_session_resume`.
 
 Node snapshot health is `unobserved`, `online`, `reconnecting`, `stale`,
 `unreachable`, `authentication_required`, `identity_changed`,
@@ -524,6 +538,11 @@ exact ID returned by `session.list` resolves; external IDs, descriptions, shell
 IDs, and Agent IDs never resolve through `session.inspect`.
 All session commands require a negotiated daemon protocol of at least 12 and return
 `unsupported_version` before projection against an older daemon.
+`session list`, `session inspect`, and human-only `session resume` accept
+`--node SELECTOR` under protocol 36. Remote JSON responses add the exact
+`node_id`. Resume opens a local native terminal but resolves the opaque ID and
+executes the integration argv only on the owner; it creates no ordinary
+Workspace or Shell.
 
 ## Schedule Data
 

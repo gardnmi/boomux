@@ -555,6 +555,17 @@ impl WorkspaceView {
                     .any(|capability| capability == "remote_pty_attachment"))
     }
 
+    fn launcher_invokable(&self) -> bool {
+        self.local_actionable()
+            || (self.node.current
+                && !self.node.stale
+                && self
+                    .node
+                    .observed_capabilities
+                    .iter()
+                    .any(|capability| capability == "typed_node_host_services"))
+    }
+
     fn shell_count(&self) -> usize {
         self.items
             .iter()
@@ -2627,10 +2638,12 @@ impl App {
                 .shell_attachable()
                 .then(|| OpenTarget::Shell(workspace.qualify(&agent_shell.shell.id))),
             WorkspaceItemView::Launcher(launcher) => {
-                workspace.local_actionable().then(|| OpenTarget::Launcher {
-                    workspace_id,
-                    launcher_id: workspace.qualify(&launcher.id),
-                })
+                workspace
+                    .launcher_invokable()
+                    .then(|| OpenTarget::Launcher {
+                        workspace_id,
+                        launcher_id: workspace.qualify(&launcher.id),
+                    })
             }
             WorkspaceItemView::Schedule(_) => None,
         })?;

@@ -109,6 +109,8 @@ operations remain local-only. Protocol 34 adds closed typed exact-Node private
 reads and guarded management; unclassified mutation remains unavailable.
 Protocol 35 adds Node-qualified native-terminal attachment and owner-environment
 startup for remote pending and exited Shells.
+Protocol 36 adds closed typed Node host services and owner-executed exact Agent
+Session resume.
 
 ## Components
 
@@ -601,6 +603,17 @@ arbitrary `UnixEnvironment`; old wire values default it off. Remote handoff
 attachment and drops the old SSH bridge; the replacement discovers and verifies
 a fresh helper channel. No SSH child, remote PTY descriptor, process, cursor, or
 reconstruction state enters the handoff manifest.
+Protocol 36 adds `HostServiceOperation`, `RouteNodeHostService`, and separate
+streamed Agent Session resume requests. The closed union contains bounded project
+discovery, owner-side directory resolution, Shell name suggestion, exact stored
+launcher invocation, integration status and preview-bound mutation, verification,
+and bounded Agent Session list/inspect/resolve. It cannot represent arbitrary
+command execution. Remote integration previews are transient owner memory: commit
+consumes one opaque token only while its Node-local action, force policy, paths,
+and observed asset states still match. Exact Session resume resolves the opaque
+projected ID and constructs cwd/argv on the owner, then relays bounded attachment
+frames to a local native terminal without creating a Workspace or Shell. Host
+service responses do not update Node projection cache or publish events.
 Protocol-25 lists are daemon-bounded, newest-first pages with explicit limit and
 truncation. The request limit is optional on the wire; protocol 25 defaults it to
 100 and clamps it to 1 through 1,000, while protocol-23 and protocol-24 requests
