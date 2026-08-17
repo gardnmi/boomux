@@ -1,6 +1,5 @@
 use std::collections::HashSet;
 use std::env;
-#[cfg(test)]
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
@@ -9,10 +8,14 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use uuid::Uuid;
+
+use crate::federation::FederationHandshake;
+use crate::protocol::{self, Envelope, Request, Response};
 
 const MAX_SSH_TARGET_BYTES: usize = 1024;
 const MAX_REMOTE_EXECUTABLE_BYTES: usize = 4096;
@@ -65,6 +68,18 @@ pub enum RemoteArchitecture {
 pub struct RemotePlatform {
     pub operating_system: RemoteOperatingSystem,
     pub architecture: RemoteArchitecture,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteDiscovery {
+    pub platform: RemotePlatform,
+    pub executables: Vec<RemoteExecutable>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompatibleRemoteHelper {
+    pub executable: RemoteExecutable,
+    pub handshake: FederationHandshake,
 }
 
 impl RemotePlatform {
@@ -171,6 +186,7 @@ impl RemoteExecutable {
 }
 
 pub struct SshInvocation {
+    program: OsString,
     directory: PathBuf,
     config_path: PathBuf,
     control_path: PathBuf,
@@ -211,7 +227,7 @@ impl SshInvocation {
     }
 
     pub fn command(&self) -> Command {
-        let mut command = Command::new("ssh");
+        let mut command = Command::new(&self.program);
         command
             .arg("-F")
             .arg(&self.config_path)
@@ -279,6 +295,10 @@ impl SshInvocation {
         run_bounded_command(self.command(), timeout)
     }
 
+    pub fn verify_helper(&self, timeout: Duration) -> io::Result<FederationHandshake> {
+        run_helper_probe_command(self.command(), timeout)
+    }
+
     fn prepare_at(
         runtime_directory: &Path,
         user_config: Option<&Path>,
@@ -304,6 +324,24 @@ impl SshInvocation {
         target: SshTarget,
         remote_command: String,
         authentication: SshAuthenticationMode,
+    ) -> io::Result<Self> {
+        Self::prepare_command_with_program_at(
+            runtime_directory,
+            user_config,
+            target,
+            remote_command,
+            authentication,
+            OsStr::new("ssh"),
+        )
+    }
+
+    fn prepare_command_with_program_at(
+        runtime_directory: &Path,
+        user_config: Option<&Path>,
+        target: SshTarget,
+        remote_command: String,
+        authentication: SshAuthenticationMode,
+        program: &OsStr,
     ) -> io::Result<Self> {
         secure_runtime_directory(runtime_directory)?;
         let directory = runtime_directory.join(format!("ssh-{}", Uuid::new_v4()));
@@ -341,6 +379,7 @@ impl SshInvocation {
             return Err(error);
         }
         Ok(Self {
+            program: program.to_owned(),
             directory,
             config_path,
             control_path,
@@ -349,6 +388,140 @@ impl SshInvocation {
             authentication,
         })
     }
+}
+
+pub fn discover_remote(
+    target: SshTarget,
+    authentication: SshAuthenticationMode,
+    timeout: Duration,
+) -> io::Result<RemoteDiscovery> {
+    let socket_path = crate::client::socket_path()?;
+    let runtime_directory = socket_path
+        .parent()
+        .ok_or_else(|| io::Error::other("Boomux runtime socket has no parent"))?;
+    let user_config = env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .map(|home| home.join(".ssh/config"));
+    discover_remote_at(
+        runtime_directory,
+        user_config.as_deref(),
+        target,
+        authentication,
+        timeout,
+        OsStr::new("ssh"),
+    )
+}
+
+pub fn find_compatible_remote_helper(
+    target: SshTarget,
+    executables: &[RemoteExecutable],
+    authentication: SshAuthenticationMode,
+    timeout: Duration,
+) -> io::Result<CompatibleRemoteHelper> {
+    let socket_path = crate::client::socket_path()?;
+    let runtime_directory = socket_path
+        .parent()
+        .ok_or_else(|| io::Error::other("Boomux runtime socket has no parent"))?;
+    let user_config = env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .map(|home| home.join(".ssh/config"));
+    find_compatible_remote_helper_at(
+        runtime_directory,
+        user_config.as_deref(),
+        target,
+        executables,
+        authentication,
+        timeout,
+        OsStr::new("ssh"),
+    )
+}
+
+fn find_compatible_remote_helper_at(
+    runtime_directory: &Path,
+    user_config: Option<&Path>,
+    target: SshTarget,
+    executables: &[RemoteExecutable],
+    authentication: SshAuthenticationMode,
+    timeout: Duration,
+    program: &OsStr,
+) -> io::Result<CompatibleRemoteHelper> {
+    if timeout.is_zero() || timeout > MAX_PROBE_TIMEOUT {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "SSH helper selection timeout is outside the supported bound",
+        ));
+    }
+    let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "SSH helper selection timeout overflow",
+        )
+    })?;
+    for executable in executables {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "SSH helper selection timed out",
+            ));
+        }
+        let invocation = SshInvocation::prepare_command_with_program_at(
+            runtime_directory,
+            user_config,
+            target.clone(),
+            format!(
+                "{} __federation-stdio",
+                quote_posix_shell(executable.as_str())
+            ),
+            authentication,
+            program,
+        )?;
+        if let Ok(handshake) = invocation.verify_helper(remaining) {
+            return Ok(CompatibleRemoteHelper {
+                executable: executable.clone(),
+                handshake,
+            });
+        }
+    }
+    if Instant::now() >= deadline {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "SSH helper selection timed out",
+        ));
+    }
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        "no discovered remote Boomux executable is federation-compatible",
+    ))
+}
+
+fn discover_remote_at(
+    runtime_directory: &Path,
+    user_config: Option<&Path>,
+    target: SshTarget,
+    authentication: SshAuthenticationMode,
+    timeout: Duration,
+    program: &OsStr,
+) -> io::Result<RemoteDiscovery> {
+    let run = |probe: RemoteProbe| -> io::Result<SshProbeOutput> {
+        SshInvocation::prepare_command_with_program_at(
+            runtime_directory,
+            user_config,
+            target.clone(),
+            probe.command().to_owned(),
+            authentication,
+            program,
+        )?
+        .run_probe(timeout)
+    };
+    let platform = RemotePlatform::parse_probe(&run(RemoteProbe::Platform)?.stdout)?;
+    let executables = parse_executable_probe(&run(RemoteProbe::Executables)?.stdout)?;
+    Ok(RemoteDiscovery {
+        platform,
+        executables,
+    })
 }
 
 impl Drop for SshInvocation {
@@ -512,6 +685,136 @@ fn run_bounded_command(mut command: Command, timeout: Duration) -> io::Result<Ss
     Ok(SshProbeOutput { stdout, stderr })
 }
 
+fn run_helper_probe_command(
+    mut command: Command,
+    timeout: Duration,
+) -> io::Result<FederationHandshake> {
+    if timeout.is_zero() || timeout > MAX_PROBE_TIMEOUT {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "SSH helper probe timeout is outside the supported bound",
+        ));
+    }
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // The child has not executed remote or user code; `setsid` gives timeout
+    // cleanup one process-group boundary.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    let mut child = command.spawn()?;
+    let pid = i32::try_from(child.id()).map_err(|_| io::Error::other("child PID overflow"))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| io::Error::other("SSH helper stdin was not captured"))?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("SSH helper stdout was not captured"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::other("SSH helper stderr was not captured"))?;
+    let stderr_reader = spawn_bounded_reader(stderr, MAX_PROBE_STDERR_BYTES, "stderr")?;
+    let (result_sender, result_receiver) = mpsc::sync_channel(1);
+    let protocol_worker = thread::Builder::new()
+        .name("boomux-ssh-helper-probe".into())
+        .spawn(move || {
+            let result = (|| {
+                let handshake = crate::federation::read_handshake(&mut stdout)?;
+                if !(protocol::MIN_PROTOCOL_VERSION..=protocol::PROTOCOL_VERSION)
+                    .contains(&handshake.core_protocol_version)
+                {
+                    return Err(invalid_probe(
+                        "remote helper reported an incompatible core protocol",
+                    ));
+                }
+                protocol::write_message(
+                    &mut stdin,
+                    &Envelope::with_version(handshake.core_protocol_version, Request::Ping),
+                )?;
+                let response: Envelope<Response> = protocol::read_message(&mut stdout)?;
+                if response.version != handshake.core_protocol_version
+                    || response.message != Response::Pong
+                {
+                    return Err(invalid_probe(
+                        "remote helper returned an invalid compatibility response",
+                    ));
+                }
+                Ok(handshake)
+            })();
+            let _ = result_sender.send(result);
+        })?;
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "SSH probe timeout overflow"))?;
+    let result = match result_receiver.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "SSH helper handshake timed out",
+        )),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err(io::Error::other("SSH helper probe worker stopped"))
+        }
+    };
+    let status = if result.is_err() {
+        kill_process_group(pid, &mut child)?;
+        None
+    } else {
+        let status = loop {
+            if let Some(status) = child.try_wait()? {
+                break Some(status);
+            }
+            if Instant::now() >= deadline {
+                kill_process_group(pid, &mut child)?;
+                break None;
+            }
+            thread::sleep(CHILD_POLL_INTERVAL);
+        };
+        // The SSH leader can exit while a descendant still owns a pipe.
+        kill_process_group(pid, &mut child)?;
+        status
+    };
+    protocol_worker
+        .join()
+        .map_err(|_| io::Error::other("SSH helper probe worker panicked"))?;
+    let (_, stderr_truncated) = join_bounded_reader(stderr_reader)?;
+    if stderr_truncated {
+        return Err(invalid_probe("SSH helper stderr exceeds the size limit"));
+    }
+    if result.is_ok() && status.is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "SSH helper did not exit before the compatibility deadline",
+        ));
+    }
+    if status.is_some_and(|status| !status.success()) {
+        return Err(io::Error::other("SSH helper exited unsuccessfully"));
+    }
+    result
+}
+
+fn kill_process_group(pid: i32, child: &mut std::process::Child) -> io::Result<()> {
+    if unsafe { libc::kill(-pid, libc::SIGKILL) } == -1 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            return Err(error);
+        }
+    }
+    let _ = child.wait();
+    Ok(())
+}
+
 fn spawn_bounded_reader(
     mut reader: impl Read + Send + 'static,
     limit: usize,
@@ -545,9 +848,18 @@ fn command_arguments(command: &Command) -> Vec<OsString> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::federation::{FEDERATION_VERSION, FederationConnectionMode};
 
     fn runtime_directory() -> PathBuf {
         env::temp_dir().join(format!("boomux-ssh-{}", Uuid::new_v4()))
+    }
+
+    fn shell_printf(bytes: &[u8]) -> String {
+        let escaped = bytes
+            .iter()
+            .map(|byte| format!("\\{byte:03o}"))
+            .collect::<String>();
+        format!("printf '{escaped}'")
     }
 
     #[test]
@@ -759,5 +1071,201 @@ mod tests {
                 .kind(),
             io::ErrorKind::InvalidInput
         );
+    }
+
+    #[test]
+    fn helper_probe_verifies_handshake_and_ping_on_one_channel() {
+        let handshake = FederationHandshake {
+            version: FEDERATION_VERSION,
+            node_id: Uuid::new_v4().to_string(),
+            helper_version: "0.18.0".into(),
+            core_protocol_version: protocol::PROTOCOL_VERSION,
+            connection_mode: FederationConnectionMode::AdHoc,
+        };
+        let mut handshake_bytes = Vec::new();
+        crate::federation::write_handshake(&mut handshake_bytes, &handshake).unwrap();
+        let mut request_bytes = Vec::new();
+        protocol::write_message(
+            &mut request_bytes,
+            &Envelope::with_version(protocol::PROTOCOL_VERSION, Request::Ping),
+        )
+        .unwrap();
+        let mut response_bytes = Vec::new();
+        protocol::write_message(
+            &mut response_bytes,
+            &Envelope::with_version(protocol::PROTOCOL_VERSION, Response::Pong),
+        )
+        .unwrap();
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            &format!(
+                "{}; dd bs=1 count={} of=/dev/null 2>/dev/null; {}",
+                shell_printf(&handshake_bytes),
+                request_bytes.len(),
+                shell_printf(&response_bytes),
+            ),
+        ]);
+
+        assert_eq!(
+            run_helper_probe_command(command, Duration::from_secs(1)).unwrap(),
+            handshake
+        );
+    }
+
+    #[test]
+    fn helper_probe_rejects_invalid_handshakes_and_timeouts() {
+        let mut invalid = Command::new("sh");
+        invalid.args(["-c", "printf 'NOTMAGIC'"]);
+        assert_eq!(
+            run_helper_probe_command(invalid, Duration::from_secs(1))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        let started = Instant::now();
+        let mut timeout = Command::new("sh");
+        timeout.args(["-c", "sleep 5"]);
+        assert_eq!(
+            run_helper_probe_command(timeout, Duration::from_millis(50))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn helper_selection_skips_incompatible_discovered_executables() {
+        let runtime = runtime_directory();
+        fs::create_dir_all(&runtime).unwrap();
+        let ssh = runtime.join("ssh");
+        let handshake = FederationHandshake {
+            version: FEDERATION_VERSION,
+            node_id: Uuid::new_v4().to_string(),
+            helper_version: "0.18.0".into(),
+            core_protocol_version: protocol::PROTOCOL_VERSION,
+            connection_mode: FederationConnectionMode::AdHoc,
+        };
+        let mut handshake_bytes = Vec::new();
+        crate::federation::write_handshake(&mut handshake_bytes, &handshake).unwrap();
+        let mut request_bytes = Vec::new();
+        protocol::write_message(
+            &mut request_bytes,
+            &Envelope::with_version(protocol::PROTOCOL_VERSION, Request::Ping),
+        )
+        .unwrap();
+        let mut response_bytes = Vec::new();
+        protocol::write_message(
+            &mut response_bytes,
+            &Envelope::with_version(protocol::PROTOCOL_VERSION, Response::Pong),
+        )
+        .unwrap();
+        fs::write(
+            &ssh,
+            format!(
+                "#!/bin/sh\nlast=\nfor arg do last=$arg; done\ncase \"$last\" in\n  \"'/bad/boomux' __federation-stdio\") printf 'NOTMAGIC' ;;\n  \"'/good/boomux' __federation-stdio\") {}; dd bs=1 count={} of=/dev/null 2>/dev/null; {} ;;\n  *) exit 64 ;;\nesac\n",
+                shell_printf(&handshake_bytes),
+                request_bytes.len(),
+                shell_printf(&response_bytes),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+        let candidates = [
+            RemoteExecutable::parse("/bad/boomux").unwrap(),
+            RemoteExecutable::parse("/good/boomux").unwrap(),
+        ];
+
+        let compatible = find_compatible_remote_helper_at(
+            &runtime,
+            None,
+            SshTarget::parse("workbox").unwrap(),
+            &candidates,
+            SshAuthenticationMode::Batch,
+            Duration::from_secs(1),
+            ssh.as_os_str(),
+        )
+        .unwrap();
+        assert_eq!(compatible.executable, candidates[1]);
+        assert_eq!(compatible.handshake, handshake);
+        assert_eq!(
+            fs::read_dir(&runtime)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().starts_with("ssh-"))
+                .count(),
+            0
+        );
+        fs::remove_dir_all(runtime).unwrap();
+    }
+
+    #[test]
+    fn discovery_runs_fixed_probes_through_the_real_ssh_argv_boundary() {
+        let runtime = runtime_directory();
+        fs::create_dir_all(&runtime).unwrap();
+        let log = runtime.join("arguments");
+        let ssh = runtime.join("ssh");
+        let quoted_log = quote_posix_shell(log.to_str().unwrap());
+        fs::write(
+            &ssh,
+            format!(
+                "#!/bin/sh\nprintf 'call\\0' >> {quoted_log}\nfor arg do printf '%s\\0' \"$arg\" >> {quoted_log}; done\nprintf 'end\\0' >> {quoted_log}\nlast=\nfor arg do last=$arg; done\ncase \"$last\" in\n  *boomux-platform-v1*) printf 'boomux-platform-v1\\0Linux\\0x86_64\\0' ;;\n  *boomux-executables-v1*) printf 'boomux-executables-v1\\0/usr/bin/boomux\\0/opt/homebrew/bin/boomux\\0' ;;\n  *) exit 64 ;;\nesac\n"
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let discovery = discover_remote_at(
+            &runtime,
+            Some(Path::new("/home/person/.ssh/config")),
+            SshTarget::parse("user@workbox").unwrap(),
+            SshAuthenticationMode::Interactive,
+            Duration::from_secs(1),
+            ssh.as_os_str(),
+        )
+        .unwrap();
+        assert_eq!(
+            discovery.platform,
+            RemotePlatform {
+                operating_system: RemoteOperatingSystem::Linux,
+                architecture: RemoteArchitecture::X86_64,
+            }
+        );
+        assert_eq!(
+            discovery
+                .executables
+                .iter()
+                .map(RemoteExecutable::as_str)
+                .collect::<Vec<_>>(),
+            ["/usr/bin/boomux", "/opt/homebrew/bin/boomux"]
+        );
+
+        let arguments = fs::read(&log).unwrap();
+        let fields = arguments
+            .split(|byte| *byte == 0)
+            .filter(|field| !field.is_empty())
+            .map(|field| std::str::from_utf8(field).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(fields.iter().filter(|field| **field == "call").count(), 2);
+        assert_eq!(
+            fields
+                .iter()
+                .filter(|field| **field == "user@workbox")
+                .count(),
+            2
+        );
+        assert!(fields.contains(&PLATFORM_PROBE_COMMAND));
+        assert!(fields.contains(&EXECUTABLE_PROBE_COMMAND));
+        assert_eq!(
+            fs::read_dir(&runtime)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().starts_with("ssh-"))
+                .count(),
+            0
+        );
+        fs::remove_dir_all(runtime).unwrap();
     }
 }
