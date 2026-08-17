@@ -51,6 +51,10 @@
 - **Scheduled Agent authority:** [`scheduled-agent-work.md`](scheduled-agent-work.md)
   defines the boundary between manual and timed dispatch, concurrency policy,
   process outcome, and authoritative Agent lifecycle.
+- **Remote Node authority:** [`remote-nodes.md`](remote-nodes.md) defines the
+  accepted federation boundary: one owning Node remains authoritative, SSH is a
+  route, and local cached projections never authorize mutation or lifecycle
+  inference. Implementation is tracked by #173 and is not yet shipped.
 
 ## Product Boundary
 
@@ -70,6 +74,22 @@ terminal emulator
 The terminal emulator remains responsible for rendering, fonts, themes,
 selection, clipboard integration, and window behavior. Boomux provides process
 persistence across attachment disconnects, naming, grouping, and orchestration.
+
+### Accepted Federation Boundary
+
+Remote Node federation is an accepted but not yet implemented extension of this
+product boundary. A remote daemon, not a local SSH process, owns its remote PTYs,
+processes, Workspaces, and runtime identities. The local daemon can later retain
+a bounded prompt-free projection for its TUI, CLI integrations, and desktop
+presentation, but that projection remains separate from the authoritative local
+registry and becomes visibly stale when its owner cannot be reached.
+
+The transport follows the existing client/server split: an authenticated fixed
+SSH stdio helper verifies a stable remote Node identity, then carries one
+ordinary negotiated daemon protocol stream to the remote Unix socket. It does
+not expose a TCP listener or the local daemon socket. Remote work continues when
+the SSH bridge or local presentation disconnects. The complete accepted contract
+and deferred behavior are in [`remote-nodes.md`](remote-nodes.md).
 
 ## Components
 
@@ -96,7 +116,9 @@ output, resize, and detach events. Old-peer response transforms remain isolated
 in the daemon compatibility boundary and use the same feature registry when
 deciding which fields, values, and events to downgrade.
 
-The domain has five durable identities:
+The implemented protocol has seven durable identities beneath its implicit
+local Node. Federation will qualify each existing identity with a stable owning
+Node without rewriting the inner ID:
 
 - A workspace is a globally named shell container with a UUID and an optional
   default working directory for newly created shells. The default is creation
@@ -115,6 +137,12 @@ The domain has five durable identities:
   exactly one shell run. It owns no process or PTY. Its latest explicit
   observation records state, reporting authority, evidence, confidence,
   revision, and time; completion is terminal and durable.
+- An Agent Schedule is a durable recurring-work definition owned by one
+  Workspace. It owns its trigger and prompt revisions but no process or Agent
+  lifecycle state.
+- A Scheduled Execution is one durable manual or timed decision bound to exact
+  Schedule revisions. It can later link a ShellRun and Agent Instance without
+  merging those identities.
 
 There are no separate tab, pane, and terminal identity layers.
 
@@ -783,6 +811,13 @@ Protocol 27 adds paused, revision-conditional schedule definition updates and
 prompt-free `agent_schedule_updated` events. Protocol-26 peers filter those
 events while advancing their cursor. State schema remains 12.
 
+Remote Node federation is tracked by #173 and has no assigned shipped protocol,
+state, or handoff version. Its compatibility contract requires older clients to
+retain local-only meaning, a separately versioned pre-protocol SSH identity
+handshake, and explicit schemas for Node identity, registrations, and disposable
+projection cache. A future implementation must update this protocol history only
+when those exact source versions are established.
+
 Cron day matching preserves syntactic wildcard origin: `*/n` is wildcard-origin,
 while numeric lists and ranges remain restricted even when they cover the full
 field. Trigger acceptance proves at least one occurrence across a Gregorian
@@ -845,6 +880,17 @@ writes, fsync, rename, and directory fsync therefore never retain locks required
 by PTY readers. Shell close, workspace close, and shutdown use one lifecycle
 transaction policy: prepare every runtime stop, finalize visible lifecycle
 changes, apply the operation-specific durable removal, persist, then publish.
+
+The accepted remote federation coordinator remains outside this core durable
+order. Its order is daemon transition, Node mutation gate, Node persistence gate,
+local `EventStream` transition frontier, then Node registry/cache state. It never
+acquires core durable, shell lifecycle, runtime, or terminal locks and never
+retains a federation lock during SSH I/O. A copied registration revision is
+revalidated only after network work and before an atomic cache or registration
+commit. Notification qualification and delivery occur after every federation and
+event lock is released. This is an accepted future invariant; each federation
+delivery issue must preserve the applicable part as the coordinator is built.
+
 Failure at any stage restores removed entities and exhaustively compensates every
 stopped shell. Already-running processes cannot be resurrected, so their
 compensated durable state is pending with a terminated last run; exited shells

@@ -3,6 +3,21 @@
 > **Status: Canonical terminology.** These product distinctions govern naming
 > and semantics even when implementation names are less precise.
 
+## Boomux Node
+
+A durable authority for the Workspaces and runtime identities it owns. A Node is
+identified independently from any hostname, SSH destination, network address,
+or other route used to reach it. A route changing does not change Node identity,
+and a route resolving to a different Node does not transfer ownership.
+
+Every Workspace belongs to exactly one Node. Resource identity across Nodes is
+the pair of owning Node identity and the resource's unchanged Node-local
+identity. The Node is an outer name-resolution scope: Workspace names are unique
+within a Node, while Shell, launcher, Agent Schedule, and other names retain
+their existing Workspace or identity-specific scopes. A projection of another
+Node can be stale or unavailable, but never becomes authoritative and cannot
+establish lifecycle completion or authorize mutation.
+
 ## Workspace Launcher
 
 A durable detached argument-vector command associated with a workspace and invoked on every

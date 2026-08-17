@@ -74,6 +74,28 @@ graceful daemon restart. Cold startup creates a new stream, so cursors from a
 stopped or crashed daemon expire. Event history is intentionally memory-backed;
 the durable registry remains the cold-recovery authority.
 
+### Accepted Federation Rules
+
+Remote Node federation is not yet implemented, but its event boundary is fixed
+by [`remote-nodes.md`](remote-nodes.md). Each Node retains its own stream UUID,
+event IDs, retention, baseline, and cursor authority. There is no cross-Node
+event order, and timestamps cannot be used to fabricate one.
+
+A local federation coordinator persists one independently bounded prompt-free
+projection and remote cursor per registered Node. It publishes only a local
+projection invalidation after that cache replacement and cursor are persisted;
+it does not copy remote domain events into the authoritative local journal.
+Local clients can therefore continue using one local cursor that orders local
+observations without reinterpreting a remote mutation as local authority.
+
+Remote cursor expiry reseeds only the affected Node. A disconnect marks its
+cached projection stale and publishes no Agent completion, execution outcome,
+attention acknowledgment, Schedule decision, or replacement dispatch. Recovered
+baselines update presentation but emit neither historical notifications nor a
+reconnect digest because the expired stream cannot prove which transitions were
+unseen. Older clients remain local-only and do not receive federation
+invalidations when the future capability is filtered.
+
 ## Events
 
 The event vocabulary is:

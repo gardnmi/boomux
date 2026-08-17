@@ -41,6 +41,41 @@ The `sound_notifications` feature similarly advertises optional direct sound
 delivery through `canberra-gtk-play`. `boomux notification test` is a human-facing
 delivery diagnostic and does not support `--json`.
 
+### Accepted Remote Node Compatibility
+
+Remote Node federation is an accepted, unimplemented extension tracked by #173.
+No current `boomux.cli/v1` command implies remote behavior. When the capability
+ships, it must be advertised explicitly by `capabilities`; clients must not infer
+support from a CLI or daemon version string.
+
+That passive command advertises only what the installed local CLI can speak and
+never reports negotiated state for a registered Node. Future `node.list`,
+`node.inspect`, and combined projection data carry each Node's observed protocol,
+capabilities, health, and observation time after contacting only the local
+daemon. Integrations must keep static CLI support distinct from per-Node runtime
+support.
+
+Existing unqualified commands and JSON methods retain local-Node meaning and
+local-only result sets. Older clients continue to receive only local resources.
+New, separately named combined read-only surfaces can expose Node identity,
+health, observation time, and stale state, while every actionable resource is
+identified structurally by both its owning Node ID and unchanged resource ID.
+Names are resolved only within an explicit Node context when they are not local.
+
+Cached remote projections can satisfy only documented prompt-free summary reads.
+Exact private inspection, terminal output, revision waits, and all mutations
+require a live identity-verified connection to the owning Node. Offline writes
+are never queued. Transport loss after an ambiguous write without an explicit
+wire idempotency key returns a stable unknown-outcome error rather than replaying
+the request. Identity change and unavailable-Node failures are also typed errors,
+not message-parsed states.
+
+Node registration and SSH bootstrap are separately authorized operations.
+Per-Node observed capabilities must distinguish passive combined projection from
+process-starting, destructive, integration-management, Schedule, and
+exact-attachment support. The full compatibility and privacy rules are defined
+in [`remote-nodes.md`](remote-nodes.md).
+
 The following commands support `--json`:
 
 - `boomux capabilities`
