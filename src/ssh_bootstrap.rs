@@ -3,11 +3,14 @@ use std::env;
 #[cfg(test)]
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use uuid::Uuid;
 
@@ -16,6 +19,9 @@ const MAX_REMOTE_EXECUTABLE_BYTES: usize = 4096;
 const MAX_CONTROL_PATH_BYTES: usize = 100;
 const MAX_PROBE_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_DISCOVERED_EXECUTABLES: usize = 32;
+const MAX_PROBE_STDERR_BYTES: usize = 16 * 1024;
+const MAX_PROBE_TIMEOUT: Duration = Duration::from_secs(120);
+const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const PLATFORM_PROBE_PREFIX: &[u8] = b"boomux-platform-v1";
 const EXECUTABLE_PROBE_PREFIX: &[u8] = b"boomux-executables-v1";
 
@@ -173,6 +179,14 @@ pub struct SshInvocation {
     authentication: SshAuthenticationMode,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshProbeOutput {
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
+type BoundedReader = thread::JoinHandle<io::Result<(Vec<u8>, bool)>>;
+
 impl SshInvocation {
     pub fn prepare(
         target: SshTarget,
@@ -211,7 +225,7 @@ impl SshInvocation {
             .args(["-o", "StdinNull=no"])
             .args(["-o", "SessionType=default"])
             .args(["-o", "ControlMaster=auto"])
-            .args(["-o", "ControlPersist=60"])
+            .args(["-o", "ControlPersist=no"])
             .arg("-o")
             .arg(format!(
                 "ControlPath={}",
@@ -259,6 +273,10 @@ impl SshInvocation {
 
     pub fn control_path(&self) -> &Path {
         &self.control_path
+    }
+
+    pub fn run_probe(&self, timeout: Duration) -> io::Result<SshProbeOutput> {
+        run_bounded_command(self.command(), timeout)
     }
 
     fn prepare_at(
@@ -419,6 +437,104 @@ fn parse_nul_fields<'a>(output: &'a [u8], prefix: &[u8]) -> io::Result<Vec<&'a [
 
 fn invalid_probe(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+fn run_bounded_command(mut command: Command, timeout: Duration) -> io::Result<SshProbeOutput> {
+    if timeout.is_zero() || timeout > MAX_PROBE_TIMEOUT {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "SSH probe timeout is outside the supported bound",
+        ));
+    }
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // The child has not executed remote or user code; `setsid` creates a process
+    // group that can be terminated and reaped as one bounded probe.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    let mut child = command.spawn()?;
+    let pid = i32::try_from(child.id()).map_err(|_| io::Error::other("child PID overflow"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("SSH probe stdout was not captured"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::other("SSH probe stderr was not captured"))?;
+    let stdout_reader = spawn_bounded_reader(stdout, MAX_PROBE_OUTPUT_BYTES, "stdout")?;
+    let stderr_reader = spawn_bounded_reader(stderr, MAX_PROBE_STDERR_BYTES, "stderr")?;
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "SSH probe timeout overflow"))?;
+
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break Some(status);
+        }
+        if Instant::now() >= deadline {
+            // Negative PID addresses the process group created by `setsid`.
+            if unsafe { libc::kill(-pid, libc::SIGKILL) } == -1 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::ESRCH) {
+                    return Err(error);
+                }
+            }
+            let _ = child.wait();
+            break None;
+        }
+        thread::sleep(CHILD_POLL_INTERVAL);
+    };
+
+    let (stdout, stdout_truncated) = join_bounded_reader(stdout_reader)?;
+    let (stderr, stderr_truncated) = join_bounded_reader(stderr_reader)?;
+    if status.is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "SSH probe timed out",
+        ));
+    }
+    if stdout_truncated || stderr_truncated {
+        return Err(invalid_probe("SSH probe output exceeds the size limit"));
+    }
+    if !status.expect("checked above").success() {
+        return Err(io::Error::other("SSH probe exited unsuccessfully"));
+    }
+    Ok(SshProbeOutput { stdout, stderr })
+}
+
+fn spawn_bounded_reader(
+    mut reader: impl Read + Send + 'static,
+    limit: usize,
+    stream: &'static str,
+) -> io::Result<BoundedReader> {
+    thread::Builder::new()
+        .name(format!("boomux-ssh-{stream}"))
+        .spawn(move || {
+            let mut bytes = Vec::new();
+            reader
+                .by_ref()
+                .take((limit + 1) as u64)
+                .read_to_end(&mut bytes)?;
+            let truncated = bytes.len() > limit;
+            bytes.truncate(limit);
+            Ok((bytes, truncated))
+        })
+}
+
+fn join_bounded_reader(reader: BoundedReader) -> io::Result<(Vec<u8>, bool)> {
+    reader
+        .join()
+        .map_err(|_| io::Error::other("SSH probe output reader panicked"))?
 }
 
 #[cfg(test)]
@@ -592,5 +708,56 @@ mod tests {
         assert_eq!(arguments.last().unwrap(), PLATFORM_PROBE_COMMAND);
         drop(invocation);
         fs::remove_dir_all(runtime).unwrap();
+    }
+
+    #[test]
+    fn bounded_runner_captures_output_and_classifies_exit() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "printf stdout; printf stderr >&2"]);
+        let output = run_bounded_command(command, Duration::from_secs(1)).unwrap();
+        assert_eq!(output.stdout, b"stdout");
+        assert_eq!(output.stderr, b"stderr");
+
+        let mut command = Command::new("sh");
+        command.args(["-c", "exit 7"]);
+        assert_eq!(
+            run_bounded_command(command, Duration::from_secs(1))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Other
+        );
+    }
+
+    #[test]
+    fn bounded_runner_kills_process_group_on_timeout() {
+        let started = Instant::now();
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 5"]);
+        assert_eq!(
+            run_bounded_command(command, Duration::from_millis(50))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn bounded_runner_rejects_oversized_output_and_timeout() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "head -c 70000 /dev/zero"]);
+        assert_eq!(
+            run_bounded_command(command, Duration::from_secs(1))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        assert_eq!(
+            run_bounded_command(Command::new("true"), Duration::ZERO)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
     }
 }
