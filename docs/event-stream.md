@@ -41,6 +41,13 @@ Protocol 32 adds owner-side reduced Node projection cuts and the local
 Protocol 37 adds remote Schedule management and execution observation without a
 new event kind: owner events remain owner-local and the presenting Node receives
 only its existing projection invalidation.
+Protocol 39 adds live Node-qualified focused-terminal presentation to the
+combined Node snapshot and the prompt-free
+`focused_terminal_presentation_changed` invalidation event. The event wakes
+local presentation clients without carrying the focused identity; clients read
+the combined snapshot for the current value. It is not copied into another
+Node's projection transitions or persisted projection cache. A one-second
+ephemeral refresh remains the fallback for legacy or missed invalidations.
 Remote notification presentation adds no protocol or event kind. It consumes the
 protocol-32 reduced transition batch at the projection-cache boundary and never
 copies owner events into the presenting Node's domain journal.
@@ -126,6 +133,7 @@ The event vocabulary is:
   `agent_schedule_resumed`, `agent_schedule_removed`
 - `scheduled_execution_created`, `scheduled_execution_changed`
 - `node_projection_changed`
+- `focused_terminal_presentation_changed`
 - `handoff_completed`
 
 Output events carry run identity and the latest output revision, not raw PTY

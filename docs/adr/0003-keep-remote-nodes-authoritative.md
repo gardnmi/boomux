@@ -1,6 +1,6 @@
 # Keep Remote Nodes Authoritative
 
-Status: Accepted; implementation pending
+Status: Accepted for runtime resources; Workspace ownership superseded by ADR 0004
 
 Remote Workspaces and their Shells, ShellRuns, Agent Instances, Schedules,
 Scheduled Executions, PTYs, and processes remain authoritative on one remote

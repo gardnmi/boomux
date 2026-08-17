@@ -36,8 +36,12 @@ fn shell_name_suggestion_is_stable_non_mutating_cli_data() {
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["schema"], "boomux.cli/v1");
     assert_eq!(value["command"], "shell.suggest-name");
+    assert_eq!(
+        value["data"]["node_id"],
+        daemon.client.node_identity().unwrap()
+    );
     assert_eq!(value["data"]["workspace_id"], workspace.id);
-    assert_eq!(value["data"].as_object().unwrap().len(), 2);
+    assert_eq!(value["data"].as_object().unwrap().len(), 3);
     let name = value["data"]["name"].as_str().unwrap();
     assert!(!name.is_empty());
     assert_generated_name(name);

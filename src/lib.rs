@@ -8,6 +8,7 @@ mod fd_transfer;
 pub mod federation;
 #[allow(dead_code)]
 mod generated_names;
+pub(crate) mod global_workspace_store;
 mod handoff;
 pub mod host_services;
 #[allow(dead_code)]

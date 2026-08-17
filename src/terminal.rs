@@ -164,13 +164,18 @@ fn open_with_expected_run(
 }
 
 pub fn open_node_add(desktop_entry: Option<&str>) -> Result<(), Box<dyn Error>> {
+    let arguments = node_add_arguments();
     launch(
         desktop_entry,
         "Add Boomux Node",
         None,
         attachment_executable()?.as_os_str(),
-        &["node".into(), "add".into()],
+        &arguments,
     )
+}
+
+fn node_add_arguments() -> [OsString; 1] {
+    ["__guided-node-add".into()]
 }
 
 fn launch(
@@ -411,6 +416,11 @@ mod tests {
             .map(OsStr::new)
             .map(OsStr::to_owned)
         );
+    }
+
+    #[test]
+    fn guided_node_add_uses_only_the_hidden_wrapper_argument() {
+        assert_eq!(node_add_arguments(), [OsString::from("__guided-node-add")]);
     }
 
     #[test]

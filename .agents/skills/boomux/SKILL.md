@@ -1,10 +1,10 @@
 ---
 name: boomux
-description: Inspect and manage Boomux persistent terminal workspaces, launchers, shells, run-scoped agent instances, attention, projected sessions, recurring Agent schedules, notifications, process supervision, and integrations. Use when asked to discover shells, agents, sessions, or schedules, read terminal output, manage explicitly authorized recurring Agent prompts, supervise an explicitly identified external session, report agent lifecycle state, configure or test notifications, install or remove the OpenCode or Pi integration, create or open workspaces and shells, inspect status, rename or close targets, or manage the Boomux daemon.
-compatibility: Requires boomux on PATH. Some name operations require Boomux workspace context or an explicit --workspace; schedule names require BOOMUX_WORKSPACE_ID or explicit --workspace; agent mutation and supervision require exact shell-run context, and continuation schedules or supervision require caller-supplied exact canonical session identity.
+description: Inspect and manage Boomux Nodes, coordinated persistent terminal Workspaces, launchers, shells, run-scoped agent instances, attention, projected sessions, recurring Agent schedules, notifications, process supervision, and integrations. Use when asked to discover Nodes, shells, agents, sessions, or schedules, read terminal output, manage explicitly authorized recurring Agent prompts, supervise an explicitly identified external session, report agent lifecycle state, configure or test notifications, install or remove the OpenCode or Pi integration, create or open Workspaces and shells, inspect status, rename or close targets, or manage the local Boomux daemon.
+compatibility: Requires boomux on PATH. Federated resource identity is the pair of owning Node ID and Node-local inner ID. Some name operations require Workspace context or an explicit --workspace/--node; agent mutation and supervision require exact shell-run context, and continuation schedules or supervision require caller-supplied exact canonical session identity.
 metadata:
   author: boomux
-  version: "14"
+  version: "15"
 ---
 
 # Boomux
@@ -26,7 +26,7 @@ Inside a Boomux shell, discover siblings with:
 boomux shells
 ```
 
-Outside Boomux, discover every shell with:
+Outside Boomux, discover shells owned by the local Node with:
 
 ```console
 boomux list
@@ -38,7 +38,14 @@ Use these commands for structured inspection:
 boomux workspace list
 boomux workspace inspect "<workspace-name-or-id>"
 boomux shell inspect "<shell-name-or-id>" --workspace "<workspace-name-or-id>"
+boomux node snapshot --json
 ```
+
+`node snapshot` is the combined qualified view. Every projected Node-owned
+resource identity is `(node_id, inner_id)`; retain both fields together. Never
+route a remote inner ID without its owning Node ID. Cached remote rows can be
+stale and are suitable only for documented prompt-free summaries, not authority,
+private inspection, terminal reads, or mutation.
 
 For machine-readable inspection, add `--json`. Supported commands emit the
 stable `boomux.cli/v1` envelope. Discover the exact command, feature, and
@@ -49,10 +56,10 @@ boomux capabilities --json
 ```
 
 Parse `data` on success and `error.code` on a nonzero exit; do not parse human
-tables or `error.message`. JSON mutation support includes Agent register,
-ensure, and report; attention acknowledgment; schedule create, pause, resume,
-remove, and run; execution cancellation; and integration installation and
-uninstallation.
+tables or `error.message`. JSON mutation support includes Node registration
+management, Agent lifecycle reporting, attention acknowledgment, Schedule
+management, execution open/cancellation, and integration management. Treat this
+as illustrative; `capabilities.data.json_commands` is authoritative.
 
 Most daemon-backed inspection commands automatically start Boomux when it is
 not running. This includes `list`, `shells`, `read`, `events`, workspace, shell,
@@ -60,6 +67,42 @@ and launcher inspection, Agent, attention, session, and schedule inspection, and
 `doctor`. Use `boomux daemon status` first when starting the daemon would be an
 unwanted side effect. `capabilities`, `project list`, `integration list`, and
 `integration status` do not start it.
+
+## Manage Nodes And Federation
+
+Inspect or register persistent identity-pinned OpenSSH routes with:
+
+```console
+boomux node list --json
+boomux node inspect "<node-alias-or-id>" --json
+boomux node snapshot --json
+boomux node add "<alias>" "<user@host>"
+boomux node rename "<node>" "<new-alias>" --revision <revision> --json
+boomux node retarget "<node>" "<user@host>" --revision <revision> --json
+boomux node forget "<node>" --json
+boomux node rekey
+```
+
+`node add` verifies and pins the remote Node identity. Interactive setup may,
+after explicit confirmation, install or replace a remote helper and gracefully
+restart an incompatible remote daemon. JSON setup never approves installation;
+it returns typed `install_required` or `upgrade_required`. Retargeting must prove
+the pinned identity before replacing the route. Forget removes only the local
+registration and cached projection; it does not contact or delete the owner.
+`node rekey` changes this Node's durable identity and is local, interactive, and
+human-only; use it only after the command's exact confirmation requirements are
+explicitly authorized.
+
+For one unregistered ad hoc route, `boomux --remote "<user@host>" ...` uses a
+temporary verified connection and does not persist registration. Registered and
+ad hoc routes do not make hostnames or addresses resource identities.
+
+Node-qualified host operations include `project list`, launcher invocation,
+integration management, Session catalogs/resume, Schedule and execution
+management, and `open`. Preserve the same explicit `--node` on every follow-up
+operation. Remote paths, commands, catalogs, and integration assets are resolved
+only by their owning Node. Daemon status, restart, and stop remain local and are
+not routed through registration.
 
 Inspect bundled lifecycle integrations with:
 
@@ -227,6 +270,10 @@ Discover projected session metadata with:
 boomux session list --json
 boomux session list --workspace "<workspace-name-or-id>" --json
 boomux session inspect "<exact-session-id>" --json
+boomux session resume "<exact-session-id>"
+boomux session list --node "<node>" --json
+boomux session inspect "<exact-session-id>" --node "<same-node>" --json
+boomux session resume "<exact-session-id>" --node "<same-node>"
 ```
 
 Use the exact opaque session ID returned by `session list`. Never guess or
@@ -236,7 +283,9 @@ run of a running retained shell; otherwise it is last-known. Catalog-only
 OpenCode history has state `unknown`, no fabricated occurrence, and a sanitized
 host title. Registered-session descriptions remain durable Agent names.
 Protocol-13 sessions retain a `source_cwd` after shell removal so an exact
-canonical session can be resumed in its original context.
+canonical session can be resumed in its original context. Resume launches a
+native host process and requires authorization. A remote Session ID is exact
+only within its owning Node; keep the same `--node` used for discovery.
 
 ## Manage Agent Schedules
 
@@ -247,7 +296,7 @@ unattended Agent process and tool activity; never pass `--enabled` or run
 `schedule resume` without explicit authorization for that continuing effect.
 
 ```console
-boomux schedule create "<name>" --workspace "<workspace-name-or-id>" --cwd "/absolute/project/path" --integration opencode --prompt-file "/path/to/prompt.txt" --weekdays 09:00 --json
+boomux schedule create "<name>" --workspace "<workspace-name-or-id>" --node "<node>" --cwd "/absolute/owner/path" --integration opencode --prompt-file "/path/to/prompt.txt" --weekdays 09:00 --json
 boomux schedule list --json
 boomux schedule list --workspace "<workspace-name-or-id>" --json
 boomux schedule inspect "<exact-id-or-contextual-name>" --workspace "<workspace-name-or-id>" --json
@@ -257,11 +306,12 @@ boomux schedule run "<exact-id-or-contextual-name>" --workspace "<workspace-name
 boomux execution list --workspace "<workspace-name-or-id>" --schedule "<schedule-name-or-id>" --limit 100 --json
 boomux execution inspect "<exact-execution-id>" --json
 boomux execution wait "<exact-execution-id>" --after-revision "<revision>" --wait-ms 30000 --json
+boomux execution open "<exact-execution-id>" --json
 boomux execution cancel "<exact-execution-id>" --json
 boomux schedule remove "<exact-id-or-contextual-name>" --workspace "<workspace-name-or-id>" --json
 ```
 
-Create requires explicit workspace, cwd, integration, exactly one prompt source,
+Create requires explicit Workspace, owner-local cwd, integration, exactly one prompt source,
 and exactly one trigger source. `--prompt` preserves the accepted bytes;
 `--prompt-file` snapshots exact UTF-8, including a final newline, and does not
 track later file changes. Use `--cron '<five fields>'`, `--every Nm|Nh`, `--daily
@@ -279,8 +329,10 @@ session, Agent ID, or shell ID.
 List, create, pause, resume, remove, run, and all execution responses are
 prompt-free. Inspect
 returns the private prompt under `data.schedule.prompt`; do not log or repeat it
-unless needed for the authorized request. Exact schedule IDs resolve globally.
-Names resolve only with explicit `--workspace` or `BOOMUX_WORKSPACE_ID`.
+unless needed for the authorized request. Exact Schedule and execution IDs are
+global only within one Node. Names resolve only with explicit `--workspace` or
+`BOOMUX_WORKSPACE_ID`; preserve `--node` for remote discovery and every exact
+follow-up operation.
 Removing a schedule removes its persisted prompt. Workspace close removes every
 owned schedule and persisted prompt and must be confirmed with that full scope.
 
@@ -291,6 +343,10 @@ before sending. Never retry with a new key when the intent is the same dispatch.
 Inspect the returned exact execution ID, and cancel only when process-tree
 termination is authorized. Execution exit or cancellation never means Agent
 `done`.
+
+`execution open` is also process-starting/presentation behavior. It opens only
+the exact active run or exact linked canonical Agent Session; it must not restart
+the reusable Schedule shell or substitute a later run or Session.
 
 Execution list responses are newest-first and contain `limit`, `truncated`, and
 prompt-free records. Limits are 1-1,000 and default to 100. Each execution has a
@@ -317,7 +373,7 @@ restricted day fields use OR. Boomux rejects schedules with no occurrence in a
 Gregorian 400-year cycle. Treat scheduler `offline` health as not evaluating
 timed work even when the daemon still answers other requests.
 
-Exact shell IDs resolve globally. Shell names resolve in the current workspace,
+Exact shell IDs are global only within one Node. Shell names resolve in the current workspace,
 or through `--workspace` for `shell inspect`, `shell rename`, and `shell close`.
 `boomux read` and top-level `boomux close` require an exact shell ID outside a
 managed shell. If a name remains ambiguous, ask the user to select a target.
@@ -428,7 +484,11 @@ boomux "/path/to/project" -- command arg1 arg2
 Without `--name`, Boomux creates the next generated workspace and stores the
 selected path as its default cwd. With `--name`, it adds a shell to an existing
 exact-name workspace or creates that workspace with the selected path as its
-default. A command after `--` is an exact executable and argument vector; shell
+default. This shorthand is a local Node-owned workflow and can produce an
+external unlinked Workspace under protocol 38; it does not select or join a
+coordinated Workspace by equal name. Prefer `workspace create` followed by
+Node-qualified first-resource creation when coordination is intended. A command
+after `--` is an exact executable and argument vector; shell
 operators such as pipes or redirects work only when explicitly passed through a
 shell, for example `-- /bin/sh -lc 'command | command'`.
 
@@ -447,7 +507,7 @@ boomux doctor
 `boomux` and `boomux ui` must run from a fresh host terminal; they are rejected
 when `BOOMUX_SHELL_ID` is set. `boomux doctor` can run in either context.
 
-The dashboard has Workspaces, Agents, Shells, and Schedules views. `/` or
+The dashboard has Workspaces, Agents, Shells, Schedules, and Nodes views. `/` or
 `:` opens its action and search palette, `?` shows contextual help, `Enter`
 restores the selected workspace or opens the selected entry, and `x` followed
 by `y` confirms close or removal. Shell previews are bounded and read-only.
@@ -457,6 +517,12 @@ managed terminal selects its owning workspace and shell or Agent row once;
 manual navigation remains until another focus change. Press `Space` to pin the
 current dashboard selection and pause focus following; press it again to unpin
 and catch up to the currently focused terminal.
+
+The Nodes view inspects and refreshes registrations, starts guided setup,
+revision-safely renames or retargets routes, and forgets a registration after
+confirmation. It is not a resource filter. Coordinated Workspace rows aggregate
+persisted placements while every item retains its owner Node; external owner
+Workspaces remain distinct and offer explicit adopt/link actions.
 
 Each Agent Schedule appears once in its owning workspace with `KIND schedule`.
 That row is the durable definition, not a process; Enter navigates to its exact
@@ -500,8 +566,8 @@ Scheduled dispatch-failure and cold-interruption notification categories are
 configured independently as `[notifications] scheduled_dispatch_failed` and
 `scheduled_interrupted`; both default to false and never disclose schedule
 prompts or acknowledge Agent attention.
-Selecting a discovered project in the dashboard persists its canonical path as
-the workspace default cwd for later shells. Set
+Selecting a discovered project in the dashboard uses its name only and creates
+empty coordinator metadata. Set
 `[dashboard] follow_focused_terminal = false` to disable the default
 focus-following behavior.
 
@@ -509,48 +575,68 @@ Discover the same configured projects locally without starting the daemon:
 
 ```console
 boomux project list --json
+boomux project list --node "<node>" --json
 ```
 
-Use the canonical `path` returned for workspace creation. An empty list with
-`roots_configured: false` means no roots are configured; inspect `warnings` when
-configured roots cannot be scanned.
+Use the canonical `path` only on the Node that returned it when creating a
+Node-hosted item. An empty
+list with `roots_configured: false` means no roots are configured; inspect
+`warnings` when configured roots cannot be scanned.
 
 ## Manage Workspaces
 
 ```console
 boomux workspace list
 boomux workspace create "<name>"
-boomux workspace create "<name>" --cwd "/path/to/project"
 boomux workspace open "<name-or-id>"
 boomux workspace inspect "<name-or-id>"
 boomux workspace rename "<name-or-id>" "<new-name>"
+boomux workspace adopt "<external-workspace-name-or-id>" --node "<node>"
+boomux workspace link "<global-workspace-name-or-id>" "<owner-workspace-name-or-id>" --node "<node>"
 boomux workspace close "<name-or-id>"
+boomux workspace retry "<closing-global-workspace-name-or-id>"
 ```
 
-`workspace create` creates an empty workspace. `--cwd` stores an optional
-default used by dashboard shells and `shell create` when no explicit cwd is
-given. The default does not prevent individual shells from using other paths.
-`workspace close` terminates every running shell process session and removes the
-workspace, all shell and launcher definitions, schedules and persisted prompts,
-retained terminal state, and all durable Agent and attention records associated
-with it. Canonical OpenCode or Pi host data is not deleted. A workspace cannot
-close itself from one of its own shells. Confirm the exact target and full
-removal scope first.
+On protocol 38 or newer, `workspace create` creates empty coordinator metadata.
+It does not select a Node or store a path; choose those when creating the first
+Shell, launcher, or schedule. Older daemons retain empty local Workspace
+creation. Exactly one eligible Node may be selected implicitly; multiple eligible
+Nodes require explicit `--node`, while zero means creation is unavailable.
+Filesystem paths are interpreted only
+by that owner, and its first hosted resource establishes the placement. An
+explicit `--node` never falls back to local Shell or launcher creation.
 
-`workspace open` is an active, non-transactional restore operation. It invokes
-every launcher in creation order and attempts to open every shell even if an
-earlier item fails. Each shell opens with takeover, disconnecting its current
-writable controller, and an exited shell restarts as a new run. Obtain explicit
-authorization before running it, especially from inside that workspace. A
-launcher-only workspace is valid, but an empty workspace cannot be opened.
+Adopt creates a coordinated Workspace from one unlinked owner Workspace. Link's
+argument order is global Workspace first, owner Workspace second. Both require a
+current eligible owner and fresh identity-pinned revision. Equal names never
+establish membership.
+
+`workspace close` terminates every running Shell process and removes launchers,
+Schedules and persisted prompts, retained terminal state, and Agent/attention
+records after each owner confirms removal. A coordinated close can remain
+`closing`; unresolved membership is retained until `workspace retry` or repeated
+close succeeds. Canonical OpenCode or Pi host data is not deleted. A Workspace
+cannot close itself from one of its own Shells. Confirm the exact target and full
+multi-Node removal scope first.
+
+`workspace open` is an active, non-transactional restore operation. For a
+coordinated Workspace it attempts every currently available placement once and
+reports per-Node failures; unavailable membership remains visible, and ambiguous
+launcher outcomes are not replayed automatically. Each Shell opens with
+takeover, disconnecting its current writable controller, and an exited Shell
+restarts as a new run. `workspace open OWNER_ID --node NODE` instead addresses
+one owner-local Workspace and requires the exact owner Workspace ID remotely.
+Obtain explicit authorization before opening. A launcher-only Workspace is
+valid, but an empty Workspace cannot be opened.
 
 ## Manage Workspace Launchers
 
 ```console
 boomux launcher list --workspace "<workspace-name-or-id>"
-boomux launcher create "<name>" --workspace "<workspace-name-or-id>" --cwd "/path" -- command arg
+boomux launcher create "<name>" --workspace "<workspace-name-or-id>" --node "<node>" --cwd "/owner/path" -- command arg
 boomux launcher inspect "<name-or-id>" --workspace "<workspace-name-or-id>"
 boomux launcher invoke "<name-or-id>" --workspace "<workspace-name-or-id>"
+boomux launcher invoke "<exact-launcher-id>" --node "<node>"
 boomux launcher rename "<name-or-id>" "<new-name>" --workspace "<workspace-name-or-id>"
 boomux launcher remove "<name-or-id>" --workspace "<workspace-name-or-id>"
 ```
@@ -559,15 +645,17 @@ Launchers are durable ordered definitions, but each invocation is a detached,
 ephemeral process without a PTY or retained output. Commands are exact argument
 vectors; use an explicit shell for pipelines or expansion. `--cwd` defaults to
 the current directory. Removing a launcher does not terminate applications from
-earlier invocations. Exact launcher IDs resolve globally; names require current
-workspace context or `--workspace`.
+earlier invocations. Exact launcher IDs are global only within one Node; local
+names require current Workspace context or `--workspace`. Remote invocation
+requires the exact launcher ID and its owning `--node`.
 
 ## Manage Shells
 
 ```console
 boomux shell suggest-name "<workspace-name-or-id>" --json
-boomux shell create "<workspace-name-or-id>"
-boomux shell create "<workspace-name-or-id>" --name "<name>" --cwd "/path"
+boomux shell suggest-name "<exact-owner-workspace-id>" --node "<node>" --json
+boomux shell create "<workspace-name-or-id>" --node "<node>"
+boomux shell create "<workspace-name-or-id>" --node "<node>" --name "<name>" --cwd "/owner/path"
 boomux shell create "<workspace-name-or-id>" --name "<name>" -- command arg
 boomux shell inspect "<name-or-id>" --workspace "<workspace-name-or-id>"
 boomux shell rename "<name-or-id>" "<new-name>" --workspace "<workspace-name-or-id>"
@@ -587,6 +675,7 @@ exact `workspace_id` and nonempty `name`, without creating or reserving a shell.
 Use it only as a UI suggestion. Creation can still fail with typed
 `already_exists` if another operation claims the name first; request another
 suggestion rather than changing or inferring a name.
+Remote suggestion requires the exact owner Workspace ID plus `--node`.
 
 The contextual close shorthand is:
 
@@ -602,13 +691,15 @@ Open an exact shell ID in a new native terminal window:
 boomux open "<shell-id>"
 boomux open "<shell-id>" --title "<window-title>"
 boomux open "<shell-id>" --takeover
+boomux open "<exact-shell-id>" --node "<node>"
 boomux --terminal "kitty.desktop" open "<shell-id>"
 ```
 
 `--takeover` disconnects the current writable controller. Do not use it without
 the user's consent. Opening an exited shell explicitly restarts its stored
 command as a new run on the same durable shell identity; use `boomux read` when
-the goal is only to inspect retained output.
+the goal is only to inspect retained output. Remote open requires the exact
+Node-local Shell ID plus its owning `--node`; never infer either from a name.
 
 ## Manage The Daemon
 
@@ -618,14 +709,15 @@ boomux daemon restart
 boomux daemon stop
 ```
 
-`restart` performs a transactional graceful handoff that preserves pending,
+These commands affect only this Node. `restart` performs a transactional graceful handoff that preserves pending,
 running, and exited shells, including final exited terminal state, and reconnects
 active clients. It does not start a new process for an exited shell. `stop`
 terminates every managed process session and stops the daemon, but durable
 definitions remain. A later daemon-backed command can start Boomux again;
 recovered shells are pending and opening them starts new processes. Process
 memory, PTYs, and mutated environments do not survive. Confirm before either
-operation when the user did not request it explicitly.
+operation when the user did not request it explicitly. They do not restart or
+stop daemons on registered remote Nodes.
 
 ## Install Or Update This Skill
 
@@ -718,7 +810,9 @@ BOOMUX_RUN_ID
 Protocol 16 starts pending and exited shell runs with the attaching client's
 ephemeral Unix environment. Boomux does not persist or project that payload;
 terminal-profile and `BOOMUX_*` identity values are authoritative. Reattaching
-does not alter an already-running process environment.
+does not alter an already-running process environment. For protocol-35 remote
+attachment, the owner Node supplies its own process environment; the presenting
+Node's Unix environment is never forwarded.
 
 Detached launcher invocations inherit the invoking client's environment and
 receive `BOOMUX_WORKSPACE_ID`, `BOOMUX_WORKSPACE`, `BOOMUX_LAUNCHER_ID`, and

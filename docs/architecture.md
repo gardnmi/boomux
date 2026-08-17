@@ -14,11 +14,12 @@
 | `src/client.rs` | Daemon discovery/startup, protocol negotiation, typed management requests, and attachment setup |
 | `src/daemon.rs` | `DaemonService` coordination over durable registry, event-stream, shell-runtime, persistence, and handoff owners |
 | `src/state_store.rs` | Versioned durable schemas, validation, atomic state storage, and migrations |
+| `src/global_workspace_store.rs` | Independently versioned coordinator Workspace metadata, placement membership, initialization and schema migration, prepared resource recovery, and resumable close progress |
 | `src/node_identity.rs` | Stable Node identity persistence, federation admission leases, and bounded rekey drain |
 | `src/node_registration.rs` | Independently versioned remote Node registrations, identity pinning, admission drain, validation, and atomic storage |
 | `src/node_projection.rs` | Disposable owner-only remote projection cache, deterministic bounds, health, generation CAS, quarantine, and atomic storage |
 | `src/federation.rs` | Independently versioned federation handshake and verified stdio daemon bridging |
-| `src/ssh_bootstrap.rs` | Validated SSH targets, private invocation configuration, deadline-bound remote discovery, and helper compatibility selection |
+| `src/ssh_bootstrap.rs` | Validated SSH targets, private invocation configuration, bounded interactive authentication presentation, deadline-bound remote discovery, and helper compatibility selection |
 | `src/handoff.rs`, `src/fd_transfer.rs` | Graceful daemon replacement records and Unix descriptor transfer |
 | `src/attach.rs` | Terminal-side raw mode, control frames, live input/output, resize, focus, and reconnect handling |
 | `src/terminal.rs` | Selection and launch of native terminal windows through `xdg-terminal-exec` |
@@ -100,7 +101,15 @@ and deferred behavior are in [`remote-nodes.md`](remote-nodes.md).
 
 Public `boomux --remote TARGET` performs ad hoc bootstrap only. It
 discovers and verifies a compatible helper, or interactively installs one before
-opening and pinging a daemon-bound stdio channel. Explicit `boomux node add
+opening a daemon-bound stdio channel. The verified-connection boundary performs
+exactly one live ping: after connecting a Ready helper, or before transaction
+commit for an installed helper. Callers consume that verified result without a
+second channel write. One private owned OpenSSH
+master binds discovery, authorization, optional transactional replacement and
+owner/PID/start-identity claim recovery, process-neutral missing-install rollback,
+proof-bound daemon activation, daemon restart, final identity verification, protocol
+ping, and marker-only commit to the same
+authenticated endpoint. Explicit `boomux node add
 ALIAS TARGET` and revision-conditional registration management persist an
 identity-pinned route separately. A registration starts one noninteractive
 projection worker. Protocol 33 exposes cached projections through the separately
@@ -113,8 +122,16 @@ Protocol 36 adds closed typed Node host services and owner-executed exact Agent
 Session resume.
 Protocol 37 adds Node-qualified remote Agent Schedule creation and bounded
 Scheduled Execution observation without adding local scheduler authority.
+Protocol 38 adds coordinator-owned Workspace identity and explicit Node-owned
+placements. Coordinator metadata is stored independently from Node-local runtime
+state; equal names never establish membership, and adoption and linking require
+exact owner identities and revisions.
+Protocol 39 adds Node-qualified focused-terminal presentation to the combined
+Node snapshot and a prompt-free local invalidation event for responsive
+presentation. Focus remains ephemeral and controller-authorized, and is not
+persisted in the reduced remote projection cache.
 Remote notification presentation reuses protocol-32 atomic reduced transitions,
-so the core protocol remains 37. Node-cache schema 2 adds bounded local
+so it does not require a later protocol. Node-cache schema 2 adds bounded local
 at-most-once individual and reconnect-digest claims with an explicit schema-1
 migration.
 
@@ -143,13 +160,16 @@ output, resize, and detach events. Old-peer response transforms remain isolated
 in the daemon compatibility boundary and use the same feature registry when
 deciding which fields, values, and events to downgrade.
 
-The implemented protocol has seven durable identities beneath its implicit
-local Node. Federation will qualify each existing identity with a stable owning
-Node without rewriting the inner ID:
+The protocol qualifies every Node-owned durable identity with a stable owning
+Node without rewriting its inner ID. A coordinator-owned global Workspace is a
+separate organizing identity whose placements reference exact Node-local
+Workspace identities:
 
-- A workspace is a globally named shell container with a UUID and an optional
-  default working directory for newly created shells. The default is creation
-  behavior, not workspace identity; individual shells may use other paths.
+- A global Workspace owns its UUID, name, revision, placement membership, and
+  close state, but no process or filesystem context.
+- A Node-local workspace is a shell container with a UUID and optional default
+  working directory. Its default applies only on that owning Node; individual
+  resources may use other paths.
 - A shell is a durable process slot with a name, startup command, explicit
   working directory, and workspace ID.
 - A shell run identifies one process incarnation beneath that durable shell. It
@@ -191,6 +211,11 @@ workspace launcher in creation order using its own desktop environment, then
 opens native terminal windows for the workspace shells. Launcher processes are
 detached into their own sessions and reaped while the invoking client remains
 alive, but Boomux does not retain or manage their runtime lifecycle.
+For a protocol-38 global Workspace, the coordinator first returns explicit
+per-placement availability. The client then performs the same owner-side open on
+every available placement, using local attachment for the local owner and typed
+Node host services plus Node-qualified attachment for remote owners. Failures are
+reported per Node and do not replay an ambiguous launcher invocation.
 
 ### Daemon
 
@@ -312,7 +337,17 @@ Shell ID. The local daemon opens one identity-verified SSH helper channel and
 relays bounded `AttachFrame` values; the remote daemon retains PTY, controller,
 focus, takeover, resize, reconstruction, and exact-run authority. Remote
 transport loss closes only the local attachment and does not synthesize Shell,
-Agent, or Scheduled Execution completion.
+Agent, or Scheduled Execution completion. Protocol 39 also records a relayed
+focus gain as ephemeral presentation state on the local daemon after forwarding
+it to the owner. The presentation identity is the exact owner Node and Shell;
+it does not transfer focus authority or enter the remote projection cache.
+Presentation recording reflects the physical local focus report after the frame
+is written to the owner stream; it is not an acknowledgment that the owner
+accepted the frame and is never used as lifecycle evidence.
+The presenting daemon publishes a payload-free local invalidation after this
+recording so dashboards refresh the combined view on their next event poll. The
+owner's corresponding event remains owner-local and is excluded from reduced
+projection transitions.
 
 No emulator-specific adapter or compositor window ID is required.
 Spawned terminal windows start in independent process sessions with null
@@ -326,13 +361,17 @@ window has spawned, preserving retained output when terminal preparation fails.
 dashboard events and returns explicit external effects. The terminal runtime
 executes those effects through one backend interface and feeds typed completion
 events back into the model; model transitions do not call daemon or terminal
-callbacks directly. Rendering remains a function of typed model state. One
+callbacks directly. The backend runs effects serially off the terminal thread,
+so daemon, SSH, and preview latency cannot delay input or rendering; periodic
+refresh and preview reads are single-flight to keep stale work from accumulating.
+Rendering remains a function of typed model state. One
 daemon snapshot contains each workspace, its launchers, and its shells, avoiding
 races between separate list operations. Configured project roots provide
-workspace suggestions; selecting one persists its canonical path as the
-workspace's default cwd. Git information is still collected independently from
-shell directories and cached. A default cwd does not create workspace-level Git
-identity, and mixed-directory workspaces remain valid.
+Workspace-name suggestions; when global Workspaces are negotiated, selecting one
+creates empty coordinator metadata without retaining its path. Older peers
+retain empty local Workspace creation. Git information is still collected
+independently from item directories and cached. Paths do not create
+Workspace-level Git identity, and mixed-directory Workspaces remain valid.
 
 The dashboard establishes an atomic event-stream baseline and treats later
 events as invalidation signals for authoritative snapshot reprojection. It also
@@ -367,14 +406,22 @@ Agent presentation takes precedence when the current run has an active Agent or
 an exact `opencode` or `pi` foreground hint.
 
 The daemon retains the latest controller-authorized terminal focus gain as
-ephemeral workspace, shell, run, and monotonic revision metadata. With
+ephemeral workspace, shell, run, and monotonic revision metadata. Protocol 39
+also retains one monotonic presentation revision across local and relayed remote
+focus gains and exposes its exact `(node_id, shell_id)` through the combined
+Node snapshot. With
 `dashboard.follow_focused_terminal` enabled (the default), the dashboard uses a
 new revision as a one-shot selection trigger and resolves both shell and Agent
-rows by durable shell ID. Repeated snapshot refreshes do not enforce the
+rows by Node-qualified durable Shell identity. Repeated snapshot refreshes do not enforce the
 selection, so manual navigation remains usable until another terminal focus
 gain. Focus changes are deferred while an overlay or close confirmation is
 active. The setting is dashboard-local and disabling it does not stop focus
 reporting by attachments.
+Temporary projection absence does not reset the client's observed focus
+frontier. A replaced event stream or a handoff that changes the negotiated
+protocol resets it once. Same-version handoff retains the exact presentation
+frontier, while 39-to-38 and 38-to-39 transitions deliberately start the active
+protocol's revision domain without suppressing later physical focus gains.
 
 Selected-kind previews remain read-only. Workspace, launcher, and run metadata
 come from the polled snapshot. Shell output uses a bounded plain-text read only
@@ -477,8 +524,9 @@ explicit install or restart guidance.
 The optional vendor-neutral `boomux` Agent Skill documents the complete public
 CLI for compatible clients, including discovery, inspection, output reads,
 lifecycle operations, native-terminal opening, and daemon management.
-`BOOMUX_SHELL_ID` provides current-shell context while exact shell IDs remain
-globally addressable within the daemon. The installer safely removes an
+`BOOMUX_SHELL_ID` provides current-shell context. Federated resource identity is
+the pair of owning Node ID and unchanged Node-local ID; exact IDs are global only
+within one Node. The installer safely removes an
 untouched legacy `boomux-shells` skill and preserves customized copies.
 
 Read-only CLI integrations use the separate `boomux.cli/v1` JSON envelope rather
@@ -626,7 +674,138 @@ Workspace through a fresh owner read, validates cwd and any continuation Session
 through protocol-36 owner host services, and sends the prompt only in the
 transient owner mutation request. Creation is not retried after channel loss;
 run-now remains the only Schedule write retried, using the unchanged dispatch
-key. The local scheduler never evaluates, dispatches, or retries remote work.
+key. Exact-ID Schedule creation canonicalizes cron whitespace and timezone before
+comparing an existing definition, so a normalizable wire replay is unchanged.
+The local scheduler never evaluates, dispatches, or retries remote work.
+Protocol 38 adds an independently versioned owner-only
+`global_workspaces.json` coordinator store. Schema 6 records global Workspace
+identity, name, revision, explicit `(node_id, workspace_id)` placements,
+owner-local Workspace names, durable close progress, and prompt-free prepared
+resource operations keyed by exact caller-generated operation UUID. It separates
+the caller-requested owner UUID from the canonical owner UUID selected for a
+shared first placement. Schema 6 also retains prompt-free SHA-256 request
+fingerprints and completed success snapshots for the newest 256 operations,
+subject to the file's 1 MiB total bound. Each pending operation physically
+reserves a conservative upper bound for its completed outcome; preparation
+evicts oldest completed outcomes as needed and rejects insufficient capacity
+before owner mutation. Preparing a distinct placement atomically expands every
+related pending reservation for the additional possible placement, preserving
+concurrent shared-revision creation without under-reserving either completion.
+Schema 6 adds a durable `owner_attempted` dispatch boundary. It is persisted
+within the completion reservation immediately before owner mutation. Schemas 1
+through 5 migrate explicitly to schema 6;
+unknown legacy owner names are learned from a fresh owner read,
+schema-2 pending resource UUIDs become their operation identities, and a
+schema-3 pending operation binds its previously unavailable fingerprint on its
+first structurally matching retry. A schema-4 pending operation acquires its
+completion reservation before its next owner dispatch. The Node-local `state.json` schema remains 13 and is the
+sole authority for Shells, launchers, Agent Instances, Agent Schedules, paths,
+and process lifecycle. On first coordinator-store creation, existing local
+Workspaces are initialized once as global Workspaces with one local placement. Later
+unlinked local or projected remote Workspaces remain external until an explicit
+revision-guarded adoption or link; names are display metadata and never infer
+membership. Creating a Workspace writes only empty coordinator metadata; Node
+and path selection begins when creating its first Node-hosted resource.
+
+The combined Node snapshot adds global and external Workspace arrays only for
+protocol-38 peers. Placement availability is projected from current Node health;
+stale or unavailable projections never authorize owner mutations. Global close
+first persists `close_pending` for every placement, then performs fresh
+owner-revision-guarded closes. Confirmed and already-absent owners are removed
+from coordinator metadata individually. Unreachable or ambiguous outcomes remain
+persisted for explicit retry, and the global record is removed only after every
+owner is confirmed. A Workspace with no placements completes close immediately.
+Resource creation first persists a prompt-free prepared operation containing
+stable operation, requested and effective owner Workspace, and resource UUIDs,
+plus a hash of the complete request. Concurrent operations retain separate
+pending records; cancellation and completion target only the exact operation
+identity. Concurrent first resources on one Node may request distinct owner
+UUIDs but share the canonical prepared owner Workspace identity without sharing
+resource identity. Exact-operation handlers, including background reconciliation,
+serialize in coordinator memory, while durable completion and cancellation are
+idempotent against the terminal outcome.
+The owner atomically creates the Node-local placement and Shell, launcher, or
+Schedule, treats an exact replay as unchanged, and rejects conflicting ID reuse.
+This makes exact recovery retryable after transport ambiguity without
+name matching, shell interpolation, or duplicated runtime resources.
+The coordinator exposes one transaction for each Shell, launcher, and Schedule.
+It validates the selected Node against the current combined snapshot, persists
+the prepared operation, creates or exactly reads back the owner-local Workspace
+and resource, then atomically records the placement observation and converts the
+prepared operation to a completed outcome before acknowledging success. A failure between owner
+persistence and coordinator completion leaves the prepared UUIDs durable; the
+next request reads the exact owner resource and completes metadata without blind
+replay or a duplicate resource. An owner `not_found` observation is not proof of
+failure because it may race the in-flight owner mutation; reconciliation retains
+the pending record until an exact request retries or the exact resource is
+observed. A definitive synchronous owner rejection may cancel only its serialized
+operation. Schedule
+prompts remain only in the transient owner request, and launcher and Shell argv
+remain arrays throughout routing.
+Protocol 39 adds an optional Node-qualified focused Shell and presentation
+revision to the combined Node snapshot. Protocol-38 responses omit the field.
+The value is live daemon memory, is returned only while the selected combined
+view still contains that exact Shell, and adds no durable projection field. A
+payload-free focus-presentation invalidation wakes protocol-39 clients without
+placing identity in the event stream; protocol-38 responses filter it while
+advancing their cursor.
+The retained internal compound first-placement request prepares new global
+Workspace metadata and its first Shell in one coordinator-store replacement. It
+is a wire/recovery primitive, not a public CLI or dashboard creation flow. An exact retry returns its stored success
+even after the original global revision becomes stale. A new project request by
+the same name resumes or replays only when Node, cwd, and Shell definition have
+the same semantic fingerprint; its newly requested UUIDs map to the canonical
+prepared or completed identities. Definitive owner rejection removes only that
+pending operation and removes still-empty global metadata only when no related
+operation remains.
+Before creating compound first-placement metadata, the coordinator performs cached eligibility
+and fresh live capability preflight for the selected Node. Missing, ineligible,
+or runtime-capability-disabled owners therefore leave no empty global record. A
+definitive pre-owner failure on an existing exact preparation atomically cancels
+that operation and removes metadata only when it is still empty, unshared, and
+durably proven never dispatched. Every migrated pending operation is treated as
+attempted because an older schema cannot prove otherwise. Once attempted, later
+admission, capability, identity, synchronous owner error, or exact `not_found`
+cannot free the name or remove pending state; absence after a transport ambiguity
+does not prove the mutation was never attempted. Exact readback or an idempotent
+retry remains required. Network, timeout, persistence, and unknown outcomes also
+retain recovery state.
+
+Completed replay is guaranteed only while the operation remains in the bounded
+ledger: at most the newest 256 successful operations and potentially fewer when
+needed to keep the complete coordinator file within 1 MiB. Eviction is oldest
+first. After eviction there is no idempotency guarantee; the request is evaluated
+as new and ordinary identity and revision guards apply. Completed entries retain
+only response snapshots and request hashes, never Schedule prompts or attachment
+environments.
+
+Eligible placement owners are current, non-stale Nodes whose live daemon
+advertises protocol-38 global Workspace support. A daemon whose coordinator
+store did not load suppresses the capability and local eligibility. One eligible Node may be selected directly. Zero or
+multiple eligible Nodes require an explicit selector; no candidate is selected
+by default, and unavailable Nodes remain visible with their stable health and
+reason. Existing placement default cwd values are retained per owner. A new
+placement resolves its requested cwd on the selected owner and stores only that
+owner-local value.
+Adoption and linking use cached eligibility only as an initial presentation
+guard. Under one route admission reservation, they fetch a fresh protocol-38
+combined local snapshot, require its runtime `global_workspaces` capability and
+eligibility, read the exact owner revision from that same snapshot, and commit
+coordinator membership before releasing admission. A live downgrade or disabled
+coordinator store therefore fails even while protocol-38 eligibility remains in
+the projection cache.
+
+The dashboard groups resources only through persisted placement pairs. One
+global Workspace row aggregates qualified resources from all placements while
+each item retains its exact owner Node and owner Workspace ID. Unlinked owner
+Workspaces remain external singleton rows even when names match. External rows
+offer explicit revision-guarded adopt-as-new and link-to-existing actions. The
+Nodes tab is not a filter: it exposes inspection plus revision-pinned alias
+rename and verified retarget, confirmed route forget, and projection refresh.
+Refresh wakes that Node's existing projection worker; it never starts an
+overlapping observer.
+Resource tables place `NODE` after task identity columns rather than making Node
+the primary organizing column.
 
 Protocol-25 lists are daemon-bounded, newest-first pages with explicit limit and
 truncation. The request limit is optional on the wire; protocol 25 defaults it to

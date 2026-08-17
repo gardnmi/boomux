@@ -30,14 +30,175 @@ const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const PLATFORM_PROBE_PREFIX: &[u8] = b"boomux-platform-v1";
 const EXECUTABLE_PROBE_PREFIX: &[u8] = b"boomux-executables-v1";
 const INSTALL_DESTINATION_PROBE_PREFIX: &[u8] = b"boomux-install-destination-v1";
-const MAX_RELEASE_BYTES: u64 = 128 * 1024 * 1024;
-const REMOTE_INSTALL_COMMAND: &str = "set -eu; case \"$HOME\" in /*) ;; *) exit 1 ;; esac; umask 077; directory=$HOME/.local/bin; destination=$directory/boomux; mkdir -p \"$directory\"; temporary=$(mktemp \"$directory/.boomux.XXXXXXXX\"); trap 'rm -f \"$temporary\"' EXIT HUP INT TERM; cat > \"$temporary\"; chmod 755 \"$temporary\"; mv -f \"$temporary\" \"$destination\"; trap - EXIT HUP INT TERM";
-const REMOTE_RESTART_COMMAND: &str =
-    "case \"$HOME\" in /*) exec \"$HOME/.local/bin/boomux\" daemon restart ;; *) exit 1 ;; esac";
+const INSTALL_TRANSACTION_PREFIX: &[u8] = b"boomux-install-transaction-v1";
+const INSTALL_ACTIVATION_PREFIX: &[u8] = b"boomux-install-activation-v1";
+const INSTALL_COMMIT_PREFIX: &[u8] = b"boomux-install-commit-v1";
+const INSTALL_STAGE_PREFIX: &str = "boomux-install-stage-v1";
+const RUNTIME_STAGE_PREFIX: &str = "boomux-runtime-v1";
+const DAEMON_STATUS_PREFIX: &[u8] = b"boomux-daemon-status-v1";
+const DAEMON_PRESENCE_PREFIX: &[u8] = b"boomux-daemon-presence-v1";
+const MAX_RELEASE_BYTES: u64 = 256 * 1024 * 1024;
 
-pub const PLATFORM_PROBE_COMMAND: &str = "os=$(uname -s) || exit; arch=$(uname -m) || exit; printf 'boomux-platform-v1\\0%s\\0%s\\0' \"$os\" \"$arch\"";
-pub const EXECUTABLE_PROBE_COMMAND: &str = "printf 'boomux-executables-v1\\0'; path=$(command -v boomux 2>/dev/null || true); for candidate in \"$path\" /usr/local/bin/boomux /usr/bin/boomux /opt/homebrew/bin/boomux /home/linuxbrew/.linuxbrew/bin/boomux \"$HOME/.local/bin/boomux\" \"$HOME/.local/share/mise/shims/boomux\" \"$HOME/.nix-profile/bin/boomux\" /run/current-system/sw/bin/boomux; do case \"$candidate\" in /*) [ -f \"$candidate\" ] && [ -x \"$candidate\" ] && printf '%s\\0' \"$candidate\" ;; esac; done";
+macro_rules! remote_runtime_prefix {
+    () => {
+        "PATH=/usr/bin:/bin; export PATH; boomux_runtime_fail() { printf 'boomux-runtime-v1:%s:%s\\n' \"$1\" \"$2\" >&2; exit \"$2\"; }; boomux_os=$(/usr/bin/uname -s 2>/dev/null) || boomux_runtime_fail unsupported 91; boomux_uid=$(/usr/bin/id -u 2>/dev/null) || boomux_runtime_fail invalid 89; case \"$boomux_uid\" in ''|*[!0-9]*) boomux_runtime_fail invalid 89 ;; esac; if [ -n \"${XDG_RUNTIME_DIR-}\" ]; then boomux_runtime=$XDG_RUNTIME_DIR; elif [ \"$boomux_os\" = Linux ]; then boomux_runtime=/run/user/$boomux_uid; else boomux_runtime_fail missing 88; fi; case \"$boomux_runtime\" in /*) ;; *) boomux_runtime_fail invalid 89 ;; esac; [ \"${#boomux_runtime}\" -le 4096 ] || boomux_runtime_fail invalid 89; case \"$boomux_runtime\" in *[!A-Za-z0-9_./-]*) boomux_runtime_fail invalid 89 ;; esac; [ -d \"$boomux_runtime\" ] && [ ! -L \"$boomux_runtime\" ] || boomux_runtime_fail unsafe 90; case \"$boomux_os\" in Linux) boomux_runtime_stat=$(/usr/bin/stat -Lc '%u:%a' -- \"$boomux_runtime\" 2>/dev/null) || boomux_runtime_fail unsafe 90 ;; Darwin) boomux_runtime_owner=$(/usr/bin/stat -f '%u' \"$boomux_runtime\" 2>/dev/null) || boomux_runtime_fail unsafe 90; boomux_runtime_mode=$(/usr/bin/stat -f '%Lp' \"$boomux_runtime\" 2>/dev/null) || boomux_runtime_fail unsafe 90; boomux_runtime_stat=$boomux_runtime_owner:$boomux_runtime_mode ;; *) boomux_runtime_fail unsupported 91 ;; esac; [ \"$boomux_runtime_stat\" = \"$boomux_uid:700\" ] || boomux_runtime_fail unsafe 90; XDG_RUNTIME_DIR=$boomux_runtime; export XDG_RUNTIME_DIR; "
+    };
+}
+
+macro_rules! remote_install_restore {
+    () => {
+        "sync_install_path() { boomux_sync_os=$(/usr/bin/uname -s 2>/dev/null || true); if [ \"$boomux_sync_os\" = Linux ]; then /bin/sync -f \"$1\"; fi; }; restore_install() { prior_daemon=$(/bin/cat \"$transaction/prior_daemon\" 2>/dev/null || true); contacted=false; [ ! -e \"$transaction/daemon_contacted\" ] || contacted=true; if [ -e \"$transaction/missing\" ]; then if [ -e \"$transaction/restore_required\" ]; then /bin/rm -f \"$destination\"; sync_install_path \"$directory\"; fi; elif [ -e \"$transaction/backup_ready\" ] && [ -e \"$transaction/restore_required\" ]; then /bin/mv -f \"$transaction/backup\" \"$destination\"; sync_install_path \"$destination\"; sync_install_path \"$directory\"; fi; case \"$prior_daemon:$contacted\" in [0-9]*:true) boomux_runtime_daemon daemon restart >/dev/null 2>&1 || true ;; esac; }; "
+    };
+}
+
+macro_rules! remote_claim_functions {
+    () => {
+        "claim_process_start() { claim_pid=$1; case \"$boomux_os\" in Linux) claim_stat=$(/bin/cat \"/proc/$claim_pid/stat\" 2>/dev/null) || return 1; claim_tail=${claim_stat##*) }; set -- $claim_tail; [ \"$#\" -ge 20 ] || return 1; shift 19; printf '%s' \"$1\" ;; Darwin) /bin/ps -p \"$claim_pid\" -o lstart= 2>/dev/null ;; *) return 1 ;; esac; }; claim_release() { /bin/rm -rf \"$lock/claim\"; }; claim_acquire() { boomux_os=$(/usr/bin/uname -s 2>/dev/null) || return 1; claim_now=$(/bin/date +%s 2>/dev/null) || return 1; claim_pid=${claim_pid_override-$$}; claim_start=$(claim_process_start \"$claim_pid\") || return 1; claim_owner=$txn:$claim_pid:$claim_start; if ! /bin/mkdir \"$lock/claim\" 2>/dev/null; then old_pid=$(/bin/cat \"$lock/claim/pid\" 2>/dev/null || true); old_start=$(/bin/cat \"$lock/claim/start\" 2>/dev/null || true); old_heartbeat=$(/bin/cat \"$lock/claim/heartbeat\" 2>/dev/null || true); case \"$old_pid:$old_heartbeat\" in *[!0-9:]*) return 1 ;; esac; claim_age=$((claim_now - old_heartbeat)); [ \"$claim_age\" -ge 180 ] || return 1; old_current=$(claim_process_start \"$old_pid\" 2>/dev/null || true); if /bin/kill -0 \"$old_pid\" 2>/dev/null && [ \"$old_current\" = \"$old_start\" ]; then return 1; fi; /bin/rm -rf \"$lock/claim\"; /bin/mkdir \"$lock/claim\" 2>/dev/null || return 1; fi; printf '%s\\n' \"$claim_owner\" > \"$lock/claim/owner\"; printf '%s\\n' \"$claim_pid\" > \"$lock/claim/pid\"; printf '%s\\n' \"$claim_start\" > \"$lock/claim/start\"; printf '%s\\n' \"$claim_now\" > \"$lock/claim/heartbeat\"; }; "
+    };
+}
+
+const REMOTE_RUNTIME_PREFIX: &str = remote_runtime_prefix!();
+#[doc(hidden)]
+pub const REMOTE_INSTALL_COMMAND: &str = concat!(
+    "boomux_runtime_daemon() ( ",
+    remote_runtime_prefix!(),
+    "exec \"$destination\" \"$@\"; ); ",
+    "set -u; exec 3>&2; exec 2>/dev/null; umask 077; IFS= read -r txn; ",
+    "stage=home; stage_code=74; transaction=; watchdog=; lock_owned=false; ",
+    remote_install_restore!(),
+    "rollback_install() { set +e; if [ -n \"$watchdog\" ]; then kill \"$watchdog\" 2>/dev/null || true; fi; if [ -n \"$transaction\" ]; then restore_install; /bin/rm -rf \"$transaction\"; fi; if [ \"$lock_owned\" = true ]; then /bin/rm -rf \"$lock\"; fi; }; ",
+    "fail_install() { trap - EXIT HUP INT TERM; set +e; printf 'boomux-install-stage-v1:%s:%s\\n' \"$stage\" \"$stage_code\" >&3; rollback_install; exit \"$stage_code\"; }; ",
+    "trap fail_install EXIT; trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM; set -e; ",
+    "case \"$HOME\" in /*) ;; *) exit 1 ;; esac; case \"$txn\" in .boomux.bootstrap.[A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9]) ;; *) exit 2 ;; esac; directory=$HOME/.local/bin; destination=$directory/boomux; lock=$directory/.boomux.bootstrap.lock; transaction=$directory/$txn; ",
+    "stage=directory; stage_code=75; /bin/mkdir -p \"$directory\"; ",
+    "stage=lock; stage_code=76; if ! /bin/mkdir \"$lock\" 2>/dev/null; then current=$(/bin/cat \"$lock/id\" 2>/dev/null || true); if [ \"$current\" = \"$txn\" ] && [ -e \"$transaction/new_ready\" ]; then /bin/cat >/dev/null; printf 'boomux-install-transaction-v1\\0%s\\0' \"$txn\"; trap - EXIT HUP INT TERM; exit; fi; trap - EXIT HUP INT TERM; exit 73; fi; lock_owned=true; ",
+    "stage=transaction; stage_code=77; /bin/mkdir \"$transaction\"; ",
+    "stage=lock_id; stage_code=79; printf '%s\\n' \"$txn\" > \"$lock/id\"; printf '0\\n' > \"$transaction/lease\"; temporary=$transaction/new.next; ",
+    "stage=stream; stage_code=80; /bin/cat > \"$temporary\"; ",
+    "stage=mode; stage_code=81; /bin/chmod 755 \"$temporary\"; upload_uid=$(/usr/bin/id -u); upload_size=$(/usr/bin/stat -Lc '%s' -- \"$temporary\" 2>/dev/null || /usr/bin/stat -f '%z' \"$temporary\"); case \"$upload_uid:$upload_size\" in *[!0-9:]*) false ;; esac; if [ \"$upload_size\" -le 0 ] || [ \"$upload_size\" -gt 268435456 ] || [ -L \"$temporary\" ] || [ ! -f \"$temporary\" ] || [ ! -x \"$temporary\" ]; then false; fi; /bin/mv \"$temporary\" \"$transaction/new\"; : > \"$transaction/new_ready\"; sync_install_path \"$transaction/new\"; ",
+    "stage=watchdog_spawn; stage_code=84; ( exec 3>&-; trap '' HUP; lease_limit=180; lease_value=$(/bin/cat \"$transaction/lease\"); unchanged=0; committed=false; : > \"$transaction/watchdog_ready\"; ",
+    remote_claim_functions!(),
+    "while :; do if claim_pid_override=$(/bin/cat \"$transaction/watchdog_pid\" 2>/dev/null); then break; fi; if claim_pid_override=$(/bin/cat \"$lock/committed/watchdog_pid\" 2>/dev/null); then transaction=$lock/committed; committed=true; break; fi; [ -d \"$lock\" ] || exit; /bin/sleep 1; done; while [ -d \"$lock\" ]; do /bin/sleep 1; current=$(/bin/cat \"$transaction/lease\" 2>/dev/null || true); if [ \"$current\" != \"$lease_value\" ]; then lease_value=$current; unchanged=0; continue; fi; unchanged=$((unchanged + 1)); [ \"$unchanged\" -lt \"$lease_limit\" ] && continue; if claim_acquire; then current=$(/bin/cat \"$lock/id\" 2>/dev/null || true); claimed_lease=$(/bin/cat \"$transaction/lease\" 2>/dev/null || true); if [ \"$current\" != \"$txn\" ]; then claim_release; exit; fi; if [ \"$claimed_lease\" != \"$lease_value\" ]; then claim_release; lease_value=$claimed_lease; unchanged=0; continue; fi; if ! $committed; then restore_install; fi; /bin/rm -rf \"$transaction\" \"$lock\"; exit; fi; unchanged=0; done ) </dev/null >/dev/null 2>&1 & watchdog=$!; ",
+    "stage=watchdog_ready; stage_code=85; attempts=0; while [ ! -e \"$transaction/watchdog_ready\" ]; do kill -0 \"$watchdog\"; attempts=$((attempts + 1)); [ \"$attempts\" -lt 10000 ]; done; ",
+    "stage=watchdog_pid; stage_code=86; printf '%s\\n' \"$watchdog\" > \"$transaction/watchdog_pid\"; rm -f \"$transaction/watchdog_ready\"; ",
+    "stage=result; stage_code=87; printf 'boomux-install-transaction-v1\\0%s\\0' \"$txn\"; ",
+    "trap - EXIT HUP INT TERM; exec 3>&-"
+);
+#[allow(dead_code)]
+const REMOTE_INSTALL_ACTIVATE_COMMAND_LEGACY: &str = concat!(
+    "boomux_runtime_daemon() ( ",
+    remote_runtime_prefix!(),
+    "exec \"$destination\" \"$@\"; ); ",
+    "set -eu; exec 3>&2; exec 2>/dev/null; umask 077; IFS= read -r txn; IFS= read -r reason; IFS= read -r prior; case \"$HOME\" in /*) ;; *) exit 1 ;; esac; case \"$txn\" in .boomux.bootstrap.[A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9]) ;; *) exit 2 ;; esac; case \"$reason:$prior\" in missing:absent|upgrade:[0-9]*) ;; *) exit 2 ;; esac; directory=$HOME/.local/bin; destination=$directory/boomux; lock=$directory/.boomux.bootstrap.lock; transaction=$directory/$txn; backup=$transaction/backup; ",
+    "[ \"$(/bin/cat \"$lock/id\")\" = \"$txn\" ]; if ! /bin/mkdir \"$lock/claim\" 2>/dev/null; then exit 73; fi; trap '/bin/rmdir \"$lock/claim\" 2>/dev/null || true' EXIT HUP INT TERM; if [ -e \"$transaction/activated\" ]; then trap - EXIT HUP INT TERM; /bin/rmdir \"$lock/claim\"; printf 'boomux-install-activation-v1\\0activated\\0'; exit; fi; if [ ! -e \"$transaction/new_ready\" ] || [ ! -f \"$transaction/new\" ] || [ ! -x \"$transaction/new\" ] || [ -L \"$transaction/new\" ]; then false; fi; ",
+    "if [ \"$reason\" = missing ]; then ",
+    remote_runtime_prefix!(),
+    "socket=$XDG_RUNTIME_DIR/boomux/daemon.sock; if [ -S \"$socket\" ] || [ -e \"$socket\" ] || [ -L \"$socket\" ]; then trap - EXIT HUP INT TERM; /bin/rmdir \"$lock/claim\"; printf 'boomux-install-activation-v1\\0daemon_present\\0'; exit; fi; fi; ",
+    "sync_install_path() { boomux_sync_os=$(/usr/bin/uname -s 2>/dev/null || true); if [ \"$boomux_sync_os\" = Linux ]; then /bin/sync -f \"$1\"; fi; }; restore_activation() { if [ -e \"$transaction/restore_required\" ]; then if [ -e \"$transaction/missing\" ]; then /bin/rm -f \"$destination\"; elif [ -e \"$transaction/backup_ready\" ]; then /bin/mv -f \"$backup\" \"$destination\"; fi; sync_install_path \"$directory\"; fi; }; fail_activation() { code=$?; trap - EXIT HUP INT TERM; set +e; restore_activation; /bin/rmdir \"$lock/claim\" 2>/dev/null || true; exit \"$code\"; }; trap fail_activation EXIT HUP INT TERM; install_os=$(/usr/bin/uname -s); install_uid=$(/usr/bin/id -u); case \"$install_uid\" in ''|*[!0-9]*) false ;; esac; case \"$install_os\" in Linux) install_metadata() { /usr/bin/stat -Lc '%u:%g:%a:%s:%Y' -- \"$1\"; }; install_size() { /usr/bin/stat -Lc '%s' -- \"$1\"; } ;; Darwin) install_metadata() { /usr/bin/stat -f '%u:%g:%Lp:%z:%m' \"$1\"; }; install_size() { /usr/bin/stat -f '%z' \"$1\"; } ;; *) false ;; esac; if [ -e \"$destination\" ] || [ -L \"$destination\" ]; then if [ -L \"$destination\" ] || [ ! -f \"$destination\" ] || [ ! -x \"$destination\" ]; then false; fi; destination_metadata=$(install_metadata \"$destination\"); destination_owner=${destination_metadata%%:*}; [ \"$destination_owner\" = \"$install_uid\" ]; destination_size=$(install_size \"$destination\"); case \"$destination_size\" in ''|*[!0-9]*) false ;; esac; if [ \"$destination_size\" -le 0 ] || [ \"$destination_size\" -gt 268435456 ]; then false; fi; /bin/cp -p \"$destination\" \"$backup\"; if [ -L \"$backup\" ] || [ ! -f \"$backup\" ] || [ ! -x \"$backup\" ]; then false; fi; [ \"$(install_metadata \"$destination\")\" = \"$destination_metadata\" ]; [ \"$(install_metadata \"$backup\")\" = \"$destination_metadata\" ]; /usr/bin/cmp -s \"$destination\" \"$backup\"; sync_install_path \"$backup\"; : > \"$transaction/backup_ready\"; else : > \"$transaction/missing\"; fi; printf '%s\\n' \"$prior\" > \"$transaction/prior_daemon\"; : > \"$transaction/restore_required\"; /bin/mv -f \"$transaction/new\" \"$destination\"; sync_install_path \"$destination\"; sync_install_path \"$directory\"; : > \"$transaction/activated\"; trap - EXIT HUP INT TERM; /bin/rmdir \"$lock/claim\"; printf 'boomux-install-activation-v1\\0activated\\0'"
+);
+#[doc(hidden)]
+pub const REMOTE_INSTALL_ACTIVATE_COMMAND: &str = concat!(
+    "set -eu; exec 3>&2; exec 2>/dev/null; umask 077; ",
+    "IFS= read -r txn; IFS= read -r reason; IFS= read -r prior; IFS= read -r proof_pid; IFS= read -r proof_executable; IFS= read -r proof_device; IFS= read -r proof_inode; ",
+    "case \"$HOME\" in /*) ;; *) exit 1 ;; esac; case \"$txn\" in .boomux.bootstrap.[A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9]) ;; *) exit 2 ;; esac; case \"$reason:$prior\" in missing:absent|upgrade:[0-9]*) ;; *) exit 2 ;; esac; ",
+    "directory=$HOME/.local/bin; destination=$directory/boomux; lock=$directory/.boomux.bootstrap.lock; transaction=$directory/$txn; backup=$transaction/backup; [ \"$(/bin/cat \"$lock/id\")\" = \"$txn\" ]; ",
+    remote_claim_functions!(),
+    "claim_acquire || exit 73; trap claim_release EXIT HUP INT TERM; ",
+    "if [ -e \"$transaction/activated\" ]; then trap - EXIT HUP INT TERM; claim_release; printf 'boomux-install-activation-v1\\0activated\\0'; exit; fi; [ -e \"$transaction/new_ready\" ] && [ -f \"$transaction/new\" ] && [ -x \"$transaction/new\" ] && [ ! -L \"$transaction/new\" ]; ",
+    "restore_activation() { if [ -e \"$transaction/restore_required\" ]; then if [ -e \"$transaction/missing\" ]; then /bin/rm -f \"$destination\"; elif [ -e \"$transaction/backup_ready\" ]; then /bin/mv -f \"$backup\" \"$destination\"; fi; fi; }; fail_activation() { code=$?; trap - EXIT HUP INT TERM; set +e; restore_activation; claim_release; exit \"$code\"; }; trap fail_activation EXIT HUP INT TERM; ",
+    "if [ -e \"$destination\" ] || [ -L \"$destination\" ]; then if [ -L \"$destination\" ] || [ ! -f \"$destination\" ] || [ ! -x \"$destination\" ]; then false; fi; /bin/cp -p \"$destination\" \"$backup\"; if [ -L \"$backup\" ] || [ ! -f \"$backup\" ] || [ ! -x \"$backup\" ]; then false; fi; /usr/bin/cmp -s \"$destination\" \"$backup\"; : > \"$transaction/backup_ready\"; else : > \"$transaction/missing\"; fi; printf '%s\\n' \"$prior\" > \"$transaction/prior_daemon\"; : > \"$transaction/restore_required\"; ",
+    "if [ \"$reason\" = missing ]; then ",
+    remote_runtime_prefix!(),
+    "socket=$XDG_RUNTIME_DIR/boomux/daemon.sock; if [ -S \"$socket\" ] || [ -e \"$socket\" ] || [ -L \"$socket\" ]; then restore_activation; /bin/rm -f \"$transaction/restore_required\"; trap - EXIT HUP INT TERM; claim_release; printf 'boomux-install-activation-v1\\0daemon_present\\0'; exit; fi; /bin/mv -f \"$transaction/new\" \"$destination\"; : > \"$transaction/activated\"; else case \"$proof_pid:$proof_device:$proof_inode\" in *[!0-9:]*) false ;; esac; [ \"$proof_executable\" = \"$destination\" ]; \"$transaction/new\" __bootstrap-activate \"$txn\" \"$proof_pid\" \"$prior\" \"$proof_executable\" \"$proof_device\" \"$proof_inode\"; fi; ",
+    "trap - EXIT HUP INT TERM; claim_release; printf 'boomux-install-activation-v1\\0activated\\0'"
+);
+#[doc(hidden)]
+#[allow(dead_code)]
+const REMOTE_INSTALL_ROLLBACK_COMMAND_LEGACY: &str = concat!(
+    "boomux_runtime_daemon() ( ",
+    remote_runtime_prefix!(),
+    "exec \"$destination\" \"$@\"; ); ",
+    "set -eu; case \"$HOME\" in /*) ;; *) exit 1 ;; esac; IFS= read -r txn; case \"$txn\" in .boomux.bootstrap.[A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9]) ;; *) exit 2 ;; esac; directory=$HOME/.local/bin; destination=$directory/boomux; lock=$directory/.boomux.bootstrap.lock; transaction=$directory/$txn; [ \"$(/bin/cat \"$lock/id\")\" = \"$txn\" ]; /bin/mkdir \"$lock/claim\"; trap '/bin/rmdir \"$lock/claim\" 2>/dev/null || true' EXIT HUP INT TERM; watchdog=$(/bin/cat \"$transaction/watchdog_pid\" 2>/dev/null || true); ",
+    remote_install_restore!(),
+    "case \"$watchdog\" in *[!0-9]*|'') ;; *) kill \"$watchdog\" 2>/dev/null || true ;; esac; restore_install; trap - EXIT HUP INT TERM; /bin/rm -rf \"$transaction\" \"$lock\""
+);
+#[doc(hidden)]
+pub const REMOTE_INSTALL_ROLLBACK_COMMAND: &str = concat!(
+    "PATH=/usr/bin:/bin; export PATH; boomux_runtime_daemon() ( ",
+    remote_runtime_prefix!(),
+    "exec \"$destination\" \"$@\"; ); set -eu; case \"$HOME\" in /*) ;; *) exit 1 ;; esac; IFS= read -r txn; case \"$txn\" in .boomux.bootstrap.[A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9]) ;; *) exit 2 ;; esac; directory=$HOME/.local/bin; destination=$directory/boomux; lock=$directory/.boomux.bootstrap.lock; transaction=$directory/$txn; [ \"$(/bin/cat \"$lock/id\")\" = \"$txn\" ]; ",
+    remote_claim_functions!(),
+    "claim_acquire || exit 73; trap claim_release EXIT HUP INT TERM; watchdog=$(/bin/cat \"$transaction/watchdog_pid\" 2>/dev/null || true); ",
+    remote_install_restore!(),
+    "case \"$watchdog\" in *[!0-9]*|'') ;; *) /bin/kill \"$watchdog\" 2>/dev/null || true ;; esac; restore_install; trap - EXIT HUP INT TERM; /bin/rm -rf \"$transaction\" \"$lock\""
+);
+#[allow(dead_code)]
+const REMOTE_INSTALL_COMMIT_COMMAND_LEGACY: &str = "set -eu; case \"$HOME\" in /*) ;; *) exit 1 ;; esac; IFS= read -r txn; case \"$txn\" in .boomux.bootstrap.[A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9]) ;; *) exit 2 ;; esac; directory=$HOME/.local/bin; lock=$directory/.boomux.bootstrap.lock; transaction=$directory/$txn; committed=$lock/committed; [ \"$(cat \"$lock/id\")\" = \"$txn\" ]; ( trap '' HUP; sleep 180; if [ \"$(cat \"$lock/id\" 2>/dev/null || true)\" = \"$txn\" ]; then rm -rf \"$lock/claim\"; fi ) </dev/null >/dev/null 2>&1 & if [ -d \"$committed\" ]; then printf 'boomux-install-commit-v1\\0committed\\0'; exit; fi; mkdir \"$lock/claim\"; trap 'rmdir \"$lock/claim\" 2>/dev/null || true' EXIT HUP INT TERM; if [ -d \"$committed\" ]; then :; elif [ -d \"$transaction\" ]; then mv \"$transaction\" \"$committed\"; else exit 1; fi; trap - EXIT HUP INT TERM; rmdir \"$lock/claim\"; printf 'boomux-install-commit-v1\\0committed\\0'";
+const REMOTE_INSTALL_COMMIT_COMMAND: &str = concat!(
+    "PATH=/usr/bin:/bin; export PATH; set -eu; case \"$HOME\" in /*) ;; *) exit 1 ;; esac; IFS= read -r txn; case \"$txn\" in .boomux.bootstrap.[A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9]) ;; *) exit 2 ;; esac; directory=$HOME/.local/bin; lock=$directory/.boomux.bootstrap.lock; transaction=$directory/$txn; committed=$lock/committed; [ \"$(/bin/cat \"$lock/id\")\" = \"$txn\" ]; ",
+    remote_claim_functions!(),
+    "if [ -d \"$committed\" ]; then printf 'boomux-install-commit-v1\\0committed\\0'; exit; fi; claim_acquire || exit 73; trap claim_release EXIT HUP INT TERM; if [ -d \"$committed\" ]; then :; elif [ -d \"$transaction\" ]; then /bin/mv \"$transaction\" \"$committed\"; else exit 1; fi; trap - EXIT HUP INT TERM; claim_release; printf 'boomux-install-commit-v1\\0committed\\0'"
+);
+#[doc(hidden)]
+pub const REMOTE_INSTALL_MARK_RESTARTED_COMMAND: &str = "set -eu; case \"$HOME\" in /*) ;; *) exit 1 ;; esac; IFS= read -r txn; case \"$txn\" in .boomux.bootstrap.[A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9]) ;; *) exit 2 ;; esac; directory=$HOME/.local/bin; lock=$directory/.boomux.bootstrap.lock; transaction=$directory/$txn; [ \"$(cat \"$lock/id\")\" = \"$txn\" ]; : > \"$transaction/restarted\"";
+const REMOTE_INSTALL_MARK_DAEMON_CONTACTED_COMMAND: &str = "set -eu; case \"$HOME\" in /*) ;; *) exit 1 ;; esac; IFS= read -r txn; case \"$txn\" in .boomux.bootstrap.[A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9]) ;; *) exit 2 ;; esac; directory=$HOME/.local/bin; lock=$directory/.boomux.bootstrap.lock; transaction=$directory/$txn; [ \"$(cat \"$lock/id\")\" = \"$txn\" ]; : > \"$transaction/daemon_contacted\"";
+#[allow(dead_code)]
+const REMOTE_INSTALL_RENEW_COMMAND_LEGACY: &str = "set -eu; case \"$HOME\" in /*) ;; *) exit 1 ;; esac; IFS= read -r txn; IFS= read -r renewal; case \"$txn\" in .boomux.bootstrap.[A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9]) ;; *) exit 2 ;; esac; case \"$renewal\" in ''|*[!0-9]*) exit 2 ;; esac; directory=$HOME/.local/bin; lock=$directory/.boomux.bootstrap.lock; transaction=$directory/$txn; temporary=$transaction/lease.next.$$; printf '%s\\n' \"$renewal\" > \"$temporary\"; if ! /bin/mkdir \"$lock/claim\" 2>/dev/null; then /bin/rm -f \"$temporary\"; exit 3; fi; trap '/bin/rm -f \"$temporary\"; /bin/rmdir \"$lock/claim\" 2>/dev/null || true' EXIT HUP INT TERM; [ \"$(/bin/cat \"$lock/id\")\" = \"$txn\" ]; /bin/mv -f \"$temporary\" \"$transaction/lease\"; trap - EXIT HUP INT TERM; /bin/rmdir \"$lock/claim\"";
+const REMOTE_INSTALL_RENEW_COMMAND: &str = concat!(
+    "PATH=/usr/bin:/bin; export PATH; set -eu; case \"$HOME\" in /*) ;; *) exit 1 ;; esac; IFS= read -r txn; IFS= read -r renewal; case \"$txn\" in .boomux.bootstrap.[A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9]) ;; *) exit 2 ;; esac; case \"$renewal\" in ''|*[!0-9]*) exit 2 ;; esac; directory=$HOME/.local/bin; lock=$directory/.boomux.bootstrap.lock; transaction=$directory/$txn; temporary=$transaction/lease.next.$$; printf '%s\\n' \"$renewal\" > \"$temporary\"; ",
+    remote_claim_functions!(),
+    "if [ -d \"$lock/claim\" ] || ! claim_acquire; then /bin/rm -f \"$temporary\"; exit 3; fi; trap '/bin/rm -f \"$temporary\"; claim_release' EXIT HUP INT TERM; [ \"$(/bin/cat \"$lock/id\")\" = \"$txn\" ]; /bin/mv -f \"$temporary\" \"$transaction/lease\"; trap - EXIT HUP INT TERM; claim_release"
+);
+
+pub const PLATFORM_PROBE_COMMAND: &str = "os=$(/usr/bin/uname -s) || exit 92; arch=$(/usr/bin/uname -m) || exit 92; case \"$os\" in Linux|Darwin) ;; *) exit 92 ;; esac; for command in /usr/bin/uname /usr/bin/id /usr/bin/stat /usr/bin/cmp /bin/cat /bin/chmod /bin/cp /bin/date /bin/kill /bin/mkdir /bin/mv /bin/ps /bin/rm /bin/rmdir /bin/sleep /bin/sync; do [ -x \"$command\" ] || exit 92; done; printf 'boomux-platform-v1\\0%s\\0%s\\0' \"$os\" \"$arch\"";
+pub const EXECUTABLE_PROBE_COMMAND: &str = "printf 'boomux-executables-v1\\0'; path=$(command -v boomux 2>/dev/null || true); for candidate in \"$path\" /usr/local/bin/boomux /usr/bin/boomux /opt/homebrew/bin/boomux /home/linuxbrew/.linuxbrew/bin/boomux \"$HOME/.local/bin/boomux\" \"$HOME/.local/share/mise/shims/boomux\" \"$HOME/.nix-profile/bin/boomux\" /run/current-system/sw/bin/boomux; do case \"$candidate\" in /*) if [ \"$candidate\" = \"$HOME/.local/bin/boomux\" ] && [ -d \"$HOME/.local/bin/.boomux.bootstrap.lock\" ] && [ ! -d \"$HOME/.local/bin/.boomux.bootstrap.lock/committed\" ]; then continue; fi; [ -f \"$candidate\" ] && [ -x \"$candidate\" ] && printf '%s\\0' \"$candidate\" ;; esac; done; true";
 pub const INSTALL_DESTINATION_PROBE_COMMAND: &str = "case \"$HOME\" in /*) printf 'boomux-install-destination-v1\\0%s\\0' \"$HOME/.local/bin/boomux\" ;; *) exit 1 ;; esac";
+
+fn remote_daemon_command(executable: &RemoteExecutable, arguments: &str) -> String {
+    format!(
+        "{REMOTE_RUNTIME_PREFIX}exec {} {arguments}",
+        quote_posix_shell(executable.as_str())
+    )
+}
+
+fn remote_installed_daemon_command(arguments: &str) -> String {
+    format!(
+        "case \"$HOME\" in /*) ;; *) exit 89 ;; esac; {REMOTE_RUNTIME_PREFIX}exec \"$HOME/.local/bin/boomux\" {arguments}"
+    )
+}
+
+fn remote_daemon_status_command() -> String {
+    format!(
+        "case \"$HOME\" in /*) ;; *) exit 89 ;; esac; {REMOTE_RUNTIME_PREFIX}if [ ! -S \"$XDG_RUNTIME_DIR/boomux/daemon.sock\" ]; then printf 'boomux-daemon-status-v1\\0absent\\0'; exit; fi; exec \"$HOME/.local/bin/boomux\" daemon status --json"
+    )
+}
+
+fn remote_daemon_status_command_for(executable: &RemoteExecutable) -> String {
+    if executable.as_str().ends_with("/.local/bin/boomux") {
+        return remote_daemon_status_command();
+    }
+    format!(
+        "{REMOTE_RUNTIME_PREFIX}if [ ! -S \"$XDG_RUNTIME_DIR/boomux/daemon.sock\" ]; then printf 'boomux-daemon-status-v1\\0absent\\0'; exit; fi; exec {} daemon status --json",
+        quote_posix_shell(executable.as_str())
+    )
+}
+
+fn remote_transaction_daemon_status_command(transaction: &InstallTransactionId) -> String {
+    format!(
+        "case \"$HOME\" in /*) ;; *) exit 89 ;; esac; {REMOTE_RUNTIME_PREFIX}exec \"$HOME/.local/bin/{}/new\" daemon status --json",
+        transaction.0
+    )
+}
+
+fn remote_daemon_presence_command() -> String {
+    format!(
+        "{REMOTE_RUNTIME_PREFIX}socket=$XDG_RUNTIME_DIR/boomux/daemon.sock; if [ -S \"$socket\" ] || [ -e \"$socket\" ] || [ -L \"$socket\" ]; then printf 'boomux-daemon-presence-v1\\0present\\0'; else printf 'boomux-daemon-presence-v1\\0absent\\0'; fi"
+    )
+}
+
+fn remote_helper_command(executable: &RemoteExecutable) -> String {
+    remote_daemon_command(executable, "__federation-stdio")
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SshAuthenticationMode {
@@ -91,21 +252,49 @@ pub struct RemoteDiscovery {
 pub struct CompatibleRemoteHelper {
     pub executable: RemoteExecutable,
     pub handshake: FederationHandshake,
+    bootstrap_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RemoteInstallSource {
-    CurrentBinary(PathBuf),
-    Release { target: &'static str, tag: String },
+    CurrentBinary {
+        path: PathBuf,
+        sha256: String,
+        bytes: Vec<u8>,
+    },
+    Release {
+        target: &'static str,
+        tag: String,
+        sha256: String,
+        bytes: Vec<u8>,
+    },
 }
 
 impl RemoteInstallSource {
     pub fn description(&self) -> String {
         match self {
-            Self::CurrentBinary(path) => format!("current binary {}", path.display()),
-            Self::Release { target, tag } => {
-                format!("checksum-verified GitHub release {tag} for {target}")
+            Self::CurrentBinary { path, sha256, .. } => {
+                format!(
+                    "ABI-unverified pinned current binary {} (sha256 {sha256})",
+                    path.display()
+                )
             }
+            Self::Release {
+                target,
+                tag,
+                sha256,
+                ..
+            } => {
+                format!(
+                    "pinned checksum-verified GitHub release {tag} for {target} (sha256 {sha256})"
+                )
+            }
+        }
+    }
+
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::CurrentBinary { bytes, .. } | Self::Release { bytes, .. } => bytes,
         }
     }
 }
@@ -115,12 +304,292 @@ pub struct RemoteInstallPlan {
     pub target: SshTarget,
     pub destination: RemoteExecutable,
     pub source: RemoteInstallSource,
-    pub may_restart_daemon: bool,
+    pub reason: RemoteInstallReason,
+    bootstrap_id: Option<Uuid>,
+    upgrade_helper: Option<RemoteExecutable>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteInstallReason {
+    Missing,
+    Upgrade,
+}
+
+#[derive(Debug)]
+struct ClassifiedBootstrapError {
+    code: &'static str,
+    message: String,
+}
+
+impl std::fmt::Display for ClassifiedBootstrapError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ClassifiedBootstrapError {}
+
+fn classified_error(
+    kind: io::ErrorKind,
+    code: &'static str,
+    message: impl Into<String>,
+) -> io::Error {
+    io::Error::new(
+        kind,
+        ClassifiedBootstrapError {
+            code,
+            message: message.into(),
+        },
+    )
+}
+
+fn post_install_failure(stage: &'static str, error: io::Error) -> io::Error {
+    if error_code(&error) == "bootstrap_runtime_unavailable" {
+        return error;
+    }
+    let message = match stage {
+        "stream" => "remote provisional executable upload failed",
+        "activation" => "remote guarded executable activation failed",
+        "daemon_status" => "remote post-install daemon status verification failed",
+        "daemon_restart" => "remote post-install graceful daemon restart failed",
+        "helper_verification" => "remote post-install helper verification failed",
+        "live_handshake" => "remote post-install live helper handshake failed",
+        "protocol_ping" => "remote post-install protocol ping failed",
+        _ => "remote post-install verification failed",
+    };
+    let transport = matches!(
+        error.kind(),
+        io::ErrorKind::TimedOut
+            | io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::NotConnected
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::UnexpectedEof
+    );
+    classified_error(
+        error.kind(),
+        if transport {
+            "bootstrap_transport_failed"
+        } else {
+            "bootstrap_install_failed"
+        },
+        message,
+    )
+}
+
+fn post_contact_failure(
+    stage: &'static str,
+    error: io::Error,
+    reason: RemoteInstallReason,
+) -> io::Error {
+    let error = post_install_failure(stage, error);
+    if reason != RemoteInstallReason::Missing {
+        return error;
+    }
+    classified_error(
+        error.kind(),
+        error_code(&error),
+        format!(
+            "{error}; filesystem rollback does not stop runtime processes, so a daemon started independently during bootstrap may remain and require manual recovery"
+        ),
+    )
+}
+
+pub fn error_code(error: &io::Error) -> &'static str {
+    if let Some(classified) = error
+        .get_ref()
+        .and_then(|error| error.downcast_ref::<ClassifiedBootstrapError>())
+    {
+        return classified.code;
+    }
+    let message = error.to_string();
+    match error.kind() {
+        io::ErrorKind::PermissionDenied if message.contains("different Node identities") => {
+            "node_identity_conflict"
+        }
+        io::ErrorKind::PermissionDenied if message.contains("identity changed") => {
+            "node_identity_changed"
+        }
+        io::ErrorKind::PermissionDenied => "bootstrap_authentication_failed",
+        io::ErrorKind::TimedOut
+        | io::ErrorKind::ConnectionRefused
+        | io::ErrorKind::ConnectionReset
+        | io::ErrorKind::ConnectionAborted
+        | io::ErrorKind::NotConnected
+        | io::ErrorKind::BrokenPipe
+        | io::ErrorKind::UnexpectedEof => "bootstrap_transport_failed",
+        io::ErrorKind::Unsupported if message.contains("platform") => {
+            "bootstrap_unsupported_platform"
+        }
+        io::ErrorKind::Unsupported => "unsupported_version",
+        io::ErrorKind::InvalidData
+            if message.contains("platform")
+                || message.contains("operating system")
+                || message.contains("architecture")
+                || message.contains("release asset") =>
+        {
+            "bootstrap_unsupported_platform"
+        }
+        io::ErrorKind::InvalidData if message.contains("newer incompatible") => {
+            "unsupported_version"
+        }
+        io::ErrorKind::InvalidData if message.contains("install source") => {
+            "bootstrap_install_failed"
+        }
+        io::ErrorKind::InvalidData => "bootstrap_malformed_helper",
+        io::ErrorKind::Other
+            if message.contains("install")
+                || message.contains("rollback")
+                || message.contains("release asset") =>
+        {
+            "bootstrap_install_failed"
+        }
+        io::ErrorKind::Other => "bootstrap_transport_failed",
+        _ => "bootstrap_transport_failed",
+    }
+}
+
+impl RemoteInstallReason {
+    pub const fn error_code(self) -> &'static str {
+        match self {
+            Self::Missing => "install_required",
+            Self::Upgrade => "upgrade_required",
+        }
+    }
+
+    pub const fn noninteractive_message(self) -> &'static str {
+        match self {
+            Self::Missing => {
+                "remote Boomux installation is required; rerun `boomux node add ALIAS TARGET` in an interactive terminal to review and authorize it"
+            }
+            Self::Upgrade => {
+                "remote Boomux is outdated and must be upgraded; rerun `boomux node add ALIAS TARGET` in an interactive terminal to review and authorize it"
+            }
+        }
+    }
 }
 
 pub enum RemoteBootstrapPlan {
     Ready(CompatibleRemoteHelper),
     Install(RemoteInstallPlan),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InstallTransactionId(String);
+
+impl InstallTransactionId {
+    fn generate() -> Self {
+        let simple = Uuid::new_v4().simple().to_string();
+        Self(format!(".boomux.bootstrap.{}", &simple[..8]))
+    }
+
+    fn parse_probe(output: &[u8]) -> io::Result<Self> {
+        let fields = parse_nul_fields(output, INSTALL_TRANSACTION_PREFIX)?;
+        if fields.len() != 1 {
+            return Err(invalid_probe(
+                "remote install returned an invalid transaction field count",
+            ));
+        }
+        let value = std::str::from_utf8(fields[0])
+            .map_err(|_| invalid_probe("remote install returned a non-UTF-8 transaction ID"))?;
+        let suffix = value
+            .strip_prefix(".boomux.bootstrap.")
+            .filter(|suffix| {
+                suffix.len() == 8 && suffix.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            })
+            .ok_or_else(|| invalid_probe("remote install returned an invalid transaction ID"))?;
+        let _ = suffix;
+        Ok(Self(value.to_owned()))
+    }
+
+    fn input(&self) -> Vec<u8> {
+        let mut input = self.0.as_bytes().to_vec();
+        input.push(b'\n');
+        input
+    }
+
+    fn upload_input(&self, bytes: &[u8]) -> Vec<u8> {
+        let mut input = self.input();
+        input.extend_from_slice(bytes);
+        input
+    }
+
+    fn activation_input(&self, reason: RemoteInstallReason, prior: &RemoteDaemonStatus) -> Vec<u8> {
+        let mut input = self.input();
+        match reason {
+            RemoteInstallReason::Missing => input.extend_from_slice(b"missing\nabsent\n\n\n\n\n"),
+            RemoteInstallReason::Upgrade => {
+                input.extend_from_slice(b"upgrade\n");
+                match prior {
+                    RemoteDaemonStatus::Present {
+                        protocol_version,
+                        pid: Some(pid),
+                        executable: Some(executable),
+                        socket_device: Some(socket_device),
+                        socket_inode: Some(socket_inode),
+                    } => {
+                        input.extend_from_slice(protocol_version.to_string().as_bytes());
+                        input.push(b'\n');
+                        input.extend_from_slice(pid.to_string().as_bytes());
+                        input.push(b'\n');
+                        input.extend_from_slice(executable.as_str().as_bytes());
+                        input.push(b'\n');
+                        input.extend_from_slice(socket_device.to_string().as_bytes());
+                        input.push(b'\n');
+                        input.extend_from_slice(socket_inode.to_string().as_bytes());
+                        input.push(b'\n');
+                    }
+                    _ => input.extend_from_slice(b"absent\n\n\n\n\n"),
+                }
+            }
+        }
+        input
+    }
+
+    fn renewal_input(&self, renewal: u64) -> Vec<u8> {
+        let mut input = self.input();
+        input.extend_from_slice(renewal.to_string().as_bytes());
+        input.push(b'\n');
+        input
+    }
+}
+
+fn parse_install_activation(output: &[u8]) -> io::Result<bool> {
+    let fields = parse_nul_fields(output, INSTALL_ACTIVATION_PREFIX)?;
+    match fields.as_slice() {
+        [b"activated"] => Ok(true),
+        [b"daemon_present"] => Ok(false),
+        _ => Err(invalid_probe(
+            "remote install activation returned an invalid result",
+        )),
+    }
+}
+
+fn shadow_upgrade_required(helper: &RemoteExecutable) -> io::Error {
+    let path = helper.as_str();
+    classified_error(
+        io::ErrorKind::Unsupported,
+        "upgrade_required",
+        format!(
+            "could not prove that the running remote daemon executable is the install destination; update the verified helper {path} through its owner or package mechanism, or explicitly stop the daemon before retrying"
+        ),
+    )
+}
+
+fn install_presence_required(message: &str) -> io::Error {
+    classified_error(io::ErrorKind::Unsupported, "install_required", message)
+}
+
+fn parse_install_commit(output: &[u8]) -> io::Result<()> {
+    let fields = parse_nul_fields(output, INSTALL_COMMIT_PREFIX)?;
+    if fields.len() == 1 && fields[0] == b"committed" {
+        Ok(())
+    } else {
+        Err(invalid_probe(
+            "remote install commit returned an invalid result",
+        ))
+    }
 }
 
 pub struct RemoteConnection {
@@ -131,6 +600,7 @@ pub struct RemoteConnection {
     stderr_reader: Option<BoundedReader>,
     pub executable: RemoteExecutable,
     pub handshake: FederationHandshake,
+    _bootstrap_session: Option<BootstrapSession>,
 }
 
 pub(crate) struct RemoteAttachmentReader {
@@ -138,6 +608,7 @@ pub(crate) struct RemoteAttachmentReader {
     pid: i32,
     stdout: ChildStdout,
     stderr_reader: Option<BoundedReader>,
+    _bootstrap_session: Option<BootstrapSession>,
 }
 
 pub(crate) struct RemoteAttachmentWriter(Option<ChildStdin>);
@@ -159,6 +630,7 @@ impl RemoteConnection {
                     pid: this.pid,
                     stdout: std::ptr::read(&this.stdout),
                     stderr_reader: this.stderr_reader.take(),
+                    _bootstrap_session: this._bootstrap_session.take(),
                 },
                 RemoteAttachmentWriter(this.stdin.take()),
             )
@@ -195,6 +667,15 @@ impl RemoteConnection {
             Err(invalid_probe(
                 "remote helper returned an invalid ping response",
             ))
+        }
+    }
+
+    fn ping_with_timeout(&mut self, timeout: Duration) -> io::Result<()> {
+        match self.request(Request::Ping, timeout)? {
+            Response::Pong => Ok(()),
+            _ => Err(invalid_probe(
+                "remote helper returned an invalid post-install ping response",
+            )),
         }
     }
 
@@ -424,12 +905,24 @@ impl RemotePlatform {
         let operating_system = match fields[0] {
             b"Linux" => RemoteOperatingSystem::Linux,
             b"Darwin" => RemoteOperatingSystem::MacOs,
-            _ => return Err(invalid_probe("remote operating system is unsupported")),
+            _ => {
+                return Err(classified_error(
+                    io::ErrorKind::Unsupported,
+                    "bootstrap_unsupported_platform",
+                    "remote operating system is unsupported",
+                ));
+            }
         };
         let architecture = match fields[1] {
             b"x86_64" | b"amd64" => RemoteArchitecture::X86_64,
             b"aarch64" | b"arm64" => RemoteArchitecture::Aarch64,
-            _ => return Err(invalid_probe("remote architecture is unsupported")),
+            _ => {
+                return Err(classified_error(
+                    io::ErrorKind::Unsupported,
+                    "bootstrap_unsupported_platform",
+                    "remote architecture is unsupported",
+                ));
+            }
         };
         Ok(Self {
             operating_system,
@@ -491,7 +984,8 @@ pub fn parse_executable_probe(output: &[u8]) -> io::Result<Vec<RemoteExecutable>
     for field in fields {
         let value = std::str::from_utf8(field)
             .map_err(|_| invalid_probe("executable probe returned non-UTF-8 data"))?;
-        let executable = RemoteExecutable::parse(value.to_owned())?;
+        let executable = RemoteExecutable::parse(value.to_owned())
+            .map_err(|_| invalid_probe("executable probe returned an invalid executable path"))?;
         if seen.insert(executable.0.clone()) {
             executables.push(executable);
         }
@@ -509,6 +1003,7 @@ pub fn parse_install_destination_probe(output: &[u8]) -> io::Result<RemoteExecut
     let value = std::str::from_utf8(fields[0])
         .map_err(|_| invalid_probe("install destination probe returned non-UTF-8 data"))?;
     RemoteExecutable::parse(value.to_owned())
+        .map_err(|_| invalid_probe("install destination probe returned an invalid executable path"))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -570,6 +1065,18 @@ pub struct SshInvocation {
     authentication: SshAuthenticationMode,
 }
 
+pub struct BootstrapSession {
+    id: Uuid,
+    program: OsString,
+    directory: PathBuf,
+    config_path: PathBuf,
+    control_path: PathBuf,
+    target: SshTarget,
+    master: Child,
+    master_pid: i32,
+    stderr_reader: Option<MasterStderrReader>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SshProbeOutput {
     pub stdout: Vec<u8>,
@@ -577,6 +1084,585 @@ pub struct SshProbeOutput {
 }
 
 type BoundedReader = thread::JoinHandle<io::Result<(Vec<u8>, bool)>>;
+
+trait StderrMirror: Write + AsRawFd + Send {}
+
+impl<T: Write + AsRawFd + Send> StderrMirror for T {}
+
+#[derive(Debug, Clone, Copy)]
+enum MasterStderrEvent {
+    Truncated,
+    MirrorFailed,
+}
+
+struct MasterStderrReader {
+    reader: BoundedReader,
+    events: mpsc::Receiver<MasterStderrEvent>,
+}
+
+impl MasterStderrReader {
+    fn event(&self) -> Option<MasterStderrEvent> {
+        self.events.try_recv().ok()
+    }
+
+    fn finish(self) -> (io::Result<(Vec<u8>, bool)>, Option<MasterStderrEvent>) {
+        let result = join_bounded_reader(self.reader);
+        (result, self.events.try_recv().ok())
+    }
+}
+
+impl BootstrapSession {
+    pub fn open(
+        target: SshTarget,
+        authentication: SshAuthenticationMode,
+        timeout: Duration,
+    ) -> io::Result<Self> {
+        let socket_path = crate::client::socket_path()?;
+        let runtime_directory = socket_path
+            .parent()
+            .ok_or_else(|| io::Error::other("Boomux runtime socket has no parent"))?;
+        let user_config = env::var_os("HOME")
+            .filter(|home| !home.is_empty())
+            .map(PathBuf::from)
+            .map(|home| home.join(".ssh/config"));
+        let stderr_mirror = match authentication {
+            SshAuthenticationMode::Interactive => Some(Box::new(
+                OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK)
+                    .open("/dev/tty")?,
+            ) as Box<dyn StderrMirror>),
+            SshAuthenticationMode::Batch => None,
+        };
+        Self::open_at_with_mirror(
+            runtime_directory,
+            user_config.as_deref(),
+            target,
+            authentication,
+            timeout,
+            OsStr::new("ssh"),
+            stderr_mirror,
+        )
+    }
+
+    #[cfg(test)]
+    fn open_at(
+        runtime_directory: &Path,
+        user_config: Option<&Path>,
+        target: SshTarget,
+        authentication: SshAuthenticationMode,
+        timeout: Duration,
+        program: &OsStr,
+    ) -> io::Result<Self> {
+        Self::open_at_with_mirror(
+            runtime_directory,
+            user_config,
+            target,
+            authentication,
+            timeout,
+            program,
+            None,
+        )
+    }
+
+    fn open_at_with_mirror(
+        runtime_directory: &Path,
+        user_config: Option<&Path>,
+        target: SshTarget,
+        authentication: SshAuthenticationMode,
+        timeout: Duration,
+        program: &OsStr,
+        stderr_mirror: Option<Box<dyn StderrMirror>>,
+    ) -> io::Result<Self> {
+        if timeout.is_zero() || timeout > MAX_PROBE_TIMEOUT {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "SSH bootstrap timeout is outside the supported bound",
+            ));
+        }
+        let (directory, config_path, control_path) =
+            prepare_ssh_directory(runtime_directory, user_config)?;
+        let mut command = Command::new(program);
+        append_ssh_security_options(&mut command, &config_path, &control_path, authentication);
+        command
+            .args(["-o", "ControlMaster=yes"])
+            .args(["-o", "ControlPersist=no"])
+            .arg("-N")
+            .arg(target.as_str())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+        let mut master = match command.spawn() {
+            Ok(master) => master,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&directory);
+                return Err(error);
+            }
+        };
+        let master_pid = i32::try_from(master.id()).map_err(|error| {
+            let _ = master.kill();
+            let _ = master.wait();
+            let _ = fs::remove_dir_all(&directory);
+            io::Error::other(format!("child PID overflow: {error}"))
+        })?;
+        let stderr = match master.stderr.take() {
+            Some(stderr) => stderr,
+            None => {
+                let _ = kill_process_group(master_pid, &mut master);
+                let _ = fs::remove_dir_all(&directory);
+                return Err(io::Error::other("SSH master stderr was not captured"));
+            }
+        };
+        let deadline = Instant::now() + timeout;
+        let stderr_reader = match spawn_master_stderr_reader(
+            stderr,
+            MAX_PROBE_STDERR_BYTES,
+            if authentication == SshAuthenticationMode::Interactive {
+                stderr_mirror
+            } else {
+                None
+            },
+            master_pid,
+            deadline,
+        ) {
+            Ok(reader) => reader,
+            Err(error) => {
+                let _ = kill_process_group(master_pid, &mut master);
+                let _ = fs::remove_dir_all(&directory);
+                return Err(error);
+            }
+        };
+        loop {
+            if let Some(event) = stderr_reader.event() {
+                let _ = kill_process_group(master_pid, &mut master);
+                let _ = stderr_reader.finish();
+                let _ = fs::remove_dir_all(&directory);
+                return Err(master_stderr_event_error(event));
+            }
+            let status = match master.try_wait() {
+                Ok(status) => status,
+                Err(error) => {
+                    let _ = kill_process_group(master_pid, &mut master);
+                    let _ = stderr_reader.finish();
+                    let _ = fs::remove_dir_all(&directory);
+                    return Err(error);
+                }
+            };
+            if let Some(status) = status {
+                let (result, event) = stderr_reader.finish();
+                let _ = fs::remove_dir_all(&directory);
+                if let Some(event) = event {
+                    return Err(master_stderr_event_error(event));
+                }
+                let (stderr, truncated) = result?;
+                if truncated {
+                    return Err(master_stderr_event_error(MasterStderrEvent::Truncated));
+                }
+                return Err(classify_ssh_start_failure(status.code(), &stderr));
+            }
+            let mut check = Command::new(program);
+            check
+                .arg("-F")
+                .arg(&config_path)
+                .arg("-S")
+                .arg(&control_path)
+                .args(["-O", "check"])
+                .arg(target.as_str())
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            if check.status().is_ok_and(|status| status.success()) {
+                if let Some(event) = stderr_reader.event() {
+                    let _ = kill_process_group(master_pid, &mut master);
+                    let _ = stderr_reader.finish();
+                    let _ = fs::remove_dir_all(&directory);
+                    return Err(master_stderr_event_error(event));
+                }
+                break;
+            }
+            if Instant::now() >= deadline {
+                let _ = kill_process_group(master_pid, &mut master);
+                let _ = stderr_reader.finish();
+                let _ = fs::remove_dir_all(&directory);
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "SSH bootstrap authentication timed out",
+                ));
+            }
+            thread::sleep(CHILD_POLL_INTERVAL);
+        }
+        Ok(Self {
+            id: Uuid::new_v4(),
+            program: program.to_owned(),
+            directory,
+            config_path,
+            control_path,
+            target,
+            master,
+            master_pid,
+            stderr_reader: Some(stderr_reader),
+        })
+    }
+
+    fn command(&self, remote_command: &str) -> Command {
+        slave_command(
+            &self.program,
+            &self.config_path,
+            &self.control_path,
+            &self.target,
+            remote_command,
+        )
+    }
+
+    pub fn plan(&mut self, timeout: Duration) -> io::Result<RemoteBootstrapPlan> {
+        let discovery = discover_remote_in_session(self, timeout)?;
+        let selection = inspect_remote_helpers_in_session(self, &discovery.executables, timeout)?;
+        if let Some(helper) = selection.compatible {
+            return Ok(RemoteBootstrapPlan::Ready(helper));
+        }
+        let reason = if discovery.executables.is_empty() {
+            RemoteInstallReason::Missing
+        } else if selection.incompatible == discovery.executables.len() {
+            RemoteInstallReason::Upgrade
+        } else {
+            return Err(io::Error::other(
+                "remote Boomux candidates could not be verified; refusing remote modification",
+            ));
+        };
+        let source = select_install_source(discovery.platform)?;
+        let upgrade_helper = (reason == RemoteInstallReason::Upgrade)
+            .then(|| selection.incompatible_executables.first().cloned())
+            .flatten();
+        Ok(RemoteBootstrapPlan::Install(RemoteInstallPlan {
+            target: self.target.clone(),
+            destination: discovery.install_destination,
+            source,
+            reason,
+            bootstrap_id: Some(self.id),
+            upgrade_helper,
+        }))
+    }
+
+    pub fn connect(
+        self,
+        helper: CompatibleRemoteHelper,
+        timeout: Duration,
+    ) -> io::Result<RemoteConnection> {
+        if helper.bootstrap_id != Some(self.id) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "remote helper observation belongs to a different bootstrap endpoint",
+            ));
+        }
+        connect_remote_in_session(self, helper, timeout)
+    }
+
+    pub fn install_and_connect(
+        self,
+        plan: &RemoteInstallPlan,
+        timeout: Duration,
+    ) -> io::Result<RemoteConnection> {
+        if plan.bootstrap_id != Some(self.id) || plan.target != self.target {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "remote install authorization belongs to a different bootstrap endpoint",
+            ));
+        }
+        let upgrade_helper = if plan.reason == RemoteInstallReason::Upgrade {
+            Some(plan.upgrade_helper.as_ref().ok_or_else(|| {
+                invalid_probe("remote upgrade omitted its verified outdated helper")
+            })?)
+        } else {
+            prove_remote_daemon_absent(&self, timeout)?;
+            None
+        };
+        let requested_transaction = InstallTransactionId::generate();
+        let upload = || {
+            run_streaming_command_capture(
+                self.command(REMOTE_INSTALL_COMMAND),
+                requested_transaction.upload_input(plan.source.bytes()),
+                timeout,
+            )
+            .and_then(|output| InstallTransactionId::parse_probe(&output.stdout))
+        };
+        let transaction = match upload() {
+            Ok(transaction) if transaction == requested_transaction => transaction,
+            Ok(_) => {
+                return Err(post_install_failure(
+                    "stream",
+                    invalid_probe("remote upload acknowledged a different transaction"),
+                ));
+            }
+            Err(first_error) => match upload() {
+                Ok(transaction) if transaction == requested_transaction => transaction,
+                Ok(_) => {
+                    return Err(post_install_failure(
+                        "stream",
+                        invalid_probe("upload retry acknowledged a different transaction"),
+                    ));
+                }
+                Err(retry_error) => {
+                    return Err(post_install_failure(
+                        "stream",
+                        io::Error::new(
+                            retry_error.kind(),
+                            format!("upload retry failed after ambiguous outcome: {first_error}"),
+                        ),
+                    ));
+                }
+            },
+        };
+        let mut renewal = 0_u64;
+        macro_rules! renew_lease {
+            ($stage:literal) => {{
+                renewal += 1;
+                if let Err(error) = run_streaming_command(
+                    self.command(REMOTE_INSTALL_RENEW_COMMAND),
+                    transaction.renewal_input(renewal),
+                    timeout,
+                ) {
+                    let _ = self.rollback_install(&transaction, timeout);
+                    return Err(post_install_failure($stage, error));
+                }
+            }};
+        }
+        renew_lease!("daemon_status");
+        let prior_daemon = if let Some(helper) = upgrade_helper {
+            let status = run_bounded_command(
+                self.command(&remote_transaction_daemon_status_command(&transaction)),
+                timeout,
+            )
+            .and_then(|output| parse_remote_daemon_status(&output.stdout));
+            match status {
+                Ok(status) if status.proves_executable(&plan.destination) => status,
+                _ => {
+                    return Err(shadow_upgrade_required(helper));
+                }
+            }
+        } else {
+            RemoteDaemonStatus::Absent
+        };
+        renew_lease!("activation");
+        let activate = || {
+            run_streaming_command_capture(
+                self.command(REMOTE_INSTALL_ACTIVATE_COMMAND),
+                transaction.activation_input(plan.reason, &prior_daemon),
+                timeout,
+            )
+            .and_then(|output| parse_install_activation(&output.stdout))
+        };
+        let activated = match activate() {
+            Ok(activated) => activated,
+            Err(first_error) => match activate() {
+                Ok(activated) => activated,
+                Err(retry_error) => {
+                    return Err(post_install_failure(
+                        "activation",
+                        io::Error::new(
+                            retry_error.kind(),
+                            format!(
+                                "activation retry failed after ambiguous outcome: {first_error}"
+                            ),
+                        ),
+                    ));
+                }
+            },
+        };
+        if !activated {
+            return Err(install_presence_required(
+                "a remote daemon socket appeared before activation; recover or stop that daemon before retrying installation",
+            ));
+        }
+        renew_lease!("helper_verification");
+        if let Err(error) = run_streaming_command(
+            self.command(REMOTE_INSTALL_MARK_DAEMON_CONTACTED_COMMAND),
+            transaction.input(),
+            timeout,
+        ) {
+            self.rollback_install(&transaction, timeout)?;
+            return Err(post_contact_failure(
+                "helper_verification",
+                error,
+                plan.reason,
+            ));
+        }
+        renew_lease!("helper_verification");
+        let initial_helper = (|| {
+            let candidates = [plan.destination.clone()];
+            let helper =
+                match inspect_remote_helpers_in_session(&self, &candidates, timeout)?.compatible {
+                    Some(helper) => helper,
+                    None => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Unsupported,
+                            "installed remote helper is not federation-compatible",
+                        ));
+                    }
+                };
+            Ok(helper)
+        })();
+        let daemon_status = if plan.reason == RemoteInstallReason::Upgrade {
+            renew_lease!("daemon_status");
+            match remote_daemon_status_in_session(&self, &plan.destination, timeout) {
+                Ok(status) => Some(status),
+                Err(error) => {
+                    self.rollback_install(&transaction, timeout)?;
+                    return Err(post_contact_failure("daemon_status", error, plan.reason));
+                }
+            }
+        } else {
+            None
+        };
+        let helper = if daemon_status
+            .as_ref()
+            .is_some_and(RemoteDaemonStatus::restart_required)
+        {
+            renew_lease!("daemon_restart");
+            if let Err(error) = run_streaming_command(
+                self.command(REMOTE_INSTALL_MARK_RESTARTED_COMMAND),
+                transaction.input(),
+                timeout,
+            ) {
+                self.rollback_install(&transaction, timeout)?;
+                return Err(post_contact_failure("daemon_restart", error, plan.reason));
+            }
+            renew_lease!("daemon_restart");
+            if let Err(error) = run_bounded_command(
+                self.command(&remote_installed_daemon_command("daemon restart")),
+                timeout,
+            ) {
+                self.rollback_install(&transaction, timeout)?;
+                return Err(post_contact_failure("daemon_restart", error, plan.reason));
+            }
+            renew_lease!("helper_verification");
+            match inspect_remote_helpers_in_session(
+                &self,
+                std::slice::from_ref(&plan.destination),
+                timeout,
+            )
+            .and_then(|inspection| {
+                inspection.compatible.ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "installed remote helper failed after daemon restart",
+                    )
+                })
+            }) {
+                Ok(helper) => helper,
+                Err(error) => {
+                    self.rollback_install(&transaction, timeout)?;
+                    return Err(post_contact_failure(
+                        "helper_verification",
+                        error,
+                        plan.reason,
+                    ));
+                }
+            }
+        } else {
+            match initial_helper {
+                Ok(helper) => helper,
+                Err(error) => {
+                    self.rollback_install(&transaction, timeout)?;
+                    return Err(post_contact_failure(
+                        "helper_verification",
+                        error,
+                        plan.reason,
+                    ));
+                }
+            }
+        };
+
+        renew_lease!("live_handshake");
+        let command = self.command(&remote_helper_command(&helper.executable));
+        let mut connection = match connect_remote_command(command, helper, timeout, None) {
+            Ok(connection) => connection,
+            Err(error) => {
+                self.rollback_install(&transaction, timeout)?;
+                return Err(post_contact_failure("live_handshake", error, plan.reason));
+            }
+        };
+        renew_lease!("protocol_ping");
+        if let Err(error) = connection.ping_with_timeout(timeout) {
+            drop(connection);
+            self.rollback_install(&transaction, timeout)?;
+            return Err(post_contact_failure("protocol_ping", error, plan.reason));
+        }
+        renew_lease!("commit");
+        let commit = run_streaming_command_capture(
+            self.command(REMOTE_INSTALL_COMMIT_COMMAND),
+            transaction.input(),
+            timeout,
+        )
+        .and_then(|output| parse_install_commit(&output.stdout));
+        if let Err(error) = commit {
+            drop(connection);
+            return Err(classified_error(
+                io::ErrorKind::Other,
+                "bootstrap_commit_outcome_unknown",
+                format!(
+                    "remote install commit outcome is unknown after successful helper verification and protocol ping; retry the exact bootstrap to discover the installed helper: {error}"
+                ),
+            ));
+        }
+        connection._bootstrap_session = Some(self);
+        Ok(connection)
+    }
+
+    fn rollback_install(
+        &self,
+        transaction: &InstallTransactionId,
+        timeout: Duration,
+    ) -> io::Result<()> {
+        run_streaming_command(
+            self.command(REMOTE_INSTALL_ROLLBACK_COMMAND),
+            transaction.input(),
+            timeout,
+        )
+    }
+}
+
+fn slave_command(
+    program: &OsStr,
+    config_path: &Path,
+    control_path: &Path,
+    target: &SshTarget,
+    remote_command: &str,
+) -> Command {
+    let mut command = Command::new(program);
+    append_ssh_security_options(
+        &mut command,
+        config_path,
+        control_path,
+        SshAuthenticationMode::Batch,
+    );
+    command
+        .args(["-o", "ControlMaster=no"])
+        .args(["-o", "HostName=boomux-mux-only.invalid"])
+        .args(["-o", "ProxyCommand=/bin/false"])
+        .args(["-o", "ConnectionAttempts=1"])
+        .arg(target.as_str())
+        .arg(remote_command);
+    command
+}
+
+impl Drop for BootstrapSession {
+    fn drop(&mut self) {
+        let _ = kill_process_group(self.master_pid, &mut self.master);
+        if let Some(reader) = self.stderr_reader.take() {
+            let _ = reader.finish();
+        }
+        let _ = fs::remove_dir_all(&self.directory);
+    }
+}
 
 impl SshInvocation {
     pub fn prepare(
@@ -685,10 +1771,7 @@ impl SshInvocation {
             runtime_directory,
             user_config,
             target,
-            format!(
-                "{} __federation-stdio",
-                quote_posix_shell(executable.as_str())
-            ),
+            remote_helper_command(&executable),
             authentication,
         )
     }
@@ -741,6 +1824,7 @@ impl SshInvocation {
                 .open(&config_path)?;
             if let Some(user_config) = user_config {
                 writeln!(config, "Include {}", quote_ssh_config_path(user_config)?)?;
+                writeln!(config, "Match all")?;
             }
             // SendEnv is list-valued, so clear user entries after their config.
             writeln!(config, "SendEnv -*")?;
@@ -766,6 +1850,119 @@ impl SshInvocation {
     }
 }
 
+fn append_ssh_security_options(
+    command: &mut Command,
+    config_path: &Path,
+    control_path: &Path,
+    authentication: SshAuthenticationMode,
+) {
+    command
+        .arg("-F")
+        .arg(config_path)
+        .arg("-T")
+        .args(["-o", "ClearAllForwardings=yes"])
+        .args(["-o", "ForwardAgent=no"])
+        .args(["-o", "ForwardX11=no"])
+        .args(["-o", "PermitLocalCommand=no"])
+        .args(["-o", "RemoteCommand=none"])
+        .args(["-o", "ForkAfterAuthentication=no"])
+        .args(["-o", "StdinNull=no"])
+        .arg("-o")
+        .arg(format!(
+            "ControlPath={}",
+            control_path.to_str().expect("validated SSH control path")
+        ))
+        .args([
+            "-o",
+            match authentication {
+                SshAuthenticationMode::Interactive => "BatchMode=no",
+                SshAuthenticationMode::Batch => "BatchMode=yes",
+            },
+        ]);
+}
+
+fn prepare_ssh_directory(
+    runtime_directory: &Path,
+    user_config: Option<&Path>,
+) -> io::Result<(PathBuf, PathBuf, PathBuf)> {
+    secure_runtime_directory(runtime_directory)?;
+    let nonce = Uuid::new_v4().simple().to_string();
+    let directory = runtime_directory.join(format!("ssh-{}", &nonce[..16]));
+    fs::create_dir(&directory)?;
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
+    let config_path = directory.join("config");
+    let control_path = directory.join("c");
+    if control_path.as_os_str().as_bytes().len() > MAX_CONTROL_PATH_BYTES {
+        let _ = fs::remove_dir_all(&directory);
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "SSH control socket path exceeds the safe Unix socket bound",
+        ));
+    }
+    validate_option_path(&control_path, "SSH control socket")?;
+    let result = (|| {
+        let mut config = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&config_path)?;
+        if let Some(user_config) = user_config {
+            writeln!(config, "Include {}", quote_ssh_config_path(user_config)?)?;
+            writeln!(config, "Match all")?;
+        }
+        writeln!(config, "SendEnv -*")?;
+        writeln!(config, "Host *")?;
+        writeln!(config, "    ServerAliveInterval 15")?;
+        writeln!(config, "    ServerAliveCountMax 3")?;
+        config.sync_all()
+    })();
+    if let Err(error) = result {
+        let _ = fs::remove_dir_all(&directory);
+        return Err(error);
+    }
+    Ok((directory, config_path, control_path))
+}
+
+fn classify_ssh_start_failure(status: Option<i32>, stderr: &[u8]) -> io::Error {
+    let stderr = String::from_utf8_lossy(stderr).to_ascii_lowercase();
+    if stderr.contains("permission denied")
+        || stderr.contains("authentication failed")
+        || stderr.contains("host key verification failed")
+    {
+        classified_error(
+            io::ErrorKind::PermissionDenied,
+            "bootstrap_authentication_failed",
+            "SSH authentication or host-key verification failed",
+        )
+    } else {
+        classified_error(
+            io::ErrorKind::ConnectionRefused,
+            "bootstrap_transport_failed",
+            format!(
+                "SSH bootstrap transport failed{}",
+                status.map_or_else(String::new, |status| format!(" with status {status}"))
+            ),
+        )
+    }
+}
+
+fn master_stderr_event_error(event: MasterStderrEvent) -> io::Error {
+    let message = match event {
+        MasterStderrEvent::Truncated => {
+            "SSH bootstrap authentication output exceeded the supported bound"
+        }
+        MasterStderrEvent::MirrorFailed => {
+            "SSH bootstrap authentication output could not be shown safely"
+        }
+    };
+    classified_error(
+        io::ErrorKind::ConnectionAborted,
+        "bootstrap_transport_failed",
+        message,
+    )
+}
+
+#[cfg(test)]
 pub fn discover_remote(
     target: SshTarget,
     authentication: SshAuthenticationMode,
@@ -789,55 +1986,219 @@ pub fn discover_remote(
     )
 }
 
+fn discover_remote_in_session(
+    session: &BootstrapSession,
+    timeout: Duration,
+) -> io::Result<RemoteDiscovery> {
+    let run = |probe: RemoteProbe| run_bounded_command(session.command(probe.command()), timeout);
+    let platform = RemotePlatform::parse_probe(&run(RemoteProbe::Platform)?.stdout)?;
+    let executables = parse_executable_probe(&run(RemoteProbe::Executables)?.stdout)?;
+    let install_destination =
+        parse_install_destination_probe(&run(RemoteProbe::InstallDestination)?.stdout)?;
+    Ok(RemoteDiscovery {
+        platform,
+        executables,
+        install_destination,
+    })
+}
+
+#[cfg(test)]
 pub fn plan_remote_bootstrap(
     target: SshTarget,
     authentication: SshAuthenticationMode,
     timeout: Duration,
 ) -> io::Result<RemoteBootstrapPlan> {
-    let discovery = discover_remote(target.clone(), authentication, timeout)?;
-    if let Ok(helper) = find_compatible_remote_helper(
+    let socket_path = crate::client::socket_path()?;
+    let runtime_directory = socket_path
+        .parent()
+        .ok_or_else(|| io::Error::other("Boomux runtime socket has no parent"))?;
+    let user_config = env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .map(|home| home.join(".ssh/config"));
+    plan_remote_bootstrap_at(
+        runtime_directory,
+        user_config.as_deref(),
+        target,
+        authentication,
+        timeout,
+        OsStr::new("ssh"),
+    )
+}
+
+#[cfg(test)]
+fn plan_remote_bootstrap_at(
+    runtime_directory: &Path,
+    user_config: Option<&Path>,
+    target: SshTarget,
+    authentication: SshAuthenticationMode,
+    timeout: Duration,
+    program: &OsStr,
+) -> io::Result<RemoteBootstrapPlan> {
+    let discovery = discover_remote_at(
+        runtime_directory,
+        user_config,
+        target.clone(),
+        authentication,
+        timeout,
+        program,
+    )?;
+    let selection = inspect_remote_helpers_at(
+        runtime_directory,
+        user_config,
         target.clone(),
         &discovery.executables,
         authentication,
         timeout,
-    ) {
+        program,
+    )?;
+    if let Some(helper) = selection.compatible {
         return Ok(RemoteBootstrapPlan::Ready(helper));
     }
+    let reason = if discovery.executables.is_empty() {
+        RemoteInstallReason::Missing
+    } else if selection.incompatible == discovery.executables.len() {
+        RemoteInstallReason::Upgrade
+    } else {
+        return Err(io::Error::other(
+            "remote Boomux candidates could not be verified; check remote executable access and SSH transport before retrying",
+        ));
+    };
     let source = select_install_source(discovery.platform)?;
+    let upgrade_helper = (reason == RemoteInstallReason::Upgrade)
+        .then(|| selection.incompatible_executables.first().cloned())
+        .flatten();
     Ok(RemoteBootstrapPlan::Install(RemoteInstallPlan {
         target,
         destination: discovery.install_destination,
         source,
-        may_restart_daemon: !discovery.executables.is_empty(),
+        reason,
+        bootstrap_id: None,
+        upgrade_helper,
     }))
 }
 
-pub fn install_remote(
-    plan: &RemoteInstallPlan,
-    authentication: SshAuthenticationMode,
-    timeout: Duration,
-) -> io::Result<CompatibleRemoteHelper> {
-    let binary = load_install_source(&plan.source)?;
-    let invocation =
-        prepare_fixed_invocation(plan.target.clone(), REMOTE_INSTALL_COMMAND, authentication)?;
-    run_streaming_command(invocation.command(), binary, timeout)?;
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RemoteDaemonStatus {
+    Absent,
+    Present {
+        protocol_version: u32,
+        pid: Option<u32>,
+        executable: Option<RemoteExecutable>,
+        socket_device: Option<u64>,
+        socket_inode: Option<u64>,
+    },
+}
 
-    let candidates = [plan.destination.clone()];
-    match find_compatible_remote_helper(plan.target.clone(), &candidates, authentication, timeout) {
-        Ok(helper) => Ok(helper),
-        Err(first_error) if plan.may_restart_daemon => {
-            let restart = prepare_fixed_invocation(
-                plan.target.clone(),
-                REMOTE_RESTART_COMMAND,
-                authentication,
-            )?;
-            run_bounded_command(restart.command(), timeout).map_err(|_| first_error)?;
-            find_compatible_remote_helper(plan.target.clone(), &candidates, authentication, timeout)
-        }
-        Err(error) => Err(error),
+impl RemoteDaemonStatus {
+    fn restart_required(&self) -> bool {
+        matches!(
+            self,
+            Self::Present {
+                protocol_version, ..
+            }
+                if !(federation_protocol_floor()..=protocol::PROTOCOL_VERSION)
+                    .contains(protocol_version)
+        )
+    }
+
+    fn proves_executable(&self, destination: &RemoteExecutable) -> bool {
+        matches!(
+            self,
+            Self::Present {
+                pid: Some(_),
+                executable: Some(executable),
+                socket_device: Some(_),
+                socket_inode: Some(_),
+                ..
+            } if executable == destination
+        )
     }
 }
 
+fn remote_daemon_status_in_session(
+    session: &BootstrapSession,
+    executable: &RemoteExecutable,
+    timeout: Duration,
+) -> io::Result<RemoteDaemonStatus> {
+    let status = run_bounded_command(
+        session.command(&remote_daemon_status_command_for(executable)),
+        timeout,
+    )?;
+    parse_remote_daemon_status(&status.stdout)
+}
+
+fn prove_remote_daemon_absent(session: &BootstrapSession, timeout: Duration) -> io::Result<()> {
+    let output = run_bounded_command(session.command(&remote_daemon_presence_command()), timeout)
+        .map_err(|_| {
+            install_presence_required(
+                "remote daemon absence could not be proven; inspect or remove the runtime socket manually before installing Boomux",
+            )
+        })?;
+    let fields = parse_nul_fields(&output.stdout, DAEMON_PRESENCE_PREFIX).map_err(|_| {
+        install_presence_required(
+            "remote daemon absence could not be proven; inspect or remove the runtime socket manually before installing Boomux",
+        )
+    })?;
+    if fields == [b"absent"] {
+        Ok(())
+    } else {
+        Err(install_presence_required(
+            "a remote daemon socket already exists; stop or recover that daemon and remove only a confirmed stale socket before installing Boomux",
+        ))
+    }
+}
+
+fn parse_remote_daemon_status(stdout: &[u8]) -> io::Result<RemoteDaemonStatus> {
+    if stdout.starts_with(DAEMON_STATUS_PREFIX) {
+        let fields = parse_nul_fields(stdout, DAEMON_STATUS_PREFIX)?;
+        return if fields == [b"absent"] {
+            Ok(RemoteDaemonStatus::Absent)
+        } else {
+            Err(invalid_probe(
+                "remote daemon status returned an invalid result",
+            ))
+        };
+    }
+    let value: serde_json::Value = serde_json::from_slice(stdout)
+        .map_err(|_| invalid_probe("remote daemon status returned invalid JSON"))?;
+    if value.get("schema").and_then(serde_json::Value::as_str) != Some("boomux.cli/v1")
+        || value.get("command").and_then(serde_json::Value::as_str) != Some("daemon.status")
+    {
+        return Err(invalid_probe(
+            "remote daemon status returned an invalid envelope",
+        ));
+    }
+    let version = value
+        .pointer("/data/protocol_version")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|version| u32::try_from(version).ok())
+        .ok_or_else(|| invalid_probe("remote daemon status omitted its protocol version"))?;
+    let pid = value
+        .pointer("/data/pid")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|pid| u32::try_from(pid).ok())
+        .filter(|pid| *pid != 0);
+    let executable = value
+        .pointer("/data/executable")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|executable| RemoteExecutable::parse(executable).ok());
+    let socket_device = value
+        .pointer("/data/socket_device")
+        .and_then(serde_json::Value::as_u64);
+    let socket_inode = value
+        .pointer("/data/socket_inode")
+        .and_then(serde_json::Value::as_u64);
+    Ok(RemoteDaemonStatus::Present {
+        protocol_version: version,
+        pid,
+        executable,
+        socket_device,
+        socket_inode,
+    })
+}
+
+#[cfg(test)]
 pub fn connect_remote(
     target: SshTarget,
     helper: CompatibleRemoteHelper,
@@ -851,7 +2212,30 @@ pub fn connect_remote(
         ));
     }
     let invocation = SshInvocation::prepare(target, helper.executable.clone(), authentication)?;
-    let mut command = invocation.command();
+    connect_remote_command(invocation.command(), helper, timeout, None)
+}
+
+fn connect_remote_in_session(
+    session: BootstrapSession,
+    helper: CompatibleRemoteHelper,
+    timeout: Duration,
+) -> io::Result<RemoteConnection> {
+    let command = session.command(&remote_helper_command(&helper.executable));
+    connect_remote_command(command, helper, timeout, Some(session))
+}
+
+fn connect_remote_command(
+    mut command: Command,
+    helper: CompatibleRemoteHelper,
+    timeout: Duration,
+    bootstrap_session: Option<BootstrapSession>,
+) -> io::Result<RemoteConnection> {
+    if timeout.is_zero() || timeout > MAX_PROBE_TIMEOUT {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "SSH connection timeout is outside the supported bound",
+        ));
+    }
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -927,7 +2311,10 @@ pub fn connect_remote(
         Ok(handshake) => handshake,
         Err(error) => {
             let _ = kill_process_group(pid, &mut child);
-            let _ = join_bounded_reader(stderr_reader);
+            let (stderr, truncated) = join_bounded_reader(stderr_reader)?;
+            if !truncated && let Some(runtime_error) = runtime_stage_failure(None, &stderr) {
+                return Err(runtime_error);
+            }
             return Err(error);
         }
     };
@@ -944,6 +2331,7 @@ pub fn connect_remote(
         stderr_reader: Some(stderr_reader),
         executable: helper.executable,
         handshake,
+        _bootstrap_session: bootstrap_session,
     })
 }
 
@@ -951,7 +2339,7 @@ fn validate_live_handshake(
     expected: &FederationHandshake,
     actual: &FederationHandshake,
 ) -> io::Result<()> {
-    if !(protocol::MIN_PROTOCOL_VERSION..=protocol::PROTOCOL_VERSION)
+    if !(federation_protocol_floor()..=protocol::PROTOCOL_VERSION)
         .contains(&actual.core_protocol_version)
     {
         return Err(invalid_probe(
@@ -959,68 +2347,134 @@ fn validate_live_handshake(
         ));
     }
     if actual.node_id != expected.node_id {
-        return Err(io::Error::new(
+        return Err(classified_error(
             io::ErrorKind::PermissionDenied,
+            "node_identity_changed",
             "remote helper identity changed after bootstrap",
         ));
     }
     Ok(())
 }
 
-fn prepare_fixed_invocation(
-    target: SshTarget,
-    command: &'static str,
-    authentication: SshAuthenticationMode,
-) -> io::Result<SshInvocation> {
-    let socket_path = crate::client::socket_path()?;
-    let runtime_directory = socket_path
-        .parent()
-        .ok_or_else(|| io::Error::other("Boomux runtime socket has no parent"))?;
-    let user_config = env::var_os("HOME")
-        .filter(|home| !home.is_empty())
-        .map(PathBuf::from)
-        .map(|home| home.join(".ssh/config"));
-    SshInvocation::prepare_command_at(
-        runtime_directory,
-        user_config.as_deref(),
-        target,
-        command.to_owned(),
-        authentication,
-    )
-}
-
 fn select_install_source(platform: RemotePlatform) -> io::Result<RemoteInstallSource> {
     if platform.matches_local() {
-        return Ok(RemoteInstallSource::CurrentBinary(env::current_exe()?));
+        let path = env::current_exe()?;
+        let bytes = read_bounded_file(&path)?;
+        let sha256 = format!("{:x}", Sha256::digest(&bytes));
+        return Ok(RemoteInstallSource::CurrentBinary {
+            path,
+            sha256,
+            bytes,
+        });
     }
     let target = platform.release_target().ok_or_else(|| {
-        io::Error::new(
+        classified_error(
             io::ErrorKind::Unsupported,
+            "bootstrap_unsupported_platform",
             "no Boomux release asset supports the remote platform",
         )
     })?;
+    let release = select_published_release(target)?;
+    let bytes = download_release_binary(target, release.tag)?;
+    let sha256 = format!("{:x}", Sha256::digest(&bytes));
     Ok(RemoteInstallSource::Release {
         target,
-        tag: format!("v{}", env!("CARGO_PKG_VERSION")),
+        tag: release.tag.to_owned(),
+        sha256,
+        bytes,
     })
 }
 
-fn load_install_source(source: &RemoteInstallSource) -> io::Result<Vec<u8>> {
-    match source {
-        RemoteInstallSource::CurrentBinary(path) => read_bounded_file(path),
-        RemoteInstallSource::Release { target, tag } => download_release_binary(target, tag),
-    }
+fn select_published_release(target: &str) -> io::Result<&'static PublishedRelease> {
+    PUBLISHED_RELEASES
+        .iter()
+        .rev()
+        .find(|release| {
+            release.target == target
+                && release.protocol_version >= federation_protocol_floor()
+                && release.protocol_version <= protocol::PROTOCOL_VERSION
+        })
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "no published Boomux release for {target} is compatible with local protocol {}; build for the remote target and manually stream the current development binary",
+                    protocol::PROTOCOL_VERSION
+                ),
+            )
+        })
+}
+
+#[derive(Debug)]
+struct PublishedRelease {
+    tag: &'static str,
+    target: &'static str,
+    protocol_version: u32,
+}
+
+// Keep this matrix explicit: package versions on development branches do not
+// prove that an asset exists or that its wire protocol matches this source.
+const PUBLISHED_RELEASES: &[PublishedRelease] = &[PublishedRelease {
+    tag: "v0.18.1",
+    target: "x86_64-unknown-linux-gnu",
+    protocol_version: 27,
+}];
+
+const fn federation_protocol_floor() -> u32 {
+    protocol::ProtocolFeature::FederationChannel.minimum_version()
 }
 
 fn read_bounded_file(path: &Path) -> io::Result<Vec<u8>> {
-    let metadata = fs::metadata(path)?;
-    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_RELEASE_BYTES {
-        return Err(io::Error::new(
+    read_bounded_file_with_hook(path, || {})
+}
+
+fn read_bounded_file_with_hook(path: &Path, after_metadata: impl FnOnce()) -> io::Result<Vec<u8>> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|_| {
+            classified_error(
+                io::ErrorKind::InvalidData,
+                "bootstrap_install_failed",
+                "Boomux install source could not be opened safely",
+            )
+        })?;
+    let before = file.metadata()?;
+    if !before.is_file() || before.len() == 0 || before.len() > MAX_RELEASE_BYTES {
+        return Err(classified_error(
             io::ErrorKind::InvalidData,
+            "bootstrap_install_failed",
             "Boomux install source is not a bounded regular file",
         ));
     }
-    fs::read(path)
+    after_metadata();
+    let mut bytes = Vec::with_capacity(usize::try_from(before.len()).unwrap_or(0));
+    Read::by_ref(&mut file)
+        .take(MAX_RELEASE_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    let after = file.metadata()?;
+    if bytes.len() as u64 != before.len()
+        || bytes.len() as u64 > MAX_RELEASE_BYTES
+        || file_metadata_changed(&before, &after)
+    {
+        return Err(classified_error(
+            io::ErrorKind::InvalidData,
+            "bootstrap_install_failed",
+            "Boomux install source changed while it was being pinned",
+        ));
+    }
+    Ok(bytes)
+}
+
+fn file_metadata_changed(before: &fs::Metadata, after: &fs::Metadata) -> bool {
+    before.dev() != after.dev()
+        || before.ino() != after.ino()
+        || before.len() != after.len()
+        || before.mtime() != after.mtime()
+        || before.mtime_nsec() != after.mtime_nsec()
+        || before.ctime() != after.ctime()
+        || before.ctime_nsec() != after.ctime_nsec()
 }
 
 fn download_release_binary(target: &str, tag: &str) -> io::Result<Vec<u8>> {
@@ -1116,12 +2570,144 @@ fn verify_release_checksum(archive: &Path, checksum: &Path, archive_name: &str) 
     Ok(())
 }
 
+#[cfg(test)]
 pub fn find_compatible_remote_helper(
     target: SshTarget,
     executables: &[RemoteExecutable],
     authentication: SshAuthenticationMode,
     timeout: Duration,
 ) -> io::Result<CompatibleRemoteHelper> {
+    inspect_remote_helpers(target, executables, authentication, timeout)?
+        .compatible
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "no discovered remote Boomux executable is federation-compatible",
+            )
+        })
+}
+
+struct RemoteHelperInspection {
+    compatible: Option<CompatibleRemoteHelper>,
+    incompatible: usize,
+    incompatible_executables: Vec<RemoteExecutable>,
+}
+
+fn inspect_remote_helpers_in_session(
+    session: &BootstrapSession,
+    executables: &[RemoteExecutable],
+    timeout: Duration,
+) -> io::Result<RemoteHelperInspection> {
+    if timeout.is_zero() || timeout > MAX_PROBE_TIMEOUT {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "SSH helper selection timeout is outside the supported bound",
+        ));
+    }
+    let deadline = Instant::now() + timeout;
+    let mut compatible: Option<CompatibleRemoteHelper> = None;
+    let mut incompatible = 0;
+    let mut incompatible_executables = Vec::new();
+    let mut indeterminate = 0;
+    let mut first_indeterminate_error = None;
+    for (index, executable) in executables.iter().enumerate() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "SSH helper selection timed out",
+            ));
+        }
+        let candidates_left = u32::try_from(executables.len() - index).unwrap_or(u32::MAX);
+        let candidate_budget = remaining / candidates_left;
+        if candidate_budget.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "SSH helper selection timed out",
+            ));
+        }
+        let candidate_deadline = Instant::now() + candidate_budget;
+        let helper_command = remote_helper_command(executable);
+        match run_helper_probe_command(session.command(&helper_command), candidate_budget) {
+            Ok(handshake) => {
+                if let Some(selected) = &compatible {
+                    if selected.handshake.node_id != handshake.node_id {
+                        return Err(classified_error(
+                            io::ErrorKind::PermissionDenied,
+                            "node_identity_conflict",
+                            "discovered remote Boomux executables reported different Node identities",
+                        ));
+                    }
+                } else {
+                    compatible = Some(CompatibleRemoteHelper {
+                        executable: executable.clone(),
+                        handshake,
+                        bootstrap_id: Some(session.id),
+                    });
+                }
+            }
+            Err(helper_error) => {
+                let remaining = candidate_deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    indeterminate += 1;
+                    first_indeterminate_error.get_or_insert(helper_error);
+                    continue;
+                }
+                let version = run_bounded_command(
+                    session.command(&format!(
+                        "{} --version",
+                        quote_posix_shell(executable.as_str())
+                    )),
+                    remaining,
+                );
+                let published_version = version
+                    .as_ref()
+                    .ok()
+                    .and_then(|output| published_protocol_from_version_output(&output.stdout));
+                if matches!(
+                    helper_error.kind(),
+                    io::ErrorKind::UnexpectedEof | io::ErrorKind::Unsupported
+                ) && published_version
+                    .is_some_and(|version| version < federation_protocol_floor())
+                {
+                    incompatible += 1;
+                    incompatible_executables.push(executable.clone());
+                } else {
+                    indeterminate += 1;
+                    let error = if matches!(
+                        helper_error.kind(),
+                        io::ErrorKind::InvalidData | io::ErrorKind::PermissionDenied
+                    ) {
+                        helper_error
+                    } else {
+                        version.err().unwrap_or(helper_error)
+                    };
+                    first_indeterminate_error.get_or_insert(error);
+                }
+            }
+        }
+    }
+    if compatible.is_none() && indeterminate > 0 {
+        return Err(first_indeterminate_error.unwrap_or_else(|| {
+            io::Error::other(
+                "remote Boomux candidate failed compatibility verification; refusing remote modification",
+            )
+        }));
+    }
+    Ok(RemoteHelperInspection {
+        compatible,
+        incompatible,
+        incompatible_executables,
+    })
+}
+
+#[cfg(test)]
+fn inspect_remote_helpers(
+    target: SshTarget,
+    executables: &[RemoteExecutable],
+    authentication: SshAuthenticationMode,
+    timeout: Duration,
+) -> io::Result<RemoteHelperInspection> {
     let socket_path = crate::client::socket_path()?;
     let runtime_directory = socket_path
         .parent()
@@ -1130,7 +2716,7 @@ pub fn find_compatible_remote_helper(
         .filter(|home| !home.is_empty())
         .map(PathBuf::from)
         .map(|home| home.join(".ssh/config"));
-    find_compatible_remote_helper_at(
+    inspect_remote_helpers_at(
         runtime_directory,
         user_config.as_deref(),
         target,
@@ -1141,6 +2727,7 @@ pub fn find_compatible_remote_helper(
     )
 }
 
+#[cfg(test)]
 fn find_compatible_remote_helper_at(
     runtime_directory: &Path,
     user_config: Option<&Path>,
@@ -1150,6 +2737,34 @@ fn find_compatible_remote_helper_at(
     timeout: Duration,
     program: &OsStr,
 ) -> io::Result<CompatibleRemoteHelper> {
+    inspect_remote_helpers_at(
+        runtime_directory,
+        user_config,
+        target,
+        executables,
+        authentication,
+        timeout,
+        program,
+    )?
+    .compatible
+    .ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "no discovered remote Boomux executable is federation-compatible",
+        )
+    })
+}
+
+#[cfg(test)]
+fn inspect_remote_helpers_at(
+    runtime_directory: &Path,
+    user_config: Option<&Path>,
+    target: SshTarget,
+    executables: &[RemoteExecutable],
+    authentication: SshAuthenticationMode,
+    timeout: Duration,
+    program: &OsStr,
+) -> io::Result<RemoteHelperInspection> {
     if timeout.is_zero() || timeout > MAX_PROBE_TIMEOUT {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -1162,7 +2777,12 @@ fn find_compatible_remote_helper_at(
             "SSH helper selection timeout overflow",
         )
     })?;
-    for executable in executables {
+    let mut compatible: Option<CompatibleRemoteHelper> = None;
+    let mut incompatible = 0;
+    let mut incompatible_executables = Vec::new();
+    let mut indeterminate = 0;
+    let mut first_indeterminate_error = None;
+    for (index, executable) in executables.iter().enumerate() {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err(io::Error::new(
@@ -1170,36 +2790,128 @@ fn find_compatible_remote_helper_at(
                 "SSH helper selection timed out",
             ));
         }
+        let candidates_left = u32::try_from(executables.len() - index).unwrap_or(u32::MAX);
+        let candidate_budget = remaining / candidates_left;
+        if candidate_budget.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "SSH helper selection timed out",
+            ));
+        }
+        let candidate_deadline = Instant::now() + candidate_budget;
         let invocation = SshInvocation::prepare_command_with_program_at(
             runtime_directory,
             user_config,
             target.clone(),
-            format!(
-                "{} __federation-stdio",
-                quote_posix_shell(executable.as_str())
-            ),
+            remote_helper_command(executable),
             authentication,
             program,
         )?;
-        if let Ok(handshake) = invocation.verify_helper(remaining) {
-            return Ok(CompatibleRemoteHelper {
-                executable: executable.clone(),
-                handshake,
-            });
+        match invocation.verify_helper(candidate_budget) {
+            Ok(handshake) => {
+                if let Some(selected) = &compatible {
+                    if selected.handshake.node_id != handshake.node_id {
+                        return Err(classified_error(
+                            io::ErrorKind::PermissionDenied,
+                            "node_identity_conflict",
+                            "discovered remote Boomux executables reported different Node identities",
+                        ));
+                    }
+                } else {
+                    compatible = Some(CompatibleRemoteHelper {
+                        executable: executable.clone(),
+                        handshake,
+                        bootstrap_id: None,
+                    });
+                }
+            }
+            Err(helper_error) => {
+                let remaining = candidate_deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    indeterminate += 1;
+                    first_indeterminate_error.get_or_insert(helper_error);
+                    continue;
+                }
+                let version = SshInvocation::prepare_command_with_program_at(
+                    runtime_directory,
+                    user_config,
+                    target.clone(),
+                    format!("{} --version", quote_posix_shell(executable.as_str())),
+                    authentication,
+                    program,
+                )?
+                .run_probe(remaining);
+                let published_version = version
+                    .as_ref()
+                    .ok()
+                    .and_then(|output| published_protocol_from_version_output(&output.stdout));
+                if matches!(
+                    helper_error.kind(),
+                    io::ErrorKind::UnexpectedEof | io::ErrorKind::Unsupported
+                ) && published_version
+                    .is_some_and(|version| version < federation_protocol_floor())
+                {
+                    incompatible += 1;
+                    incompatible_executables.push(executable.clone());
+                } else {
+                    indeterminate += 1;
+                    let error = if matches!(
+                        helper_error.kind(),
+                        io::ErrorKind::InvalidData | io::ErrorKind::PermissionDenied
+                    ) {
+                        helper_error
+                    } else {
+                        version.err().unwrap_or(helper_error)
+                    };
+                    first_indeterminate_error.get_or_insert(error);
+                }
+            }
         }
     }
-    if Instant::now() >= deadline {
-        return Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            "SSH helper selection timed out",
-        ));
+    if compatible.is_none() && indeterminate > 0 {
+        return Err(first_indeterminate_error.unwrap_or_else(|| {
+            io::Error::other(
+                "remote Boomux candidate failed compatibility verification; refusing remote modification",
+            )
+        }));
     }
-    Err(io::Error::new(
-        io::ErrorKind::NotFound,
-        "no discovered remote Boomux executable is federation-compatible",
-    ))
+    Ok(RemoteHelperInspection {
+        compatible,
+        incompatible,
+        incompatible_executables,
+    })
 }
 
+fn published_protocol_from_version_output(output: &[u8]) -> Option<u32> {
+    if output.len() > 128 {
+        return None;
+    }
+    let version = std::str::from_utf8(output)
+        .ok()?
+        .strip_prefix("boomux ")?
+        .strip_suffix('\n')?;
+    if version.is_empty()
+        || version.len() > 32
+        || !version
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'.')
+    {
+        return None;
+    }
+    match version {
+        "0.2.0" | "0.3.0" | "0.4.0" | "0.4.1" => Some(16),
+        "0.4.2" => Some(17),
+        "0.5.0" => Some(18),
+        "0.5.1" => Some(19),
+        "0.6.0" | "0.7.0" | "0.8.0" | "0.9.0" | "0.9.1" | "0.10.0" | "0.10.1" | "0.11.0"
+        | "0.12.0" | "0.13.0" => Some(20),
+        "0.14.0" | "0.14.1" | "0.14.2" | "0.15.0" => Some(21),
+        "0.16.0" | "0.17.0" | "0.18.0" | "0.18.1" => Some(27),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
 fn discover_remote_at(
     runtime_directory: &Path,
     user_config: Option<&Path>,
@@ -1315,7 +3027,11 @@ fn parse_nul_fields<'a>(output: &'a [u8], prefix: &[u8]) -> io::Result<Vec<&'a [
 }
 
 fn invalid_probe(message: &'static str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, message)
+    classified_error(
+        io::ErrorKind::InvalidData,
+        "bootstrap_malformed_helper",
+        message,
+    )
 }
 
 fn run_bounded_command(mut command: Command, timeout: Duration) -> io::Result<SshProbeOutput> {
@@ -1385,17 +3101,129 @@ fn run_bounded_command(mut command: Command, timeout: Duration) -> io::Result<Ss
     if stdout_truncated || stderr_truncated {
         return Err(invalid_probe("SSH probe output exceeds the size limit"));
     }
-    if !status.expect("checked above").success() {
-        return Err(io::Error::other("SSH probe exited unsuccessfully"));
+    let status = status.expect("checked above");
+    if !status.success() {
+        return Err(classify_ssh_command_failure(status.code(), &stderr));
     }
     Ok(SshProbeOutput { stdout, stderr })
 }
 
-fn run_streaming_command(
+fn classify_ssh_command_failure(status: Option<i32>, stderr: &[u8]) -> io::Error {
+    let lower = String::from_utf8_lossy(stderr).to_ascii_lowercase();
+    if lower.contains("permission denied")
+        || lower.contains("authentication failed")
+        || lower.contains("host key verification failed")
+    {
+        return classified_error(
+            io::ErrorKind::PermissionDenied,
+            "bootstrap_authentication_failed",
+            "SSH authentication or host-key verification failed",
+        );
+    }
+    if status == Some(73) {
+        return classified_error(
+            io::ErrorKind::ResourceBusy,
+            "busy",
+            "another remote Boomux bootstrap transaction is active",
+        );
+    }
+    if status == Some(92) {
+        return classified_error(
+            io::ErrorKind::Unsupported,
+            "bootstrap_unsupported_platform",
+            "remote platform does not provide the fixed command layout required for safe bootstrap",
+        );
+    }
+    if let Some(error) = runtime_stage_failure(status, stderr) {
+        return error;
+    }
+    if let Some(detail) = install_stage_failure(status, stderr) {
+        return classified_error(io::ErrorKind::Other, "bootstrap_install_failed", detail);
+    }
+    if status == Some(255) {
+        return classified_error(
+            io::ErrorKind::ConnectionAborted,
+            "bootstrap_transport_failed",
+            "SSH transport failed while using the authenticated bootstrap endpoint",
+        );
+    }
+    io::Error::other("SSH remote command failed; verify executable access and remote shell support")
+}
+
+fn runtime_stage_failure(status: Option<i32>, stderr: &[u8]) -> Option<io::Error> {
+    let (reason, code) = std::str::from_utf8(stderr).ok()?.lines().find_map(|line| {
+        let fields = line.strip_prefix(RUNTIME_STAGE_PREFIX)?.strip_prefix(':')?;
+        let (reason, code) = fields.split_once(':')?;
+        let code = code.parse::<i32>().ok()?;
+        (status.is_none() || status == Some(code)).then_some((reason, code))
+    })?;
+    let message = match (reason, code) {
+        ("missing", 88) => {
+            "remote runtime discovery failed: XDG_RUNTIME_DIR is unset on a non-Linux host"
+        }
+        ("invalid", 89) => {
+            "remote runtime discovery failed: user identity or XDG_RUNTIME_DIR is invalid"
+        }
+        ("unsafe", 90) => {
+            "remote runtime discovery failed: runtime directory must be an owner-controlled, non-symlink directory with mode 0700"
+        }
+        ("unsupported", 91) => {
+            "remote runtime discovery failed: remote operating system is unsupported"
+        }
+        _ => return None,
+    };
+    Some(classified_error(
+        io::ErrorKind::NotFound,
+        "bootstrap_runtime_unavailable",
+        message,
+    ))
+}
+
+fn install_stage_failure(status: Option<i32>, stderr: &[u8]) -> Option<&'static str> {
+    let status = status?;
+    let marker = std::str::from_utf8(stderr).ok()?.lines().find_map(|line| {
+        let fields = line.strip_prefix(INSTALL_STAGE_PREFIX)?.strip_prefix(':')?;
+        let (stage, code) = fields.split_once(':')?;
+        (code.parse::<i32>().ok()? == status).then_some(stage)
+    })?;
+    Some(match marker {
+        "home" => "remote Boomux install failed: remote HOME is not an absolute path",
+        "directory" => "remote Boomux install failed while creating the owner install directory",
+        "lock" => "remote Boomux install failed while acquiring its transaction lock",
+        "transaction" => {
+            "remote Boomux install failed while creating its private transaction directory"
+        }
+        "transaction_id" => {
+            "remote Boomux install failed because mktemp returned an invalid transaction name"
+        }
+        "lock_id" => "remote Boomux install failed while recording its transaction identity",
+        "stream" => {
+            "remote Boomux install failed while writing the streamed binary; check remote free space and quota"
+        }
+        "mode" => "remote Boomux install failed while making the streamed binary executable",
+        "backup" => "remote Boomux install failed while preserving the previous executable",
+        "activate" => "remote Boomux install failed while activating the replacement executable",
+        "watchdog_spawn" => "remote Boomux install failed while starting the rollback watchdog",
+        "watchdog_ready" => {
+            "remote Boomux install failed because the rollback watchdog did not become ready"
+        }
+        "watchdog_pid" => {
+            "remote Boomux install failed while recording rollback watchdog ownership"
+        }
+        "result" => "remote Boomux install failed while returning its transaction result",
+        _ => return None,
+    })
+}
+
+fn run_streaming_command(command: Command, input: Vec<u8>, timeout: Duration) -> io::Result<()> {
+    run_streaming_command_capture(command, input, timeout).map(|_| ())
+}
+
+fn run_streaming_command_capture(
     mut command: Command,
     input: Vec<u8>,
     timeout: Duration,
-) -> io::Result<()> {
+) -> io::Result<SshProbeOutput> {
     if timeout.is_zero() || timeout > MAX_PROBE_TIMEOUT {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -1404,7 +3232,7 @@ fn run_streaming_command(
     }
     command
         .stdin(Stdio::piped())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     unsafe {
         command.pre_exec(|| {
@@ -1425,6 +3253,11 @@ fn run_streaming_command(
         .stderr
         .take()
         .ok_or_else(|| io::Error::other("SSH install stderr was not captured"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("SSH install stdout was not captured"))?;
+    let stdout_reader = spawn_bounded_reader(stdout, MAX_PROBE_OUTPUT_BYTES, "install-stdout")?;
     let stderr_reader = spawn_bounded_reader(stderr, MAX_PROBE_STDERR_BYTES, "stderr")?;
     let writer = thread::Builder::new()
         .name("boomux-ssh-install-input".into())
@@ -1442,23 +3275,40 @@ fn run_streaming_command(
         }
         thread::sleep(CHILD_POLL_INTERVAL);
     };
-    writer
+    let write_result = writer
         .join()
-        .map_err(|_| io::Error::other("SSH install input worker panicked"))??;
-    let (_, stderr_truncated) = join_bounded_reader(stderr_reader)?;
+        .map_err(|_| io::Error::other("SSH install input worker panicked"))?;
+    let (stdout, stdout_truncated) = join_bounded_reader(stdout_reader)?;
+    let (stderr, stderr_truncated) = join_bounded_reader(stderr_reader)?;
     if status.is_none() {
         return Err(io::Error::new(
             io::ErrorKind::TimedOut,
             "SSH install timed out",
         ));
     }
-    if stderr_truncated {
-        return Err(invalid_probe("SSH install stderr exceeds the size limit"));
+    if stdout_truncated || stderr_truncated {
+        return Err(invalid_probe("SSH install output exceeds the size limit"));
     }
-    if !status.expect("checked above").success() {
-        return Err(io::Error::other("remote Boomux install failed"));
+    let status = status.expect("checked above");
+    if !status.success() {
+        let error = classify_ssh_command_failure(status.code(), &stderr);
+        return if error.kind() == io::ErrorKind::Other
+            && error
+                .get_ref()
+                .and_then(|error| error.downcast_ref::<ClassifiedBootstrapError>())
+                .is_none()
+        {
+            Err(classified_error(
+                io::ErrorKind::Other,
+                "bootstrap_install_failed",
+                "remote Boomux install failed",
+            ))
+        } else {
+            Err(error)
+        };
     }
-    Ok(())
+    write_result?;
+    Ok(SshProbeOutput { stdout, stderr })
 }
 
 fn run_helper_probe_command(
@@ -1507,11 +3357,17 @@ fn run_helper_probe_command(
         .spawn(move || {
             let result = (|| {
                 let handshake = crate::federation::read_handshake(&mut stdout)?;
-                if !(protocol::MIN_PROTOCOL_VERSION..=protocol::PROTOCOL_VERSION)
-                    .contains(&handshake.core_protocol_version)
-                {
-                    return Err(invalid_probe(
-                        "remote helper reported an incompatible core protocol",
+                if handshake.core_protocol_version < federation_protocol_floor() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "remote helper reported an older incompatible core protocol",
+                    ));
+                }
+                if handshake.core_protocol_version > protocol::PROTOCOL_VERSION {
+                    return Err(classified_error(
+                        io::ErrorKind::Unsupported,
+                        "unsupported_version",
+                        "remote helper reported a newer incompatible core protocol",
                     ));
                 }
                 protocol::write_message(
@@ -1564,9 +3420,12 @@ fn run_helper_probe_command(
     protocol_worker
         .join()
         .map_err(|_| io::Error::other("SSH helper probe worker panicked"))?;
-    let (_, stderr_truncated) = join_bounded_reader(stderr_reader)?;
+    let (stderr, stderr_truncated) = join_bounded_reader(stderr_reader)?;
     if stderr_truncated {
         return Err(invalid_probe("SSH helper stderr exceeds the size limit"));
+    }
+    if let Some(error) = runtime_stage_failure(status.and_then(|status| status.code()), &stderr) {
+        return Err(error);
     }
     if result.is_ok() && status.is_none() {
         return Err(io::Error::new(
@@ -1575,7 +3434,16 @@ fn run_helper_probe_command(
         ));
     }
     if status.is_some_and(|status| !status.success()) {
-        return Err(io::Error::other("SSH helper exited unsuccessfully"));
+        return Err(classify_ssh_command_failure(
+            status.and_then(|status| status.code()),
+            &stderr,
+        ));
+    }
+    if result.is_err()
+        && (String::from_utf8_lossy(&stderr).contains("Permission denied")
+            || String::from_utf8_lossy(&stderr).contains("Host key verification failed"))
+    {
+        return Err(classify_ssh_command_failure(Some(255), &stderr));
     }
     result
 }
@@ -1589,6 +3457,115 @@ fn kill_process_group(pid: i32, child: &mut std::process::Child) -> io::Result<(
     }
     let _ = child.wait();
     Ok(())
+}
+
+fn spawn_master_stderr_reader(
+    mut reader: impl Read + Send + 'static,
+    limit: usize,
+    mut mirror: Option<Box<dyn StderrMirror>>,
+    master_pid: i32,
+    deadline: Instant,
+) -> io::Result<MasterStderrReader> {
+    if let Some(mirror) = mirror.as_ref() {
+        let flags = unsafe { libc::fcntl(mirror.as_raw_fd(), libc::F_GETFL) };
+        if flags == -1
+            || unsafe { libc::fcntl(mirror.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) }
+                == -1
+        {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    let (event_sender, events) = mpsc::channel();
+    let reader = thread::Builder::new()
+        .name("boomux-ssh-master-stderr".into())
+        .spawn(move || {
+            let mut retained = Vec::with_capacity(limit);
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let count = match reader.read(&mut buffer) {
+                    Ok(0) => return Ok((retained, false)),
+                    Ok(count) => count,
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(error) => return Err(error),
+                };
+                let mirrored = count.min(limit.saturating_sub(retained.len()));
+                if mirrored != 0 {
+                    if let Some(mirror) = mirror.as_mut()
+                        && write_mirror_with_deadline(
+                            mirror.as_mut(),
+                            &buffer[..mirrored],
+                            deadline,
+                        )
+                        .is_err()
+                    {
+                        let _ = event_sender.send(MasterStderrEvent::MirrorFailed);
+                        unsafe {
+                            libc::kill(-master_pid, libc::SIGKILL);
+                        }
+                        return Err(io::Error::other("SSH master stderr mirror failed"));
+                    }
+                    retained.extend_from_slice(&buffer[..mirrored]);
+                }
+                if mirrored < count {
+                    let _ = event_sender.send(MasterStderrEvent::Truncated);
+                    unsafe {
+                        libc::kill(-master_pid, libc::SIGKILL);
+                    }
+                    return Ok((retained, true));
+                }
+            }
+        })?;
+    Ok(MasterStderrReader { reader, events })
+}
+
+fn write_mirror_with_deadline(
+    mirror: &mut dyn StderrMirror,
+    mut bytes: &[u8],
+    deadline: Instant,
+) -> io::Result<()> {
+    while !bytes.is_empty() {
+        match mirror.write(bytes) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "terminal output closed",
+                ));
+            }
+            Ok(count) => bytes = &bytes[count..],
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "terminal output timed out",
+                    ));
+                }
+                let mut descriptor = libc::pollfd {
+                    fd: mirror.as_raw_fd(),
+                    events: libc::POLLOUT,
+                    revents: 0,
+                };
+                let milliseconds =
+                    i32::try_from(remaining.as_millis().min(i32::MAX as u128)).unwrap_or(i32::MAX);
+                let status = unsafe { libc::poll(&mut descriptor, 1, milliseconds) };
+                if status == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "terminal output timed out",
+                    ));
+                }
+                if status == -1 {
+                    let error = io::Error::last_os_error();
+                    if error.kind() != io::ErrorKind::Interrupted {
+                        return Err(error);
+                    }
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    mirror.flush()
 }
 
 fn spawn_bounded_reader(
@@ -1626,8 +3603,193 @@ mod tests {
     use super::*;
     use crate::federation::{FEDERATION_VERSION, FederationConnectionMode};
 
-    fn runtime_directory() -> PathBuf {
-        env::temp_dir().join(format!("boomux-ssh-{}", Uuid::new_v4()))
+    const CONTROL_MASTER_SCRIPT: &str = "control=; previous=; master=false; check=false; last=; for arg do last=$arg; case \"$previous\" in -S) control=$arg ;; -O) [ \"$arg\" = check ] && check=true ;; esac; case \"$arg\" in ControlPath=*) control=${arg#ControlPath=} ;; -N) master=true ;; esac; previous=$arg; done; if $master; then : > \"$control.ready\"; trap 'rm -f \"$control.ready\"' EXIT HUP INT TERM; while :; do sleep 60; done; fi; if $check; then [ -e \"$control.ready\" ]; exit; fi; case \"$last\" in *'boomux-install-activation-v1'*) cat >/dev/null; printf 'boomux-install-activation-v1\\0activated\\0'; exit ;; *'boomux-install-transaction-v1'*) IFS= read -r boomux_test_txn; printf() { case \"$1\" in boomux-install-transaction-v1*) command printf 'boomux-install-transaction-v1\\0%s\\0' \"$boomux_test_txn\" ;; *) command printf \"$@\" ;; esac; } ;; *'prior_daemon.next'*|*': > \"$transaction/daemon_contacted\"'*|*'lease.next'*) cat >/dev/null; exit ;; esac";
+    const CONTROL_MASTER_ONLY_SCRIPT: &str = "control=; previous=; master=false; check=false; for arg do case \"$previous\" in -S) control=$arg ;; -O) [ \"$arg\" = check ] && check=true ;; esac; case \"$arg\" in ControlPath=*) control=${arg#ControlPath=} ;; -N) master=true ;; esac; previous=$arg; done; if $master; then : > \"$control.ready\"; trap 'rm -f \"$control.ready\"' EXIT HUP INT TERM; while :; do sleep 60; done; fi; if $check; then [ -e \"$control.ready\" ]; exit; fi";
+
+    fn add_fake_daemon_identity(script: &Path, executable: &str) {
+        let contents = fs::read_to_string(script).unwrap();
+        let contents = contents
+            .replace(
+                "\"protocol_version\":21}",
+                &format!(
+                    "\"protocol_version\":21,\"pid\":123,\"executable\":{},\"socket_device\":1,\"socket_inode\":1}}",
+                    serde_json::to_string(executable).unwrap()
+                ),
+            )
+            .replace(
+                "\"protocol_version\":38}",
+                &format!(
+                    "\"protocol_version\":38,\"pid\":123,\"executable\":{},\"socket_device\":1,\"socket_inode\":1}}",
+                    serde_json::to_string(executable).unwrap()
+                ),
+            );
+        fs::write(script, contents).unwrap();
+    }
+
+    struct TestDirectory {
+        path: PathBuf,
+        watchdogs: PathBuf,
+    }
+
+    impl std::ops::Deref for TestDirectory {
+        type Target = Path;
+
+        fn deref(&self) -> &Self::Target {
+            &self.path
+        }
+    }
+
+    impl AsRef<Path> for TestDirectory {
+        fn as_ref(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl AsRef<OsStr> for TestDirectory {
+        fn as_ref(&self) -> &OsStr {
+            self.path.as_os_str()
+        }
+    }
+
+    impl TestDirectory {
+        fn reap_watchdogs(&self) {
+            let mut pids = fs::read_to_string(&self.watchdogs)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| {
+                    let (pid, start) = line.split_once('\t')?;
+                    Some((pid.parse::<i32>().ok()?, start.to_owned()))
+                })
+                .collect::<HashSet<_>>();
+            let bin = self.path.join(".local/bin");
+            if let Ok(entries) = fs::read_dir(&bin) {
+                for entry in entries.filter_map(Result::ok) {
+                    let pid_file = entry.path().join("watchdog_pid");
+                    if let Ok(pid) = fs::read_to_string(pid_file)
+                        && let Ok(pid) = pid.trim().parse()
+                        && let Some(start) = test_process_start(pid)
+                    {
+                        pids.insert((pid, start));
+                    }
+                }
+            }
+            for (pid, start) in &pids {
+                if test_process_start(*pid).as_ref() != Some(start) {
+                    continue;
+                }
+                unsafe {
+                    libc::kill(*pid, libc::SIGTERM);
+                }
+            }
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while pids
+                .iter()
+                .any(|(pid, start)| test_process_start(*pid).as_ref() == Some(start))
+                && Instant::now() < deadline
+            {
+                thread::sleep(Duration::from_millis(10));
+            }
+            for (pid, start) in pids {
+                if test_process_start(pid).as_ref() == Some(&start) {
+                    unsafe {
+                        libc::kill(pid, libc::SIGKILL);
+                    }
+                }
+            }
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            self.reap_watchdogs();
+            let _ = fs::remove_dir_all(&self.path);
+            let _ = fs::remove_file(&self.watchdogs);
+        }
+    }
+
+    fn runtime_directory() -> TestDirectory {
+        let id = Uuid::new_v4();
+        TestDirectory {
+            path: env::temp_dir().join(format!("boomux-ssh-{id}")),
+            watchdogs: env::temp_dir().join(format!("boomux-ssh-watchdogs-{id}")),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn test_process_start(pid: i32) -> Option<String> {
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let mut fields = stat.rsplit_once(") ")?.1.split_whitespace();
+        if fields.next()? == "Z" {
+            return None;
+        }
+        fields.nth(18).map(str::to_owned)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn test_process_start(pid: i32) -> Option<String> {
+        let output = Command::new("/bin/ps")
+            .args(["-p", &pid.to_string(), "-o", "lstart="])
+            .output()
+            .ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+            .filter(|start| !start.is_empty())
+    }
+
+    fn local_shell_command(shell: &str, home: &Path) -> Command {
+        let runtime = home.join("runtime");
+        fs::create_dir_all(&runtime).unwrap();
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+        let shell = match shell {
+            "sh" => "/bin/sh",
+            "bash" => "/bin/bash",
+            _ => panic!("unsupported test shell: {shell}"),
+        };
+        let mut command = Command::new(shell);
+        command
+            .env_clear()
+            .env("HOME", home)
+            .env("PATH", "/usr/bin:/bin")
+            .env("XDG_RUNTIME_DIR", runtime)
+            .env("XDG_STATE_HOME", home.join("state"))
+            .current_dir(home);
+        command
+    }
+
+    fn record_watchdog(home: &Path, transaction: &InstallTransactionId) {
+        let pid = fs::read_to_string(
+            home.join(".local/bin")
+                .join(&transaction.0)
+                .join("watchdog_pid"),
+        )
+        .unwrap();
+        let pid = pid.trim().parse::<i32>().unwrap();
+        let start = test_process_start(pid).unwrap();
+        let id = home.file_name().unwrap().to_string_lossy();
+        let registry = env::temp_dir().join(format!(
+            "boomux-ssh-watchdogs-{}",
+            id.trim_start_matches("boomux-ssh-")
+        ));
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(registry)
+            .unwrap();
+        writeln!(file, "{pid}\t{start}").unwrap();
+    }
+
+    fn gate_watchdog(command: &str) -> String {
+        let gated = command.replacen(
+            "while [ -d \"$lock\" ]; do /bin/sleep 1;",
+            "while [ -d \"$lock\" ]; do test_watchdog_tick;",
+            1,
+        );
+        assert_ne!(gated, command);
+        format!(
+            "test_watchdog_tick() {{ while [ ! -e \"$HOME/watchdog-tick\" ]; do /bin/sleep 0.01; done; /bin/sleep 0.01; }}; {gated}"
+        )
     }
 
     fn shell_printf(bytes: &[u8]) -> String {
@@ -1636,6 +3798,403 @@ mod tests {
             .map(|byte| format!("\\{byte:03o}"))
             .collect::<String>();
         format!("printf '{escaped}'")
+    }
+
+    fn write_master_stderr_ssh(runtime: &Path, master_body: &str) -> PathBuf {
+        let ssh = runtime.join("ssh-master-stderr");
+        fs::write(
+            &ssh,
+            format!(
+                "#!/bin/sh\ncontrol=; previous=; master=false; check=false\nfor arg do\n  case \"$previous\" in -S) control=$arg ;; -O) [ \"$arg\" = check ] && check=true ;; esac\n  case \"$arg\" in ControlPath=*) control=${{arg#ControlPath=}} ;; -N) master=true ;; esac\n  previous=$arg\ndone\nif $master; then\n  {master_body}\nfi\nif $check; then [ -e \"$control.ready\" ]; exit; fi\nexit 64\n"
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+        ssh
+    }
+
+    fn run_local_install(home: &Path, bytes: &[u8]) -> InstallTransactionId {
+        run_local_install_with_shell(home, bytes, "sh")
+    }
+
+    fn run_local_install_with_shell(
+        home: &Path,
+        bytes: &[u8],
+        shell: &str,
+    ) -> InstallTransactionId {
+        let transaction = run_local_upload_with_command(home, bytes, shell, REMOTE_INSTALL_COMMAND);
+        run_local_activation(home, shell, &transaction, RemoteInstallReason::Missing);
+        transaction
+    }
+
+    fn run_local_upload_with_command(
+        home: &Path,
+        bytes: &[u8],
+        shell: &str,
+        command_text: &str,
+    ) -> InstallTransactionId {
+        let transaction = InstallTransactionId::generate();
+        let mut command = local_shell_command(shell, home);
+        command.args(["-c", command_text]);
+        let output = run_streaming_command_capture(
+            command,
+            transaction.upload_input(bytes),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(
+            InstallTransactionId::parse_probe(&output.stdout).unwrap(),
+            transaction
+        );
+        record_watchdog(home, &transaction);
+        transaction
+    }
+
+    fn run_local_activation(
+        home: &Path,
+        shell: &str,
+        transaction: &InstallTransactionId,
+        reason: RemoteInstallReason,
+    ) {
+        let mut activate = local_shell_command(shell, home);
+        activate.args(["-c", REMOTE_INSTALL_ACTIVATE_COMMAND]);
+        let output = run_streaming_command_capture(
+            activate,
+            transaction.activation_input(
+                reason,
+                &RemoteDaemonStatus::Present {
+                    protocol_version: protocol::PROTOCOL_VERSION,
+                    pid: Some(1),
+                    executable: Some(RemoteExecutable::parse("/tmp/test-destination").unwrap()),
+                    socket_device: Some(1),
+                    socket_inode: Some(1),
+                },
+            ),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        assert!(parse_install_activation(&output.stdout).unwrap());
+    }
+
+    #[test]
+    fn exact_install_script_runs_under_posix_sh_and_bash() {
+        for shell in ["sh", "bash"] {
+            let directory = runtime_directory();
+            fs::create_dir_all(directory.join(".local/bin")).unwrap();
+            let destination = directory.join(".local/bin/boomux");
+            fs::write(&destination, b"previous").unwrap();
+            fs::set_permissions(&destination, fs::Permissions::from_mode(0o755)).unwrap();
+            let previous_metadata = fs::metadata(&destination).unwrap();
+            let transaction = run_local_install_with_shell(&directory, b"replacement", shell);
+            assert_eq!(fs::read(&destination).unwrap(), b"replacement");
+            let backup = directory
+                .join(".local/bin")
+                .join(&transaction.0)
+                .join("backup");
+            let backup_metadata = fs::metadata(&backup).unwrap();
+            assert_eq!(fs::read(&backup).unwrap(), b"previous");
+            assert_eq!(backup_metadata.mode(), previous_metadata.mode());
+            assert_eq!(backup_metadata.uid(), previous_metadata.uid());
+            assert_eq!(backup_metadata.gid(), previous_metadata.gid());
+            assert_eq!(backup_metadata.mtime(), previous_metadata.mtime());
+            run_local_transaction(&directory, REMOTE_INSTALL_ROLLBACK_COMMAND, &transaction);
+            assert_eq!(fs::read(&destination).unwrap(), b"previous");
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn install_rejects_symlink_special_and_non_executable_destinations_before_activation() {
+        use std::os::unix::fs::FileTypeExt;
+
+        for kind in ["symlink", "fifo", "non-executable"] {
+            let directory = runtime_directory();
+            let bin = directory.join(".local/bin");
+            fs::create_dir_all(&bin).unwrap();
+            let destination = bin.join("boomux");
+            let target = directory.join("target");
+            match kind {
+                "symlink" => {
+                    fs::write(&target, b"outside").unwrap();
+                    std::os::unix::fs::symlink(&target, &destination).unwrap();
+                }
+                "fifo" => {
+                    let path = std::ffi::CString::new(destination.as_os_str().as_bytes()).unwrap();
+                    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o700) }, 0);
+                }
+                "non-executable" => {
+                    fs::write(&destination, b"old").unwrap();
+                    fs::set_permissions(&destination, fs::Permissions::from_mode(0o600)).unwrap();
+                }
+                _ => unreachable!(),
+            }
+
+            let transaction = run_local_upload_with_command(
+                &directory,
+                b"replacement",
+                "sh",
+                REMOTE_INSTALL_COMMAND,
+            );
+            let result = run_activation_script(
+                "sh",
+                REMOTE_INSTALL_ACTIVATE_COMMAND,
+                &directory,
+                &transaction,
+            );
+            assert!(result.is_err(), "{kind}");
+            match kind {
+                "symlink" => {
+                    assert_eq!(fs::read_link(&destination).unwrap(), target);
+                    assert_eq!(fs::read(&target).unwrap(), b"outside");
+                }
+                "fifo" => assert!(
+                    fs::symlink_metadata(&destination)
+                        .unwrap()
+                        .file_type()
+                        .is_fifo()
+                ),
+                "non-executable" => {
+                    assert_eq!(fs::read(&destination).unwrap(), b"old");
+                    assert_eq!(fs::metadata(&destination).unwrap().mode() & 0o777, 0o600);
+                }
+                _ => unreachable!(),
+            }
+            run_local_transaction(&directory, REMOTE_INSTALL_ROLLBACK_COMMAND, &transaction);
+            assert!(!bin.join(".boomux.bootstrap.lock").exists());
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn disk_full_backup_copy_failure_leaves_the_old_destination_untouched() {
+        use std::os::unix::fs::FileTypeExt;
+
+        let directory = runtime_directory();
+        let bin = directory.join(".local/bin");
+        fs::create_dir_all(&bin).unwrap();
+        let destination = bin.join("boomux");
+        fs::write(&destination, b"previous").unwrap();
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o755)).unwrap();
+        let transaction =
+            run_local_upload_with_command(&directory, b"replacement", "sh", REMOTE_INSTALL_COMMAND);
+        let command = REMOTE_INSTALL_ACTIVATE_COMMAND.replacen(
+            "backup=$transaction/backup;",
+            "backup=/dev/full;",
+            1,
+        );
+        assert_ne!(command, REMOTE_INSTALL_ACTIVATE_COMMAND);
+        assert!(run_activation_script("sh", &command, &directory, &transaction).is_err());
+        assert_eq!(fs::read(&destination).unwrap(), b"previous");
+        assert_eq!(fs::metadata(&destination).unwrap().mode() & 0o777, 0o755);
+        assert!(
+            fs::metadata("/dev/full")
+                .unwrap()
+                .file_type()
+                .is_char_device()
+        );
+        run_local_transaction(&directory, REMOTE_INSTALL_ROLLBACK_COMMAND, &transaction);
+        assert!(!bin.join(".boomux.bootstrap.lock").exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn run_install_script_raw(
+        shell: &str,
+        command_text: &str,
+        home: &Path,
+        input: &[u8],
+    ) -> std::process::Output {
+        let transaction = InstallTransactionId::generate();
+        let shell = match shell {
+            "sh" => "/bin/sh",
+            "bash" => "/bin/bash",
+            _ => panic!("unsupported test shell: {shell}"),
+        };
+        let mut command = Command::new(shell);
+        command
+            .env_clear()
+            .env("HOME", home)
+            .env("PATH", "/usr/bin:/bin")
+            .args(["-c", command_text])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if home.is_absolute() && home.is_dir() {
+            command.current_dir(home);
+        }
+        let mut child = command.spawn().unwrap();
+        let _ = child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(&transaction.upload_input(input));
+        child.wait_with_output().unwrap()
+    }
+
+    fn run_activation_script(
+        shell: &str,
+        command_text: &str,
+        home: &Path,
+        transaction: &InstallTransactionId,
+    ) -> io::Result<()> {
+        let mut child = local_shell_command(shell, home);
+        child.args(["-c", command_text]);
+        run_streaming_command(
+            child,
+            transaction.activation_input(
+                RemoteInstallReason::Missing,
+                &RemoteDaemonStatus::Present {
+                    protocol_version: protocol::PROTOCOL_VERSION,
+                    pid: Some(1),
+                    executable: Some(RemoteExecutable::parse("/tmp/test").unwrap()),
+                    socket_device: Some(1),
+                    socket_inode: Some(1),
+                },
+            ),
+            Duration::from_secs(1),
+        )
+    }
+
+    #[test]
+    fn every_install_stage_reports_only_a_bounded_marker_and_rolls_back() {
+        let stages = [
+            ("directory", 75),
+            ("lock", 76),
+            ("transaction", 77),
+            ("lock_id", 79),
+            ("stream", 80),
+            ("mode", 81),
+            ("watchdog_spawn", 84),
+            ("watchdog_ready", 85),
+            ("watchdog_pid", 86),
+            ("result", 87),
+        ];
+        for shell in ["sh", "bash"] {
+            for (stage, code) in stages {
+                let directory = runtime_directory();
+                let bin = directory.join(".local/bin");
+                fs::create_dir_all(&bin).unwrap();
+                let destination = bin.join("boomux");
+                fs::write(&destination, b"previous").unwrap();
+                fs::set_permissions(&destination, fs::Permissions::from_mode(0o755)).unwrap();
+                let assignment = format!("stage={stage}; stage_code={code};");
+                let injected = format!("{assignment} printf 'private remote detail' >&2; false;");
+                let command = REMOTE_INSTALL_COMMAND.replacen(&assignment, &injected, 1);
+                assert_ne!(command, REMOTE_INSTALL_COMMAND);
+
+                let output = run_install_script_raw(shell, &command, &directory, b"replacement");
+                assert_eq!(output.status.code(), Some(code), "{shell} stage {stage}");
+                assert_eq!(
+                    output.stderr,
+                    format!("{INSTALL_STAGE_PREFIX}:{stage}:{code}\n").as_bytes(),
+                    "{shell} stage {stage}"
+                );
+                let error = classify_ssh_command_failure(output.status.code(), &output.stderr);
+                assert_eq!(error_code(&error), "bootstrap_install_failed");
+                assert!(error.to_string().contains("remote Boomux install failed"));
+                assert!(!error.to_string().contains("private remote detail"));
+                assert_eq!(fs::read(&destination).unwrap(), b"previous");
+                assert!(
+                    fs::read_dir(&bin)
+                        .unwrap()
+                        .filter_map(Result::ok)
+                        .all(|entry| !entry.file_name().to_string_lossy().starts_with(".boomux.")),
+                    "{shell} stage {stage} left transaction state"
+                );
+                fs::remove_dir_all(directory).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_remote_home_has_a_fixed_non_secret_install_stage() {
+        let output = run_install_script_raw(
+            "bash",
+            REMOTE_INSTALL_COMMAND,
+            Path::new("relative-home"),
+            b"replacement",
+        );
+        assert_eq!(output.status.code(), Some(74));
+        assert_eq!(output.stderr, b"boomux-install-stage-v1:home:74\n");
+        let error = classify_ssh_command_failure(output.status.code(), &output.stderr);
+        assert_eq!(error_code(&error), "bootstrap_install_failed");
+        assert!(error.to_string().contains("HOME is not an absolute path"));
+    }
+
+    #[test]
+    fn failed_watchdog_readiness_is_typed_and_restores_the_previous_binary() {
+        let directory = runtime_directory();
+        let bin = directory.join(".local/bin");
+        fs::create_dir_all(&bin).unwrap();
+        let destination = bin.join("boomux");
+        fs::write(&destination, b"previous").unwrap();
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o755)).unwrap();
+        let command = REMOTE_INSTALL_COMMAND.replacen(
+            ": > \"$transaction/watchdog_ready\"; claim_process_start",
+            "exit 1; claim_process_start",
+            1,
+        );
+        let output = run_install_script_raw("bash", &command, &directory, b"replacement");
+        assert_eq!(output.status.code(), Some(85));
+        assert_eq!(
+            output.stderr,
+            b"boomux-install-stage-v1:watchdog_ready:85\n"
+        );
+        let error = classify_ssh_command_failure(output.status.code(), &output.stderr);
+        assert_eq!(error_code(&error), "bootstrap_install_failed");
+        assert!(error.to_string().contains("watchdog did not become ready"));
+        assert_eq!(fs::read(&destination).unwrap(), b"previous");
+        assert!(!bin.join(".boomux.bootstrap.lock").exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn run_local_transaction(home: &Path, command: &str, transaction: &InstallTransactionId) {
+        let mut child = local_shell_command("sh", home);
+        child.args(["-c", command]);
+        run_streaming_command(child, transaction.input(), Duration::from_secs(1)).unwrap();
+    }
+
+    fn compatible_helper_script(node_id: &str) -> String {
+        let handshake = FederationHandshake {
+            version: FEDERATION_VERSION,
+            node_id: node_id.into(),
+            helper_version: env!("CARGO_PKG_VERSION").into(),
+            core_protocol_version: protocol::PROTOCOL_VERSION,
+            connection_mode: FederationConnectionMode::AdHoc,
+        };
+        let mut handshake_bytes = Vec::new();
+        crate::federation::write_handshake(&mut handshake_bytes, &handshake).unwrap();
+        let mut request_bytes = Vec::new();
+        protocol::write_message(
+            &mut request_bytes,
+            &Envelope::with_version(protocol::PROTOCOL_VERSION, Request::Ping),
+        )
+        .unwrap();
+        let mut response_bytes = Vec::new();
+        protocol::write_message(
+            &mut response_bytes,
+            &Envelope::with_version(protocol::PROTOCOL_VERSION, Response::Pong),
+        )
+        .unwrap();
+        format!(
+            "{}; dd bs=1 count={} of=/dev/null 2>/dev/null; {}",
+            shell_printf(&handshake_bytes),
+            request_bytes.len(),
+            shell_printf(&response_bytes),
+        )
+    }
+
+    fn write_bootstrap_ssh(runtime: &Path, executable_cases: &str, candidates: &str) -> PathBuf {
+        fs::create_dir_all(runtime).unwrap();
+        let ssh = runtime.join("ssh");
+        fs::write(
+            &ssh,
+            format!(
+                "#!/bin/sh\nlast=\nfor arg do last=$arg; done\ncase \"$last\" in *'exec '*) last=${{last##*exec }} ;; esac\ncase \"$last\" in\n  *boomux-platform-v1*) printf 'boomux-platform-v1\\0Linux\\0x86_64\\0' ;;\n  *boomux-executables-v1*) printf 'boomux-executables-v1\\0{candidates}' ;;\n  *boomux-install-destination-v1*) printf 'boomux-install-destination-v1\\0/home/person/.local/bin/boomux\\0' ;;\n{executable_cases}\n  *) exit 64 ;;\nesac\n"
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+        ssh
     }
 
     #[test]
@@ -1695,11 +4254,24 @@ mod tests {
         assert_eq!(arguments[arguments.len() - 2], "workbox");
         assert_eq!(
             arguments.last().unwrap(),
-            "'/opt/boomux'\\''s bin/boomux' __federation-stdio"
+            &OsString::from(remote_helper_command(
+                &RemoteExecutable::parse("/opt/boomux's bin/boomux").unwrap()
+            ))
+        );
+        assert!(
+            arguments
+                .last()
+                .unwrap()
+                .to_string_lossy()
+                .contains("exec '/opt/boomux'\\''s bin/boomux' __federation-stdio")
         );
 
         let config = fs::read_to_string(invocation.config_path()).unwrap();
-        assert!(config.starts_with("Include \"/home/person/.ssh/config\"\nSendEnv -*\nHost *\n"));
+        assert!(
+            config.starts_with(
+                "Include \"/home/person/.ssh/config\"\nMatch all\nSendEnv -*\nHost *\n"
+            )
+        );
         assert!(config.contains("ServerAliveInterval 15"));
         assert_eq!(
             fs::symlink_metadata(invocation.config_path())
@@ -1712,6 +4284,394 @@ mod tests {
         drop(invocation);
         assert!(!directory.exists());
         fs::remove_dir_all(runtime).unwrap();
+    }
+
+    #[test]
+    fn generated_config_ends_trailing_included_match_before_clearing_sendenv() {
+        let runtime = runtime_directory();
+        fs::create_dir_all(&runtime).unwrap();
+        let user_config = runtime.join("user-config");
+        fs::write(
+            &user_config,
+            "Host *\n    SendEnv BOOMUX_SECRET\nMatch host never-matches\n",
+        )
+        .unwrap();
+        let invocation = SshInvocation::prepare_at(
+            &runtime,
+            Some(&user_config),
+            SshTarget::parse("workbox").unwrap(),
+            RemoteExecutable::parse("/usr/bin/boomux").unwrap(),
+            SshAuthenticationMode::Batch,
+        )
+        .unwrap();
+        let output = Command::new("ssh")
+            .args(["-G", "-F"])
+            .arg(invocation.config_path())
+            .arg("workbox")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "ssh -G failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let effective = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
+        assert!(!effective.contains("boomux_secret"), "{effective}");
+        assert!(!effective.lines().any(|line| line.starts_with("sendenv ")));
+        drop(invocation);
+        fs::remove_dir_all(runtime).unwrap();
+    }
+
+    fn run_runtime_prefix(runtime: Option<&Path>, path: Option<&Path>) -> std::process::Output {
+        run_runtime_prefix_text(REMOTE_RUNTIME_PREFIX, runtime, path)
+    }
+
+    fn run_runtime_prefix_text(
+        prefix: &str,
+        runtime: Option<&Path>,
+        path: Option<&Path>,
+    ) -> std::process::Output {
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", &format!("{prefix}printf '%s' \"$XDG_RUNTIME_DIR\"")])
+            .env_remove("XDG_RUNTIME_DIR");
+        if let Some(runtime) = runtime {
+            command.env("XDG_RUNTIME_DIR", runtime);
+        }
+        if let Some(path) = path {
+            command.env("PATH", path);
+        }
+        command.output().unwrap()
+    }
+
+    #[test]
+    fn linux_runtime_discovery_derives_or_validates_owner_runtime_without_local_forwarding() {
+        let uid = unsafe { libc::geteuid() };
+        let derived = PathBuf::from(format!("/run/user/{uid}"));
+        let output = run_runtime_prefix(None, None);
+        assert!(
+            output.status.success(),
+            "runtime discovery failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, derived.as_os_str().as_bytes());
+
+        let supplied = runtime_directory();
+        fs::create_dir(&supplied).unwrap();
+        fs::set_permissions(&supplied, fs::Permissions::from_mode(0o700)).unwrap();
+        let output = run_runtime_prefix(Some(&supplied), None);
+        assert!(output.status.success());
+        assert_eq!(output.stdout, supplied.as_os_str().as_bytes());
+        assert!(
+            !remote_helper_command(&RemoteExecutable::parse("/bin/boomux").unwrap())
+                .contains(supplied.to_str().unwrap())
+        );
+        fs::remove_dir_all(supplied).unwrap();
+    }
+
+    #[test]
+    fn runtime_discovery_rejects_malicious_identity_and_unsafe_environment() {
+        let relative = run_runtime_prefix(Some(Path::new("relative")), None);
+        assert_eq!(relative.status.code(), Some(89));
+        assert_eq!(relative.stderr, b"boomux-runtime-v1:invalid:89\n");
+        assert_eq!(
+            error_code(&classify_ssh_command_failure(
+                relative.status.code(),
+                &relative.stderr
+            )),
+            "bootstrap_runtime_unavailable"
+        );
+
+        let unsafe_runtime = runtime_directory();
+        fs::create_dir(&unsafe_runtime).unwrap();
+        fs::set_permissions(&unsafe_runtime, fs::Permissions::from_mode(0o755)).unwrap();
+        let unsafe_output = run_runtime_prefix(Some(&unsafe_runtime), None);
+        assert_eq!(unsafe_output.status.code(), Some(90));
+        assert_eq!(unsafe_output.stderr, b"boomux-runtime-v1:unsafe:90\n");
+        fs::remove_dir_all(unsafe_runtime).unwrap();
+
+        let malicious_prefix =
+            REMOTE_RUNTIME_PREFIX.replace("/usr/bin/id -u", "printf '1;touch-pwned\\n'");
+        let malicious = run_runtime_prefix_text(&malicious_prefix, None, None);
+        assert_eq!(malicious.status.code(), Some(89));
+        assert_eq!(malicious.stderr, b"boomux-runtime-v1:invalid:89\n");
+    }
+
+    #[test]
+    fn macos_runtime_discovery_preserves_explicit_runtime_and_rejects_absence() {
+        let root = runtime_directory();
+        let runtime = root.join("runtime");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir(&runtime).unwrap();
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+        let uid = unsafe { libc::geteuid() };
+        let macos_prefix = REMOTE_RUNTIME_PREFIX
+            .replace("/usr/bin/uname -s", "printf 'Darwin\\n'")
+            .replace("/usr/bin/stat -f '%u'", &format!("printf '{uid}\\n'"))
+            .replace("/usr/bin/stat -f '%Lp'", "printf '700\\n'");
+        let supplied = run_runtime_prefix_text(&macos_prefix, Some(&runtime), None);
+        assert!(supplied.status.success());
+        assert_eq!(supplied.stdout, runtime.as_os_str().as_bytes());
+
+        let missing = run_runtime_prefix_text(&macos_prefix, None, None);
+        assert_eq!(missing.status.code(), Some(88));
+        assert_eq!(missing.stderr, b"boomux-runtime-v1:missing:88\n");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn post_install_failures_name_the_fixed_stage_without_remote_stderr() {
+        for (stage, expected) in [
+            ("daemon_status", "daemon status"),
+            ("daemon_restart", "daemon restart"),
+            ("helper_verification", "helper verification"),
+            ("live_handshake", "live helper handshake"),
+            ("protocol_ping", "protocol ping"),
+        ] {
+            let error =
+                post_install_failure(stage, io::Error::other("private remote stderr and path"));
+            assert_eq!(error_code(&error), "bootstrap_install_failed");
+            assert!(error.to_string().contains(expected));
+            assert!(!error.to_string().contains("private remote"));
+        }
+        let runtime = classify_ssh_command_failure(
+            Some(90),
+            b"boomux-runtime-v1:unsafe:90\nprivate remote stderr",
+        );
+        let preserved = post_install_failure("daemon_status", runtime);
+        assert_eq!(error_code(&preserved), "bootstrap_runtime_unavailable");
+        assert!(!preserved.to_string().contains("private remote"));
+    }
+
+    #[test]
+    fn daemon_status_distinguishes_absent_compatible_and_incompatible() {
+        assert_eq!(
+            parse_remote_daemon_status(b"boomux-daemon-status-v1\0absent\0").unwrap(),
+            RemoteDaemonStatus::Absent
+        );
+        for (version, expected) in [
+            (
+                21,
+                RemoteDaemonStatus::Present {
+                    protocol_version: 21,
+                    pid: None,
+                    executable: None,
+                    socket_device: None,
+                    socket_inode: None,
+                },
+            ),
+            (
+                protocol::PROTOCOL_VERSION,
+                RemoteDaemonStatus::Present {
+                    protocol_version: protocol::PROTOCOL_VERSION,
+                    pid: None,
+                    executable: None,
+                    socket_device: None,
+                    socket_inode: None,
+                },
+            ),
+            (
+                protocol::PROTOCOL_VERSION + 1,
+                RemoteDaemonStatus::Present {
+                    protocol_version: protocol::PROTOCOL_VERSION + 1,
+                    pid: None,
+                    executable: None,
+                    socket_device: None,
+                    socket_inode: None,
+                },
+            ),
+        ] {
+            let status = format!(
+                "{{\"schema\":\"boomux.cli/v1\",\"command\":\"daemon.status\",\"data\":{{\"protocol_version\":{version}}}}}"
+            );
+            assert_eq!(
+                parse_remote_daemon_status(status.as_bytes()).unwrap(),
+                expected
+            );
+        }
+        let status = br#"{"schema":"boomux.cli/v1","command":"daemon.status","data":{"protocol_version":38,"pid":42,"executable":"/custom/path with spaces/boomux","socket_device":7,"socket_inode":8}}"#;
+        let parsed = parse_remote_daemon_status(status).unwrap();
+        assert!(parsed.proves_executable(
+            &RemoteExecutable::parse("/custom/path with spaces/boomux").unwrap()
+        ));
+        assert!(!parsed.proves_executable(&RemoteExecutable::parse("/other/boomux").unwrap()));
+
+        let runtime = runtime_directory();
+        fs::create_dir(&runtime).unwrap();
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", &remote_daemon_status_command()])
+            .env("HOME", &runtime)
+            .env("XDG_RUNTIME_DIR", &runtime);
+        let output = run_bounded_command(command, Duration::from_secs(1)).unwrap();
+        assert_eq!(
+            parse_remote_daemon_status(&output.stdout).unwrap(),
+            RemoteDaemonStatus::Absent
+        );
+        fs::remove_dir_all(runtime).unwrap();
+    }
+
+    #[test]
+    fn running_non_destination_helper_rejects_shadow_upgrade_before_remote_mutation() {
+        for (helper_path, daemon_executable) in [
+            ("/usr/bin/boomux", "/usr/bin/boomux"),
+            ("/custom/bin/boomux", "/custom/bin/boomux"),
+            (
+                "/custom/path with spaces/boomux",
+                "/custom/path with spaces/boomux",
+            ),
+            (
+                "/home/person/.local/bin/boomux",
+                "/deleted/undiscovered/boomux",
+            ),
+        ] {
+            let runtime = runtime_directory();
+            fs::create_dir_all(&runtime).unwrap();
+            let mutated = runtime.join("mutated");
+            let log = runtime.join("ssh.log");
+            let ssh = runtime.join("ssh");
+            let status = serde_json::json!({
+                "schema": "boomux.cli/v1",
+                "command": "daemon.status",
+                "data": {
+                    "protocol_version": 21,
+                    "pid": 123,
+                    "executable": daemon_executable,
+                }
+            })
+            .to_string();
+            fs::write(
+                &ssh,
+                format!(
+                    "#!/bin/sh\n{CONTROL_MASTER_SCRIPT}\nlast=\nfor arg do last=$arg; done\nprintf '%s\\n' \"$last\" >> {}\ncase \"$last\" in\n  *'daemon status --json'*) printf '%s' {} ;;\n  *'boomux-install-transaction-v1'*) cat >/dev/null; printf 'boomux-install-transaction-v1\\0.boomux.bootstrap.ABC12345\\0' ;;\n  *'daemon restart'*|*'daemon stop'*) : > {}; exit 99 ;;\n  *) exit 64 ;;\nesac\n",
+                    quote_posix_shell(log.to_str().unwrap()),
+                    quote_posix_shell(&status),
+                    quote_posix_shell(mutated.to_str().unwrap()),
+                ),
+            )
+            .unwrap();
+            fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+            let session = BootstrapSession::open_at(
+                &runtime,
+                None,
+                SshTarget::parse("workbox").unwrap(),
+                SshAuthenticationMode::Batch,
+                Duration::from_secs(1),
+                ssh.as_os_str(),
+            )
+            .unwrap();
+            let plan = RemoteInstallPlan {
+                target: SshTarget::parse("workbox").unwrap(),
+                destination: RemoteExecutable::parse("/home/person/.local/bin/boomux").unwrap(),
+                source: RemoteInstallSource::CurrentBinary {
+                    path: runtime.join("pinned"),
+                    sha256: format!("{:x}", Sha256::digest(b"replacement")),
+                    bytes: b"replacement".to_vec(),
+                },
+                reason: RemoteInstallReason::Upgrade,
+                bootstrap_id: Some(session.id),
+                upgrade_helper: Some(RemoteExecutable::parse(helper_path).unwrap()),
+            };
+            let error = session
+                .install_and_connect(&plan, Duration::from_secs(1))
+                .err()
+                .expect("shadow upgrade must fail");
+            assert_eq!(error_code(&error), "upgrade_required");
+            assert!(error.to_string().contains(helper_path));
+            assert!(error.to_string().contains("owner or package mechanism"));
+            assert!(error.to_string().contains("explicitly stop the daemon"));
+            assert!(!mutated.exists());
+            let commands = fs::read_to_string(&log).unwrap();
+            assert!(commands.contains("/new\" daemon status --json"));
+            assert!(commands.contains("boomux-install-transaction-v1"));
+            fs::remove_dir_all(runtime).unwrap();
+        }
+    }
+
+    #[test]
+    fn missing_helper_requires_proven_socket_absence_before_remote_mutation() {
+        for (case, probe) in [
+            (
+                "undiscovered daemon",
+                "printf 'boomux-daemon-presence-v1\\0present\\0'",
+            ),
+            (
+                "stale socket",
+                "printf 'boomux-daemon-presence-v1\\0present\\0'",
+            ),
+            ("unknown presence", "exit 71"),
+        ] {
+            let runtime = runtime_directory();
+            fs::create_dir_all(&runtime).unwrap();
+            let mutated = runtime.join("mutated");
+            let ssh = runtime.join("ssh");
+            fs::write(
+                &ssh,
+                format!(
+                    "#!/bin/sh\n{CONTROL_MASTER_SCRIPT}\nlast=\nfor arg do last=$arg; done\ncase \"$last\" in\n  *'boomux-daemon-presence-v1'*) {probe} ;;\n  *'boomux-install-transaction-v1'*|*'daemon restart'*|*'daemon stop'*) : > {}; exit 99 ;;\n  *) exit 64 ;;\nesac\n",
+                    quote_posix_shell(mutated.to_str().unwrap()),
+                ),
+            )
+            .unwrap();
+            fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+            let session = BootstrapSession::open_at(
+                &runtime,
+                None,
+                SshTarget::parse("workbox").unwrap(),
+                SshAuthenticationMode::Batch,
+                Duration::from_secs(1),
+                ssh.as_os_str(),
+            )
+            .unwrap();
+            let plan = RemoteInstallPlan {
+                target: SshTarget::parse("workbox").unwrap(),
+                destination: RemoteExecutable::parse("/home/person/.local/bin/boomux").unwrap(),
+                source: RemoteInstallSource::CurrentBinary {
+                    path: runtime.join("pinned"),
+                    sha256: format!("{:x}", Sha256::digest(b"replacement")),
+                    bytes: b"replacement".to_vec(),
+                },
+                reason: RemoteInstallReason::Missing,
+                bootstrap_id: Some(session.id),
+                upgrade_helper: None,
+            };
+            let error = session
+                .install_and_connect(&plan, Duration::from_secs(1))
+                .err()
+                .unwrap_or_else(|| panic!("{case} must prevent installation"));
+            assert_eq!(error_code(&error), "install_required", "{case}");
+            assert!(!mutated.exists(), "{case}");
+            fs::remove_dir_all(runtime).unwrap();
+        }
+    }
+
+    #[test]
+    fn live_helper_handshake_preserves_runtime_discovery_failure() {
+        let unsafe_runtime = runtime_directory();
+        fs::create_dir(&unsafe_runtime).unwrap();
+        fs::set_permissions(&unsafe_runtime, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", &format!("{REMOTE_RUNTIME_PREFIX}exec false")])
+            .env("XDG_RUNTIME_DIR", &unsafe_runtime);
+        let helper = CompatibleRemoteHelper {
+            executable: RemoteExecutable::parse("/bin/false").unwrap(),
+            handshake: FederationHandshake {
+                version: FEDERATION_VERSION,
+                node_id: Uuid::new_v4().to_string(),
+                helper_version: "test".into(),
+                core_protocol_version: protocol::PROTOCOL_VERSION,
+                connection_mode: FederationConnectionMode::AdHoc,
+            },
+            bootstrap_id: None,
+        };
+        let error = connect_remote_command(command, helper, Duration::from_secs(1), None)
+            .err()
+            .expect("unsafe runtime must fail before the helper handshake");
+        assert_eq!(error_code(&error), "bootstrap_runtime_unavailable");
+        assert!(error.to_string().contains("owner-controlled"));
+        fs::remove_dir_all(unsafe_runtime).unwrap();
     }
 
     #[test]
@@ -1736,6 +4696,160 @@ mod tests {
     }
 
     #[test]
+    fn master_stderr_is_mirrored_live_only_for_interactive_authentication() {
+        let challenge = b"To authenticate, visit:\nhttps://login.tailscale.test/a?c=123\n\xff";
+        for authentication in [
+            SshAuthenticationMode::Interactive,
+            SshAuthenticationMode::Batch,
+        ] {
+            let runtime = runtime_directory();
+            fs::create_dir_all(&runtime).unwrap();
+            let first = shell_printf(&challenge[..17]);
+            let second = shell_printf(&challenge[17..43]);
+            let third = shell_printf(&challenge[43..]);
+            let ssh = write_master_stderr_ssh(
+                &runtime,
+                &format!(
+                    "{first} >&2; {second} >&2; {third} >&2; : > \"$control.ready\"; trap 'rm -f \"$control.ready\"' EXIT HUP INT TERM; while :; do sleep 60; done"
+                ),
+            );
+            let (mut mirrored, mirror) = std::os::unix::net::UnixStream::pair().unwrap();
+            mirrored
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let session = BootstrapSession::open_at_with_mirror(
+                &runtime,
+                None,
+                SshTarget::parse("workbox").unwrap(),
+                authentication,
+                Duration::from_secs(2),
+                ssh.as_os_str(),
+                Some(Box::new(mirror)),
+            )
+            .unwrap();
+
+            if authentication == SshAuthenticationMode::Interactive {
+                let mut output = vec![0; challenge.len()];
+                mirrored.read_exact(&mut output).unwrap();
+                assert_eq!(output, challenge);
+            } else {
+                let mut byte = [0];
+                assert_eq!(mirrored.read(&mut byte).unwrap(), 0);
+            }
+            drop(session);
+            fs::remove_dir_all(runtime).unwrap();
+        }
+    }
+
+    #[test]
+    fn master_stderr_classification_uses_retained_bytes_without_batch_mirroring() {
+        let runtime = runtime_directory();
+        fs::create_dir_all(&runtime).unwrap();
+        let private =
+            b"private challenge: https://login.test/token\nPermission denied (publickey).\n";
+        let first = shell_printf(&private[..31]);
+        let second = shell_printf(&private[31..]);
+        let ssh =
+            write_master_stderr_ssh(&runtime, &format!("{first} >&2; {second} >&2; exit 255"));
+        let mirror_path = runtime.join("batch-mirror");
+        let mirror = fs::File::create(&mirror_path).unwrap();
+        let error = BootstrapSession::open_at_with_mirror(
+            &runtime,
+            None,
+            SshTarget::parse("workbox").unwrap(),
+            SshAuthenticationMode::Batch,
+            Duration::from_secs(2),
+            ssh.as_os_str(),
+            Some(Box::new(mirror)),
+        )
+        .err()
+        .expect("the fake master must fail authentication");
+        assert_eq!(error_code(&error), "bootstrap_authentication_failed");
+        assert!(!error.to_string().contains("login.test"));
+        assert!(fs::read(&mirror_path).unwrap().is_empty());
+        fs::remove_dir_all(runtime).unwrap();
+    }
+
+    #[test]
+    fn master_stderr_truncation_kills_the_waiting_master_and_reports_the_bound() {
+        let runtime = runtime_directory();
+        fs::create_dir_all(&runtime).unwrap();
+        let oversized = vec![b'x'; MAX_PROBE_STDERR_BYTES + 1];
+        let output = shell_printf(&oversized);
+        let ssh = write_master_stderr_ssh(
+            &runtime,
+            &format!("{output} >&2; while :; do /bin/sleep 60; done"),
+        );
+        let mirror_path = runtime.join("interactive-mirror");
+        let mirror = fs::File::create(&mirror_path).unwrap();
+        let started = Instant::now();
+        let error = BootstrapSession::open_at_with_mirror(
+            &runtime,
+            None,
+            SshTarget::parse("workbox").unwrap(),
+            SshAuthenticationMode::Interactive,
+            Duration::from_secs(10),
+            ssh.as_os_str(),
+            Some(Box::new(mirror)),
+        )
+        .err()
+        .expect("oversized master stderr must fail");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(error_code(&error), "bootstrap_transport_failed");
+        assert!(error.to_string().contains("exceeded the supported bound"));
+        assert_eq!(
+            fs::read(&mirror_path).unwrap(),
+            &oversized[..MAX_PROBE_STDERR_BYTES]
+        );
+        assert!(
+            fs::read_dir(&runtime)
+                .unwrap()
+                .filter_map(Result::ok)
+                .all(|entry| {
+                    !entry.file_type().unwrap().is_dir()
+                        || !entry.file_name().to_string_lossy().starts_with("ssh-")
+                })
+        );
+        fs::remove_dir_all(runtime).unwrap();
+    }
+
+    #[test]
+    fn real_ssh_missing_master_cannot_fall_back_to_a_network_connection() {
+        let runtime = runtime_directory();
+        let (directory, config, control) = prepare_ssh_directory(&runtime, None).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut file = OpenOptions::new().append(true).open(&config).unwrap();
+        writeln!(
+            file,
+            "Host workbox\n    HostName 127.0.0.1\n    Port {port}\n    ConnectTimeout 1"
+        )
+        .unwrap();
+        let command = slave_command(
+            OsStr::new("ssh"),
+            &config,
+            &control,
+            &SshTarget::parse("workbox").unwrap(),
+            "true",
+        );
+        let arguments = command_arguments(&command);
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair == ["-o", "ProxyCommand=/bin/false"])
+        );
+        assert!(run_bounded_command(command, Duration::from_secs(2)).is_err());
+        thread::sleep(Duration::from_millis(50));
+        assert!(matches!(
+            listener.accept(),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock
+        ));
+        fs::remove_dir_all(directory).unwrap();
+        fs::remove_dir_all(runtime).unwrap();
+    }
+
+    #[test]
     fn parses_supported_platforms_and_current_release_matrix() {
         let linux = RemotePlatform::parse_probe(b"boomux-platform-v1\0Linux\0x86_64\0").unwrap();
         assert_eq!(linux.operating_system, RemoteOperatingSystem::Linux);
@@ -1749,8 +4863,6 @@ mod tests {
 
         for invalid in [
             &b"wrong\0Linux\0x86_64\0"[..],
-            &b"boomux-platform-v1\0Plan9\0x86_64\0"[..],
-            &b"boomux-platform-v1\0Linux\0mips\0"[..],
             &b"boomux-platform-v1\0Linux\0x86_64"[..],
         ] {
             assert_eq!(
@@ -1758,6 +4870,26 @@ mod tests {
                 io::ErrorKind::InvalidData
             );
         }
+        for unsupported in [
+            &b"boomux-platform-v1\0Plan9\0x86_64\0"[..],
+            &b"boomux-platform-v1\0Linux\0mips\0"[..],
+        ] {
+            let error = RemotePlatform::parse_probe(unsupported).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+            assert_eq!(error_code(&error), "bootstrap_unsupported_platform");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn platform_preflight_ignores_a_poisoned_path() {
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", PLATFORM_PROBE_COMMAND])
+            .env("PATH", "/definitely/not/a/bootstrap/tool/path");
+        let output = run_bounded_command(command, Duration::from_secs(1)).unwrap();
+        let platform = RemotePlatform::parse_probe(&output.stdout).unwrap();
+        assert_eq!(platform.operating_system, RemoteOperatingSystem::Linux);
     }
 
     #[test]
@@ -1773,12 +4905,20 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["/usr/bin/boomux", "/opt/boomux/bin/boomux"]
         );
-        assert_eq!(
-            parse_executable_probe(b"boomux-executables-v1\0relative/boomux\0")
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::InvalidInput
-        );
+        for invalid in [
+            b"boomux-executables-v1\0relative/boomux\0".to_vec(),
+            b"boomux-executables-v1\0/opt/boomux\nbin\0".to_vec(),
+            {
+                let mut probe = b"boomux-executables-v1\0/".to_vec();
+                probe.extend(std::iter::repeat_n(b'x', MAX_REMOTE_EXECUTABLE_BYTES));
+                probe.push(0);
+                probe
+            },
+        ] {
+            let error = parse_executable_probe(&invalid).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(error_code(&error), "bootstrap_malformed_helper");
+        }
 
         assert_eq!(
             parse_install_destination_probe(
@@ -1788,12 +4928,11 @@ mod tests {
             .as_str(),
             "/home/person/.local/bin/boomux"
         );
-        assert_eq!(
+        let error =
             parse_install_destination_probe(b"boomux-install-destination-v1\0relative/boomux\0")
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::InvalidInput
-        );
+                .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(error_code(&error), "bootstrap_malformed_helper");
     }
 
     #[test]
@@ -1814,6 +4953,40 @@ mod tests {
     }
 
     #[test]
+    fn executable_probe_hides_only_an_uncommitted_provisional_destination() {
+        let home = runtime_directory();
+        let bin = home.join(".local/bin");
+        let destination = bin.join("boomux");
+        let lock = bin.join(".boomux.bootstrap.lock");
+        fs::create_dir_all(&lock).unwrap();
+        fs::write(&destination, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let run = || {
+            let mut command = Command::new("sh");
+            command
+                .args(["-c", EXECUTABLE_PROBE_COMMAND])
+                .env("HOME", &home)
+                .env("PATH", format!("{}:/usr/bin:/bin", bin.display()));
+            let output = run_bounded_command(command, Duration::from_secs(1)).unwrap();
+            parse_executable_probe(&output.stdout).unwrap()
+        };
+        assert!(
+            !run()
+                .iter()
+                .any(|path| path.as_str() == destination.to_str().unwrap())
+        );
+
+        fs::create_dir(lock.join("committed")).unwrap();
+        assert!(
+            run()
+                .iter()
+                .any(|path| path.as_str() == destination.to_str().unwrap())
+        );
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
     fn bounded_runner_captures_output_and_classifies_exit() {
         let mut command = Command::new("sh");
         command.args(["-c", "printf stdout; printf stderr >&2"]);
@@ -1823,11 +4996,11 @@ mod tests {
 
         let mut command = Command::new("sh");
         command.args(["-c", "exit 7"]);
+        let error = run_bounded_command(command, Duration::from_secs(1)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
         assert_eq!(
-            run_bounded_command(command, Duration::from_secs(1))
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::Other
+            error.to_string(),
+            "SSH remote command failed; verify executable access and remote shell support"
         );
     }
 
@@ -1979,7 +5152,7 @@ mod tests {
         fs::write(
             &ssh,
             format!(
-                "#!/bin/sh\nlast=\nfor arg do last=$arg; done\ncase \"$last\" in\n  \"'/bad/boomux' __federation-stdio\") printf 'NOTMAGIC' ;;\n  \"'/good/boomux' __federation-stdio\") {}; dd bs=1 count={} of=/dev/null 2>/dev/null; {} ;;\n  *) exit 64 ;;\nesac\n",
+                "#!/bin/sh\nlast=\nfor arg do last=$arg; done\ncase \"$last\" in *'exec '*) last=${{last##*exec }} ;; esac\ncase \"$last\" in\n  \"'/bad/boomux' __federation-stdio\") printf 'NOTMAGIC' ;;\n  \"'/good/boomux' __federation-stdio\") {}; dd bs=1 count={} of=/dev/null 2>/dev/null; {} ;;\n  *) exit 64 ;;\nesac\n",
                 shell_printf(&handshake_bytes),
                 request_bytes.len(),
                 shell_printf(&response_bytes),
@@ -2004,6 +5177,737 @@ mod tests {
         .unwrap();
         assert_eq!(compatible.executable, candidates[1]);
         assert_eq!(compatible.handshake, handshake);
+        assert_eq!(
+            fs::read_dir(&runtime)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().starts_with("ssh-"))
+                .count(),
+            0
+        );
+        fs::remove_dir_all(runtime).unwrap();
+    }
+
+    #[test]
+    fn bootstrap_plans_install_when_no_remote_executable_exists() {
+        let runtime = runtime_directory();
+        let ssh = write_bootstrap_ssh(&runtime, "", "");
+        let plan = plan_remote_bootstrap_at(
+            &runtime,
+            None,
+            SshTarget::parse("workbox").unwrap(),
+            SshAuthenticationMode::Batch,
+            Duration::from_secs(1),
+            ssh.as_os_str(),
+        )
+        .unwrap();
+        let RemoteBootstrapPlan::Install(plan) = plan else {
+            panic!("expected install plan");
+        };
+        assert_eq!(plan.reason, RemoteInstallReason::Missing);
+        assert_eq!(plan.destination.as_str(), "/home/person/.local/bin/boomux");
+        assert!(matches!(
+            plan.source,
+            RemoteInstallSource::CurrentBinary { .. }
+        ));
+        fs::remove_dir_all(runtime).unwrap();
+    }
+
+    #[test]
+    fn bootstrap_plans_upgrade_for_a_known_old_protocol_helper() {
+        let runtime = runtime_directory();
+        let ssh = write_bootstrap_ssh(
+            &runtime,
+            "  \"'/old/boomux' __federation-stdio\") exit 2 ;;\n  \"'/old/boomux' --version\") printf 'boomux 0.14.2\\n' ;;",
+            "/old/boomux\\0",
+        );
+        let plan = plan_remote_bootstrap_at(
+            &runtime,
+            None,
+            SshTarget::parse("workbox").unwrap(),
+            SshAuthenticationMode::Batch,
+            Duration::from_secs(1),
+            ssh.as_os_str(),
+        )
+        .unwrap();
+        assert!(matches!(
+            plan,
+            RemoteBootstrapPlan::Install(RemoteInstallPlan {
+                reason: RemoteInstallReason::Upgrade,
+                ..
+            })
+        ));
+        fs::remove_dir_all(runtime).unwrap();
+    }
+
+    #[test]
+    fn bootstrap_keeps_a_compatible_candidate_when_an_old_one_is_also_discovered() {
+        let runtime = runtime_directory();
+        let node_id = Uuid::new_v4().to_string();
+        let good = compatible_helper_script(&node_id);
+        let ssh = write_bootstrap_ssh(
+            &runtime,
+            &format!(
+                "  \"'/old/boomux' __federation-stdio\") exit 2 ;;\n  \"'/old/boomux' --version\") printf 'boomux 0.14.2\\n' ;;\n  \"'/good/boomux' __federation-stdio\") {good} ;;"
+            ),
+            "/old/boomux\\0/good/boomux\\0",
+        );
+        let plan = plan_remote_bootstrap_at(
+            &runtime,
+            None,
+            SshTarget::parse("workbox").unwrap(),
+            SshAuthenticationMode::Batch,
+            Duration::from_secs(1),
+            ssh.as_os_str(),
+        )
+        .unwrap();
+        let RemoteBootstrapPlan::Ready(helper) = plan else {
+            panic!("expected compatible helper");
+        };
+        assert_eq!(helper.executable.as_str(), "/good/boomux");
+        assert_eq!(helper.handshake.node_id, node_id);
+        fs::remove_dir_all(runtime).unwrap();
+    }
+
+    #[test]
+    fn mixed_compatible_identities_fail_as_a_typed_conflict() {
+        let runtime = runtime_directory();
+        let first = compatible_helper_script(&Uuid::new_v4().to_string());
+        let second = compatible_helper_script(&Uuid::new_v4().to_string());
+        let ssh = write_bootstrap_ssh(
+            &runtime,
+            &format!(
+                "  \"'/first/boomux' __federation-stdio\") {first} ;;\n  \"'/second/boomux' __federation-stdio\") {second} ;;"
+            ),
+            "/first/boomux\\0/second/boomux\\0",
+        );
+        let error = plan_remote_bootstrap_at(
+            &runtime,
+            None,
+            SshTarget::parse("workbox").unwrap(),
+            SshAuthenticationMode::Batch,
+            Duration::from_secs(1),
+            ssh.as_os_str(),
+        )
+        .err()
+        .expect("identity conflict must fail");
+        assert_eq!(error_code(&error), "node_identity_conflict");
+        fs::remove_dir_all(runtime).unwrap();
+    }
+
+    #[test]
+    fn newer_helper_is_unsupported_and_never_an_upgrade_candidate() {
+        let runtime = runtime_directory();
+        fs::create_dir_all(&runtime).unwrap();
+        let handshake = FederationHandshake {
+            version: FEDERATION_VERSION,
+            node_id: Uuid::new_v4().to_string(),
+            helper_version: "future".into(),
+            core_protocol_version: protocol::PROTOCOL_VERSION + 1,
+            connection_mode: FederationConnectionMode::AdHoc,
+        };
+        let mut bytes = Vec::new();
+        crate::federation::write_handshake(&mut bytes, &handshake).unwrap();
+        let ssh = write_bootstrap_ssh(
+            &runtime,
+            &format!(
+                "  \"'/future/boomux' __federation-stdio\") {} ;;\n  \"'/future/boomux' --version\") printf 'boomux 99.0.0\\n' ;;",
+                shell_printf(&bytes)
+            ),
+            "/future/boomux\\0",
+        );
+        let error = plan_remote_bootstrap_at(
+            &runtime,
+            None,
+            SshTarget::parse("workbox").unwrap(),
+            SshAuthenticationMode::Batch,
+            Duration::from_secs(1),
+            ssh.as_os_str(),
+        )
+        .err()
+        .expect("newer helper must fail");
+        assert_eq!(error_code(&error), "unsupported_version");
+        fs::remove_dir_all(runtime).unwrap();
+    }
+
+    #[test]
+    fn bootstrap_error_codes_preserve_failure_semantics() {
+        for (error, code) in [
+            (
+                io::Error::new(io::ErrorKind::PermissionDenied, "SSH authentication failed"),
+                "bootstrap_authentication_failed",
+            ),
+            (
+                io::Error::new(io::ErrorKind::ConnectionAborted, "route EOF"),
+                "bootstrap_transport_failed",
+            ),
+            (
+                invalid_probe("remote helper returned an invalid header"),
+                "bootstrap_malformed_helper",
+            ),
+            (
+                RemotePlatform::parse_probe(b"boomux-platform-v1\0Linux\0mips\0").unwrap_err(),
+                "bootstrap_unsupported_platform",
+            ),
+            (
+                io::Error::other("remote Boomux install failed"),
+                "bootstrap_install_failed",
+            ),
+        ] {
+            assert_eq!(error_code(&error), code);
+        }
+    }
+
+    #[test]
+    fn stalled_candidate_cannot_starve_a_later_compatible_helper() {
+        let runtime = runtime_directory();
+        let node_id = Uuid::new_v4().to_string();
+        let good = compatible_helper_script(&node_id);
+        let ssh = write_bootstrap_ssh(
+            &runtime,
+            &format!(
+                "  \"'/stalled/boomux' __federation-stdio\") sleep 2 ;;\n  \"'/good/boomux' __federation-stdio\") {good} ;;"
+            ),
+            "/stalled/boomux\\0/good/boomux\\0",
+        );
+        let plan = plan_remote_bootstrap_at(
+            &runtime,
+            None,
+            SshTarget::parse("workbox").unwrap(),
+            SshAuthenticationMode::Batch,
+            Duration::from_millis(400),
+            ssh.as_os_str(),
+        )
+        .unwrap();
+        let RemoteBootstrapPlan::Ready(helper) = plan else {
+            panic!("expected compatible helper");
+        };
+        assert_eq!(helper.executable.as_str(), "/good/boomux");
+        fs::remove_dir_all(runtime).unwrap();
+    }
+
+    #[test]
+    fn inaccessible_and_malformed_candidates_do_not_authorize_replacement() {
+        for (executable_case, expected_code) in [
+            (
+                "  \"'/bad/boomux' __federation-stdio\" | \"'/bad/boomux' --version\") exit 126 ;;",
+                "bootstrap_transport_failed",
+            ),
+            (
+                "  \"'/bad/boomux' __federation-stdio\") printf 'NOTMAGIC' ;;\n  \"'/bad/boomux' --version\") printf 'boomux 0.14.2\\n' ;;",
+                "bootstrap_malformed_helper",
+            ),
+        ] {
+            let runtime = runtime_directory();
+            let ssh = write_bootstrap_ssh(&runtime, executable_case, "/bad/boomux\\0");
+            let error = plan_remote_bootstrap_at(
+                &runtime,
+                None,
+                SshTarget::parse("workbox").unwrap(),
+                SshAuthenticationMode::Batch,
+                Duration::from_secs(1),
+                ssh.as_os_str(),
+            )
+            .err()
+            .expect("candidate must fail closed");
+            assert_eq!(error_code(&error), expected_code);
+            fs::remove_dir_all(runtime).unwrap();
+        }
+    }
+
+    #[test]
+    fn unreleased_local_protocol_has_no_compatible_published_release() {
+        let error = select_published_release("x86_64-unknown-linux-gnu").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        assert!(error.to_string().contains("local protocol 39"));
+        assert!(error.to_string().contains("manually stream"));
+    }
+
+    #[test]
+    fn session_rolls_back_prior_helper_after_installed_binary_cannot_execute() {
+        let runtime = runtime_directory();
+        fs::create_dir_all(&runtime).unwrap();
+        let remote = runtime.join("remote");
+        fs::create_dir_all(&remote).unwrap();
+        let destination = remote.join("boomux");
+        let backup = remote.join("backup");
+        let restart = remote.join("restart");
+        fs::write(&destination, b"previous-helper").unwrap();
+        let ssh = runtime.join("ssh");
+        fs::write(
+            &ssh,
+            format!(
+                "#!/bin/sh\n{control}\nlast=\nfor arg do last=$arg; done\ncase \"$last\" in\n  *'boomux-install-transaction-v1'*) mv {destination} {backup}; cat > {destination}; printf 'boomux-install-transaction-v1\\0.boomux.bootstrap.ABC12345\\0' ;;\n  *'transaction/watchdog_pid'*'daemon stop'*) cat >/dev/null; rm -f {destination}; mv {backup} {destination} ;;\n  *'daemon status --json'*) exit 126 ;;\n  *'daemon restart'*) : > {restart} ;;\n  *\"'/home/person/.local/bin/boomux' __federation-stdio\" | \"'/home/person/.local/bin/boomux' --version\") exit 126 ;;\n  *) exit 64 ;;\nesac\n",
+                control = CONTROL_MASTER_SCRIPT,
+                destination = quote_posix_shell(destination.to_str().unwrap()),
+                backup = quote_posix_shell(backup.to_str().unwrap()),
+                restart = quote_posix_shell(restart.to_str().unwrap()),
+            ),
+        )
+        .unwrap();
+        let script = fs::read_to_string(&ssh).unwrap().replace(
+            &format!(
+                "mv {} {}; cat > {};",
+                quote_posix_shell(destination.to_str().unwrap()),
+                quote_posix_shell(backup.to_str().unwrap()),
+                quote_posix_shell(destination.to_str().unwrap())
+            ),
+            "cat >/dev/null;",
+        );
+        fs::write(&ssh, script).unwrap();
+        fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+        let session = BootstrapSession::open_at(
+            &runtime,
+            None,
+            SshTarget::parse("workbox").unwrap(),
+            SshAuthenticationMode::Batch,
+            Duration::from_secs(1),
+            ssh.as_os_str(),
+        )
+        .unwrap();
+        let plan = RemoteInstallPlan {
+            target: SshTarget::parse("workbox").unwrap(),
+            destination: RemoteExecutable::parse("/home/person/.local/bin/boomux").unwrap(),
+            source: RemoteInstallSource::CurrentBinary {
+                path: runtime.join("pinned"),
+                sha256: format!("{:x}", Sha256::digest(b"wrong-abi")),
+                bytes: b"wrong-abi".to_vec(),
+            },
+            reason: RemoteInstallReason::Upgrade,
+            bootstrap_id: Some(session.id),
+            upgrade_helper: Some(
+                RemoteExecutable::parse("/home/person/.local/bin/boomux").unwrap(),
+            ),
+        };
+
+        assert!(
+            session
+                .install_and_connect(&plan, Duration::from_secs(1))
+                .is_err()
+        );
+        assert_eq!(fs::read(&destination).unwrap(), b"previous-helper");
+        assert!(!backup.exists());
+        assert!(!restart.exists());
+        assert_eq!(
+            fs::read_dir(&runtime)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().starts_with("ssh-"))
+                .count(),
+            0
+        );
+        fs::remove_dir_all(runtime).unwrap();
+    }
+
+    #[test]
+    fn post_install_protocol_ping_eof_rolls_back_before_commit() {
+        let runtime = runtime_directory();
+        fs::create_dir_all(&runtime).unwrap();
+        let destination = runtime.join("destination");
+        let backup = runtime.join("backup");
+        let count = runtime.join("count");
+        let committed = runtime.join("committed");
+        fs::write(&destination, b"previous-helper").unwrap();
+        let handshake = FederationHandshake {
+            version: FEDERATION_VERSION,
+            node_id: Uuid::new_v4().to_string(),
+            helper_version: "test".into(),
+            core_protocol_version: protocol::PROTOCOL_VERSION,
+            connection_mode: FederationConnectionMode::AdHoc,
+        };
+        let mut handshake_bytes = Vec::new();
+        crate::federation::write_handshake(&mut handshake_bytes, &handshake).unwrap();
+        let mut request = Vec::new();
+        protocol::write_message(
+            &mut request,
+            &Envelope::with_version(protocol::PROTOCOL_VERSION, Request::Ping),
+        )
+        .unwrap();
+        let mut pong = Vec::new();
+        protocol::write_message(
+            &mut pong,
+            &Envelope::with_version(protocol::PROTOCOL_VERSION, Response::Pong),
+        )
+        .unwrap();
+        let ssh = runtime.join("ssh");
+        fs::write(
+            &ssh,
+            format!(
+                "#!/bin/sh\n{control}\nlast=\nfor arg do last=$arg; done\ncase \"$last\" in\n  *'boomux-install-transaction-v1'*) mv {destination} {backup}; cat > {destination}; printf 'boomux-install-transaction-v1\\0.boomux.bootstrap.ABC12345\\0' ;;\n  *'transaction/watchdog_pid'*'restore_install'*) cat >/dev/null; rm -f {destination}; mv {backup} {destination} ;;\n  *'daemon status --json'*) printf '%s' '{{\"schema\":\"boomux.cli/v1\",\"command\":\"daemon.status\",\"data\":{{\"protocol_version\":38}}}}' ;;\n  *'daemon restart'*) exit 99 ;;\n  *'rm -f \"$transaction/backup\"'*) cat >/dev/null; : > {committed} ;;\n  *\"'/home/person/.local/bin/boomux' __federation-stdio\") n=0; [ ! -f {count} ] || n=$(cat {count}); n=$((n + 1)); printf '%s' \"$n\" > {count}; {handshake}; dd bs=1 count={request_len} of=/dev/null 2>/dev/null; [ \"$n\" -eq 1 ] && {pong} ;;\n  *) exit 64 ;;\nesac\n",
+                control = CONTROL_MASTER_SCRIPT,
+                destination = quote_posix_shell(destination.to_str().unwrap()),
+                backup = quote_posix_shell(backup.to_str().unwrap()),
+                committed = quote_posix_shell(committed.to_str().unwrap()),
+                count = quote_posix_shell(count.to_str().unwrap()),
+                handshake = shell_printf(&handshake_bytes),
+                request_len = request.len(),
+                pong = shell_printf(&pong),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+        add_fake_daemon_identity(&ssh, "/home/person/.local/bin/boomux");
+        let session = BootstrapSession::open_at(
+            &runtime,
+            None,
+            SshTarget::parse("workbox").unwrap(),
+            SshAuthenticationMode::Batch,
+            Duration::from_secs(1),
+            ssh.as_os_str(),
+        )
+        .unwrap();
+        let plan = RemoteInstallPlan {
+            target: SshTarget::parse("workbox").unwrap(),
+            destination: RemoteExecutable::parse("/home/person/.local/bin/boomux").unwrap(),
+            source: RemoteInstallSource::CurrentBinary {
+                path: runtime.join("pinned"),
+                sha256: format!("{:x}", Sha256::digest(b"replacement")),
+                bytes: b"replacement".to_vec(),
+            },
+            reason: RemoteInstallReason::Upgrade,
+            bootstrap_id: Some(session.id),
+            upgrade_helper: Some(
+                RemoteExecutable::parse("/home/person/.local/bin/boomux").unwrap(),
+            ),
+        };
+        let error = session
+            .install_and_connect(&plan, Duration::from_secs(1))
+            .err()
+            .expect("post-install ping EOF must fail");
+        assert_eq!(error_code(&error), "bootstrap_transport_failed");
+        assert_eq!(fs::read(&destination).unwrap(), b"previous-helper");
+        assert!(!backup.exists());
+        assert!(!committed.exists());
+        fs::remove_dir_all(runtime).unwrap();
+    }
+
+    #[test]
+    fn compatible_running_daemon_is_checked_without_restart_before_commit() {
+        let runtime = runtime_directory();
+        fs::create_dir_all(&runtime).unwrap();
+        let destination = runtime.join("destination");
+        let backup = runtime.join("backup");
+        let count = runtime.join("count");
+        let committed = runtime.join("committed");
+        let status_checked = runtime.join("status-checked");
+        fs::write(&destination, b"previous-helper").unwrap();
+        let helper = compatible_helper_script(&Uuid::new_v4().to_string());
+        let ssh = runtime.join("ssh");
+        fs::write(
+            &ssh,
+            format!(
+                "#!/bin/sh\n{control}\nlast=\nfor arg do last=$arg; done\ncase \"$last\" in\n  *'boomux-install-transaction-v1'*) mv {destination} {backup}; cat > {destination}; printf 'boomux-install-transaction-v1\\0.boomux.bootstrap.ABC12345\\0' ;;\n  *'committed=$lock/committed'*) cat >/dev/null; [ \"$(cat {count})\" -eq 2 ]; : > {committed}; printf 'boomux-install-commit-v1\\0committed\\0' ;;\n  *'transaction/watchdog_pid'*'daemon stop'*) exit 70 ;;\n  *'daemon status --json'*) : > {status_checked}; printf '%s' '{{\"schema\":\"boomux.cli/v1\",\"command\":\"daemon.status\",\"data\":{{\"protocol_version\":38}}}}' ;;\n  *'daemon restart'*) exit 99 ;;\n  *\"'/home/person/.local/bin/boomux' __federation-stdio\") n=0; [ ! -f {count} ] || n=$(cat {count}); n=$((n + 1)); printf '%s' \"$n\" > {count}; {helper} ;;\n  *) exit 64 ;;\nesac\n",
+                control = CONTROL_MASTER_SCRIPT,
+                destination = quote_posix_shell(destination.to_str().unwrap()),
+                backup = quote_posix_shell(backup.to_str().unwrap()),
+                count = quote_posix_shell(count.to_str().unwrap()),
+                committed = quote_posix_shell(committed.to_str().unwrap()),
+                status_checked = quote_posix_shell(status_checked.to_str().unwrap()),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+        add_fake_daemon_identity(&ssh, "/home/person/.local/bin/boomux");
+        let session = BootstrapSession::open_at(
+            &runtime,
+            None,
+            SshTarget::parse("workbox").unwrap(),
+            SshAuthenticationMode::Batch,
+            Duration::from_secs(1),
+            ssh.as_os_str(),
+        )
+        .unwrap();
+        let plan = RemoteInstallPlan {
+            target: SshTarget::parse("workbox").unwrap(),
+            destination: RemoteExecutable::parse("/home/person/.local/bin/boomux").unwrap(),
+            source: RemoteInstallSource::CurrentBinary {
+                path: runtime.join("pinned"),
+                sha256: format!("{:x}", Sha256::digest(b"replacement")),
+                bytes: b"replacement".to_vec(),
+            },
+            reason: RemoteInstallReason::Upgrade,
+            bootstrap_id: Some(session.id),
+            upgrade_helper: Some(
+                RemoteExecutable::parse("/home/person/.local/bin/boomux").unwrap(),
+            ),
+        };
+        let connection = session
+            .install_and_connect(&plan, Duration::from_secs(1))
+            .unwrap();
+        assert!(committed.exists());
+        assert!(status_checked.exists());
+        assert!(backup.exists());
+        assert_eq!(fs::read_to_string(&count).unwrap(), "2");
+        drop(connection);
+        fs::remove_dir_all(runtime).unwrap();
+    }
+
+    #[test]
+    fn upgrade_with_absent_daemon_refuses_before_activation() {
+        let runtime = runtime_directory();
+        fs::create_dir_all(&runtime).unwrap();
+        let destination = runtime.join("destination");
+        let backup = runtime.join("backup");
+        let count = runtime.join("count");
+        let started = runtime.join("started-by-helper");
+        let restarted = runtime.join("explicit-restart");
+        let committed = runtime.join("committed");
+        fs::write(&destination, b"previous-helper").unwrap();
+        let helper = compatible_helper_script(&Uuid::new_v4().to_string());
+        let ssh = runtime.join("ssh");
+        fs::write(
+            &ssh,
+            format!(
+                "#!/bin/sh\n{control}\nlast=\nfor arg do last=$arg; done\ncase \"$last\" in\n  *'boomux-install-transaction-v1'*) mv {destination} {backup}; cat > {destination}; printf 'boomux-install-transaction-v1\\0.boomux.bootstrap.ABC12345\\0' ;;\n  *': > \"$transaction/daemon_absent\"'*) cat >/dev/null ;;\n  *'committed=$lock/committed'*) cat >/dev/null; [ \"$(cat {count})\" -eq 2 ]; : > {committed}; printf 'boomux-install-commit-v1\\0committed\\0' ;;\n  *'daemon status --json'*) if [ -e {started} ]; then printf '%s' '{{\"schema\":\"boomux.cli/v1\",\"command\":\"daemon.status\",\"data\":{{\"protocol_version\":38}}}}'; else printf 'boomux-daemon-status-v1\\0absent\\0'; fi ;;\n  *'daemon restart'*) : > {restarted} ;;\n  *\"'/home/person/.local/bin/boomux' __federation-stdio\") : > {started}; n=0; [ ! -f {count} ] || n=$(cat {count}); n=$((n + 1)); printf '%s' \"$n\" > {count}; {helper} ;;\n  *) exit 64 ;;\nesac\n",
+                control = CONTROL_MASTER_SCRIPT,
+                destination = quote_posix_shell(destination.to_str().unwrap()),
+                backup = quote_posix_shell(backup.to_str().unwrap()),
+                count = quote_posix_shell(count.to_str().unwrap()),
+                started = quote_posix_shell(started.to_str().unwrap()),
+                restarted = quote_posix_shell(restarted.to_str().unwrap()),
+                committed = quote_posix_shell(committed.to_str().unwrap()),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+        let session = BootstrapSession::open_at(
+            &runtime,
+            None,
+            SshTarget::parse("workbox").unwrap(),
+            SshAuthenticationMode::Batch,
+            Duration::from_secs(1),
+            ssh.as_os_str(),
+        )
+        .unwrap();
+        let plan = RemoteInstallPlan {
+            target: SshTarget::parse("workbox").unwrap(),
+            destination: RemoteExecutable::parse("/home/person/.local/bin/boomux").unwrap(),
+            source: RemoteInstallSource::CurrentBinary {
+                path: runtime.join("pinned"),
+                sha256: format!("{:x}", Sha256::digest(b"replacement")),
+                bytes: b"replacement".to_vec(),
+            },
+            reason: RemoteInstallReason::Upgrade,
+            bootstrap_id: Some(session.id),
+            upgrade_helper: Some(
+                RemoteExecutable::parse("/home/person/.local/bin/boomux").unwrap(),
+            ),
+        };
+        let error = session
+            .install_and_connect(&plan, Duration::from_secs(1))
+            .err()
+            .expect("upgrade requires a running daemon identity");
+        assert_eq!(error_code(&error), "upgrade_required");
+        assert!(!restarted.exists());
+        assert!(!committed.exists());
+        fs::remove_dir_all(runtime).unwrap();
+    }
+
+    #[test]
+    fn unset_runtime_old_daemon_upgrade_restarts_verifies_pings_and_commits() {
+        let runtime = runtime_directory();
+        fs::create_dir_all(&runtime).unwrap();
+        let destination = runtime.join("destination");
+        let backup = runtime.join("backup");
+        let socket = runtime.join("remote-runtime/boomux/daemon.sock");
+        let restarted = runtime.join("restarted");
+        let committed = runtime.join("committed");
+        let count = runtime.join("helper-count");
+        let log = runtime.join("stages");
+        fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        fs::write(&socket, b"existing-socket").unwrap();
+        fs::write(&destination, b"protocol-21-helper").unwrap();
+
+        let old_handshake = FederationHandshake {
+            version: FEDERATION_VERSION,
+            node_id: Uuid::new_v4().to_string(),
+            helper_version: "old".into(),
+            core_protocol_version: protocol::PROTOCOL_VERSION,
+            connection_mode: FederationConnectionMode::AdHoc,
+        };
+        let current_helper = compatible_helper_script(&old_handshake.node_id);
+        let ssh = runtime.join("ssh");
+        fs::write(
+            &ssh,
+            format!(
+                "#!/bin/sh\n{control}\nunset XDG_RUNTIME_DIR\nlast=\nfor arg do last=$arg; done\nrequire_runtime() {{ case \"$last\" in *boomux-runtime-v1*'/run/user/$boomux_uid'*'export XDG_RUNTIME_DIR'*) [ -e {socket} ] ;; *) return 1 ;; esac; }}\ncase \"$last\" in\n  *'boomux-install-transaction-v1'*) mv {destination} {backup}; cat > {destination}; printf 'boomux-install-transaction-v1\\0.boomux.bootstrap.ABC12345\\0'; printf 'install\\n' >> {log} ;;\n  *': > \"$transaction/restarted\"'*) cat >/dev/null; : > {restarted}; printf 'mark-restarted\\n' >> {log} ;;\n  *'committed=$lock/committed'*) cat >/dev/null; [ \"$(cat {count})\" -eq 3 ]; : > {committed}; printf 'commit\\n' >> {log}; printf 'boomux-install-commit-v1\\0committed\\0' ;;\n  *'daemon status --json'*) require_runtime || exit 97; [ -e {socket} ] || exit 98; printf 'status\\n' >> {log}; printf '%s' '{{\"schema\":\"boomux.cli/v1\",\"command\":\"daemon.status\",\"data\":{{\"protocol_version\":21}}}}' ;;\n  *'daemon restart'*) require_runtime || exit 97; [ -e {socket} ] || exit 98; : > {restarted}; printf 'restart\\n' >> {log} ;;\n  *\"'/home/person/.local/bin/boomux' __federation-stdio\") require_runtime || exit 97; [ -e {socket} ] || exit 98; n=0; [ ! -e {count} ] || n=$(cat {count}); n=$((n + 1)); printf '%s' \"$n\" > {count}; if [ \"$n\" -eq 1 ]; then printf 'helper-old\\n' >> {log}; {old_handshake}; else printf 'helper-current\\n' >> {log}; {current_helper}; fi ;;\n  \"'/home/person/.local/bin/boomux' --version\") printf 'version\\n' >> {log}; printf 'boomux {version}\\n' ;;\n  *) exit 64 ;;\nesac\n",
+                control = CONTROL_MASTER_SCRIPT,
+                socket = quote_posix_shell(socket.to_str().unwrap()),
+                destination = quote_posix_shell(destination.to_str().unwrap()),
+                backup = quote_posix_shell(backup.to_str().unwrap()),
+                restarted = quote_posix_shell(restarted.to_str().unwrap()),
+                committed = quote_posix_shell(committed.to_str().unwrap()),
+                count = quote_posix_shell(count.to_str().unwrap()),
+                log = quote_posix_shell(log.to_str().unwrap()),
+                old_handshake = current_helper,
+                version = env!("CARGO_PKG_VERSION"),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+        add_fake_daemon_identity(&ssh, "/home/person/.local/bin/boomux");
+        let session = BootstrapSession::open_at(
+            &runtime,
+            None,
+            SshTarget::parse("workbox").unwrap(),
+            SshAuthenticationMode::Batch,
+            Duration::from_secs(1),
+            ssh.as_os_str(),
+        )
+        .unwrap();
+        let plan = RemoteInstallPlan {
+            target: SshTarget::parse("workbox").unwrap(),
+            destination: RemoteExecutable::parse("/home/person/.local/bin/boomux").unwrap(),
+            source: RemoteInstallSource::CurrentBinary {
+                path: runtime.join("pinned"),
+                sha256: format!("{:x}", Sha256::digest(b"replacement")),
+                bytes: b"replacement".to_vec(),
+            },
+            reason: RemoteInstallReason::Upgrade,
+            bootstrap_id: Some(session.id),
+            upgrade_helper: Some(
+                RemoteExecutable::parse("/home/person/.local/bin/boomux").unwrap(),
+            ),
+        };
+        let connection = session
+            .install_and_connect(&plan, Duration::from_secs(1))
+            .unwrap();
+        assert!(restarted.exists());
+        assert!(committed.exists());
+        assert_eq!(fs::read(&destination).unwrap(), b"replacement");
+        assert_eq!(
+            fs::read_to_string(&log).unwrap(),
+            "install\nstatus\nhelper-old\nstatus\nmark-restarted\nrestart\nhelper-current\nhelper-current\ncommit\n"
+        );
+        drop(connection);
+        fs::remove_dir_all(runtime).unwrap();
+    }
+
+    #[test]
+    fn lost_commit_ack_is_unknown_and_exact_retry_discovers_installed_helper() {
+        let runtime = runtime_directory();
+        fs::create_dir_all(&runtime).unwrap();
+        let destination = runtime.join("destination");
+        let backup = runtime.join("backup");
+        let installed = runtime.join("installed");
+        let committed = runtime.join("committed");
+        fs::write(&destination, b"previous-helper").unwrap();
+        let helper = compatible_helper_script(&Uuid::new_v4().to_string());
+        let ssh = runtime.join("ssh");
+        fs::write(
+            &ssh,
+            format!(
+                "#!/bin/sh\n{control}\nlast=\nfor arg do last=$arg; done\ncase \"$last\" in\n  *boomux-platform-v1*) printf 'boomux-platform-v1\\0Linux\\0x86_64\\0' ;;\n  *boomux-executables-v1*) printf 'boomux-executables-v1\\0'; [ -e {installed} ] && printf '/home/person/.local/bin/boomux\\0' ;;\n  *boomux-install-destination-v1*) printf 'boomux-install-destination-v1\\0/home/person/.local/bin/boomux\\0' ;;\n  *'boomux-install-transaction-v1'*) mv {destination} {backup}; cat > {destination}; : > {installed}; printf 'boomux-install-transaction-v1\\0.boomux.bootstrap.ABC12345\\0' ;;\n  *'committed=$lock/committed'*) cat >/dev/null; : > {committed}; printf 'boomux-install-commit-v1\\0committed'; exit 255 ;;\n  *'daemon status --json'*) printf '%s' '{{\"schema\":\"boomux.cli/v1\",\"command\":\"daemon.status\",\"data\":{{\"protocol_version\":38}}}}' ;;\n  *'daemon restart'*) exit 99 ;;\n  *\"'/home/person/.local/bin/boomux' __federation-stdio\") {helper} ;;\n  *) exit 64 ;;\nesac\n",
+                control = CONTROL_MASTER_SCRIPT,
+                destination = quote_posix_shell(destination.to_str().unwrap()),
+                backup = quote_posix_shell(backup.to_str().unwrap()),
+                installed = quote_posix_shell(installed.to_str().unwrap()),
+                committed = quote_posix_shell(committed.to_str().unwrap()),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+        add_fake_daemon_identity(&ssh, "/home/person/.local/bin/boomux");
+
+        let session = BootstrapSession::open_at(
+            &runtime,
+            None,
+            SshTarget::parse("workbox").unwrap(),
+            SshAuthenticationMode::Batch,
+            Duration::from_secs(1),
+            ssh.as_os_str(),
+        )
+        .unwrap();
+        let plan = RemoteInstallPlan {
+            target: SshTarget::parse("workbox").unwrap(),
+            destination: RemoteExecutable::parse("/home/person/.local/bin/boomux").unwrap(),
+            source: RemoteInstallSource::CurrentBinary {
+                path: runtime.join("pinned"),
+                sha256: format!("{:x}", Sha256::digest(b"replacement")),
+                bytes: b"replacement".to_vec(),
+            },
+            reason: RemoteInstallReason::Upgrade,
+            bootstrap_id: Some(session.id),
+            upgrade_helper: Some(
+                RemoteExecutable::parse("/home/person/.local/bin/boomux").unwrap(),
+            ),
+        };
+        let error = session
+            .install_and_connect(&plan, Duration::from_secs(1))
+            .err()
+            .expect("lost commit acknowledgment must be unknown");
+        assert_eq!(error_code(&error), "bootstrap_commit_outcome_unknown");
+        assert!(committed.exists());
+        assert_eq!(fs::read(&destination).unwrap(), b"replacement");
+        assert!(backup.exists());
+
+        let mut retry = BootstrapSession::open_at(
+            &runtime,
+            None,
+            SshTarget::parse("workbox").unwrap(),
+            SshAuthenticationMode::Batch,
+            Duration::from_secs(1),
+            ssh.as_os_str(),
+        )
+        .unwrap();
+        let RemoteBootstrapPlan::Ready(helper) = retry.plan(Duration::from_secs(1)).unwrap() else {
+            panic!("exact retry must discover the committed compatible helper");
+        };
+        let mut connection = retry.connect(helper, Duration::from_secs(1)).unwrap();
+        connection
+            .ping_with_timeout(Duration::from_secs(1))
+            .unwrap();
+        drop(connection);
+        fs::remove_dir_all(runtime).unwrap();
+    }
+
+    #[test]
+    fn observation_from_one_master_cannot_authorize_another_route() {
+        let runtime = runtime_directory();
+        fs::create_dir_all(&runtime).unwrap();
+        let ssh = runtime.join("ssh");
+        fs::write(
+            &ssh,
+            format!("#!/bin/sh\n{CONTROL_MASTER_SCRIPT}\nexit 64\n"),
+        )
+        .unwrap();
+        fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+        let first = BootstrapSession::open_at(
+            &runtime,
+            None,
+            SshTarget::parse("workbox").unwrap(),
+            SshAuthenticationMode::Batch,
+            Duration::from_secs(1),
+            ssh.as_os_str(),
+        )
+        .unwrap();
+        let second = BootstrapSession::open_at(
+            &runtime,
+            None,
+            SshTarget::parse("workbox").unwrap(),
+            SshAuthenticationMode::Batch,
+            Duration::from_secs(1),
+            ssh.as_os_str(),
+        )
+        .unwrap();
+        let helper = CompatibleRemoteHelper {
+            executable: RemoteExecutable::parse("/remote/boomux").unwrap(),
+            handshake: FederationHandshake {
+                version: FEDERATION_VERSION,
+                node_id: Uuid::new_v4().to_string(),
+                helper_version: "test".into(),
+                core_protocol_version: protocol::PROTOCOL_VERSION,
+                connection_mode: FederationConnectionMode::AdHoc,
+            },
+            bootstrap_id: Some(first.id),
+        };
+        let error = second
+            .connect(helper, Duration::from_secs(1))
+            .err()
+            .expect("cross-master observation must fail");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("different bootstrap endpoint"));
+        drop(first);
         assert_eq!(
             fs::read_dir(&runtime)
                 .unwrap()
@@ -2095,19 +5999,493 @@ mod tests {
         let destination = directory.join(".local/bin/boomux");
         fs::write(&destination, b"previous").unwrap();
         fs::set_permissions(&destination, fs::Permissions::from_mode(0o755)).unwrap();
-        let mut command = Command::new("sh");
-        command
-            .args(["-c", REMOTE_INSTALL_COMMAND])
-            .env("HOME", &directory);
-        run_streaming_command(command, b"replacement".to_vec(), Duration::from_secs(1)).unwrap();
+        let install =
+            gate_watchdog(&REMOTE_INSTALL_COMMAND.replace("lease_limit=180", "lease_limit=1"));
+        let transaction = run_local_upload_with_command(&directory, b"replacement", "sh", &install);
+        assert_eq!(fs::read(&destination).unwrap(), b"previous");
+        run_local_activation(&directory, "sh", &transaction, RemoteInstallReason::Missing);
         assert_eq!(fs::read(&destination).unwrap(), b"replacement");
         assert_eq!(fs::metadata(&destination).unwrap().mode() & 0o777, 0o755);
+        let commit = REMOTE_INSTALL_COMMIT_COMMAND.replace("sleep 180", "sleep 3");
+        let mut child = local_shell_command("sh", &directory);
+        child.args(["-c", &commit]);
+        let output =
+            run_streaming_command_capture(child, transaction.input(), Duration::from_secs(1))
+                .unwrap();
+        parse_install_commit(&output.stdout).unwrap();
+        let mut retry = local_shell_command("sh", &directory);
+        retry.args(["-c", &commit]);
+        let retry =
+            run_streaming_command_capture(retry, transaction.input(), Duration::from_secs(1))
+                .unwrap();
+        parse_install_commit(&retry.stdout).unwrap();
         assert!(
-            fs::read_dir(directory.join(".local/bin"))
-                .unwrap()
-                .filter_map(Result::ok)
-                .all(|entry| !entry.file_name().to_string_lossy().starts_with(".boomux."))
+            directory
+                .join(".local/bin/.boomux.bootstrap.lock/committed/backup")
+                .exists()
         );
+        directory.reap_watchdogs();
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn commit_transport_loss_at_every_step_preserves_atomic_outcome_and_cleans_lock() {
+        let cuts = [
+            ("directory=$HOME/.local/bin;", false),
+            ("[ \"$(/bin/cat \"$lock/id\")\" = \"$txn\" ];", false),
+            ("claim_acquire || exit 73;", false),
+            ("/bin/mv \"$transaction\" \"$committed\";", true),
+            ("trap - EXIT HUP INT TERM; claim_release;", true),
+            (
+                "claim_release; printf 'boomux-install-commit-v1\\0committed\\0'",
+                true,
+            ),
+        ];
+        for (needle, committed) in cuts {
+            let directory = runtime_directory();
+            fs::create_dir_all(directory.join(".local/bin")).unwrap();
+            let destination = directory.join(".local/bin/boomux");
+            fs::write(&destination, b"previous").unwrap();
+            fs::set_permissions(&destination, fs::Permissions::from_mode(0o755)).unwrap();
+
+            let install = REMOTE_INSTALL_COMMAND
+                .replace("lease_limit=180", "lease_limit=1")
+                .replace("[ \"$claim_age\" -ge 180 ]", "[ \"$claim_age\" -ge 1 ]");
+            let install = gate_watchdog(&install);
+            let delayed_install = install.replacen(
+                "while :; do if claim_pid_override=",
+                "while [ ! -e \"$HOME/watchdog-pid-release\" ]; do /bin/sleep 0.01; done; while :; do if claim_pid_override=",
+                1,
+            );
+            assert_ne!(delayed_install, install);
+            let transaction =
+                run_local_upload_with_command(&directory, b"replacement", "sh", &delayed_install);
+            run_local_activation(&directory, "sh", &transaction, RemoteInstallReason::Missing);
+
+            let commit_base = REMOTE_INSTALL_COMMIT_COMMAND.replace("sleep 180", "sleep 1");
+            let injected = format!("{}; kill -KILL $$;", needle.trim_end_matches(';'));
+            let commit_command = commit_base.replacen(needle, &injected, 1);
+            assert_ne!(commit_command, commit_base);
+            let mut child = local_shell_command("sh", &directory);
+            child.args(["-c", &commit_command]);
+            assert!(
+                run_streaming_command_capture(child, transaction.input(), Duration::from_secs(1),)
+                    .is_err(),
+                "commit unexpectedly acknowledged after cut at {needle}"
+            );
+            fs::write(directory.join("watchdog-pid-release"), b"").unwrap();
+            fs::write(directory.join("watchdog-tick"), b"").unwrap();
+
+            let lock = directory.join(".local/bin/.boomux.bootstrap.lock");
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while lock.exists() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(20));
+            }
+            assert!(!lock.exists(), "stale lock after cut at {needle}");
+            assert_eq!(
+                fs::read(&destination).unwrap(),
+                if committed {
+                    &b"replacement"[..]
+                } else {
+                    &b"previous"[..]
+                },
+                "wrong outcome after cut at {needle}"
+            );
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn post_install_failure_atomically_restores_previous_or_missing_destination() {
+        for previous in [Some(&b"previous"[..]), None] {
+            let directory = runtime_directory();
+            fs::create_dir_all(directory.join(".local/bin")).unwrap();
+            let destination = directory.join(".local/bin/boomux");
+            if let Some(previous) = previous {
+                fs::write(&destination, previous).unwrap();
+                fs::set_permissions(&destination, fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let transaction = run_local_install(&directory, b"incompatible-abi");
+            assert_eq!(fs::read(&destination).unwrap(), b"incompatible-abi");
+
+            run_local_transaction(&directory, REMOTE_INSTALL_ROLLBACK_COMMAND, &transaction);
+            match previous {
+                Some(previous) => assert_eq!(fs::read(&destination).unwrap(), previous),
+                None => assert!(!destination.exists()),
+            }
+            assert!(
+                fs::read_dir(directory.join(".local/bin"))
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .all(|entry| !entry.file_name().to_string_lossy().starts_with(".boomux."))
+            );
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn concurrent_install_transaction_fails_busy_without_touching_the_first() {
+        let directory = runtime_directory();
+        fs::create_dir_all(directory.join(".local/bin")).unwrap();
+        let destination = directory.join(".local/bin/boomux");
+        fs::write(&destination, b"previous").unwrap();
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o755)).unwrap();
+        let first = run_local_install(&directory, b"first-provisional");
+
+        let mut second = Command::new("sh");
+        second
+            .args(["-c", REMOTE_INSTALL_COMMAND])
+            .env("HOME", &directory);
+        let second_transaction = InstallTransactionId::generate();
+        let error = run_streaming_command_capture(
+            second,
+            second_transaction.upload_input(b"second-provisional"),
+            Duration::from_secs(1),
+        )
+        .unwrap_err();
+        assert_eq!(error_code(&error), "busy");
+        assert_eq!(fs::read(&destination).unwrap(), b"first-provisional");
+        assert!(directory.join(".local/bin/.boomux.bootstrap.lock").is_dir());
+
+        run_local_transaction(&directory, REMOTE_INSTALL_ROLLBACK_COMMAND, &first);
+        assert_eq!(fs::read(&destination).unwrap(), b"previous");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn two_bootstrap_sessions_share_atomic_remote_install_exclusion() {
+        let runtime = runtime_directory();
+        fs::create_dir_all(&runtime).unwrap();
+        let home = runtime.join("remote-home");
+        fs::create_dir_all(home.join(".local/bin")).unwrap();
+        let destination = home.join(".local/bin/boomux");
+        fs::write(&destination, b"previous").unwrap();
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o755)).unwrap();
+        let ssh = runtime.join("ssh");
+        fs::write(
+            &ssh,
+            format!(
+                "#!/bin/sh\n{CONTROL_MASTER_ONLY_SCRIPT}\nlast=\nfor arg do last=$arg; done\nexec env HOME={} /bin/sh -c \"$last\"\n",
+                quote_posix_shell(home.to_str().unwrap())
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+        let first = BootstrapSession::open_at(
+            &runtime,
+            None,
+            SshTarget::parse("workbox").unwrap(),
+            SshAuthenticationMode::Batch,
+            Duration::from_secs(1),
+            ssh.as_os_str(),
+        )
+        .unwrap();
+        let second = BootstrapSession::open_at(
+            &runtime,
+            None,
+            SshTarget::parse("workbox").unwrap(),
+            SshAuthenticationMode::Batch,
+            Duration::from_secs(1),
+            ssh.as_os_str(),
+        )
+        .unwrap();
+        let transaction = InstallTransactionId::generate();
+        let output = run_streaming_command_capture(
+            first.command(REMOTE_INSTALL_COMMAND),
+            transaction.upload_input(b"first"),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        assert_eq!(
+            InstallTransactionId::parse_probe(&output.stdout).unwrap(),
+            transaction
+        );
+        let second_transaction = InstallTransactionId::generate();
+        let error = run_streaming_command_capture(
+            second.command(REMOTE_INSTALL_COMMAND),
+            second_transaction.upload_input(b"second"),
+            Duration::from_secs(1),
+        )
+        .unwrap_err();
+        assert_eq!(error_code(&error), "busy");
+        assert_eq!(fs::read(&destination).unwrap(), b"previous");
+        run_streaming_command(
+            first.command(REMOTE_INSTALL_ROLLBACK_COMMAND),
+            transaction.input(),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        assert_eq!(fs::read(&destination).unwrap(), b"previous");
+        drop(first);
+        drop(second);
+        fs::remove_dir_all(runtime).unwrap();
+    }
+
+    #[test]
+    fn rollback_watchdog_restores_after_local_status_is_lost() {
+        let directory = runtime_directory();
+        fs::create_dir_all(directory.join(".local/bin")).unwrap();
+        let destination = directory.join(".local/bin/boomux");
+        fs::write(&destination, b"previous").unwrap();
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o755)).unwrap();
+        let command_text = REMOTE_INSTALL_COMMAND.replacen("lease_limit=180", "lease_limit=1", 1);
+        let transaction =
+            run_local_upload_with_command(&directory, b"provisional", "sh", &command_text);
+        assert_eq!(fs::read(&destination).unwrap(), b"previous");
+        assert!(
+            directory
+                .join(".local/bin")
+                .join(&transaction.0)
+                .join("new")
+                .exists()
+        );
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let lock = directory.join(".local/bin/.boomux.bootstrap.lock");
+        while lock.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(fs::read(&destination).unwrap(), b"previous");
+        assert!(!lock.exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn renewable_lease_survives_multiple_simulated_watchdog_windows() {
+        let directory = runtime_directory();
+        fs::create_dir_all(directory.join(".local/bin")).unwrap();
+        let destination = directory.join(".local/bin/boomux");
+        fs::write(&destination, b"previous").unwrap();
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o755)).unwrap();
+        let install = REMOTE_INSTALL_COMMAND.replace("lease_limit=180", "lease_limit=2");
+        let transaction = run_local_upload_with_command(&directory, b"replacement", "sh", &install);
+        for renewal in 1..=4 {
+            thread::sleep(Duration::from_secs(1));
+            let mut renew = Command::new("sh");
+            renew
+                .args(["-c", REMOTE_INSTALL_RENEW_COMMAND])
+                .env("HOME", &directory);
+            run_streaming_command(
+                renew,
+                transaction.renewal_input(renewal),
+                Duration::from_secs(1),
+            )
+            .unwrap();
+            assert_eq!(fs::read(&destination).unwrap(), b"previous");
+        }
+        run_local_activation(&directory, "sh", &transaction, RemoteInstallReason::Missing);
+        run_local_transaction(&directory, REMOTE_INSTALL_COMMIT_COMMAND, &transaction);
+        assert_eq!(fs::read(&destination).unwrap(), b"replacement");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn watchdog_honors_renewal_at_the_claim_boundary() {
+        let directory = runtime_directory();
+        fs::create_dir_all(directory.join(".local/bin")).unwrap();
+        let destination = directory.join(".local/bin/boomux");
+        fs::write(&destination, b"previous").unwrap();
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o755)).unwrap();
+        let install = REMOTE_INSTALL_COMMAND
+            .replace("lease_limit=180", "lease_limit=1")
+            .replacen(
+                "if claim_acquire; then current=",
+                ": > \"$HOME/watchdog-boundary\"; while [ ! -e \"$HOME/watchdog-release\" ]; do /bin/sleep 1; done; if claim_acquire; then current=",
+                1,
+            )
+            .replacen(
+                "lease_value=$claimed_lease; unchanged=0; continue",
+                "lease_value=$claimed_lease; unchanged=0; : > \"$HOME/watchdog-honored\"; continue",
+                1,
+            );
+        assert!(install.contains("watchdog-boundary"));
+        assert!(install.contains("watchdog-honored"));
+        let transaction = run_local_upload_with_command(&directory, b"replacement", "sh", &install);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !directory.join("watchdog-boundary").exists() {
+            assert!(Instant::now() < deadline, "watchdog did not reach boundary");
+            thread::sleep(Duration::from_millis(10));
+        }
+        let claim = directory.join(".local/bin/.boomux.bootstrap.lock/claim");
+        fs::create_dir(&claim).unwrap();
+        let mut blocked_renewal = Command::new("sh");
+        blocked_renewal
+            .args(["-c", REMOTE_INSTALL_RENEW_COMMAND])
+            .env("HOME", &directory);
+        assert!(
+            run_streaming_command(
+                blocked_renewal,
+                transaction.renewal_input(1),
+                Duration::from_secs(1),
+            )
+            .is_err()
+        );
+        assert_eq!(
+            fs::read_to_string(
+                directory
+                    .join(".local/bin")
+                    .join(&transaction.0)
+                    .join("lease")
+            )
+            .unwrap(),
+            "0\n"
+        );
+        fs::remove_dir(&claim).unwrap();
+        let mut renew = Command::new("sh");
+        renew
+            .args(["-c", REMOTE_INSTALL_RENEW_COMMAND])
+            .env("HOME", &directory);
+        run_streaming_command(renew, transaction.renewal_input(1), Duration::from_secs(1)).unwrap();
+        fs::write(directory.join("watchdog-release"), b"").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !directory.join("watchdog-honored").exists() {
+            assert!(
+                Instant::now() < deadline,
+                "watchdog did not honor boundary renewal"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(fs::read(&destination).unwrap(), b"previous");
+        run_local_activation(&directory, "sh", &transaction, RemoteInstallReason::Missing);
+        run_local_transaction(&directory, REMOTE_INSTALL_COMMIT_COMMAND, &transaction);
+        assert_eq!(fs::read(&destination).unwrap(), b"replacement");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn rollback_restores_daemon_consistency_for_restarted_and_first_installs() {
+        let directory = runtime_directory();
+        fs::create_dir_all(directory.join(".local/bin")).unwrap();
+        let destination = directory.join(".local/bin/boomux");
+        let log = directory.join("daemon-actions");
+        fs::write(
+            &destination,
+            format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n", log.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o755)).unwrap();
+        let transaction = run_local_install(&directory, b"provisional");
+        fs::write(
+            directory
+                .join(".local/bin")
+                .join(&transaction.0)
+                .join("prior_daemon"),
+            protocol::PROTOCOL_VERSION.to_string(),
+        )
+        .unwrap();
+        fs::write(
+            directory
+                .join(".local/bin")
+                .join(&transaction.0)
+                .join("daemon_contacted"),
+            b"",
+        )
+        .unwrap();
+        run_local_transaction(&directory, REMOTE_INSTALL_ROLLBACK_COMMAND, &transaction);
+        assert_eq!(fs::read_to_string(&log).unwrap(), "daemon restart\n");
+
+        fs::remove_file(&destination).unwrap();
+        let provisional = format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n", log.display());
+        let transaction = run_local_install(&directory, provisional.as_bytes());
+        fs::write(
+            directory
+                .join(".local/bin")
+                .join(&transaction.0)
+                .join("prior_daemon"),
+            b"absent",
+        )
+        .unwrap();
+        fs::write(
+            directory
+                .join(".local/bin")
+                .join(&transaction.0)
+                .join("daemon_contacted"),
+            b"",
+        )
+        .unwrap();
+        run_local_transaction(&directory, REMOTE_INSTALL_ROLLBACK_COMMAND, &transaction);
+        assert!(!destination.exists());
+        assert_eq!(fs::read_to_string(&log).unwrap(), "daemon restart\n");
+
+        fs::write(
+            &destination,
+            format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n", log.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o755)).unwrap();
+        let transaction = run_local_install(&directory, provisional.as_bytes());
+        fs::write(
+            directory
+                .join(".local/bin")
+                .join(&transaction.0)
+                .join("prior_daemon"),
+            b"absent",
+        )
+        .unwrap();
+        fs::write(
+            directory
+                .join(".local/bin")
+                .join(&transaction.0)
+                .join("daemon_contacted"),
+            b"",
+        )
+        .unwrap();
+        run_local_transaction(&directory, REMOTE_INSTALL_ROLLBACK_COMMAND, &transaction);
+        assert!(destination.exists());
+        assert_eq!(fs::read_to_string(&log).unwrap(), "daemon restart\n");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn pinned_source_bytes_survive_path_replacement() {
+        let directory = runtime_directory();
+        fs::create_dir_all(&directory).unwrap();
+        let source_path = directory.join("boomux-source");
+        fs::write(&source_path, b"authorized-bytes").unwrap();
+        let bytes = read_bounded_file(&source_path).unwrap();
+        let source = RemoteInstallSource::CurrentBinary {
+            path: source_path.clone(),
+            sha256: format!("{:x}", Sha256::digest(&bytes)),
+            bytes,
+        };
+        fs::write(&source_path, b"replaced-after-confirmation").unwrap();
+        assert_eq!(source.bytes(), b"authorized-bytes");
+        assert!(source.description().contains("sha256"));
+        let transaction = run_local_install(&directory, source.bytes());
+        assert_eq!(
+            fs::read(directory.join(".local/bin/boomux")).unwrap(),
+            b"authorized-bytes"
+        );
+        run_local_transaction(&directory, REMOTE_INSTALL_ROLLBACK_COMMAND, &transaction);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn install_source_pinning_rejects_symlinks_and_special_files() {
+        let directory = runtime_directory();
+        fs::create_dir_all(&directory).unwrap();
+        let regular = directory.join("regular");
+        let symlink = directory.join("symlink");
+        fs::write(&regular, b"boomux").unwrap();
+        std::os::unix::fs::symlink(&regular, &symlink).unwrap();
+        assert!(read_bounded_file(&symlink).is_err());
+        assert!(read_bounded_file(&directory).is_err());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn install_source_pinning_rejects_same_length_in_place_mutation() {
+        let directory = runtime_directory();
+        fs::create_dir_all(&directory).unwrap();
+        let source = directory.join("source");
+        fs::write(&source, b"before!!").unwrap();
+        let error = read_bounded_file_with_hook(&source, || {
+            let mut file = OpenOptions::new().write(true).open(&source).unwrap();
+            file.write_all(b"after!!!").unwrap();
+            file.sync_all().unwrap();
+        })
+        .unwrap_err();
+        assert_eq!(error_code(&error), "bootstrap_install_failed");
+        assert!(error.to_string().contains("changed while"));
         fs::remove_dir_all(directory).unwrap();
     }
 

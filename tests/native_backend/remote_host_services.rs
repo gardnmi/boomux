@@ -8,7 +8,7 @@ use boomux::protocol::{
     WorkspaceLauncherSpec,
 };
 
-use crate::support::{TestDaemon, profile, wait_until};
+use crate::support::{CONTROL_MASTER_PREFIX, TestDaemon, profile, wait_until};
 
 #[test]
 fn registered_node_host_services_use_only_owner_path_config_cwd_and_stored_argv() {
@@ -65,7 +65,7 @@ fn registered_node_host_services_use_only_owner_path_config_cwd_and_stored_argv(
     fs::write(
         &ssh,
         format!(
-            "#!/bin/sh\nlast=\nfor arg do last=$arg; done\ncase \"$last\" in\n  *boomux-platform-v1*) printf 'boomux-platform-v1\\0Linux\\0x86_64\\0' ;;\n  *boomux-executables-v1*) printf 'boomux-executables-v1\\0{}\\0' ;;\n  *boomux-install-destination-v1*) printf 'boomux-install-destination-v1\\0{}\\0' ;;\n  *__federation-stdio*) exec env XDG_RUNTIME_DIR='{}' XDG_STATE_HOME='{}' '{}' __federation-stdio ;;\n  *) exit 64 ;;\nesac\n",
+            "#!/bin/sh\n{CONTROL_MASTER_PREFIX}\nlast=\nfor arg do last=$arg; done\ncase \"$last\" in\n  *boomux-platform-v1*) printf 'boomux-platform-v1\\0Linux\\0x86_64\\0' ;;\n  *boomux-executables-v1*) printf 'boomux-executables-v1\\0{}\\0' ;;\n  *boomux-install-destination-v1*) printf 'boomux-install-destination-v1\\0{}\\0' ;;\n  *__federation-stdio*) exec env XDG_RUNTIME_DIR='{}' XDG_STATE_HOME='{}' '{}' __federation-stdio ;;\n  *) exit 64 ;;\nesac\n",
             owner.executable.display(),
             owner.executable.display(),
             owner.runtime_dir.display(),
@@ -131,18 +131,16 @@ fn registered_node_host_services_use_only_owner_path_config_cwd_and_stored_argv(
         )
         .unwrap();
     assert!(matches!(invoked, HostServiceResult::LauncherInvoked { .. }));
+    let expected_output = format!(
+        "{}\n{}\ntwo words\n",
+        owner_projects.join("remote-only").display(),
+        exact_argument,
+    );
     wait_until(
-        || output.is_file(),
+        || fs::read_to_string(&output).is_ok_and(|value| value == expected_output),
         "owner-side launcher did not produce its output",
     );
-    assert_eq!(
-        fs::read_to_string(&output).unwrap(),
-        format!(
-            "{}\n{}\ntwo words\n",
-            owner_projects.join("remote-only").display(),
-            exact_argument,
-        )
-    );
+    assert_eq!(fs::read_to_string(&output).unwrap(), expected_output);
     assert!(!root.join("local-pwned").exists());
 
     let session_workspace = owner

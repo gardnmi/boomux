@@ -3,9 +3,9 @@
 **Persistent workspaces for native terminal windows.**
 
 Boomux keeps shells and commands running after their terminal windows close. It
-groups related work into named workspaces that you can reopen from a dashboard,
-while continuing to use Ghostty, Alacritty, or another XDG terminal as ordinary
-native windows.
+groups related work into named Workspaces that can span independently
+authoritative Nodes and reopen from one dashboard, while continuing to use
+Ghostty, Alacritty, or another XDG terminal as ordinary native windows.
 
 Optional integrations show whether supported coding agents are working, blocked,
 idle, or untracked without trying to infer state from quiet terminal output.
@@ -106,7 +106,10 @@ boomux . --name my-project --new -- sh -lc 'cargo test | tee test.log'
 
 | Concept | Meaning |
 | --- | --- |
-| **Workspace** | A named group of managed shells, commands, and launchers. |
+| **Node** | The durable authority for the shells, launchers, schedules, paths, and other runtime identities it owns. A Node is not its SSH route. |
+| **Workspace** | A coordinator-owned organizing boundary whose resources may run on several Nodes. It does not imply a default Node. |
+| **Placement** | One Node's membership and filesystem context in a coordinated Workspace, established when the first resource is created or an existing Node-local Workspace is explicitly linked. |
+| **External Workspace** | A discovered Node-local Workspace that has not been adopted or linked. Equal names do not merge ownership. |
 | **Managed shell** | A persistent terminal session, usually running your login shell. |
 | **Command** | A managed terminal session that runs one command instead of a login shell. |
 | **Launcher** | A desktop command run when its workspace opens. Boomux does not retain its output or process. |
@@ -129,7 +132,12 @@ boomux . --name my-project --new -- sh -lc 'cargo test | tee test.log'
 | --- | --- |
 | Create a generated workspace | `boomux .` |
 | Create or add to a named workspace | `boomux . --name feature-x` |
-| Create an empty workspace with a default directory | `boomux workspace create feature-x --cwd .` |
+| Create an empty workspace | `boomux workspace create feature-x` |
+| Add a shell on one Node | `boomux shell create feature-x --node laptop --cwd /path/to/project` |
+| Register a remote Node | `boomux node add laptop user@host` |
+| Adopt an external Workspace | `boomux workspace adopt <workspace-id> --node laptop` |
+| Link an external Workspace | `boomux workspace link feature-x <owner-workspace-id> --node laptop` |
+| Retry an incomplete close | `boomux workspace retry <workspace-id>` |
 | Suggest an unused shell name | `boomux shell suggest-name feature-x` |
 | Add a randomly named shell | `boomux shell create feature-x` |
 | Open the new shell in another terminal | `boomux . --name feature-x --new` |
@@ -141,7 +149,12 @@ boomux . --name my-project --new -- sh -lc 'cargo test | tee test.log'
 
 Without `--name`, Boomux creates the next `workspace-N` and stores the selected
 path as its default for later shells. With `--name`, it adds a shell to an
-existing exact-name workspace or creates a workspace with that default.
+existing exact-name Node-local workspace or creates one with that default. This
+path-opening shorthand is a local terminal workflow. In the coordinated CLI,
+`workspace create` instead creates empty coordinator metadata with no Node or
+path; the first `shell`, `launcher`, or `schedule` creation selects a Node and
+establishes that Node's placement-specific filesystem context. A sole eligible
+Node is selected automatically, while multiple eligible Nodes require `--node`.
 Shells created without an explicit shell name receive a memorable lowercase
 `adjective-noun` name such as `quiet-otter`; that concrete name is retained like
 any explicit name. `shell suggest-name` exposes the same collision-aware naming
@@ -169,9 +182,32 @@ terminate applications launched earlier. Exact launcher IDs can be invoked
 without `--workspace`; launcher names use the current managed workspace or an
 explicit `--workspace`.
 
+### Remote Nodes
+
+Register a remote Boomux authority through an ordinary OpenSSH destination:
+
+```console
+boomux node add laptop user@host
+boomux node list
+boomux node inspect laptop
+```
+
+Interactive setup verifies the remote Node identity. If its helper is missing or
+outdated, Boomux shows the exact destination and process impact before asking to
+install or replace it; an incompatible running daemon is changed through a
+graceful restart. Noninteractive and JSON requests never approve that mutation
+and instead return a typed `install_required` or `upgrade_required` error.
+Routes can later be revision-safely renamed or retargeted. Forgetting a route
+does not contact or delete the remote Node.
+
+Each Node remains authoritative for its own resources and paths. Cached remote
+state can remain visible while stale or unavailable, but it cannot authorize a
+mutation or silently transfer ownership. Use `boomux node --help` for the full
+management surface.
+
 ## Dashboard
 
-The dashboard has four primary views: Workspaces, Agents, Shells, and Schedules. The
+The dashboard has five primary views: Workspaces, Agents, Shells, Schedules, and Nodes. The
 Workspaces view combines the selected workspace's Agents, shells, commands,
 launchers, and schedule definitions in one item table. A `schedule` row represents
 the durable definition, opens its specialized history and controls, and never
@@ -179,7 +215,8 @@ represents an execution process. Its `ACTIVITY` column shows an Agent task, shel
 foreground process, stored command, launcher command, or schedule trigger; branch
 and worktree columns keep repository context visible without repeating full paths.
 
-The Agents view shows lifecycle status and recency, owning workspace and shell,
+Workspace, Agent, and Shell tables qualify Node-owned resources with a `NODE`
+column. The Agents view shows lifecycle status and recency, owning workspace and shell,
 root-session task, branch, and worktree. The Shells view distinguishes login
 shells from stored commands and shows run generation, process, branch, and
 worktree. Selecting an item opens a labeled detail panel with the full path,
@@ -195,12 +232,17 @@ from growing without limit. The schedule and history panes render side by side,
 then stack when the terminal is narrow. Schedule-owned execution shells do not
 appear as ordinary shell rows; only the owning schedule definition does.
 
+The Nodes view shows registered routes and health. It can inspect and refresh a
+Node, launch guided setup, revision-safely rename or retarget a route, and forget
+a registration after confirmation. Remote state remains secondary to the owning
+Node's authority.
+
 The workspace overview includes item and Agent-state counts plus its most urgent
 outstanding attention item.
 
 | Key | Action |
 | --- | --- |
-| `Tab`, `Shift-Tab`, `1`-`4` | Change view. |
+| `Tab`, `Shift-Tab`, `1`-`5` | Change view. |
 | `/` or `:` | Search actions, workspaces, and entries. |
 | `?` | Explain keys plus the selected kind and state. |
 | `h`, `l`, left, right | Move between workspace and entry tables. |
@@ -209,7 +251,7 @@ outstanding attention item.
 | `a` | Create a workspace or add a shell, depending on focus. |
 | `e` | Rename the selection. |
 | `x`, then `y` | Confirm closing or removing the selection. |
-| `q` or `Esc` | Quit from normal mode. |
+| `q` or `Esc` | Quit from normal mode after any in-flight mutation completes. |
 
 In Schedules, Left/Right changes between the schedule and history panes, `j`/`k`
 navigates the focused pane, and `[`/`]` also selects retained executions by exact
@@ -229,8 +271,13 @@ does not emulate one with pause/resume. Exact active Scheduled Execution attachm
 requires protocol 26; protocol-25 dashboards retain schedule controls and
 history while showing upgrade-and-restart guidance for Open.
 
-Closing a workspace terminates its managed shells and removes its schedules and
-persisted prompts. Closing a shell or command terminates its managed process.
+Opening a coordinated Workspace attempts every currently available placement
+and reports a result per Node. It does not automatically replay an ambiguous
+launcher start. Closing terminates managed shells and removes schedules and
+persisted prompts, but a partially completed close remains visibly `closing`
+with unresolved placement metadata until each owner confirms removal. Run
+`boomux workspace retry <workspace-id>` or repeat the close to resume it.
+Closing a shell or command terminates its managed process.
 Removing a launcher affects future workspace opens only. Press `?` in the
 dashboard for context-specific controls.
 
@@ -243,9 +290,10 @@ working, idle, blocked, and completed activity; opens workspaces or individual
 items; creates workspaces, shells, and coding-agent commands; acknowledges
 durable attention; and launches the full Boomux dashboard in a native terminal.
 
-The plugin requires Boomux `0.14.0` or newer and Omarchy's Quattro shell plugin
-system. Review its source before installation because Omarchy plugins run as
-unsandboxed code inside the long-running shell process.
+The plugin's federated Workspace support requires Boomux `0.19.0` or newer and
+Omarchy's Quattro shell plugin system. Review its source before installation
+because Omarchy plugins run as unsandboxed code inside the long-running shell
+process.
 
 ```console
 omarchy plugin add https://github.com/gardnmi/omarchy-boomux.git --enable
@@ -424,10 +472,12 @@ scheduled_dispatch_failed = "dialog-warning"
 scheduled_interrupted = "dialog-warning"
 ```
 
-Project roots provide workspace suggestions in the dashboard. Selecting one
-stores its path as the workspace default for shells added later. Free-text and
-legacy workspaces without a default continue to use the directory where the
-dashboard was opened. An explicit shell cwd always takes precedence.
+Project roots provide Workspace-name suggestions in the dashboard. Selecting one
+creates empty coordinator metadata using its name; it does not assign a Node or
+persist the discovered path. Choose the Node and working directory when adding
+the first shell, launcher, or schedule. Existing Node-local workspaces retain
+their own placement-specific defaults, and an explicit resource cwd takes
+precedence.
 
 List the same discovered projects without starting the daemon:
 
@@ -440,7 +490,8 @@ JSON output uses the stable `boomux.cli/v1` contract and includes canonical
 paths, root groups and ordering, warnings, and whether any roots are configured.
 
 The dashboard follows the most recently focused Boomux terminal by default,
-selecting its workspace and shell or Agent row. Manual dashboard navigation is
+including locally presented remote terminals, by selecting its exact Node,
+workspace, and shell or Agent row. Manual dashboard navigation is
 preserved until another managed terminal gains focus. Press `Space` to pin the
 current selection and pause following; press it again to unpin and catch up to
 the currently focused terminal. Set
@@ -496,6 +547,7 @@ Use built-in help for the complete, current CLI:
 ```console
 boomux --help
 boomux workspace --help
+boomux node --help
 boomux shell --help
 boomux launcher --help
 boomux agent --help

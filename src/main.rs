@@ -4,8 +4,10 @@ use std::error::Error;
 use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::fs;
-use std::io::{self, IsTerminal, Read};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::io::{self, BufRead, IsTerminal, Read};
+use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
@@ -101,6 +103,15 @@ impl DashboardRefresh {
         }
         match self.watch.poll(client) {
             Ok(poll) => {
+                let handoff_completed = poll.events.iter().any(|event| {
+                    matches!(&event.kind, protocol::DaemonEventKind::HandoffCompleted)
+                });
+                let protocol_changed = if handoff_completed {
+                    let negotiated = client.protocol_version()?;
+                    update_negotiated_protocol(&mut self.negotiated_protocol, negotiated)
+                } else {
+                    false
+                };
                 if poll.changed {
                     if poll.stream_changed || poll.baseline_replaced {
                         self.needs_reseed = true;
@@ -110,7 +121,10 @@ impl DashboardRefresh {
                         self.apply_events(&poll.events);
                     }
                     self.last_snapshot_at = Instant::now();
-                    return Ok(Some((self.watch.snapshot().clone(), poll.stream_changed)));
+                    return Ok(Some((
+                        self.watch.snapshot().clone(),
+                        poll.stream_changed || protocol_changed,
+                    )));
                 }
                 if self.last_snapshot_at.elapsed() < DASHBOARD_FALLBACK_REFRESH_INTERVAL {
                     return Ok(None);
@@ -249,6 +263,12 @@ impl DashboardRefresh {
     }
 }
 
+fn update_negotiated_protocol(current: &mut u32, negotiated: u32) -> bool {
+    let changed = *current != negotiated;
+    *current = negotiated;
+    changed
+}
+
 const BOOMUX_SKILL: &str = include_str!("../.agents/skills/boomux/SKILL.md");
 #[cfg(test)]
 const BOOMUX_OPENCODE_PLUGIN: &str = integration_management::OPENCODE_ASSET;
@@ -313,7 +333,7 @@ const READ_BYTES: usize = 1024 * 1024;
     subcommand_value_name = "SUBCOMMAND"
 )]
 struct Cli {
-    /// Emit the stable boomux.cli/v1 JSON envelope
+    /// Emit the stable boomux.cli/v1 envelope for commands advertised by capabilities
     #[arg(long, global = true)]
     json: bool,
 
@@ -496,6 +516,17 @@ enum Commands {
     },
     #[command(name = "__federation-stdio", hide = true)]
     FederationStdio,
+    #[command(name = "__guided-node-add", hide = true)]
+    GuidedNodeAdd,
+    #[command(name = "__bootstrap-activate", hide = true)]
+    BootstrapActivate {
+        transaction: String,
+        expected_pid: u32,
+        expected_protocol: u32,
+        expected_executable: String,
+        expected_socket_device: u64,
+        expected_socket_inode: u64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -546,13 +577,11 @@ enum WorkspaceCommands {
     /// List workspaces
     List,
     /// Create an empty workspace
-    Create {
-        name: String,
-        #[arg(long)]
-        cwd: Option<PathBuf>,
-    },
+    Create { name: String },
     /// Open terminal windows and invoke launchers
     Open {
+        /// Coordinated Workspace name/ID, or exact owner Workspace ID with --node
+        #[arg(value_name = "WORKSPACE")]
         target: String,
         /// Exact registered Node alias or Node ID
         #[arg(long)]
@@ -562,8 +591,31 @@ enum WorkspaceCommands {
     Inspect { target: String },
     /// Rename a workspace
     Rename { target: String, name: String },
+    /// Adopt an unlinked Node-local Workspace as a new coordinated Workspace
+    Adopt {
+        #[arg(value_name = "EXTERNAL_WORKSPACE")]
+        target: String,
+        /// Exact eligible Node alias or Node ID
+        #[arg(long)]
+        node: String,
+    },
+    /// Link an unlinked Node-local Workspace to a coordinated Workspace
+    Link {
+        #[arg(value_name = "GLOBAL_WORKSPACE")]
+        target: String,
+        #[arg(value_name = "OWNER_WORKSPACE")]
+        owner: String,
+        /// Exact eligible Node alias or Node ID
+        #[arg(long)]
+        node: String,
+    },
     /// Close a workspace and all of its shells
     Close { target: String },
+    /// Retry unresolved placement removals for a closing Workspace
+    Retry {
+        #[arg(value_name = "CLOSING_GLOBAL_WORKSPACE")]
+        target: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -576,8 +628,12 @@ enum LauncherCommands {
     /// Create a launcher in a workspace
     Create {
         name: String,
-        #[arg(long, value_name = "NAME_OR_ID")]
+        /// Coordinated Workspace name or ID when --node is used
+        #[arg(long, value_name = "WORKSPACE")]
         workspace: String,
+        /// Exact eligible Node alias or Node ID
+        #[arg(long)]
+        node: Option<String>,
         #[arg(long, default_value = ".")]
         cwd: PathBuf,
         #[arg(last = true, num_args = 1.., required = true, value_name = "COMMAND")]
@@ -591,6 +647,8 @@ enum LauncherCommands {
     },
     /// Invoke a launcher as a detached process
     Invoke {
+        /// Launcher name/ID locally, or exact launcher ID with --node
+        #[arg(value_name = "LAUNCHER")]
         target: String,
         #[arg(long, value_name = "NAME_OR_ID")]
         workspace: Option<String>,
@@ -617,6 +675,8 @@ enum LauncherCommands {
 enum ShellCommands {
     /// Suggest an unused generated name without reserving it
     SuggestName {
+        /// Workspace name/ID locally, or exact owner Workspace ID with --node
+        #[arg(value_name = "WORKSPACE")]
         workspace: String,
         /// Exact registered Node alias or Node ID
         #[arg(long)]
@@ -624,7 +684,12 @@ enum ShellCommands {
     },
     /// Create a pending shell in a workspace
     Create {
+        /// Coordinated Workspace name or ID when --node is used
+        #[arg(value_name = "WORKSPACE")]
         workspace: String,
+        /// Exact eligible Node alias or Node ID
+        #[arg(long)]
+        node: Option<String>,
         #[arg(long)]
         name: Option<String>,
         #[arg(long)]
@@ -1414,7 +1479,10 @@ impl Cli {
                     WorkspaceCommands::Create { .. }
                     | WorkspaceCommands::Open { .. }
                     | WorkspaceCommands::Rename { .. }
-                    | WorkspaceCommands::Close { .. },
+                    | WorkspaceCommands::Adopt { .. }
+                    | WorkspaceCommands::Link { .. }
+                    | WorkspaceCommands::Close { .. }
+                    | WorkspaceCommands::Retry { .. },
             }) => CommandKey::Workspace,
             Some(Commands::Shell {
                 command:
@@ -1454,6 +1522,8 @@ impl Cli {
             Some(Commands::ResumeSession { .. }) => CommandKey::ResumeSessionInternal,
             Some(Commands::ScheduledRunner { .. }) => CommandKey::Attach,
             Some(Commands::FederationStdio) => CommandKey::Attach,
+            Some(Commands::GuidedNodeAdd) => CommandKey::NodeAdd,
+            Some(Commands::BootstrapActivate { .. }) => CommandKey::Daemon,
         }
     }
 }
@@ -1490,6 +1560,12 @@ impl CliExit {
 }
 
 fn main() -> ExitCode {
+    if env::var_os("BOOMUX_INTERNAL_GUIDED_STOP").as_deref() == Some(std::ffi::OsStr::new("1")) {
+        unsafe {
+            env::remove_var("BOOMUX_INTERNAL_GUIDED_STOP");
+            libc::raise(libc::SIGSTOP);
+        }
+    }
     let json_requested = requests_json(env::args_os().skip(1));
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
@@ -1607,6 +1683,27 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
             federation::run_stdio_helper()?;
             return Ok(CliExit::Success);
         }
+        Some(Commands::GuidedNodeAdd) => {
+            return guided_node_add().map(CliExit::Child);
+        }
+        Some(Commands::BootstrapActivate {
+            transaction,
+            expected_pid,
+            expected_protocol,
+            expected_executable,
+            expected_socket_device,
+            expected_socket_inode,
+        }) => {
+            bootstrap_activate(
+                transaction,
+                *expected_pid,
+                *expected_protocol,
+                expected_executable,
+                *expected_socket_device,
+                *expected_socket_inode,
+            )?;
+            return Ok(CliExit::Success);
+        }
         _ => {}
     }
 
@@ -1630,7 +1727,7 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
     }
 
     let result = match cli.command {
-        Some(Commands::Ui) => dashboard(cli.terminal.as_deref(), None),
+        Some(Commands::Ui) => dashboard(cli.terminal.as_deref()),
         Some(Commands::Doctor) => doctor(cli.terminal.as_deref()),
         Some(Commands::Capabilities) => capabilities(cli.json),
         Some(Commands::List) => list_shells(cli.json),
@@ -1708,15 +1805,16 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
         Some(Commands::ResumeSession { .. }) => unreachable!(),
         Some(Commands::ScheduledRunner { .. }) => unreachable!(),
         Some(Commands::FederationStdio) => unreachable!(),
-        None => dashboard(cli.terminal.as_deref(), None),
+        Some(Commands::GuidedNodeAdd) => unreachable!(),
+        Some(Commands::BootstrapActivate { .. }) => unreachable!(),
+        None => dashboard(cli.terminal.as_deref()),
     };
     result?;
     Ok(CliExit::Success)
 }
 
 fn remote_connect(target: &str, terminal: Option<&str>) -> Result<(), Box<dyn Error>> {
-    let mut connection = verified_remote_connection(target, true)?;
-    connection.ping()?;
+    let connection = verified_remote_connection(target, true)?;
     println!(
         "Connected to Boomux Node {} (protocol {}, helper {}, {})",
         connection.handshake.node_id,
@@ -1736,7 +1834,7 @@ fn remote_connect(target: &str, terminal: Option<&str>) -> Result<(), Box<dyn Er
             .supports(protocol::ProtocolFeature::CombinedNodeSnapshot)
             .unwrap_or(false)
     {
-        dashboard(terminal, Some(node_id))?;
+        dashboard(terminal)?;
     }
     Ok(())
 }
@@ -1755,18 +1853,23 @@ fn verified_remote_connection(
     } else {
         ssh_bootstrap::SshAuthenticationMode::Batch
     };
-    let helper = match ssh_bootstrap::plan_remote_bootstrap(
-        target.clone(),
-        authentication,
-        TIMEOUT,
-    )? {
-        ssh_bootstrap::RemoteBootstrapPlan::Ready(helper) => helper,
-        ssh_bootstrap::RemoteBootstrapPlan::Install(_plan) if !interactive => {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "remote Boomux installation is required, but noninteractive --remote never modifies remote software",
-            )
-            .into());
+    let mut session = ssh_bootstrap::BootstrapSession::open(target, authentication, TIMEOUT)
+        .map_err(bootstrap_cli_failure)?;
+    // Both branches return a channel verified by exactly one protocol ping. An
+    // installed channel is pinged before commit inside install_and_connect.
+    match session.plan(TIMEOUT).map_err(bootstrap_cli_failure)? {
+        ssh_bootstrap::RemoteBootstrapPlan::Ready(helper) => {
+            let mut connection = session
+                .connect(helper, TIMEOUT)
+                .map_err(bootstrap_cli_failure)?;
+            connection.ping().map_err(bootstrap_cli_failure)?;
+            Ok(connection)
+        }
+        ssh_bootstrap::RemoteBootstrapPlan::Install(plan) if !interactive => {
+            Err(cli_output::failure(
+                plan.reason.error_code(),
+                plan.reason.noninteractive_message(),
+            ))
         }
         ssh_bootstrap::RemoteBootstrapPlan::Install(plan) => {
             println!("Remote target: {}", plan.target.as_str());
@@ -1774,10 +1877,10 @@ fn verified_remote_connection(
             println!("Install destination: {}", plan.destination.as_str());
             println!(
                 "Process impact: {}",
-                if plan.may_restart_daemon {
-                    "the daemon may be gracefully restarted only if the installed helper cannot connect to the running daemon"
+                if plan.reason == ssh_bootstrap::RemoteInstallReason::Upgrade {
+                    "the pinned binary is uploaded privately first; activation occurs only if that provisional client proves the running daemon executable is this destination, then the previous executable is retained for rollback and an incompatible daemon is gracefully restarted"
                 } else {
-                    "a detached daemon may be started; no running daemon will be restarted for a release-version difference"
+                    "the pinned binary is uploaded privately first; the runtime socket must remain absent through guarded activation, and rollback removes only a destination activated by this transaction"
                 }
             );
             if !confirm_setup("Install Boomux on this remote target?")? {
@@ -1787,23 +1890,22 @@ fn verified_remote_connection(
                 )
                 .into());
             }
-            ssh_bootstrap::install_remote(&plan, authentication, TIMEOUT)?
+            session
+                .install_and_connect(&plan, TIMEOUT)
+                .map_err(bootstrap_cli_failure)
         }
-    };
-    Ok(ssh_bootstrap::connect_remote(
-        target,
-        helper,
-        authentication,
-        TIMEOUT,
-    )?)
+    }
+}
+
+fn bootstrap_cli_failure(error: io::Error) -> Box<dyn Error> {
+    cli_output::failure(ssh_bootstrap::error_code(&error), error.to_string())
 }
 
 fn node_command(command: NodeCommands, json: bool) -> Result<(), Box<dyn Error>> {
     match command {
         NodeCommands::Add { alias, target } => {
             let (alias, target) = resolve_node_add_inputs(alias, target, json)?;
-            let mut remote = verified_remote_connection(&target, !json)?;
-            remote.ping()?;
+            let remote = verified_remote_connection(&target, !json)?;
             let registration = client::connect_or_start()?.add_node_registration(
                 alias,
                 target,
@@ -1891,6 +1993,9 @@ fn node_command(command: NodeCommands, json: bool) -> Result<(), Box<dyn Error>>
         NodeCommands::Snapshot { selector } => {
             let snapshot = client::connect_or_start()?.combined_node_snapshot(selector)?;
             if json {
+                let workspaces = snapshot.workspaces.clone();
+                let external_workspaces = snapshot.external_workspaces.clone();
+                let focused_terminal = snapshot.focused_terminal.clone();
                 let nodes = snapshot
                     .nodes
                     .into_iter()
@@ -1898,7 +2003,12 @@ fn node_command(command: NodeCommands, json: bool) -> Result<(), Box<dyn Error>>
                     .collect::<Result<Vec<_>, _>>()?;
                 print_json(
                     CommandKey::NodeSnapshot,
-                    serde_json::json!({ "nodes": nodes }),
+                    serde_json::json!({
+                        "nodes": nodes,
+                        "workspaces": workspaces,
+                        "external_workspaces": external_workspaces,
+                        "focused_terminal": focused_terminal,
+                    }),
                 )
             } else {
                 println!("ALIAS\tOWNERSHIP\tHEALTH\tCURRENT\tOBSERVED\tWORKSPACES\tSCHEDULER");
@@ -1924,6 +2034,51 @@ fn node_command(command: NodeCommands, json: bool) -> Result<(), Box<dyn Error>>
                         format!("{:?}", node.scheduler.state).to_ascii_lowercase(),
                         node.scheduler.active_executions,
                         node.scheduler.max_concurrent,
+                    );
+                }
+                println!("\nGLOBAL WORKSPACES");
+                println!("NAME\tID\tREVISION\tSTATE\tPLACEMENTS");
+                for workspace in snapshot.workspaces {
+                    println!(
+                        "{}\t{}\t{}\t{}\t{}",
+                        workspace.name,
+                        workspace.id,
+                        workspace.revision,
+                        if workspace.closing {
+                            "closing"
+                        } else {
+                            "active"
+                        },
+                        workspace.placements.len(),
+                    );
+                    for placement in workspace.placements {
+                        println!(
+                            "  ->\t{}:{}\t{}\t{:?}\t{}",
+                            placement.node_id,
+                            placement.workspace_id,
+                            placement.owner_revision,
+                            placement.state,
+                            placement
+                                .default_cwd
+                                .as_deref()
+                                .map_or_else(|| "-".into(), |path| path.display().to_string()),
+                        );
+                    }
+                }
+                println!("\nEXTERNAL WORKSPACES");
+                println!("NAME\tOWNER\tREVISION\tAVAILABLE\tDEFAULT CWD");
+                for workspace in snapshot.external_workspaces {
+                    println!(
+                        "{}\t{}:{}\t{}\t{}\t{}",
+                        workspace.name,
+                        workspace.identity.node_id,
+                        workspace.identity.inner_id,
+                        workspace.revision,
+                        workspace.available,
+                        workspace
+                            .default_cwd
+                            .as_deref()
+                            .map_or_else(|| "-".into(), |path| path.display().to_string()),
                     );
                 }
                 Ok(())
@@ -1954,8 +2109,7 @@ fn node_command(command: NodeCommands, json: bool) -> Result<(), Box<dyn Error>>
                     ),
                 ));
             }
-            let mut remote = verified_remote_connection(&target, !json)?;
-            remote.ping()?;
+            let remote = verified_remote_connection(&target, !json)?;
             let registration = local.retarget_node_registration(
                 selector,
                 target,
@@ -1970,6 +2124,157 @@ fn node_command(command: NodeCommands, json: bool) -> Result<(), Box<dyn Error>>
         }
         NodeCommands::Rekey => rekey_node(),
     }
+}
+
+fn guided_node_add() -> Result<process_adapter::ProcessExit, Box<dyn Error>> {
+    let executable = env::current_exe()?;
+    let stdin = io::stdin();
+    let interactive = stdin.is_terminal() && io::stdout().is_terminal();
+    let mut input = stdin.lock();
+    let mut output = io::stdout().lock();
+    guided_node_add_with(
+        &executable,
+        &mut input,
+        &mut output,
+        interactive,
+        interactive.then(|| stdin.as_raw_fd()),
+    )
+}
+
+fn restore_terminal_foreground(fd: i32, foreground: i32) {
+    unsafe {
+        let previous = libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+        let _ = libc::tcsetpgrp(fd, foreground);
+        libc::signal(libc::SIGTTOU, previous);
+    }
+}
+
+fn guided_node_add_with(
+    executable: &Path,
+    input: &mut impl BufRead,
+    output: &mut impl io::Write,
+    wait_for_newline: bool,
+    terminal_fd: Option<i32>,
+) -> Result<process_adapter::ProcessExit, Box<dyn Error>> {
+    let mut command = Command::new(executable);
+    command.args(["node", "add"]);
+    if terminal_fd.is_some() {
+        command.env("BOOMUX_INTERNAL_GUIDED_STOP", "1");
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) == -1 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+    }
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            writeln!(output, "\nNode setup failed to start: {error}")?;
+            hold_guided_result(input, output, wait_for_newline)?;
+            return Ok(process_adapter::ProcessExit::Code(1));
+        }
+    };
+
+    let original_foreground = if let Some(fd) = terminal_fd {
+        let foreground = unsafe { libc::tcgetpgrp(fd) };
+        let child_group = i32::try_from(child.id()).unwrap_or(i32::MAX);
+        let mut stopped_status = 0;
+        let stopped = unsafe { libc::waitpid(child_group, &mut stopped_status, libc::WUNTRACED) };
+        if foreground == -1
+            || stopped != child_group
+            || !libc::WIFSTOPPED(stopped_status)
+            || unsafe { libc::tcsetpgrp(fd, child_group) } == -1
+        {
+            let error = io::Error::last_os_error();
+            unsafe {
+                libc::kill(-child_group, libc::SIGKILL);
+            }
+            let _ = child.wait();
+            writeln!(
+                output,
+                "\nNode setup failed to acquire the terminal: {error}"
+            )?;
+            hold_guided_result(input, output, wait_for_newline)?;
+            return Ok(process_adapter::ProcessExit::Code(1));
+        }
+        let continued = if cfg!(test) && env::var_os("BOOMUX_TEST_GUIDED_SIGCONT_FAILURE").is_some()
+        {
+            Err(io::Error::other("injected SIGCONT failure"))
+        } else if unsafe { libc::kill(-child_group, libc::SIGCONT) } == -1 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        };
+        if let Err(error) = continued {
+            unsafe {
+                libc::kill(-child_group, libc::SIGKILL);
+            }
+            restore_terminal_foreground(fd, foreground);
+            let _ = child.wait();
+            writeln!(output, "\nNode setup failed to continue: {error}")?;
+            hold_guided_result(input, output, wait_for_newline)?;
+            return Ok(process_adapter::ProcessExit::Code(1));
+        }
+        Some((fd, foreground))
+    } else {
+        None
+    };
+    let status = child.wait();
+    if let Some((fd, foreground)) = original_foreground {
+        restore_terminal_foreground(fd, foreground);
+    }
+    let status = match status {
+        Ok(status) => status,
+        Err(error) => {
+            writeln!(output, "\nNode setup status could not be read: {error}")?;
+            hold_guided_result(input, output, wait_for_newline)?;
+            return Ok(process_adapter::ProcessExit::Code(1));
+        }
+    };
+    writeln!(
+        output,
+        "\nNode setup {} ({}).",
+        if status.success() {
+            "finished"
+        } else {
+            "failed"
+        },
+        match status.code() {
+            Some(code) => format!("exit {code}"),
+            None => format!("signal {}", status.signal().unwrap_or(0)),
+        }
+    )?;
+    hold_guided_result(input, output, wait_for_newline)?;
+    Ok(match status.code() {
+        Some(code) => process_adapter::ProcessExit::Code(code),
+        None => process_adapter::ProcessExit::Signal(status.signal().unwrap_or(0)),
+    })
+}
+
+fn hold_guided_result(
+    input: &mut impl BufRead,
+    output: &mut impl io::Write,
+    wait_for_newline: bool,
+) -> io::Result<()> {
+    if !wait_for_newline {
+        writeln!(
+            output,
+            "No interactive terminal is available; closing without waiting."
+        )?;
+        return Ok(());
+    }
+    write!(output, "Press Enter to close. ")?;
+    output.flush()?;
+    let mut bytes = Vec::new();
+    let count = input.read_until(b'\n', &mut bytes)?;
+    if count == 0 || bytes.last() != Some(&b'\n') {
+        writeln!(output, "\nInput closed before a newline; closing now.")?;
+    }
+    Ok(())
 }
 
 fn resolve_node_add_inputs(
@@ -2030,27 +2335,36 @@ fn node_snapshot_json(node: protocol::CombinedNode) -> Result<serde_json::Value,
         node_id,
         alias,
         local,
+        route,
+        registration_revision,
         health,
         current,
         stale,
         observed_at_ms,
         observed_protocol_version,
         observed_capabilities,
+        workspace_owner_eligible,
+        workspace_owner_unavailable_reason,
         scheduler,
         local_snapshot,
         remote_projection,
+        ..
     } = node;
     let qualify = |value| qualify_resource_identities(value, &node_id);
     Ok(serde_json::json!({
         "node_id": node_id,
         "alias": alias,
         "local": local,
+        "route": route,
+        "registration_revision": registration_revision,
         "health": health,
         "current": current,
         "stale": stale,
         "observed_at_ms": observed_at_ms,
         "observed_protocol_version": observed_protocol_version,
         "observed_capabilities": observed_capabilities,
+        "workspace_owner_eligible": workspace_owner_eligible,
+        "workspace_owner_unavailable_reason": workspace_owner_unavailable_reason,
         "scheduler": scheduler,
         "local_snapshot": local_snapshot.map(serde_json::to_value).transpose()?.map(qualify),
         "remote_projection": remote_projection.map(serde_json::to_value).transpose()?.map(qualify),
@@ -2149,14 +2463,22 @@ fn daemon_control(command: DaemonCommands, json: bool) -> Result<(), Box<dyn Err
     let client = client::connect()?;
     match command {
         DaemonCommands::Status if json => {
-            let protocol_version = client.protocol_version()?;
             let scheduler = client.snapshot()?.scheduler;
+            let identity = daemon_process_identity(&client);
+            let protocol_version = identity.as_ref().map_or_else(
+                || client.protocol_version(),
+                |identity| Ok(identity.protocol_version),
+            )?;
             print_json(
                 CommandKey::DaemonStatus,
                 serde_json::json!({
                     "status": "running",
                     "protocol_version": protocol_version,
                     "socket_path": client.socket_path().display().to_string(),
+                    "pid": identity.as_ref().map(|identity| identity.pid),
+                    "executable": identity.as_ref().and_then(|identity| identity.executable.as_deref()),
+                    "socket_device": identity.as_ref().map(|identity| identity.socket_device),
+                    "socket_inode": identity.as_ref().map(|identity| identity.socket_inode),
                     "scheduler": scheduler.map(|health| serde_json::json!({
                         "state": match health.state {
                             protocol::SchedulerState::Active => "active",
@@ -2201,6 +2523,146 @@ fn daemon_control(command: DaemonCommands, json: bool) -> Result<(), Box<dyn Err
     Ok(())
 }
 
+struct DaemonProcessIdentity {
+    pid: u32,
+    protocol_version: u32,
+    executable: Option<String>,
+    socket_device: u64,
+    socket_inode: u64,
+}
+
+#[cfg(target_os = "linux")]
+fn daemon_process_identity(client: &client::Client) -> Option<DaemonProcessIdentity> {
+    let socket_before = fs::metadata(client.socket_path()).ok()?;
+    let credentials = match client.daemon_peer_credentials() {
+        Ok(credentials) if credentials.uid == unsafe { libc::geteuid() } => credentials,
+        _ => return None,
+    };
+    let socket_after = fs::metadata(client.socket_path()).ok()?;
+    if socket_before.dev() != socket_after.dev() || socket_before.ino() != socket_after.ino() {
+        return None;
+    }
+    let process_directory = PathBuf::from(format!("/proc/{}", credentials.pid));
+    if fs::metadata(&process_directory).map_or(true, |metadata| {
+        metadata.uid() != credentials.uid || !metadata.is_dir()
+    }) {
+        return None;
+    }
+    let executable = fs::read_link(process_directory.join("exe"))
+        .ok()
+        .and_then(|executable| normalize_daemon_executable(executable.as_os_str().as_bytes()));
+    Some(DaemonProcessIdentity {
+        pid: credentials.pid,
+        protocol_version: credentials.protocol_version,
+        executable,
+        socket_device: socket_after.dev(),
+        socket_inode: socket_after.ino(),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn normalize_daemon_executable(path: &[u8]) -> Option<String> {
+    const MAX_EXECUTABLE_PATH: usize = 4096;
+    let mut bytes = path;
+    if let Some(path) = bytes.strip_suffix(b" (deleted)") {
+        bytes = path;
+    }
+    if bytes.is_empty()
+        || bytes.len() > MAX_EXECUTABLE_PATH
+        || bytes.iter().any(u8::is_ascii_control)
+    {
+        return None;
+    }
+    let executable = match String::from_utf8(bytes.to_vec()) {
+        Ok(executable) => executable,
+        Err(_) => return None,
+    };
+    let executable_path = Path::new(&executable);
+    if !executable_path.is_absolute() {
+        return None;
+    }
+    Some(executable)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn daemon_process_identity(_client: &client::Client) -> Option<DaemonProcessIdentity> {
+    None
+}
+
+fn bootstrap_activate(
+    transaction: &str,
+    expected_pid: u32,
+    expected_protocol: u32,
+    expected_executable: &str,
+    expected_socket_device: u64,
+    expected_socket_inode: u64,
+) -> io::Result<()> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (
+            transaction,
+            expected_pid,
+            expected_protocol,
+            expected_executable,
+            expected_socket_device,
+            expected_socket_inode,
+        );
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "proof-bound bootstrap activation is unsupported on this platform",
+        ));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let suffix = transaction
+            .strip_prefix(".boomux.bootstrap.")
+            .filter(|suffix| {
+                suffix.len() == 8 && suffix.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            })
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "invalid bootstrap transaction")
+            })?;
+        let _ = suffix;
+        let home = env::var_os("HOME")
+            .map(PathBuf::from)
+            .filter(|home| home.is_absolute())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "HOME must be absolute"))?;
+        let directory = home.join(".local/bin");
+        let destination = directory.join("boomux");
+        if destination.as_os_str().as_bytes() != expected_executable.as_bytes() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "bootstrap destination does not match the daemon proof",
+            ));
+        }
+        let provisional = directory.join(transaction).join("new");
+        let socket = client::socket_path()?;
+        let daemon_client = client::Client::from_socket_path(socket);
+        let identity = daemon_process_identity(&daemon_client).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "the daemon identity could not be bound to activation",
+            )
+        })?;
+        if identity.pid != expected_pid
+            || identity.protocol_version != expected_protocol
+            || identity.executable.as_deref() != Some(expected_executable)
+            || identity.socket_device != expected_socket_device
+            || identity.socket_inode != expected_socket_inode
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "the daemon identity changed before activation",
+            ));
+        }
+        fs::rename(&provisional, &destination)?;
+        fs::File::open(&destination)?.sync_all()?;
+        fs::File::create(directory.join(transaction).join("activated"))?.sync_all()?;
+        fs::File::open(&directory)?.sync_all()?;
+        Ok(())
+    }
+}
+
 fn should_open_new_window(new_window: bool, terminal: Option<&str>) -> bool {
     new_window || terminal.is_some()
 }
@@ -2212,11 +2674,9 @@ fn effective_terminal(override_entry: Option<&str>) -> Result<Option<String>, Bo
     Ok(config::load()?.terminal)
 }
 
-fn dashboard(
-    terminal_override: Option<&str>,
-    initial_node_filter: Option<String>,
-) -> Result<(), Box<dyn Error>> {
+fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
     ensure_host_terminal()?;
+    validate_dashboard_terminal(io::stdin().is_terminal(), io::stdout().is_terminal())?;
     let launch_cwd = resolve_directory(Path::new("."))?;
     let client = client::connect_or_start()?;
     let local_node_id = client.node_identity()?;
@@ -2247,7 +2707,7 @@ fn dashboard(
         roots_configured,
     };
 
-    let mut initial_state = dashboard_state(
+    let initial_state = dashboard_state(
         snapshot,
         combined,
         &refresh,
@@ -2255,13 +2715,12 @@ fn dashboard(
         &mut title_cache,
         false,
     );
-    initial_state.initial_node_filter = initial_node_filter;
     tui::run(
         initial_state,
         config.dashboard.follow_focused_terminal,
         project_context,
         true,
-        |effect| match effect {
+        move |effect| match effect {
             tui::DashboardEffect::Quit => unreachable!("quit is handled by the dashboard runtime"),
             tui::DashboardEffect::AddNode => tui::DashboardEvent::OperationCompleted(
                 terminal::open_node_add(terminal.as_deref())
@@ -2292,6 +2751,12 @@ fn dashboard(
                     Err(error) => tui::DashboardEvent::RefreshCompleted(Err(error)),
                 }
             }
+            tui::DashboardEffect::RefreshNode(node_id) => tui::DashboardEvent::OperationCompleted(
+                client
+                    .force_node_projection_refresh(node_id)
+                    .map(|_| "Requested a fresh Node observation".into())
+                    .map_err(|error| error.to_string()),
+            ),
             tui::DashboardEffect::RestoreWorkspace(workspace_id) => {
                 let result = (|| {
                     let workspace_id = local_dashboard_inner(&workspace_id, &local_node_id)?;
@@ -2307,6 +2772,51 @@ fn dashboard(
                         workspace.name
                     ))
                 })();
+                tui::DashboardEvent::OperationCompleted(result)
+            }
+            tui::DashboardEffect::OpenGlobalWorkspace {
+                workspace_id,
+                expected_revision,
+            } => {
+                let result = (|| {
+                    let combined = client
+                        .combined_node_snapshot(None)
+                        .map_err(|error| error.to_string())?;
+                    let workspace = combined
+                        .workspaces
+                        .iter()
+                        .find(|workspace| workspace.id == workspace_id)
+                        .ok_or_else(|| "global Workspace is no longer retained".to_owned())?;
+                    if workspace.revision != expected_revision {
+                        return Err("global Workspace revision changed; refresh and retry".into());
+                    }
+                    open_coordinated_workspace(&client, &combined, workspace, terminal.as_deref())
+                        .map_err(|error| error.to_string())?;
+                    Ok(format!(
+                        "Opened {} across available placements",
+                        workspace.name
+                    ))
+                })();
+                tui::DashboardEvent::OperationCompleted(result)
+            }
+            tui::DashboardEffect::RetryGlobalWorkspaceClose { workspace_id } => {
+                let result = client
+                    .retry_global_workspace_close(workspace_id)
+                    .map(|result| {
+                        let unresolved = result
+                            .placements
+                            .iter()
+                            .filter(|placement| placement.status == "unresolved")
+                            .count();
+                        if unresolved == 0 {
+                            "Completed Workspace close".into()
+                        } else {
+                            format!(
+                                "Workspace close still has {unresolved} unresolved placement(s)"
+                            )
+                        }
+                    })
+                    .map_err(|error| error.to_string());
                 tui::DashboardEvent::OperationCompleted(result)
             }
             tui::DashboardEffect::Open(target) => {
@@ -2357,6 +2867,25 @@ fn dashboard(
             }
             tui::DashboardEffect::Close(target) => {
                 let result = (|| match &target {
+                    tui::CloseTarget::GlobalWorkspace {
+                        workspace_id,
+                        expected_revision,
+                    } => {
+                        let result = client
+                            .close_global_workspace(workspace_id, *expected_revision)
+                            .map_err(|error| error.to_string())?;
+                        let unresolved = result
+                            .placements
+                            .iter()
+                            .filter(|placement| placement.status != "closed")
+                            .count();
+                        if unresolved > 0 {
+                            return Err(format!(
+                                "Workspace close remains unresolved on {unresolved} Node(s); refresh and retry"
+                            ));
+                        }
+                        Ok("Closed global Workspace across every placement".into())
+                    }
                     tui::CloseTarget::Workspace(workspace_id) => {
                         let workspace =
                             routed_dashboard_workspace(&client, workspace_id, &local_node_id)?;
@@ -2431,22 +2960,155 @@ fn dashboard(
                 })();
                 tui::DashboardEvent::OperationCompleted(result)
             }
-            tui::DashboardEffect::CreateWorkspace { name, default_cwd } => {
+            tui::DashboardEffect::CreateWorkspace { name } => {
                 tui::DashboardEvent::OperationCompleted(
-                    create_dashboard_workspace(&client, &name, default_cwd.as_ref())
-                        .map_err(|error| error.to_string()),
+                    create_dashboard_workspace(&client, &name).map_err(|error| error.to_string()),
                 )
             }
             tui::DashboardEffect::CreateShell(workspace_id) => {
-                tui::DashboardEvent::OperationCompleted(
+                tui::DashboardEvent::ShellCreationCompleted(
                     local_dashboard_inner(&workspace_id, &local_node_id).and_then(|workspace_id| {
                         create_dashboard_shell(&client, workspace_id, &launch_cwd)
                             .map_err(|error| error.to_string())
                     }),
                 )
             }
+            tui::DashboardEffect::CreateGlobalShell {
+                workspace_id,
+                expected_revision,
+                node_id,
+                owner_workspace_id,
+                default_cwd,
+            } => {
+                let result = (|| {
+                    let combined = client
+                        .combined_node_snapshot(Some(node_id.clone()))
+                        .map_err(|error| error.to_string())?;
+                    let node = combined
+                        .nodes
+                        .iter()
+                        .find(|node| node.node_id == node_id)
+                        .ok_or_else(|| "selected Node is no longer available".to_owned())?;
+                    let cwd = resolve_owner_directory(
+                        &client,
+                        node,
+                        default_cwd.clone().unwrap_or_else(|| PathBuf::from(".")),
+                    )
+                    .map_err(|error| error.to_string())?;
+                    let name = generated_shell_name(std::iter::empty())
+                        .map_err(|error| error.to_string())?;
+                    let (_, shell) = client
+                        .create_global_workspace_shell(
+                            Uuid::new_v4().to_string(),
+                            workspace_id,
+                            expected_revision,
+                            node_id,
+                            owner_workspace_id,
+                            default_cwd.or_else(|| Some(cwd.clone())),
+                            Uuid::new_v4().to_string(),
+                            shell_spec(name, &cwd, &[]),
+                        )
+                        .map_err(|error| error.to_string())?;
+                    Ok(format!("Created {} on Node {}", shell.name, node.alias))
+                })();
+                tui::DashboardEvent::ShellCreationCompleted(result)
+            }
+            tui::DashboardEffect::AdoptExternalWorkspace {
+                identity,
+                expected_revision,
+            } => {
+                let result = (|| {
+                    let owner = routed_dashboard_workspace(&client, &identity, &local_node_id)?;
+                    if expected_revision > 0 && owner.revision != expected_revision {
+                        return Err(format!(
+                            "owner Workspace revision changed: expected {expected_revision}, current {}",
+                            owner.revision
+                        ));
+                    }
+                    let global = client
+                        .adopt_node_workspace(identity, owner.revision)
+                        .map_err(|error| error.to_string())?;
+                    Ok(format!("Adopted {} as a new Workspace", global.name))
+                })();
+                tui::DashboardEvent::OperationCompleted(result)
+            }
+            tui::DashboardEffect::LinkExternalWorkspace {
+                workspace_id,
+                expected_revision,
+                identity,
+                expected_owner_revision,
+            } => {
+                let result = (|| {
+                    let owner = routed_dashboard_workspace(&client, &identity, &local_node_id)?;
+                    if expected_owner_revision > 0 && owner.revision != expected_owner_revision {
+                        return Err(format!(
+                            "owner Workspace revision changed: expected {expected_owner_revision}, current {}",
+                            owner.revision
+                        ));
+                    }
+                    let global = client
+                        .link_node_workspace(
+                            workspace_id,
+                            expected_revision,
+                            identity,
+                            owner.revision,
+                        )
+                        .map_err(|error| error.to_string())?;
+                    Ok(format!("Linked owner Workspace to {}", global.name))
+                })();
+                tui::DashboardEvent::OperationCompleted(result)
+            }
+            tui::DashboardEffect::RetargetNode {
+                node_id,
+                expected_revision,
+                route,
+            } => {
+                let result = (|| {
+                    let remote = verified_remote_connection(&route, true)
+                        .map_err(|error| error.to_string())?;
+                    if remote.handshake.node_id != node_id {
+                        return Err("retargeted route reached a different Node identity".into());
+                    }
+                    let registration = client
+                        .retarget_node_registration(
+                            &node_id,
+                            route,
+                            node_id.clone(),
+                            expected_revision,
+                        )
+                        .map_err(|error| error.to_string())?;
+                    Ok(format!("Retargeted Node {}", registration.alias))
+                })();
+                tui::DashboardEvent::OperationCompleted(result)
+            }
+            tui::DashboardEffect::ForgetNode { node_id } => {
+                tui::DashboardEvent::OperationCompleted(
+                    client
+                        .forget_node_registration(node_id)
+                        .map(|registration| format!("Forgot Node {}", registration.alias))
+                        .map_err(|error| error.to_string()),
+                )
+            }
             tui::DashboardEffect::Rename { target, name } => {
                 let result = (|| match &target {
+                    tui::RenameTarget::Node {
+                        node_id,
+                        expected_revision,
+                    } => {
+                        client
+                            .rename_node_registration(node_id, &name, *expected_revision)
+                            .map_err(|error| error.to_string())?;
+                        Ok(format!("Renamed Node alias to {name}"))
+                    }
+                    tui::RenameTarget::GlobalWorkspace {
+                        workspace_id,
+                        expected_revision,
+                    } => {
+                        client
+                            .rename_global_workspace(workspace_id, *expected_revision, &name)
+                            .map_err(|error| error.to_string())?;
+                        Ok(format!("Renamed workspace to {name}"))
+                    }
                     tui::RenameTarget::Workspace(workspace_id) => {
                         let workspace =
                             routed_dashboard_workspace(&client, workspace_id, &local_node_id)?;
@@ -2848,6 +3510,9 @@ fn dashboard_state(
     title_cache: &mut host_session_titles::Cache,
     reset_focus_revision: bool,
 ) -> tui::DashboardState {
+    let qualified_focused_terminal = combined
+        .as_ref()
+        .and_then(|snapshot| snapshot.focused_terminal.clone());
     let schedules_supported = protocol::ProtocolFeature::ScheduledExecutionObservation
         .is_supported_by(refresh.negotiated_protocol);
     let mut workspaces = dashboard_views_with_catalog(&snapshot.workspaces, git_cache, title_cache);
@@ -2895,21 +3560,27 @@ fn dashboard_state(
     };
     let mut nodes = Vec::new();
     if let Some(combined) = combined {
+        let global_workspaces = combined.workspaces;
+        let external_workspaces = combined.external_workspaces;
         for node in combined.nodes {
             let node_view = tui::NodeView {
                 id: node.node_id.clone(),
                 alias: node.alias.clone(),
                 local: node.local,
+                route: node.route.clone(),
+                registration_revision: node.registration_revision,
                 health: node.health,
                 current: node.current,
                 stale: node.stale,
+                observed_at_ms: node.observed_at_ms,
+                observed_protocol_version: node.observed_protocol_version,
                 observed_capabilities: node.observed_capabilities.clone(),
+                workspace_owner_eligible: node.workspace_owner_eligible,
+                workspace_owner_unavailable_reason: node.workspace_owner_unavailable_reason.clone(),
                 scheduler: node.scheduler.clone(),
             };
             if node.local {
-                for workspace in &mut workspaces {
-                    workspace.node = node_view.clone();
-                }
+                assign_local_workspace_node(&mut workspaces, &node_view);
                 for schedule in &mut schedules {
                     schedule.node_id = node.node_id.clone();
                     schedule.node_alias = node.alias.clone();
@@ -2923,6 +3594,18 @@ fn dashboard_state(
             }
             nodes.push(node_view);
         }
+        for schedule in &mut schedules {
+            if let Some(global) = global_workspaces.iter().find(|workspace| {
+                workspace.placements.iter().any(|placement| {
+                    placement.node_id == schedule.node_id
+                        && placement.workspace_id == schedule.workspace_id
+                })
+            }) {
+                schedule.workspace = global.name.clone();
+            }
+        }
+        workspaces =
+            group_dashboard_workspaces(workspaces, &nodes, global_workspaces, external_workspaces);
     }
     if nodes.is_empty() {
         nodes.extend(
@@ -2932,13 +3615,7 @@ fn dashboard_state(
                 .take(1),
         );
     }
-    workspaces.sort_by(|left, right| {
-        left.node
-            .alias
-            .cmp(&right.node.alias)
-            .then_with(|| left.name.cmp(&right.name))
-            .then_with(|| left.id.cmp(&right.id))
-    });
+    sort_dashboard_workspaces(&mut workspaces);
     schedules.sort_by(|left, right| {
         left.node_alias
             .cmp(&right.node_alias)
@@ -2955,10 +3632,30 @@ fn dashboard_state(
             .is_supported_by(refresh.negotiated_protocol),
         schedule_editing: protocol::ProtocolFeature::AgentScheduleEditing
             .is_supported_by(refresh.negotiated_protocol),
-        focused_terminal: snapshot.focused_terminal.map(focused_terminal_view),
+        focused_terminal: dashboard_focused_terminal_view(
+            refresh.negotiated_protocol,
+            qualified_focused_terminal,
+            snapshot.focused_terminal,
+        ),
         reset_focus_revision,
-        initial_node_filter: None,
     }
+}
+
+fn assign_local_workspace_node(workspaces: &mut [tui::WorkspaceView], node: &tui::NodeView) {
+    for workspace in workspaces {
+        workspace.node = node.clone();
+        for owner in &mut workspace.item_owners {
+            owner.node = node.clone();
+        }
+    }
+}
+
+fn sort_dashboard_workspaces(workspaces: &mut [tui::WorkspaceView]) {
+    workspaces.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then_with(|| left.id.cmp(&right.id))
+    });
 }
 
 fn combined_node_snapshot_for_dashboard(
@@ -2971,11 +3668,197 @@ fn combined_node_snapshot_for_dashboard(
     }
 }
 
+fn group_dashboard_workspaces(
+    mut owner_workspaces: Vec<tui::WorkspaceView>,
+    nodes: &[tui::NodeView],
+    global_workspaces: Vec<protocol::GlobalWorkspaceSnapshot>,
+    external_workspaces: Vec<protocol::ExternalWorkspaceSnapshot>,
+) -> Vec<tui::WorkspaceView> {
+    let fallback_node = nodes
+        .iter()
+        .find(|node| node.local)
+        .or_else(|| nodes.first())
+        .cloned();
+    let mut grouped = Vec::new();
+    for global in global_workspaces {
+        let mut items = Vec::new();
+        let mut item_owners = Vec::new();
+        let mut sessions = Vec::new();
+        let mut attention = Vec::new();
+        let mut counts = agent_attention_projection::AgentStateCounts::default();
+        let mut attention_count = 0;
+        let placements = global
+            .placements
+            .iter()
+            .map(|placement| {
+                let node = nodes
+                    .iter()
+                    .find(|node| node.id == placement.node_id)
+                    .cloned()
+                    .unwrap_or_else(|| unavailable_placement_node(&placement.node_id));
+                if let Some(index) = owner_workspaces.iter().position(|workspace| {
+                    workspace.node.id == placement.node_id && workspace.id == placement.workspace_id
+                }) {
+                    let owner = owner_workspaces.remove(index);
+                    let owner_item_count = owner.items.len();
+                    if owner.item_owners.len() == owner_item_count {
+                        item_owners.extend(owner.item_owners);
+                    } else {
+                        item_owners.extend((0..owner_item_count).map(|_| {
+                            tui::WorkspaceItemOwnerView {
+                                node: owner.node.clone(),
+                                workspace_id: owner.id.clone(),
+                            }
+                        }));
+                    }
+                    items.extend(owner.items);
+                    sessions.extend(owner.sessions);
+                    attention.extend(owner.attention.into_iter().map(|mut attention| {
+                        attention.node_id = owner.node.id.clone();
+                        attention.workspace_id = owner.id.clone();
+                        attention
+                    }));
+                    counts.unknown += owner.agent_state_counts.unknown;
+                    counts.working += owner.agent_state_counts.working;
+                    counts.blocked += owner.agent_state_counts.blocked;
+                    counts.idle += owner.agent_state_counts.idle;
+                    counts.inactive += owner.agent_state_counts.inactive;
+                    counts.done += owner.agent_state_counts.done;
+                    attention_count += owner.attention_count;
+                }
+                tui::WorkspacePlacementView {
+                    node,
+                    workspace_id: placement.workspace_id.clone(),
+                    owner_revision: placement.owner_revision,
+                    default_cwd: placement
+                        .default_cwd
+                        .as_ref()
+                        .map(|cwd| cwd.display().to_string()),
+                    state: placement.state,
+                }
+            })
+            .collect::<Vec<_>>();
+        let Some(node) = fallback_node
+            .clone()
+            .or_else(|| placements.first().map(|placement| placement.node.clone()))
+        else {
+            continue;
+        };
+        grouped.push(tui::WorkspaceView {
+            node,
+            id: global.id,
+            name: global.name,
+            default_cwd: None,
+            items,
+            sessions,
+            agent_state_counts: counts,
+            attention_count,
+            attention,
+            item_owners,
+            coordination: tui::WorkspaceCoordinationView::Global {
+                revision: global.revision,
+                closing: global.closing,
+                placements,
+            },
+        });
+    }
+    for external in external_workspaces {
+        if let Some(workspace) = owner_workspaces.iter_mut().find(|workspace| {
+            workspace.node.id == external.identity.node_id
+                && workspace.id == external.identity.inner_id
+        }) {
+            workspace.coordination = tui::WorkspaceCoordinationView::External {
+                owner_revision: external.revision,
+                available: external.available,
+            };
+            continue;
+        }
+        let Some(node) = nodes
+            .iter()
+            .find(|node| node.id == external.identity.node_id)
+            .cloned()
+        else {
+            continue;
+        };
+        grouped.push(tui::WorkspaceView {
+            node,
+            id: external.identity.inner_id,
+            name: external.name,
+            default_cwd: external
+                .default_cwd
+                .as_ref()
+                .map(|cwd| cwd.display().to_string()),
+            items: Vec::new(),
+            sessions: Vec::new(),
+            agent_state_counts: agent_attention_projection::AgentStateCounts::default(),
+            attention_count: 0,
+            attention: Vec::new(),
+            item_owners: Vec::new(),
+            coordination: tui::WorkspaceCoordinationView::External {
+                owner_revision: external.revision,
+                available: external.available,
+            },
+        });
+    }
+    grouped.extend(owner_workspaces);
+    grouped
+}
+
+fn unavailable_placement_node(node_id: &str) -> tui::NodeView {
+    tui::NodeView {
+        id: node_id.to_owned(),
+        alias: format!(
+            "unregistered:{}",
+            node_id.chars().take(8).collect::<String>()
+        ),
+        local: false,
+        route: None,
+        registration_revision: None,
+        health: protocol::NodeProjectionHealthCode::Unobserved,
+        current: false,
+        stale: true,
+        observed_at_ms: 0,
+        observed_protocol_version: None,
+        observed_capabilities: Vec::new(),
+        workspace_owner_eligible: false,
+        workspace_owner_unavailable_reason: Some("Node is not registered".into()),
+        scheduler: protocol::SchedulerHealth {
+            state: protocol::SchedulerState::Offline,
+            max_concurrent: 0,
+            active_executions: 0,
+        },
+    }
+}
+
 fn focused_terminal_view(focused: protocol::FocusedTerminalSnapshot) -> tui::FocusedTerminalView {
     tui::FocusedTerminalView {
         revision: focused.revision,
+        node_id: None,
         workspace_id: focused.workspace_id,
         shell_id: focused.shell_id,
+    }
+}
+
+fn qualified_focused_terminal_view(
+    focused: protocol::QualifiedFocusedTerminalSnapshot,
+) -> tui::FocusedTerminalView {
+    tui::FocusedTerminalView {
+        revision: focused.revision,
+        node_id: Some(focused.shell.node_id),
+        workspace_id: String::new(),
+        shell_id: focused.shell.inner_id,
+    }
+}
+
+fn dashboard_focused_terminal_view(
+    negotiated_protocol: u32,
+    qualified: Option<protocol::QualifiedFocusedTerminalSnapshot>,
+    local: Option<protocol::FocusedTerminalSnapshot>,
+) -> Option<tui::FocusedTerminalView> {
+    if protocol::ProtocolFeature::QualifiedFocusedTerminal.is_supported_by(negotiated_protocol) {
+        qualified.map(qualified_focused_terminal_view)
+    } else {
+        local.map(focused_terminal_view)
     }
 }
 
@@ -3636,6 +4519,20 @@ fn ensure_host_terminal() -> Result<(), Box<dyn Error>> {
     }
 }
 
+fn validate_dashboard_terminal(
+    stdin_is_terminal: bool,
+    stdout_is_terminal: bool,
+) -> io::Result<()> {
+    if stdin_is_terminal && stdout_is_terminal {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "dashboard requires an interactive terminal",
+        ))
+    }
+}
+
 fn resolve_directory(path: &Path) -> Result<PathBuf, Box<dyn Error>> {
     let absolute = if path.is_absolute() {
         path.to_owned()
@@ -3686,16 +4583,256 @@ fn resolve_workspace_target<'a>(
         .ok_or_else(|| cli_output::failure("not_found", format!("workspace not found: {target}")))
 }
 
+fn resolve_global_workspace_target<'a>(
+    workspaces: &'a [protocol::GlobalWorkspaceSnapshot],
+    target: &str,
+) -> Option<&'a protocol::GlobalWorkspaceSnapshot> {
+    workspaces
+        .iter()
+        .find(|workspace| workspace.id == target)
+        .or_else(|| workspaces.iter().find(|workspace| workspace.name == target))
+}
+
+fn resolve_combined_node<'a>(
+    nodes: &'a [protocol::CombinedNode],
+    selector: &str,
+) -> Result<&'a protocol::CombinedNode, Box<dyn Error>> {
+    let matches = nodes
+        .iter()
+        .filter(|node| node.node_id == selector || node.alias == selector)
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [node] => Ok(*node),
+        [] => Err(cli_output::failure(
+            "not_found",
+            format!("Node not found: {selector}"),
+        )),
+        _ => Err(cli_output::failure(
+            "ambiguous_target",
+            format!("Node selector is ambiguous: {selector}"),
+        )),
+    }
+}
+
+fn resolve_workspace_open_node<'a>(
+    nodes: &'a [protocol::CombinedNode],
+    selector: &str,
+) -> Result<&'a protocol::CombinedNode, Box<dyn Error>> {
+    let matches = nodes
+        .iter()
+        .filter(|node| node.node_id == selector || (!node.local && node.alias == selector))
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [node] => Ok(*node),
+        [] => Err(cli_output::failure(
+            "not_found",
+            format!("Node not found: {selector}"),
+        )),
+        _ => Err(cli_output::failure(
+            "ambiguous_target",
+            format!("Node selector is ambiguous: {selector}"),
+        )),
+    }
+}
+
+fn resolve_external_workspace<'a>(
+    workspaces: &'a [protocol::ExternalWorkspaceSnapshot],
+    node_id: &str,
+    target: &str,
+) -> Result<&'a protocol::ExternalWorkspaceSnapshot, Box<dyn Error>> {
+    workspaces
+        .iter()
+        .find(|workspace| {
+            workspace.identity.node_id == node_id
+                && (workspace.identity.inner_id == target || workspace.name == target)
+        })
+        .ok_or_else(|| {
+            cli_output::failure(
+                "not_found",
+                format!("unlinked owner Workspace not found: {target}"),
+            )
+        })
+}
+
+fn select_eligible_workspace_owner(
+    nodes: &[protocol::CombinedNode],
+    node_selector: Option<&str>,
+) -> Result<protocol::CombinedNode, Box<dyn Error>> {
+    if let Some(selector) = node_selector {
+        let node = resolve_combined_node(nodes, selector)?;
+        if !node.workspace_owner_eligible {
+            return Err(cli_output::failure(
+                "busy",
+                format!(
+                    "Node {} is unavailable for Workspace placement: {}",
+                    node.alias,
+                    node.workspace_owner_unavailable_reason
+                        .as_deref()
+                        .unwrap_or("unavailable")
+                ),
+            ));
+        }
+        return Ok(node.clone());
+    }
+    let eligible = nodes
+        .iter()
+        .filter(|node| node.workspace_owner_eligible)
+        .collect::<Vec<_>>();
+    let [node] = eligible.as_slice() else {
+        let status = nodes
+            .iter()
+            .map(|node| {
+                format!(
+                    "{} ({})",
+                    node.alias,
+                    if node.workspace_owner_eligible {
+                        "eligible"
+                    } else {
+                        node.workspace_owner_unavailable_reason
+                            .as_deref()
+                            .unwrap_or("unavailable")
+                    }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(cli_output::failure(
+            "ambiguous_target",
+            format!(
+                "Workspace resource placement requires --node when zero or multiple eligible Nodes exist; Nodes: {status}"
+            ),
+        ));
+    };
+    Ok((*node).clone())
+}
+
+fn shell_suggestion_json(
+    workspace_id: &str,
+    name: &str,
+    node_id: Option<&str>,
+) -> serde_json::Value {
+    let mut data = serde_json::json!({
+        "workspace_id": workspace_id,
+        "name": name,
+    });
+    if let Some(node_id) = node_id {
+        data["node_id"] = serde_json::Value::String(node_id.to_owned());
+    }
+    data
+}
+
+struct CoordinatedOwnerSelection {
+    workspace: protocol::GlobalWorkspaceSnapshot,
+    node: protocol::CombinedNode,
+    owner_workspace_id: String,
+    default_cwd: Option<PathBuf>,
+}
+
+fn require_protocol_feature(
+    client: &client::Client,
+    feature: protocol::ProtocolFeature,
+) -> Result<(), Box<dyn Error>> {
+    if client.supports(feature)? {
+        return Ok(());
+    }
+    Err(cli_output::failure(
+        "unsupported_version",
+        format!(
+            "{} requires daemon protocol {} or newer",
+            feature.requirement(),
+            feature.minimum_version()
+        ),
+    ))
+}
+
+fn require_explicit_coordinated_owner<T>(
+    selection: Option<T>,
+    node_selector: Option<&str>,
+    global_workspaces_supported: bool,
+) -> Result<Option<T>, Box<dyn Error>> {
+    if selection.is_some() || node_selector.is_none() {
+        return Ok(selection);
+    }
+    if !global_workspaces_supported {
+        return Err(cli_output::failure(
+            "unsupported_version",
+            format!(
+                "explicit Workspace placement requires daemon protocol {} or newer",
+                protocol::ProtocolFeature::GlobalWorkspaces.minimum_version()
+            ),
+        ));
+    }
+    Err(cli_output::failure(
+        "invalid_argument",
+        "--node can create a Shell or launcher only in a coordinated Workspace; adopt or link an external Workspace first",
+    ))
+}
+
+fn select_coordinated_owner(
+    client: &client::Client,
+    workspace_target: &str,
+    node_selector: Option<&str>,
+) -> Result<Option<CoordinatedOwnerSelection>, Box<dyn Error>> {
+    if !client.supports(protocol::ProtocolFeature::GlobalWorkspaces)? {
+        return Ok(None);
+    }
+    let combined = client.combined_node_snapshot(None)?;
+    let Some(workspace) =
+        resolve_global_workspace_target(&combined.workspaces, workspace_target).cloned()
+    else {
+        return Ok(None);
+    };
+    let node = select_eligible_workspace_owner(&combined.nodes, node_selector)?;
+    let placement = workspace
+        .placements
+        .iter()
+        .find(|placement| placement.node_id == node.node_id);
+    let owner_workspace_id = placement.map_or_else(
+        || Uuid::new_v4().to_string(),
+        |placement| placement.workspace_id.clone(),
+    );
+    let default_cwd = placement.and_then(|placement| placement.default_cwd.clone());
+    Ok(Some(CoordinatedOwnerSelection {
+        workspace,
+        node,
+        owner_workspace_id,
+        default_cwd,
+    }))
+}
+
+fn resolve_owner_directory(
+    client: &client::Client,
+    node: &protocol::CombinedNode,
+    path: PathBuf,
+) -> Result<PathBuf, Box<dyn Error>> {
+    if node.local {
+        return resolve_directory(&path);
+    }
+    match client.route_node_host_service(
+        &node.node_id,
+        protocol::HostServiceOperation::ResolveDirectory { path },
+    )? {
+        protocol::HostServiceResult::Directory { path } => Ok(path),
+        _ => Err("owner Node returned an unexpected directory response".into()),
+    }
+}
+
 fn create_dashboard_workspace(
     client: &client::Client,
     name: &str,
-    default_cwd: Option<&PathBuf>,
 ) -> Result<String, Box<dyn Error>> {
     let name = name.trim();
     if name.is_empty() {
         return Err("workspace name cannot be empty".into());
     }
-    client.create_workspace_with_default_cwd(name, default_cwd.cloned(), Vec::new())?;
+    if client.supports(protocol::ProtocolFeature::GlobalWorkspaces)? {
+        let workspace = client.create_global_workspace(name)?;
+        return Ok(format!(
+            "Created empty workspace {} ({})",
+            workspace.name, workspace.id
+        ));
+    }
+    client.create_workspace_with_default_cwd(name, None, Vec::new())?;
     Ok(format!("Created empty workspace {name}"))
 }
 
@@ -4648,7 +5785,7 @@ fn capabilities(json: bool) -> Result<(), Box<dyn Error>> {
         .copied()
         .chain(protocol::protocol_capabilities())
         .collect::<Vec<_>>();
-    let error_codes = [
+    let error_codes: &[&str] = &[
         "invalid_argument",
         "not_found",
         "already_exists",
@@ -4659,6 +5796,16 @@ fn capabilities(json: bool) -> Result<(), Box<dyn Error>> {
         "persistence_failed",
         "timeout",
         "unsupported_version",
+        "install_required",
+        "upgrade_required",
+        "bootstrap_authentication_failed",
+        "bootstrap_transport_failed",
+        "bootstrap_malformed_helper",
+        "bootstrap_unsupported_platform",
+        "bootstrap_install_failed",
+        "bootstrap_commit_outcome_unknown",
+        "bootstrap_runtime_unavailable",
+        "node_identity_conflict",
         "cursor_expired",
         "run_changed",
         "revision_ahead",
@@ -4836,6 +5983,109 @@ fn list_shells(json: bool) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn open_coordinated_workspace(
+    client: &client::Client,
+    combined: &protocol::CombinedNodeSnapshot,
+    workspace: &protocol::GlobalWorkspaceSnapshot,
+    terminal_override: Option<&str>,
+) -> Result<(usize, usize), Box<dyn Error>> {
+    let operation = client.open_global_workspace(&workspace.id, workspace.revision)?;
+    let terminal = effective_terminal(terminal_override)?;
+    let mut opened_launchers = 0;
+    let mut opened_shells = 0;
+    let mut failures = Vec::new();
+    for placement in operation.placements {
+        let node = combined
+            .nodes
+            .iter()
+            .find(|node| node.node_id == placement.node_id);
+        let alias = node.map_or(placement.node_id.as_str(), |node| node.alias.as_str());
+        if placement.status != "available" {
+            failures.push(format!(
+                "Node {alias}: {}",
+                placement.message.unwrap_or(placement.status)
+            ));
+            continue;
+        }
+        let owner = if node.is_some_and(|node| node.local) {
+            client.get_workspace(&placement.workspace_id)
+        } else {
+            client
+                .route_node_operation(
+                    &placement.node_id,
+                    protocol::RoutedOperation::GetWorkspace {
+                        workspace_id: placement.workspace_id.clone(),
+                    },
+                )
+                .and_then(|result| match result {
+                    protocol::RoutedOperationResult::Workspace { workspace } => Ok(workspace),
+                    _ => Err(client::ClientError::Protocol(
+                        client::ProtocolError::UnexpectedResponse(Box::new(
+                            protocol::Response::RoutedNodeOperation { result },
+                        )),
+                    )),
+                })
+        };
+        let owner = match owner {
+            Ok(owner) => owner,
+            Err(error) => {
+                failures.push(format!("Node {alias}: {error}"));
+                continue;
+            }
+        };
+        if node.is_some_and(|node| node.local) {
+            match open_workspace(&owner, terminal.as_deref()) {
+                Ok(()) => {
+                    opened_launchers += owner.launchers.len();
+                    opened_shells += workspace_user_shell_count(&owner);
+                }
+                Err(error) => failures.push(format!("Node {alias}: {error}")),
+            }
+            continue;
+        }
+        for launcher in &owner.launchers {
+            match client.route_node_host_service(
+                &placement.node_id,
+                protocol::HostServiceOperation::InvokeLauncher {
+                    workspace_id: owner.id.clone(),
+                    launcher_id: launcher.id.clone(),
+                },
+            ) {
+                Ok(_) => opened_launchers += 1,
+                Err(error) => {
+                    failures.push(format!("Node {alias} launcher {}: {error}", launcher.name))
+                }
+            }
+        }
+        for shell in owner
+            .shells
+            .iter()
+            .filter(|shell| matches!(shell.owner, protocol::ShellOwner::User))
+        {
+            match terminal::open_remote(
+                terminal.as_deref(),
+                &placement.node_id,
+                &shell.id,
+                &format!("[{alias}] {} - {}", workspace.name, shell.name),
+                true,
+            ) {
+                Ok(()) => opened_shells += 1,
+                Err(error) => failures.push(format!("Node {alias} shell {}: {error}", shell.name)),
+            }
+        }
+    }
+    if failures.is_empty() {
+        Ok((opened_launchers, opened_shells))
+    } else {
+        Err(io::Error::other(format!(
+            "Workspace {} opened with per-Node failures: {}",
+            workspace.name,
+            failures.join("; ")
+        ))
+        .into())
+    }
+}
+
 fn workspace_command(
     command: WorkspaceCommands,
     json: bool,
@@ -4844,6 +6094,48 @@ fn workspace_command(
     let client = client::connect_or_start()?;
     match command {
         WorkspaceCommands::List => {
+            if client.supports(protocol::ProtocolFeature::GlobalWorkspaces)? {
+                let combined = client.combined_node_snapshot(None)?;
+                if json {
+                    return print_json(
+                        CommandKey::WorkspaceList,
+                        serde_json::json!({
+                            "workspaces": combined.workspaces,
+                            "external_workspaces": combined.external_workspaces,
+                        }),
+                    );
+                }
+                println!("NAME\tWORKSPACE ID\tREVISION\tSTATE\tPLACEMENTS");
+                for workspace in combined.workspaces {
+                    println!(
+                        "{}\t{}\t{}\t{}\t{}",
+                        workspace.name,
+                        workspace.id,
+                        workspace.revision,
+                        if workspace.closing {
+                            "closing"
+                        } else {
+                            "active"
+                        },
+                        workspace.placements.len(),
+                    );
+                }
+                if !combined.external_workspaces.is_empty() {
+                    println!("\nUNLINKED OWNER WORKSPACES");
+                    println!("NAME\tNODE ID\tOWNER WORKSPACE ID\tREVISION\tAVAILABLE");
+                    for workspace in combined.external_workspaces {
+                        println!(
+                            "{}\t{}\t{}\t{}\t{}",
+                            workspace.name,
+                            workspace.identity.node_id,
+                            workspace.identity.inner_id,
+                            workspace.revision,
+                            workspace.available,
+                        );
+                    }
+                }
+                return Ok(());
+            }
             let workspaces = client.snapshot()?.workspaces;
             if json {
                 let workspaces = workspaces
@@ -4886,16 +6178,35 @@ fn workspace_command(
                 );
             }
         }
-        WorkspaceCommands::Create { name, cwd } => {
+        WorkspaceCommands::Create { name } => {
             let name = cli_name(name, "workspace")?;
-            let default_cwd = cwd.as_deref().map(resolve_directory).transpose()?;
-            let workspace =
-                client.create_workspace_with_default_cwd(name, default_cwd, Vec::new())?;
+            if client.supports(protocol::ProtocolFeature::GlobalWorkspaces)? {
+                let workspace = client.create_global_workspace(name)?;
+                println!("Created workspace {} ({})", workspace.name, workspace.id);
+                return Ok(());
+            }
+            let workspace = client.create_workspace_with_default_cwd(name, None, Vec::new())?;
             println!("Created workspace {} ({})", workspace.name, workspace.id);
         }
         WorkspaceCommands::Open { target, node } => {
-            if let Some(node) = node {
-                let registration = client.node_registration(node)?;
+            if let Some(node_selector) = node {
+                let combined = client.combined_node_snapshot(None)?;
+                let selected_node = resolve_workspace_open_node(&combined.nodes, &node_selector)?;
+                if selected_node.local {
+                    let snapshot = client.snapshot()?;
+                    let workspace = resolve_workspace_target(&snapshot.workspaces, &target)?;
+                    let terminal = effective_terminal(terminal_override)?;
+                    open_workspace(workspace, terminal.as_deref())?;
+                    println!(
+                        "Opened {} launcher(s) and {} shell(s) for {} on Node {}",
+                        workspace.launchers.len(),
+                        workspace_user_shell_count(workspace),
+                        workspace.name,
+                        selected_node.alias,
+                    );
+                    return Ok(());
+                }
+                let registration = client.node_registration(&selected_node.node_id)?;
                 let workspace = match client.route_node_operation(
                     &registration.node_id,
                     protocol::RoutedOperation::GetWorkspace {
@@ -4952,6 +6263,24 @@ fn workspace_command(
                 );
                 return Ok(());
             }
+            if client.supports(protocol::ProtocolFeature::GlobalWorkspaces)? {
+                let combined = client.combined_node_snapshot(None)?;
+                if let Some(workspace) =
+                    resolve_global_workspace_target(&combined.workspaces, &target).cloned()
+                {
+                    let (launchers, shells) = open_coordinated_workspace(
+                        &client,
+                        &combined,
+                        &workspace,
+                        terminal_override,
+                    )?;
+                    println!(
+                        "Opened {launchers} launcher(s) and {shells} shell(s) for {}",
+                        workspace.name
+                    );
+                    return Ok(());
+                }
+            }
             let snapshot = client.snapshot()?;
             let workspace = resolve_workspace_target(&snapshot.workspaces, &target)?;
             let terminal = effective_terminal(terminal_override)?;
@@ -4964,6 +6293,50 @@ fn workspace_command(
             );
         }
         WorkspaceCommands::Inspect { target } => {
+            if client.supports(protocol::ProtocolFeature::GlobalWorkspaces)? {
+                let combined = client.combined_node_snapshot(None)?;
+                if let Some(workspace) =
+                    resolve_global_workspace_target(&combined.workspaces, &target)
+                {
+                    if json {
+                        return print_json(
+                            CommandKey::WorkspaceInspect,
+                            serde_json::json!({ "workspace": workspace }),
+                        );
+                    }
+                    println!("ID\t{}", workspace.id);
+                    println!("NAME\t{}", workspace.name);
+                    println!("REVISION\t{}", workspace.revision);
+                    println!(
+                        "STATE\t{}",
+                        if workspace.closing {
+                            "closing"
+                        } else {
+                            "active"
+                        }
+                    );
+                    println!("PLACEMENTS\t{}", workspace.placements.len());
+                    if !workspace.placements.is_empty() {
+                        println!(
+                            "\nNODE ID\tOWNER WORKSPACE ID\tOWNER REVISION\tSTATE\tDEFAULT CWD"
+                        );
+                        for placement in &workspace.placements {
+                            println!(
+                                "{}\t{}\t{}\t{:?}\t{}",
+                                placement.node_id,
+                                placement.workspace_id,
+                                placement.owner_revision,
+                                placement.state,
+                                placement
+                                    .default_cwd
+                                    .as_deref()
+                                    .map_or_else(|| "-".into(), |path| path.display().to_string()),
+                            );
+                        }
+                    }
+                    return Ok(());
+                }
+            }
             let snapshot = client.snapshot()?;
             let workspace = resolve_workspace_target(&snapshot.workspaces, &target)?;
             let agent_summary = agent_attention_projection::summarize_workspace(workspace);
@@ -5068,12 +6441,155 @@ fn workspace_command(
         }
         WorkspaceCommands::Rename { target, name } => {
             let name = cli_name(name, "workspace")?;
+            if client.supports(protocol::ProtocolFeature::GlobalWorkspaces)? {
+                let combined = client.combined_node_snapshot(None)?;
+                if let Some(workspace) =
+                    resolve_global_workspace_target(&combined.workspaces, &target)
+                {
+                    let renamed =
+                        client.rename_global_workspace(&workspace.id, workspace.revision, &name)?;
+                    println!("Renamed workspace {} to {}", workspace.name, renamed.name);
+                    return Ok(());
+                }
+            }
             let snapshot = client.snapshot()?;
             let workspace = resolve_workspace_target(&snapshot.workspaces, &target)?;
             client.rename_workspace(&workspace.id, &name)?;
             println!("Renamed workspace {} to {name}", workspace.name);
         }
+        WorkspaceCommands::Adopt { target, node } => {
+            require_protocol_feature(&client, protocol::ProtocolFeature::GlobalWorkspaces)?;
+            let combined = client.combined_node_snapshot(None)?;
+            let node = resolve_combined_node(&combined.nodes, &node)?;
+            if !node.workspace_owner_eligible {
+                return Err(cli_output::failure(
+                    "busy",
+                    node.workspace_owner_unavailable_reason
+                        .clone()
+                        .unwrap_or_else(|| "owner Node is not eligible for placement".into()),
+                ));
+            }
+            let external =
+                resolve_external_workspace(&combined.external_workspaces, &node.node_id, &target)?;
+            if !external.available {
+                return Err(cli_output::failure(
+                    "busy",
+                    "unavailable owner Workspace cannot be adopted",
+                ));
+            }
+            let local_node_id = combined
+                .nodes
+                .iter()
+                .find(|candidate| candidate.local)
+                .map(|candidate| candidate.node_id.as_str())
+                .unwrap_or_default();
+            let owner = routed_dashboard_workspace(&client, &external.identity, local_node_id)
+                .map_err(io::Error::other)?;
+            let workspace =
+                client.adopt_node_workspace(external.identity.clone(), owner.revision)?;
+            println!("Adopted workspace {} ({})", workspace.name, workspace.id);
+        }
+        WorkspaceCommands::Link {
+            target,
+            owner,
+            node,
+        } => {
+            require_protocol_feature(&client, protocol::ProtocolFeature::GlobalWorkspaces)?;
+            let combined = client.combined_node_snapshot(None)?;
+            let workspace = resolve_global_workspace_target(&combined.workspaces, &target)
+                .ok_or_else(|| {
+                    cli_output::failure("not_found", format!("workspace not found: {target}"))
+                })?;
+            let node = resolve_combined_node(&combined.nodes, &node)?;
+            if !node.workspace_owner_eligible {
+                return Err(cli_output::failure(
+                    "busy",
+                    node.workspace_owner_unavailable_reason
+                        .clone()
+                        .unwrap_or_else(|| "owner Node is not eligible for placement".into()),
+                ));
+            }
+            let external =
+                resolve_external_workspace(&combined.external_workspaces, &node.node_id, &owner)?;
+            if !external.available {
+                return Err(cli_output::failure(
+                    "busy",
+                    "unavailable owner Workspace cannot be linked",
+                ));
+            }
+            let local_node_id = combined
+                .nodes
+                .iter()
+                .find(|candidate| candidate.local)
+                .map(|candidate| candidate.node_id.as_str())
+                .unwrap_or_default();
+            let owner = routed_dashboard_workspace(&client, &external.identity, local_node_id)
+                .map_err(io::Error::other)?;
+            let workspace = client.link_node_workspace(
+                &workspace.id,
+                workspace.revision,
+                external.identity.clone(),
+                owner.revision,
+            )?;
+            println!("Linked owner Workspace to {}", workspace.name);
+        }
         WorkspaceCommands::Close { target } => {
+            if client.supports(protocol::ProtocolFeature::GlobalWorkspaces)? {
+                let combined = client.combined_node_snapshot(None)?;
+                if let Some(workspace) =
+                    resolve_global_workspace_target(&combined.workspaces, &target)
+                {
+                    if let Ok(shell_id) = env::var("BOOMUX_SHELL_ID") {
+                        let local_node_id = combined
+                            .nodes
+                            .iter()
+                            .find(|node| node.local)
+                            .map(|node| node.node_id.as_str());
+                        let current_owner = workspace
+                            .placements
+                            .iter()
+                            .find(|placement| Some(placement.node_id.as_str()) == local_node_id);
+                        if let Some(current_owner) = current_owner {
+                            match client.get_workspace(&current_owner.workspace_id) {
+                                Ok(owner)
+                                    if owner.shells.iter().any(|shell| shell.id == shell_id) =>
+                                {
+                                    return Err(
+                                        "cannot close the current workspace from inside it; use the dashboard or another shell"
+                                            .into(),
+                                    );
+                                }
+                                Ok(_) => {}
+                                Err(client::ClientError::Remote(error))
+                                    if error.code == Some(protocol::ErrorCode::NotFound) => {}
+                                Err(error) => return Err(error.into()),
+                            }
+                        }
+                    }
+                    let result = if workspace.closing {
+                        client.retry_global_workspace_close(&workspace.id)?
+                    } else {
+                        client.close_global_workspace(&workspace.id, workspace.revision)?
+                    };
+                    let unresolved = result
+                        .placements
+                        .iter()
+                        .filter(|placement| placement.status != "closed")
+                        .count();
+                    if unresolved > 0 {
+                        return Err(io::Error::other(format!(
+                            "Workspace {} close remains unresolved on {unresolved} Node(s); retry with the same Workspace ID",
+                            workspace.name
+                        ))
+                        .into());
+                    }
+                    println!(
+                        "Closed workspace {} across all confirmed placements",
+                        workspace.name
+                    );
+                    return Ok(());
+                }
+            }
             let snapshot = client.snapshot()?;
             let workspace = resolve_workspace_target(&snapshot.workspaces, &target)?;
             if env::var("BOOMUX_SHELL_ID")
@@ -5090,6 +6606,27 @@ fn workspace_command(
                 "Closed workspace {}; its schedules and persisted prompts were removed",
                 workspace.name
             );
+        }
+        WorkspaceCommands::Retry { target } => {
+            require_protocol_feature(&client, protocol::ProtocolFeature::GlobalWorkspaces)?;
+            let combined = client.combined_node_snapshot(None)?;
+            let workspace = resolve_global_workspace_target(&combined.workspaces, &target)
+                .ok_or_else(|| {
+                    cli_output::failure("not_found", format!("workspace not found: {target}"))
+                })?;
+            if !workspace.closing {
+                return Err(cli_output::failure(
+                    "invalid_argument",
+                    "Workspace is not awaiting close retry",
+                ));
+            }
+            let result = client.retry_global_workspace_close(&workspace.id)?;
+            let unresolved = result
+                .placements
+                .iter()
+                .filter(|placement| placement.status == "unresolved")
+                .count();
+            println!("Retried Workspace close; {unresolved} placement(s) unresolved");
         }
     }
     Ok(())
@@ -5134,12 +6671,27 @@ fn shell_command(command: ShellCommands, json: bool) -> Result<(), Box<dyn Error
             let name =
                 generated_shell_name(workspace.shells.iter().map(|shell| shell.name.as_str()))?;
             if json {
+                let node_id = if client.supports(protocol::ProtocolFeature::GlobalWorkspaces)? {
+                    Some(
+                        client
+                            .combined_node_snapshot(None)?
+                            .nodes
+                            .into_iter()
+                            .find(|node| node.local)
+                            .map(|node| node.node_id)
+                            .ok_or_else(|| {
+                                cli_output::failure(
+                                    "internal",
+                                    "local Node identity is unavailable",
+                                )
+                            })?,
+                    )
+                } else {
+                    None
+                };
                 return print_json(
                     CommandKey::ShellSuggestName,
-                    serde_json::json!({
-                        "workspace_id": workspace.id,
-                        "name": name,
-                    }),
+                    shell_suggestion_json(&workspace.id, &name, node_id.as_deref()),
                 );
             }
             println!(
@@ -5152,10 +6704,44 @@ fn shell_command(command: ShellCommands, json: bool) -> Result<(), Box<dyn Error
         }
         ShellCommands::Create {
             workspace,
+            node,
             name,
             cwd,
             command,
         } => {
+            let global_workspaces_supported =
+                client.supports(protocol::ProtocolFeature::GlobalWorkspaces)?;
+            let selection = select_coordinated_owner(&client, &workspace, node.as_deref())?;
+            if let Some(selection) = require_explicit_coordinated_owner(
+                selection,
+                node.as_deref(),
+                global_workspaces_supported,
+            )? {
+                let requested_cwd = cwd
+                    .or_else(|| selection.default_cwd.clone())
+                    .unwrap_or_else(|| PathBuf::from("."));
+                let cwd = resolve_owner_directory(&client, &selection.node, requested_cwd)?;
+                let name = match name {
+                    Some(name) => cli_name(name, "shell")?,
+                    None => generated_shell_name(std::iter::empty())?,
+                };
+                let owner_default_cwd = selection.default_cwd.clone().or_else(|| Some(cwd.clone()));
+                let (_, shell) = client.create_global_workspace_shell(
+                    Uuid::new_v4().to_string(),
+                    &selection.workspace.id,
+                    selection.workspace.revision,
+                    &selection.node.node_id,
+                    selection.owner_workspace_id,
+                    owner_default_cwd,
+                    Uuid::new_v4().to_string(),
+                    shell_spec(name, &cwd, &command),
+                )?;
+                println!(
+                    "Created pending shell {} ({}) in {} on Node {}",
+                    shell.name, shell.id, selection.workspace.name, selection.node.alias
+                );
+                return Ok(());
+            }
             let snapshot = client.snapshot()?;
             let workspace = resolve_workspace_target(&snapshot.workspaces, &workspace)?;
             let cwd = resolve_shell_cwd(
@@ -5268,10 +6854,37 @@ fn launcher_command(command: LauncherCommands, json: bool) -> Result<(), Box<dyn
         LauncherCommands::Create {
             name,
             workspace,
+            node,
             cwd,
             command,
         } => {
             let name = cli_name(name, "workspace launcher")?;
+            let global_workspaces_supported =
+                client.supports(protocol::ProtocolFeature::GlobalWorkspaces)?;
+            let selection = select_coordinated_owner(&client, &workspace, node.as_deref())?;
+            if let Some(selection) = require_explicit_coordinated_owner(
+                selection,
+                node.as_deref(),
+                global_workspaces_supported,
+            )? {
+                let cwd = resolve_owner_directory(&client, &selection.node, cwd)?;
+                let owner_default_cwd = selection.default_cwd.clone().or_else(|| Some(cwd.clone()));
+                let (_, launcher) = client.create_global_workspace_launcher(
+                    Uuid::new_v4().to_string(),
+                    &selection.workspace.id,
+                    selection.workspace.revision,
+                    &selection.node.node_id,
+                    selection.owner_workspace_id,
+                    owner_default_cwd,
+                    Uuid::new_v4().to_string(),
+                    WorkspaceLauncherSpec { name, cwd, command },
+                )?;
+                println!(
+                    "Created launcher {} ({}) in {} on Node {}",
+                    launcher.name, launcher.id, selection.workspace.name, selection.node.alias
+                );
+                return Ok(());
+            }
             let snapshot = client.snapshot()?;
             let workspace = resolve_workspace_target(&snapshot.workspaces, &workspace)?;
             let launcher = client.create_launcher(
@@ -5845,6 +7458,15 @@ fn remote_session_command(
 
 fn schedule_command(command: ScheduleCommands, json: bool) -> Result<(), Box<dyn Error>> {
     let client = client::connect_or_start()?;
+    if let ScheduleCommands::Create(arguments) = &command
+        && let Some(selection) =
+            select_coordinated_owner(&client, &arguments.workspace, arguments.node.as_deref())?
+    {
+        let ScheduleCommands::Create(arguments) = command else {
+            unreachable!()
+        };
+        return create_coordinated_schedule(&client, *arguments, selection, json);
+    }
     if let Some(node) = command.node().map(str::to_owned) {
         return remote_schedule_command(&client, command, &node, json);
     }
@@ -7068,6 +8690,161 @@ fn validate_schedule_protocol(negotiated: u32) -> Result<(), Box<dyn Error>> {
                 ),
             )
         })
+}
+
+fn create_coordinated_schedule(
+    client: &client::Client,
+    arguments: ScheduleCreateArgs,
+    selection: CoordinatedOwnerSelection,
+    json: bool,
+) -> Result<(), Box<dyn Error>> {
+    let name = cli_name(arguments.name, "schedule")?;
+    let cwd = resolve_owner_directory(client, &selection.node, arguments.cwd)?;
+    let prompt = schedule_prompt(arguments.prompt, arguments.prompt_file.as_deref())?;
+    let cron = schedule_cron(
+        arguments.cron.as_deref(),
+        arguments.every.as_deref(),
+        arguments.daily.as_deref(),
+        arguments.weekdays.as_deref(),
+        arguments.weekly.as_deref(),
+    )?;
+    let timezone = arguments
+        .timezone
+        .as_deref()
+        .map(boomux::scheduling::canonicalize_timezone)
+        .transpose()?
+        .map_or_else(boomux::scheduling::resolve_system_timezone, Ok)?;
+    let integration = schedule_integration(&arguments.integration)?;
+    let session = if let Some(session_id) = arguments.continue_session.as_deref() {
+        if selection.workspace.placements.iter().all(|placement| {
+            placement.node_id != selection.node.node_id
+                || placement.workspace_id != selection.owner_workspace_id
+        }) {
+            return Err(cli_output::failure(
+                "invalid_argument",
+                "a continuation Schedule requires an existing placement on the selected Node",
+            ));
+        }
+        let external_session_id = if selection.node.local {
+            let owner = client.get_workspace(&selection.owner_workspace_id)?;
+            let catalog = discover_host_catalog(std::slice::from_ref(&owner));
+            let sessions = session_projection::project_workspaces_with_catalog(
+                std::slice::from_ref(&owner),
+                Some(&catalog),
+            );
+            let session =
+                session_projection::resolve_exact(&sessions, session_id).map_err(|_| {
+                    cli_output::failure(
+                        "not_found",
+                        format!("projected session not found on selected Node: {session_id}"),
+                    )
+                })?;
+            if session.integration != integration.key {
+                return Err(cli_output::failure(
+                    "invalid_argument",
+                    "continued session integration does not match --integration",
+                ));
+            }
+            session.external_session_id.clone().ok_or_else(|| {
+                cli_output::failure(
+                    "invalid_argument",
+                    "continued projected session has no canonical external session ID",
+                )
+            })?
+        } else {
+            let result = client.route_node_host_service(
+                &selection.node.node_id,
+                protocol::HostServiceOperation::InspectAgentSession {
+                    session_id: session_id.to_owned(),
+                },
+            )?;
+            let protocol::HostServiceResult::AgentSession { session } = result else {
+                return Err("owner Node returned an unexpected Agent Session response".into());
+            };
+            if session.summary.workspace_id != selection.owner_workspace_id
+                || session.summary.integration != integration.key
+            {
+                return Err(cli_output::failure(
+                    "invalid_argument",
+                    "continued session must belong to the selected placement and integration",
+                ));
+            }
+            session.summary.external_session_id.ok_or_else(|| {
+                cli_output::failure(
+                    "invalid_argument",
+                    "continued projected session has no canonical external session ID",
+                )
+            })?
+        };
+        boomux::scheduling::validate_external_session_id(&external_session_id)?;
+        if !integration
+            .schedule_dispatch
+            .is_some_and(|dispatch| dispatch.continuation)
+        {
+            return Err(cli_output::failure(
+                "unsupported_integration",
+                "integration does not support continuation schedule dispatch",
+            ));
+        }
+        AgentScheduleSession::Continue {
+            external_session_id,
+        }
+    } else {
+        if !integration
+            .schedule_dispatch
+            .is_some_and(|dispatch| dispatch.fresh)
+        {
+            return Err(cli_output::failure(
+                "unsupported_integration",
+                "integration does not support fresh schedule dispatch",
+            ));
+        }
+        AgentScheduleSession::Fresh
+    };
+    let spec = AgentScheduleSpec {
+        name,
+        cwd: cwd.clone(),
+        integration: integration.key.to_owned(),
+        prompt,
+        session,
+        trigger: AgentScheduleTrigger { cron, timezone },
+        state: if arguments.enabled {
+            AgentScheduleState::Enabled
+        } else {
+            AgentScheduleState::Paused
+        },
+        overlap_policy: AgentScheduleOverlapPolicy::Skip,
+    };
+    let owner_default_cwd = selection.default_cwd.clone().or(Some(cwd));
+    let (_, schedule) = client.create_global_workspace_agent_schedule(
+        Uuid::new_v4().to_string(),
+        &selection.workspace.id,
+        selection.workspace.revision,
+        &selection.node.node_id,
+        selection.owner_workspace_id,
+        owner_default_cwd,
+        Uuid::new_v4().to_string(),
+        spec,
+    )?;
+    if json {
+        return print_json(
+            CommandKey::ScheduleCreate,
+            serde_json::json!({
+                "node_id": selection.node.node_id,
+                "workspace_id": selection.workspace.id,
+                "schedule": cli_output::schedule(&schedule, Some(&selection.workspace.name)),
+            }),
+        );
+    }
+    println!(
+        "Created {} schedule {} ({}) in {} on Node {}",
+        cli_output::schedule_state(schedule.state),
+        sanitize_table_cell(&schedule.name),
+        sanitize_table_cell(&schedule.id),
+        selection.workspace.name,
+        selection.node.alias,
+    );
+    Ok(())
 }
 
 fn create_schedule(
@@ -8800,6 +10577,18 @@ mod tests {
     use crate::integration_management::{opencode_config_root, pi_config_root};
     use std::os::unix::net::UnixListener;
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn daemon_executable_normalization_is_exact_and_bounded() {
+        assert_eq!(
+            normalize_daemon_executable(b"/custom/path with spaces/boomux (deleted)"),
+            Some("/custom/path with spaces/boomux".into())
+        );
+        assert_eq!(normalize_daemon_executable(b"relative/boomux"), None);
+        assert_eq!(normalize_daemon_executable(b"/bad\npath"), None);
+        assert_eq!(normalize_daemon_executable(&vec![b'x'; 4097]), None);
+    }
+
     fn shell(id: &str, workspace_id: &str, name: &str) -> ShellSnapshot {
         ShellSnapshot {
             owner: boomux::protocol::ShellOwner::User,
@@ -8834,6 +10623,181 @@ mod tests {
             agents: Vec::new(),
             schedules: Vec::new(),
         }
+    }
+
+    fn combined_node(id: &str, alias: &str, eligible: bool) -> protocol::CombinedNode {
+        protocol::CombinedNode {
+            node_id: id.into(),
+            alias: alias.into(),
+            local: alias == "local",
+            route: None,
+            registration_revision: None,
+            health: protocol::NodeProjectionHealthCode::Online,
+            current: true,
+            stale: false,
+            observed_at_ms: 1,
+            observed_protocol_version: Some(protocol::PROTOCOL_VERSION),
+            observed_capabilities: vec!["global_workspaces".into()],
+            workspace_owner_eligible: eligible,
+            workspace_owner_unavailable_reason: (!eligible).then(|| "unavailable".into()),
+            scheduler: protocol::SchedulerHealth {
+                state: protocol::SchedulerState::Active,
+                active_executions: 0,
+                max_concurrent: 4,
+            },
+            local_snapshot: None,
+            remote_projection: None,
+        }
+    }
+
+    #[test]
+    fn global_workspace_grouping_uses_exact_placements_and_keeps_equal_name_external() {
+        let first = workspace("owner-1", "same", vec![shell("shell-1", "owner-1", "one")]);
+        let second = workspace(
+            "owner-2",
+            "different",
+            vec![shell("shell-2", "owner-2", "two")],
+        );
+        let external = workspace("owner-3", "same", Vec::new());
+        let mut cache = git::Cache::default();
+        let mut views = dashboard_projection::project(&[first, second, external], &mut cache);
+        let mut local = views[0].node.clone();
+        local.id = Uuid::from_u128(1).to_string();
+        let mut remote = local.clone();
+        remote.id = Uuid::from_u128(2).to_string();
+        remote.alias = "work".into();
+        remote.local = false;
+        let mut other = remote.clone();
+        other.id = Uuid::from_u128(3).to_string();
+        other.alias = "other".into();
+        views[0].node = local.clone();
+        views[1].node = remote.clone();
+        views[2].node = other.clone();
+        for (view, node) in views.iter_mut().zip([&local, &remote, &other]) {
+            view.item_owners = vec![
+                tui::WorkspaceItemOwnerView {
+                    node: node.clone(),
+                    workspace_id: view.id.clone(),
+                };
+                view.items.len()
+            ];
+        }
+        let global_id = Uuid::from_u128(10).to_string();
+        let grouped = group_dashboard_workspaces(
+            views,
+            &[local.clone(), remote.clone(), other.clone()],
+            vec![protocol::GlobalWorkspaceSnapshot {
+                id: global_id.clone(),
+                revision: 2,
+                name: "same".into(),
+                closing: false,
+                placements: vec![
+                    protocol::WorkspacePlacementSnapshot {
+                        node_id: local.id.clone(),
+                        workspace_id: "owner-1".into(),
+                        owner_workspace_name: Some("local-owner".into()),
+                        owner_revision: 1,
+                        default_cwd: None,
+                        state: protocol::WorkspacePlacementState::Active,
+                    },
+                    protocol::WorkspacePlacementSnapshot {
+                        node_id: remote.id.clone(),
+                        workspace_id: "owner-2".into(),
+                        owner_workspace_name: Some("remote-owner".into()),
+                        owner_revision: 1,
+                        default_cwd: None,
+                        state: protocol::WorkspacePlacementState::Active,
+                    },
+                    protocol::WorkspacePlacementSnapshot {
+                        node_id: Uuid::from_u128(99).to_string(),
+                        workspace_id: "missing-owner".into(),
+                        owner_workspace_name: Some("missing".into()),
+                        owner_revision: 1,
+                        default_cwd: None,
+                        state: protocol::WorkspacePlacementState::Unavailable,
+                    },
+                ],
+            }],
+            vec![protocol::ExternalWorkspaceSnapshot {
+                identity: protocol::QualifiedIdentity::new(&other.id, "owner-3"),
+                revision: 1,
+                name: "same".into(),
+                default_cwd: None,
+                available: true,
+            }],
+        );
+        assert_eq!(grouped.len(), 2);
+        let global = grouped
+            .iter()
+            .find(|workspace| workspace.id == global_id)
+            .unwrap();
+        assert_eq!(global.items.len(), 2);
+        let tui::WorkspaceCoordinationView::Global { placements, .. } = &global.coordination else {
+            panic!("expected global Workspace");
+        };
+        assert_eq!(placements.len(), 3);
+        assert!(placements.iter().any(|placement| {
+            placement.workspace_id == "missing-owner"
+                && placement.node.alias.starts_with("unregistered:")
+                && !placement.node.current
+        }));
+        assert_eq!(global.item_owners[0].node.id, local.id);
+        assert_eq!(global.item_owners[1].node.id, remote.id);
+        let singleton = grouped
+            .iter()
+            .find(|workspace| workspace.id == "owner-3")
+            .unwrap();
+        assert!(matches!(
+            singleton.coordination,
+            tui::WorkspaceCoordinationView::External { .. }
+        ));
+    }
+
+    #[test]
+    fn dashboard_workspaces_sort_by_task_name_before_node_alias() {
+        let mut cache = git::Cache::default();
+        let mut views = dashboard_projection::project(
+            &[
+                workspace("owner-z", "alpha", Vec::new()),
+                workspace("owner-a", "zulu", Vec::new()),
+            ],
+            &mut cache,
+        );
+        views[0].node.alias = "z-node".into();
+        views[1].node.alias = "a-node".into();
+        sort_dashboard_workspaces(&mut views);
+        assert_eq!(
+            views
+                .iter()
+                .map(|workspace| workspace.name.as_str())
+                .collect::<Vec<_>>(),
+            ["alpha", "zulu"]
+        );
+    }
+
+    #[test]
+    fn local_schedule_item_owner_is_rewritten_before_action_qualification() {
+        let snapshot = workspace(
+            "owner-local",
+            "local",
+            vec![shell("shell-local", "owner-local", "placeholder")],
+        );
+        let mut cache = git::Cache::default();
+        let mut views = dashboard_projection::project(&[snapshot], &mut cache);
+        views[0].items[0] = tui::WorkspaceItemView::Schedule(tui::ScheduleItemView {
+            id: "schedule-local".into(),
+            name: "schedule".into(),
+            integration: "opencode".into(),
+            state: tui::ScheduleDisplayState::Paused,
+            friendly_trigger: "daily".into(),
+        });
+        let mut local = views[0].node.clone();
+        local.id = Uuid::from_u128(88).to_string();
+        assign_local_workspace_node(&mut views, &local);
+        let owner = &views[0].item_owners[0];
+        let action_id = protocol::QualifiedIdentity::new(&owner.node.id, "schedule-local");
+        assert_eq!(action_id.node_id, local.id);
+        assert_eq!(action_id.inner_id, "schedule-local");
     }
 
     fn schedule(id: &str, workspace_id: &str, name: &str) -> AgentScheduleSnapshot {
@@ -9433,6 +11397,19 @@ mod tests {
     }
 
     #[test]
+    fn dashboard_requires_terminal_input_and_output() {
+        validate_dashboard_terminal(true, true).unwrap();
+        assert_eq!(
+            validate_dashboard_terminal(false, true).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            validate_dashboard_terminal(true, false).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
     fn parses_node_rekey_and_requires_exact_confirmation() {
         let cli = Cli::try_parse_from(["boomux", "node", "rekey"]).unwrap();
         assert!(matches!(
@@ -9481,6 +11458,280 @@ mod tests {
         );
         assert!(resolve_node_add_inputs(Some("work".into()), None, false).is_err());
         assert!(resolve_node_add_inputs(None, None, true).is_err());
+
+        let held = Cli::try_parse_from(["boomux", "__guided-node-add"]).unwrap();
+        assert!(matches!(held.command, Some(Commands::GuidedNodeAdd)));
+        assert_eq!(held.command_descriptor().key, "node.add");
+    }
+
+    #[test]
+    fn guided_node_add_preserves_failure_status_and_distinguishes_newline_from_eof() {
+        let directory = env::temp_dir().join(format!("boomux-guided-{}", Uuid::new_v4()));
+        fs::create_dir(&directory).unwrap();
+        let child = directory.join("child");
+        let child_output = directory.join("child-output");
+        fs::write(
+            &child,
+            format!(
+                "#!/bin/sh\nprintf 'child failed\\n'\nprintf 'child failed\\n' > '{}'\nexit 7\n",
+                child_output.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&child, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let mut newline = io::Cursor::new(b"\n");
+        let mut output = Vec::new();
+        assert_eq!(
+            guided_node_add_with(&child, &mut newline, &mut output, true, None).unwrap(),
+            process_adapter::ProcessExit::Code(7)
+        );
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(fs::read_to_string(&child_output).unwrap(), "child failed\n");
+        assert!(output.contains("Node setup failed (exit 7)."));
+        assert!(output.contains("Press Enter to close."));
+        assert!(!output.contains("Input closed before a newline"));
+
+        let mut eof = io::Cursor::new(b"partial");
+        let mut output = Vec::new();
+        assert_eq!(
+            guided_node_add_with(&child, &mut eof, &mut output, true, None).unwrap(),
+            process_adapter::ProcessExit::Code(7)
+        );
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .contains("Input closed before a newline")
+        );
+
+        let mut eof = io::Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+        assert_eq!(
+            guided_node_add_with(
+                &directory.join("missing"),
+                &mut eof,
+                &mut output,
+                true,
+                None,
+            )
+            .unwrap(),
+            process_adapter::ProcessExit::Code(1)
+        );
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("failed to start"));
+        assert!(output.contains("Press Enter to close."));
+        assert!(output.contains("Input closed before a newline"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn guided_pty_helper_process() {
+        let Some(executable) = env::var_os("BOOMUX_TEST_GUIDED_EXECUTABLE") else {
+            return;
+        };
+        let stdin = io::stdin();
+        let mut input = stdin.lock();
+        let mut output = io::stdout().lock();
+        let outcome = guided_node_add_with(
+            Path::new(&executable),
+            &mut input,
+            &mut output,
+            true,
+            Some(stdin.as_raw_fd()),
+        )
+        .unwrap();
+        std::process::exit(match outcome {
+            process_adapter::ProcessExit::Code(code) => code,
+            process_adapter::ProcessExit::Signal(signal) => 128 + signal,
+        });
+    }
+
+    #[test]
+    fn guided_node_add_pty_interrupts_child_and_holds_for_newline() {
+        use std::os::fd::{FromRawFd, OwnedFd};
+
+        let directory = env::temp_dir().join(format!("boomux-guided-pty-{}", Uuid::new_v4()));
+        fs::create_dir(&directory).unwrap();
+        let child = directory.join("child");
+        fs::write(
+            &child,
+            "#!/bin/sh\nkill -STOP $$\nprintf 'child-ready\\n'\nread line\nexit 7\n",
+        )
+        .unwrap();
+        fs::set_permissions(&child, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let mut master = 0;
+        let mut slave = 0;
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            },
+            0
+        );
+        let master = unsafe { OwnedFd::from_raw_fd(master) };
+        let slave = unsafe { OwnedFd::from_raw_fd(slave) };
+        let stdin = Stdio::from(slave.try_clone().unwrap());
+        let stdout = Stdio::from(slave.try_clone().unwrap());
+        let stderr = Stdio::from(slave);
+        let mut command = Command::new(env::current_exe().unwrap());
+        command
+            .args(["--exact", "tests::guided_pty_helper_process", "--nocapture"])
+            .env("BOOMUX_TEST_GUIDED_EXECUTABLE", &child)
+            .stdin(stdin)
+            .stdout(stdout)
+            .stderr(stderr);
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY, 0) == -1 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+        let mut wrapper = command.spawn().unwrap();
+        let mut master = std::fs::File::from(master);
+        let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
+        assert_ne!(flags, -1);
+        assert_ne!(
+            unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK,) },
+            -1
+        );
+        let mut output = Vec::new();
+        read_pty_until(
+            &mut master,
+            &mut output,
+            b"child-ready",
+            Duration::from_secs(3),
+        );
+        io::Write::write_all(&mut master, &[3]).unwrap();
+        read_pty_until(
+            &mut master,
+            &mut output,
+            b"Press Enter to close.",
+            Duration::from_secs(3),
+        );
+        assert!(wrapper.try_wait().unwrap().is_none());
+        io::Write::write_all(&mut master, b"\n").unwrap();
+        let status = wrapper.wait().unwrap();
+        assert_eq!(status.code(), Some(130));
+        let output = String::from_utf8_lossy(&output);
+        assert!(output.contains("Node setup failed (signal 2)."));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn guided_node_add_pty_restores_foreground_and_kills_group_after_sigcont_failure() {
+        use std::os::fd::{FromRawFd, OwnedFd};
+
+        let directory = env::temp_dir().join(format!("boomux-guided-cont-{}", Uuid::new_v4()));
+        fs::create_dir(&directory).unwrap();
+        let child = directory.join("child");
+        let resumed = directory.join("resumed");
+        fs::write(
+            &child,
+            format!(
+                "#!/bin/sh\nkill -STOP $$\nprintf resumed > '{}'\nsleep 30\n",
+                resumed.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&child, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let mut master = 0;
+        let mut slave = 0;
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            },
+            0
+        );
+        let master = unsafe { OwnedFd::from_raw_fd(master) };
+        let slave = unsafe { OwnedFd::from_raw_fd(slave) };
+        let mut command = Command::new(env::current_exe().unwrap());
+        command
+            .args(["--exact", "tests::guided_pty_helper_process", "--nocapture"])
+            .env("BOOMUX_TEST_GUIDED_EXECUTABLE", &child)
+            .env("BOOMUX_TEST_GUIDED_SIGCONT_FAILURE", "1")
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave));
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY, 0) == -1 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+        let mut wrapper = command.spawn().unwrap();
+        let mut master = std::fs::File::from(master);
+        let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
+        assert_ne!(flags, -1);
+        assert_ne!(
+            unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            -1
+        );
+        let mut output = Vec::new();
+        read_pty_until(
+            &mut master,
+            &mut output,
+            b"Node setup failed to continue",
+            Duration::from_secs(3),
+        );
+        read_pty_until(
+            &mut master,
+            &mut output,
+            b"Press Enter to close.",
+            Duration::from_secs(3),
+        );
+        assert!(wrapper.try_wait().unwrap().is_none());
+        assert!(!resumed.exists());
+        io::Write::write_all(&mut master, b"\n").unwrap();
+        assert_eq!(wrapper.wait().unwrap().code(), Some(1));
+        assert!(!resumed.exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn read_pty_until(
+        master: &mut fs::File,
+        output: &mut Vec<u8>,
+        expected: &[u8],
+        timeout: Duration,
+    ) {
+        let deadline = Instant::now() + timeout;
+        let mut bytes = [0_u8; 1024];
+        while !output
+            .windows(expected.len())
+            .any(|window| window == expected)
+        {
+            match master.read(&mut bytes) {
+                Ok(0) => panic!("PTY closed before {:?}", String::from_utf8_lossy(expected)),
+                Ok(count) => output.extend_from_slice(&bytes[..count]),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "PTY output: {}",
+                        String::from_utf8_lossy(output)
+                    );
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("PTY read failed: {error}"),
+            }
+        }
     }
 
     #[test]
@@ -9529,6 +11780,100 @@ mod tests {
                 .command,
             Some(Commands::Close { target }) if target == "tests"
         ));
+    }
+
+    #[test]
+    fn parses_public_workspace_adopt_link_and_retry_commands() {
+        assert!(matches!(
+            Cli::try_parse_from(["boomux", "workspace", "adopt", "owner", "--node", "work"])
+                .unwrap()
+                .command,
+            Some(Commands::Workspace {
+                command: WorkspaceCommands::Adopt { target, node }
+            }) if target == "owner" && node == "work"
+        ));
+        assert!(matches!(
+            Cli::try_parse_from([
+                "boomux", "workspace", "link", "global", "owner", "--node", "work"
+            ])
+            .unwrap()
+            .command,
+            Some(Commands::Workspace {
+                command: WorkspaceCommands::Link { target, owner, node }
+            }) if target == "global" && owner == "owner" && node == "work"
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["boomux", "workspace", "retry", "global"])
+                .unwrap()
+                .command,
+            Some(Commands::Workspace {
+                command: WorkspaceCommands::Retry { target }
+            }) if target == "global"
+        ));
+    }
+
+    #[test]
+    fn workspace_resource_owner_selection_delegates_sole_and_requires_ambiguous_choice() {
+        let local = combined_node("local-id", "local", true);
+        let remote = combined_node("remote-id", "work", true);
+        assert_eq!(
+            select_eligible_workspace_owner(std::slice::from_ref(&local), None)
+                .unwrap()
+                .node_id,
+            "local-id"
+        );
+        assert!(select_eligible_workspace_owner(&[local.clone(), remote.clone()], None).is_err());
+        assert_eq!(
+            select_eligible_workspace_owner(&[local, remote], Some("remote-id"))
+                .unwrap()
+                .node_id,
+            "remote-id"
+        );
+    }
+
+    #[test]
+    fn explicit_node_placement_never_falls_back_to_local_creation() {
+        assert_eq!(
+            require_explicit_coordinated_owner(Some(7), Some("work"), true).unwrap(),
+            Some(7)
+        );
+        let external = require_explicit_coordinated_owner::<()>(None, Some("work"), true)
+            .unwrap_err()
+            .to_string();
+        assert!(external.contains("coordinated Workspace"));
+        let legacy = require_explicit_coordinated_owner::<()>(None, Some("work"), false)
+            .unwrap_err()
+            .to_string();
+        assert!(legacy.contains("protocol 38"));
+        assert!(
+            require_explicit_coordinated_owner::<()>(None, None, false)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn workspace_open_node_resolution_requires_exact_local_identity() {
+        let local = combined_node("local-id", "local", true);
+        let remote = combined_node("remote-id", "work", true);
+        let nodes = [local, remote];
+        assert!(resolve_workspace_open_node(&nodes, "local").is_err());
+        let selected = resolve_workspace_open_node(&nodes, "local-id").unwrap();
+        assert!(selected.local);
+        assert_eq!(selected.node_id, "local-id");
+        assert_eq!(
+            resolve_workspace_open_node(&nodes, "work").unwrap().node_id,
+            "remote-id"
+        );
+    }
+
+    #[test]
+    fn protocol_thirty_eight_shell_suggestion_identifies_its_exact_local_node() {
+        let current = shell_suggestion_json("owner-id", "first", Some("local-node-id"));
+        assert_eq!(current["node_id"], "local-node-id");
+        assert_eq!(current["workspace_id"], "owner-id");
+        let legacy = shell_suggestion_json("owner-id", "first", None);
+        assert!(legacy.get("node_id").is_none());
     }
 
     #[test]
@@ -9618,27 +11963,13 @@ mod tests {
                 .unwrap()
                 .command,
             Some(Commands::Workspace {
-                command: WorkspaceCommands::Create { name, cwd: None }
+                command: WorkspaceCommands::Create { name }
             }) if name == "project"
         ));
-        assert!(matches!(
-            Cli::try_parse_from([
-                "boomux",
-                "workspace",
-                "create",
-                "project",
-                "--cwd",
-                "/tmp"
-            ])
-            .unwrap()
-            .command,
-            Some(Commands::Workspace {
-                command: WorkspaceCommands::Create {
-                    name,
-                    cwd: Some(cwd)
-                }
-            }) if name == "project" && cwd == Path::new("/tmp")
-        ));
+        assert!(
+            Cli::try_parse_from(["boomux", "workspace", "create", "project", "--cwd", "/tmp"])
+                .is_err()
+        );
         let cli = Cli::try_parse_from([
             "boomux",
             "launcher",
@@ -9661,6 +11992,7 @@ mod tests {
                     workspace,
                     cwd,
                     command,
+                    ..
                 }
             }) if name == "editor"
                 && workspace == "project"
@@ -9708,6 +12040,7 @@ mod tests {
                     name: Some(name),
                     cwd,
                     command,
+                    ..
                 }
             }) if workspace == "project"
                 && name == "tests"
@@ -10310,10 +12643,16 @@ mod tests {
                 id: String::new(),
                 alias: "local".into(),
                 local: true,
+                route: None,
+                registration_revision: None,
                 health: protocol::NodeProjectionHealthCode::Online,
                 current: true,
                 stale: false,
+                observed_at_ms: 0,
+                observed_protocol_version: Some(protocol::PROTOCOL_VERSION),
                 observed_capabilities: Vec::new(),
+                workspace_owner_eligible: true,
+                workspace_owner_unavailable_reason: None,
                 scheduler: protocol::SchedulerHealth {
                     state: protocol::SchedulerState::Active,
                     max_concurrent: 4,
@@ -10327,6 +12666,11 @@ mod tests {
             agent_state_counts: agent_attention_projection::AgentStateCounts::default(),
             attention_count: 0,
             attention: Vec::new(),
+            item_owners: Vec::new(),
+            coordination: tui::WorkspaceCoordinationView::External {
+                owner_revision: 1,
+                available: true,
+            },
             sessions: vec![tui::AgentSessionView {
                 id: "session".into(),
                 label: "opencode".into(),
@@ -11687,7 +14031,37 @@ mod tests {
                 .validated_version,
             "0.84.1"
         );
-        assert_eq!(protocol::PROTOCOL_VERSION, 37);
+        assert_eq!(protocol::PROTOCOL_VERSION, 39);
+    }
+
+    #[test]
+    fn protocol_thirty_nine_focus_absence_does_not_restore_legacy_local_focus() {
+        let local = protocol::FocusedTerminalSnapshot {
+            revision: 8,
+            workspace_id: "local-workspace".into(),
+            shell_id: "local-shell".into(),
+            run_id: "local-run".into(),
+        };
+        assert!(
+            dashboard_focused_terminal_view(39, None, Some(local.clone())).is_none(),
+            "qualified focus absence is authoritative for protocol 39"
+        );
+        assert_eq!(
+            dashboard_focused_terminal_view(38, None, Some(local))
+                .unwrap()
+                .shell_id,
+            "local-shell"
+        );
+    }
+
+    #[test]
+    fn focus_frontier_resets_once_per_protocol_handoff_transition() {
+        let mut negotiated = 38;
+
+        assert!(update_negotiated_protocol(&mut negotiated, 39));
+        assert!(!update_negotiated_protocol(&mut negotiated, 39));
+        assert!(update_negotiated_protocol(&mut negotiated, 38));
+        assert!(!update_negotiated_protocol(&mut negotiated, 38));
     }
 
     #[test]
@@ -11916,12 +14290,24 @@ mod tests {
             "boomux close",
             "boomux open",
             "boomux project list",
+            "boomux node add",
+            "boomux node list",
+            "boomux node inspect",
+            "boomux node snapshot",
+            "boomux node rename",
+            "boomux node retarget",
+            "boomux node forget",
+            "boomux node rekey",
             "boomux workspace list",
             "boomux workspace create",
             "boomux workspace open",
             "boomux workspace inspect",
             "boomux workspace rename",
+            "boomux workspace adopt",
+            "boomux workspace link",
             "boomux workspace close",
+            "boomux workspace retry",
+            "boomux shell suggest-name",
             "boomux shell create",
             "boomux shell inspect",
             "boomux shell rename",
@@ -11944,6 +14330,19 @@ mod tests {
             "boomux notification test",
             "boomux session list",
             "boomux session inspect",
+            "boomux session resume",
+            "boomux schedule create",
+            "boomux schedule list",
+            "boomux schedule inspect",
+            "boomux schedule pause",
+            "boomux schedule resume",
+            "boomux schedule remove",
+            "boomux schedule run",
+            "boomux execution list",
+            "boomux execution inspect",
+            "boomux execution wait",
+            "boomux execution open",
+            "boomux execution cancel",
             "boomux integration list",
             "boomux integration status",
             "boomux integration install",
@@ -11969,7 +14368,11 @@ mod tests {
         }
         assert!(BOOMUX_SKILL.contains("BOOMUX_SHELL_ID"));
         assert!(BOOMUX_SKILL.contains("--workspace"));
+        assert!(BOOMUX_SKILL.contains("--node"));
+        assert!(BOOMUX_SKILL.contains("--revision"));
         assert!(BOOMUX_SKILL.contains("--terminal"));
+        assert!(!BOOMUX_SKILL.contains("boomux session read"));
+        assert!(!BOOMUX_SKILL.contains("workspace create \"<name>\" --cwd"));
     }
 
     #[test]

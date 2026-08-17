@@ -36,6 +36,8 @@ The private handoff channel carries a versioned manifest followed by Unix
   sanitized final VT state without process descriptors
 - The latest non-durable focused-terminal revision and workspace/shell/run
   identity, when it still refers to a transferred runtime
+- The latest non-durable Node-qualified presentation focus and its monotonic
+  revision, including an external Node Shell when that was focused most recently
 
 The PTY master is full duplex, so reader and writer duplicates do not need to be
 transferred separately. The replacement cannot inherit Unix parenthood; process
@@ -68,6 +70,13 @@ resuming readers, so output revisions remain ordered after the ownership
 boundary. The optional focused-terminal snapshot crosses the same graceful
 handoff so dashboard following does not forget the last focused managed window;
 ordinary cold recovery does not restore it.
+Protocol-39 qualified presentation focus crosses the same handoff independently
+from PTY ownership, so a later local or external focus gain always advances past
+the revision already observed by a surviving dashboard.
+An intermediate protocol-38 replacement may omit this additive field. A
+surviving dashboard detects the negotiated protocol transition from the
+`handoff_completed` boundary and resets its observed focus frontier once, so
+each protocol's revision domain remains usable.
 
 ## Accepted Remote Node Boundary
 
@@ -77,6 +86,12 @@ owned by the remote daemon and never enter a local handoff manifest. Remote
 daemon replacement uses this existing descriptor-transfer protocol on the
 remote machine, and its attachment reconnect frames pass unchanged through the
 SSH bridge.
+Remote transactional upgrade copies the old executable into private rollback
+state before atomically replacing its installed pathname. It does not rename the
+live executable to the backup path: on Linux the old daemon therefore observes a
+deleted installed path and selects the replacement at that path for graceful
+handoff. Rollback performs the inverse atomic replacement before asking the
+provisional daemon to hand off to the restored executable.
 
 Local daemon replacement instead closes federation admission, drains admitted
 Node requests and projection commits to known outcome boundaries, stops

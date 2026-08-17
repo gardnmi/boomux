@@ -1,5 +1,7 @@
 use std::io;
 use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossterm::event::{
@@ -51,26 +53,30 @@ const BOOMUX_SMOKE: [&str; 5] = [
 const TERMINAL_PREVIEW_ROWS: usize = 16;
 const TERMINAL_PREVIEW_SCROLL_STEP: usize = 12;
 const PREVIEW_RESERVED_ITEM_HEIGHT: u16 = 6;
-const AGENT_TABLE_HEADERS: [&str; 7] = [
+const AGENT_TABLE_HEADERS: [&str; 8] = [
     "STATUS",
     "UPDATED",
     "WORKSPACE",
+    "NODE",
     "SHELL",
     "TASK",
     "ROOT BRANCH",
     "ROOT WORKTREE",
 ];
-const SHELL_TABLE_HEADERS: [&str; 8] = [
+const SHELL_TABLE_HEADERS: [&str; 9] = [
     "STATUS",
     "RUN",
     "WORKSPACE",
+    "NODE",
     "SHELL",
     "KIND",
     "PROCESS",
     "BRANCH",
     "WORKTREE",
 ];
-const ITEM_TABLE_HEADERS: [&str; 6] = ["KIND", "STATUS", "NAME", "ACTIVITY", "BRANCH", "WORKTREE"];
+const ITEM_TABLE_HEADERS: [&str; 7] = [
+    "KIND", "STATUS", "NAME", "NODE", "ACTIVITY", "BRANCH", "WORKTREE",
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BombAnimationFrame {
@@ -147,10 +153,16 @@ pub(crate) struct NodeView {
     pub(crate) id: String,
     pub(crate) alias: String,
     pub(crate) local: bool,
+    pub(crate) route: Option<String>,
+    pub(crate) registration_revision: Option<u64>,
     pub(crate) health: NodeProjectionHealthCode,
     pub(crate) current: bool,
     pub(crate) stale: bool,
+    pub(crate) observed_at_ms: u64,
+    pub(crate) observed_protocol_version: Option<u32>,
     pub(crate) observed_capabilities: Vec<String>,
+    pub(crate) workspace_owner_eligible: bool,
+    pub(crate) workspace_owner_unavailable_reason: Option<String>,
     pub(crate) scheduler: SchedulerHealth,
 }
 
@@ -165,6 +177,36 @@ pub(crate) struct WorkspaceView {
     pub(crate) agent_state_counts: AgentStateCounts,
     pub(crate) attention_count: usize,
     pub(crate) attention: Vec<WorkspaceAttentionView>,
+    pub(crate) item_owners: Vec<WorkspaceItemOwnerView>,
+    pub(crate) coordination: WorkspaceCoordinationView,
+}
+
+#[derive(Clone)]
+pub(crate) struct WorkspaceItemOwnerView {
+    pub(crate) node: NodeView,
+    pub(crate) workspace_id: String,
+}
+
+#[derive(Clone)]
+pub(crate) struct WorkspacePlacementView {
+    pub(crate) node: NodeView,
+    pub(crate) workspace_id: String,
+    pub(crate) owner_revision: u64,
+    pub(crate) default_cwd: Option<String>,
+    pub(crate) state: crate::protocol::WorkspacePlacementState,
+}
+
+#[derive(Clone)]
+pub(crate) enum WorkspaceCoordinationView {
+    Global {
+        revision: u64,
+        closing: bool,
+        placements: Vec<WorkspacePlacementView>,
+    },
+    External {
+        owner_revision: u64,
+        available: bool,
+    },
 }
 
 pub(crate) struct DashboardState {
@@ -176,7 +218,6 @@ pub(crate) struct DashboardState {
     pub(crate) schedule_editing: bool,
     pub(crate) focused_terminal: Option<FocusedTerminalView>,
     pub(crate) reset_focus_revision: bool,
-    pub(crate) initial_node_filter: Option<String>,
 }
 
 pub(crate) struct ScheduleEditInspection {
@@ -357,12 +398,15 @@ pub(crate) enum ExecutionOutcomeDisplay {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct FocusedTerminalView {
     pub(crate) revision: u64,
+    pub(crate) node_id: Option<String>,
     pub(crate) workspace_id: String,
     pub(crate) shell_id: String,
 }
 
 #[derive(Clone)]
 pub(crate) struct WorkspaceAttentionView {
+    pub(crate) node_id: String,
+    pub(crate) workspace_id: String,
     pub(crate) agent_id: String,
     pub(crate) shell_id: String,
     pub(crate) agent_name: String,
@@ -542,28 +586,6 @@ impl WorkspaceView {
         self.node.local && self.node.current && !self.node.stale
     }
 
-    fn shell_attachable(&self) -> bool {
-        self.local_actionable()
-            || (self.node.current
-                && !self.node.stale
-                && self
-                    .node
-                    .observed_capabilities
-                    .iter()
-                    .any(|capability| capability == "remote_pty_attachment"))
-    }
-
-    fn launcher_invokable(&self) -> bool {
-        self.local_actionable()
-            || (self.node.current
-                && !self.node.stale
-                && self
-                    .node
-                    .observed_capabilities
-                    .iter()
-                    .any(|capability| capability == "typed_node_host_services"))
-    }
-
     fn shell_count(&self) -> usize {
         self.items
             .iter()
@@ -617,6 +639,56 @@ impl WorkspaceView {
             .iter()
             .filter(|item| item.ordinary_visible())
             .count()
+    }
+
+    fn item_owner(&self, index: usize) -> (&NodeView, &str) {
+        self.item_owners
+            .get(index)
+            .map_or((&self.node, self.id.as_str()), |owner| {
+                (&owner.node, owner.workspace_id.as_str())
+            })
+    }
+
+    fn qualify_item(&self, index: usize, inner_id: impl Into<String>) -> QualifiedIdentity {
+        QualifiedIdentity::new(self.item_owner(index).0.id.clone(), inner_id)
+    }
+
+    fn qualify_item_workspace(&self, index: usize) -> QualifiedIdentity {
+        let (node, workspace_id) = self.item_owner(index);
+        QualifiedIdentity::new(node.id.clone(), workspace_id)
+    }
+
+    fn item_actionable(&self, index: usize) -> bool {
+        let node = self.item_owner(index).0;
+        node.current
+            && !node.stale
+            && (node.local
+                || node
+                    .observed_capabilities
+                    .iter()
+                    .any(|capability| capability == "guarded_remote_management"))
+    }
+
+    fn item_shell_attachable(&self, index: usize) -> bool {
+        let node = self.item_owner(index).0;
+        (node.local && node.current && !node.stale)
+            || (node.current
+                && !node.stale
+                && node
+                    .observed_capabilities
+                    .iter()
+                    .any(|capability| capability == "remote_pty_attachment"))
+    }
+
+    fn item_launcher_invokable(&self, index: usize) -> bool {
+        let node = self.item_owner(index).0;
+        (node.local && node.current && !node.stale)
+            || (node.current
+                && !node.stale
+                && node
+                    .observed_capabilities
+                    .iter()
+                    .any(|capability| capability == "typed_node_host_services"))
     }
 }
 
@@ -775,14 +847,46 @@ pub(crate) enum DashboardEffect {
     Close(CloseTarget),
     CreateWorkspace {
         name: String,
-        default_cwd: Option<PathBuf>,
     },
     CreateShell(QualifiedIdentity),
+    CreateGlobalShell {
+        workspace_id: String,
+        expected_revision: u64,
+        node_id: String,
+        owner_workspace_id: String,
+        default_cwd: Option<PathBuf>,
+    },
+    AdoptExternalWorkspace {
+        identity: QualifiedIdentity,
+        expected_revision: u64,
+    },
+    OpenGlobalWorkspace {
+        workspace_id: String,
+        expected_revision: u64,
+    },
+    RetryGlobalWorkspaceClose {
+        workspace_id: String,
+    },
+    LinkExternalWorkspace {
+        workspace_id: String,
+        expected_revision: u64,
+        identity: QualifiedIdentity,
+        expected_owner_revision: u64,
+    },
+    RetargetNode {
+        node_id: String,
+        expected_revision: u64,
+        route: String,
+    },
+    ForgetNode {
+        node_id: String,
+    },
     Rename {
         target: RenameTarget,
         name: String,
     },
     CheckForUpdates,
+    RefreshNode(String),
     Refresh,
     RunSchedule(QualifiedIdentity),
     PauseSchedule(QualifiedIdentity),
@@ -811,6 +915,21 @@ pub(crate) enum DashboardEffect {
     },
 }
 
+impl DashboardEffect {
+    fn must_finish_before_quit(&self) -> bool {
+        !matches!(
+            self,
+            Self::Quit
+                | Self::CheckForUpdates
+                | Self::RefreshNode(_)
+                | Self::Refresh
+                | Self::LoadScheduleHistory { .. }
+                | Self::LoadScheduleEditor { .. }
+                | Self::ReadTerminalPreview { .. }
+        )
+    }
+}
+
 pub(crate) enum DashboardEvent {
     KeyPressed {
         code: KeyCode,
@@ -820,6 +939,7 @@ pub(crate) enum DashboardEvent {
     PreviewRequested,
     UpdateCheckCompleted,
     OperationCompleted(Result<String, String>),
+    ShellCreationCompleted(Result<String, String>),
     RefreshCompleted(Result<DashboardState, String>),
     ScheduleHistoryCompleted {
         schedule_id: QualifiedIdentity,
@@ -855,6 +975,104 @@ where
     }
 }
 
+struct DashboardRuntime {
+    effects: Sender<DashboardEffect>,
+    completions: Receiver<(DashboardEffect, DashboardEvent)>,
+    update_check_in_flight: bool,
+    preview_in_flight: bool,
+    operations_in_flight: usize,
+}
+
+impl DashboardRuntime {
+    fn spawn(mut backend: impl DashboardBackend + Send + 'static) -> Self {
+        let (effect_sender, effect_receiver) = mpsc::channel::<DashboardEffect>();
+        let (completion_sender, completion_receiver) = mpsc::channel();
+        thread::spawn(move || {
+            while let Ok(effect) = effect_receiver.recv() {
+                let completed_effect = effect.clone();
+                let event = backend.execute(effect);
+                if completion_sender.send((completed_effect, event)).is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            effects: effect_sender,
+            completions: completion_receiver,
+            update_check_in_flight: false,
+            preview_in_flight: false,
+            operations_in_flight: 0,
+        }
+    }
+
+    fn dispatch(&mut self, effects: Vec<DashboardEffect>) -> io::Result<bool> {
+        for effect in effects {
+            if effect == DashboardEffect::Quit {
+                if self.can_quit() {
+                    return Ok(true);
+                }
+                continue;
+            }
+            if (effect == DashboardEffect::CheckForUpdates && self.update_check_in_flight)
+                || (matches!(effect, DashboardEffect::ReadTerminalPreview { .. })
+                    && self.preview_in_flight)
+            {
+                continue;
+            }
+            match &effect {
+                DashboardEffect::CheckForUpdates => self.update_check_in_flight = true,
+                DashboardEffect::ReadTerminalPreview { .. } => self.preview_in_flight = true,
+                _ => {}
+            }
+            if effect.must_finish_before_quit() {
+                self.operations_in_flight += 1;
+            }
+            self.effects.send(effect).map_err(|_| {
+                io::Error::new(io::ErrorKind::BrokenPipe, "dashboard backend stopped")
+            })?;
+        }
+        Ok(false)
+    }
+
+    fn drain(&mut self, app: &mut App) -> io::Result<bool> {
+        loop {
+            match self.completions.try_recv() {
+                Ok((effect, event)) => {
+                    match effect {
+                        DashboardEffect::CheckForUpdates => self.update_check_in_flight = false,
+                        DashboardEffect::ReadTerminalPreview { .. } => {
+                            self.preview_in_flight = false;
+                        }
+                        _ => {}
+                    }
+                    if effect.must_finish_before_quit() {
+                        self.operations_in_flight = self.operations_in_flight.saturating_sub(1);
+                    }
+                    let effects = app.update(event);
+                    if self.dispatch(effects)? {
+                        return Ok(true);
+                    }
+                }
+                Err(TryRecvError::Empty) => return Ok(false),
+                Err(TryRecvError::Disconnected) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "dashboard backend stopped",
+                    ));
+                }
+            }
+        }
+    }
+
+    fn has_in_flight_effect(&self) -> bool {
+        self.update_check_in_flight || self.preview_in_flight || self.operations_in_flight > 0
+    }
+
+    fn can_quit(&self) -> bool {
+        self.operations_in_flight == 0
+    }
+}
+
 struct App {
     nodes: Vec<NodeView>,
     all_workspaces: Vec<WorkspaceView>,
@@ -869,17 +1087,18 @@ struct App {
     workspace_state: TableState,
     item_state: TableState,
     global_state: TableState,
+    node_state: TableState,
     primary_tab: PrimaryTab,
     focus: Focus,
     mode: Mode,
     message: Option<Message>,
+    pending_shell_creation: Option<String>,
     pending_close: Option<PendingClose>,
     project_context: ProjectContext,
     terminal_preview: Option<TerminalPreviewState>,
     follow_focused_terminal: bool,
     selection_pinned: bool,
     observed_focus_revision: Option<u64>,
-    node_filter: Option<String>,
 }
 
 struct TerminalPreviewState {
@@ -902,14 +1121,16 @@ enum PrimaryTab {
     Agents,
     Shells,
     Schedules,
+    Nodes,
 }
 
 impl PrimaryTab {
-    const ALL: [Self; 4] = [
+    const ALL: [Self; 5] = [
         Self::Workspaces,
         Self::Agents,
         Self::Shells,
         Self::Schedules,
+        Self::Nodes,
     ];
 
     fn kind(self) -> Option<ItemKind> {
@@ -918,6 +1139,7 @@ impl PrimaryTab {
             Self::Agents => Some(ItemKind::Agent),
             Self::Shells => Some(ItemKind::Shell),
             Self::Schedules => None,
+            Self::Nodes => None,
         }
     }
 
@@ -927,6 +1149,7 @@ impl PrimaryTab {
             Self::Agents => "AGENTS",
             Self::Shells => "SHELLS",
             Self::Schedules => "SCHEDULES",
+            Self::Nodes => "NODES",
         }
     }
 }
@@ -962,6 +1185,14 @@ pub(crate) enum OpenTarget {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RenameTarget {
+    GlobalWorkspace {
+        workspace_id: String,
+        expected_revision: u64,
+    },
+    Node {
+        node_id: String,
+        expected_revision: u64,
+    },
     Workspace(QualifiedIdentity),
     Shell(QualifiedIdentity),
     Launcher(QualifiedIdentity),
@@ -969,6 +1200,10 @@ pub(crate) enum RenameTarget {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum CloseTarget {
+    GlobalWorkspace {
+        workspace_id: String,
+        expected_revision: u64,
+    },
     Workspace(QualifiedIdentity),
     Shell(QualifiedIdentity),
     Launcher(QualifiedIdentity),
@@ -979,6 +1214,8 @@ pub(crate) enum CloseTarget {
 impl RenameTarget {
     fn label(&self) -> &'static str {
         match self {
+            Self::GlobalWorkspace { .. } => "workspace",
+            Self::Node { .. } => "Node alias",
             Self::Workspace(_) => "workspace",
             Self::Shell(_) => "shell",
             Self::Launcher(_) => "launcher",
@@ -991,8 +1228,112 @@ enum Mode {
     PickProject(ProjectPicker),
     Palette(CommandPalette),
     Help,
-    Rename { target: RenameTarget, input: String },
+    Rename {
+        target: RenameTarget,
+        input: String,
+    },
+    SelectWorkspaceNode(WorkspaceNodePicker),
+    LinkWorkspace(LinkWorkspacePicker),
+    InspectNode(NodeView),
+    RetargetNode {
+        node_id: String,
+        expected_revision: u64,
+        input: String,
+    },
+    ConfirmForgetNode(NodeView),
     EditSchedule(ScheduleEditor),
+}
+
+struct LinkWorkspacePicker {
+    identity: QualifiedIdentity,
+    expected_owner_revision: u64,
+    workspaces: Vec<(String, String, u64)>,
+    selected: Option<usize>,
+}
+
+struct WorkspaceNodePicker {
+    workspace_id: String,
+    workspace_name: String,
+    expected_revision: u64,
+    placements: Vec<WorkspacePlacementView>,
+    nodes: Vec<NodeView>,
+    selected: Option<usize>,
+}
+
+impl WorkspaceNodePicker {
+    fn move_selection(&mut self, forwards: bool) {
+        let eligible = self
+            .nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, node)| node.workspace_owner_eligible.then_some(index))
+            .collect::<Vec<_>>();
+        if eligible.is_empty() {
+            self.selected = None;
+            return;
+        }
+        self.selected = Some(
+            match self
+                .selected
+                .and_then(|selected| eligible.iter().position(|index| *index == selected))
+            {
+                Some(position) if forwards => eligible[(position + 1) % eligible.len()],
+                Some(0) => *eligible.last().expect("eligible Node"),
+                Some(position) => eligible[position - 1],
+                None if forwards => eligible[0],
+                None => *eligible.last().expect("eligible Node"),
+            },
+        );
+    }
+
+    fn effect(&self) -> Option<DashboardEffect> {
+        let node = self.nodes.get(self.selected?)?;
+        if !node.workspace_owner_eligible {
+            return None;
+        }
+        let placement = self
+            .placements
+            .iter()
+            .find(|placement| placement.node.id == node.id);
+        Some(DashboardEffect::CreateGlobalShell {
+            workspace_id: self.workspace_id.clone(),
+            expected_revision: self.expected_revision,
+            node_id: node.id.clone(),
+            owner_workspace_id: placement.map_or_else(
+                || uuid::Uuid::new_v4().to_string(),
+                |placement| placement.workspace_id.clone(),
+            ),
+            default_cwd: placement
+                .and_then(|placement| placement.default_cwd.as_deref())
+                .map(PathBuf::from),
+        })
+    }
+}
+
+impl LinkWorkspacePicker {
+    fn move_selection(&mut self, forwards: bool) {
+        if self.workspaces.is_empty() {
+            self.selected = None;
+            return;
+        }
+        self.selected = Some(match self.selected {
+            Some(index) if forwards => (index + 1) % self.workspaces.len(),
+            Some(0) => self.workspaces.len() - 1,
+            Some(index) => index - 1,
+            None if forwards => 0,
+            None => self.workspaces.len() - 1,
+        });
+    }
+
+    fn effect(&self) -> Option<DashboardEffect> {
+        let (workspace_id, _, expected_revision) = self.workspaces.get(self.selected?)?;
+        Some(DashboardEffect::LinkExternalWorkspace {
+            workspace_id: workspace_id.clone(),
+            expected_revision: *expected_revision,
+            identity: self.identity.clone(),
+            expected_owner_revision: self.expected_owner_revision,
+        })
+    }
 }
 
 struct ScheduleEditor {
@@ -1615,7 +1956,7 @@ impl CommandPalette {
                 });
             }
 
-            for item in &workspace.items {
+            for (item_index, item) in workspace.items.iter().enumerate() {
                 if !item.ordinary_visible() {
                     continue;
                 }
@@ -1624,8 +1965,8 @@ impl CommandPalette {
                     continue;
                 }
                 let identity = ItemIdentity {
-                    workspace_id: workspace.qualify(&workspace.id),
-                    item_id: workspace.qualify(item.id()),
+                    workspace_id: workspace.qualify_item_workspace(item_index),
+                    item_id: workspace.qualify_item(item_index, item.id()),
                     kind: if kind == ItemKind::Launcher {
                         ItemIdentityKind::Launcher
                     } else {
@@ -1654,7 +1995,9 @@ impl CommandPalette {
                     (ItemPaletteAction::Rename, PaletteActionGroup::Rename),
                     (ItemPaletteAction::Close, PaletteActionGroup::Close),
                 ] {
-                    if !workspace.actionable() && !matches!(action, ItemPaletteAction::GoTo) {
+                    if !workspace.item_actionable(item_index)
+                        && !matches!(action, ItemPaletteAction::GoTo)
+                    {
                         continue;
                     }
                     entries.push(PaletteEntry {
@@ -1704,9 +2047,34 @@ impl CommandPalette {
                             attention.shell_id
                         ),
                         command: PaletteCommand::Attention {
-                            workspace_id: workspace.qualify(&workspace.id),
-                            shell_id: workspace.qualify(&attention.shell_id),
-                            agent_id: workspace.qualify(&attention.agent_id),
+                            workspace_id: QualifiedIdentity::new(
+                                if attention.node_id.is_empty() {
+                                    workspace.node.id.clone()
+                                } else {
+                                    attention.node_id.clone()
+                                },
+                                if attention.workspace_id.is_empty() {
+                                    workspace.id.clone()
+                                } else {
+                                    attention.workspace_id.clone()
+                                },
+                            ),
+                            shell_id: QualifiedIdentity::new(
+                                if attention.node_id.is_empty() {
+                                    workspace.node.id.clone()
+                                } else {
+                                    attention.node_id.clone()
+                                },
+                                &attention.shell_id,
+                            ),
+                            agent_id: QualifiedIdentity::new(
+                                if attention.node_id.is_empty() {
+                                    workspace.node.id.clone()
+                                } else {
+                                    attention.node_id.clone()
+                                },
+                                &attention.agent_id,
+                            ),
                         },
                     },
                 ));
@@ -1950,6 +2318,7 @@ impl App {
             }
             nodes
         });
+        let has_nodes = !nodes.is_empty();
         Self {
             nodes,
             all_workspaces: workspaces.clone(),
@@ -1967,73 +2336,19 @@ impl App {
             workspace_state,
             item_state,
             global_state: TableState::default(),
+            node_state: TableState::default().with_selected(has_nodes.then_some(0)),
             primary_tab: PrimaryTab::Workspaces,
             focus: Focus::Workspaces,
             mode: Mode::Normal,
             message: None,
+            pending_shell_creation: None,
             pending_close: None,
             project_context,
             terminal_preview: None,
             follow_focused_terminal: false,
             selection_pinned: false,
             observed_focus_revision: None,
-            node_filter: None,
         }
-    }
-
-    fn cycle_node_filter(&mut self) {
-        if self.nodes.is_empty() {
-            return;
-        }
-        let filter = match self
-            .node_filter
-            .as_ref()
-            .and_then(|id| self.nodes.iter().position(|node| &node.id == id))
-        {
-            None => Some(self.nodes[0].id.clone()),
-            Some(index) if index + 1 < self.nodes.len() => Some(self.nodes[index + 1].id.clone()),
-            Some(_) => None,
-        };
-        self.set_node_filter(filter);
-    }
-
-    fn set_node_filter(&mut self, filter: Option<String>) {
-        self.node_filter = filter.filter(|id| self.nodes.iter().any(|node| &node.id == id));
-        let workspaces = self
-            .all_workspaces
-            .iter()
-            .filter(|workspace| {
-                self.node_filter
-                    .as_ref()
-                    .is_none_or(|node_id| workspace.node.id == *node_id)
-            })
-            .cloned()
-            .collect();
-        let schedules = self
-            .all_schedules
-            .iter()
-            .filter(|schedule| {
-                self.node_filter
-                    .as_ref()
-                    .is_none_or(|node_id| schedule.node_id == *node_id)
-            })
-            .cloned()
-            .collect();
-        self.replace_workspaces(workspaces);
-        self.replace_schedules(schedules);
-        self.message = Some(Message {
-            text: self.node_filter.as_ref().map_or_else(
-                || "Showing all Nodes".into(),
-                |id| {
-                    let node = self.nodes.iter().find(|node| &node.id == id);
-                    format!(
-                        "Showing Node {}",
-                        node.map_or(id.as_str(), |node| &node.alias)
-                    )
-                },
-            ),
-            error: false,
-        });
     }
 
     fn enable_focus_following(&mut self, focused_terminal: Option<&FocusedTerminalView>) {
@@ -2046,7 +2361,6 @@ impl App {
             return;
         }
         let Some(focused) = focused_terminal else {
-            self.observed_focus_revision = None;
             return;
         };
         if self
@@ -2058,21 +2372,30 @@ impl App {
         if !matches!(self.mode, Mode::Normal) || self.pending_close.is_some() {
             return;
         }
-        let Some(workspace_index) = self
-            .workspaces
-            .iter()
-            .position(|workspace| workspace.node.local && workspace.id == focused.workspace_id)
-        else {
-            return;
-        };
-        let Some(item_index) = self.workspaces[workspace_index]
-            .items
-            .iter()
-            .position(|item| {
-                !matches!(item, WorkspaceItemView::Launcher(_))
-                    && item.id() == focused.shell_id
-                    && (self.primary_tab != PrimaryTab::Workspaces || item.ordinary_visible())
-            })
+        let Some((workspace_index, item_index)) =
+            self.workspaces
+                .iter()
+                .enumerate()
+                .find_map(|(workspace_index, workspace)| {
+                    workspace
+                        .items
+                        .iter()
+                        .enumerate()
+                        .find(|(item_index, item)| {
+                            let (node, owner_workspace_id) = workspace.item_owner(*item_index);
+                            focused
+                                .node_id
+                                .as_ref()
+                                .map_or(node.local, |node_id| node.id == *node_id)
+                                && (focused.node_id.is_some()
+                                    || owner_workspace_id == focused.workspace_id)
+                                && !matches!(item, WorkspaceItemView::Launcher(_))
+                                && item.id() == focused.shell_id
+                                && (self.primary_tab != PrimaryTab::Workspaces
+                                    || item.ordinary_visible())
+                        })
+                        .map(|(item_index, _)| (workspace_index, item_index))
+                })
         else {
             return;
         };
@@ -2095,7 +2418,7 @@ impl App {
                     .checked_sub(1),
             );
         } else {
-            let identity = item_identity(&self.workspaces[workspace_index], item);
+            let identity = item_identity(&self.workspaces[workspace_index], item_index, item);
             self.global_state
                 .select(self.global_item_position(&identity));
         }
@@ -2250,6 +2573,9 @@ impl App {
     }
 
     fn global_item_count(&self) -> usize {
+        if self.primary_tab == PrimaryTab::Nodes {
+            return self.nodes.len();
+        }
         if self.primary_tab == PrimaryTab::Schedules {
             return self.schedules.len();
         }
@@ -2267,6 +2593,13 @@ impl App {
         self.primary_tab = tab;
         if tab == PrimaryTab::Workspaces {
             self.focus = Focus::Workspaces;
+            return;
+        }
+        if tab == PrimaryTab::Nodes {
+            self.focus = Focus::Workspaces;
+            self.node_state
+                .select((!self.nodes.is_empty()).then_some(0));
+            self.message = None;
             return;
         }
         self.focus = if tab == PrimaryTab::Schedules {
@@ -2301,6 +2634,16 @@ impl App {
             return;
         }
         if self.primary_tab != PrimaryTab::Workspaces {
+            if self.primary_tab == PrimaryTab::Nodes {
+                if !self.nodes.is_empty() {
+                    let next = self
+                        .node_state
+                        .selected()
+                        .map_or(0, |index| (index + 1) % self.nodes.len());
+                    self.node_state.select(Some(next));
+                }
+                return;
+            }
             let item_count = self.global_item_count();
             if item_count > 0 {
                 let next = self
@@ -2349,6 +2692,19 @@ impl App {
             return;
         }
         if self.primary_tab != PrimaryTab::Workspaces {
+            if self.primary_tab == PrimaryTab::Nodes {
+                if !self.nodes.is_empty() {
+                    let previous = self.node_state.selected().map_or(0, |index| {
+                        if index == 0 {
+                            self.nodes.len() - 1
+                        } else {
+                            index - 1
+                        }
+                    });
+                    self.node_state.select(Some(previous));
+                }
+                return;
+            }
             let item_count = self.global_item_count();
             if item_count > 0 {
                 let previous = self.global_state.selected().map_or(0, |index| {
@@ -2434,8 +2790,11 @@ impl App {
 
     fn select_item_identity(&mut self, identity: &ItemIdentity) -> bool {
         let Some(workspace_index) = self.workspaces.iter().position(|workspace| {
-            workspace.node.id == identity.workspace_id.node_id
-                && workspace.id == identity.workspace_id.inner_id
+            workspace.items.iter().enumerate().any(|(item_index, _)| {
+                let (node, workspace_id) = workspace.item_owner(item_index);
+                node.id == identity.workspace_id.node_id
+                    && workspace_id == identity.workspace_id.inner_id
+            })
         }) else {
             self.message = Some(Message {
                 text: "item workspace is no longer available".into(),
@@ -2446,10 +2805,18 @@ impl App {
         let Some(item_ordinal) = self.workspaces[workspace_index]
             .items
             .iter()
-            .filter(|item| item.ordinary_visible())
-            .position(|item| item_matches(item, identity))
+            .enumerate()
+            .filter(|(_, item)| item.ordinary_visible())
+            .position(|(item_index, item)| {
+                let owner = self.workspaces[workspace_index].item_owner(item_index);
+                owner.0.id == identity.workspace_id.node_id
+                    && owner.1 == identity.workspace_id.inner_id
+                    && item_matches(item, identity)
+            })
         else {
-            self.select_workspace(&identity.workspace_id, Focus::Workspaces);
+            self.select_tab(PrimaryTab::Workspaces);
+            self.workspace_state.select(Some(workspace_index));
+            self.select_first_details();
             self.message = Some(Message {
                 text: "item is no longer available; selected its workspace".into(),
                 error: true,
@@ -2522,14 +2889,34 @@ impl App {
     }
 
     fn request_rename(&mut self) -> Option<DashboardEffect> {
+        if self.primary_tab == PrimaryTab::Nodes {
+            if let Some(node) = self
+                .node_state
+                .selected()
+                .and_then(|index| self.nodes.get(index))
+                .filter(|node| !node.local)
+                && let Some(expected_revision) = node.registration_revision
+            {
+                self.mode = Mode::Rename {
+                    target: RenameTarget::Node {
+                        node_id: node.id.clone(),
+                        expected_revision,
+                    },
+                    input: String::new(),
+                };
+            }
+            return None;
+        }
         let schedule_id = if self.primary_tab == PrimaryTab::Schedules {
             self.selected_schedule()
                 .map(|schedule| schedule.qualify(&schedule.id))
         } else {
             match self.selected_item() {
-                Some(WorkspaceItemView::Schedule(schedule)) => self
-                    .selected_item_workspace()
-                    .map(|workspace| workspace.qualify(&schedule.id)),
+                Some(WorkspaceItemView::Schedule(schedule)) => {
+                    self.selected_item_location().map(|(workspace, item)| {
+                        self.workspaces[workspace].qualify_item(item, &schedule.id)
+                    })
+                }
                 _ => None,
             }
         };
@@ -2557,21 +2944,44 @@ impl App {
             return None;
         }
         let target = if self.primary_tab != PrimaryTab::Workspaces {
-            self.selected_item_workspace()
-                .filter(|workspace| workspace.actionable())
-                .zip(self.selected_item().filter(|item| item.ordinary_visible()))
-                .and_then(|(workspace, item)| item_rename_target(workspace, item))
+            self.selected_item_location().and_then(|(workspace, item)| {
+                let workspace = &self.workspaces[workspace];
+                workspace
+                    .item_actionable(item)
+                    .then(|| workspace.items.get(item))
+                    .flatten()
+                    .filter(|item| item.ordinary_visible())
+                    .and_then(|value| item_rename_target(workspace, item, value))
+            })
         } else {
             match self.focus {
                 Focus::Workspaces => self
                     .selected()
                     .filter(|workspace| workspace.actionable())
-                    .map(|workspace| RenameTarget::Workspace(workspace.qualify(&workspace.id))),
-                Focus::Items => self
-                    .selected()
-                    .filter(|workspace| workspace.actionable())
-                    .zip(self.selected_item().filter(|item| item.ordinary_visible()))
-                    .and_then(|(workspace, item)| item_rename_target(workspace, item)),
+                    .and_then(|workspace| match workspace.coordination {
+                        WorkspaceCoordinationView::Global {
+                            revision,
+                            closing: false,
+                            ..
+                        } => Some(RenameTarget::GlobalWorkspace {
+                            workspace_id: workspace.id.clone(),
+                            expected_revision: revision,
+                        }),
+                        WorkspaceCoordinationView::External {
+                            available: true, ..
+                        } => Some(RenameTarget::Workspace(workspace.qualify(&workspace.id))),
+                        WorkspaceCoordinationView::Global { .. }
+                        | WorkspaceCoordinationView::External { .. } => None,
+                    }),
+                Focus::Items => self.selected_item_location().and_then(|(workspace, item)| {
+                    let workspace = &self.workspaces[workspace];
+                    workspace
+                        .item_actionable(item)
+                        .then(|| workspace.items.get(item))
+                        .flatten()
+                        .filter(|item| item.ordinary_visible())
+                        .and_then(|value| item_rename_target(workspace, item, value))
+                }),
             }
         };
         if let Some(target) = target {
@@ -2585,6 +2995,9 @@ impl App {
     }
 
     fn request_add(&mut self) -> Option<DashboardEffect> {
+        if self.primary_tab == PrimaryTab::Nodes {
+            return Some(DashboardEffect::AddNode);
+        }
         if self.primary_tab == PrimaryTab::Schedules {
             self.message = Some(Message {
                 text: "Create schedules with `boomux schedule create --help` (new schedules are paused by default)".into(),
@@ -2602,21 +3015,121 @@ impl App {
                 None
             }
             Focus::Items => {
-                let workspace_id = self
-                    .selected()
-                    .filter(|workspace| workspace.local_actionable())
-                    .map(|workspace| workspace.qualify(&workspace.id))?;
-                Some(DashboardEffect::CreateShell(workspace_id))
+                if self.pending_shell_creation.is_some() {
+                    return None;
+                }
+                let workspace = self.selected()?.clone();
+                if let WorkspaceCoordinationView::Global {
+                    revision,
+                    placements,
+                    ..
+                } = &workspace.coordination
+                {
+                    let eligible = self
+                        .nodes
+                        .iter()
+                        .filter(|node| node.workspace_owner_eligible)
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    if let [node] = eligible.as_slice() {
+                        self.begin_shell_creation(&workspace.name, &node.alias);
+                        return Some(global_shell_effect(&workspace, *revision, placements, node));
+                    }
+                    self.mode = Mode::SelectWorkspaceNode(WorkspaceNodePicker {
+                        workspace_id: workspace.id.clone(),
+                        workspace_name: workspace.name.clone(),
+                        expected_revision: *revision,
+                        placements: placements.clone(),
+                        nodes: self.nodes.clone(),
+                        selected: None,
+                    });
+                    self.message = None;
+                    return None;
+                }
+                let effect = workspace
+                    .local_actionable()
+                    .then(|| DashboardEffect::CreateShell(workspace.qualify(&workspace.id)));
+                if effect.is_some() {
+                    self.begin_shell_creation(&workspace.name, &workspace.node.alias);
+                }
+                effect
             }
         }
     }
 
-    fn create_workspace(&mut self, name: &str, default_cwd: Option<PathBuf>) -> DashboardEffect {
-        self.mode = Mode::Normal;
-        DashboardEffect::CreateWorkspace {
-            name: name.to_owned(),
-            default_cwd,
+    fn begin_shell_creation(&mut self, workspace_name: &str, node_alias: &str) {
+        self.message = None;
+        self.pending_shell_creation = Some(format!(
+            "Creating Shell in {workspace_name} on Node {node_alias}..."
+        ));
+    }
+
+    fn adopt_selected_external(&self) -> Option<DashboardEffect> {
+        let workspace = self.selected()?;
+        let WorkspaceCoordinationView::External {
+            owner_revision,
+            available,
+        } = workspace.coordination
+        else {
+            return None;
+        };
+        (available && workspace.node.workspace_owner_eligible).then(|| {
+            DashboardEffect::AdoptExternalWorkspace {
+                identity: workspace.qualify(&workspace.id),
+                expected_revision: owner_revision,
+            }
+        })
+    }
+
+    fn link_selected_external(&mut self) {
+        let Some(workspace) = self.selected().cloned() else {
+            return;
+        };
+        let WorkspaceCoordinationView::External {
+            owner_revision,
+            available,
+        } = workspace.coordination
+        else {
+            return;
+        };
+        if !available || !workspace.node.workspace_owner_eligible {
+            self.message = Some(Message {
+                text: workspace
+                    .node
+                    .workspace_owner_unavailable_reason
+                    .clone()
+                    .unwrap_or_else(|| "Unavailable external Workspaces cannot be linked".into()),
+                error: true,
+            });
+            return;
         }
+        let workspaces = self
+            .workspaces
+            .iter()
+            .filter_map(|candidate| match candidate.coordination {
+                WorkspaceCoordinationView::Global {
+                    revision,
+                    closing: false,
+                    ..
+                } => Some((candidate.id.clone(), candidate.name.clone(), revision)),
+                WorkspaceCoordinationView::Global { .. }
+                | WorkspaceCoordinationView::External { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        self.mode = Mode::LinkWorkspace(LinkWorkspacePicker {
+            identity: workspace.qualify(&workspace.id),
+            expected_owner_revision: owner_revision,
+            workspaces,
+            selected: None,
+        });
+        self.message = None;
+    }
+
+    fn create_workspace(&mut self, name: &str) -> Option<DashboardEffect> {
+        self.mode = Mode::Normal;
+        Some(DashboardEffect::CreateWorkspace {
+            name: name.to_owned(),
+        })
     }
 
     fn rename(&mut self, target: RenameTarget, name: String) -> DashboardEffect {
@@ -2628,9 +3141,28 @@ impl App {
         if self.primary_tab != PrimaryTab::Workspaces {
             return None;
         }
-        self.selected()
-            .filter(|workspace| workspace.local_actionable())
-            .map(|workspace| DashboardEffect::RestoreWorkspace(workspace.qualify(&workspace.id)))
+        let workspace = self.selected()?;
+        match workspace.coordination {
+            WorkspaceCoordinationView::Global {
+                revision,
+                closing: false,
+                ..
+            } => Some(DashboardEffect::OpenGlobalWorkspace {
+                workspace_id: workspace.id.clone(),
+                expected_revision: revision,
+            }),
+            WorkspaceCoordinationView::Global { closing: true, .. } => {
+                Some(DashboardEffect::RetryGlobalWorkspaceClose {
+                    workspace_id: workspace.id.clone(),
+                })
+            }
+            WorkspaceCoordinationView::External {
+                available: true, ..
+            } if workspace.local_actionable() => Some(DashboardEffect::RestoreWorkspace(
+                workspace.qualify(&workspace.id),
+            )),
+            WorkspaceCoordinationView::External { .. } => None,
+        }
     }
 
     fn open_selected_item(&self) -> Option<DashboardEffect> {
@@ -2638,33 +3170,39 @@ impl App {
         {
             return None;
         }
-        let workspace = self.selected_item_workspace()?;
-        let workspace_id = workspace.qualify(&workspace.id);
-        let target = self.selected_item().and_then(|item| match item {
-            WorkspaceItemView::Shell(shell) => workspace
-                .shell_attachable()
-                .then(|| OpenTarget::Shell(workspace.qualify(&shell.id))),
-            WorkspaceItemView::AgentShell(agent_shell) => workspace
-                .shell_attachable()
-                .then(|| OpenTarget::Shell(workspace.qualify(&agent_shell.shell.id))),
-            WorkspaceItemView::Launcher(launcher) => {
-                workspace
-                    .launcher_invokable()
+        let (workspace_index, item_index) = self.selected_item_location()?;
+        let workspace = &self.workspaces[workspace_index];
+        let workspace_id = workspace.qualify_item_workspace(item_index);
+        let target = workspace
+            .items
+            .get(item_index)
+            .and_then(|item| match item {
+                WorkspaceItemView::Shell(shell) => workspace
+                    .item_shell_attachable(item_index)
+                    .then(|| OpenTarget::Shell(workspace.qualify_item(item_index, &shell.id))),
+                WorkspaceItemView::AgentShell(agent_shell) => {
+                    workspace.item_shell_attachable(item_index).then(|| {
+                        OpenTarget::Shell(workspace.qualify_item(item_index, &agent_shell.shell.id))
+                    })
+                }
+                WorkspaceItemView::Launcher(launcher) => workspace
+                    .item_launcher_invokable(item_index)
                     .then(|| OpenTarget::Launcher {
                         workspace_id,
-                        launcher_id: workspace.qualify(&launcher.id),
-                    })
-            }
-            WorkspaceItemView::Schedule(_) => None,
-        })?;
+                        launcher_id: workspace.qualify_item(item_index, &launcher.id),
+                    }),
+                WorkspaceItemView::Schedule(_) => None,
+            })?;
         Some(DashboardEffect::Open(target))
     }
 
     fn activate_selected_item(&mut self) -> Option<DashboardEffect> {
         let schedule_id = match self.selected_item() {
-            Some(WorkspaceItemView::Schedule(schedule)) => self
-                .selected_item_workspace()
-                .map(|workspace| workspace.qualify(&schedule.id)),
+            Some(WorkspaceItemView::Schedule(schedule)) => {
+                self.selected_item_location().map(|(workspace, item)| {
+                    self.workspaces[workspace].qualify_item(item, &schedule.id)
+                })
+            }
             _ => None,
         };
         if let Some(schedule_id) = schedule_id {
@@ -2677,6 +3215,18 @@ impl App {
     }
 
     fn request_close(&mut self) {
+        if self.primary_tab == PrimaryTab::Nodes {
+            if let Some(node) = self
+                .node_state
+                .selected()
+                .and_then(|index| self.nodes.get(index))
+                .filter(|node| !node.local)
+                .cloned()
+            {
+                self.mode = Mode::ConfirmForgetNode(node);
+            }
+            return;
+        }
         if self.primary_tab == PrimaryTab::Schedules {
             self.pending_close = self
                 .selected_schedule()
@@ -2690,28 +3240,81 @@ impl App {
             return;
         }
         self.pending_close = if self.primary_tab != PrimaryTab::Workspaces {
-            self.selected_item_workspace()
-                .filter(|workspace| workspace.actionable())
-                .zip(self.selected_item().filter(|item| item.ordinary_visible()))
-                .map(|(workspace, item)| item_pending_close(workspace, item))
+            self.selected_item_location().and_then(|(workspace, item)| {
+                let workspace = &self.workspaces[workspace];
+                workspace
+                    .item_actionable(item)
+                    .then(|| workspace.items.get(item))
+                    .flatten()
+                    .filter(|item| item.ordinary_visible())
+                    .map(|value| item_pending_close(workspace, item, value))
+            })
         } else {
             match self.focus {
                 Focus::Workspaces => self
                     .selected()
                     .filter(|workspace| workspace.actionable())
-                    .map(|workspace| PendingClose {
-                        target: CloseTarget::Workspace(workspace.qualify(&workspace.id)),
-                        name: workspace.name.clone(),
-                        shell_count: workspace.process_count(),
-                        launcher_count: workspace.launcher_count(),
+                    .and_then(|workspace| {
+                        let target = match workspace.coordination {
+                            WorkspaceCoordinationView::Global {
+                                revision,
+                                closing: false,
+                                ..
+                            } => CloseTarget::GlobalWorkspace {
+                                workspace_id: workspace.id.clone(),
+                                expected_revision: revision,
+                            },
+                            WorkspaceCoordinationView::External {
+                                available: true, ..
+                            } => CloseTarget::Workspace(workspace.qualify(&workspace.id)),
+                            WorkspaceCoordinationView::Global { .. }
+                            | WorkspaceCoordinationView::External { .. } => return None,
+                        };
+                        Some(PendingClose {
+                            target,
+                            name: workspace.name.clone(),
+                            shell_count: workspace.process_count(),
+                            launcher_count: workspace.launcher_count(),
+                        })
                     }),
-                Focus::Items => self
-                    .selected()
-                    .filter(|workspace| workspace.actionable())
-                    .zip(self.selected_item().filter(|item| item.ordinary_visible()))
-                    .map(|(workspace, item)| item_pending_close(workspace, item)),
+                Focus::Items => self.selected_item_location().and_then(|(workspace, item)| {
+                    let workspace = &self.workspaces[workspace];
+                    workspace
+                        .item_actionable(item)
+                        .then(|| workspace.items.get(item))
+                        .flatten()
+                        .filter(|item| item.ordinary_visible())
+                        .map(|value| item_pending_close(workspace, item, value))
+                }),
             }
         };
+    }
+
+    fn inspect_selected_node(&mut self) {
+        if let Some(node) = self
+            .node_state
+            .selected()
+            .and_then(|index| self.nodes.get(index))
+            .cloned()
+        {
+            self.mode = Mode::InspectNode(node);
+        }
+    }
+
+    fn retarget_selected_node(&mut self) {
+        if let Some(node) = self
+            .node_state
+            .selected()
+            .and_then(|index| self.nodes.get(index))
+            .filter(|node| !node.local)
+            && let Some(expected_revision) = node.registration_revision
+        {
+            self.mode = Mode::RetargetNode {
+                node_id: node.id.clone(),
+                expected_revision,
+                input: node.route.clone().unwrap_or_default(),
+            };
+        }
     }
 
     fn cancel_close(&mut self) {
@@ -2747,6 +3350,11 @@ impl App {
             }
             DashboardEvent::UpdateCheckCompleted => {}
             DashboardEvent::OperationCompleted(result) => {
+                self.message = Some(Message::from_result(result));
+                return vec![DashboardEffect::Refresh];
+            }
+            DashboardEvent::ShellCreationCompleted(result) => {
+                self.pending_shell_creation = None;
                 self.message = Some(Message::from_result(result));
                 return vec![DashboardEffect::Refresh];
             }
@@ -2891,6 +3499,10 @@ impl App {
             KeyCode::Home => self.scroll_terminal_preview_to_start(),
             KeyCode::End => self.scroll_terminal_preview_to_end(),
             KeyCode::Enter => {
+                if self.primary_tab == PrimaryTab::Nodes {
+                    self.inspect_selected_node();
+                    return None;
+                }
                 if self.primary_tab == PrimaryTab::Schedules {
                     return self.open_selected_schedule_link();
                 }
@@ -2903,8 +3515,16 @@ impl App {
                     }
                 };
             }
+            KeyCode::Char('r') if self.primary_tab == PrimaryTab::Nodes => {
+                return self
+                    .node_state
+                    .selected()
+                    .and_then(|index| self.nodes.get(index))
+                    .filter(|node| !node.local)
+                    .map(|node| DashboardEffect::RefreshNode(node.id.clone()))
+                    .or(Some(DashboardEffect::Refresh));
+            }
             KeyCode::Char('r') => return Some(DashboardEffect::Refresh),
-            KeyCode::Char('n') => self.cycle_node_filter(),
             KeyCode::Char('[') if self.primary_tab == PrimaryTab::Schedules => {
                 self.cycle_execution(false);
             }
@@ -2948,7 +3568,16 @@ impl App {
             }
             KeyCode::Char('x') => self.request_close(),
             KeyCode::Char('a') => return self.request_add(),
+            KeyCode::Char('d') if self.primary_tab == PrimaryTab::Workspaces => {
+                return self.adopt_selected_external();
+            }
+            KeyCode::Char('L') if self.primary_tab == PrimaryTab::Workspaces => {
+                self.link_selected_external();
+            }
             KeyCode::Char('e') => return self.request_rename(),
+            KeyCode::Char('t') if self.primary_tab == PrimaryTab::Nodes => {
+                self.retarget_selected_node();
+            }
             KeyCode::Char(' ') => self.toggle_selection_pin(),
             KeyCode::Char('/' | ':') => self.open_palette(),
             KeyCode::Char('?') => self.mode = Mode::Help,
@@ -2976,26 +3605,16 @@ impl App {
                 self.nodes = state.nodes;
                 self.all_workspaces = state.workspaces;
                 self.all_schedules = state.schedules;
-                let workspaces = self
-                    .all_workspaces
-                    .iter()
-                    .filter(|workspace| {
-                        self.node_filter
-                            .as_ref()
-                            .is_none_or(|node_id| workspace.node.id == *node_id)
-                    })
-                    .cloned()
-                    .collect();
-                let schedules = self
-                    .all_schedules
-                    .iter()
-                    .filter(|schedule| {
-                        self.node_filter
-                            .as_ref()
-                            .is_none_or(|node_id| schedule.node_id == *node_id)
-                    })
-                    .cloned()
-                    .collect();
+                let workspaces = self.all_workspaces.clone();
+                let schedules = self.all_schedules.clone();
+                self.node_state.select(
+                    (!self.nodes.is_empty()).then_some(
+                        self.node_state
+                            .selected()
+                            .unwrap_or(0)
+                            .min(self.nodes.len().saturating_sub(1)),
+                    ),
+                );
                 self.replace_workspaces(workspaces);
                 self.replace_schedules(schedules);
                 self.scheduling = state.scheduling;
@@ -3014,12 +3633,14 @@ impl App {
         let selected = if self.primary_tab == PrimaryTab::Workspaces && self.focus != Focus::Items {
             None
         } else {
-            let workspace = self
-                .selected_item_workspace()
-                .filter(|workspace| workspace.actionable())?;
-            self.selected_item().and_then(|item| match item {
+            let (workspace_index, item_index) = self.selected_item_location()?;
+            let workspace = &self.workspaces[workspace_index];
+            if !workspace.item_actionable(item_index) {
+                return None;
+            }
+            workspace.items.get(item_index).and_then(|item| match item {
                 WorkspaceItemView::Shell(shell) if shell.kind == TerminalKind::Shell => Some((
-                    workspace.qualify(&shell.id),
+                    workspace.qualify_item(item_index, &shell.id),
                     shell.run.as_ref().map(|run| run.id.clone()),
                     shell.run.as_ref().map_or(0, |run| run.output_revision),
                 )),
@@ -3037,7 +3658,6 @@ impl App {
             preview.shell_id == shell_id.inner_id
                 && preview.run_id == run_id
                 && preview.output_revision == output_revision
-                && preview.output.is_ok()
         }) {
             return None;
         }
@@ -3219,11 +3839,9 @@ impl App {
 
     fn select_agent_id(&mut self, agent_id: &QualifiedIdentity) -> bool {
         let Some((workspace_index, item_index)) = self.workspaces.iter().enumerate().find_map(|(workspace_index, workspace)| {
-            if workspace.node.id != agent_id.node_id {
-                return None;
-            }
             workspace.items.iter().enumerate().find_map(|(item_index, item)| {
-                matches!(item, WorkspaceItemView::AgentShell(agent) if agent.agent.as_ref().is_some_and(|agent| agent.id == agent_id.inner_id))
+                (workspace.item_owner(item_index).0.id == agent_id.node_id
+                    && matches!(item, WorkspaceItemView::AgentShell(agent) if agent.agent.as_ref().is_some_and(|agent| agent.id == agent_id.inner_id)))
                     .then_some((workspace_index, item_index))
             })
         }) else {
@@ -3232,6 +3850,7 @@ impl App {
         self.select_tab(PrimaryTab::Agents);
         let identity = item_identity(
             &self.workspaces[workspace_index],
+            item_index,
             &self.workspaces[workspace_index].items[item_index],
         );
         self.global_state
@@ -3242,7 +3861,11 @@ impl App {
     fn workspace_item_identity(&self) -> Option<ItemIdentity> {
         let (workspace_index, item_index) = self.selected_item_location()?;
         let workspace = self.workspaces.get(workspace_index)?;
-        Some(item_identity(workspace, workspace.items.get(item_index)?))
+        Some(item_identity(
+            workspace,
+            item_index,
+            workspace.items.get(item_index)?,
+        ))
     }
 
     fn global_item_identity(&self) -> Option<ItemIdentity> {
@@ -3252,6 +3875,7 @@ impl App {
         let (workspace, item) = self.selected_item_location()?;
         Some(item_identity(
             &self.workspaces[workspace],
+            item,
             &self.workspaces[workspace].items[item],
         ))
     }
@@ -3261,15 +3885,20 @@ impl App {
             self.global_item_location(ordinal)
                 .is_some_and(|(workspace, item)| {
                     let workspace = &self.workspaces[workspace];
+                    let owner = workspace.item_owner(item);
                     item_matches(&workspace.items[item], identity)
-                        && workspace.node.id == identity.workspace_id.node_id
-                        && workspace.id == identity.workspace_id.inner_id
+                        && owner.0.id == identity.workspace_id.node_id
+                        && owner.1 == identity.workspace_id.inner_id
                 })
         })
     }
 }
 
-fn item_identity(workspace: &WorkspaceView, item: &WorkspaceItemView) -> ItemIdentity {
+fn item_identity(
+    workspace: &WorkspaceView,
+    item_index: usize,
+    item: &WorkspaceItemView,
+) -> ItemIdentity {
     let (item_id, kind) = match item {
         WorkspaceItemView::Shell(shell) => (shell.id.clone(), ItemIdentityKind::Shell),
         WorkspaceItemView::AgentShell(agent) => (agent.shell.id.clone(), ItemIdentityKind::Shell),
@@ -3277,9 +3906,32 @@ fn item_identity(workspace: &WorkspaceView, item: &WorkspaceItemView) -> ItemIde
         WorkspaceItemView::Schedule(schedule) => (schedule.id.clone(), ItemIdentityKind::Schedule),
     };
     ItemIdentity {
-        workspace_id: workspace.qualify(&workspace.id),
-        item_id: workspace.qualify(item_id),
+        workspace_id: workspace.qualify_item_workspace(item_index),
+        item_id: workspace.qualify_item(item_index, item_id),
         kind,
+    }
+}
+
+fn global_shell_effect(
+    workspace: &WorkspaceView,
+    expected_revision: u64,
+    placements: &[WorkspacePlacementView],
+    node: &NodeView,
+) -> DashboardEffect {
+    let placement = placements
+        .iter()
+        .find(|placement| placement.node.id == node.id);
+    DashboardEffect::CreateGlobalShell {
+        workspace_id: workspace.id.clone(),
+        expected_revision,
+        node_id: node.id.clone(),
+        owner_workspace_id: placement.map_or_else(
+            || uuid::Uuid::new_v4().to_string(),
+            |placement| placement.workspace_id.clone(),
+        ),
+        default_cwd: placement
+            .and_then(|placement| placement.default_cwd.as_deref())
+            .map(PathBuf::from),
     }
 }
 
@@ -3300,41 +3952,51 @@ fn item_matches(item: &WorkspaceItemView, identity: &ItemIdentity) -> bool {
     }
 }
 
-fn item_rename_target(workspace: &WorkspaceView, item: &WorkspaceItemView) -> Option<RenameTarget> {
+fn item_rename_target(
+    workspace: &WorkspaceView,
+    item_index: usize,
+    item: &WorkspaceItemView,
+) -> Option<RenameTarget> {
     match item {
-        WorkspaceItemView::Shell(shell) => Some(RenameTarget::Shell(workspace.qualify(&shell.id))),
-        WorkspaceItemView::AgentShell(agent) => {
-            Some(RenameTarget::Shell(workspace.qualify(&agent.shell.id)))
-        }
-        WorkspaceItemView::Launcher(launcher) => {
-            Some(RenameTarget::Launcher(workspace.qualify(&launcher.id)))
-        }
+        WorkspaceItemView::Shell(shell) => Some(RenameTarget::Shell(
+            workspace.qualify_item(item_index, &shell.id),
+        )),
+        WorkspaceItemView::AgentShell(agent) => Some(RenameTarget::Shell(
+            workspace.qualify_item(item_index, &agent.shell.id),
+        )),
+        WorkspaceItemView::Launcher(launcher) => Some(RenameTarget::Launcher(
+            workspace.qualify_item(item_index, &launcher.id),
+        )),
         WorkspaceItemView::Schedule(_) => None,
     }
 }
 
-fn item_pending_close(workspace: &WorkspaceView, item: &WorkspaceItemView) -> PendingClose {
+fn item_pending_close(
+    workspace: &WorkspaceView,
+    item_index: usize,
+    item: &WorkspaceItemView,
+) -> PendingClose {
     match item {
         WorkspaceItemView::Shell(shell) => PendingClose {
-            target: CloseTarget::Shell(workspace.qualify(&shell.id)),
+            target: CloseTarget::Shell(workspace.qualify_item(item_index, &shell.id)),
             name: shell.name.clone(),
             shell_count: 1,
             launcher_count: 0,
         },
         WorkspaceItemView::AgentShell(agent) => PendingClose {
-            target: CloseTarget::Shell(workspace.qualify(&agent.shell.id)),
+            target: CloseTarget::Shell(workspace.qualify_item(item_index, &agent.shell.id)),
             name: agent.shell.name.clone(),
             shell_count: 1,
             launcher_count: 0,
         },
         WorkspaceItemView::Launcher(launcher) => PendingClose {
-            target: CloseTarget::Launcher(workspace.qualify(&launcher.id)),
+            target: CloseTarget::Launcher(workspace.qualify_item(item_index, &launcher.id)),
             name: launcher.name.clone(),
             shell_count: 0,
             launcher_count: 1,
         },
         WorkspaceItemView::Schedule(schedule) => PendingClose {
-            target: CloseTarget::Schedule(workspace.qualify(&schedule.id)),
+            target: CloseTarget::Schedule(workspace.qualify_item(item_index, &schedule.id)),
             name: schedule.name.clone(),
             shell_count: 0,
             launcher_count: 0,
@@ -3342,25 +4004,28 @@ fn item_pending_close(workspace: &WorkspaceView, item: &WorkspaceItemView) -> Pe
     }
 }
 
-pub(crate) fn run<B: DashboardBackend>(
+pub(crate) fn run<B: DashboardBackend + Send + 'static>(
     state: DashboardState,
     follow_focused_terminal: bool,
     project_context: ProjectContext,
     play_intro: bool,
     backend: B,
 ) -> io::Result<()> {
-    let mut terminal = ratatui::init();
+    let mut terminal = ratatui::try_init().map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("dashboard requires an interactive terminal: {error}"),
+        )
+    })?;
     if let Err(error) = execute!(io::stdout(), EnableBracketedPaste) {
-        ratatui::restore();
+        let _ = ratatui::try_restore();
         return Err(error);
     }
     let mut app = App::new(state.workspaces, project_context);
     app.nodes = state.nodes;
+    app.node_state.select((!app.nodes.is_empty()).then_some(0));
     app.all_schedules = state.schedules.clone();
     app.schedules = state.schedules;
-    if state.initial_node_filter.is_some() {
-        app.set_node_filter(state.initial_node_filter);
-    }
     app.scheduling = state.scheduling;
     app.exact_run_attachment = state.exact_run_attachment;
     app.schedule_editing = state.schedule_editing;
@@ -3373,8 +4038,9 @@ pub(crate) fn run<B: DashboardBackend>(
         run_loop(&mut terminal, app, backend)
     };
     let paste_result = execute!(io::stdout(), DisableBracketedPaste);
-    ratatui::restore();
+    let restore_result = ratatui::try_restore();
     paste_result?;
+    restore_result?;
     result
 }
 
@@ -3395,23 +4061,35 @@ fn play_bomb_animation(terminal: &mut ratatui::DefaultTerminal) -> io::Result<()
     }
 }
 
-fn run_loop<B: DashboardBackend>(
-    terminal: &mut ratatui::DefaultTerminal,
-    mut app: App,
-    mut backend: B,
-) -> io::Result<()> {
+fn run_loop<B>(terminal: &mut ratatui::DefaultTerminal, mut app: App, backend: B) -> io::Result<()>
+where
+    B: DashboardBackend + Send + 'static,
+{
+    let mut runtime = DashboardRuntime::spawn(backend);
     let mut last_refresh = Instant::now();
     loop {
+        if runtime.drain(&mut app)? {
+            return Ok(());
+        }
         if last_refresh.elapsed() >= UPDATE_CHECK_INTERVAL {
             let effects = app.update(DashboardEvent::RefreshElapsed);
-            execute_effects(&mut app, &mut backend, effects);
+            if runtime.dispatch(effects)? {
+                return Ok(());
+            }
             last_refresh = Instant::now();
         }
         let effects = app.update(DashboardEvent::PreviewRequested);
-        execute_effects(&mut app, &mut backend, effects);
+        if runtime.dispatch(effects)? {
+            return Ok(());
+        }
         terminal.draw(|frame| render(frame, &mut app))?;
 
-        if !event::poll(Duration::from_millis(250))? {
+        let poll_interval = if runtime.has_in_flight_effect() {
+            INTRO_POLL_INTERVAL
+        } else {
+            UPDATE_CHECK_INTERVAL
+        };
+        if !event::poll(poll_interval)? {
             continue;
         }
         let effects = match event::read()? {
@@ -3425,28 +4103,19 @@ fn run_loop<B: DashboardBackend>(
             _ => continue,
         };
         if effects.contains(&DashboardEffect::Quit) {
-            return Ok(());
-        }
-        if !effects.is_empty() {
-            execute_effects(&mut app, &mut backend, effects);
-        }
-        // Keep navigation responsive by waiting for an idle input window before
-        // performing the next synchronous background refresh.
-        last_refresh = Instant::now();
-    }
-}
-
-fn execute_effects(
-    app: &mut App,
-    backend: &mut impl DashboardBackend,
-    effects: Vec<DashboardEffect>,
-) {
-    let mut pending = effects;
-    while let Some(effect) = pending.pop() {
-        if effect == DashboardEffect::Quit {
+            if runtime.can_quit() {
+                return Ok(());
+            }
+            app.message = Some(Message {
+                text: "Wait for the current operation to finish before quitting".into(),
+                error: false,
+            });
             continue;
         }
-        pending.extend(app.update(backend.execute(effect)));
+        if !effects.is_empty() && runtime.dispatch(effects)? {
+            return Ok(());
+        }
+        last_refresh = Instant::now();
     }
 }
 
@@ -3657,11 +4326,11 @@ fn handle_mode_key(
                     .custom_name()
                     .expect("nonempty workspace name")
                     .to_owned();
-                Some(app.create_workspace(&name, None))
+                app.create_workspace(&name)
             }
             KeyCode::Enter if picker.selected().is_some() => {
                 let project = picker.selected().expect("selected project").clone();
-                Some(app.create_workspace(&project.name, Some(project.path)))
+                app.create_workspace(&project.name)
             }
             KeyCode::Enter => {
                 app.mode = Mode::PickProject(picker);
@@ -3697,6 +4366,115 @@ fn handle_mode_key(
             }
             _ => {
                 app.mode = Mode::PickProject(picker);
+                None
+            }
+        },
+        Mode::SelectWorkspaceNode(mut picker) => match key {
+            KeyCode::Enter => match picker.effect() {
+                Some(effect) => {
+                    let node_alias = picker
+                        .selected
+                        .and_then(|selected| picker.nodes.get(selected))
+                        .map(|node| node.alias.clone())
+                        .expect("Shell creation requires a selected Node");
+                    app.begin_shell_creation(&picker.workspace_name, &node_alias);
+                    Some(effect)
+                }
+                None => {
+                    app.mode = Mode::SelectWorkspaceNode(picker);
+                    None
+                }
+            },
+            KeyCode::Down | KeyCode::Char('j') => {
+                picker.move_selection(true);
+                app.mode = Mode::SelectWorkspaceNode(picker);
+                None
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                picker.move_selection(false);
+                app.mode = Mode::SelectWorkspaceNode(picker);
+                None
+            }
+            KeyCode::Esc => None,
+            _ => {
+                app.mode = Mode::SelectWorkspaceNode(picker);
+                None
+            }
+        },
+        Mode::LinkWorkspace(mut picker) => match key {
+            KeyCode::Enter => match picker.effect() {
+                Some(effect) => Some(effect),
+                None => {
+                    app.mode = Mode::LinkWorkspace(picker);
+                    None
+                }
+            },
+            KeyCode::Down | KeyCode::Char('j') => {
+                picker.move_selection(true);
+                app.mode = Mode::LinkWorkspace(picker);
+                None
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                picker.move_selection(false);
+                app.mode = Mode::LinkWorkspace(picker);
+                None
+            }
+            KeyCode::Esc => None,
+            _ => {
+                app.mode = Mode::LinkWorkspace(picker);
+                None
+            }
+        },
+        Mode::InspectNode(node) => match key {
+            KeyCode::Esc | KeyCode::Enter => None,
+            _ => {
+                app.mode = Mode::InspectNode(node);
+                None
+            }
+        },
+        Mode::RetargetNode {
+            node_id,
+            expected_revision,
+            mut input,
+        } => match key {
+            KeyCode::Enter if !input.trim().is_empty() => Some(DashboardEffect::RetargetNode {
+                node_id,
+                expected_revision,
+                route: input.trim().to_owned(),
+            }),
+            KeyCode::Esc => None,
+            KeyCode::Backspace => {
+                input.pop();
+                app.mode = Mode::RetargetNode {
+                    node_id,
+                    expected_revision,
+                    input,
+                };
+                None
+            }
+            KeyCode::Char(character) => {
+                input.push(character);
+                app.mode = Mode::RetargetNode {
+                    node_id,
+                    expected_revision,
+                    input,
+                };
+                None
+            }
+            _ => {
+                app.mode = Mode::RetargetNode {
+                    node_id,
+                    expected_revision,
+                    input,
+                };
+                None
+            }
+        },
+        Mode::ConfirmForgetNode(node) => match key {
+            KeyCode::Char('y') => Some(DashboardEffect::ForgetNode { node_id: node.id }),
+            KeyCode::Char('n') | KeyCode::Esc => None,
+            _ => {
+                app.mode = Mode::ConfirmForgetNode(node);
                 None
             }
         },
@@ -3826,7 +4604,9 @@ fn render(frame: &mut Frame, app: &mut App) {
     .areas(area);
 
     render_tabs(frame, tabs_area, app);
-    if app.primary_tab == PrimaryTab::Schedules {
+    if app.primary_tab == PrimaryTab::Nodes {
+        render_nodes(frame, dashboard_area, app);
+    } else if app.primary_tab == PrimaryTab::Schedules {
         render_schedules(frame, dashboard_area, app);
     } else if app.primary_tab != PrimaryTab::Workspaces {
         render_global_items(frame, dashboard_area, app);
@@ -3847,9 +4627,211 @@ fn render(frame: &mut Frame, app: &mut App) {
         Mode::PickProject(picker) => render_project_picker(frame, area, picker),
         Mode::Palette(palette) => render_command_palette(frame, area, palette),
         Mode::Help => render_help_overlay(frame, area, app),
+        Mode::SelectWorkspaceNode(picker) => render_workspace_node_picker(frame, area, picker),
+        Mode::LinkWorkspace(picker) => render_link_workspace_picker(frame, area, picker),
+        Mode::InspectNode(node) => render_node_inspection(frame, area, node),
+        Mode::RetargetNode { input, .. } => render_node_retarget(frame, area, input),
+        Mode::ConfirmForgetNode(node) => render_node_forget_confirmation(frame, area, node),
         Mode::EditSchedule(editor) => render_schedule_editor(frame, area, editor),
         Mode::Normal | Mode::Rename { .. } => {}
     }
+}
+
+fn render_node_inspection(frame: &mut Frame, area: Rect, node: &NodeView) {
+    let popup = centered_rect(area, 70, 72);
+    frame.render_widget(Clear, popup);
+    let lines = vec![
+        Line::from(format!("ID           {}", node.id)),
+        Line::from(format!("Alias        {}", node.alias)),
+        Line::from(format!(
+            "Route        {}",
+            node.route.as_deref().unwrap_or("local")
+        )),
+        Line::from(format!(
+            "Revision     {}",
+            node.registration_revision
+                .map_or_else(|| "-".into(), |value| value.to_string())
+        )),
+        Line::from(format!("Health       {}", node_health_label(node.health))),
+        Line::from(format!("Current      {}", node.current)),
+        Line::from(format!("Stale        {}", node.stale)),
+        Line::from(format!(
+            "Protocol     {}",
+            node.observed_protocol_version
+                .map_or_else(|| "-".into(), |value| value.to_string())
+        )),
+        Line::from(format!(
+            "Last sync    {}",
+            if node.observed_at_ms == 0 {
+                "never".into()
+            } else {
+                compact_recency(node.observed_at_ms)
+            }
+        )),
+        Line::from(format!(
+            "Scheduler    {:?} {}/{}",
+            node.scheduler.state, node.scheduler.active_executions, node.scheduler.max_concurrent
+        )),
+        Line::from(format!(
+            "Placement    {}",
+            if node.workspace_owner_eligible {
+                "eligible"
+            } else {
+                node.workspace_owner_unavailable_reason
+                    .as_deref()
+                    .unwrap_or("unavailable")
+            }
+        )),
+        Line::from(format!(
+            "Capabilities {}",
+            node.observed_capabilities.join(", ")
+        )),
+        Line::from(""),
+        Line::styled("enter/esc close", Style::new().fg(SUBTEXT)),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::bordered()
+                    .title(" Node inspection ")
+                    .border_style(Style::new().fg(TEAL)),
+            )
+            .wrap(Wrap { trim: false }),
+        popup,
+    );
+}
+
+fn render_node_retarget(frame: &mut Frame, area: Rect, input: &str) {
+    let popup = centered_rect(area, 68, 24);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(format!(
+            "New SSH route:\n\n{input}_\n\nenter verify and retarget  esc cancel"
+        ))
+        .block(
+            Block::bordered()
+                .title(" Retarget Node ")
+                .border_style(Style::new().fg(YELLOW)),
+        ),
+        popup,
+    );
+}
+
+fn render_node_forget_confirmation(frame: &mut Frame, area: Rect, node: &NodeView) {
+    let popup = centered_rect(area, 64, 24);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(format!(
+            "Forget Node {} ({})?\n\nThis removes only the local route and projection. Remote work continues.\n\ny confirm  n/esc cancel",
+            node.alias, node.id
+        ))
+        .block(Block::bordered().title(" Confirm forget ").border_style(Style::new().fg(RED)))
+        .wrap(Wrap { trim: false }),
+        popup,
+    );
+}
+
+fn render_workspace_node_picker(frame: &mut Frame, area: Rect, picker: &WorkspaceNodePicker) {
+    let popup = centered_rect(area, 76, 70);
+    frame.render_widget(Clear, popup);
+    let block = Block::bordered()
+        .title(format!(
+            " Place first resource for {} ",
+            picker.workspace_name
+        ))
+        .border_style(Style::new().fg(TEAL));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let [notice, table_area, help] = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Fill(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+    frame.render_widget(
+        Paragraph::new("No Node is preselected. Unavailable owners remain visible but disabled.")
+            .style(Style::new().fg(SUBTEXT)),
+        notice,
+    );
+    let rows = picker.nodes.iter().map(|node| {
+        let status = if node.workspace_owner_eligible {
+            "eligible".into()
+        } else {
+            node.workspace_owner_unavailable_reason
+                .clone()
+                .unwrap_or_else(|| "unavailable".into())
+        };
+        Row::new([
+            node.alias.clone(),
+            node_health_label(node.health).into(),
+            status,
+            node.route.clone().unwrap_or_else(|| "local".into()),
+        ])
+        .style(Style::new().fg(if node.workspace_owner_eligible {
+            TEXT
+        } else {
+            OVERLAY
+        }))
+    });
+    let mut state = TableState::default().with_selected(picker.selected);
+    frame.render_stateful_widget(
+        Table::new(
+            rows,
+            [
+                Constraint::Length(16),
+                Constraint::Length(18),
+                Constraint::Min(24),
+                Constraint::Length(24),
+            ],
+        )
+        .header(Row::new(["NODE", "HEALTH", "PLACEMENT", "ROUTE"]).style(Style::new().fg(BLUE)))
+        .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED))
+        .highlight_symbol("> "),
+        table_area,
+        &mut state,
+    );
+    frame.render_widget(
+        Paragraph::new("j/k select eligible Node  enter confirm  esc cancel")
+            .style(Style::new().fg(SUBTEXT)),
+        help,
+    );
+}
+
+fn render_link_workspace_picker(frame: &mut Frame, area: Rect, picker: &LinkWorkspacePicker) {
+    let popup = centered_rect(area, 60, 60);
+    frame.render_widget(Clear, popup);
+    let block = Block::bordered()
+        .title(" Link external Workspace to ")
+        .border_style(Style::new().fg(TEAL));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let [table_area, help] =
+        Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(inner);
+    let rows = picker
+        .workspaces
+        .iter()
+        .map(|(id, name, revision)| Row::new([name.clone(), short_id(id), revision.to_string()]));
+    let mut state = TableState::default().with_selected(picker.selected);
+    frame.render_stateful_widget(
+        Table::new(
+            rows,
+            [
+                Constraint::Min(20),
+                Constraint::Length(10),
+                Constraint::Length(10),
+            ],
+        )
+        .header(Row::new(["WORKSPACE", "ID", "REVISION"]).style(Style::new().fg(BLUE)))
+        .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED))
+        .highlight_symbol("> "),
+        table_area,
+        &mut state,
+    );
+    frame.render_widget(
+        Paragraph::new("j/k select  enter guarded link  esc cancel")
+            .style(Style::new().fg(SUBTEXT)),
+        help,
+    );
 }
 
 fn render_schedule_editor(frame: &mut Frame, area: Rect, editor: &ScheduleEditor) {
@@ -4770,6 +5752,26 @@ fn workspace_display_name(workspace: &WorkspaceView) -> String {
     )
 }
 
+fn workspace_table_display_name(workspace: &WorkspaceView, duplicate_name: bool) -> String {
+    if matches!(
+        workspace.coordination,
+        WorkspaceCoordinationView::Global { .. }
+    ) || (workspace.node.local && !duplicate_name)
+    {
+        return workspace.name.clone();
+    }
+    let health = node_health_label(workspace.node.health);
+    let freshness = if workspace.node.stale || !workspace.node.current {
+        " stale"
+    } else {
+        ""
+    };
+    format!(
+        "[{} {health}{freshness}] {}",
+        workspace.node.alias, workspace.name
+    )
+}
+
 fn node_health_label(health: NodeProjectionHealthCode) -> &'static str {
     match health {
         NodeProjectionHealthCode::Unobserved => "unobserved",
@@ -4801,8 +5803,6 @@ fn render_tabs(frame: &mut Frame, area: Rect, app: &App) {
                 ]
             })
             .collect::<Vec<_>>();
-        let mut spans = spans;
-        append_node_filter(&mut spans, app);
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
         return;
     }
@@ -4839,6 +5839,7 @@ fn render_tabs(frame: &mut Frame, area: Rect, app: &App) {
                         app.workspaces.iter().map(WorkspaceView::shell_count).sum()
                     }
                     PrimaryTab::Schedules => app.schedules.len(),
+                    PrimaryTab::Nodes => app.nodes.len(),
                     PrimaryTab::Workspaces => unreachable!("workspace tab is rendered separately"),
                 };
                 let style = if *tab == app.primary_tab {
@@ -4852,24 +5853,65 @@ fn render_tabs(frame: &mut Frame, area: Rect, app: &App) {
                 ]
             }),
     );
-    append_node_filter(&mut spans, app);
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn append_node_filter<'a>(spans: &mut Vec<Span<'a>>, app: &'a App) {
-    if app.nodes.len() <= 1 && app.node_filter.is_none() {
-        return;
-    }
-    let filter = app.node_filter.as_ref().map_or("all", |id| {
-        app.nodes
-            .iter()
-            .find(|node| &node.id == id)
-            .map_or("unknown", |node| node.alias.as_str())
+fn render_nodes(frame: &mut Frame, area: Rect, app: &mut App) {
+    let rows = app.nodes.iter().map(|node| {
+        let protocol = node
+            .observed_protocol_version
+            .map_or_else(|| "-".into(), |version| version.to_string());
+        let last_sync = if node.observed_at_ms == 0 {
+            "never".into()
+        } else {
+            compact_recency(node.observed_at_ms)
+        };
+        let scheduler = match node.scheduler.state {
+            crate::protocol::SchedulerState::Active => "active",
+            crate::protocol::SchedulerState::Offline => "offline",
+        };
+        Row::new(vec![
+            node.alias.clone(),
+            node_health_label(node.health).into(),
+            node.route.clone().unwrap_or_else(|| "local".into()),
+            protocol,
+            last_sync,
+            scheduler.into(),
+            node.observed_capabilities.join(","),
+        ])
     });
-    spans.push(Span::styled(
-        format!(" NODE:{filter}"),
-        Style::new().fg(YELLOW),
-    ));
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(14),
+            Constraint::Length(18),
+            Constraint::Length(24),
+            Constraint::Length(9),
+            Constraint::Length(12),
+            Constraint::Length(11),
+            Constraint::Fill(1),
+        ],
+    )
+    .header(
+        Row::new([
+            "ALIAS",
+            "HEALTH",
+            "ROUTE",
+            "PROTOCOL",
+            "LAST SYNC",
+            "SCHEDULER",
+            "CAPABILITIES",
+        ])
+        .style(Style::new().fg(BLUE).add_modifier(Modifier::BOLD)),
+    )
+    .block(
+        Block::bordered()
+            .title(" Nodes ")
+            .border_style(Style::new().fg(OVERLAY)),
+    )
+    .row_highlight_style(Style::new().fg(TEXT).add_modifier(Modifier::REVERSED))
+    .highlight_symbol("> ");
+    frame.render_stateful_widget(table, area, &mut app.node_state);
 }
 
 fn render_workspaces(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
@@ -4892,7 +5934,18 @@ fn render_workspaces(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut A
     } else {
         app.workspaces
             .iter()
-            .map(|workspace| Row::new([Cell::from(workspace_display_name(workspace))]))
+            .map(|workspace| {
+                let duplicate_name = app
+                    .workspaces
+                    .iter()
+                    .filter(|candidate| candidate.name == workspace.name)
+                    .count()
+                    > 1;
+                Row::new([Cell::from(workspace_table_display_name(
+                    workspace,
+                    duplicate_name,
+                ))])
+            })
             .collect()
     };
     let table = Table::new(rows, [Constraint::Min(8)])
@@ -4936,9 +5989,13 @@ fn render_schedules(frame: &mut Frame, area: Rect, app: &mut App) {
         (area, None)
     };
     let show_trigger = table_area.width >= 60;
+    let show_node = app.nodes.len() > 1;
     let show_workspace = table_area.width >= 74;
     let show_integration = table_area.width >= 88;
     let mut headers = vec!["NAME"];
+    if show_node {
+        headers.push("NODE");
+    }
     if show_trigger {
         headers.push("TRIGGER");
     }
@@ -4999,21 +6056,20 @@ fn render_schedules(frame: &mut Frame, area: Rect, app: &mut App) {
                     },
                     occurrence_recency,
                 );
-                let mut values = vec![if schedule.node_alias == "local" {
+                let mut values = vec![if show_node || schedule.node_alias == "local" {
                     schedule.name.clone()
                 } else {
                     format!("[{}] {}", schedule.node_alias, schedule.name)
                 }];
+                if show_node {
+                    values.push(schedule.node_alias.clone());
+                }
                 if show_trigger {
                     values.push(schedule.friendly_trigger.clone());
                 }
                 values.extend([next, last, schedule.state.label().into()]);
                 if show_workspace {
-                    values.push(if schedule.node_alias == "local" {
-                        schedule.workspace.clone()
-                    } else {
-                        format!("[{}] {}", schedule.node_alias, schedule.workspace)
-                    });
+                    values.push(schedule.workspace.clone());
                 }
                 if show_integration {
                     values.push(schedule.integration.clone());
@@ -5221,44 +6277,58 @@ fn render_global_items(frame: &mut Frame, area: Rect, app: &mut App) {
         (items_area, Some(preview_area))
     });
     let (rows, widths, header) = if app.primary_tab == PrimaryTab::Agents {
-        let values: Vec<[String; 7]> = app
+        let values: Vec<[String; 8]> = app
             .workspaces
             .iter()
             .flat_map(|workspace| {
-                workspace.items.iter().filter_map(move |item| {
-                    let WorkspaceItemView::AgentShell(agent) = item else {
-                        return None;
-                    };
-                    let task = matched_agent_session(workspace, agent)
-                        .and_then(session_task_label)
-                        .unwrap_or("-");
-                    let (updated, branch, worktree) = agent.agent.as_ref().map_or_else(
-                        || ("-".into(), "-".into(), "-".into()),
-                        |view| {
-                            (
-                                compact_recency(view.updated_at_ms),
-                                view.root_branch.clone(),
-                                view.root_worktree.clone(),
-                            )
-                        },
-                    );
-                    Some([
-                        agent.state().label().to_owned(),
-                        updated,
-                        workspace_display_name(workspace),
-                        agent.shell.name.clone(),
-                        task.to_owned(),
-                        branch,
-                        worktree,
-                    ])
-                })
+                workspace
+                    .items
+                    .iter()
+                    .enumerate()
+                    .filter_map(move |(item_index, item)| {
+                        let WorkspaceItemView::AgentShell(agent) = item else {
+                            return None;
+                        };
+                        let task = matched_agent_session(workspace, agent)
+                            .and_then(session_task_label)
+                            .unwrap_or("-");
+                        let (updated, branch, worktree) = agent.agent.as_ref().map_or_else(
+                            || ("-".into(), "-".into(), "-".into()),
+                            |view| {
+                                (
+                                    compact_recency(view.updated_at_ms),
+                                    view.root_branch.clone(),
+                                    view.root_worktree.clone(),
+                                )
+                            },
+                        );
+                        Some([
+                            agent.state().label().to_owned(),
+                            updated,
+                            workspace_display_name(workspace),
+                            workspace.item_owner(item_index).0.alias.clone(),
+                            agent.shell.name.clone(),
+                            task.to_owned(),
+                            branch,
+                            worktree,
+                        ])
+                    })
             })
             .collect();
         let widths = agent_column_widths(items_inner.width, &values);
         let rows: Vec<_> = values
             .into_iter()
             .map(
-                |[status, updated, workspace, shell, task, branch, worktree]| {
+                |[
+                    status,
+                    updated,
+                    workspace,
+                    node,
+                    shell,
+                    task,
+                    branch,
+                    worktree,
+                ]| {
                     Row::new([
                         Cell::from(Span::styled(
                             status.clone(),
@@ -5266,6 +6336,7 @@ fn render_global_items(frame: &mut Frame, area: Rect, app: &mut App) {
                         )),
                         Cell::from(updated),
                         Cell::from(workspace),
+                        Cell::from(node),
                         Cell::from(shell),
                         Cell::from(task),
                         Cell::from(branch),
@@ -5276,28 +6347,33 @@ fn render_global_items(frame: &mut Frame, area: Rect, app: &mut App) {
             .collect();
         (rows, widths, AGENT_TABLE_HEADERS.to_vec())
     } else if app.primary_tab == PrimaryTab::Shells {
-        let values: Vec<[String; 8]> = app
+        let values: Vec<[String; 9]> = app
             .workspaces
             .iter()
             .flat_map(|workspace| {
-                workspace.items.iter().filter_map(move |item| {
-                    let WorkspaceItemView::Shell(shell) = item else {
-                        return None;
-                    };
-                    Some([
-                        shell.table_status(),
-                        shell
-                            .run
-                            .as_ref()
-                            .map_or_else(|| "-".into(), |run| format!("#{}", run.generation)),
-                        workspace_display_name(workspace),
-                        shell.name.clone(),
-                        shell.kind.label().into(),
-                        shell.process().into(),
-                        shell.branch.clone(),
-                        shell.worktree.clone(),
-                    ])
-                })
+                workspace
+                    .items
+                    .iter()
+                    .enumerate()
+                    .filter_map(move |(item_index, item)| {
+                        let WorkspaceItemView::Shell(shell) = item else {
+                            return None;
+                        };
+                        Some([
+                            shell.table_status(),
+                            shell
+                                .run
+                                .as_ref()
+                                .map_or_else(|| "-".into(), |run| format!("#{}", run.generation)),
+                            workspace_display_name(workspace),
+                            workspace.item_owner(item_index).0.alias.clone(),
+                            shell.name.clone(),
+                            shell.kind.label().into(),
+                            shell.process().into(),
+                            shell.branch.clone(),
+                            shell.worktree.clone(),
+                        ])
+                    })
             })
             .collect();
         let widths = shell_column_widths(items_inner.width, &values);
@@ -5308,6 +6384,7 @@ fn render_global_items(frame: &mut Frame, area: Rect, app: &mut App) {
                     status,
                     run,
                     workspace,
+                    node,
                     shell,
                     kind,
                     process,
@@ -5321,6 +6398,7 @@ fn render_global_items(frame: &mut Frame, area: Rect, app: &mut App) {
                         )),
                         Cell::from(run),
                         Cell::from(workspace),
+                        Cell::from(node),
                         Cell::from(shell),
                         Cell::from(kind),
                         Cell::from(process),
@@ -5449,74 +6527,83 @@ fn render_items(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
             Layout::vertical([Constraint::Fill(1), Constraint::Length(panel_height)]).areas(inner);
         (items_area, Some(preview_area))
     });
-    let values: Vec<[String; 6]> = selected
+    let values: Vec<[String; 7]> = selected
         .into_iter()
         .flat_map(|workspace| {
             workspace
                 .items
                 .iter()
-                .filter(|item| item.ordinary_visible())
-                .map(|item| match item {
-                    WorkspaceItemView::Shell(terminal) => [
-                        terminal.kind.label().into(),
-                        terminal.table_status(),
-                        terminal.name.clone(),
-                        terminal.process().into(),
-                        terminal.branch.clone(),
-                        terminal.worktree.clone(),
-                    ],
-                    WorkspaceItemView::AgentShell(agent_shell) => {
-                        let (activity, branch, worktree) = agent_shell.agent.as_ref().map_or_else(
-                            || {
-                                (
-                                    agent_shell.shell.process().to_owned(),
-                                    agent_shell.shell.branch.clone(),
-                                    agent_shell.shell.worktree.clone(),
-                                )
-                            },
-                            |agent| {
-                                (
-                                    matched_agent_session(workspace, agent_shell)
-                                        .and_then(session_task_label)
-                                        .unwrap_or(&agent.integration)
-                                        .to_owned(),
-                                    agent.root_branch.clone(),
-                                    agent.root_worktree.clone(),
-                                )
-                            },
-                        );
-                        [
-                            "agent".into(),
-                            agent_shell.state().label().into(),
-                            agent_shell.shell.name.clone(),
-                            activity,
-                            branch,
-                            worktree,
-                        ]
+                .enumerate()
+                .filter(|(_, item)| item.ordinary_visible())
+                .map(|(item_index, item)| {
+                    let node = workspace.item_owner(item_index).0.alias.clone();
+                    match item {
+                        WorkspaceItemView::Shell(terminal) => [
+                            terminal.kind.label().into(),
+                            terminal.table_status(),
+                            terminal.name.clone(),
+                            node,
+                            terminal.process().into(),
+                            terminal.branch.clone(),
+                            terminal.worktree.clone(),
+                        ],
+                        WorkspaceItemView::AgentShell(agent_shell) => {
+                            let (activity, branch, worktree) =
+                                agent_shell.agent.as_ref().map_or_else(
+                                    || {
+                                        (
+                                            agent_shell.shell.process().to_owned(),
+                                            agent_shell.shell.branch.clone(),
+                                            agent_shell.shell.worktree.clone(),
+                                        )
+                                    },
+                                    |agent| {
+                                        (
+                                            matched_agent_session(workspace, agent_shell)
+                                                .and_then(session_task_label)
+                                                .unwrap_or(&agent.integration)
+                                                .to_owned(),
+                                            agent.root_branch.clone(),
+                                            agent.root_worktree.clone(),
+                                        )
+                                    },
+                                );
+                            [
+                                "agent".into(),
+                                agent_shell.state().label().into(),
+                                agent_shell.shell.name.clone(),
+                                node,
+                                activity,
+                                branch,
+                                worktree,
+                            ]
+                        }
+                        WorkspaceItemView::Launcher(launcher) => [
+                            "launcher".into(),
+                            "ready".into(),
+                            launcher.name.clone(),
+                            node,
+                            launcher.command.clone(),
+                            launcher.branch.clone(),
+                            launcher.worktree.clone(),
+                        ],
+                        WorkspaceItemView::Schedule(schedule) => [
+                            "schedule".into(),
+                            schedule.state.label().into(),
+                            schedule.name.clone(),
+                            node,
+                            format!("{} · {}", schedule.integration, schedule.friendly_trigger),
+                            "-".into(),
+                            "-".into(),
+                        ],
                     }
-                    WorkspaceItemView::Launcher(launcher) => [
-                        "launcher".into(),
-                        "ready".into(),
-                        launcher.name.clone(),
-                        launcher.command.clone(),
-                        launcher.branch.clone(),
-                        launcher.worktree.clone(),
-                    ],
-                    WorkspaceItemView::Schedule(schedule) => [
-                        "schedule".into(),
-                        schedule.state.label().into(),
-                        schedule.name.clone(),
-                        format!("{} · {}", schedule.integration, schedule.friendly_trigger),
-                        "-".into(),
-                        "-".into(),
-                    ],
                 })
         })
         .collect();
     let widths = item_column_widths(items_inner.width, &values);
     let rows = values
         .into_iter()
-        .map(|[kind, status, name, activity, branch, worktree]| {
+        .map(|[kind, status, name, node, activity, branch, worktree]| {
             let kind_color = match kind.as_str() {
                 "agent" => TEAL,
                 "command" | "launcher" | "schedule" => YELLOW,
@@ -5529,6 +6616,7 @@ fn render_items(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
                     Style::new().fg(status_color(&status)),
                 )),
                 Cell::from(name),
+                Cell::from(node),
                 Cell::from(activity),
                 Cell::from(branch),
                 Cell::from(worktree),
@@ -5579,6 +6667,38 @@ fn workspace_preview(workspace: &WorkspaceView) -> ContextualPreview {
             Span::styled("default  ", Style::new().fg(SUBTEXT)),
             Span::raw(default_cwd.clone()),
         ]));
+    }
+    match &workspace.coordination {
+        WorkspaceCoordinationView::Global {
+            revision,
+            closing,
+            placements,
+        } => {
+            lines.push(Line::from(format!(
+                "global revision {revision} · {}",
+                if *closing { "closing" } else { "active" }
+            )));
+            lines.extend(placements.iter().map(|placement| {
+                Line::from(format!(
+                    "{} · {:?} · owner r{} · {}",
+                    placement.node.alias,
+                    placement.state,
+                    placement.owner_revision,
+                    placement.default_cwd.as_deref().unwrap_or("no default cwd")
+                ))
+            }));
+        }
+        WorkspaceCoordinationView::External {
+            owner_revision,
+            available,
+        } => lines.push(Line::from(format!(
+            "external owner revision {owner_revision} · {}",
+            if *available {
+                "available"
+            } else {
+                "unavailable"
+            }
+        ))),
     }
     lines.extend([
         Line::from(format!(
@@ -6051,16 +7171,16 @@ fn integration_display_name(integration: &str) -> &str {
     boomux::integrations::display_name(integration)
 }
 
-fn item_column_widths(width: u16, rows: &[[String; 6]]) -> Vec<Constraint> {
+fn item_column_widths(width: u16, rows: &[[String; 7]]) -> Vec<Constraint> {
     let caps = if width >= 140 {
-        [10, 12, 24, 52, 32, 24]
+        [10, 12, 24, 14, 52, 32, 24]
     } else if width >= 100 {
-        [10, 11, 18, 36, 24, 20]
+        [10, 11, 18, 12, 36, 24, 20]
     } else {
-        [8, 10, 14, 24, 18, 16]
+        [8, 10, 14, 9, 24, 18, 16]
     };
     let minimums = ITEM_TABLE_HEADERS.map(|header| header.len() as u16);
-    let mut widths: [u16; 6] = std::array::from_fn(|index| {
+    let mut widths: [u16; 7] = std::array::from_fn(|index| {
         rows.iter()
             .map(|row| row[index].chars().count() as u16)
             .max()
@@ -6070,10 +7190,10 @@ fn item_column_widths(width: u16, rows: &[[String; 6]]) -> Vec<Constraint> {
             .min(caps[index])
     });
 
-    // Five column gaps and the highlight marker also consume table width.
-    let available = width.saturating_sub(7);
+    // Six column gaps and the highlight marker also consume table width.
+    let available = width.saturating_sub(8);
     let mut overflow = widths.iter().sum::<u16>().saturating_sub(available);
-    for index in [3, 5, 4, 2, 1, 0] {
+    for index in [4, 6, 5, 2, 3, 1, 0] {
         let reduction = widths[index].saturating_sub(minimums[index]).min(overflow);
         widths[index] -= reduction;
         overflow -= reduction;
@@ -6133,18 +7253,18 @@ fn schedule_column_widths(width: u16, headers: &[&str], rows: &[Vec<String>]) ->
     widths.into_iter().map(Constraint::Length).collect()
 }
 
-fn shell_column_widths(width: u16, rows: &[[String; 8]]) -> Vec<Constraint> {
+fn shell_column_widths(width: u16, rows: &[[String; 9]]) -> Vec<Constraint> {
     let caps = if width >= 160 {
-        [12, 6, 24, 20, 9, 40, 32, 24]
+        [12, 6, 24, 14, 20, 9, 40, 32, 24]
     } else if width >= 120 {
-        [12, 6, 18, 16, 9, 28, 24, 20]
+        [12, 6, 18, 12, 16, 9, 28, 24, 20]
     } else if width >= 90 {
-        [11, 5, 14, 13, 8, 20, 18, 16]
+        [11, 5, 14, 10, 13, 8, 20, 18, 16]
     } else {
-        [10, 4, 11, 10, 7, 14, 12, 13]
+        [10, 4, 11, 8, 10, 7, 14, 12, 13]
     };
     let minimums = SHELL_TABLE_HEADERS.map(|header| header.len() as u16);
-    let mut widths: [u16; 8] = std::array::from_fn(|index| {
+    let mut widths: [u16; 9] = std::array::from_fn(|index| {
         rows.iter()
             .map(|row| row[index].chars().count() as u16)
             .max()
@@ -6154,10 +7274,10 @@ fn shell_column_widths(width: u16, rows: &[[String; 8]]) -> Vec<Constraint> {
             .min(caps[index])
     });
 
-    // Seven column gaps and the highlight marker also consume table width.
-    let available = width.saturating_sub(9);
+    // Eight column gaps and the highlight marker also consume table width.
+    let available = width.saturating_sub(10);
     let mut overflow = widths.iter().sum::<u16>().saturating_sub(available);
-    for index in [5, 7, 2, 3, 6, 4, 0, 1] {
+    for index in [6, 8, 2, 4, 7, 3, 5, 0, 1] {
         let reduction = widths[index].saturating_sub(minimums[index]).min(overflow);
         widths[index] -= reduction;
         overflow -= reduction;
@@ -6186,18 +7306,18 @@ fn global_column_widths(width: u16) -> Vec<Constraint> {
     ]
 }
 
-fn agent_column_widths(width: u16, rows: &[[String; 7]]) -> Vec<Constraint> {
+fn agent_column_widths(width: u16, rows: &[[String; 8]]) -> Vec<Constraint> {
     let caps = if width >= 160 {
-        [10, 9, 24, 16, 52, 36, 24]
+        [10, 9, 24, 14, 16, 52, 36, 24]
     } else if width >= 140 {
-        [10, 9, 20, 16, 44, 28, 20]
+        [10, 9, 20, 12, 16, 44, 28, 20]
     } else if width >= 100 {
-        [9, 8, 14, 12, 32, 18, 16]
+        [9, 8, 14, 10, 12, 32, 18, 16]
     } else {
-        [8, 7, 11, 10, 24, 12, 13]
+        [8, 7, 11, 8, 10, 24, 12, 13]
     };
     let minimums = AGENT_TABLE_HEADERS.map(|header| header.len() as u16);
-    let mut widths: [u16; 7] = std::array::from_fn(|index| {
+    let mut widths: [u16; 8] = std::array::from_fn(|index| {
         rows.iter()
             .map(|row| row[index].chars().count() as u16)
             .max()
@@ -6207,10 +7327,10 @@ fn agent_column_widths(width: u16, rows: &[[String; 7]]) -> Vec<Constraint> {
             .min(caps[index])
     });
 
-    // Six column gaps and the highlight marker also consume table width.
-    let available = width.saturating_sub(8);
+    // Seven column gaps and the highlight marker also consume table width.
+    let available = width.saturating_sub(9);
     let mut overflow = widths.iter().sum::<u16>().saturating_sub(available);
-    for index in [4, 2, 5, 3, 6, 0, 1] {
+    for index in [5, 2, 6, 4, 7, 3, 0, 1] {
         let reduction = widths[index].saturating_sub(minimums[index]).min(overflow);
         widths[index] -= reduction;
         overflow -= reduction;
@@ -6266,6 +7386,10 @@ fn session_state_color(state: AgentDisplayState) -> Color {
 fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     let line = if let Some(pending) = &app.pending_close {
         let prompt = match pending.target {
+            CloseTarget::GlobalWorkspace { .. } => format!(
+                " Close global workspace '{}', fan out guarded removal across {} shell(s) and {} launcher(s)?  ",
+                pending.name, pending.shell_count, pending.launcher_count
+            ),
             CloseTarget::Workspace(_) => format!(
                 " Close workspace '{}', terminate {} shell(s), and remove {} launcher(s)?  ",
                 pending.name, pending.shell_count, pending.launcher_count
@@ -6307,6 +7431,11 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
             Span::styled("esc", Style::new().fg(RED)),
             Span::raw(" cancel"),
         ])
+    } else if let Some(text) = &app.pending_shell_creation {
+        Line::from(Span::styled(
+            format!(" {text}"),
+            Style::new().fg(YELLOW).add_modifier(Modifier::BOLD),
+        ))
     } else if let Some(message) = &app.message {
         Line::from(Span::styled(
             format!(" {}", message.text),
@@ -6314,6 +7443,36 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
         ))
     } else {
         let launcher_selected = matches!(app.selected_item(), Some(WorkspaceItemView::Launcher(_)));
+        if app.primary_tab == PrimaryTab::Nodes {
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(" j/k", Style::new().fg(TEAL)),
+                    Span::styled(" navigate  ", Style::new().fg(SUBTEXT)),
+                    Span::styled("a", Style::new().fg(GREEN)),
+                    Span::styled(" add Node  ", Style::new().fg(SUBTEXT)),
+                    Span::styled("r", Style::new().fg(BLUE)),
+                    Span::styled(" retry/refresh  ", Style::new().fg(SUBTEXT)),
+                    Span::styled("enter", Style::new().fg(GREEN)),
+                    Span::styled(" inspect  ", Style::new().fg(SUBTEXT)),
+                    Span::styled("e", Style::new().fg(YELLOW)),
+                    Span::styled(" rename  ", Style::new().fg(SUBTEXT)),
+                    Span::styled("t", Style::new().fg(YELLOW)),
+                    Span::styled(" retarget  ", Style::new().fg(SUBTEXT)),
+                    Span::styled("x", Style::new().fg(RED)),
+                    Span::styled(" forget  ", Style::new().fg(SUBTEXT)),
+                    Span::styled("tab/shift-tab", Style::new().fg(TEAL)),
+                    Span::styled(" views  ", Style::new().fg(SUBTEXT)),
+                    Span::styled("1-5", Style::new().fg(TEAL)),
+                    Span::styled(" select view  ", Style::new().fg(SUBTEXT)),
+                    Span::styled("/", Style::new().fg(TEAL)),
+                    Span::styled(" palette  ", Style::new().fg(SUBTEXT)),
+                    Span::styled("q", Style::new().fg(RED)),
+                    Span::styled(" quit", Style::new().fg(SUBTEXT)),
+                ])),
+                area,
+            );
+            return;
+        }
         if app.primary_tab == PrimaryTab::Schedules {
             let paused = app
                 .selected_schedule()
@@ -6407,7 +7566,7 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
                 if app.primary_tab == PrimaryTab::Workspaces {
                     " navigate  tab/shift-tab views  h/l panes  "
                 } else {
-                    " navigate  tab/shift-tab views  1-4 select view  "
+                    " navigate  tab/shift-tab views  1-5 select view  "
                 },
                 Style::new().fg(SUBTEXT),
             ),
@@ -6454,6 +7613,24 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
                     Style::new().fg(SUBTEXT),
                 ),
             ]);
+            if app.focus == Focus::Workspaces
+                && app.selected().is_some_and(|workspace| {
+                    matches!(
+                        workspace.coordination,
+                        WorkspaceCoordinationView::External {
+                            available: true,
+                            ..
+                        }
+                    )
+                })
+            {
+                spans.extend([
+                    Span::styled("d", Style::new().fg(GREEN)),
+                    Span::styled(" adopt as new  ", Style::new().fg(SUBTEXT)),
+                    Span::styled("L", Style::new().fg(GREEN)),
+                    Span::styled(" link existing  ", Style::new().fg(SUBTEXT)),
+                ]);
+            }
         }
         spans.extend([
             Span::styled("e", Style::new().fg(YELLOW)),
@@ -6530,6 +7707,102 @@ mod tests {
 
     fn app() -> App {
         App::new(vec![workspace("w1", "boomux")], project_context())
+    }
+
+    #[test]
+    fn blocked_refresh_does_not_delay_navigation_and_remains_single_flight() {
+        let mut app = app();
+        let mut second = app.workspaces[0].items[0].clone();
+        let WorkspaceItemView::Shell(shell) = &mut second else {
+            unreachable!();
+        };
+        shell.id = "term_2".into();
+        shell.name = "second".into();
+        app.workspaces[0].items.push(second);
+        focus_items(&mut app);
+        assert_eq!(app.item_state.selected(), Some(0));
+
+        let (started_sender, started_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let mut runtime = DashboardRuntime::spawn(move |effect: DashboardEffect| {
+            started_sender.send(effect.clone()).unwrap();
+            release_receiver.recv().unwrap();
+            match effect {
+                DashboardEffect::CheckForUpdates => DashboardEvent::UpdateCheckCompleted,
+                effect => panic!("unexpected effect: {effect:?}"),
+            }
+        });
+
+        assert!(
+            !runtime
+                .dispatch(vec![DashboardEffect::CheckForUpdates])
+                .unwrap()
+        );
+        assert_eq!(
+            started_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+            DashboardEffect::CheckForUpdates
+        );
+        assert!(
+            !runtime
+                .dispatch(vec![DashboardEffect::CheckForUpdates])
+                .unwrap()
+        );
+
+        let effects = app.update(DashboardEvent::KeyPressed {
+            code: KeyCode::Down,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(effects.is_empty());
+        assert_eq!(app.item_state.selected(), Some(1));
+
+        release_sender.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while runtime.update_check_in_flight && Instant::now() < deadline {
+            runtime.drain(&mut app).unwrap();
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!runtime.update_check_in_flight);
+        assert!(matches!(
+            started_receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn mutation_must_finish_before_dashboard_can_quit() {
+        let mut app = app();
+        let (started_sender, started_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let mut runtime = DashboardRuntime::spawn(move |effect: DashboardEffect| match effect {
+            DashboardEffect::Rename { .. } => {
+                started_sender.send(()).unwrap();
+                release_receiver.recv().unwrap();
+                DashboardEvent::OperationCompleted(Ok("renamed".into()))
+            }
+            DashboardEffect::Refresh => DashboardEvent::RefreshCompleted(Err("ignored".into())),
+            effect => panic!("unexpected effect: {effect:?}"),
+        });
+
+        runtime
+            .dispatch(vec![DashboardEffect::Rename {
+                target: RenameTarget::Workspace("workspace".into()),
+                name: "renamed".into(),
+            }])
+            .unwrap();
+        started_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert!(!runtime.can_quit());
+
+        release_sender.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !runtime.can_quit() && Instant::now() < deadline {
+            runtime.drain(&mut app).unwrap();
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(runtime.can_quit());
     }
 
     #[test]
@@ -6724,10 +7997,16 @@ mod tests {
                 id: String::new(),
                 alias: "local".into(),
                 local: true,
+                route: None,
+                registration_revision: None,
                 health: NodeProjectionHealthCode::Online,
                 current: true,
                 stale: false,
+                observed_at_ms: current_time_ms(),
+                observed_protocol_version: Some(crate::protocol::PROTOCOL_VERSION),
                 observed_capabilities: Vec::new(),
+                workspace_owner_eligible: true,
+                workspace_owner_unavailable_reason: None,
                 scheduler: SchedulerHealth {
                     state: crate::protocol::SchedulerState::Active,
                     max_concurrent: 4,
@@ -6756,6 +8035,11 @@ mod tests {
             agent_state_counts: AgentStateCounts::default(),
             attention_count: 0,
             attention: Vec::new(),
+            item_owners: Vec::new(),
+            coordination: WorkspaceCoordinationView::External {
+                owner_revision: 1,
+                available: true,
+            },
         }
     }
 
@@ -6887,14 +8171,34 @@ mod tests {
         app.request_close();
         assert!(app.pending_close.is_none());
 
-        app.cycle_node_filter();
-        assert_eq!(app.workspaces.len(), 1);
-        assert_eq!(app.workspaces[0].node.alias, "local");
-        app.cycle_node_filter();
-        assert_eq!(app.workspaces.len(), 1);
-        assert_eq!(app.workspaces[0].node.alias, "work");
-        app.cycle_node_filter();
         assert_eq!(app.workspaces.len(), 2);
+    }
+
+    #[test]
+    fn focus_following_selects_the_exact_remote_node_when_shell_ids_collide() {
+        let mut local = workspace("same-workspace", "local");
+        local.node.id = "00000000-0000-0000-0000-000000000001".into();
+        let mut remote = local.clone();
+        remote.node.id = "00000000-0000-0000-0000-000000000002".into();
+        remote.node.alias = "work".into();
+        remote.node.local = false;
+        let mut app = App::new(vec![local, remote], project_context());
+
+        app.enable_focus_following(Some(&FocusedTerminalView {
+            revision: 1,
+            node_id: Some("00000000-0000-0000-0000-000000000002".into()),
+            workspace_id: String::new(),
+            shell_id: "term_1".into(),
+        }));
+
+        assert_eq!(
+            app.selected().map(|workspace| workspace.node.id.as_str()),
+            Some("00000000-0000-0000-0000-000000000002")
+        );
+        assert_eq!(
+            app.selected_item().map(WorkspaceItemView::id),
+            Some("term_1")
+        );
     }
 
     #[test]
@@ -6931,6 +8235,270 @@ mod tests {
                 "{health:?}: {compact}"
             );
         }
+    }
+
+    #[test]
+    fn nodes_tab_renders_route_protocol_health_and_scheduler() {
+        let mut remote = workspace("remote-workspace", "remote");
+        remote.node.id = "00000000-0000-0000-0000-000000000002".into();
+        remote.node.alias = "work".into();
+        remote.node.local = false;
+        remote.node.route = Some("user@workbox".into());
+        remote.node.health = NodeProjectionHealthCode::Reconnecting;
+        remote.node.observed_protocol_version = Some(38);
+        remote.node.observed_capabilities = vec!["global_workspaces".into()];
+        let mut app = App::new(vec![remote], project_context());
+        app.select_tab(PrimaryTab::Nodes);
+        assert_eq!(app.request_add(), Some(DashboardEffect::AddNode));
+
+        let rendered = rendered_text(&mut app, 180, 24);
+        for expected in [
+            "ALIAS",
+            "HEALTH",
+            "ROUTE",
+            "PROTOCOL",
+            "SCHEDULER",
+            "work",
+            "reconnecting",
+            "user@workbox",
+            "38",
+            "global_workspaces",
+            "add Node",
+            "retry/refresh",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "missing {expected}: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn multi_node_workspace_table_omits_node_column_and_qualifies_external_names() {
+        let mut local = workspace("global-workspace", "local work");
+        local.coordination = WorkspaceCoordinationView::Global {
+            revision: 1,
+            closing: false,
+            placements: Vec::new(),
+        };
+        let local_external = workspace("local-workspace", "local work");
+        let mut remote = workspace("remote-workspace", "remote work");
+        remote.node.id = "00000000-0000-0000-0000-000000000002".into();
+        remote.node.alias = "work".into();
+        remote.node.local = false;
+        let mut app = App::new(vec![local, local_external, remote], project_context());
+        focus_items(&mut app);
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| render_workspaces(frame, frame.area(), &mut app))
+            .unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("NAME"));
+        assert!(!rendered.contains("NODE"));
+        assert!(rendered.contains("local work"));
+        assert!(rendered.contains("[local online] local work"));
+        assert!(rendered.contains("[work online] remote work"));
+    }
+
+    #[test]
+    fn first_resource_node_picker_has_no_default_and_disables_unavailable_nodes() {
+        let mut global = workspace("global-1", "coordinated");
+        global.items.clear();
+        global.coordination = WorkspaceCoordinationView::Global {
+            revision: 4,
+            closing: false,
+            placements: Vec::new(),
+        };
+        let mut local = global.node.clone();
+        local.id = "00000000-0000-0000-0000-000000000001".into();
+        local.workspace_owner_eligible = true;
+        let mut remote = local.clone();
+        remote.id = "00000000-0000-0000-0000-000000000002".into();
+        remote.alias = "work".into();
+        remote.local = false;
+        remote.route = Some("user@work".into());
+        let mut unavailable = remote.clone();
+        unavailable.id = "00000000-0000-0000-0000-000000000003".into();
+        unavailable.alias = "offline".into();
+        unavailable.workspace_owner_eligible = false;
+        unavailable.workspace_owner_unavailable_reason = Some("Node health is unreachable".into());
+        let mut app = App::new(vec![global], project_context());
+        app.nodes = vec![local, remote, unavailable];
+        app.focus = Focus::Items;
+
+        assert_eq!(app.request_add(), None);
+        let Mode::SelectWorkspaceNode(picker) = &app.mode else {
+            panic!("expected Node placement picker");
+        };
+        assert_eq!(picker.selected, None);
+        let rendered = rendered_text(&mut app, 140, 36);
+        assert!(rendered.contains("No Node is preselected"));
+        assert!(rendered.contains("offline"));
+        assert!(rendered.contains("Node health is unreachable"));
+
+        assert_eq!(app.update_key(KeyCode::Down, KeyModifiers::NONE), None);
+        assert_eq!(app.update_key(KeyCode::Down, KeyModifiers::NONE), None);
+        let effect = app.update_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(
+            matches!(effect, Some(DashboardEffect::CreateGlobalShell { node_id, .. }) if node_id == "00000000-0000-0000-0000-000000000002")
+        );
+        assert_eq!(
+            app.pending_shell_creation.as_deref(),
+            Some("Creating Shell in coordinated on Node work...")
+        );
+        assert!(
+            rendered_text(&mut app, 140, 36)
+                .contains("Creating Shell in coordinated on Node work...")
+        );
+    }
+
+    #[test]
+    fn nodes_tab_management_actions_are_exact_and_forget_is_confirmed() {
+        let mut remote = workspace("remote-workspace", "remote");
+        remote.node.id = "00000000-0000-0000-0000-000000000002".into();
+        remote.node.alias = "work".into();
+        remote.node.local = false;
+        remote.node.route = Some("user@work".into());
+        remote.node.registration_revision = Some(7);
+        let mut app = App::new(vec![remote], project_context());
+        app.select_tab(PrimaryTab::Nodes);
+
+        assert!(matches!(
+            app.update_key(KeyCode::Char('r'), KeyModifiers::NONE),
+            Some(DashboardEffect::RefreshNode(node_id))
+                if node_id == "00000000-0000-0000-0000-000000000002"
+        ));
+
+        assert_eq!(app.update_key(KeyCode::Enter, KeyModifiers::NONE), None);
+        assert!(matches!(app.mode, Mode::InspectNode(_)));
+        app.update_key(KeyCode::Esc, KeyModifiers::NONE);
+        app.update_key(KeyCode::Char('e'), KeyModifiers::NONE);
+        assert!(matches!(
+            app.mode,
+            Mode::Rename {
+                target: RenameTarget::Node {
+                    expected_revision: 7,
+                    ..
+                },
+                ..
+            }
+        ));
+        let effect = app.update_key(KeyCode::Char('n'), KeyModifiers::NONE);
+        assert_eq!(effect, None);
+        let effect = app.update_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(
+            matches!(effect, Some(DashboardEffect::Rename { target: RenameTarget::Node { expected_revision: 7, .. }, name }) if name == "n")
+        );
+
+        app.mode = Mode::Normal;
+        app.update_key(KeyCode::Char('t'), KeyModifiers::NONE);
+        assert!(matches!(
+            app.mode,
+            Mode::RetargetNode {
+                expected_revision: 7,
+                ..
+            }
+        ));
+        app.mode = Mode::Normal;
+        app.update_key(KeyCode::Char('x'), KeyModifiers::NONE);
+        assert!(matches!(app.mode, Mode::ConfirmForgetNode(_)));
+        let effect = app.update_key(KeyCode::Char('y'), KeyModifiers::NONE);
+        assert!(
+            matches!(effect, Some(DashboardEffect::ForgetNode { node_id }) if node_id == "00000000-0000-0000-0000-000000000002")
+        );
+    }
+
+    #[test]
+    fn external_workspace_adopt_and_link_actions_are_explicit_and_revision_guarded() {
+        let mut global = workspace("global-1", "canonical");
+        global.coordination = WorkspaceCoordinationView::Global {
+            revision: 6,
+            closing: false,
+            placements: Vec::new(),
+        };
+        let mut external = workspace("owner-1", "external");
+        external.node.id = "00000000-0000-0000-0000-000000000002".into();
+        external.node.alias = "work".into();
+        external.node.local = false;
+        external.coordination = WorkspaceCoordinationView::External {
+            owner_revision: 9,
+            available: true,
+        };
+        let mut app = App::new(vec![global, external], project_context());
+        let external_index = app
+            .workspaces
+            .iter()
+            .position(|workspace| workspace.id == "owner-1")
+            .unwrap();
+        app.workspace_state.select(Some(external_index));
+
+        assert!(matches!(
+            app.adopt_selected_external(),
+            Some(DashboardEffect::AdoptExternalWorkspace {
+                expected_revision: 9,
+                identity: QualifiedIdentity { ref node_id, ref inner_id },
+            }) if node_id == "00000000-0000-0000-0000-000000000002" && inner_id == "owner-1"
+        ));
+        app.link_selected_external();
+        let Mode::LinkWorkspace(picker) = &app.mode else {
+            panic!("expected guarded link picker");
+        };
+        assert_eq!(picker.selected, None);
+        app.update_key(KeyCode::Down, KeyModifiers::NONE);
+        let effect = app.update_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(matches!(
+            effect,
+            Some(DashboardEffect::LinkExternalWorkspace {
+                workspace_id,
+                expected_revision: 6,
+                expected_owner_revision: 9,
+                ..
+            }) if workspace_id == "global-1"
+        ));
+    }
+
+    #[test]
+    fn external_workspace_actions_require_owner_placement_capability() {
+        let mut external = workspace("owner-1", "old-peer");
+        external.node.local = false;
+        external.node.workspace_owner_eligible = false;
+        external.node.workspace_owner_unavailable_reason =
+            Some("Node does not support coordinated Workspaces".into());
+        external.coordination = WorkspaceCoordinationView::External {
+            owner_revision: 0,
+            available: true,
+        };
+        let mut app = App::new(vec![external], project_context());
+        assert_eq!(app.adopt_selected_external(), None);
+        app.link_selected_external();
+        assert!(matches!(
+            app.message,
+            Some(Message { ref text, error: true })
+                if text.contains("does not support coordinated Workspaces")
+        ));
+    }
+
+    #[test]
+    fn closing_global_workspace_enter_retries_unresolved_close() {
+        let mut global = workspace("global-1", "closing");
+        global.coordination = WorkspaceCoordinationView::Global {
+            revision: 8,
+            closing: true,
+            placements: Vec::new(),
+        };
+        let mut app = App::new(vec![global], project_context());
+        assert!(matches!(
+            app.update_key(KeyCode::Enter, KeyModifiers::NONE),
+            Some(DashboardEffect::RetryGlobalWorkspaceClose { workspace_id })
+                if workspace_id == "global-1"
+        ));
     }
 
     fn schedule_item() -> WorkspaceItemView {
@@ -7021,6 +8589,7 @@ mod tests {
         let mut app = App::new(vec![one, two], project_context());
         let focused = FocusedTerminalView {
             revision: 1,
+            node_id: None,
             workspace_id: "w2".into(),
             shell_id: "s2".into(),
         };
@@ -7057,13 +8626,15 @@ mod tests {
         app.apply_focused_terminal(None);
         app.apply_focused_terminal(Some(&FocusedTerminalView {
             revision: 1,
+            node_id: None,
             workspace_id: "w1".into(),
             shell_id: "s1".into(),
         }));
         assert_eq!(
             app.selected().map(|workspace| workspace.id.as_str()),
-            Some("w1")
+            Some("w2")
         );
+        assert_eq!(app.observed_focus_revision, Some(2));
     }
 
     #[test]
@@ -7087,6 +8658,7 @@ mod tests {
         app.select_tab(PrimaryTab::Agents);
         app.apply_focused_terminal(Some(&FocusedTerminalView {
             revision: 1,
+            node_id: None,
             workspace_id: "w3".into(),
             shell_id: "agent-2".into(),
         }));
@@ -7098,6 +8670,7 @@ mod tests {
 
         app.apply_focused_terminal(Some(&FocusedTerminalView {
             revision: 2,
+            node_id: None,
             workspace_id: "w2".into(),
             shell_id: "shell-1".into(),
         }));
@@ -7111,6 +8684,7 @@ mod tests {
         app.select_tab(PrimaryTab::Shells);
         app.apply_focused_terminal(Some(&FocusedTerminalView {
             revision: 3,
+            node_id: None,
             workspace_id: "w4".into(),
             shell_id: "shell-2".into(),
         }));
@@ -7122,6 +8696,7 @@ mod tests {
 
         app.apply_focused_terminal(Some(&FocusedTerminalView {
             revision: 4,
+            node_id: None,
             workspace_id: "w1".into(),
             shell_id: "agent-1".into(),
         }));
@@ -7141,6 +8716,7 @@ mod tests {
         set_shell_id(&mut two, "s2");
         let focused = FocusedTerminalView {
             revision: 1,
+            node_id: None,
             workspace_id: "w2".into(),
             shell_id: "s2".into(),
         };
@@ -7176,6 +8752,7 @@ mod tests {
         let mut app = App::new(vec![one, two], project_context());
         app.enable_focus_following(Some(&FocusedTerminalView {
             revision: 1,
+            node_id: None,
             workspace_id: "w1".into(),
             shell_id: "s1".into(),
         }));
@@ -7183,6 +8760,7 @@ mod tests {
         app.toggle_selection_pin();
         app.apply_focused_terminal(Some(&FocusedTerminalView {
             revision: 2,
+            node_id: None,
             workspace_id: "w2".into(),
             shell_id: "s2".into(),
         }));
@@ -7196,6 +8774,7 @@ mod tests {
         assert_eq!(app.observed_focus_revision, None);
         app.apply_focused_terminal(Some(&FocusedTerminalView {
             revision: 2,
+            node_id: None,
             workspace_id: "w2".into(),
             shell_id: "s2".into(),
         }));
@@ -7220,6 +8799,7 @@ mod tests {
         set_shell_id(&mut one, "s1");
         let focused = FocusedTerminalView {
             revision: 1,
+            node_id: None,
             workspace_id: "w2".into(),
             shell_id: "s2".into(),
         };
@@ -7319,6 +8899,7 @@ mod tests {
             "launcher",
             "ready",
             "editor",
+            "work",
             "zeditor --foreground .",
             "feature/workspace-items",
             "linked:workspace-items",
@@ -7330,6 +8911,7 @@ mod tests {
                 Constraint::Length(10),
                 Constraint::Length(8),
                 Constraint::Length(8),
+                Constraint::Length(6),
                 Constraint::Length(24),
                 Constraint::Length(25),
                 Constraint::Length(24),
@@ -7341,9 +8923,10 @@ mod tests {
                 Constraint::Length(8),
                 Constraint::Length(8),
                 Constraint::Length(8),
+                Constraint::Length(6),
                 Constraint::Length(8),
-                Constraint::Length(18),
-                Constraint::Length(13),
+                Constraint::Length(16),
+                Constraint::Length(8),
             ]
         );
     }
@@ -7400,6 +8983,7 @@ mod tests {
             "interrupted",
             "#12",
             "edge-datapipe-support",
+            "work",
             "integration-tests",
             "command",
             "cargo test --all-targets --release",
@@ -7413,6 +8997,7 @@ mod tests {
                 Constraint::Length(12),
                 Constraint::Length(5),
                 Constraint::Length(23),
+                Constraint::Length(6),
                 Constraint::Length(19),
                 Constraint::Length(9),
                 Constraint::Length(36),
@@ -7425,12 +9010,13 @@ mod tests {
             vec![
                 Constraint::Length(10),
                 Constraint::Length(4),
-                Constraint::Length(11),
-                Constraint::Length(10),
+                Constraint::Length(9),
+                Constraint::Length(6),
+                Constraint::Length(7),
                 Constraint::Length(7),
                 Constraint::Length(7),
                 Constraint::Length(12),
-                Constraint::Length(10),
+                Constraint::Length(8),
             ]
         );
     }
@@ -7470,6 +9056,7 @@ mod tests {
             "idle",
             "7h ago",
             "edge-datapipe-support",
+            "work",
             "agent",
             "Check Slack tickets against GitHub releases",
             "fix/confluent-direct-download",
@@ -7482,6 +9069,7 @@ mod tests {
                 Constraint::Length(8),
                 Constraint::Length(9),
                 Constraint::Length(23),
+                Constraint::Length(6),
                 Constraint::Length(7),
                 Constraint::Length(45),
                 Constraint::Length(31),
@@ -7494,8 +9082,9 @@ mod tests {
                 Constraint::Length(8),
                 Constraint::Length(7),
                 Constraint::Length(11),
+                Constraint::Length(6),
                 Constraint::Length(7),
-                Constraint::Length(14),
+                Constraint::Length(7),
                 Constraint::Length(12),
                 Constraint::Length(13),
             ]
@@ -7559,11 +9148,11 @@ mod tests {
     #[test]
     fn numeric_shortcuts_match_primary_tab_order() {
         assert_eq!(
-            ('1'..='4').filter_map(shortcut_tab).collect::<Vec<_>>(),
+            ('1'..='5').filter_map(shortcut_tab).collect::<Vec<_>>(),
             PrimaryTab::ALL
         );
         assert_eq!(shortcut_tab('0'), None);
-        assert_eq!(shortcut_tab('5'), None);
+        assert_eq!(shortcut_tab('6'), None);
     }
 
     #[test]
@@ -7798,8 +9387,13 @@ mod tests {
     }
 
     #[test]
-    fn project_suggestion_creates_workspace_with_default_cwd() {
+    fn project_suggestion_creates_an_empty_workspace_regardless_of_nodes() {
         let mut app = app();
+        let mut remote = app.nodes[0].clone();
+        remote.id = "remote-node".into();
+        remote.alias = "remote".into();
+        remote.local = false;
+        app.nodes.push(remote);
         assert!(app.request_add().is_none());
         for character in "alp".chars() {
             handle_mode_key(&mut app, KeyCode::Char(character), KeyModifiers::NONE);
@@ -7808,7 +9402,6 @@ mod tests {
             handle_mode_key(&mut app, KeyCode::Enter, KeyModifiers::NONE),
             Some(DashboardEffect::CreateWorkspace {
                 name: "alpha".into(),
-                default_cwd: Some("/tmp/alpha".into()),
             })
         );
         assert!(matches!(app.mode, Mode::Normal));
@@ -7828,7 +9421,6 @@ mod tests {
             handle_mode_key(&mut app, KeyCode::Enter, KeyModifiers::NONE),
             Some(DashboardEffect::CreateWorkspace {
                 name: "custom workspace".into(),
-                default_cwd: None,
             })
         );
     }
@@ -7849,7 +9441,6 @@ mod tests {
             handle_mode_key(&mut app, KeyCode::Enter, KeyModifiers::NONE),
             Some(DashboardEffect::CreateWorkspace {
                 name: "alpha".into(),
-                default_cwd: None,
             })
         );
     }
@@ -7929,6 +9520,8 @@ mod tests {
         agent.agent.as_mut().unwrap().state = AgentDisplayState::Blocked;
         workspace.items[0] = WorkspaceItemView::AgentShell(agent);
         workspace.attention = vec![WorkspaceAttentionView {
+            node_id: String::new(),
+            workspace_id: workspace.id.clone(),
             agent_id: "agent-active".into(),
             shell_id: "term_1".into(),
             agent_name: "review-agent".into(),
@@ -7991,6 +9584,8 @@ mod tests {
     fn command_palette_orders_attention_by_global_urgency() {
         let mut completed = workspace("w1", "first");
         completed.attention = vec![WorkspaceAttentionView {
+            node_id: String::new(),
+            workspace_id: completed.id.clone(),
             agent_id: "completed-agent-id".into(),
             shell_id: "completed-shell".into(),
             agent_name: "completed-agent".into(),
@@ -8000,6 +9595,8 @@ mod tests {
         }];
         let mut blocked = workspace("w2", "second");
         blocked.attention = vec![WorkspaceAttentionView {
+            node_id: String::new(),
+            workspace_id: blocked.id.clone(),
             agent_id: "blocked-agent-id".into(),
             shell_id: "blocked-shell".into(),
             agent_name: "blocked-agent".into(),
@@ -8266,6 +9863,29 @@ mod tests {
             Some(DashboardEffect::CreateShell("w1".into()))
         );
         assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(
+            app.pending_shell_creation.as_deref(),
+            Some("Creating Shell in boomux on Node local...")
+        );
+        assert_eq!(app.request_add(), None);
+    }
+
+    #[test]
+    fn shell_creation_completion_replaces_the_pending_indicator_and_refreshes() {
+        let mut app = app();
+        focus_items(&mut app);
+        app.request_add();
+
+        assert_eq!(
+            app.update(DashboardEvent::ShellCreationCompleted(Ok(
+                "Created first on Node local".into()
+            ))),
+            vec![DashboardEffect::Refresh]
+        );
+        assert!(app.pending_shell_creation.is_none());
+        assert!(app.message.as_ref().is_some_and(|message| {
+            !message.error && message.text == "Created first on Node local"
+        }));
     }
 
     #[test]
@@ -9398,6 +11018,29 @@ mod tests {
     }
 
     #[test]
+    fn failed_terminal_preview_is_not_retried_without_a_revision_change() {
+        let mut app = app();
+        focus_items(&mut app);
+        let effect = app.terminal_preview_effect().unwrap();
+        let DashboardEffect::ReadTerminalPreview {
+            shell_id,
+            run_id,
+            output_revision,
+        } = effect
+        else {
+            unreachable!();
+        };
+        app.apply_terminal_preview(
+            shell_id.inner_id,
+            run_id,
+            output_revision,
+            Err("preview unavailable".into()),
+        );
+
+        assert!(app.terminal_preview_effect().is_none());
+    }
+
+    #[test]
     fn terminal_viewport_trims_edges_and_scrolls_from_the_tail() {
         let output = text_preview("\nold\n\nrecent one  \nrecent two\n\n");
 
@@ -9577,6 +11220,8 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         let mut workspace = workspace("w1", "review");
         workspace.attention = vec![WorkspaceAttentionView {
+            node_id: String::new(),
+            workspace_id: workspace.id.clone(),
             agent_id: "agent-active".into(),
             shell_id: "term_1".into(),
             agent_name: "review-agent".into(),

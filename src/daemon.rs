@@ -18,6 +18,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -27,6 +28,10 @@ use crate::desktop_notifications::{
     NotificationReason, NotificationRequest, NotificationSink, category_enabled, test_delivery,
 };
 use crate::fd_transfer::send_descriptor;
+use crate::global_workspace_store::{
+    GlobalWorkspaceStore, PendingResourceKind, PendingWorkspaceResource, PreparedWorkspaceResource,
+    PreparedWorkspaceShell,
+};
 use crate::handoff;
 use crate::host_services::{self, PreparedIntegrationMutation};
 use crate::node_identity::{NodeIdentityLease, NodeIdentityManager};
@@ -45,13 +50,14 @@ use crate::protocol::{
     NodeProjectionAttention, NodeProjectionExecution, NodeProjectionLauncher,
     NodeProjectionSchedule, NodeProjectionShell, NodeProjectionSnapshot, NodeProjectionSync,
     NodeProjectionSyncMode, NodeProjectionTransition, NodeProjectionTransitionKind,
-    NodeProjectionWorkspace, NotificationDeliveryConfig, Request, Response, RoutedOperation,
-    RoutedOperationResult, ScheduledExecutionDispatchKind, ScheduledExecutionOutcome,
-    ScheduledExecutionReason, ScheduledExecutionScheduleProjection, ScheduledExecutionSnapshot,
-    ScheduledExecutionState, ScheduledOccurrence, ScheduledRunnerResult, SchedulerHealth,
-    SchedulerState, ShellOwner, ShellRunExitReason, ShellRunSnapshot, ShellSnapshot, ShellSpec,
-    ShellStatus, Snapshot, TerminalPreview, TerminalProfile, UnixEnvironment,
-    UnixEnvironmentVariable, WorkspaceLauncherSnapshot, WorkspaceLauncherSpec, WorkspaceSnapshot,
+    NodeProjectionWorkspace, NotificationDeliveryConfig, QualifiedFocusedTerminalSnapshot,
+    QualifiedIdentity, Request, Response, RoutedOperation, RoutedOperationResult,
+    ScheduledExecutionDispatchKind, ScheduledExecutionOutcome, ScheduledExecutionReason,
+    ScheduledExecutionScheduleProjection, ScheduledExecutionSnapshot, ScheduledExecutionState,
+    ScheduledOccurrence, ScheduledRunnerResult, SchedulerHealth, SchedulerState, ShellOwner,
+    ShellRunExitReason, ShellRunSnapshot, ShellSnapshot, ShellSpec, ShellStatus, Snapshot,
+    TerminalPreview, TerminalProfile, UnixEnvironment, UnixEnvironmentVariable,
+    WorkspaceLauncherSnapshot, WorkspaceLauncherSpec, WorkspaceSnapshot,
 };
 use crate::ssh_bootstrap::{self, RemoteBootstrapPlan, SshAuthenticationMode, SshTarget};
 use crate::state_store::{
@@ -258,6 +264,7 @@ pub fn receive_handoff_with_notification_delivery(
             event_stream,
             notifications,
             focused_terminal,
+            presented_focused_terminal,
         } => {
             let store = StateStore::from_transferred_lock(state_lock)?;
             let socket_path = client::socket_path()?;
@@ -271,6 +278,7 @@ pub fn receive_handoff_with_notification_delivery(
                     exited,
                     events: Some(*event_stream),
                     focused_terminal: focused_terminal.map(|focused| *focused),
+                    presented_focused_terminal: presented_focused_terminal.map(|focused| *focused),
                 },
                 Some(&mut channel),
                 notifications
@@ -327,6 +335,7 @@ struct TransferredState {
     exited: Vec<handoff::TransferredExited>,
     events: Option<handoff::EventStreamManifest>,
     focused_terminal: Option<FocusedTerminalSnapshot>,
+    presented_focused_terminal: Option<QualifiedFocusedTerminalSnapshot>,
 }
 
 fn run_daemon(
@@ -354,6 +363,19 @@ fn run_daemon(
     }
     registry.node_registrations = Some(registrations);
     registry.node_projection_cache = Some(NodeProjectionCache::load_from_environment());
+    registry.global_workspaces = match GlobalWorkspaceStore::load_from_environment() {
+        Ok(store) => {
+            if let Some(identity) = registry.node_identity.as_ref() {
+                let node_id = identity.id()?;
+                store.initialize_local_once(&node_id, &registry.snapshot()?)?;
+            }
+            Some(store)
+        }
+        Err(error) => {
+            eprintln!("boomux: global Workspace coordination disabled: {error}");
+            None
+        }
+    };
     registry.startup_environment = capture_current_environment();
     registry.configure_scheduler_clock()?;
     registry.notification_settings = notification_settings.clone();
@@ -374,6 +396,7 @@ fn run_daemon(
         registry.persist()?;
     }
     registry.import_focused_terminal(transferred.focused_terminal)?;
+    registry.import_presented_focused_terminal(transferred.presented_focused_terminal)?;
     if let Some(channel) = committed {
         {
             registry.events.transaction()?.reserve(1)?;
@@ -743,6 +766,7 @@ fn launch_replacement(
         }
         let state_lock = registry.state_lock_descriptor()?;
         let focused_terminal = registry.focused_terminal_for_handoff()?;
+        let presented_focused_terminal = registry.runtimes.presented_focused_terminal()?;
         launch_replacement_process(
             listener.as_fd(),
             daemon_lock.as_fd(),
@@ -752,6 +776,7 @@ fn launch_replacement(
             &event_stream,
             ReplacementOptions {
                 focused_terminal,
+                presented_focused_terminal,
                 notification_settings,
                 startup_environment,
             },
@@ -769,6 +794,7 @@ fn launch_replacement(
 
 struct ReplacementOptions {
     focused_terminal: Option<FocusedTerminalSnapshot>,
+    presented_focused_terminal: Option<QualifiedFocusedTerminalSnapshot>,
     notification_settings: Option<NotificationDeliverySettings>,
     startup_environment: Option<UnixEnvironment>,
 }
@@ -784,6 +810,7 @@ fn launch_replacement_process(
 ) -> io::Result<()> {
     let ReplacementOptions {
         focused_terminal,
+        presented_focused_terminal,
         notification_settings,
         startup_environment,
     } = options;
@@ -838,6 +865,7 @@ fn launch_replacement_process(
                 event_stream: event_stream.clone(),
                 notifications: notification_settings.map(Into::into),
                 focused_terminal,
+                presented_focused_terminal,
             },
         )?;
         send_descriptor(&channel, listener, handoff::LISTENER_MARKER)?;
@@ -1248,6 +1276,8 @@ fn handle_connection_inner(
     let schedule_semantics_changed = matches!(
         &request.message,
         Request::CreateAgentSchedule { .. }
+            | Request::CreateWorkspaceAgentSchedule { .. }
+            | Request::CreateGlobalWorkspaceAgentSchedule { .. }
             | Request::PauseAgentSchedule { .. }
             | Request::ResumeAgentSchedule { .. }
             | Request::RemoveAgentSchedule { .. }
@@ -1326,6 +1356,15 @@ fn node_registration_error(error: io::Error) -> DaemonError {
     DaemonError::from(error)
 }
 
+fn global_workspace_error(error: io::Error) -> DaemonError {
+    if error.kind() == io::ErrorKind::InvalidInput && error.to_string().contains("revision changed")
+    {
+        DaemonError::lifecycle(ErrorCode::RevisionChanged, error.to_string())
+    } else {
+        DaemonError::from(error)
+    }
+}
+
 #[cfg(test)]
 fn response_for_version(response: Response, version: u32) -> Response {
     response_for_version_with_schedule_shells(response, version, &HashSet::new())
@@ -1337,6 +1376,34 @@ fn response_for_version_with_schedule_shells(
     schedule_shell_ids: &HashSet<String>,
 ) -> Response {
     let mut response = response;
+    if !protocol::ProtocolFeature::QualifiedFocusedTerminal.is_supported_by(version) {
+        match &mut response {
+            Response::CombinedNodeSnapshot { snapshot } => snapshot.focused_terminal = None,
+            Response::Events { events, .. } => events.retain(|event| {
+                !matches!(
+                    event.kind,
+                    DaemonEventKind::FocusedTerminalPresentationChanged
+                )
+            }),
+            _ => {}
+        }
+    }
+    if !protocol::ProtocolFeature::GlobalWorkspaces.is_supported_by(version) {
+        match &mut response {
+            Response::CombinedNodeSnapshot { snapshot } => {
+                snapshot.workspaces.clear();
+                snapshot.external_workspaces.clear();
+                for node in &mut snapshot.nodes {
+                    node.route = None;
+                    node.registration_revision = None;
+                    node.workspace_owner_eligible = false;
+                    node.workspace_owner_unavailable_reason = None;
+                }
+            }
+            Response::NodeProjectionSync { sync } => sync.capabilities.clear(),
+            _ => {}
+        }
+    }
     if !protocol::ProtocolFeature::NodeProjectionSync.is_supported_by(version)
         && let Response::Events { events, .. } = &mut response
     {
@@ -1904,11 +1971,12 @@ fn send_registered_node_request_with_timeout(
     route_feature: Option<protocol::ProtocolFeature>,
 ) -> io::Result<Response> {
     let target = SshTarget::parse(registration.target.clone())?;
-    let helper = match ssh_bootstrap::plan_remote_bootstrap(
-        target.clone(),
+    let mut bootstrap = ssh_bootstrap::BootstrapSession::open(
+        target,
         SshAuthenticationMode::Batch,
         Duration::from_secs(2),
-    )? {
+    )?;
+    let helper = match bootstrap.plan(Duration::from_secs(2))? {
         RemoteBootstrapPlan::Ready(helper) => helper,
         RemoteBootstrapPlan::Install(_) => {
             return Err(io::Error::new(
@@ -1931,12 +1999,7 @@ fn send_registered_node_request_with_timeout(
             format!("remote Node does not support {}", feature.requirement()),
         ));
     }
-    let mut remote = ssh_bootstrap::connect_remote(
-        target,
-        helper,
-        SshAuthenticationMode::Batch,
-        Duration::from_secs(2),
-    )?;
+    let mut remote = bootstrap.connect(helper, Duration::from_secs(2))?;
     remote.request(request, response_timeout)
 }
 
@@ -1950,6 +2013,14 @@ fn routed_response_timeout(operation: &RoutedOperation) -> Duration {
 }
 
 fn routed_owner_feature(operation: &RoutedOperation) -> Option<protocol::ProtocolFeature> {
+    if matches!(
+        operation,
+        RoutedOperation::CreateWorkspaceShell { .. }
+            | RoutedOperation::CreateWorkspaceLauncher { .. }
+            | RoutedOperation::CreateWorkspaceAgentSchedule { .. }
+    ) {
+        return Some(protocol::ProtocolFeature::GlobalWorkspaces);
+    }
     matches!(
         operation,
         RoutedOperation::CreateAgentSchedule { .. }
@@ -1968,6 +2039,68 @@ fn require_guard(actual: u64, expected: u64, resource: &str) -> DaemonResult<()>
             format!("{resource} revision is {actual}; guarded operation supplied {expected}"),
         ))
     }
+}
+
+fn request_fingerprint(value: &impl Serialize) -> DaemonResult<String> {
+    let bytes = serde_json::to_vec(value).map_err(|error| {
+        DaemonError::Internal(io::Error::other(format!(
+            "could not fingerprint Workspace operation: {error}"
+        )))
+    })?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+struct WorkspaceRequestFingerprint {
+    digest: String,
+    bytes: usize,
+}
+
+fn workspace_operation_fingerprints(
+    request: &Request,
+) -> DaemonResult<(Option<WorkspaceRequestFingerprint>, Option<String>)> {
+    let exact = matches!(
+        request,
+        Request::CreateGlobalWorkspaceShell { .. }
+            | Request::CreateGlobalWorkspaceWithShell { .. }
+            | Request::CreateGlobalWorkspaceLauncher { .. }
+            | Request::CreateGlobalWorkspaceAgentSchedule { .. }
+    )
+    .then(|| {
+        let bytes = serde_json::to_vec(request).map_err(|error| {
+            DaemonError::Internal(io::Error::other(format!(
+                "could not fingerprint Workspace operation: {error}"
+            )))
+        })?;
+        Ok::<_, DaemonError>(WorkspaceRequestFingerprint {
+            digest: format!("{:x}", Sha256::digest(&bytes)),
+            bytes: bytes.len(),
+        })
+    })
+    .transpose()?;
+    let semantic = match request {
+        Request::CreateGlobalWorkspaceWithShell {
+            name,
+            node_id,
+            default_cwd,
+            shell,
+            ..
+        } => Some(request_fingerprint(&(
+            "project_with_shell",
+            name,
+            node_id,
+            default_cwd,
+            shell,
+        ))?),
+        _ => None,
+    };
+    Ok((exact, semantic))
+}
+
+fn workspace_pre_owner_failure_is_ambiguous(error: &DaemonError) -> bool {
+    matches!(
+        error.wire_code(),
+        ErrorCode::OutcomeUnknown | ErrorCode::PersistenceFailed | ErrorCode::Timeout
+    )
 }
 
 fn bump_revision(revision: &Mutex<u64>, resource: &str) -> io::Result<()> {
@@ -2006,11 +2139,13 @@ struct DaemonService {
     node_identity: Option<Arc<NodeIdentityManager>>,
     node_registrations: Option<NodeRegistrationManager>,
     node_projection_cache: Option<NodeProjectionCache>,
+    global_workspaces: Option<GlobalWorkspaceStore>,
     durable: DurableRegistry,
     events: EventStream,
     runtimes: ShellRuntimeManager,
     remote_attachments: RemoteAttachmentManager,
     host_service_previews: Mutex<HashMap<String, HostServicePreview>>,
+    workspace_operation_locks: Mutex<HashMap<String, Weak<Mutex<()>>>>,
     mutation_lock: Mutex<()>,
     schedule_dispatch_lock: Mutex<()>,
     notification_settings: NotificationDeliverySettings,
@@ -2268,6 +2403,7 @@ struct SchedulerWorkerState {
 struct NodeProjectionWorkers {
     stop: Arc<AtomicBool>,
     handles: Mutex<HashMap<String, thread::JoinHandle<()>>>,
+    wake: Mutex<HashSet<String>>,
 }
 
 struct DurableRegistry {
@@ -2289,6 +2425,8 @@ struct ShellRuntimeManager {
 struct FocusState {
     revision: u64,
     focused_terminal: Option<FocusedTerminalSnapshot>,
+    presented_revision: u64,
+    presented_terminal: Option<QualifiedFocusedTerminalSnapshot>,
 }
 
 enum DurableMutation<T> {
@@ -3203,7 +3341,8 @@ fn reduce_projection_transition(event: &DaemonEvent) -> Option<NodeProjectionTra
             revision: execution.revision,
         },
         DaemonEventKind::HandoffCompleted => NodeProjectionTransitionKind::HandoffCompleted,
-        DaemonEventKind::NodeProjectionChanged { .. } => return None,
+        DaemonEventKind::NodeProjectionChanged { .. }
+        | DaemonEventKind::FocusedTerminalPresentationChanged => return None,
     };
     Some(NodeProjectionTransition {
         event_id: event.id,
@@ -3791,6 +3930,70 @@ impl DurableRegistry {
         ))
     }
 
+    fn create_workspace_exact(
+        &self,
+        workspace_id: &str,
+        name: String,
+        default_cwd: Option<PathBuf>,
+    ) -> io::Result<(WorkspaceSnapshot, Option<DurableUndo>)> {
+        validate_uuid(workspace_id, "workspace ID")?;
+        validate_name(&name)?;
+        if let Some(default_cwd) = &default_cwd {
+            validate_cwd(default_cwd)?;
+        }
+        if let Ok(existing) = self.workspace(workspace_id) {
+            let snapshot = existing.snapshot(self)?;
+            if snapshot.name == name && snapshot.default_cwd == default_cwd {
+                return Ok((snapshot, None));
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "workspace idempotency identity exists with a different definition",
+            ));
+        }
+        let workspace = Arc::new(Workspace {
+            id: workspace_id.to_owned(),
+            revision: Mutex::new(1),
+            name: Mutex::new(name.clone()),
+            default_cwd: default_cwd.clone(),
+            shell_ids: Mutex::new(Vec::new()),
+            launcher_ids: Mutex::new(Vec::new()),
+            agent_ids: Mutex::new(Vec::new()),
+            schedule_ids: Mutex::new(Vec::new()),
+        });
+        let snapshot = WorkspaceSnapshot {
+            id: workspace_id.to_owned(),
+            revision: 1,
+            name: name.clone(),
+            default_cwd,
+            shells: Vec::new(),
+            launchers: Vec::new(),
+            agents: Vec::new(),
+            schedules: Vec::new(),
+        };
+        let mut state = lock(&self.state)?;
+        if state
+            .workspaces
+            .values()
+            .any(|current| current.name.lock().is_ok_and(|current| *current == name))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("workspace name already exists: {name}"),
+            ));
+        }
+        state
+            .workspaces
+            .insert(workspace_id.to_owned(), Arc::clone(&workspace));
+        Ok((
+            snapshot,
+            Some(DurableUndo::CreatedWorkspace {
+                workspace,
+                shells: Vec::new(),
+            }),
+        ))
+    }
+
     fn create_shell(
         &self,
         workspace_id: &str,
@@ -3825,6 +4028,55 @@ impl DurableRegistry {
         drop(shell_ids);
         drop(state);
         Ok((snapshot, DurableUndo::CreatedShell { workspace, shell }))
+    }
+
+    fn create_shell_exact(
+        &self,
+        workspace_id: &str,
+        shell_id: &str,
+        spec: ShellSpec,
+    ) -> io::Result<(ShellSnapshot, Option<DurableUndo>)> {
+        validate_uuid(shell_id, "Shell idempotency key")?;
+        if let Some(existing) = lock(&self.state)?.shells.get(shell_id).cloned() {
+            let snapshot = existing.snapshot()?;
+            if snapshot.workspace_id == workspace_id
+                && snapshot.name == spec.name
+                && snapshot.cwd == spec.cwd
+                && snapshot.command == spec.command
+            {
+                return Ok((snapshot, None));
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "Shell idempotency key exists with a different definition",
+            ));
+        }
+        let workspace = self.workspace(workspace_id)?;
+        let shell = create_pending_shell_with_id(workspace_id, shell_id.to_owned(), spec)?;
+        let snapshot = shell.snapshot()?;
+        let mut state = lock(&self.state)?;
+        let mut shell_ids = lock(&workspace.shell_ids)?;
+        if shell_ids.iter().any(|id| {
+            state
+                .shells
+                .get(id)
+                .and_then(|existing| existing.name.lock().ok())
+                .is_some_and(|name| *name == snapshot.name)
+        }) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("shell name already exists: {}", snapshot.name),
+            ));
+        }
+        state.shells.insert(shell.id.clone(), Arc::clone(&shell));
+        shell_ids.push(shell.id.clone());
+        bump_revision(&workspace.revision, "workspace")?;
+        drop(shell_ids);
+        drop(state);
+        Ok((
+            snapshot,
+            Some(DurableUndo::CreatedShell { workspace, shell }),
+        ))
     }
 
     fn create_schedule_shell(
@@ -3976,6 +4228,70 @@ impl DurableRegistry {
         ))
     }
 
+    fn create_launcher_exact(
+        &self,
+        workspace_id: &str,
+        launcher_id: &str,
+        spec: WorkspaceLauncherSpec,
+    ) -> io::Result<(WorkspaceLauncherSnapshot, Option<DurableUndo>)> {
+        validate_uuid(launcher_id, "launcher idempotency key")?;
+        if let Some(existing) = lock(&self.state)?.launchers.get(launcher_id).cloned() {
+            let snapshot = existing.snapshot()?;
+            if snapshot.workspace_id == workspace_id
+                && snapshot.name == spec.name
+                && snapshot.cwd == spec.cwd
+                && snapshot.command == spec.command
+            {
+                return Ok((snapshot, None));
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "launcher idempotency key exists with a different definition",
+            ));
+        }
+        validate_name(&spec.name)?;
+        validate_cwd(&spec.cwd)?;
+        validate_launcher_command(&spec.command)?;
+        let workspace = self.workspace(workspace_id)?;
+        let launcher = Arc::new(WorkspaceLauncher {
+            id: launcher_id.to_owned(),
+            revision: Mutex::new(1),
+            workspace_id: workspace_id.into(),
+            name: Mutex::new(spec.name),
+            cwd: spec.cwd,
+            command: spec.command,
+        });
+        let snapshot = launcher.snapshot()?;
+        let mut state = lock(&self.state)?;
+        let mut launcher_ids = lock(&workspace.launcher_ids)?;
+        if launcher_ids.iter().any(|id| {
+            state
+                .launchers
+                .get(id)
+                .and_then(|existing| existing.name.lock().ok())
+                .is_some_and(|name| *name == snapshot.name)
+        }) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("workspace launcher name already exists: {}", snapshot.name),
+            ));
+        }
+        state
+            .launchers
+            .insert(launcher.id.clone(), Arc::clone(&launcher));
+        launcher_ids.push(launcher.id.clone());
+        bump_revision(&workspace.revision, "workspace")?;
+        drop(launcher_ids);
+        drop(state);
+        Ok((
+            snapshot,
+            Some(DurableUndo::CreatedLauncher {
+                workspace,
+                launcher,
+            }),
+        ))
+    }
+
     #[cfg(test)]
     fn create_schedule(
         &self,
@@ -3988,23 +4304,57 @@ impl DurableRegistry {
     fn create_schedule_at(
         &self,
         workspace_id: &str,
-        mut spec: AgentScheduleSpec,
+        spec: AgentScheduleSpec,
         now: u64,
     ) -> io::Result<(AgentScheduleSnapshot, DurableUndo)> {
-        validate_name(&spec.name)?;
-        validate_cwd(&spec.cwd)?;
-        validate_schedule_spec(&spec)?;
+        let (snapshot, undo) =
+            self.create_schedule_at_with_id(workspace_id, Uuid::new_v4().to_string(), spec, now)?;
+        Ok((
+            snapshot,
+            undo.expect("new random Schedule ID cannot be idempotent"),
+        ))
+    }
+
+    fn create_schedule_at_with_id(
+        &self,
+        workspace_id: &str,
+        schedule_id: String,
+        mut spec: AgentScheduleSpec,
+        now: u64,
+    ) -> io::Result<(AgentScheduleSnapshot, Option<DurableUndo>)> {
+        validate_uuid(&schedule_id, "Schedule idempotency key")?;
         spec.trigger.cron = crate::scheduling::canonicalize_cron(&spec.trigger.cron)
             .map_err(schedule_validation_error)?;
         spec.trigger.timezone = crate::scheduling::canonicalize_timezone(&spec.trigger.timezone)
             .map_err(schedule_validation_error)?;
+        if let Some(existing) = lock(&self.state)?.schedules.get(&schedule_id).cloned() {
+            let inspection = existing.inspection()?;
+            if inspection.schedule.workspace_id == workspace_id
+                && inspection.schedule.name == spec.name
+                && inspection.schedule.cwd == spec.cwd
+                && inspection.schedule.integration == spec.integration
+                && inspection.schedule.session == spec.session
+                && inspection.schedule.trigger == spec.trigger
+                && inspection.schedule.state == spec.state
+                && inspection.prompt == spec.prompt
+            {
+                return Ok((inspection.schedule, None));
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "Schedule idempotency key exists with a different definition",
+            ));
+        }
+        validate_name(&spec.name)?;
+        validate_cwd(&spec.cwd)?;
+        validate_schedule_spec(&spec)?;
         crate::scheduling::CronSchedule::compile(&spec.trigger.cron, &spec.trigger.timezone)
             .and_then(|cron| cron.ensure_possible())
             .map_err(schedule_validation_error)?;
         validate_schedule_capability(&spec.integration, &spec.session)?;
         let workspace = self.workspace(workspace_id)?;
         let schedule = Arc::new(AgentSchedule {
-            id: Uuid::new_v4().to_string(),
+            id: schedule_id,
             workspace_id: workspace_id.into(),
             cwd: spec.cwd,
             integration: spec.integration,
@@ -4066,10 +4416,10 @@ impl DurableRegistry {
         drop(state);
         Ok((
             snapshot,
-            DurableUndo::CreatedSchedule {
+            Some(DurableUndo::CreatedSchedule {
                 workspace,
                 schedule,
-            },
+            }),
         ))
     }
 
@@ -5097,6 +5447,41 @@ impl ShellRuntimeManager {
         Ok(lock(&self.focus)?.focused_terminal.clone())
     }
 
+    fn presented_focused_terminal(&self) -> io::Result<Option<QualifiedFocusedTerminalSnapshot>> {
+        Ok(lock(&self.focus)?.presented_terminal.clone())
+    }
+
+    fn record_presented_focus(&self, node_id: String, shell_id: String) -> io::Result<()> {
+        let mut focus = lock(&self.focus)?;
+        let revision = focus
+            .presented_revision
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("presented terminal focus revision exhausted"))?;
+        focus.presented_revision = revision;
+        focus.presented_terminal = Some(QualifiedFocusedTerminalSnapshot {
+            revision,
+            shell: QualifiedIdentity::new(node_id, shell_id),
+        });
+        Ok(())
+    }
+
+    fn import_presented_focus(
+        &self,
+        node_id: String,
+        shell_id: String,
+        revision: u64,
+    ) -> io::Result<()> {
+        let mut focus = lock(&self.focus)?;
+        if revision >= focus.presented_revision {
+            focus.presented_revision = revision;
+            focus.presented_terminal = Some(QualifiedFocusedTerminalSnapshot {
+                revision,
+                shell: QualifiedIdentity::new(node_id, shell_id),
+            });
+        }
+        Ok(())
+    }
+
     fn record_focus_gained(
         &self,
         workspace_id: String,
@@ -5768,6 +6153,7 @@ impl Default for DaemonService {
             node_identity: None,
             node_registrations: None,
             node_projection_cache: None,
+            global_workspaces: None,
             durable: DurableRegistry {
                 state: Mutex::new(DurableState::default()),
                 store: None,
@@ -5783,6 +6169,7 @@ impl Default for DaemonService {
             },
             remote_attachments: RemoteAttachmentManager::default(),
             host_service_previews: Mutex::new(HashMap::new()),
+            workspace_operation_locks: Mutex::new(HashMap::new()),
             mutation_lock: Mutex::new(()),
             schedule_dispatch_lock: Mutex::new(()),
             notification_settings: NotificationDeliverySettings::default(),
@@ -6603,7 +6990,7 @@ fn node_projection_worker(service: Weak<DaemonService>, node_id: String) {
             })
             .unwrap_or(false);
         if !admitted {
-            if interruptible_node_sleep(&service, Duration::from_millis(100)) {
+            if interruptible_node_sleep(&service, &node_id, Duration::from_millis(100)) {
                 return;
             }
             continue;
@@ -6754,7 +7141,7 @@ fn node_projection_worker(service: Weak<DaemonService>, node_id: String) {
                     .unwrap_or(crate::protocol::NodeProjectionHealthCode::Unreachable),
             )
         };
-        if interruptible_node_sleep(&service, delay) {
+        if interruptible_node_sleep(&service, &node_id, delay) {
             return;
         }
     }
@@ -6998,11 +7385,13 @@ fn fetch_node_projection(
     use crate::protocol::NodeProjectionHealthCode;
     let target = SshTarget::parse(registration.target.clone())
         .map_err(|error| (NodeProjectionHealthCode::Unreachable, error))?;
-    let helper = match ssh_bootstrap::plan_remote_bootstrap(
-        target.clone(),
+    let mut bootstrap = ssh_bootstrap::BootstrapSession::open(
+        target,
         SshAuthenticationMode::Batch,
         Duration::from_secs(2),
-    ) {
+    )
+    .map_err(|error| (classify_node_sync_error(&error), error))?;
+    let helper = match bootstrap.plan(Duration::from_secs(2)) {
         Ok(RemoteBootstrapPlan::Ready(helper)) => helper,
         Ok(RemoteBootstrapPlan::Install(_)) => {
             return Err((
@@ -7034,13 +7423,9 @@ fn fetch_node_projection(
             ),
         ));
     }
-    let mut remote = ssh_bootstrap::connect_remote(
-        target,
-        helper,
-        SshAuthenticationMode::Batch,
-        Duration::from_secs(2),
-    )
-    .map_err(|error| (classify_node_sync_error(&error), error))?;
+    let mut remote = bootstrap
+        .connect(helper, Duration::from_secs(2))
+        .map_err(|error| (classify_node_sync_error(&error), error))?;
     let sync = remote
         .node_projection_sync(after, Duration::from_secs(2))
         .map_err(|error| (classify_node_sync_error(&error), error))?;
@@ -7053,14 +7438,18 @@ fn fetch_node_projection(
             ),
         ));
     }
-    let capabilities = protocol::ProtocolFeature::ALL
-        .iter()
-        .copied()
-        .filter(|feature| feature.is_supported_by(version))
-        .flat_map(protocol::ProtocolFeature::capability_names)
-        .copied()
-        .map(str::to_owned)
-        .collect();
+    let capabilities = if protocol::ProtocolFeature::GlobalWorkspaces.is_supported_by(version) {
+        sync.capabilities.clone()
+    } else {
+        protocol::ProtocolFeature::ALL
+            .iter()
+            .copied()
+            .filter(|feature| feature.is_supported_by(version))
+            .flat_map(protocol::ProtocolFeature::capability_names)
+            .copied()
+            .map(str::to_owned)
+            .collect()
+    };
     Ok((sync, capabilities))
 }
 
@@ -7106,11 +7495,17 @@ fn node_projection_retry_delay(
     Duration::from_millis(base.saturating_mul(1_000).saturating_add(jitter))
 }
 
-fn interruptible_node_sleep(service: &DaemonService, duration: Duration) -> bool {
+fn interruptible_node_sleep(service: &DaemonService, node_id: &str, duration: Duration) -> bool {
     let deadline = Instant::now() + duration;
     while Instant::now() < deadline {
         if service.node_projection_workers.stop.load(Ordering::Acquire) {
             return true;
+        }
+        if lock(&service.node_projection_workers.wake)
+            .map(|mut wake| wake.remove(node_id))
+            .unwrap_or(false)
+        {
+            return false;
         }
         thread::sleep(
             deadline
@@ -7179,6 +7574,15 @@ impl DaemonService {
             DaemonError::lifecycle(
                 ErrorCode::NodeRegistrationUnavailable,
                 "Boomux Node projection cache is unavailable",
+            )
+        })
+    }
+
+    fn global_workspaces(&self) -> DaemonResult<&GlobalWorkspaceStore> {
+        self.global_workspaces.as_ref().ok_or_else(|| {
+            DaemonError::lifecycle(
+                ErrorCode::PersistenceFailed,
+                "global Workspace coordination is unavailable",
             )
         })
     }
@@ -7401,11 +7805,12 @@ impl DaemonService {
         profile: TerminalProfile,
     ) -> io::Result<()> {
         let target = SshTarget::parse(registration.target.clone())?;
-        let helper = match ssh_bootstrap::plan_remote_bootstrap(
-            target.clone(),
+        let mut bootstrap = ssh_bootstrap::BootstrapSession::open(
+            target,
             SshAuthenticationMode::Batch,
             HANDSHAKE_TIMEOUT,
-        )? {
+        )?;
+        let helper = match bootstrap.plan(HANDSHAKE_TIMEOUT)? {
             RemoteBootstrapPlan::Ready(helper) => helper,
             RemoteBootstrapPlan::Install(_) => {
                 return send_response(
@@ -7440,12 +7845,7 @@ impl DaemonService {
                 ),
             );
         }
-        let remote = ssh_bootstrap::connect_remote(
-            target,
-            helper,
-            SshAuthenticationMode::Batch,
-            HANDSHAKE_TIMEOUT,
-        )?;
+        let remote = bootstrap.connect(helper, HANDSHAKE_TIMEOUT)?;
         let (response, mut remote_reader, mut remote_writer) = remote.open_attachment(
             Request::ResumeAgentSession {
                 session_id: session_id.to_owned(),
@@ -7586,11 +7986,12 @@ impl DaemonService {
         profile: TerminalProfile,
     ) -> io::Result<()> {
         let target = SshTarget::parse(registration.target.clone())?;
-        let helper = match ssh_bootstrap::plan_remote_bootstrap(
-            target.clone(),
+        let mut bootstrap = ssh_bootstrap::BootstrapSession::open(
+            target,
             SshAuthenticationMode::Batch,
             HANDSHAKE_TIMEOUT,
-        )? {
+        )?;
+        let helper = match bootstrap.plan(HANDSHAKE_TIMEOUT)? {
             RemoteBootstrapPlan::Ready(helper) => helper,
             RemoteBootstrapPlan::Install(_) => {
                 return send_response(
@@ -7657,12 +8058,7 @@ impl DaemonService {
                 );
             }
         }
-        let remote = ssh_bootstrap::connect_remote(
-            target,
-            helper,
-            SshAuthenticationMode::Batch,
-            HANDSHAKE_TIMEOUT,
-        )?;
+        let remote = bootstrap.connect(helper, HANDSHAKE_TIMEOUT)?;
         let request = Request::Attach {
             shell_id: shell_id.to_owned(),
             takeover,
@@ -7721,6 +8117,13 @@ impl DaemonService {
             }
             let closes = matches!(frame, AttachFrame::Detached | AttachFrame::ReconnectAck);
             remote_writer.write_frame(&frame, RESPONSE_WRITE_TIMEOUT)?;
+            if matches!(frame, AttachFrame::FocusGained) {
+                self.runtimes
+                    .record_presented_focus(registration.node_id.clone(), shell_id.to_owned())?;
+                let _ = self.events.publish_runtime_batch(vec![
+                    DaemonEventKind::FocusedTerminalPresentationChanged,
+                ]);
+            }
             if closes {
                 if matches!(frame, AttachFrame::ReconnectAck) {
                     let _ = reconnect_finished.try_send(());
@@ -8060,6 +8463,686 @@ impl DaemonService {
         }
     }
 
+    fn owner_workspace(
+        &self,
+        identity: &protocol::QualifiedIdentity,
+    ) -> DaemonResult<WorkspaceSnapshot> {
+        let local_node_id = self.node_identity()?.id()?;
+        if identity.node_id == local_node_id {
+            return Ok(self
+                .workspace(&identity.inner_id)?
+                .snapshot(&self.durable)?);
+        }
+        match self.route_node_operation(
+            &identity.node_id,
+            RoutedOperation::GetWorkspace {
+                workspace_id: identity.inner_id.clone(),
+            },
+        ) {
+            Response::RoutedNodeOperation {
+                result: RoutedOperationResult::Workspace { workspace },
+            } => Ok(workspace),
+            Response::Error { message, code } => Err(DaemonError::lifecycle(
+                code.unwrap_or(ErrorCode::Internal),
+                message,
+            )),
+            _ => Err(DaemonError::lifecycle(
+                ErrorCode::Internal,
+                "owner returned an unexpected Workspace response",
+            )),
+        }
+    }
+
+    fn with_live_workspace_node<T>(
+        &self,
+        node_id: &str,
+        operation: impl FnOnce(protocol::CombinedNode) -> DaemonResult<T>,
+    ) -> DaemonResult<T> {
+        let local_node_id = self.node_identity()?.id()?;
+        if node_id == local_node_id {
+            let snapshot = self.combined_node_snapshot(Some(&local_node_id))?;
+            let node = snapshot
+                .nodes
+                .into_iter()
+                .find(|node| node.local && node.node_id == local_node_id)
+                .ok_or_else(|| {
+                    DaemonError::lifecycle(ErrorCode::NotFound, "local owner Node not found")
+                })?;
+            Self::require_live_workspace_capability(&node)?;
+            return operation(node);
+        }
+        let registrations = self.node_registrations()?;
+        let registration = registrations
+            .inspect(node_id)
+            .map_err(node_registration_error)?;
+        if registration.node_id != node_id || !registrations.admit(&registration)? {
+            return Err(DaemonError::lifecycle(
+                ErrorCode::RevisionChanged,
+                "owner Node registration changed before live verification",
+            ));
+        }
+        let result = (|| {
+            let response = send_registered_node_request_with_timeout(
+                &registration,
+                Request::GetCombinedNodeSnapshot {
+                    selector: Some(registration.node_id.clone()),
+                },
+                Duration::from_secs(2),
+                Some(protocol::ProtocolFeature::GlobalWorkspaces),
+            )
+            .map_err(|error| {
+                DaemonError::lifecycle(
+                    match error.kind() {
+                        io::ErrorKind::PermissionDenied => ErrorCode::NodeIdentityChanged,
+                        io::ErrorKind::Unsupported => ErrorCode::UnsupportedVersion,
+                        _ => ErrorCode::Timeout,
+                    },
+                    format!("live owner verification failed: {error}"),
+                )
+            })?;
+            let current = registrations
+                .with_current(&registration, || Ok(()))
+                .map_err(node_registration_error)?
+                .is_some();
+            if !current {
+                return Err(DaemonError::lifecycle(
+                    ErrorCode::RevisionChanged,
+                    "owner Node registration changed during live verification",
+                ));
+            }
+            let snapshot = match response {
+                Response::CombinedNodeSnapshot { snapshot } => snapshot,
+                Response::Error { message, code } => Err(DaemonError::lifecycle(
+                    code.unwrap_or(ErrorCode::Internal),
+                    message,
+                ))?,
+                _ => {
+                    return Err(DaemonError::lifecycle(
+                        ErrorCode::Internal,
+                        "owner returned an unexpected live capability response",
+                    ));
+                }
+            };
+            let node = snapshot
+                .nodes
+                .into_iter()
+                .find(|node| node.local && node.node_id == registration.node_id)
+                .ok_or_else(|| {
+                    DaemonError::lifecycle(
+                        ErrorCode::NodeIdentityChanged,
+                        "live capability response did not describe the pinned local Node",
+                    )
+                })?;
+            Self::require_live_workspace_capability(&node)?;
+            operation(node)
+        })();
+        registrations.release(&registration);
+        result
+    }
+
+    fn require_live_workspace_capability(node: &protocol::CombinedNode) -> DaemonResult<()> {
+        if node.workspace_owner_eligible
+            && node
+                .observed_capabilities
+                .iter()
+                .any(|capability| capability == "global_workspaces")
+        {
+            Ok(())
+        } else {
+            Err(DaemonError::lifecycle(
+                ErrorCode::UnsupportedVersion,
+                node.workspace_owner_unavailable_reason
+                    .clone()
+                    .unwrap_or_else(|| {
+                        "live owner does not advertise coordinated Workspace support".into()
+                    }),
+            ))
+        }
+    }
+
+    fn preflight_workspace_owner(&self, node_id: &str) -> DaemonResult<()> {
+        self.require_cached_workspace_owner_eligible(node_id)?;
+        self.with_live_workspace_node(node_id, |_| Ok(()))
+    }
+
+    fn require_cached_workspace_owner_eligible(&self, node_id: &str) -> DaemonResult<()> {
+        let snapshot = self.combined_node_snapshot(Some(node_id))?;
+        let node = snapshot
+            .nodes
+            .iter()
+            .find(|node| node.node_id == node_id)
+            .ok_or_else(|| DaemonError::lifecycle(ErrorCode::NotFound, "owner Node not found"))?;
+        if node.workspace_owner_eligible {
+            Ok(())
+        } else {
+            Err(DaemonError::lifecycle(
+                ErrorCode::Busy,
+                node.workspace_owner_unavailable_reason
+                    .clone()
+                    .unwrap_or_else(|| "owner Node is not eligible for Workspace placement".into()),
+            ))
+        }
+    }
+
+    fn with_workspace_operation_lock<T>(
+        &self,
+        operation_id: &str,
+        operation: impl FnOnce() -> DaemonResult<T>,
+    ) -> DaemonResult<T> {
+        let operation_lock = {
+            let mut locks = lock(&self.workspace_operation_locks)?;
+            locks.retain(|_, operation_lock| operation_lock.strong_count() > 0);
+            locks
+                .entry(operation_id.to_owned())
+                .or_insert_with(Weak::new)
+                .upgrade()
+                .unwrap_or_else(|| {
+                    let operation_lock = Arc::new(Mutex::new(()));
+                    locks.insert(operation_id.to_owned(), Arc::downgrade(&operation_lock));
+                    operation_lock
+                })
+        };
+        let operation_guard = lock(&operation_lock)?;
+        let result = operation();
+        drop(operation_guard);
+        let mut locks = lock(&self.workspace_operation_locks)?;
+        if Arc::strong_count(&operation_lock) == 1 {
+            locks.remove(operation_id);
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create_global_workspace_resource(
+        &self,
+        operation_id: &str,
+        request_fingerprint: &str,
+        request_bytes: usize,
+        global_workspace_id: &str,
+        expected_global_revision: u64,
+        node_id: &str,
+        owner_workspace_id: &str,
+        default_cwd: Option<PathBuf>,
+        resource_id: &str,
+        kind: PendingResourceKind,
+        build: impl FnOnce(&PendingWorkspaceResource) -> RoutedOperation,
+    ) -> DaemonResult<(protocol::GlobalWorkspaceSnapshot, RoutedOperationResult)> {
+        self.with_workspace_operation_lock(operation_id, || {
+            self.create_global_workspace_resource_inner(
+                operation_id,
+                request_fingerprint,
+                request_bytes,
+                false,
+                global_workspace_id,
+                expected_global_revision,
+                node_id,
+                owner_workspace_id,
+                default_cwd,
+                resource_id,
+                kind,
+                build,
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create_global_workspace_resource_inner(
+        &self,
+        operation_id: &str,
+        request_fingerprint: &str,
+        request_bytes: usize,
+        owner_preflight_complete: bool,
+        global_workspace_id: &str,
+        expected_global_revision: u64,
+        node_id: &str,
+        owner_workspace_id: &str,
+        default_cwd: Option<PathBuf>,
+        resource_id: &str,
+        kind: PendingResourceKind,
+        build: impl FnOnce(&PendingWorkspaceResource) -> RoutedOperation,
+    ) -> DaemonResult<(protocol::GlobalWorkspaceSnapshot, RoutedOperationResult)> {
+        if let Some(completed) = self
+            .global_workspaces()?
+            .completed_operation(operation_id, request_fingerprint)
+            .map_err(global_workspace_error)?
+        {
+            return Ok((completed.workspace, completed.resource));
+        }
+        let global = self
+            .global_workspaces()?
+            .get(global_workspace_id)
+            .map_err(global_workspace_error)?;
+        require_guard(
+            global.revision,
+            expected_global_revision,
+            "global Workspace",
+        )?;
+        if global.closing {
+            return Err(DaemonError::lifecycle(
+                ErrorCode::Busy,
+                "global Workspace close is in progress",
+            ));
+        }
+        if !owner_preflight_complete {
+            let selected = self.combined_node_snapshot(Some(node_id))?;
+            let node = selected
+                .nodes
+                .iter()
+                .find(|node| node.node_id == node_id)
+                .ok_or_else(|| {
+                    DaemonError::lifecycle(ErrorCode::NotFound, "selected Node not found")
+                })?;
+            if !node.workspace_owner_eligible {
+                return Err(DaemonError::lifecycle(
+                    ErrorCode::Busy,
+                    node.workspace_owner_unavailable_reason
+                        .clone()
+                        .unwrap_or_else(|| "selected Node is unavailable".into()),
+                ));
+            }
+        }
+        let existing = global
+            .placements
+            .iter()
+            .find(|placement| placement.node_id == node_id);
+        let owner = existing
+            .map(|placement| {
+                self.owner_workspace(&protocol::QualifiedIdentity::new(
+                    node_id,
+                    &placement.workspace_id,
+                ))
+            })
+            .transpose()?;
+        let owner_name = owner
+            .as_ref()
+            .map(|owner| owner.name.as_str())
+            .unwrap_or(&global.name);
+        let owner_cwd = owner
+            .as_ref()
+            .map(|owner| owner.default_cwd.clone())
+            .unwrap_or(default_cwd);
+        let prepared = self
+            .global_workspaces()?
+            .prepare_resource(
+                global_workspace_id,
+                operation_id,
+                request_fingerprint,
+                request_bytes,
+                expected_global_revision,
+                node_id,
+                owner_workspace_id,
+                owner_name,
+                owner_cwd,
+                resource_id,
+                kind,
+            )
+            .map_err(global_workspace_error)?;
+        let (mut pending, newly_prepared) = match prepared {
+            PreparedWorkspaceResource::Completed(completed) => {
+                let completed = *completed;
+                return Ok((completed.workspace, completed.resource));
+            }
+            PreparedWorkspaceResource::Pending {
+                pending,
+                newly_prepared,
+            } => (*pending, newly_prepared),
+        };
+        if !newly_prepared && let Some(resource) = self.pending_owner_resource(&pending)? {
+            Self::validate_pending_owner_resource(&pending, &resource)?;
+            let owner = self.owner_workspace(&protocol::QualifiedIdentity::new(
+                &pending.node_id,
+                &pending.owner_workspace_id,
+            ))?;
+            let completed = self
+                .global_workspaces()?
+                .complete_resource(&pending, &owner, &resource)
+                .map_err(global_workspace_error)?;
+            return Ok((completed.workspace, completed.resource));
+        }
+        let local_node_id = self.node_identity()?.id()?;
+        pending = self
+            .global_workspaces()?
+            .mark_owner_attempted(&pending)
+            .map_err(global_workspace_error)?;
+        let operation = build(&pending);
+        let response = if pending.node_id == local_node_id {
+            self.dispatch(operation.owner_request())
+                .unwrap_or_else(DaemonError::into_response)
+        } else {
+            self.route_node_operation(&pending.node_id, operation)
+        };
+        let resource = match response {
+            Response::RoutedNodeOperation { result } => result,
+            Response::Error { message, code } => {
+                if (!pending.creates_workspace || !pending.owner_attempted)
+                    && !matches!(
+                        code,
+                        Some(
+                            ErrorCode::OutcomeUnknown
+                                | ErrorCode::PersistenceFailed
+                                | ErrorCode::Timeout
+                        )
+                    )
+                {
+                    self.global_workspaces()?
+                        .cancel_resource(&pending)
+                        .map_err(global_workspace_error)?;
+                }
+                return Err(DaemonError::lifecycle(
+                    code.unwrap_or(ErrorCode::Internal),
+                    message,
+                ));
+            }
+            response => routed_result(response).map_err(|_| {
+                DaemonError::lifecycle(
+                    ErrorCode::Internal,
+                    "owner returned an unexpected resource response",
+                )
+            })?,
+        };
+        Self::validate_pending_owner_resource(&pending, &resource)?;
+        let resource_workspace_id = match &resource {
+            RoutedOperationResult::Shell { shell } => &shell.workspace_id,
+            RoutedOperationResult::Launcher { launcher } => &launcher.workspace_id,
+            RoutedOperationResult::AgentSchedule { schedule } => &schedule.workspace_id,
+            _ => {
+                return Err(DaemonError::lifecycle(
+                    ErrorCode::Internal,
+                    "owner returned an unexpected resource type",
+                ));
+            }
+        };
+        if resource_workspace_id != &pending.owner_workspace_id {
+            return Err(DaemonError::lifecycle(
+                ErrorCode::Internal,
+                "owner resource belongs to a different Workspace",
+            ));
+        }
+        let owner = self.owner_workspace(&protocol::QualifiedIdentity::new(
+            &pending.node_id,
+            &pending.owner_workspace_id,
+        ))?;
+        if owner.name != pending.owner_workspace_name || owner.default_cwd != pending.default_cwd {
+            return Err(DaemonError::lifecycle(
+                ErrorCode::OutcomeUnknown,
+                "owner Workspace metadata does not match the coordinator request",
+            ));
+        }
+        let completed = self
+            .global_workspaces()?
+            .complete_resource(&pending, &owner, &resource)
+            .map_err(global_workspace_error)?;
+        Ok((completed.workspace, completed.resource))
+    }
+
+    fn pending_owner_resource(
+        &self,
+        pending: &PendingWorkspaceResource,
+    ) -> DaemonResult<Option<RoutedOperationResult>> {
+        let operation = match pending.kind {
+            PendingResourceKind::Shell => RoutedOperation::GetShell {
+                shell_id: pending.resource_id.clone(),
+            },
+            PendingResourceKind::Launcher => RoutedOperation::GetLauncher {
+                launcher_id: pending.resource_id.clone(),
+            },
+            PendingResourceKind::AgentSchedule => RoutedOperation::GetAgentSchedule {
+                schedule_id: pending.resource_id.clone(),
+            },
+        };
+        let local_node_id = self.node_identity()?.id()?;
+        let response = if pending.node_id == local_node_id {
+            self.dispatch(operation.owner_request())
+                .unwrap_or_else(DaemonError::into_response)
+        } else {
+            self.route_node_operation(&pending.node_id, operation)
+        };
+        match response {
+            Response::Error {
+                code: Some(ErrorCode::NotFound),
+                ..
+            } => Ok(None),
+            Response::Error { message, code } => Err(DaemonError::lifecycle(
+                code.unwrap_or(ErrorCode::Internal),
+                message,
+            )),
+            Response::RoutedNodeOperation { result } => Ok(Some(result)),
+            response => routed_result(response).map(Some).map_err(|_| {
+                DaemonError::lifecycle(
+                    ErrorCode::Internal,
+                    "owner returned an unexpected pending-resource response",
+                )
+            }),
+        }
+    }
+
+    fn reconcile_pending_workspace_resources(&self) {
+        let pending = match self
+            .global_workspaces()
+            .and_then(|store| store.pending_resources().map_err(global_workspace_error))
+        {
+            Ok(pending) => pending,
+            Err(_) => return,
+        };
+        for pending in pending {
+            let recovered = self.with_workspace_operation_lock(&pending.operation_id, || {
+                let Some(resource) = self.pending_owner_resource(&pending)? else {
+                    self.global_workspaces()?
+                        .reconcile_resource(&pending, None)
+                        .map_err(global_workspace_error)?;
+                    return Ok(());
+                };
+                Self::validate_pending_owner_resource(&pending, &resource)?;
+                let owner = self.owner_workspace(&protocol::QualifiedIdentity::new(
+                    &pending.node_id,
+                    &pending.owner_workspace_id,
+                ))?;
+                self.global_workspaces()?
+                    .reconcile_resource(&pending, Some((&owner, &resource)))
+                    .map_err(global_workspace_error)?;
+                Ok::<(), DaemonError>(())
+            });
+            if let Err(error) = recovered {
+                eprintln!(
+                    "boomux: prepared Workspace resource {} remains unresolved: {error}",
+                    pending.operation_id
+                );
+            }
+        }
+    }
+
+    fn validate_pending_owner_resource(
+        pending: &PendingWorkspaceResource,
+        resource: &RoutedOperationResult,
+    ) -> DaemonResult<()> {
+        let (kind, resource_id, workspace_id) = match resource {
+            RoutedOperationResult::Shell { shell } => {
+                (PendingResourceKind::Shell, &shell.id, &shell.workspace_id)
+            }
+            RoutedOperationResult::Launcher { launcher } => (
+                PendingResourceKind::Launcher,
+                &launcher.id,
+                &launcher.workspace_id,
+            ),
+            RoutedOperationResult::AgentSchedule { schedule } => (
+                PendingResourceKind::AgentSchedule,
+                &schedule.id,
+                &schedule.workspace_id,
+            ),
+            _ => {
+                return Err(DaemonError::lifecycle(
+                    ErrorCode::Internal,
+                    "owner returned an unexpected prepared resource type",
+                ));
+            }
+        };
+        if kind != pending.kind
+            || resource_id != &pending.resource_id
+            || workspace_id != &pending.owner_workspace_id
+        {
+            return Err(DaemonError::lifecycle(
+                ErrorCode::OutcomeUnknown,
+                "owner resource does not match the prepared identity",
+            ));
+        }
+        Ok(())
+    }
+
+    fn open_global_workspace(
+        &self,
+        workspace_id: &str,
+        expected_revision: u64,
+    ) -> DaemonResult<protocol::GlobalWorkspaceOperationResult> {
+        let workspace = self
+            .global_workspaces()?
+            .get(workspace_id)
+            .map_err(global_workspace_error)?;
+        require_guard(workspace.revision, expected_revision, "global Workspace")?;
+        if workspace.closing {
+            return Err(DaemonError::lifecycle(
+                ErrorCode::Busy,
+                "global Workspace close is in progress",
+            ));
+        }
+        let placements = workspace
+            .placements
+            .iter()
+            .map(|placement| {
+                let identity = protocol::QualifiedIdentity::new(
+                    placement.node_id.clone(),
+                    placement.workspace_id.clone(),
+                );
+                match self.owner_workspace(&identity) {
+                    Ok(owner) if owner.revision >= placement.owner_revision => {
+                        protocol::WorkspacePlacementResult {
+                            node_id: placement.node_id.clone(),
+                            workspace_id: placement.workspace_id.clone(),
+                            status: "available".into(),
+                            message: None,
+                        }
+                    }
+                    Ok(_) => protocol::WorkspacePlacementResult {
+                        node_id: placement.node_id.clone(),
+                        workspace_id: placement.workspace_id.clone(),
+                        status: "stale".into(),
+                        message: Some("owner Workspace revision moved backwards".into()),
+                    },
+                    Err(error) => protocol::WorkspacePlacementResult {
+                        node_id: placement.node_id.clone(),
+                        workspace_id: placement.workspace_id.clone(),
+                        status: "unavailable".into(),
+                        message: Some(error.to_string()),
+                    },
+                }
+            })
+            .collect();
+        Ok(protocol::GlobalWorkspaceOperationResult {
+            workspace,
+            placements,
+        })
+    }
+
+    fn close_global_workspace(
+        &self,
+        workspace_id: &str,
+        expected_revision: Option<u64>,
+    ) -> DaemonResult<protocol::GlobalWorkspaceOperationResult> {
+        let mut workspace = self
+            .global_workspaces()?
+            .get(workspace_id)
+            .map_err(global_workspace_error)?;
+        if let Some(expected_revision) = expected_revision {
+            workspace = self
+                .global_workspaces()?
+                .begin_close(workspace_id, expected_revision)
+                .map_err(global_workspace_error)?;
+        } else if !workspace.closing {
+            return Err(DaemonError::lifecycle(
+                ErrorCode::InvalidArgument,
+                "global Workspace is not awaiting close retry",
+            ));
+        }
+        if workspace.placements.is_empty() {
+            self.global_workspaces()?
+                .confirm_empty_closed(workspace_id)
+                .map_err(global_workspace_error)?;
+            return Ok(protocol::GlobalWorkspaceOperationResult {
+                workspace,
+                placements: Vec::new(),
+            });
+        }
+        let local_node_id = self.node_identity()?.id()?;
+        let mut results = Vec::new();
+        for placement in workspace.placements.clone() {
+            let identity = protocol::QualifiedIdentity::new(
+                placement.node_id.clone(),
+                placement.workspace_id.clone(),
+            );
+            let response = match self.owner_workspace(&identity) {
+                Ok(owner) if placement.node_id == local_node_id => self
+                    .dispatch(Request::GuardedCloseWorkspace {
+                        workspace_id: placement.workspace_id.clone(),
+                        expected_revision: owner.revision,
+                    })
+                    .unwrap_or_else(DaemonError::into_response),
+                Ok(owner) => self.route_node_operation(
+                    &placement.node_id,
+                    RoutedOperation::CloseWorkspace {
+                        workspace_id: placement.workspace_id.clone(),
+                        expected_revision: owner.revision,
+                    },
+                ),
+                Err(error) => error.into_response(),
+            };
+            let confirmed = matches!(response, Response::Ok)
+                || matches!(
+                    response,
+                    Response::RoutedNodeOperation {
+                        result: RoutedOperationResult::Ok
+                    }
+                )
+                || matches!(
+                    response,
+                    Response::Error {
+                        code: Some(ErrorCode::NotFound),
+                        ..
+                    }
+                );
+            if confirmed {
+                let remaining = self
+                    .global_workspaces()?
+                    .confirm_closed(workspace_id, &placement.node_id, &placement.workspace_id)
+                    .map_err(global_workspace_error)?;
+                if let Some(remaining) = remaining {
+                    workspace = remaining;
+                } else {
+                    workspace.placements.clear();
+                }
+                results.push(protocol::WorkspacePlacementResult {
+                    node_id: placement.node_id,
+                    workspace_id: placement.workspace_id,
+                    status: "closed".into(),
+                    message: None,
+                });
+            } else {
+                let message = match response {
+                    Response::Error { message, .. } => message,
+                    _ => "owner returned an unexpected close response".into(),
+                };
+                results.push(protocol::WorkspacePlacementResult {
+                    node_id: placement.node_id,
+                    workspace_id: placement.workspace_id,
+                    status: "unresolved".into(),
+                    message: Some(message),
+                });
+            }
+        }
+        Ok(protocol::GlobalWorkspaceOperationResult {
+            workspace,
+            placements: results,
+        })
+    }
+
     fn combined_node_snapshot(
         &self,
         selector: Option<&str>,
@@ -8110,14 +9193,19 @@ impl DaemonService {
                 node_id: local_node_id,
                 alias: "local".into(),
                 local: true,
+                route: None,
+                registration_revision: None,
                 health: NodeProjectionHealthCode::Online,
                 current: true,
                 stale: false,
                 observed_at_ms: unix_time_ms(),
                 observed_protocol_version: Some(protocol::PROTOCOL_VERSION),
-                observed_capabilities: protocol::protocol_capabilities()
-                    .map(str::to_owned)
-                    .collect(),
+                observed_capabilities: self.runtime_protocol_capabilities(),
+                workspace_owner_eligible: self.global_workspaces.is_some(),
+                workspace_owner_unavailable_reason: self
+                    .global_workspaces
+                    .is_none()
+                    .then(|| "coordinated Workspace storage is unavailable".into()),
                 scheduler,
                 local_snapshot: Some(snapshot),
                 remote_projection: None,
@@ -8140,16 +9228,34 @@ impl DaemonService {
                 .iter()
                 .filter_map(|capability| capability.strip_prefix("protocol_")?.parse().ok())
                 .max();
+            let workspace_owner_eligible = !view.health.stale
+                && view.health.code == NodeProjectionHealthCode::Online
+                && view
+                    .health
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == "global_workspaces");
+            let workspace_owner_unavailable_reason = (!workspace_owner_eligible).then(|| {
+                if view.health.stale || view.health.code != NodeProjectionHealthCode::Online {
+                    format!("Node health is {:?}", view.health.code).to_ascii_lowercase()
+                } else {
+                    "Node does not support coordinated Workspaces".into()
+                }
+            });
             nodes.push(CombinedNode {
                 node_id: registration.node_id.clone(),
                 alias: registration.alias.clone(),
                 local: false,
+                route: Some(registration.target.clone()),
+                registration_revision: Some(registration.revision),
                 health: view.health.code,
                 current: !view.health.stale,
                 stale: view.health.stale,
                 observed_at_ms: view.health.last_success_at_ms.unwrap_or(0),
                 observed_protocol_version,
                 observed_capabilities: view.health.capabilities,
+                workspace_owner_eligible,
+                workspace_owner_unavailable_reason,
                 scheduler,
                 local_snapshot: None,
                 remote_projection: view.projection,
@@ -8162,7 +9268,109 @@ impl DaemonService {
                 .then_with(|| left.alias.cmp(&right.alias))
                 .then_with(|| left.node_id.cmp(&right.node_id))
         });
-        Ok(CombinedNodeSnapshot { nodes })
+        let mut workspaces = self
+            .global_workspaces
+            .as_ref()
+            .map(GlobalWorkspaceStore::list)
+            .transpose()?
+            .unwrap_or_default();
+        let node_current = nodes
+            .iter()
+            .map(|node| (node.node_id.as_str(), node.current && !node.stale))
+            .collect::<HashMap<_, _>>();
+        for workspace in &mut workspaces {
+            for placement in &mut workspace.placements {
+                if !workspace.closing
+                    && !node_current
+                        .get(placement.node_id.as_str())
+                        .copied()
+                        .unwrap_or(false)
+                {
+                    placement.state = protocol::WorkspacePlacementState::Unavailable;
+                }
+            }
+        }
+        let linked = workspaces
+            .iter()
+            .flat_map(|workspace| &workspace.placements)
+            .map(|placement| (placement.node_id.clone(), placement.workspace_id.clone()))
+            .collect::<HashSet<_>>();
+        let mut external_workspaces = Vec::new();
+        for node in &nodes {
+            if let Some(snapshot) = &node.local_snapshot {
+                external_workspaces.extend(
+                    snapshot
+                        .workspaces
+                        .iter()
+                        .filter(|workspace| {
+                            !linked.contains(&(node.node_id.clone(), workspace.id.clone()))
+                        })
+                        .map(|workspace| protocol::ExternalWorkspaceSnapshot {
+                            identity: protocol::QualifiedIdentity::new(
+                                &node.node_id,
+                                &workspace.id,
+                            ),
+                            revision: workspace.revision,
+                            name: workspace.name.clone(),
+                            default_cwd: workspace.default_cwd.clone(),
+                            available: node.current && !node.stale,
+                        }),
+                );
+            }
+            if let Some(projection) = &node.remote_projection {
+                external_workspaces.extend(
+                    projection
+                        .workspaces
+                        .iter()
+                        .filter(|workspace| {
+                            !linked.contains(&(node.node_id.clone(), workspace.id.clone()))
+                        })
+                        .map(|workspace| protocol::ExternalWorkspaceSnapshot {
+                            identity: protocol::QualifiedIdentity::new(
+                                &node.node_id,
+                                &workspace.id,
+                            ),
+                            revision: 0,
+                            name: workspace.name.clone(),
+                            default_cwd: None,
+                            available: node.current && !node.stale,
+                        }),
+                );
+            }
+        }
+        external_workspaces.sort_by(|left, right| {
+            left.name
+                .cmp(&right.name)
+                .then_with(|| left.identity.node_id.cmp(&right.identity.node_id))
+                .then_with(|| left.identity.inner_id.cmp(&right.identity.inner_id))
+        });
+        let focused_terminal = self
+            .runtimes
+            .presented_focused_terminal()?
+            .filter(|focused| {
+                nodes.iter().any(|node| {
+                    node.node_id == focused.shell.node_id
+                        && (node.local_snapshot.as_ref().is_some_and(|snapshot| {
+                            snapshot.workspaces.iter().any(|workspace| {
+                                workspace
+                                    .shells
+                                    .iter()
+                                    .any(|shell| shell.id == focused.shell.inner_id)
+                            })
+                        }) || node.remote_projection.as_ref().is_some_and(|projection| {
+                            projection
+                                .shells
+                                .iter()
+                                .any(|shell| shell.id == focused.shell.inner_id)
+                        }))
+                })
+            });
+        Ok(CombinedNodeSnapshot {
+            nodes,
+            workspaces,
+            external_workspaces,
+            focused_terminal,
+        })
     }
 
     fn clock_now_ms(&self) -> u64 {
@@ -8270,6 +9478,20 @@ impl DaemonService {
             .spawn(move || node_projection_worker(service, worker_node_id))?;
         handles.insert(node_id, handle);
         Ok(())
+    }
+
+    fn force_node_projection_refresh(
+        &self,
+        selector: &str,
+    ) -> DaemonResult<protocol::NodeProjectionHealth> {
+        let registration = self
+            .node_registrations()?
+            .inspect(selector)
+            .map_err(node_registration_error)?;
+        lock(&self.node_projection_workers.wake)?.insert(registration.node_id.clone());
+        self.node_projection_cache()?
+            .health(&registration)
+            .map_err(DaemonError::from)
     }
 
     fn stop_node_projection_workers(&self) -> io::Result<()> {
@@ -9464,6 +10686,8 @@ impl DaemonService {
     }
 
     fn dispatch(&self, request: Request) -> DaemonResult<Response> {
+        let (workspace_request_fingerprint, workspace_semantic_fingerprint) =
+            workspace_operation_fingerprints(&request)?;
         let _dispatch_eligibility = matches!(
             &request,
             Request::RegisterAgent { .. }
@@ -9563,9 +10787,325 @@ impl DaemonService {
                     health: self.node_projection_cache()?.health(&registration)?,
                 })
             }
-            Request::GetCombinedNodeSnapshot { selector } => Ok(Response::CombinedNodeSnapshot {
-                snapshot: self.combined_node_snapshot(selector.as_deref())?,
+            Request::ForceNodeProjectionRefresh { selector } => {
+                Ok(Response::NodeProjectionHealth {
+                    health: self.force_node_projection_refresh(&selector)?,
+                })
+            }
+            Request::GetCombinedNodeSnapshot { selector } => {
+                self.reconcile_pending_workspace_resources();
+                Ok(Response::CombinedNodeSnapshot {
+                    snapshot: self.combined_node_snapshot(selector.as_deref())?,
+                })
+            }
+            Request::CreateGlobalWorkspace { name } => Ok(Response::GlobalWorkspace {
+                workspace: self
+                    .global_workspaces()?
+                    .create(name)
+                    .map_err(global_workspace_error)?,
             }),
+            Request::AdoptNodeWorkspace {
+                identity,
+                expected_revision,
+            } => {
+                self.require_cached_workspace_owner_eligible(&identity.node_id)?;
+                let node_id = identity.node_id.clone();
+                self.with_live_workspace_node(&identity.node_id, |node| {
+                    let owner = node
+                        .local_snapshot
+                        .and_then(|snapshot| {
+                            snapshot
+                                .workspaces
+                                .into_iter()
+                                .find(|workspace| workspace.id == identity.inner_id)
+                        })
+                        .ok_or_else(|| {
+                            DaemonError::lifecycle(
+                                ErrorCode::NotFound,
+                                "owner Workspace not found in live capability snapshot",
+                            )
+                        })?;
+                    Ok(Response::GlobalWorkspace {
+                        workspace: self
+                            .global_workspaces()?
+                            .adopt(&node_id, &owner, expected_revision)
+                            .map_err(global_workspace_error)?,
+                    })
+                })
+            }
+            Request::LinkNodeWorkspace {
+                global_workspace_id,
+                expected_global_revision,
+                identity,
+                expected_owner_revision,
+            } => {
+                self.require_cached_workspace_owner_eligible(&identity.node_id)?;
+                let node_id = identity.node_id.clone();
+                self.with_live_workspace_node(&identity.node_id, |node| {
+                    let owner = node
+                        .local_snapshot
+                        .and_then(|snapshot| {
+                            snapshot
+                                .workspaces
+                                .into_iter()
+                                .find(|workspace| workspace.id == identity.inner_id)
+                        })
+                        .ok_or_else(|| {
+                            DaemonError::lifecycle(
+                                ErrorCode::NotFound,
+                                "owner Workspace not found in live capability snapshot",
+                            )
+                        })?;
+                    Ok(Response::GlobalWorkspace {
+                        workspace: self
+                            .global_workspaces()?
+                            .link(
+                                &global_workspace_id,
+                                expected_global_revision,
+                                &node_id,
+                                &owner,
+                                expected_owner_revision,
+                            )
+                            .map_err(global_workspace_error)?,
+                    })
+                })
+            }
+            Request::RenameGlobalWorkspace {
+                workspace_id,
+                expected_revision,
+                name,
+            } => Ok(Response::GlobalWorkspace {
+                workspace: self
+                    .global_workspaces()?
+                    .rename(&workspace_id, expected_revision, name)
+                    .map_err(global_workspace_error)?,
+            }),
+            Request::OpenGlobalWorkspace {
+                workspace_id,
+                expected_revision,
+            } => Ok(Response::GlobalWorkspaceOperation {
+                result: self.open_global_workspace(&workspace_id, expected_revision)?,
+            }),
+            Request::CloseGlobalWorkspace {
+                workspace_id,
+                expected_revision,
+            } => Ok(Response::GlobalWorkspaceOperation {
+                result: self.close_global_workspace(&workspace_id, Some(expected_revision))?,
+            }),
+            Request::RetryGlobalWorkspaceClose { workspace_id } => {
+                Ok(Response::GlobalWorkspaceOperation {
+                    result: self.close_global_workspace(&workspace_id, None)?,
+                })
+            }
+            Request::CreateGlobalWorkspaceShell {
+                operation_id,
+                global_workspace_id,
+                expected_global_revision,
+                node_id,
+                owner_workspace_id,
+                default_cwd,
+                shell_id,
+                shell,
+            } => {
+                let request = workspace_request_fingerprint
+                    .as_ref()
+                    .expect("Workspace resource request has a fingerprint");
+                let (workspace, resource) = self.create_global_workspace_resource(
+                    &operation_id,
+                    &request.digest,
+                    request.bytes,
+                    &global_workspace_id,
+                    expected_global_revision,
+                    &node_id,
+                    &owner_workspace_id,
+                    default_cwd,
+                    &shell_id,
+                    PendingResourceKind::Shell,
+                    move |pending| RoutedOperation::CreateWorkspaceShell {
+                        workspace_id: pending.owner_workspace_id.clone(),
+                        workspace_name: pending.owner_workspace_name.clone(),
+                        default_cwd: pending.default_cwd.clone(),
+                        shell_id: pending.resource_id.clone(),
+                        shell,
+                    },
+                )?;
+                Ok(Response::GlobalWorkspaceResource {
+                    workspace,
+                    resource,
+                })
+            }
+            Request::CreateGlobalWorkspaceWithShell {
+                operation_id,
+                global_workspace_id,
+                name,
+                node_id,
+                owner_workspace_id,
+                default_cwd,
+                shell_id,
+                shell,
+            } => {
+                let request = workspace_request_fingerprint
+                    .as_ref()
+                    .expect("Workspace resource request has a fingerprint");
+                let request_fingerprint = request.digest.as_str();
+                let semantic_fingerprint = workspace_semantic_fingerprint
+                    .as_deref()
+                    .expect("project Workspace request has a semantic fingerprint");
+                let (workspace, resource) =
+                    self.with_workspace_operation_lock(&operation_id, || {
+                        if let Some(completed) = self
+                            .global_workspaces()?
+                            .completed_operation(&operation_id, request_fingerprint)
+                            .map_err(global_workspace_error)?
+                        {
+                            return Ok((completed.workspace, completed.resource));
+                        }
+                        if let Err(error) = self.preflight_workspace_owner(&node_id) {
+                            if !workspace_pre_owner_failure_is_ambiguous(&error) {
+                                self.global_workspaces()?
+                                    .cancel_pending_operation_if_never_attempted(
+                                        &operation_id,
+                                        request_fingerprint,
+                                    )
+                                    .map_err(global_workspace_error)?;
+                            }
+                            return Err(error);
+                        }
+                        let prepared = self
+                            .global_workspaces()?
+                            .prepare_workspace_shell(
+                                &operation_id,
+                                request_fingerprint,
+                                request.bytes,
+                                semantic_fingerprint,
+                                &global_workspace_id,
+                                &name,
+                                &node_id,
+                                &owner_workspace_id,
+                                default_cwd,
+                                &shell_id,
+                            )
+                            .map_err(global_workspace_error)?;
+                        let (prepared_workspace, pending) = match prepared {
+                            PreparedWorkspaceShell::Completed(completed) => {
+                                let completed = *completed;
+                                return Ok((completed.workspace, completed.resource));
+                            }
+                            PreparedWorkspaceShell::Pending { workspace, pending } => {
+                                (workspace, *pending)
+                            }
+                        };
+                        let result = self.create_global_workspace_resource_inner(
+                            &pending.operation_id,
+                            request_fingerprint,
+                            request.bytes,
+                            true,
+                            &prepared_workspace.id,
+                            prepared_workspace.revision,
+                            &pending.node_id,
+                            &pending.requested_owner_workspace_id,
+                            pending.default_cwd.clone(),
+                            &pending.resource_id,
+                            PendingResourceKind::Shell,
+                            move |pending| RoutedOperation::CreateWorkspaceShell {
+                                workspace_id: pending.owner_workspace_id.clone(),
+                                workspace_name: pending.owner_workspace_name.clone(),
+                                default_cwd: pending.default_cwd.clone(),
+                                shell_id: pending.resource_id.clone(),
+                                shell,
+                            },
+                        );
+                        if let Err(error) = &result
+                            && !workspace_pre_owner_failure_is_ambiguous(error)
+                        {
+                            self.global_workspaces()?
+                                .cancel_pending_operation_if_never_attempted(
+                                    &operation_id,
+                                    request_fingerprint,
+                                )
+                                .map_err(global_workspace_error)?;
+                        }
+                        result
+                    })?;
+                Ok(Response::GlobalWorkspaceResource {
+                    workspace,
+                    resource,
+                })
+            }
+            Request::CreateGlobalWorkspaceLauncher {
+                operation_id,
+                global_workspace_id,
+                expected_global_revision,
+                node_id,
+                owner_workspace_id,
+                default_cwd,
+                launcher_id,
+                spec,
+            } => {
+                let request = workspace_request_fingerprint
+                    .as_ref()
+                    .expect("Workspace resource request has a fingerprint");
+                let (workspace, resource) = self.create_global_workspace_resource(
+                    &operation_id,
+                    &request.digest,
+                    request.bytes,
+                    &global_workspace_id,
+                    expected_global_revision,
+                    &node_id,
+                    &owner_workspace_id,
+                    default_cwd,
+                    &launcher_id,
+                    PendingResourceKind::Launcher,
+                    move |pending| RoutedOperation::CreateWorkspaceLauncher {
+                        workspace_id: pending.owner_workspace_id.clone(),
+                        workspace_name: pending.owner_workspace_name.clone(),
+                        default_cwd: pending.default_cwd.clone(),
+                        launcher_id: pending.resource_id.clone(),
+                        spec,
+                    },
+                )?;
+                Ok(Response::GlobalWorkspaceResource {
+                    workspace,
+                    resource,
+                })
+            }
+            Request::CreateGlobalWorkspaceAgentSchedule {
+                operation_id,
+                global_workspace_id,
+                expected_global_revision,
+                node_id,
+                owner_workspace_id,
+                default_cwd,
+                schedule_id,
+                spec,
+            } => {
+                let request = workspace_request_fingerprint
+                    .as_ref()
+                    .expect("Workspace resource request has a fingerprint");
+                let (workspace, resource) = self.create_global_workspace_resource(
+                    &operation_id,
+                    &request.digest,
+                    request.bytes,
+                    &global_workspace_id,
+                    expected_global_revision,
+                    &node_id,
+                    &owner_workspace_id,
+                    default_cwd,
+                    &schedule_id,
+                    PendingResourceKind::AgentSchedule,
+                    move |pending| RoutedOperation::CreateWorkspaceAgentSchedule {
+                        workspace_id: pending.owner_workspace_id.clone(),
+                        workspace_name: pending.owner_workspace_name.clone(),
+                        default_cwd: pending.default_cwd.clone(),
+                        schedule_id: pending.resource_id.clone(),
+                        spec,
+                    },
+                )?;
+                Ok(Response::GlobalWorkspaceResource {
+                    workspace,
+                    resource,
+                })
+            }
             Request::RouteNodeOperation { node_id, operation } => {
                 Ok(self.route_node_operation(&node_id, operation))
             }
@@ -9675,6 +11215,142 @@ impl DaemonService {
                 let workspace = self.create_workspace_mutation(undo, name, default_cwd, shells)?;
                 let events = workspace_created_events(&workspace);
                 Ok((Response::Workspace { workspace }, events))
+            }),
+            Request::CreateWorkspaceShell {
+                workspace_id,
+                workspace_name,
+                default_cwd,
+                shell_id,
+                shell,
+            } => self.durable_mutation_outcome(|undo| {
+                let (workspace, workspace_undo) = self.durable.create_workspace_exact(
+                    &workspace_id,
+                    workspace_name,
+                    default_cwd,
+                )?;
+                let workspace_created = workspace_undo.is_some();
+                if let Some(record) = workspace_undo {
+                    undo.record(record);
+                }
+                let (shell, shell_undo) =
+                    self.durable
+                        .create_shell_exact(&workspace_id, &shell_id, shell)?;
+                let shell_created = shell_undo.is_some();
+                if let Some(record) = shell_undo {
+                    undo.record(record);
+                }
+                if !workspace_created && !shell_created {
+                    return Ok(DurableMutation::Unchanged(Response::Shell { shell }));
+                }
+                let mut events = Vec::new();
+                if workspace_created {
+                    events.push(DaemonEventKind::WorkspaceCreated {
+                        workspace_id: workspace.id,
+                        name: workspace.name,
+                    });
+                }
+                if shell_created {
+                    events.push(DaemonEventKind::ShellCreated {
+                        workspace_id,
+                        shell_id: shell.id.clone(),
+                        name: shell.name.clone(),
+                    });
+                }
+                Ok(DurableMutation::Changed(Response::Shell { shell }, events))
+            }),
+            Request::CreateWorkspaceLauncher {
+                workspace_id,
+                workspace_name,
+                default_cwd,
+                launcher_id,
+                spec,
+            } => self.durable_mutation_outcome(|undo| {
+                let (workspace, workspace_undo) = self.durable.create_workspace_exact(
+                    &workspace_id,
+                    workspace_name,
+                    default_cwd,
+                )?;
+                let workspace_created = workspace_undo.is_some();
+                if let Some(record) = workspace_undo {
+                    undo.record(record);
+                }
+                let (launcher, launcher_undo) =
+                    self.durable
+                        .create_launcher_exact(&workspace_id, &launcher_id, spec)?;
+                let launcher_created = launcher_undo.is_some();
+                if let Some(record) = launcher_undo {
+                    undo.record(record);
+                }
+                if !workspace_created && !launcher_created {
+                    return Ok(DurableMutation::Unchanged(Response::Launcher { launcher }));
+                }
+                let mut events = Vec::new();
+                if workspace_created {
+                    events.push(DaemonEventKind::WorkspaceCreated {
+                        workspace_id: workspace.id,
+                        name: workspace.name,
+                    });
+                }
+                if launcher_created {
+                    events.push(DaemonEventKind::LauncherCreated {
+                        workspace_id,
+                        launcher_id: launcher.id.clone(),
+                        name: launcher.name.clone(),
+                    });
+                }
+                Ok(DurableMutation::Changed(
+                    Response::Launcher { launcher },
+                    events,
+                ))
+            }),
+            Request::CreateWorkspaceAgentSchedule {
+                workspace_id,
+                workspace_name,
+                default_cwd,
+                schedule_id,
+                spec,
+            } => self.durable_mutation_outcome(|undo| {
+                let (workspace, workspace_undo) = self.durable.create_workspace_exact(
+                    &workspace_id,
+                    workspace_name,
+                    default_cwd,
+                )?;
+                let workspace_created = workspace_undo.is_some();
+                if let Some(record) = workspace_undo {
+                    undo.record(record);
+                }
+                let (schedule, schedule_undo) = self.durable.create_schedule_at_with_id(
+                    &workspace_id,
+                    schedule_id,
+                    spec,
+                    self.clock_now_ms(),
+                )?;
+                let schedule_created = schedule_undo.is_some();
+                if let Some(record) = schedule_undo {
+                    undo.record(record);
+                }
+                if !workspace_created && !schedule_created {
+                    return Ok(DurableMutation::Unchanged(Response::AgentSchedule {
+                        schedule,
+                    }));
+                }
+                let mut events = Vec::new();
+                if workspace_created {
+                    events.push(DaemonEventKind::WorkspaceCreated {
+                        workspace_id: workspace.id,
+                        name: workspace.name,
+                    });
+                }
+                if schedule_created {
+                    events.push(DaemonEventKind::AgentScheduleCreated {
+                        workspace_id,
+                        schedule: schedule.clone(),
+                    });
+                }
+                Ok(DurableMutation::Changed(
+                    Response::AgentSchedule { schedule },
+                    events,
+                ))
             }),
             Request::CreateShell {
                 workspace_id,
@@ -10497,6 +12173,7 @@ impl DaemonService {
             node_identity: None,
             node_registrations: None,
             node_projection_cache: None,
+            global_workspaces: None,
             durable: DurableRegistry {
                 state: Mutex::new(state),
                 store: Some(store),
@@ -10512,6 +12189,7 @@ impl DaemonService {
             },
             remote_attachments: RemoteAttachmentManager::default(),
             host_service_previews: Mutex::new(HashMap::new()),
+            workspace_operation_locks: Mutex::new(HashMap::new()),
             mutation_lock: Mutex::new(()),
             schedule_dispatch_lock: Mutex::new(()),
             notification_settings: NotificationDeliverySettings::default(),
@@ -11436,7 +13114,22 @@ impl DaemonService {
             cursor,
             projection,
             transitions,
+            capabilities: self.runtime_protocol_capabilities(),
         })
+    }
+
+    fn runtime_protocol_capabilities(&self) -> Vec<String> {
+        protocol::ProtocolFeature::ALL
+            .iter()
+            .copied()
+            .filter(|feature| {
+                *feature != protocol::ProtocolFeature::GlobalWorkspaces
+                    || self.global_workspaces.is_some()
+            })
+            .flat_map(protocol::ProtocolFeature::capability_names)
+            .copied()
+            .map(str::to_owned)
+            .collect()
     }
 
     fn scheduler_health(&self) -> io::Result<SchedulerHealth> {
@@ -11549,6 +13242,15 @@ impl DaemonService {
         }
         self.runtimes
             .record_focus_gained(shell.workspace_id.clone(), shell.id.clone(), run_id)?;
+        if let Some(identity) = &self.node_identity
+            && let Ok(node_id) = identity.id()
+        {
+            self.runtimes
+                .record_presented_focus(node_id, shell.id.clone())?;
+            let _ = self
+                .events
+                .publish_runtime_batch(vec![DaemonEventKind::FocusedTerminalPresentationChanged]);
+        }
         Ok(true)
     }
 
@@ -11564,7 +13266,32 @@ impl DaemonService {
         }
         let current = self.focus_target_is_current(&focused_terminal)?;
         self.runtimes
-            .import_focused_terminal(focused_terminal, current)
+            .import_focused_terminal(focused_terminal.clone(), current)?;
+        if current
+            && let Some(identity) = &self.node_identity
+            && let Ok(node_id) = identity.id()
+        {
+            self.runtimes.import_presented_focus(
+                node_id,
+                focused_terminal.shell_id,
+                focused_terminal.revision,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn import_presented_focused_terminal(
+        &self,
+        focused_terminal: Option<QualifiedFocusedTerminalSnapshot>,
+    ) -> io::Result<()> {
+        let Some(focused_terminal) = focused_terminal else {
+            return Ok(());
+        };
+        self.runtimes.import_presented_focus(
+            focused_terminal.shell.node_id,
+            focused_terminal.shell.inner_id,
+            focused_terminal.revision,
+        )
     }
 
     fn lifecycle_transaction(
@@ -12962,10 +14689,18 @@ impl Shell {
 }
 
 fn create_pending_shell(workspace_id: &str, spec: ShellSpec) -> io::Result<Arc<Shell>> {
+    create_pending_shell_with_id(workspace_id, Uuid::new_v4().to_string(), spec)
+}
+
+fn create_pending_shell_with_id(
+    workspace_id: &str,
+    shell_id: String,
+    spec: ShellSpec,
+) -> io::Result<Arc<Shell>> {
     validate_name(&spec.name)?;
     validate_cwd(&spec.cwd)?;
     Ok(Arc::new(Shell {
-        id: Uuid::new_v4().to_string(),
+        id: shell_id,
         revision: Mutex::new(1),
         workspace_id: workspace_id.to_owned(),
         name: Mutex::new(spec.name),
@@ -14121,6 +15856,18 @@ fn validate_name(name: &str) -> io::Result<()> {
     }
 }
 
+fn validate_uuid(value: &str, label: &str) -> io::Result<()> {
+    let parsed = Uuid::parse_str(value)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, format!("invalid {label}")))?;
+    if parsed.to_string() != value {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{label} must use canonical UUID syntax"),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_persisted_name(name: &str) -> io::Result<()> {
     if name.trim().is_empty() {
         Err(io::Error::new(
@@ -15240,6 +16987,52 @@ mod tests {
     }
 
     #[test]
+    fn exact_workspace_shell_creation_is_atomic_idempotent_and_collision_safe() {
+        let registry = DaemonService::default();
+        let workspace_id = Uuid::from_u128(1).to_string();
+        let shell_id = Uuid::from_u128(2).to_string();
+        let cwd = env::temp_dir();
+        let request = Request::CreateWorkspaceShell {
+            workspace_id: workspace_id.clone(),
+            workspace_name: "coordinated".into(),
+            default_cwd: Some(cwd.clone()),
+            shell_id: shell_id.clone(),
+            shell: ShellSpec {
+                name: "shell".into(),
+                command: vec!["bash".into(), "-lc".into(), "printf %s safe".into()],
+                cwd: cwd.clone(),
+            },
+        };
+        assert!(matches!(
+            registry.dispatch(request.clone()).unwrap(),
+            Response::Shell { .. }
+        ));
+        assert!(matches!(
+            registry.dispatch(request).unwrap(),
+            Response::Shell { .. }
+        ));
+        let snapshot = registry.snapshot().unwrap();
+        assert_eq!(snapshot.workspaces.len(), 1);
+        assert_eq!(snapshot.workspaces[0].id, workspace_id);
+        assert_eq!(snapshot.workspaces[0].shells.len(), 1);
+        assert_eq!(snapshot.workspaces[0].shells[0].id, shell_id);
+
+        let conflict = registry.dispatch(Request::CreateWorkspaceShell {
+            workspace_id: snapshot.workspaces[0].id.clone(),
+            workspace_name: "coordinated".into(),
+            default_cwd: Some(cwd.clone()),
+            shell_id: snapshot.workspaces[0].shells[0].id.clone(),
+            shell: ShellSpec {
+                name: "different".into(),
+                command: vec!["bash".into()],
+                cwd,
+            },
+        });
+        assert!(conflict.is_err());
+        assert_eq!(registry.snapshot().unwrap().workspaces[0].shells.len(), 1);
+    }
+
+    #[test]
     fn scheduler_health_tracks_running_stopped_and_panicked_workers() {
         let registry = Arc::new(DaemonService::default());
         assert_eq!(
@@ -15331,6 +17124,30 @@ mod tests {
             .shells
             .remove(&shell.id);
         assert!(registry.snapshot().unwrap().focused_terminal.is_none());
+    }
+
+    #[test]
+    fn presented_focus_revisions_order_local_and_remote_nodes() {
+        let runtimes = ShellRuntimeManager::default();
+
+        runtimes
+            .record_presented_focus("local-node".into(), "local-shell".into())
+            .unwrap();
+        let local_revision = runtimes
+            .presented_focused_terminal()
+            .unwrap()
+            .unwrap()
+            .revision;
+        runtimes
+            .record_presented_focus("remote-node".into(), "remote-shell".into())
+            .unwrap();
+
+        let remote = runtimes.presented_focused_terminal().unwrap().unwrap();
+        assert!(remote.revision > local_revision);
+        assert_eq!(
+            remote.shell,
+            QualifiedIdentity::new("remote-node", "remote-shell")
+        );
     }
 
     #[test]
@@ -17684,6 +19501,52 @@ mod tests {
     }
 
     #[test]
+    fn protocol_thirty_eight_filters_focus_invalidation_without_rewinding_cursor() {
+        let cursor = EventCursor {
+            stream_id: Uuid::new_v4().to_string(),
+            event_id: 5,
+        };
+        let response = Response::Events {
+            stream_id: cursor.stream_id.clone(),
+            cursor: cursor.clone(),
+            snapshot: None,
+            events: vec![DaemonEvent {
+                id: 5,
+                at_ms: 10,
+                kind: DaemonEventKind::FocusedTerminalPresentationChanged,
+            }],
+        };
+
+        let Response::Events {
+            cursor: current_cursor,
+            events: current_events,
+            ..
+        } = response_for_version(response.clone(), 39)
+        else {
+            panic!("expected current events");
+        };
+        assert_eq!(current_cursor, cursor);
+        assert!(matches!(
+            current_events.as_slice(),
+            [DaemonEvent {
+                kind: DaemonEventKind::FocusedTerminalPresentationChanged,
+                ..
+            }]
+        ));
+
+        let Response::Events {
+            cursor: filtered_cursor,
+            events,
+            ..
+        } = response_for_version(response, 38)
+        else {
+            panic!("expected filtered events");
+        };
+        assert_eq!(filtered_cursor, cursor);
+        assert!(events.is_empty());
+    }
+
+    #[test]
     fn projection_cut_resumes_exactly_or_reseeds_on_stream_expiry() {
         let events = EventStream::new();
         let baseline = events.transaction().unwrap().cursor();
@@ -17880,6 +19743,7 @@ mod tests {
                     },
                 },
             ],
+            capabilities: Vec::new(),
         };
         let live = ProjectionCommit {
             generation: 2,
@@ -17951,6 +19815,7 @@ mod tests {
             },
             projection: remote_notification_projection(&node_id),
             transitions: Vec::new(),
+            capabilities: Vec::new(),
         };
         let commit = ProjectionCommit {
             generation: 2,
@@ -20205,6 +22070,126 @@ mod tests {
     }
 
     #[test]
+    fn protocol_thirty_seven_combined_snapshots_hide_coordinator_workspaces() {
+        let workspace_id = Uuid::from_u128(1).to_string();
+        let node_id = Uuid::from_u128(2).to_string();
+        let current_node = protocol::CombinedNode {
+            node_id: node_id.clone(),
+            alias: "remote".into(),
+            local: false,
+            route: Some("remote.example".into()),
+            registration_revision: Some(7),
+            health: protocol::NodeProjectionHealthCode::Online,
+            current: true,
+            stale: false,
+            observed_at_ms: 10,
+            observed_protocol_version: Some(37),
+            observed_capabilities: vec!["protocol_37".into()],
+            workspace_owner_eligible: true,
+            workspace_owner_unavailable_reason: Some("new field".into()),
+            scheduler: SchedulerHealth {
+                state: SchedulerState::Active,
+                max_concurrent: 1,
+                active_executions: 0,
+            },
+            local_snapshot: None,
+            remote_projection: None,
+        };
+        let response = Response::CombinedNodeSnapshot {
+            snapshot: protocol::CombinedNodeSnapshot {
+                nodes: vec![current_node.clone()],
+                workspaces: vec![protocol::GlobalWorkspaceSnapshot {
+                    id: workspace_id.clone(),
+                    revision: 1,
+                    name: "work".into(),
+                    closing: false,
+                    placements: Vec::new(),
+                }],
+                external_workspaces: vec![protocol::ExternalWorkspaceSnapshot {
+                    identity: protocol::QualifiedIdentity::new(node_id.clone(), workspace_id),
+                    revision: 1,
+                    name: "external".into(),
+                    default_cwd: Some("/owner/work".into()),
+                    available: true,
+                }],
+                focused_terminal: Some(protocol::QualifiedFocusedTerminalSnapshot {
+                    revision: 9,
+                    shell: protocol::QualifiedIdentity::new(node_id.clone(), "shell"),
+                }),
+            },
+        };
+        let Response::CombinedNodeSnapshot {
+            snapshot: protocol_thirty_eight,
+        } = response_for_version(response.clone(), 38)
+        else {
+            panic!("expected combined Node snapshot");
+        };
+        assert_eq!(protocol_thirty_eight.workspaces.len(), 1);
+        assert_eq!(protocol_thirty_eight.external_workspaces.len(), 1);
+        assert!(protocol_thirty_eight.focused_terminal.is_none());
+        let Response::CombinedNodeSnapshot { snapshot } = response_for_version(response, 37) else {
+            panic!("expected combined Node snapshot");
+        };
+        assert!(snapshot.workspaces.is_empty());
+        assert!(snapshot.external_workspaces.is_empty());
+        assert!(snapshot.focused_terminal.is_none());
+        let encoded_node = serde_json::to_value(&snapshot.nodes[0]).unwrap();
+        assert!(encoded_node.get("route").is_none());
+        assert!(encoded_node.get("registration_revision").is_none());
+        assert!(encoded_node.get("workspace_owner_eligible").is_none());
+        assert!(
+            encoded_node
+                .get("workspace_owner_unavailable_reason")
+                .is_none()
+        );
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct ProtocolThirtySevenCombinedNode {
+            node_id: String,
+            alias: String,
+            local: bool,
+            health: protocol::NodeProjectionHealthCode,
+            current: bool,
+            stale: bool,
+            observed_at_ms: u64,
+            observed_protocol_version: Option<u32>,
+            observed_capabilities: Vec<String>,
+            scheduler: SchedulerHealth,
+            local_snapshot: Option<Snapshot>,
+            remote_projection: Option<NodeProjectionSnapshot>,
+        }
+        for version in 33..=37 {
+            let Response::CombinedNodeSnapshot { snapshot } = response_for_version(
+                Response::CombinedNodeSnapshot {
+                    snapshot: protocol::CombinedNodeSnapshot {
+                        nodes: vec![current_node.clone()],
+                        workspaces: Vec::new(),
+                        external_workspaces: Vec::new(),
+                        focused_terminal: None,
+                    },
+                },
+                version,
+            ) else {
+                unreachable!();
+            };
+            let old: ProtocolThirtySevenCombinedNode =
+                serde_json::from_value(serde_json::to_value(&snapshot.nodes[0]).unwrap()).unwrap();
+            assert_eq!(old.node_id, node_id);
+            assert_eq!(old.alias, "remote");
+            assert!(!old.local);
+            assert_eq!(old.health, protocol::NodeProjectionHealthCode::Online);
+            assert!(old.current);
+            assert!(!old.stale);
+            assert_eq!(old.observed_at_ms, 10);
+            assert_eq!(old.observed_protocol_version, Some(37));
+            assert_eq!(old.observed_capabilities, ["protocol_37"]);
+            assert_eq!(old.scheduler.state, SchedulerState::Active);
+            assert!(old.local_snapshot.is_none());
+            assert!(old.remote_projection.is_none());
+        }
+    }
+
+    #[test]
     fn protocol_seventeen_responses_hide_focused_terminal() {
         let response = Response::Snapshot {
             snapshot: Snapshot {
@@ -20654,6 +22639,38 @@ mod tests {
         assert!(workspace.shells.is_empty());
         assert!(workspace.default_cwd.is_none());
         assert!(value.get("default_cwd").is_none());
+    }
+
+    #[test]
+    fn unavailable_global_store_suppresses_runtime_coordination_capabilities() {
+        let registry = DaemonService::default();
+        let capabilities = registry.runtime_protocol_capabilities();
+        assert!(!capabilities.iter().any(|capability| {
+            protocol::ProtocolFeature::GlobalWorkspaces
+                .capability_names()
+                .contains(&capability.as_str())
+        }));
+    }
+
+    #[test]
+    fn forced_node_projection_refresh_interrupts_only_the_existing_worker_sleep() {
+        let registry = DaemonService::default();
+        let node_id = Uuid::from_u128(42).to_string();
+        lock(&registry.node_projection_workers.wake)
+            .unwrap()
+            .insert(node_id.clone());
+        let started = Instant::now();
+        assert!(!interruptible_node_sleep(
+            &registry,
+            &node_id,
+            Duration::from_secs(1)
+        ));
+        assert!(started.elapsed() < Duration::from_millis(200));
+        assert!(
+            lock(&registry.node_projection_workers.wake)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
