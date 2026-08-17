@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 33;
+pub const PROTOCOL_VERSION: u32 = 34;
 pub const MIN_PROTOCOL_VERSION: u32 = 6;
 pub const MAX_CONTROL_FRAME: usize = 8 * 1024 * 1024;
 pub const MAX_ATTACH_FRAME: usize = 1024 * 1024;
@@ -132,6 +132,11 @@ define_protocol_features! {
         "protocol_33",
         "combined_node_snapshot",
         "node_qualified_dashboard",
+    ]),
+    GuardedNodeRouting => (34, "guarded Node routing", [
+        "protocol_34",
+        "typed_exact_node_routing",
+        "guarded_remote_management",
     ]),
 }
 
@@ -536,6 +541,8 @@ pub struct CombinedNode {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceSnapshot {
     pub id: String,
+    #[serde(default)]
+    pub revision: u64,
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_cwd: Option<PathBuf>,
@@ -905,6 +912,8 @@ pub struct WorkspaceLauncherSpec {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceLauncherSnapshot {
     pub id: String,
+    #[serde(default)]
+    pub revision: u64,
     pub workspace_id: String,
     pub name: String,
     pub command: Vec<String>,
@@ -914,6 +923,8 @@ pub struct WorkspaceLauncherSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShellSnapshot {
     pub id: String,
+    #[serde(default)]
+    pub revision: u64,
     pub workspace_id: String,
     pub name: String,
     pub cwd: PathBuf,
@@ -986,9 +997,329 @@ pub enum ErrorCode {
     NodeIdentityChanged,
     AmbiguousTarget,
     RevisionChanged,
+    OutcomeUnknown,
     Internal,
     #[serde(other)]
     Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RoutedOperation {
+    GetWorkspace {
+        workspace_id: String,
+    },
+    GetShell {
+        shell_id: String,
+    },
+    GetLauncher {
+        launcher_id: String,
+    },
+    GetAgent {
+        agent_id: String,
+    },
+    GetAgentSchedule {
+        schedule_id: String,
+    },
+    GetScheduledExecution {
+        execution_id: String,
+    },
+    RenameWorkspace {
+        workspace_id: String,
+        name: String,
+        expected_revision: u64,
+    },
+    RenameShell {
+        shell_id: String,
+        name: String,
+        expected_revision: u64,
+    },
+    RenameLauncher {
+        launcher_id: String,
+        name: String,
+        expected_revision: u64,
+    },
+    CloseWorkspace {
+        workspace_id: String,
+        expected_revision: u64,
+    },
+    CloseShell {
+        shell_id: String,
+        expected_revision: u64,
+    },
+    RestartShell {
+        shell_id: String,
+        expected_revision: u64,
+        expected_run_id: String,
+    },
+    RemoveLauncher {
+        launcher_id: String,
+        expected_revision: u64,
+    },
+    PauseAgentSchedule {
+        schedule_id: String,
+        expected_revision: u64,
+    },
+    ResumeAgentSchedule {
+        schedule_id: String,
+        expected_revision: u64,
+    },
+    UpdateAgentSchedule {
+        schedule_id: String,
+        expected_revision: u64,
+        update: AgentScheduleUpdate,
+    },
+    RemoveAgentSchedule {
+        schedule_id: String,
+        expected_revision: u64,
+    },
+    RunAgentSchedule {
+        schedule_id: String,
+        dispatch_key: String,
+    },
+    CancelScheduledExecution {
+        execution_id: String,
+        expected_revision: u64,
+    },
+    AcknowledgeAgentAttention {
+        agent_id: String,
+        observation_revision: u64,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoutedGuard {
+    ExactId,
+    ResourceRevision,
+    ResourceRevisionAndRun,
+    ScheduleRevision,
+    ExecutionRevision,
+    DispatchKey,
+    AttentionObservationRevision,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoutedAmbiguity {
+    RetrySameRequest,
+    ReadAndProve,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RoutedOperationClass {
+    pub guard: RoutedGuard,
+    pub ambiguity: RoutedAmbiguity,
+}
+
+impl RoutedOperation {
+    pub const fn classification(&self) -> RoutedOperationClass {
+        use RoutedAmbiguity::{ReadAndProve, RetrySameRequest};
+        use RoutedGuard::{
+            AttentionObservationRevision, DispatchKey, ExactId, ExecutionRevision,
+            ResourceRevision, ResourceRevisionAndRun, ScheduleRevision,
+        };
+        match self {
+            Self::GetWorkspace { .. }
+            | Self::GetShell { .. }
+            | Self::GetLauncher { .. }
+            | Self::GetAgent { .. }
+            | Self::GetAgentSchedule { .. }
+            | Self::GetScheduledExecution { .. } => RoutedOperationClass {
+                guard: ExactId,
+                ambiguity: RetrySameRequest,
+            },
+            Self::RenameWorkspace { .. }
+            | Self::RenameShell { .. }
+            | Self::RenameLauncher { .. }
+            | Self::CloseWorkspace { .. }
+            | Self::CloseShell { .. }
+            | Self::RemoveLauncher { .. } => RoutedOperationClass {
+                guard: ResourceRevision,
+                ambiguity: ReadAndProve,
+            },
+            Self::RestartShell { .. } => RoutedOperationClass {
+                guard: ResourceRevisionAndRun,
+                ambiguity: ReadAndProve,
+            },
+            Self::PauseAgentSchedule { .. }
+            | Self::ResumeAgentSchedule { .. }
+            | Self::UpdateAgentSchedule { .. }
+            | Self::RemoveAgentSchedule { .. } => RoutedOperationClass {
+                guard: ScheduleRevision,
+                ambiguity: ReadAndProve,
+            },
+            Self::RunAgentSchedule { .. } => RoutedOperationClass {
+                guard: DispatchKey,
+                ambiguity: RetrySameRequest,
+            },
+            Self::CancelScheduledExecution { .. } => RoutedOperationClass {
+                guard: ExecutionRevision,
+                ambiguity: ReadAndProve,
+            },
+            Self::AcknowledgeAgentAttention { .. } => RoutedOperationClass {
+                guard: AttentionObservationRevision,
+                ambiguity: RetrySameRequest,
+            },
+        }
+    }
+
+    pub const fn is_retryable(&self) -> bool {
+        matches!(
+            self.classification().ambiguity,
+            RoutedAmbiguity::RetrySameRequest
+        )
+    }
+
+    pub fn ambiguity_probe(&self) -> Option<Request> {
+        match self {
+            Self::RenameWorkspace { workspace_id, .. }
+            | Self::CloseWorkspace { workspace_id, .. } => Some(Request::GetWorkspace {
+                workspace_id: workspace_id.clone(),
+            }),
+            Self::RenameShell { shell_id, .. }
+            | Self::CloseShell { shell_id, .. }
+            | Self::RestartShell { shell_id, .. } => Some(Request::GetShell {
+                shell_id: shell_id.clone(),
+            }),
+            Self::RenameLauncher { launcher_id, .. } | Self::RemoveLauncher { launcher_id, .. } => {
+                Some(Request::GetLauncher {
+                    launcher_id: launcher_id.clone(),
+                })
+            }
+            Self::PauseAgentSchedule { schedule_id, .. }
+            | Self::ResumeAgentSchedule { schedule_id, .. }
+            | Self::UpdateAgentSchedule { schedule_id, .. }
+            | Self::RemoveAgentSchedule { schedule_id, .. } => Some(Request::GetAgentSchedule {
+                schedule_id: schedule_id.clone(),
+            }),
+            Self::CancelScheduledExecution { execution_id, .. } => {
+                Some(Request::GetScheduledExecution {
+                    execution_id: execution_id.clone(),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    pub fn owner_request(&self) -> Request {
+        match self.clone() {
+            Self::GetWorkspace { workspace_id } => Request::GetWorkspace { workspace_id },
+            Self::GetShell { shell_id } => Request::GetShell { shell_id },
+            Self::GetLauncher { launcher_id } => Request::GetLauncher { launcher_id },
+            Self::GetAgent { agent_id } => Request::GetAgent { agent_id },
+            Self::GetAgentSchedule { schedule_id } => Request::GetAgentSchedule { schedule_id },
+            Self::GetScheduledExecution { execution_id } => {
+                Request::GetScheduledExecution { execution_id }
+            }
+            Self::RenameWorkspace {
+                workspace_id,
+                name,
+                expected_revision,
+            } => Request::GuardedRenameWorkspace {
+                workspace_id,
+                name,
+                expected_revision,
+            },
+            Self::RenameShell {
+                shell_id,
+                name,
+                expected_revision,
+            } => Request::GuardedRenameShell {
+                shell_id,
+                name,
+                expected_revision,
+            },
+            Self::RenameLauncher {
+                launcher_id,
+                name,
+                expected_revision,
+            } => Request::GuardedRenameLauncher {
+                launcher_id,
+                name,
+                expected_revision,
+            },
+            Self::CloseWorkspace {
+                workspace_id,
+                expected_revision,
+            } => Request::GuardedCloseWorkspace {
+                workspace_id,
+                expected_revision,
+            },
+            Self::CloseShell {
+                shell_id,
+                expected_revision,
+            } => Request::GuardedCloseShell {
+                shell_id,
+                expected_revision,
+            },
+            Self::RestartShell {
+                shell_id,
+                expected_revision,
+                expected_run_id,
+            } => Request::GuardedRestartShell {
+                shell_id,
+                expected_revision,
+                expected_run_id,
+            },
+            Self::RemoveLauncher {
+                launcher_id,
+                expected_revision,
+            } => Request::GuardedRemoveLauncher {
+                launcher_id,
+                expected_revision,
+            },
+            Self::PauseAgentSchedule {
+                schedule_id,
+                expected_revision,
+            } => Request::GuardedPauseAgentSchedule {
+                schedule_id,
+                expected_revision,
+            },
+            Self::ResumeAgentSchedule {
+                schedule_id,
+                expected_revision,
+            } => Request::GuardedResumeAgentSchedule {
+                schedule_id,
+                expected_revision,
+            },
+            Self::UpdateAgentSchedule {
+                schedule_id,
+                expected_revision,
+                update,
+            } => Request::UpdateAgentSchedule {
+                schedule_id,
+                expected_revision,
+                update,
+            },
+            Self::RemoveAgentSchedule {
+                schedule_id,
+                expected_revision,
+            } => Request::GuardedRemoveAgentSchedule {
+                schedule_id,
+                expected_revision,
+            },
+            Self::RunAgentSchedule {
+                schedule_id,
+                dispatch_key,
+            } => Request::RunAgentSchedule {
+                schedule_id,
+                dispatch_key,
+            },
+            Self::CancelScheduledExecution {
+                execution_id,
+                expected_revision,
+            } => Request::GuardedCancelScheduledExecution {
+                execution_id,
+                expected_revision,
+            },
+            Self::AcknowledgeAgentAttention {
+                agent_id,
+                observation_revision,
+            } => Request::AcknowledgeAgentAttention {
+                agent_id,
+                observation_revision,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1282,6 +1613,10 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         selector: Option<String>,
     },
+    RouteNodeOperation {
+        node_id: String,
+        operation: RoutedOperation,
+    },
     Restart,
     RestartWithNotificationConfig {
         notifications: NotificationDeliveryConfig,
@@ -1360,6 +1695,10 @@ pub enum Request {
     CancelScheduledExecution {
         execution_id: String,
     },
+    GuardedCancelScheduledExecution {
+        execution_id: String,
+        expected_revision: u64,
+    },
     ResolveScheduledExecutionClaim {
         schedule_id: String,
         shell_id: String,
@@ -1423,34 +1762,78 @@ pub enum Request {
         workspace_id: String,
         name: String,
     },
+    GuardedRenameWorkspace {
+        workspace_id: String,
+        name: String,
+        expected_revision: u64,
+    },
     RenameShell {
         shell_id: String,
         name: String,
+    },
+    GuardedRenameShell {
+        shell_id: String,
+        name: String,
+        expected_revision: u64,
     },
     RenameLauncher {
         launcher_id: String,
         name: String,
     },
+    GuardedRenameLauncher {
+        launcher_id: String,
+        name: String,
+        expected_revision: u64,
+    },
     CloseWorkspace {
         workspace_id: String,
+    },
+    GuardedCloseWorkspace {
+        workspace_id: String,
+        expected_revision: u64,
     },
     CloseShell {
         shell_id: String,
     },
+    GuardedCloseShell {
+        shell_id: String,
+        expected_revision: u64,
+    },
     RestartShell {
         shell_id: String,
+    },
+    GuardedRestartShell {
+        shell_id: String,
+        expected_revision: u64,
+        expected_run_id: String,
     },
     RemoveLauncher {
         launcher_id: String,
     },
+    GuardedRemoveLauncher {
+        launcher_id: String,
+        expected_revision: u64,
+    },
     PauseAgentSchedule {
         schedule_id: String,
+    },
+    GuardedPauseAgentSchedule {
+        schedule_id: String,
+        expected_revision: u64,
     },
     ResumeAgentSchedule {
         schedule_id: String,
     },
+    GuardedResumeAgentSchedule {
+        schedule_id: String,
+        expected_revision: u64,
+    },
     RemoveAgentSchedule {
         schedule_id: String,
+    },
+    GuardedRemoveAgentSchedule {
+        schedule_id: String,
+        expected_revision: u64,
     },
     Attach {
         shell_id: String,
@@ -1481,6 +1864,18 @@ impl Request {
                 Some(ProtocolFeature::NodeProjectionSync)
             }
             Self::GetCombinedNodeSnapshot { .. } => Some(ProtocolFeature::CombinedNodeSnapshot),
+            Self::RouteNodeOperation { .. }
+            | Self::GuardedCancelScheduledExecution { .. }
+            | Self::GuardedRenameWorkspace { .. }
+            | Self::GuardedRenameShell { .. }
+            | Self::GuardedRenameLauncher { .. }
+            | Self::GuardedCloseWorkspace { .. }
+            | Self::GuardedCloseShell { .. }
+            | Self::GuardedRestartShell { .. }
+            | Self::GuardedRemoveLauncher { .. }
+            | Self::GuardedPauseAgentSchedule { .. }
+            | Self::GuardedResumeAgentSchedule { .. }
+            | Self::GuardedRemoveAgentSchedule { .. } => Some(ProtocolFeature::GuardedNodeRouting),
             Self::WaitScheduledExecution { .. } => {
                 Some(ProtocolFeature::ScheduledExecutionObservation)
             }
@@ -1602,6 +1997,9 @@ pub enum Response {
     CombinedNodeSnapshot {
         snapshot: CombinedNodeSnapshot,
     },
+    RoutedNodeOperation {
+        result: RoutedOperationResult,
+    },
     Snapshot {
         snapshot: Snapshot,
     },
@@ -1689,6 +2087,39 @@ pub enum Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         code: Option<ErrorCode>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RoutedOperationResult {
+    Workspace {
+        workspace: WorkspaceSnapshot,
+    },
+    Shell {
+        shell: ShellSnapshot,
+    },
+    Launcher {
+        launcher: WorkspaceLauncherSnapshot,
+    },
+    Agent {
+        agent: AgentInstanceSnapshot,
+    },
+    AgentSchedule {
+        schedule: AgentScheduleSnapshot,
+    },
+    AgentScheduleInspection {
+        inspection: AgentScheduleInspection,
+    },
+    ScheduledExecution {
+        execution: ScheduledExecutionSnapshot,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        next_occurrence: Option<ScheduledOccurrence>,
+    },
+    AgentAttentionAcknowledged {
+        agent: AgentInstanceSnapshot,
+        changed: bool,
+    },
+    Ok,
 }
 
 fn default_event_limit() -> u16 {
@@ -2183,7 +2614,7 @@ mod tests {
 
     #[test]
     fn protocol_version_is_thirty_three_with_minimum_six() {
-        assert_eq!(PROTOCOL_VERSION, 33);
+        assert_eq!(PROTOCOL_VERSION, 34);
         assert_eq!(MIN_PROTOCOL_VERSION, 6);
     }
 
@@ -2361,6 +2792,42 @@ mod tests {
         assert_eq!(
             serde_json::to_value(identity).unwrap(),
             serde_json::json!({"node_id": "node", "inner_id": "resource"})
+        );
+    }
+
+    #[test]
+    fn protocol_thirty_four_routes_only_closed_typed_operations() {
+        let operation = RoutedOperation::RestartShell {
+            shell_id: "shell".into(),
+            expected_revision: 7,
+            expected_run_id: "run".into(),
+        };
+        let request = Request::RouteNodeOperation {
+            node_id: uuid::Uuid::from_u128(2).to_string(),
+            operation: operation.clone(),
+        };
+        assert_eq!(
+            request.required_feature(),
+            Some(ProtocolFeature::GuardedNodeRouting)
+        );
+        assert_eq!(
+            serde_json::from_value::<Request>(serde_json::to_value(&request).unwrap()).unwrap(),
+            request
+        );
+        assert_eq!(
+            operation.owner_request(),
+            Request::GuardedRestartShell {
+                shell_id: "shell".into(),
+                expected_revision: 7,
+                expected_run_id: "run".into(),
+            }
+        );
+        assert!(!operation.is_retryable());
+        assert!(
+            serde_json::from_value::<RoutedOperation>(serde_json::json!({
+                "operation": "shutdown"
+            }))
+            .is_err()
         );
     }
 
@@ -3138,6 +3605,14 @@ mod tests {
                     "node_qualified_dashboard",
                 ][..],
             ),
+            (
+                34,
+                &[
+                    "protocol_34",
+                    "typed_exact_node_routing",
+                    "guarded_remote_management",
+                ][..],
+            ),
         ];
 
         let actual = ProtocolFeature::ALL
@@ -3368,6 +3843,7 @@ mod tests {
     fn protocol_six_client_ignores_additive_shell_snapshot_fields() {
         let snapshot = ShellSnapshot {
             id: "s1".into(),
+            revision: 1,
             workspace_id: "w1".into(),
             name: "shell".into(),
             cwd: "/tmp".into(),

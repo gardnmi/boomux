@@ -55,6 +55,28 @@ fn registrations_survive_cold_recovery_outside_authoritative_state() {
 }
 
 #[test]
+fn guarded_resource_revisions_survive_cold_recovery() {
+    let mut daemon = TestDaemon::start();
+    let workspace = daemon
+        .client
+        .create_workspace("guarded", Vec::new())
+        .unwrap();
+    assert_eq!(workspace.revision, 1);
+    daemon
+        .client
+        .rename_workspace(&workspace.id, "guarded-renamed")
+        .unwrap();
+    let renamed = daemon.client.get_workspace(&workspace.id).unwrap();
+    assert_eq!(renamed.revision, 2);
+
+    daemon.crash();
+    daemon.restart();
+    let recovered = daemon.client.get_workspace(&workspace.id).unwrap();
+    assert_eq!(recovered.name, "guarded-renamed");
+    assert_eq!(recovered.revision, 2);
+}
+
+#[test]
 fn combined_snapshot_is_separate_and_local_alias_ambiguity_is_typed() {
     let daemon = TestDaemon::start();
     daemon
@@ -184,16 +206,38 @@ fn fake_ssh(directory: &Path) {
         ),
     )
     .unwrap();
+    let mut workspace = Vec::new();
+    protocol::write_message(
+        &mut workspace,
+        &Envelope::with_version(
+            protocol::PROTOCOL_VERSION,
+            Response::Workspace {
+                workspace: protocol::WorkspaceSnapshot {
+                    id: "shared-workspace".into(),
+                    revision: 7,
+                    name: "shared-private".into(),
+                    default_cwd: Some("/remote/private".into()),
+                    shells: Vec::new(),
+                    launchers: Vec::new(),
+                    agents: Vec::new(),
+                    schedules: Vec::new(),
+                },
+            },
+        ),
+    )
+    .unwrap();
     fs::write(directory.join("pong.bin"), ping).unwrap();
     fs::write(directory.join("sync.bin"), sync).unwrap();
+    fs::write(directory.join("workspace.bin"), workspace).unwrap();
     let ssh = directory.join("ssh");
     fs::write(
         &ssh,
         format!(
-            "#!/bin/sh\nlast=\nfor arg do last=$arg; done\ncase \"$last\" in\n  *boomux-platform-v1*) printf 'boomux-platform-v1\\0Linux\\0x86_64\\0' ;;\n  *boomux-executables-v1*) printf 'boomux-executables-v1\\0/remote/boomux\\0' ;;\n  *boomux-install-destination-v1*) printf 'boomux-install-destination-v1\\0/home/remote/.local/bin/boomux\\0' ;;\n  \"'/remote/boomux' __federation-stdio\") {}; python3 -c 'import json,struct,sys; data=sys.stdin.buffer.read(struct.unpack(\">I\",sys.stdin.buffer.read(4))[0]); request=json.loads(data)[\"message\"][\"request\"]; path=sys.argv[1] if request==\"ping\" else sys.argv[2]; sys.stdout.buffer.write(open(path,\"rb\").read())' \"{}\" \"{}\" ;;\n  *) exit 64 ;;\nesac\n",
+            "#!/bin/sh\nlast=\nfor arg do last=$arg; done\ncase \"$last\" in\n  *boomux-platform-v1*) printf 'boomux-platform-v1\\0Linux\\0x86_64\\0' ;;\n  *boomux-executables-v1*) printf 'boomux-executables-v1\\0/remote/boomux\\0' ;;\n  *boomux-install-destination-v1*) printf 'boomux-install-destination-v1\\0/home/remote/.local/bin/boomux\\0' ;;\n  \"'/remote/boomux' __federation-stdio\") {}; python3 -c 'import json,struct,sys; data=sys.stdin.buffer.read(struct.unpack(\">I\",sys.stdin.buffer.read(4))[0]); request=json.loads(data)[\"message\"][\"request\"]; paths={{\"ping\":sys.argv[1],\"sync_node_projection\":sys.argv[2],\"get_workspace\":sys.argv[3]}}; sys.stdout.buffer.write(open(paths[request],\"rb\").read())' \"{}\" \"{}\" \"{}\" ;;\n  *) exit 64 ;;\nesac\n",
             shell_printf(&handshake_bytes),
             directory.join("pong.bin").display(),
             directory.join("sync.bin").display(),
+            directory.join("workspace.bin").display(),
         ),
     )
     .unwrap();
@@ -255,6 +299,23 @@ fn cli_add_and_retarget_pin_verified_identity_without_persisting_helper_path() {
     let online = online
         .unwrap_or_else(|| panic!("background projection did not become online: {last_inspect:?}"));
     assert_eq!(online["data"]["projection"]["cursor"], 0);
+    let routed =
+        boomux::client::Client::from_socket_path(directory.join("runtime/boomux/daemon.sock"))
+            .route_node_operation(
+                node_id(2),
+                boomux::protocol::RoutedOperation::GetWorkspace {
+                    workspace_id: "shared-workspace".into(),
+                },
+            )
+            .unwrap();
+    let boomux::protocol::RoutedOperationResult::Workspace { workspace } = routed else {
+        panic!("expected routed workspace");
+    };
+    assert_eq!(workspace.revision, 7);
+    assert_eq!(
+        workspace.default_cwd.as_deref(),
+        Some(Path::new("/remote/private"))
+    );
     let combined = command(&directory)
         .args(["node", "snapshot", "--json"])
         .output()

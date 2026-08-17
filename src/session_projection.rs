@@ -360,6 +360,7 @@ mod tests {
         let shell = boomux::protocol::ShellSnapshot {
             owner: boomux::protocol::ShellOwner::User,
             id: "shell".into(),
+            revision: 1,
             workspace_id: id.into(),
             name: "agent".into(),
             cwd: "/tmp/project".into(),
@@ -378,6 +379,7 @@ mod tests {
         };
         WorkspaceSnapshot {
             id: id.into(),
+            revision: 1,
             name: format!("workspace-{id}"),
             default_cwd: None,
             shells: vec![shell],
@@ -567,6 +569,7 @@ mod tests {
             .launchers
             .push(boomux::protocol::WorkspaceLauncherSnapshot {
                 id: "launcher".into(),
+                revision: 1,
                 workspace_id: "launcher".into(),
                 name: "build".into(),
                 command: vec!["make".into()],
@@ -642,6 +645,7 @@ mod tests {
             .launchers
             .push(boomux::protocol::WorkspaceLauncherSnapshot {
                 id: "launcher".into(),
+                revision: 1,
                 workspace_id: "w1".into(),
                 name: "agent".into(),
                 command: vec!["opencode".into()],

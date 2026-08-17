@@ -161,11 +161,13 @@ mod tests {
     fn workspace(agents: Vec<AgentInstanceSnapshot>) -> WorkspaceSnapshot {
         WorkspaceSnapshot {
             id: "w1".into(),
+            revision: 1,
             name: "project".into(),
             default_cwd: None,
             shells: vec![boomux::protocol::ShellSnapshot {
                 owner: boomux::protocol::ShellOwner::User,
                 id: "s1".into(),
+                revision: 1,
                 workspace_id: "w1".into(),
                 name: "shell".into(),
                 cwd: PathBuf::from("/tmp"),

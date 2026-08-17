@@ -2134,38 +2134,68 @@ fn dashboard(
             tui::DashboardEffect::Close(target) => {
                 let result = (|| match &target {
                     tui::CloseTarget::Workspace(workspace_id) => {
-                        let workspace_id = local_dashboard_inner(workspace_id, &local_node_id)?;
-                        let name = client
-                            .get_workspace(workspace_id)
-                            .map(|workspace| workspace.name)
-                            .unwrap_or_else(|_| "workspace".into());
-                        client
-                            .close_workspace(workspace_id)
-                            .map_err(|error| error.to_string())?;
+                        let workspace =
+                            routed_dashboard_workspace(&client, workspace_id, &local_node_id)?;
+                        let name = workspace.name.clone();
+                        if workspace_id.node_id == local_node_id || workspace_id.node_id.is_empty()
+                        {
+                            client
+                                .close_workspace(&workspace_id.inner_id)
+                                .map_err(|error| error.to_string())?;
+                        } else {
+                            routed_dashboard_operation(
+                                &client,
+                                workspace_id,
+                                &local_node_id,
+                                protocol::RoutedOperation::CloseWorkspace {
+                                    workspace_id: workspace_id.inner_id.clone(),
+                                    expected_revision: workspace.revision,
+                                },
+                            )?;
+                        }
                         Ok(format!(
                             "Closed {name}, its launchers, shells, schedules, and persisted prompts"
                         ))
                     }
                     tui::CloseTarget::Shell(shell_id) => {
-                        let shell_id = local_dashboard_inner(shell_id, &local_node_id)?;
-                        let name = client
-                            .get_shell(shell_id)
-                            .map(|shell| shell.name)
-                            .unwrap_or_else(|_| "shell".into());
-                        client
-                            .close_shell(shell_id)
-                            .map_err(|error| error.to_string())?;
+                        let shell = routed_dashboard_shell(&client, shell_id, &local_node_id)?;
+                        let name = shell.name.clone();
+                        if shell_id.node_id == local_node_id || shell_id.node_id.is_empty() {
+                            client
+                                .close_shell(&shell_id.inner_id)
+                                .map_err(|error| error.to_string())?;
+                        } else {
+                            routed_dashboard_operation(
+                                &client,
+                                shell_id,
+                                &local_node_id,
+                                protocol::RoutedOperation::CloseShell {
+                                    shell_id: shell_id.inner_id.clone(),
+                                    expected_revision: shell.revision,
+                                },
+                            )?;
+                        }
                         Ok(format!("Closed shell {name}"))
                     }
                     tui::CloseTarget::Launcher(launcher_id) => {
-                        let launcher_id = local_dashboard_inner(launcher_id, &local_node_id)?;
-                        let name = client
-                            .get_launcher(launcher_id)
-                            .map(|launcher| launcher.name)
-                            .unwrap_or_else(|_| "launcher".into());
-                        client
-                            .remove_launcher(launcher_id)
-                            .map_err(|error| error.to_string())?;
+                        let launcher =
+                            routed_dashboard_launcher(&client, launcher_id, &local_node_id)?;
+                        let name = launcher.name.clone();
+                        if launcher_id.node_id == local_node_id || launcher_id.node_id.is_empty() {
+                            client
+                                .remove_launcher(&launcher_id.inner_id)
+                                .map_err(|error| error.to_string())?;
+                        } else {
+                            routed_dashboard_operation(
+                                &client,
+                                launcher_id,
+                                &local_node_id,
+                                protocol::RoutedOperation::RemoveLauncher {
+                                    launcher_id: launcher_id.inner_id.clone(),
+                                    expected_revision: launcher.revision,
+                                },
+                            )?;
+                        }
                         Ok(format!("Removed launcher {name}"))
                     }
                     tui::CloseTarget::Schedule(_) => {
@@ -2194,24 +2224,66 @@ fn dashboard(
             tui::DashboardEffect::Rename { target, name } => {
                 let result = (|| match &target {
                     tui::RenameTarget::Workspace(workspace_id) => {
-                        let workspace_id = local_dashboard_inner(workspace_id, &local_node_id)?;
-                        client
-                            .rename_workspace(workspace_id, &name)
-                            .map_err(|error| error.to_string())?;
+                        let workspace =
+                            routed_dashboard_workspace(&client, workspace_id, &local_node_id)?;
+                        if workspace_id.node_id == local_node_id || workspace_id.node_id.is_empty()
+                        {
+                            client
+                                .rename_workspace(&workspace_id.inner_id, &name)
+                                .map_err(|error| error.to_string())?;
+                        } else {
+                            routed_dashboard_operation(
+                                &client,
+                                workspace_id,
+                                &local_node_id,
+                                protocol::RoutedOperation::RenameWorkspace {
+                                    workspace_id: workspace_id.inner_id.clone(),
+                                    name: name.clone(),
+                                    expected_revision: workspace.revision,
+                                },
+                            )?;
+                        }
                         Ok(format!("Renamed workspace to {name}"))
                     }
                     tui::RenameTarget::Shell(shell_id) => {
-                        let shell_id = local_dashboard_inner(shell_id, &local_node_id)?;
-                        client
-                            .rename_shell(shell_id, &name)
-                            .map_err(|error| error.to_string())?;
+                        let shell = routed_dashboard_shell(&client, shell_id, &local_node_id)?;
+                        if shell_id.node_id == local_node_id || shell_id.node_id.is_empty() {
+                            client
+                                .rename_shell(&shell_id.inner_id, &name)
+                                .map_err(|error| error.to_string())?;
+                        } else {
+                            routed_dashboard_operation(
+                                &client,
+                                shell_id,
+                                &local_node_id,
+                                protocol::RoutedOperation::RenameShell {
+                                    shell_id: shell_id.inner_id.clone(),
+                                    name: name.clone(),
+                                    expected_revision: shell.revision,
+                                },
+                            )?;
+                        }
                         Ok(format!("Renamed shell to {name}"))
                     }
                     tui::RenameTarget::Launcher(launcher_id) => {
-                        let launcher_id = local_dashboard_inner(launcher_id, &local_node_id)?;
-                        client
-                            .rename_launcher(launcher_id, &name)
-                            .map_err(|error| error.to_string())?;
+                        let launcher =
+                            routed_dashboard_launcher(&client, launcher_id, &local_node_id)?;
+                        if launcher_id.node_id == local_node_id || launcher_id.node_id.is_empty() {
+                            client
+                                .rename_launcher(&launcher_id.inner_id, &name)
+                                .map_err(|error| error.to_string())?;
+                        } else {
+                            routed_dashboard_operation(
+                                &client,
+                                launcher_id,
+                                &local_node_id,
+                                protocol::RoutedOperation::RenameLauncher {
+                                    launcher_id: launcher_id.inner_id.clone(),
+                                    name: name.clone(),
+                                    expected_revision: launcher.revision,
+                                },
+                            )?;
+                        }
                         Ok(format!("Renamed launcher to {name}"))
                     }
                 })();
@@ -2235,48 +2307,114 @@ fn dashboard(
                 tui::DashboardEvent::RefreshCompleted(result)
             }
             tui::DashboardEffect::RunSchedule(schedule_id) => {
-                let result = local_dashboard_inner(&schedule_id, &local_node_id)
-                    .and_then(|id| run_dashboard_schedule(&client, id));
+                let result =
+                    if schedule_id.node_id == local_node_id || schedule_id.node_id.is_empty() {
+                        run_dashboard_schedule(&client, &schedule_id.inner_id)
+                    } else {
+                        (|| {
+                            routed_dashboard_schedule(&client, &schedule_id, &local_node_id)?;
+                            let dispatch_key = Uuid::new_v4().to_string();
+                            match routed_dashboard_operation(
+                                &client,
+                                &schedule_id,
+                                &local_node_id,
+                                protocol::RoutedOperation::RunAgentSchedule {
+                                    schedule_id: schedule_id.inner_id.clone(),
+                                    dispatch_key,
+                                },
+                            )? {
+                                protocol::RoutedOperationResult::ScheduledExecution {
+                                    execution,
+                                    ..
+                                } => Ok(format!("Started scheduled execution {}", execution.id)),
+                                _ => {
+                                    Err("remote Node returned an unexpected schedule run response"
+                                        .into())
+                                }
+                            }
+                        })()
+                    };
                 tui::DashboardEvent::OperationCompleted(result)
             }
             tui::DashboardEffect::PauseSchedule(schedule_id) => {
-                let result = local_dashboard_inner(&schedule_id, &local_node_id).and_then(|id| {
-                    client
-                        .pause_agent_schedule(id)
-                        .map(|schedule| format!("Paused schedule {}", schedule.name))
-                        .map_err(|error| error.to_string())
-                });
+                let result = (|| {
+                    let inspection =
+                        routed_dashboard_schedule(&client, &schedule_id, &local_node_id)?;
+                    let schedule = if schedule_id.node_id == local_node_id
+                        || schedule_id.node_id.is_empty()
+                    {
+                        client
+                            .pause_agent_schedule(&schedule_id.inner_id)
+                            .map_err(|error| error.to_string())?
+                    } else {
+                        match routed_dashboard_operation(
+                            &client,
+                            &schedule_id,
+                            &local_node_id,
+                            protocol::RoutedOperation::PauseAgentSchedule {
+                                schedule_id: schedule_id.inner_id.clone(),
+                                expected_revision: inspection.schedule.revision,
+                            },
+                        )? {
+                            protocol::RoutedOperationResult::AgentSchedule { schedule } => schedule,
+                            _ => {
+                                return Err(
+                                    "remote Node returned an unexpected pause response".into()
+                                );
+                            }
+                        }
+                    };
+                    Ok(format!("Paused schedule {}", schedule.name))
+                })();
                 tui::DashboardEvent::OperationCompleted(result)
             }
             tui::DashboardEffect::ResumeSchedule(schedule_id) => {
-                let result = local_dashboard_inner(&schedule_id, &local_node_id).and_then(|id| {
-                    client
-                        .resume_agent_schedule(id)
-                        .map(|schedule| {
-                            format!(
-                                "Enabled schedule {} for future timed dispatch",
-                                schedule.name
-                            )
-                        })
-                        .map_err(|error| error.to_string())
-                });
+                let result = (|| {
+                    let inspection =
+                        routed_dashboard_schedule(&client, &schedule_id, &local_node_id)?;
+                    let schedule = if schedule_id.node_id == local_node_id
+                        || schedule_id.node_id.is_empty()
+                    {
+                        client
+                            .resume_agent_schedule(&schedule_id.inner_id)
+                            .map_err(|error| error.to_string())?
+                    } else {
+                        match routed_dashboard_operation(
+                            &client,
+                            &schedule_id,
+                            &local_node_id,
+                            protocol::RoutedOperation::ResumeAgentSchedule {
+                                schedule_id: schedule_id.inner_id.clone(),
+                                expected_revision: inspection.schedule.revision,
+                            },
+                        )? {
+                            protocol::RoutedOperationResult::AgentSchedule { schedule } => schedule,
+                            _ => {
+                                return Err(
+                                    "remote Node returned an unexpected resume response".into()
+                                );
+                            }
+                        }
+                    };
+                    Ok(format!(
+                        "Enabled schedule {} for future timed dispatch",
+                        schedule.name
+                    ))
+                })();
                 tui::DashboardEvent::OperationCompleted(result)
             }
             tui::DashboardEffect::LoadScheduleEditor { schedule_id } => {
-                let result = local_dashboard_inner(&schedule_id, &local_node_id).and_then(|id| {
-                    client
-                        .get_agent_schedule(id)
-                        .map(|inspection| tui::ScheduleEditInspection {
-                            schedule_id: schedule_id.clone(),
-                            name: inspection.schedule.name,
-                            cron: inspection.schedule.trigger.cron,
-                            timezone: inspection.schedule.trigger.timezone,
-                            prompt: inspection.prompt,
-                            revision: inspection.schedule.revision,
-                            paused: inspection.schedule.state == AgentScheduleState::Paused,
-                        })
-                        .map_err(|error| error.to_string())
-                });
+                let result = routed_dashboard_schedule(&client, &schedule_id, &local_node_id).map(
+                    |inspection| tui::ScheduleEditInspection {
+                        schedule_id: schedule_id.clone(),
+                        name: inspection.schedule.name,
+                        cron: inspection.schedule.trigger.cron,
+                        timezone: inspection.schedule.trigger.timezone,
+                        prompt: inspection.prompt,
+                        revision: inspection.schedule.revision,
+                        paused: inspection.schedule.state == AgentScheduleState::Paused,
+                    },
+                );
                 tui::DashboardEvent::ScheduleEditorLoaded {
                     schedule_id,
                     result,
@@ -2287,31 +2425,74 @@ fn dashboard(
                 expected_revision,
                 update,
             } => {
-                let result = local_dashboard_inner(&schedule_id, &local_node_id).and_then(|id| {
+                let definition = AgentScheduleUpdate {
+                    name: update.name,
+                    prompt: update.prompt,
+                    trigger: AgentScheduleTrigger {
+                        cron: update.cron,
+                        timezone: update.timezone,
+                    },
+                };
+                let result = if schedule_id.node_id == local_node_id
+                    || schedule_id.node_id.is_empty()
+                {
                     client
-                        .update_agent_schedule(
-                            id,
-                            expected_revision,
-                            AgentScheduleUpdate {
-                                name: update.name,
-                                prompt: update.prompt,
-                                trigger: AgentScheduleTrigger {
-                                    cron: update.cron,
-                                    timezone: update.timezone,
-                                },
-                            },
-                        )
+                        .update_agent_schedule(&schedule_id.inner_id, expected_revision, definition)
                         .map(|schedule| format!("Updated schedule {}", schedule.name))
                         .map_err(|error| error.to_string())
-                });
+                } else {
+                    routed_dashboard_operation(
+                        &client,
+                        &schedule_id,
+                        &local_node_id,
+                        protocol::RoutedOperation::UpdateAgentSchedule {
+                            schedule_id: schedule_id.inner_id.clone(),
+                            expected_revision,
+                            update: definition,
+                        },
+                    )
+                    .and_then(|result| match result {
+                        protocol::RoutedOperationResult::AgentSchedule { schedule } => {
+                            Ok(format!("Updated schedule {}", schedule.name))
+                        }
+                        _ => Err(
+                            "remote Node returned an unexpected schedule update response".into(),
+                        ),
+                    })
+                };
                 tui::DashboardEvent::ScheduleEditorSaved {
                     schedule_id,
                     result,
                 }
             }
             tui::DashboardEffect::CancelExecution(execution_id) => {
-                let result = local_dashboard_inner(&execution_id, &local_node_id)
-                    .and_then(|id| cancel_dashboard_execution(&client, id));
+                let result =
+                    if execution_id.node_id == local_node_id || execution_id.node_id.is_empty() {
+                        cancel_dashboard_execution(&client, &execution_id.inner_id)
+                    } else {
+                        (|| {
+                            let execution =
+                                routed_dashboard_execution(&client, &execution_id, &local_node_id)?;
+                            match routed_dashboard_operation(
+                                &client,
+                                &execution_id,
+                                &local_node_id,
+                                protocol::RoutedOperation::CancelScheduledExecution {
+                                    execution_id: execution_id.inner_id.clone(),
+                                    expected_revision: execution.revision,
+                                },
+                            )? {
+                                protocol::RoutedOperationResult::ScheduledExecution {
+                                    execution,
+                                    ..
+                                } => Ok(format!("Cancelled scheduled execution {}", execution.id)),
+                                _ => {
+                                    Err("remote Node returned an unexpected cancellation response"
+                                        .into())
+                                }
+                            }
+                        })()
+                    };
                 tui::DashboardEvent::OperationCompleted(result)
             }
             tui::DashboardEffect::OpenScheduledExecution { execution_id } => {
@@ -2331,15 +2512,32 @@ fn dashboard(
                     .flat_map(|workspace| &workspace.schedules)
                     .find(|schedule| schedule_inner.as_ref().is_ok_and(|id| schedule.id == **id))
                     .map_or_else(|| "schedule".into(), |schedule| schedule.name.clone());
-                let result = schedule_inner.and_then(|id| {
-                    client
-                    .remove_agent_schedule(id)
-                    .map(|()| {
-                        format!(
-                            "Removed schedule {name}, its persisted prompt, and retained history"
-                        )
+                let result = if schedule_id.node_id == local_node_id
+                    || schedule_id.node_id.is_empty()
+                {
+                    schedule_inner.and_then(|id| {
+                        client
+                            .remove_agent_schedule(id)
+                            .map_err(|error| error.to_string())
                     })
-                    .map_err(|error| error.to_string())
+                } else {
+                    (|| {
+                        let inspection =
+                            routed_dashboard_schedule(&client, &schedule_id, &local_node_id)?;
+                        routed_dashboard_operation(
+                            &client,
+                            &schedule_id,
+                            &local_node_id,
+                            protocol::RoutedOperation::RemoveAgentSchedule {
+                                schedule_id: schedule_id.inner_id.clone(),
+                                expected_revision: inspection.schedule.revision,
+                            },
+                        )?;
+                        Ok(())
+                    })()
+                }
+                .map(|()| {
+                    format!("Removed schedule {name}, its persisted prompt, and retained history")
                 });
                 tui::DashboardEvent::OperationCompleted(result)
             }
@@ -2563,6 +2761,140 @@ fn local_dashboard_inner<'a>(
             identity.node_id
         ))
     }
+}
+
+fn routed_dashboard_workspace(
+    client: &client::Client,
+    identity: &protocol::QualifiedIdentity,
+    local_node_id: &str,
+) -> Result<protocol::WorkspaceSnapshot, String> {
+    if identity.node_id == local_node_id || identity.node_id.is_empty() {
+        return client
+            .get_workspace(&identity.inner_id)
+            .map_err(|error| error.to_string());
+    }
+    match client
+        .route_node_operation(
+            &identity.node_id,
+            protocol::RoutedOperation::GetWorkspace {
+                workspace_id: identity.inner_id.clone(),
+            },
+        )
+        .map_err(|error| error.to_string())?
+    {
+        protocol::RoutedOperationResult::Workspace { workspace } => Ok(workspace),
+        _ => Err("remote Node returned an unexpected workspace response".into()),
+    }
+}
+
+fn routed_dashboard_shell(
+    client: &client::Client,
+    identity: &protocol::QualifiedIdentity,
+    local_node_id: &str,
+) -> Result<protocol::ShellSnapshot, String> {
+    if identity.node_id == local_node_id || identity.node_id.is_empty() {
+        return client
+            .get_shell(&identity.inner_id)
+            .map_err(|error| error.to_string());
+    }
+    match client
+        .route_node_operation(
+            &identity.node_id,
+            protocol::RoutedOperation::GetShell {
+                shell_id: identity.inner_id.clone(),
+            },
+        )
+        .map_err(|error| error.to_string())?
+    {
+        protocol::RoutedOperationResult::Shell { shell } => Ok(shell),
+        _ => Err("remote Node returned an unexpected shell response".into()),
+    }
+}
+
+fn routed_dashboard_launcher(
+    client: &client::Client,
+    identity: &protocol::QualifiedIdentity,
+    local_node_id: &str,
+) -> Result<protocol::WorkspaceLauncherSnapshot, String> {
+    if identity.node_id == local_node_id || identity.node_id.is_empty() {
+        return client
+            .get_launcher(&identity.inner_id)
+            .map_err(|error| error.to_string());
+    }
+    match client
+        .route_node_operation(
+            &identity.node_id,
+            protocol::RoutedOperation::GetLauncher {
+                launcher_id: identity.inner_id.clone(),
+            },
+        )
+        .map_err(|error| error.to_string())?
+    {
+        protocol::RoutedOperationResult::Launcher { launcher } => Ok(launcher),
+        _ => Err("remote Node returned an unexpected launcher response".into()),
+    }
+}
+
+fn routed_dashboard_schedule(
+    client: &client::Client,
+    identity: &protocol::QualifiedIdentity,
+    local_node_id: &str,
+) -> Result<protocol::AgentScheduleInspection, String> {
+    if identity.node_id == local_node_id || identity.node_id.is_empty() {
+        return client
+            .get_agent_schedule(&identity.inner_id)
+            .map_err(|error| error.to_string());
+    }
+    match client
+        .route_node_operation(
+            &identity.node_id,
+            protocol::RoutedOperation::GetAgentSchedule {
+                schedule_id: identity.inner_id.clone(),
+            },
+        )
+        .map_err(|error| error.to_string())?
+    {
+        protocol::RoutedOperationResult::AgentScheduleInspection { inspection } => Ok(inspection),
+        _ => Err("remote Node returned an unexpected schedule response".into()),
+    }
+}
+
+fn routed_dashboard_execution(
+    client: &client::Client,
+    identity: &protocol::QualifiedIdentity,
+    local_node_id: &str,
+) -> Result<protocol::ScheduledExecutionSnapshot, String> {
+    if identity.node_id == local_node_id || identity.node_id.is_empty() {
+        return client
+            .get_scheduled_execution(&identity.inner_id)
+            .map_err(|error| error.to_string());
+    }
+    match client
+        .route_node_operation(
+            &identity.node_id,
+            protocol::RoutedOperation::GetScheduledExecution {
+                execution_id: identity.inner_id.clone(),
+            },
+        )
+        .map_err(|error| error.to_string())?
+    {
+        protocol::RoutedOperationResult::ScheduledExecution { execution, .. } => Ok(execution),
+        _ => Err("remote Node returned an unexpected execution response".into()),
+    }
+}
+
+fn routed_dashboard_operation(
+    client: &client::Client,
+    identity: &protocol::QualifiedIdentity,
+    local_node_id: &str,
+    operation: protocol::RoutedOperation,
+) -> Result<protocol::RoutedOperationResult, String> {
+    if identity.node_id == local_node_id || identity.node_id.is_empty() {
+        return Err("internal error: local operation was sent through Node routing".into());
+    }
+    client
+        .route_node_operation(&identity.node_id, operation)
+        .map_err(|error| error.to_string())
 }
 
 fn run_dashboard_schedule(client: &client::Client, schedule_id: &str) -> Result<String, String> {
@@ -6816,6 +7148,7 @@ mod tests {
         ShellSnapshot {
             owner: boomux::protocol::ShellOwner::User,
             id: id.into(),
+            revision: 1,
             workspace_id: workspace_id.into(),
             name: name.into(),
             cwd: PathBuf::from("/tmp/project"),
@@ -6837,6 +7170,7 @@ mod tests {
     fn workspace(id: &str, name: &str, shells: Vec<ShellSnapshot>) -> WorkspaceSnapshot {
         WorkspaceSnapshot {
             id: id.into(),
+            revision: 1,
             name: name.into(),
             default_cwd: None,
             shells,
@@ -6927,6 +7261,7 @@ mod tests {
     fn launcher(id: &str, workspace_id: &str, name: &str) -> WorkspaceLauncherSnapshot {
         WorkspaceLauncherSnapshot {
             id: id.into(),
+            revision: 1,
             workspace_id: workspace_id.into(),
             name: name.into(),
             cwd: PathBuf::from("/tmp/project"),
@@ -8989,6 +9324,7 @@ mod tests {
         workspace.launchers = vec![
             WorkspaceLauncherSnapshot {
                 id: "l1".into(),
+                revision: 1,
                 workspace_id: "w1".into(),
                 name: "missing".into(),
                 cwd: env::temp_dir(),
@@ -8996,6 +9332,7 @@ mod tests {
             },
             WorkspaceLauncherSnapshot {
                 id: "l2".into(),
+                revision: 1,
                 workspace_id: "w1".into(),
                 name: "later".into(),
                 cwd: env::temp_dir(),
@@ -9658,7 +9995,7 @@ mod tests {
                 .validated_version,
             "0.84.1"
         );
-        assert_eq!(protocol::PROTOCOL_VERSION, 33);
+        assert_eq!(protocol::PROTOCOL_VERSION, 34);
     }
 
     #[test]

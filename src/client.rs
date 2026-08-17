@@ -17,10 +17,10 @@ use crate::protocol::{
     self, AgentInstanceSnapshot, AgentRegistrationSpec, AgentReport, AgentScheduleInspection,
     AgentScheduleSnapshot, AgentScheduleSpec, AgentScheduleUpdate, CombinedNodeSnapshot,
     DaemonEvent, Envelope, ErrorCode, EventCursor, FocusedTerminalSnapshot, NodeProjectionHealth,
-    NodeRegistrationSnapshot, NotificationDeliveryConfig, Request, Response,
-    ScheduledExecutionScheduleProjection, ScheduledExecutionSnapshot, ScheduledOccurrence,
-    ScheduledRunnerResult, ShellSnapshot, ShellSpec, ShellStatus, Snapshot, TerminalPreview,
-    TerminalPreviewLine, TerminalPreviewSpan, TerminalProfile, UnixEnvironment,
+    NodeRegistrationSnapshot, NotificationDeliveryConfig, Request, Response, RoutedOperation,
+    RoutedOperationResult, ScheduledExecutionScheduleProjection, ScheduledExecutionSnapshot,
+    ScheduledOccurrence, ScheduledRunnerResult, ShellSnapshot, ShellSpec, ShellStatus, Snapshot,
+    TerminalPreview, TerminalPreviewLine, TerminalPreviewSpan, TerminalProfile, UnixEnvironment,
     UnixEnvironmentVariable, WorkspaceLauncherSnapshot, WorkspaceLauncherSpec, WorkspaceSnapshot,
 };
 
@@ -608,6 +608,20 @@ impl Client {
     pub fn combined_node_snapshot(&self, selector: Option<String>) -> Result<CombinedNodeSnapshot> {
         match self.request(Request::GetCombinedNodeSnapshot { selector })? {
             Response::CombinedNodeSnapshot { snapshot } => Ok(snapshot),
+            response => unexpected(response),
+        }
+    }
+
+    pub fn route_node_operation(
+        &self,
+        node_id: impl Into<String>,
+        operation: RoutedOperation,
+    ) -> Result<RoutedOperationResult> {
+        match self.request(Request::RouteNodeOperation {
+            node_id: node_id.into(),
+            operation,
+        })? {
+            Response::RoutedNodeOperation { result } => Ok(result),
             response => unexpected(response),
         }
     }
@@ -1871,6 +1885,7 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
+            reject_protocol(&listener, 34, 33);
             reject_protocol(&listener, 33, 32);
             reject_protocol(&listener, 32, 31);
             reject_protocol(&listener, 31, 30);
@@ -2025,7 +2040,7 @@ mod tests {
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
-            assert_eq!(request.version, 33);
+            assert_eq!(request.version, 34);
             assert_eq!(request.message, Request::GetNodeIdentity);
             protocol::write_message(
                 &mut stream,
@@ -2039,6 +2054,7 @@ mod tests {
             )
             .unwrap();
 
+            reject_protocol(&listener, 34, 33);
             reject_protocol(&listener, 33, 32);
             reject_protocol(&listener, 32, 31);
             reject_protocol(&listener, 31, 30);
@@ -2087,7 +2103,7 @@ mod tests {
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
-            assert_eq!(request.version, 33);
+            assert_eq!(request.version, 34);
             assert_eq!(request.message, Request::OpenFederationChannel);
             protocol::write_message(
                 &mut stream,
@@ -2101,6 +2117,7 @@ mod tests {
             )
             .unwrap();
 
+            reject_protocol(&listener, 34, 33);
             reject_protocol(&listener, 33, 32);
             reject_protocol(&listener, 32, 31);
             reject_protocol(&listener, 31, 30);
@@ -2132,7 +2149,7 @@ mod tests {
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
-            assert_eq!(request.version, 33);
+            assert_eq!(request.version, 34);
             assert_eq!(request.message, Request::ListNodeRegistrations);
             protocol::write_message(
                 &mut stream,
@@ -2145,6 +2162,7 @@ mod tests {
                 ),
             )
             .unwrap();
+            reject_protocol(&listener, 34, 33);
             reject_protocol(&listener, 33, 32);
             reject_protocol(&listener, 32, 31);
             reject_protocol(&listener, 31, 30);
@@ -2319,6 +2337,7 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
+            reject_protocol(&listener, 34, 33);
             reject_protocol(&listener, 33, 32);
             reject_protocol(&listener, 32, 31);
             reject_protocol(&listener, 31, 30);
@@ -2388,6 +2407,7 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
+            reject_protocol(&listener, 34, 33);
             reject_protocol(&listener, 33, 32);
             reject_protocol(&listener, 32, 31);
             reject_protocol(&listener, 31, 30);

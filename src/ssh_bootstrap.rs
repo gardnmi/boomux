@@ -134,6 +134,21 @@ pub struct RemoteConnection {
 }
 
 impl RemoteConnection {
+    pub(crate) fn request(&mut self, request: Request, timeout: Duration) -> io::Result<Response> {
+        let version = self.handshake.core_protocol_version;
+        protocol::write_message(
+            self.stdin.as_mut().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::BrokenPipe, "remote channel closed")
+            })?,
+            &Envelope::with_version(version, request),
+        )?;
+        let response: Envelope<Response> = read_message_with_deadline(&mut self.stdout, timeout)?;
+        if response.version != version {
+            return Err(invalid_probe("remote response version mismatch"));
+        }
+        Ok(response.message)
+    }
+
     pub fn ping(&mut self) -> io::Result<()> {
         let version = self.handshake.core_protocol_version;
         protocol::write_message(
