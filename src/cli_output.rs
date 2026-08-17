@@ -681,6 +681,7 @@ fn protocol_error_code(code: ErrorCode) -> &'static str {
         ErrorCode::NodeIdentityUnavailable => "node_identity_unavailable",
         ErrorCode::NodeRegistrationUnavailable => "node_registration_unavailable",
         ErrorCode::NodeIdentityChanged => "node_identity_changed",
+        ErrorCode::AmbiguousTarget => "ambiguous_target",
         ErrorCode::RevisionChanged => "revision_changed",
         ErrorCode::Internal => "internal",
         ErrorCode::Unknown => "unknown",

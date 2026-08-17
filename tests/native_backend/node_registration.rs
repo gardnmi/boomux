@@ -55,6 +55,31 @@ fn registrations_survive_cold_recovery_outside_authoritative_state() {
 }
 
 #[test]
+fn combined_snapshot_is_separate_and_local_alias_ambiguity_is_typed() {
+    let daemon = TestDaemon::start();
+    daemon
+        .client
+        .add_node_registration("local", "other.example", node_id(3))
+        .unwrap();
+    let combined = daemon.client.combined_node_snapshot(None).unwrap();
+    assert_eq!(combined.nodes.len(), 2);
+    assert!(combined.nodes.iter().any(|node| node.local));
+    assert!(combined.nodes.iter().any(|node| !node.local));
+
+    let error = daemon
+        .client
+        .combined_node_snapshot(Some("local".into()))
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        ClientError::Remote(RemoteError {
+            code: Some(ErrorCode::AmbiguousTarget),
+            ..
+        })
+    ));
+}
+
+#[test]
 fn malformed_registration_store_preserves_local_daemon_operation() {
     let mut daemon = TestDaemon::start();
     daemon.crash();
@@ -91,8 +116,9 @@ fn fake_ssh(directory: &Path) {
         FEDERATION_VERSION, FederationConnectionMode, FederationHandshake, write_handshake,
     };
     use boomux::protocol::{
-        self, Envelope, EventCursor, NodeProjectionSnapshot, NodeProjectionSync,
-        NodeProjectionSyncMode, Response, SchedulerHealth, SchedulerState,
+        self, Envelope, EventCursor, NodeProjectionShell, NodeProjectionSnapshot,
+        NodeProjectionSync, NodeProjectionSyncMode, NodeProjectionWorkspace, Response,
+        SchedulerHealth, SchedulerState, ShellOwner, ShellStatus,
     };
 
     let handshake = FederationHandshake {
@@ -124,8 +150,23 @@ fn fake_ssh(directory: &Path) {
                     },
                     projection: NodeProjectionSnapshot {
                         node_id: node_id(2),
-                        workspaces: Vec::new(),
-                        shells: Vec::new(),
+                        workspaces: vec![NodeProjectionWorkspace {
+                            id: "shared-workspace".into(),
+                            name: "shared".into(),
+                            item_count: 1,
+                            attention_count: 0,
+                        }],
+                        shells: vec![NodeProjectionShell {
+                            id: "shared-shell".into(),
+                            workspace_id: "shared-workspace".into(),
+                            name: "shared".into(),
+                            owner: ShellOwner::User,
+                            status: ShellStatus::Running,
+                            run_id: Some("shared-run".into()),
+                            generation: Some(1),
+                            started_at_ms: Some(1),
+                            ended_at_ms: None,
+                        }],
                         launchers: Vec::new(),
                         agents: Vec::new(),
                         schedules: Vec::new(),
@@ -214,6 +255,38 @@ fn cli_add_and_retarget_pin_verified_identity_without_persisting_helper_path() {
     let online = online
         .unwrap_or_else(|| panic!("background projection did not become online: {last_inspect:?}"));
     assert_eq!(online["data"]["projection"]["cursor"], 0);
+    let combined = command(&directory)
+        .args(["node", "snapshot", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        combined.status.success(),
+        "node snapshot failed: {}",
+        String::from_utf8_lossy(&combined.stderr)
+    );
+    let combined: serde_json::Value = serde_json::from_slice(&combined.stdout).unwrap();
+    assert_eq!(combined["command"], "node.snapshot");
+    assert_eq!(combined["data"]["nodes"].as_array().unwrap().len(), 2);
+    let remote = combined["data"]["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| node["alias"] == "work")
+        .unwrap();
+    assert_eq!(remote["health"], "online");
+    assert_eq!(remote["current"], true);
+    assert_eq!(
+        remote["remote_projection"]["workspaces"][0]["id"]["node_id"],
+        node_id(2)
+    );
+    assert_eq!(
+        remote["remote_projection"]["workspaces"][0]["id"]["inner_id"],
+        "shared-workspace"
+    );
+    assert_eq!(
+        remote["remote_projection"]["shells"][0]["workspace_id"]["inner_id"],
+        "shared-workspace"
+    );
     let cache: serde_json::Value =
         serde_json::from_slice(&fs::read(directory.join("state/boomux/node-cache.json")).unwrap())
             .unwrap();

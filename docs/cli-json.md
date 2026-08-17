@@ -48,6 +48,10 @@ advertises registration management explicitly; clients must not infer support
 from a CLI or daemon version string. Registration commands manage local routes
 only and do not imply projected reads or routed resource mutation.
 
+Protocol 33 advertises the separately named `node.snapshot` combined read. It
+contacts only the local daemon and never changes the local-only meaning of any
+existing snapshot or list operation.
+
 That passive command advertises only what the installed local CLI can speak and
 never reports negotiated state for a registered Node. Implemented `node.list`
 and `node.inspect` return registration data only. Future combined projection data
@@ -93,6 +97,7 @@ The following commands support `--json`:
 - `boomux node add`
 - `boomux node list`
 - `boomux node inspect`
+- `boomux node snapshot [SELECTOR]`
 - `boomux node rename`
 - `boomux node retarget`
 - `boomux node forget`
@@ -165,6 +170,16 @@ Command payloads are:
   one registration object with `alias`, exact `target`, pinned `node_id`,
   `revision`, and `tombstone_epoch`. Add and retarget verify the SSH route before
   the local mutation; forget performs no SSH operation.
+- `node.snapshot`: a `nodes` array containing the authoritative rich local Node
+  and bounded reduced cached remote Nodes. `SELECTOR` is an exact Node ID or
+  local alias; omission returns the all-Node overview. The local Node has alias
+  `local`. A selector matching both that alias and a registration returns typed
+  `ambiguous_target`; exact Node IDs disambiguate. Entries contain `node_id`,
+  `alias`, `local`, `health`, `current`, `stale`, `observed_at_ms`, nullable
+  `observed_protocol_version`, `observed_capabilities`, `scheduler`, and nullable
+  `local_snapshot` and `remote_projection` payloads. Every resource `id` and
+  relationship ID in those payloads is `{ "node_id": "...", "inner_id":
+  "..." }`; inner IDs are unchanged and must not be routed without their Node.
 - `shell.suggest-name`: exact resolved `workspace_id` plus a nonempty generated
   `name` that does not match any shell name in that workspace at observation
   time.
@@ -278,6 +293,16 @@ Protocol 27 adds `protocol_27` and `agent_schedule_editing` for paused,
 revision-conditional schedule-definition updates. Update responses and events
 remain prompt-free; exact inspection is still the only response that discloses
 the current prompt.
+Protocol 32 adds `protocol_32`, `node_projection_sync`, and
+`bounded_remote_node_projections`. Protocol 33 adds `protocol_33`,
+`combined_node_snapshot`, and `node_qualified_dashboard`.
+
+Node snapshot health is `unobserved`, `online`, `reconnecting`, `stale`,
+`unreachable`, `authentication_required`, `identity_changed`,
+`identity_conflict`, or `unsupported`. `current` is true only for a live
+identity-verified observation. Cached rows remain visible when stale, but cached
+state never authorizes terminal reads, private inspection, Schedule controls, or
+mutation. Scheduler health is reported independently for every Node.
 
 ## Execution Data
 

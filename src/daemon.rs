@@ -6419,6 +6419,111 @@ impl DaemonService {
         })
     }
 
+    fn combined_node_snapshot(
+        &self,
+        selector: Option<&str>,
+    ) -> DaemonResult<crate::protocol::CombinedNodeSnapshot> {
+        use crate::protocol::{
+            CombinedNode, CombinedNodeSnapshot, NodeProjectionHealthCode, SchedulerHealth,
+            SchedulerState,
+        };
+
+        let local_node_id = self.node_identity()?.id()?;
+        let registrations = self
+            .node_registrations()?
+            .list()
+            .map_err(node_registration_error)?;
+        let local_selected = selector.is_none()
+            || selector.is_some_and(|value| value == "local" || value == local_node_id);
+        let remote_selected = registrations
+            .iter()
+            .filter(|registration| {
+                selector.is_none()
+                    || selector.is_some_and(|value| {
+                        value == registration.alias || value == registration.node_id
+                    })
+            })
+            .collect::<Vec<_>>();
+        if selector == Some("local") && !remote_selected.is_empty() {
+            return Err(DaemonError::lifecycle(
+                ErrorCode::AmbiguousTarget,
+                "combined Node selector 'local' matches the local Node and a registered alias; use an exact Node ID",
+            ));
+        }
+        if !local_selected && remote_selected.is_empty() {
+            return Err(DaemonError::lifecycle(
+                ErrorCode::NotFound,
+                "Node selector not found",
+            ));
+        }
+
+        let mut nodes = Vec::with_capacity(usize::from(local_selected) + remote_selected.len());
+        if local_selected {
+            let snapshot = self.snapshot()?;
+            let scheduler = snapshot.scheduler.clone().unwrap_or(SchedulerHealth {
+                state: SchedulerState::Offline,
+                max_concurrent: 0,
+                active_executions: 0,
+            });
+            nodes.push(CombinedNode {
+                node_id: local_node_id,
+                alias: "local".into(),
+                local: true,
+                health: NodeProjectionHealthCode::Online,
+                current: true,
+                stale: false,
+                observed_at_ms: unix_time_ms(),
+                observed_protocol_version: Some(protocol::PROTOCOL_VERSION),
+                observed_capabilities: protocol::protocol_capabilities()
+                    .map(str::to_owned)
+                    .collect(),
+                scheduler,
+                local_snapshot: Some(snapshot),
+                remote_projection: None,
+            });
+        }
+        for registration in remote_selected {
+            let view = self.node_projection_cache()?.view(registration)?;
+            let scheduler = view
+                .projection
+                .as_ref()
+                .map(|projection| projection.scheduler.clone())
+                .unwrap_or(SchedulerHealth {
+                    state: SchedulerState::Offline,
+                    max_concurrent: 0,
+                    active_executions: 0,
+                });
+            let observed_protocol_version = view
+                .health
+                .capabilities
+                .iter()
+                .filter_map(|capability| capability.strip_prefix("protocol_")?.parse().ok())
+                .max();
+            nodes.push(CombinedNode {
+                node_id: registration.node_id.clone(),
+                alias: registration.alias.clone(),
+                local: false,
+                health: view.health.code,
+                current: !view.health.stale,
+                stale: view.health.stale,
+                observed_at_ms: view.health.last_success_at_ms.unwrap_or(0),
+                observed_protocol_version,
+                observed_capabilities: view.health.capabilities,
+                scheduler,
+                local_snapshot: None,
+                remote_projection: view.projection,
+            });
+        }
+        nodes.sort_by(|left, right| {
+            right
+                .local
+                .cmp(&left.local)
+                .then_with(|| left.alias.cmp(&right.alias))
+                .then_with(|| left.node_id.cmp(&right.node_id))
+        });
+        Ok(CombinedNodeSnapshot { nodes })
+    }
+
     fn clock_now_ms(&self) -> u64 {
         lock(&self.clock)
             .map(|clock| clock.now_ms())
@@ -7810,6 +7915,9 @@ impl DaemonService {
                     health: self.node_projection_cache()?.health(&registration)?,
                 })
             }
+            Request::GetCombinedNodeSnapshot { selector } => Ok(Response::CombinedNodeSnapshot {
+                snapshot: self.combined_node_snapshot(selector.as_deref())?,
+            }),
             Request::Restart | Request::RestartWithNotificationConfig { .. } => {
                 unreachable!("restart is handled before dispatch")
             }

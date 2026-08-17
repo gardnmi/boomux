@@ -14,10 +14,29 @@ use crate::session_projection::{self, SessionProjection};
 use crate::tui::{
     AgentAuthorityDisplay, AgentDisplayState, AgentSessionRunView, AgentSessionView,
     AgentShellView, AgentView, AttentionReason, ExecutionDisplayState, ExecutionOutcomeDisplay,
-    ExecutionReasonDisplay, ExecutionView, LauncherView, ScheduleDisplayState, ScheduleItemView,
-    ScheduleView, TerminalKind, TerminalRunView, TerminalView, WorkspaceAttentionView,
-    WorkspaceItemView, WorkspaceView,
+    ExecutionReasonDisplay, ExecutionView, LauncherView, NodeView, ScheduleDisplayState,
+    ScheduleItemView, ScheduleView, TerminalKind, TerminalRunView, TerminalView,
+    WorkspaceAttentionView, WorkspaceItemView, WorkspaceView,
 };
+
+fn local_node_placeholder() -> NodeView {
+    NodeView {
+        id: String::new(),
+        alias: "local".into(),
+        local: true,
+        health: boomux::protocol::NodeProjectionHealthCode::Online,
+        current: true,
+        stale: false,
+        observed_at_ms: 0,
+        observed_protocol_version: None,
+        observed_capabilities: Vec::new(),
+        scheduler: boomux::protocol::SchedulerHealth {
+            state: boomux::protocol::SchedulerState::Offline,
+            max_concurrent: 0,
+            active_executions: 0,
+        },
+    }
+}
 
 #[cfg(test)]
 pub(crate) fn project(
@@ -57,6 +76,9 @@ pub(crate) fn project_schedules(
                     .filter(|execution| !execution.state.is_active())
                     .count();
                 ScheduleView {
+                    node_id: String::new(),
+                    node_alias: "local".into(),
+                    actionable: true,
                     id: schedule.id.clone(),
                     workspace_id: workspace.id.clone(),
                     workspace: workspace.name.clone(),
@@ -243,6 +265,293 @@ pub(crate) fn project_with_sessions(
         .collect()
 }
 
+pub(crate) fn project_remote_node(
+    node: &boomux::protocol::CombinedNode,
+) -> (Vec<WorkspaceView>, Vec<ScheduleView>) {
+    let Some(projection) = node.remote_projection.as_ref() else {
+        return (Vec::new(), Vec::new());
+    };
+    let node_view = NodeView {
+        id: node.node_id.clone(),
+        alias: node.alias.clone(),
+        local: false,
+        health: node.health,
+        current: node.current,
+        stale: node.stale,
+        observed_at_ms: node.observed_at_ms,
+        observed_protocol_version: node.observed_protocol_version,
+        observed_capabilities: node.observed_capabilities.clone(),
+        scheduler: node.scheduler.clone(),
+    };
+    let mut workspaces = projection
+        .workspaces
+        .iter()
+        .map(|workspace| {
+            let mut agent_state_counts =
+                crate::agent_attention_projection::AgentStateCounts::default();
+            for agent in projection
+                .agents
+                .iter()
+                .filter(|agent| agent.workspace_id == workspace.id)
+            {
+                match agent.state {
+                    AgentState::Unknown => agent_state_counts.unknown += 1,
+                    AgentState::Working => agent_state_counts.working += 1,
+                    AgentState::Blocked => agent_state_counts.blocked += 1,
+                    AgentState::Idle => agent_state_counts.idle += 1,
+                    AgentState::Inactive => agent_state_counts.inactive += 1,
+                    AgentState::Done => agent_state_counts.done += 1,
+                }
+            }
+            let mut items = Vec::new();
+            for shell in projection
+                .shells
+                .iter()
+                .filter(|shell| shell.workspace_id == workspace.id)
+            {
+                if matches!(shell.owner, boomux::protocol::ShellOwner::Schedule { .. }) {
+                    continue;
+                }
+                let terminal = TerminalView {
+                    id: shell.id.clone(),
+                    name: shell.name.clone(),
+                    status: match shell.status {
+                        ShellStatus::Pending => "pending",
+                        ShellStatus::Running => "running",
+                        ShellStatus::Exited { .. } => "exited",
+                    }
+                    .into(),
+                    directory: "remote path unavailable".into(),
+                    repository: String::new(),
+                    branch: String::new(),
+                    git_state: String::new(),
+                    worktree: String::new(),
+                    foreground_process: None,
+                    kind: TerminalKind::Shell,
+                    command: String::new(),
+                    argv: Vec::new(),
+                    run: shell.run_id.as_ref().map(|run_id| TerminalRunView {
+                        id: run_id.clone(),
+                        generation: shell.generation.unwrap_or(0),
+                        started_at_ms: shell.started_at_ms.unwrap_or(0),
+                        ended_at_ms: shell.ended_at_ms,
+                        exit_reason: None,
+                        output_revision: 0,
+                    }),
+                };
+                let agent = shell.run_id.as_deref().and_then(|run_id| {
+                    projection
+                        .agents
+                        .iter()
+                        .filter(|agent| {
+                            agent.shell_id == shell.id
+                                && agent.run_id == run_id
+                                && !matches!(agent.state, AgentState::Inactive | AgentState::Done)
+                        })
+                        .max_by_key(|agent| (agent.observed_at_ms, &agent.id))
+                });
+                if let Some(agent) = agent {
+                    items.push(WorkspaceItemView::AgentShell(AgentShellView {
+                        shell: terminal,
+                        agent: Some(AgentView {
+                            id: agent.id.clone(),
+                            state: agent.state.into(),
+                            integration: agent.integration.clone(),
+                            external_session_id: None,
+                            authority: AgentAuthorityDisplay::DaemonLifecycle,
+                            confidence: 0,
+                            evidence: "cached reduced observation".into(),
+                            updated_at_ms: agent.observed_at_ms,
+                            root_branch: String::new(),
+                            root_worktree: String::new(),
+                        }),
+                        schedule_id: None,
+                    }));
+                } else {
+                    items.push(WorkspaceItemView::Shell(terminal));
+                }
+            }
+            items.extend(
+                projection
+                    .launchers
+                    .iter()
+                    .filter(|launcher| launcher.workspace_id == workspace.id)
+                    .map(|launcher| {
+                        WorkspaceItemView::Launcher(LauncherView {
+                            id: launcher.id.clone(),
+                            name: launcher.name.clone(),
+                            directory: "remote path unavailable".into(),
+                            repository: String::new(),
+                            branch: String::new(),
+                            git_state: String::new(),
+                            worktree: String::new(),
+                            command: "cached definition".into(),
+                            argv: Vec::new(),
+                        })
+                    }),
+            );
+            items.extend(
+                projection
+                    .schedules
+                    .iter()
+                    .filter(|schedule| schedule.workspace_id == workspace.id)
+                    .map(|schedule| {
+                        WorkspaceItemView::Schedule(ScheduleItemView {
+                            id: schedule.id.clone(),
+                            name: schedule.name.clone(),
+                            integration: schedule.integration.clone(),
+                            state: match schedule.state {
+                                AgentScheduleState::Paused => ScheduleDisplayState::Paused,
+                                AgentScheduleState::Enabled => ScheduleDisplayState::Enabled,
+                            },
+                            friendly_trigger: friendly_trigger(&schedule.trigger.cron),
+                        })
+                    }),
+            );
+            WorkspaceView {
+                node: node_view.clone(),
+                id: workspace.id.clone(),
+                name: workspace.name.clone(),
+                default_cwd: None,
+                items,
+                sessions: Vec::new(),
+                agent_state_counts,
+                attention_count: workspace.attention_count as usize,
+                attention: Vec::new(),
+            }
+        })
+        .collect::<Vec<_>>();
+    workspaces.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+
+    let mut schedules = projection
+        .schedules
+        .iter()
+        .map(|schedule| {
+            let workspace = projection
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.id == schedule.workspace_id)
+                .map_or("unknown", |workspace| workspace.name.as_str());
+            let mut executions = projection
+                .executions
+                .iter()
+                .filter(|execution| execution.schedule_id == schedule.id)
+                .map(|execution| ExecutionView {
+                    id: execution.id.clone(),
+                    state: match execution.state {
+                        ScheduledExecutionState::Skipped => ExecutionDisplayState::Skipped,
+                        ScheduledExecutionState::Claimed => ExecutionDisplayState::Claimed,
+                        ScheduledExecutionState::Starting => ExecutionDisplayState::Starting,
+                        ScheduledExecutionState::Active => ExecutionDisplayState::Active,
+                        ScheduledExecutionState::DispatchFailed => {
+                            ExecutionDisplayState::DispatchFailed
+                        }
+                        ScheduledExecutionState::Exited => ExecutionDisplayState::Exited,
+                        ScheduledExecutionState::Cancelled => ExecutionDisplayState::Cancelled,
+                        ScheduledExecutionState::Interrupted => ExecutionDisplayState::Interrupted,
+                    },
+                    reason: execution.reason.map(|reason| match reason {
+                        ScheduledExecutionReason::Overlap => ExecutionReasonDisplay::Overlap,
+                        ScheduledExecutionReason::ActiveSession => {
+                            ExecutionReasonDisplay::ActiveSession
+                        }
+                        ScheduledExecutionReason::WorkspaceCapacity => {
+                            ExecutionReasonDisplay::WorkspaceCapacity
+                        }
+                        ScheduledExecutionReason::GlobalCapacity => {
+                            ExecutionReasonDisplay::GlobalCapacity
+                        }
+                        ScheduledExecutionReason::Missed => ExecutionReasonDisplay::Missed,
+                        ScheduledExecutionReason::PausedRace => ExecutionReasonDisplay::PausedRace,
+                        ScheduledExecutionReason::InvalidTarget => {
+                            ExecutionReasonDisplay::InvalidTarget
+                        }
+                        ScheduledExecutionReason::RunnerStartFailed => {
+                            ExecutionReasonDisplay::RunnerStartFailed
+                        }
+                        ScheduledExecutionReason::HostSpawnFailed => {
+                            ExecutionReasonDisplay::HostSpawnFailed
+                        }
+                        ScheduledExecutionReason::CancelledByUser => {
+                            ExecutionReasonDisplay::CancelledByUser
+                        }
+                        ScheduledExecutionReason::ColdDaemonRecovery => {
+                            ExecutionReasonDisplay::ColdDaemonRecovery
+                        }
+                        ScheduledExecutionReason::RunnerExitedWithoutReport => {
+                            ExecutionReasonDisplay::RunnerExitedWithoutReport
+                        }
+                        ScheduledExecutionReason::DaemonShutdown => {
+                            ExecutionReasonDisplay::DaemonShutdown
+                        }
+                    }),
+                    outcome: execution.outcome.as_ref().map(|outcome| match outcome {
+                        ScheduledExecutionOutcome::ExitCode { code } => {
+                            ExecutionOutcomeDisplay::ExitCode(*code)
+                        }
+                        ScheduledExecutionOutcome::Signal { signal } => {
+                            ExecutionOutcomeDisplay::Signal(*signal)
+                        }
+                    }),
+                    requested_at_ms: execution.requested_at_ms,
+                    shell_id: execution.shell_id.clone(),
+                    run_id: execution.run_id.clone(),
+                    agent_id: execution.agent_id.clone(),
+                    agent_state: execution.agent_id.as_deref().and_then(|agent_id| {
+                        projection
+                            .agents
+                            .iter()
+                            .find(|agent| agent.id == agent_id)
+                            .map(|agent| agent.state.into())
+                    }),
+                    session_id: None,
+                })
+                .collect::<Vec<_>>();
+            executions.sort_by(|left, right| {
+                right
+                    .requested_at_ms
+                    .cmp(&left.requested_at_ms)
+                    .then_with(|| right.id.cmp(&left.id))
+            });
+            ScheduleView {
+                node_id: node.node_id.clone(),
+                node_alias: node.alias.clone(),
+                actionable: false,
+                id: schedule.id.clone(),
+                workspace_id: schedule.workspace_id.clone(),
+                workspace: workspace.into(),
+                name: schedule.name.clone(),
+                integration: schedule.integration.clone(),
+                state: match schedule.state {
+                    AgentScheduleState::Paused => ScheduleDisplayState::Paused,
+                    AgentScheduleState::Enabled => ScheduleDisplayState::Enabled,
+                },
+                friendly_trigger: friendly_trigger(&schedule.trigger.cron),
+                next_occurrence_ms: schedule
+                    .next_occurrence
+                    .as_ref()
+                    .map(|value| value.scheduled_at_ms),
+                executions,
+                history_truncated: projection.executions_truncated,
+                possible_pruning_boundary: projection.executions_truncated,
+                history_scoped: true,
+                history_complete: !projection.executions_truncated,
+            }
+        })
+        .collect::<Vec<_>>();
+    schedules.sort_by(|left, right| {
+        left.workspace
+            .cmp(&right.workspace)
+            .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    (workspaces, schedules)
+}
+
 fn project_workspace(
     workspace: &WorkspaceSnapshot,
     git_cache: &mut git::Cache,
@@ -424,6 +733,7 @@ fn project_workspace(
         })
     });
     WorkspaceView {
+        node: local_node_placeholder(),
         id: workspace.id.clone(),
         name: workspace.name.clone(),
         default_cwd: workspace

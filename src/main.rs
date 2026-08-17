@@ -501,6 +501,8 @@ enum NodeCommands {
     List,
     /// Inspect a registered remote Node by alias or exact Node ID
     Inspect { selector: String },
+    /// Show the combined Node-qualified local and cached remote projection
+    Snapshot { selector: Option<String> },
     /// Rename a registered remote Node alias at an exact revision
     Rename {
         selector: String,
@@ -1077,6 +1079,7 @@ command_keys! {
     NodeAdd => ("node.add", Json),
     NodeList => ("node.list", Json),
     NodeInspect => ("node.inspect", Json),
+    NodeSnapshot => ("node.snapshot", Json),
     NodeRename => ("node.rename", Json),
     NodeRetarget => ("node.retarget", Json),
     NodeForget => ("node.forget", Json),
@@ -1157,6 +1160,9 @@ impl Cli {
             Some(Commands::Node {
                 command: NodeCommands::Inspect { .. },
             }) => CommandKey::NodeInspect,
+            Some(Commands::Node {
+                command: NodeCommands::Snapshot { .. },
+            }) => CommandKey::NodeSnapshot,
             Some(Commands::Node {
                 command: NodeCommands::Rename { .. },
             }) => CommandKey::NodeRename,
@@ -1425,7 +1431,7 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
             )
             .into());
         }
-        remote_connect(target)?;
+        remote_connect(target, cli.terminal.as_deref())?;
         return Ok(CliExit::Success);
     }
     match cli.command.as_ref() {
@@ -1488,7 +1494,7 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
     }
 
     let result = match cli.command {
-        Some(Commands::Ui) => dashboard(cli.terminal.as_deref()),
+        Some(Commands::Ui) => dashboard(cli.terminal.as_deref(), None),
         Some(Commands::Doctor) => doctor(cli.terminal.as_deref()),
         Some(Commands::Capabilities) => capabilities(cli.json),
         Some(Commands::List) => list_shells(cli.json),
@@ -1558,13 +1564,13 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
         Some(Commands::Attach { .. }) => unreachable!(),
         Some(Commands::ScheduledRunner { .. }) => unreachable!(),
         Some(Commands::FederationStdio) => unreachable!(),
-        None => dashboard(cli.terminal.as_deref()),
+        None => dashboard(cli.terminal.as_deref(), None),
     };
     result?;
     Ok(CliExit::Success)
 }
 
-fn remote_connect(target: &str) -> Result<(), Box<dyn Error>> {
+fn remote_connect(target: &str, terminal: Option<&str>) -> Result<(), Box<dyn Error>> {
     let mut connection = verified_remote_connection(target, true)?;
     connection.ping()?;
     println!(
@@ -1574,6 +1580,20 @@ fn remote_connect(target: &str) -> Result<(), Box<dyn Error>> {
         connection.handshake.helper_version,
         connection.executable.as_str(),
     );
+    let node_id = connection.handshake.node_id.clone();
+    drop(connection);
+    if let Ok(local) = client::connect_or_start()
+        && local.node_registrations().is_ok_and(|registrations| {
+            registrations
+                .iter()
+                .any(|registration| registration.node_id == node_id)
+        })
+        && local
+            .supports(protocol::ProtocolFeature::CombinedNodeSnapshot)
+            .unwrap_or(false)
+    {
+        dashboard(terminal, Some(node_id))?;
+    }
     Ok(())
 }
 
@@ -1723,6 +1743,47 @@ fn node_command(command: NodeCommands, json: bool) -> Result<(), Box<dyn Error>>
                 Ok(())
             }
         }
+        NodeCommands::Snapshot { selector } => {
+            let snapshot = client::connect_or_start()?.combined_node_snapshot(selector)?;
+            if json {
+                let nodes = snapshot
+                    .nodes
+                    .into_iter()
+                    .map(node_snapshot_json)
+                    .collect::<Result<Vec<_>, _>>()?;
+                print_json(
+                    CommandKey::NodeSnapshot,
+                    serde_json::json!({ "nodes": nodes }),
+                )
+            } else {
+                println!("ALIAS\tOWNERSHIP\tHEALTH\tCURRENT\tOBSERVED\tWORKSPACES\tSCHEDULER");
+                for node in snapshot.nodes {
+                    let workspace_count = node
+                        .local_snapshot
+                        .as_ref()
+                        .map(|snapshot| snapshot.workspaces.len())
+                        .or_else(|| {
+                            node.remote_projection
+                                .as_ref()
+                                .map(|projection| projection.workspaces.len())
+                        })
+                        .unwrap_or(0);
+                    println!(
+                        "{}\t{}\t{}\t{}\t{}\t{}\t{} {}/{}",
+                        node.alias,
+                        if node.local { "local" } else { "remote" },
+                        format!("{:?}", node.health).to_ascii_lowercase(),
+                        node.current,
+                        node.observed_at_ms,
+                        workspace_count,
+                        format!("{:?}", node.scheduler.state).to_ascii_lowercase(),
+                        node.scheduler.active_executions,
+                        node.scheduler.max_concurrent,
+                    );
+                }
+                Ok(())
+            }
+        }
         NodeCommands::Rename {
             selector,
             alias,
@@ -1764,6 +1825,75 @@ fn node_command(command: NodeCommands, json: bool) -> Result<(), Box<dyn Error>>
         }
         NodeCommands::Rekey => rekey_node(),
     }
+}
+
+fn node_snapshot_json(node: protocol::CombinedNode) -> Result<serde_json::Value, Box<dyn Error>> {
+    let protocol::CombinedNode {
+        node_id,
+        alias,
+        local,
+        health,
+        current,
+        stale,
+        observed_at_ms,
+        observed_protocol_version,
+        observed_capabilities,
+        scheduler,
+        local_snapshot,
+        remote_projection,
+    } = node;
+    let qualify = |value| qualify_resource_identities(value, &node_id);
+    Ok(serde_json::json!({
+        "node_id": node_id,
+        "alias": alias,
+        "local": local,
+        "health": health,
+        "current": current,
+        "stale": stale,
+        "observed_at_ms": observed_at_ms,
+        "observed_protocol_version": observed_protocol_version,
+        "observed_capabilities": observed_capabilities,
+        "scheduler": scheduler,
+        "local_snapshot": local_snapshot.map(serde_json::to_value).transpose()?.map(qualify),
+        "remote_projection": remote_projection.map(serde_json::to_value).transpose()?.map(qualify),
+    }))
+}
+
+fn qualify_resource_identities(mut value: serde_json::Value, node_id: &str) -> serde_json::Value {
+    const ID_FIELDS: &[&str] = &[
+        "id",
+        "workspace_id",
+        "shell_id",
+        "run_id",
+        "launcher_id",
+        "agent_id",
+        "schedule_id",
+        "execution_id",
+        "owner_schedule_id",
+    ];
+    match &mut value {
+        serde_json::Value::Array(values) => {
+            for value in values {
+                *value = qualify_resource_identities(value.take(), node_id);
+            }
+        }
+        serde_json::Value::Object(object) => {
+            for (key, value) in object {
+                if ID_FIELDS.contains(&key.as_str()) {
+                    if let Some(inner_id) = value.as_str() {
+                        *value = serde_json::to_value(protocol::QualifiedIdentity::new(
+                            node_id, inner_id,
+                        ))
+                        .expect("qualified identity serializes");
+                    }
+                } else {
+                    *value = qualify_resource_identities(value.take(), node_id);
+                }
+            }
+        }
+        _ => {}
+    }
+    value
 }
 
 fn print_node_registration(
@@ -1884,14 +2014,19 @@ fn effective_terminal(override_entry: Option<&str>) -> Result<Option<String>, Bo
     Ok(config::load()?.terminal)
 }
 
-fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
+fn dashboard(
+    terminal_override: Option<&str>,
+    initial_node_filter: Option<String>,
+) -> Result<(), Box<dyn Error>> {
     ensure_host_terminal()?;
     let launch_cwd = resolve_directory(Path::new("."))?;
     let client = client::connect_or_start()?;
+    let local_node_id = client.node_identity()?;
     let mut git_cache = git::Cache::default();
     let mut title_cache = host_session_titles::Cache::default();
     let mut refresh = DashboardRefresh::baseline(&client)?;
     let snapshot = refresh.snapshot().clone();
+    let combined = combined_node_snapshot_for_dashboard(&client)?;
     let config = config::load()?;
     let terminal = terminal_override
         .map(str::to_owned)
@@ -1914,8 +2049,17 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
         roots_configured,
     };
 
+    let mut initial_state = dashboard_state(
+        snapshot,
+        combined,
+        &refresh,
+        &mut git_cache,
+        &mut title_cache,
+        false,
+    );
+    initial_state.initial_node_filter = initial_node_filter;
     tui::run(
-        dashboard_state(snapshot, &refresh, &mut git_cache, &mut title_cache, false),
+        initial_state,
         config.dashboard.follow_focused_terminal,
         project_context,
         true,
@@ -1925,13 +2069,21 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
                 let result = refresh.check(&client).map_err(|error| error.to_string());
                 match result {
                     Ok(Some((snapshot, reset_focus_revision))) => {
-                        tui::DashboardEvent::RefreshCompleted(Ok(dashboard_state(
-                            snapshot,
-                            &refresh,
-                            &mut git_cache,
-                            &mut title_cache,
-                            reset_focus_revision,
-                        )))
+                        match combined_node_snapshot_for_dashboard(&client) {
+                            Ok(combined) => {
+                                tui::DashboardEvent::RefreshCompleted(Ok(dashboard_state(
+                                    snapshot,
+                                    combined,
+                                    &refresh,
+                                    &mut git_cache,
+                                    &mut title_cache,
+                                    reset_focus_revision,
+                                )))
+                            }
+                            Err(error) => {
+                                tui::DashboardEvent::RefreshCompleted(Err(error.to_string()))
+                            }
+                        }
                     }
                     Ok(None) => tui::DashboardEvent::UpdateCheckCompleted,
                     Err(error) => tui::DashboardEvent::RefreshCompleted(Err(error)),
@@ -1939,8 +2091,9 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
             }
             tui::DashboardEffect::RestoreWorkspace(workspace_id) => {
                 let result = (|| {
+                    let workspace_id = local_dashboard_inner(&workspace_id, &local_node_id)?;
                     let workspace = client
-                        .get_workspace(&workspace_id)
+                        .get_workspace(workspace_id)
                         .map_err(|error| error.to_string())?;
                     open_workspace(&workspace, terminal.as_deref())
                         .map_err(|error| error.to_string())?;
@@ -1956,6 +2109,7 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
             tui::DashboardEffect::Open(target) => {
                 let result = dispatch_dashboard_open(
                     &target,
+                    &local_node_id,
                     |shell_id| {
                         open_dashboard_shell(&client, shell_id, terminal.as_deref())
                             .map_err(|error| error.to_string())
@@ -1980,6 +2134,7 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
             tui::DashboardEffect::Close(target) => {
                 let result = (|| match &target {
                     tui::CloseTarget::Workspace(workspace_id) => {
+                        let workspace_id = local_dashboard_inner(workspace_id, &local_node_id)?;
                         let name = client
                             .get_workspace(workspace_id)
                             .map(|workspace| workspace.name)
@@ -1992,6 +2147,7 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
                         ))
                     }
                     tui::CloseTarget::Shell(shell_id) => {
+                        let shell_id = local_dashboard_inner(shell_id, &local_node_id)?;
                         let name = client
                             .get_shell(shell_id)
                             .map(|shell| shell.name)
@@ -2002,6 +2158,7 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
                         Ok(format!("Closed shell {name}"))
                     }
                     tui::CloseTarget::Launcher(launcher_id) => {
+                        let launcher_id = local_dashboard_inner(launcher_id, &local_node_id)?;
                         let name = client
                             .get_launcher(launcher_id)
                             .map(|launcher| launcher.name)
@@ -2028,25 +2185,30 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
             }
             tui::DashboardEffect::CreateShell(workspace_id) => {
                 tui::DashboardEvent::OperationCompleted(
-                    create_dashboard_shell(&client, &workspace_id, &launch_cwd)
-                        .map_err(|error| error.to_string()),
+                    local_dashboard_inner(&workspace_id, &local_node_id).and_then(|workspace_id| {
+                        create_dashboard_shell(&client, workspace_id, &launch_cwd)
+                            .map_err(|error| error.to_string())
+                    }),
                 )
             }
             tui::DashboardEffect::Rename { target, name } => {
                 let result = (|| match &target {
                     tui::RenameTarget::Workspace(workspace_id) => {
+                        let workspace_id = local_dashboard_inner(workspace_id, &local_node_id)?;
                         client
                             .rename_workspace(workspace_id, &name)
                             .map_err(|error| error.to_string())?;
                         Ok(format!("Renamed workspace to {name}"))
                     }
                     tui::RenameTarget::Shell(shell_id) => {
+                        let shell_id = local_dashboard_inner(shell_id, &local_node_id)?;
                         client
                             .rename_shell(shell_id, &name)
                             .map_err(|error| error.to_string())?;
                         Ok(format!("Renamed shell to {name}"))
                     }
                     tui::RenameTarget::Launcher(launcher_id) => {
+                        let launcher_id = local_dashboard_inner(launcher_id, &local_node_id)?;
                         client
                             .rename_launcher(launcher_id, &name)
                             .map_err(|error| error.to_string())?;
@@ -2062,6 +2224,8 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
                         .map_err(|error| error.to_string())?;
                     Ok(dashboard_state(
                         snapshot,
+                        combined_node_snapshot_for_dashboard(&client)
+                            .map_err(|error| error.to_string())?,
                         &refresh,
                         &mut git_cache,
                         &mut title_cache,
@@ -2071,41 +2235,48 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
                 tui::DashboardEvent::RefreshCompleted(result)
             }
             tui::DashboardEffect::RunSchedule(schedule_id) => {
-                let result = run_dashboard_schedule(&client, &schedule_id);
+                let result = local_dashboard_inner(&schedule_id, &local_node_id)
+                    .and_then(|id| run_dashboard_schedule(&client, id));
                 tui::DashboardEvent::OperationCompleted(result)
             }
             tui::DashboardEffect::PauseSchedule(schedule_id) => {
-                let result = client
-                    .pause_agent_schedule(&schedule_id)
-                    .map(|schedule| format!("Paused schedule {}", schedule.name))
-                    .map_err(|error| error.to_string());
+                let result = local_dashboard_inner(&schedule_id, &local_node_id).and_then(|id| {
+                    client
+                        .pause_agent_schedule(id)
+                        .map(|schedule| format!("Paused schedule {}", schedule.name))
+                        .map_err(|error| error.to_string())
+                });
                 tui::DashboardEvent::OperationCompleted(result)
             }
             tui::DashboardEffect::ResumeSchedule(schedule_id) => {
-                let result = client
-                    .resume_agent_schedule(&schedule_id)
-                    .map(|schedule| {
-                        format!(
-                            "Enabled schedule {} for future timed dispatch",
-                            schedule.name
-                        )
-                    })
-                    .map_err(|error| error.to_string());
+                let result = local_dashboard_inner(&schedule_id, &local_node_id).and_then(|id| {
+                    client
+                        .resume_agent_schedule(id)
+                        .map(|schedule| {
+                            format!(
+                                "Enabled schedule {} for future timed dispatch",
+                                schedule.name
+                            )
+                        })
+                        .map_err(|error| error.to_string())
+                });
                 tui::DashboardEvent::OperationCompleted(result)
             }
             tui::DashboardEffect::LoadScheduleEditor { schedule_id } => {
-                let result = client
-                    .get_agent_schedule(&schedule_id)
-                    .map(|inspection| tui::ScheduleEditInspection {
-                        schedule_id: inspection.schedule.id,
-                        name: inspection.schedule.name,
-                        cron: inspection.schedule.trigger.cron,
-                        timezone: inspection.schedule.trigger.timezone,
-                        prompt: inspection.prompt,
-                        revision: inspection.schedule.revision,
-                        paused: inspection.schedule.state == AgentScheduleState::Paused,
-                    })
-                    .map_err(|error| error.to_string());
+                let result = local_dashboard_inner(&schedule_id, &local_node_id).and_then(|id| {
+                    client
+                        .get_agent_schedule(id)
+                        .map(|inspection| tui::ScheduleEditInspection {
+                            schedule_id: schedule_id.clone(),
+                            name: inspection.schedule.name,
+                            cron: inspection.schedule.trigger.cron,
+                            timezone: inspection.schedule.trigger.timezone,
+                            prompt: inspection.prompt,
+                            revision: inspection.schedule.revision,
+                            paused: inspection.schedule.state == AgentScheduleState::Paused,
+                        })
+                        .map_err(|error| error.to_string())
+                });
                 tui::DashboardEvent::ScheduleEditorLoaded {
                     schedule_id,
                     result,
@@ -2116,71 +2287,81 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
                 expected_revision,
                 update,
             } => {
-                let result = client
-                    .update_agent_schedule(
-                        &schedule_id,
-                        expected_revision,
-                        AgentScheduleUpdate {
-                            name: update.name,
-                            prompt: update.prompt,
-                            trigger: AgentScheduleTrigger {
-                                cron: update.cron,
-                                timezone: update.timezone,
+                let result = local_dashboard_inner(&schedule_id, &local_node_id).and_then(|id| {
+                    client
+                        .update_agent_schedule(
+                            id,
+                            expected_revision,
+                            AgentScheduleUpdate {
+                                name: update.name,
+                                prompt: update.prompt,
+                                trigger: AgentScheduleTrigger {
+                                    cron: update.cron,
+                                    timezone: update.timezone,
+                                },
                             },
-                        },
-                    )
-                    .map(|schedule| format!("Updated schedule {}", schedule.name))
-                    .map_err(|error| error.to_string());
+                        )
+                        .map(|schedule| format!("Updated schedule {}", schedule.name))
+                        .map_err(|error| error.to_string())
+                });
                 tui::DashboardEvent::ScheduleEditorSaved {
                     schedule_id,
                     result,
                 }
             }
             tui::DashboardEffect::CancelExecution(execution_id) => {
-                let result = cancel_dashboard_execution(&client, &execution_id);
+                let result = local_dashboard_inner(&execution_id, &local_node_id)
+                    .and_then(|id| cancel_dashboard_execution(&client, id));
                 tui::DashboardEvent::OperationCompleted(result)
             }
             tui::DashboardEffect::OpenScheduledExecution { execution_id } => {
-                let result = open_scheduled_execution(&client, &execution_id, terminal.as_deref())
-                    .map(|opened| opened.message)
-                    .map_err(|error| error.to_string());
+                let result = local_dashboard_inner(&execution_id, &local_node_id).and_then(|id| {
+                    open_scheduled_execution(&client, id, terminal.as_deref())
+                        .map(|opened| opened.message)
+                        .map_err(|error| error.to_string())
+                });
                 tui::DashboardEvent::OperationCompleted(result)
             }
             tui::DashboardEffect::RemoveSchedule(schedule_id) => {
+                let schedule_inner = local_dashboard_inner(&schedule_id, &local_node_id);
                 let name = refresh
                     .snapshot()
                     .workspaces
                     .iter()
                     .flat_map(|workspace| &workspace.schedules)
-                    .find(|schedule| schedule.id == schedule_id)
+                    .find(|schedule| schedule_inner.as_ref().is_ok_and(|id| schedule.id == **id))
                     .map_or_else(|| "schedule".into(), |schedule| schedule.name.clone());
-                let result = client
-                    .remove_agent_schedule(&schedule_id)
+                let result = schedule_inner.and_then(|id| {
+                    client
+                    .remove_agent_schedule(id)
                     .map(|()| {
                         format!(
                             "Removed schedule {name}, its persisted prompt, and retained history"
                         )
                     })
-                    .map_err(|error| error.to_string());
+                    .map_err(|error| error.to_string())
+                });
                 tui::DashboardEvent::OperationCompleted(result)
             }
             tui::DashboardEffect::LoadScheduleHistory { schedule_id, limit } => {
-                let result = refresh
-                    .load_schedule_history(&client, &schedule_id, limit)
-                    .map(|(_, truncated)| {
-                        let schedules = dashboard_projection::project_schedules(
-                            refresh.snapshot(),
-                            &refresh.executions(),
-                            refresh.history_truncated,
-                            &refresh.scoped_history,
-                        );
-                        let executions = schedules
-                            .into_iter()
-                            .find(|schedule| schedule.id == schedule_id)
-                            .map_or_else(Vec::new, |schedule| schedule.executions);
-                        (executions, truncated)
-                    })
-                    .map_err(|error| error.to_string());
+                let result = local_dashboard_inner(&schedule_id, &local_node_id).and_then(|id| {
+                    refresh
+                        .load_schedule_history(&client, id, limit)
+                        .map(|(_, truncated)| {
+                            let schedules = dashboard_projection::project_schedules(
+                                refresh.snapshot(),
+                                &refresh.executions(),
+                                refresh.history_truncated,
+                                &refresh.scoped_history,
+                            );
+                            let executions = schedules
+                                .into_iter()
+                                .find(|schedule| schedule.id == schedule_id.inner_id)
+                                .map_or_else(Vec::new, |schedule| schedule.executions);
+                            (executions, truncated)
+                        })
+                        .map_err(|error| error.to_string())
+                });
                 tui::DashboardEvent::ScheduleHistoryCompleted {
                     schedule_id,
                     result,
@@ -2191,10 +2372,12 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
                 run_id,
                 output_revision,
             } => tui::DashboardEvent::TerminalPreviewCompleted {
-                output: client
-                    .read_shell_preview(&shell_id, READ_BYTES, 500)
-                    .map_err(|error| error.to_string()),
-                shell_id,
+                output: local_dashboard_inner(&shell_id, &local_node_id).and_then(|id| {
+                    client
+                        .read_shell_preview(id, READ_BYTES, 500)
+                        .map_err(|error| error.to_string())
+                }),
+                shell_id: shell_id.inner_id,
                 run_id,
                 output_revision,
             },
@@ -2205,6 +2388,7 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
 
 fn dashboard_state(
     snapshot: Snapshot,
+    combined: Option<protocol::CombinedNodeSnapshot>,
     refresh: &DashboardRefresh,
     git_cache: &mut git::Cache,
     title_cache: &mut host_session_titles::Cache,
@@ -2245,7 +2429,7 @@ fn dashboard_state(
             },
         }
     };
-    let schedules = if schedules_supported {
+    let mut schedules = if schedules_supported {
         dashboard_projection::project_schedules(
             &snapshot,
             &refresh.executions(),
@@ -2255,7 +2439,63 @@ fn dashboard_state(
     } else {
         Vec::new()
     };
+    let mut nodes = Vec::new();
+    if let Some(combined) = combined {
+        for node in combined.nodes {
+            let node_view = tui::NodeView {
+                id: node.node_id.clone(),
+                alias: node.alias.clone(),
+                local: node.local,
+                health: node.health,
+                current: node.current,
+                stale: node.stale,
+                observed_at_ms: node.observed_at_ms,
+                observed_protocol_version: node.observed_protocol_version,
+                observed_capabilities: node.observed_capabilities.clone(),
+                scheduler: node.scheduler.clone(),
+            };
+            if node.local {
+                for workspace in &mut workspaces {
+                    workspace.node = node_view.clone();
+                }
+                for schedule in &mut schedules {
+                    schedule.node_id = node.node_id.clone();
+                    schedule.node_alias = node.alias.clone();
+                    schedule.actionable = node.current && !node.stale;
+                }
+            } else {
+                let (mut remote_workspaces, mut remote_schedules) =
+                    dashboard_projection::project_remote_node(&node);
+                workspaces.append(&mut remote_workspaces);
+                schedules.append(&mut remote_schedules);
+            }
+            nodes.push(node_view);
+        }
+    }
+    if nodes.is_empty() {
+        nodes.extend(
+            workspaces
+                .iter()
+                .map(|workspace| workspace.node.clone())
+                .take(1),
+        );
+    }
+    workspaces.sort_by(|left, right| {
+        left.node
+            .alias
+            .cmp(&right.node.alias)
+            .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    schedules.sort_by(|left, right| {
+        left.node_alias
+            .cmp(&right.node_alias)
+            .then_with(|| left.workspace.cmp(&right.workspace))
+            .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| left.id.cmp(&right.id))
+    });
     tui::DashboardState {
+        nodes,
         workspaces,
         schedules,
         scheduling,
@@ -2265,6 +2505,17 @@ fn dashboard_state(
             .is_supported_by(refresh.negotiated_protocol),
         focused_terminal: snapshot.focused_terminal.map(focused_terminal_view),
         reset_focus_revision,
+        initial_node_filter: None,
+    }
+}
+
+fn combined_node_snapshot_for_dashboard(
+    client: &client::Client,
+) -> Result<Option<protocol::CombinedNodeSnapshot>, client::ClientError> {
+    if client.supports(protocol::ProtocolFeature::CombinedNodeSnapshot)? {
+        client.combined_node_snapshot(None).map(Some)
+    } else {
+        Ok(None)
     }
 }
 
@@ -2278,6 +2529,7 @@ fn focused_terminal_view(focused: protocol::FocusedTerminalSnapshot) -> tui::Foc
 
 fn dispatch_dashboard_open<S, L>(
     target: &tui::OpenTarget,
+    local_node_id: &str,
     mut open_shell: S,
     mut launch: L,
 ) -> Result<String, String>
@@ -2286,11 +2538,30 @@ where
     L: FnMut(&str, &str) -> Result<String, String>,
 {
     match target {
-        tui::OpenTarget::Shell(shell_id) => open_shell(shell_id),
+        tui::OpenTarget::Shell(shell_id) => {
+            open_shell(local_dashboard_inner(shell_id, local_node_id)?)
+        }
         tui::OpenTarget::Launcher {
             workspace_id,
             launcher_id,
-        } => launch(workspace_id, launcher_id),
+        } => launch(
+            local_dashboard_inner(workspace_id, local_node_id)?,
+            local_dashboard_inner(launcher_id, local_node_id)?,
+        ),
+    }
+}
+
+fn local_dashboard_inner<'a>(
+    identity: &'a protocol::QualifiedIdentity,
+    local_node_id: &str,
+) -> Result<&'a str, String> {
+    if identity.node_id == local_node_id || identity.node_id.is_empty() {
+        Ok(&identity.inner_id)
+    } else {
+        Err(format!(
+            "remote Node {} is read-only in this Boomux version",
+            identity.node_id
+        ))
     }
 }
 
@@ -7192,6 +7463,35 @@ mod tests {
     }
 
     #[test]
+    fn node_snapshot_is_separate_json_command_with_structural_identities() {
+        let cli = Cli::try_parse_from(["boomux", "--json", "node", "snapshot", "work"]).unwrap();
+        assert!(matches!(
+            cli.command.as_ref(),
+            Some(Commands::Node {
+                command: NodeCommands::Snapshot {
+                    selector: Some(selector)
+                }
+            }) if selector == "work"
+        ));
+        assert_eq!(cli.command_descriptor().key, "node.snapshot");
+
+        let qualified = qualify_resource_identities(
+            serde_json::json!({
+                "id": "resource",
+                "workspace_id": "workspace",
+                "external_session_id": "private-host-id"
+            }),
+            "node",
+        );
+        assert_eq!(
+            qualified["id"],
+            serde_json::json!({"node_id": "node", "inner_id": "resource"})
+        );
+        assert_eq!(qualified["workspace_id"]["node_id"], "node");
+        assert_eq!(qualified["external_session_id"], "private-host-id");
+    }
+
+    #[test]
     fn accepts_path_options_and_named_subcommands() {
         let cli = Cli::try_parse_from(["boomux", ".", "--name", "feature", "--new"]).unwrap();
         assert_eq!(cli.name.as_deref(), Some("feature"));
@@ -7983,6 +8283,22 @@ mod tests {
     #[test]
     fn enriches_from_the_newest_available_session_directory() {
         let mut views = vec![tui::WorkspaceView {
+            node: tui::NodeView {
+                id: String::new(),
+                alias: "local".into(),
+                local: true,
+                health: protocol::NodeProjectionHealthCode::Online,
+                current: true,
+                stale: false,
+                observed_at_ms: 0,
+                observed_protocol_version: None,
+                observed_capabilities: Vec::new(),
+                scheduler: protocol::SchedulerHealth {
+                    state: protocol::SchedulerState::Active,
+                    max_concurrent: 4,
+                    active_executions: 0,
+                },
+            },
             id: "w1".into(),
             name: "project".into(),
             default_cwd: None,
@@ -8439,6 +8755,7 @@ mod tests {
                 workspace_id: "w1".into(),
                 launcher_id: "l1".into(),
             },
+            "",
             |_| {
                 shell_calls += 1;
                 Ok("shell".into())
@@ -9341,7 +9658,7 @@ mod tests {
                 .validated_version,
             "0.84.1"
         );
-        assert_eq!(protocol::PROTOCOL_VERSION, 32);
+        assert_eq!(protocol::PROTOCOL_VERSION, 33);
     }
 
     #[test]
@@ -9369,6 +9686,7 @@ mod tests {
                 "node.add",
                 "node.list",
                 "node.inspect",
+                "node.snapshot",
                 "node.rename",
                 "node.retarget",
                 "node.forget",
