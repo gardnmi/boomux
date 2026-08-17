@@ -24,7 +24,7 @@ use boomux::protocol::{
     ShellSpec, ShellStatus, Snapshot, WorkspaceLauncherSnapshot, WorkspaceLauncherSpec,
     WorkspaceSnapshot,
 };
-use boomux::{attach, client, daemon, protocol};
+use boomux::{attach, client, daemon, federation, protocol};
 
 use crate::integration_management::{
     InstallOutcome, ensure_safe_directory, install_asset_at, regular_file_matches,
@@ -474,6 +474,8 @@ enum Commands {
     },
     #[command(name = "__scheduled-runner", hide = true)]
     ScheduledRunner { schedule_id: String },
+    #[command(name = "__federation-stdio", hide = true)]
+    FederationStdio,
 }
 
 #[derive(Subcommand)]
@@ -1250,6 +1252,7 @@ impl Cli {
             Some(Commands::Prompt) => CommandKey::Prompt,
             Some(Commands::Attach { .. }) => CommandKey::Attach,
             Some(Commands::ScheduledRunner { .. }) => CommandKey::Attach,
+            Some(Commands::FederationStdio) => CommandKey::Attach,
         }
     }
 }
@@ -1376,6 +1379,10 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
         Some(Commands::ScheduledRunner { schedule_id }) => {
             return scheduled_runner(schedule_id).map(CliExit::Child);
         }
+        Some(Commands::FederationStdio) => {
+            federation::run_stdio_helper()?;
+            return Ok(CliExit::Success);
+        }
         _ => {}
     }
 
@@ -1467,6 +1474,7 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
         Some(Commands::Daemon { command }) => daemon_control(command, cli.json),
         Some(Commands::Attach { .. }) => unreachable!(),
         Some(Commands::ScheduledRunner { .. }) => unreachable!(),
+        Some(Commands::FederationStdio) => unreachable!(),
         None => dashboard(cli.terminal.as_deref()),
     };
     result?;
@@ -8969,7 +8977,7 @@ mod tests {
                 .validated_version,
             "0.84.1"
         );
-        assert_eq!(protocol::PROTOCOL_VERSION, 28);
+        assert_eq!(protocol::PROTOCOL_VERSION, 29);
     }
 
     #[test]

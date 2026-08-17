@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 28;
+pub const PROTOCOL_VERSION: u32 = 29;
 pub const MIN_PROTOCOL_VERSION: u32 = 6;
 pub const MAX_CONTROL_FRAME: usize = 8 * 1024 * 1024;
 pub const MAX_ATTACH_FRAME: usize = 1024 * 1024;
@@ -112,6 +112,10 @@ define_protocol_features! {
     NodeIdentity => (28, "Node identity", [
         "protocol_28",
         "stable_node_identity",
+    ]),
+    FederationChannel => (29, "federation daemon channel", [
+        "protocol_29",
+        "federation_daemon_channel",
     ]),
 }
 
@@ -927,6 +931,7 @@ impl ShellSpec {
 pub enum Request {
     Ping,
     GetNodeIdentity,
+    OpenFederationChannel,
     Restart,
     RestartWithNotificationConfig {
         notifications: NotificationDeliveryConfig,
@@ -1114,6 +1119,7 @@ impl Request {
     pub fn required_feature(&self) -> Option<ProtocolFeature> {
         match self {
             Self::GetNodeIdentity => Some(ProtocolFeature::NodeIdentity),
+            Self::OpenFederationChannel => Some(ProtocolFeature::FederationChannel),
             Self::WaitScheduledExecution { .. } => {
                 Some(ProtocolFeature::ScheduledExecutionObservation)
             }
@@ -1215,6 +1221,9 @@ impl Request {
 pub enum Response {
     Pong,
     NodeIdentity {
+        node_id: String,
+    },
+    FederationChannel {
         node_id: String,
     },
     Snapshot {
@@ -1797,8 +1806,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_twenty_eight_with_minimum_six() {
-        assert_eq!(PROTOCOL_VERSION, 28);
+    fn protocol_version_is_twenty_nine_with_minimum_six() {
+        assert_eq!(PROTOCOL_VERSION, 29);
         assert_eq!(MIN_PROTOCOL_VERSION, 6);
     }
 
@@ -1816,6 +1825,18 @@ mod tests {
         };
         let encoded = serde_json::to_value(&response).unwrap();
         assert_eq!(encoded["response"], "node_identity");
+        assert_eq!(
+            serde_json::from_value::<Response>(encoded).unwrap(),
+            response
+        );
+
+        let request = serde_json::to_value(Request::OpenFederationChannel).unwrap();
+        assert_eq!(request["request"], "open_federation_channel");
+        let response = Response::FederationChannel {
+            node_id: "550e8400-e29b-41d4-a716-446655440000".into(),
+        };
+        let encoded = serde_json::to_value(&response).unwrap();
+        assert_eq!(encoded["response"], "federation_channel");
         assert_eq!(
             serde_json::from_value::<Response>(encoded).unwrap(),
             response
@@ -2144,6 +2165,7 @@ mod tests {
     #[test]
     fn request_feature_requirements_cover_all_groups() {
         let groups = vec![
+            (29, vec![Request::OpenFederationChannel]),
             (28, vec![Request::GetNodeIdentity]),
             (
                 25,
@@ -2531,6 +2553,7 @@ mod tests {
             (26, &["protocol_26", "exact_run_attachment"][..]),
             (27, &["protocol_27", "agent_schedule_editing"][..]),
             (28, &["protocol_28", "stable_node_identity"][..]),
+            (29, &["protocol_29", "federation_daemon_channel"][..]),
         ];
 
         let actual = ProtocolFeature::ALL

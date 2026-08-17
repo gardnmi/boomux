@@ -3,6 +3,7 @@ pub mod client;
 pub mod daemon;
 mod desktop_notifications;
 mod fd_transfer;
+pub mod federation;
 mod handoff;
 pub mod integrations;
 mod node_identity;

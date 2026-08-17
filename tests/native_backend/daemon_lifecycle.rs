@@ -46,7 +46,7 @@ fn native_daemon_lifecycle() {
     let capabilities: serde_json::Value = serde_json::from_slice(&capabilities.stdout).unwrap();
     assert_eq!(capabilities["schema"], "boomux.cli/v1");
     assert_eq!(capabilities["command"], "capabilities");
-    assert_eq!(capabilities["data"]["daemon_protocol_version"], 28);
+    assert_eq!(capabilities["data"]["daemon_protocol_version"], 29);
     assert!(
         capabilities["data"]
             .get("session_transcript_integrations")
@@ -117,6 +117,7 @@ fn native_daemon_lifecycle() {
         "protocol_26",
         "protocol_27",
         "protocol_28",
+        "protocol_29",
         "exact_run_attachment",
         "stable_node_identity",
         "revision_aware_scheduled_execution_wait",
@@ -151,7 +152,7 @@ fn native_daemon_lifecycle() {
         .unwrap();
     assert!(status.status.success());
     let status_text = String::from_utf8_lossy(&status.stdout);
-    assert!(status_text.contains("running (protocol 28"));
+    assert!(status_text.contains("running (protocol 29"));
     assert!(status_text.contains("scheduler active (0/4 active executions)"));
     let status = daemon
         .command()
@@ -861,6 +862,98 @@ fn malformed_node_identity_disables_federation_without_blocking_local_daemon() {
     assert_eq!(
         fs::read(daemon.runtime_dir.join("state/boomux/node.json")).unwrap(),
         b"not-json"
+    );
+}
+
+#[test]
+fn federation_helper_binds_handshake_and_inner_request_to_one_daemon_socket() {
+    let daemon = TestDaemon::start();
+    let node_id = daemon.client.node_identity().unwrap();
+
+    let mut stream = UnixStream::connect(daemon.client.socket_path()).unwrap();
+    protocol::write_message(
+        &mut stream,
+        &protocol::Envelope::with_version(29, protocol::Request::OpenFederationChannel),
+    )
+    .unwrap();
+    let response: protocol::Envelope<protocol::Response> =
+        protocol::read_message(&mut stream).unwrap();
+    assert_eq!(
+        response,
+        protocol::Envelope::with_version(
+            29,
+            protocol::Response::FederationChannel {
+                node_id: node_id.clone(),
+            },
+        )
+    );
+    protocol::write_message(
+        &mut stream,
+        &protocol::Envelope::with_version(29, protocol::Request::Ping),
+    )
+    .unwrap();
+    let response: protocol::Envelope<protocol::Response> =
+        protocol::read_message(&mut stream).unwrap();
+    assert_eq!(
+        response,
+        protocol::Envelope::with_version(29, protocol::Response::Pong)
+    );
+
+    let mut child = daemon
+        .command()
+        .arg("__federation-stdio")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let handshake = boomux::federation::read_handshake(&mut stdout).unwrap();
+    assert_eq!(handshake.version, boomux::federation::FEDERATION_VERSION);
+    assert_eq!(handshake.node_id, node_id);
+    assert_eq!(handshake.core_protocol_version, 29);
+    assert_eq!(
+        handshake.connection_mode,
+        boomux::federation::FederationConnectionMode::AdHoc
+    );
+
+    protocol::write_message(
+        &mut stdin,
+        &protocol::Envelope::with_version(29, protocol::Request::Ping),
+    )
+    .unwrap();
+    drop(stdin);
+    let response: protocol::Envelope<protocol::Response> =
+        protocol::read_message(&mut stdout).unwrap();
+    assert_eq!(
+        response,
+        protocol::Envelope::with_version(29, protocol::Response::Pong)
+    );
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "federation helper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn federation_helper_emits_no_handshake_for_a_mismatched_state_root() {
+    let daemon = TestDaemon::start();
+    let mismatched_state = daemon.runtime_dir.join("mismatched-state");
+    let output = daemon
+        .command()
+        .arg("__federation-stdio")
+        .env("XDG_STATE_HOME", &mismatched_state)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("daemon Node identity does not match the helper state root")
     );
 }
 

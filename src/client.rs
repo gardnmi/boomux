@@ -159,6 +159,13 @@ pub struct Attachment {
 }
 
 #[derive(Debug)]
+pub struct FederationChannel {
+    pub stream: UnixStream,
+    pub protocol_version: u32,
+    pub node_id: String,
+}
+
+#[derive(Debug)]
 pub struct OutputState {
     pub bytes: Vec<u8>,
     pub run_id: Option<String>,
@@ -531,6 +538,18 @@ impl Client {
     pub fn node_identity(&self) -> Result<String> {
         match self.request(Request::GetNodeIdentity)? {
             Response::NodeIdentity { node_id } => Ok(node_id),
+            response => unexpected(response),
+        }
+    }
+
+    pub fn open_federation_channel(&self) -> Result<FederationChannel> {
+        let (stream, protocol_version, response) = self.send(Request::OpenFederationChannel)?;
+        match response {
+            Response::FederationChannel { node_id } => Ok(FederationChannel {
+                stream,
+                protocol_version,
+                node_id,
+            }),
             response => unexpected(response),
         }
     }
@@ -1750,6 +1769,7 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
+            reject_protocol(&listener, 29, 28);
             reject_protocol(&listener, 28, 27);
             reject_protocol(&listener, 27, 26);
             reject_protocol(&listener, 26, 25);
@@ -1899,7 +1919,7 @@ mod tests {
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
-            assert_eq!(request.version, 28);
+            assert_eq!(request.version, 29);
             assert_eq!(request.message, Request::GetNodeIdentity);
             protocol::write_message(
                 &mut stream,
@@ -1912,6 +1932,8 @@ mod tests {
                 ),
             )
             .unwrap();
+
+            reject_protocol(&listener, 29, 27);
 
             let (mut stream, _) = listener.accept().unwrap();
             let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
@@ -1940,6 +1962,47 @@ mod tests {
         let client = Client::from_socket_path(socket);
         assert!(matches!(
             client.node_identity(),
+            Err(ClientError::Protocol(ProtocolError::UnsupportedVersion(_)))
+        ));
+        server.join().unwrap();
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn federation_channel_requires_protocol_twenty_nine() {
+        let directory = env::temp_dir().join(format!("boomux-client-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let socket = directory.join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+            assert_eq!(request.version, 29);
+            assert_eq!(request.message, Request::OpenFederationChannel);
+            protocol::write_message(
+                &mut stream,
+                &Envelope::with_version(
+                    28,
+                    Response::Error {
+                        message: "federation channel requires protocol 29".into(),
+                        code: Some(ErrorCode::UnsupportedVersion),
+                    },
+                ),
+            )
+            .unwrap();
+
+            reject_protocol(&listener, 29, 28);
+            let (mut stream, _) = listener.accept().unwrap();
+            let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+            assert_eq!(request.version, 28);
+            assert_eq!(request.message, Request::Ping);
+            protocol::write_message(&mut stream, &Envelope::with_version(28, Response::Pong))
+                .unwrap();
+        });
+
+        let client = Client::from_socket_path(socket);
+        assert!(matches!(
+            client.open_federation_channel(),
             Err(ClientError::Protocol(ProtocolError::UnsupportedVersion(_)))
         ));
         server.join().unwrap();
@@ -2100,6 +2163,7 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
+            reject_protocol(&listener, 29, 28);
             reject_protocol(&listener, 28, 27);
             reject_protocol(&listener, 27, 26);
             reject_protocol(&listener, 26, 25);
@@ -2164,6 +2228,7 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
+            reject_protocol(&listener, 29, 28);
             reject_protocol(&listener, 28, 27);
             reject_protocol(&listener, 27, 26);
             reject_protocol(&listener, 26, 25);
