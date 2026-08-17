@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 30;
+pub const PROTOCOL_VERSION: u32 = 31;
 pub const MIN_PROTOCOL_VERSION: u32 = 6;
 pub const MAX_CONTROL_FRAME: usize = 8 * 1024 * 1024;
 pub const MAX_ATTACH_FRAME: usize = 1024 * 1024;
@@ -118,6 +118,11 @@ define_protocol_features! {
         "federation_daemon_channel",
     ]),
     NodeRekey => (30, "Node rekey", ["protocol_30", "node_rekey"]),
+    NodeRegistration => (31, "Node registration management", [
+        "protocol_31",
+        "node_registration_management",
+        "pinned_node_identity",
+    ]),
 }
 
 pub const DEFAULT_SCHEDULED_EXECUTION_LIST_LIMIT: u16 = 100;
@@ -229,6 +234,15 @@ pub struct FocusedTerminalSnapshot {
     pub workspace_id: String,
     pub shell_id: String,
     pub run_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeRegistrationSnapshot {
+    pub alias: String,
+    pub target: String,
+    pub node_id: String,
+    pub revision: u64,
+    pub tombstone_epoch: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -680,6 +694,9 @@ pub enum ErrorCode {
     RevisionAhead,
     IdempotencyExpired,
     NodeIdentityUnavailable,
+    NodeRegistrationUnavailable,
+    NodeIdentityChanged,
+    RevisionChanged,
     Internal,
     #[serde(other)]
     Unknown,
@@ -936,6 +953,29 @@ pub enum Request {
     RekeyNode {
         expected_node_id: String,
     },
+    AddNodeRegistration {
+        alias: String,
+        target: String,
+        node_id: String,
+    },
+    ListNodeRegistrations,
+    GetNodeRegistration {
+        selector: String,
+    },
+    RenameNodeRegistration {
+        selector: String,
+        alias: String,
+        expected_revision: u64,
+    },
+    RetargetNodeRegistration {
+        selector: String,
+        target: String,
+        node_id: String,
+        expected_revision: u64,
+    },
+    ForgetNodeRegistration {
+        selector: String,
+    },
     Restart,
     RestartWithNotificationConfig {
         notifications: NotificationDeliveryConfig,
@@ -1125,6 +1165,12 @@ impl Request {
             Self::GetNodeIdentity => Some(ProtocolFeature::NodeIdentity),
             Self::OpenFederationChannel => Some(ProtocolFeature::FederationChannel),
             Self::RekeyNode { .. } => Some(ProtocolFeature::NodeRekey),
+            Self::AddNodeRegistration { .. }
+            | Self::ListNodeRegistrations
+            | Self::GetNodeRegistration { .. }
+            | Self::RenameNodeRegistration { .. }
+            | Self::RetargetNodeRegistration { .. }
+            | Self::ForgetNodeRegistration { .. } => Some(ProtocolFeature::NodeRegistration),
             Self::WaitScheduledExecution { .. } => {
                 Some(ProtocolFeature::ScheduledExecutionObservation)
             }
@@ -1230,6 +1276,12 @@ pub enum Response {
     },
     FederationChannel {
         node_id: String,
+    },
+    NodeRegistration {
+        registration: NodeRegistrationSnapshot,
+    },
+    NodeRegistrations {
+        registrations: Vec<NodeRegistrationSnapshot>,
     },
     Snapshot {
         snapshot: Snapshot,
@@ -1811,8 +1863,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_thirty_with_minimum_six() {
-        assert_eq!(PROTOCOL_VERSION, 30);
+    fn protocol_version_is_thirty_one_with_minimum_six() {
+        assert_eq!(PROTOCOL_VERSION, 31);
         assert_eq!(MIN_PROTOCOL_VERSION, 6);
     }
 
@@ -1853,6 +1905,63 @@ mod tests {
         let encoded = serde_json::to_value(&request).unwrap();
         assert_eq!(encoded["request"], "rekey_node");
         assert_eq!(serde_json::from_value::<Request>(encoded).unwrap(), request);
+    }
+
+    #[test]
+    fn node_registration_messages_round_trip() {
+        let registration = NodeRegistrationSnapshot {
+            alias: "work".into(),
+            target: "user@work.example".into(),
+            node_id: "550e8400-e29b-41d4-a716-446655440000".into(),
+            revision: 3,
+            tombstone_epoch: 1,
+        };
+        for request in [
+            Request::AddNodeRegistration {
+                alias: registration.alias.clone(),
+                target: registration.target.clone(),
+                node_id: registration.node_id.clone(),
+            },
+            Request::ListNodeRegistrations,
+            Request::GetNodeRegistration {
+                selector: registration.alias.clone(),
+            },
+            Request::RenameNodeRegistration {
+                selector: registration.alias.clone(),
+                alias: "office".into(),
+                expected_revision: 3,
+            },
+            Request::RetargetNodeRegistration {
+                selector: registration.alias.clone(),
+                target: "new.example".into(),
+                node_id: registration.node_id.clone(),
+                expected_revision: 3,
+            },
+            Request::ForgetNodeRegistration {
+                selector: registration.alias.clone(),
+            },
+        ] {
+            let encoded = serde_json::to_value(&request).unwrap();
+            assert_eq!(serde_json::from_value::<Request>(encoded).unwrap(), request);
+            assert_eq!(
+                request.required_feature(),
+                Some(ProtocolFeature::NodeRegistration)
+            );
+        }
+        for response in [
+            Response::NodeRegistration {
+                registration: registration.clone(),
+            },
+            Response::NodeRegistrations {
+                registrations: vec![registration.clone()],
+            },
+        ] {
+            let encoded = serde_json::to_value(&response).unwrap();
+            assert_eq!(
+                serde_json::from_value::<Response>(encoded).unwrap(),
+                response
+            );
+        }
     }
 
     #[test]
@@ -2177,6 +2286,34 @@ mod tests {
     #[test]
     fn request_feature_requirements_cover_all_groups() {
         let groups = vec![
+            (
+                31,
+                vec![
+                    Request::AddNodeRegistration {
+                        alias: "work".into(),
+                        target: "work.example".into(),
+                        node_id: "550e8400-e29b-41d4-a716-446655440000".into(),
+                    },
+                    Request::ListNodeRegistrations,
+                    Request::GetNodeRegistration {
+                        selector: "work".into(),
+                    },
+                    Request::RenameNodeRegistration {
+                        selector: "work".into(),
+                        alias: "office".into(),
+                        expected_revision: 1,
+                    },
+                    Request::RetargetNodeRegistration {
+                        selector: "work".into(),
+                        target: "new.example".into(),
+                        node_id: "550e8400-e29b-41d4-a716-446655440000".into(),
+                        expected_revision: 1,
+                    },
+                    Request::ForgetNodeRegistration {
+                        selector: "work".into(),
+                    },
+                ],
+            ),
             (
                 30,
                 vec![Request::RekeyNode {
@@ -2573,6 +2710,14 @@ mod tests {
             (28, &["protocol_28", "stable_node_identity"][..]),
             (29, &["protocol_29", "federation_daemon_channel"][..]),
             (30, &["protocol_30", "node_rekey"][..]),
+            (
+                31,
+                &[
+                    "protocol_31",
+                    "node_registration_management",
+                    "pinned_node_identity",
+                ][..],
+            ),
         ];
 
         let actual = ProtocolFeature::ALL

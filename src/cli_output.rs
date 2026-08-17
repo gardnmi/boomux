@@ -679,6 +679,9 @@ fn protocol_error_code(code: ErrorCode) -> &'static str {
         ErrorCode::RevisionAhead => "revision_ahead",
         ErrorCode::IdempotencyExpired => "idempotency_expired",
         ErrorCode::NodeIdentityUnavailable => "node_identity_unavailable",
+        ErrorCode::NodeRegistrationUnavailable => "node_registration_unavailable",
+        ErrorCode::NodeIdentityChanged => "node_identity_changed",
+        ErrorCode::RevisionChanged => "revision_changed",
         ErrorCode::Internal => "internal",
         ErrorCode::Unknown => "unknown",
     }

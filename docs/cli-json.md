@@ -43,17 +43,17 @@ delivery diagnostic and does not support `--json`.
 
 ### Accepted Remote Node Compatibility
 
-Remote Node federation is an accepted, unimplemented extension tracked by #173.
-No current `boomux.cli/v1` command implies remote behavior. When the capability
-ships, it must be advertised explicitly by `capabilities`; clients must not infer
-support from a CLI or daemon version string.
+Remote Node federation is an incremental extension tracked by #173. Protocol 31
+advertises registration management explicitly; clients must not infer support
+from a CLI or daemon version string. Registration commands manage local routes
+only and do not imply projected reads or routed resource mutation.
 
 That passive command advertises only what the installed local CLI can speak and
-never reports negotiated state for a registered Node. Future `node.list`,
-`node.inspect`, and combined projection data carry each Node's observed protocol,
-capabilities, health, and observation time after contacting only the local
-daemon. Integrations must keep static CLI support distinct from per-Node runtime
-support.
+never reports negotiated state for a registered Node. Implemented `node.list`
+and `node.inspect` return registration data only. Future combined projection data
+will carry each Node's observed protocol, capabilities, health, and observation
+time after contacting only the local daemon. Integrations must keep static CLI
+support, registration data, and per-Node runtime support distinct.
 
 Existing unqualified commands and JSON methods retain local-Node meaning and
 local-only result sets. Older clients continue to receive only local resources.
@@ -90,6 +90,12 @@ The following commands support `--json`:
 - `boomux project list`
 - `boomux workspace list`
 - `boomux workspace inspect`
+- `boomux node add`
+- `boomux node list`
+- `boomux node inspect`
+- `boomux node rename`
+- `boomux node retarget`
+- `boomux node forget`
 - `boomux shell suggest-name <workspace-name-or-id>`
 - `boomux shell inspect`
 - `boomux launcher list`
@@ -125,7 +131,8 @@ The following commands support `--json`:
 - `boomux integration verify <opencode|pi>`
 - `boomux daemon status`
 
-JSON mutations are deliberately narrow. Agent register, ensure, and report;
+JSON mutations are deliberately narrow. Node registration add, rename, retarget,
+and forget; Agent register, ensure, and report;
 attention acknowledgment; schedule create, pause, resume, remove, and run;
 execution open and cancellation; and
 integration install and uninstall support the contract. Other mutation commands
@@ -153,6 +160,11 @@ Command payloads are:
 - `workspace.inspect`: one `workspace` object containing `id`, `name`, nullable
   `default_cwd`, and prompt-free `shells`, `launchers`, `schedules`, and `agents`
   arrays.
+- `node.list`: an alias-then-Node-ID ordered array of registration objects.
+- `node.add`, `node.inspect`, `node.rename`, `node.retarget`, and `node.forget`:
+  one registration object with `alias`, exact `target`, pinned `node_id`,
+  `revision`, and `tombstone_epoch`. Add and retarget verify the SSH route before
+  the local mutation; forget performs no SSH operation.
 - `shell.suggest-name`: exact resolved `workspace_id` plus a nonempty generated
   `name` that does not match any shell name in that workspace at observation
   time.
