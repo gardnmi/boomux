@@ -60,6 +60,13 @@ revision, observation revision, or dispatch key required by the operation.
 Stale Nodes and Nodes without the capability remain non-actionable. Existing
 unqualified CLI methods preserve local-only semantics.
 
+Protocol 35 advertises `remote_pty_attachment` and
+`owner_environment_attachment`. `boomux open SHELL --node SELECTOR` is a
+human-facing local presentation command: the selector resolves to an exact
+registered Node, the title includes its alias, and the hidden attachment carries
+the exact qualified identity. It does not add a JSON method or change legacy
+unqualified `open` semantics.
+
 That passive command advertises only what the installed local CLI can speak and
 never reports negotiated state for a registered Node. Implemented `node.list`
 and `node.inspect` return registration data only. Future combined projection data
@@ -306,6 +313,8 @@ Protocol 32 adds `protocol_32`, `node_projection_sync`, and
 `combined_node_snapshot`, and `node_qualified_dashboard`.
 Protocol 34 adds `protocol_34`, `typed_exact_node_routing`, and
 `guarded_remote_management`.
+Protocol 35 adds `protocol_35`, `remote_pty_attachment`, and
+`owner_environment_attachment`.
 
 Node snapshot health is `unobserved`, `online`, `reconnecting`, `stale`,
 `unreachable`, `authentication_required`, `identity_changed`,

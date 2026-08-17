@@ -71,8 +71,8 @@ ordinary cold recovery does not restore it.
 
 ## Accepted Remote Node Boundary
 
-Remote Node federation is not yet implemented. Under its accepted contract, a
-remote PTY descriptor, process handle, runtime, and reconstruction state remain
+Protocol 35 implements the accepted remote attachment boundary. A remote PTY
+descriptor, process handle, runtime, and reconstruction state remain
 owned by the remote daemon and never enter a local handoff manifest. Remote
 daemon replacement uses this existing descriptor-transfer protocol on the
 remote machine, and its attachment reconnect frames pass unchanged through the

@@ -840,6 +840,7 @@ fn attach_with_environment(
                 expected_run_id: None,
                 profile: profile(),
                 environment: Some(environment),
+                owner_environment: false,
             },
         ),
     )
@@ -861,4 +862,45 @@ fn attach_with_environment(
         },
         response => panic!("unexpected attach response: {response:?}"),
     }
+}
+
+#[test]
+fn owner_environment_attach_rejects_an_arbitrary_unix_environment() {
+    let daemon = TestDaemon::start();
+    let workspace = daemon
+        .client
+        .create_workspace("owner-environment-exclusive", Vec::new())
+        .unwrap();
+    let shell = daemon
+        .client
+        .create_shell(&workspace.id, ShellSpec::login("exclusive", "/tmp"))
+        .unwrap();
+    let mut stream = UnixStream::connect(daemon.client.socket_path()).unwrap();
+    protocol::write_message(
+        &mut stream,
+        &protocol::Envelope::with_version(
+            protocol::PROTOCOL_VERSION,
+            protocol::Request::Attach {
+                shell_id: shell.id,
+                takeover: false,
+                restart_exited: false,
+                expected_run_id: None,
+                profile: profile(),
+                environment: Some(UnixEnvironment {
+                    variables: Vec::new(),
+                }),
+                owner_environment: true,
+            },
+        ),
+    )
+    .unwrap();
+    let response: protocol::Envelope<protocol::Response> =
+        protocol::read_message(&mut stream).unwrap();
+    assert!(matches!(
+        response.message,
+        protocol::Response::Error {
+            code: Some(ErrorCode::InvalidArgument),
+            ..
+        }
+    ));
 }

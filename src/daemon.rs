@@ -723,6 +723,7 @@ fn launch_replacement(
     registry.notify_output_waiters();
     let mut paused = Vec::new();
     let result = (|| {
+        registry.remote_attachments.quiesce()?;
         let shells = registry.durable.shells()?;
         let prepared = registry.runtimes.prepare_handoff(shells)?;
         paused = prepared.paused;
@@ -1052,6 +1053,25 @@ fn handle_connection_inner(
         return send_response(&mut stream, response_version, response);
     }
 
+    if let Request::AttachNode {
+        identity,
+        takeover,
+        restart_exited,
+        expected_run_id,
+        profile,
+    } = request.message
+    {
+        return registry.handle_remote_attach(
+            stream,
+            response_version,
+            identity,
+            takeover,
+            restart_exited,
+            expected_run_id,
+            profile,
+        );
+    }
+
     if let Request::Attach {
         shell_id,
         takeover,
@@ -1059,6 +1079,7 @@ fn handle_connection_inner(
         expected_run_id,
         profile,
         environment,
+        owner_environment,
     } = request.message
     {
         return registry.runtimes.handle_attach(
@@ -1072,6 +1093,7 @@ fn handle_connection_inner(
                 expected_run_id,
                 profile,
                 environment,
+                owner_environment,
             },
         );
     }
@@ -1909,6 +1931,7 @@ struct DaemonService {
     durable: DurableRegistry,
     events: EventStream,
     runtimes: ShellRuntimeManager,
+    remote_attachments: RemoteAttachmentManager,
     mutation_lock: Mutex<()>,
     schedule_dispatch_lock: Mutex<()>,
     notification_settings: NotificationDeliverySettings,
@@ -1920,6 +1943,74 @@ struct DaemonService {
     clock: Mutex<Arc<dyn SchedulerClock>>,
     #[cfg(test)]
     fail_after_mutation: AtomicBool,
+}
+
+#[derive(Default)]
+struct RemoteAttachmentManager {
+    controllers: Mutex<HashMap<String, RemoteAttachmentController>>,
+}
+
+struct RemoteAttachmentController {
+    connection: Arc<Mutex<UnixStream>>,
+    reconnect_ack: Option<SyncSender<()>>,
+}
+
+impl RemoteAttachmentManager {
+    fn insert(&self, token: String, connection: UnixStream) -> io::Result<()> {
+        lock(&self.controllers)?.insert(
+            token,
+            RemoteAttachmentController {
+                connection: Arc::new(Mutex::new(connection)),
+                reconnect_ack: None,
+            },
+        );
+        Ok(())
+    }
+
+    fn connection(&self, token: &str) -> io::Result<Option<Arc<Mutex<UnixStream>>>> {
+        Ok(lock(&self.controllers)?
+            .get(token)
+            .map(|controller| Arc::clone(&controller.connection)))
+    }
+
+    fn acknowledge(&self, token: &str) -> io::Result<bool> {
+        let acknowledge = lock(&self.controllers)?
+            .get_mut(token)
+            .and_then(|controller| controller.reconnect_ack.take());
+        if let Some(acknowledge) = acknowledge {
+            let _ = acknowledge.send(());
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn remove(&self, token: &str) {
+        if let Ok(mut controllers) = self.controllers.lock() {
+            controllers.remove(token);
+        }
+    }
+
+    fn quiesce(&self) -> io::Result<()> {
+        let mut acknowledgements = Vec::new();
+        {
+            let mut controllers = lock(&self.controllers)?;
+            for controller in controllers.values_mut() {
+                let (acknowledge, acknowledged) = mpsc::sync_channel(1);
+                controller.reconnect_ack = Some(acknowledge);
+                AttachFrame::Reconnect.write_to(&mut *lock(&controller.connection)?)?;
+                acknowledgements.push(acknowledged);
+            }
+        }
+        for acknowledged in acknowledgements {
+            acknowledged.recv_timeout(HANDSHAKE_TIMEOUT).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "remote attachment did not acknowledge local reconnect",
+                )
+            })?;
+        }
+        Ok(())
+    }
 }
 
 trait SchedulerClock: Send + Sync {
@@ -5606,6 +5697,7 @@ impl Default for DaemonService {
                 focus: Mutex::new(FocusState::default()),
                 stopping: AtomicBool::new(false),
             },
+            remote_attachments: RemoteAttachmentManager::default(),
             mutation_lock: Mutex::new(()),
             schedule_dispatch_lock: Mutex::new(()),
             notification_settings: NotificationDeliverySettings::default(),
@@ -6722,6 +6814,252 @@ impl DaemonService {
                 "Boomux Node projection cache is unavailable",
             )
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn handle_remote_attach(
+        &self,
+        mut stream: UnixStream,
+        response_version: u32,
+        identity: protocol::QualifiedIdentity,
+        takeover: bool,
+        restart_exited: bool,
+        expected_run_id: Option<String>,
+        profile: TerminalProfile,
+    ) -> io::Result<()> {
+        if identity.node_id.is_empty() || identity.inner_id.is_empty() {
+            return send_response(
+                &mut stream,
+                response_version,
+                DaemonError::validation("remote attachment requires an exact qualified identity")
+                    .into_response(),
+            );
+        }
+        if self
+            .node_identity()
+            .and_then(|node| node.id().map_err(DaemonError::from))
+            .is_ok_and(|node_id| node_id == identity.node_id)
+        {
+            return send_response(
+                &mut stream,
+                response_version,
+                DaemonError::validation("local shells must use the local attachment request")
+                    .into_response(),
+            );
+        }
+        if let Err(error) = validate_terminal_profile(&profile) {
+            return send_daemon_error(&mut stream, response_version, error.into());
+        }
+        let registrations = match self.node_registrations() {
+            Ok(registrations) => registrations,
+            Err(error) => {
+                return send_response(&mut stream, response_version, error.into_response());
+            }
+        };
+        let registration = match registrations.inspect(&identity.node_id) {
+            Ok(registration) if registration.node_id == identity.node_id => registration,
+            Ok(_) => {
+                return send_response(
+                    &mut stream,
+                    response_version,
+                    error_response(ErrorCode::NotFound, "exact Node registration not found"),
+                );
+            }
+            Err(error) => {
+                return send_response(
+                    &mut stream,
+                    response_version,
+                    node_registration_error(error).into_response(),
+                );
+            }
+        };
+        if !registrations.admit(&registration).unwrap_or(false) {
+            return send_response(
+                &mut stream,
+                response_version,
+                error_response(
+                    ErrorCode::RevisionChanged,
+                    "Node registration changed before attachment",
+                ),
+            );
+        }
+        let result = self.bridge_remote_attach(
+            &mut stream,
+            response_version,
+            &registration,
+            &identity.inner_id,
+            takeover,
+            restart_exited,
+            expected_run_id,
+            profile,
+        );
+        registrations.release(&registration);
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn bridge_remote_attach(
+        &self,
+        stream: &mut UnixStream,
+        response_version: u32,
+        registration: &crate::protocol::NodeRegistrationSnapshot,
+        shell_id: &str,
+        takeover: bool,
+        restart_exited: bool,
+        expected_run_id: Option<String>,
+        profile: TerminalProfile,
+    ) -> io::Result<()> {
+        let target = SshTarget::parse(registration.target.clone())?;
+        let helper = match ssh_bootstrap::plan_remote_bootstrap(
+            target.clone(),
+            SshAuthenticationMode::Batch,
+            HANDSHAKE_TIMEOUT,
+        )? {
+            RemoteBootstrapPlan::Ready(helper) => helper,
+            RemoteBootstrapPlan::Install(_) => {
+                return send_response(
+                    stream,
+                    response_version,
+                    error_response(
+                        ErrorCode::UnsupportedVersion,
+                        "remote helper requires installation",
+                    ),
+                );
+            }
+        };
+        if helper.handshake.node_id != registration.node_id {
+            return send_response(
+                stream,
+                response_version,
+                error_response(
+                    ErrorCode::NodeIdentityChanged,
+                    "remote Node identity changed",
+                ),
+            );
+        }
+        let remote_version = helper.handshake.core_protocol_version;
+        let owner_environment =
+            protocol::ProtocolFeature::RemotePtyAttachment.is_supported_by(remote_version);
+        if !owner_environment {
+            let shell = match send_registered_node_request(
+                registration,
+                Request::GetShell {
+                    shell_id: shell_id.to_owned(),
+                },
+            ) {
+                Ok(Response::Shell { shell }) => shell,
+                Ok(Response::Error { message, code }) => {
+                    return send_response(
+                        stream,
+                        response_version,
+                        Response::Error { message, code },
+                    );
+                }
+                Ok(_) => {
+                    return send_response(
+                        stream,
+                        response_version,
+                        error_response(ErrorCode::Internal, "remote shell preflight was invalid"),
+                    );
+                }
+                Err(error) => {
+                    return send_response(
+                        stream,
+                        response_version,
+                        error_response(ErrorCode::Timeout, error.to_string()),
+                    );
+                }
+            };
+            if shell.status != ShellStatus::Running {
+                return send_response(
+                    stream,
+                    response_version,
+                    error_response(
+                        ErrorCode::UnsupportedVersion,
+                        "remote pending or exited shell requires owner-environment attachment support",
+                    ),
+                );
+            }
+        }
+        let remote = ssh_bootstrap::connect_remote(
+            target,
+            helper,
+            SshAuthenticationMode::Batch,
+            HANDSHAKE_TIMEOUT,
+        )?;
+        let request = Request::Attach {
+            shell_id: shell_id.to_owned(),
+            takeover,
+            restart_exited: restart_exited && owner_environment,
+            expected_run_id,
+            profile,
+            environment: None,
+            owner_environment,
+        };
+        let (response, mut remote_reader, mut remote_writer) =
+            remote.open_attachment(request, HANDSHAKE_TIMEOUT)?;
+        let token = match &response {
+            Response::Attached { token, .. } => token.clone(),
+            _ => return send_response(stream, response_version, response),
+        };
+        send_response(stream, response_version, response)?;
+        let connection = stream.try_clone()?;
+        connection.set_write_timeout(Some(RESPONSE_WRITE_TIMEOUT))?;
+        self.remote_attachments.insert(token.clone(), connection)?;
+        let output_connection = self
+            .remote_attachments
+            .connection(&token)?
+            .ok_or_else(|| io::Error::other("remote attachment registration disappeared"))?;
+        let (reconnect_finished, reconnect_wait) = mpsc::sync_channel(1);
+        let output = thread::Builder::new()
+            .name(format!("boomux-remote-attachment-{shell_id}"))
+            .spawn(move || -> io::Result<()> {
+                let mut reconnect = false;
+                while let Ok(frame) = remote_reader.read_frame() {
+                    frame.write_to(&mut *lock(&output_connection)?)?;
+                    if matches!(frame, AttachFrame::Reconnect) {
+                        reconnect = true;
+                        let _ = reconnect_wait.recv_timeout(HANDSHAKE_TIMEOUT);
+                        break;
+                    }
+                    if matches!(frame, AttachFrame::Detached) {
+                        break;
+                    }
+                }
+                if !reconnect {
+                    let _ = lock(&output_connection)?.shutdown(std::net::Shutdown::Both);
+                }
+                Ok(())
+            })?;
+        let input_result = loop {
+            let frame = match AttachFrame::read_from(stream) {
+                Ok(frame) => frame,
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break Ok(()),
+                Err(error) => break Err(error),
+            };
+            if matches!(frame, AttachFrame::ReconnectAck)
+                && self.remote_attachments.acknowledge(&token)?
+            {
+                let _ = reconnect_finished.try_send(());
+                break Ok(());
+            }
+            let closes = matches!(frame, AttachFrame::Detached | AttachFrame::ReconnectAck);
+            remote_writer.write_frame(&frame, RESPONSE_WRITE_TIMEOUT)?;
+            if closes {
+                if matches!(frame, AttachFrame::ReconnectAck) {
+                    let _ = reconnect_finished.try_send(());
+                }
+                break Ok(());
+            }
+        };
+        drop(remote_writer);
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+        let output_result = output
+            .join()
+            .map_err(|_| io::Error::other("remote attachment output thread panicked"))?;
+        self.remote_attachments.remove(&token);
+        input_result?;
+        output_result
     }
 
     fn route_node_operation(&self, node_id: &str, operation: RoutedOperation) -> Response {
@@ -8896,7 +9234,9 @@ impl DaemonService {
                     }],
                 ))
             }),
-            Request::Attach { .. } => unreachable!("attach is handled before dispatch"),
+            Request::Attach { .. } | Request::AttachNode { .. } => {
+                unreachable!("attach is handled before dispatch")
+            }
         }
     }
 
@@ -9243,6 +9583,7 @@ impl DaemonService {
                 focus: Mutex::new(FocusState::default()),
                 stopping: AtomicBool::new(false),
             },
+            remote_attachments: RemoteAttachmentManager::default(),
             mutation_lock: Mutex::new(()),
             schedule_dispatch_lock: Mutex::new(()),
             notification_settings: NotificationDeliverySettings::default(),
@@ -12171,6 +12512,7 @@ struct AttachRequestOptions {
     expected_run_id: Option<String>,
     profile: TerminalProfile,
     environment: Option<UnixEnvironment>,
+    owner_environment: bool,
 }
 
 impl ShellRuntimeManager {
@@ -12188,6 +12530,7 @@ impl ShellRuntimeManager {
             expected_run_id,
             profile,
             environment,
+            owner_environment,
         } = options;
         if let Err(error) = validate_terminal_profile(&profile) {
             return send_daemon_error(&mut stream, response_version, error.into());
@@ -12196,6 +12539,16 @@ impl ShellRuntimeManager {
             && let Err(error) = validate_unix_environment(environment)
         {
             return send_daemon_error(&mut stream, response_version, error.into());
+        }
+        if owner_environment && environment.is_some() {
+            return send_response(
+                &mut stream,
+                response_version,
+                DaemonError::validation(
+                    "owner-environment attachment cannot include a Unix environment",
+                )
+                .into_response(),
+            );
         }
         let shell = match registry.shell(shell_id) {
             Ok(shell) => shell,
@@ -12324,7 +12677,11 @@ impl ShellRuntimeManager {
                         workspace_name: &workspace_name,
                         shell_name: &shell_name,
                         profile: &profile,
-                        environment: environment.as_ref(),
+                        environment: if owner_environment {
+                            Some(&registry.startup_environment)
+                        } else {
+                            environment.as_ref()
+                        },
                         recovery: RuntimeRecovery {
                             effective_command: resume_command.as_deref(),
                             history: restored_history.as_deref(),

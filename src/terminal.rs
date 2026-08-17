@@ -39,7 +39,24 @@ pub(crate) fn open(
     title: &str,
     takeover: bool,
 ) -> Result<(), Box<dyn Error>> {
-    open_with_expected_run(desktop_entry, shell_id, title, takeover, None)
+    open_with_expected_run(desktop_entry, shell_id, None, title, takeover, None)
+}
+
+pub(crate) fn open_remote(
+    desktop_entry: Option<&str>,
+    node_id: &str,
+    shell_id: &str,
+    title: &str,
+    takeover: bool,
+) -> Result<(), Box<dyn Error>> {
+    open_with_expected_run(
+        desktop_entry,
+        shell_id,
+        Some(node_id),
+        title,
+        takeover,
+        None,
+    )
 }
 
 pub(crate) fn open_exact_run(
@@ -52,6 +69,25 @@ pub(crate) fn open_exact_run(
     open_with_expected_run(
         desktop_entry,
         shell_id,
+        None,
+        title,
+        takeover,
+        Some(expected_run_id),
+    )
+}
+
+pub(crate) fn open_remote_exact_run(
+    desktop_entry: Option<&str>,
+    node_id: &str,
+    shell_id: &str,
+    expected_run_id: &str,
+    title: &str,
+    takeover: bool,
+) -> Result<(), Box<dyn Error>> {
+    open_with_expected_run(
+        desktop_entry,
+        shell_id,
+        Some(node_id),
         title,
         takeover,
         Some(expected_run_id),
@@ -88,12 +124,13 @@ fn terminal_command_arguments(command: &[String]) -> Option<(&OsStr, Vec<OsStrin
 fn open_with_expected_run(
     desktop_entry: Option<&str>,
     shell_id: &str,
+    node_id: Option<&str>,
     title: &str,
     takeover: bool,
     expected_run_id: Option<&str>,
 ) -> Result<(), Box<dyn Error>> {
     let executable = attachment_executable()?;
-    let mut arguments = attachment_arguments(shell_id, expected_run_id);
+    let mut arguments = attachment_arguments(shell_id, node_id, expected_run_id);
     if takeover {
         arguments.push("--takeover".into());
     }
@@ -160,8 +197,15 @@ fn launch(
     Ok(())
 }
 
-fn attachment_arguments(shell_id: &str, expected_run_id: Option<&str>) -> Vec<OsString> {
+fn attachment_arguments(
+    shell_id: &str,
+    node_id: Option<&str>,
+    expected_run_id: Option<&str>,
+) -> Vec<OsString> {
     let mut arguments = vec!["__attach".into(), shell_id.into()];
+    if let Some(node_id) = node_id {
+        arguments.extend(["--node".into(), node_id.into()]);
+    }
     if let Some(expected_run_id) = expected_run_id {
         arguments.extend(["--expected-run-id".into(), expected_run_id.into()]);
     } else {
@@ -313,16 +357,29 @@ mod tests {
     #[test]
     fn exact_run_attachment_arguments_never_enable_restart() {
         assert_eq!(
-            attachment_arguments("shell-1", Some("run-1")),
+            attachment_arguments("shell-1", None, Some("run-1")),
             ["__attach", "shell-1", "--expected-run-id", "run-1"]
                 .map(OsStr::new)
                 .map(OsStr::to_owned)
         );
         assert_eq!(
-            attachment_arguments("shell-1", None),
+            attachment_arguments("shell-1", None, None),
             ["__attach", "shell-1", "--restart-exited"]
                 .map(OsStr::new)
                 .map(OsStr::to_owned)
+        );
+        assert_eq!(
+            attachment_arguments("shell-1", Some("node-1"), Some("run-1")),
+            [
+                "__attach",
+                "shell-1",
+                "--node",
+                "node-1",
+                "--expected-run-id",
+                "run-1",
+            ]
+            .map(OsStr::new)
+            .map(OsStr::to_owned)
         );
     }
 

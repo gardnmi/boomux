@@ -135,8 +135,15 @@ pub fn run_stdio_helper() -> Result<(), Box<dyn Error>> {
         })?;
 
     let mut daemon_reader = channel.stream;
-    io::copy(&mut daemon_reader, &mut stdout)?;
-    stdout.flush()?;
+    let mut bytes = [0_u8; 16 * 1024];
+    loop {
+        let count = daemon_reader.read(&mut bytes)?;
+        if count == 0 {
+            break;
+        }
+        stdout.write_all(&bytes[..count])?;
+        stdout.flush()?;
+    }
     let _ = daemon_reader.shutdown(Shutdown::Both);
     Ok(())
 }

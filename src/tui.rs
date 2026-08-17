@@ -544,6 +544,17 @@ impl WorkspaceView {
         self.node.local && self.node.current && !self.node.stale
     }
 
+    fn shell_attachable(&self) -> bool {
+        self.local_actionable()
+            || (self.node.current
+                && !self.node.stale
+                && self
+                    .node
+                    .observed_capabilities
+                    .iter()
+                    .any(|capability| capability == "remote_pty_attachment"))
+    }
+
     fn shell_count(&self) -> usize {
         self.items
             .iter()
@@ -2606,21 +2617,21 @@ impl App {
         {
             return None;
         }
-        let workspace = self
-            .selected_item_workspace()
-            .filter(|workspace| workspace.local_actionable())?;
+        let workspace = self.selected_item_workspace()?;
         let workspace_id = workspace.qualify(&workspace.id);
         let target = self.selected_item().and_then(|item| match item {
-            WorkspaceItemView::Shell(shell) => {
-                Some(OpenTarget::Shell(workspace.qualify(&shell.id)))
+            WorkspaceItemView::Shell(shell) => workspace
+                .shell_attachable()
+                .then(|| OpenTarget::Shell(workspace.qualify(&shell.id))),
+            WorkspaceItemView::AgentShell(agent_shell) => workspace
+                .shell_attachable()
+                .then(|| OpenTarget::Shell(workspace.qualify(&agent_shell.shell.id))),
+            WorkspaceItemView::Launcher(launcher) => {
+                workspace.local_actionable().then(|| OpenTarget::Launcher {
+                    workspace_id,
+                    launcher_id: workspace.qualify(&launcher.id),
+                })
             }
-            WorkspaceItemView::AgentShell(agent_shell) => {
-                Some(OpenTarget::Shell(workspace.qualify(&agent_shell.shell.id)))
-            }
-            WorkspaceItemView::Launcher(launcher) => Some(OpenTarget::Launcher {
-                workspace_id,
-                launcher_id: workspace.qualify(&launcher.id),
-            }),
             WorkspaceItemView::Schedule(_) => None,
         })?;
         Some(DashboardEffect::Open(target))

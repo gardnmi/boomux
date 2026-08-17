@@ -114,6 +114,7 @@ impl Drop for RawMode {
 
 pub fn run(
     shell_id: &str,
+    node_id: Option<&str>,
     takeover: bool,
     restart_exited: bool,
     expected_run_id: Option<&str>,
@@ -129,6 +130,7 @@ pub fn run(
     let mut attachment = attach_once(
         &client,
         shell_id,
+        node_id,
         takeover,
         restart_exited,
         expected_run_id,
@@ -182,7 +184,14 @@ pub fn run(
                 profile.pixel_width = pixel_width;
                 profile.pixel_height = pixel_height;
             }
-            attachment = reconnect(&client, shell_id, takeover, expected_run_id, &profile)?;
+            attachment = reconnect(
+                &client,
+                shell_id,
+                node_id,
+                takeover,
+                expected_run_id,
+                &profile,
+            )?;
         }
     })();
     if focus_reporting {
@@ -199,13 +208,22 @@ pub fn run(
 fn reconnect(
     client: &client::Client,
     shell_id: &str,
+    node_id: Option<&str>,
     takeover: bool,
     expected_run_id: Option<&str>,
     profile: &TerminalProfile,
 ) -> client::Result<client::Attachment> {
     let mut last_error = None;
     for _ in 0..RECONNECT_ATTEMPTS {
-        match attach_once(client, shell_id, takeover, false, expected_run_id, profile) {
+        match attach_once(
+            client,
+            shell_id,
+            node_id,
+            takeover,
+            false,
+            expected_run_id,
+            profile,
+        ) {
             Ok(attachment) => return Ok(attachment),
             Err(error) if exact_reconnect_error_is_permanent(expected_run_id, &error) => {
                 return Err(error);
@@ -236,11 +254,21 @@ fn exact_reconnect_error_is_permanent(
 fn attach_once(
     client: &client::Client,
     shell_id: &str,
+    node_id: Option<&str>,
     takeover: bool,
     restart_exited: bool,
     expected_run_id: Option<&str>,
     profile: &TerminalProfile,
 ) -> client::Result<client::Attachment> {
+    if let Some(node_id) = node_id {
+        return client.attach_node(
+            crate::protocol::QualifiedIdentity::new(node_id, shell_id),
+            takeover,
+            restart_exited,
+            expected_run_id.map(str::to_owned),
+            profile.clone(),
+        );
+    }
     if let Some(expected_run_id) = expected_run_id {
         return client.attach_exact_run_with_client_environment(
             shell_id,
@@ -455,6 +483,7 @@ mod tests {
         let error = reconnect(
             &client,
             "shell-1",
+            None,
             true,
             Some("run-1"),
             &TerminalProfile {

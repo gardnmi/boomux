@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::federation::FederationHandshake;
-use crate::protocol::{self, Envelope, Request, Response};
+use crate::protocol::{self, AttachFrame, Envelope, Request, Response};
 
 const MAX_SSH_TARGET_BYTES: usize = 1024;
 const MAX_REMOTE_EXECUTABLE_BYTES: usize = 4096;
@@ -133,7 +133,38 @@ pub struct RemoteConnection {
     pub handshake: FederationHandshake,
 }
 
+pub(crate) struct RemoteAttachmentReader {
+    child: Child,
+    pid: i32,
+    stdout: ChildStdout,
+    stderr_reader: Option<BoundedReader>,
+}
+
+pub(crate) struct RemoteAttachmentWriter(Option<ChildStdin>);
+
 impl RemoteConnection {
+    pub(crate) fn open_attachment(
+        mut self,
+        request: Request,
+        timeout: Duration,
+    ) -> io::Result<(Response, RemoteAttachmentReader, RemoteAttachmentWriter)> {
+        let response = self.request(request, timeout)?;
+        let mut this = std::mem::ManuallyDrop::new(self);
+        // Ownership moves to the attachment while suppressing RemoteConnection's
+        // process-group cleanup for the still-live channel.
+        let (reader, writer) = unsafe {
+            (
+                RemoteAttachmentReader {
+                    child: std::ptr::read(&this.child),
+                    pid: this.pid,
+                    stdout: std::ptr::read(&this.stdout),
+                    stderr_reader: this.stderr_reader.take(),
+                },
+                RemoteAttachmentWriter(this.stdin.take()),
+            )
+        };
+        Ok((response, reader, writer))
+    }
     pub(crate) fn request(&mut self, request: Request, timeout: Duration) -> io::Result<Response> {
         let version = self.handshake.core_protocol_version;
         protocol::write_message(
@@ -196,6 +227,96 @@ impl RemoteConnection {
             _ => Err(invalid_probe(
                 "remote helper returned an invalid projection response",
             )),
+        }
+    }
+}
+
+impl RemoteAttachmentReader {
+    pub(crate) fn read_frame(&mut self) -> io::Result<AttachFrame> {
+        AttachFrame::read_from(&mut self.stdout)
+    }
+
+    pub(crate) fn close(&mut self) {
+        let _ = kill_process_group(self.pid, &mut self.child);
+    }
+}
+
+impl RemoteAttachmentWriter {
+    pub(crate) fn write_frame(&mut self, frame: &AttachFrame, timeout: Duration) -> io::Result<()> {
+        if timeout.is_zero() || timeout > MAX_PROBE_TIMEOUT {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "attachment write deadline is outside the supported bound",
+            ));
+        }
+        let stdin = self
+            .0
+            .as_mut()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "remote channel closed"))?;
+        let mut bytes = Vec::new();
+        frame.write_to(&mut bytes)?;
+        write_all_with_deadline(stdin, &bytes, timeout)
+    }
+}
+
+fn write_all_with_deadline(
+    writer: &mut (impl Write + AsRawFd),
+    mut bytes: &[u8],
+    timeout: Duration,
+) -> io::Result<()> {
+    let fd = writer.as_raw_fd();
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let deadline = Instant::now() + timeout;
+    let result = (|| {
+        while !bytes.is_empty() {
+            match writer.write(bytes) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "remote channel closed",
+                    ));
+                }
+                Ok(count) => bytes = &bytes[count..],
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "remote attachment write timed out",
+                        ));
+                    }
+                    let mut descriptor = libc::pollfd {
+                        fd,
+                        events: libc::POLLOUT,
+                        revents: 0,
+                    };
+                    let milliseconds = i32::try_from(remaining.as_millis().min(i32::MAX as u128))
+                        .unwrap_or(i32::MAX);
+                    if unsafe { libc::poll(&mut descriptor, 1, milliseconds) } == 0 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "remote attachment write timed out",
+                        ));
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        writer.flush()
+    })();
+    let _ = unsafe { libc::fcntl(fd, libc::F_SETFL, flags) };
+    result
+}
+
+impl Drop for RemoteAttachmentReader {
+    fn drop(&mut self) {
+        self.close();
+        if let Some(reader) = self.stderr_reader.take() {
+            let _ = join_bounded_reader(reader);
         }
     }
 }
@@ -598,7 +719,8 @@ impl SshInvocation {
         program: &OsStr,
     ) -> io::Result<Self> {
         secure_runtime_directory(runtime_directory)?;
-        let directory = runtime_directory.join(format!("ssh-{}", Uuid::new_v4()));
+        let nonce = Uuid::new_v4().simple().to_string();
+        let directory = runtime_directory.join(format!("ssh-{}", &nonce[..16]));
         fs::create_dir(&directory)?;
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
         let config_path = directory.join("config");
