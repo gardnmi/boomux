@@ -7,11 +7,12 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::federation::FederationHandshake;
@@ -27,9 +28,15 @@ const MAX_PROBE_TIMEOUT: Duration = Duration::from_secs(120);
 const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const PLATFORM_PROBE_PREFIX: &[u8] = b"boomux-platform-v1";
 const EXECUTABLE_PROBE_PREFIX: &[u8] = b"boomux-executables-v1";
+const INSTALL_DESTINATION_PROBE_PREFIX: &[u8] = b"boomux-install-destination-v1";
+const MAX_RELEASE_BYTES: u64 = 128 * 1024 * 1024;
+const REMOTE_INSTALL_COMMAND: &str = "set -eu; case \"$HOME\" in /*) ;; *) exit 1 ;; esac; umask 077; directory=$HOME/.local/bin; destination=$directory/boomux; mkdir -p \"$directory\"; temporary=$(mktemp \"$directory/.boomux.XXXXXXXX\"); trap 'rm -f \"$temporary\"' EXIT HUP INT TERM; cat > \"$temporary\"; chmod 755 \"$temporary\"; mv -f \"$temporary\" \"$destination\"; trap - EXIT HUP INT TERM";
+const REMOTE_RESTART_COMMAND: &str =
+    "case \"$HOME\" in /*) exec \"$HOME/.local/bin/boomux\" daemon restart ;; *) exit 1 ;; esac";
 
 pub const PLATFORM_PROBE_COMMAND: &str = "os=$(uname -s) || exit; arch=$(uname -m) || exit; printf 'boomux-platform-v1\\0%s\\0%s\\0' \"$os\" \"$arch\"";
 pub const EXECUTABLE_PROBE_COMMAND: &str = "printf 'boomux-executables-v1\\0'; path=$(command -v boomux 2>/dev/null || true); for candidate in \"$path\" /usr/local/bin/boomux /usr/bin/boomux /opt/homebrew/bin/boomux /home/linuxbrew/.linuxbrew/bin/boomux \"$HOME/.local/bin/boomux\" \"$HOME/.local/share/mise/shims/boomux\" \"$HOME/.nix-profile/bin/boomux\" /run/current-system/sw/bin/boomux; do case \"$candidate\" in /*) [ -f \"$candidate\" ] && [ -x \"$candidate\" ] && printf '%s\\0' \"$candidate\" ;; esac; done";
+pub const INSTALL_DESTINATION_PROBE_COMMAND: &str = "case \"$HOME\" in /*) printf 'boomux-install-destination-v1\\0%s\\0' \"$HOME/.local/bin/boomux\" ;; *) exit 1 ;; esac";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SshAuthenticationMode {
@@ -41,6 +48,7 @@ pub enum SshAuthenticationMode {
 pub enum RemoteProbe {
     Platform,
     Executables,
+    InstallDestination,
 }
 
 impl RemoteProbe {
@@ -48,6 +56,7 @@ impl RemoteProbe {
         match self {
             Self::Platform => PLATFORM_PROBE_COMMAND,
             Self::Executables => EXECUTABLE_PROBE_COMMAND,
+            Self::InstallDestination => INSTALL_DESTINATION_PROBE_COMMAND,
         }
     }
 }
@@ -74,12 +83,83 @@ pub struct RemotePlatform {
 pub struct RemoteDiscovery {
     pub platform: RemotePlatform,
     pub executables: Vec<RemoteExecutable>,
+    pub install_destination: RemoteExecutable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompatibleRemoteHelper {
     pub executable: RemoteExecutable,
     pub handshake: FederationHandshake,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteInstallSource {
+    CurrentBinary(PathBuf),
+    Release { target: &'static str, tag: String },
+}
+
+impl RemoteInstallSource {
+    pub fn description(&self) -> String {
+        match self {
+            Self::CurrentBinary(path) => format!("current binary {}", path.display()),
+            Self::Release { target, tag } => {
+                format!("checksum-verified GitHub release {tag} for {target}")
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteInstallPlan {
+    pub target: SshTarget,
+    pub destination: RemoteExecutable,
+    pub source: RemoteInstallSource,
+    pub may_restart_daemon: bool,
+}
+
+pub enum RemoteBootstrapPlan {
+    Ready(CompatibleRemoteHelper),
+    Install(RemoteInstallPlan),
+}
+
+pub struct RemoteConnection {
+    child: Child,
+    pid: i32,
+    stdin: Option<ChildStdin>,
+    stdout: ChildStdout,
+    stderr_reader: Option<BoundedReader>,
+    pub executable: RemoteExecutable,
+    pub handshake: FederationHandshake,
+}
+
+impl RemoteConnection {
+    pub fn ping(&mut self) -> io::Result<()> {
+        let version = self.handshake.core_protocol_version;
+        protocol::write_message(
+            self.stdin.as_mut().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::BrokenPipe, "remote channel closed")
+            })?,
+            &Envelope::with_version(version, Request::Ping),
+        )?;
+        let response: Envelope<Response> = protocol::read_message(&mut self.stdout)?;
+        if response.version == version && response.message == Response::Pong {
+            Ok(())
+        } else {
+            Err(invalid_probe(
+                "remote helper returned an invalid ping response",
+            ))
+        }
+    }
+}
+
+impl Drop for RemoteConnection {
+    fn drop(&mut self) {
+        self.stdin.take();
+        let _ = kill_process_group(self.pid, &mut self.child);
+        if let Some(reader) = self.stderr_reader.take() {
+            let _ = join_bounded_reader(reader);
+        }
+    }
 }
 
 impl RemotePlatform {
@@ -114,6 +194,38 @@ impl RemotePlatform {
             _ => None,
         }
     }
+
+    fn matches_local(self) -> bool {
+        matches!(
+            (
+                self.operating_system,
+                self.architecture,
+                env::consts::OS,
+                env::consts::ARCH
+            ),
+            (
+                RemoteOperatingSystem::Linux,
+                RemoteArchitecture::X86_64,
+                "linux",
+                "x86_64"
+            ) | (
+                RemoteOperatingSystem::Linux,
+                RemoteArchitecture::Aarch64,
+                "linux",
+                "aarch64"
+            ) | (
+                RemoteOperatingSystem::MacOs,
+                RemoteArchitecture::X86_64,
+                "macos",
+                "x86_64"
+            ) | (
+                RemoteOperatingSystem::MacOs,
+                RemoteArchitecture::Aarch64,
+                "macos",
+                "aarch64"
+            )
+        )
+    }
 }
 
 pub fn parse_executable_probe(output: &[u8]) -> io::Result<Vec<RemoteExecutable>> {
@@ -134,6 +246,18 @@ pub fn parse_executable_probe(output: &[u8]) -> io::Result<Vec<RemoteExecutable>
         }
     }
     Ok(executables)
+}
+
+pub fn parse_install_destination_probe(output: &[u8]) -> io::Result<RemoteExecutable> {
+    let fields = parse_nul_fields(output, INSTALL_DESTINATION_PROBE_PREFIX)?;
+    if fields.len() != 1 {
+        return Err(invalid_probe(
+            "install destination probe returned an invalid field count",
+        ));
+    }
+    let value = std::str::from_utf8(fields[0])
+        .map_err(|_| invalid_probe("install destination probe returned non-UTF-8 data"))?;
+    RemoteExecutable::parse(value.to_owned())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -413,6 +537,333 @@ pub fn discover_remote(
     )
 }
 
+pub fn plan_remote_bootstrap(
+    target: SshTarget,
+    authentication: SshAuthenticationMode,
+    timeout: Duration,
+) -> io::Result<RemoteBootstrapPlan> {
+    let discovery = discover_remote(target.clone(), authentication, timeout)?;
+    if let Ok(helper) = find_compatible_remote_helper(
+        target.clone(),
+        &discovery.executables,
+        authentication,
+        timeout,
+    ) {
+        return Ok(RemoteBootstrapPlan::Ready(helper));
+    }
+    let source = select_install_source(discovery.platform)?;
+    Ok(RemoteBootstrapPlan::Install(RemoteInstallPlan {
+        target,
+        destination: discovery.install_destination,
+        source,
+        may_restart_daemon: !discovery.executables.is_empty(),
+    }))
+}
+
+pub fn install_remote(
+    plan: &RemoteInstallPlan,
+    authentication: SshAuthenticationMode,
+    timeout: Duration,
+) -> io::Result<CompatibleRemoteHelper> {
+    let binary = load_install_source(&plan.source)?;
+    let invocation =
+        prepare_fixed_invocation(plan.target.clone(), REMOTE_INSTALL_COMMAND, authentication)?;
+    run_streaming_command(invocation.command(), binary, timeout)?;
+
+    let candidates = [plan.destination.clone()];
+    match find_compatible_remote_helper(plan.target.clone(), &candidates, authentication, timeout) {
+        Ok(helper) => Ok(helper),
+        Err(first_error) if plan.may_restart_daemon => {
+            let restart = prepare_fixed_invocation(
+                plan.target.clone(),
+                REMOTE_RESTART_COMMAND,
+                authentication,
+            )?;
+            run_bounded_command(restart.command(), timeout).map_err(|_| first_error)?;
+            find_compatible_remote_helper(plan.target.clone(), &candidates, authentication, timeout)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+pub fn connect_remote(
+    target: SshTarget,
+    helper: CompatibleRemoteHelper,
+    authentication: SshAuthenticationMode,
+    timeout: Duration,
+) -> io::Result<RemoteConnection> {
+    if timeout.is_zero() || timeout > MAX_PROBE_TIMEOUT {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "SSH connection timeout is outside the supported bound",
+        ));
+    }
+    let invocation = SshInvocation::prepare(target, helper.executable.clone(), authentication)?;
+    let mut command = invocation.command();
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    let mut child = command.spawn()?;
+    let pid = i32::try_from(child.id()).map_err(|error| {
+        let _ = child.kill();
+        let _ = child.wait();
+        io::Error::other(format!("child PID overflow: {error}"))
+    })?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| io::Error::other("SSH helper stdin was not captured"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("SSH helper stdout was not captured"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::other("SSH helper stderr was not captured"))?;
+    let stderr_reader = match spawn_bounded_reader(stderr, MAX_PROBE_STDERR_BYTES, "stderr") {
+        Ok(reader) => reader,
+        Err(error) => {
+            let _ = kill_process_group(pid, &mut child);
+            return Err(error);
+        }
+    };
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let handshake_worker = match thread::Builder::new()
+        .name("boomux-ssh-handshake".into())
+        .spawn(move || {
+            let mut stdout = stdout;
+            let result = crate::federation::read_handshake(&mut stdout);
+            let _ = sender.send((result, stdout));
+        }) {
+        Ok(worker) => worker,
+        Err(error) => {
+            let _ = kill_process_group(pid, &mut child);
+            let _ = join_bounded_reader(stderr_reader);
+            return Err(error);
+        }
+    };
+    let received = receiver.recv_timeout(timeout);
+    let (handshake, stdout) = match received {
+        Ok((result, stdout)) => (result, stdout),
+        Err(_) => {
+            let _ = kill_process_group(pid, &mut child);
+            handshake_worker
+                .join()
+                .map_err(|_| io::Error::other("SSH handshake worker panicked"))?;
+            let _ = join_bounded_reader(stderr_reader);
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "SSH helper handshake timed out",
+            ));
+        }
+    };
+    handshake_worker
+        .join()
+        .map_err(|_| io::Error::other("SSH handshake worker panicked"))?;
+    let handshake = match handshake {
+        Ok(handshake) => handshake,
+        Err(error) => {
+            let _ = kill_process_group(pid, &mut child);
+            let _ = join_bounded_reader(stderr_reader);
+            return Err(error);
+        }
+    };
+    if let Err(error) = validate_live_handshake(&helper.handshake, &handshake) {
+        let _ = kill_process_group(pid, &mut child);
+        let _ = join_bounded_reader(stderr_reader);
+        return Err(error);
+    }
+    Ok(RemoteConnection {
+        child,
+        pid,
+        stdin: Some(stdin),
+        stdout,
+        stderr_reader: Some(stderr_reader),
+        executable: helper.executable,
+        handshake,
+    })
+}
+
+fn validate_live_handshake(
+    expected: &FederationHandshake,
+    actual: &FederationHandshake,
+) -> io::Result<()> {
+    if !(protocol::MIN_PROTOCOL_VERSION..=protocol::PROTOCOL_VERSION)
+        .contains(&actual.core_protocol_version)
+    {
+        return Err(invalid_probe(
+            "remote helper reported an incompatible core protocol",
+        ));
+    }
+    if actual.node_id != expected.node_id {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "remote helper identity changed after bootstrap",
+        ));
+    }
+    Ok(())
+}
+
+fn prepare_fixed_invocation(
+    target: SshTarget,
+    command: &'static str,
+    authentication: SshAuthenticationMode,
+) -> io::Result<SshInvocation> {
+    let socket_path = crate::client::socket_path()?;
+    let runtime_directory = socket_path
+        .parent()
+        .ok_or_else(|| io::Error::other("Boomux runtime socket has no parent"))?;
+    let user_config = env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .map(|home| home.join(".ssh/config"));
+    SshInvocation::prepare_command_at(
+        runtime_directory,
+        user_config.as_deref(),
+        target,
+        command.to_owned(),
+        authentication,
+    )
+}
+
+fn select_install_source(platform: RemotePlatform) -> io::Result<RemoteInstallSource> {
+    if platform.matches_local() {
+        return Ok(RemoteInstallSource::CurrentBinary(env::current_exe()?));
+    }
+    let target = platform.release_target().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            "no Boomux release asset supports the remote platform",
+        )
+    })?;
+    Ok(RemoteInstallSource::Release {
+        target,
+        tag: format!("v{}", env!("CARGO_PKG_VERSION")),
+    })
+}
+
+fn load_install_source(source: &RemoteInstallSource) -> io::Result<Vec<u8>> {
+    match source {
+        RemoteInstallSource::CurrentBinary(path) => read_bounded_file(path),
+        RemoteInstallSource::Release { target, tag } => download_release_binary(target, tag),
+    }
+}
+
+fn read_bounded_file(path: &Path) -> io::Result<Vec<u8>> {
+    let metadata = fs::metadata(path)?;
+    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_RELEASE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Boomux install source is not a bounded regular file",
+        ));
+    }
+    fs::read(path)
+}
+
+fn download_release_binary(target: &str, tag: &str) -> io::Result<Vec<u8>> {
+    let socket_path = crate::client::socket_path()?;
+    let parent = socket_path
+        .parent()
+        .ok_or_else(|| io::Error::other("Boomux runtime socket has no parent"))?;
+    secure_runtime_directory(parent)?;
+    let directory = parent.join(format!("release-{}", Uuid::new_v4()));
+    fs::create_dir(&directory)?;
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
+    let result = (|| {
+        let archive_name = format!("boomux-{tag}-{target}.tar.gz");
+        let archive = directory.join(&archive_name);
+        let checksum = directory.join(format!("{archive_name}.sha256"));
+        let base = format!("https://github.com/gardnmi/boomux/releases/download/{tag}");
+        for (url, destination, maximum_size) in [
+            (
+                format!("{base}/{archive_name}"),
+                &archive,
+                MAX_RELEASE_BYTES,
+            ),
+            (format!("{base}/{archive_name}.sha256"), &checksum, 1024),
+        ] {
+            let status = Command::new("curl")
+                .args([
+                    "--fail",
+                    "--location",
+                    "--silent",
+                    "--show-error",
+                    "--output",
+                ])
+                .arg(destination)
+                .arg("--max-filesize")
+                .arg(maximum_size.to_string())
+                .arg(url)
+                .status()?;
+            if !status.success() {
+                return Err(io::Error::other("could not download Boomux release asset"));
+            }
+        }
+        if fs::metadata(&archive)?.len() > MAX_RELEASE_BYTES {
+            return Err(invalid_probe(
+                "Boomux release archive exceeds the size limit",
+            ));
+        }
+        verify_release_checksum(&archive, &checksum, &archive_name)?;
+        let member = format!("boomux-{tag}-{target}/boomux");
+        let status = Command::new("tar")
+            .args(["-xzf"])
+            .arg(&archive)
+            .args(["-C"])
+            .arg(&directory)
+            .arg(&member)
+            .status()?;
+        if !status.success() {
+            return Err(io::Error::other("could not extract Boomux release asset"));
+        }
+        read_bounded_file(&directory.join(member))
+    })();
+    let _ = fs::remove_dir_all(&directory);
+    result
+}
+
+fn verify_release_checksum(archive: &Path, checksum: &Path, archive_name: &str) -> io::Result<()> {
+    let checksum = fs::read_to_string(checksum)?;
+    if checksum.len() > 1024 {
+        return Err(invalid_probe(
+            "Boomux release checksum exceeds the size limit",
+        ));
+    }
+    let mut fields = checksum.split_ascii_whitespace();
+    let expected = fields
+        .next()
+        .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .ok_or_else(|| invalid_probe("Boomux release checksum is invalid"))?;
+    let name = fields
+        .next()
+        .map(|value| value.trim_start_matches('*'))
+        .ok_or_else(|| invalid_probe("Boomux release checksum has no filename"))?;
+    if name != archive_name || fields.next().is_some() {
+        return Err(invalid_probe(
+            "Boomux release checksum names an unexpected asset",
+        ));
+    }
+    let mut file = fs::File::open(archive)?;
+    let mut digest = Sha256::new();
+    io::copy(&mut file, &mut digest)?;
+    let actual = format!("{:x}", digest.finalize());
+    if actual != expected.to_ascii_lowercase() {
+        return Err(invalid_probe("Boomux release checksum did not match"));
+    }
+    Ok(())
+}
+
 pub fn find_compatible_remote_helper(
     target: SshTarget,
     executables: &[RemoteExecutable],
@@ -518,9 +969,12 @@ fn discover_remote_at(
     };
     let platform = RemotePlatform::parse_probe(&run(RemoteProbe::Platform)?.stdout)?;
     let executables = parse_executable_probe(&run(RemoteProbe::Executables)?.stdout)?;
+    let install_destination =
+        parse_install_destination_probe(&run(RemoteProbe::InstallDestination)?.stdout)?;
     Ok(RemoteDiscovery {
         platform,
         executables,
+        install_destination,
     })
 }
 
@@ -683,6 +1137,76 @@ fn run_bounded_command(mut command: Command, timeout: Duration) -> io::Result<Ss
         return Err(io::Error::other("SSH probe exited unsuccessfully"));
     }
     Ok(SshProbeOutput { stdout, stderr })
+}
+
+fn run_streaming_command(
+    mut command: Command,
+    input: Vec<u8>,
+    timeout: Duration,
+) -> io::Result<()> {
+    if timeout.is_zero() || timeout > MAX_PROBE_TIMEOUT {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "SSH install timeout is outside the supported bound",
+        ));
+    }
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    let mut child = command.spawn()?;
+    let pid = i32::try_from(child.id()).map_err(|_| io::Error::other("child PID overflow"))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| io::Error::other("SSH install stdin was not captured"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::other("SSH install stderr was not captured"))?;
+    let stderr_reader = spawn_bounded_reader(stderr, MAX_PROBE_STDERR_BYTES, "stderr")?;
+    let writer = thread::Builder::new()
+        .name("boomux-ssh-install-input".into())
+        .spawn(move || stdin.write_all(&input))?;
+    let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "SSH install timeout overflow")
+    })?;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break Some(status);
+        }
+        if Instant::now() >= deadline {
+            kill_process_group(pid, &mut child)?;
+            break None;
+        }
+        thread::sleep(CHILD_POLL_INTERVAL);
+    };
+    writer
+        .join()
+        .map_err(|_| io::Error::other("SSH install input worker panicked"))??;
+    let (_, stderr_truncated) = join_bounded_reader(stderr_reader)?;
+    if status.is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "SSH install timed out",
+        ));
+    }
+    if stderr_truncated {
+        return Err(invalid_probe("SSH install stderr exceeds the size limit"));
+    }
+    if !status.expect("checked above").success() {
+        return Err(io::Error::other("remote Boomux install failed"));
+    }
+    Ok(())
 }
 
 fn run_helper_probe_command(
@@ -1003,6 +1527,21 @@ mod tests {
                 .kind(),
             io::ErrorKind::InvalidInput
         );
+
+        assert_eq!(
+            parse_install_destination_probe(
+                b"boomux-install-destination-v1\0/home/person/.local/bin/boomux\0"
+            )
+            .unwrap()
+            .as_str(),
+            "/home/person/.local/bin/boomux"
+        );
+        assert_eq!(
+            parse_install_destination_probe(b"boomux-install-destination-v1\0relative/boomux\0")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
     }
 
     #[test]
@@ -1137,6 +1676,29 @@ mod tests {
     }
 
     #[test]
+    fn live_handshake_pins_identity_but_allows_compatible_version_changes() {
+        let expected = FederationHandshake {
+            version: FEDERATION_VERSION,
+            node_id: Uuid::new_v4().to_string(),
+            helper_version: "0.17.0".into(),
+            core_protocol_version: protocol::MIN_PROTOCOL_VERSION,
+            connection_mode: FederationConnectionMode::AdHoc,
+        };
+        let mut changed = expected.clone();
+        changed.helper_version = "0.18.0".into();
+        changed.core_protocol_version = protocol::PROTOCOL_VERSION;
+        validate_live_handshake(&expected, &changed).unwrap();
+
+        changed.node_id = Uuid::new_v4().to_string();
+        assert_eq!(
+            validate_live_handshake(&expected, &changed)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
     fn helper_selection_skips_incompatible_discovered_executables() {
         let runtime = runtime_directory();
         fs::create_dir_all(&runtime).unwrap();
@@ -1211,7 +1773,7 @@ mod tests {
         fs::write(
             &ssh,
             format!(
-                "#!/bin/sh\nprintf 'call\\0' >> {quoted_log}\nfor arg do printf '%s\\0' \"$arg\" >> {quoted_log}; done\nprintf 'end\\0' >> {quoted_log}\nlast=\nfor arg do last=$arg; done\ncase \"$last\" in\n  *boomux-platform-v1*) printf 'boomux-platform-v1\\0Linux\\0x86_64\\0' ;;\n  *boomux-executables-v1*) printf 'boomux-executables-v1\\0/usr/bin/boomux\\0/opt/homebrew/bin/boomux\\0' ;;\n  *) exit 64 ;;\nesac\n"
+                "#!/bin/sh\nprintf 'call\\0' >> {quoted_log}\nfor arg do printf '%s\\0' \"$arg\" >> {quoted_log}; done\nprintf 'end\\0' >> {quoted_log}\nlast=\nfor arg do last=$arg; done\ncase \"$last\" in\n  *boomux-platform-v1*) printf 'boomux-platform-v1\\0Linux\\0x86_64\\0' ;;\n  *boomux-executables-v1*) printf 'boomux-executables-v1\\0/usr/bin/boomux\\0/opt/homebrew/bin/boomux\\0' ;;\n  *boomux-install-destination-v1*) printf 'boomux-install-destination-v1\\0/home/person/.local/bin/boomux\\0' ;;\n  *) exit 64 ;;\nesac\n"
             ),
         )
         .unwrap();
@@ -1241,6 +1803,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["/usr/bin/boomux", "/opt/homebrew/bin/boomux"]
         );
+        assert_eq!(
+            discovery.install_destination.as_str(),
+            "/home/person/.local/bin/boomux"
+        );
 
         let arguments = fs::read(&log).unwrap();
         let fields = arguments
@@ -1248,16 +1814,17 @@ mod tests {
             .filter(|field| !field.is_empty())
             .map(|field| std::str::from_utf8(field).unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(fields.iter().filter(|field| **field == "call").count(), 2);
+        assert_eq!(fields.iter().filter(|field| **field == "call").count(), 3);
         assert_eq!(
             fields
                 .iter()
                 .filter(|field| **field == "user@workbox")
                 .count(),
-            2
+            3
         );
         assert!(fields.contains(&PLATFORM_PROBE_COMMAND));
         assert!(fields.contains(&EXECUTABLE_PROBE_COMMAND));
+        assert!(fields.contains(&INSTALL_DESTINATION_PROBE_COMMAND));
         assert_eq!(
             fs::read_dir(&runtime)
                 .unwrap()
@@ -1267,5 +1834,80 @@ mod tests {
             0
         );
         fs::remove_dir_all(runtime).unwrap();
+    }
+
+    #[test]
+    fn fixed_install_command_streams_private_executable_and_replaces_atomically() {
+        let directory = runtime_directory();
+        fs::create_dir_all(directory.join(".local/bin")).unwrap();
+        let destination = directory.join(".local/bin/boomux");
+        fs::write(&destination, b"previous").unwrap();
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", REMOTE_INSTALL_COMMAND])
+            .env("HOME", &directory);
+        run_streaming_command(command, b"replacement".to_vec(), Duration::from_secs(1)).unwrap();
+        assert_eq!(fs::read(&destination).unwrap(), b"replacement");
+        assert_eq!(fs::metadata(&destination).unwrap().mode() & 0o777, 0o755);
+        assert!(
+            fs::read_dir(directory.join(".local/bin"))
+                .unwrap()
+                .filter_map(Result::ok)
+                .all(|entry| !entry.file_name().to_string_lossy().starts_with(".boomux."))
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn failed_streamed_install_leaves_previous_binary_usable() {
+        let directory = runtime_directory();
+        fs::create_dir_all(directory.join("bin")).unwrap();
+        let destination = directory.join("bin/boomux");
+        fs::write(&destination, b"previous").unwrap();
+        let temporary = directory.join("bin/.boomux.test");
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            "set -eu; trap 'rm -f \"$TEMPORARY\"' EXIT; cat > \"$TEMPORARY\"; false; mv -f \"$TEMPORARY\" \"$DESTINATION\"",
+        ]);
+        command
+            .env("TEMPORARY", &temporary)
+            .env("DESTINATION", &destination);
+        assert!(
+            run_streaming_command(command, b"replacement".to_vec(), Duration::from_secs(1))
+                .is_err()
+        );
+        assert_eq!(fs::read(&destination).unwrap(), b"previous");
+        assert!(!temporary.exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn release_checksum_requires_exact_asset_name_and_digest() {
+        let directory = runtime_directory();
+        fs::create_dir_all(&directory).unwrap();
+        let archive = directory.join("asset.tar.gz");
+        let checksum = directory.join("asset.tar.gz.sha256");
+        fs::write(&archive, b"archive").unwrap();
+        let digest = format!("{:x}", Sha256::digest(b"archive"));
+        fs::write(&checksum, format!("{digest}  asset.tar.gz\n")).unwrap();
+        verify_release_checksum(&archive, &checksum, "asset.tar.gz").unwrap();
+
+        fs::write(&checksum, format!("{digest}  another.tar.gz\n")).unwrap();
+        assert_eq!(
+            verify_release_checksum(&archive, &checksum, "asset.tar.gz")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        fs::write(&checksum, format!("{}  asset.tar.gz\n", "0".repeat(64))).unwrap();
+        assert_eq!(
+            verify_release_checksum(&archive, &checksum, "asset.tar.gz")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        fs::remove_dir_all(directory).unwrap();
     }
 }
