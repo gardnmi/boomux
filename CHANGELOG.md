@@ -1,5 +1,35 @@
 # Changelog
 
+## [0.19.0](https://github.com/gardnmi/boomux/compare/v0.18.1...v0.19.0) (2026-08-17)
+
+
+### Features
+
+* **node:** combine federated dashboard views ([#200](https://github.com/gardnmi/boomux/issues/200)) ([8d34336](https://github.com/gardnmi/boomux/commit/8d34336c0e1a6d11539d3616bed99ce43d5e54cd))
+* **node:** deliver remote attention notifications ([#205](https://github.com/gardnmi/boomux/issues/205)) ([e67fb09](https://github.com/gardnmi/boomux/commit/e67fb09abf2b49a9c87ff22bcdedc10851408f26))
+* **node:** manage owner-evaluated schedules ([#204](https://github.com/gardnmi/boomux/issues/204)) ([5f14f38](https://github.com/gardnmi/boomux/commit/5f14f382d849473769f7c583f9defd6d2d84ed6f))
+* **node:** persist remote registrations ([#198](https://github.com/gardnmi/boomux/issues/198)) ([0439b2e](https://github.com/gardnmi/boomux/commit/0439b2e2163497301a43f01a4b5b287beaa93922))
+* **node:** persist stable node identity ([#188](https://github.com/gardnmi/boomux/issues/188)) ([9ca76bb](https://github.com/gardnmi/boomux/commit/9ca76bb95acc5cbde828695068d32f6a8cdb0e5c))
+* **node:** rekey identity after bounded drain ([#191](https://github.com/gardnmi/boomux/issues/191)) ([8389616](https://github.com/gardnmi/boomux/commit/838961638172ec1625df8a8ac2ada77983fb6379))
+* **node:** require interactive rekey confirmation ([#192](https://github.com/gardnmi/boomux/issues/192)) ([72cd31a](https://github.com/gardnmi/boomux/commit/72cd31a97838ae0b3737c0c43fe448ab885354b7))
+* **node:** route guarded remote operations ([#201](https://github.com/gardnmi/boomux/issues/201)) ([e0b8f11](https://github.com/gardnmi/boomux/commit/e0b8f112a841682ad3c29d3833cdfdfe7d9b16ad))
+* **node:** route owner host services ([#203](https://github.com/gardnmi/boomux/issues/203)) ([736144c](https://github.com/gardnmi/boomux/commit/736144cf0f9f725a4afefdebec14fa88f8f907f3))
+* **node:** synchronize remote projections ([#199](https://github.com/gardnmi/boomux/issues/199)) ([5e4c3d3](https://github.com/gardnmi/boomux/commit/5e4c3d3decc646a1384772e0fac2bd7720838442))
+* **remote:** add verified federation stdio bridge ([#189](https://github.com/gardnmi/boomux/issues/189)) ([18c39df](https://github.com/gardnmi/boomux/commit/18c39df7bc737b43db63edebe8df794636d23c2a))
+* **remote:** attach owner-managed PTYs ([#202](https://github.com/gardnmi/boomux/issues/202)) ([c98e467](https://github.com/gardnmi/boomux/commit/c98e4673492dbe41ac32286251031782d12f3ef4))
+* **remote:** bootstrap ad hoc SSH access ([#197](https://github.com/gardnmi/boomux/issues/197)) ([bc62cb2](https://github.com/gardnmi/boomux/commit/bc62cb2cf2d9ce779c17373cd8b99a83fdf8ef3a))
+* **remote:** bound SSH probe execution ([#195](https://github.com/gardnmi/boomux/issues/195)) ([64c6927](https://github.com/gardnmi/boomux/commit/64c69279a61bb826482c51dd171fd6e51446d942))
+* **remote:** build safe SSH helper invocations ([#193](https://github.com/gardnmi/boomux/issues/193)) ([db6910d](https://github.com/gardnmi/boomux/commit/db6910dbcc375d32d8e4398e097b34ce3e0a538d))
+* **remote:** discover remote platforms and binaries ([#194](https://github.com/gardnmi/boomux/issues/194)) ([3f144be](https://github.com/gardnmi/boomux/commit/3f144beb37d7bd265ce39c0eb36c906187189286))
+* **remote:** orchestrate SSH helper discovery ([#196](https://github.com/gardnmi/boomux/issues/196)) ([45512fd](https://github.com/gardnmi/boomux/commit/45512fd90fca3913f50524b6dfed2abffe69f2ef))
+* **workspace:** coordinate multi-node resources ([#207](https://github.com/gardnmi/boomux/issues/207)) ([ef84d4e](https://github.com/gardnmi/boomux/commit/ef84d4eab3ddf8a911062a07cb0c6b10b42b5840))
+
+
+### Bug Fixes
+
+* **node:** streamline onboarding and dashboard chrome ([#206](https://github.com/gardnmi/boomux/issues/206)) ([8f077bb](https://github.com/gardnmi/boomux/commit/8f077bb3e3b6de8d04978a00147bca84fe49169f))
+* **node:** yield while watchdog becomes ready ([#209](https://github.com/gardnmi/boomux/issues/209)) ([e2aa319](https://github.com/gardnmi/boomux/commit/e2aa3194fb79aa270d6421d00bd1a06e29149b20))
+
 ## [0.18.1](https://github.com/gardnmi/boomux/compare/v0.18.0...v0.18.1) (2026-08-15)
 
 
