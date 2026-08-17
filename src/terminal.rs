@@ -163,6 +163,16 @@ fn open_with_expected_run(
     )
 }
 
+pub fn open_node_add(desktop_entry: Option<&str>) -> Result<(), Box<dyn Error>> {
+    launch(
+        desktop_entry,
+        "Add Boomux Node",
+        None,
+        attachment_executable()?.as_os_str(),
+        &["node".into(), "add".into()],
+    )
+}
+
 fn launch(
     desktop_entry: Option<&str>,
     title: &str,

@@ -511,7 +511,10 @@ enum ProjectCommands {
 #[derive(Subcommand)]
 enum NodeCommands {
     /// Verify and persist a remote Boomux Node route
-    Add { alias: String, target: String },
+    Add {
+        alias: Option<String>,
+        target: Option<String>,
+    },
     /// List registered remote Nodes
     List,
     /// Inspect a registered remote Node by alias or exact Node ID
@@ -1798,6 +1801,7 @@ fn verified_remote_connection(
 fn node_command(command: NodeCommands, json: bool) -> Result<(), Box<dyn Error>> {
     match command {
         NodeCommands::Add { alias, target } => {
+            let (alias, target) = resolve_node_add_inputs(alias, target, json)?;
             let mut remote = verified_remote_connection(&target, !json)?;
             remote.ping()?;
             let registration = client::connect_or_start()?.add_node_registration(
@@ -1966,6 +1970,59 @@ fn node_command(command: NodeCommands, json: bool) -> Result<(), Box<dyn Error>>
         }
         NodeCommands::Rekey => rekey_node(),
     }
+}
+
+fn resolve_node_add_inputs(
+    alias: Option<String>,
+    target: Option<String>,
+    json: bool,
+) -> Result<(String, String), Box<dyn Error>> {
+    match (alias, target) {
+        (Some(alias), Some(target)) => return Ok((alias, target)),
+        (None, None) => {}
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "provide both ALIAS and TARGET, or omit both for guided setup",
+            )
+            .into());
+        }
+    }
+    if json || !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "guided Node setup requires an interactive terminal; use: boomux node add ALIAS TARGET",
+        )
+        .into());
+    }
+
+    println!("Add a remote Boomux Node");
+    println!("Boomux uses your normal OpenSSH configuration and keeps remote work on its owner.");
+    let target = prompt_node_value("SSH target (for example user@workbox): ", None)?;
+    let suggested_alias = target.rsplit('@').next().filter(|value| !value.is_empty());
+    let alias = prompt_node_value("Local alias", suggested_alias)?;
+    Ok((alias, target))
+}
+
+fn prompt_node_value(label: &str, default: Option<&str>) -> io::Result<String> {
+    match default {
+        Some(default) => print!("{label} [{default}]: "),
+        None => print!("{label}"),
+    }
+    std::io::Write::flush(&mut io::stdout())?;
+    let mut value = String::new();
+    io::stdin().read_line(&mut value)?;
+    let value = value.trim();
+    if value.is_empty() {
+        if let Some(default) = default {
+            return Ok(default.to_owned());
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Node setup value cannot be empty",
+        ));
+    }
+    Ok(value.to_owned())
 }
 
 fn node_snapshot_json(node: protocol::CombinedNode) -> Result<serde_json::Value, Box<dyn Error>> {
@@ -2206,6 +2263,11 @@ fn dashboard(
         true,
         |effect| match effect {
             tui::DashboardEffect::Quit => unreachable!("quit is handled by the dashboard runtime"),
+            tui::DashboardEffect::AddNode => tui::DashboardEvent::OperationCompleted(
+                terminal::open_node_add(terminal.as_deref())
+                    .map(|()| "Opened guided Node setup".into())
+                    .map_err(|error| error.to_string()),
+            ),
             tui::DashboardEffect::CheckForUpdates => {
                 let result = refresh.check(&client).map_err(|error| error.to_string());
                 match result {
@@ -2841,8 +2903,6 @@ fn dashboard_state(
                 health: node.health,
                 current: node.current,
                 stale: node.stale,
-                observed_at_ms: node.observed_at_ms,
-                observed_protocol_version: node.observed_protocol_version,
                 observed_capabilities: node.observed_capabilities.clone(),
                 scheduler: node.scheduler.clone(),
             };
@@ -9394,6 +9454,36 @@ mod tests {
     }
 
     #[test]
+    fn node_add_supports_explicit_and_guided_inputs() {
+        let explicit = Cli::try_parse_from(["boomux", "node", "add", "work", "user@host"]).unwrap();
+        assert!(matches!(
+            explicit.command,
+            Some(Commands::Node {
+                command: NodeCommands::Add {
+                    alias: Some(alias),
+                    target: Some(target),
+                }
+            }) if alias == "work" && target == "user@host"
+        ));
+        let guided = Cli::try_parse_from(["boomux", "node", "add"]).unwrap();
+        assert!(matches!(
+            guided.command,
+            Some(Commands::Node {
+                command: NodeCommands::Add {
+                    alias: None,
+                    target: None,
+                }
+            })
+        ));
+        assert_eq!(
+            resolve_node_add_inputs(Some("work".into()), Some("host".into()), false).unwrap(),
+            ("work".into(), "host".into())
+        );
+        assert!(resolve_node_add_inputs(Some("work".into()), None, false).is_err());
+        assert!(resolve_node_add_inputs(None, None, true).is_err());
+    }
+
+    #[test]
     fn node_snapshot_is_separate_json_command_with_structural_identities() {
         let cli = Cli::try_parse_from(["boomux", "--json", "node", "snapshot", "work"]).unwrap();
         assert!(matches!(
@@ -10223,8 +10313,6 @@ mod tests {
                 health: protocol::NodeProjectionHealthCode::Online,
                 current: true,
                 stale: false,
-                observed_at_ms: 0,
-                observed_protocol_version: None,
                 observed_capabilities: Vec::new(),
                 scheduler: protocol::SchedulerHealth {
                     state: protocol::SchedulerState::Active,

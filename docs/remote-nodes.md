@@ -108,7 +108,9 @@ destructive changes, integration installation, Schedule enablement, and remote
 daemon management retain their existing explicit user authorization. Boomux
 never scans SSH configuration and automatically connects to every alias.
 
-The implemented registration CLI is `boomux node add ALIAS TARGET`, `node list`,
+The implemented registration CLI is `boomux node add ALIAS TARGET`, or guided
+interactive `boomux node add` from the dashboard command palette or Omarchy
+panel. Registration management continues with `node list`,
 `node inspect`, revision-conditional `node rename` and `node retarget`, and `node
 forget`. Add and retarget complete verified bootstrap before submitting a
 registration mutation to the local daemon. The selected helper path is
