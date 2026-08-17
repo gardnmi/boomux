@@ -14,7 +14,7 @@
 | `src/client.rs` | Daemon discovery/startup, protocol negotiation, typed management requests, and attachment setup |
 | `src/daemon.rs` | `DaemonService` coordination over durable registry, event-stream, shell-runtime, persistence, and handoff owners |
 | `src/state_store.rs` | Versioned durable schemas, validation, atomic state storage, and migrations |
-| `src/node_identity.rs` | Independent stable Node identity creation, validation, and atomic persistence |
+| `src/node_identity.rs` | Stable Node identity persistence, federation admission leases, and bounded rekey drain |
 | `src/federation.rs` | Independently versioned federation handshake and verified stdio daemon bridging |
 | `src/handoff.rs`, `src/fd_transfer.rs` | Graceful daemon replacement records and Unix descriptor transfer |
 | `src/attach.rs` | Terminal-side raw mode, control frames, live input/output, resize, focus, and reconnect handling |
@@ -826,8 +826,14 @@ handshake version 1 is emitted by the hidden `__federation-stdio` helper only
 after the helper's state-root identity matches the identity returned on the exact
 daemon socket subsequently used for inner protocol bytes. Protocol-28 peers keep
 stable identity queries but cannot open that channel. The SSH launcher/bootstrap,
-rekey admission, registration, and projection protocols remain unimplemented
-under #173.
+registration, and projection protocols remain unimplemented under #173.
+
+Protocol 30 adds expected-ID-conditional Node rekey. The daemon excludes restart,
+shutdown, and concurrent rekey transitions, closes federation admission, and
+atomically replaces `node.json` only after every admitted channel drains within
+the bound. Timeout returns `busy`, reopens admission, and preserves the old ID;
+rekey cannot be routed through a federation channel. A public owner-confirmation
+workflow remains pending.
 
 Cron day matching preserves syntactic wildcard origin: `*/n` is wildcard-origin,
 while numeric lists and ranges remain restricted even when they cover the full

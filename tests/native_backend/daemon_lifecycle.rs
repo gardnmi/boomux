@@ -46,7 +46,7 @@ fn native_daemon_lifecycle() {
     let capabilities: serde_json::Value = serde_json::from_slice(&capabilities.stdout).unwrap();
     assert_eq!(capabilities["schema"], "boomux.cli/v1");
     assert_eq!(capabilities["command"], "capabilities");
-    assert_eq!(capabilities["data"]["daemon_protocol_version"], 29);
+    assert_eq!(capabilities["data"]["daemon_protocol_version"], 30);
     assert!(
         capabilities["data"]
             .get("session_transcript_integrations")
@@ -118,6 +118,7 @@ fn native_daemon_lifecycle() {
         "protocol_27",
         "protocol_28",
         "protocol_29",
+        "protocol_30",
         "exact_run_attachment",
         "stable_node_identity",
         "revision_aware_scheduled_execution_wait",
@@ -152,7 +153,7 @@ fn native_daemon_lifecycle() {
         .unwrap();
     assert!(status.status.success());
     let status_text = String::from_utf8_lossy(&status.stdout);
-    assert!(status_text.contains("running (protocol 29"));
+    assert!(status_text.contains("running (protocol 30"));
     assert!(status_text.contains("scheduler active (0/4 active executions)"));
     let status = daemon
         .command()
@@ -912,7 +913,7 @@ fn federation_helper_binds_handshake_and_inner_request_to_one_daemon_socket() {
     let handshake = boomux::federation::read_handshake(&mut stdout).unwrap();
     assert_eq!(handshake.version, boomux::federation::FEDERATION_VERSION);
     assert_eq!(handshake.node_id, node_id);
-    assert_eq!(handshake.core_protocol_version, 29);
+    assert_eq!(handshake.core_protocol_version, 30);
     assert_eq!(
         handshake.connection_mode,
         boomux::federation::FederationConnectionMode::AdHoc
@@ -920,7 +921,7 @@ fn federation_helper_binds_handshake_and_inner_request_to_one_daemon_socket() {
 
     protocol::write_message(
         &mut stdin,
-        &protocol::Envelope::with_version(29, protocol::Request::Ping),
+        &protocol::Envelope::with_version(30, protocol::Request::Ping),
     )
     .unwrap();
     drop(stdin);
@@ -928,7 +929,7 @@ fn federation_helper_binds_handshake_and_inner_request_to_one_daemon_socket() {
         protocol::read_message(&mut stdout).unwrap();
     assert_eq!(
         response,
-        protocol::Envelope::with_version(29, protocol::Response::Pong)
+        protocol::Envelope::with_version(30, protocol::Response::Pong)
     );
     let output = child.wait_with_output().unwrap();
     assert!(
@@ -955,6 +956,35 @@ fn federation_helper_emits_no_handshake_for_a_mismatched_state_root() {
         String::from_utf8_lossy(&output.stderr)
             .contains("daemon Node identity does not match the helper state root")
     );
+}
+
+#[test]
+fn node_rekey_is_expected_identity_conditional_and_drains_federation_channels() {
+    let daemon = TestDaemon::start();
+    let original = daemon.client.node_identity().unwrap();
+    let channel = daemon.client.open_federation_channel().unwrap();
+
+    assert_remote_code(
+        &daemon.client.rekey_node(&original).unwrap_err(),
+        ErrorCode::Busy,
+    );
+    assert_eq!(daemon.client.node_identity().unwrap(), original);
+
+    drop(channel);
+    let replacement = daemon.client.rekey_node(&original).unwrap();
+    assert_ne!(replacement, original);
+    assert_eq!(daemon.client.node_identity().unwrap(), replacement);
+    assert_remote_code(
+        &daemon.client.rekey_node(&original).unwrap_err(),
+        ErrorCode::InvalidArgument,
+    );
+    assert_eq!(daemon.client.node_identity().unwrap(), replacement);
+
+    let identity: serde_json::Value = serde_json::from_slice(
+        &fs::read(daemon.runtime_dir.join("state/boomux/node.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(identity["node_id"], replacement);
 }
 
 #[test]
