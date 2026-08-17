@@ -3626,8 +3626,170 @@ mod tests {
         fs::write(script, contents).unwrap();
     }
 
-    fn runtime_directory() -> PathBuf {
-        env::temp_dir().join(format!("boomux-ssh-{}", Uuid::new_v4()))
+    struct TestDirectory {
+        path: PathBuf,
+        watchdogs: PathBuf,
+    }
+
+    impl std::ops::Deref for TestDirectory {
+        type Target = Path;
+
+        fn deref(&self) -> &Self::Target {
+            &self.path
+        }
+    }
+
+    impl AsRef<Path> for TestDirectory {
+        fn as_ref(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl AsRef<OsStr> for TestDirectory {
+        fn as_ref(&self) -> &OsStr {
+            self.path.as_os_str()
+        }
+    }
+
+    impl TestDirectory {
+        fn reap_watchdogs(&self) {
+            let mut pids = fs::read_to_string(&self.watchdogs)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| {
+                    let (pid, start) = line.split_once('\t')?;
+                    Some((pid.parse::<i32>().ok()?, start.to_owned()))
+                })
+                .collect::<HashSet<_>>();
+            let bin = self.path.join(".local/bin");
+            if let Ok(entries) = fs::read_dir(&bin) {
+                for entry in entries.filter_map(Result::ok) {
+                    let pid_file = entry.path().join("watchdog_pid");
+                    if let Ok(pid) = fs::read_to_string(pid_file)
+                        && let Ok(pid) = pid.trim().parse()
+                        && let Some(start) = test_process_start(pid)
+                    {
+                        pids.insert((pid, start));
+                    }
+                }
+            }
+            for (pid, start) in &pids {
+                if test_process_start(*pid).as_ref() != Some(start) {
+                    continue;
+                }
+                unsafe {
+                    libc::kill(*pid, libc::SIGTERM);
+                }
+            }
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while pids
+                .iter()
+                .any(|(pid, start)| test_process_start(*pid).as_ref() == Some(start))
+                && Instant::now() < deadline
+            {
+                thread::sleep(Duration::from_millis(10));
+            }
+            for (pid, start) in pids {
+                if test_process_start(pid).as_ref() == Some(&start) {
+                    unsafe {
+                        libc::kill(pid, libc::SIGKILL);
+                    }
+                }
+            }
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            self.reap_watchdogs();
+            let _ = fs::remove_dir_all(&self.path);
+            let _ = fs::remove_file(&self.watchdogs);
+        }
+    }
+
+    fn runtime_directory() -> TestDirectory {
+        let id = Uuid::new_v4();
+        TestDirectory {
+            path: env::temp_dir().join(format!("boomux-ssh-{id}")),
+            watchdogs: env::temp_dir().join(format!("boomux-ssh-watchdogs-{id}")),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn test_process_start(pid: i32) -> Option<String> {
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let mut fields = stat.rsplit_once(") ")?.1.split_whitespace();
+        if fields.next()? == "Z" {
+            return None;
+        }
+        fields.nth(18).map(str::to_owned)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn test_process_start(pid: i32) -> Option<String> {
+        let output = Command::new("/bin/ps")
+            .args(["-p", &pid.to_string(), "-o", "lstart="])
+            .output()
+            .ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+            .filter(|start| !start.is_empty())
+    }
+
+    fn local_shell_command(shell: &str, home: &Path) -> Command {
+        let runtime = home.join("runtime");
+        fs::create_dir_all(&runtime).unwrap();
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+        let shell = match shell {
+            "sh" => "/bin/sh",
+            "bash" => "/bin/bash",
+            _ => panic!("unsupported test shell: {shell}"),
+        };
+        let mut command = Command::new(shell);
+        command
+            .env_clear()
+            .env("HOME", home)
+            .env("PATH", "/usr/bin:/bin")
+            .env("XDG_RUNTIME_DIR", runtime)
+            .env("XDG_STATE_HOME", home.join("state"))
+            .current_dir(home);
+        command
+    }
+
+    fn record_watchdog(home: &Path, transaction: &InstallTransactionId) {
+        let pid = fs::read_to_string(
+            home.join(".local/bin")
+                .join(&transaction.0)
+                .join("watchdog_pid"),
+        )
+        .unwrap();
+        let pid = pid.trim().parse::<i32>().unwrap();
+        let start = test_process_start(pid).unwrap();
+        let id = home.file_name().unwrap().to_string_lossy();
+        let registry = env::temp_dir().join(format!(
+            "boomux-ssh-watchdogs-{}",
+            id.trim_start_matches("boomux-ssh-")
+        ));
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(registry)
+            .unwrap();
+        writeln!(file, "{pid}\t{start}").unwrap();
+    }
+
+    fn gate_watchdog(command: &str) -> String {
+        let command = command.replacen(
+            "while [ -d \"$lock\" ]; do /bin/sleep 1;",
+            "while [ -d \"$lock\" ]; do test_watchdog_tick;",
+            1,
+        );
+        assert_ne!(command, REMOTE_INSTALL_COMMAND);
+        format!(
+            "test_watchdog_tick() {{ while [ ! -e \"$HOME/watchdog-tick\" ]; do /bin/sleep 0.01; done; /bin/sleep 0.01; }}; {command}"
+        )
     }
 
     fn shell_printf(bytes: &[u8]) -> String {
@@ -3672,8 +3834,8 @@ mod tests {
         command_text: &str,
     ) -> InstallTransactionId {
         let transaction = InstallTransactionId::generate();
-        let mut command = Command::new(shell);
-        command.args(["-c", command_text]).env("HOME", home);
+        let mut command = local_shell_command(shell, home);
+        command.args(["-c", command_text]);
         let output = run_streaming_command_capture(
             command,
             transaction.upload_input(bytes),
@@ -3684,6 +3846,7 @@ mod tests {
             InstallTransactionId::parse_probe(&output.stdout).unwrap(),
             transaction
         );
+        record_watchdog(home, &transaction);
         transaction
     }
 
@@ -3693,14 +3856,8 @@ mod tests {
         transaction: &InstallTransactionId,
         reason: RemoteInstallReason,
     ) {
-        let runtime = home.join("runtime");
-        fs::create_dir_all(&runtime).unwrap();
-        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
-        let mut activate = Command::new(shell);
-        activate
-            .args(["-c", REMOTE_INSTALL_ACTIVATE_COMMAND])
-            .env("HOME", home)
-            .env("XDG_RUNTIME_DIR", runtime);
+        let mut activate = local_shell_command(shell, home);
+        activate.args(["-c", REMOTE_INSTALL_ACTIVATE_COMMAND]);
         let output = run_streaming_command_capture(
             activate,
             transaction.activation_input(
@@ -3847,14 +4004,24 @@ mod tests {
         input: &[u8],
     ) -> std::process::Output {
         let transaction = InstallTransactionId::generate();
-        let mut child = Command::new(shell)
-            .args(["-c", command_text])
+        let shell = match shell {
+            "sh" => "/bin/sh",
+            "bash" => "/bin/bash",
+            _ => panic!("unsupported test shell: {shell}"),
+        };
+        let mut command = Command::new(shell);
+        command
+            .env_clear()
             .env("HOME", home)
+            .env("PATH", "/usr/bin:/bin")
+            .args(["-c", command_text])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
+            .stderr(Stdio::piped());
+        if home.is_absolute() && home.is_dir() {
+            command.current_dir(home);
+        }
+        let mut child = command.spawn().unwrap();
         let _ = child
             .stdin
             .take()
@@ -3869,14 +4036,8 @@ mod tests {
         home: &Path,
         transaction: &InstallTransactionId,
     ) -> io::Result<()> {
-        let runtime = home.join("runtime");
-        fs::create_dir_all(&runtime)?;
-        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700))?;
-        let mut child = Command::new(shell);
-        child
-            .args(["-c", command_text])
-            .env("HOME", home)
-            .env("XDG_RUNTIME_DIR", runtime);
+        let mut child = local_shell_command(shell, home);
+        child.args(["-c", command_text]);
         run_streaming_command(
             child,
             transaction.activation_input(
@@ -3987,8 +4148,8 @@ mod tests {
     }
 
     fn run_local_transaction(home: &Path, command: &str, transaction: &InstallTransactionId) {
-        let mut child = Command::new("sh");
-        child.args(["-c", command]).env("HOME", home);
+        let mut child = local_shell_command("sh", home);
+        child.args(["-c", command]);
         run_streaming_command(child, transaction.input(), Duration::from_secs(1)).unwrap();
     }
 
@@ -4617,9 +4778,7 @@ mod tests {
         let output = shell_printf(&oversized);
         let ssh = write_master_stderr_ssh(
             &runtime,
-            &format!(
-                "{output} >&2; : > \"$control.ready\"; trap 'rm -f \"$control.ready\"' EXIT HUP INT TERM; while :; do sleep 60; done"
-            ),
+            &format!("{output} >&2; while :; do /bin/sleep 60; done"),
         );
         let mirror_path = runtime.join("interactive-mirror");
         let mirror = fs::File::create(&mirror_path).unwrap();
@@ -5840,21 +5999,22 @@ mod tests {
         let destination = directory.join(".local/bin/boomux");
         fs::write(&destination, b"previous").unwrap();
         fs::set_permissions(&destination, fs::Permissions::from_mode(0o755)).unwrap();
-        let install = REMOTE_INSTALL_COMMAND.replace("lease_limit=180", "lease_limit=1");
+        let install =
+            gate_watchdog(&REMOTE_INSTALL_COMMAND.replace("lease_limit=180", "lease_limit=1"));
         let transaction = run_local_upload_with_command(&directory, b"replacement", "sh", &install);
         assert_eq!(fs::read(&destination).unwrap(), b"previous");
         run_local_activation(&directory, "sh", &transaction, RemoteInstallReason::Missing);
         assert_eq!(fs::read(&destination).unwrap(), b"replacement");
         assert_eq!(fs::metadata(&destination).unwrap().mode() & 0o777, 0o755);
         let commit = REMOTE_INSTALL_COMMIT_COMMAND.replace("sleep 180", "sleep 3");
-        let mut child = Command::new("sh");
-        child.args(["-c", &commit]).env("HOME", &directory);
+        let mut child = local_shell_command("sh", &directory);
+        child.args(["-c", &commit]);
         let output =
             run_streaming_command_capture(child, transaction.input(), Duration::from_secs(1))
                 .unwrap();
         parse_install_commit(&output.stdout).unwrap();
-        let mut retry = Command::new("sh");
-        retry.args(["-c", &commit]).env("HOME", &directory);
+        let mut retry = local_shell_command("sh", &directory);
+        retry.args(["-c", &commit]);
         let retry =
             run_streaming_command_capture(retry, transaction.input(), Duration::from_secs(1))
                 .unwrap();
@@ -5864,12 +6024,7 @@ mod tests {
                 .join(".local/bin/.boomux.bootstrap.lock/committed/backup")
                 .exists()
         );
-        let lock = directory.join(".local/bin/.boomux.bootstrap.lock");
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while lock.exists() && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(20));
-        }
-        assert!(!lock.exists());
+        directory.reap_watchdogs();
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -5896,6 +6051,7 @@ mod tests {
             let install = REMOTE_INSTALL_COMMAND
                 .replace("lease_limit=180", "lease_limit=1")
                 .replace("[ \"$claim_age\" -ge 180 ]", "[ \"$claim_age\" -ge 1 ]");
+            let install = gate_watchdog(&install);
             let transaction =
                 run_local_upload_with_command(&directory, b"replacement", "sh", &install);
             run_local_activation(&directory, "sh", &transaction, RemoteInstallReason::Missing);
@@ -5904,13 +6060,14 @@ mod tests {
             let injected = format!("{}; kill -KILL $$;", needle.trim_end_matches(';'));
             let commit_command = commit_base.replacen(needle, &injected, 1);
             assert_ne!(commit_command, commit_base);
-            let mut child = Command::new("sh");
-            child.args(["-c", &commit_command]).env("HOME", &directory);
+            let mut child = local_shell_command("sh", &directory);
+            child.args(["-c", &commit_command]);
             assert!(
                 run_streaming_command_capture(child, transaction.input(), Duration::from_secs(1),)
                     .is_err(),
                 "commit unexpectedly acknowledged after cut at {needle}"
             );
+            fs::write(directory.join("watchdog-tick"), b"").unwrap();
 
             let lock = directory.join(".local/bin/.boomux.bootstrap.lock");
             let deadline = Instant::now() + Duration::from_secs(4);
