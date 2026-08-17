@@ -76,9 +76,9 @@ pub const REMOTE_INSTALL_COMMAND: &str = concat!(
     "stage=lock_id; stage_code=79; printf '%s\\n' \"$txn\" > \"$lock/id\"; printf '0\\n' > \"$transaction/lease\"; temporary=$transaction/new.next; ",
     "stage=stream; stage_code=80; /bin/cat > \"$temporary\"; ",
     "stage=mode; stage_code=81; /bin/chmod 755 \"$temporary\"; upload_uid=$(/usr/bin/id -u); upload_size=$(/usr/bin/stat -Lc '%s' -- \"$temporary\" 2>/dev/null || /usr/bin/stat -f '%z' \"$temporary\"); case \"$upload_uid:$upload_size\" in *[!0-9:]*) false ;; esac; if [ \"$upload_size\" -le 0 ] || [ \"$upload_size\" -gt 268435456 ] || [ -L \"$temporary\" ] || [ ! -f \"$temporary\" ] || [ ! -x \"$temporary\" ]; then false; fi; /bin/mv \"$temporary\" \"$transaction/new\"; : > \"$transaction/new_ready\"; sync_install_path \"$transaction/new\"; ",
-    "stage=watchdog_spawn; stage_code=84; ( exec 3>&-; trap '' HUP; lease_limit=180; lease_value=$(/bin/cat \"$transaction/lease\"); unchanged=0; : > \"$transaction/watchdog_ready\"; ",
+    "stage=watchdog_spawn; stage_code=84; ( exec 3>&-; trap '' HUP; lease_limit=180; lease_value=$(/bin/cat \"$transaction/lease\"); unchanged=0; committed=false; : > \"$transaction/watchdog_ready\"; ",
     remote_claim_functions!(),
-    "while [ ! -e \"$transaction/watchdog_pid\" ]; do /bin/sleep 1; done; claim_pid_override=$(/bin/cat \"$transaction/watchdog_pid\"); while [ -d \"$lock\" ]; do /bin/sleep 1; current=$(/bin/cat \"$transaction/lease\" 2>/dev/null || true); if [ \"$current\" != \"$lease_value\" ]; then lease_value=$current; unchanged=0; continue; fi; unchanged=$((unchanged + 1)); [ \"$unchanged\" -lt \"$lease_limit\" ] && continue; if claim_acquire; then current=$(/bin/cat \"$lock/id\" 2>/dev/null || true); claimed_lease=$(/bin/cat \"$transaction/lease\" 2>/dev/null || true); if [ \"$current\" != \"$txn\" ]; then claim_release; exit; fi; if [ \"$claimed_lease\" != \"$lease_value\" ]; then claim_release; lease_value=$claimed_lease; unchanged=0; continue; fi; restore_install; /bin/rm -rf \"$transaction\" \"$lock\"; exit; fi; unchanged=0; done ) </dev/null >/dev/null 2>&1 & watchdog=$!; ",
+    "while :; do if claim_pid_override=$(/bin/cat \"$transaction/watchdog_pid\" 2>/dev/null); then break; fi; if claim_pid_override=$(/bin/cat \"$lock/committed/watchdog_pid\" 2>/dev/null); then transaction=$lock/committed; committed=true; break; fi; [ -d \"$lock\" ] || exit; /bin/sleep 1; done; while [ -d \"$lock\" ]; do /bin/sleep 1; current=$(/bin/cat \"$transaction/lease\" 2>/dev/null || true); if [ \"$current\" != \"$lease_value\" ]; then lease_value=$current; unchanged=0; continue; fi; unchanged=$((unchanged + 1)); [ \"$unchanged\" -lt \"$lease_limit\" ] && continue; if claim_acquire; then current=$(/bin/cat \"$lock/id\" 2>/dev/null || true); claimed_lease=$(/bin/cat \"$transaction/lease\" 2>/dev/null || true); if [ \"$current\" != \"$txn\" ]; then claim_release; exit; fi; if [ \"$claimed_lease\" != \"$lease_value\" ]; then claim_release; lease_value=$claimed_lease; unchanged=0; continue; fi; if ! $committed; then restore_install; fi; /bin/rm -rf \"$transaction\" \"$lock\"; exit; fi; unchanged=0; done ) </dev/null >/dev/null 2>&1 & watchdog=$!; ",
     "stage=watchdog_ready; stage_code=85; attempts=0; while [ ! -e \"$transaction/watchdog_ready\" ]; do kill -0 \"$watchdog\"; attempts=$((attempts + 1)); [ \"$attempts\" -lt 10000 ]; done; ",
     "stage=watchdog_pid; stage_code=86; printf '%s\\n' \"$watchdog\" > \"$transaction/watchdog_pid\"; rm -f \"$transaction/watchdog_ready\"; ",
     "stage=result; stage_code=87; printf 'boomux-install-transaction-v1\\0%s\\0' \"$txn\"; ",
@@ -3781,14 +3781,14 @@ mod tests {
     }
 
     fn gate_watchdog(command: &str) -> String {
-        let command = command.replacen(
+        let gated = command.replacen(
             "while [ -d \"$lock\" ]; do /bin/sleep 1;",
             "while [ -d \"$lock\" ]; do test_watchdog_tick;",
             1,
         );
-        assert_ne!(command, REMOTE_INSTALL_COMMAND);
+        assert_ne!(gated, command);
         format!(
-            "test_watchdog_tick() {{ while [ ! -e \"$HOME/watchdog-tick\" ]; do /bin/sleep 0.01; done; /bin/sleep 0.01; }}; {command}"
+            "test_watchdog_tick() {{ while [ ! -e \"$HOME/watchdog-tick\" ]; do /bin/sleep 0.01; done; /bin/sleep 0.01; }}; {gated}"
         )
     }
 
@@ -6052,8 +6052,14 @@ mod tests {
                 .replace("lease_limit=180", "lease_limit=1")
                 .replace("[ \"$claim_age\" -ge 180 ]", "[ \"$claim_age\" -ge 1 ]");
             let install = gate_watchdog(&install);
+            let delayed_install = install.replacen(
+                "while :; do if claim_pid_override=",
+                "while [ ! -e \"$HOME/watchdog-pid-release\" ]; do /bin/sleep 0.01; done; while :; do if claim_pid_override=",
+                1,
+            );
+            assert_ne!(delayed_install, install);
             let transaction =
-                run_local_upload_with_command(&directory, b"replacement", "sh", &install);
+                run_local_upload_with_command(&directory, b"replacement", "sh", &delayed_install);
             run_local_activation(&directory, "sh", &transaction, RemoteInstallReason::Missing);
 
             let commit_base = REMOTE_INSTALL_COMMIT_COMMAND.replace("sleep 180", "sleep 1");
@@ -6067,10 +6073,11 @@ mod tests {
                     .is_err(),
                 "commit unexpectedly acknowledged after cut at {needle}"
             );
+            fs::write(directory.join("watchdog-pid-release"), b"").unwrap();
             fs::write(directory.join("watchdog-tick"), b"").unwrap();
 
             let lock = directory.join(".local/bin/.boomux.bootstrap.lock");
-            let deadline = Instant::now() + Duration::from_secs(4);
+            let deadline = Instant::now() + Duration::from_secs(15);
             while lock.exists() && Instant::now() < deadline {
                 thread::sleep(Duration::from_millis(20));
             }
