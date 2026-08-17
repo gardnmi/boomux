@@ -8969,7 +8969,7 @@ mod tests {
                 .validated_version,
             "0.84.1"
         );
-        assert_eq!(protocol::PROTOCOL_VERSION, 27);
+        assert_eq!(protocol::PROTOCOL_VERSION, 28);
     }
 
     #[test]

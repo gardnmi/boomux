@@ -528,6 +528,13 @@ impl Client {
         expect_ok(self.request(Request::Ping)?, Response::Pong)
     }
 
+    pub fn node_identity(&self) -> Result<String> {
+        match self.request(Request::GetNodeIdentity)? {
+            Response::NodeIdentity { node_id } => Ok(node_id),
+            response => unexpected(response),
+        }
+    }
+
     pub fn shutdown(&self) -> Result<()> {
         expect_ok(self.request(Request::Shutdown)?, Response::Ok)?;
         for _ in 0..SHUTDOWN_ATTEMPTS {
@@ -1577,7 +1584,7 @@ mod tests {
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
-            assert_eq!(request.version, 27);
+            assert_eq!(request.version, protocol::PROTOCOL_VERSION);
             let Request::UpdateAgentSchedule {
                 schedule_id,
                 expected_revision,
@@ -1592,7 +1599,7 @@ mod tests {
             protocol::write_message(
                 &mut stream,
                 &Envelope::with_version(
-                    27,
+                    protocol::PROTOCOL_VERSION,
                     Response::AgentSchedule {
                         schedule: AgentScheduleSnapshot {
                             id: schedule_id,
@@ -1743,6 +1750,7 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
+            reject_protocol(&listener, 28, 27);
             reject_protocol(&listener, 27, 26);
             reject_protocol(&listener, 26, 25);
             reject_protocol(&listener, 25, 24);
@@ -1877,6 +1885,62 @@ mod tests {
             error,
             ClientError::Protocol(ProtocolError::UnsupportedVersion(ref message))
                 if message == "daemon does not support Agent wait"
+        ));
+        server.join().unwrap();
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn node_identity_requires_protocol_twenty_eight() {
+        let directory = env::temp_dir().join(format!("boomux-client-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let socket = directory.join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+            assert_eq!(request.version, 28);
+            assert_eq!(request.message, Request::GetNodeIdentity);
+            protocol::write_message(
+                &mut stream,
+                &Envelope::with_version(
+                    27,
+                    Response::Error {
+                        message: "Node identity requires protocol 28".into(),
+                        code: Some(ErrorCode::UnsupportedVersion),
+                    },
+                ),
+            )
+            .unwrap();
+
+            let (mut stream, _) = listener.accept().unwrap();
+            let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+            assert_eq!(request.version, 28);
+            assert_eq!(request.message, Request::Ping);
+            protocol::write_message(
+                &mut stream,
+                &Envelope::with_version(
+                    27,
+                    Response::Error {
+                        message: "protocol 28 unsupported".into(),
+                        code: Some(ErrorCode::UnsupportedVersion),
+                    },
+                ),
+            )
+            .unwrap();
+
+            let (mut stream, _) = listener.accept().unwrap();
+            let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+            assert_eq!(request.version, 27);
+            assert_eq!(request.message, Request::Ping);
+            protocol::write_message(&mut stream, &Envelope::with_version(27, Response::Pong))
+                .unwrap();
+        });
+
+        let client = Client::from_socket_path(socket);
+        assert!(matches!(
+            client.node_identity(),
+            Err(ClientError::Protocol(ProtocolError::UnsupportedVersion(_)))
         ));
         server.join().unwrap();
         fs::remove_dir_all(directory).unwrap();
@@ -2036,6 +2100,7 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
+            reject_protocol(&listener, 28, 27);
             reject_protocol(&listener, 27, 26);
             reject_protocol(&listener, 26, 25);
             reject_protocol(&listener, 25, 24);
@@ -2099,6 +2164,7 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
+            reject_protocol(&listener, 28, 27);
             reject_protocol(&listener, 27, 26);
             reject_protocol(&listener, 26, 25);
             reject_protocol(&listener, 25, 24);

@@ -28,6 +28,7 @@ use crate::desktop_notifications::{
 };
 use crate::fd_transfer::send_descriptor;
 use crate::handoff;
+use crate::node_identity::NodeIdentity;
 use crate::protocol::{
     self, AgentAttentionReason, AgentAttentionSnapshot, AgentAuthority, AgentInstanceSnapshot,
     AgentObservationSnapshot, AgentRegistrationSpec, AgentReport, AgentScheduleInspection,
@@ -324,6 +325,13 @@ fn run_daemon(
     validate_notification_delivery_settings(&notification_settings)?;
     let live_handoff = committed.is_some();
     let mut registry = DaemonService::restore(store, live_handoff, transferred.events)?;
+    registry.node_identity = match NodeIdentity::load_or_create_from_environment() {
+        Ok(identity) => Some(identity),
+        Err(error) => {
+            eprintln!("boomux: federation disabled: {error}");
+            None
+        }
+    };
     registry.startup_environment = capture_current_environment();
     registry.configure_scheduler_clock()?;
     registry.notification_settings = notification_settings.clone();
@@ -1491,6 +1499,7 @@ fn scheduled_execution_response(
 }
 
 struct DaemonService {
+    node_identity: Option<NodeIdentity>,
     durable: DurableRegistry,
     events: EventStream,
     runtimes: ShellRuntimeManager,
@@ -4842,6 +4851,7 @@ struct DurableState {
 impl Default for DaemonService {
     fn default() -> Self {
         Self {
+            node_identity: None,
             durable: DurableRegistry {
                 state: Mutex::new(DurableState::default()),
                 store: None,
@@ -6904,6 +6914,18 @@ impl DaemonService {
         .transpose()?;
         match request {
             Request::Ping => Ok(Response::Pong),
+            Request::GetNodeIdentity => self
+                .node_identity
+                .as_ref()
+                .map(|identity| Response::NodeIdentity {
+                    node_id: identity.id().to_owned(),
+                })
+                .ok_or_else(|| {
+                    DaemonError::lifecycle(
+                        ErrorCode::NodeIdentityUnavailable,
+                        "Boomux Node identity is unavailable",
+                    )
+                }),
             Request::Restart | Request::RestartWithNotificationConfig { .. } => {
                 unreachable!("restart is handled before dispatch")
             }
@@ -7696,6 +7718,7 @@ impl DaemonService {
         let store = Arc::new(store);
         let persistence_writer = PersistenceWriter::start(Arc::clone(&store));
         let registry = Self {
+            node_identity: None,
             durable: DurableRegistry {
                 state: Mutex::new(state),
                 store: Some(store),

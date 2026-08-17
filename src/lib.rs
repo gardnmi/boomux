@@ -5,6 +5,7 @@ mod desktop_notifications;
 mod fd_transfer;
 mod handoff;
 pub mod integrations;
+mod node_identity;
 pub mod protocol;
 pub mod scheduling;
 mod state_store;

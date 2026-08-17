@@ -14,6 +14,7 @@
 | `src/client.rs` | Daemon discovery/startup, protocol negotiation, typed management requests, and attachment setup |
 | `src/daemon.rs` | `DaemonService` coordination over durable registry, event-stream, shell-runtime, persistence, and handoff owners |
 | `src/state_store.rs` | Versioned durable schemas, validation, atomic state storage, and migrations |
+| `src/node_identity.rs` | Independent stable Node identity creation, validation, and atomic persistence |
 | `src/handoff.rs`, `src/fd_transfer.rs` | Graceful daemon replacement records and Unix descriptor transfer |
 | `src/attach.rs` | Terminal-side raw mode, control frames, live input/output, resize, focus, and reconnect handling |
 | `src/terminal.rs` | Selection and launch of native terminal windows through `xdg-terminal-exec` |
@@ -811,12 +812,17 @@ Protocol 27 adds paused, revision-conditional schedule definition updates and
 prompt-free `agent_schedule_updated` events. Protocol-26 peers filter those
 events while advancing their cursor. State schema remains 12.
 
-Remote Node federation is tracked by #173 and has no assigned shipped protocol,
-state, or handoff version. Its compatibility contract requires older clients to
-retain local-only meaning, a separately versioned pre-protocol SSH identity
-handshake, and explicit schemas for Node identity, registrations, and disposable
-projection cache. A future implementation must update this protocol history only
-when those exact source versions are established.
+Protocol 28 and Node identity schema 1 establish the stable local Node ID used by
+future federation. The daemon creates owner-only `node.json` independently from
+authoritative `state.json`, preserves malformed or future identity files while
+disabling federation, and exposes the identity through the version-gated
+`GetNodeIdentity` request. Cold restart and graceful handoff read the same file;
+the identity is not transferred in the handoff manifest. State schema remains 12.
+Protocol-27 peers remain local-only and cannot query Node identity.
+
+The SSH federation handshake, transport, registration, and projection protocols
+remain unimplemented under #173. Their separately versioned schemas and protocol
+history entries are added only when the corresponding source versions land.
 
 Cron day matching preserves syntactic wildcard origin: `*/n` is wildcard-origin,
 while numeric lists and ranges remain restricted even when they cover the full

@@ -1078,7 +1078,7 @@ fn unix_time_ms() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
-pub(crate) fn lock_path_from_environment() -> io::Result<PathBuf> {
+pub(crate) fn state_directory_from_environment() -> io::Result<PathBuf> {
     let root = match env::var_os("XDG_STATE_HOME").filter(|path| !path.is_empty()) {
         Some(path) => PathBuf::from(path),
         None => PathBuf::from(
@@ -1093,10 +1093,14 @@ pub(crate) fn lock_path_from_environment() -> io::Result<PathBuf> {
             "XDG_STATE_HOME must be an absolute path",
         ));
     }
-    Ok(root.join("boomux/daemon.lock"))
+    Ok(root.join("boomux"))
 }
 
-fn secure_state_dir(path: &Path) -> io::Result<()> {
+pub(crate) fn lock_path_from_environment() -> io::Result<PathBuf> {
+    Ok(state_directory_from_environment()?.join("daemon.lock"))
+}
+
+pub(crate) fn secure_state_dir(path: &Path) -> io::Result<()> {
     fs::create_dir_all(path)?;
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.is_dir() || metadata.uid() != effective_uid() {
@@ -1108,7 +1112,7 @@ fn secure_state_dir(path: &Path) -> io::Result<()> {
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))
 }
 
-fn effective_uid() -> u32 {
+pub(crate) fn effective_uid() -> u32 {
     // `geteuid` has no arguments, pointers, or caller safety requirements.
     unsafe { libc::geteuid() }
 }
