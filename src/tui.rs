@@ -396,6 +396,7 @@ pub(crate) enum ExecutionOutcomeDisplay {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct FocusedTerminalView {
     pub(crate) revision: u64,
+    pub(crate) node_id: Option<String>,
     pub(crate) workspace_id: String,
     pub(crate) shell_id: String,
 }
@@ -2256,7 +2257,6 @@ impl App {
             return;
         }
         let Some(focused) = focused_terminal else {
-            self.observed_focus_revision = None;
             return;
         };
         if self
@@ -2279,8 +2279,12 @@ impl App {
                         .enumerate()
                         .find(|(item_index, item)| {
                             let (node, owner_workspace_id) = workspace.item_owner(*item_index);
-                            node.local
-                                && owner_workspace_id == focused.workspace_id
+                            focused
+                                .node_id
+                                .as_ref()
+                                .map_or(node.local, |node_id| node.id == *node_id)
+                                && (focused.node_id.is_some()
+                                    || owner_workspace_id == focused.workspace_id)
                                 && !matches!(item, WorkspaceItemView::Launcher(_))
                                 && item.id() == focused.shell_id
                                 && (self.primary_tab != PrimaryTab::Workspaces
@@ -7960,6 +7964,33 @@ mod tests {
     }
 
     #[test]
+    fn focus_following_selects_the_exact_remote_node_when_shell_ids_collide() {
+        let mut local = workspace("same-workspace", "local");
+        local.node.id = "00000000-0000-0000-0000-000000000001".into();
+        let mut remote = local.clone();
+        remote.node.id = "00000000-0000-0000-0000-000000000002".into();
+        remote.node.alias = "work".into();
+        remote.node.local = false;
+        let mut app = App::new(vec![local, remote], project_context());
+
+        app.enable_focus_following(Some(&FocusedTerminalView {
+            revision: 1,
+            node_id: Some("00000000-0000-0000-0000-000000000002".into()),
+            workspace_id: String::new(),
+            shell_id: "term_1".into(),
+        }));
+
+        assert_eq!(
+            app.selected().map(|workspace| workspace.node.id.as_str()),
+            Some("00000000-0000-0000-0000-000000000002")
+        );
+        assert_eq!(
+            app.selected_item().map(WorkspaceItemView::id),
+            Some("term_1")
+        );
+    }
+
+    #[test]
     fn every_remote_health_code_is_unmistakable_wide_and_compact() {
         for health in [
             NodeProjectionHealthCode::Unobserved,
@@ -8321,6 +8352,7 @@ mod tests {
         let mut app = App::new(vec![one, two], project_context());
         let focused = FocusedTerminalView {
             revision: 1,
+            node_id: None,
             workspace_id: "w2".into(),
             shell_id: "s2".into(),
         };
@@ -8357,13 +8389,15 @@ mod tests {
         app.apply_focused_terminal(None);
         app.apply_focused_terminal(Some(&FocusedTerminalView {
             revision: 1,
+            node_id: None,
             workspace_id: "w1".into(),
             shell_id: "s1".into(),
         }));
         assert_eq!(
             app.selected().map(|workspace| workspace.id.as_str()),
-            Some("w1")
+            Some("w2")
         );
+        assert_eq!(app.observed_focus_revision, Some(2));
     }
 
     #[test]
@@ -8387,6 +8421,7 @@ mod tests {
         app.select_tab(PrimaryTab::Agents);
         app.apply_focused_terminal(Some(&FocusedTerminalView {
             revision: 1,
+            node_id: None,
             workspace_id: "w3".into(),
             shell_id: "agent-2".into(),
         }));
@@ -8398,6 +8433,7 @@ mod tests {
 
         app.apply_focused_terminal(Some(&FocusedTerminalView {
             revision: 2,
+            node_id: None,
             workspace_id: "w2".into(),
             shell_id: "shell-1".into(),
         }));
@@ -8411,6 +8447,7 @@ mod tests {
         app.select_tab(PrimaryTab::Shells);
         app.apply_focused_terminal(Some(&FocusedTerminalView {
             revision: 3,
+            node_id: None,
             workspace_id: "w4".into(),
             shell_id: "shell-2".into(),
         }));
@@ -8422,6 +8459,7 @@ mod tests {
 
         app.apply_focused_terminal(Some(&FocusedTerminalView {
             revision: 4,
+            node_id: None,
             workspace_id: "w1".into(),
             shell_id: "agent-1".into(),
         }));
@@ -8441,6 +8479,7 @@ mod tests {
         set_shell_id(&mut two, "s2");
         let focused = FocusedTerminalView {
             revision: 1,
+            node_id: None,
             workspace_id: "w2".into(),
             shell_id: "s2".into(),
         };
@@ -8476,6 +8515,7 @@ mod tests {
         let mut app = App::new(vec![one, two], project_context());
         app.enable_focus_following(Some(&FocusedTerminalView {
             revision: 1,
+            node_id: None,
             workspace_id: "w1".into(),
             shell_id: "s1".into(),
         }));
@@ -8483,6 +8523,7 @@ mod tests {
         app.toggle_selection_pin();
         app.apply_focused_terminal(Some(&FocusedTerminalView {
             revision: 2,
+            node_id: None,
             workspace_id: "w2".into(),
             shell_id: "s2".into(),
         }));
@@ -8496,6 +8537,7 @@ mod tests {
         assert_eq!(app.observed_focus_revision, None);
         app.apply_focused_terminal(Some(&FocusedTerminalView {
             revision: 2,
+            node_id: None,
             workspace_id: "w2".into(),
             shell_id: "s2".into(),
         }));
@@ -8520,6 +8562,7 @@ mod tests {
         set_shell_id(&mut one, "s1");
         let focused = FocusedTerminalView {
             revision: 1,
+            node_id: None,
             workspace_id: "w2".into(),
             shell_id: "s2".into(),
         };

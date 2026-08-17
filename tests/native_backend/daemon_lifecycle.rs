@@ -46,7 +46,10 @@ fn native_daemon_lifecycle() {
     let capabilities: serde_json::Value = serde_json::from_slice(&capabilities.stdout).unwrap();
     assert_eq!(capabilities["schema"], "boomux.cli/v1");
     assert_eq!(capabilities["command"], "capabilities");
-    assert_eq!(capabilities["data"]["daemon_protocol_version"], 38);
+    assert_eq!(
+        capabilities["data"]["daemon_protocol_version"],
+        protocol::PROTOCOL_VERSION
+    );
     assert!(
         capabilities["data"]
             .get("session_transcript_integrations")
@@ -128,6 +131,7 @@ fn native_daemon_lifecycle() {
         "protocol_36",
         "protocol_37",
         "protocol_38",
+        "protocol_39",
         "node_registration_management",
         "node_projection_sync",
         "bounded_remote_node_projections",
@@ -149,6 +153,7 @@ fn native_daemon_lifecycle() {
         "multi_node_workspace_placements",
         "guarded_workspace_adoption",
         "resumable_workspace_close",
+        "qualified_focused_terminal",
         "exact_run_attachment",
         "stable_node_identity",
         "revision_aware_scheduled_execution_wait",
@@ -183,7 +188,7 @@ fn native_daemon_lifecycle() {
         .unwrap();
     assert!(status.status.success());
     let status_text = String::from_utf8_lossy(&status.stdout);
-    assert!(status_text.contains("running (protocol 38"));
+    assert!(status_text.contains(&format!("running (protocol {}", protocol::PROTOCOL_VERSION)));
     assert!(status_text.contains("scheduler active (0/4 active executions)"));
     let status = daemon
         .command()
@@ -948,7 +953,7 @@ fn federation_helper_binds_handshake_and_inner_request_to_one_daemon_socket() {
     let handshake = boomux::federation::read_handshake(&mut stdout).unwrap();
     assert_eq!(handshake.version, boomux::federation::FEDERATION_VERSION);
     assert_eq!(handshake.node_id, node_id);
-    assert_eq!(handshake.core_protocol_version, 38);
+    assert_eq!(handshake.core_protocol_version, protocol::PROTOCOL_VERSION);
     assert_eq!(
         handshake.connection_mode,
         boomux::federation::FederationConnectionMode::AdHoc

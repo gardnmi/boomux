@@ -300,6 +300,7 @@ fn two_daemon_remote_attachment_keeps_environment_and_runtime_on_owner() {
     assert!(contains(&output, b"local=unset"));
     let pid = parse_pid(&output, "pid=").expect("remote shell PID");
     let run_id = remote.client.get_shell(&shell.id).unwrap().run.unwrap().id;
+    let local_event_cursor = local.client.events(None, 256, 0).unwrap().cursor;
 
     AttachFrame::Resize {
         rows: 40,
@@ -316,6 +317,47 @@ fn two_daemon_remote_attachment_keeps_environment_and_runtime_on_owner() {
         &read_until(&mut attachment.stream, b"remote-input"),
         b"remote-input"
     ));
+    AttachFrame::FocusGained
+        .write_to(&mut attachment.stream)
+        .unwrap();
+    let focus_events = local
+        .client
+        .events(Some(local_event_cursor), 256, 1_000)
+        .unwrap();
+    assert!(focus_events.events.iter().any(|event| matches!(
+        event.kind,
+        boomux::protocol::DaemonEventKind::FocusedTerminalPresentationChanged
+    )));
+    wait_until(
+        || {
+            remote
+                .client
+                .focused_terminal()
+                .ok()
+                .flatten()
+                .is_some_and(|focused| focused.shell_id == shell.id)
+        },
+        "remote owner did not accept the relayed focus frame",
+    );
+    wait_until(
+        || {
+            local
+                .client
+                .combined_node_snapshot(None)
+                .ok()
+                .and_then(|snapshot| snapshot.focused_terminal)
+                .is_some_and(|focused| {
+                    focused.shell == QualifiedIdentity::new(&remote_node, &shell.id)
+                })
+        },
+        "remote attachment focus was not presented by the local daemon",
+    );
+    let focus_before_handoff = local
+        .client
+        .combined_node_snapshot(None)
+        .unwrap()
+        .focused_terminal
+        .unwrap();
     drop(attachment);
     wait_until(
         || {
@@ -354,6 +396,14 @@ fn two_daemon_remote_attachment_keeps_environment_and_runtime_on_owner() {
         .write_to(&mut reattached.stream)
         .unwrap();
     assert!(restart.wait_with_output().unwrap().status.success());
+    assert_eq!(
+        local
+            .client
+            .combined_node_snapshot(None)
+            .unwrap()
+            .focused_terminal,
+        Some(focus_before_handoff.clone())
+    );
     let mut after_handoff = local
         .client
         .attach_node(
@@ -364,6 +414,20 @@ fn two_daemon_remote_attachment_keeps_environment_and_runtime_on_owner() {
             profile(),
         )
         .unwrap();
+    AttachFrame::FocusGained
+        .write_to(&mut after_handoff.stream)
+        .unwrap();
+    wait_until(
+        || {
+            local
+                .client
+                .combined_node_snapshot(None)
+                .ok()
+                .and_then(|snapshot| snapshot.focused_terminal)
+                .is_some_and(|focused| focused.revision > focus_before_handoff.revision)
+        },
+        "remote focus revision did not advance after local handoff",
+    );
     AttachFrame::Input(b"after-local-handoff\n".to_vec())
         .write_to(&mut after_handoff.stream)
         .unwrap();

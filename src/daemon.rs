@@ -50,13 +50,14 @@ use crate::protocol::{
     NodeProjectionAttention, NodeProjectionExecution, NodeProjectionLauncher,
     NodeProjectionSchedule, NodeProjectionShell, NodeProjectionSnapshot, NodeProjectionSync,
     NodeProjectionSyncMode, NodeProjectionTransition, NodeProjectionTransitionKind,
-    NodeProjectionWorkspace, NotificationDeliveryConfig, Request, Response, RoutedOperation,
-    RoutedOperationResult, ScheduledExecutionDispatchKind, ScheduledExecutionOutcome,
-    ScheduledExecutionReason, ScheduledExecutionScheduleProjection, ScheduledExecutionSnapshot,
-    ScheduledExecutionState, ScheduledOccurrence, ScheduledRunnerResult, SchedulerHealth,
-    SchedulerState, ShellOwner, ShellRunExitReason, ShellRunSnapshot, ShellSnapshot, ShellSpec,
-    ShellStatus, Snapshot, TerminalPreview, TerminalProfile, UnixEnvironment,
-    UnixEnvironmentVariable, WorkspaceLauncherSnapshot, WorkspaceLauncherSpec, WorkspaceSnapshot,
+    NodeProjectionWorkspace, NotificationDeliveryConfig, QualifiedFocusedTerminalSnapshot,
+    QualifiedIdentity, Request, Response, RoutedOperation, RoutedOperationResult,
+    ScheduledExecutionDispatchKind, ScheduledExecutionOutcome, ScheduledExecutionReason,
+    ScheduledExecutionScheduleProjection, ScheduledExecutionSnapshot, ScheduledExecutionState,
+    ScheduledOccurrence, ScheduledRunnerResult, SchedulerHealth, SchedulerState, ShellOwner,
+    ShellRunExitReason, ShellRunSnapshot, ShellSnapshot, ShellSpec, ShellStatus, Snapshot,
+    TerminalPreview, TerminalProfile, UnixEnvironment, UnixEnvironmentVariable,
+    WorkspaceLauncherSnapshot, WorkspaceLauncherSpec, WorkspaceSnapshot,
 };
 use crate::ssh_bootstrap::{self, RemoteBootstrapPlan, SshAuthenticationMode, SshTarget};
 use crate::state_store::{
@@ -263,6 +264,7 @@ pub fn receive_handoff_with_notification_delivery(
             event_stream,
             notifications,
             focused_terminal,
+            presented_focused_terminal,
         } => {
             let store = StateStore::from_transferred_lock(state_lock)?;
             let socket_path = client::socket_path()?;
@@ -276,6 +278,7 @@ pub fn receive_handoff_with_notification_delivery(
                     exited,
                     events: Some(*event_stream),
                     focused_terminal: focused_terminal.map(|focused| *focused),
+                    presented_focused_terminal: presented_focused_terminal.map(|focused| *focused),
                 },
                 Some(&mut channel),
                 notifications
@@ -332,6 +335,7 @@ struct TransferredState {
     exited: Vec<handoff::TransferredExited>,
     events: Option<handoff::EventStreamManifest>,
     focused_terminal: Option<FocusedTerminalSnapshot>,
+    presented_focused_terminal: Option<QualifiedFocusedTerminalSnapshot>,
 }
 
 fn run_daemon(
@@ -392,6 +396,7 @@ fn run_daemon(
         registry.persist()?;
     }
     registry.import_focused_terminal(transferred.focused_terminal)?;
+    registry.import_presented_focused_terminal(transferred.presented_focused_terminal)?;
     if let Some(channel) = committed {
         {
             registry.events.transaction()?.reserve(1)?;
@@ -761,6 +766,7 @@ fn launch_replacement(
         }
         let state_lock = registry.state_lock_descriptor()?;
         let focused_terminal = registry.focused_terminal_for_handoff()?;
+        let presented_focused_terminal = registry.runtimes.presented_focused_terminal()?;
         launch_replacement_process(
             listener.as_fd(),
             daemon_lock.as_fd(),
@@ -770,6 +776,7 @@ fn launch_replacement(
             &event_stream,
             ReplacementOptions {
                 focused_terminal,
+                presented_focused_terminal,
                 notification_settings,
                 startup_environment,
             },
@@ -787,6 +794,7 @@ fn launch_replacement(
 
 struct ReplacementOptions {
     focused_terminal: Option<FocusedTerminalSnapshot>,
+    presented_focused_terminal: Option<QualifiedFocusedTerminalSnapshot>,
     notification_settings: Option<NotificationDeliverySettings>,
     startup_environment: Option<UnixEnvironment>,
 }
@@ -802,6 +810,7 @@ fn launch_replacement_process(
 ) -> io::Result<()> {
     let ReplacementOptions {
         focused_terminal,
+        presented_focused_terminal,
         notification_settings,
         startup_environment,
     } = options;
@@ -856,6 +865,7 @@ fn launch_replacement_process(
                 event_stream: event_stream.clone(),
                 notifications: notification_settings.map(Into::into),
                 focused_terminal,
+                presented_focused_terminal,
             },
         )?;
         send_descriptor(&channel, listener, handoff::LISTENER_MARKER)?;
@@ -1366,6 +1376,18 @@ fn response_for_version_with_schedule_shells(
     schedule_shell_ids: &HashSet<String>,
 ) -> Response {
     let mut response = response;
+    if !protocol::ProtocolFeature::QualifiedFocusedTerminal.is_supported_by(version) {
+        match &mut response {
+            Response::CombinedNodeSnapshot { snapshot } => snapshot.focused_terminal = None,
+            Response::Events { events, .. } => events.retain(|event| {
+                !matches!(
+                    event.kind,
+                    DaemonEventKind::FocusedTerminalPresentationChanged
+                )
+            }),
+            _ => {}
+        }
+    }
     if !protocol::ProtocolFeature::GlobalWorkspaces.is_supported_by(version) {
         match &mut response {
             Response::CombinedNodeSnapshot { snapshot } => {
@@ -2403,6 +2425,8 @@ struct ShellRuntimeManager {
 struct FocusState {
     revision: u64,
     focused_terminal: Option<FocusedTerminalSnapshot>,
+    presented_revision: u64,
+    presented_terminal: Option<QualifiedFocusedTerminalSnapshot>,
 }
 
 enum DurableMutation<T> {
@@ -3317,7 +3341,8 @@ fn reduce_projection_transition(event: &DaemonEvent) -> Option<NodeProjectionTra
             revision: execution.revision,
         },
         DaemonEventKind::HandoffCompleted => NodeProjectionTransitionKind::HandoffCompleted,
-        DaemonEventKind::NodeProjectionChanged { .. } => return None,
+        DaemonEventKind::NodeProjectionChanged { .. }
+        | DaemonEventKind::FocusedTerminalPresentationChanged => return None,
     };
     Some(NodeProjectionTransition {
         event_id: event.id,
@@ -5420,6 +5445,41 @@ impl ShellRuntimeManager {
 
     fn focused_terminal(&self) -> io::Result<Option<FocusedTerminalSnapshot>> {
         Ok(lock(&self.focus)?.focused_terminal.clone())
+    }
+
+    fn presented_focused_terminal(&self) -> io::Result<Option<QualifiedFocusedTerminalSnapshot>> {
+        Ok(lock(&self.focus)?.presented_terminal.clone())
+    }
+
+    fn record_presented_focus(&self, node_id: String, shell_id: String) -> io::Result<()> {
+        let mut focus = lock(&self.focus)?;
+        let revision = focus
+            .presented_revision
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("presented terminal focus revision exhausted"))?;
+        focus.presented_revision = revision;
+        focus.presented_terminal = Some(QualifiedFocusedTerminalSnapshot {
+            revision,
+            shell: QualifiedIdentity::new(node_id, shell_id),
+        });
+        Ok(())
+    }
+
+    fn import_presented_focus(
+        &self,
+        node_id: String,
+        shell_id: String,
+        revision: u64,
+    ) -> io::Result<()> {
+        let mut focus = lock(&self.focus)?;
+        if revision >= focus.presented_revision {
+            focus.presented_revision = revision;
+            focus.presented_terminal = Some(QualifiedFocusedTerminalSnapshot {
+                revision,
+                shell: QualifiedIdentity::new(node_id, shell_id),
+            });
+        }
+        Ok(())
     }
 
     fn record_focus_gained(
@@ -8057,6 +8117,13 @@ impl DaemonService {
             }
             let closes = matches!(frame, AttachFrame::Detached | AttachFrame::ReconnectAck);
             remote_writer.write_frame(&frame, RESPONSE_WRITE_TIMEOUT)?;
+            if matches!(frame, AttachFrame::FocusGained) {
+                self.runtimes
+                    .record_presented_focus(registration.node_id.clone(), shell_id.to_owned())?;
+                let _ = self.events.publish_runtime_batch(vec![
+                    DaemonEventKind::FocusedTerminalPresentationChanged,
+                ]);
+            }
             if closes {
                 if matches!(frame, AttachFrame::ReconnectAck) {
                     let _ = reconnect_finished.try_send(());
@@ -9277,10 +9344,32 @@ impl DaemonService {
                 .then_with(|| left.identity.node_id.cmp(&right.identity.node_id))
                 .then_with(|| left.identity.inner_id.cmp(&right.identity.inner_id))
         });
+        let focused_terminal = self
+            .runtimes
+            .presented_focused_terminal()?
+            .filter(|focused| {
+                nodes.iter().any(|node| {
+                    node.node_id == focused.shell.node_id
+                        && (node.local_snapshot.as_ref().is_some_and(|snapshot| {
+                            snapshot.workspaces.iter().any(|workspace| {
+                                workspace
+                                    .shells
+                                    .iter()
+                                    .any(|shell| shell.id == focused.shell.inner_id)
+                            })
+                        }) || node.remote_projection.as_ref().is_some_and(|projection| {
+                            projection
+                                .shells
+                                .iter()
+                                .any(|shell| shell.id == focused.shell.inner_id)
+                        }))
+                })
+            });
         Ok(CombinedNodeSnapshot {
             nodes,
             workspaces,
             external_workspaces,
+            focused_terminal,
         })
     }
 
@@ -13153,6 +13242,15 @@ impl DaemonService {
         }
         self.runtimes
             .record_focus_gained(shell.workspace_id.clone(), shell.id.clone(), run_id)?;
+        if let Some(identity) = &self.node_identity
+            && let Ok(node_id) = identity.id()
+        {
+            self.runtimes
+                .record_presented_focus(node_id, shell.id.clone())?;
+            let _ = self
+                .events
+                .publish_runtime_batch(vec![DaemonEventKind::FocusedTerminalPresentationChanged]);
+        }
         Ok(true)
     }
 
@@ -13168,7 +13266,32 @@ impl DaemonService {
         }
         let current = self.focus_target_is_current(&focused_terminal)?;
         self.runtimes
-            .import_focused_terminal(focused_terminal, current)
+            .import_focused_terminal(focused_terminal.clone(), current)?;
+        if current
+            && let Some(identity) = &self.node_identity
+            && let Ok(node_id) = identity.id()
+        {
+            self.runtimes.import_presented_focus(
+                node_id,
+                focused_terminal.shell_id,
+                focused_terminal.revision,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn import_presented_focused_terminal(
+        &self,
+        focused_terminal: Option<QualifiedFocusedTerminalSnapshot>,
+    ) -> io::Result<()> {
+        let Some(focused_terminal) = focused_terminal else {
+            return Ok(());
+        };
+        self.runtimes.import_presented_focus(
+            focused_terminal.shell.node_id,
+            focused_terminal.shell.inner_id,
+            focused_terminal.revision,
+        )
     }
 
     fn lifecycle_transaction(
@@ -17004,6 +17127,30 @@ mod tests {
     }
 
     #[test]
+    fn presented_focus_revisions_order_local_and_remote_nodes() {
+        let runtimes = ShellRuntimeManager::default();
+
+        runtimes
+            .record_presented_focus("local-node".into(), "local-shell".into())
+            .unwrap();
+        let local_revision = runtimes
+            .presented_focused_terminal()
+            .unwrap()
+            .unwrap()
+            .revision;
+        runtimes
+            .record_presented_focus("remote-node".into(), "remote-shell".into())
+            .unwrap();
+
+        let remote = runtimes.presented_focused_terminal().unwrap().unwrap();
+        assert!(remote.revision > local_revision);
+        assert_eq!(
+            remote.shell,
+            QualifiedIdentity::new("remote-node", "remote-shell")
+        );
+    }
+
+    #[test]
     fn focus_reports_from_a_replaced_controller_are_ignored() {
         let registry = DaemonService::default();
         let (_workspace, shell, runtime) = running_shell(&registry);
@@ -19348,6 +19495,52 @@ mod tests {
         } = response
         else {
             panic!("expected events");
+        };
+        assert_eq!(filtered_cursor, cursor);
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn protocol_thirty_eight_filters_focus_invalidation_without_rewinding_cursor() {
+        let cursor = EventCursor {
+            stream_id: Uuid::new_v4().to_string(),
+            event_id: 5,
+        };
+        let response = Response::Events {
+            stream_id: cursor.stream_id.clone(),
+            cursor: cursor.clone(),
+            snapshot: None,
+            events: vec![DaemonEvent {
+                id: 5,
+                at_ms: 10,
+                kind: DaemonEventKind::FocusedTerminalPresentationChanged,
+            }],
+        };
+
+        let Response::Events {
+            cursor: current_cursor,
+            events: current_events,
+            ..
+        } = response_for_version(response.clone(), 39)
+        else {
+            panic!("expected current events");
+        };
+        assert_eq!(current_cursor, cursor);
+        assert!(matches!(
+            current_events.as_slice(),
+            [DaemonEvent {
+                kind: DaemonEventKind::FocusedTerminalPresentationChanged,
+                ..
+            }]
+        ));
+
+        let Response::Events {
+            cursor: filtered_cursor,
+            events,
+            ..
+        } = response_for_version(response, 38)
+        else {
+            panic!("expected filtered events");
         };
         assert_eq!(filtered_cursor, cursor);
         assert!(events.is_empty());
@@ -21919,13 +22112,27 @@ mod tests {
                     default_cwd: Some("/owner/work".into()),
                     available: true,
                 }],
+                focused_terminal: Some(protocol::QualifiedFocusedTerminalSnapshot {
+                    revision: 9,
+                    shell: protocol::QualifiedIdentity::new(node_id.clone(), "shell"),
+                }),
             },
         };
+        let Response::CombinedNodeSnapshot {
+            snapshot: protocol_thirty_eight,
+        } = response_for_version(response.clone(), 38)
+        else {
+            panic!("expected combined Node snapshot");
+        };
+        assert_eq!(protocol_thirty_eight.workspaces.len(), 1);
+        assert_eq!(protocol_thirty_eight.external_workspaces.len(), 1);
+        assert!(protocol_thirty_eight.focused_terminal.is_none());
         let Response::CombinedNodeSnapshot { snapshot } = response_for_version(response, 37) else {
             panic!("expected combined Node snapshot");
         };
         assert!(snapshot.workspaces.is_empty());
         assert!(snapshot.external_workspaces.is_empty());
+        assert!(snapshot.focused_terminal.is_none());
         let encoded_node = serde_json::to_value(&snapshot.nodes[0]).unwrap();
         assert!(encoded_node.get("route").is_none());
         assert!(encoded_node.get("registration_revision").is_none());
@@ -21958,6 +22165,7 @@ mod tests {
                         nodes: vec![current_node.clone()],
                         workspaces: Vec::new(),
                         external_workspaces: Vec::new(),
+                        focused_terminal: None,
                     },
                 },
                 version,

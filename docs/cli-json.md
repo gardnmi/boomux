@@ -287,7 +287,9 @@ Command payloads are:
   revision, nullable owner-local Workspace name, nullable owner-local `default_cwd`, and `active`, `close_pending`, or
   `unavailable` state. `external_workspaces` contains unlinked qualified owner
   identity, revision, name, nullable owner-local default cwd, and availability.
-  Protocol-37 and older responses omit both additive arrays.
+  Protocol-37 and older responses omit both additive arrays. Protocol 39 adds
+  nullable `focused_terminal` with a monotonic presentation `revision` and exact
+  qualified `shell`; protocol-38 responses omit it.
 - `shell.suggest-name`: exact resolved `workspace_id` plus a nonempty generated
   `name` that does not match any shell name in that workspace at observation
   time. Protocol-38 responses also include exact `node_id` for local and routed
@@ -422,6 +424,7 @@ Protocol 37 adds `protocol_37`, `remote_agent_schedule_management`, and
 Protocol 38 adds `protocol_38`, `global_workspaces`,
 `multi_node_workspace_placements`, `guarded_workspace_adoption`, and
 `resumable_workspace_close`.
+Protocol 39 adds `protocol_39` and `qualified_focused_terminal`.
 
 Protocol-38 `workspace create` without `--cwd` creates coordinator metadata
 without a default Node or cwd. The compatibility form with `--cwd` continues to

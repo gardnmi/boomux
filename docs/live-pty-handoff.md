@@ -36,6 +36,8 @@ The private handoff channel carries a versioned manifest followed by Unix
   sanitized final VT state without process descriptors
 - The latest non-durable focused-terminal revision and workspace/shell/run
   identity, when it still refers to a transferred runtime
+- The latest non-durable Node-qualified presentation focus and its monotonic
+  revision, including an external Node Shell when that was focused most recently
 
 The PTY master is full duplex, so reader and writer duplicates do not need to be
 transferred separately. The replacement cannot inherit Unix parenthood; process
@@ -68,6 +70,13 @@ resuming readers, so output revisions remain ordered after the ownership
 boundary. The optional focused-terminal snapshot crosses the same graceful
 handoff so dashboard following does not forget the last focused managed window;
 ordinary cold recovery does not restore it.
+Protocol-39 qualified presentation focus crosses the same handoff independently
+from PTY ownership, so a later local or external focus gain always advances past
+the revision already observed by a surviving dashboard.
+An intermediate protocol-38 replacement may omit this additive field. A
+surviving dashboard detects the negotiated protocol transition from the
+`handoff_completed` boundary and resets its observed focus frontier once, so
+each protocol's revision domain remains usable.
 
 ## Accepted Remote Node Boundary
 

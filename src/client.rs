@@ -2345,7 +2345,8 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
-            reject_protocol(&listener, protocol::PROTOCOL_VERSION, 37);
+            reject_protocol(&listener, protocol::PROTOCOL_VERSION, 38);
+            reject_protocol(&listener, 38, 37);
             reject_protocol(&listener, 37, 36);
             reject_protocol(&listener, 36, 35);
             reject_protocol(&listener, 35, 34);
@@ -2518,7 +2519,8 @@ mod tests {
             )
             .unwrap();
 
-            reject_protocol(&listener, protocol::PROTOCOL_VERSION, 37);
+            reject_protocol(&listener, protocol::PROTOCOL_VERSION, 38);
+            reject_protocol(&listener, 38, 37);
             reject_protocol(&listener, 37, 36);
             reject_protocol(&listener, 36, 35);
             reject_protocol(&listener, 35, 34);
@@ -2585,7 +2587,8 @@ mod tests {
             )
             .unwrap();
 
-            reject_protocol(&listener, protocol::PROTOCOL_VERSION, 37);
+            reject_protocol(&listener, protocol::PROTOCOL_VERSION, 38);
+            reject_protocol(&listener, 38, 37);
             reject_protocol(&listener, 37, 36);
             reject_protocol(&listener, 36, 35);
             reject_protocol(&listener, 35, 34);
@@ -2634,7 +2637,8 @@ mod tests {
                 ),
             )
             .unwrap();
-            reject_protocol(&listener, protocol::PROTOCOL_VERSION, 37);
+            reject_protocol(&listener, protocol::PROTOCOL_VERSION, 38);
+            reject_protocol(&listener, 38, 37);
             reject_protocol(&listener, 37, 36);
             reject_protocol(&listener, 36, 35);
             reject_protocol(&listener, 35, 34);
@@ -2813,7 +2817,8 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
-            reject_protocol(&listener, protocol::PROTOCOL_VERSION, 37);
+            reject_protocol(&listener, protocol::PROTOCOL_VERSION, 38);
+            reject_protocol(&listener, 38, 37);
             reject_protocol(&listener, 37, 36);
             reject_protocol(&listener, 36, 35);
             reject_protocol(&listener, 35, 34);
@@ -2887,7 +2892,8 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
-            reject_protocol(&listener, protocol::PROTOCOL_VERSION, 37);
+            reject_protocol(&listener, protocol::PROTOCOL_VERSION, 38);
+            reject_protocol(&listener, 38, 37);
             reject_protocol(&listener, 37, 36);
             reject_protocol(&listener, 36, 35);
             reject_protocol(&listener, 35, 34);

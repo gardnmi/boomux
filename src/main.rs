@@ -103,6 +103,15 @@ impl DashboardRefresh {
         }
         match self.watch.poll(client) {
             Ok(poll) => {
+                let handoff_completed = poll.events.iter().any(|event| {
+                    matches!(&event.kind, protocol::DaemonEventKind::HandoffCompleted)
+                });
+                let protocol_changed = if handoff_completed {
+                    let negotiated = client.protocol_version()?;
+                    update_negotiated_protocol(&mut self.negotiated_protocol, negotiated)
+                } else {
+                    false
+                };
                 if poll.changed {
                     if poll.stream_changed || poll.baseline_replaced {
                         self.needs_reseed = true;
@@ -112,7 +121,10 @@ impl DashboardRefresh {
                         self.apply_events(&poll.events);
                     }
                     self.last_snapshot_at = Instant::now();
-                    return Ok(Some((self.watch.snapshot().clone(), poll.stream_changed)));
+                    return Ok(Some((
+                        self.watch.snapshot().clone(),
+                        poll.stream_changed || protocol_changed,
+                    )));
                 }
                 if self.last_snapshot_at.elapsed() < DASHBOARD_FALLBACK_REFRESH_INTERVAL {
                     return Ok(None);
@@ -249,6 +261,12 @@ impl DashboardRefresh {
             self.executions.remove(&id);
         }
     }
+}
+
+fn update_negotiated_protocol(current: &mut u32, negotiated: u32) -> bool {
+    let changed = *current != negotiated;
+    *current = negotiated;
+    changed
 }
 
 const BOOMUX_SKILL: &str = include_str!("../.agents/skills/boomux/SKILL.md");
@@ -1977,6 +1995,7 @@ fn node_command(command: NodeCommands, json: bool) -> Result<(), Box<dyn Error>>
             if json {
                 let workspaces = snapshot.workspaces.clone();
                 let external_workspaces = snapshot.external_workspaces.clone();
+                let focused_terminal = snapshot.focused_terminal.clone();
                 let nodes = snapshot
                     .nodes
                     .into_iter()
@@ -1988,6 +2007,7 @@ fn node_command(command: NodeCommands, json: bool) -> Result<(), Box<dyn Error>>
                         "nodes": nodes,
                         "workspaces": workspaces,
                         "external_workspaces": external_workspaces,
+                        "focused_terminal": focused_terminal,
                     }),
                 )
             } else {
@@ -3533,6 +3553,9 @@ fn dashboard_state(
     title_cache: &mut host_session_titles::Cache,
     reset_focus_revision: bool,
 ) -> tui::DashboardState {
+    let qualified_focused_terminal = combined
+        .as_ref()
+        .and_then(|snapshot| snapshot.focused_terminal.clone());
     let schedules_supported = protocol::ProtocolFeature::ScheduledExecutionObservation
         .is_supported_by(refresh.negotiated_protocol);
     let mut workspaces = dashboard_views_with_catalog(&snapshot.workspaces, git_cache, title_cache);
@@ -3652,7 +3675,11 @@ fn dashboard_state(
             .is_supported_by(refresh.negotiated_protocol),
         schedule_editing: protocol::ProtocolFeature::AgentScheduleEditing
             .is_supported_by(refresh.negotiated_protocol),
-        focused_terminal: snapshot.focused_terminal.map(focused_terminal_view),
+        focused_terminal: dashboard_focused_terminal_view(
+            refresh.negotiated_protocol,
+            qualified_focused_terminal,
+            snapshot.focused_terminal,
+        ),
         reset_focus_revision,
     }
 }
@@ -3849,8 +3876,32 @@ fn unavailable_placement_node(node_id: &str) -> tui::NodeView {
 fn focused_terminal_view(focused: protocol::FocusedTerminalSnapshot) -> tui::FocusedTerminalView {
     tui::FocusedTerminalView {
         revision: focused.revision,
+        node_id: None,
         workspace_id: focused.workspace_id,
         shell_id: focused.shell_id,
+    }
+}
+
+fn qualified_focused_terminal_view(
+    focused: protocol::QualifiedFocusedTerminalSnapshot,
+) -> tui::FocusedTerminalView {
+    tui::FocusedTerminalView {
+        revision: focused.revision,
+        node_id: Some(focused.shell.node_id),
+        workspace_id: String::new(),
+        shell_id: focused.shell.inner_id,
+    }
+}
+
+fn dashboard_focused_terminal_view(
+    negotiated_protocol: u32,
+    qualified: Option<protocol::QualifiedFocusedTerminalSnapshot>,
+    local: Option<protocol::FocusedTerminalSnapshot>,
+) -> Option<tui::FocusedTerminalView> {
+    if protocol::ProtocolFeature::QualifiedFocusedTerminal.is_supported_by(negotiated_protocol) {
+        qualified.map(qualified_focused_terminal_view)
+    } else {
+        local.map(focused_terminal_view)
     }
 }
 
@@ -14038,7 +14089,37 @@ mod tests {
                 .validated_version,
             "0.84.1"
         );
-        assert_eq!(protocol::PROTOCOL_VERSION, 38);
+        assert_eq!(protocol::PROTOCOL_VERSION, 39);
+    }
+
+    #[test]
+    fn protocol_thirty_nine_focus_absence_does_not_restore_legacy_local_focus() {
+        let local = protocol::FocusedTerminalSnapshot {
+            revision: 8,
+            workspace_id: "local-workspace".into(),
+            shell_id: "local-shell".into(),
+            run_id: "local-run".into(),
+        };
+        assert!(
+            dashboard_focused_terminal_view(39, None, Some(local.clone())).is_none(),
+            "qualified focus absence is authoritative for protocol 39"
+        );
+        assert_eq!(
+            dashboard_focused_terminal_view(38, None, Some(local))
+                .unwrap()
+                .shell_id,
+            "local-shell"
+        );
+    }
+
+    #[test]
+    fn focus_frontier_resets_once_per_protocol_handoff_transition() {
+        let mut negotiated = 38;
+
+        assert!(update_negotiated_protocol(&mut negotiated, 39));
+        assert!(!update_negotiated_protocol(&mut negotiated, 39));
+        assert!(update_negotiated_protocol(&mut negotiated, 38));
+        assert!(!update_negotiated_protocol(&mut negotiated, 38));
     }
 
     #[test]

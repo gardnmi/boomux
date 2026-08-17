@@ -893,6 +893,7 @@ fn write_fake_combined_snapshot(directory: &Path, workspace_owner_eligible: bool
                     }],
                     workspaces: Vec::new(),
                     external_workspaces: Vec::new(),
+                    focused_terminal: None,
                 },
             },
         ),

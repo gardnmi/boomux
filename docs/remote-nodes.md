@@ -23,6 +23,8 @@
 > Protocol 38 implements coordinator-owned Workspace metadata, explicit
 > Node-owned placements, guarded adoption and linking, and resumable close
 > progress. Node-local runtime state remains authoritative on each owner.
+> Protocol 39 implements live Node-qualified focused-terminal presentation in
+> the combined Node snapshot without extending persisted remote projections.
 > Public `boomux --remote TARGET`
 > remains ad hoc.
 
@@ -665,6 +667,21 @@ and launches local presentation with a Node-qualified title. The dashboard opens
 current remote Shell rows and active exact Scheduled Execution runs only when
 the observed owner capabilities include remote attachment.
 
+Protocol 39 advertises `qualified_focused_terminal`. A focus frame relayed by a
+local attachment is still validated and recorded by the owning daemon. After a
+successful forward, the presenting daemon also advances one ephemeral
+presentation revision for the exact qualified Shell. The combined Node snapshot
+returns that value only while its selected Node view contains the Shell. It is
+not written to `node-cache.json`, copied into owner events, or used as lifecycle
+or mutation authority. This local physical-focus hint does not wait for a
+per-frame owner acknowledgment; the owner independently rejects stale controller
+frames under its existing attachment rules. Protocol-38 clients receive the
+combined snapshot without this additive field. The presenting daemon emits a
+payload-free `focused_terminal_presentation_changed` local invalidation so a
+dashboard reads the combined snapshot on its next event poll instead of waiting
+for the one-second fallback. The event does not become a reduced owner
+transition.
+
 Remote graceful handoff sends its existing reconnect boundary through the
 bridge. Local graceful handoff asks the local attachment to reconnect and opens
 a fresh SSH stream after finalization. No remote PTY descriptor, process handle,
@@ -774,7 +791,9 @@ stable schema. A client never infers federation support from a version string.
 Protocol-32 and older clients cannot request the combined snapshot and continue
 to receive only local resources from every legacy surface. Protocol 33 adds no
 new event kind; protocol-31 filtering of `node_projection_changed` remains the
-event compatibility boundary.
+event compatibility boundary. Protocol 39 adds the local-only
+`focused_terminal_presentation_changed` invalidation; older clients do not
+receive it, but their cursors advance across the filtered event.
 
 Federation has three independent compatibility boundaries:
 

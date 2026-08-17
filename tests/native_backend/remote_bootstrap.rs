@@ -535,7 +535,8 @@ fn live_destination_replacement_and_rollback_select_the_correct_daemon_binary() 
     assert!(!backup.exists());
     let socket_metadata = fs::metadata(runtime.join("boomux/daemon.sock")).unwrap();
     let activation_input = format!(
-        "{transaction}\nupgrade\n38\n{old_pid}\n{}\n{}\n{}\n",
+        "{transaction}\nupgrade\n{}\n{old_pid}\n{}\n{}\n{}\n",
+        protocol::PROTOCOL_VERSION,
         destination.display(),
         socket_metadata.dev(),
         socket_metadata.ino()
@@ -558,7 +559,11 @@ fn live_destination_replacement_and_rollback_select_the_correct_daemon_binary() 
         std::path::PathBuf::from(format!("{} (deleted)", destination.display()))
     );
 
-    fs::write(bin.join(transaction).join("prior_daemon"), b"38").unwrap();
+    fs::write(
+        bin.join(transaction).join("prior_daemon"),
+        protocol::PROTOCOL_VERSION.to_string(),
+    )
+    .unwrap();
     fs::write(bin.join(transaction).join("daemon_contacted"), b"").unwrap();
     let restart = Command::new(&destination)
         .args(["daemon", "restart"])

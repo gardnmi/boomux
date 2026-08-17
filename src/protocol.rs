@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 38;
+pub const PROTOCOL_VERSION: u32 = 39;
 pub const MIN_PROTOCOL_VERSION: u32 = 6;
 pub const MAX_CONTROL_FRAME: usize = 8 * 1024 * 1024;
 pub const MAX_ATTACH_FRAME: usize = 1024 * 1024;
@@ -167,6 +167,10 @@ define_protocol_features! {
         "multi_node_workspace_placements",
         "guarded_workspace_adoption",
         "resumable_workspace_close",
+    ]),
+    QualifiedFocusedTerminal => (39, "Node-qualified focused terminal presentation", [
+        "protocol_39",
+        "qualified_focused_terminal",
     ]),
 }
 
@@ -474,6 +478,13 @@ pub struct FocusedTerminalSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QualifiedFocusedTerminalSnapshot {
+    pub revision: u64,
+    pub shell: QualifiedIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeRegistrationSnapshot {
     pub alias: String,
     pub target: String,
@@ -741,6 +752,8 @@ pub struct CombinedNodeSnapshot {
     pub workspaces: Vec<GlobalWorkspaceSnapshot>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub external_workspaces: Vec<ExternalWorkspaceSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focused_terminal: Option<QualifiedFocusedTerminalSnapshot>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1856,6 +1869,7 @@ pub enum DaemonEventKind {
         node_id: String,
         cache_generation: u64,
     },
+    FocusedTerminalPresentationChanged,
     HandoffCompleted,
 }
 
@@ -3215,8 +3229,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_thirty_eight_with_minimum_six() {
-        assert_eq!(PROTOCOL_VERSION, 38);
+    fn protocol_version_is_thirty_nine_with_minimum_six() {
+        assert_eq!(PROTOCOL_VERSION, 39);
         assert_eq!(MIN_PROTOCOL_VERSION, 6);
     }
 
@@ -3388,6 +3402,10 @@ mod tests {
                 nodes: Vec::new(),
                 workspaces: Vec::new(),
                 external_workspaces: Vec::new(),
+                focused_terminal: Some(QualifiedFocusedTerminalSnapshot {
+                    revision: 4,
+                    shell: QualifiedIdentity::new("node", "shell"),
+                }),
             },
         };
         assert_eq!(
@@ -4495,6 +4513,7 @@ mod tests {
                     "resumable_workspace_close",
                 ][..],
             ),
+            (39, &["protocol_39", "qualified_focused_terminal"][..]),
         ];
 
         let actual = ProtocolFeature::ALL

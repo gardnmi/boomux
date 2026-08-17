@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize};
 use crate::client;
 use crate::fd_transfer::receive_descriptor;
 use crate::protocol::{
-    self, DaemonEvent, FocusedTerminalSnapshot, NotificationDeliveryConfig, TerminalProfile,
+    self, DaemonEvent, FocusedTerminalSnapshot, NotificationDeliveryConfig,
+    QualifiedFocusedTerminalSnapshot, TerminalProfile,
 };
 use crate::state_store;
 
@@ -39,6 +40,8 @@ pub(crate) struct Manifest {
     pub(crate) notifications: Option<NotificationDeliveryConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) focused_terminal: Option<FocusedTerminalSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) presented_focused_terminal: Option<QualifiedFocusedTerminalSnapshot>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -94,6 +97,7 @@ pub(crate) enum Bootstrap {
         event_stream: Box<EventStreamManifest>,
         notifications: Option<NotificationDeliveryConfig>,
         focused_terminal: Option<Box<FocusedTerminalSnapshot>>,
+        presented_focused_terminal: Option<Box<QualifiedFocusedTerminalSnapshot>>,
     },
 }
 
@@ -114,6 +118,7 @@ pub(crate) fn receive_bootstrap(channel: RawFd) -> io::Result<Bootstrap> {
     let event_stream = manifest.event_stream.clone();
     let notifications = manifest.notifications.clone();
     let focused_terminal = manifest.focused_terminal.clone().map(Box::new);
+    let presented_focused_terminal = manifest.presented_focused_terminal.clone().map(Box::new);
     let listener = receive_descriptor(&channel, LISTENER_MARKER)?;
     let runtime_lock = receive_descriptor(&channel, RUNTIME_LOCK_MARKER)?;
     let state_lock = receive_descriptor(&channel, STATE_LOCK_MARKER)?;
@@ -183,6 +188,7 @@ pub(crate) fn receive_bootstrap(channel: RawFd) -> io::Result<Bootstrap> {
             event_stream: Box::new(event_stream),
             notifications,
             focused_terminal,
+            presented_focused_terminal,
         }),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -233,6 +239,20 @@ fn validate_pidfd(descriptor: &OwnedFd, expected_pid: u32) -> io::Result<()> {
 }
 
 fn validate_manifest(manifest: &Manifest) -> io::Result<()> {
+    if manifest
+        .presented_focused_terminal
+        .as_ref()
+        .is_some_and(|focused| {
+            focused.revision == 0
+                || uuid::Uuid::parse_str(&focused.shell.node_id).is_err()
+                || uuid::Uuid::parse_str(&focused.shell.inner_id).is_err()
+        })
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "handoff manifest contains invalid presented terminal focus",
+        ));
+    }
     if manifest.notifications.as_ref().is_some_and(|settings| {
         !(1..=crate::daemon::MAX_SCHEDULED_EXECUTION_CONCURRENCY)
             .contains(&settings.max_scheduled_execution_concurrency)
@@ -426,7 +446,7 @@ mod tests {
     }
 
     #[test]
-    fn old_manifest_defaults_focused_terminal() {
+    fn old_manifest_defaults_focus_state() {
         let manifest: Manifest = serde_json::from_value(serde_json::json!({
             "runtimes": [],
             "exited": [],
@@ -436,6 +456,7 @@ mod tests {
         .unwrap();
 
         assert!(manifest.focused_terminal.is_none());
+        assert!(manifest.presented_focused_terminal.is_none());
     }
 
     #[test]
@@ -452,12 +473,20 @@ mod tests {
             event_stream: event_stream(),
             notifications: None,
             focused_terminal: Some(focused_terminal.clone()),
+            presented_focused_terminal: Some(QualifiedFocusedTerminalSnapshot {
+                revision: 5,
+                shell: protocol::QualifiedIdentity::new(
+                    uuid::Uuid::from_u128(1).to_string(),
+                    uuid::Uuid::from_u128(2).to_string(),
+                ),
+            }),
         };
 
         let decoded: Manifest =
             serde_json::from_value(serde_json::to_value(manifest).unwrap()).unwrap();
 
         assert_eq!(decoded.focused_terminal, Some(focused_terminal));
+        assert_eq!(decoded.presented_focused_terminal.unwrap().revision, 5);
     }
 
     #[test]
@@ -480,6 +509,7 @@ mod tests {
                     ..Default::default()
                 }),
                 focused_terminal: None,
+                presented_focused_terminal: None,
             };
             assert_eq!(
                 validate_manifest(&manifest).unwrap_err().kind(),

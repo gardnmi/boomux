@@ -126,6 +126,10 @@ Protocol 38 adds coordinator-owned Workspace identity and explicit Node-owned
 placements. Coordinator metadata is stored independently from Node-local runtime
 state; equal names never establish membership, and adoption and linking require
 exact owner identities and revisions.
+Protocol 39 adds Node-qualified focused-terminal presentation to the combined
+Node snapshot and a prompt-free local invalidation event for responsive
+presentation. Focus remains ephemeral and controller-authorized, and is not
+persisted in the reduced remote projection cache.
 Remote notification presentation reuses protocol-32 atomic reduced transitions,
 so it does not require a later protocol. Node-cache schema 2 adds bounded local
 at-most-once individual and reconnect-digest claims with an explicit schema-1
@@ -330,7 +334,17 @@ Shell ID. The local daemon opens one identity-verified SSH helper channel and
 relays bounded `AttachFrame` values; the remote daemon retains PTY, controller,
 focus, takeover, resize, reconstruction, and exact-run authority. Remote
 transport loss closes only the local attachment and does not synthesize Shell,
-Agent, or Scheduled Execution completion.
+Agent, or Scheduled Execution completion. Protocol 39 also records a relayed
+focus gain as ephemeral presentation state on the local daemon after forwarding
+it to the owner. The presentation identity is the exact owner Node and Shell;
+it does not transfer focus authority or enter the remote projection cache.
+Presentation recording reflects the physical local focus report after the frame
+is written to the owner stream; it is not an acknowledgment that the owner
+accepted the frame and is never used as lifecycle evidence.
+The presenting daemon publishes a payload-free local invalidation after this
+recording so dashboards refresh the combined view on their next event poll. The
+owner's corresponding event remains owner-local and is excluded from reduced
+projection transitions.
 
 No emulator-specific adapter or compositor window ID is required.
 Spawned terminal windows start in independent process sessions with null
@@ -385,14 +399,22 @@ Agent presentation takes precedence when the current run has an active Agent or
 an exact `opencode` or `pi` foreground hint.
 
 The daemon retains the latest controller-authorized terminal focus gain as
-ephemeral workspace, shell, run, and monotonic revision metadata. With
+ephemeral workspace, shell, run, and monotonic revision metadata. Protocol 39
+also retains one monotonic presentation revision across local and relayed remote
+focus gains and exposes its exact `(node_id, shell_id)` through the combined
+Node snapshot. With
 `dashboard.follow_focused_terminal` enabled (the default), the dashboard uses a
 new revision as a one-shot selection trigger and resolves both shell and Agent
-rows by durable shell ID. Repeated snapshot refreshes do not enforce the
+rows by Node-qualified durable Shell identity. Repeated snapshot refreshes do not enforce the
 selection, so manual navigation remains usable until another terminal focus
 gain. Focus changes are deferred while an overlay or close confirmation is
 active. The setting is dashboard-local and disabling it does not stop focus
 reporting by attachments.
+Temporary projection absence does not reset the client's observed focus
+frontier. A replaced event stream or a handoff that changes the negotiated
+protocol resets it once. Same-version handoff retains the exact presentation
+frontier, while 39-to-38 and 38-to-39 transitions deliberately start the active
+protocol's revision domain without suppressing later physical focus gains.
 
 Selected-kind previews remain read-only. Workspace, launcher, and run metadata
 come from the polled snapshot. Shell output uses a bounded plain-text read only
@@ -711,6 +733,13 @@ observed. A definitive synchronous owner rejection may cancel only its serialize
 operation. Schedule
 prompts remain only in the transient owner request, and launcher and Shell argv
 remain arrays throughout routing.
+Protocol 39 adds an optional Node-qualified focused Shell and presentation
+revision to the combined Node snapshot. Protocol-38 responses omit the field.
+The value is live daemon memory, is returned only while the selected combined
+view still contains that exact Shell, and adds no durable projection field. A
+payload-free focus-presentation invalidation wakes protocol-39 clients without
+placing identity in the event stream; protocol-38 responses filter it while
+advancing their cursor.
 Project creation prepares the new global Workspace metadata and first Shell in
 one coordinator-store replacement. An exact retry returns its stored success
 even after the original global revision becomes stale. A new project request by
