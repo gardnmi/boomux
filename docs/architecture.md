@@ -832,8 +832,10 @@ Protocol 30 adds expected-ID-conditional Node rekey. The daemon excludes restart
 shutdown, and concurrent rekey transitions, closes federation admission, and
 atomically replaces `node.json` only after every admitted channel drains within
 the bound. Timeout returns `busy`, reopens admission, and preserves the old ID;
-rekey cannot be routed through a federation channel. A public owner-confirmation
-workflow remains pending.
+rekey cannot be routed through a federation channel. `boomux node rekey` is a
+local human-only workflow: it refuses noninteractive input and requires the
+operator to type the exact current Node ID before sending the conditional
+request.
 
 Cron day matching preserves syntactic wildcard origin: `*/n` is wildcard-origin,
 while numeric lists and ranges remain restricted even when they cover the full

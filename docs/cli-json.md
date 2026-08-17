@@ -76,6 +76,10 @@ process-starting, destructive, integration-management, Schedule, and
 exact-attachment support. The full compatibility and privacy rules are defined
 in [`remote-nodes.md`](remote-nodes.md).
 
+`boomux node rekey` is an implemented local identity-administration command. It
+requires an interactive terminal and exact current-ID confirmation, and does not
+support `--json`; it cannot be routed through federation.
+
 The following commands support `--json`:
 
 - `boomux capabilities`

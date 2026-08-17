@@ -7,8 +7,8 @@
 > compatibility tests remain authoritative for shipped behavior. Protocol 28
 > implements stable local Node identity; protocol 29, handshake version 1, and
 > the hidden stdio helper establish the verified same-socket bridge boundary.
-> Protocol 30 implements bounded expected-ID rekey admission, but its public
-> confirmation workflow remains pending. No public remote Node command, SSH
+> Protocol 30 and local `boomux node rekey` implement bounded expected-ID rekey
+> with exact interactive confirmation. No public remote access command, SSH
 > bootstrap, registration, or projection is implemented yet.
 
 ## Purpose

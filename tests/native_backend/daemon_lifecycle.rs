@@ -962,6 +962,20 @@ fn federation_helper_emits_no_handshake_for_a_mismatched_state_root() {
 fn node_rekey_is_expected_identity_conditional_and_drains_federation_channels() {
     let daemon = TestDaemon::start();
     let original = daemon.client.node_identity().unwrap();
+
+    let noninteractive = daemon
+        .command()
+        .args(["node", "rekey"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!noninteractive.status.success());
+    assert!(
+        String::from_utf8_lossy(&noninteractive.stderr)
+            .contains("node rekey requires an interactive terminal")
+    );
+    assert_eq!(daemon.client.node_identity().unwrap(), original);
+
     let channel = daemon.client.open_federation_channel().unwrap();
 
     assert_remote_code(
