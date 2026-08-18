@@ -417,7 +417,13 @@ pub(crate) fn project_remote_node(
                         .filter(|agent| {
                             agent.shell_id == shell.id
                                 && agent.run_id == run_id
-                                && !matches!(agent.state, AgentState::Inactive | AgentState::Done)
+                                && if matches!(shell.status, ShellStatus::Pending) {
+                                    shell.recovered_agent_id.as_deref() == Some(agent.id.as_str())
+                                        && agent.ended_at_ms.is_none()
+                                        && agent.state != AgentState::Done
+                                } else {
+                                    !matches!(agent.state, AgentState::Inactive | AgentState::Done)
+                                }
                         })
                         .max_by_key(|agent| (agent.observed_at_ms, &agent.id))
                 });
@@ -426,7 +432,11 @@ pub(crate) fn project_remote_node(
                         shell: terminal,
                         agent: Some(AgentView {
                             id: agent.id.clone(),
-                            state: agent.state.into(),
+                            state: if matches!(shell.status, ShellStatus::Pending) {
+                                AgentDisplayState::Inactive
+                            } else {
+                                agent.state.into()
+                            },
                             integration: agent.integration.clone(),
                             external_session_id: None,
                             authority: AgentAuthorityDisplay::DaemonLifecycle,
@@ -735,6 +745,26 @@ fn project_workspace(
                                 .cmp(&right.observation.observed_at_ms)
                                 .then_with(|| left.id.cmp(&right.id))
                         })
+                } else if matches!(shell.status, ShellStatus::Pending) {
+                    workspace
+                        .agents
+                        .iter()
+                        .filter(|agent| {
+                            agent.workspace_id == workspace.id
+                                && shell.recovered_agent_id.as_deref() == Some(agent.id.as_str())
+                                && agent.shell_id == shell.id
+                                && agent.run_id == run.id
+                                && agent.ended_at_ms.is_none()
+                                && agent.observation.authority
+                                    == boomux::protocol::AgentAuthority::LifecycleIntegration
+                                && agent.observation.state != AgentState::Done
+                        })
+                        .max_by(|left, right| {
+                            left.observation
+                                .observed_at_ms
+                                .cmp(&right.observation.observed_at_ms)
+                                .then_with(|| left.id.cmp(&right.id))
+                        })
                 } else {
                     None
                 }
@@ -769,7 +799,11 @@ fn project_workspace(
                     shell: shell_view,
                     agent: Some(AgentView {
                         id: agent.id.clone(),
-                        state: agent.observation.state.into(),
+                        state: if matches!(shell.status, ShellStatus::Pending) {
+                            AgentDisplayState::Inactive
+                        } else {
+                            agent.observation.state.into()
+                        },
                         integration: agent.integration.clone(),
                         external_session_id: agent.external_session_id.clone(),
                         authority: agent.observation.authority.into(),
@@ -1004,6 +1038,7 @@ mod tests {
                     output_revision: 0,
                     environment_has_run_id: true,
                 }),
+                recovered_agent_id: None,
                 foreground_process: None,
             }],
             launchers: Vec::new(),
@@ -1105,7 +1140,6 @@ mod tests {
             },
             attention: None,
         });
-
         let views = project(std::slice::from_ref(&workspace), &mut git::Cache::default());
         let WorkspaceItemView::AgentShell(agent) = &views[0].items[0] else {
             panic!("expected Agent shell");
@@ -1114,6 +1148,144 @@ mod tests {
 
         workspace.agents[0].observation.state = AgentState::Inactive;
         let views = project(std::slice::from_ref(&workspace), &mut git::Cache::default());
+        assert!(matches!(views[0].items[0], WorkspaceItemView::Shell(_)));
+    }
+
+    #[test]
+    fn recovered_pending_shell_keeps_its_exact_agent_kind_as_inactive() {
+        let mut workspace = workspace(Vec::new());
+        workspace.shells[0].status = ShellStatus::Pending;
+        workspace.shells[0].run.as_mut().unwrap().ended_at_ms = Some(2);
+        workspace.shells[0].run.as_mut().unwrap().exit_reason =
+            Some(ShellRunExitReason::Interrupted);
+        workspace.shells[0].recovered_agent_id = Some("agent-1".into());
+        workspace.agents.push(AgentInstanceSnapshot {
+            id: "agent-1".into(),
+            workspace_id: workspace.id.clone(),
+            shell_id: "shell-1".into(),
+            run_id: "run-1".into(),
+            name: "review".into(),
+            integration: "opencode".into(),
+            external_session_id: Some("session-1".into()),
+            cwd: Some(PathBuf::from("/tmp/project")),
+            started_at_ms: 1,
+            ended_at_ms: None,
+            observation: AgentObservationSnapshot {
+                revision: 1,
+                state: AgentState::Blocked,
+                authority: AgentAuthority::LifecycleIntegration,
+                evidence: "permission".into(),
+                confidence: 100,
+                observed_at_ms: 2,
+            },
+            attention: None,
+        });
+        let mut distractor = workspace.agents[0].clone();
+        distractor.id = "agent-2".into();
+        distractor.name = "wrong-agent".into();
+        distractor.integration = "native-test".into();
+        distractor.external_session_id = None;
+        distractor.observation.observed_at_ms = 3;
+        workspace.agents.push(distractor);
+
+        let views = project(std::slice::from_ref(&workspace), &mut git::Cache::default());
+        let WorkspaceItemView::AgentShell(agent) = &views[0].items[0] else {
+            panic!("expected recovered Agent shell");
+        };
+        assert_eq!(agent.agent.as_ref().unwrap().id, "agent-1");
+        assert_eq!(agent.state(), AgentDisplayState::Inactive);
+        assert_eq!(agent.shell.status, "pending");
+
+        workspace.shells[0].run = None;
+        let views = project(&[workspace], &mut git::Cache::default());
+        assert!(matches!(views[0].items[0], WorkspaceItemView::Shell(_)));
+    }
+
+    #[test]
+    fn remote_recovery_marker_projects_only_as_inactive() {
+        let mut node = boomux::protocol::CombinedNode {
+            node_id: "node-1".into(),
+            alias: "remote".into(),
+            local: false,
+            route: Some("remote.example".into()),
+            registration_revision: Some(1),
+            health: boomux::protocol::NodeProjectionHealthCode::Online,
+            current: true,
+            stale: false,
+            observed_at_ms: 2,
+            observed_protocol_version: Some(40),
+            observed_capabilities: vec!["recovered_agent_presentation".into()],
+            workspace_owner_eligible: true,
+            workspace_owner_unavailable_reason: None,
+            scheduler: boomux::protocol::SchedulerHealth {
+                state: boomux::protocol::SchedulerState::Active,
+                max_concurrent: 4,
+                active_executions: 0,
+            },
+            local_snapshot: None,
+            remote_projection: Some(boomux::protocol::NodeProjectionSnapshot {
+                node_id: "node-1".into(),
+                workspaces: vec![boomux::protocol::NodeProjectionWorkspace {
+                    id: "workspace-1".into(),
+                    name: "project".into(),
+                    item_count: 1,
+                    attention_count: 0,
+                }],
+                shells: vec![boomux::protocol::NodeProjectionShell {
+                    id: "shell-1".into(),
+                    workspace_id: "workspace-1".into(),
+                    name: "agent".into(),
+                    owner: ShellOwner::User,
+                    status: ShellStatus::Pending,
+                    run_id: Some("run-1".into()),
+                    generation: Some(1),
+                    started_at_ms: Some(1),
+                    ended_at_ms: Some(2),
+                    recovered_agent_id: Some("agent-1".into()),
+                }],
+                launchers: Vec::new(),
+                agents: vec![boomux::protocol::NodeProjectionAgent {
+                    id: "agent-1".into(),
+                    workspace_id: "workspace-1".into(),
+                    shell_id: "shell-1".into(),
+                    run_id: "run-1".into(),
+                    name: "review".into(),
+                    integration: "opencode".into(),
+                    state: AgentState::Blocked,
+                    observation_revision: 1,
+                    observed_at_ms: 2,
+                    started_at_ms: 1,
+                    ended_at_ms: None,
+                    attention: None,
+                }],
+                schedules: Vec::new(),
+                executions: Vec::new(),
+                executions_truncated: false,
+                scheduler: boomux::protocol::SchedulerHealth {
+                    state: boomux::protocol::SchedulerState::Active,
+                    max_concurrent: 4,
+                    active_executions: 0,
+                },
+            }),
+        };
+
+        let projection = node.remote_projection.as_mut().unwrap();
+        let mut distractor = projection.agents[0].clone();
+        distractor.id = "agent-2".into();
+        distractor.name = "wrong-agent".into();
+        distractor.integration = "native-test".into();
+        distractor.observed_at_ms = 3;
+        projection.agents.push(distractor);
+
+        let (views, _) = project_remote_node(&node);
+        let WorkspaceItemView::AgentShell(agent) = &views[0].items[0] else {
+            panic!("expected recovered remote Agent shell");
+        };
+        assert_eq!(agent.agent.as_ref().unwrap().id, "agent-1");
+        assert_eq!(agent.state(), AgentDisplayState::Inactive);
+
+        node.remote_projection.as_mut().unwrap().shells[0].run_id = None;
+        let (views, _) = project_remote_node(&node);
         assert!(matches!(views[0].items[0], WorkspaceItemView::Shell(_)));
     }
 

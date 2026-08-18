@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 39;
+pub const PROTOCOL_VERSION: u32 = 40;
 pub const MIN_PROTOCOL_VERSION: u32 = 6;
 pub const MAX_CONTROL_FRAME: usize = 8 * 1024 * 1024;
 pub const MAX_ATTACH_FRAME: usize = 1024 * 1024;
@@ -171,6 +171,10 @@ define_protocol_features! {
     QualifiedFocusedTerminal => (39, "Node-qualified focused terminal presentation", [
         "protocol_39",
         "qualified_focused_terminal",
+    ]),
+    RecoveredAgentPresentation => (40, "recovered Agent presentation", [
+        "protocol_40",
+        "recovered_agent_presentation",
     ]),
 }
 
@@ -586,6 +590,8 @@ pub struct NodeProjectionShell {
     pub started_at_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ended_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovered_agent_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1241,6 +1247,8 @@ pub struct ShellSnapshot {
     pub status: ShellStatus,
     #[serde(default)]
     pub run: Option<ShellRunSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovered_agent_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub foreground_process: Option<String>,
 }
@@ -3229,8 +3237,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_thirty_nine_with_minimum_six() {
-        assert_eq!(PROTOCOL_VERSION, 39);
+    fn protocol_version_is_forty_with_minimum_six() {
+        assert_eq!(PROTOCOL_VERSION, 40);
         assert_eq!(MIN_PROTOCOL_VERSION, 6);
     }
 
@@ -4557,6 +4565,7 @@ mod tests {
                 ][..],
             ),
             (39, &["protocol_39", "qualified_focused_terminal"][..]),
+            (40, &["protocol_40", "recovered_agent_presentation"][..]),
         ];
 
         let actual = ProtocolFeature::ALL
@@ -4803,6 +4812,7 @@ mod tests {
                 output_revision: 2,
                 environment_has_run_id: true,
             }),
+            recovered_agent_id: Some("a1".into()),
             foreground_process: Some("sleep".into()),
         };
 

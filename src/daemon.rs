@@ -1388,6 +1388,9 @@ fn response_for_version_with_schedule_shells(
             _ => {}
         }
     }
+    if !protocol::ProtocolFeature::RecoveredAgentPresentation.is_supported_by(version) {
+        remove_recovered_agent_presentation(&mut response);
+    }
     if !protocol::ProtocolFeature::GlobalWorkspaces.is_supported_by(version) {
         match &mut response {
             Response::CombinedNodeSnapshot { snapshot } => {
@@ -1553,6 +1556,69 @@ fn response_for_version_with_schedule_shells(
             }
         }
         response => response,
+    }
+}
+
+fn remove_recovered_agent_presentation(response: &mut Response) {
+    let clear_shell = |shell: &mut ShellSnapshot| {
+        if matches!(shell.status, ShellStatus::Pending) {
+            shell.run = None;
+            shell.recovered_agent_id = None;
+        }
+    };
+    let clear_workspace = |workspace: &mut WorkspaceSnapshot| {
+        for shell in &mut workspace.shells {
+            clear_shell(shell);
+        }
+    };
+    let clear_projection = |projection: &mut NodeProjectionSnapshot| {
+        for shell in &mut projection.shells {
+            if matches!(shell.status, ShellStatus::Pending) {
+                shell.run_id = None;
+                shell.generation = None;
+                shell.started_at_ms = None;
+                shell.ended_at_ms = None;
+                shell.recovered_agent_id = None;
+            }
+        }
+    };
+    let clear_routed = |result: &mut RoutedOperationResult| match result {
+        RoutedOperationResult::Workspace { workspace } => clear_workspace(workspace),
+        RoutedOperationResult::Shell { shell } => clear_shell(shell),
+        _ => {}
+    };
+    match response {
+        Response::Snapshot { snapshot } => {
+            for workspace in &mut snapshot.workspaces {
+                clear_workspace(workspace);
+            }
+        }
+        Response::Workspace { workspace } => clear_workspace(workspace),
+        Response::Shell { shell } => clear_shell(shell),
+        Response::Events {
+            snapshot: Some(snapshot),
+            ..
+        } => {
+            for workspace in &mut snapshot.workspaces {
+                clear_workspace(workspace);
+            }
+        }
+        Response::NodeProjectionSync { sync } => clear_projection(&mut sync.projection),
+        Response::GlobalWorkspaceResource { resource, .. }
+        | Response::RoutedNodeOperation { result: resource } => clear_routed(resource),
+        Response::CombinedNodeSnapshot { snapshot } => {
+            for node in &mut snapshot.nodes {
+                if let Some(local) = &mut node.local_snapshot {
+                    for workspace in &mut local.workspaces {
+                        clear_workspace(workspace);
+                    }
+                }
+                if let Some(remote) = &mut node.remote_projection {
+                    clear_projection(remote);
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -3780,21 +3846,20 @@ impl DurableRegistry {
         Ok(changed)
     }
 
-    fn agent_resume_command(
+    fn resumable_agent(
         &self,
         shell: &Shell,
         previous_run: &PersistedShellRun,
-    ) -> io::Result<Option<Vec<String>>> {
+    ) -> io::Result<Option<(String, Vec<String>)>> {
         let state = lock(&self.state)?;
         let mut candidates = Vec::new();
         for agent in state.agents.values() {
             if let Some(identity) = resume_identity(agent, shell, previous_run)? {
-                candidates.push(identity);
+                candidates.push((agent.id.clone(), identity.0, identity.1));
             }
         }
         candidates.sort();
-        candidates.dedup();
-        let [(integration, external_session_id)] = candidates.as_slice() else {
+        let [(agent_id, integration, external_session_id)] = candidates.as_slice() else {
             return Ok(None);
         };
 
@@ -3827,7 +3892,8 @@ impl DurableRegistry {
 
         Ok(crate::integrations::by_key(integration)
             .and_then(|descriptor| descriptor.resume)
-            .and_then(|resume| resume.command(&shell.command, external_session_id)))
+            .and_then(|resume| resume.command(&shell.command, external_session_id))
+            .map(|command| (agent_id.clone(), command)))
     }
 
     fn notification_context(&self, workspace_id: &str, shell_id: &str) -> (String, String) {
@@ -9944,6 +10010,16 @@ impl DaemonService {
         shell: &Shell,
         previous_run: Option<&PersistedShellRun>,
     ) -> io::Result<Option<Vec<String>>> {
+        Ok(self
+            .resumable_agent(shell, previous_run)?
+            .map(|(_, command)| command))
+    }
+
+    fn resumable_agent(
+        &self,
+        shell: &Shell,
+        previous_run: Option<&PersistedShellRun>,
+    ) -> io::Result<Option<(String, Vec<String>)>> {
         if !self.notification_settings.resume_agents {
             return Ok(None);
         }
@@ -9952,7 +10028,7 @@ impl DaemonService {
         else {
             return Ok(None);
         };
-        self.durable.agent_resume_command(shell, previous_run)
+        self.durable.resumable_agent(shell, previous_run)
     }
 
     fn change_execution(
@@ -11125,12 +11201,18 @@ impl DaemonService {
             Request::GetFocusedTerminal => Ok(Response::FocusedTerminal {
                 focused_terminal: self.focused_terminal()?,
             }),
-            Request::GetWorkspace { workspace_id } => Ok(Response::Workspace {
-                workspace: self.workspace(&workspace_id)?.snapshot(&self.durable)?,
-            }),
-            Request::GetShell { shell_id } => Ok(Response::Shell {
-                shell: self.shell(&shell_id)?.snapshot()?,
-            }),
+            Request::GetWorkspace { workspace_id } => {
+                let mut workspace = self.workspace(&workspace_id)?.snapshot(&self.durable)?;
+                for shell in &mut workspace.shells {
+                    self.add_recovery_presentation(shell)?;
+                }
+                Ok(Response::Workspace { workspace })
+            }
+            Request::GetShell { shell_id } => {
+                let mut shell = self.shell(&shell_id)?.snapshot()?;
+                self.add_recovery_presentation(&mut shell)?;
+                Ok(Response::Shell { shell })
+            }
             Request::GetLauncher { launcher_id } => Ok(Response::Launcher {
                 launcher: self.launcher(&launcher_id)?.snapshot()?,
             }),
@@ -13059,6 +13141,11 @@ impl DaemonService {
 
     fn snapshot(&self) -> io::Result<Snapshot> {
         let mut snapshot = self.durable.snapshot(self.focused_terminal()?)?;
+        for workspace in &mut snapshot.workspaces {
+            for shell in &mut workspace.shells {
+                self.add_recovery_presentation(shell)?;
+            }
+        }
         let active = self.scheduler.state.lock().ok().is_some_and(|scheduler| {
             scheduler.running
                 && scheduler.healthy
@@ -13080,6 +13167,61 @@ impl DaemonService {
                 .unwrap_or(u16::MAX),
         });
         Ok(snapshot)
+    }
+
+    fn add_recovery_presentation(&self, shell: &mut ShellSnapshot) -> io::Result<()> {
+        if matches!(shell.status, ShellStatus::Pending)
+            && let Some((agent_id, run)) = self.recovery_presentation(&shell.id)?
+        {
+            shell.run = Some(run);
+            shell.recovered_agent_id = Some(agent_id);
+        }
+        Ok(())
+    }
+
+    fn add_recovery_projection(&self, shell: &mut NodeProjectionShell) -> io::Result<()> {
+        if matches!(shell.status, ShellStatus::Pending)
+            && let Some((agent_id, run)) = self.recovery_presentation(&shell.id)?
+        {
+            shell.run_id = Some(run.id);
+            shell.generation = Some(run.generation);
+            shell.started_at_ms = Some(run.started_at_ms);
+            shell.ended_at_ms = run.ended_at_ms;
+            shell.recovered_agent_id = Some(agent_id);
+        }
+        Ok(())
+    }
+
+    fn recovery_presentation(
+        &self,
+        shell_id: &str,
+    ) -> io::Result<Option<(String, ShellRunSnapshot)>> {
+        let shell = self.durable.shell(shell_id)?;
+        if !matches!(*lock(&shell.lifecycle)?, ShellLifecycle::Pending) {
+            return Ok(None);
+        }
+        let previous_run = lock(&shell.last_run)?.clone();
+        let Some(previous_run) = previous_run.as_ref() else {
+            return Ok(None);
+        };
+        let Some((agent_id, _)) = self.resumable_agent(&shell, Some(previous_run))? else {
+            return Ok(None);
+        };
+        if !matches!(*lock(&shell.lifecycle)?, ShellLifecycle::Pending) {
+            return Ok(None);
+        }
+        Ok(Some((
+            agent_id,
+            ShellRunSnapshot {
+                id: previous_run.id.clone(),
+                generation: previous_run.generation,
+                started_at_ms: previous_run.started_at_ms,
+                ended_at_ms: previous_run.ended_at_ms,
+                exit_reason: previous_run.exit_reason.clone(),
+                output_revision: previous_run.output_revision,
+                environment_has_run_id: previous_run.environment_has_run_id,
+            },
+        )))
     }
 
     fn node_projection_sync(
@@ -13108,7 +13250,10 @@ impl DaemonService {
             projection_transitions(&transaction.events, after.as_ref(), &cursor);
         let node_id = self.node_identity()?.id()?;
         let scheduler = self.scheduler_health()?;
-        let projection = self.durable.node_projection(node_id, scheduler)?;
+        let mut projection = self.durable.node_projection(node_id, scheduler)?;
+        for shell in &mut projection.shells {
+            self.add_recovery_projection(shell)?;
+        }
         Ok(NodeProjectionSync {
             mode,
             cursor,
@@ -14649,6 +14794,7 @@ impl Shell {
             generation,
             started_at_ms,
             ended_at_ms,
+            recovered_agent_id: None,
         })
     }
 
@@ -14683,6 +14829,7 @@ impl Shell {
             owner: self.owner.clone(),
             status,
             run,
+            recovered_agent_id: None,
             foreground_process,
         })
     }
@@ -16767,7 +16914,7 @@ mod tests {
         run_id: &str,
         integration: &str,
         external_session_id: &str,
-    ) {
+    ) -> String {
         let agent = Arc::new(AgentInstance {
             id: Uuid::new_v4().to_string(),
             workspace_id: shell.workspace_id.clone(),
@@ -16791,10 +16938,12 @@ mod tests {
                 attention: None,
             }),
         });
+        let agent_id = agent.id.clone();
         lock(&registry.durable.state)
             .unwrap()
             .agents
             .insert(agent.id.clone(), agent);
+        agent_id
     }
 
     fn recovery_shell(
@@ -16831,7 +16980,27 @@ mod tests {
     fn interrupted_authoritative_agent_builds_native_resume_command() {
         let registry = DaemonService::default();
         let (shell, run) = recovery_shell(&registry, vec!["/opt/bin/opencode".into()]);
-        add_recovery_agent(&registry, &shell, &run.id, "opencode", "session-1");
+        let agent_id = add_recovery_agent(&registry, &shell, &run.id, "opencode", "session-1");
+        add_recovery_agent(&registry, &shell, &run.id, "native-test", "other");
+
+        let snapshot = registry.snapshot().unwrap();
+        let snapshot = &snapshot.workspaces[0].shells[0];
+        assert_eq!(snapshot.status, ShellStatus::Pending);
+        assert_eq!(
+            snapshot.run.as_ref().map(|run| run.id.as_str()),
+            Some(run.id.as_str())
+        );
+        assert_eq!(
+            snapshot.recovered_agent_id.as_deref(),
+            Some(agent_id.as_str())
+        );
+        let mut projection = shell.node_projection().unwrap();
+        registry.add_recovery_projection(&mut projection).unwrap();
+        assert_eq!(projection.run_id.as_deref(), Some(run.id.as_str()));
+        assert_eq!(
+            projection.recovered_agent_id.as_deref(),
+            Some(agent_id.as_str())
+        );
 
         assert_eq!(
             registry.agent_resume_command(&shell, Some(&run)).unwrap(),
@@ -16845,8 +17014,7 @@ mod tests {
         let agent = lock(&registry.durable.state)
             .unwrap()
             .agents
-            .values()
-            .next()
+            .get(&agent_id)
             .unwrap()
             .clone();
         lock(&agent.state).unwrap().observation.authority = AgentAuthority::TerminalHeuristic;
@@ -16856,6 +17024,7 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        assert!(registry.recovery_presentation(&shell.id).unwrap().is_none());
     }
 
     #[test]
@@ -16871,6 +17040,7 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        assert!(registry.recovery_presentation(&shell.id).unwrap().is_none());
 
         lock(&registry.durable.state)
             .unwrap()
@@ -16883,6 +17053,7 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        assert!(registry.recovery_presentation(&shell.id).unwrap().is_none());
     }
 
     #[test]
@@ -19610,6 +19781,7 @@ mod tests {
                 generation: Some(1),
                 started_at_ms: Some(1),
                 ended_at_ms: None,
+                recovered_agent_id: None,
             }],
             launchers: Vec::new(),
             agents: vec![
@@ -22187,6 +22359,136 @@ mod tests {
             assert!(old.local_snapshot.is_none());
             assert!(old.remote_projection.is_none());
         }
+    }
+
+    #[test]
+    fn protocol_forty_preserves_only_negotiated_recovery_presentations() {
+        let shell = ShellSnapshot {
+            id: "shell-1".into(),
+            revision: 1,
+            workspace_id: "workspace-1".into(),
+            name: "agent".into(),
+            cwd: "/tmp/project".into(),
+            command: Vec::new(),
+            owner: ShellOwner::User,
+            status: ShellStatus::Pending,
+            run: Some(ShellRunSnapshot {
+                id: "run-1".into(),
+                generation: 1,
+                started_at_ms: 1,
+                ended_at_ms: Some(2),
+                exit_reason: Some(ShellRunExitReason::Interrupted),
+                output_revision: 3,
+                environment_has_run_id: true,
+            }),
+            recovered_agent_id: Some("agent-1".into()),
+            foreground_process: None,
+        };
+        let workspace = WorkspaceSnapshot {
+            id: "workspace-1".into(),
+            revision: 1,
+            name: "project".into(),
+            default_cwd: None,
+            shells: vec![shell.clone()],
+            launchers: Vec::new(),
+            agents: Vec::new(),
+            schedules: Vec::new(),
+        };
+        let response = Response::Snapshot {
+            snapshot: Snapshot {
+                workspaces: vec![workspace.clone()],
+                focused_terminal: None,
+                scheduler: None,
+            },
+        };
+        let Response::Snapshot { snapshot } = response_for_version(response.clone(), 39) else {
+            panic!("expected snapshot");
+        };
+        assert!(snapshot.workspaces[0].shells[0].run.is_none());
+        assert!(
+            snapshot.workspaces[0].shells[0]
+                .recovered_agent_id
+                .is_none()
+        );
+        let Response::Snapshot { snapshot } = response_for_version(response, 40) else {
+            panic!("expected snapshot");
+        };
+        assert_eq!(
+            snapshot.workspaces[0].shells[0].run.as_ref().unwrap().id,
+            "run-1"
+        );
+        assert_eq!(
+            snapshot.workspaces[0].shells[0]
+                .recovered_agent_id
+                .as_deref(),
+            Some("agent-1")
+        );
+
+        let response = Response::RoutedNodeOperation {
+            result: RoutedOperationResult::Workspace {
+                workspace: workspace.clone(),
+            },
+        };
+        let Response::RoutedNodeOperation {
+            result: RoutedOperationResult::Workspace { workspace },
+        } = response_for_version(response, 39)
+        else {
+            panic!("expected routed workspace");
+        };
+        assert!(workspace.shells[0].run.is_none());
+        assert!(workspace.shells[0].recovered_agent_id.is_none());
+
+        let response = Response::GlobalWorkspaceResource {
+            workspace: protocol::GlobalWorkspaceSnapshot {
+                id: "global-1".into(),
+                revision: 1,
+                name: "project".into(),
+                closing: false,
+                placements: Vec::new(),
+            },
+            resource: RoutedOperationResult::Shell {
+                shell: shell.clone(),
+            },
+        };
+        let Response::GlobalWorkspaceResource {
+            resource: RoutedOperationResult::Shell { shell },
+            ..
+        } = response_for_version(response, 39)
+        else {
+            panic!("expected global workspace shell");
+        };
+        assert!(shell.run.is_none());
+        assert!(shell.recovered_agent_id.is_none());
+
+        let mut projection = remote_notification_projection("node-1");
+        projection.shells[0].status = ShellStatus::Pending;
+        projection.shells[0].recovered_agent_id = Some("agent-blocked".into());
+        let response = Response::NodeProjectionSync {
+            sync: NodeProjectionSync {
+                mode: NodeProjectionSyncMode::Baseline,
+                cursor: EventCursor {
+                    stream_id: "stream".into(),
+                    event_id: 1,
+                },
+                projection,
+                transitions: Vec::new(),
+                capabilities: vec!["recovered_agent_presentation".into()],
+            },
+        };
+        let Response::NodeProjectionSync { sync } = response_for_version(response.clone(), 39)
+        else {
+            panic!("expected projection sync");
+        };
+        assert!(sync.projection.shells[0].run_id.is_none());
+        assert!(sync.projection.shells[0].recovered_agent_id.is_none());
+        let Response::NodeProjectionSync { sync } = response_for_version(response, 40) else {
+            panic!("expected projection sync");
+        };
+        assert_eq!(sync.projection.shells[0].run_id.as_deref(), Some("run-1"));
+        assert_eq!(
+            sync.projection.shells[0].recovered_agent_id.as_deref(),
+            Some("agent-blocked")
+        );
     }
 
     #[test]

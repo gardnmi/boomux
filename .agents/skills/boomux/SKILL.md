@@ -384,6 +384,11 @@ Shell status meanings:
 - `running`: the process and PTY are live, attached or detached.
 - `exited`: the process ended; bounded reconstructed terminal state remains.
 
+Under protocol 40, an owner-authorized pending Shell with one exact resumable
+lifecycle Agent retains `KIND agent` with `STATUS inactive`; opening it starts a
+new run and resumes that exact session. Fresh or ineligible pending Shells remain
+`KIND shell` or `KIND command`.
+
 The dashboard `KIND` is `shell` when the slot starts a login shell and `command`
 when it starts a stored exact argument vector. Interrupting the primary process
 of a command ends its run; an active agent presentation takes precedence.

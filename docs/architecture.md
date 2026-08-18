@@ -130,6 +130,11 @@ Protocol 39 adds Node-qualified focused-terminal presentation to the combined
 Node snapshot and a prompt-free local invalidation event for responsive
 presentation. Focus remains ephemeral and controller-authorized, and is not
 persisted in the reduced remote projection cache.
+Protocol 40 lets an owner mark a pending Shell with its interrupted prior run
+only when startup configuration and exact lifecycle state prove one unambiguous
+Agent session can resume. Dashboards present that association as inactive;
+protocol-39 responses remove the marker so old peers cannot display stale Agent
+state as current.
 Remote notification presentation reuses protocol-32 atomic reduced transitions,
 so it does not require a later protocol. Node-cache schema 2 adds bounded local
 at-most-once individual and reconnect-digest claims with an explicit schema-1
@@ -518,6 +523,13 @@ durable state observation, persistence, or events. It displays `untracked` until
 lifecycle data exists, then yields to that authoritative observation. `doctor`
 checks installed integration assets and reports a running untracked host with
 explicit install or restart guidance.
+Under protocol 40, a pending Shell snapshot exposes its exact interrupted last
+run and owner-selected Agent ID only when the owning daemon's startup
+configuration and durable state prove one unambiguous lifecycle-authoritative
+resumable Agent. The dashboard keeps that exact row's `agent` kind but presents
+it as `inactive` until opening starts a new run.
+Fresh or ineligible pending Shells have no run marker and remain ordinary Shell
+rows.
 
 ### Agent Skill
 

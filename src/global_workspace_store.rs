@@ -1592,6 +1592,7 @@ mod tests {
                 owner: ShellOwner::User,
                 status: ShellStatus::Pending,
                 run: None,
+                recovered_agent_id: None,
                 foreground_process: None,
             },
         }
