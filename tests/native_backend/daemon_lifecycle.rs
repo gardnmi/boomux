@@ -155,6 +155,7 @@ fn native_daemon_lifecycle() {
         "guarded_workspace_adoption",
         "resumable_workspace_close",
         "qualified_focused_terminal",
+        "recovered_agent_presentation",
         "cached_projection_dismissal",
         "exact_run_attachment",
         "stable_node_identity",

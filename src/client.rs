@@ -2035,6 +2035,7 @@ mod tests {
                                 owner: protocol::ShellOwner::User,
                                 status: protocol::ShellStatus::Pending,
                                 run: None,
+                                recovered_agent_id: None,
                                 foreground_process: None,
                             },
                         },

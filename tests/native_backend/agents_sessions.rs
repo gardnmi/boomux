@@ -992,6 +992,75 @@ fn explicit_process_supervisor_preserves_child_io_exit_and_agent_authority() {
     )));
 }
 
+#[test]
+fn cold_recovery_presents_resumable_agent_only_to_protocol_forty() {
+    let mut daemon = TestDaemon::start();
+    let workspace = daemon
+        .client
+        .create_workspace(
+            "recover-agent-presentation",
+            vec![ShellSpec::login("agent", std::env::temp_dir())],
+        )
+        .unwrap();
+    let workspace_id = workspace.id.clone();
+    let shell_id = workspace.shells[0].id.clone();
+    let attachment = daemon.client.attach(&shell_id, false, profile()).unwrap();
+    let first_run = daemon.client.get_shell(&shell_id).unwrap().run.unwrap();
+    let agent = daemon
+        .client
+        .register_agent(
+            &shell_id,
+            &first_run.id,
+            AgentRegistrationSpec {
+                name: "recovered-agent".into(),
+                integration: "opencode".into(),
+                external_session_id: Some("session-1".into()),
+                report: AgentReport {
+                    state: AgentState::Blocked,
+                    authority: AgentAuthority::LifecycleIntegration,
+                    evidence: "waiting before crash".into(),
+                    confidence: 100,
+                },
+            },
+        )
+        .unwrap();
+
+    daemon.crash();
+    drop(attachment.stream);
+    daemon.restart();
+
+    let recovered = daemon.client.get_shell(&shell_id).unwrap();
+    assert_eq!(recovered.status, protocol::ShellStatus::Pending);
+    let recovered_run = recovered.run.expect("protocol 40 omitted recovery run");
+    assert_eq!(
+        recovered.recovered_agent_id.as_deref(),
+        Some(agent.id.as_str())
+    );
+    assert_eq!(recovered_run.id, first_run.id);
+    assert_eq!(
+        recovered_run.exit_reason,
+        Some(protocol::ShellRunExitReason::Interrupted)
+    );
+    assert!(recovered_run.ended_at_ms.is_some());
+    assert_eq!(daemon.client.get_agent(&agent.id).unwrap(), agent);
+
+    let protocol::Response::Snapshot { snapshot } =
+        versioned_request(&daemon.client, 39, protocol::Request::Snapshot)
+    else {
+        panic!("expected protocol-39 snapshot");
+    };
+    let old_shell = snapshot
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.id == workspace_id)
+        .and_then(|workspace| workspace.shells.iter().find(|shell| shell.id == shell_id))
+        .expect("protocol-39 snapshot omitted recovered shell");
+    assert!(old_shell.run.is_none());
+    assert!(old_shell.recovered_agent_id.is_none());
+
+    daemon.stop_with_cli();
+}
+
 fn versioned_request(
     client: &Client,
     version: u32,

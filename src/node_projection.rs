@@ -934,6 +934,7 @@ mod tests {
             generation: Some(1),
             started_at_ms: Some(1),
             ended_at_ms: None,
+            recovered_agent_id: None,
         });
         projection.agents.push(NodeProjectionAgent {
             id: "agent-1".into(),

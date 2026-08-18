@@ -435,6 +435,9 @@ than serialization of existing public summary objects:
 - Workspace IDs, names, and bounded item/attention counts.
 - Shell IDs, Workspace IDs, names, ownership, status, run ID, generation, and
   lifecycle timestamps, but not cwd, argv, foreground process, or terminal data.
+  Protocol 40 includes a pending Shell's interrupted run and selected Agent ID
+  only when the owner has authoritatively selected one resumable Agent; older
+  negotiated projections omit both markers.
 - Launcher IDs, Workspace IDs, and names, but not cwd or argv.
 - Agent IDs, names, integration, Workspace/Shell/Run links, state, observation
   revision/timestamps, and bounded attention reason/revision, but not evidence,

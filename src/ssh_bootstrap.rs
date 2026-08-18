@@ -79,7 +79,7 @@ pub const REMOTE_INSTALL_COMMAND: &str = concat!(
     "stage=watchdog_spawn; stage_code=84; ( exec 3>&-; trap '' HUP; lease_limit=180; lease_value=$(/bin/cat \"$transaction/lease\"); unchanged=0; committed=false; : > \"$transaction/watchdog_ready\"; ",
     remote_claim_functions!(),
     "while :; do if claim_pid_override=$(/bin/cat \"$transaction/watchdog_pid\" 2>/dev/null); then break; fi; if claim_pid_override=$(/bin/cat \"$lock/committed/watchdog_pid\" 2>/dev/null); then transaction=$lock/committed; committed=true; break; fi; [ -d \"$lock\" ] || exit; /bin/sleep 1; done; while [ -d \"$lock\" ]; do /bin/sleep 1; current=$(/bin/cat \"$transaction/lease\" 2>/dev/null || true); if [ \"$current\" != \"$lease_value\" ]; then lease_value=$current; unchanged=0; continue; fi; unchanged=$((unchanged + 1)); [ \"$unchanged\" -lt \"$lease_limit\" ] && continue; if claim_acquire; then current=$(/bin/cat \"$lock/id\" 2>/dev/null || true); claimed_lease=$(/bin/cat \"$transaction/lease\" 2>/dev/null || true); if [ \"$current\" != \"$txn\" ]; then claim_release; exit; fi; if [ \"$claimed_lease\" != \"$lease_value\" ]; then claim_release; lease_value=$claimed_lease; unchanged=0; continue; fi; if ! $committed; then restore_install; fi; /bin/rm -rf \"$transaction\" \"$lock\"; exit; fi; unchanged=0; done ) </dev/null >/dev/null 2>&1 & watchdog=$!; ",
-    "stage=watchdog_ready; stage_code=85; attempts=0; while [ ! -e \"$transaction/watchdog_ready\" ]; do kill -0 \"$watchdog\"; attempts=$((attempts + 1)); [ \"$attempts\" -lt 10000 ]; done; ",
+    "stage=watchdog_ready; stage_code=85; attempts=0; while [ ! -e \"$transaction/watchdog_ready\" ]; do kill -0 \"$watchdog\"; attempts=$((attempts + 1)); [ \"$attempts\" -lt 1000 ]; /bin/sleep 0.01; done; ",
     "stage=watchdog_pid; stage_code=86; printf '%s\\n' \"$watchdog\" > \"$transaction/watchdog_pid\"; rm -f \"$transaction/watchdog_ready\"; ",
     "stage=result; stage_code=87; printf 'boomux-install-transaction-v1\\0%s\\0' \"$txn\"; ",
     "trap - EXIT HUP INT TERM; exec 3>&-"
@@ -3792,6 +3792,16 @@ mod tests {
         )
     }
 
+    fn delay_watchdog_readiness(command: &str) -> String {
+        let delayed = command.replacen(
+            ": > \"$transaction/watchdog_ready\";",
+            "/bin/sleep 1; : > \"$transaction/watchdog_ready\";",
+            1,
+        );
+        assert_ne!(delayed, command);
+        delayed
+    }
+
     fn shell_printf(bytes: &[u8]) -> String {
         let escaped = bytes
             .iter()
@@ -3899,6 +3909,25 @@ mod tests {
             assert_eq!(backup_metadata.mtime(), previous_metadata.mtime());
             run_local_transaction(&directory, REMOTE_INSTALL_ROLLBACK_COMMAND, &transaction);
             assert_eq!(fs::read(&destination).unwrap(), b"previous");
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn install_waits_for_a_delayed_watchdog_readiness_marker() {
+        for shell in ["sh", "bash"] {
+            let directory = runtime_directory();
+            let command = delay_watchdog_readiness(REMOTE_INSTALL_COMMAND);
+            let transaction =
+                run_local_upload_with_command(&directory, b"replacement", shell, &command);
+            assert!(
+                directory
+                    .join(".local/bin")
+                    .join(&transaction.0)
+                    .join("new_ready")
+                    .exists()
+            );
+            run_local_transaction(&directory, REMOTE_INSTALL_ROLLBACK_COMMAND, &transaction);
             fs::remove_dir_all(directory).unwrap();
         }
     }

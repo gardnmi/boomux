@@ -375,6 +375,7 @@ mod tests {
                 output_revision: 0,
                 environment_has_run_id: true,
             }),
+            recovered_agent_id: None,
             foreground_process: None,
         };
         WorkspaceSnapshot {

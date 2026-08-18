@@ -172,8 +172,11 @@ define_protocol_features! {
         "protocol_39",
         "qualified_focused_terminal",
     ]),
-    CachedProjectionDismissal => (40, "cached projection dismissal", [
+    RecoveredAgentPresentation => (40, "recovered Agent presentation", [
         "protocol_40",
+        "recovered_agent_presentation",
+    ]),
+    CachedProjectionDismissal => (40, "cached projection dismissal", [
         "cached_projection_dismissal",
     ]),
 }
@@ -590,6 +593,8 @@ pub struct NodeProjectionShell {
     pub started_at_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ended_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovered_agent_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1245,6 +1250,8 @@ pub struct ShellSnapshot {
     pub status: ShellStatus,
     #[serde(default)]
     pub run: Option<ShellRunSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovered_agent_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub foreground_process: Option<String>,
 }
@@ -4600,7 +4607,8 @@ mod tests {
                 ][..],
             ),
             (39, &["protocol_39", "qualified_focused_terminal"][..]),
-            (40, &["protocol_40", "cached_projection_dismissal"][..]),
+            (40, &["protocol_40", "recovered_agent_presentation"][..]),
+            (40, &["cached_projection_dismissal"][..]),
         ];
 
         let actual = ProtocolFeature::ALL
@@ -4847,6 +4855,7 @@ mod tests {
                 output_revision: 2,
                 environment_has_run_id: true,
             }),
+            recovered_agent_id: Some("a1".into()),
             foreground_process: Some("sleep".into()),
         };
 
