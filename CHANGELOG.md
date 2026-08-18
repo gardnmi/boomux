@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.21.0](https://github.com/gardnmi/boomux/compare/v0.20.0...v0.21.0) (2026-08-18)
+
+
+### Features
+
+* **node:** add guided node upgrades ([#214](https://github.com/gardnmi/boomux/issues/214)) ([7e68148](https://github.com/gardnmi/boomux/commit/7e681484409974ca1cb338d44df496f4b7be15f9))
+
 ## [0.20.0](https://github.com/gardnmi/boomux/compare/v0.19.0...v0.20.0) (2026-08-18)
 
 
