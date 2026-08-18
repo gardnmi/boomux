@@ -238,10 +238,13 @@ from growing without limit. The schedule and history panes render side by side,
 then stack when the terminal is narrow. Schedule-owned execution shells do not
 appear as ordinary shell rows; only the owning schedule definition does.
 
-The Nodes view shows registered routes, observed helper versions, and health. It
-can inspect and refresh a Node, launch guided setup or an identity-pinned upgrade,
-revision-safely rename or retarget a route, and forget a registration after
-confirmation. Remote state remains secondary to the owning Node's authority.
+The Nodes view shows observed helper versions, health, freshness, routes, and
+per-Node Workspace, Shell, Agent, Schedule, and attention counts. It can inspect
+and refresh a Node, launch guided setup or an identity-pinned upgrade,
+revision-safely rename local or registered aliases, retarget a remote route, and
+forget a registration after confirmation. Protocol and capability details remain
+available through inspection, and remote state remains secondary to the owning
+Node's authority.
 
 The workspace overview includes item and Agent-state counts plus its most urgent
 outstanding attention item.

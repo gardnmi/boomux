@@ -16,12 +16,13 @@ use std::time::Duration;
 use crate::protocol::{
     self, AgentInstanceSnapshot, AgentRegistrationSpec, AgentReport, AgentScheduleInspection,
     AgentScheduleSnapshot, AgentScheduleSpec, AgentScheduleUpdate, CombinedNodeSnapshot,
-    DaemonEvent, Envelope, ErrorCode, EventCursor, FocusedTerminalSnapshot, NodeProjectionHealth,
-    NodeRegistrationSnapshot, NotificationDeliveryConfig, Request, Response, RoutedOperation,
-    RoutedOperationResult, ScheduledExecutionScheduleProjection, ScheduledExecutionSnapshot,
-    ScheduledOccurrence, ScheduledRunnerResult, ShellSnapshot, ShellSpec, ShellStatus, Snapshot,
-    TerminalPreview, TerminalPreviewLine, TerminalPreviewSpan, TerminalProfile, UnixEnvironment,
-    UnixEnvironmentVariable, WorkspaceLauncherSnapshot, WorkspaceLauncherSpec, WorkspaceSnapshot,
+    DaemonEvent, Envelope, ErrorCode, EventCursor, FocusedTerminalSnapshot, LocalNodeMetadata,
+    NodeProjectionHealth, NodeRegistrationSnapshot, NotificationDeliveryConfig, Request, Response,
+    RoutedOperation, RoutedOperationResult, ScheduledExecutionScheduleProjection,
+    ScheduledExecutionSnapshot, ScheduledOccurrence, ScheduledRunnerResult, ShellSnapshot,
+    ShellSpec, ShellStatus, Snapshot, TerminalPreview, TerminalPreviewLine, TerminalPreviewSpan,
+    TerminalProfile, UnixEnvironment, UnixEnvironmentVariable, WorkspaceLauncherSnapshot,
+    WorkspaceLauncherSpec, WorkspaceSnapshot,
 };
 
 const CONNECT_ATTEMPTS: usize = 40;
@@ -1002,6 +1003,20 @@ impl Client {
             alias: alias.into(),
             expected_revision,
         })
+    }
+
+    pub fn rename_local_node_alias(
+        &self,
+        alias: impl Into<String>,
+        expected_revision: u64,
+    ) -> Result<LocalNodeMetadata> {
+        match self.request(Request::RenameLocalNodeAlias {
+            alias: alias.into(),
+            expected_revision,
+        })? {
+            Response::LocalNodeMetadata { node } => Ok(node),
+            response => unexpected(response),
+        }
     }
 
     pub fn retarget_node_registration(
@@ -2417,7 +2432,8 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
-            reject_protocol(&listener, protocol::PROTOCOL_VERSION, 40);
+            reject_protocol(&listener, protocol::PROTOCOL_VERSION, 41);
+            reject_protocol(&listener, 41, 40);
             reject_protocol(&listener, 40, 39);
             reject_protocol(&listener, 39, 38);
             reject_protocol(&listener, 38, 37);
@@ -2593,7 +2609,8 @@ mod tests {
             )
             .unwrap();
 
-            reject_protocol(&listener, protocol::PROTOCOL_VERSION, 40);
+            reject_protocol(&listener, protocol::PROTOCOL_VERSION, 41);
+            reject_protocol(&listener, 41, 40);
             reject_protocol(&listener, 40, 39);
             reject_protocol(&listener, 39, 38);
             reject_protocol(&listener, 38, 37);
@@ -2663,7 +2680,8 @@ mod tests {
             )
             .unwrap();
 
-            reject_protocol(&listener, protocol::PROTOCOL_VERSION, 40);
+            reject_protocol(&listener, protocol::PROTOCOL_VERSION, 41);
+            reject_protocol(&listener, 41, 40);
             reject_protocol(&listener, 40, 39);
             reject_protocol(&listener, 39, 38);
             reject_protocol(&listener, 38, 37);
@@ -2715,7 +2733,8 @@ mod tests {
                 ),
             )
             .unwrap();
-            reject_protocol(&listener, protocol::PROTOCOL_VERSION, 40);
+            reject_protocol(&listener, protocol::PROTOCOL_VERSION, 41);
+            reject_protocol(&listener, 41, 40);
             reject_protocol(&listener, 40, 39);
             reject_protocol(&listener, 39, 38);
             reject_protocol(&listener, 38, 37);
@@ -2897,7 +2916,8 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
-            reject_protocol(&listener, protocol::PROTOCOL_VERSION, 40);
+            reject_protocol(&listener, protocol::PROTOCOL_VERSION, 41);
+            reject_protocol(&listener, 41, 40);
             reject_protocol(&listener, 40, 39);
             reject_protocol(&listener, 39, 38);
             reject_protocol(&listener, 38, 37);
@@ -2974,7 +2994,8 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
-            reject_protocol(&listener, protocol::PROTOCOL_VERSION, 40);
+            reject_protocol(&listener, protocol::PROTOCOL_VERSION, 41);
+            reject_protocol(&listener, 41, 40);
             reject_protocol(&listener, 40, 39);
             reject_protocol(&listener, 39, 38);
             reject_protocol(&listener, 38, 37);

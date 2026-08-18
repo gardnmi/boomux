@@ -11,12 +11,17 @@ use uuid::Uuid;
 
 use crate::state_store::{effective_uid, secure_state_dir, state_directory_from_environment};
 
-const NODE_IDENTITY_VERSION: u32 = 1;
+const NODE_IDENTITY_VERSION: u32 = 2;
 const MAX_NODE_IDENTITY_BYTES: u64 = 4 * 1024;
+const MAX_NODE_ALIAS_BYTES: usize = 128;
+
+pub(crate) const DEFAULT_NODE_ALIAS: &str = "local";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NodeIdentity {
     id: String,
+    alias: String,
+    revision: u64,
 }
 
 pub(crate) struct NodeIdentityManager {
@@ -44,14 +49,26 @@ impl NodeIdentity {
         &self.id
     }
 
+    pub(crate) fn alias(&self) -> &str {
+        &self.alias
+    }
+
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision
+    }
+
     fn load_or_create_at(path: PathBuf) -> io::Result<Self> {
         let parent = path
             .parent()
             .ok_or_else(|| io::Error::other("Node identity path has no parent"))?;
         secure_state_dir(parent)?;
         let _lock = acquire_identity_lock(parent)?;
-        match load(&path) {
-            Ok(identity) => Ok(identity),
+        match load_versioned(&path) {
+            Ok(LoadedNodeIdentity::Current(identity)) => Ok(identity),
+            Ok(LoadedNodeIdentity::Legacy(identity)) => {
+                replace_file(&path, &identity)?;
+                Ok(identity)
+            }
             Err(error) if error.kind() == io::ErrorKind::NotFound => create(&path),
             Err(error) => Err(error),
         }
@@ -75,6 +92,44 @@ impl NodeIdentityManager {
 
     pub(crate) fn id(&self) -> io::Result<String> {
         Ok(self.lock_state()?.identity.id.clone())
+    }
+
+    pub(crate) fn metadata(&self) -> io::Result<NodeIdentity> {
+        Ok(self.lock_state()?.identity.clone())
+    }
+
+    pub(crate) fn rename_alias(
+        &self,
+        alias: String,
+        expected_revision: u64,
+    ) -> io::Result<NodeIdentity> {
+        validate_node_alias(&alias)?;
+        let mut state = self.lock_state()?;
+        if state.identity.revision != expected_revision {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "local Node alias revision changed: expected {expected_revision}, current {}",
+                    state.identity.revision
+                ),
+            ));
+        }
+        if state.identity.alias == alias {
+            return Ok(state.identity.clone());
+        }
+        let revision = state
+            .identity
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("local Node alias revision overflow"))?;
+        let replacement = NodeIdentity {
+            id: state.identity.id.clone(),
+            alias,
+            revision,
+        };
+        persist_replacement(&self.path, &state.identity, &replacement)?;
+        state.identity = replacement.clone();
+        Ok(replacement)
     }
 
     pub(crate) fn admit(self: &Arc<Self>) -> io::Result<NodeIdentityLease> {
@@ -166,11 +221,41 @@ impl Drop for NodeIdentityLease {
     }
 }
 
+pub(crate) fn validate_node_alias(alias: &str) -> io::Result<()> {
+    if alias.is_empty()
+        || alias.len() > MAX_NODE_ALIAS_BYTES
+        || alias.chars().any(char::is_control)
+        || alias.chars().any(char::is_whitespace)
+        || Uuid::parse_str(alias).is_ok_and(|id| id.to_string() == alias)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Node alias must be bounded, nonempty, whitespace-free, and not a canonical Node ID",
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PersistedNodeIdentity {
     version: u32,
     node_id: String,
+    alias: String,
+    revision: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedNodeIdentityV1 {
+    #[serde(rename = "version")]
+    _version: u32,
+    node_id: String,
+}
+
+enum LoadedNodeIdentity {
+    Current(NodeIdentity),
+    Legacy(NodeIdentity),
 }
 
 fn acquire_identity_lock(parent: &Path) -> io::Result<File> {
@@ -199,6 +284,14 @@ fn acquire_identity_lock(parent: &Path) -> io::Result<File> {
 }
 
 fn load(path: &Path) -> io::Result<NodeIdentity> {
+    match load_versioned(path)? {
+        LoadedNodeIdentity::Current(identity) | LoadedNodeIdentity::Legacy(identity) => {
+            Ok(identity)
+        }
+    }
+}
+
+fn load_versioned(path: &Path) -> io::Result<LoadedNodeIdentity> {
     let mut file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
@@ -224,36 +317,88 @@ fn load(path: &Path) -> io::Result<NodeIdentity> {
     }
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
     file.read_to_end(&mut bytes)?;
-    let persisted: PersistedNodeIdentity = serde_json::from_slice(&bytes).map_err(|error| {
+    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!("could not parse Boomux Node identity: {error}"),
         )
     })?;
-    if persisted.version != NODE_IDENTITY_VERSION {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "unsupported Boomux Node identity version {}; expected {NODE_IDENTITY_VERSION}",
-                persisted.version
-            ),
-        ));
-    }
-    let parsed = Uuid::parse_str(&persisted.node_id).map_err(|_| {
+    let version = value.get("version").and_then(serde_json::Value::as_u64);
+    let (identity, legacy) = match version {
+        Some(1) => {
+            let persisted: PersistedNodeIdentityV1 =
+                serde_json::from_value(value).map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("could not parse Boomux Node identity: {error}"),
+                    )
+                })?;
+            (
+                NodeIdentity {
+                    id: persisted.node_id,
+                    alias: DEFAULT_NODE_ALIAS.into(),
+                    revision: 1,
+                },
+                true,
+            )
+        }
+        Some(version) if version == u64::from(NODE_IDENTITY_VERSION) => {
+            let persisted: PersistedNodeIdentity =
+                serde_json::from_value(value).map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("could not parse Boomux Node identity: {error}"),
+                    )
+                })?;
+            validate_node_alias(&persisted.alias)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+            if persisted.revision == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Boomux Node identity contains an invalid alias revision",
+                ));
+            }
+            (
+                NodeIdentity {
+                    id: persisted.node_id,
+                    alias: persisted.alias,
+                    revision: persisted.revision,
+                },
+                false,
+            )
+        }
+        Some(version) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "unsupported Boomux Node identity version {version}; expected {NODE_IDENTITY_VERSION}"
+                ),
+            ));
+        }
+        None => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Boomux Node identity is missing its version",
+            ));
+        }
+    };
+    let parsed = Uuid::parse_str(&identity.id).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             "Boomux Node identity contains an invalid Node ID",
         )
     })?;
-    if parsed.to_string() != persisted.node_id {
+    if parsed.to_string() != identity.id {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "Boomux Node identity contains a noncanonical Node ID",
         ));
     }
-    Ok(NodeIdentity {
-        id: persisted.node_id,
-    })
+    if legacy {
+        Ok(LoadedNodeIdentity::Legacy(identity))
+    } else {
+        Ok(LoadedNodeIdentity::Current(identity))
+    }
 }
 
 fn create(path: &Path) -> io::Result<NodeIdentity> {
@@ -262,10 +407,14 @@ fn create(path: &Path) -> io::Result<NodeIdentity> {
         .ok_or_else(|| io::Error::other("Node identity path has no parent"))?;
     let identity = NodeIdentity {
         id: Uuid::new_v4().to_string(),
+        alias: DEFAULT_NODE_ALIAS.into(),
+        revision: 1,
     };
     let bytes = serde_json::to_vec_pretty(&PersistedNodeIdentity {
         version: NODE_IDENTITY_VERSION,
         node_id: identity.id.clone(),
+        alias: identity.alias.clone(),
+        revision: identity.revision,
     })
     .map_err(io::Error::other)?;
     let temporary = parent.join(format!(".node-{}.tmp", Uuid::new_v4()));
@@ -295,7 +444,8 @@ fn replace(path: &Path, expected_node_id: &str) -> io::Result<NodeIdentity> {
         .ok_or_else(|| io::Error::other("Node identity path has no parent"))?;
     secure_state_dir(parent)?;
     let _lock = acquire_identity_lock(parent)?;
-    if load(path)?.id != expected_node_id {
+    let current = load(path)?;
+    if current.id != expected_node_id {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "persisted Node identity changed before rekey",
@@ -303,10 +453,41 @@ fn replace(path: &Path, expected_node_id: &str) -> io::Result<NodeIdentity> {
     }
     let identity = NodeIdentity {
         id: Uuid::new_v4().to_string(),
+        alias: current.alias,
+        revision: current.revision,
     };
+    replace_file(path, &identity)?;
+    Ok(identity)
+}
+
+fn persist_replacement(
+    path: &Path,
+    expected: &NodeIdentity,
+    replacement: &NodeIdentity,
+) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("Node identity path has no parent"))?;
+    secure_state_dir(parent)?;
+    let _lock = acquire_identity_lock(parent)?;
+    if load(path)? != *expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "persisted Node identity changed before alias rename",
+        ));
+    }
+    replace_file(path, replacement)
+}
+
+fn replace_file(path: &Path, identity: &NodeIdentity) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("Node identity path has no parent"))?;
     let bytes = serde_json::to_vec_pretty(&PersistedNodeIdentity {
         version: NODE_IDENTITY_VERSION,
         node_id: identity.id.clone(),
+        alias: identity.alias.clone(),
+        revision: identity.revision,
     })
     .map_err(io::Error::other)?;
     let temporary = parent.join(format!(".node-{}.tmp", Uuid::new_v4()));
@@ -320,7 +501,7 @@ fn replace(path: &Path, expected_node_id: &str) -> io::Result<NodeIdentity> {
         file.sync_all()?;
         fs::rename(&temporary, path)?;
         let _ = File::open(parent).and_then(|directory| directory.sync_all());
-        Ok(identity)
+        Ok(())
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
@@ -351,6 +532,63 @@ mod tests {
             fs::symlink_metadata(path.parent().unwrap()).unwrap().mode() & 0o777,
             0o700
         );
+        fs::remove_dir_all(path.parent().unwrap().parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn migrates_schema_one_with_the_default_alias() {
+        let path = test_path();
+        secure_state_dir(path.parent().unwrap()).unwrap();
+        let node_id = Uuid::new_v4().to_string();
+        fs::write(
+            &path,
+            serde_json::to_vec(&PersistedNodeIdentityV1 {
+                _version: 1,
+                node_id: node_id.clone(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let identity = NodeIdentity::load_or_create_at(path.clone()).unwrap();
+        assert_eq!(identity.id(), node_id);
+        assert_eq!(identity.alias(), DEFAULT_NODE_ALIAS);
+        assert_eq!(identity.revision(), 1);
+        let persisted: PersistedNodeIdentity =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(persisted.version, NODE_IDENTITY_VERSION);
+        assert_eq!(persisted.alias, DEFAULT_NODE_ALIAS);
+        fs::remove_dir_all(path.parent().unwrap().parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn alias_rename_is_revision_guarded_and_survives_rekey() {
+        let path = test_path();
+        let identity = NodeIdentity::load_or_create_at(path.clone()).unwrap();
+        let manager = NodeIdentityManager {
+            path: path.clone(),
+            state: Mutex::new(NodeIdentityState {
+                identity: identity.clone(),
+                admission_open: true,
+                admitted: 0,
+            }),
+            changed: Condvar::new(),
+        };
+        let renamed = manager.rename_alias("desktop".into(), 1).unwrap();
+        assert_eq!(renamed.alias(), "desktop");
+        assert_eq!(renamed.revision(), 2);
+        assert_eq!(
+            manager.rename_alias("stale".into(), 1).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        let replacement = manager
+            .rekey(identity.id(), Duration::from_secs(1))
+            .unwrap();
+        let reloaded = load(&path).unwrap();
+        assert_eq!(reloaded.id(), replacement);
+        assert_eq!(reloaded.alias(), "desktop");
+        assert_eq!(reloaded.revision(), 2);
         fs::remove_dir_all(path.parent().unwrap().parent().unwrap()).unwrap();
     }
 
@@ -395,6 +633,8 @@ mod tests {
         let bytes = serde_json::to_vec(&PersistedNodeIdentity {
             version: NODE_IDENTITY_VERSION + 1,
             node_id: Uuid::new_v4().to_string(),
+            alias: DEFAULT_NODE_ALIAS.into(),
+            revision: 1,
         })
         .unwrap();
         fs::write(&path, &bytes).unwrap();
@@ -414,6 +654,8 @@ mod tests {
             serde_json::to_vec(&PersistedNodeIdentity {
                 version: NODE_IDENTITY_VERSION,
                 node_id: Uuid::new_v4().to_string(),
+                alias: DEFAULT_NODE_ALIAS.into(),
+                revision: 1,
             })
             .unwrap(),
         )

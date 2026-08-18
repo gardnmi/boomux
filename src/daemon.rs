@@ -1431,6 +1431,21 @@ fn node_upgrade_maintenance_active(registry: &DaemonService) -> Result<bool, Dae
         .map_err(node_registration_error)
 }
 
+fn node_identity_error(error: io::Error) -> DaemonError {
+    if error.kind() == io::ErrorKind::InvalidInput
+        && error.to_string().contains("alias revision changed")
+    {
+        return DaemonError::lifecycle(ErrorCode::RevisionChanged, error.to_string());
+    }
+    if matches!(
+        error.kind(),
+        io::ErrorKind::PermissionDenied | io::ErrorKind::Other
+    ) {
+        return DaemonError::persistence(error);
+    }
+    DaemonError::from(error)
+}
+
 fn global_workspace_error(error: io::Error) -> DaemonError {
     if error.kind() == io::ErrorKind::InvalidInput && error.to_string().contains("revision changed")
     {
@@ -1461,6 +1476,13 @@ fn response_for_version_with_schedule_shells(
                 )
             }),
             _ => {}
+        }
+    }
+    if !protocol::ProtocolFeature::LocalNodeAlias.is_supported_by(version)
+        && let Response::CombinedNodeSnapshot { snapshot } = &mut response
+    {
+        for node in &mut snapshot.nodes {
+            node.local_alias_revision = None;
         }
     }
     if !protocol::ProtocolFeature::RecoveredAgentPresentation.is_supported_by(version) {
@@ -9312,13 +9334,16 @@ impl DaemonService {
             SchedulerState,
         };
 
-        let local_node_id = self.node_identity()?.id()?;
+        let local_identity = self.node_identity()?.metadata()?;
+        let local_node_id = local_identity.id().to_owned();
         let registrations = self
             .node_registrations()?
             .list()
             .map_err(node_registration_error)?;
         let local_selected = selector.is_none()
-            || selector.is_some_and(|value| value == "local" || value == local_node_id);
+            || selector.is_some_and(|value| {
+                value == "local" || value == local_identity.alias() || value == local_node_id
+            });
         let remote_selected = registrations
             .iter()
             .filter(|registration| {
@@ -9328,10 +9353,10 @@ impl DaemonService {
                     })
             })
             .collect::<Vec<_>>();
-        if selector == Some("local") && !remote_selected.is_empty() {
+        if local_selected && selector.is_some() && !remote_selected.is_empty() {
             return Err(DaemonError::lifecycle(
                 ErrorCode::AmbiguousTarget,
-                "combined Node selector 'local' matches the local Node and a registered alias; use an exact Node ID",
+                "combined Node selector matches the local Node and a registered alias; use an exact Node ID",
             ));
         }
         if !local_selected && remote_selected.is_empty() {
@@ -9351,10 +9376,11 @@ impl DaemonService {
             });
             nodes.push(CombinedNode {
                 node_id: local_node_id,
-                alias: "local".into(),
+                alias: local_identity.alias().into(),
                 local: true,
                 route: None,
                 registration_revision: None,
+                local_alias_revision: Some(local_identity.revision()),
                 health: NodeProjectionHealthCode::Online,
                 current: true,
                 stale: false,
@@ -9409,6 +9435,7 @@ impl DaemonService {
                 local: false,
                 route: Some(registration.target.clone()),
                 registration_revision: Some(registration.revision),
+                local_alias_revision: None,
                 health: view.health.code,
                 current: !view.health.stale,
                 stale: view.health.stale,
@@ -10916,6 +10943,20 @@ impl DaemonService {
                 .rename(&selector, alias, expected_revision)
                 .map(|registration| Response::NodeRegistration { registration })
                 .map_err(node_registration_error),
+            Request::RenameLocalNodeAlias {
+                alias,
+                expected_revision,
+            } => self
+                .node_identity()?
+                .rename_alias(alias, expected_revision)
+                .map(|identity| Response::LocalNodeMetadata {
+                    node: protocol::LocalNodeMetadata {
+                        node_id: identity.id().into(),
+                        alias: identity.alias().into(),
+                        revision: identity.revision(),
+                    },
+                })
+                .map_err(node_identity_error),
             Request::RetargetNodeRegistration {
                 selector,
                 target,
@@ -22396,6 +22437,7 @@ mod tests {
             local: false,
             route: Some("remote.example".into()),
             registration_revision: Some(7),
+            local_alias_revision: None,
             health: protocol::NodeProjectionHealthCode::Online,
             current: true,
             stale: false,
@@ -22515,6 +22557,7 @@ mod tests {
             local: false,
             route: None,
             registration_revision: None,
+            local_alias_revision: None,
             health: protocol::NodeProjectionHealthCode::Online,
             current: true,
             stale: false,
@@ -22578,6 +22621,51 @@ mod tests {
             unreachable!();
         };
         assert!(serde_json::to_value(health).unwrap()["observed_helper_version"].is_null());
+    }
+
+    #[test]
+    fn protocol_forty_one_combined_snapshots_hide_local_alias_revisions() {
+        let node = protocol::CombinedNode {
+            node_id: Uuid::from_u128(1).to_string(),
+            alias: "desktop".into(),
+            local: true,
+            route: None,
+            registration_revision: None,
+            local_alias_revision: Some(3),
+            health: protocol::NodeProjectionHealthCode::Online,
+            current: true,
+            stale: false,
+            observed_at_ms: 1,
+            observed_protocol_version: Some(42),
+            observed_capabilities: vec!["local_node_alias_management".into()],
+            observed_helper_version: Some("0.42.0".into()),
+            workspace_owner_eligible: true,
+            workspace_owner_unavailable_reason: None,
+            scheduler: SchedulerHealth {
+                state: SchedulerState::Active,
+                max_concurrent: 1,
+                active_executions: 0,
+            },
+            local_snapshot: None,
+            remote_projection: None,
+        };
+        let response = response_for_version(
+            Response::CombinedNodeSnapshot {
+                snapshot: protocol::CombinedNodeSnapshot {
+                    nodes: vec![node],
+                    workspaces: Vec::new(),
+                    external_workspaces: Vec::new(),
+                    focused_terminal: None,
+                },
+            },
+            41,
+        );
+        let encoded = serde_json::to_value(response).unwrap();
+        assert!(
+            encoded["snapshot"]["nodes"][0]
+                .get("local_alias_revision")
+                .is_none()
+        );
     }
 
     #[test]

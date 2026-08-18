@@ -278,10 +278,13 @@ Command payloads are:
   the local mutation; forget performs no SSH operation.
 - `node.snapshot`: a `nodes` array containing the authoritative rich local Node
   and bounded reduced cached remote Nodes. `SELECTOR` is an exact Node ID or
-  local alias; omission returns the all-Node overview. The local Node has alias
-  `local`. A selector matching both that alias and a registration returns typed
+  local alias; reserved selector `local` continues to identify the local Node,
+  and omission returns the all-Node overview. A new local Node defaults to alias
+  `local`, and protocol 42 allows that alias to change. A selector matching both
+  the local Node and a registration returns typed
   `ambiguous_target`; exact Node IDs disambiguate. Entries contain `node_id`,
-  `alias`, `local`, nullable `route`, nullable `registration_revision`, `health`,
+  `alias`, `local`, nullable `route`, nullable `registration_revision`, nullable
+  `local_alias_revision`, `health`,
   `current`, `stale`, `observed_at_ms`, nullable
   `observed_protocol_version`, nullable `observed_helper_version`,
   `observed_capabilities`, `scheduler`, and nullable
@@ -437,6 +440,7 @@ Protocol 40 adds `protocol_40`, `recovered_agent_presentation`, and
 `cached_projection_dismissal`.
 Protocol 41 adds `protocol_41`, `observed_node_helper_version`, and
 `node_upgrade_coordination`.
+Protocol 42 adds `protocol_42` and `local_node_alias_management`.
 
 Protocol-38 `workspace create` creates empty coordinator metadata without a
 default Node or cwd. First global `shell create`, `launcher create`, or

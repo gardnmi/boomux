@@ -144,6 +144,10 @@ It also adds bounded local Node-upgrade coordination so an explicitly authorized
 SSH replacement closes registration admission across activation and commit. The
 CLI renews that lease while the transaction runs, and local daemon restart or
 stop is rejected until the lease is released or expires.
+Protocol 42 adds revision-guarded local Node alias mutation. Node identity schema
+2 stores the bounded alias and its positive revision beside the stable Node ID;
+schema 1 migrates explicitly to alias `local` at revision 1. Protocol-41 combined
+snapshots omit the additive local alias revision.
 Remote notification presentation reuses protocol-32 atomic reduced transitions,
 so it does not require a later protocol. Node-cache schema 2 adds bounded local
 at-most-once individual and reconnect-digest claims with an explicit schema-1
@@ -824,7 +828,10 @@ each item retains its exact owner Node and owner Workspace ID. Unlinked owner
 Workspaces remain external singleton rows even when names match. External rows
 offer explicit revision-guarded adopt-as-new and link-to-existing actions. The
 Nodes tab is not a filter: it exposes inspection plus revision-pinned alias
-rename and verified retarget, confirmed route forget, and projection refresh.
+rename for local and registered Nodes, verified remote retarget, confirmed route
+forget, and projection refresh. Its primary table favors operational health,
+freshness, route, and per-Node Workspace, Shell, Agent, Schedule, and attention
+counts; protocol and capability details remain in inspection.
 Refresh wakes that Node's existing projection worker; it never starts an
 overlapping observer.
 Resource tables place `NODE` after task identity columns rather than making Node
@@ -1138,6 +1145,13 @@ disabling federation, and exposes the identity through a version-gated query.
 Cold restart and graceful handoff read the same file; the identity is not
 transferred in the handoff manifest. State schema remains 12. Protocol-27 peers
 remain local-only and cannot query Node identity.
+
+Protocol 42 and Node identity schema 2 add a bounded mutable local alias and
+positive alias revision to `node.json`. Schema 1 migrates atomically to alias
+`local` at revision 1. Rename is revision-conditional, while rekey changes only
+the stable Node ID and preserves alias metadata. The alias is presentation and
+selection metadata, never Node identity or a route. Protocol-41 responses omit
+the additive `local_alias_revision` field and cannot request alias mutation.
 
 Protocol 29 adds the same-socket `OpenFederationChannel` request. Federation
 handshake version 1 is emitted by the hidden `__federation-stdio` helper only
