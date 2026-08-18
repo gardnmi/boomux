@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.20.0](https://github.com/gardnmi/boomux/compare/v0.19.0...v0.20.0) (2026-08-18)
+
+
+### Features
+
+* **node:** dismiss stale shell projections ([#211](https://github.com/gardnmi/boomux/issues/211)) ([a19ef53](https://github.com/gardnmi/boomux/commit/a19ef535c4c0f2bf94974b71b54a80801d512e10))
+
+
+### Bug Fixes
+
+* **agent:** preserve recovery presentation ([#210](https://github.com/gardnmi/boomux/issues/210)) ([c0a1014](https://github.com/gardnmi/boomux/commit/c0a1014ea310d66e5ba4f65527ed086d87cd235d))
+
 ## [0.19.0](https://github.com/gardnmi/boomux/compare/v0.18.1...v0.19.0) (2026-08-17)
 
 
