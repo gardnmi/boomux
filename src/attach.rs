@@ -14,6 +14,7 @@ const POLL_INTERVAL_MS: i32 = 100;
 const ESCAPE_DISAMBIGUATION_MS: i32 = 10;
 const RECONNECT_ATTEMPTS: usize = 600;
 const RECONNECT_DELAY: Duration = Duration::from_millis(25);
+const REATTACH_RESIZE_SETTLE: Duration = Duration::from_millis(100);
 const ENABLE_FOCUS_REPORTING: &[u8] = b"\x1b[?1004h";
 const DISABLE_FOCUS_REPORTING: &[u8] = b"\x1b[?1004l";
 
@@ -166,6 +167,7 @@ pub fn run(
             }
             stdout.flush()?;
             let mut stream = attachment.stream;
+            resynchronize_terminal_size(&mut stream, size)?;
 
             if !pump_attachment(
                 &mut stream,
@@ -203,6 +205,34 @@ pub fn run(
         }
     }
     result
+}
+
+fn resynchronize_terminal_size(
+    stream: &mut std::os::unix::net::UnixStream,
+    size: (u16, u16, u16, u16),
+) -> io::Result<()> {
+    let nudged = if size.0 > 1 {
+        (size.0 - 1, size.1, size.2, size.3)
+    } else if size.1 > 1 {
+        (size.0, size.1 - 1, size.2, size.3)
+    } else {
+        return Ok(());
+    };
+    AttachFrame::Resize {
+        rows: nudged.0,
+        cols: nudged.1,
+        pixel_width: nudged.2,
+        pixel_height: nudged.3,
+    }
+    .write_to(stream)?;
+    thread::sleep(REATTACH_RESIZE_SETTLE);
+    AttachFrame::Resize {
+        rows: size.0,
+        cols: size.1,
+        pixel_width: size.2,
+        pixel_height: size.3,
+    }
+    .write_to(stream)
 }
 
 pub fn run_agent_session(
@@ -669,5 +699,34 @@ mod tests {
         sender.join().unwrap();
         assert!(!reconnect);
         assert_eq!(stdout, b"before\x1b[?1004;2004lafter\x1b[?1004h");
+    }
+
+    #[test]
+    fn reattachment_nudges_then_restores_the_terminal_size() {
+        let (mut daemon, mut attachment) = UnixStream::pair().unwrap();
+        let receiver = thread::spawn(move || {
+            assert_eq!(
+                AttachFrame::read_from(&mut daemon).unwrap(),
+                AttachFrame::Resize {
+                    rows: 23,
+                    cols: 80,
+                    pixel_width: 800,
+                    pixel_height: 600,
+                }
+            );
+            assert_eq!(
+                AttachFrame::read_from(&mut daemon).unwrap(),
+                AttachFrame::Resize {
+                    rows: 24,
+                    cols: 80,
+                    pixel_width: 800,
+                    pixel_height: 600,
+                }
+            );
+        });
+
+        resynchronize_terminal_size(&mut attachment, (24, 80, 800, 600)).unwrap();
+
+        receiver.join().unwrap();
     }
 }

@@ -6815,32 +6815,6 @@ impl PtyMaster {
         Ok(())
     }
 
-    fn signal_foreground_process_group(&self, signal: libc::c_int) -> io::Result<()> {
-        let mut process_group: libc::pid_t = 0;
-        // The descriptor is a live Unix PTY master and process_group is writable.
-        if unsafe {
-            libc::ioctl(
-                self.descriptor.as_raw_fd(),
-                libc::TIOCGPGRP,
-                &mut process_group,
-            )
-        } == -1
-        {
-            return Err(io::Error::last_os_error());
-        }
-        if process_group <= 0 {
-            return Ok(());
-        }
-        // A negative PID targets the authoritative PTY foreground process group.
-        if unsafe { libc::kill(-process_group, signal) } == -1 {
-            let error = io::Error::last_os_error();
-            if error.raw_os_error() != Some(libc::ESRCH) {
-                return Err(error);
-            }
-        }
-        Ok(())
-    }
-
     fn foreground_process(&self) -> Option<String> {
         let mut process_group: libc::pid_t = 0;
         // The descriptor is a live Unix PTY master and process_group is writable.
@@ -15851,14 +15825,12 @@ impl ShellRuntimeManager {
                 );
             }
         }
-        // Resize and lock the shadow before signaling the PTY. A fullscreen child may
-        // redraw immediately on SIGWINCH, and that output must be parsed at the new size.
-        let mut terminal = lock(&terminal)?;
-        terminal.resize(profile.rows, profile.cols);
         lock(&runtime.master)?.resize(Self::profile_size(&profile))?;
         Self::update_runtime_dimensions(&shell, &runtime, Self::profile_size(&profile))?;
+        lock(&terminal)?.resize(profile.rows, profile.cols);
         // Keep terminal state locked until the controller is installed so the
         // reconstruction ends exactly where live delivery begins.
+        let terminal = lock(&terminal)?;
         send_response(
             &mut stream,
             response_version,
@@ -15932,9 +15904,6 @@ impl ShellRuntimeManager {
                 return Err(error);
             }
         };
-        if !started {
-            let _ = lock(&runtime.master)?.signal_foreground_process_group(libc::SIGWINCH);
-        }
         drop(mutation);
         drop(lifecycle);
         drop(terminal);
@@ -16002,8 +15971,8 @@ impl ShellRuntimeManager {
                                 pixel_width,
                                 pixel_height,
                             };
-                            lock(&runtime.master)?.resize(size)?;
                             lock(&runtime.terminal)?.resize(rows, cols);
+                            lock(&runtime.master)?.resize(size)?;
                             Self::update_runtime_dimensions(&shell, &runtime, size)?;
                             Ok(())
                         }

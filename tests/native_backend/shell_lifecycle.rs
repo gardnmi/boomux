@@ -269,52 +269,6 @@ fn reattachment_reflows_retained_output_for_the_new_terminal_width() {
 }
 
 #[test]
-fn reattachment_requests_fullscreen_redraw_after_reconstruction() {
-    let mut daemon = TestDaemon::start();
-    let workspace = daemon
-        .client
-        .create_workspace(
-            "resize-redraw-order",
-            vec![ShellSpec {
-                name: "tui".into(),
-                command: vec![
-                    "/bin/sh".into(),
-                    "-c".into(),
-                    r#"trap 'printf "\033[2J\033[Hredraw-%s\n" "$(stty size)"' WINCH; printf '\033[?1049hinitial-screen\n'; while :; do sleep 1; done"#
-                        .into(),
-                ],
-                cwd: std::env::temp_dir(),
-            }],
-        )
-        .unwrap();
-    let shell_id = workspace.shells[0].id.clone();
-    let mut initial_profile = profile();
-    initial_profile.rows = 20;
-    initial_profile.cols = 100;
-    let mut first = daemon
-        .client
-        .attach(&shell_id, false, initial_profile)
-        .unwrap();
-    if !contains(&first.reconstruction, b"initial-screen") {
-        read_until(&mut first.stream, b"initial-screen");
-    }
-    drop(first);
-
-    let mut same_profile = profile();
-    same_profile.rows = 20;
-    same_profile.cols = 100;
-    let mut second = wait_for_attach_with_profile(&daemon.client, &shell_id, same_profile);
-    assert!(!contains(&second.reconstruction, b"redraw-20 100"));
-    assert!(contains(
-        &read_until(&mut second.stream, b"redraw-20 100"),
-        b"redraw-20 100"
-    ));
-
-    drop(second);
-    daemon.stop_with_cli();
-}
-
-#[test]
 fn structured_shell_preview_preserves_color_while_plain_read_stays_plain() {
     let mut daemon = TestDaemon::start();
     let workspace = daemon
