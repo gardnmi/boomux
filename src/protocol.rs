@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 39;
+pub const PROTOCOL_VERSION: u32 = 40;
 pub const MIN_PROTOCOL_VERSION: u32 = 6;
 pub const MAX_CONTROL_FRAME: usize = 8 * 1024 * 1024;
 pub const MAX_ATTACH_FRAME: usize = 1024 * 1024;
@@ -171,6 +171,10 @@ define_protocol_features! {
     QualifiedFocusedTerminal => (39, "Node-qualified focused terminal presentation", [
         "protocol_39",
         "qualified_focused_terminal",
+    ]),
+    CachedProjectionDismissal => (40, "cached projection dismissal", [
+        "protocol_40",
+        "cached_projection_dismissal",
     ]),
 }
 
@@ -2036,6 +2040,13 @@ pub enum Request {
     ForceNodeProjectionRefresh {
         selector: String,
     },
+    DismissNodeProjectionShell {
+        node_id: String,
+        shell_id: String,
+    },
+    RestoreDismissedNodeProjectionShells {
+        node_id: String,
+    },
     GetCombinedNodeSnapshot {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         selector: Option<String>,
@@ -2415,6 +2426,10 @@ impl Request {
             }
             Self::GetCombinedNodeSnapshot { .. } => Some(ProtocolFeature::CombinedNodeSnapshot),
             Self::ForceNodeProjectionRefresh { .. } => Some(ProtocolFeature::GlobalWorkspaces),
+            Self::DismissNodeProjectionShell { .. }
+            | Self::RestoreDismissedNodeProjectionShells { .. } => {
+                Some(ProtocolFeature::CachedProjectionDismissal)
+            }
             Self::CreateGlobalWorkspace { .. }
             | Self::AdoptNodeWorkspace { .. }
             | Self::LinkNodeWorkspace { .. }
@@ -3229,8 +3244,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_thirty_nine_with_minimum_six() {
-        assert_eq!(PROTOCOL_VERSION, 39);
+    fn protocol_version_is_forty_with_minimum_six() {
+        assert_eq!(PROTOCOL_VERSION, 40);
         assert_eq!(MIN_PROTOCOL_VERSION, 6);
     }
 
@@ -3417,6 +3432,34 @@ mod tests {
             serde_json::to_value(identity).unwrap(),
             serde_json::json!({"node_id": "node", "inner_id": "resource"})
         );
+    }
+
+    #[test]
+    fn cached_projection_dismissal_is_protocol_forty_and_round_trips() {
+        for request in [
+            Request::DismissNodeProjectionShell {
+                node_id: "node-1".into(),
+                shell_id: "shell-1".into(),
+            },
+            Request::RestoreDismissedNodeProjectionShells {
+                node_id: "node-1".into(),
+            },
+        ] {
+            assert_eq!(
+                request.required_feature(),
+                Some(ProtocolFeature::CachedProjectionDismissal)
+            );
+            assert_eq!(
+                request
+                    .required_feature()
+                    .map(ProtocolFeature::minimum_version),
+                Some(40)
+            );
+            assert_eq!(
+                serde_json::from_value::<Request>(serde_json::to_value(&request).unwrap()).unwrap(),
+                request
+            );
+        }
     }
 
     #[test]
@@ -4557,6 +4600,7 @@ mod tests {
                 ][..],
             ),
             (39, &["protocol_39", "qualified_focused_terminal"][..]),
+            (40, &["protocol_40", "cached_projection_dismissal"][..]),
         ];
 
         let actual = ProtocolFeature::ALL

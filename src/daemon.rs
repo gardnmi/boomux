@@ -7046,7 +7046,7 @@ fn node_projection_worker(service: Weak<DaemonService>, node_id: String) {
                                         })?
                                         .claim_notifications(
                                             &registration,
-                                            commit.generation,
+                                            &sync.cursor,
                                             &claims,
                                             digest.as_ref().map(|digest| &digest.claim),
                                         )
@@ -10791,6 +10791,42 @@ impl DaemonService {
                 Ok(Response::NodeProjectionHealth {
                     health: self.force_node_projection_refresh(&selector)?,
                 })
+            }
+            Request::DismissNodeProjectionShell { node_id, shell_id } => {
+                let registration = self
+                    .node_registrations()?
+                    .inspect(&node_id)
+                    .map_err(node_registration_error)?;
+                let (health, changed) = self
+                    .node_projection_cache()?
+                    .dismiss_shell(&registration, &shell_id)?;
+                if changed {
+                    let _ = self.events.publish_runtime_batch(vec![
+                        DaemonEventKind::NodeProjectionChanged {
+                            node_id,
+                            cache_generation: health.cache_generation,
+                        },
+                    ]);
+                }
+                Ok(Response::NodeProjectionHealth { health })
+            }
+            Request::RestoreDismissedNodeProjectionShells { node_id } => {
+                let registration = self
+                    .node_registrations()?
+                    .inspect(&node_id)
+                    .map_err(node_registration_error)?;
+                let (health, changed) = self
+                    .node_projection_cache()?
+                    .restore_dismissed_shells(&registration)?;
+                if changed {
+                    let _ = self.events.publish_runtime_batch(vec![
+                        DaemonEventKind::NodeProjectionChanged {
+                            node_id,
+                            cache_generation: health.cache_generation,
+                        },
+                    ]);
+                }
+                Ok(Response::NodeProjectionHealth { health })
             }
             Request::GetCombinedNodeSnapshot { selector } => {
                 self.reconcile_pending_workspace_resources();

@@ -216,6 +216,7 @@ pub(crate) struct DashboardState {
     pub(crate) scheduling: SchedulingView,
     pub(crate) exact_run_attachment: bool,
     pub(crate) schedule_editing: bool,
+    pub(crate) cached_projection_dismissal: bool,
     pub(crate) focused_terminal: Option<FocusedTerminalView>,
     pub(crate) reset_focus_revision: bool,
 }
@@ -669,6 +670,11 @@ impl WorkspaceView {
                     .any(|capability| capability == "guarded_remote_management"))
     }
 
+    fn item_dismissible(&self, index: usize) -> bool {
+        let node = self.item_owner(index).0;
+        !node.local && (!node.current || node.stale)
+    }
+
     fn item_shell_attachable(&self, index: usize) -> bool {
         let node = self.item_owner(index).0;
         (node.local && node.current && !node.stale)
@@ -887,6 +893,7 @@ pub(crate) enum DashboardEffect {
     },
     CheckForUpdates,
     RefreshNode(String),
+    RestoreDismissedShells(String),
     Refresh,
     RunSchedule(QualifiedIdentity),
     PauseSchedule(QualifiedIdentity),
@@ -1082,6 +1089,7 @@ struct App {
     scheduling: SchedulingView,
     exact_run_attachment: bool,
     schedule_editing: bool,
+    cached_projection_dismissal: bool,
     selected_execution_id: Option<String>,
     execution_state: TableState,
     workspace_state: TableState,
@@ -1206,6 +1214,7 @@ pub(crate) enum CloseTarget {
     },
     Workspace(QualifiedIdentity),
     Shell(QualifiedIdentity),
+    DismissCachedShell(QualifiedIdentity),
     Launcher(QualifiedIdentity),
     Schedule(QualifiedIdentity),
     Execution(QualifiedIdentity),
@@ -2331,6 +2340,7 @@ impl App {
             },
             exact_run_attachment: false,
             schedule_editing: false,
+            cached_projection_dismissal: false,
             selected_execution_id: None,
             execution_state: TableState::default(),
             workspace_state,
@@ -3243,11 +3253,17 @@ impl App {
             self.selected_item_location().and_then(|(workspace, item)| {
                 let workspace = &self.workspaces[workspace];
                 workspace
-                    .item_actionable(item)
-                    .then(|| workspace.items.get(item))
-                    .flatten()
+                    .items
+                    .get(item)
                     .filter(|item| item.ordinary_visible())
-                    .map(|value| item_pending_close(workspace, item, value))
+                    .and_then(|value| {
+                        item_pending_removal(
+                            workspace,
+                            item,
+                            value,
+                            self.cached_projection_dismissal,
+                        )
+                    })
             })
         } else {
             match self.focus {
@@ -3280,11 +3296,17 @@ impl App {
                 Focus::Items => self.selected_item_location().and_then(|(workspace, item)| {
                     let workspace = &self.workspaces[workspace];
                     workspace
-                        .item_actionable(item)
-                        .then(|| workspace.items.get(item))
-                        .flatten()
+                        .items
+                        .get(item)
                         .filter(|item| item.ordinary_visible())
-                        .map(|value| item_pending_close(workspace, item, value))
+                        .and_then(|value| {
+                            item_pending_removal(
+                                workspace,
+                                item,
+                                value,
+                                self.cached_projection_dismissal,
+                            )
+                        })
                 }),
             }
         };
@@ -3525,6 +3547,17 @@ impl App {
                     .or(Some(DashboardEffect::Refresh));
             }
             KeyCode::Char('r') => return Some(DashboardEffect::Refresh),
+            KeyCode::Char('u') if self.primary_tab == PrimaryTab::Nodes => {
+                if !self.cached_projection_dismissal {
+                    return None;
+                }
+                return self
+                    .node_state
+                    .selected()
+                    .and_then(|index| self.nodes.get(index))
+                    .filter(|node| !node.local)
+                    .map(|node| DashboardEffect::RestoreDismissedShells(node.id.clone()));
+            }
             KeyCode::Char('[') if self.primary_tab == PrimaryTab::Schedules => {
                 self.cycle_execution(false);
             }
@@ -4004,6 +4037,31 @@ fn item_pending_close(
     }
 }
 
+fn item_pending_removal(
+    workspace: &WorkspaceView,
+    item_index: usize,
+    item: &WorkspaceItemView,
+    dismissal_supported: bool,
+) -> Option<PendingClose> {
+    if workspace.item_actionable(item_index) {
+        return Some(item_pending_close(workspace, item_index, item));
+    }
+    if !dismissal_supported || !workspace.item_dismissible(item_index) {
+        return None;
+    }
+    let (id, name) = match item {
+        WorkspaceItemView::Shell(shell) => (&shell.id, &shell.name),
+        WorkspaceItemView::AgentShell(agent) => (&agent.shell.id, &agent.shell.name),
+        WorkspaceItemView::Launcher(_) | WorkspaceItemView::Schedule(_) => return None,
+    };
+    Some(PendingClose {
+        target: CloseTarget::DismissCachedShell(workspace.qualify_item(item_index, id)),
+        name: name.clone(),
+        shell_count: 0,
+        launcher_count: 0,
+    })
+}
+
 pub(crate) fn run<B: DashboardBackend + Send + 'static>(
     state: DashboardState,
     follow_focused_terminal: bool,
@@ -4029,6 +4087,7 @@ pub(crate) fn run<B: DashboardBackend + Send + 'static>(
     app.scheduling = state.scheduling;
     app.exact_run_attachment = state.exact_run_attachment;
     app.schedule_editing = state.schedule_editing;
+    app.cached_projection_dismissal = state.cached_projection_dismissal;
     if follow_focused_terminal {
         app.enable_focus_following(state.focused_terminal.as_ref());
     }
@@ -7400,6 +7459,10 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
                     pending.name
                 )
             }
+            CloseTarget::DismissCachedShell(_) => format!(
+                " Dismiss cached shell '{}'? Its remote process will not be closed.  ",
+                pending.name
+            ),
             CloseTarget::Launcher(_) => {
                 format!(" Remove launcher '{}'?  ", pending.name)
             }
@@ -7443,34 +7506,50 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
         ))
     } else {
         let launcher_selected = matches!(app.selected_item(), Some(WorkspaceItemView::Launcher(_)));
+        let offline_shell_selected =
+            app.selected_item_location()
+                .is_some_and(|(workspace, item)| {
+                    app.workspaces[workspace].item_dismissible(item)
+                        && matches!(
+                            app.workspaces[workspace].items.get(item),
+                            Some(WorkspaceItemView::Shell(_) | WorkspaceItemView::AgentShell(_))
+                        )
+                });
+        let dismiss_selected = app.cached_projection_dismissal && offline_shell_selected;
         if app.primary_tab == PrimaryTab::Nodes {
-            frame.render_widget(
-                Paragraph::new(Line::from(vec![
-                    Span::styled(" j/k", Style::new().fg(TEAL)),
-                    Span::styled(" navigate  ", Style::new().fg(SUBTEXT)),
-                    Span::styled("a", Style::new().fg(GREEN)),
-                    Span::styled(" add Node  ", Style::new().fg(SUBTEXT)),
-                    Span::styled("r", Style::new().fg(BLUE)),
-                    Span::styled(" retry/refresh  ", Style::new().fg(SUBTEXT)),
-                    Span::styled("enter", Style::new().fg(GREEN)),
-                    Span::styled(" inspect  ", Style::new().fg(SUBTEXT)),
-                    Span::styled("e", Style::new().fg(YELLOW)),
-                    Span::styled(" rename  ", Style::new().fg(SUBTEXT)),
-                    Span::styled("t", Style::new().fg(YELLOW)),
-                    Span::styled(" retarget  ", Style::new().fg(SUBTEXT)),
-                    Span::styled("x", Style::new().fg(RED)),
-                    Span::styled(" forget  ", Style::new().fg(SUBTEXT)),
-                    Span::styled("tab/shift-tab", Style::new().fg(TEAL)),
-                    Span::styled(" views  ", Style::new().fg(SUBTEXT)),
-                    Span::styled("1-5", Style::new().fg(TEAL)),
-                    Span::styled(" select view  ", Style::new().fg(SUBTEXT)),
-                    Span::styled("/", Style::new().fg(TEAL)),
-                    Span::styled(" palette  ", Style::new().fg(SUBTEXT)),
-                    Span::styled("q", Style::new().fg(RED)),
-                    Span::styled(" quit", Style::new().fg(SUBTEXT)),
-                ])),
-                area,
-            );
+            let mut spans = vec![
+                Span::styled(" j/k", Style::new().fg(TEAL)),
+                Span::styled(" navigate  ", Style::new().fg(SUBTEXT)),
+                Span::styled("a", Style::new().fg(GREEN)),
+                Span::styled(" add Node  ", Style::new().fg(SUBTEXT)),
+                Span::styled("r", Style::new().fg(BLUE)),
+                Span::styled(" retry/refresh  ", Style::new().fg(SUBTEXT)),
+            ];
+            if app.cached_projection_dismissal {
+                spans.extend([
+                    Span::styled("u", Style::new().fg(GREEN)),
+                    Span::styled(" restore dismissed  ", Style::new().fg(SUBTEXT)),
+                ]);
+            }
+            spans.extend([
+                Span::styled("enter", Style::new().fg(GREEN)),
+                Span::styled(" inspect  ", Style::new().fg(SUBTEXT)),
+                Span::styled("e", Style::new().fg(YELLOW)),
+                Span::styled(" rename  ", Style::new().fg(SUBTEXT)),
+                Span::styled("t", Style::new().fg(YELLOW)),
+                Span::styled(" retarget  ", Style::new().fg(SUBTEXT)),
+                Span::styled("x", Style::new().fg(RED)),
+                Span::styled(" forget  ", Style::new().fg(SUBTEXT)),
+                Span::styled("tab/shift-tab", Style::new().fg(TEAL)),
+                Span::styled(" views  ", Style::new().fg(SUBTEXT)),
+                Span::styled("1-5", Style::new().fg(TEAL)),
+                Span::styled(" select view  ", Style::new().fg(SUBTEXT)),
+                Span::styled("/", Style::new().fg(TEAL)),
+                Span::styled(" palette  ", Style::new().fg(SUBTEXT)),
+                Span::styled("q", Style::new().fg(RED)),
+                Span::styled(" quit", Style::new().fg(SUBTEXT)),
+            ]);
+            frame.render_widget(Paragraph::new(Line::from(spans)), area);
             return;
         }
         if app.primary_tab == PrimaryTab::Schedules {
@@ -7668,19 +7747,23 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
             Span::styled("r", Style::new().fg(BLUE)),
             Span::styled(" refresh  ", Style::new().fg(SUBTEXT)),
         ]);
-        spans.extend([
-            Span::styled("x", Style::new().fg(RED)),
-            Span::styled(
-                if app.primary_tab == PrimaryTab::Workspaces && app.focus == Focus::Workspaces {
-                    " close workspace  "
-                } else if launcher_selected {
-                    " remove launcher  "
-                } else {
-                    " close shell  "
-                },
-                Style::new().fg(SUBTEXT),
-            ),
-        ]);
+        if !offline_shell_selected || app.cached_projection_dismissal {
+            spans.extend([
+                Span::styled("x", Style::new().fg(RED)),
+                Span::styled(
+                    if app.primary_tab == PrimaryTab::Workspaces && app.focus == Focus::Workspaces {
+                        " close workspace  "
+                    } else if launcher_selected {
+                        " remove launcher  "
+                    } else if dismiss_selected {
+                        " dismiss cached shell  "
+                    } else {
+                        " close shell  "
+                    },
+                    Style::new().fg(SUBTEXT),
+                ),
+            ]);
+        }
         spans.extend([
             Span::styled("q", Style::new().fg(RED)),
             Span::styled(" quit", Style::new().fg(SUBTEXT)),
@@ -8156,6 +8239,7 @@ mod tests {
         remote.node.stale = true;
         remote.node.health = NodeProjectionHealthCode::Stale;
         let mut app = App::new(vec![local.clone(), remote.clone()], project_context());
+        app.cached_projection_dismissal = true;
         app.workspace_state.select(Some(1));
         app.item_state.select(Some(0));
 
@@ -8168,8 +8252,31 @@ mod tests {
         assert_eq!(app.selected_item().unwrap().id(), "term_1");
         assert_eq!(app.restore_selected(), None);
         assert_eq!(app.open_selected_item(), None);
+        app.focus = Focus::Items;
+        app.request_close();
+        assert!(matches!(
+            app.pending_close,
+            Some(PendingClose {
+                target: CloseTarget::DismissCachedShell(ref id),
+                ..
+            }) if id.node_id == "00000000-0000-0000-0000-000000000002"
+                && id.inner_id == "term_1"
+        ));
+        let rendered = rendered_text(&mut app, 140, 36);
+        assert!(rendered.contains("Dismiss cached shell"));
+        assert!(rendered.contains("remote process will not be closed"));
+        assert!(matches!(
+            app.confirm_close(),
+            Some(DashboardEffect::Close(CloseTarget::DismissCachedShell(id)))
+                if id.node_id == "00000000-0000-0000-0000-000000000002"
+                    && id.inner_id == "term_1"
+        ));
+        app.cached_projection_dismissal = false;
         app.request_close();
         assert!(app.pending_close.is_none());
+        let rendered = rendered_text(&mut app, 140, 36);
+        assert!(!rendered.contains("dismiss cached shell"));
+        assert!(!rendered.contains("close shell"));
 
         assert_eq!(app.workspaces.len(), 2);
     }
@@ -8369,10 +8476,18 @@ mod tests {
         remote.node.registration_revision = Some(7);
         let mut app = App::new(vec![remote], project_context());
         app.select_tab(PrimaryTab::Nodes);
+        assert_eq!(app.update_key(KeyCode::Char('u'), KeyModifiers::NONE), None);
+        assert!(!rendered_text(&mut app, 180, 24).contains("restore dismissed"));
+        app.cached_projection_dismissal = true;
 
         assert!(matches!(
             app.update_key(KeyCode::Char('r'), KeyModifiers::NONE),
             Some(DashboardEffect::RefreshNode(node_id))
+                if node_id == "00000000-0000-0000-0000-000000000002"
+        ));
+        assert!(matches!(
+            app.update_key(KeyCode::Char('u'), KeyModifiers::NONE),
+            Some(DashboardEffect::RestoreDismissedShells(node_id))
                 if node_id == "00000000-0000-0000-0000-000000000002"
         ));
 

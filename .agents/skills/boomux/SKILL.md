@@ -89,6 +89,10 @@ restart an incompatible remote daemon. JSON setup never approves installation;
 it returns typed `install_required` or `upgrade_required`. Retargeting must prove
 the pinned identity before replacing the route. Forget removes only the local
 registration and cached projection; it does not contact or delete the owner.
+In the dashboard, `x` on a stale remote Shell dismisses only its cached local
+presentation and explicitly warns that the remote process is not closed. On the
+Nodes tab, `u` restores dismissed Shells for the selected Node. Online `x`
+continues to perform an owner-authoritative close.
 `node rekey` changes this Node's durable identity and is local, interactive, and
 human-only; use it only after the command's exact confirmation requirements are
 explicitly authorized.
