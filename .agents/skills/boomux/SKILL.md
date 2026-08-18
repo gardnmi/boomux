@@ -515,11 +515,23 @@ Open the dashboard or run diagnostics with:
 ```console
 boomux
 boomux ui
+boomux web
 boomux doctor
 ```
 
 `boomux` and `boomux ui` must run from a fresh host terminal; they are rejected
 when `BOOMUX_SHELL_ID` is set. `boomux doctor` can run in either context.
+
+`boomux web` serves an experimental read-only Agent PWA on
+`127.0.0.1:3737`. Use `--port` to change the loopback port and
+`--trusted-user LOGIN` to require the exact `Tailscale-User-Login` inserted by
+Tailscale Serve. It uses the Omarchy presentation model: one current user-Shell
+Agent per exact run plus historical Agents with durable attention, excluding
+schedule-owned Agents. It also presents local working-to-idle transitions as
+ephemeral finished alerts. It displays bounded output for an exact current local
+Shell run, but cannot send terminal input, acknowledge attention, resume a
+Session, or expose remote terminal output. Never present its rendered terminal
+view as a structured conversation transcript.
 
 The dashboard has Workspaces, Agents, Shells, Schedules, and Nodes views. `/` or
 `:` opens its action and search palette, `?` shows contextual help, `Enter`
