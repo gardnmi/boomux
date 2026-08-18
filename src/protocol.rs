@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 41;
+pub const PROTOCOL_VERSION: u32 = 42;
 pub const MIN_PROTOCOL_VERSION: u32 = 6;
 pub const MAX_CONTROL_FRAME: usize = 8 * 1024 * 1024;
 pub const MAX_ATTACH_FRAME: usize = 1024 * 1024;
@@ -185,6 +185,10 @@ define_protocol_features! {
     ]),
     NodeUpgradeCoordination => (41, "Node upgrade coordination", [
         "node_upgrade_coordination",
+    ]),
+    LocalNodeAlias => (42, "local Node alias management", [
+        "protocol_42",
+        "local_node_alias_management",
     ]),
 }
 
@@ -505,6 +509,14 @@ pub struct NodeRegistrationSnapshot {
     pub node_id: String,
     pub revision: u64,
     pub tombstone_epoch: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalNodeMetadata {
+    pub node_id: String,
+    pub alias: String,
+    pub revision: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -843,6 +855,8 @@ pub struct CombinedNode {
     pub route: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub registration_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_alias_revision: Option<u64>,
     pub health: NodeProjectionHealthCode,
     pub current: bool,
     pub stale: bool,
@@ -2037,6 +2051,10 @@ pub enum Request {
         alias: String,
         expected_revision: u64,
     },
+    RenameLocalNodeAlias {
+        alias: String,
+        expected_revision: u64,
+    },
     RetargetNodeRegistration {
         selector: String,
         target: String,
@@ -2456,6 +2474,7 @@ impl Request {
             | Self::RenewNodeUpgradeMaintenance { .. } => {
                 Some(ProtocolFeature::NodeUpgradeCoordination)
             }
+            Self::RenameLocalNodeAlias { .. } => Some(ProtocolFeature::LocalNodeAlias),
             Self::SyncNodeProjection { .. } | Self::GetNodeProjectionHealth { .. } => {
                 Some(ProtocolFeature::NodeProjectionSync)
             }
@@ -2631,6 +2650,9 @@ pub enum Response {
     NodeUpgradeMaintenance {
         registration: NodeRegistrationSnapshot,
         token: String,
+    },
+    LocalNodeMetadata {
+        node: LocalNodeMetadata,
     },
     NodeProjectionSync {
         sync: NodeProjectionSync,
@@ -3283,8 +3305,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_forty_one_with_minimum_six() {
-        assert_eq!(PROTOCOL_VERSION, 41);
+    fn protocol_version_is_forty_two_with_minimum_six() {
+        assert_eq!(PROTOCOL_VERSION, 42);
         assert_eq!(MIN_PROTOCOL_VERSION, 6);
     }
 
@@ -3419,6 +3441,35 @@ mod tests {
             token: "token".into(),
         };
         let encoded = serde_json::to_value(&response).unwrap();
+        assert_eq!(
+            serde_json::from_value::<Response>(encoded).unwrap(),
+            response
+        );
+    }
+
+    #[test]
+    fn local_node_alias_messages_require_protocol_forty_two() {
+        let request = Request::RenameLocalNodeAlias {
+            alias: "desktop".into(),
+            expected_revision: 3,
+        };
+        let encoded = serde_json::to_value(&request).unwrap();
+        assert_eq!(encoded["request"], "rename_local_node_alias");
+        assert_eq!(serde_json::from_value::<Request>(encoded).unwrap(), request);
+        assert_eq!(
+            request.required_feature(),
+            Some(ProtocolFeature::LocalNodeAlias)
+        );
+
+        let response = Response::LocalNodeMetadata {
+            node: LocalNodeMetadata {
+                node_id: "550e8400-e29b-41d4-a716-446655440000".into(),
+                alias: "desktop".into(),
+                revision: 4,
+            },
+        };
+        let encoded = serde_json::to_value(&response).unwrap();
+        assert_eq!(encoded["response"], "local_node_metadata");
         assert_eq!(
             serde_json::from_value::<Response>(encoded).unwrap(),
             response
@@ -4130,6 +4181,13 @@ mod tests {
     fn request_feature_requirements_cover_all_groups() {
         let groups = vec![
             (
+                42,
+                vec![Request::RenameLocalNodeAlias {
+                    alias: "desktop".into(),
+                    expected_revision: 1,
+                }],
+            ),
+            (
                 33,
                 vec![Request::GetCombinedNodeSnapshot { selector: None }],
             ),
@@ -4732,6 +4790,7 @@ mod tests {
             (40, &["cached_projection_dismissal"][..]),
             (41, &["protocol_41", "observed_node_helper_version"][..]),
             (41, &["node_upgrade_coordination"][..]),
+            (42, &["protocol_42", "local_node_alias_management"][..]),
         ];
 
         let actual = ProtocolFeature::ALL

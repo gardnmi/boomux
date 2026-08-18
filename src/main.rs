@@ -2463,6 +2463,7 @@ fn node_snapshot_json(node: protocol::CombinedNode) -> Result<serde_json::Value,
         local,
         route,
         registration_revision,
+        local_alias_revision,
         health,
         current,
         stale,
@@ -2484,6 +2485,7 @@ fn node_snapshot_json(node: protocol::CombinedNode) -> Result<serde_json::Value,
         "local": local,
         "route": route,
         "registration_revision": registration_revision,
+        "local_alias_revision": local_alias_revision,
         "health": health,
         "current": current,
         "stale": stale,
@@ -3240,11 +3242,18 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
                 let result = (|| match &target {
                     tui::RenameTarget::Node {
                         node_id,
+                        local,
                         expected_revision,
                     } => {
-                        client
-                            .rename_node_registration(node_id, &name, *expected_revision)
-                            .map_err(|error| error.to_string())?;
+                        if *local {
+                            client
+                                .rename_local_node_alias(&name, *expected_revision)
+                                .map_err(|error| error.to_string())?;
+                        } else {
+                            client
+                                .rename_node_registration(node_id, &name, *expected_revision)
+                                .map_err(|error| error.to_string())?;
+                        }
                         Ok(format!("Renamed Node alias to {name}"))
                     }
                     tui::RenameTarget::GlobalWorkspace {
@@ -3716,6 +3725,7 @@ fn dashboard_state(
                 local: node.local,
                 route: node.route.clone(),
                 registration_revision: node.registration_revision,
+                local_alias_revision: node.local_alias_revision,
                 health: node.health,
                 current: node.current,
                 stale: node.stale,
@@ -3964,6 +3974,7 @@ fn unavailable_placement_node(node_id: &str) -> tui::NodeView {
         local: false,
         route: None,
         registration_revision: None,
+        local_alias_revision: None,
         health: protocol::NodeProjectionHealthCode::Unobserved,
         current: false,
         stale: true,
@@ -10784,6 +10795,7 @@ mod tests {
             local: alias == "local",
             route: None,
             registration_revision: None,
+            local_alias_revision: (alias == "local").then_some(1),
             health: protocol::NodeProjectionHealthCode::Online,
             current: true,
             stale: false,
@@ -12818,6 +12830,7 @@ mod tests {
                 local: true,
                 route: None,
                 registration_revision: None,
+                local_alias_revision: Some(1),
                 health: protocol::NodeProjectionHealthCode::Online,
                 current: true,
                 stale: false,
@@ -14205,7 +14218,7 @@ mod tests {
                 .validated_version,
             "0.84.1"
         );
-        assert_eq!(protocol::PROTOCOL_VERSION, 41);
+        assert_eq!(protocol::PROTOCOL_VERSION, 42);
     }
 
     #[test]

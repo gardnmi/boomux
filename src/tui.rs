@@ -155,6 +155,7 @@ pub(crate) struct NodeView {
     pub(crate) local: bool,
     pub(crate) route: Option<String>,
     pub(crate) registration_revision: Option<u64>,
+    pub(crate) local_alias_revision: Option<u64>,
     pub(crate) health: NodeProjectionHealthCode,
     pub(crate) current: bool,
     pub(crate) stale: bool,
@@ -1201,6 +1202,7 @@ pub(crate) enum RenameTarget {
     },
     Node {
         node_id: String,
+        local: bool,
         expected_revision: u64,
     },
     Workspace(QualifiedIdentity),
@@ -2906,12 +2908,16 @@ impl App {
                 .node_state
                 .selected()
                 .and_then(|index| self.nodes.get(index))
-                .filter(|node| !node.local)
-                && let Some(expected_revision) = node.registration_revision
+                && let Some(expected_revision) = if node.local {
+                    node.local_alias_revision
+                } else {
+                    node.registration_revision
+                }
             {
                 self.mode = Mode::Rename {
                     target: RenameTarget::Node {
                         node_id: node.id.clone(),
+                        local: node.local,
                         expected_revision,
                     },
                     input: String::new(),
@@ -4718,7 +4724,8 @@ fn render_node_inspection(frame: &mut Frame, area: Rect, node: &NodeView) {
         )),
         Line::from(format!(
             "Revision     {}",
-            node.registration_revision
+            node.local_alias_revision
+                .or(node.registration_revision)
                 .map_or_else(|| "-".into(), |value| value.to_string())
         )),
         Line::from(format!("Health       {}", node_health_label(node.health))),
@@ -5931,31 +5938,27 @@ fn render_tabs(frame: &mut Frame, area: Rect, app: &App) {
 
 fn render_nodes(frame: &mut Frame, area: Rect, app: &mut App) {
     let rows = app.nodes.iter().map(|node| {
-        let protocol = node
-            .observed_protocol_version
-            .map_or_else(|| "-".into(), |version| version.to_string());
         let version = node
             .observed_helper_version
             .clone()
             .unwrap_or_else(|| "-".into());
+        let activity = node_activity(app, &node.id);
         let last_sync = if node.observed_at_ms == 0 {
             "never".into()
         } else {
             compact_recency(node.observed_at_ms)
         };
-        let scheduler = match node.scheduler.state {
-            crate::protocol::SchedulerState::Active => "active",
-            crate::protocol::SchedulerState::Offline => "offline",
-        };
         Row::new(vec![
             node.alias.clone(),
             version,
             node_health_label(node.health).into(),
-            node.route.clone().unwrap_or_else(|| "local".into()),
-            protocol,
+            activity.workspaces.to_string(),
+            activity.shells.to_string(),
+            activity.agents.to_string(),
+            activity.schedules.to_string(),
+            activity.attention.to_string(),
             last_sync,
-            scheduler.into(),
-            node.observed_capabilities.join(","),
+            node.route.clone().unwrap_or_else(|| "local".into()),
         ])
     });
     let table = Table::new(
@@ -5964,10 +5967,12 @@ fn render_nodes(frame: &mut Frame, area: Rect, app: &mut App) {
             Constraint::Length(14),
             Constraint::Length(12),
             Constraint::Length(18),
-            Constraint::Length(24),
+            Constraint::Length(10),
+            Constraint::Length(7),
+            Constraint::Length(7),
+            Constraint::Length(9),
             Constraint::Length(9),
             Constraint::Length(12),
-            Constraint::Length(11),
             Constraint::Fill(1),
         ],
     )
@@ -5976,11 +5981,13 @@ fn render_nodes(frame: &mut Frame, area: Rect, app: &mut App) {
             "ALIAS",
             "VERSION",
             "HEALTH",
-            "ROUTE",
-            "PROTOCOL",
+            "WORKSPACES",
+            "SHELLS",
+            "AGENTS",
+            "SCHEDULES",
+            "ATTENTION",
             "LAST SYNC",
-            "SCHEDULER",
-            "CAPABILITIES",
+            "ROUTE",
         ])
         .style(Style::new().fg(BLUE).add_modifier(Modifier::BOLD)),
     )
@@ -5992,6 +5999,53 @@ fn render_nodes(frame: &mut Frame, area: Rect, app: &mut App) {
     .row_highlight_style(Style::new().fg(TEXT).add_modifier(Modifier::REVERSED))
     .highlight_symbol("> ");
     frame.render_stateful_widget(table, area, &mut app.node_state);
+}
+
+#[derive(Default)]
+struct NodeActivity {
+    workspaces: usize,
+    shells: usize,
+    agents: usize,
+    schedules: usize,
+    attention: usize,
+}
+
+fn node_activity(app: &App, node_id: &str) -> NodeActivity {
+    let mut activity = NodeActivity::default();
+    for workspace in &app.workspaces {
+        activity.workspaces += match &workspace.coordination {
+            WorkspaceCoordinationView::Global { placements, .. } => usize::from(
+                placements
+                    .iter()
+                    .any(|placement| placement.node.id == node_id),
+            ),
+            WorkspaceCoordinationView::External { .. } => usize::from(workspace.node.id == node_id),
+        };
+        for (index, item) in workspace.items.iter().enumerate() {
+            if workspace.item_owner(index).0.id != node_id {
+                continue;
+            }
+            match item {
+                WorkspaceItemView::Shell(_) => activity.shells += 1,
+                WorkspaceItemView::AgentShell(_) => {
+                    activity.shells += 1;
+                    activity.agents += 1;
+                }
+                WorkspaceItemView::Launcher(_) | WorkspaceItemView::Schedule(_) => {}
+            }
+        }
+        activity.attention += workspace
+            .attention
+            .iter()
+            .filter(|attention| attention.node_id == node_id)
+            .count();
+    }
+    activity.schedules = app
+        .schedules
+        .iter()
+        .filter(|schedule| schedule.node_id == node_id)
+        .count();
+    activity
 }
 
 fn render_workspaces(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
@@ -8107,6 +8161,7 @@ mod tests {
                 local: true,
                 route: None,
                 registration_revision: None,
+                local_alias_revision: Some(1),
                 health: NodeProjectionHealthCode::Online,
                 current: true,
                 stale: false,
@@ -8371,7 +8426,7 @@ mod tests {
     }
 
     #[test]
-    fn nodes_tab_renders_route_protocol_health_and_scheduler() {
+    fn nodes_tab_renders_route_health_and_workload_counts() {
         let mut remote = workspace("remote-workspace", "remote");
         remote.node.id = "00000000-0000-0000-0000-000000000002".into();
         remote.node.alias = "work".into();
@@ -8390,15 +8445,16 @@ mod tests {
             "ALIAS",
             "VERSION",
             "HEALTH",
+            "WORKSPACES",
+            "SHELLS",
+            "AGENTS",
+            "SCHEDULES",
+            "ATTENTION",
             "ROUTE",
-            "PROTOCOL",
-            "SCHEDULER",
             "work",
             "reconnecting",
             "user@workbox",
-            "38",
             "0.17.2",
-            "global_workspaces",
             "add Node",
             "retry/refresh",
             "upgrade",
@@ -8563,6 +8619,42 @@ mod tests {
         assert!(
             matches!(effect, Some(DashboardEffect::ForgetNode { node_id }) if node_id == "00000000-0000-0000-0000-000000000002")
         );
+    }
+
+    #[test]
+    fn nodes_tab_renames_the_local_alias_at_its_exact_revision() {
+        let local = workspace("local-workspace", "local");
+        let mut app = App::new(vec![local], project_context());
+        app.select_tab(PrimaryTab::Nodes);
+
+        assert_eq!(app.update_key(KeyCode::Char('e'), KeyModifiers::NONE), None);
+        assert!(matches!(
+            app.mode,
+            Mode::Rename {
+                target: RenameTarget::Node {
+                    local: true,
+                    expected_revision: 1,
+                    ..
+                },
+                ..
+            }
+        ));
+        app.update_key(KeyCode::Char('d'), KeyModifiers::NONE);
+        app.update_key(KeyCode::Char('e'), KeyModifiers::NONE);
+        app.update_key(KeyCode::Char('s'), KeyModifiers::NONE);
+        app.update_key(KeyCode::Char('k'), KeyModifiers::NONE);
+        let effect = app.update_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(matches!(
+            effect,
+            Some(DashboardEffect::Rename {
+                target: RenameTarget::Node {
+                    local: true,
+                    expected_revision: 1,
+                    ..
+                },
+                name
+            }) if name == "desk"
+        ));
     }
 
     #[test]

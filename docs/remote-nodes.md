@@ -29,6 +29,8 @@
 > dismissal and restore of stale cached Shell presentation.
 > Protocol 41 and Node-cache schema 4 retain the bounded helper package version
 > from an authenticated projection connection for Nodes-view presentation.
+> Protocol 42 and Node identity schema 2 add revision-guarded local alias
+> management with an explicit schema-1 migration.
 > Public `boomux --remote TARGET`
 > remains ad hoc.
 
@@ -70,11 +72,11 @@ distinct placements atomically enlarge all related pending reservations for the
 additional future placement before either new owner dispatch proceeds.
 
 The dashboard has a dedicated Nodes tab rather than a Node filter. Inspection is
-read-only; alias rename and route retarget use registration revisions, retarget
-verifies the pinned identity before mutation, and forget requires confirmation
-and removes only the local route. Projection refresh wakes the selected Node's
-existing observer without starting an overlapping worker or changing remote
-authority.
+read-only; the local alias uses its Node-identity revision, while registered alias
+rename and route retarget use registration revisions. Retarget verifies the
+pinned identity before mutation, and forget requires confirmation and removes
+only the local route. Projection refresh wakes the selected Node's existing
+observer without starting an overlapping worker or changing remote authority.
 Prepared operations are isolated and serialized by operation UUID, so concurrent
 identical handlers return one durable result and cancellation cannot consume an
 in-flight or completed success. Distinct first-placement requests retain their
@@ -153,13 +155,16 @@ rewrite the change: they fail `node_identity_changed`, discard no evidence
 automatically, and require explicit forget and add. Rekey cannot be routed
 through a conflicted registration or inferred from clone detection.
 
-A registration also has one bounded, nonempty local alias. Aliases are unique
-within the local coordinator, mutable only through a
-registration-revision-conditional rename, and are neither Node identity nor SSH
-target. Node selectors accept an exact Node ID or one exact local alias; aliases
-cannot use the canonical Node-ID syntax, so those selector forms are disjoint. No
-fuzzy, prefix, or cross-Node resource-name inference is allowed. Alias collision
-returns `already_exists`.
+A Node shown by one coordinator has one bounded, nonempty local alias. The local
+Node alias is stored with local identity metadata and defaults to `local`; a
+registered remote alias is stored in its registration. Aliases are mutable only
+through their owning revision and are neither Node identity nor SSH target. Node
+selectors accept an exact Node ID or one exact local alias; the reserved `local`
+selector continues to identify the local Node after a rename. Aliases cannot use
+canonical Node-ID syntax, so those selector forms are disjoint. Registration
+aliases remain unique among registrations; a selector shared by the local Node
+and a registration is typed `ambiguous_target`. No fuzzy, prefix, or cross-Node
+resource-name inference is allowed.
 
 ## Connection And Registration
 
@@ -474,10 +479,10 @@ The projection never contains terminal output or reconstruction, attachment or
 daemon environments, SSH credentials or authentication output, host session
 files, private integration transport, or any omitted field above.
 
-The current local alias is read from the registration when constructing a view;
-it is not duplicated in disposable projection state. Alias rename therefore has
-one persistence owner and becomes visible atomically with the registration
-revision.
+The current registered remote alias is read from the registration when
+constructing a view; it is not duplicated in disposable projection state. The
+local Node's alias is read from `node.json`. Each alias therefore has one
+persistence owner and becomes visible atomically with its owning revision.
 
 Projection storage is disposable and separately versioned from authoritative
 state. Corruption or capacity exhaustion cannot prevent authoritative local
@@ -489,7 +494,7 @@ Node-cache schema 4 is `node-cache.json` beside, but independent from,
 `state.json`, `node.json`, and `node_registrations.json`. It is owner-only,
 atomically replaced, and capped at 4 MiB and 128 Nodes. Per Node it accepts at
 most 1,024 Workspaces, 4,096 Shells, 4,096 launchers, 4,096 Agents, 1,024
-Schedules, 1,000 executions, 4,096 dismissed Shell IDs, and 96 capability
+Schedules, 1,000 executions, 4,096 dismissed Shell IDs, and 128 capability
 identifiers of at most 128 bytes.
 Names and identifiers in reduced collections are capped at 256 bytes. An invalid
 cache is renamed to `node-cache.corrupt-<uuid>.json` when possible and otherwise
@@ -896,6 +901,9 @@ valid identity file exists; external registrations then observe a new ID and
 fail closed until explicitly repaired. A malformed or unsupported existing
 identity disables federation without blocking authoritative local daemon state
 and is never silently replaced.
+Node identity schema 2 adds the local alias and its positive revision. Schema 1
+migrates atomically to alias `local` at revision 1. Revision-guarded alias rename
+does not change Node identity, and Node rekey preserves the alias and revision.
 
 A malformed or unsupported registration file similarly disables remote routing
 while preserving the file for operator recovery. An invalid disposable cache is

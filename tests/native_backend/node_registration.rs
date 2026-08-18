@@ -21,6 +21,44 @@ fn node_id(value: u128) -> String {
 }
 
 #[test]
+fn local_node_alias_is_revision_guarded_and_survives_cold_restart() {
+    let mut daemon = TestDaemon::start();
+    let initial = daemon.client.combined_node_snapshot(None).unwrap();
+    let local = initial.nodes.iter().find(|node| node.local).unwrap();
+    assert_eq!(local.alias, "local");
+    assert_eq!(local.local_alias_revision, Some(1));
+
+    let renamed = daemon
+        .client
+        .rename_local_node_alias("desktop", local.local_alias_revision.unwrap())
+        .unwrap();
+    assert_eq!(renamed.alias, "desktop");
+    assert_eq!(renamed.revision, 2);
+    let stale = daemon
+        .client
+        .rename_local_node_alias("stale", 1)
+        .unwrap_err();
+    assert!(matches!(
+        stale,
+        ClientError::Remote(RemoteError {
+            code: Some(ErrorCode::RevisionChanged),
+            ..
+        })
+    ));
+
+    daemon.stop_with_cli();
+    daemon.restart();
+    let restarted = daemon
+        .client
+        .combined_node_snapshot(Some("desktop".into()))
+        .unwrap();
+    assert_eq!(restarted.nodes.len(), 1);
+    assert!(restarted.nodes[0].local);
+    assert_eq!(restarted.nodes[0].alias, "desktop");
+    assert_eq!(restarted.nodes[0].local_alias_revision, Some(2));
+}
+
+#[test]
 fn coordinator_workspace_migrates_once_and_closes_after_owner_revision_changes() {
     let mut daemon = TestDaemon::start();
     let owner = daemon
@@ -918,6 +956,7 @@ fn write_fake_combined_snapshot(directory: &Path, workspace_owner_eligible: bool
                         local: true,
                         route: None,
                         registration_revision: None,
+                        local_alias_revision: Some(1),
                         health: NodeProjectionHealthCode::Online,
                         current: true,
                         stale: false,

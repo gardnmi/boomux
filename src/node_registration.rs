@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::node_identity::validate_node_alias;
 use crate::protocol::NodeRegistrationSnapshot;
 use crate::ssh_bootstrap::SshTarget;
 use crate::state_store::{effective_uid, secure_state_dir, state_directory_from_environment};
@@ -18,7 +19,6 @@ use crate::state_store::{effective_uid, secure_state_dir, state_directory_from_e
 const REGISTRATION_VERSION: u32 = 1;
 const MAX_REGISTRATION_BYTES: u64 = 128 * 1024;
 const MAX_REGISTRATIONS: usize = 128;
-const MAX_ALIAS_BYTES: usize = 128;
 
 pub(crate) struct NodeRegistrationManager {
     path: PathBuf,
@@ -197,7 +197,7 @@ impl NodeRegistrationManager {
         node_id: String,
         local_node_id: &str,
     ) -> io::Result<NodeRegistrationSnapshot> {
-        validate_alias(&alias)?;
+        validate_node_alias(&alias)?;
         validate_target(&target)?;
         validate_node_id(&node_id)?;
         if node_id == local_node_id {
@@ -257,7 +257,7 @@ impl NodeRegistrationManager {
         alias: String,
         expected_revision: u64,
     ) -> io::Result<NodeRegistrationSnapshot> {
-        validate_alias(&alias)?;
+        validate_node_alias(&alias)?;
         let mut state = self.lock_state()?;
         let current = available_mut(&mut state)?;
         expire_maintenance(current);
@@ -678,21 +678,6 @@ fn require_revision(registration: &Registration, expected: u64) -> io::Result<()
     }
 }
 
-fn validate_alias(alias: &str) -> io::Result<()> {
-    if alias.is_empty()
-        || alias.len() > MAX_ALIAS_BYTES
-        || alias.chars().any(char::is_control)
-        || alias.chars().any(char::is_whitespace)
-        || Uuid::parse_str(alias).is_ok_and(|id| id.to_string() == alias)
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "Node alias must be bounded, nonempty, whitespace-free, and not a canonical Node ID",
-        ));
-    }
-    Ok(())
-}
-
 fn validate_target(target: &str) -> io::Result<()> {
     SshTarget::parse(target.to_owned()).map(|_| ())
 }
@@ -771,7 +756,7 @@ fn validate_persisted(persisted: PersistedRegistrations) -> io::Result<Registrat
     let mut node_ids = HashSet::new();
     let mut registrations = Vec::with_capacity(persisted.registrations.len());
     for snapshot in persisted.registrations {
-        validate_alias(&snapshot.alias).map_err(invalid_persisted)?;
+        validate_node_alias(&snapshot.alias).map_err(invalid_persisted)?;
         validate_target(&snapshot.target).map_err(invalid_persisted)?;
         validate_node_id(&snapshot.node_id).map_err(invalid_persisted)?;
         if snapshot.revision == 0
