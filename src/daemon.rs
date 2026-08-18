@@ -36,8 +36,8 @@ use crate::handoff;
 use crate::host_services::{self, PreparedIntegrationMutation};
 use crate::node_identity::{NodeIdentityLease, NodeIdentityManager};
 use crate::node_projection::{
-    NodeProjectionCache, ProjectionCommit, RemoteDigestClaim, RemoteNotificationCategory,
-    RemoteNotificationClaim,
+    NodeProjectionCache, ProjectionCommit, ProjectionObservation, RemoteDigestClaim,
+    RemoteNotificationCategory, RemoteNotificationClaim,
 };
 use crate::node_registration::NodeRegistrationManager;
 use crate::protocol::{
@@ -104,6 +104,7 @@ const TRANSITION_SHUTDOWN: u8 = 2;
 const TRANSITION_REKEY: u8 = 3;
 const NODE_REKEY_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 const NODE_REGISTRATION_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
+const NODE_UPGRADE_MAINTENANCE_LEASE: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NotificationSettings {
@@ -1175,6 +1176,25 @@ fn handle_connection_inner(
                 .into_response(),
             );
         }
+        match node_upgrade_maintenance_active(&registry) {
+            Ok(true) => {
+                transition.store(TRANSITION_IDLE, Ordering::Release);
+                return send_response(
+                    &mut stream,
+                    response_version,
+                    DaemonError::lifecycle(
+                        ErrorCode::Busy,
+                        "a registered Node upgrade is in progress",
+                    )
+                    .into_response(),
+                );
+            }
+            Ok(false) => {}
+            Err(error) => {
+                transition.store(TRANSITION_IDLE, Ordering::Release);
+                return send_response(&mut stream, response_version, error.into_response());
+            }
+        }
         registry.stop_scheduler()?;
         registry.stop_node_projection_workers()?;
         return match registry.shutdown() {
@@ -1246,6 +1266,25 @@ fn handle_connection_inner(
                     .into_response(),
             );
         }
+        match node_upgrade_maintenance_active(&registry) {
+            Ok(true) => {
+                transition.store(TRANSITION_IDLE, Ordering::Release);
+                return send_response(
+                    &mut stream,
+                    response_version,
+                    DaemonError::lifecycle(
+                        ErrorCode::Busy,
+                        "a registered Node upgrade is in progress",
+                    )
+                    .into_response(),
+                );
+            }
+            Ok(false) => {}
+            Err(error) => {
+                transition.store(TRANSITION_IDLE, Ordering::Release);
+                return send_response(&mut stream, response_version, error.into_response());
+            }
+        }
         let (reply, response) = mpsc::sync_channel(1);
         if restart_sender
             .send(RestartRequest {
@@ -1271,6 +1310,32 @@ fn handle_connection_inner(
                 .into_response(),
             ),
         };
+    }
+
+    if let Request::BeginNodeUpgradeMaintenance {
+        selector,
+        expected_revision,
+    } = &request.message
+    {
+        let response = registry
+            .node_registrations()
+            .and_then(|registrations| {
+                registrations
+                    .begin_upgrade_maintenance_if(
+                        selector,
+                        *expected_revision,
+                        NODE_REGISTRATION_DRAIN_TIMEOUT,
+                        NODE_UPGRADE_MAINTENANCE_LEASE,
+                        || transition.load(Ordering::Acquire) == TRANSITION_IDLE,
+                    )
+                    .map_err(node_registration_error)
+            })
+            .map(|(registration, token)| Response::NodeUpgradeMaintenance {
+                registration,
+                token,
+            })
+            .unwrap_or_else(DaemonError::into_response);
+        return send_response(&mut stream, response_version, response);
     }
 
     let schedule_semantics_changed = matches!(
@@ -1356,6 +1421,16 @@ fn node_registration_error(error: io::Error) -> DaemonError {
     DaemonError::from(error)
 }
 
+fn node_upgrade_maintenance_active(registry: &DaemonService) -> Result<bool, DaemonError> {
+    registry
+        .node_registrations
+        .as_ref()
+        .map(NodeRegistrationManager::has_active_upgrade_maintenance)
+        .transpose()
+        .map(|active| active.unwrap_or(false))
+        .map_err(node_registration_error)
+}
+
 fn global_workspace_error(error: io::Error) -> DaemonError {
     if error.kind() == io::ErrorKind::InvalidInput && error.to_string().contains("revision changed")
     {
@@ -1390,6 +1465,19 @@ fn response_for_version_with_schedule_shells(
     }
     if !protocol::ProtocolFeature::RecoveredAgentPresentation.is_supported_by(version) {
         remove_recovered_agent_presentation(&mut response);
+    }
+    if !protocol::ProtocolFeature::ObservedNodeHelperVersion.is_supported_by(version) {
+        match &mut response {
+            Response::CombinedNodeSnapshot { snapshot } => {
+                for node in &mut snapshot.nodes {
+                    node.observed_helper_version = None;
+                }
+            }
+            Response::NodeProjectionHealth { health } => {
+                health.observed_helper_version = None;
+            }
+            _ => {}
+        }
     }
     if !protocol::ProtocolFeature::GlobalWorkspaces.is_supported_by(version) {
         match &mut response {
@@ -7066,7 +7154,7 @@ fn node_projection_worker(service: Weak<DaemonService>, node_id: String) {
         let mut published_generation = None;
         let mut remote_notifications = Vec::new();
         match result {
-            Ok((sync, capabilities)) => {
+            Ok((sync, capabilities, observed_helper_version)) => {
                 let commit = service.node_registrations().and_then(|registrations| {
                     registrations
                         .with_current(&registration, || {
@@ -7079,10 +7167,13 @@ fn node_projection_worker(service: Weak<DaemonService>, node_id: String) {
                                 .commit_projection(
                                     &registration,
                                     expected_generation,
-                                    sync.cursor.clone(),
-                                    sync.projection.clone(),
-                                    capabilities,
-                                    attempt_at_ms,
+                                    ProjectionObservation {
+                                        cursor: sync.cursor.clone(),
+                                        projection: sync.projection.clone(),
+                                        capabilities,
+                                        helper_version: observed_helper_version,
+                                        observed_at_ms: attempt_at_ms,
+                                    },
                                 )
                         })
                         .map_err(node_registration_error)
@@ -7446,8 +7537,10 @@ fn remote_notification_reason_key(category: RemoteNotificationCategory) -> &'sta
 fn fetch_node_projection(
     registration: &crate::protocol::NodeRegistrationSnapshot,
     after: Option<EventCursor>,
-) -> Result<(NodeProjectionSync, Vec<String>), (crate::protocol::NodeProjectionHealthCode, io::Error)>
-{
+) -> Result<
+    (NodeProjectionSync, Vec<String>, String),
+    (crate::protocol::NodeProjectionHealthCode, io::Error),
+> {
     use crate::protocol::NodeProjectionHealthCode;
     let target = SshTarget::parse(registration.target.clone())
         .map_err(|error| (NodeProjectionHealthCode::Unreachable, error))?;
@@ -7492,6 +7585,7 @@ fn fetch_node_projection(
     let mut remote = bootstrap
         .connect(helper, Duration::from_secs(2))
         .map_err(|error| (classify_node_sync_error(&error), error))?;
+    let observed_helper_version = remote.handshake.helper_version.clone();
     let sync = remote
         .node_projection_sync(after, Duration::from_secs(2))
         .map_err(|error| (classify_node_sync_error(&error), error))?;
@@ -7516,7 +7610,7 @@ fn fetch_node_projection(
             .map(str::to_owned)
             .collect()
     };
-    Ok((sync, capabilities))
+    Ok((sync, capabilities, observed_helper_version))
 }
 
 fn classify_node_sync_error(error: &io::Error) -> crate::protocol::NodeProjectionHealthCode {
@@ -9267,6 +9361,7 @@ impl DaemonService {
                 observed_at_ms: unix_time_ms(),
                 observed_protocol_version: Some(protocol::PROTOCOL_VERSION),
                 observed_capabilities: self.runtime_protocol_capabilities(),
+                observed_helper_version: Some(env!("CARGO_PKG_VERSION").into()),
                 workspace_owner_eligible: self.global_workspaces.is_some(),
                 workspace_owner_unavailable_reason: self
                     .global_workspaces
@@ -9320,6 +9415,7 @@ impl DaemonService {
                 observed_at_ms: view.health.last_success_at_ms.unwrap_or(0),
                 observed_protocol_version,
                 observed_capabilities: view.health.capabilities,
+                observed_helper_version: view.health.observed_helper_version,
                 workspace_owner_eligible,
                 workspace_owner_unavailable_reason,
                 scheduler,
@@ -10851,6 +10947,19 @@ impl DaemonService {
                 }
                 Ok(Response::NodeRegistration { registration })
             }
+            Request::BeginNodeUpgradeMaintenance { .. } => {
+                unreachable!("Node upgrade maintenance begin is handled before dispatch")
+            }
+            Request::FinishNodeUpgradeMaintenance { node_id, token } => self
+                .node_registrations()?
+                .finish_upgrade_maintenance(&node_id, &token)
+                .map(|()| Response::Ok)
+                .map_err(node_registration_error),
+            Request::RenewNodeUpgradeMaintenance { node_id, token } => self
+                .node_registrations()?
+                .renew_upgrade_maintenance(&node_id, &token, NODE_UPGRADE_MAINTENANCE_LEASE)
+                .map(|()| Response::Ok)
+                .map_err(node_registration_error),
             Request::SyncNodeProjection { after, wait_ms } => Ok(Response::NodeProjectionSync {
                 sync: self.node_projection_sync(after, wait_ms)?,
             }),
@@ -22293,6 +22402,7 @@ mod tests {
             observed_at_ms: 10,
             observed_protocol_version: Some(37),
             observed_capabilities: vec!["protocol_37".into()],
+            observed_helper_version: Some("0.41.0".into()),
             workspace_owner_eligible: true,
             workspace_owner_unavailable_reason: Some("new field".into()),
             scheduler: SchedulerHealth {
@@ -22395,6 +22505,79 @@ mod tests {
             assert!(old.local_snapshot.is_none());
             assert!(old.remote_projection.is_none());
         }
+    }
+
+    #[test]
+    fn protocol_forty_combined_snapshots_omit_observed_helper_version() {
+        let node = protocol::CombinedNode {
+            node_id: Uuid::from_u128(2).to_string(),
+            alias: "remote".into(),
+            local: false,
+            route: None,
+            registration_revision: None,
+            health: protocol::NodeProjectionHealthCode::Online,
+            current: true,
+            stale: false,
+            observed_at_ms: 10,
+            observed_protocol_version: Some(41),
+            observed_capabilities: vec!["protocol_41".into()],
+            observed_helper_version: Some("0.41.0".into()),
+            workspace_owner_eligible: false,
+            workspace_owner_unavailable_reason: None,
+            scheduler: SchedulerHealth {
+                state: SchedulerState::Active,
+                max_concurrent: 1,
+                active_executions: 0,
+            },
+            local_snapshot: None,
+            remote_projection: None,
+        };
+        let response = |version| {
+            response_for_version(
+                Response::CombinedNodeSnapshot {
+                    snapshot: protocol::CombinedNodeSnapshot {
+                        nodes: vec![node.clone()],
+                        workspaces: Vec::new(),
+                        external_workspaces: Vec::new(),
+                        focused_terminal: None,
+                    },
+                },
+                version,
+            )
+        };
+
+        let Response::CombinedNodeSnapshot { snapshot } = response(40) else {
+            unreachable!();
+        };
+        let old = serde_json::to_value(&snapshot.nodes[0]).unwrap();
+        assert!(old.get("observed_helper_version").is_none());
+
+        let Response::CombinedNodeSnapshot { snapshot } = response(41) else {
+            unreachable!();
+        };
+        assert_eq!(
+            serde_json::to_value(&snapshot.nodes[0]).unwrap()["observed_helper_version"],
+            "0.41.0"
+        );
+
+        let health = protocol::NodeProjectionHealth {
+            code: protocol::NodeProjectionHealthCode::Online,
+            stale: false,
+            cache_generation: 1,
+            stream_id: None,
+            cursor: None,
+            last_attempt_at_ms: None,
+            last_success_at_ms: None,
+            retry_at_ms: None,
+            capabilities: vec!["protocol_41".into()],
+            observed_helper_version: Some("0.41.0".into()),
+        };
+        let Response::NodeProjectionHealth { health } =
+            response_for_version(Response::NodeProjectionHealth { health }, 40)
+        else {
+            unreachable!();
+        };
+        assert!(serde_json::to_value(health).unwrap()["observed_helper_version"].is_null());
     }
 
     #[test]

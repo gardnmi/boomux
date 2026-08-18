@@ -307,6 +307,39 @@ pub struct RemoteInstallPlan {
     pub reason: RemoteInstallReason,
     bootstrap_id: Option<Uuid>,
     upgrade_helper: Option<RemoteExecutable>,
+    intent: RemoteInstallIntent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RemoteInstallIntent {
+    AutomaticCompatibility,
+    ExplicitRegisteredUpgrade { expected_node_id: String },
+}
+
+impl RemoteInstallIntent {
+    fn verify_helper_identity(&self, helper: &CompatibleRemoteHelper) -> io::Result<()> {
+        let Self::ExplicitRegisteredUpgrade { expected_node_id } = self else {
+            return Ok(());
+        };
+        if helper.handshake.node_id == *expected_node_id {
+            Ok(())
+        } else {
+            Err(classified_error(
+                io::ErrorKind::PermissionDenied,
+                "node_identity_changed",
+                "remote helper identity changed from the registered Node",
+            ))
+        }
+    }
+
+    fn daemon_restart_required(&self, status: &RemoteDaemonStatus) -> bool {
+        match self {
+            Self::AutomaticCompatibility => status.restart_required(),
+            Self::ExplicitRegisteredUpgrade { .. } => {
+                matches!(status, RemoteDaemonStatus::Present { .. })
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -344,7 +377,10 @@ fn classified_error(
 }
 
 fn post_install_failure(stage: &'static str, error: io::Error) -> io::Error {
-    if error_code(&error) == "bootstrap_runtime_unavailable" {
+    if matches!(
+        error_code(&error),
+        "bootstrap_runtime_unavailable" | "node_identity_changed"
+    ) {
         return error;
     }
     let message = match stage {
@@ -1349,7 +1385,38 @@ impl BootstrapSession {
             reason,
             bootstrap_id: Some(self.id),
             upgrade_helper,
+            intent: RemoteInstallIntent::AutomaticCompatibility,
         }))
+    }
+
+    pub fn plan_explicit_upgrade(
+        &mut self,
+        expected_node_id: &str,
+        timeout: Duration,
+    ) -> io::Result<RemoteInstallPlan> {
+        let discovery = discover_remote_in_session(self, timeout)?;
+        let selection = inspect_remote_helpers_in_session(self, &discovery.executables, timeout)?;
+        let helper = selection.compatible.ok_or_else(|| {
+            classified_error(
+                io::ErrorKind::Unsupported,
+                "upgrade_required",
+                "explicit registered Node upgrade requires a currently compatible remote helper",
+            )
+        })?;
+        let intent = RemoteInstallIntent::ExplicitRegisteredUpgrade {
+            expected_node_id: expected_node_id.to_owned(),
+        };
+        intent.verify_helper_identity(&helper)?;
+        let source = select_install_source(discovery.platform)?;
+        Ok(RemoteInstallPlan {
+            target: self.target.clone(),
+            destination: discovery.install_destination,
+            source,
+            reason: RemoteInstallReason::Upgrade,
+            bootstrap_id: Some(self.id),
+            upgrade_helper: Some(helper.executable),
+            intent,
+        })
     }
 
     pub fn connect(
@@ -1371,6 +1438,16 @@ impl BootstrapSession {
         plan: &RemoteInstallPlan,
         timeout: Duration,
     ) -> io::Result<RemoteConnection> {
+        self.install_and_connect_guarded(plan, timeout, || Ok(()))
+    }
+
+    pub fn install_and_connect_guarded(
+        self,
+        plan: &RemoteInstallPlan,
+        timeout: Duration,
+        mut maintenance: impl FnMut() -> io::Result<()>,
+    ) -> io::Result<RemoteConnection> {
+        maintenance()?;
         if plan.bootstrap_id != Some(self.id) || plan.target != self.target {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -1402,29 +1479,41 @@ impl BootstrapSession {
                     invalid_probe("remote upload acknowledged a different transaction"),
                 ));
             }
-            Err(first_error) => match upload() {
-                Ok(transaction) if transaction == requested_transaction => transaction,
-                Ok(_) => {
-                    return Err(post_install_failure(
-                        "stream",
-                        invalid_probe("upload retry acknowledged a different transaction"),
-                    ));
+            Err(first_error) => {
+                if let Err(error) = maintenance() {
+                    let _ = self.rollback_install(&requested_transaction, timeout);
+                    return Err(post_install_failure("stream", error));
                 }
-                Err(retry_error) => {
-                    return Err(post_install_failure(
-                        "stream",
-                        io::Error::new(
-                            retry_error.kind(),
-                            format!("upload retry failed after ambiguous outcome: {first_error}"),
-                        ),
-                    ));
+                match upload() {
+                    Ok(transaction) if transaction == requested_transaction => transaction,
+                    Ok(_) => {
+                        return Err(post_install_failure(
+                            "stream",
+                            invalid_probe("upload retry acknowledged a different transaction"),
+                        ));
+                    }
+                    Err(retry_error) => {
+                        return Err(post_install_failure(
+                            "stream",
+                            io::Error::new(
+                                retry_error.kind(),
+                                format!(
+                                    "upload retry failed after ambiguous outcome: {first_error}"
+                                ),
+                            ),
+                        ));
+                    }
                 }
-            },
+            }
         };
         let mut renewal = 0_u64;
         macro_rules! renew_lease {
             ($stage:literal) => {{
                 renewal += 1;
+                if let Err(error) = maintenance() {
+                    let _ = self.rollback_install(&transaction, timeout);
+                    return Err(post_install_failure($stage, error));
+                }
                 if let Err(error) = run_streaming_command(
                     self.command(REMOTE_INSTALL_RENEW_COMMAND),
                     transaction.renewal_input(renewal),
@@ -1508,8 +1597,20 @@ impl BootstrapSession {
                         ));
                     }
                 };
+            plan.intent.verify_helper_identity(&helper)?;
             Ok(helper)
         })();
+        if let (RemoteInstallIntent::ExplicitRegisteredUpgrade { .. }, Err(error)) =
+            (&plan.intent, &initial_helper)
+        {
+            let error = io::Error::new(error.kind(), error.to_string());
+            self.rollback_install(&transaction, timeout)?;
+            return Err(post_contact_failure(
+                "helper_verification",
+                error,
+                plan.reason,
+            ));
+        }
         let daemon_status = if plan.reason == RemoteInstallReason::Upgrade {
             renew_lease!("daemon_status");
             match remote_daemon_status_in_session(&self, &plan.destination, timeout) {
@@ -1524,7 +1625,7 @@ impl BootstrapSession {
         };
         let helper = if daemon_status
             .as_ref()
-            .is_some_and(RemoteDaemonStatus::restart_required)
+            .is_some_and(|status| plan.intent.daemon_restart_required(status))
         {
             renew_lease!("daemon_restart");
             if let Err(error) = run_streaming_command(
@@ -1550,12 +1651,14 @@ impl BootstrapSession {
                 timeout,
             )
             .and_then(|inspection| {
-                inspection.compatible.ok_or_else(|| {
+                let helper = inspection.compatible.ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::Unsupported,
                         "installed remote helper failed after daemon restart",
                     )
-                })
+                })?;
+                plan.intent.verify_helper_identity(&helper)?;
+                Ok(helper)
             }) {
                 Ok(helper) => helper,
                 Err(error) => {
@@ -2075,6 +2178,7 @@ fn plan_remote_bootstrap_at(
         reason,
         bootstrap_id: None,
         upgrade_helper,
+        intent: RemoteInstallIntent::AutomaticCompatibility,
     }))
 }
 
@@ -4226,6 +4330,24 @@ mod tests {
         ssh
     }
 
+    fn write_session_bootstrap_ssh(
+        runtime: &Path,
+        executable_cases: &str,
+        candidates: &str,
+    ) -> PathBuf {
+        fs::create_dir_all(runtime).unwrap();
+        let ssh = runtime.join("ssh");
+        fs::write(
+            &ssh,
+            format!(
+                "#!/bin/sh\n{CONTROL_MASTER_SCRIPT}\ncase \"$last\" in *'exec '*) last=${{last##*exec }} ;; esac\ncase \"$last\" in\n  *boomux-platform-v1*) printf 'boomux-platform-v1\\0Linux\\0x86_64\\0' ;;\n  *boomux-executables-v1*) printf 'boomux-executables-v1\\0{candidates}' ;;\n  *boomux-install-destination-v1*) printf 'boomux-install-destination-v1\\0/home/person/.local/bin/boomux\\0' ;;\n{executable_cases}\n  *) exit 64 ;;\nesac\n"
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+        ssh
+    }
+
     #[test]
     fn rejects_option_like_and_unbounded_targets() {
         for target in ["", "-oProxyCommand=bad", "host name", "host\nname"] {
@@ -4542,6 +4664,25 @@ mod tests {
     }
 
     #[test]
+    fn explicit_upgrade_restart_policy_forces_only_present_compatible_daemons() {
+        let compatible = RemoteDaemonStatus::Present {
+            protocol_version: protocol::PROTOCOL_VERSION,
+            pid: None,
+            executable: None,
+            socket_device: None,
+            socket_inode: None,
+        };
+        let automatic = RemoteInstallIntent::AutomaticCompatibility;
+        let explicit = RemoteInstallIntent::ExplicitRegisteredUpgrade {
+            expected_node_id: Uuid::new_v4().to_string(),
+        };
+
+        assert!(!automatic.daemon_restart_required(&compatible));
+        assert!(explicit.daemon_restart_required(&compatible));
+        assert!(!explicit.daemon_restart_required(&RemoteDaemonStatus::Absent));
+    }
+
+    #[test]
     fn running_non_destination_helper_rejects_shadow_upgrade_before_remote_mutation() {
         for (helper_path, daemon_executable) in [
             ("/usr/bin/boomux", "/usr/bin/boomux"),
@@ -4601,6 +4742,7 @@ mod tests {
                 reason: RemoteInstallReason::Upgrade,
                 bootstrap_id: Some(session.id),
                 upgrade_helper: Some(RemoteExecutable::parse(helper_path).unwrap()),
+                intent: RemoteInstallIntent::AutomaticCompatibility,
             };
             let error = session
                 .install_and_connect(&plan, Duration::from_secs(1))
@@ -4664,6 +4806,7 @@ mod tests {
                 reason: RemoteInstallReason::Missing,
                 bootstrap_id: Some(session.id),
                 upgrade_helper: None,
+                intent: RemoteInstallIntent::AutomaticCompatibility,
             };
             let error = session
                 .install_and_connect(&plan, Duration::from_secs(1))
@@ -5299,6 +5442,112 @@ mod tests {
     }
 
     #[test]
+    fn session_plan_keeps_a_compatible_helper_ready() {
+        let runtime = runtime_directory();
+        let node_id = Uuid::new_v4().to_string();
+        let helper = compatible_helper_script(&node_id);
+        let ssh = write_session_bootstrap_ssh(
+            &runtime,
+            &format!("  \"'/good/boomux' __federation-stdio\") {helper} ;;"),
+            "/good/boomux\\0",
+        );
+        let mut session = BootstrapSession::open_at(
+            &runtime,
+            None,
+            SshTarget::parse("workbox").unwrap(),
+            SshAuthenticationMode::Batch,
+            Duration::from_secs(1),
+            ssh.as_os_str(),
+        )
+        .unwrap();
+
+        let RemoteBootstrapPlan::Ready(ready) = session.plan(Duration::from_secs(1)).unwrap()
+        else {
+            panic!("ordinary compatible planning must remain ready");
+        };
+        assert_eq!(ready.executable.as_str(), "/good/boomux");
+        assert_eq!(ready.handshake.node_id, node_id);
+        drop(session);
+        fs::remove_dir_all(runtime).unwrap();
+    }
+
+    #[test]
+    fn explicit_upgrade_plans_replacement_for_a_compatible_registered_node() {
+        let runtime = runtime_directory();
+        let node_id = Uuid::new_v4().to_string();
+        let helper = compatible_helper_script(&node_id);
+        let ssh = write_session_bootstrap_ssh(
+            &runtime,
+            &format!("  \"'/good/boomux' __federation-stdio\") {helper} ;;"),
+            "/good/boomux\\0",
+        );
+        let mut session = BootstrapSession::open_at(
+            &runtime,
+            None,
+            SshTarget::parse("workbox").unwrap(),
+            SshAuthenticationMode::Batch,
+            Duration::from_secs(1),
+            ssh.as_os_str(),
+        )
+        .unwrap();
+
+        let plan = session
+            .plan_explicit_upgrade(&node_id, Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(plan.reason, RemoteInstallReason::Upgrade);
+        assert_eq!(
+            plan.upgrade_helper.as_ref().unwrap().as_str(),
+            "/good/boomux"
+        );
+        assert!(matches!(
+            plan.source,
+            RemoteInstallSource::CurrentBinary { .. }
+        ));
+        assert_eq!(
+            plan.intent,
+            RemoteInstallIntent::ExplicitRegisteredUpgrade {
+                expected_node_id: node_id
+            }
+        );
+        drop(session);
+        fs::remove_dir_all(runtime).unwrap();
+    }
+
+    #[test]
+    fn explicit_upgrade_rejects_a_different_node_before_remote_mutation() {
+        let runtime = runtime_directory();
+        let actual_node_id = Uuid::new_v4().to_string();
+        let expected_node_id = Uuid::new_v4().to_string();
+        let mutated = runtime.join("mutated");
+        let helper = compatible_helper_script(&actual_node_id);
+        let ssh = write_session_bootstrap_ssh(
+            &runtime,
+            &format!(
+                "  \"'/good/boomux' __federation-stdio\") {helper} ;;\n  *'boomux-install-transaction-v1'*) : > {}; exit 99 ;;",
+                quote_posix_shell(mutated.to_str().unwrap())
+            ),
+            "/good/boomux\\0",
+        );
+        let mut session = BootstrapSession::open_at(
+            &runtime,
+            None,
+            SshTarget::parse("workbox").unwrap(),
+            SshAuthenticationMode::Batch,
+            Duration::from_secs(1),
+            ssh.as_os_str(),
+        )
+        .unwrap();
+
+        let error = session
+            .plan_explicit_upgrade(&expected_node_id, Duration::from_secs(1))
+            .unwrap_err();
+        assert_eq!(error_code(&error), "node_identity_changed");
+        assert!(!mutated.exists());
+        drop(session);
+        fs::remove_dir_all(runtime).unwrap();
+    }
+
+    #[test]
     fn mixed_compatible_identities_fail_as_a_typed_conflict() {
         let runtime = runtime_directory();
         let first = compatible_helper_script(&Uuid::new_v4().to_string());
@@ -5448,7 +5697,11 @@ mod tests {
     fn unreleased_local_protocol_has_no_compatible_published_release() {
         let error = select_published_release("x86_64-unknown-linux-gnu").unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Unsupported);
-        assert!(error.to_string().contains("local protocol 40"));
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("local protocol {}", protocol::PROTOCOL_VERSION))
+        );
         assert!(error.to_string().contains("manually stream"));
     }
 
@@ -5507,6 +5760,7 @@ mod tests {
             upgrade_helper: Some(
                 RemoteExecutable::parse("/home/person/.local/bin/boomux").unwrap(),
             ),
+            intent: RemoteInstallIntent::AutomaticCompatibility,
         };
 
         assert!(
@@ -5598,6 +5852,7 @@ mod tests {
             upgrade_helper: Some(
                 RemoteExecutable::parse("/home/person/.local/bin/boomux").unwrap(),
             ),
+            intent: RemoteInstallIntent::AutomaticCompatibility,
         };
         let error = session
             .install_and_connect(&plan, Duration::from_secs(1))
@@ -5659,6 +5914,7 @@ mod tests {
             upgrade_helper: Some(
                 RemoteExecutable::parse("/home/person/.local/bin/boomux").unwrap(),
             ),
+            intent: RemoteInstallIntent::AutomaticCompatibility,
         };
         let connection = session
             .install_and_connect(&plan, Duration::from_secs(1))
@@ -5668,6 +5924,134 @@ mod tests {
         assert!(backup.exists());
         assert_eq!(fs::read_to_string(&count).unwrap(), "2");
         drop(connection);
+        fs::remove_dir_all(runtime).unwrap();
+    }
+
+    #[test]
+    fn explicit_upgrade_gracefully_restarts_a_compatible_running_daemon() {
+        let runtime = runtime_directory();
+        fs::create_dir_all(&runtime).unwrap();
+        let destination = runtime.join("destination");
+        let backup = runtime.join("backup");
+        let count = runtime.join("count");
+        let committed = runtime.join("committed");
+        let restarted = runtime.join("restarted");
+        fs::write(&destination, b"previous-helper").unwrap();
+        let node_id = Uuid::new_v4().to_string();
+        let helper = compatible_helper_script(&node_id);
+        let ssh = runtime.join("ssh");
+        fs::write(
+            &ssh,
+            format!(
+                "#!/bin/sh\n{control}\nlast=\nfor arg do last=$arg; done\ncase \"$last\" in\n  *'boomux-install-transaction-v1'*) mv {destination} {backup}; cat > {destination}; printf 'boomux-install-transaction-v1\\0.boomux.bootstrap.ABC12345\\0' ;;\n  *'committed=$lock/committed'*) cat >/dev/null; [ \"$(cat {count})\" -eq 3 ]; : > {committed}; printf 'boomux-install-commit-v1\\0committed\\0' ;;\n  *': > \"$transaction/restarted\"'*) cat >/dev/null; : > {restarted} ;;\n  *'transaction/watchdog_pid'*'restore_install'*) cat >/dev/null; rm -f {destination}; mv {backup} {destination} ;;\n  *'daemon status --json'*) printf '%s' '{{\"schema\":\"boomux.cli/v1\",\"command\":\"daemon.status\",\"data\":{{\"protocol_version\":38}}}}' ;;\n  *'daemon restart'*) : > {restarted} ;;\n  *\"'/home/person/.local/bin/boomux' __federation-stdio\") n=0; [ ! -f {count} ] || n=$(cat {count}); n=$((n + 1)); printf '%s' \"$n\" > {count}; {helper} ;;\n  *) exit 64 ;;\nesac\n",
+                control = CONTROL_MASTER_SCRIPT,
+                destination = quote_posix_shell(destination.to_str().unwrap()),
+                backup = quote_posix_shell(backup.to_str().unwrap()),
+                count = quote_posix_shell(count.to_str().unwrap()),
+                committed = quote_posix_shell(committed.to_str().unwrap()),
+                restarted = quote_posix_shell(restarted.to_str().unwrap()),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+        add_fake_daemon_identity(&ssh, "/home/person/.local/bin/boomux");
+        let session = BootstrapSession::open_at(
+            &runtime,
+            None,
+            SshTarget::parse("workbox").unwrap(),
+            SshAuthenticationMode::Batch,
+            Duration::from_secs(1),
+            ssh.as_os_str(),
+        )
+        .unwrap();
+        let plan = RemoteInstallPlan {
+            target: SshTarget::parse("workbox").unwrap(),
+            destination: RemoteExecutable::parse("/home/person/.local/bin/boomux").unwrap(),
+            source: RemoteInstallSource::CurrentBinary {
+                path: runtime.join("pinned"),
+                sha256: format!("{:x}", Sha256::digest(b"replacement")),
+                bytes: b"replacement".to_vec(),
+            },
+            reason: RemoteInstallReason::Upgrade,
+            bootstrap_id: Some(session.id),
+            upgrade_helper: Some(
+                RemoteExecutable::parse("/home/person/.local/bin/boomux").unwrap(),
+            ),
+            intent: RemoteInstallIntent::ExplicitRegisteredUpgrade {
+                expected_node_id: node_id,
+            },
+        };
+
+        let connection = session
+            .install_and_connect(&plan, Duration::from_secs(1))
+            .unwrap();
+        assert!(restarted.exists());
+        assert!(committed.exists());
+        assert_eq!(fs::read_to_string(&count).unwrap(), "3");
+        drop(connection);
+        fs::remove_dir_all(runtime).unwrap();
+    }
+
+    #[test]
+    fn explicit_upgrade_rolls_back_post_activation_node_identity_mismatch() {
+        let runtime = runtime_directory();
+        fs::create_dir_all(&runtime).unwrap();
+        let destination = runtime.join("destination");
+        let backup = runtime.join("backup");
+        let committed = runtime.join("committed");
+        let restarted = runtime.join("restarted");
+        fs::write(&destination, b"previous-helper").unwrap();
+        let expected_node_id = Uuid::new_v4().to_string();
+        let changed_helper = compatible_helper_script(&Uuid::new_v4().to_string());
+        let ssh = runtime.join("ssh");
+        fs::write(
+            &ssh,
+            format!(
+                "#!/bin/sh\n{control}\nlast=\nfor arg do last=$arg; done\ncase \"$last\" in\n  *'boomux-install-transaction-v1'*) mv {destination} {backup}; cat > {destination}; printf 'boomux-install-transaction-v1\\0.boomux.bootstrap.ABC12345\\0' ;;\n  *'transaction/watchdog_pid'*'restore_install'*) cat >/dev/null; rm -f {destination}; mv {backup} {destination} ;;\n  *'committed=$lock/committed'*) cat >/dev/null; : > {committed}; printf 'boomux-install-commit-v1\\0committed\\0' ;;\n  *'daemon status --json'*) printf '%s' '{{\"schema\":\"boomux.cli/v1\",\"command\":\"daemon.status\",\"data\":{{\"protocol_version\":38}}}}' ;;\n  *'daemon restart'*) : > {restarted} ;;\n  *\"'/home/person/.local/bin/boomux' __federation-stdio\") {changed_helper} ;;\n  *) exit 64 ;;\nesac\n",
+                control = CONTROL_MASTER_SCRIPT,
+                destination = quote_posix_shell(destination.to_str().unwrap()),
+                backup = quote_posix_shell(backup.to_str().unwrap()),
+                committed = quote_posix_shell(committed.to_str().unwrap()),
+                restarted = quote_posix_shell(restarted.to_str().unwrap()),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+        add_fake_daemon_identity(&ssh, "/home/person/.local/bin/boomux");
+        let session = BootstrapSession::open_at(
+            &runtime,
+            None,
+            SshTarget::parse("workbox").unwrap(),
+            SshAuthenticationMode::Batch,
+            Duration::from_secs(1),
+            ssh.as_os_str(),
+        )
+        .unwrap();
+        let plan = RemoteInstallPlan {
+            target: SshTarget::parse("workbox").unwrap(),
+            destination: RemoteExecutable::parse("/home/person/.local/bin/boomux").unwrap(),
+            source: RemoteInstallSource::CurrentBinary {
+                path: runtime.join("pinned"),
+                sha256: format!("{:x}", Sha256::digest(b"replacement")),
+                bytes: b"replacement".to_vec(),
+            },
+            reason: RemoteInstallReason::Upgrade,
+            bootstrap_id: Some(session.id),
+            upgrade_helper: Some(
+                RemoteExecutable::parse("/home/person/.local/bin/boomux").unwrap(),
+            ),
+            intent: RemoteInstallIntent::ExplicitRegisteredUpgrade { expected_node_id },
+        };
+
+        let error = session
+            .install_and_connect(&plan, Duration::from_secs(1))
+            .err()
+            .expect("changed installed Node identity must fail");
+        assert_eq!(error_code(&error), "node_identity_changed");
+        assert_eq!(fs::read(&destination).unwrap(), b"previous-helper");
+        assert!(!backup.exists());
+        assert!(!committed.exists());
+        assert!(!restarted.exists());
         fs::remove_dir_all(runtime).unwrap();
     }
 
@@ -5721,6 +6105,7 @@ mod tests {
             upgrade_helper: Some(
                 RemoteExecutable::parse("/home/person/.local/bin/boomux").unwrap(),
             ),
+            intent: RemoteInstallIntent::AutomaticCompatibility,
         };
         let error = session
             .install_and_connect(&plan, Duration::from_secs(1))
@@ -5797,6 +6182,7 @@ mod tests {
             upgrade_helper: Some(
                 RemoteExecutable::parse("/home/person/.local/bin/boomux").unwrap(),
             ),
+            intent: RemoteInstallIntent::AutomaticCompatibility,
         };
         let connection = session
             .install_and_connect(&plan, Duration::from_secs(1))
@@ -5860,6 +6246,7 @@ mod tests {
             upgrade_helper: Some(
                 RemoteExecutable::parse("/home/person/.local/bin/boomux").unwrap(),
             ),
+            intent: RemoteInstallIntent::AutomaticCompatibility,
         };
         let error = session
             .install_and_connect(&plan, Duration::from_secs(1))

@@ -166,6 +166,18 @@ forwarded. Post-install status, restart, helper verification, handshake, and pin
 failures identify that fixed stage without exposing remote stderr.
 An already-active remote bootstrap transaction returns the existing stable
 `busy` code before changing the destination.
+`boomux node upgrade NODE` is a human-only operation and rejects `--json` before
+SSH discovery or mutation. It requires a currently compatible helper to verify
+the registration's pinned Node ID, asks once after showing source, destination,
+and process impact, and rechecks the registration before activation. A changed
+binary gracefully restarts any present daemon even when its protocol remains
+compatible; the transaction verifies the same Node identity again before commit.
+A bounded local maintenance lease drains and closes registration admission from
+the final revision check through transaction completion, then reopens it on
+successful commit or lease expiry. The CLI renews the lease while active, and
+local daemon restart or stop returns `busy` until release or expiry.
+Successful commit releases it immediately; a failed or ambiguous upgrade keeps
+it closed through bounded expiry so remote watchdog rollback cannot race routing.
 Per-Node observed capabilities must distinguish passive combined projection from
 process-starting, destructive, integration-management, Schedule, and
 exact-attachment support. The full compatibility and privacy rules are defined
@@ -271,7 +283,8 @@ Command payloads are:
   `ambiguous_target`; exact Node IDs disambiguate. Entries contain `node_id`,
   `alias`, `local`, nullable `route`, nullable `registration_revision`, `health`,
   `current`, `stale`, `observed_at_ms`, nullable
-  `observed_protocol_version`, `observed_capabilities`, `scheduler`, and nullable
+  `observed_protocol_version`, nullable `observed_helper_version`,
+  `observed_capabilities`, `scheduler`, and nullable
   `workspace_owner_eligible`, nullable `workspace_owner_unavailable_reason`,
   `local_snapshot`, and `remote_projection` payloads. Every resource `id` and
   relationship ID in those payloads is `{ "node_id": "...", "inner_id":
@@ -422,6 +435,8 @@ Protocol 38 adds `protocol_38`, `global_workspaces`,
 Protocol 39 adds `protocol_39` and `qualified_focused_terminal`.
 Protocol 40 adds `protocol_40`, `recovered_agent_presentation`, and
 `cached_projection_dismissal`.
+Protocol 41 adds `protocol_41`, `observed_node_helper_version`, and
+`node_upgrade_coordination`.
 
 Protocol-38 `workspace create` creates empty coordinator metadata without a
 default Node or cwd. First global `shell create`, `launcher create`, or

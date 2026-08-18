@@ -160,6 +160,7 @@ pub(crate) struct NodeView {
     pub(crate) stale: bool,
     pub(crate) observed_at_ms: u64,
     pub(crate) observed_protocol_version: Option<u32>,
+    pub(crate) observed_helper_version: Option<String>,
     pub(crate) observed_capabilities: Vec<String>,
     pub(crate) workspace_owner_eligible: bool,
     pub(crate) workspace_owner_unavailable_reason: Option<String>,
@@ -848,6 +849,7 @@ impl AttentionReason {
 pub(crate) enum DashboardEffect {
     Quit,
     AddNode,
+    UpgradeNode(String),
     RestoreWorkspace(QualifiedIdentity),
     Open(OpenTarget),
     Close(CloseTarget),
@@ -3570,6 +3572,14 @@ impl App {
                     .filter(|schedule| schedule.actionable)
                     .map(|schedule| DashboardEffect::RunSchedule(schedule.qualify(&schedule.id)));
             }
+            KeyCode::Char('U') if self.primary_tab == PrimaryTab::Nodes => {
+                return self
+                    .node_state
+                    .selected()
+                    .and_then(|index| self.nodes.get(index))
+                    .filter(|node| !node.local)
+                    .map(|node| DashboardEffect::UpgradeNode(node.id.clone()));
+            }
             KeyCode::Char('p') if self.primary_tab == PrimaryTab::Schedules => {
                 return self
                     .selected_schedule()
@@ -4718,6 +4728,10 @@ fn render_node_inspection(frame: &mut Frame, area: Rect, node: &NodeView) {
             "Protocol     {}",
             node.observed_protocol_version
                 .map_or_else(|| "-".into(), |value| value.to_string())
+        )),
+        Line::from(format!(
+            "Version      {}",
+            node.observed_helper_version.as_deref().unwrap_or("-")
         )),
         Line::from(format!(
             "Last sync    {}",
@@ -5920,6 +5934,10 @@ fn render_nodes(frame: &mut Frame, area: Rect, app: &mut App) {
         let protocol = node
             .observed_protocol_version
             .map_or_else(|| "-".into(), |version| version.to_string());
+        let version = node
+            .observed_helper_version
+            .clone()
+            .unwrap_or_else(|| "-".into());
         let last_sync = if node.observed_at_ms == 0 {
             "never".into()
         } else {
@@ -5931,6 +5949,7 @@ fn render_nodes(frame: &mut Frame, area: Rect, app: &mut App) {
         };
         Row::new(vec![
             node.alias.clone(),
+            version,
             node_health_label(node.health).into(),
             node.route.clone().unwrap_or_else(|| "local".into()),
             protocol,
@@ -5943,6 +5962,7 @@ fn render_nodes(frame: &mut Frame, area: Rect, app: &mut App) {
         rows,
         [
             Constraint::Length(14),
+            Constraint::Length(12),
             Constraint::Length(18),
             Constraint::Length(24),
             Constraint::Length(9),
@@ -5954,6 +5974,7 @@ fn render_nodes(frame: &mut Frame, area: Rect, app: &mut App) {
     .header(
         Row::new([
             "ALIAS",
+            "VERSION",
             "HEALTH",
             "ROUTE",
             "PROTOCOL",
@@ -7532,6 +7553,10 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
                 ]);
             }
             spans.extend([
+                Span::styled("U", Style::new().fg(GREEN)),
+                Span::styled(" upgrade  ", Style::new().fg(SUBTEXT)),
+            ]);
+            spans.extend([
                 Span::styled("enter", Style::new().fg(GREEN)),
                 Span::styled(" inspect  ", Style::new().fg(SUBTEXT)),
                 Span::styled("e", Style::new().fg(YELLOW)),
@@ -8087,6 +8112,7 @@ mod tests {
                 stale: false,
                 observed_at_ms: current_time_ms(),
                 observed_protocol_version: Some(crate::protocol::PROTOCOL_VERSION),
+                observed_helper_version: Some(env!("CARGO_PKG_VERSION").into()),
                 observed_capabilities: Vec::new(),
                 workspace_owner_eligible: true,
                 workspace_owner_unavailable_reason: None,
@@ -8353,6 +8379,7 @@ mod tests {
         remote.node.route = Some("user@workbox".into());
         remote.node.health = NodeProjectionHealthCode::Reconnecting;
         remote.node.observed_protocol_version = Some(38);
+        remote.node.observed_helper_version = Some("0.17.2".into());
         remote.node.observed_capabilities = vec!["global_workspaces".into()];
         let mut app = App::new(vec![remote], project_context());
         app.select_tab(PrimaryTab::Nodes);
@@ -8361,6 +8388,7 @@ mod tests {
         let rendered = rendered_text(&mut app, 180, 24);
         for expected in [
             "ALIAS",
+            "VERSION",
             "HEALTH",
             "ROUTE",
             "PROTOCOL",
@@ -8369,9 +8397,11 @@ mod tests {
             "reconnecting",
             "user@workbox",
             "38",
+            "0.17.2",
             "global_workspaces",
             "add Node",
             "retry/refresh",
+            "upgrade",
         ] {
             assert!(
                 rendered.contains(expected),
@@ -8488,6 +8518,11 @@ mod tests {
         assert!(matches!(
             app.update_key(KeyCode::Char('u'), KeyModifiers::NONE),
             Some(DashboardEffect::RestoreDismissedShells(node_id))
+                if node_id == "00000000-0000-0000-0000-000000000002"
+        ));
+        assert!(matches!(
+            app.update_key(KeyCode::Char('U'), KeyModifiers::NONE),
+            Some(DashboardEffect::UpgradeNode(node_id))
                 if node_id == "00000000-0000-0000-0000-000000000002"
         ));
 

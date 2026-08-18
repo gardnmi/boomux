@@ -174,8 +174,23 @@ pub fn open_node_add(desktop_entry: Option<&str>) -> Result<(), Box<dyn Error>> 
     )
 }
 
+pub fn open_node_upgrade(desktop_entry: Option<&str>, node_id: &str) -> Result<(), Box<dyn Error>> {
+    let arguments = node_upgrade_arguments(node_id);
+    launch(
+        desktop_entry,
+        "Upgrade Boomux Node",
+        None,
+        attachment_executable()?.as_os_str(),
+        &arguments,
+    )
+}
+
 fn node_add_arguments() -> [OsString; 1] {
     ["__guided-node-add".into()]
+}
+
+fn node_upgrade_arguments(node_id: &str) -> [OsString; 2] {
+    ["__guided-node-upgrade".into(), node_id.into()]
 }
 
 fn launch(
@@ -421,6 +436,17 @@ mod tests {
     #[test]
     fn guided_node_add_uses_only_the_hidden_wrapper_argument() {
         assert_eq!(node_add_arguments(), [OsString::from("__guided-node-add")]);
+    }
+
+    #[test]
+    fn guided_node_upgrade_preserves_the_exact_node_id_argument() {
+        assert_eq!(
+            node_upgrade_arguments("node;still-one-argument"),
+            [
+                OsString::from("__guided-node-upgrade"),
+                OsString::from("node;still-one-argument"),
+            ]
+        );
     }
 
     #[test]

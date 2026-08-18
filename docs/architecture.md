@@ -137,11 +137,19 @@ protocol-39 responses remove the marker so old peers cannot display stale Agent
 state as current.
 It also adds coordinator-local dismissal and restore of stale cached Shell
 presentation without routing, queuing, or claiming an owner mutation.
+Protocol 41 carries the package version from each authenticated federation
+handshake into the disposable Node projection and combined Node snapshot. The
+Nodes dashboard displays that observed version; protocol-40 responses omit it.
+It also adds bounded local Node-upgrade coordination so an explicitly authorized
+SSH replacement closes registration admission across activation and commit. The
+CLI renews that lease while the transaction runs, and local daemon restart or
+stop is rejected until the lease is released or expires.
 Remote notification presentation reuses protocol-32 atomic reduced transitions,
 so it does not require a later protocol. Node-cache schema 2 adds bounded local
-at-most-once individual and reconnect-digest claims. Node-cache schema 3 adds at
-most 4,096 dismissed Shell IDs per Node and explicitly migrates schema 2 with an
-empty dismissal set.
+at-most-once individual and reconnect-digest claims with an explicit schema-1
+migration. Node-cache schema 3 adds at most 4,096 dismissed Shell IDs per Node
+and explicitly migrates schema 2 with an empty dismissal set. Node-cache schema
+4 adds the bounded observed helper version with an explicit schema-3 migration.
 
 ## Components
 

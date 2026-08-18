@@ -77,6 +77,7 @@ boomux node list --json
 boomux node inspect "<node-alias-or-id>" --json
 boomux node snapshot --json
 boomux node add "<alias>" "<user@host>"
+boomux node upgrade "<node>"
 boomux node rename "<node>" "<new-alias>" --revision <revision> --json
 boomux node retarget "<node>" "<user@host>" --revision <revision> --json
 boomux node forget "<node>" --json
@@ -92,7 +93,11 @@ registration and cached projection; it does not contact or delete the owner.
 In the dashboard, `x` on a stale remote Shell dismisses only its cached local
 presentation and explicitly warns that the remote process is not closed. On the
 Nodes tab, `u` restores dismissed Shells for the selected Node. Online `x`
-continues to perform an owner-authoritative close.
+continues to perform an owner-authoritative close. `U` opens an explicitly
+authorized upgrade for the selected remote Node in a native terminal.
+`node upgrade` is human-only and requires an interactive terminal. It verifies
+the registered Node identity before replacing the helper transactionally and
+gracefully restarting its daemon, including when the old helper remains protocol-compatible.
 `node rekey` changes this Node's durable identity and is local, interactive, and
 human-only; use it only after the command's exact confirmation requirements are
 explicitly authorized.

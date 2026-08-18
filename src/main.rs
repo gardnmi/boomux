@@ -518,6 +518,8 @@ enum Commands {
     FederationStdio,
     #[command(name = "__guided-node-add", hide = true)]
     GuidedNodeAdd,
+    #[command(name = "__guided-node-upgrade", hide = true)]
+    GuidedNodeUpgrade { selector: String },
     #[command(name = "__bootstrap-activate", hide = true)]
     BootstrapActivate {
         transaction: String,
@@ -548,6 +550,8 @@ enum NodeCommands {
     },
     /// List registered remote Nodes
     List,
+    /// Upgrade a registered remote Node after interactive authorization
+    Upgrade { selector: String },
     /// Inspect a registered remote Node by alias or exact Node ID
     Inspect { selector: String },
     /// Show the combined Node-qualified local and cached remote projection
@@ -1266,6 +1270,7 @@ command_keys! {
     WorkspaceInspect => ("workspace.inspect", Json),
     Workspace => ("workspace", HumanOnly),
     NodeAdd => ("node.add", Json),
+    NodeUpgrade => ("node.upgrade", HumanOnly),
     NodeList => ("node.list", Json),
     NodeInspect => ("node.inspect", Json),
     NodeSnapshot => ("node.snapshot", Json),
@@ -1348,6 +1353,9 @@ impl Cli {
             Some(Commands::Node {
                 command: NodeCommands::List,
             }) => CommandKey::NodeList,
+            Some(Commands::Node {
+                command: NodeCommands::Upgrade { .. },
+            }) => CommandKey::NodeUpgrade,
             Some(Commands::Node {
                 command: NodeCommands::Inspect { .. },
             }) => CommandKey::NodeInspect,
@@ -1523,6 +1531,7 @@ impl Cli {
             Some(Commands::ScheduledRunner { .. }) => CommandKey::Attach,
             Some(Commands::FederationStdio) => CommandKey::Attach,
             Some(Commands::GuidedNodeAdd) => CommandKey::NodeAdd,
+            Some(Commands::GuidedNodeUpgrade { .. }) => CommandKey::NodeUpgrade,
             Some(Commands::BootstrapActivate { .. }) => CommandKey::Daemon,
         }
     }
@@ -1686,6 +1695,9 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
         Some(Commands::GuidedNodeAdd) => {
             return guided_node_add().map(CliExit::Child);
         }
+        Some(Commands::GuidedNodeUpgrade { selector }) => {
+            return guided_node_upgrade(selector).map(CliExit::Child);
+        }
         Some(Commands::BootstrapActivate {
             transaction,
             expected_pid,
@@ -1806,6 +1818,7 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
         Some(Commands::ScheduledRunner { .. }) => unreachable!(),
         Some(Commands::FederationStdio) => unreachable!(),
         Some(Commands::GuidedNodeAdd) => unreachable!(),
+        Some(Commands::GuidedNodeUpgrade { .. }) => unreachable!(),
         Some(Commands::BootstrapActivate { .. }) => unreachable!(),
         None => dashboard(cli.terminal.as_deref()),
     };
@@ -1901,6 +1914,81 @@ fn bootstrap_cli_failure(error: io::Error) -> Box<dyn Error> {
     cli_output::failure(ssh_bootstrap::error_code(&error), error.to_string())
 }
 
+fn upgrade_node(selector: &str) -> Result<(), Box<dyn Error>> {
+    const TIMEOUT: Duration = Duration::from_secs(120);
+
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Node upgrade requires an interactive terminal",
+        )
+        .into());
+    }
+    let local = client::connect_or_start()?;
+    let registration = local.node_registration(selector)?;
+    let target = ssh_bootstrap::SshTarget::parse(&registration.target)?;
+    let mut session = ssh_bootstrap::BootstrapSession::open(
+        target,
+        ssh_bootstrap::SshAuthenticationMode::Interactive,
+        TIMEOUT,
+    )
+    .map_err(bootstrap_cli_failure)?;
+    let plan = session
+        .plan_explicit_upgrade(&registration.node_id, TIMEOUT)
+        .map_err(bootstrap_cli_failure)?;
+
+    println!("Node: {} ({})", registration.alias, registration.node_id);
+    println!("Remote target: {}", registration.target);
+    println!("Install source: {}", plan.source.description());
+    println!("Install destination: {}", plan.destination.as_str());
+    println!(
+        "Process impact: the pinned binary is uploaded privately first; activation requires proof that the running daemon uses this destination, then the previous executable is retained for rollback and the daemon is gracefully restarted with its managed processes"
+    );
+    if !confirm_setup("Upgrade Boomux on this registered Node?")? {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "remote Boomux upgrade was not authorized",
+        )
+        .into());
+    }
+
+    let (current, maintenance_token) =
+        local.begin_node_upgrade_maintenance(&registration.node_id, registration.revision)?;
+    if current.target != registration.target || current.node_id != registration.node_id {
+        let _ = local.finish_node_upgrade_maintenance(&registration.node_id, &maintenance_token);
+        return Err(cli_output::failure(
+            "revision_changed",
+            "Node registration changed while upgrade authorization was pending; refresh and retry",
+        ));
+    }
+    let upgrade = session
+        .install_and_connect_guarded(&plan, TIMEOUT, || {
+            local
+                .renew_node_upgrade_maintenance(&registration.node_id, &maintenance_token)
+                .map_err(|error| io::Error::other(error.to_string()))
+        })
+        .map_err(bootstrap_cli_failure);
+    let connection = match upgrade {
+        Ok(connection) => {
+            local.finish_node_upgrade_maintenance(&registration.node_id, maintenance_token)?;
+            connection
+        }
+        Err(error) => {
+            eprintln!(
+                "boomux: Node upgrade maintenance remains active until bounded expiry while remote rollback settles"
+            );
+            return Err(error);
+        }
+    };
+    println!(
+        "Upgraded {} to helper {} (protocol {})",
+        registration.alias,
+        connection.handshake.helper_version,
+        connection.handshake.core_protocol_version,
+    );
+    Ok(())
+}
+
 fn node_command(command: NodeCommands, json: bool) -> Result<(), Box<dyn Error>> {
     match command {
         NodeCommands::Add { alias, target } => {
@@ -1956,6 +2044,7 @@ fn node_command(command: NodeCommands, json: bool) -> Result<(), Box<dyn Error>>
                 Ok(())
             }
         }
+        NodeCommands::Upgrade { selector } => upgrade_node(&selector),
         NodeCommands::Inspect { selector } => {
             let client = client::connect_or_start()?;
             let registration = client.node_registration(selector)?;
@@ -2141,6 +2230,23 @@ fn guided_node_add() -> Result<process_adapter::ProcessExit, Box<dyn Error>> {
     )
 }
 
+fn guided_node_upgrade(selector: &str) -> Result<process_adapter::ProcessExit, Box<dyn Error>> {
+    let executable = env::current_exe()?;
+    let stdin = io::stdin();
+    let interactive = stdin.is_terminal() && io::stdout().is_terminal();
+    let mut input = stdin.lock();
+    let mut output = io::stdout().lock();
+    guided_node_command_with(
+        &executable,
+        &["node", "upgrade", selector],
+        "Node upgrade",
+        &mut input,
+        &mut output,
+        interactive,
+        interactive.then(|| stdin.as_raw_fd()),
+    )
+}
+
 fn restore_terminal_foreground(fd: i32, foreground: i32) {
     unsafe {
         let previous = libc::signal(libc::SIGTTOU, libc::SIG_IGN);
@@ -2156,8 +2262,28 @@ fn guided_node_add_with(
     wait_for_newline: bool,
     terminal_fd: Option<i32>,
 ) -> Result<process_adapter::ProcessExit, Box<dyn Error>> {
+    guided_node_command_with(
+        executable,
+        &["node", "add"],
+        "Node setup",
+        input,
+        output,
+        wait_for_newline,
+        terminal_fd,
+    )
+}
+
+fn guided_node_command_with(
+    executable: &Path,
+    arguments: &[&str],
+    operation: &str,
+    input: &mut impl BufRead,
+    output: &mut impl io::Write,
+    wait_for_newline: bool,
+    terminal_fd: Option<i32>,
+) -> Result<process_adapter::ProcessExit, Box<dyn Error>> {
     let mut command = Command::new(executable);
-    command.args(["node", "add"]);
+    command.args(arguments);
     if terminal_fd.is_some() {
         command.env("BOOMUX_INTERNAL_GUIDED_STOP", "1");
         unsafe {
@@ -2173,7 +2299,7 @@ fn guided_node_add_with(
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
-            writeln!(output, "\nNode setup failed to start: {error}")?;
+            writeln!(output, "\n{operation} failed to start: {error}")?;
             hold_guided_result(input, output, wait_for_newline)?;
             return Ok(process_adapter::ProcessExit::Code(1));
         }
@@ -2196,7 +2322,7 @@ fn guided_node_add_with(
             let _ = child.wait();
             writeln!(
                 output,
-                "\nNode setup failed to acquire the terminal: {error}"
+                "\n{operation} failed to acquire the terminal: {error}"
             )?;
             hold_guided_result(input, output, wait_for_newline)?;
             return Ok(process_adapter::ProcessExit::Code(1));
@@ -2215,7 +2341,7 @@ fn guided_node_add_with(
             }
             restore_terminal_foreground(fd, foreground);
             let _ = child.wait();
-            writeln!(output, "\nNode setup failed to continue: {error}")?;
+            writeln!(output, "\n{operation} failed to continue: {error}")?;
             hold_guided_result(input, output, wait_for_newline)?;
             return Ok(process_adapter::ProcessExit::Code(1));
         }
@@ -2230,14 +2356,14 @@ fn guided_node_add_with(
     let status = match status {
         Ok(status) => status,
         Err(error) => {
-            writeln!(output, "\nNode setup status could not be read: {error}")?;
+            writeln!(output, "\n{operation} status could not be read: {error}")?;
             hold_guided_result(input, output, wait_for_newline)?;
             return Ok(process_adapter::ProcessExit::Code(1));
         }
     };
     writeln!(
         output,
-        "\nNode setup {} ({}).",
+        "\n{operation} {} ({}).",
         if status.success() {
             "finished"
         } else {
@@ -2343,6 +2469,7 @@ fn node_snapshot_json(node: protocol::CombinedNode) -> Result<serde_json::Value,
         observed_at_ms,
         observed_protocol_version,
         observed_capabilities,
+        observed_helper_version,
         workspace_owner_eligible,
         workspace_owner_unavailable_reason,
         scheduler,
@@ -2362,6 +2489,7 @@ fn node_snapshot_json(node: protocol::CombinedNode) -> Result<serde_json::Value,
         "stale": stale,
         "observed_at_ms": observed_at_ms,
         "observed_protocol_version": observed_protocol_version,
+        "observed_helper_version": observed_helper_version,
         "observed_capabilities": observed_capabilities,
         "workspace_owner_eligible": workspace_owner_eligible,
         "workspace_owner_unavailable_reason": workspace_owner_unavailable_reason,
@@ -2725,6 +2853,11 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
             tui::DashboardEffect::AddNode => tui::DashboardEvent::OperationCompleted(
                 terminal::open_node_add(terminal.as_deref())
                     .map(|()| "Opened guided Node setup".into())
+                    .map_err(|error| error.to_string()),
+            ),
+            tui::DashboardEffect::UpgradeNode(node_id) => tui::DashboardEvent::OperationCompleted(
+                terminal::open_node_upgrade(terminal.as_deref(), &node_id)
+                    .map(|()| "Opened Node upgrade".into())
                     .map_err(|error| error.to_string()),
             ),
             tui::DashboardEffect::CheckForUpdates => {
@@ -3588,6 +3721,7 @@ fn dashboard_state(
                 stale: node.stale,
                 observed_at_ms: node.observed_at_ms,
                 observed_protocol_version: node.observed_protocol_version,
+                observed_helper_version: node.observed_helper_version.clone(),
                 observed_capabilities: node.observed_capabilities.clone(),
                 workspace_owner_eligible: node.workspace_owner_eligible,
                 workspace_owner_unavailable_reason: node.workspace_owner_unavailable_reason.clone(),
@@ -3835,6 +3969,7 @@ fn unavailable_placement_node(node_id: &str) -> tui::NodeView {
         stale: true,
         observed_at_ms: 0,
         observed_protocol_version: None,
+        observed_helper_version: None,
         observed_capabilities: Vec::new(),
         workspace_owner_eligible: false,
         workspace_owner_unavailable_reason: Some("Node is not registered".into()),
@@ -10654,6 +10789,7 @@ mod tests {
             stale: false,
             observed_at_ms: 1,
             observed_protocol_version: Some(protocol::PROTOCOL_VERSION),
+            observed_helper_version: Some(env!("CARGO_PKG_VERSION").into()),
             observed_capabilities: vec!["global_workspaces".into()],
             workspace_owner_eligible: eligible,
             workspace_owner_unavailable_reason: (!eligible).then(|| "unavailable".into()),
@@ -11445,6 +11581,26 @@ mod tests {
                 .kind(),
             io::ErrorKind::InvalidInput
         );
+    }
+
+    #[test]
+    fn node_upgrade_and_hidden_wrapper_are_human_only() {
+        let cli = Cli::try_parse_from(["boomux", "node", "upgrade", "work"]).unwrap();
+        assert!(matches!(
+            cli.command.as_ref(),
+            Some(Commands::Node {
+                command: NodeCommands::Upgrade { selector }
+            }) if selector == "work"
+        ));
+        assert_eq!(cli.command_descriptor().key, "node.upgrade");
+        assert_eq!(cli.command_descriptor().output, OutputMode::HumanOnly);
+
+        let cli = Cli::try_parse_from(["boomux", "__guided-node-upgrade", "node-id"]).unwrap();
+        assert!(matches!(
+            cli.command.as_ref(),
+            Some(Commands::GuidedNodeUpgrade { selector }) if selector == "node-id"
+        ));
+        assert_eq!(cli.command_descriptor().key, "node.upgrade");
     }
 
     #[test]
@@ -12667,6 +12823,7 @@ mod tests {
                 stale: false,
                 observed_at_ms: 0,
                 observed_protocol_version: Some(protocol::PROTOCOL_VERSION),
+                observed_helper_version: Some(env!("CARGO_PKG_VERSION").into()),
                 observed_capabilities: Vec::new(),
                 workspace_owner_eligible: true,
                 workspace_owner_unavailable_reason: None,
@@ -14048,7 +14205,7 @@ mod tests {
                 .validated_version,
             "0.84.1"
         );
-        assert_eq!(protocol::PROTOCOL_VERSION, 40);
+        assert_eq!(protocol::PROTOCOL_VERSION, 41);
     }
 
     #[test]
@@ -14308,6 +14465,7 @@ mod tests {
             "boomux open",
             "boomux project list",
             "boomux node add",
+            "boomux node upgrade",
             "boomux node list",
             "boomux node inspect",
             "boomux node snapshot",

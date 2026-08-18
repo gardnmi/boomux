@@ -95,7 +95,13 @@ fn validate_handshake(handshake: &FederationHandshake) -> io::Result<()> {
             "federation handshake contains a noncanonical Node ID",
         ));
     }
-    if handshake.helper_version.is_empty() || handshake.helper_version.len() > 128 {
+    if handshake.helper_version.is_empty()
+        || handshake.helper_version.len() > 128
+        || !handshake
+            .helper_version
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic())
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "federation handshake contains an invalid helper version",
@@ -198,6 +204,15 @@ mod tests {
         bytes.extend_from_slice(&((MAX_HANDSHAKE_BYTES + 1) as u32).to_be_bytes());
         assert_eq!(
             read_handshake(&mut bytes.as_slice()).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        let mut invalid = handshake();
+        invalid.helper_version = "1.2.3\u{1b}[2J".into();
+        assert_eq!(
+            write_handshake(&mut Vec::new(), &invalid)
+                .unwrap_err()
+                .kind(),
             io::ErrorKind::InvalidData
         );
     }
