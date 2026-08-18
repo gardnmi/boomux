@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.21.1](https://github.com/gardnmi/boomux/compare/v0.21.0...v0.21.1) (2026-08-18)
+
+
+### Bug Fixes
+
+* **terminal:** resynchronize size after reattach ([#217](https://github.com/gardnmi/boomux/issues/217)) ([0f15f16](https://github.com/gardnmi/boomux/commit/0f15f162760a68187a434c10f2a79d6aa2ca4546))
+
 ## [0.21.0](https://github.com/gardnmi/boomux/compare/v0.20.0...v0.21.0) (2026-08-18)
 
 
