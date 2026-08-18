@@ -812,6 +812,10 @@ fn load(path: &Path) -> io::Result<(CacheState, bool)> {
             old.version = NODE_CACHE_VERSION;
             (old, true)
         }
+        4 => (
+            serde_json::from_slice(&bytes).map_err(|error| invalid(error.to_string()))?,
+            false,
+        ),
         _ => return Err(invalid("unsupported Node cache version")),
     };
     if state.version != NODE_CACHE_VERSION || state.nodes.len() > MAX_NODES {
