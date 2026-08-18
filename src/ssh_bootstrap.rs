@@ -5448,7 +5448,7 @@ mod tests {
     fn unreleased_local_protocol_has_no_compatible_published_release() {
         let error = select_published_release("x86_64-unknown-linux-gnu").unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Unsupported);
-        assert!(error.to_string().contains("local protocol 39"));
+        assert!(error.to_string().contains("local protocol 40"));
         assert!(error.to_string().contains("manually stream"));
     }
 

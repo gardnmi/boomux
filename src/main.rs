@@ -10608,6 +10608,7 @@ mod tests {
                 output_revision: 0,
                 environment_has_run_id: true,
             }),
+            recovered_agent_id: None,
             foreground_process: None,
         }
     }
@@ -14031,7 +14032,7 @@ mod tests {
                 .validated_version,
             "0.84.1"
         );
-        assert_eq!(protocol::PROTOCOL_VERSION, 39);
+        assert_eq!(protocol::PROTOCOL_VERSION, 40);
     }
 
     #[test]

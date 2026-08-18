@@ -947,6 +947,7 @@ fn fake_ssh(directory: &Path) {
                             generation: Some(1),
                             started_at_ms: Some(1),
                             ended_at_ms: None,
+                            recovered_agent_id: None,
                         }],
                         launchers: Vec::new(),
                         agents: Vec::new(),
