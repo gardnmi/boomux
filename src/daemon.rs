@@ -15971,8 +15971,8 @@ impl ShellRuntimeManager {
                                 pixel_width,
                                 pixel_height,
                             };
-                            lock(&runtime.master)?.resize(size)?;
                             lock(&runtime.terminal)?.resize(rows, cols);
+                            lock(&runtime.master)?.resize(size)?;
                             Self::update_runtime_dimensions(&shell, &runtime, size)?;
                             Ok(())
                         }
