@@ -269,7 +269,7 @@ fn reattachment_reflows_retained_output_for_the_new_terminal_width() {
 }
 
 #[test]
-fn reattachment_delivers_resize_redraw_after_reconstruction() {
+fn reattachment_requests_fullscreen_redraw_after_reconstruction() {
     let mut daemon = TestDaemon::start();
     let workspace = daemon
         .client
@@ -300,14 +300,14 @@ fn reattachment_delivers_resize_redraw_after_reconstruction() {
     }
     drop(first);
 
-    let mut resized_profile = profile();
-    resized_profile.rows = 10;
-    resized_profile.cols = 40;
-    let mut second = wait_for_attach_with_profile(&daemon.client, &shell_id, resized_profile);
-    assert!(!contains(&second.reconstruction, b"redraw-10 40"));
+    let mut same_profile = profile();
+    same_profile.rows = 20;
+    same_profile.cols = 100;
+    let mut second = wait_for_attach_with_profile(&daemon.client, &shell_id, same_profile);
+    assert!(!contains(&second.reconstruction, b"redraw-20 100"));
     assert!(contains(
-        &read_until(&mut second.stream, b"redraw-10 40"),
-        b"redraw-10 40"
+        &read_until(&mut second.stream, b"redraw-20 100"),
+        b"redraw-20 100"
     ));
 
     drop(second);

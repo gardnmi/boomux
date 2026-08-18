@@ -6815,6 +6815,32 @@ impl PtyMaster {
         Ok(())
     }
 
+    fn signal_foreground_process_group(&self, signal: libc::c_int) -> io::Result<()> {
+        let mut process_group: libc::pid_t = 0;
+        // The descriptor is a live Unix PTY master and process_group is writable.
+        if unsafe {
+            libc::ioctl(
+                self.descriptor.as_raw_fd(),
+                libc::TIOCGPGRP,
+                &mut process_group,
+            )
+        } == -1
+        {
+            return Err(io::Error::last_os_error());
+        }
+        if process_group <= 0 {
+            return Ok(());
+        }
+        // A negative PID targets the authoritative PTY foreground process group.
+        if unsafe { libc::kill(-process_group, signal) } == -1 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
     fn foreground_process(&self) -> Option<String> {
         let mut process_group: libc::pid_t = 0;
         // The descriptor is a live Unix PTY master and process_group is writable.
@@ -15906,6 +15932,9 @@ impl ShellRuntimeManager {
                 return Err(error);
             }
         };
+        if !started {
+            let _ = lock(&runtime.master)?.signal_foreground_process_group(libc::SIGWINCH);
+        }
         drop(mutation);
         drop(lifecycle);
         drop(terminal);
