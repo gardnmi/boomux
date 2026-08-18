@@ -2757,6 +2757,14 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
                     .map(|_| "Requested a fresh Node observation".into())
                     .map_err(|error| error.to_string()),
             ),
+            tui::DashboardEffect::RestoreDismissedShells(node_id) => {
+                tui::DashboardEvent::OperationCompleted(
+                    client
+                        .restore_dismissed_node_projection_shells(node_id)
+                        .map(|_| "Restored dismissed cached shells for the Node".into())
+                        .map_err(|error| error.to_string()),
+                )
+            }
             tui::DashboardEffect::RestoreWorkspace(workspace_id) => {
                 let result = (|| {
                     let workspace_id = local_dashboard_inner(&workspace_id, &local_node_id)?;
@@ -2929,6 +2937,12 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
                             )?;
                         }
                         Ok(format!("Closed shell {name}"))
+                    }
+                    tui::CloseTarget::DismissCachedShell(shell_id) => {
+                        client
+                            .dismiss_node_projection_shell(&shell_id.node_id, &shell_id.inner_id)
+                            .map_err(|error| error.to_string())?;
+                        Ok("Dismissed cached shell without closing its remote process".into())
                     }
                     tui::CloseTarget::Launcher(launcher_id) => {
                         let launcher =
@@ -3631,6 +3645,8 @@ fn dashboard_state(
         exact_run_attachment: protocol::ProtocolFeature::ExactRunAttachment
             .is_supported_by(refresh.negotiated_protocol),
         schedule_editing: protocol::ProtocolFeature::AgentScheduleEditing
+            .is_supported_by(refresh.negotiated_protocol),
+        cached_projection_dismissal: protocol::ProtocolFeature::CachedProjectionDismissal
             .is_supported_by(refresh.negotiated_protocol),
         focused_terminal: dashboard_focused_terminal_view(
             refresh.negotiated_protocol,

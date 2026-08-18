@@ -696,6 +696,32 @@ impl Client {
         }
     }
 
+    pub fn dismiss_node_projection_shell(
+        &self,
+        node_id: impl Into<String>,
+        shell_id: impl Into<String>,
+    ) -> Result<NodeProjectionHealth> {
+        match self.request(Request::DismissNodeProjectionShell {
+            node_id: node_id.into(),
+            shell_id: shell_id.into(),
+        })? {
+            Response::NodeProjectionHealth { health } => Ok(health),
+            response => unexpected(response),
+        }
+    }
+
+    pub fn restore_dismissed_node_projection_shells(
+        &self,
+        node_id: impl Into<String>,
+    ) -> Result<NodeProjectionHealth> {
+        match self.request(Request::RestoreDismissedNodeProjectionShells {
+            node_id: node_id.into(),
+        })? {
+            Response::NodeProjectionHealth { health } => Ok(health),
+            response => unexpected(response),
+        }
+    }
+
     pub fn combined_node_snapshot(&self, selector: Option<String>) -> Result<CombinedNodeSnapshot> {
         match self.request(Request::GetCombinedNodeSnapshot { selector })? {
             Response::CombinedNodeSnapshot { snapshot } => Ok(snapshot),

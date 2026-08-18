@@ -25,6 +25,8 @@
 > progress. Node-local runtime state remains authoritative on each owner.
 > Protocol 39 implements live Node-qualified focused-terminal presentation in
 > the combined Node snapshot without extending persisted remote projections.
+> Protocol 40 and Node-cache schema 3 implement bounded coordinator-local
+> dismissal and restore of stale cached Shell presentation.
 > Public `boomux --remote TARGET`
 > remains ad hoc.
 
@@ -467,11 +469,12 @@ state from loading or persisting. Node identity, registrations, and cache each
 use owner-only directories, bounded schemas, atomic replacement, and explicit
 validation.
 
-Node-cache schema 2 is `node-cache.json` beside, but independent from,
+Node-cache schema 3 is `node-cache.json` beside, but independent from,
 `state.json`, `node.json`, and `node_registrations.json`. It is owner-only,
 atomically replaced, and capped at 4 MiB and 128 Nodes. Per Node it accepts at
 most 1,024 Workspaces, 4,096 Shells, 4,096 launchers, 4,096 Agents, 1,024
-Schedules, 1,000 executions, and 96 capability identifiers of at most 128 bytes.
+Schedules, 1,000 executions, 4,096 dismissed Shell IDs, and 96 capability
+identifiers of at most 128 bytes.
 Names and identifiers in reduced collections are capped at 256 bytes. An invalid
 cache is renamed to `node-cache.corrupt-<uuid>.json` when possible and otherwise
 discarded in memory; it never blocks authoritative state startup.
@@ -484,6 +487,16 @@ observation or execution revision, typed category, and bounded typed reason;
 digest claims contain stream UUID, prior and through cursor IDs, and the sorted
 enabled category set. Claims are local presentation state and are removed with
 their registered Node cache.
+
+Schema 3 explicitly migrates schema 2 by retaining its complete cache and
+initializing an empty dismissal set for every Node. Dismissal is accepted only
+for a Shell in a stale or offline cached projection. It persists across restart
+and reconnect without changing the owner's synchronization generation, and
+filters the Shell plus all reduced Agents linked to it from local views. Visible
+item and attention counts are recomputed from that filtered view. It never
+creates a routed request or owner mutation. Restore clears the selected Node's
+set. A later authoritative projection retains tombstones for Shells still
+present and prunes tombstones for Shells it no longer contains.
 
 ## Synchronization And Events
 
@@ -687,6 +700,12 @@ payload-free `focused_terminal_presentation_changed` local invalidation so a
 dashboard reads the combined snapshot on its next event poll instead of waiting
 for the one-second fallback. The event does not become a reduced owner
 transition.
+
+Protocol 40 advertises `cached_projection_dismissal`. In the dashboard, `x` on
+an online Shell remains owner-authoritative close. On a stale remote Shell it
+instead asks for explicit confirmation to dismiss only cached local
+presentation and states that the remote process is not closed. The Nodes-tab
+`u` action restores dismissed Shells for the selected registered Node.
 
 Remote graceful handoff sends its existing reconnect boundary through the
 bridge. Local graceful handoff asks the local attachment to reconnect and opens

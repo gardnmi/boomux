@@ -420,7 +420,8 @@ Protocol 38 adds `protocol_38`, `global_workspaces`,
 `multi_node_workspace_placements`, `guarded_workspace_adoption`, and
 `resumable_workspace_close`.
 Protocol 39 adds `protocol_39` and `qualified_focused_terminal`.
-Protocol 40 adds `protocol_40` and `recovered_agent_presentation`.
+Protocol 40 adds `protocol_40`, `recovered_agent_presentation`, and
+`cached_projection_dismissal`.
 
 Protocol-38 `workspace create` creates empty coordinator metadata without a
 default Node or cwd. First global `shell create`, `launcher create`, or
@@ -462,6 +463,11 @@ Node snapshot health is `unobserved`, `online`, `reconnecting`, `stale`,
 identity-verified observation. Cached rows remain visible when stale, but cached
 state never authorizes terminal reads, private inspection, Schedule controls, or
 mutation. Scheduler health is reported independently for every Node.
+The dashboard may dismiss a stale cached Shell from local presentation. This
+also hides reduced Agent rows linked to that Shell, persists across daemon
+restart and reconnect, and does not close or mutate the owner resource. The
+Nodes-tab restore action makes retained projections visible again; authoritative
+owner absence removes the corresponding dismissal tombstone.
 
 ## Execution Data
 

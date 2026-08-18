@@ -16,6 +16,12 @@ Node-local identity. A projection of another Node can be stale or unavailable,
 but never becomes authoritative and cannot establish lifecycle completion or
 authorize mutation.
 
+A user may dismiss a stale projected Shell from local presentation. Dismissal
+is bounded coordinator-local cache state, not Shell closure or an offline owner
+mutation. It remains effective after reconnect until explicitly restored, and
+is discarded when a later authoritative owner projection no longer contains
+that Shell.
+
 ## Workspace
 
 A durable coordinator-owned place where a user organizes Shells, Agent

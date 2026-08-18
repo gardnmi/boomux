@@ -135,10 +135,13 @@ only when startup configuration and exact lifecycle state prove one unambiguous
 Agent session can resume. Dashboards present that association as inactive;
 protocol-39 responses remove the marker so old peers cannot display stale Agent
 state as current.
+It also adds coordinator-local dismissal and restore of stale cached Shell
+presentation without routing, queuing, or claiming an owner mutation.
 Remote notification presentation reuses protocol-32 atomic reduced transitions,
 so it does not require a later protocol. Node-cache schema 2 adds bounded local
-at-most-once individual and reconnect-digest claims with an explicit schema-1
-migration.
+at-most-once individual and reconnect-digest claims. Node-cache schema 3 adds at
+most 4,096 dismissed Shell IDs per Node and explicitly migrates schema 2 with an
+empty dismissal set.
 
 ## Components
 
@@ -858,6 +861,16 @@ and 128 digest claims per Node before enqueue; crash and graceful replacement ke
 those frontiers but create a fresh notifier worker. Delivery, queue saturation,
 and sound/desktop failures remain fail-open and never acknowledge owner attention
 or infer lifecycle from transport, process, or output state.
+
+Node-cache schema 3 retains bounded presentation-only Shell dismissals across
+daemon restart and successful baseline replacement. Views suppress each
+dismissed Shell and every reduced Agent linked to it. Dismissal is accepted only
+while the cached Node is stale or otherwise offline; an online Shell continues
+to require owner-authoritative close. Restore clears the Node's dismissal set,
+and an authoritative projection that omits a dismissed Shell prunes its
+tombstone. Cache replacement preserves the current dismissal set under the cache
+lock; remote generation compare-and-swap remains scoped to synchronization and
+health observations.
 
 Protocol 7 adds a bounded in-memory daemon event journal and atomic output-state
 reads. Clients reconnect through stream UUID/event-ID cursors and recover from
