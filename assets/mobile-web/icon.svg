@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">Boomux Agent Watch</title>
+  <desc id="desc">A dark square with an acid green B and orbit mark.</desc>
+  <rect width="512" height="512" rx="92" fill="#171713"/>
+  <path d="M82 73h348v366H82z" fill="none" stroke="#d8ff3e" stroke-width="18"/>
+  <path d="M146 134h98c67 0 106 26 106 76 0 29-14 50-42 63 38 12 57 38 57 77 0 61-44 92-131 92h-88V134Zm73 60v54h27c23 0 35-9 35-28 0-17-12-26-35-26h-27Zm0 108v78h31c29 0 43-13 43-39 0-26-14-39-43-39h-31Z" fill="#eee4ca"/>
+  <path d="M111 344c37-55 73-82 109-82 55 0 70 82 116 82 23 0 45-20 65-59" fill="none" stroke="#d8ff3e" stroke-linecap="square" stroke-width="18"/>
+  <circle cx="402" cy="282" r="13" fill="#ff7043"/>
+</svg>
