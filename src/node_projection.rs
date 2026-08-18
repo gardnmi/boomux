@@ -28,7 +28,7 @@ const MAX_SHELLS_PER_NODE: usize = 4_096;
 const MAX_LAUNCHERS_PER_NODE: usize = 4_096;
 const MAX_AGENTS_PER_NODE: usize = 4_096;
 const MAX_SCHEDULES_PER_NODE: usize = 1_024;
-const MAX_CAPABILITIES: usize = 96;
+const MAX_CAPABILITIES: usize = 128;
 const MAX_CAPABILITY_BYTES: usize = 128;
 const MAX_HELPER_VERSION_BYTES: usize = 128;
 const MAX_NAME_BYTES: usize = 256;
@@ -1511,5 +1511,14 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn current_protocol_capabilities_fit_projection_cache_bounds() {
+        let capabilities = crate::protocol::protocol_capabilities()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+
+        validate_capabilities(&capabilities).unwrap();
     }
 }
