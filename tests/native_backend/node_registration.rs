@@ -660,6 +660,58 @@ fn registrations_survive_cold_recovery_outside_authoritative_state() {
 }
 
 #[test]
+fn node_upgrade_maintenance_blocks_registration_changes_until_release() {
+    let daemon = TestDaemon::start();
+    let registration = daemon
+        .client
+        .add_node_registration("work", "work.example", node_id(2))
+        .unwrap();
+    let (leased, token) = daemon
+        .client
+        .begin_node_upgrade_maintenance(&registration.node_id, registration.revision)
+        .unwrap();
+    assert_eq!(leased, registration);
+    daemon
+        .client
+        .renew_node_upgrade_maintenance(&registration.node_id, &token)
+        .unwrap();
+    assert!(daemon.client.restart().is_err());
+    assert!(
+        daemon
+            .client
+            .retarget_node_registration(
+                &registration.node_id,
+                "new.example",
+                &registration.node_id,
+                registration.revision,
+            )
+            .is_err()
+    );
+    assert!(
+        daemon
+            .client
+            .forget_node_registration(&registration.node_id)
+            .is_err()
+    );
+    assert_eq!(
+        daemon
+            .client
+            .node_registration(&registration.node_id)
+            .unwrap(),
+        registration
+    );
+    daemon
+        .client
+        .finish_node_upgrade_maintenance(&registration.node_id, token)
+        .unwrap();
+    let renamed = daemon
+        .client
+        .rename_node_registration(&registration.node_id, "office", registration.revision)
+        .unwrap();
+    assert_eq!(renamed.alias, "office");
+}
+
+#[test]
 fn guarded_resource_revisions_survive_cold_recovery() {
     let mut daemon = TestDaemon::start();
     let workspace = daemon
@@ -871,6 +923,7 @@ fn write_fake_combined_snapshot(directory: &Path, workspace_owner_eligible: bool
                         stale: false,
                         observed_at_ms: 1,
                         observed_protocol_version: Some(protocol::PROTOCOL_VERSION),
+                        observed_helper_version: Some(env!("CARGO_PKG_VERSION").into()),
                         observed_capabilities: capabilities,
                         workspace_owner_eligible,
                         workspace_owner_unavailable_reason: unavailable_reason,
@@ -1098,6 +1151,7 @@ fn cli_add_and_retarget_use_once_verified_identity_without_persisting_helper_pat
         .unwrap();
     assert_eq!(remote["health"], "online");
     assert_eq!(remote["current"], true);
+    assert_eq!(remote["observed_helper_version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(
         remote["remote_projection"]["workspaces"][0]["id"]["node_id"],
         node_id(2)

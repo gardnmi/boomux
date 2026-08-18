@@ -20,7 +20,7 @@ pub(crate) struct NodeProjectionView {
 }
 use crate::state_store::{effective_uid, secure_state_dir, state_directory_from_environment};
 
-const NODE_CACHE_VERSION: u32 = 3;
+const NODE_CACHE_VERSION: u32 = 4;
 const MAX_CACHE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_NODES: usize = 128;
 const MAX_WORKSPACES_PER_NODE: usize = 1_024;
@@ -28,8 +28,9 @@ const MAX_SHELLS_PER_NODE: usize = 4_096;
 const MAX_LAUNCHERS_PER_NODE: usize = 4_096;
 const MAX_AGENTS_PER_NODE: usize = 4_096;
 const MAX_SCHEDULES_PER_NODE: usize = 1_024;
-const MAX_CAPABILITIES: usize = 96;
+const MAX_CAPABILITIES: usize = 128;
 const MAX_CAPABILITY_BYTES: usize = 128;
+const MAX_HELPER_VERSION_BYTES: usize = 128;
 const MAX_NAME_BYTES: usize = 256;
 const MAX_NOTIFICATION_CLAIMS_PER_NODE: usize = 512;
 const MAX_DIGEST_CLAIMS_PER_NODE: usize = 128;
@@ -46,6 +47,14 @@ pub(crate) struct ProjectionCommit {
     pub(crate) generation: u64,
     pub(crate) previous_health: Option<NodeProjectionHealthCode>,
     pub(crate) previous_cursor: Option<EventCursor>,
+}
+
+pub(crate) struct ProjectionObservation {
+    pub(crate) cursor: EventCursor,
+    pub(crate) projection: NodeProjectionSnapshot,
+    pub(crate) capabilities: Vec<String>,
+    pub(crate) helper_version: String,
+    pub(crate) observed_at_ms: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Ord, PartialOrd, Serialize, Deserialize)]
@@ -95,6 +104,8 @@ struct CachedNode {
     last_success_at_ms: Option<u64>,
     retry_at_ms: Option<u64>,
     capabilities: Vec<String>,
+    #[serde(default)]
+    observed_helper_version: Option<String>,
     cursor: Option<EventCursor>,
     projection: Option<NodeProjectionSnapshot>,
     notification_claims: Vec<RemoteNotificationClaim>,
@@ -240,13 +251,18 @@ impl NodeProjectionCache {
         &self,
         registration: &NodeRegistrationSnapshot,
         expected_generation: u64,
-        cursor: EventCursor,
-        projection: NodeProjectionSnapshot,
-        capabilities: Vec<String>,
-        now_ms: u64,
+        observation: ProjectionObservation,
     ) -> io::Result<Option<ProjectionCommit>> {
+        let ProjectionObservation {
+            cursor,
+            projection,
+            capabilities,
+            helper_version: observed_helper_version,
+            observed_at_ms: now_ms,
+        } = observation;
         validate_projection(&projection)?;
         validate_capabilities(&capabilities)?;
+        validate_helper_version(&observed_helper_version)?;
         if projection.node_id != registration.node_id {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -300,6 +316,7 @@ impl NodeProjectionCache {
             last_success_at_ms: Some(now_ms),
             retry_at_ms: None,
             capabilities,
+            observed_helper_version: Some(observed_helper_version),
             cursor: Some(cursor),
             projection: Some(projection),
             notification_claims,
@@ -363,6 +380,7 @@ impl NodeProjectionCache {
                 last_success_at_ms: None,
                 retry_at_ms,
                 capabilities: Vec::new(),
+                observed_helper_version: None,
                 cursor: None,
                 projection: None,
                 notification_claims: Vec::new(),
@@ -556,6 +574,7 @@ impl CachedNode {
             last_success_at_ms: self.last_success_at_ms,
             retry_at_ms: self.retry_at_ms,
             capabilities: self.capabilities.clone(),
+            observed_helper_version: self.observed_helper_version.clone(),
         }
     }
 
@@ -614,6 +633,7 @@ fn unobserved_health() -> NodeProjectionHealth {
         last_success_at_ms: None,
         retry_at_ms: None,
         capabilities: Vec::new(),
+        observed_helper_version: None,
     }
 }
 
@@ -682,6 +702,16 @@ fn validate_capabilities(capabilities: &[String]) -> io::Result<()> {
     Ok(())
 }
 
+fn validate_helper_version(version: &str) -> io::Result<()> {
+    if version.is_empty()
+        || version.len() > MAX_HELPER_VERSION_BYTES
+        || !version.bytes().all(|byte| byte.is_ascii_graphic())
+    {
+        return Err(invalid("Node helper version exceeds its bounds"));
+    }
+    Ok(())
+}
+
 fn load(path: &Path) -> io::Result<(CacheState, bool)> {
     let mut file = OpenOptions::new()
         .read(true)
@@ -727,6 +757,7 @@ fn load(path: &Path) -> io::Result<(CacheState, bool)> {
                             last_success_at_ms: node.last_success_at_ms,
                             retry_at_ms: node.retry_at_ms,
                             capabilities: node.capabilities,
+                            observed_helper_version: None,
                             cursor: node.cursor,
                             projection: node.projection,
                             notification_claims: Vec::new(),
@@ -760,6 +791,7 @@ fn load(path: &Path) -> io::Result<(CacheState, bool)> {
                             last_success_at_ms: node.last_success_at_ms,
                             retry_at_ms: node.retry_at_ms,
                             capabilities: node.capabilities,
+                            observed_helper_version: None,
                             cursor: node.cursor,
                             projection: node.projection,
                             notification_claims: node.notification_claims,
@@ -771,7 +803,16 @@ fn load(path: &Path) -> io::Result<(CacheState, bool)> {
                 true,
             )
         }
-        3 => (
+        3 => {
+            let mut old: CacheState =
+                serde_json::from_slice(&bytes).map_err(|error| invalid(error.to_string()))?;
+            if old.version != 3 {
+                return Err(invalid("invalid Node cache version"));
+            }
+            old.version = NODE_CACHE_VERSION;
+            (old, true)
+        }
+        4 => (
             serde_json::from_slice(&bytes).map_err(|error| invalid(error.to_string()))?,
             false,
         ),
@@ -788,6 +829,9 @@ fn load(path: &Path) -> io::Result<(CacheState, bool)> {
             ));
         }
         validate_capabilities(&node.capabilities)?;
+        if let Some(version) = &node.observed_helper_version {
+            validate_helper_version(version)?;
+        }
         if node.notification_claims.len() > MAX_NOTIFICATION_CLAIMS_PER_NODE
             || node.digest_claims.len() > MAX_DIGEST_CLAIMS_PER_NODE
             || node.dismissed_shell_ids.len() > MAX_DISMISSED_SHELLS_PER_NODE
@@ -978,10 +1022,13 @@ mod tests {
             .commit_projection(
                 &registration,
                 0,
-                cursor.clone(),
-                projection_with_shell(node_id.clone()),
-                vec!["protocol_40".into()],
-                1,
+                ProjectionObservation {
+                    cursor: cursor.clone(),
+                    projection: projection_with_shell(node_id.clone()),
+                    capabilities: vec!["protocol_40".into()],
+                    helper_version: "0.20.0".into(),
+                    observed_at_ms: 1,
+                },
             )
             .unwrap()
             .unwrap()
@@ -1035,13 +1082,16 @@ mod tests {
             .commit_projection(
                 &registration,
                 generation,
-                EventCursor {
-                    stream_id: Uuid::new_v4().to_string(),
-                    event_id: 2,
+                ProjectionObservation {
+                    cursor: EventCursor {
+                        stream_id: Uuid::new_v4().to_string(),
+                        event_id: 2,
+                    },
+                    projection: projection_with_shell(node_id.clone()),
+                    capabilities: vec!["protocol_40".into()],
+                    helper_version: "0.20.0".into(),
+                    observed_at_ms: 3,
                 },
-                projection_with_shell(node_id.clone()),
-                vec!["protocol_40".into()],
-                3,
             )
             .unwrap()
             .unwrap()
@@ -1088,13 +1138,16 @@ mod tests {
             .commit_projection(
                 &registration,
                 generation,
-                EventCursor {
-                    stream_id: Uuid::new_v4().to_string(),
-                    event_id: 3,
+                ProjectionObservation {
+                    cursor: EventCursor {
+                        stream_id: Uuid::new_v4().to_string(),
+                        event_id: 3,
+                    },
+                    projection: projection(node_id),
+                    capabilities: vec!["protocol_40".into()],
+                    helper_version: "0.20.0".into(),
+                    observed_at_ms: 5,
                 },
-                projection(node_id),
-                vec!["protocol_40".into()],
-                5,
             )
             .unwrap();
         let persisted: serde_json::Value =
@@ -1146,13 +1199,16 @@ mod tests {
                 .commit_projection(
                     &registration,
                     0,
-                    EventCursor {
-                        stream_id: Uuid::new_v4().to_string(),
-                        event_id: 7
+                    ProjectionObservation {
+                        cursor: EventCursor {
+                            stream_id: Uuid::new_v4().to_string(),
+                            event_id: 7,
+                        },
+                        projection: projection(node_id),
+                        capabilities: vec!["protocol_32".into()],
+                        helper_version: "0.41.0".into(),
+                        observed_at_ms: 10,
                     },
-                    projection(node_id),
-                    vec!["protocol_32".into()],
-                    10,
                 )
                 .unwrap()
                 .map(|commit| commit.generation),
@@ -1248,15 +1304,23 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("dismissed_shell_ids");
+        old["nodes"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("observed_helper_version");
         fs::write(&path, serde_json::to_vec_pretty(&old).unwrap()).unwrap();
 
         drop(NodeProjectionCache::load_at(path.clone()));
         let migrated: serde_json::Value =
             serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(migrated["version"], 3);
+        assert_eq!(migrated["version"], 4);
         assert_eq!(
             migrated["nodes"][0]["dismissed_shell_ids"],
             serde_json::json!([])
+        );
+        assert_eq!(
+            migrated["nodes"][0]["observed_helper_version"],
+            serde_json::Value::Null
         );
         fs::remove_dir_all(root).unwrap();
     }
@@ -1283,10 +1347,16 @@ mod tests {
             .commit_projection(
                 &registration,
                 0,
-                cursor.clone(),
-                projection(node_id),
-                vec!["protocol_32".into()],
-                10,
+                ProjectionObservation {
+                    cursor: EventCursor {
+                        stream_id: stream_id.clone(),
+                        event_id: 7,
+                    },
+                    projection: projection(node_id),
+                    capabilities: vec!["protocol_32".into()],
+                    helper_version: "0.41.0".into(),
+                    observed_at_ms: 10,
+                },
             )
             .unwrap()
             .unwrap();
@@ -1307,11 +1377,15 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("dismissed_shell_ids");
+        version_one["nodes"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("observed_helper_version");
         fs::write(&path, serde_json::to_vec_pretty(&version_one).unwrap()).unwrap();
         let cache = NodeProjectionCache::load_at(path.clone());
         let migrated: serde_json::Value =
             serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(migrated["version"], 3);
+        assert_eq!(migrated["version"], 4);
         assert_eq!(
             migrated["nodes"][0]["notification_claims"],
             serde_json::json!([])
@@ -1361,5 +1435,90 @@ mod tests {
             Some((Vec::new(), false))
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn schema_three_migrates_helper_version_as_unobserved_and_validates_bounds() {
+        let root = std::env::temp_dir().join(format!("boomux-node-v3-{}", Uuid::new_v4()));
+        let path = root.join("boomux/node-cache.json");
+        let node_id = Uuid::from_u128(2).to_string();
+        let registration = NodeRegistrationSnapshot {
+            alias: "work".into(),
+            target: "work.example".into(),
+            node_id: node_id.clone(),
+            revision: 1,
+            tombstone_epoch: 0,
+        };
+        let cache = NodeProjectionCache::load_at(path.clone());
+        cache
+            .commit_projection(
+                &registration,
+                0,
+                ProjectionObservation {
+                    cursor: EventCursor {
+                        stream_id: Uuid::from_u128(3).to_string(),
+                        event_id: 7,
+                    },
+                    projection: projection(node_id),
+                    capabilities: vec!["protocol_41".into()],
+                    helper_version: "0.41.0".into(),
+                    observed_at_ms: 10,
+                },
+            )
+            .unwrap();
+        drop(cache);
+
+        let mut version_three: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        version_three["version"] = serde_json::json!(3);
+        version_three["nodes"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("observed_helper_version");
+        fs::write(&path, serde_json::to_vec_pretty(&version_three).unwrap()).unwrap();
+
+        let migrated = NodeProjectionCache::load_at(path.clone());
+        assert_eq!(
+            migrated
+                .health(&registration)
+                .unwrap()
+                .observed_helper_version,
+            None
+        );
+        let stored: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(stored["version"], 4);
+        assert_eq!(
+            stored["nodes"][0]["observed_helper_version"],
+            serde_json::Value::Null
+        );
+
+        let generation = migrated.cursor_and_generation(&registration).unwrap().1;
+        let error = migrated
+            .commit_projection(
+                &registration,
+                generation,
+                ProjectionObservation {
+                    cursor: EventCursor {
+                        stream_id: Uuid::from_u128(3).to_string(),
+                        event_id: 8,
+                    },
+                    projection: projection(registration.node_id.clone()),
+                    capabilities: vec!["protocol_41".into()],
+                    helper_version: "x".repeat(MAX_HELPER_VERSION_BYTES + 1),
+                    observed_at_ms: 11,
+                },
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn current_protocol_capabilities_fit_projection_cache_bounds() {
+        let capabilities = crate::protocol::protocol_capabilities()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+
+        validate_capabilities(&capabilities).unwrap();
     }
 }

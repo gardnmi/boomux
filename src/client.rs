@@ -1028,6 +1028,51 @@ impl Client {
         })
     }
 
+    pub fn begin_node_upgrade_maintenance(
+        &self,
+        selector: impl Into<String>,
+        expected_revision: u64,
+    ) -> Result<(NodeRegistrationSnapshot, String)> {
+        match self.request(Request::BeginNodeUpgradeMaintenance {
+            selector: selector.into(),
+            expected_revision,
+        })? {
+            Response::NodeUpgradeMaintenance {
+                registration,
+                token,
+            } => Ok((registration, token)),
+            response => unexpected(response),
+        }
+    }
+
+    pub fn finish_node_upgrade_maintenance(
+        &self,
+        node_id: impl Into<String>,
+        token: impl Into<String>,
+    ) -> Result<()> {
+        expect_ok(
+            self.request(Request::FinishNodeUpgradeMaintenance {
+                node_id: node_id.into(),
+                token: token.into(),
+            })?,
+            Response::Ok,
+        )
+    }
+
+    pub fn renew_node_upgrade_maintenance(
+        &self,
+        node_id: impl Into<String>,
+        token: impl Into<String>,
+    ) -> Result<()> {
+        expect_ok(
+            self.request(Request::RenewNodeUpgradeMaintenance {
+                node_id: node_id.into(),
+                token: token.into(),
+            })?,
+            Response::Ok,
+        )
+    }
+
     fn node_registration_response(&self, request: Request) -> Result<NodeRegistrationSnapshot> {
         match self.request(request)? {
             Response::NodeRegistration { registration } => Ok(registration),
@@ -2372,7 +2417,8 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
-            reject_protocol(&listener, protocol::PROTOCOL_VERSION, 39);
+            reject_protocol(&listener, protocol::PROTOCOL_VERSION, 40);
+            reject_protocol(&listener, 40, 39);
             reject_protocol(&listener, 39, 38);
             reject_protocol(&listener, 38, 37);
             reject_protocol(&listener, 37, 36);
@@ -2547,7 +2593,8 @@ mod tests {
             )
             .unwrap();
 
-            reject_protocol(&listener, protocol::PROTOCOL_VERSION, 39);
+            reject_protocol(&listener, protocol::PROTOCOL_VERSION, 40);
+            reject_protocol(&listener, 40, 39);
             reject_protocol(&listener, 39, 38);
             reject_protocol(&listener, 38, 37);
             reject_protocol(&listener, 37, 36);
@@ -2616,7 +2663,8 @@ mod tests {
             )
             .unwrap();
 
-            reject_protocol(&listener, protocol::PROTOCOL_VERSION, 39);
+            reject_protocol(&listener, protocol::PROTOCOL_VERSION, 40);
+            reject_protocol(&listener, 40, 39);
             reject_protocol(&listener, 39, 38);
             reject_protocol(&listener, 38, 37);
             reject_protocol(&listener, 37, 36);
@@ -2667,7 +2715,8 @@ mod tests {
                 ),
             )
             .unwrap();
-            reject_protocol(&listener, protocol::PROTOCOL_VERSION, 39);
+            reject_protocol(&listener, protocol::PROTOCOL_VERSION, 40);
+            reject_protocol(&listener, 40, 39);
             reject_protocol(&listener, 39, 38);
             reject_protocol(&listener, 38, 37);
             reject_protocol(&listener, 37, 36);
@@ -2848,7 +2897,8 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
-            reject_protocol(&listener, protocol::PROTOCOL_VERSION, 39);
+            reject_protocol(&listener, protocol::PROTOCOL_VERSION, 40);
+            reject_protocol(&listener, 40, 39);
             reject_protocol(&listener, 39, 38);
             reject_protocol(&listener, 38, 37);
             reject_protocol(&listener, 37, 36);
@@ -2924,7 +2974,8 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
-            reject_protocol(&listener, protocol::PROTOCOL_VERSION, 39);
+            reject_protocol(&listener, protocol::PROTOCOL_VERSION, 40);
+            reject_protocol(&listener, 40, 39);
             reject_protocol(&listener, 39, 38);
             reject_protocol(&listener, 38, 37);
             reject_protocol(&listener, 37, 36);

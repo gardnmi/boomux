@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 40;
+pub const PROTOCOL_VERSION: u32 = 41;
 pub const MIN_PROTOCOL_VERSION: u32 = 6;
 pub const MAX_CONTROL_FRAME: usize = 8 * 1024 * 1024;
 pub const MAX_ATTACH_FRAME: usize = 1024 * 1024;
@@ -178,6 +178,13 @@ define_protocol_features! {
     ]),
     CachedProjectionDismissal => (40, "cached projection dismissal", [
         "cached_projection_dismissal",
+    ]),
+    ObservedNodeHelperVersion => (41, "observed Node helper version", [
+        "protocol_41",
+        "observed_node_helper_version",
+    ]),
+    NodeUpgradeCoordination => (41, "Node upgrade coordination", [
+        "node_upgrade_coordination",
     ]),
 }
 
@@ -566,6 +573,8 @@ pub struct NodeProjectionHealth {
     pub retry_at_ms: Option<u64>,
     #[serde(default)]
     pub capabilities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_helper_version: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -842,6 +851,8 @@ pub struct CombinedNode {
     pub observed_protocol_version: Option<u32>,
     #[serde(default)]
     pub observed_capabilities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_helper_version: Option<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub workspace_owner_eligible: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2035,6 +2046,18 @@ pub enum Request {
     ForgetNodeRegistration {
         selector: String,
     },
+    BeginNodeUpgradeMaintenance {
+        selector: String,
+        expected_revision: u64,
+    },
+    FinishNodeUpgradeMaintenance {
+        node_id: String,
+        token: String,
+    },
+    RenewNodeUpgradeMaintenance {
+        node_id: String,
+        token: String,
+    },
     SyncNodeProjection {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         after: Option<EventCursor>,
@@ -2428,6 +2451,11 @@ impl Request {
             | Self::RenameNodeRegistration { .. }
             | Self::RetargetNodeRegistration { .. }
             | Self::ForgetNodeRegistration { .. } => Some(ProtocolFeature::NodeRegistration),
+            Self::BeginNodeUpgradeMaintenance { .. }
+            | Self::FinishNodeUpgradeMaintenance { .. }
+            | Self::RenewNodeUpgradeMaintenance { .. } => {
+                Some(ProtocolFeature::NodeUpgradeCoordination)
+            }
             Self::SyncNodeProjection { .. } | Self::GetNodeProjectionHealth { .. } => {
                 Some(ProtocolFeature::NodeProjectionSync)
             }
@@ -2599,6 +2627,10 @@ pub enum Response {
     },
     NodeRegistrations {
         registrations: Vec<NodeRegistrationSnapshot>,
+    },
+    NodeUpgradeMaintenance {
+        registration: NodeRegistrationSnapshot,
+        token: String,
     },
     NodeProjectionSync {
         sync: NodeProjectionSync,
@@ -3251,8 +3283,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_forty_with_minimum_six() {
-        assert_eq!(PROTOCOL_VERSION, 40);
+    fn protocol_version_is_forty_one_with_minimum_six() {
+        assert_eq!(PROTOCOL_VERSION, 41);
         assert_eq!(MIN_PROTOCOL_VERSION, 6);
     }
 
@@ -3350,6 +3382,47 @@ mod tests {
                 response
             );
         }
+    }
+
+    #[test]
+    fn node_upgrade_maintenance_messages_require_protocol_forty_one() {
+        let registration = NodeRegistrationSnapshot {
+            alias: "work".into(),
+            target: "user@work.example".into(),
+            node_id: "550e8400-e29b-41d4-a716-446655440000".into(),
+            revision: 3,
+            tombstone_epoch: 1,
+        };
+        for request in [
+            Request::BeginNodeUpgradeMaintenance {
+                selector: registration.node_id.clone(),
+                expected_revision: registration.revision,
+            },
+            Request::FinishNodeUpgradeMaintenance {
+                node_id: registration.node_id.clone(),
+                token: "token".into(),
+            },
+            Request::RenewNodeUpgradeMaintenance {
+                node_id: registration.node_id.clone(),
+                token: "token".into(),
+            },
+        ] {
+            let encoded = serde_json::to_value(&request).unwrap();
+            assert_eq!(serde_json::from_value::<Request>(encoded).unwrap(), request);
+            assert_eq!(
+                request.required_feature(),
+                Some(ProtocolFeature::NodeUpgradeCoordination)
+            );
+        }
+        let response = Response::NodeUpgradeMaintenance {
+            registration,
+            token: "token".into(),
+        };
+        let encoded = serde_json::to_value(&response).unwrap();
+        assert_eq!(
+            serde_json::from_value::<Response>(encoded).unwrap(),
+            response
+        );
     }
 
     #[test]
@@ -3467,6 +3540,54 @@ mod tests {
                 request
             );
         }
+    }
+
+    #[test]
+    fn observed_helper_version_round_trips_and_defaults() {
+        let health: NodeProjectionHealth = serde_json::from_value(serde_json::json!({
+            "code": "online",
+            "stale": false,
+            "cache_generation": 1,
+            "capabilities": []
+        }))
+        .unwrap();
+        assert_eq!(health.observed_helper_version, None);
+
+        let mut encoded = serde_json::to_value(&health).unwrap();
+        assert!(encoded.get("observed_helper_version").is_none());
+        encoded["observed_helper_version"] = serde_json::json!("0.41.0");
+        let observed: NodeProjectionHealth = serde_json::from_value(encoded).unwrap();
+        assert_eq!(observed.observed_helper_version.as_deref(), Some("0.41.0"));
+        assert_eq!(
+            serde_json::from_value::<NodeProjectionHealth>(
+                serde_json::to_value(&observed).unwrap()
+            )
+            .unwrap(),
+            observed
+        );
+
+        let node: CombinedNode = serde_json::from_value(serde_json::json!({
+            "node_id": "node",
+            "alias": "remote",
+            "local": false,
+            "health": "online",
+            "current": true,
+            "stale": false,
+            "observed_at_ms": 1,
+            "observed_capabilities": [],
+            "observed_helper_version": "0.41.0",
+            "scheduler": {
+                "state": "active",
+                "max_concurrent": 4,
+                "active_executions": 0
+            }
+        }))
+        .unwrap();
+        assert_eq!(node.observed_helper_version.as_deref(), Some("0.41.0"));
+        assert_eq!(
+            serde_json::from_value::<CombinedNode>(serde_json::to_value(&node).unwrap()).unwrap(),
+            node
+        );
     }
 
     #[test]
@@ -4609,6 +4730,8 @@ mod tests {
             (39, &["protocol_39", "qualified_focused_terminal"][..]),
             (40, &["protocol_40", "recovered_agent_presentation"][..]),
             (40, &["cached_projection_dismissal"][..]),
+            (41, &["protocol_41", "observed_node_helper_version"][..]),
+            (41, &["node_upgrade_coordination"][..]),
         ];
 
         let actual = ProtocolFeature::ALL

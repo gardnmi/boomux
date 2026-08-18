@@ -27,6 +27,8 @@
 > the combined Node snapshot without extending persisted remote projections.
 > Protocol 40 and Node-cache schema 3 implement bounded coordinator-local
 > dismissal and restore of stale cached Shell presentation.
+> Protocol 41 and Node-cache schema 4 retain the bounded helper package version
+> from an authenticated projection connection for Nodes-view presentation.
 > Public `boomux --remote TARGET`
 > remains ad hoc.
 
@@ -173,8 +175,19 @@ The implemented registration CLI is `boomux node add ALIAS TARGET`, or guided
 interactive `boomux node add` from the dashboard command palette or Omarchy
 panel. Registration management continues with `node list`,
 `node inspect`, revision-conditional `node rename` and `node retarget`, and `node
-forget`. Add and retarget complete verified bootstrap before submitting a
-registration mutation to the local daemon. The selected helper path is
+forget`. Human-only `node upgrade NODE` verifies the pinned identity and, after
+confirmation, transactionally replaces a compatible registered helper without
+changing the registration. Immediately before activation it acquires a bounded
+local maintenance lease, drains admitted operations, and prevents rename,
+retarget, forget, projection, and routed operations until remote commit or
+rollback completes. The lease expires fail-open if the upgrading client dies.
+The CLI renews it during a live transaction; local daemon restart and stop are
+busy while it remains active so handoff cannot silently reopen admission.
+Successful remote commit releases it immediately. Any failed or ambiguous
+upgrade leaves it closed until bounded expiry so the remote rollback watchdog
+settles before local routing resumes.
+Add and retarget complete verified bootstrap before submitting a registration
+mutation to the local daemon. The selected helper path is
 connection-local and is rediscovered on every later connection; it is not a
 registration field. The federation handshake's current `ad_hoc` mode remains a
 transport property and is not reinterpreted as registration persistence.
@@ -356,8 +369,7 @@ not ping that returned handoff-era channel again. The remote may close the chann
 immediately after the successful verification ping without invalidating the
 verified handshake identity or a completed commit. A Ready helper that cannot
 answer its one required ping still fails before any registration mutation.
-An
-upgrade may use the existing graceful daemon restart command only when the new
+An automatic compatibility upgrade may use the existing graceful daemon restart command only when the new
 helper has verified provisionally and a separate runtime-aware status check shows
 that the running daemon protocol is outside the supported federation range. This
 status check runs for every upgrade, including when the provisional helper
@@ -367,7 +379,11 @@ live channel must still pass its protocol ping. An absent daemon is not restarte
 and can start only through ordinary helper behavior. Pre-install presence and
 protocol are recorded durably before helper contact, so rollback and watchdog
 recovery do not depend on later socket, status, or daemon-generation races. An
-already-compatible daemon is never restarted for a release-version difference.
+already-compatible daemon is never restarted by automatic bootstrap for a
+release-version difference. Explicit `node upgrade`, however, restarts any
+present daemon after activation so a same-protocol replacement actually runs;
+the registered Node ID is checked before activation and again inside the rollback
+boundary before commit. An absent daemon is not restarted.
 
 The remote bridge command uses a fixed template. No prompt, resource ID,
 integration command, or user argument is interpolated into it. Its only variable
@@ -469,7 +485,7 @@ state from loading or persisting. Node identity, registrations, and cache each
 use owner-only directories, bounded schemas, atomic replacement, and explicit
 validation.
 
-Node-cache schema 3 is `node-cache.json` beside, but independent from,
+Node-cache schema 4 is `node-cache.json` beside, but independent from,
 `state.json`, `node.json`, and `node_registrations.json`. It is owner-only,
 atomically replaced, and capped at 4 MiB and 128 Nodes. Per Node it accepts at
 most 1,024 Workspaces, 4,096 Shells, 4,096 launchers, 4,096 Agents, 1,024
@@ -487,7 +503,6 @@ observation or execution revision, typed category, and bounded typed reason;
 digest claims contain stream UUID, prior and through cursor IDs, and the sorted
 enabled category set. Claims are local presentation state and are removed with
 their registered Node cache.
-
 Schema 3 explicitly migrates schema 2 by retaining its complete cache and
 initializing an empty dismissal set for every Node. Dismissal is accepted only
 for a Shell in a stale or offline cached projection. It persists across restart
@@ -497,6 +512,10 @@ item and attention counts are recomputed from that filtered view. It never
 creates a routed request or owner mutation. Restore clears the selected Node's
 set. A later authoritative projection retains tombstones for Shells still
 present and prunes tombstones for Shells it no longer contains.
+Schema 4 explicitly migrates schema 3 by initializing the optional observed
+helper version. Successful authenticated projection commits retain that bounded
+ASCII-graphic version in the same generation as health, capabilities, cursor,
+and snapshot.
 
 ## Synchronization And Events
 

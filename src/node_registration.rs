@@ -43,6 +43,13 @@ struct Registration {
     snapshot: NodeRegistrationSnapshot,
     admission_open: bool,
     admitted: usize,
+    maintenance: Option<MaintenanceLease>,
+}
+
+#[derive(Clone)]
+struct MaintenanceLease {
+    token: String,
+    deadline: Instant,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -125,8 +132,9 @@ impl NodeRegistrationManager {
         expected: &NodeRegistrationSnapshot,
         operation: impl FnOnce() -> io::Result<T>,
     ) -> io::Result<Option<T>> {
-        let state = self.lock_state()?;
-        let state = available(&state)?;
+        let mut state = self.lock_state()?;
+        let state = available_mut(&mut state)?;
+        expire_maintenance(state);
         let Some(registration) = state
             .registrations
             .iter()
@@ -147,6 +155,7 @@ impl NodeRegistrationManager {
     pub(crate) fn admit(&self, expected: &NodeRegistrationSnapshot) -> io::Result<bool> {
         let mut state = self.lock_state()?;
         let state = available_mut(&mut state)?;
+        expire_maintenance(state);
         let Some(registration) = state
             .registrations
             .iter_mut()
@@ -235,6 +244,7 @@ impl NodeRegistrationManager {
             snapshot: snapshot.clone(),
             admission_open: true,
             admitted: 0,
+            maintenance: None,
         });
         save(&self.path, &replacement)?;
         *current = replacement;
@@ -250,8 +260,15 @@ impl NodeRegistrationManager {
         validate_alias(&alias)?;
         let mut state = self.lock_state()?;
         let current = available_mut(&mut state)?;
+        expire_maintenance(current);
         let index = find_index(current, selector)?;
         require_revision(&current.registrations[index], expected_revision)?;
+        if !current.registrations[index].admission_open {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "Node registration maintenance is in progress",
+            ));
+        }
         if current.registrations[index].snapshot.alias == alias {
             return Ok(current.registrations[index].snapshot.clone());
         }
@@ -333,6 +350,144 @@ impl NodeRegistrationManager {
         })
     }
 
+    pub(crate) fn begin_upgrade_maintenance_if(
+        &self,
+        selector: &str,
+        expected_revision: u64,
+        drain_timeout: Duration,
+        lease_duration: Duration,
+        transition_idle: impl FnOnce() -> bool,
+    ) -> io::Result<(NodeRegistrationSnapshot, String)> {
+        let mut state = self.lock_state()?;
+        let current = available_mut(&mut state)?;
+        expire_maintenance(current);
+        if !transition_idle() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "a daemon transition is already in progress",
+            ));
+        }
+        let index = find_index(current, selector)?;
+        require_revision(&current.registrations[index], expected_revision)?;
+        if !current.registrations[index].admission_open {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "Node registration change is already in progress",
+            ));
+        }
+        current.registrations[index].admission_open = false;
+        let token = Uuid::new_v4().to_string();
+        current.registrations[index].maintenance = Some(MaintenanceLease {
+            token: token.clone(),
+            deadline: Instant::now() + lease_duration,
+        });
+        let deadline = Instant::now() + drain_timeout;
+        loop {
+            let current = available_mut(&mut state)?;
+            let index = find_index(current, selector)?;
+            require_revision(&current.registrations[index], expected_revision)?;
+            if current.registrations[index].admitted == 0 {
+                return Ok((current.registrations[index].snapshot.clone(), token));
+            }
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                current.registrations[index].admission_open = true;
+                current.registrations[index].maintenance = None;
+                self.changed.notify_all();
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "timed out draining active Node registration operations",
+                ));
+            };
+            let (next_state, wait) = self
+                .changed
+                .wait_timeout(state, remaining)
+                .map_err(|_| io::Error::other("Node registration lock is poisoned"))?;
+            state = next_state;
+            if wait.timed_out() {
+                let current = available_mut(&mut state)?;
+                let index = find_index(current, selector)?;
+                current.registrations[index].admission_open = true;
+                current.registrations[index].maintenance = None;
+                self.changed.notify_all();
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "timed out draining active Node registration operations",
+                ));
+            }
+        }
+    }
+
+    pub(crate) fn finish_upgrade_maintenance(&self, node_id: &str, token: &str) -> io::Result<()> {
+        let mut state = self.lock_state()?;
+        let current = available_mut(&mut state)?;
+        expire_maintenance(current);
+        let registration = current
+            .registrations
+            .iter_mut()
+            .find(|registration| registration.snapshot.node_id == node_id)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "Node registration not found")
+            })?;
+        if registration
+            .maintenance
+            .as_ref()
+            .is_none_or(|maintenance| maintenance.token != token)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Node upgrade maintenance lease is not current",
+            ));
+        }
+        registration.maintenance = None;
+        registration.admission_open = true;
+        self.changed.notify_all();
+        Ok(())
+    }
+
+    pub(crate) fn renew_upgrade_maintenance(
+        &self,
+        node_id: &str,
+        token: &str,
+        lease_duration: Duration,
+    ) -> io::Result<()> {
+        let mut state = self.lock_state()?;
+        let current = available_mut(&mut state)?;
+        expire_maintenance(current);
+        let registration = current
+            .registrations
+            .iter_mut()
+            .find(|registration| registration.snapshot.node_id == node_id)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "Node registration not found")
+            })?;
+        let maintenance = registration.maintenance.as_mut().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Node upgrade maintenance lease is not current",
+            )
+        })?;
+        if maintenance.token != token {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Node upgrade maintenance lease is not current",
+            ));
+        }
+        maintenance.deadline = Instant::now() + lease_duration;
+        Ok(())
+    }
+
+    pub(crate) fn has_active_upgrade_maintenance(&self) -> io::Result<bool> {
+        let mut state = self.lock_state()?;
+        let ManagerState::Available(current) = &mut *state else {
+            return Ok(false);
+        };
+        expire_maintenance(current);
+        Ok(current
+            .registrations
+            .iter()
+            .any(|registration| registration.maintenance.is_some()))
+    }
+
     fn prepare_drain_commit(
         &self,
         selector: &str,
@@ -342,6 +497,7 @@ impl NodeRegistrationManager {
     ) -> io::Result<NodeRegistrationSnapshot> {
         let mut state = self.lock_state()?;
         let current = available_mut(&mut state)?;
+        expire_maintenance(current);
         let index = find_index(current, selector)?;
         require_revision(&current.registrations[index], expected_revision)?;
         if !current.registrations[index].admission_open {
@@ -457,6 +613,20 @@ fn available_mut(state: &mut ManagerState) -> io::Result<&mut RegistrationState>
             io::ErrorKind::Unsupported,
             format!("Node registration routing is disabled: {reason}"),
         )),
+    }
+}
+
+fn expire_maintenance(state: &mut RegistrationState) {
+    let now = Instant::now();
+    for registration in &mut state.registrations {
+        if registration
+            .maintenance
+            .as_ref()
+            .is_some_and(|maintenance| maintenance.deadline <= now)
+        {
+            registration.maintenance = None;
+            registration.admission_open = true;
+        }
     }
 }
 
@@ -620,6 +790,7 @@ fn validate_persisted(persisted: PersistedRegistrations) -> io::Result<Registrat
             snapshot,
             admission_open: true,
             admitted: 0,
+            maintenance: None,
         });
     }
     Ok(RegistrationState {
@@ -842,6 +1013,104 @@ mod tests {
             .unwrap();
         worker.join().unwrap();
         assert_eq!(changed.target, "new");
+        fs::remove_dir_all(path.parent().unwrap().parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn upgrade_maintenance_is_active_while_admitted_operations_drain() {
+        let path = path();
+        let manager = std::sync::Arc::new(NodeRegistrationManager::load_at(path.clone()));
+        let registration = manager
+            .add("work".into(), "old".into(), node_id(2), &node_id(1))
+            .unwrap();
+        manager.admit_for_test("work").unwrap();
+        let beginning = std::sync::Arc::clone(&manager);
+        let revision = registration.revision;
+        let worker = thread::spawn(move || {
+            beginning.begin_upgrade_maintenance_if(
+                "work",
+                revision,
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                || true,
+            )
+        });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !manager.has_active_upgrade_maintenance().unwrap() {
+            assert!(
+                Instant::now() < deadline,
+                "maintenance did not become active"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        manager.release_for_test("work");
+        let (_, token) = worker.join().unwrap().unwrap();
+        manager
+            .finish_upgrade_maintenance(&registration.node_id, &token)
+            .unwrap();
+        fs::remove_dir_all(path.parent().unwrap().parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn upgrade_maintenance_blocks_registration_changes_and_expires_safely() {
+        let path = path();
+        let manager = NodeRegistrationManager::load_at(path.clone());
+        let registration = manager
+            .add("work".into(), "old".into(), node_id(2), &node_id(1))
+            .unwrap();
+        let (leased, token) = manager
+            .begin_upgrade_maintenance_if(
+                "work",
+                registration.revision,
+                Duration::from_secs(1),
+                Duration::from_millis(1),
+                || true,
+            )
+            .unwrap();
+        assert_eq!(leased, registration);
+        manager
+            .renew_upgrade_maintenance(&registration.node_id, &token, Duration::from_secs(1))
+            .unwrap();
+        thread::sleep(Duration::from_millis(2));
+        assert!(!manager.admit(&registration).unwrap());
+        assert_eq!(
+            manager
+                .rename("work", "renamed".into(), registration.revision)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(
+            manager
+                .retarget(
+                    "work",
+                    "new".into(),
+                    &node_id(2),
+                    registration.revision,
+                    Duration::from_millis(10),
+                )
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        manager
+            .finish_upgrade_maintenance(&registration.node_id, &token)
+            .unwrap();
+        assert!(manager.admit(&registration).unwrap());
+        manager.release(&registration);
+
+        let (_, _token) = manager
+            .begin_upgrade_maintenance_if(
+                "work",
+                registration.revision,
+                Duration::from_secs(1),
+                Duration::from_millis(1),
+                || true,
+            )
+            .unwrap();
+        thread::sleep(Duration::from_millis(2));
+        assert!(manager.admit(&registration).unwrap());
+        manager.release(&registration);
         fs::remove_dir_all(path.parent().unwrap().parent().unwrap()).unwrap();
     }
 }

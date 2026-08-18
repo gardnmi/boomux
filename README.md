@@ -135,6 +135,7 @@ boomux . --name my-project --new -- sh -lc 'cargo test | tee test.log'
 | Create an empty workspace | `boomux workspace create feature-x` |
 | Add a shell on one Node | `boomux shell create feature-x --node laptop --cwd /path/to/project` |
 | Register a remote Node | `boomux node add laptop user@host` |
+| Upgrade a registered Node | `boomux node upgrade laptop` |
 | Adopt an external Workspace | `boomux workspace adopt <workspace-id> --node laptop` |
 | Link an external Workspace | `boomux workspace link feature-x <owner-workspace-id> --node laptop` |
 | Retry an incomplete close | `boomux workspace retry <workspace-id>` |
@@ -190,6 +191,7 @@ Register a remote Boomux authority through an ordinary OpenSSH destination:
 boomux node add laptop user@host
 boomux node list
 boomux node inspect laptop
+boomux node upgrade laptop
 ```
 
 Interactive setup verifies the remote Node identity. If its helper is missing or
@@ -199,6 +201,10 @@ graceful restart. Noninteractive and JSON requests never approve that mutation
 and instead return a typed `install_required` or `upgrade_required` error.
 Routes can later be revision-safely renamed or retargeted. Forgetting a route
 does not contact or delete the remote Node.
+Explicit upgrade verifies the pinned Node identity, shows the exact source and
+destination, and transactionally replaces the helper after confirmation. Any
+present daemon is gracefully restarted so managed processes survive and the new
+binary becomes active.
 
 Each Node remains authoritative for its own resources and paths. Cached remote
 state can remain visible while stale or unavailable, but it cannot authorize a
@@ -232,10 +238,10 @@ from growing without limit. The schedule and history panes render side by side,
 then stack when the terminal is narrow. Schedule-owned execution shells do not
 appear as ordinary shell rows; only the owning schedule definition does.
 
-The Nodes view shows registered routes and health. It can inspect and refresh a
-Node, launch guided setup, revision-safely rename or retarget a route, and forget
-a registration after confirmation. Remote state remains secondary to the owning
-Node's authority.
+The Nodes view shows registered routes, observed helper versions, and health. It
+can inspect and refresh a Node, launch guided setup or an identity-pinned upgrade,
+revision-safely rename or retarget a route, and forget a registration after
+confirmation. Remote state remains secondary to the owning Node's authority.
 
 The workspace overview includes item and Agent-state counts plus its most urgent
 outstanding attention item.
