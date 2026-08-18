@@ -15825,12 +15825,14 @@ impl ShellRuntimeManager {
                 );
             }
         }
+        // Resize and lock the shadow before signaling the PTY. A fullscreen child may
+        // redraw immediately on SIGWINCH, and that output must be parsed at the new size.
+        let mut terminal = lock(&terminal)?;
+        terminal.resize(profile.rows, profile.cols);
         lock(&runtime.master)?.resize(Self::profile_size(&profile))?;
         Self::update_runtime_dimensions(&shell, &runtime, Self::profile_size(&profile))?;
-        lock(&terminal)?.resize(profile.rows, profile.cols);
         // Keep terminal state locked until the controller is installed so the
         // reconstruction ends exactly where live delivery begins.
-        let terminal = lock(&terminal)?;
         send_response(
             &mut stream,
             response_version,
