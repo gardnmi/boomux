@@ -1383,6 +1383,10 @@ mod tests {
         assert!(INDEX_HTML.contains("data-filter=\"all\" aria-pressed=\"true\""));
         assert!(INDEX_HTML.contains("Agent activity."));
         assert!(!INDEX_HTML.contains("Agents in motion."));
+        assert!(INDEX_HTML.contains("class=\"brand-logo\""));
+        assert!(ICON.contains("Boomux pixel bomb"));
+        assert!(STYLES_CSS.contains(".brand-wordmark"));
+        assert!(STYLES_CSS.contains("flex: 0 0 28ch"));
     }
 
     #[test]

@@ -1,9 +1,24 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
-  <title id="title">Boomux Agent Watch</title>
-  <desc id="desc">A dark square with an acid green B and orbit mark.</desc>
-  <rect width="512" height="512" rx="92" fill="#171713"/>
-  <path d="M82 73h348v366H82z" fill="none" stroke="#d8ff3e" stroke-width="18"/>
-  <path d="M146 134h98c67 0 106 26 106 76 0 29-14 50-42 63 38 12 57 38 57 77 0 61-44 92-131 92h-88V134Zm73 60v54h27c23 0 35-9 35-28 0-17-12-26-35-26h-27Zm0 108v78h31c29 0 43-13 43-39 0-26-14-39-43-39h-31Z" fill="#eee4ca"/>
-  <path d="M111 344c37-55 73-82 109-82 55 0 70 82 116 82 23 0 45-20 65-59" fill="none" stroke="#d8ff3e" stroke-linecap="square" stroke-width="18"/>
-  <circle cx="402" cy="282" r="13" fill="#ff7043"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc" shape-rendering="crispEdges">
+  <title id="title">Boomux pixel bomb</title>
+  <desc id="desc">A dark pixel-art bomb with a red and gold lit fuse.</desc>
+  <defs>
+    <linearGradient id="shell" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#3d3e49"/>
+      <stop offset=".55" stop-color="#242633"/>
+      <stop offset="1" stop-color="#090b16"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="72" fill="#0b0d17"/>
+  <path d="M32 32h448v448H32z" fill="none" stroke="#222636" stroke-width="16"/>
+  <path d="M128 176h32v-32h128v16h32v32h32v32h16v128h-32v32h-32v32H160v-16h-32v-32H96v-32H80V224h16v-32h32z" fill="url(#shell)" stroke="#05060b" stroke-width="16"/>
+  <path d="M144 192h64v16h-32v32h-32z" fill="#f8f6e8"/>
+  <path d="M128 256h24v24h-24z" fill="#d9dbe3"/>
+  <path d="M288 176h32v32h32v32h-32v-16h-32z" fill="#111424"/>
+  <path d="M288 160v-32h32V96h32V64h24v48h-32v32h-32v32z" fill="#0a0b12"/>
+  <path d="M344 72h24v24h-24z" fill="#f5f2df"/>
+  <path d="M368 32h24v40h40v24h32v24h-32v24h48v24h-48v40h-24v-40h-40v-24h-40v-24h40V96h-24V72h24z" fill="#e52322"/>
+  <path d="M384 72h24v24h24v24h-24v24h-40v-24h-24V96h40z" fill="#ff8a19"/>
+  <path d="M384 96h24v24h24v24h-24v24h-24v-24h-24v-24h24z" fill="#ffd329"/>
+  <path d="M392 104h16v16h16v16h-16v16h-16v-16h-16v-16h16z" fill="#fff9d6"/>
+  <path d="M128 352h32v32h128v-16h32v-32h32v32h-32v32h-32v16H160v-16h-32z" fill="#080a14" opacity=".75"/>
 </svg>
