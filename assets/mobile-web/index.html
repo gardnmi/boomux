@@ -16,7 +16,7 @@
   <body>
     <a class="skip-link" href="#main-content">Skip to content</a>
     <header class="site-header">
-      <a class="brand" href="#/" aria-label="Boomux Agents home">
+      <a class="brand" href="/" aria-label="Boomux Agents home">
         <span class="brand-mark" aria-hidden="true">B<span>∞</span></span>
         <span>
           <strong>BOOMUX</strong>
@@ -33,12 +33,12 @@
     </header>
 
     <main id="main-content" tabindex="-1">
-      <section id="dashboard-view" aria-labelledby="dashboard-title">
+      <section aria-labelledby="dashboard-title">
         <div class="hero">
           <div>
-            <p class="eyebrow">Live operations index</p>
-            <h1 id="dashboard-title">Agents in motion.</h1>
-            <p class="hero-copy" id="viewer-copy">Read-only visibility across the fleet.</p>
+            <p class="eyebrow">Boomux web</p>
+            <h1 id="dashboard-title">Agent activity.</h1>
+            <p class="hero-copy" id="viewer-copy">Current work and attention across your Boomux nodes.</p>
           </div>
           <p class="last-updated" id="last-updated">Waiting for first snapshot</p>
         </div>
@@ -52,9 +52,9 @@
 
         <div class="list-toolbar">
           <div class="filters" role="group" aria-label="Filter agents">
-            <button class="filter-button is-selected" type="button" data-filter="attention" aria-pressed="true">Attention</button>
+            <button class="filter-button is-selected" type="button" data-filter="all" aria-pressed="true">All</button>
+            <button class="filter-button" type="button" data-filter="attention" aria-pressed="false">Attention</button>
             <button class="filter-button" type="button" data-filter="active" aria-pressed="false">Active</button>
-            <button class="filter-button" type="button" data-filter="all" aria-pressed="false">All</button>
           </div>
           <p id="result-count" aria-live="polite"></p>
         </div>
@@ -67,75 +67,6 @@
         <ol class="agent-list" id="agent-list" aria-live="polite" aria-busy="true"></ol>
       </section>
 
-      <section id="detail-view" class="detail-view" aria-labelledby="detail-title" hidden>
-        <nav class="detail-nav" aria-label="Agent detail navigation">
-          <a class="back-link" href="#/">← Fleet</a>
-          <button class="quiet-button" id="refresh-detail" type="button">Refresh</button>
-        </nav>
-        <div id="detail-state" class="state-panel" role="status">
-          <span class="loader" aria-hidden="true"></span>
-          <strong>Loading agent detail…</strong>
-        </div>
-        <article id="detail-content" hidden>
-          <header class="detail-header">
-            <div class="detail-heading">
-              <span class="status-glyph" id="detail-glyph" aria-hidden="true"></span>
-              <div>
-                <p class="eyebrow" id="detail-integration"></p>
-                <h1 id="detail-title"></h1>
-                <p id="detail-location"></p>
-              </div>
-            </div>
-            <span class="state-badge" id="detail-badge"></span>
-          </header>
-
-          <section class="detail-facts" aria-label="Agent facts" id="detail-facts"></section>
-
-          <section class="native-handoff" aria-labelledby="native-handoff-title">
-            <div class="section-heading">
-              <div>
-                <p class="eyebrow">OpenCode</p>
-                <h2 id="native-handoff-title">Continue in OpenCode</h2>
-              </div>
-              <span class="native-handoff-label">Native web</span>
-            </div>
-            <p class="native-handoff-notice" id="native-handoff-notice"></p>
-            <a class="native-handoff-link" id="native-handoff-link" target="_blank" rel="noreferrer" referrerpolicy="no-referrer" hidden></a>
-          </section>
-
-          <section class="activity" aria-labelledby="activity-title">
-            <div class="section-heading">
-              <div>
-                <p class="eyebrow">Observed events</p>
-                <h2 id="activity-title">Activity timeline</h2>
-              </div>
-              <span class="revision" id="detail-revision"></span>
-            </div>
-            <ol class="timeline" id="timeline"></ol>
-          </section>
-
-          <section class="terminal-section" id="terminal-section" aria-labelledby="terminal-title">
-            <div class="section-heading">
-              <div>
-                <p class="eyebrow">Rendered terminal output</p>
-                <h2 id="terminal-title">Terminal preview</h2>
-              </div>
-              <span class="terminal-label">OUTPUT, NOT TRANSCRIPT</span>
-            </div>
-            <p class="terminal-explainer">This is a rendered terminal snapshot. It is not a structured conversation transcript and may contain partial or visual terminal content.</p>
-            <pre id="terminal-output" tabindex="0"></pre>
-            <p class="terminal-notice" id="terminal-notice"></p>
-          </section>
-
-          <footer class="read-only-footer">
-            <div class="read-only-icon" aria-hidden="true">R/O</div>
-            <div>
-              <strong>Watching, not steering</strong>
-              <p>Boomux remains a read-only lifecycle dashboard. A configured native harness link opens a separate full-control application.</p>
-            </div>
-          </footer>
-        </article>
-      </section>
     </main>
 
     <noscript><p class="noscript">JavaScript is required to view the live agent dashboard.</p></noscript>

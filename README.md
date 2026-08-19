@@ -257,24 +257,32 @@ bounded projections of registered Nodes, keeps stale ownership visible, and
 shows the same current user-Shell Agents and outstanding durable attention as
 the Omarchy Boomux plugin. A locally observed `working` to `idle` transition is
 kept by the gateway as a transient finished alert while that Agent remains idle,
-even when no browser is connected. Local Agent details can show up to 256 KiB of
-rendered output only while the Agent's exact Shell run is still current. Remote
-projections never expose terminal output. The command also ensures the Node's
-Shared Harness Runtime on `127.0.0.1:4097`, so an exact claimed local OpenCode
-Agent links to the same live Session used by its desktop TUI. The TUI can be
-detached while phone events continue; on return it receives those events and is
-synchronized with the phone.
+even when no browser is connected. The home page is the complete dashboard; an
+eligible local OpenCode Agent card links directly to the same live Session used
+by its desktop TUI through the Node's Shared Harness Runtime on
+`127.0.0.1:4097`. Remote Agents remain unlinked. The TUI can be detached while
+phone events continue; on return it receives those events and is synchronized
+with the phone.
 
-Publish both loopback services through a private access layer. For example:
+Stop only the default web gateway with `boomux web stop`. If it was started with
+another HTTP port, use `boomux web stop --port PORT`. This leaves the daemon,
+managed processes, and Shared Harness Runtime running.
+
+Use `boomux web start` for detached background operation and `boomux web status`
+for passive inspection. Start requires the daemon to already be running and is
+idempotent for equivalent options. All three lifecycle commands support `--json`.
+
+Publish both loopback services to a connected Tailscale tailnet explicitly:
 
 ```console
-boomux web
-tailscale serve --https=443 --bg http://127.0.0.1:3737
-tailscale serve --https=4097 --bg http://127.0.0.1:4097
+boomux web --tailscale
+boomux web start --tailscale
 ```
 
-Boomux does not configure or authenticate the private access layer, which owns
-TLS, authentication, and ACLs. The MVP has
+Boomux reuses compatible Serve routes, rejects conflicts, records only routes it
+creates, and removes those exact routes on graceful exit or `boomux web stop`.
+It does not reset unrelated Serve configuration or define Tailscale grants and
+ACLs. Without `--tailscale`, remote publication remains external. The MVP has
 no terminal input, attention acknowledgment, transcript parsing, or cloud
 service. Native OpenCode links leave Boomux and open a full-control service whose
 origin must be protected separately. Add the remote URL

@@ -523,22 +523,34 @@ boomux doctor
 when `BOOMUX_SHELL_ID` is set. `boomux doctor` can run in either context.
 
 `boomux web` serves an experimental read-only Agent PWA on
-`127.0.0.1:3737`. Use `--port` to change the loopback port. Boomux leaves remote
-transport, TLS, identity, and access policy to the user's private access layer.
+`127.0.0.1:3737`. Use `--port` to change the loopback port. `--tailscale` is an
+explicit mutation that publishes the dashboard and enabled OpenCode runtime
+through a connected PATH-resolved Tailscale CLI. It reuses compatible routes,
+rejects conflicts, tracks only routes it creates, and removes those exact routes
+on graceful exit or `boomux web stop`; it never resets unrelated Serve state or
+defines tailnet grants and ACLs. Without the flag, remote publication remains
+external.
 It uses the Omarchy presentation model: one current user-Shell
 Agent per exact run plus historical Agents with durable attention, excluding
 schedule-owned Agents. It also presents local working-to-idle transitions as
 gateway-owned ephemeral finished alerts, refreshed even without a connected
-browser. It displays bounded output for an exact current local Shell run, but
-cannot send terminal input, acknowledge attention, or expose remote terminal
-output. It ensures the Node's loopback Shared Harness Runtime and links exact
-local Sessions only while a current Agent Session Claim binds that runtime
-generation to the exact ShellRun. `--opencode-web-url URL` is the public origin
-for that same local runtime, never an unrelated server. `--no-opencode-web`
-disables web-triggered runtime startup and native links. Boomux does not proxy or
-authenticate that full-control service. The private access layer owns TLS,
-authentication, and ACLs. Remote Agents remain unlinked. Never present rendered
-terminal output as a structured conversation transcript.
+browser. Its home page is the complete dashboard and cannot send terminal input
+or acknowledge attention. It ensures the Node's loopback Shared Harness Runtime
+and links exact local Sessions directly from eligible Agent cards only while a
+current Agent Session Claim binds that runtime generation to the exact ShellRun.
+`--opencode-web-url URL` is the public origin for that same local runtime, never
+an unrelated server. `--no-opencode-web` disables web-triggered runtime startup
+and native links. Boomux does not proxy or authenticate that full-control
+service. The private access layer owns TLS, authentication, and ACLs. Remote
+Agents remain unlinked.
+Stop only the default gateway with `boomux web stop`, or an alternate gateway
+with `boomux web stop --port PORT`. This leaves the daemon, managed processes,
+and Shared Harness Runtime running. The command is safe when no matching gateway
+is running.
+Use `boomux web start [--tailscale]` for detached operation and `boomux web
+status` for passive inspection. Start requires an already running daemon, waits
+for readiness, and is idempotent only for equivalent options. Start, status, and
+stop support `--json` as `web.start`, `web.status`, and `web.stop`.
 `OPENCODE_SERVER_PASSWORD` and `OPENCODE_SERVER_USERNAME` are ephemeral
 first-start runtime environment, are never persisted by Boomux, and must remain
 consistent for attached clients.
