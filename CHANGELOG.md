@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.22.0](https://github.com/gardnmi/boomux/compare/v0.21.1...v0.22.0) (2026-08-19)
+
+
+### Features
+
+* **opencode:** share sessions across tui and web ([#220](https://github.com/gardnmi/boomux/issues/220)) ([a8c16a2](https://github.com/gardnmi/boomux/commit/a8c16a27eb24fc2f23eeddabd1dde5e6493598d5))
+* **web:** add arcade dashboard branding ([#224](https://github.com/gardnmi/boomux/issues/224)) ([e29e04f](https://github.com/gardnmi/boomux/commit/e29e04f24f61f4f97303b50fbebd0c19b49a9dea))
+* **web:** add mobile agent dashboard ([#219](https://github.com/gardnmi/boomux/issues/219)) ([3da42f0](https://github.com/gardnmi/boomux/commit/3da42f09215aef63f21289f628020338cd512f37))
+* **web:** add tailnet dashboard lifecycle ([#223](https://github.com/gardnmi/boomux/issues/223)) ([fe110e8](https://github.com/gardnmi/boomux/commit/fe110e88f42b4e7a9c21d3ec6ee4a8cb855ce383))
+
 ## [0.21.1](https://github.com/gardnmi/boomux/compare/v0.21.0...v0.21.1) (2026-08-18)
 
 
