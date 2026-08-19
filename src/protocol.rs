@@ -2753,7 +2753,6 @@ pub enum Response {
         agent: AgentInstanceSnapshot,
     },
     OpenCodeSessionClaimReleased {
-        holder_id: String,
         released: bool,
     },
     AgentSchedule {
@@ -3629,10 +3628,7 @@ mod tests {
                 claim,
                 agent: agent.clone(),
             },
-            Response::OpenCodeSessionClaimReleased {
-                holder_id,
-                released: true,
-            },
+            Response::OpenCodeSessionClaimReleased { released: true },
             Response::Agent { agent },
         ] {
             let encoded = serde_json::to_value(&response).unwrap();

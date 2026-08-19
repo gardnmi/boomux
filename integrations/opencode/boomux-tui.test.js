@@ -98,7 +98,10 @@ describe("TUI claim selection", () => {
     });
     await controller.select("child");
     expect(calls).toEqual([ensureClaimArgv(identity, "root")]);
-    expect(controller.snapshot().current.rootID).toBe("root");
+    expect(controller.snapshot().current).toEqual({
+      rootID: "root",
+      claimID: "claim-root",
+    });
     await controller.dispose();
   });
 

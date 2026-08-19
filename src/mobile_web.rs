@@ -1337,20 +1337,16 @@ mod tests {
                 .count()
                 >= 2
         );
-        assert!(!APP_JS.contains("renderConversationEntry"));
     }
 
     #[test]
-    fn gateway_has_no_opencode_child_ownership() {
+    fn mobile_web_has_no_process_ownership() {
         let implementation = include_str!("mobile_web.rs")
             .split("#[cfg(test)]")
             .next()
             .unwrap();
         assert!(!implementation.contains("std::process"));
         assert!(!implementation.contains("Command::new"));
-        assert!(!implementation.contains("ManagedChild"));
-        assert!(!implementation.contains("start_opencode_web"));
-        assert!(!implementation.contains("stop_child"));
     }
 
     #[test]

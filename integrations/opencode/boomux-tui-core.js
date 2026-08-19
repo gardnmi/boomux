@@ -85,13 +85,11 @@ export function releaseClaimArgv(identity, claimID) {
 function claimResponse(result) {
   const data = result?.data ?? result;
   const claim = data?.claim;
-  const agent = data?.agent;
   const claimID = text(claim?.claim_id);
-  const agentID = text(agent?.id);
-  if (!claimID || !agentID) {
-    throw new Error("boomux claim response has no claim or Agent identity");
+  if (!claimID) {
+    throw new Error("boomux claim response has no claim identity");
   }
-  return { claimID, agentID };
+  return { claimID };
 }
 
 function rateLimitedLogger(log, now = Date.now) {
@@ -151,7 +149,7 @@ export function createClaimController(options) {
     const ensured = claimResponse(
       await options.run(ensureClaimArgv(identity, rootID)),
     );
-    current = { rootID, claimID: ensured.claimID, agentID: ensured.agentID };
+    current = { rootID, claimID: ensured.claimID };
     if (prior && prior.rootID !== rootID) await release(prior);
   }
 
