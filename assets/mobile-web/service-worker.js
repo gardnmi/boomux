@@ -1,12 +1,10 @@
 "use strict";
 
-const CACHE_NAME = "boomux-agent-watch-v21";
+const CACHE_NAME = "boomux-agent-watch-v11";
 const APP_SHELL = [
   "./",
   "./index.html",
   "./app.js",
-  "./terminal.js",
-  "./ghostty-vt.wasm",
   "./styles.css",
   "./manifest.webmanifest",
   "./icon.svg",

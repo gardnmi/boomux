@@ -1,9 +1,9 @@
 # Mobile Web Terminal Exploration
 
-> **Status: Historical exploration.** The first local explicit-control slice is
-> implemented and documented in `architecture.md` and `mobile-web.md`; those
-> documents, protocol contracts, and source are authoritative. Uncompleted
-> experiments and validation items below remain future work.
+> **Status: Exploration, not an accepted design or release commitment.** This
+> workstream is separate from opening a harness-native web UI for conversation
+> and tool interaction. `CONTEXT.md`, `architecture.md`, protocol contracts, and
+> source remain authoritative.
 
 ## Goal
 
@@ -22,8 +22,8 @@ This is complementary to native harness handoff:
 
 ## Candidate Prior Art
 
-[`coder/ghostty-web`](https://github.com/coder/ghostty-web) was selected for the
-first renderer slice at version 0.4.0.
+[`coder/ghostty-web`](https://github.com/coder/ghostty-web) is useful prior art,
+but adopting that package is not assumed.
 
 As of 2026-08-18 it provides:
 

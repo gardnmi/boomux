@@ -7,30 +7,17 @@ use std::time::{Duration, Instant};
 use crossterm::terminal;
 
 use crate::client;
-use crate::protocol::{AttachFrame, ErrorCode, ProtocolFeature, TerminalProfile};
+use crate::protocol::{AttachFrame, ProtocolFeature, TerminalProfile};
 use crate::terminal_focus::FocusMode;
 
 const POLL_INTERVAL_MS: i32 = 100;
 const ESCAPE_DISAMBIGUATION_MS: i32 = 10;
 const RECONNECT_ATTEMPTS: usize = 600;
 const RECONNECT_DELAY: Duration = Duration::from_millis(25);
-const SUSPENDED_RETRY_DELAY: Duration = Duration::from_millis(250);
-const CARRIAGE_RETURN: u8 = b'\r';
-const LINE_FEED: u8 = b'\n';
-const INTERRUPT: u8 = 0x03;
 const ENABLE_FOCUS_REPORTING: &[u8] = b"\x1b[?1004h";
 const DISABLE_FOCUS_REPORTING: &[u8] = b"\x1b[?1004l";
-const CLEAR_TERMINAL_SCREEN: &[u8] = b"\x1b[0m\x1b[?6l\x1b[r\x1b[2J\x1b[H";
-const WEB_CONTROL_SCREEN: &[u8] = b"\x1b[0m\x1b[?6l\x1b[r\x1b[2J\x1b[H\x1b[1;33mBoomux terminal controlled by Web UI\x1b[0m\r\n\r\nThe Shell is still running, but its output and input are available only in the Web UI.\r\nPress Enter to reclaim control here or Ctrl-C to close this attachment.\r\n";
 
 struct RawMode;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PumpOutcome {
-    Detached,
-    Reconnect,
-    Suspended,
-}
 
 const FOCUS_GAINED: &[u8] = b"\x1b[I";
 const FOCUS_LOST: &[u8] = b"\x1b[O";
@@ -140,8 +127,6 @@ pub fn run(
         profile.pixel_height,
     );
     let client = client::connect_or_start()?;
-    let reversible =
-        node_id.is_none() && client.supports(ProtocolFeature::ReversibleAttachmentTakeover)?;
     let mut attachment = attach_once(
         &client,
         shell_id,
@@ -150,18 +135,7 @@ pub fn run(
         restart_exited,
         expected_run_id,
         &profile,
-        reversible,
     )?;
-    let attached_run_id = if reversible {
-        expected_run_id.map(str::to_owned).or_else(|| {
-            client
-                .get_shell(shell_id)
-                .ok()
-                .and_then(|shell| shell.run.map(|run| run.id))
-        })
-    } else {
-        expected_run_id.map(str::to_owned)
-    };
     let _raw_mode = RawMode::enter()?;
     let mut stdin = io::stdin().lock();
     let mut stdout = io::stdout().lock();
@@ -193,7 +167,7 @@ pub fn run(
             stdout.flush()?;
             let mut stream = attachment.stream;
 
-            match pump_attachment(
+            if !pump_attachment(
                 &mut stream,
                 &mut stdin,
                 &mut stdout,
@@ -201,32 +175,7 @@ pub fn run(
                 &mut size,
                 &mut focus,
             )? {
-                PumpOutcome::Detached => return Ok(()),
-                PumpOutcome::Suspended => {
-                    let run_id = attached_run_id
-                        .as_deref()
-                        .ok_or("suspended attachment has no exact run identity")?;
-                    let Some(resumed) = wait_for_suspended_control(
-                        &client,
-                        shell_id,
-                        run_id,
-                        &mut profile,
-                        &mut stdin,
-                        &mut stdout,
-                    )?
-                    else {
-                        return Ok(());
-                    };
-                    size = (
-                        profile.rows,
-                        profile.cols,
-                        profile.pixel_width,
-                        profile.pixel_height,
-                    );
-                    attachment = resumed;
-                    continue;
-                }
-                PumpOutcome::Reconnect => {}
+                return Ok(());
             }
             if let Ok((rows, cols, pixel_width, pixel_height)) = dimensions() {
                 size = (rows, cols, pixel_width, pixel_height);
@@ -242,7 +191,6 @@ pub fn run(
                 takeover,
                 expected_run_id,
                 &profile,
-                reversible,
             )?;
         }
     })();
@@ -296,22 +244,9 @@ fn reconnect(
     takeover: bool,
     expected_run_id: Option<&str>,
     profile: &TerminalProfile,
-    reversible: bool,
 ) -> client::Result<client::Attachment> {
     let mut last_error = None;
     for _ in 0..RECONNECT_ATTEMPTS {
-        let current_reversible = if reversible {
-            match client.supports(ProtocolFeature::ReversibleAttachmentTakeover) {
-                Ok(supported) => supported,
-                Err(error) => {
-                    last_error = Some(error);
-                    thread::sleep(RECONNECT_DELAY);
-                    continue;
-                }
-            }
-        } else {
-            false
-        };
         match attach_once(
             client,
             shell_id,
@@ -320,7 +255,6 @@ fn reconnect(
             false,
             expected_run_id,
             profile,
-            current_reversible,
         ) {
             Ok(attachment) => return Ok(attachment),
             Err(error) if exact_reconnect_error_is_permanent(expected_run_id, &error) => {
@@ -349,115 +283,6 @@ fn exact_reconnect_error_is_permanent(
         )
 }
 
-fn wait_for_suspended_control(
-    client: &client::Client,
-    shell_id: &str,
-    expected_run_id: &str,
-    profile: &mut TerminalProfile,
-    stdin: &mut (impl Read + AsRawFd),
-    stdout: &mut impl Write,
-) -> Result<Option<client::Attachment>, Box<dyn std::error::Error>> {
-    stdout.write_all(WEB_CONTROL_SCREEN)?;
-    stdout.flush()?;
-    let result =
-        poll_for_suspended_control(client, shell_id, expected_run_id, profile, stdin, stdout);
-    let clear_result = stdout
-        .write_all(CLEAR_TERMINAL_SCREEN)
-        .and_then(|()| stdout.flush());
-    if result.is_ok() {
-        clear_result?;
-    }
-    result
-}
-
-fn poll_for_suspended_control(
-    client: &client::Client,
-    shell_id: &str,
-    expected_run_id: &str,
-    profile: &mut TerminalProfile,
-    stdin: &mut (impl Read + AsRawFd),
-    stdout: &mut impl Write,
-) -> Result<Option<client::Attachment>, Box<dyn std::error::Error>> {
-    let mut next_attempt = Instant::now();
-    let mut reclaim = false;
-    let mut input = [0_u8; 1024];
-    loop {
-        if let Ok(dimensions) = dimensions() {
-            redraw_suspended_for_dimensions(profile, dimensions, stdout)?;
-        }
-        if Instant::now() >= next_attempt {
-            match client.attach_native(shell_id, expected_run_id, reclaim, profile.clone()) {
-                Ok(attachment) => return Ok(Some(attachment)),
-                Err(client::ClientError::Remote(client::RemoteError {
-                    code: Some(ErrorCode::Busy | ErrorCode::DaemonStopping),
-                    ..
-                })) => {}
-                Err(error) => return Err(Box::new(error)),
-            }
-            next_attempt = Instant::now() + SUSPENDED_RETRY_DELAY;
-        }
-
-        let timeout = next_attempt
-            .saturating_duration_since(Instant::now())
-            .as_millis()
-            .min(i32::MAX as u128) as i32;
-        let mut descriptor = libc::pollfd {
-            fd: stdin.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // stdin remains open and borrowed for this poll call.
-        let ready = unsafe { libc::poll(&mut descriptor, 1, timeout) };
-        if ready < 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() != io::ErrorKind::Interrupted {
-                return Err(Box::new(error));
-            }
-            continue;
-        }
-        if ready > 0 && descriptor.revents & (libc::POLLIN | libc::POLLHUP) != 0 {
-            let count = stdin.read(&mut input)?;
-            if count == 0 || input[..count].contains(&INTERRUPT) {
-                return Ok(None);
-            }
-            if contains_reclaim_input(&input[..count]) {
-                reclaim = true;
-                next_attempt = Instant::now();
-            }
-        }
-    }
-}
-
-fn contains_reclaim_input(input: &[u8]) -> bool {
-    input.contains(&CARRIAGE_RETURN) || input.contains(&LINE_FEED)
-}
-
-fn redraw_suspended_for_dimensions(
-    profile: &mut TerminalProfile,
-    dimensions: (u16, u16, u16, u16),
-    stdout: &mut impl Write,
-) -> io::Result<bool> {
-    if (
-        profile.rows,
-        profile.cols,
-        profile.pixel_width,
-        profile.pixel_height,
-    ) == dimensions
-    {
-        return Ok(false);
-    }
-    (
-        profile.rows,
-        profile.cols,
-        profile.pixel_width,
-        profile.pixel_height,
-    ) = dimensions;
-    stdout.write_all(WEB_CONTROL_SCREEN)?;
-    stdout.flush()?;
-    Ok(true)
-}
-
-#[allow(clippy::too_many_arguments)]
 fn attach_once(
     client: &client::Client,
     shell_id: &str,
@@ -466,7 +291,6 @@ fn attach_once(
     restart_exited: bool,
     expected_run_id: Option<&str>,
     profile: &TerminalProfile,
-    reversible: bool,
 ) -> client::Result<client::Attachment> {
     if let Some(node_id) = node_id {
         return client.attach_node(
@@ -474,15 +298,6 @@ fn attach_once(
             takeover,
             restart_exited,
             expected_run_id.map(str::to_owned),
-            profile.clone(),
-        );
-    }
-    if reversible {
-        return client.attach_native_controller(
-            shell_id,
-            expected_run_id.map(str::to_owned),
-            takeover,
-            restart_exited,
             profile.clone(),
         );
     }
@@ -512,7 +327,7 @@ fn pump_attachment(
     input: &mut [u8],
     size: &mut (u16, u16, u16, u16),
     focus: &mut FocusTracking,
-) -> io::Result<PumpOutcome> {
+) -> io::Result<bool> {
     loop {
         let mut descriptors = [
             libc::pollfd {
@@ -555,25 +370,22 @@ fn pump_attachment(
                     }
                     stdout.flush()?;
                 }
-                Ok(AttachFrame::Detached) => return Ok(PumpOutcome::Detached),
+                Ok(AttachFrame::Detached) => return Ok(false),
                 Ok(AttachFrame::Reconnect) => {
                     let pending = focus.input.flush_pending();
                     if !pending.is_empty() {
                         AttachFrame::Input(pending).write_to(stream)?;
                     }
                     let _ = AttachFrame::ReconnectAck.write_to(stream);
-                    return Ok(PumpOutcome::Reconnect);
+                    return Ok(true);
                 }
-                Ok(AttachFrame::Suspended) => return Ok(PumpOutcome::Suspended),
                 Ok(_) => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "daemon sent an invalid attach frame",
                     ));
                 }
-                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
-                    return Ok(PumpOutcome::Detached);
-                }
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(false),
                 Err(error) => return Err(error),
             }
         }
@@ -585,7 +397,7 @@ fn pump_attachment(
                     AttachFrame::Input(pending).write_to(stream)?;
                 }
                 AttachFrame::Detached.write_to(stream)?;
-                return Ok(PumpOutcome::Detached);
+                return Ok(false);
             }
             if focus.enabled {
                 let (forwarded, gained) = focus
@@ -716,7 +528,6 @@ mod tests {
                 pixel_width: 0,
                 pixel_height: 0,
             },
-            false,
         )
         .unwrap_err();
         assert!(matches!(
@@ -753,7 +564,7 @@ mod tests {
         let mut input = [0; 128];
         let mut size = (24, 80, 0, 0);
 
-        let outcome = pump_attachment(
+        let reconnect = pump_attachment(
             &mut attachment,
             &mut fake_stdin,
             &mut stdout,
@@ -764,160 +575,8 @@ mod tests {
         .unwrap();
 
         sender.join().unwrap();
-        assert_eq!(outcome, PumpOutcome::Reconnect);
+        assert!(reconnect);
         assert_eq!(stdout, b"before-reconnect");
-    }
-
-    #[test]
-    fn suspended_frame_parks_the_current_attachment() {
-        let (mut daemon, mut attachment) = UnixStream::pair().unwrap();
-        let (mut fake_stdin, _stdin_writer) = UnixStream::pair().unwrap();
-        let sender = thread::spawn(move || {
-            AttachFrame::Suspended.write_to(&mut daemon).unwrap();
-        });
-        let mut stdout = Vec::new();
-        let mut input = [0; 128];
-        let mut size = (24, 80, 0, 0);
-
-        let outcome = pump_attachment(
-            &mut attachment,
-            &mut fake_stdin,
-            &mut stdout,
-            &mut input,
-            &mut size,
-            &mut FocusTracking::default(),
-        )
-        .unwrap();
-
-        sender.join().unwrap();
-        assert_eq!(outcome, PumpOutcome::Suspended);
-    }
-
-    #[test]
-    fn enter_retries_the_exact_native_attachment_with_takeover() {
-        let directory = std::env::temp_dir().join(format!("boomux-reclaim-{}", Uuid::new_v4()));
-        fs::create_dir_all(&directory).unwrap();
-        let socket = directory.join("daemon.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
-        let server = thread::spawn(move || {
-            let mut expected_takeovers = [false, true].into_iter();
-            loop {
-                let (mut stream, _) = listener.accept().unwrap();
-                let request: crate::protocol::Envelope<crate::protocol::Request> =
-                    crate::protocol::read_message(&mut stream).unwrap();
-                if matches!(request.message, crate::protocol::Request::Ping) {
-                    crate::protocol::write_message(
-                        &mut stream,
-                        &crate::protocol::Envelope::with_version(
-                            request.version,
-                            crate::protocol::Response::Pong,
-                        ),
-                    )
-                    .unwrap();
-                    continue;
-                }
-                let takeover = expected_takeovers
-                    .next()
-                    .expect("unexpected attach request");
-                assert!(matches!(
-                    request.message,
-                    crate::protocol::Request::Attach {
-                        takeover: actual,
-                        expected_run_id: Some(ref run_id),
-                        controller_kind: crate::protocol::AttachmentControllerKind::Native,
-                        ..
-                    } if actual == takeover && run_id == "run-1"
-                ));
-                let response = if takeover {
-                    crate::protocol::Response::Attached {
-                        token: "native-token".into(),
-                        reconstruction: Vec::new(),
-                        warning: None,
-                    }
-                } else {
-                    crate::protocol::Response::Error {
-                        message: "web controller is active".into(),
-                        code: Some(ErrorCode::Busy),
-                    }
-                };
-                crate::protocol::write_message(
-                    &mut stream,
-                    &crate::protocol::Envelope::with_version(request.version, response),
-                )
-                .unwrap();
-                if takeover {
-                    break;
-                }
-            }
-        });
-        let client = client::Client::from_socket_path(socket);
-        let (mut stdin, mut stdin_writer) = UnixStream::pair().unwrap();
-        stdin_writer.write_all(&[CARRIAGE_RETURN]).unwrap();
-        let mut stdout = Vec::new();
-        let mut profile = TerminalProfile {
-            term: Some("xterm-256color".into()),
-            colorterm: None,
-            term_program: None,
-            term_program_version: None,
-            rows: 24,
-            cols: 80,
-            pixel_width: 0,
-            pixel_height: 0,
-        };
-
-        let attachment = wait_for_suspended_control(
-            &client,
-            "shell-1",
-            "run-1",
-            &mut profile,
-            &mut stdin,
-            &mut stdout,
-        )
-        .unwrap()
-        .unwrap();
-
-        assert_eq!(attachment.token, "native-token");
-        assert!(stdout.starts_with(WEB_CONTROL_SCREEN));
-        assert!(stdout.ends_with(CLEAR_TERMINAL_SCREEN));
-        let rendered = String::from_utf8(stdout).unwrap();
-        assert!(rendered.contains("controlled by Web UI"));
-        assert!(rendered.contains("Enter to reclaim"));
-        server.join().unwrap();
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn suspended_screen_redraws_for_each_native_terminal_size() {
-        let mut profile = TerminalProfile {
-            term: None,
-            colorterm: None,
-            term_program: None,
-            term_program_version: None,
-            rows: 24,
-            cols: 80,
-            pixel_width: 800,
-            pixel_height: 480,
-        };
-        let mut stdout = Vec::new();
-
-        assert!(
-            !redraw_suspended_for_dimensions(&mut profile, (24, 80, 800, 480), &mut stdout)
-                .unwrap()
-        );
-        assert!(stdout.is_empty());
-        assert!(
-            redraw_suspended_for_dimensions(&mut profile, (40, 120, 1200, 800), &mut stdout)
-                .unwrap()
-        );
-        assert_eq!((profile.rows, profile.cols), (40, 120));
-        assert_eq!(stdout, WEB_CONTROL_SCREEN);
-    }
-
-    #[test]
-    fn enter_reclaims_for_carriage_return_or_line_feed() {
-        assert!(contains_reclaim_input(b"\r"));
-        assert!(contains_reclaim_input(b"\n"));
-        assert!(!contains_reclaim_input(&[0x1d]));
     }
 
     #[test]
@@ -953,7 +612,7 @@ mod tests {
         let mut input = [0; 128];
         let mut size = (24, 80, 0, 0);
 
-        let outcome = pump_attachment(
+        let reconnect = pump_attachment(
             &mut attachment,
             &mut fake_stdin,
             &mut stdout,
@@ -967,7 +626,7 @@ mod tests {
         .unwrap();
 
         sender.join().unwrap();
-        assert_eq!(outcome, PumpOutcome::Detached);
+        assert!(!reconnect);
     }
 
     #[test]
@@ -994,7 +653,7 @@ mod tests {
         let mut input = [0; 128];
         let mut size = (24, 80, 0, 0);
 
-        let outcome = pump_attachment(
+        let reconnect = pump_attachment(
             &mut attachment,
             &mut fake_stdin,
             &mut stdout,
@@ -1008,7 +667,7 @@ mod tests {
         .unwrap();
 
         sender.join().unwrap();
-        assert_eq!(outcome, PumpOutcome::Detached);
+        assert!(!reconnect);
         assert_eq!(stdout, b"before\x1b[?1004;2004lafter\x1b[?1004h");
     }
 }

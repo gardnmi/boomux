@@ -26,7 +26,7 @@
 | `src/terminal_state.rs` | Shadow VT parsing, bounded reconstruction, logical output, and structured previews |
 | `src/terminal_focus.rs` | Stateful parsing and restoration of child focus-reporting mode |
 | `src/tui.rs` | Dashboard state, interaction, palette, polling, and Ratatui rendering; no direct daemon transport |
-| `src/mobile_web.rs`, `assets/mobile-web/` | Loopback-only Agent gateway, Node-qualified projection, exact local terminal attachment, native harness web handoff, and embedded installable web assets |
+| `src/mobile_web.rs`, `assets/mobile-web/` | Loopback-only read-only HTTP gateway, Node-qualified Agent projection, native harness web handoff, and embedded installable web assets |
 | `src/session_projection.rs` | Projection of daemon Agent state and host catalogs into client-visible sessions |
 | `src/integrations.rs` | Integration identity, display metadata, and optional installation, title/catalog, resume, and foreground capabilities |
 | `src/host_session_titles.rs` and children | Shared title/catalog policy and host-specific discovery adapters |
@@ -152,18 +152,6 @@ to one exact current ShellRun and ensured Agent Instance while one or more TUI
 holders maintain it. Claims are absent from durable state, snapshots,
 projections, events, and handoff; a surviving TUI reacquires after graceful
 replacement. The runtime process identity and generation do transfer.
-Protocol 43 adds `reversible_attachment_takeover`. Attach requests identify
-legacy, reconnectable native, and web controllers. A web controller may replace
-only a protocol-43 native controller: the daemon first sends `Suspended`, waits
-for that controller to release, and then installs the web controller without
-changing the ShellRun. Legacy and already-web controllers fail closed. A parked
-native attachment retries the exact run without takeover and discards ordinary
-input; Enter explicitly reclaims with takeover while `Ctrl-C` closes the
-parked terminal. Web detach or transport loss releases its controller, allowing
-the parked native attachment to reacquire it.
-It also adds `terminal_reconstruction_read`, an exact-run, bounded read of the
-shadow terminal's inert VT reconstruction. This lets Ghostty restore full-screen
-row geometry after acquiring controller authority.
 Handoff generation 5 accepts generation 4, whose manifest has no shared-runtime
 record.
 Remote notification presentation reuses protocol-32 atomic reduced transitions,
@@ -358,13 +346,6 @@ reporting enabled. Each focus gain is also reported through the
 controller-authorized attach stream. RAII cleanup restores terminal and
 focus-reporting modes when the attachment exits.
 
-Protocol-43 local native attachments are reconnectable controllers. When a web
-controller suspends one, the terminal stays in raw-mode standby and does not
-forward focus or ordinary input. It retries only the same ShellRun; focus never
-implies ownership. Enter is the explicit reclaim operation and hard takeover
-atomically revokes the web stream. This ownership transition changes neither
-the PTY nor the ShellRun identity.
-
 The daemon keeps a bounded output queue per active controller. A slow client
 drops output rather than blocking the PTY reader and child process.
 The listener admits at most 64 concurrent connection handlers and closes newly
@@ -372,8 +353,7 @@ accepted sockets while that capacity is exhausted. Management responses and
 attachment output use bounded write deadlines. Attachments retain one admission
 slot for their lifetime, and their input handler joins the output worker after
 either side closes the shared socket, so abandoned clients cannot delay shutdown
-indefinitely. A controller whose PTY input remains backpressured for five seconds
-is detached rather than blocking controller release or graceful handoff.
+indefinitely.
 It also feeds a shadow `vt100` parser while forwarding the original PTY bytes
 unchanged. Reattachment receives a bounded reconstruction of rendered state,
 not historical OSC or graphics commands. Plain reads and structured previews
@@ -560,43 +540,13 @@ when the Agent leaves idle, ceases to own the exact current run, or the gateway
 process restarts. A temporary daemon failure marks the cached response
 disconnected without discarding its last bounded projection or finished markers.
 
-The projection and detail routes are read-only and the server has no arbitrary
-daemon-protocol pass-through, attention acknowledgment, Session resume, or
-harness transcript adapter. Agent detail never includes terminal output. Local
-terminal bytes are disclosed only after the authenticated control grant becomes
-the exact run's active controller; remote projection detail contains no terminal
-output because the coordinator cache is prompt-free and non-authoritative.
-
-An explicit **Take control** action may create one writable terminal attachment
-for an authoritative local, current, running, user-owned ShellRun. The HTTP route
-issues a random, single-use, 30-second grant only after validating the same
-Origin and Host against a loopback or explicit `--public-url` allowlist. The
-WebSocket upgrade consumes the grant and repeats exact Shell/run validation.
-Attachment uses protocol-26 exact-run semantics with
-`restart_exited=false` and protocol-43 web-controller identity. Page load cannot
-acquire control; an explicit action may suspend only a reconnectable native
-controller, and a replacement run is never substituted. The browser receives
-the daemon reconstruction followed by ordered raw PTY output and may send
-bounded input frames. Ghostty remains blank before and after control; there is no
-read-only terminal observer. The one-time grant supplies Ghostty's fitted browser
-grid, and exclusive Web ownership resizes the PTY to that grid before taking the
-reconstruction. Later browser layout changes resize the same web-owned PTY. This
-is safe because the native attachment is parked on a separate ownership screen;
-when native control returns, its latest profile resizes the PTY back before the
-daemon takes the native reconstruction. Browser wheel events become PageUp or
-PageDown terminal input, which scrolls full-screen application viewports instead
-of cycling prompt history with Up or Down. Suspension clears the native terminal and displays
-only its Web-ownership and reclaim notice. The parked attachment redraws that
-notice whenever the native window dimensions change and retains that latest grid
-for restoration. Native reacquisition clears the notice before replaying the
-exact reconstruction.
-Fixed-depth queues,
-64 KiB WebSocket frames, a 64-connection limit, timed socket writes, and a
-15-minute inactivity timeout bound each bridge.
-Explicit detach, leaving the view, transport loss, or bridge inactivity detaches
-it; page visibility changes alone do not. Remote Nodes, schedule-owned Shells,
-clipboard integration, file transfer, and OSC-triggered browser actions are not
-eligible.
+All Boomux routes are read-only. The server has no arbitrary daemon-protocol
+pass-through, terminal attachment, input, attention acknowledgment, Session
+resume, or harness transcript adapter. Local Agent detail may perform one bounded
+rendered Shell read only when the Shell's current run ID still equals the Agent's
+retained run ID. It never substitutes output from a later run. Remote projection
+detail contains no terminal output because the coordinator cache is prompt-free
+and non-authoritative.
 
 `boomux web` ensures the same daemon-supervised Shared Harness Runtime used by
 eligible native OpenCode TUIs. For an authoritative claimed local OpenCode Agent

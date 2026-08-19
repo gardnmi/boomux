@@ -103,10 +103,6 @@ impl TerminalState {
         fallback
     }
 
-    pub(crate) fn dimensions(&self) -> (u16, u16) {
-        self.parser.screen().size()
-    }
-
     #[cfg(test)]
     pub(crate) fn plain_text(&self) -> String {
         let screen = self.parser.screen();

@@ -2,35 +2,30 @@ use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::http::header::{
-    CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE, HOST, HeaderValue, ORIGIN,
-    REFERRER_POLICY, X_CONTENT_TYPE_OPTIONS,
+    CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE, HeaderValue, REFERRER_POLICY,
+    X_CONTENT_TYPE_OPTIONS,
 };
-use axum::http::{HeaderMap, Request, StatusCode};
+use axum::http::{Request, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::get;
 use axum::{Json, Router};
 use boomux::client::{self, Client};
 use boomux::protocol::{
-    AgentAttentionReason, AgentInstanceSnapshot, AgentState, AttachFrame, CombinedNodeSnapshot,
+    AgentAttentionReason, AgentInstanceSnapshot, AgentState, CombinedNodeSnapshot,
     NodeProjectionHealthCode, OpenCodeSessionClaimSnapshot, OpenCodeSharedRuntimeSnapshot,
-    ProtocolFeature, ShellOwner, ShellStatus, TerminalProfile,
+    ShellOwner,
 };
-use futures_util::stream::SplitSink;
-use futures_util::{SinkExt, StreamExt};
-use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc as async_mpsc;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-use uuid::Uuid;
+use serde::Serialize;
 
+const TERMINAL_OUTPUT_BYTES: usize = 256 * 1024;
 const PROJECTION_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const PROJECTION_STOP_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const INDEX_HTML: &str = include_str!("../assets/mobile-web/index.html");
@@ -41,32 +36,12 @@ const SERVICE_WORKER: &str = include_str!("../assets/mobile-web/service-worker.j
 const ICON: &str = include_str!("../assets/mobile-web/icon.svg");
 const ICON_192: &[u8] = include_bytes!("../assets/mobile-web/icon-192.png");
 const ICON_512: &[u8] = include_bytes!("../assets/mobile-web/icon-512.png");
-const TERMINAL_JS: &str = include_str!("../assets/mobile-web/terminal.js");
-const GHOSTTY_WASM: &[u8] = include_bytes!("../assets/mobile-web/ghostty-vt.wasm");
-const TERMINAL_GRANT_LIFETIME: Duration = Duration::from_secs(30);
-const TERMINAL_IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
-const TERMINAL_MAX_GRANTS: usize = 128;
-const TERMINAL_MAX_MESSAGE_BYTES: usize = 64 * 1024;
-const TERMINAL_QUEUE_DEPTH: usize = 32;
-const TERMINAL_SOCKET_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
-const TERMINAL_MAX_CONNECTIONS: usize = 64;
 #[derive(Clone)]
 struct AppState {
     client: Client,
     presentation: Arc<Mutex<PresentationState>>,
     opencode_web_url: Option<Arc<str>>,
     opencode_runtime_hint: Option<OpenCodeRuntimeHint>,
-    terminal_grants: Arc<Mutex<HashMap<String, TerminalGrant>>>,
-    terminal_origins: Arc<HashSet<String>>,
-    terminal_connections: Arc<Semaphore>,
-}
-
-#[derive(Clone)]
-struct TerminalGrant {
-    shell_id: String,
-    run_id: String,
-    profile: TerminalProfile,
-    expires_at: Instant,
 }
 
 #[derive(Clone)]
@@ -156,8 +131,8 @@ struct AgentDetail {
     timeline: Vec<TimelineEntry>,
     native_web: Option<NativeWebHandoff>,
     native_web_notice: String,
+    terminal_output: Option<String>,
     terminal_available: bool,
-    terminal_control_available: bool,
     notice: &'static str,
 }
 
@@ -183,31 +158,6 @@ struct ErrorBody {
     message: &'static str,
 }
 
-#[derive(Debug, Serialize)]
-struct TerminalGrantResponse {
-    websocket_url: String,
-    rows: u16,
-    cols: u16,
-}
-
-#[derive(Default, Deserialize)]
-struct TerminalDimensions {
-    rows: Option<u16>,
-    cols: Option<u16>,
-}
-
-#[derive(Deserialize)]
-struct TerminalResize {
-    #[serde(rename = "type")]
-    kind: String,
-    rows: u16,
-    cols: u16,
-    #[serde(default)]
-    pixel_width: u16,
-    #[serde(default)]
-    pixel_height: u16,
-}
-
 struct ApiError {
     status: StatusCode,
     code: &'static str,
@@ -228,22 +178,6 @@ impl ApiError {
             status: StatusCode::NOT_FOUND,
             code: "agent_not_found",
             message: "The qualified Agent is no longer available",
-        }
-    }
-
-    fn terminal_unavailable() -> Self {
-        Self {
-            status: StatusCode::CONFLICT,
-            code: "terminal_unavailable",
-            message: "Only a current, running, user-owned local Shell can be controlled",
-        }
-    }
-
-    fn invalid_origin() -> Self {
-        Self {
-            status: StatusCode::FORBIDDEN,
-            code: "invalid_origin",
-            message: "Terminal control requires a same-origin request",
         }
     }
 }
@@ -269,14 +203,12 @@ impl IntoResponse for ApiError {
 
 pub(crate) fn run(
     port: u16,
-    public_url: Option<&str>,
     opencode_web_url: Option<&str>,
     opencode_web_port: u16,
     no_opencode_web: bool,
 ) -> Result<(), Box<dyn Error>> {
     let configuration =
         opencode_web_configuration(port, opencode_web_url, opencode_web_port, no_opencode_web)?;
-    let terminal_origins = terminal_origins(port, public_url)?;
     let client = client::connect_or_start()?;
     let opencode_runtime = configuration
         .runtime_port
@@ -292,9 +224,6 @@ pub(crate) fn run(
             generation_id: Arc::from(runtime.generation_id),
             port: runtime.port,
         }),
-        terminal_grants: Arc::new(Mutex::new(HashMap::new())),
-        terminal_origins: Arc::new(terminal_origins),
-        terminal_connections: Arc::new(Semaphore::new(TERMINAL_MAX_CONNECTIONS)),
     };
     let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
     let runtime = tokio::runtime::Runtime::new()?;
@@ -315,20 +244,6 @@ fn opencode_web_configuration(
         public_url,
         runtime_port: (!disabled).then_some(runtime_port),
     })
-}
-
-fn terminal_origins(
-    port: u16,
-    public_url: Option<&str>,
-) -> Result<HashSet<String>, Box<dyn Error>> {
-    let mut origins = HashSet::from([
-        format!("http://127.0.0.1:{port}"),
-        format!("http://localhost:{port}"),
-    ]);
-    if let Some(public_url) = public_url {
-        origins.insert(normalize_public_origin(public_url, "--public-url")?);
-    }
-    Ok(origins)
 }
 
 async fn serve(address: SocketAddr, state: AppState) -> Result<(), Box<dyn Error>> {
@@ -352,8 +267,6 @@ async fn serve(address: SocketAddr, state: AppState) -> Result<(), Box<dyn Error
         .route("/", get(index))
         .route("/index.html", get(index))
         .route("/app.js", get(app_js))
-        .route("/terminal.js", get(terminal_js))
-        .route("/ghostty-vt.wasm", get(ghostty_wasm))
         .route("/styles.css", get(styles))
         .route("/manifest.webmanifest", get(manifest))
         .route("/service-worker.js", get(service_worker))
@@ -362,11 +275,6 @@ async fn serve(address: SocketAddr, state: AppState) -> Result<(), Box<dyn Error
         .route("/icon-512.png", get(icon_512))
         .route("/api/snapshot", get(snapshot))
         .route("/api/agents/{node_id}/{agent_id}", get(agent_detail))
-        .route(
-            "/api/agents/{node_id}/{agent_id}/terminal-grant",
-            post(terminal_grant),
-        )
-        .route("/api/terminal/{token}", get(terminal_socket))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             security_headers,
@@ -446,7 +354,7 @@ async fn security_headers(request: Request<Body>, next: Next) -> Response {
     headers.insert(
         CONTENT_SECURITY_POLICY,
         HeaderValue::from_static(
-            "default-src 'self'; base-uri 'none'; connect-src 'self'; img-src 'self' data:; manifest-src 'self'; object-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'",
+            "default-src 'self'; base-uri 'none'; connect-src 'self'; img-src 'self' data:; manifest-src 'self'; object-src 'none'; script-src 'self'; style-src 'self'; frame-ancestors 'none'",
         ),
     );
     headers.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
@@ -455,42 +363,27 @@ async fn security_headers(request: Request<Body>, next: Next) -> Response {
 }
 
 fn normalize_native_web_url(value: &str) -> Result<String, Box<dyn Error>> {
-    normalize_public_origin(value, "--opencode-web-url")
-}
-
-fn normalize_public_origin(value: &str, option: &str) -> Result<String, Box<dyn Error>> {
     let value = value.trim();
     let uri = value
         .parse::<axum::http::Uri>()
-        .map_err(|_| format!("{option} must be an absolute HTTP or HTTPS URL"))?;
+        .map_err(|_| "--opencode-web-url must be an absolute HTTP or HTTPS URL")?;
     let scheme = uri
         .scheme_str()
         .filter(|scheme| matches!(*scheme, "http" | "https"))
-        .ok_or_else(|| format!("{option} must use http or https"))?;
+        .ok_or("--opencode-web-url must use http or https")?;
     let authority = uri
         .authority()
-        .ok_or_else(|| format!("{option} must include a host"))?;
+        .ok_or("--opencode-web-url must include a host")?;
     if authority.as_str().contains('@') {
-        return Err(format!("{option} must not include credentials").into());
+        return Err("--opencode-web-url must not include credentials".into());
     }
     if !matches!(uri.path(), "" | "/") || uri.query().is_some() {
-        return Err(format!("{option} must not include a path or query").into());
+        return Err("--opencode-web-url must not include a path or query".into());
     }
     if scheme == "http" && !matches!(authority.host(), "127.0.0.1" | "localhost" | "::1") {
-        return Err(format!("{option} requires https except for a loopback origin").into());
+        return Err("--opencode-web-url requires https except for a loopback origin".into());
     }
-    let host = if authority.host().contains(':') {
-        format!("[{}]", authority.host())
-    } else {
-        authority.host().to_owned()
-    };
-    let port = authority
-        .port_u16()
-        .filter(|port| !matches!((scheme, *port), ("http", 80) | ("https", 443)));
-    Ok(match port {
-        Some(port) => format!("{scheme}://{host}:{port}"),
-        None => format!("{scheme}://{host}"),
-    })
+    Ok(format!("{scheme}://{authority}"))
 }
 
 fn opencode_handoff(
@@ -560,14 +453,6 @@ async fn app_js() -> Response {
     asset(APP_JS, "text/javascript; charset=utf-8", "no-cache")
 }
 
-async fn terminal_js() -> Response {
-    asset(TERMINAL_JS, "text/javascript; charset=utf-8", "no-cache")
-}
-
-async fn ghostty_wasm() -> Response {
-    binary_asset(GHOSTTY_WASM, "application/wasm", "no-cache")
-}
-
 async fn styles() -> Response {
     asset(STYLES_CSS, "text/css; charset=utf-8", "no-cache")
 }
@@ -589,11 +474,11 @@ async fn icon() -> Response {
 }
 
 async fn icon_192() -> Response {
-    binary_asset(ICON_192, "image/png", "public, max-age=86400")
+    binary_asset(ICON_192, "image/png")
 }
 
 async fn icon_512() -> Response {
-    binary_asset(ICON_512, "image/png", "public, max-age=86400")
+    binary_asset(ICON_512, "image/png")
 }
 
 fn asset(body: &'static str, content_type: &'static str, cache: &'static str) -> Response {
@@ -607,11 +492,14 @@ fn asset(body: &'static str, content_type: &'static str, cache: &'static str) ->
         .into_response()
 }
 
-fn binary_asset(body: &'static [u8], content_type: &'static str, cache: &'static str) -> Response {
+fn binary_asset(body: &'static [u8], content_type: &'static str) -> Response {
     (
         [
             (CONTENT_TYPE, HeaderValue::from_static(content_type)),
-            (CACHE_CONTROL, HeaderValue::from_static(cache)),
+            (
+                CACHE_CONTROL,
+                HeaderValue::from_static("public, max-age=86400"),
+            ),
         ],
         body,
     )
@@ -669,341 +557,6 @@ async fn agent_detail(
         .headers_mut()
         .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
     Ok(response)
-}
-
-async fn terminal_grant(
-    State(state): State<AppState>,
-    Path((node_id, agent_id)): Path<(String, String)>,
-    Query(dimensions): Query<TerminalDimensions>,
-    headers: HeaderMap,
-) -> Result<Response, ApiError> {
-    require_same_origin(&headers, &state.terminal_origins)?;
-    if Uuid::parse_str(&node_id).is_err() || Uuid::parse_str(&agent_id).is_err() {
-        return Err(ApiError::not_found());
-    }
-    let client = state.client.clone();
-    let target = tokio::task::spawn_blocking(move || terminal_target(&client, &node_id, &agent_id))
-        .await
-        .map_err(|_| ApiError::daemon())??;
-    let (shell_id, run_id, source_rows, source_cols) = target;
-    let (rows, cols) = requested_terminal_dimensions(dimensions, source_rows, source_cols)?;
-    let token = Uuid::new_v4().simple().to_string();
-    let expires_at = Instant::now() + TERMINAL_GRANT_LIFETIME;
-    let mut grants = state
-        .terminal_grants
-        .lock()
-        .map_err(|_| ApiError::daemon())?;
-    grants.retain(|_, grant| {
-        grant.expires_at > Instant::now() && (grant.shell_id != shell_id || grant.run_id != run_id)
-    });
-    if grants.len() >= TERMINAL_MAX_GRANTS {
-        return Err(ApiError::terminal_unavailable());
-    }
-    grants.insert(
-        token.clone(),
-        TerminalGrant {
-            shell_id,
-            run_id,
-            profile: browser_terminal_profile(rows, cols),
-            expires_at,
-        },
-    );
-    let mut response = Json(TerminalGrantResponse {
-        websocket_url: format!("/api/terminal/{token}"),
-        rows,
-        cols,
-    })
-    .into_response();
-    response
-        .headers_mut()
-        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    Ok(response)
-}
-
-async fn terminal_socket(
-    State(state): State<AppState>,
-    Path(token): Path<String>,
-    headers: HeaderMap,
-    upgrade: WebSocketUpgrade,
-) -> Result<Response, ApiError> {
-    require_same_origin(&headers, &state.terminal_origins)?;
-    let grant = state
-        .terminal_grants
-        .lock()
-        .map_err(|_| ApiError::daemon())?
-        .remove(&token)
-        .filter(|grant| grant.expires_at > Instant::now())
-        .ok_or_else(ApiError::not_found)?;
-    let permit = Arc::clone(&state.terminal_connections)
-        .try_acquire_owned()
-        .map_err(|_| ApiError::terminal_unavailable())?;
-    let client = state.client.clone();
-    let attachment = tokio::task::spawn_blocking(move || {
-        validate_terminal_target(&client, &grant.shell_id, &grant.run_id)?;
-        client
-            .attach_exact_run_from_web(grant.shell_id, grant.run_id, grant.profile)
-            .map_err(|_| ApiError::terminal_unavailable())
-    })
-    .await
-    .map_err(|_| ApiError::daemon())??;
-    Ok(upgrade
-        .max_message_size(TERMINAL_MAX_MESSAGE_BYTES)
-        .max_frame_size(TERMINAL_MAX_MESSAGE_BYTES)
-        .on_upgrade(move |socket| bridge_terminal(socket, attachment, permit))
-        .into_response())
-}
-
-fn require_same_origin(
-    headers: &HeaderMap,
-    allowed_origins: &HashSet<String>,
-) -> Result<(), ApiError> {
-    let host = headers
-        .get(HOST)
-        .and_then(|value| value.to_str().ok())
-        .ok_or_else(ApiError::invalid_origin)?;
-    let origin = headers
-        .get(ORIGIN)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<axum::http::Uri>().ok())
-        .ok_or_else(ApiError::invalid_origin)?;
-    let Some(scheme) = origin
-        .scheme_str()
-        .filter(|scheme| matches!(*scheme, "http" | "https"))
-    else {
-        return Err(ApiError::invalid_origin());
-    };
-    let Some(authority) = origin.authority().map(|value| value.as_str()) else {
-        return Err(ApiError::invalid_origin());
-    };
-    let canonical = format!("{scheme}://{authority}");
-    if authority != host || !allowed_origins.contains(&canonical) {
-        return Err(ApiError::invalid_origin());
-    }
-    Ok(())
-}
-
-fn terminal_target(
-    client: &Client,
-    node_id: &str,
-    agent_id: &str,
-) -> Result<(String, String, u16, u16), ApiError> {
-    let combined = client
-        .combined_node_snapshot(None)
-        .map_err(|_| ApiError::daemon())?;
-    let agent = project_visible_agents(&combined)
-        .into_iter()
-        .find(|agent| agent.node_id == node_id && agent.agent_id == agent_id)
-        .ok_or_else(ApiError::not_found)?;
-    if !agent.node_local || !agent.node_current || !agent.run_current || agent.schedule_owned {
-        return Err(ApiError::terminal_unavailable());
-    }
-    validate_terminal_target(client, &agent.shell_id, &agent.run_id)?;
-    let (_, _, rows, cols) = client
-        .read_terminal_reconstruction(&agent.shell_id, &agent.run_id)
-        .map_err(|_| ApiError::terminal_unavailable())?;
-    Ok((agent.shell_id, agent.run_id, rows, cols))
-}
-
-fn validate_terminal_target(client: &Client, shell_id: &str, run_id: &str) -> Result<(), ApiError> {
-    let snapshot = client.snapshot().map_err(|_| ApiError::daemon())?;
-    let shell = snapshot
-        .workspaces
-        .iter()
-        .flat_map(|workspace| &workspace.shells)
-        .find(|shell| shell.id == shell_id)
-        .ok_or_else(ApiError::terminal_unavailable)?;
-    if shell.owner != ShellOwner::User
-        || shell.status != ShellStatus::Running
-        || shell.run.as_ref().map(|run| run.id.as_str()) != Some(run_id)
-    {
-        return Err(ApiError::terminal_unavailable());
-    }
-    Ok(())
-}
-
-fn browser_terminal_profile(rows: u16, cols: u16) -> TerminalProfile {
-    TerminalProfile {
-        term: Some("xterm-256color".into()),
-        colorterm: Some("truecolor".into()),
-        term_program: Some("boomux-web".into()),
-        term_program_version: Some(env!("CARGO_PKG_VERSION").into()),
-        rows,
-        cols,
-        pixel_width: 0,
-        pixel_height: 0,
-    }
-}
-
-fn requested_terminal_dimensions(
-    dimensions: TerminalDimensions,
-    source_rows: u16,
-    source_cols: u16,
-) -> Result<(u16, u16), ApiError> {
-    let rows = dimensions.rows.unwrap_or(source_rows);
-    let cols = dimensions.cols.unwrap_or(source_cols);
-    valid_terminal_dimensions(rows, cols)
-        .then_some((rows, cols))
-        .ok_or_else(ApiError::terminal_unavailable)
-}
-
-fn valid_terminal_dimensions(rows: u16, cols: u16) -> bool {
-    rows > 0 && cols > 0 && rows <= 1_000 && cols <= 1_000
-}
-
-async fn bridge_terminal(
-    socket: WebSocket,
-    attachment: client::Attachment,
-    _permit: OwnedSemaphorePermit,
-) {
-    let (mut websocket_output, mut websocket_input) = socket.split();
-    if !send_terminal_bytes(&mut websocket_output, &attachment.reconstruction).await {
-        return;
-    }
-    if let Some(warning) = &attachment.warning
-        && !send_terminal_message(&mut websocket_output, terminal_status("warning", warning)).await
-    {
-        return;
-    }
-
-    let (daemon_output, mut output) = async_mpsc::channel(TERMINAL_QUEUE_DEPTH);
-    let (input, daemon_input) = mpsc::sync_channel::<AttachFrame>(TERMINAL_QUEUE_DEPTH);
-    let reconnect_input = input.clone();
-    let _ = attachment
-        .stream
-        .set_write_timeout(Some(TERMINAL_SOCKET_WRITE_TIMEOUT));
-    let mut read_stream = match attachment.stream.try_clone() {
-        Ok(stream) => stream,
-        Err(_) => return,
-    };
-    let shutdown_stream = match attachment.stream.try_clone() {
-        Ok(stream) => stream,
-        Err(_) => return,
-    };
-    let mut write_stream = attachment.stream;
-    let reader = thread::spawn(move || {
-        loop {
-            match AttachFrame::read_from(&mut read_stream) {
-                Ok(AttachFrame::Output(bytes)) => {
-                    if daemon_output.blocking_send(Ok(bytes)).is_err() {
-                        break;
-                    }
-                }
-                Ok(AttachFrame::Reconnect) => {
-                    let _ = reconnect_input.send(AttachFrame::ReconnectAck);
-                    let _ = daemon_output
-                        .blocking_send(Err("The daemon restarted; reconnect the terminal."));
-                    break;
-                }
-                Ok(AttachFrame::Detached) | Err(_) => break,
-                Ok(AttachFrame::Suspended) => {
-                    let _ = daemon_output
-                        .blocking_send(Err("Web terminal control was suspended unexpectedly."));
-                    break;
-                }
-                Ok(_) => {
-                    let _ = daemon_output
-                        .blocking_send(Err("The daemon sent an invalid terminal frame."));
-                    break;
-                }
-            }
-        }
-    });
-    let writer = thread::spawn(move || {
-        for frame in daemon_input {
-            let detached = frame == AttachFrame::Detached;
-            if frame.write_to(&mut write_stream).is_err() || detached {
-                break;
-            }
-        }
-        let _ = write_stream.shutdown(std::net::Shutdown::Both);
-    });
-
-    let idle = tokio::time::sleep(TERMINAL_IDLE_TIMEOUT);
-    tokio::pin!(idle);
-    'bridge: loop {
-        tokio::select! {
-            () = &mut idle => break,
-            frame = output.recv() => match frame {
-                Some(Ok(bytes)) => {
-                    if !send_terminal_bytes(&mut websocket_output, &bytes).await {
-                        break 'bridge;
-                    }
-                    idle.as_mut().reset(tokio::time::Instant::now() + TERMINAL_IDLE_TIMEOUT);
-                }
-                Some(Err(message)) => {
-                    let _ = send_terminal_message(
-                        &mut websocket_output,
-                        terminal_status("error", message),
-                    ).await;
-                    break;
-                }
-                None => break,
-            },
-            message = websocket_input.next() => match message {
-                Some(Ok(Message::Binary(bytes))) => {
-                    if input.try_send(AttachFrame::Input(bytes.to_vec())).is_err() {
-                        break;
-                    }
-                    idle.as_mut().reset(tokio::time::Instant::now() + TERMINAL_IDLE_TIMEOUT);
-                }
-                Some(Ok(Message::Text(text))) => {
-                    if let Ok(resize) = serde_json::from_str::<TerminalResize>(&text)
-                        && resize.kind == "resize"
-                        && valid_terminal_dimensions(resize.rows, resize.cols)
-                        && input.try_send(AttachFrame::Resize {
-                            rows: resize.rows,
-                            cols: resize.cols,
-                            pixel_width: resize.pixel_width,
-                            pixel_height: resize.pixel_height,
-                        }).is_err()
-                    {
-                        break;
-                    }
-                    idle.as_mut().reset(tokio::time::Instant::now() + TERMINAL_IDLE_TIMEOUT);
-                }
-                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
-                Some(Ok(_)) => {}
-            }
-        }
-    }
-    let _ = input.try_send(AttachFrame::Detached);
-    let _ = shutdown_stream.shutdown(std::net::Shutdown::Both);
-    drop(input);
-    drop(output);
-    let _ = tokio::task::spawn_blocking(move || {
-        let _ = writer.join();
-        let _ = reader.join();
-    })
-    .await;
-}
-
-async fn send_terminal_message(
-    output: &mut SplitSink<WebSocket, Message>,
-    message: Message,
-) -> bool {
-    tokio::time::timeout(TERMINAL_SOCKET_WRITE_TIMEOUT, output.send(message))
-        .await
-        .is_ok_and(|result| result.is_ok())
-}
-
-async fn send_terminal_bytes(output: &mut SplitSink<WebSocket, Message>, bytes: &[u8]) -> bool {
-    if bytes.is_empty() {
-        return send_terminal_message(output, Message::Binary(Vec::new().into())).await;
-    }
-    for chunk in bytes.chunks(TERMINAL_MAX_MESSAGE_BYTES) {
-        if !send_terminal_message(output, Message::Binary(chunk.to_vec().into())).await {
-            return false;
-        }
-    }
-    true
-}
-
-fn terminal_status(kind: &str, message: &str) -> Message {
-    Message::Text(
-        serde_json::json!({ "type": kind, "message": message })
-            .to_string()
-            .into(),
-    )
 }
 
 fn project_snapshot(combined: CombinedNodeSnapshot, viewer: Option<String>) -> MobileSnapshot {
@@ -1487,7 +1040,7 @@ fn agent_detail_with_terminal(
     native_web: Option<NativeWebHandoff>,
     native_web_notice: String,
 ) -> AgentDetail {
-    let current_shell = combined
+    let current_run = combined
         .nodes
         .iter()
         .find(|node| node.node_id == agent.node_id)
@@ -1498,26 +1051,39 @@ fn agent_detail_with_terminal(
                 .iter()
                 .flat_map(|workspace| &workspace.shells)
                 .find(|shell| shell.id == agent.shell_id)
-        });
-    let current_run = current_shell
+        })
         .and_then(|shell| shell.run.as_ref())
         .is_some_and(|run| run.id == agent.run_id);
-    let terminal_control_available = agent.node_local
-        && agent.node_current
-        && agent.run_current
-        && !agent.schedule_owned
-        && current_shell.is_some_and(|shell| {
-            shell.owner == ShellOwner::User && shell.status == ShellStatus::Running
-        })
-        && current_run
-        && client
-            .supports(ProtocolFeature::ReversibleAttachmentTakeover)
-            .unwrap_or(false);
-    let terminal_available = terminal_control_available;
-    let notice = if terminal_control_available {
-        "Terminal output remains hidden until this browser takes exclusive control."
+    let (terminal_output, terminal_read_failed) = if agent.node_local && current_run {
+        match client.read_shell_at(
+            agent.shell_id.clone(),
+            TERMINAL_OUTPUT_BYTES,
+            Some(agent.run_id.clone()),
+            Some(0),
+            0,
+        ) {
+            Ok(output) => (
+                Some(String::from_utf8_lossy(&output.bytes).into_owned()),
+                false,
+            ),
+            Err(error) => {
+                eprintln!(
+                    "boomux: mobile terminal read failed for Agent {} on Shell {}: {error}",
+                    agent.agent_id, agent.shell_id
+                );
+                (None, true)
+            }
+        }
+    } else {
+        (None, false)
+    };
+    let terminal_available = terminal_output.is_some();
+    let notice = if terminal_available {
+        "Rendered Shell output is a bounded terminal view, not a structured conversation transcript."
+    } else if terminal_read_failed {
+        "The exact run-scoped terminal read failed. Refresh after checking the Boomux server log."
     } else if current_run {
-        "This Shell run is not eligible for web terminal control."
+        "Rendered terminal output is currently unavailable for this local Shell run."
     } else if agent.node_local {
         "The Agent's exact Shell run is no longer current, so Boomux will not substitute output from a later run."
     } else {
@@ -1528,8 +1094,8 @@ fn agent_detail_with_terminal(
         timeline,
         native_web,
         native_web_notice,
+        terminal_output,
         terminal_available,
-        terminal_control_available,
         notice,
     }
 }
@@ -1765,100 +1331,11 @@ mod tests {
         assert!(APP_JS.contains("payload.native_web"));
         assert!(APP_JS.contains("if (routeDetail()) requests.push(refreshDetail())"));
         assert!(APP_JS.contains("clearNativeHandoff();"));
-        assert!(INDEX_HTML.contains("id=\"take-terminal-control\""));
-        assert!(!INDEX_HTML.contains("id=\"terminal-output\""));
-        assert!(APP_JS.contains("terminal_control_available"));
-        assert!(!APP_JS.contains("payload.terminal_reconstruction"));
-        assert!(!APP_JS.contains("decodeBase64Url"));
-        assert!(APP_JS.contains("new WebSocket(url)"));
-        assert!(APP_JS.contains("renderInactiveTerminal(view)"));
-        assert!(TERMINAL_JS.contains("setWritable"));
-        assert!(TERMINAL_JS.contains("ghostty-vt.wasm"));
-        assert!(TERMINAL_JS.contains("ResizeObserver"));
-        assert!(TERMINAL_JS.contains("addEventListener(\"wheel\""));
-        assert!(TERMINAL_JS.contains("proposeDimensions"));
-        assert!(TERMINAL_JS.contains("\\x1B[5~"));
-        assert!(TERMINAL_JS.contains("\\x1B[6~"));
-        assert!(SERVICE_WORKER.contains("./ghostty-vt.wasm"));
         assert!(
             APP_JS
                 .matches("nativeLink.removeAttribute(\"href\");")
                 .count()
                 >= 2
-        );
-    }
-
-    #[test]
-    fn terminal_control_requires_an_exact_same_origin() {
-        let allowed = HashSet::from(["https://desktop.example:3737".into()]);
-        let mut headers = HeaderMap::new();
-        headers.insert(HOST, HeaderValue::from_static("desktop.example:3737"));
-        headers.insert(
-            ORIGIN,
-            HeaderValue::from_static("https://desktop.example:3737"),
-        );
-        assert!(require_same_origin(&headers, &allowed).is_ok());
-
-        headers.insert(ORIGIN, HeaderValue::from_static("https://attacker.example"));
-        assert!(require_same_origin(&headers, &allowed).is_err());
-        headers.insert(HOST, HeaderValue::from_static("attacker.example"));
-        assert!(require_same_origin(&headers, &allowed).is_err());
-        headers.remove(ORIGIN);
-        assert!(require_same_origin(&headers, &allowed).is_err());
-    }
-
-    #[test]
-    fn terminal_public_origin_is_explicit_and_https() {
-        let origins = terminal_origins(3737, Some("https://desktop.example")).unwrap();
-        assert!(origins.contains("http://127.0.0.1:3737"));
-        assert!(origins.contains("http://localhost:3737"));
-        assert!(origins.contains("https://desktop.example"));
-        assert_eq!(
-            normalize_public_origin("https://desktop.example:443", "--public-url").unwrap(),
-            "https://desktop.example"
-        );
-        assert!(terminal_origins(3737, Some("http://desktop.example")).is_err());
-    }
-
-    #[test]
-    fn browser_terminal_profile_does_not_copy_server_environment() {
-        let profile = browser_terminal_profile(37, 121);
-        assert_eq!(profile.term.as_deref(), Some("xterm-256color"));
-        assert_eq!(profile.colorterm.as_deref(), Some("truecolor"));
-        assert_eq!(profile.rows, 37);
-        assert_eq!(profile.cols, 121);
-        assert_eq!(profile.pixel_width, 0);
-        assert_eq!(profile.pixel_height, 0);
-    }
-
-    #[test]
-    fn browser_terminal_dimensions_use_fitted_grid_with_bounded_fallback() {
-        assert_eq!(
-            requested_terminal_dimensions(
-                TerminalDimensions {
-                    rows: Some(42),
-                    cols: Some(132),
-                },
-                24,
-                80,
-            )
-            .ok(),
-            Some((42, 132))
-        );
-        assert_eq!(
-            requested_terminal_dimensions(TerminalDimensions::default(), 24, 80).ok(),
-            Some((24, 80))
-        );
-        assert!(
-            requested_terminal_dimensions(
-                TerminalDimensions {
-                    rows: Some(1_001),
-                    cols: Some(80),
-                },
-                24,
-                80,
-            )
-            .is_err()
         );
     }
 

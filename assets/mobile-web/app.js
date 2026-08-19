@@ -1,7 +1,5 @@
 "use strict";
 
-import { createWebTerminal } from "./terminal.js";
-
 const POLL_INTERVAL_MS = 2_000;
 const state = {
   snapshot: null,
@@ -11,9 +9,6 @@ const state = {
   snapshotRequest: null,
   detailRequest: null,
   online: true,
-  terminalView: null,
-  terminalSession: null,
-  terminalAttempt: null,
 };
 
 const elements = {
@@ -224,16 +219,6 @@ async function fetchJson(url, signal) {
   return response.json();
 }
 
-async function postJson(url) {
-  const response = await fetch(url, {
-    method: "POST",
-    cache: "no-store",
-    headers: { Accept: "application/json" },
-  });
-  if (!response.ok) throw new Error(`Request failed (${response.status})`);
-  return response.json();
-}
-
 async function refreshSnapshot() {
   state.snapshotRequest?.abort();
   const controller = new AbortController();
@@ -311,206 +296,18 @@ function renderDetail(payload) {
     if (nativeUrl) nativeLink.href = nativeUrl;
   }
 
+  const terminal = document.querySelector("#terminal-output");
   const terminalSection = document.querySelector("#terminal-section");
-  const route = routeDetail();
-  const routeKey = route && `${route.nodeId}/${route.agentId}`;
-  syncTerminalView(payload, routeKey);
+  const notice = document.querySelector("#terminal-notice");
+  terminal.textContent = payload.terminal_output || "No rendered terminal output is available.";
+  terminal.classList.toggle("is-empty", !payload.terminal_output);
   terminalSection.dataset.available = String(Boolean(payload.terminal_available));
+  notice.textContent = payload.notice || (payload.terminal_available
+    ? "The terminal is available, but no output has been rendered yet."
+    : "Terminal output is not available for this agent.");
 
   elements.detailState.hidden = true;
   elements.detailContent.hidden = false;
-}
-
-function syncTerminalView(payload, routeKey) {
-  if (!routeKey) return;
-  const key = `${routeKey}/${payload.agent.run_id || "unknown"}`;
-  if (state.terminalView?.key !== key) disposeTerminal();
-  let view = state.terminalView;
-  if (!view) {
-    view = {
-      key,
-      routeKey,
-      terminal: null,
-      sourceRows: null,
-      sourceCols: null,
-      inactive: false,
-      controlAvailable: false,
-      notice: "",
-    };
-    state.terminalView = view;
-    const container = document.querySelector("#web-terminal");
-    container.replaceChildren();
-    createWebTerminal(container, {
-      onData(data) {
-        const session = state.terminalSession;
-        if (state.terminalView === view && session?.view === view && session.socket?.readyState === WebSocket.OPEN) {
-          session.socket.send(new TextEncoder().encode(data));
-        }
-      },
-      onResize(dimensions) {
-        const session = state.terminalSession;
-        if (state.terminalView === view && session?.view === view && session.socket?.readyState === WebSocket.OPEN) {
-          session.socket.send(JSON.stringify({ type: "resize", ...dimensions }));
-        }
-      },
-    }).then((terminal) => {
-      if (state.terminalView !== view) {
-        terminal.dispose();
-        return;
-      }
-      view.terminal = terminal;
-      renderInactiveTerminal(view);
-      updateTerminalControls(view);
-    }).catch(() => {
-      if (state.terminalView !== view) return;
-      view.notice = "The Ghostty terminal renderer could not be loaded.";
-      updateTerminalControls(view);
-    });
-  }
-  view.controlAvailable = Boolean(payload.terminal_control_available);
-  view.notice = payload.notice || (payload.terminal_available
-    ? "The terminal is available, but no output has been rendered yet."
-    : "Terminal output is not available for this agent.");
-  if (state.terminalSession?.view !== view) renderInactiveTerminal(view);
-  updateTerminalControls(view);
-}
-
-function renderInactiveTerminal(view) {
-  if (!view.terminal || view.inactive) return;
-  view.terminal.setWritable(false);
-  view.terminal.reset();
-  view.inactive = true;
-}
-
-function updateTerminalControls(view, noticeOverride) {
-  if (state.terminalView !== view) return;
-  const button = document.querySelector("#take-terminal-control");
-  const label = document.querySelector("#terminal-label");
-  const notice = document.querySelector("#terminal-notice");
-  const controlled = state.terminalSession?.view === view;
-  const connecting = state.terminalAttempt?.view === view;
-  label.textContent = controlled ? "LIVE CONTROL" : "NOT ATTACHED";
-  button.hidden = controlled ? false : !view.controlAvailable || !view.terminal;
-  button.disabled = connecting;
-  button.textContent = controlled ? "Detach" : connecting ? "Connecting…" : "Take control";
-  notice.textContent = noticeOverride || (controlled
-    ? "Attached to the exact current Shell run. Detach explicitly to return control."
-    : view.notice);
-}
-
-async function takeTerminalControl() {
-  if (state.terminalSession) {
-    detachTerminalControl();
-    return;
-  }
-  if (state.terminalAttempt) return;
-  const route = routeDetail();
-  const view = state.terminalView;
-  if (!route || !view?.terminal) return;
-  const attempt = { view };
-  let session = null;
-  state.terminalAttempt = attempt;
-  const notice = document.querySelector("#terminal-notice");
-  updateTerminalControls(view);
-  try {
-    const dimensions = view.terminal.fitDimensions();
-    const grantUrl = new URL(`/api/agents/${encodeURIComponent(route.nodeId)}/${encodeURIComponent(route.agentId)}/terminal-grant`, window.location.href);
-    grantUrl.searchParams.set("rows", dimensions.rows);
-    grantUrl.searchParams.set("cols", dimensions.cols);
-    const grant = await postJson(grantUrl);
-    if (state.terminalAttempt !== attempt || state.terminalView !== view) {
-      throw new Error("Agent detail changed while requesting terminal control");
-    }
-    view.sourceRows = grant.rows;
-    view.sourceCols = grant.cols;
-    view.terminal.reset();
-    view.terminal.resize(grant.rows, grant.cols);
-    view.inactive = false;
-    session = { view, socket: null };
-    state.terminalSession = session;
-    const url = new URL(grant.websocket_url, window.location.href);
-    url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
-    const socket = new WebSocket(url);
-    session.socket = socket;
-    state.terminalAttempt = null;
-    socket.binaryType = "arraybuffer";
-    socket.addEventListener("open", () => {
-      if (state.terminalSession !== session) return;
-      view.terminal.reset();
-      view.terminal.resize(view.sourceRows, view.sourceCols);
-      view.terminal.setWritable(true);
-      updateTerminalControls(view);
-      view.terminal.focus();
-    });
-    socket.addEventListener("message", (event) => {
-      if (state.terminalSession !== session) return;
-      if (typeof event.data === "string") {
-        try {
-          const status = JSON.parse(event.data);
-          notice.textContent = status.message || "Terminal connection changed.";
-        } catch {
-          notice.textContent = "Terminal connection changed.";
-        }
-      } else {
-        view.terminal.write(new Uint8Array(event.data));
-      }
-    });
-    socket.addEventListener("close", () => {
-      if (state.terminalSession !== session) return;
-      finishTerminalSession(session, "Terminal detached. The existing desktop terminal may reclaim control.");
-    });
-    socket.addEventListener("error", () => {
-      if (state.terminalSession !== session) return;
-      notice.textContent = "The terminal connection failed.";
-    });
-  } catch {
-    const ownsAttempt = state.terminalAttempt === attempt;
-    const ownsSession = session && state.terminalSession === session;
-    if (!ownsAttempt && !ownsSession) return;
-    if (ownsAttempt) state.terminalAttempt = null;
-    if (ownsSession) {
-      state.terminalSession = null;
-      session.socket?.close();
-    }
-    if (state.terminalView !== view) return;
-    view.inactive = false;
-    renderInactiveTerminal(view);
-    updateTerminalControls(view, "Boomux could not attach to this exact Shell run. It may no longer be current.");
-  }
-}
-
-function finishTerminalSession(session, message) {
-  if (state.terminalSession !== session) return;
-  state.terminalSession = null;
-  const view = session.view;
-  if (state.terminalView !== view) return;
-  view.inactive = false;
-  renderInactiveTerminal(view);
-  updateTerminalControls(view, message);
-}
-
-function detachTerminalControl() {
-  const session = state.terminalSession;
-  state.terminalSession = null;
-  state.terminalAttempt = null;
-  if (!session) return;
-  session.socket?.close();
-  if (state.terminalView === session.view) {
-    session.view.inactive = false;
-    renderInactiveTerminal(session.view);
-    updateTerminalControls(session.view, "Terminal detached. The existing desktop terminal may reclaim control.");
-  }
-}
-
-function disposeTerminal() {
-  state.terminalAttempt = null;
-  const session = state.terminalSession;
-  state.terminalSession = null;
-  session?.socket?.close();
-  const view = state.terminalView;
-  state.terminalView = null;
-  view?.terminal?.dispose();
-  document.querySelector("#web-terminal")?.replaceChildren();
 }
 
 function derivedNativeUrl(nativeWeb) {
@@ -576,10 +373,7 @@ async function refreshDetail({ announceLoading = false } = {}) {
 }
 
 function applyRoute() {
-  const previousTerminalKey = state.terminalView?.routeKey;
   const detail = routeDetail();
-  const detailKey = detail && `${detail.nodeId}/${detail.agentId}`;
-  if (previousTerminalKey && previousTerminalKey !== detailKey) disposeTerminal();
   elements.dashboardView.hidden = Boolean(detail);
   elements.detailView.hidden = !detail;
   if (detail) {
@@ -618,9 +412,7 @@ document.querySelectorAll(".filter-button").forEach((button) => {
 });
 
 elements.refreshDetail.addEventListener("click", () => refreshDetail({ announceLoading: true }));
-document.querySelector("#take-terminal-control").addEventListener("click", takeTerminalControl);
 window.addEventListener("hashchange", applyRoute);
-window.addEventListener("beforeunload", disposeTerminal);
 window.addEventListener("focus", restartPolling);
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible") restartPolling();

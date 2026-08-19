@@ -5,8 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
     <meta name="theme-color" content="#171713">
     <meta name="color-scheme" content="dark">
-    <meta name="description" content="Observe Boomux agents and explicitly control current local terminals.">
-    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; manifest-src 'self'; worker-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'">
+    <meta name="description" content="A read-only view of Boomux agents across connected nodes.">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; manifest-src 'self'; worker-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'">
     <link rel="manifest" href="manifest.webmanifest">
     <link rel="icon" href="icon.svg" type="image/svg+xml">
     <link rel="apple-touch-icon" href="icon-192.png">
@@ -117,24 +117,21 @@
           <section class="terminal-section" id="terminal-section" aria-labelledby="terminal-title">
             <div class="section-heading">
               <div>
-                <p class="eyebrow">Shell run</p>
-                <h2 id="terminal-title">Terminal</h2>
+                <p class="eyebrow">Rendered terminal output</p>
+                <h2 id="terminal-title">Terminal preview</h2>
               </div>
-              <div class="terminal-actions">
-                <span class="terminal-label" id="terminal-label">NOT ATTACHED</span>
-                <button class="terminal-control-button" id="take-terminal-control" type="button" hidden>Take control</button>
-              </div>
+              <span class="terminal-label">OUTPUT, NOT TRANSCRIPT</span>
             </div>
-            <p class="terminal-explainer">Terminal output appears only while this browser exclusively controls the exact current Shell run. Taking control never restarts it.</p>
-            <div id="web-terminal" class="web-terminal" aria-label="Terminal" data-mode="inactive"></div>
+            <p class="terminal-explainer">This is a rendered terminal snapshot. It is not a structured conversation transcript and may contain partial or visual terminal content.</p>
+            <pre id="terminal-output" tabindex="0"></pre>
             <p class="terminal-notice" id="terminal-notice"></p>
           </section>
 
           <footer class="read-only-footer">
-            <div class="read-only-icon" aria-hidden="true">1:1</div>
+            <div class="read-only-icon" aria-hidden="true">R/O</div>
             <div>
-              <strong>Terminal control is exclusive</strong>
-              <p>No terminal output is shown until you take control. The parked machine terminal shows only the ownership notice until control returns.</p>
+              <strong>Watching, not steering</strong>
+              <p>Boomux remains a read-only lifecycle dashboard. A configured native harness link opens a separate full-control application.</p>
             </div>
           </footer>
         </article>

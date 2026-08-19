@@ -1748,25 +1748,6 @@ impl Client {
         }
     }
 
-    pub fn read_terminal_reconstruction(
-        &self,
-        shell_id: impl Into<String>,
-        run_id: impl Into<String>,
-    ) -> Result<(Vec<u8>, u64, u16, u16)> {
-        match self.request(Request::ReadTerminalReconstruction {
-            shell_id: shell_id.into(),
-            run_id: run_id.into(),
-        })? {
-            Response::TerminalReconstruction {
-                bytes,
-                output_revision,
-                rows,
-                cols,
-            } => Ok((bytes, output_revision, rows, cols)),
-            other => unexpected(other),
-        }
-    }
-
     pub fn events(
         &self,
         after: Option<EventCursor>,
@@ -1967,78 +1948,6 @@ impl Client {
         )
     }
 
-    pub fn attach_exact_run(
-        &self,
-        shell_id: impl Into<String>,
-        expected_run_id: impl Into<String>,
-        takeover: bool,
-        profile: TerminalProfile,
-    ) -> Result<Attachment> {
-        self.attach_with_restart(
-            shell_id.into(),
-            takeover,
-            false,
-            Some(expected_run_id.into()),
-            profile,
-            None,
-        )
-    }
-
-    pub fn attach_native(
-        &self,
-        shell_id: impl Into<String>,
-        expected_run_id: impl Into<String>,
-        takeover: bool,
-        profile: TerminalProfile,
-    ) -> Result<Attachment> {
-        self.attach_native_controller(
-            shell_id,
-            Some(expected_run_id.into()),
-            takeover,
-            false,
-            profile,
-        )
-    }
-
-    pub fn attach_native_controller(
-        &self,
-        shell_id: impl Into<String>,
-        expected_run_id: Option<String>,
-        takeover: bool,
-        restart_exited: bool,
-        profile: TerminalProfile,
-    ) -> Result<Attachment> {
-        let environment = self
-            .supports(protocol::ProtocolFeature::ClientEnvironment)?
-            .then(current_environment);
-        self.attach_with_controller(
-            shell_id.into(),
-            takeover,
-            restart_exited,
-            expected_run_id,
-            profile,
-            environment,
-            protocol::AttachmentControllerKind::Native,
-        )
-    }
-
-    pub fn attach_exact_run_from_web(
-        &self,
-        shell_id: impl Into<String>,
-        expected_run_id: impl Into<String>,
-        profile: TerminalProfile,
-    ) -> Result<Attachment> {
-        self.attach_with_controller(
-            shell_id.into(),
-            true,
-            false,
-            Some(expected_run_id.into()),
-            profile,
-            None,
-            protocol::AttachmentControllerKind::Web,
-        )
-    }
-
     pub fn attach_node(
         &self,
         identity: protocol::QualifiedIdentity,
@@ -2088,28 +1997,6 @@ impl Client {
         profile: TerminalProfile,
         environment: Option<UnixEnvironment>,
     ) -> Result<Attachment> {
-        self.attach_with_controller(
-            shell_id,
-            takeover,
-            restart_exited,
-            expected_run_id,
-            profile,
-            environment,
-            protocol::AttachmentControllerKind::Legacy,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn attach_with_controller(
-        &self,
-        shell_id: String,
-        takeover: bool,
-        restart_exited: bool,
-        expected_run_id: Option<String>,
-        profile: TerminalProfile,
-        environment: Option<UnixEnvironment>,
-        controller_kind: protocol::AttachmentControllerKind,
-    ) -> Result<Attachment> {
         let (stream, protocol_version, response) = self.send(Request::Attach {
             shell_id,
             takeover,
@@ -2118,7 +2005,6 @@ impl Client {
             profile,
             environment,
             owner_environment: false,
-            controller_kind,
         })?;
         attachment_from_response(stream, protocol_version, response)
     }
@@ -2258,7 +2144,6 @@ mod tests {
         let (client_done_sender, client_done_receiver) = mpsc::channel();
         let server = thread::spawn(move || {
             for _ in 0..2 {
-                reject_protocol_once(&listener, 43, 41);
                 reject_protocol_once(&listener, 42, 41);
                 let (mut stream, _) = listener.accept().unwrap();
                 let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
@@ -2278,47 +2163,6 @@ mod tests {
 
         assert_eq!(client.protocol_version().unwrap(), 41);
         let error = client.ensure_opencode_shared_runtime(4096).unwrap_err();
-        assert!(matches!(
-            error,
-            ClientError::Protocol(ProtocolError::UnsupportedVersion(_))
-        ));
-        client_done_sender.send(()).unwrap();
-
-        server.join().unwrap();
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn protocol_forty_two_daemon_rejects_terminal_reconstruction_before_request() {
-        let directory =
-            env::temp_dir().join(format!("boomux-client-reconstruction-{}", Uuid::new_v4()));
-        fs::create_dir_all(&directory).unwrap();
-        let socket = directory.join("daemon.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
-        let (client_done_sender, client_done_receiver) = mpsc::channel();
-        let server = thread::spawn(move || {
-            for _ in 0..2 {
-                reject_protocol_once(&listener, 43, 42);
-                let (mut stream, _) = listener.accept().unwrap();
-                let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
-                assert_eq!(request.version, 42);
-                assert!(matches!(request.message, Request::Ping));
-                protocol::write_message(&mut stream, &Envelope::with_version(42, Response::Pong))
-                    .unwrap();
-            }
-
-            client_done_receiver.recv().unwrap();
-            listener.set_nonblocking(true).unwrap();
-            assert!(
-                matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
-            );
-        });
-        let client = Client::from_socket_path(socket);
-
-        assert_eq!(client.protocol_version().unwrap(), 42);
-        let error = client
-            .read_terminal_reconstruction("shell-1", "run-1")
-            .unwrap_err();
         assert!(matches!(
             error,
             ClientError::Protocol(ProtocolError::UnsupportedVersion(_))
@@ -2708,7 +2552,6 @@ mod tests {
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
             reject_protocol(&listener, protocol::PROTOCOL_VERSION, 41);
-            reject_protocol(&listener, 42, 41);
             reject_protocol(&listener, 41, 40);
             reject_protocol(&listener, 40, 39);
             reject_protocol(&listener, 39, 38);
@@ -2886,7 +2729,6 @@ mod tests {
             .unwrap();
 
             reject_protocol(&listener, protocol::PROTOCOL_VERSION, 41);
-            reject_protocol(&listener, 42, 41);
             reject_protocol(&listener, 41, 40);
             reject_protocol(&listener, 40, 39);
             reject_protocol(&listener, 39, 38);
@@ -2958,7 +2800,6 @@ mod tests {
             .unwrap();
 
             reject_protocol(&listener, protocol::PROTOCOL_VERSION, 41);
-            reject_protocol(&listener, 42, 41);
             reject_protocol(&listener, 41, 40);
             reject_protocol(&listener, 40, 39);
             reject_protocol(&listener, 39, 38);
@@ -3012,7 +2853,6 @@ mod tests {
             )
             .unwrap();
             reject_protocol(&listener, protocol::PROTOCOL_VERSION, 41);
-            reject_protocol(&listener, 42, 41);
             reject_protocol(&listener, 41, 40);
             reject_protocol(&listener, 40, 39);
             reject_protocol(&listener, 39, 38);
@@ -3196,7 +3036,6 @@ mod tests {
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
             reject_protocol(&listener, protocol::PROTOCOL_VERSION, 41);
-            reject_protocol(&listener, 42, 41);
             reject_protocol(&listener, 41, 40);
             reject_protocol(&listener, 40, 39);
             reject_protocol(&listener, 39, 38);
@@ -3275,7 +3114,6 @@ mod tests {
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
             reject_protocol(&listener, protocol::PROTOCOL_VERSION, 41);
-            reject_protocol(&listener, 42, 41);
             reject_protocol(&listener, 41, 40);
             reject_protocol(&listener, 40, 39);
             reject_protocol(&listener, 39, 38);

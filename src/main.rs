@@ -370,14 +370,11 @@ struct Cli {
 enum Commands {
     /// Open the interactive workspace dashboard
     Ui,
-    /// Serve the mobile Agent dashboard on loopback
+    /// Serve the read-only mobile Agent dashboard on loopback
     Web {
         /// Loopback port for the HTTP server
         #[arg(long, default_value_t = 3737, value_parser = clap::value_parser!(u16).range(1..))]
         port: u16,
-        /// Trusted public origin allowed to request terminal control
-        #[arg(long, value_name = "URL")]
-        public_url: Option<String>,
         /// Public base URL of an authenticated OpenCode Web server
         #[arg(long, value_name = "URL")]
         opencode_web_url: Option<String>,
@@ -1758,14 +1755,12 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
         }
         Some(Commands::Web {
             port,
-            public_url,
             opencode_web_url,
             opencode_web_port,
             no_opencode_web,
         }) => {
             mobile_web::run(
                 *port,
-                public_url.as_deref(),
                 opencode_web_url.as_deref(),
                 *opencode_web_port,
                 *no_opencode_web,
@@ -14719,7 +14714,7 @@ mod tests {
                 .validated_version,
             "0.84.1"
         );
-        assert_eq!(protocol::PROTOCOL_VERSION, 43);
+        assert_eq!(protocol::PROTOCOL_VERSION, 42);
     }
 
     #[test]

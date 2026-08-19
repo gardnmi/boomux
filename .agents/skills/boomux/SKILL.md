@@ -522,23 +522,16 @@ boomux doctor
 `boomux` and `boomux ui` must run from a fresh host terminal; they are rejected
 when `BOOMUX_SHELL_ID` is set. `boomux doctor` can run in either context.
 
-`boomux web` serves an experimental read-only-by-default Agent PWA on
+`boomux web` serves an experimental read-only Agent PWA on
 `127.0.0.1:3737`. Use `--port` to change the loopback port. Boomux leaves remote
 transport, TLS, identity, and access policy to the user's private access layer.
-Pass that dashboard's exact HTTPS origin with `--public-url`; terminal control
-rejects non-loopback Host values that were not explicitly allowlisted.
-The ordinary dashboard URL offers explicit terminal control for eligible local
-ShellRuns. Boomux does not authenticate that HTTP origin; protect a published
-origin through the user's private access layer.
 It uses the Omarchy presentation model: one current user-Shell
 Agent per exact run plus historical Agents with durable attention, excluding
 schedule-owned Agents. It also presents local working-to-idle transitions as
 gateway-owned ephemeral finished alerts, refreshed even without a connected
-browser. Terminal output remains hidden until an explicit **Take control** action
-attaches to that exact local, running,
-user-owned ShellRun without restart or takeover; closing or leaving the view
-detaches it. It cannot acknowledge attention or expose or control remote and
-schedule-owned Shells. It ensures the Node's loopback Shared Harness Runtime and links exact
+browser. It displays bounded output for an exact current local Shell run, but
+cannot send terminal input, acknowledge attention, or expose remote terminal
+output. It ensures the Node's loopback Shared Harness Runtime and links exact
 local Sessions only while a current Agent Session Claim binds that runtime
 generation to the exact ShellRun. `--opencode-web-url URL` is the public origin
 for that same local runtime, never an unrelated server. `--no-opencode-web`

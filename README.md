@@ -251,19 +251,15 @@ outstanding attention item.
 
 ### Mobile Dashboard
 
-`boomux web` serves an installable, read-only-by-default Agent dashboard at
+`boomux web` serves an installable, read-only Agent dashboard at
 `http://127.0.0.1:3737`. It combines local authoritative Agent state with the
 bounded projections of registered Nodes, keeps stale ownership visible, and
 shows the same current user-Shell Agents and outstanding durable attention as
 the Omarchy Boomux plugin. A locally observed `working` to `idle` transition is
 kept by the gateway as a transient finished alert while that Agent remains idle,
-even when no browser is connected. Agent details do not expose terminal output.
-An explicit **Take control** action can attach to an eligible local current run
-without restart; terminal output appears only while that browser owns control.
-The parked machine terminal is cleared to an ownership notice until it reclaims
-control. The ordinary dashboard URL offers control for eligible runs. Remote
-projections never expose terminal output.
-The command also ensures the Node's
+even when no browser is connected. Local Agent details can show up to 256 KiB of
+rendered output only while the Agent's exact Shell run is still current. Remote
+projections never expose terminal output. The command also ensures the Node's
 Shared Harness Runtime on `127.0.0.1:4097`, so an exact claimed local OpenCode
 Agent links to the same live Session used by its desktop TUI. The TUI can be
 detached while phone events continue; on return it receives those events and is
@@ -272,17 +268,15 @@ synchronized with the phone.
 Publish both loopback services through a private access layer. For example:
 
 ```console
-boomux web --public-url https://machine.example.ts.net
+boomux web
 tailscale serve --https=443 --bg http://127.0.0.1:3737
 tailscale serve --https=4097 --bg http://127.0.0.1:4097
 ```
 
 Boomux does not configure or authenticate the private access layer, which owns
-TLS, authentication, and ACLs. `--public-url` allowlists the exact external
-dashboard origin for terminal control; unconfigured Host values remain
-read-only. Any client admitted to the configured dashboard origin can request
-terminal control, so protect that origin with the private access layer. The MVP has no remote terminal control, attention acknowledgment,
-transcript parsing, or cloud service. Native OpenCode links leave Boomux and open a full-control service whose
+TLS, authentication, and ACLs. The MVP has
+no terminal input, attention acknowledgment, transcript parsing, or cloud
+service. Native OpenCode links leave Boomux and open a full-control service whose
 origin must be protected separately. Add the remote URL
 to the phone's home screen to install the progressive web app. See
 [`docs/mobile-web.md`](docs/mobile-web.md) for the security and privacy boundary.
@@ -643,9 +637,8 @@ Revision-aware output reads and daemon event cursors are documented in
   reconstructed when a terminal reconnects.
 - One terminal window controls input for a shell at a time. Taking control from
   another window disconnects the previous window from that shell.
-- Mobile terminal output is hidden unless the browser explicitly controls an
-  exact current local user-owned Shell run. It is not structured Agent
-  conversation history.
+- The mobile dashboard is read-only and displays bounded rendered terminal
+  output, not structured Agent conversation history.
 - Seamless shared OpenCode requires a bare zero-argument interactive invocation
   in an eligible managed login Shell; `--pure`, `--mini`, absolute paths,
   modified `PATH`, and conflicting same-Session Shells fail closed.

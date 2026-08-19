@@ -446,8 +446,6 @@ Protocol 41 adds `protocol_41`, `observed_node_helper_version`, and
 `node_upgrade_coordination`.
 Protocol 42 adds `protocol_42` and
 `opencode_shared_runtime_claims`.
-Protocol 43 adds `protocol_43`, `reversible_attachment_takeover`, and
-`terminal_reconstruction_read`.
 
 Protocol-38 `workspace create` creates empty coordinator metadata without a
 default Node or cwd. First global `shell create`, `launcher create`, or
