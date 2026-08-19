@@ -38,17 +38,20 @@ The private handoff channel carries a versioned manifest followed by Unix
   identity, when it still refers to a transferred runtime
 - The latest non-durable Node-qualified presentation focus and its monotonic
   revision, including an external Node Shell when that was focused most recently
+- The Shared Harness Runtime generation, strict PID/start/runtime identity, and
+  supervision state, without Agent Session Claims
 
 The PTY master is full duplex, so reader and writer duplicates do not need to be
 transferred separately. The replacement cannot inherit Unix parenthood; process
 monitoring and cleanup therefore need an imported-process representation, with
 a Linux pidfd where available.
 
-Bootstrap starts with the `BOOMUXH4` version header and has bounded read/write
-deadlines. The receiver validates the listener path/type, forces nonblocking
-mode, matches both lock-file inodes, and establishes exclusive flock ownership
-before acknowledging readiness. Explicit abort closes every received duplicate
-without affecting descriptors retained by the old daemon.
+Bootstrap version 5 starts with the `BOOMUXH5` header, accepts an H4 sender for
+compatibility, and has bounded read/write deadlines. An H4 transfer has no
+Shared Harness Runtime record. The receiver validates the listener path/type,
+forces nonblocking mode, matches both lock-file inodes, and establishes exclusive
+flock ownership before acknowledging readiness. Explicit abort closes every
+received duplicate without affecting descriptors retained by the old daemon.
 
 For each running shell, any active controller first acknowledges its reconnect
 boundary and the old reader pauses before the manifest is captured. The
@@ -77,6 +80,14 @@ An intermediate protocol-38 replacement may omit this additive field. A
 surviving dashboard detects the negotiated protocol transition from the
 `handoff_completed` boundary and resets its observed focus frontier once, so
 each protocol's revision domain remains usable.
+
+Handoff 5 transfers a strictly identified Shared Harness Runtime generation so
+the replacement resumes supervision without changing its PID or server
+generation. Agent Session Claims deliberately do not cross the manifest.
+Surviving TUI holders reacquire claims after reconnect; until then the server
+plugin has no ShellRun lifecycle authority. Rollback leaves runtime supervision
+with the old daemon. Cold startup adopts an existing runtime only when every
+identity check matches, and `boomux daemon stop` terminates it.
 
 ## Accepted Remote Node Boundary
 

@@ -7,6 +7,43 @@ This record separates observed host behavior from reducer fixtures and intended
 semantics. Host compatibility is not inferred from process names, terminal
 output, or database recency.
 
+## 2026-08-19
+
+OpenCode `1.18.18` was live-validated with the protocol-42 Shared Harness
+Runtime. In a temporary ordinary zsh-backed Boomux Shell, bare zero-argument
+interactive `opencode` resolved through the post-startup scoped shim and ran
+stock `opencode attach` against the daemon-supervised server on port 4097. A
+Session selected through OpenCode's TUI control API produced one claim and Agent
+for the exact current ShellRun, and the Boomux web detail API returned the same
+Session's exact native OpenCode Web path. The temporary Workspace was then
+closed. This validates shared-runtime startup, zsh startup-file ordering, TUI
+plugin loading, claim creation, and phone/desktop handoff; graceful handoff and
+cold adoption remain compatibility-test evidence rather than live host
+validation.
+
+## 2026-08-18
+
+The paired shared-runtime design targets source-visible OpenCode TUI and server
+APIs at OpenCode `1.18.18`. Its TUI API path is version-gated and covered by the
+repository reducer fixture. The Shared Harness Runtime, scoped shim, claim
+reacquisition, and phone/desktop synchronization have not been live-validated;
+this record makes no such compatibility claim.
+
+OpenCode `1.18.18` was validated through the experimental mobile gateway's
+owner-local structured conversation path. A detail request for one exact local
+Agent accepted the PATH wrapper's bounded informational stdout preamble,
+revalidated the exported Session ID, and returned the newest 97 normalized
+entries from 370 under the serialized response budget. The response omitted the
+external Session ID and rendered terminal fallback. No conversation content was
+printed during the compatibility check.
+
+A separate exact local Session produced an approximately 189 MiB complete host
+export. The gateway did not weaken its 16 MiB source limit for that history and
+returned the exact run-scoped terminal fallback instead. This experimental
+adapter was subsequently removed in favor of handing exact local Sessions to
+OpenCode's native web interface; these results remain historical compatibility
+evidence only.
+
 ## 2026-08-14
 
 OpenCode `1.18.18` was validated for exact canonical transcript reading from a
@@ -79,6 +116,7 @@ The validation run was followed by:
 
 ```console
 bun test integrations/opencode/boomux.test.js
+bun test integrations/opencode/boomux-tui.test.js
 bun test integrations/pi/boomux.test.js
 cargo test
 cargo clippy --all-targets --all-features -- -D warnings

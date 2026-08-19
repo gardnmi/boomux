@@ -661,7 +661,12 @@ fn registrations_survive_cold_recovery_outside_authoritative_state() {
 
 #[test]
 fn node_upgrade_maintenance_blocks_registration_changes_until_release() {
-    let daemon = TestDaemon::start();
+    let daemon = TestDaemon::start_with(|command, runtime_dir| {
+        let ssh = runtime_dir.join("ssh");
+        fs::write(&ssh, "#!/bin/sh\nexit 64\n").unwrap();
+        fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+        command.env("PATH", format!("{}:/usr/bin:/bin", runtime_dir.display()));
+    });
     let registration = daemon
         .client
         .add_node_registration("work", "work.example", node_id(2))

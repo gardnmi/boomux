@@ -26,7 +26,7 @@
 | `src/terminal_state.rs` | Shadow VT parsing, bounded reconstruction, logical output, and structured previews |
 | `src/terminal_focus.rs` | Stateful parsing and restoration of child focus-reporting mode |
 | `src/tui.rs` | Dashboard state, interaction, palette, polling, and Ratatui rendering; no direct daemon transport |
-| `src/mobile_web.rs`, `assets/mobile-web/` | Loopback-only read-only HTTP gateway, Node-qualified Agent projection, and embedded installable web assets |
+| `src/mobile_web.rs`, `assets/mobile-web/` | Loopback-only read-only HTTP gateway, Node-qualified Agent projection, native harness web handoff, and embedded installable web assets |
 | `src/session_projection.rs` | Projection of daemon Agent state and host catalogs into client-visible sessions |
 | `src/integrations.rs` | Integration identity, display metadata, and optional installation, title/catalog, resume, and foreground capabilities |
 | `src/host_session_titles.rs` and children | Shared title/catalog policy and host-specific discovery adapters |
@@ -145,6 +145,15 @@ It also adds bounded local Node-upgrade coordination so an explicitly authorized
 SSH replacement closes registration admission across activation and commit. The
 CLI renews that lease while the transaction runs, and local daemon restart or
 stop is rejected until the lease is released or expires.
+Protocol 42 adds the `opencode_shared_runtime_claims` feature. One ephemeral
+Node-local OpenCode server generation is daemon-supervised and shared by native
+clients. Bounded Agent Session Claims map an exact root Session in that generation
+to one exact current ShellRun and ensured Agent Instance while one or more TUI
+holders maintain it. Claims are absent from durable state, snapshots,
+projections, events, and handoff; a surviving TUI reacquires after graceful
+replacement. The runtime process identity and generation do transfer.
+Handoff generation 5 accepts generation 4, whose manifest has no shared-runtime
+record.
 Remote notification presentation reuses protocol-32 atomic reduced transitions,
 so it does not require a later protocol. Node-cache schema 2 adds bounded local
 at-most-once individual and reconnect-digest claims with an explicit schema-1
@@ -279,6 +288,8 @@ The daemon supports:
 - Pending shell metadata and first-attachment terminal negotiation
 - Run-scoped agent registration, idempotent ensure, inspection, and explicit
   state reports
+- One ephemeral Node-local Shared Harness Runtime generation and bounded exact-run
+  OpenCode Agent Session Claims
 
 An empty shell specification list remains empty. When an explicit populated
 creation is requested, the daemon stages every child before publishing any of
@@ -303,6 +314,24 @@ authoritative Boomux identity. Node-qualified attachment never sends the
 presenting Node's environment. A protocol-34 owner can attach only an
 authoritatively preflighted running Shell; it cannot start or restart one
 remotely.
+
+Protocol-42 OpenCode coordination derives Workspace identity from the
+authoritative Shell and requires an exact current running ShellRun. Claim ensure
+is idempotent per runtime generation, root Session, ShellRun, and TUI holder; it
+also ensures the durable Agent Instance. Multiple holders for the same mapping
+are allowed, while a different current ShellRun for the same runtime Session is
+`busy`. Release removes one holder, expiry removes abandoned holders, and the
+last holder removes report authority. Run or runtime replacement invalidates the
+mapping. The bounded claim map is not persisted, projected, handed off, or
+event-published, so `STATE_VERSION` and all durable schemas remain unchanged.
+
+The Shared Harness Runtime is neither a durable resource nor part of the Shell
+registry. The daemon starts one generation on the first eligible bare interactive
+`opencode` or `boomux web`, supervises it, and retains it across terminal detach
+and web-client restart. Graceful handoff transfers its strict PID/start/runtime
+identity and generation; cold startup adopts only an exactly matching runtime.
+Daemon stop terminates it. A hidden shared launcher establishes a scoped `PATH`
+only for eligible Boomux login Shells and is not stable public automation.
 
 ### Attachment
 
@@ -502,26 +531,55 @@ Agent visibility follows the Omarchy presentation contract rather than exposing
 the complete durable registry. Schedule-owned Agents are excluded. For each
 exact current `(node_id, shell_id, run_id)`, the newest non-inactive and non-done
 Agent observation is shown; historical, inactive, and done Agents remain only
-while they carry outstanding durable attention. The browser retains a local
-ephemeral finished marker after observing a local current Agent transition from
-working to idle. That marker is not durable attention, is never derived from an
-initial idle baseline or remote cache update, and clears when the Agent leaves
-idle or ceases to own the exact current run.
+while they carry outstanding durable attention. A gateway-owned background
+projection worker refreshes once per second even without browser clients and
+retains an in-memory ephemeral finished marker after observing a local current
+Agent transition from working to idle. That marker is not durable attention, is
+never derived from an initial idle baseline or remote cache update, and clears
+when the Agent leaves idle, ceases to own the exact current run, or the gateway
+process restarts. A temporary daemon failure marks the cached response
+disconnected without discarding its last bounded projection or finished markers.
 
-All routes are read-only. The server has no arbitrary daemon-protocol pass-through,
-terminal attachment, input, attention acknowledgment, Session resume, or host
-transcript adapter. Local Agent detail may perform one bounded rendered Shell read
-only when the Shell's current run ID still equals the Agent's retained run ID. It
-never substitutes output from a later run. Remote projection detail contains no
-terminal output because the coordinator cache is prompt-free and non-authoritative.
+All Boomux routes are read-only. The server has no arbitrary daemon-protocol
+pass-through, terminal attachment, input, attention acknowledgment, Session
+resume, or harness transcript adapter. Local Agent detail may perform one bounded
+rendered Shell read only when the Shell's current run ID still equals the Agent's
+retained run ID. It never substitutes output from a later run. Remote projection
+detail contains no terminal output because the coordinator cache is prompt-free
+and non-authoritative.
 
-HTTP binds to `127.0.0.1` and is intended to sit behind Tailscale Serve. An
-optional exact trusted login requires Serve's `Tailscale-User-Login` header on
-every non-loopback-Host request. Direct local verification remains available
-through an exact loopback Host, while a present mismatched identity is rejected.
-Loopback binding prevents tailnet or LAN peers from spoofing either path by
-bypassing Serve. Without an exact trusted login, the owner is relying on
-local-user isolation and tailnet access policy. API responses use `no-store`,
+`boomux web` ensures the same daemon-supervised Shared Harness Runtime used by
+eligible native OpenCode TUIs. For an authoritative claimed local OpenCode Agent
+with a canonical external Session ID and UTF-8 working directory, Boomux
+base64url-encodes the directory and constructs OpenCode's exact
+`/<directory>/session/<session-id>` route. The browser derives a default public
+origin from its current scheme and hostname plus the stable runtime port.
+`--opencode-web-url` overrides that public origin for the same local runtime; it
+does not select an unrelated server. Boomux does not proxy OpenCode, persist its
+first-start username/password environment, or advertise local Session identity
+in remote projections. Attached clients must use environment consistent with
+that first start. The OpenCode origin remains a separate full-control
+security boundary behind the user's private TLS/authentication/ACL layer.
+
+In an eligible managed login Shell, only bare zero-argument interactive
+`opencode` resolves through the scoped runtime `PATH` shim and internally runs
+stock `opencode attach` against the shared server. Arguments, subcommands,
+noninteractive execution, use outside Boomux, absolute binary paths, and a
+modified `PATH` execute real OpenCode unchanged. Private bash, zsh, and fish
+startup adapters apply the shim after normal interactive shell configuration so
+startup files cannot accidentally reorder it; other shells retain fail-open
+startup behavior. The TUI plugin reactively ensures and releases claims as root
+selection switches or forks; the server
+plugin resolves a current claim before lifecycle ensure/report. Missing,
+expired, conflicting, run-changed, or generation-changed claims fail closed
+without rebinding authority. `--pure`, `--mini`, absolute paths, modified PATH,
+and conflicting same-Session Shells therefore have no native link. Remote Agents
+remain unlinked.
+
+HTTP binds to `127.0.0.1` and is intended to sit behind a user-selected private
+access layer. Boomux does not interpret proxy identity headers or configure
+remote transport, TLS, or access policy. Loopback binding prevents LAN or remote
+peers from bypassing that external boundary. API responses use `no-store`,
 the service worker caches only the public application shell, and a restrictive
 content security policy prevents external script, style, object, and framing
 origins. This edge does not expose the owner-only daemon socket over TCP.
@@ -1030,10 +1088,13 @@ exercise only the host fields and ordering Boomux consumes; the record
 deliberately distinguishes those tests from transitions observed in real
 managed sessions.
 
-### OpenCode Lifecycle Plugin
+### OpenCode Lifecycle Plugins
 
-The bundled plugin is validated against `opencode-ai` `1.18.15`. This is a
-compatibility test point rather than a runtime version pin.
+The paired bundled plugins target the source-visible OpenCode TUI API and server
+event API at the `opencode-ai` `1.18.18` compatibility point. TUI behavior is
+version-gated because that API is not a stable public package contract. This is
+a compatibility test point rather than a runtime version pin or a claim of live
+shared-runtime validation.
 
 `integrations/opencode/boomux.js` is a config-time OpenCode plugin installed by
 `boomux opencode install [--force]`. The installer targets
@@ -1044,10 +1105,12 @@ requires `--force` to replace different regular-file content. OpenCode discovers
 the global plugin file without a configuration edit, but must be quit and
 restarted after installation or replacement.
 
-The plugin activates only when both `BOOMUX_SHELL_ID` and `BOOMUX_RUN_ID` are
-present. It resolves every event's OpenCode ancestry and uses the root session
-ID as `external_session_id`; child and subagent events aggregate into that one
-root agent instance. Busy/active work, chat, tools, compaction, and resolved
+The TUI plugin activates only in an eligible managed ShellRun attached to the
+current Shared Harness Runtime generation. It reactively claims the selected
+root and updates authority after Session switches and forks. The server plugin
+resolves every event's OpenCode ancestry and current claim, then uses the root
+Session ID as `external_session_id`; child and subagent events aggregate into
+that one root Agent Instance. Busy/active work, chat, tools, compaction, and resolved
 prompts map to `working`; outstanding permission or question requests and
 session errors map to `blocked`; only root idle maps to `idle`. Blockers are
 tracked as a set. Errors remain latched until their session resumes or is
@@ -1059,13 +1122,14 @@ shell exit do not complete the instance. Once the derived state is `working`,
 later chat, tool, and compaction evidence is coalesced until a meaningful state
 transition occurs. This keeps activity bursts off the CLI and durable fsync path.
 
-On first relevant event, or after plugin reload, the plugin calls `agent ensure`
-and then reports a changed derived state when the reused durable record does not
-already represent `working`, or when another state or authority differs. Calls
-use exact argument vectors, a one-second timeout, bounded output, and the stable
-JSON envelope. Unmanaged sessions are a no-op; Boomux or ancestry failures are
-rate-limited and fail open so OpenCode continues. `run_changed` disables all
-later reports for that tracked root.
+Claim ensure creates or reacquires the durable Agent Instance before server-side
+reports are accepted. The server plugin reports a changed derived state when the
+reused durable record does not already represent `working`, or when another
+state or authority differs. Calls use exact argument vectors, a one-second
+timeout, bounded output, and the stable JSON envelope. Unclaimed Sessions are a
+no-op; Boomux, ancestry, claim, or version-gating failures are rate-limited and
+fail open so OpenCode continues. `run_changed` or runtime-generation replacement
+removes report authority rather than redirecting it.
 
 ### Pi Lifecycle Extension
 
@@ -1371,6 +1435,10 @@ remaining in raw mode. Exited shells transfer their final run metadata and
 bounded reconstructed terminal state without a PTY, pidfd, or replacement
 process. Cold startup and crash recovery still restore shells as pending and do
 not preserve live process or PTY ownership.
+The same graceful boundary transfers the Shared Harness Runtime's strict process
+identity and generation but no Agent Session Claims. Surviving TUI holders
+reacquire claims after reconnect. Cold startup adopts a runtime only when all
+identity checks match; otherwise it starts a new generation when next needed.
 
 ## Next Technical Steps
 

@@ -18,7 +18,8 @@ use crate::state_store;
 
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 pub(crate) const CHANNEL_FD: RawFd = 198;
-pub(crate) const HEADER: &[u8; 8] = b"BOOMUXH4";
+pub(crate) const HEADER: &[u8; 8] = b"BOOMUXH5";
+pub(crate) const OLD_HEADER: &[u8; 8] = b"BOOMUXH4";
 pub(crate) const LISTENER_MARKER: u8 = 1;
 pub(crate) const RUNTIME_LOCK_MARKER: u8 = 2;
 pub(crate) const STATE_LOCK_MARKER: u8 = 3;
@@ -30,6 +31,7 @@ pub(crate) const FINALIZE: u8 = 8;
 pub(crate) const COMMITTED: u8 = 9;
 pub(crate) const PTY_MARKER: u8 = 10;
 pub(crate) const PIDFD_MARKER: u8 = 11;
+pub(crate) const OPENCODE_PIDFD_MARKER: u8 = 12;
 
 #[derive(Serialize, Deserialize)]
 pub(crate) struct Manifest {
@@ -42,6 +44,8 @@ pub(crate) struct Manifest {
     pub(crate) focused_terminal: Option<FocusedTerminalSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) presented_focused_terminal: Option<QualifiedFocusedTerminalSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) opencode_runtime: Option<OpenCodeRuntimeManifest>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -73,6 +77,14 @@ pub(crate) struct ExitedManifest {
     pub(crate) code: Option<u32>,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OpenCodeRuntimeManifest {
+    pub(crate) generation_id: String,
+    pub(crate) port: u16,
+    pub(crate) pid: u32,
+}
+
 pub(crate) struct TransferredRuntime {
     pub(crate) manifest: RuntimeManifest,
     pub(crate) pty: OwnedFd,
@@ -85,6 +97,11 @@ pub(crate) struct TransferredExited {
     pub(crate) reconstruction: Vec<u8>,
 }
 
+pub(crate) struct TransferredOpenCodeRuntime {
+    pub(crate) manifest: OpenCodeRuntimeManifest,
+    pub(crate) pidfd: OwnedFd,
+}
+
 pub(crate) enum Bootstrap {
     Aborted,
     Committed {
@@ -95,9 +112,10 @@ pub(crate) enum Bootstrap {
         runtimes: Vec<TransferredRuntime>,
         exited: Vec<TransferredExited>,
         event_stream: Box<EventStreamManifest>,
-        notifications: Option<NotificationDeliveryConfig>,
+        notifications: Box<Option<NotificationDeliveryConfig>>,
         focused_terminal: Option<Box<FocusedTerminalSnapshot>>,
         presented_focused_terminal: Option<Box<QualifiedFocusedTerminalSnapshot>>,
+        opencode_runtime: Option<TransferredOpenCodeRuntime>,
     },
 }
 
@@ -107,7 +125,7 @@ pub(crate) fn receive_bootstrap(channel: RawFd) -> io::Result<Bootstrap> {
     channel.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
     let mut header = [0; HEADER.len()];
     channel.read_exact(&mut header)?;
-    if &header != HEADER {
+    if !supported_header(&header) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "replacement bootstrap version is unsupported",
@@ -122,6 +140,15 @@ pub(crate) fn receive_bootstrap(channel: RawFd) -> io::Result<Bootstrap> {
     let listener = receive_descriptor(&channel, LISTENER_MARKER)?;
     let runtime_lock = receive_descriptor(&channel, RUNTIME_LOCK_MARKER)?;
     let state_lock = receive_descriptor(&channel, STATE_LOCK_MARKER)?;
+    let opencode_runtime = manifest
+        .opencode_runtime
+        .clone()
+        .map(|manifest| {
+            let pidfd = receive_descriptor(&channel, OPENCODE_PIDFD_MARKER)?;
+            validate_pidfd(&pidfd, manifest.pid)?;
+            Ok::<_, io::Error>(TransferredOpenCodeRuntime { manifest, pidfd })
+        })
+        .transpose()?;
     let mut runtimes = Vec::with_capacity(manifest.runtimes.len());
     for manifest in manifest.runtimes {
         let pty = receive_descriptor(&channel, PTY_MARKER)?;
@@ -186,15 +213,20 @@ pub(crate) fn receive_bootstrap(channel: RawFd) -> io::Result<Bootstrap> {
             runtimes,
             exited,
             event_stream: Box::new(event_stream),
-            notifications,
+            notifications: Box::new(notifications),
             focused_terminal,
             presented_focused_terminal,
+            opencode_runtime,
         }),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "replacement bootstrap received an unsupported decision",
         )),
     }
+}
+
+fn supported_header(header: &[u8; 8]) -> bool {
+    header == HEADER || header == OLD_HEADER
 }
 
 fn validate_pty(descriptor: &OwnedFd, expected_session: u32) -> io::Result<()> {
@@ -239,6 +271,16 @@ fn validate_pidfd(descriptor: &OwnedFd, expected_pid: u32) -> io::Result<()> {
 }
 
 fn validate_manifest(manifest: &Manifest) -> io::Result<()> {
+    if manifest.opencode_runtime.as_ref().is_some_and(|runtime| {
+        runtime.port == 0
+            || runtime.pid == 0
+            || uuid::Uuid::parse_str(&runtime.generation_id).is_err()
+    }) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "handoff manifest contains an invalid OpenCode runtime",
+        ));
+    }
     if manifest
         .presented_focused_terminal
         .as_ref()
@@ -457,6 +499,14 @@ mod tests {
 
         assert!(manifest.focused_terminal.is_none());
         assert!(manifest.presented_focused_terminal.is_none());
+        assert!(manifest.opencode_runtime.is_none());
+    }
+
+    #[test]
+    fn h4_and_h5_bootstrap_headers_remain_accepted() {
+        assert!(supported_header(OLD_HEADER));
+        assert!(supported_header(HEADER));
+        assert!(!supported_header(b"BOOMUXH3"));
     }
 
     #[test]
@@ -480,6 +530,7 @@ mod tests {
                     uuid::Uuid::from_u128(2).to_string(),
                 ),
             }),
+            opencode_runtime: None,
         };
 
         let decoded: Manifest =
@@ -487,6 +538,33 @@ mod tests {
 
         assert_eq!(decoded.focused_terminal, Some(focused_terminal));
         assert_eq!(decoded.presented_focused_terminal.unwrap().revision, 5);
+    }
+
+    #[test]
+    fn manifest_round_trips_bounded_opencode_runtime() {
+        let generation_id = uuid::Uuid::new_v4().to_string();
+        let manifest = Manifest {
+            runtimes: Vec::new(),
+            exited: Vec::new(),
+            event_stream: event_stream(),
+            notifications: None,
+            focused_terminal: None,
+            presented_focused_terminal: None,
+            opencode_runtime: Some(OpenCodeRuntimeManifest {
+                generation_id: generation_id.clone(),
+                port: 4096,
+                pid: 42,
+            }),
+        };
+
+        validate_manifest(&manifest).unwrap();
+        let decoded: Manifest =
+            serde_json::from_value(serde_json::to_value(manifest).unwrap()).unwrap();
+
+        let runtime = decoded.opencode_runtime.unwrap();
+        assert_eq!(runtime.generation_id, generation_id);
+        assert_eq!(runtime.port, 4096);
+        assert_eq!(runtime.pid, 42);
     }
 
     #[test]
@@ -510,6 +588,7 @@ mod tests {
                 }),
                 focused_terminal: None,
                 presented_focused_terminal: None,
+                opencode_runtime: None,
             };
             assert_eq!(
                 validate_manifest(&manifest).unwrap_err().kind(),

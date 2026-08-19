@@ -31,7 +31,7 @@ cargo fmt --all -- --check
 cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo test --lib --bins --locked
 cargo test --test native_backend --locked -- --test-threads=1
-bun test integrations/opencode/boomux.test.js integrations/pi/boomux.test.js assets/mobile-web/mobile-model.test.js
+bun test integrations/opencode/boomux.test.js integrations/opencode/boomux-tui.test.js integrations/pi/boomux.test.js
 ```
 
 Run the narrowest relevant tests while iterating, then run the complete set
@@ -47,7 +47,7 @@ exercise process, socket, PTY, and daemon lifecycle behavior.
 | PTY, attachment, or process lifecycle | Colocated unit tests plus serial `native_backend` scenarios |
 | Graceful handoff | Serial native tests covering rollback, reconnect, PID preservation, and later cleanup |
 | TUI state or rendering | Focused `tui.rs` model, input, and rendering tests |
-| OpenCode or Pi reducer | The corresponding Bun integration test |
+| OpenCode or Pi reducer | The corresponding Bun integration test, including `boomux-tui.test.js` for OpenCode TUI claims |
 | Host compatibility claim | Focused fixtures plus an update to `docs/lifecycle-validation.md` when validated live |
 
 ## Safety And Compatibility

@@ -154,7 +154,7 @@ pub const OPENCODE: IntegrationDescriptor = IntegrationDescriptor {
     display_name: "OpenCode",
     installation: Some(InstallationCapability {
         package: "opencode-ai",
-        validated_version: "1.18.15",
+        validated_version: "1.18.18",
         asset_name: "plugin",
         content: include_str!("../integrations/opencode/boomux.js"),
         executable: "opencode",

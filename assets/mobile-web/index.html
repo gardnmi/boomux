@@ -91,7 +91,19 @@
 
           <section class="detail-facts" aria-label="Agent facts" id="detail-facts"></section>
 
-          <section class="conversation" aria-labelledby="activity-title">
+          <section class="native-handoff" aria-labelledby="native-handoff-title">
+            <div class="section-heading">
+              <div>
+                <p class="eyebrow">OpenCode</p>
+                <h2 id="native-handoff-title">Continue in OpenCode</h2>
+              </div>
+              <span class="native-handoff-label">Native web</span>
+            </div>
+            <p class="native-handoff-notice" id="native-handoff-notice"></p>
+            <a class="native-handoff-link" id="native-handoff-link" target="_blank" rel="noreferrer" referrerpolicy="no-referrer" hidden></a>
+          </section>
+
+          <section class="activity" aria-labelledby="activity-title">
             <div class="section-heading">
               <div>
                 <p class="eyebrow">Observed events</p>
@@ -119,7 +131,7 @@
             <div class="read-only-icon" aria-hidden="true">R/O</div>
             <div>
               <strong>Watching, not steering</strong>
-              <p>Replies and commands are intentionally unavailable in this read-only MVP. Open the agent in its host integration to interact.</p>
+              <p>Boomux remains a read-only lifecycle dashboard. A configured native harness link opens a separate full-control application.</p>
             </div>
           </footer>
         </article>

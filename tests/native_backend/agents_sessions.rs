@@ -1,14 +1,221 @@
 use std::fs;
+use std::net::TcpListener;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::thread;
 use std::time::Duration;
 
 use boomux::client::Client;
 use boomux::protocol::{
-    self, AgentAuthority, AgentRegistrationSpec, AgentReport, AgentState, ErrorCode, ShellSpec,
+    self, AgentAuthority, AgentRegistrationSpec, AgentReport, AgentState, ErrorCode, Request,
+    Response, ShellSpec, UnixEnvironment, UnixEnvironmentVariable,
 };
 
-use crate::support::{TestDaemon, assert_generated_name, assert_remote_code, contains, profile};
+use crate::support::{
+    TestDaemon, assert_generated_name, assert_remote_code, contains, process_exists, profile,
+    wait_until,
+};
+
+#[test]
+fn opencode_shared_runtime_and_claims_are_node_wide_and_ephemeral() {
+    let mut daemon = TestDaemon::start_with(|command, runtime_dir| {
+        let bin = runtime_dir.join("bin");
+        fs::create_dir(&bin).unwrap();
+        let opencode = bin.join("opencode");
+        fs::write(
+            &opencode,
+            "#!/bin/sh\nexec python3 -c 'import socket,sys,time; assert sys.argv[1:4] == [\"serve\", \"--hostname\", \"127.0.0.1\"]; assert sys.argv[4] == \"--port\"; s=socket.socket(); s.bind((\"127.0.0.1\", int(sys.argv[5]))); s.listen(); time.sleep(60)' \"$@\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&opencode, fs::Permissions::from_mode(0o700)).unwrap();
+        command.env(
+            "PATH",
+            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+        );
+    });
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let occupied = daemon
+        .client
+        .ensure_opencode_shared_runtime(port)
+        .unwrap_err();
+    assert_remote_code(&occupied, ErrorCode::Busy);
+    drop(listener);
+    let runtime = daemon.client.ensure_opencode_shared_runtime(port).unwrap();
+    assert_eq!(
+        daemon.client.ensure_opencode_shared_runtime(port).unwrap(),
+        runtime
+    );
+    assert_eq!(
+        daemon.client.get_opencode_shared_runtime().unwrap(),
+        Some(runtime.clone())
+    );
+    let conflict = daemon
+        .client
+        .ensure_opencode_shared_runtime(port.saturating_add(1))
+        .unwrap_err();
+    assert_remote_code(&conflict, ErrorCode::Busy);
+
+    let workspace = daemon
+        .client
+        .create_workspace(
+            "shared-claim",
+            vec![ShellSpec::login("opencode", std::env::temp_dir())],
+        )
+        .unwrap();
+    let shell_id = workspace.shells[0].id.clone();
+    let attachment = daemon.client.attach(&shell_id, false, profile()).unwrap();
+    let run_id = daemon.client.get_shell(&shell_id).unwrap().run.unwrap().id;
+    let holder_one = uuid::Uuid::new_v4().to_string();
+    let holder_two = uuid::Uuid::new_v4().to_string();
+    let spec = |root: &str| AgentRegistrationSpec {
+        name: "opencode-agent".into(),
+        integration: "opencode".into(),
+        external_session_id: Some(root.into()),
+        report: AgentReport {
+            state: AgentState::Working,
+            authority: AgentAuthority::LifecycleIntegration,
+            evidence: "native shared claim".into(),
+            confidence: 100,
+        },
+    };
+    let (first, agent) = daemon
+        .client
+        .ensure_opencode_session_claim(
+            &runtime.generation_id,
+            &holder_one,
+            "ses_native_shared",
+            &shell_id,
+            &run_id,
+            spec("ses_native_shared"),
+        )
+        .unwrap();
+    let baseline = daemon.client.events(None, 256, 0).unwrap().cursor;
+    let (second, second_agent) = daemon
+        .client
+        .ensure_opencode_session_claim(
+            &runtime.generation_id,
+            &holder_two,
+            "ses_native_shared",
+            &shell_id,
+            &run_id,
+            spec("ses_native_shared"),
+        )
+        .unwrap();
+    assert_eq!(second.claim_id, first.claim_id);
+    assert_eq!(second.holder_count, 2);
+    assert_eq!(second_agent.id, agent.id);
+    assert!(
+        daemon
+            .client
+            .events(Some(baseline), 256, 0)
+            .unwrap()
+            .events
+            .is_empty()
+    );
+    let wrong_generation = daemon
+        .client
+        .report_claimed_opencode_agent(
+            uuid::Uuid::new_v4().to_string(),
+            "ses_native_shared",
+            AgentReport {
+                state: AgentState::Blocked,
+                authority: AgentAuthority::LifecycleIntegration,
+                evidence: "unauthorized".into(),
+                confidence: 100,
+            },
+        )
+        .unwrap_err();
+    assert_remote_code(&wrong_generation, ErrorCode::NotFound);
+    let runtime_pid = runtime.pid.unwrap() as libc::pid_t;
+    drop(attachment);
+    daemon.stop_with_cli();
+    wait_until(
+        || !process_exists(runtime_pid),
+        "OpenCode shared runtime survived daemon stop",
+    );
+}
+
+#[test]
+fn opencode_runtime_receives_exact_ephemeral_environment_and_cold_adopts() {
+    let mut daemon = TestDaemon::start_with(|command, runtime_dir| {
+        let bin = runtime_dir.join("bin");
+        fs::create_dir(&bin).unwrap();
+        let opencode = bin.join("opencode");
+        fs::write(
+            &opencode,
+            "#!/bin/sh\nprintf '%s\\n%s\\n%s\\n' \"$OPENCODE_SERVER_USERNAME\" \"$OPENCODE_SERVER_PASSWORD\" \"${BOOMUX_SHELL_ID-unset}\" > \"$CAPTURE\"\nexec python3 -c 'import socket,sys,time; s=socket.socket(); s.bind((\"127.0.0.1\", int(sys.argv[5]))); s.listen(); time.sleep(60)' \"$@\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&opencode, fs::Permissions::from_mode(0o700)).unwrap();
+        command.env(
+            "PATH",
+            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+        );
+    });
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let capture = daemon.runtime_dir.join("opencode-environment");
+    let path = format!(
+        "{}:{}",
+        daemon.runtime_dir.join("bin").display(),
+        std::env::var("PATH").unwrap()
+    );
+    let response = daemon
+        .client
+        .request(Request::EnsureOpenCodeSharedRuntime {
+            port,
+            environment: Some(UnixEnvironment {
+                variables: vec![
+                    UnixEnvironmentVariable {
+                        name: b"PATH".to_vec(),
+                        value: path.into_bytes(),
+                    },
+                    UnixEnvironmentVariable {
+                        name: b"CAPTURE".to_vec(),
+                        value: capture.as_os_str().as_encoded_bytes().to_vec(),
+                    },
+                    UnixEnvironmentVariable {
+                        name: b"OPENCODE_SERVER_USERNAME".to_vec(),
+                        value: b"boomux-user".to_vec(),
+                    },
+                    UnixEnvironmentVariable {
+                        name: b"OPENCODE_SERVER_PASSWORD".to_vec(),
+                        value: b"boomux-password".to_vec(),
+                    },
+                    UnixEnvironmentVariable {
+                        name: b"BOOMUX_SHELL_ID".to_vec(),
+                        value: b"must-not-leak".to_vec(),
+                    },
+                ],
+            }),
+        })
+        .unwrap();
+    let Response::OpenCodeSharedRuntime {
+        runtime: Some(before),
+    } = response
+    else {
+        panic!("unexpected shared runtime response: {response:?}");
+    };
+    assert_eq!(
+        fs::read_to_string(&capture).unwrap(),
+        "boomux-user\nboomux-password\nunset\n"
+    );
+    let pid = before.pid.unwrap() as libc::pid_t;
+
+    daemon.crash();
+    assert!(process_exists(pid));
+    daemon.restart();
+    let after = daemon.client.ensure_opencode_shared_runtime(port).unwrap();
+    assert_eq!(after, before);
+    daemon.stop_with_cli();
+    wait_until(
+        || !process_exists(pid),
+        "cold-adopted OpenCode runtime survived daemon stop",
+    );
+    assert!(TcpListener::bind(("127.0.0.1", port)).is_ok());
+}
 
 #[test]
 fn agent_runtime_is_revisioned_durable_and_version_compatible() {

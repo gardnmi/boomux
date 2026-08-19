@@ -1,11 +1,10 @@
 "use strict";
 
-const CACHE_NAME = "boomux-agent-watch-v2";
+const CACHE_NAME = "boomux-agent-watch-v11";
 const APP_SHELL = [
   "./",
   "./index.html",
   "./app.js",
-  "./mobile-model.js",
   "./styles.css",
   "./manifest.webmanifest",
   "./icon.svg",
@@ -42,6 +41,14 @@ self.addEventListener("fetch", (event) => {
   }
 
   event.respondWith(
-    caches.match(request).then((cached) => cached || fetch(request)),
+    fetch(request)
+      .then((response) => {
+        if (response.ok) {
+          const copy = response.clone();
+          caches.open(CACHE_NAME).then((cache) => cache.put(request, copy));
+        }
+        return response;
+      })
+      .catch(() => caches.match(request)),
   );
 });

@@ -104,6 +104,27 @@ The canonical external conversation projected into one workspace from Agent Inst
 history. It can span multiple shell runs and Agent Instances that share an integration and exact
 external session identity, but it owns no process, PTY, or lifecycle observation.
 
+## Shared Harness Runtime
+
+One ephemeral Node-local, daemon-supervised generation of an external harness
+server shared by native clients. It is not a Shell, Command, Launcher, Agent,
+Session, or durable resource. The first bare interactive `opencode` in an
+eligible managed login Shell, or `boomux web`, starts it. It survives terminal
+detach, `boomux web` restart, and graceful daemon handoff. Cold adoption requires
+strict runtime identity, and `boomux daemon stop` stops it.
+
+## Agent Session Claim
+
+A bounded ephemeral mapping from one exact external root Session in one Shared
+Harness Runtime generation to one exact current ShellRun and an ensured Agent
+Instance. One or more TUI holders maintain the claim. It authorizes the paired
+server lifecycle plugin to resolve reports; it is not an Agent Instance, Agent
+Session, process, controller, projection, event, or durable identity.
+Expiry, final-holder release, ShellRun replacement, or runtime-generation
+replacement removes authority without deleting or moving durable Agent history.
+Claims are not persisted, projected, event-published, or transferred during
+daemon handoff; surviving TUIs reacquire them from the replacement daemon.
+
 ## Agent Schedule
 
 A durable workspace-owned definition for recurring prompt-driven Agent work with fixed execution

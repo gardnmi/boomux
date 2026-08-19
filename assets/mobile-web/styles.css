@@ -344,10 +344,10 @@ h1 {
 .fact strong { font-size: .86rem; }
 .fact span { margin-top: 5px; color: var(--muted); font-size: .7rem; }
 
-.conversation, .terminal-section { padding: 42px 0; border-bottom: 1px solid var(--line); }
+.native-handoff, .activity, .terminal-section { padding: 42px 0; border-bottom: 1px solid var(--line); }
 .section-heading { display: flex; margin-bottom: 25px; align-items: end; justify-content: space-between; gap: 20px; }
 .section-heading h2 { margin: 0; font-size: 1.65rem; letter-spacing: -.025em; }
-.revision, .terminal-label { color: var(--muted); font-size: .6rem; font-weight: 900; letter-spacing: .12em; text-transform: uppercase; }
+.revision, .terminal-label, .native-handoff-label { color: var(--muted); font-size: .6rem; font-weight: 900; letter-spacing: .12em; text-transform: uppercase; }
 .terminal-label { color: var(--acid); }
 
 .timeline { position: relative; margin: 0; padding: 0; list-style: none; }
@@ -364,6 +364,10 @@ h1 {
 .timeline-content p { margin: 7px 0; color: var(--paper-dim); font-family: Georgia, serif; font-size: .88rem; line-height: 1.55; white-space: pre-wrap; }
 .timeline-kind { color: var(--muted); font-size: .58rem; font-weight: 900; letter-spacing: .12em; text-transform: uppercase; }
 .timeline-empty { padding: 24px; border: 1px dashed var(--line); color: var(--muted); font-family: Georgia, serif; text-align: center; }
+
+.native-handoff-notice { max-width: 760px; margin: -8px 0 20px; color: var(--paper-dim); font-family: Georgia, serif; font-size: .9rem; line-height: 1.6; }
+.native-handoff-link { display: inline-flex; min-height: 48px; padding: 0 20px; border: 1px solid var(--acid); align-items: center; color: var(--ink); background: var(--acid); font-size: .76rem; font-weight: 900; letter-spacing: .09em; text-decoration: none; text-transform: uppercase; }
+.native-handoff-link:hover { color: var(--acid); background: transparent; }
 
 .terminal-explainer { max-width: 760px; margin-bottom: 16px; color: var(--paper-dim); font-family: Georgia, serif; font-size: .82rem; line-height: 1.55; }
 #terminal-output {
@@ -427,12 +431,13 @@ h1 {
   .detail-facts { grid-template-columns: 1fr; }
   .fact, .fact:first-child { padding: 17px 0; border-right: 0; border-bottom: 1px solid var(--line); }
   .fact:last-child { border-bottom: 0; }
-  .conversation, .terminal-section { padding: 34px 0; }
+  .native-handoff, .activity, .terminal-section { padding: 34px 0; }
   .section-heading { display: block; }
-  .revision, .terminal-label { display: inline-block; margin-top: 10px; }
+  .revision, .terminal-label, .native-handoff-label { display: inline-block; margin-top: 10px; }
   .timeline-header { display: block; }
   .timeline-header time { display: block; margin-top: 4px; }
   #terminal-output { margin-right: -18px; margin-left: -18px; border-right: 0; border-left: 0; }
+  .native-handoff-link { display: flex; justify-content: center; }
 }
 
 @media (prefers-reduced-motion: reduce) {
