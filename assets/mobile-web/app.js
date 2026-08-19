@@ -3,20 +3,15 @@
 const POLL_INTERVAL_MS = 2_000;
 const state = {
   snapshot: null,
-  filter: "attention",
+  filter: "all",
   deferredInstallPrompt: null,
   pollTimer: null,
   snapshotRequest: null,
-  detailRequest: null,
   online: true,
 };
 
 const elements = {
-  dashboardView: document.querySelector("#dashboard-view"),
-  detailView: document.querySelector("#detail-view"),
   dashboardState: document.querySelector("#dashboard-state"),
-  detailState: document.querySelector("#detail-state"),
-  detailContent: document.querySelector("#detail-content"),
   agentList: document.querySelector("#agent-list"),
   resultCount: document.querySelector("#result-count"),
   viewerCopy: document.querySelector("#viewer-copy"),
@@ -24,7 +19,6 @@ const elements = {
   connectionStatus: document.querySelector("#connection-status"),
   connectionLabel: document.querySelector("#connection-label"),
   installButton: document.querySelector("#install-button"),
-  refreshDetail: document.querySelector("#refresh-detail"),
   counts: {
     attention: document.querySelector("#count-attention"),
     active: document.querySelector("#count-active"),
@@ -42,17 +36,6 @@ function el(tag, className, text) {
 
 function formatState(value) {
   return String(value || "unknown").replaceAll("_", " ");
-}
-
-function formatTime(timestamp) {
-  if (!Number.isFinite(timestamp)) return "Unknown";
-  return new Intl.DateTimeFormat(undefined, {
-    month: "short",
-    day: "numeric",
-    hour: "numeric",
-    minute: "2-digit",
-    second: "2-digit",
-  }).format(new Date(timestamp));
 }
 
 function relativeTime(timestamp) {
@@ -96,20 +79,6 @@ function usefulAgentOrder(a, b) {
   return rank(a) - rank(b) || (b.observed_at_ms || 0) - (a.observed_at_ms || 0);
 }
 
-function detailHash(agent) {
-  return `#/agents/${encodeURIComponent(agent.node_id)}/${encodeURIComponent(agent.agent_id)}`;
-}
-
-function routeDetail() {
-  const match = location.hash.match(/^#\/agents\/([^/]+)\/([^/]+)$/);
-  if (!match) return null;
-  try {
-    return { nodeId: decodeURIComponent(match[1]), agentId: decodeURIComponent(match[2]) };
-  } catch {
-    return null;
-  }
-}
-
 function showState(container, title, message, kind = "empty") {
   container.replaceChildren();
   const symbol = el("span", `state-symbol state-symbol-${kind}`, kind === "error" ? "!" : "·");
@@ -134,8 +103,8 @@ function renderSnapshot() {
   elements.counts.agents.textContent = counts.agents ?? snapshot.agents?.length ?? 0;
   elements.counts.stale.textContent = counts.stale_nodes ?? 0;
   elements.viewerCopy.textContent = snapshot.viewer
-    ? `Read-only fleet view for ${snapshot.viewer}.`
-    : "Read-only visibility across the fleet.";
+    ? `Current work and attention for ${snapshot.viewer}.`
+    : "Current work and attention across your Boomux nodes.";
   elements.lastUpdated.textContent = `Snapshot ${relativeTime(snapshot.generated_at_ms)}`;
 
   const filtered = agents.filter((agent) => {
@@ -162,8 +131,7 @@ function renderSnapshot() {
 
 function renderAgentCard(agent) {
   const item = el("li", `agent-card tone-${toneFor(agent)}`);
-  const link = el("a", "agent-card-link");
-  link.href = detailHash(agent);
+  const content = el("article", "agent-card-content");
 
   const rail = el("span", "card-rail");
   rail.setAttribute("aria-hidden", "true");
@@ -198,8 +166,19 @@ function renderAgentCard(agent) {
     body.append(el("p", "stale-callout", "Node data is stale; this status may be out of date."));
   }
   body.append(meta);
-  link.append(rail, body, el("span", "card-arrow", "→"));
-  item.append(link);
+  const nativeUrl = agent.native_web?.url || derivedNativeUrl(agent.native_web);
+  if (nativeUrl) {
+    const actions = el("div", "card-actions");
+    const nativeLink = el("a", "card-native-link", agent.native_web.label || "Open in OpenCode");
+    nativeLink.href = nativeUrl;
+    nativeLink.target = "_blank";
+    nativeLink.rel = "noreferrer";
+    nativeLink.referrerPolicy = "no-referrer";
+    actions.append(nativeLink);
+    body.append(actions);
+  }
+  content.append(rail, body);
+  item.append(content);
   return item;
 }
 
@@ -245,71 +224,6 @@ async function refreshSnapshot() {
   }
 }
 
-function renderDetail(payload) {
-  const agent = payload.agent;
-  document.title = `${agentDisplayName(agent)} · Boomux Agents`;
-  document.querySelector("#detail-title").textContent = agentDisplayName(agent);
-  document.querySelector("#detail-integration").textContent = agent.integration || "Agent";
-  document.querySelector("#detail-location").textContent = `${agent.workspace_name || "Unnamed workspace"} / ${agent.shell_name || "Unnamed shell"}`;
-  document.querySelector("#detail-revision").textContent = `Observation r${agent.observation_revision ?? "?"}`;
-
-  const glyph = document.querySelector("#detail-glyph");
-  glyph.dataset.tone = toneFor(agent);
-  const badge = document.querySelector("#detail-badge");
-  badge.textContent = formatState(agent.state);
-  badge.dataset.tone = toneFor(agent);
-
-  const facts = document.querySelector("#detail-facts");
-  facts.replaceChildren(
-    fact("Node", agent.node_alias || agent.node_id, agent.node_stale ? "Stale" : agent.node_health || "Current"),
-    fact("Started", formatTime(agent.started_at_ms), relativeTime(agent.started_at_ms)),
-    fact("Run ID", agent.run_id || "Unavailable", agent.run_current ? "Current run" : "Historical run"),
-  );
-
-  const timeline = document.querySelector("#timeline");
-  const events = Array.isArray(payload.timeline) ? [...payload.timeline] : [];
-  if (agent.just_completed && !agent.attention) {
-    events.push({
-      kind: "completion",
-      at_ms: agent.observed_at_ms,
-      title: "Turn completed",
-      body: "This local completion was observed from the working-to-idle transition and is ready for review.",
-      tone: "success",
-    });
-  }
-  events.sort((left, right) => (left.at_ms || 0) - (right.at_ms || 0));
-  timeline.replaceChildren(...events.map(renderTimelineEvent));
-  if (!events.length) {
-    const empty = el("li", "timeline-empty", "No timeline events have been observed for this run.");
-    timeline.append(empty);
-  }
-
-  const nativeWeb = payload.native_web;
-  const nativeLink = document.querySelector("#native-handoff-link");
-  const nativeNotice = document.querySelector("#native-handoff-notice");
-  if (nativeLink && nativeNotice) {
-    nativeNotice.textContent = payload.native_web_notice || "Native web handoff is unavailable.";
-    const nativeUrl = nativeWeb?.url || derivedNativeUrl(nativeWeb);
-    nativeLink.hidden = !nativeUrl;
-    nativeLink.removeAttribute("href");
-    nativeLink.textContent = nativeWeb?.label || "Open native interface";
-    if (nativeUrl) nativeLink.href = nativeUrl;
-  }
-
-  const terminal = document.querySelector("#terminal-output");
-  const terminalSection = document.querySelector("#terminal-section");
-  const notice = document.querySelector("#terminal-notice");
-  terminal.textContent = payload.terminal_output || "No rendered terminal output is available.";
-  terminal.classList.toggle("is-empty", !payload.terminal_output);
-  terminalSection.dataset.available = String(Boolean(payload.terminal_available));
-  notice.textContent = payload.notice || (payload.terminal_available
-    ? "The terminal is available, but no output has been rendered yet."
-    : "Terminal output is not available for this agent.");
-
-  elements.detailState.hidden = true;
-  elements.detailContent.hidden = false;
-}
-
 function derivedNativeUrl(nativeWeb) {
   if (!nativeWeb?.port || !nativeWeb?.path) return null;
   const url = new URL(window.location.href);
@@ -320,77 +234,9 @@ function derivedNativeUrl(nativeWeb) {
   return url.href;
 }
 
-function clearNativeHandoff() {
-  const nativeLink = document.querySelector("#native-handoff-link");
-  if (!nativeLink) return;
-  nativeLink.hidden = true;
-  nativeLink.removeAttribute("href");
-}
-
-function fact(label, value, note) {
-  const node = el("div", "fact");
-  node.append(el("small", "", label), el("strong", "", value), el("span", "", note));
-  return node;
-}
-
-function renderTimelineEvent(event) {
-  const item = el("li", "timeline-event");
-  item.dataset.tone = event.tone || "neutral";
-  const marker = el("span", "timeline-marker");
-  marker.setAttribute("aria-hidden", "true");
-  const content = el("div", "timeline-content");
-  const header = el("div", "timeline-header");
-  header.append(el("strong", "", event.title || formatState(event.kind)), el("time", "", formatTime(event.at_ms)));
-  const body = el("p", "", event.body || "No additional detail.");
-  content.append(header, body, el("small", "timeline-kind", formatState(event.kind)));
-  item.append(marker, content);
-  return item;
-}
-
-async function refreshDetail({ announceLoading = false } = {}) {
-  const route = routeDetail();
-  if (!route) return;
-  state.detailRequest?.abort();
-  const controller = new AbortController();
-  state.detailRequest = controller;
-  if (announceLoading || elements.detailContent.hidden) {
-    elements.detailContent.hidden = true;
-    showState(elements.detailState, "Loading agent detail…", "Fetching the latest observation.");
-  }
-  try {
-    const url = `/api/agents/${encodeURIComponent(route.nodeId)}/${encodeURIComponent(route.agentId)}`;
-    const payload = await fetchJson(url, controller.signal);
-    if (routeDetail()?.nodeId === route.nodeId && routeDetail()?.agentId === route.agentId) renderDetail(payload);
-  } catch (error) {
-    if (error.name === "AbortError") return;
-    clearNativeHandoff();
-    if (elements.detailContent.hidden) {
-      showState(elements.detailState, "Agent detail unavailable", "The run may have ended or the node cannot be reached. Return to the fleet or try again.", "error");
-    }
-  } finally {
-    if (state.detailRequest === controller) state.detailRequest = null;
-  }
-}
-
-function applyRoute() {
-  const detail = routeDetail();
-  elements.dashboardView.hidden = Boolean(detail);
-  elements.detailView.hidden = !detail;
-  if (detail) {
-    refreshDetail({ announceLoading: true });
-  } else {
-    state.detailRequest?.abort();
-    document.title = "Boomux Agents";
-    renderSnapshot();
-  }
-  window.scrollTo({ top: 0, behavior: "instant" });
-}
-
 async function poll() {
   if (document.visibilityState !== "visible") return;
-  const requests = [refreshSnapshot()];
-  if (routeDetail()) requests.push(refreshDetail());
-  await Promise.all(requests);
+  await refreshSnapshot();
 }
 
 function restartPolling() {
@@ -411,8 +257,6 @@ document.querySelectorAll(".filter-button").forEach((button) => {
   });
 });
 
-elements.refreshDetail.addEventListener("click", () => refreshDetail({ announceLoading: true }));
-window.addEventListener("hashchange", applyRoute);
 window.addEventListener("focus", restartPolling);
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible") restartPolling();
@@ -444,5 +288,4 @@ if ("serviceWorker" in navigator) {
   });
 }
 
-applyRoute();
 restartPolling();

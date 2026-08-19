@@ -46,6 +46,7 @@ mod mobile_web;
 mod process_adapter;
 mod projects;
 mod session_projection;
+mod tailscale_serve;
 mod terminal;
 mod tui;
 
@@ -372,6 +373,8 @@ enum Commands {
     Ui,
     /// Serve the read-only mobile Agent dashboard on loopback
     Web {
+        #[command(subcommand)]
+        command: Option<WebCommands>,
         /// Loopback port for the HTTP server
         #[arg(long, default_value_t = 3737, value_parser = clap::value_parser!(u16).range(1..))]
         port: u16,
@@ -384,6 +387,11 @@ enum Commands {
         /// Do not start or advertise OpenCode Web
         #[arg(long, conflicts_with = "opencode_web_url")]
         no_opencode_web: bool,
+        /// Expose the dashboard and OpenCode Web to the current Tailscale tailnet
+        #[arg(long, conflicts_with = "opencode_web_url")]
+        tailscale: bool,
+        #[arg(long, hide = true)]
+        require_running_daemon: bool,
     },
     /// Check that Boomux's dependencies and daemon are available
     Doctor,
@@ -544,6 +552,40 @@ enum Commands {
         expected_executable: String,
         expected_socket_device: u64,
         expected_socket_inode: u64,
+    },
+}
+
+#[derive(Subcommand)]
+enum WebCommands {
+    /// Start the web dashboard as a detached background process
+    Start {
+        /// Loopback port for the HTTP server
+        #[arg(long, default_value_t = 3737, value_parser = clap::value_parser!(u16).range(1..))]
+        port: u16,
+        /// Public base URL of an authenticated OpenCode Web server
+        #[arg(long, value_name = "URL")]
+        opencode_web_url: Option<String>,
+        /// Loopback port for the managed OpenCode Web server
+        #[arg(long, default_value_t = 4097, value_parser = clap::value_parser!(u16).range(1..))]
+        opencode_web_port: u16,
+        /// Do not start or advertise OpenCode Web
+        #[arg(long, conflicts_with = "opencode_web_url")]
+        no_opencode_web: bool,
+        /// Expose the dashboard and OpenCode Web to the current Tailscale tailnet
+        #[arg(long, conflicts_with = "opencode_web_url")]
+        tailscale: bool,
+    },
+    /// Report web dashboard state without starting it
+    Status {
+        /// Loopback port of the web dashboard
+        #[arg(long, default_value_t = 3737, value_parser = clap::value_parser!(u16).range(1..))]
+        port: u16,
+    },
+    /// Stop the web dashboard without stopping the daemon
+    Stop {
+        /// Loopback port of the web dashboard
+        #[arg(long, default_value_t = 3737, value_parser = clap::value_parser!(u16).range(1..))]
+        port: u16,
     },
 }
 
@@ -1326,6 +1368,9 @@ macro_rules! command_keys {
 command_keys! {
     Ui => ("ui", HumanOnly),
     Web => ("web", HumanOnly),
+    WebStart => ("web.start", Json),
+    WebStatus => ("web.status", Json),
+    WebStop => ("web.stop", Json),
     Doctor => ("doctor", HumanOnly),
     Capabilities => ("capabilities", Json),
     List => ("list", Json),
@@ -1404,6 +1449,18 @@ impl Cli {
 
     fn command_key(&self) -> CommandKey {
         match self.command.as_ref() {
+            Some(Commands::Web {
+                command: Some(WebCommands::Start { .. }),
+                ..
+            }) => CommandKey::WebStart,
+            Some(Commands::Web {
+                command: Some(WebCommands::Status { .. }),
+                ..
+            }) => CommandKey::WebStatus,
+            Some(Commands::Web {
+                command: Some(WebCommands::Stop { .. }),
+                ..
+            }) => CommandKey::WebStop,
             Some(Commands::Web { .. }) => CommandKey::Web,
             Some(Commands::Capabilities) => CommandKey::Capabilities,
             Some(Commands::List) => CommandKey::List,
@@ -1754,17 +1811,68 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
             return Ok(CliExit::Success);
         }
         Some(Commands::Web {
+            command: None,
             port,
             opencode_web_url,
             opencode_web_port,
             no_opencode_web,
+            tailscale,
+            require_running_daemon,
         }) => {
             mobile_web::run(
                 *port,
                 opencode_web_url.as_deref(),
                 *opencode_web_port,
                 *no_opencode_web,
+                *tailscale,
+                *require_running_daemon,
             )?;
+            return Ok(CliExit::Success);
+        }
+        Some(Commands::Web {
+            command:
+                Some(WebCommands::Start {
+                    port,
+                    opencode_web_url,
+                    opencode_web_port,
+                    no_opencode_web,
+                    tailscale,
+                }),
+            ..
+        }) => {
+            web_start(
+                *port,
+                opencode_web_url.as_deref(),
+                *opencode_web_port,
+                *no_opencode_web,
+                *tailscale,
+                cli.json,
+            )?;
+            return Ok(CliExit::Success);
+        }
+        Some(Commands::Web {
+            command: Some(WebCommands::Status { port }),
+            ..
+        }) => {
+            web_status(*port, cli.json)?;
+            return Ok(CliExit::Success);
+        }
+        Some(Commands::Web {
+            command: Some(WebCommands::Stop { port }),
+            ..
+        }) => {
+            let stopped = mobile_web::stop(*port)?;
+            tailscale_serve::cleanup_stale(*port)?;
+            if cli.json {
+                print_json(
+                    CommandKey::WebStop,
+                    serde_json::json!({ "running": false, "changed": stopped, "port": port }),
+                )?;
+            } else if stopped {
+                println!("Stopped Boomux web on port {port}");
+            } else {
+                println!("Boomux web is not running on port {port}");
+            }
             return Ok(CliExit::Success);
         }
         Some(Commands::Attach {
@@ -2694,6 +2802,155 @@ fn validate_rekey_confirmation(expected: &str, confirmation: &str) -> io::Result
             "Node rekey confirmation did not match the current Node ID",
         ))
     }
+}
+
+fn web_status(port: u16, json: bool) -> Result<(), Box<dyn Error>> {
+    let status = mobile_web::status(port)?;
+    if json {
+        print_json(
+            CommandKey::WebStatus,
+            status.map_or_else(
+                || serde_json::json!({ "running": false, "port": port }),
+                |status| serde_json::to_value(status).expect("web status serializes"),
+            ),
+        )?;
+    } else if let Some(status) = status {
+        println!("running ({})", status.dashboard_url);
+        if let Some(url) = status.opencode_url {
+            println!("OpenCode Web: {url}");
+        }
+    } else {
+        println!("not running (port {port})");
+    }
+    Ok(())
+}
+
+fn web_start(
+    port: u16,
+    opencode_web_url: Option<&str>,
+    opencode_web_port: u16,
+    no_opencode_web: bool,
+    tailscale: bool,
+    json: bool,
+) -> Result<(), Box<dyn Error>> {
+    let requested_opencode_port = (!no_opencode_web).then_some(opencode_web_port);
+    if let Some(status) = mobile_web::status(port)? {
+        let expected_opencode_url = requested_opencode_port.and_then(|runtime_port| {
+            if tailscale {
+                None
+            } else {
+                Some(opencode_web_url.map_or_else(
+                    || format!("http://127.0.0.1:{runtime_port}"),
+                    |url| url.trim().trim_end_matches('/').to_owned(),
+                ))
+            }
+        });
+        if status.tailscale != tailscale
+            || status.opencode_port != requested_opencode_port
+            || expected_opencode_url
+                .as_deref()
+                .is_some_and(|expected| status.opencode_url.as_deref() != Some(expected))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                format!("Boomux web is already running with different options on port {port}"),
+            )
+            .into());
+        }
+        return print_web_start(status, false, json);
+    }
+
+    let daemon = client::connect()?;
+    daemon.ping()?;
+    let executable = env::current_exe()?;
+    let socket = client::socket_path()?;
+    let runtime = socket
+        .parent()
+        .ok_or_else(|| io::Error::other("Boomux daemon socket has no runtime directory"))?;
+    let log_path = runtime.join(format!("web-{port}.log"));
+    let log = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&log_path)?;
+    let metadata = log.metadata()?;
+    if !metadata.is_file() || metadata.uid() != unsafe { libc::geteuid() } {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Boomux web log is not an owner-controlled regular file",
+        )
+        .into());
+    }
+    let stderr = log.try_clone()?;
+    let mut command = Command::new(executable);
+    command
+        .args(["web", "--port", &port.to_string()])
+        .args(["--opencode-web-port", &opencode_web_port.to_string()])
+        .arg("--require-running-daemon")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(stderr));
+    if let Some(url) = opencode_web_url {
+        command.args(["--opencode-web-url", url]);
+    }
+    if no_opencode_web {
+        command.arg("--no-opencode-web");
+    }
+    if tailscale {
+        command.arg("--tailscale");
+    }
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    let mut child = command.spawn()?;
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(15) {
+        if let Some(status) = mobile_web::status(port)? {
+            return print_web_start(status, true, json);
+        }
+        if let Some(exit) = child.try_wait()? {
+            return Err(io::Error::other(format!(
+                "Boomux web exited before becoming ready ({exit}); inspect {}",
+                log_path.display()
+            ))
+            .into());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    Err(io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!(
+            "Boomux web did not become ready; inspect {}",
+            log_path.display()
+        ),
+    )
+    .into())
+}
+
+fn print_web_start(
+    status: mobile_web::WebStatus,
+    changed: bool,
+    json: bool,
+) -> Result<(), Box<dyn Error>> {
+    if json {
+        let mut value = serde_json::to_value(&status)?;
+        value["changed"] = serde_json::json!(changed);
+        print_json(CommandKey::WebStart, value)?;
+    } else if changed {
+        println!("Started Boomux web: {}", status.dashboard_url);
+    } else {
+        println!("Boomux web is already running: {}", status.dashboard_url);
+    }
+    Ok(())
 }
 
 fn daemon_control(command: DaemonCommands, json: bool) -> Result<(), Box<dyn Error>> {
@@ -11912,6 +12169,63 @@ mod tests {
     }
 
     #[test]
+    fn parses_web_serve_and_targeted_stop() {
+        let serve =
+            Cli::try_parse_from(["boomux", "web", "--port", "4040", "--tailscale"]).unwrap();
+        assert!(matches!(
+            serve.command,
+            Some(Commands::Web {
+                command: None,
+                port: 4040,
+                tailscale: true,
+                ..
+            })
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "boomux",
+                "web",
+                "--tailscale",
+                "--opencode-web-url",
+                "https://example.test"
+            ])
+            .is_err()
+        );
+
+        let stop = Cli::try_parse_from(["boomux", "web", "stop", "--port", "4040"]).unwrap();
+        assert!(matches!(
+            stop.command,
+            Some(Commands::Web {
+                command: Some(WebCommands::Stop { port: 4040 }),
+                ..
+            })
+        ));
+        let start =
+            Cli::try_parse_from(["boomux", "web", "start", "--port", "4040", "--tailscale"])
+                .unwrap();
+        assert!(matches!(
+            start.command,
+            Some(Commands::Web {
+                command: Some(WebCommands::Start {
+                    port: 4040,
+                    tailscale: true,
+                    ..
+                }),
+                ..
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["boomux", "web", "status", "--port", "4040"])
+                .unwrap()
+                .command,
+            Some(Commands::Web {
+                command: Some(WebCommands::Status { port: 4040 }),
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn dashboard_requires_terminal_input_and_output() {
         validate_dashboard_terminal(true, true).unwrap();
         assert_eq!(
@@ -14761,6 +15075,9 @@ mod tests {
         assert_eq!(
             json_commands().collect::<Vec<_>>(),
             [
+                "web.start",
+                "web.status",
+                "web.stop",
                 "capabilities",
                 "list",
                 "shells",

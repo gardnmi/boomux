@@ -27,6 +27,7 @@
 | `src/terminal_focus.rs` | Stateful parsing and restoration of child focus-reporting mode |
 | `src/tui.rs` | Dashboard state, interaction, palette, polling, and Ratatui rendering; no direct daemon transport |
 | `src/mobile_web.rs`, `assets/mobile-web/` | Loopback-only read-only HTTP gateway, Node-qualified Agent projection, native harness web handoff, and embedded installable web assets |
+| `src/tailscale_serve.rs` | Explicit Tailscale Serve preflight, conflict detection, exact route mutation, and ephemeral ownership cleanup for `boomux web --tailscale` |
 | `src/session_projection.rs` | Projection of daemon Agent state and host catalogs into client-visible sessions |
 | `src/integrations.rs` | Integration identity, display metadata, and optional installation, title/catalog, resume, and foreground capabilities |
 | `src/host_session_titles.rs` and children | Shared title/catalog policy and host-specific discovery adapters |
@@ -527,6 +528,28 @@ projects local authoritative Agents and reduced remote Agents into a deliberatel
 unstable HTTP view model. Every resource retains its exact `(node_id, agent_id)`
 identity, and remote freshness, health, and staleness remain visible.
 
+Each HTTP port owns one Unix control socket in Boomux's private runtime
+directory. The socket answers bounded versioned status requests with the exact
+loopback or tailnet URLs and accepts a versioned stop request. `boomux web start`
+requires a running daemon, launches the foreground gateway in a detached session
+with an owner-only runtime log, and waits for that socket to report readiness.
+Equivalent starts are idempotent and mismatched options fail closed. `boomux web
+stop` waits for graceful shutdown and owner-validated socket cleanup. These
+commands do not signal guessed processes, contact the daemon shutdown path, or
+stop the Shared Harness Runtime.
+
+`--tailscale` is an explicit deployment mutation. The gateway invokes the
+PATH-resolved Tailscale CLI with exact argument vectors, requires a connected
+Node with a MagicDNS name, and preflights the current Serve JSON before changing
+it. A compatible existing route is reused but never claimed. A conflicting root
+handler fails startup before mutation. Missing dashboard HTTPS 443 and OpenCode
+HTTPS runtime-port routes are added independently, and only routes created by
+that gateway are recorded in an owner-only, versioned runtime record. Graceful
+exit removes those exact root routes; `boomux web stop` also reconciles a record
+left by a crashed gateway. Changed or externally owned routes are never removed,
+and Boomux never resets unrelated Serve configuration. Tailscale remains
+responsible for certificates, tailnet identity, grants, and ACL policy.
+
 Agent visibility follows the Omarchy presentation contract rather than exposing
 the complete durable registry. Schedule-owned Agents are excluded. For each
 exact current `(node_id, shell_id, run_id)`, the newest non-inactive and non-done
@@ -542,18 +565,16 @@ disconnected without discarding its last bounded projection or finished markers.
 
 All Boomux routes are read-only. The server has no arbitrary daemon-protocol
 pass-through, terminal attachment, input, attention acknowledgment, Session
-resume, or harness transcript adapter. Local Agent detail may perform one bounded
-rendered Shell read only when the Shell's current run ID still equals the Agent's
-retained run ID. It never substitutes output from a later run. Remote projection
-detail contains no terminal output because the coordinator cache is prompt-free
-and non-authoritative.
+resume, rendered terminal output, Agent detail route, or harness transcript
+adapter. The home-page snapshot is the complete HTTP Agent projection.
 
 `boomux web` ensures the same daemon-supervised Shared Harness Runtime used by
 eligible native OpenCode TUIs. For an authoritative claimed local OpenCode Agent
 with a canonical external Session ID and UTF-8 working directory, Boomux
 base64url-encodes the directory and constructs OpenCode's exact
-`/<directory>/session/<session-id>` route. The browser derives a default public
-origin from its current scheme and hostname plus the stable runtime port.
+`/<directory>/session/<session-id>` route on that Agent's home-page card. The
+browser derives a default public origin from its current scheme and hostname plus
+the stable runtime port.
 `--opencode-web-url` overrides that public origin for the same local runtime; it
 does not select an unrelated server. Boomux does not proxy OpenCode, persist its
 first-start username/password environment, or advertise local Session identity
@@ -577,8 +598,9 @@ and conflicting same-Session Shells therefore have no native link. Remote Agents
 remain unlinked.
 
 HTTP binds to `127.0.0.1` and is intended to sit behind a user-selected private
-access layer. Boomux does not interpret proxy identity headers or configure
-remote transport, TLS, or access policy. Loopback binding prevents LAN or remote
+access layer. Except for the explicit `--tailscale` Serve integration, Boomux
+does not configure remote transport or TLS, and it never defines access policy
+or interprets proxy identity headers. Loopback binding prevents LAN or remote
 peers from bypassing that external boundary. API responses use `no-store`,
 the service worker caches only the public application shell, and a restrictive
 content security policy prevents external script, style, object, and framing

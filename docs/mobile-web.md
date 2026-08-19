@@ -9,15 +9,13 @@
 `boomux web` provides a phone-friendly, installable view of the current Agents
 and outstanding Agent attention known to one coordinating Boomux Node. It is a
 read-only presentation layer inspired by mobile agent dashboards: durable
-attention is first, active work remains easy to scan, and an Agent detail page
-presents lifecycle observations alongside bounded rendered terminal output when
-that output is authoritative locally. An optional native handoff opens an exact
-authoritative local OpenCode Session in OpenCode Web.
+attention is first and active work remains easy to scan. Eligible Agent cards
+offer a native handoff that opens the exact authoritative local OpenCode Session
+in OpenCode Web.
 
 Boomux is not an interactive chat client. It does not parse or normalize harness
 transcripts and does not send messages, commands, permission responses, or
 question answers. OpenCode's separate native interface owns those interactions.
-Rendered Shell output remains terminal state and is labeled as such.
 
 ## Start It
 
@@ -27,6 +25,19 @@ Run the gateway on its fixed loopback interface:
 boomux web
 ```
 
+For desktop integrations or normal background use, start it detached and wait
+for readiness:
+
+```console
+boomux web start
+boomux web status
+```
+
+All lifecycle subcommands support the stable JSON envelope with commands
+`web.start`, `web.status`, and `web.stop`. Background start requires an already
+running daemon and never resurrects a stopped daemon. Repeating an equivalent
+start is idempotent; different options on the same HTTP port are rejected.
+
 The default URL is `http://127.0.0.1:3737`. Select another loopback port with
 `--port`. The command also ensures one daemon-supervised Shared Harness Runtime
 generation on `127.0.0.1:4097`; choose another stable loopback port with
@@ -34,6 +45,17 @@ generation on `127.0.0.1:4097`; choose another stable loopback port with
 OpenCode TUIs and the phone. Restarting `boomux web` does not replace that
 generation. Runtime exit withdraws native links until the daemon starts or
 strictly cold-adopts a replacement generation.
+
+Stop the default gateway without stopping the Boomux daemon or any managed
+processes:
+
+```console
+boomux web stop
+```
+
+For a gateway started with another HTTP port, pass the same port to
+`boomux web stop --port PORT`. The command is idempotent when that gateway is not
+running.
 
 Set `OPENCODE_SERVER_PASSWORD` and optionally `OPENCODE_SERVER_USERNAME` before
 the runtime's first start. They are ephemeral startup environment, are never
@@ -65,22 +87,33 @@ events, and is synchronized when the terminal returns. `--pure`, `--mini`,
 absolute paths, modified `PATH`, and otherwise ineligible invocations receive no
 claim or native link.
 
-Remote access remains an external deployment concern. Publish both loopback
-ports through a private access layer. For example, with Tailscale Serve:
+To publish both loopback services to the current Tailscale tailnet, opt in when
+starting the foreground or background gateway:
 
 ```console
-tailscale serve --https=4097 --bg http://127.0.0.1:4097
-tailscale serve --https=443 --bg http://127.0.0.1:3737
+boomux web --tailscale
+boomux web start --tailscale
 ```
 
-Open the HTTPS URL printed by Tailscale on the phone. Use the browser's **Add to
-Home Screen** action to install the progressive web app.
+Boomux requires a connected PATH-resolved Tailscale CLI and MagicDNS name. It
+reuses compatible existing Serve routes, rejects conflicts before mutation, and
+adds only missing root routes for dashboard HTTPS 443 and OpenCode HTTPS on the
+configured runtime port. `Ctrl-C` and `boomux web stop` remove only routes that
+invocation created; unrelated and compatible pre-existing Serve routes remain.
+A later stop reconciles exact owned routes after a gateway crash. Boomux does
+not configure tailnet grants or ACLs.
+
+Open the printed dashboard HTTPS URL on the phone. Use the browser's **Add to
+Home Screen** action to install the progressive web app. OpenCode Web is a
+separate full-control HTTPS origin; restrict both routes to trusted tailnet
+users and configure `OPENCODE_SERVER_PASSWORD` when tailnet policy alone is not
+the intended authentication boundary.
 
 ## Presentation Rules
 
 - Local Agents come from the authoritative local snapshot.
 - Remote Agents come from each registered Node's bounded reduced projection.
-- Every Agent link carries both its owning Node ID and Node-local Agent ID.
+- Every Agent card carries both its owning Node ID and Node-local Agent ID.
 - Schedule-owned Agents are excluded.
 - One newest non-inactive and non-done Agent is selected for each exact current
   Node, Shell, and run identity.
@@ -97,9 +130,10 @@ Home Screen** action to install the progressive web app.
 - Active counts require both a working or blocked observation and an exact match
   to the Shell's current run; retained historical observations never become live
   merely because their state label remains active-looking.
-- Opening an Agent does not acknowledge attention or change lifecycle state.
-- An exact native link is returned only for a local OpenCode Agent with a
-  canonical external Session ID, UTF-8 working directory, and current Agent
+- Opening a native Agent link does not acknowledge attention or change lifecycle
+  state.
+- An exact native link is included on a card only for a local OpenCode Agent with
+  a canonical external Session ID, UTF-8 working directory, and current Agent
   Session Claim for the Agent's exact ShellRun and Shared Harness Runtime
   generation. The directory is
   base64url-encoded for OpenCode's
@@ -107,11 +141,8 @@ Home Screen** action to install the progressive web app.
 - Native links are not produced for projected remote Agents because their
   external Session identity and working directory intentionally remain on the
   owner Node. Remote Agents remain unlinked to this Node's runtime.
-- Local terminal output is capped at 256 KiB and is read only when the durable
-  Shell still has the Agent's exact run as its current run.
-- A historical Agent never displays output from a later run of the same Shell.
-- Remote terminal output, lifecycle evidence, external Session identity, and
-  working directory remain absent from cached projections.
+- Lifecycle evidence, external Session identity, and working directory remain
+  absent from remote cached projections.
 - Browser polling stops while the page is hidden and resumes on visibility or
   focus; the gateway's background projection refresh continues independently.
 - A temporary daemon failure retains the last bounded projection with
@@ -125,13 +156,12 @@ the private access layer. That layer owns TLS, authentication, and ACLs
 appropriate for both the read-only dashboard and OpenCode's
 full-control origin. Public exposure is outside this design.
 
-Terminal output and lifecycle evidence can contain private source, paths,
-commands, prompts, credentials, or model responses. Native handoff URLs expose
-the local working-directory encoding and canonical Session ID to the authorized
-dashboard client and destination OpenCode origin. API responses carry
+Native handoff URLs expose the local working-directory encoding and canonical
+Session ID to the authorized dashboard client and destination OpenCode origin.
+API responses carry
 `Cache-Control: no-store`. The service worker caches only HTML, JavaScript, CSS,
 the manifest, and the icon; it never handles `/api/` requests. Browser storage
-does not persist Agent snapshots or terminal output.
+does not persist Agent snapshots.
 
 The HTTP API is an allowlisted projection. It cannot forward arbitrary daemon
 requests, send terminal input, acquire a Shell controller, resume a Session,
@@ -145,10 +175,8 @@ reverse proxy so this boundary remains visible.
 
 ## MVP Endpoints
 
-- `GET /api/snapshot` returns the current Node-qualified Agent cards and counts.
-- `GET /api/agents/{node_id}/{agent_id}` returns one exact Agent detail and
-  lifecycle timeline, eligible local rendered terminal output, and an optional
-  exact native OpenCode Web handoff.
+- `GET /api/snapshot` returns the current Node-qualified Agent cards, counts, and
+  optional exact native OpenCode Web handoffs.
 
 These shapes are intentionally experimental. Future native handoff for other
 harnesses must preserve each harness's runtime ownership and exact Session
