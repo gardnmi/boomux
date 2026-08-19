@@ -12,8 +12,8 @@ use boomux::protocol::{
 };
 
 use crate::support::{
-    TestDaemon, assert_generated_name, assert_remote_code, contains, process_exists, profile,
-    wait_until,
+    TestDaemon, assert_generated_name, assert_remote_code, contains, ensure_test_opencode_runtime,
+    process_exists, profile, wait_until,
 };
 
 #[test]
@@ -35,25 +35,19 @@ fn opencode_shared_runtime_and_claims_are_node_wide_and_ephemeral() {
     });
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let port = listener.local_addr().unwrap().port();
-    let occupied = daemon
-        .client
-        .ensure_opencode_shared_runtime(port)
-        .unwrap_err();
+    let occupied = ensure_test_opencode_runtime(&daemon, port).unwrap_err();
     assert_remote_code(&occupied, ErrorCode::Busy);
     drop(listener);
-    let runtime = daemon.client.ensure_opencode_shared_runtime(port).unwrap();
+    let runtime = ensure_test_opencode_runtime(&daemon, port).unwrap();
     assert_eq!(
-        daemon.client.ensure_opencode_shared_runtime(port).unwrap(),
+        ensure_test_opencode_runtime(&daemon, port).unwrap(),
         runtime
     );
     assert_eq!(
         daemon.client.get_opencode_shared_runtime().unwrap(),
         Some(runtime.clone())
     );
-    let conflict = daemon
-        .client
-        .ensure_opencode_shared_runtime(port.saturating_add(1))
-        .unwrap_err();
+    let conflict = ensure_test_opencode_runtime(&daemon, port.saturating_add(1)).unwrap_err();
     assert_remote_code(&conflict, ErrorCode::Busy);
 
     let workspace = daemon
@@ -207,7 +201,7 @@ fn opencode_runtime_receives_exact_ephemeral_environment_and_cold_adopts() {
     daemon.crash();
     assert!(process_exists(pid));
     daemon.restart();
-    let after = daemon.client.ensure_opencode_shared_runtime(port).unwrap();
+    let after = ensure_test_opencode_runtime(&daemon, port).unwrap();
     assert_eq!(after, before);
     daemon.stop_with_cli();
     wait_until(
