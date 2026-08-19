@@ -31,7 +31,7 @@ cargo fmt --all -- --check
 cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo test --lib --bins --locked
 cargo test --test native_backend --locked -- --test-threads=1
-bun test integrations/opencode/boomux.test.js integrations/pi/boomux.test.js
+bun test integrations/opencode/boomux.test.js integrations/pi/boomux.test.js assets/mobile-web/mobile-model.test.js
 ```
 
 Run the narrowest relevant tests while iterating, then run the complete set

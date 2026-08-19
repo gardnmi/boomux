@@ -42,6 +42,7 @@ mod git;
 mod host_session_source;
 mod host_session_titles;
 mod integration_management;
+mod mobile_web;
 mod process_adapter;
 mod projects;
 mod session_projection;
@@ -369,6 +370,15 @@ struct Cli {
 enum Commands {
     /// Open the interactive workspace dashboard
     Ui,
+    /// Serve the read-only mobile Agent dashboard on loopback
+    Web {
+        /// Loopback port for the HTTP server
+        #[arg(long, default_value_t = 3737, value_parser = clap::value_parser!(u16).range(1..))]
+        port: u16,
+        /// Require this exact Tailscale Serve login header
+        #[arg(long, value_name = "LOGIN")]
+        trusted_user: Option<String>,
+    },
     /// Check that Boomux's dependencies and daemon are available
     Doctor,
     /// Report stable integration capabilities without starting the daemon
@@ -1258,6 +1268,7 @@ macro_rules! command_keys {
 
 command_keys! {
     Ui => ("ui", HumanOnly),
+    Web => ("web", HumanOnly),
     Doctor => ("doctor", HumanOnly),
     Capabilities => ("capabilities", Json),
     List => ("list", Json),
@@ -1333,6 +1344,7 @@ impl Cli {
 
     fn command_key(&self) -> CommandKey {
         match self.command.as_ref() {
+            Some(Commands::Web { .. }) => CommandKey::Web,
             Some(Commands::Capabilities) => CommandKey::Capabilities,
             Some(Commands::List) => CommandKey::List,
             Some(Commands::Shells) => CommandKey::Shells,
@@ -1665,6 +1677,10 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
             )?;
             return Ok(CliExit::Success);
         }
+        Some(Commands::Web { port, trusted_user }) => {
+            mobile_web::run(*port, trusted_user.as_deref())?;
+            return Ok(CliExit::Success);
+        }
         Some(Commands::Attach {
             shell_id,
             node,
@@ -1740,6 +1756,7 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
 
     let result = match cli.command {
         Some(Commands::Ui) => dashboard(cli.terminal.as_deref()),
+        Some(Commands::Web { .. }) => unreachable!(),
         Some(Commands::Doctor) => doctor(cli.terminal.as_deref()),
         Some(Commands::Capabilities) => capabilities(cli.json),
         Some(Commands::List) => list_shells(cli.json),

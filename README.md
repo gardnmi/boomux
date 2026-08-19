@@ -145,6 +145,7 @@ boomux . --name my-project --new -- sh -lc 'cargo test | tee test.log'
 | Run one command | `boomux . --name feature-x --new -- lazygit` |
 | Choose a terminal | `boomux . --terminal Alacritty.desktop` |
 | Open the dashboard | `boomux` or `boomux ui` |
+| Open the mobile dashboard | `boomux web` |
 | Inspect daemon health | `boomux doctor` |
 | List recurring Agent work | `boomux schedule list --workspace feature-x` |
 
@@ -245,6 +246,32 @@ confirmation. Remote state remains secondary to the owning Node's authority.
 
 The workspace overview includes item and Agent-state counts plus its most urgent
 outstanding attention item.
+
+### Mobile Dashboard
+
+`boomux web` serves an installable, read-only Agent dashboard at
+`http://127.0.0.1:3737`. It combines local authoritative Agent state with the
+bounded projections of registered Nodes, keeps stale ownership visible, and
+shows the same current user-Shell Agents and outstanding durable attention as
+the Omarchy Boomux plugin. A locally observed `working` to `idle` transition is
+kept as a transient finished alert while that Agent remains idle. Local Agent
+details can show up to 256 KiB of rendered output only while the Agent's exact
+Shell run is still current. Remote projections never expose terminal output.
+
+Publish the loopback service privately with Tailscale Serve:
+
+```console
+boomux web --trusted-user you@example.com
+tailscale serve --bg http://127.0.0.1:3737
+```
+
+`--trusted-user` requires the exact `Tailscale-User-Login` header inserted by
+Tailscale Serve while preserving direct local access through an exact loopback
+Host. Without it, access relies on loopback isolation and tailnet access policy.
+The MVP has no terminal input, attention acknowledgment, session resume,
+transcript parsing, or cloud service. Add the Serve URL to the phone's home
+screen to install the progressive web app. See
+[`docs/mobile-web.md`](docs/mobile-web.md) for the security and privacy boundary.
 
 | Key | Action |
 | --- | --- |
@@ -578,6 +605,8 @@ Revision-aware output reads and daemon event cursors are documented in
   reconstructed when a terminal reconnects.
 - One terminal window controls input for a shell at a time. Taking control from
   another window disconnects the previous window from that shell.
+- The mobile dashboard is read-only and displays bounded rendered terminal
+  output, not structured Agent conversation history.
 - Slow viewers may miss live output rather than block the managed process.
 - The native backend currently targets Unix/Linux desktop environments and is
   primarily exercised on Omarchy.
@@ -588,6 +617,7 @@ Revision-aware output reads and daemon event cursors are documented in
 - [Architecture](docs/architecture.md)
 - [CLI JSON contract](docs/cli-json.md)
 - [Daemon events and revision-aware reads](docs/event-stream.md)
+- [Mobile web dashboard](docs/mobile-web.md)
 - [Live PTY handoff](docs/live-pty-handoff.md)
 - [Integration lifecycle validation](docs/lifecycle-validation.md)
 - [Boomux for Omarchy companion plugin](https://github.com/gardnmi/omarchy-boomux)

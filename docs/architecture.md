@@ -26,6 +26,7 @@
 | `src/terminal_state.rs` | Shadow VT parsing, bounded reconstruction, logical output, and structured previews |
 | `src/terminal_focus.rs` | Stateful parsing and restoration of child focus-reporting mode |
 | `src/tui.rs` | Dashboard state, interaction, palette, polling, and Ratatui rendering; no direct daemon transport |
+| `src/mobile_web.rs`, `assets/mobile-web/` | Loopback-only read-only HTTP gateway, Node-qualified Agent projection, and embedded installable web assets |
 | `src/session_projection.rs` | Projection of daemon Agent state and host catalogs into client-visible sessions |
 | `src/integrations.rs` | Integration identity, display metadata, and optional installation, title/catalog, resume, and foreground capabilities |
 | `src/host_session_titles.rs` and children | Shared title/catalog policy and host-specific discovery adapters |
@@ -487,6 +488,43 @@ Agent occurrences, never latest or nearby identities. Boomux does not read or
 project host transcript and tool content.
 Protocol 25 has no skip-next action, and the dashboard does not emulate one by
 pausing and resuming.
+
+### Mobile Web Dashboard
+
+`boomux web` is a separate presentation client in the CLI process, not a daemon
+listener or new authority. It binds only to IPv4 loopback and uses the ordinary
+typed client to obtain one combined Node snapshot per refresh. The embedded PWA
+projects local authoritative Agents and reduced remote Agents into a deliberately
+unstable HTTP view model. Every resource retains its exact `(node_id, agent_id)`
+identity, and remote freshness, health, and staleness remain visible.
+
+Agent visibility follows the Omarchy presentation contract rather than exposing
+the complete durable registry. Schedule-owned Agents are excluded. For each
+exact current `(node_id, shell_id, run_id)`, the newest non-inactive and non-done
+Agent observation is shown; historical, inactive, and done Agents remain only
+while they carry outstanding durable attention. The browser retains a local
+ephemeral finished marker after observing a local current Agent transition from
+working to idle. That marker is not durable attention, is never derived from an
+initial idle baseline or remote cache update, and clears when the Agent leaves
+idle or ceases to own the exact current run.
+
+All routes are read-only. The server has no arbitrary daemon-protocol pass-through,
+terminal attachment, input, attention acknowledgment, Session resume, or host
+transcript adapter. Local Agent detail may perform one bounded rendered Shell read
+only when the Shell's current run ID still equals the Agent's retained run ID. It
+never substitutes output from a later run. Remote projection detail contains no
+terminal output because the coordinator cache is prompt-free and non-authoritative.
+
+HTTP binds to `127.0.0.1` and is intended to sit behind Tailscale Serve. An
+optional exact trusted login requires Serve's `Tailscale-User-Login` header on
+every non-loopback-Host request. Direct local verification remains available
+through an exact loopback Host, while a present mismatched identity is rejected.
+Loopback binding prevents tailnet or LAN peers from spoofing either path by
+bypassing Serve. Without an exact trusted login, the owner is relying on
+local-user isolation and tailnet access policy. API responses use `no-store`,
+the service worker caches only the public application shell, and a restrictive
+content security policy prevents external script, style, object, and framing
+origins. This edge does not expose the owner-only daemon socket over TCP.
 
 Agent sessions are a client-side projection, not a sixth durable daemon
 identity. The projection groups stored Agent instances by workspace,
