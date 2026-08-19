@@ -8,11 +8,14 @@
 
 `boomux web` provides a phone-friendly, installable view of the current Agents
 and outstanding Agent attention known to one coordinating Boomux Node. It is a
-read-only presentation layer inspired by mobile agent dashboards: durable
+read-only-by-default presentation layer inspired by mobile agent dashboards: durable
 attention is first, active work remains easy to scan, and an Agent detail page
-presents lifecycle observations alongside bounded rendered terminal output when
-that output is authoritative locally. An optional native handoff opens an exact
-authoritative local OpenCode Session in OpenCode Web.
+presents lifecycle observations without exposing terminal output until it owns
+control. An optional native handoff opens an exact
+authoritative local OpenCode Session in OpenCode Web. An explicit **Take
+control** action can attach a Ghostty-rendered terminal to an eligible exact local
+ShellRun. It can temporarily park a protocol-43 native desktop attachment while
+leaving the ShellRun and process intact.
 
 Boomux is not an interactive chat client. It does not parse or normalize harness
 transcripts and does not send messages, commands, permission responses, or
@@ -28,12 +31,20 @@ boomux web
 ```
 
 The default URL is `http://127.0.0.1:3737`. Select another loopback port with
-`--port`. The command also ensures one daemon-supervised Shared Harness Runtime
+`--port`. Local terminal control trusts only that loopback origin by default.
+When publishing the dashboard, pass its exact HTTPS origin with `--public-url`;
+unconfigured Host values can still read the dashboard but cannot obtain a
+terminal grant. The command also ensures one daemon-supervised Shared Harness Runtime
 generation on `127.0.0.1:4097`; choose another stable loopback port with
 `--opencode-web-port`. The same Node-local generation is used by eligible native
 OpenCode TUIs and the phone. Restarting `boomux web` does not replace that
 generation. Runtime exit withdraws native links until the daemon starts or
 strictly cold-adopts a replacement generation.
+
+The ordinary dashboard URL offers **Take control** for eligible ShellRuns. There
+is no separate Boomux authentication token; any client admitted to the configured
+dashboard origin can request terminal control. Protect a published origin with
+the authentication and ACLs of the private access layer.
 
 Set `OPENCODE_SERVER_PASSWORD` and optionally `OPENCODE_SERVER_USERNAME` before
 the runtime's first start. They are ephemeral startup environment, are never
@@ -71,6 +82,7 @@ ports through a private access layer. For example, with Tailscale Serve:
 ```console
 tailscale serve --https=4097 --bg http://127.0.0.1:4097
 tailscale serve --https=443 --bg http://127.0.0.1:3737
+boomux web --public-url https://machine.example.ts.net
 ```
 
 Open the HTTPS URL printed by Tailscale on the phone. Use the browser's **Add to
@@ -107,8 +119,28 @@ Home Screen** action to install the progressive web app.
 - Native links are not produced for projected remote Agents because their
   external Session identity and working directory intentionally remain on the
   owner Node. Remote Agents remain unlinked to this Node's runtime.
-- Local terminal output is capped at 256 KiB and is read only when the durable
-  Shell still has the Agent's exact run as its current run.
+- Agent detail never includes terminal output, and Ghostty remains blank unless
+  that browser owns terminal control. The one-time grant supplies
+  the current grid, then the WebSocket receives the daemon's at-most-1-MiB inert
+  VT reconstruction followed by live PTY output. Exclusive Web control resizes
+  the PTY to Ghostty's fitted browser grid and follows later pane changes. The
+  parked desktop is not rendering that grid; reacquisition restores its latest
+  native dimensions before reconstruction. A wheel over Ghostty sends PageUp or
+  PageDown so full-screen application output scrolls without cycling prompt
+  history through Up or Down.
+- Terminal control is offered only for a local, current, running, user-owned
+  ShellRun. The action revalidates the exact Shell and run, never restarts an
+  exited Shell, and can suspend only a protocol-43 reconnectable native
+  controller. Legacy or existing web controllers fail closed.
+- An active browser terminal detaches when its WebSocket closes, the user leaves
+  the Agent detail, or no input or output crosses the bridge for 15 minutes.
+  Hiding or backgrounding the page does not detach it. The parked desktop
+  attachment then reacquires the exact run automatically; Enter explicitly
+  reclaims sooner and `Ctrl-C` closes the parked desktop terminal. While parked,
+  the desktop is cleared and shows only the Web-ownership notice, which redraws
+  when the native window is resized. Reacquisition clears that notice before
+  replaying the current terminal reconstruction at the latest native grid.
+  Desktop focus and ordinary keystrokes never reclaim control.
 - A historical Agent never displays output from a later run of the same Shell.
 - Remote terminal output, lifecycle evidence, external Session identity, and
   working directory remain absent from cached projections.
@@ -122,20 +154,28 @@ Home Screen** action to install the progressive web app.
 The gateway and Shared Harness Runtime bind only to `127.0.0.1`; there is no
 option to bind a LAN or tailnet address. Boomux does not configure or authenticate
 the private access layer. That layer owns TLS, authentication, and ACLs
-appropriate for both the read-only dashboard and OpenCode's
+appropriate for both the dashboard's terminal control and OpenCode's
 full-control origin. Public exposure is outside this design.
 
 Terminal output and lifecycle evidence can contain private source, paths,
 commands, prompts, credentials, or model responses. Native handoff URLs expose
 the local working-directory encoding and canonical Session ID to the authorized
-dashboard client and destination OpenCode origin. API responses carry
+dashboard client and destination OpenCode origin. Terminal output crosses only
+the active-control WebSocket; detail responses omit it. API responses carry
 `Cache-Control: no-store`. The service worker caches only HTML, JavaScript, CSS,
 the manifest, and the icon; it never handles `/api/` requests. Browser storage
 does not persist Agent snapshots or terminal output.
 
-The HTTP API is an allowlisted projection. It cannot forward arbitrary daemon
-requests, send terminal input, acquire a Shell controller, resume a Session,
-acknowledge attention, stop processes, or mutate Node registration.
+The HTTP API is allowlisted rather than an arbitrary daemon proxy. Terminal
+control is remote shell access: its POST and WebSocket routes require exact
+same-origin Host/Origin validation against the loopback origins or the explicit
+`--public-url` allowlist, and a random exact-run grant expires after 30 seconds
+and is consumed once. Boomux does not authenticate clients at the HTTP layer;
+any client that can reach an allowed origin can request a grant. WebSocket messages are capped at 64 KiB and bridge
+queues have fixed depth. The gateway can replace only a protocol-43 native
+controller through the daemon's acknowledged suspension handshake; it cannot
+replace legacy or web controllers, resume a Session, acknowledge attention, stop processes, mutate Node
+registration, control projected remote Nodes, or persist attachment environment.
 
 The OpenCode origin is a separate full-control application. Set a nonempty
 `OPENCODE_SERVER_PASSWORD` unless the private access layer provides the intended
@@ -147,19 +187,26 @@ reverse proxy so this boundary remains visible.
 
 - `GET /api/snapshot` returns the current Node-qualified Agent cards and counts.
 - `GET /api/agents/{node_id}/{agent_id}` returns one exact Agent detail and
-  lifecycle timeline, eligible local rendered terminal output, and an optional
-  exact native OpenCode Web handoff.
+  lifecycle timeline, terminal-control eligibility, and an optional exact native
+  OpenCode Web handoff. It does not return terminal output.
+- `POST /api/agents/{node_id}/{agent_id}/terminal-grant` returns one short-lived,
+  single-use WebSocket URL and authoritative grid for an eligible exact local
+  ShellRun.
+- `GET /api/terminal/{token}` upgrades that grant to a bounded terminal bridge.
+  Binary messages carry PTY output toward the browser and input toward the
+  daemon; text messages from the server carry terminal status. Browser messages
+  cannot resize the shared PTY.
 
 These shapes are intentionally experimental. Future native handoff for other
 harnesses must preserve each harness's runtime ownership and exact Session
 identity rather than introducing transcript adapters or treating terminal
 screens as authoritative messages.
 
-## Future Terminal Work
+## Terminal Limits
 
-A real browser terminal is tracked separately from native harness web handoff.
-Any implementation must bind to an
-exact ShellRun, preserve daemon PTY and controller authority, start as a bounded
-read-only observer, and keep remote terminal bytes out of cached projections.
-See
+The terminal is local and explicit. It does not support remote Nodes,
+automatic browser reconnect after daemon handoff, clipboard integration,
+file transfer, mouse reporting, or OSC-triggered browser actions. Ghostty Web is
+vendored as a pinned generated asset; it is only the renderer and has no process
+or PTY authority. See the earlier exploration in
 [`brainstorms/2026-08-18-mobile-web-terminal.md`](brainstorms/2026-08-18-mobile-web-terminal.md).

@@ -349,6 +349,21 @@ h1 {
 .section-heading h2 { margin: 0; font-size: 1.65rem; letter-spacing: -.025em; }
 .revision, .terminal-label, .native-handoff-label { color: var(--muted); font-size: .6rem; font-weight: 900; letter-spacing: .12em; text-transform: uppercase; }
 .terminal-label { color: var(--acid); }
+.terminal-actions { display: flex; gap: 12px; align-items: center; }
+.terminal-control-button {
+  min-height: 42px;
+  padding: 0 16px;
+  border: 1px solid var(--acid);
+  color: var(--ink);
+  background: var(--acid);
+  font: inherit;
+  font-size: .68rem;
+  font-weight: 900;
+  letter-spacing: .09em;
+  text-transform: uppercase;
+}
+.terminal-control-button:hover { color: var(--acid); background: transparent; }
+.terminal-control-button:disabled { cursor: wait; opacity: .65; }
 
 .timeline { position: relative; margin: 0; padding: 0; list-style: none; }
 .timeline::before { position: absolute; top: 11px; bottom: 11px; left: 5px; width: 1px; background: var(--line); content: ""; }
@@ -370,20 +385,20 @@ h1 {
 .native-handoff-link:hover { color: var(--acid); background: transparent; }
 
 .terminal-explainer { max-width: 760px; margin-bottom: 16px; color: var(--paper-dim); font-family: Georgia, serif; font-size: .82rem; line-height: 1.55; }
-#terminal-output {
-  max-height: 440px;
-  margin: 0;
-  padding: 20px;
-  overflow: auto;
-  border: 1px solid var(--line);
-  color: #dcd8c7;
-  background: #0e0f0c;
-  box-shadow: inset 4px 0 var(--acid-deep);
-  font: .76rem/1.55 "DejaVu Sans Mono", "Liberation Mono", monospace;
-  white-space: pre-wrap;
-  word-break: break-word;
+.web-terminal {
+  position: relative;
+  height: min(62dvh, 560px);
+  min-height: 240px;
+  padding: 10px;
+  overflow: hidden;
+  border: 1px solid var(--acid-deep);
+  background: #11120f;
+  box-shadow: inset 4px 0 var(--acid);
 }
-#terminal-output.is-empty { color: var(--muted); font-style: italic; box-shadow: inset 4px 0 var(--line); }
+.web-terminal[data-mode="inactive"] { box-shadow: inset 4px 0 var(--acid-deep); }
+.web-terminal canvas { max-width: 100%; }
+.web-terminal[data-mode="live"] { border-color: var(--acid); box-shadow: inset 4px 0 var(--acid); }
+.web-terminal:focus-within { border-color: var(--acid); }
 .terminal-notice { margin: 10px 0 0; color: var(--muted); font-size: .7rem; }
 
 .read-only-footer {
@@ -434,9 +449,10 @@ h1 {
   .native-handoff, .activity, .terminal-section { padding: 34px 0; }
   .section-heading { display: block; }
   .revision, .terminal-label, .native-handoff-label { display: inline-block; margin-top: 10px; }
+  .terminal-actions { margin-top: 14px; align-items: stretch; justify-content: space-between; }
   .timeline-header { display: block; }
   .timeline-header time { display: block; margin-top: 4px; }
-  #terminal-output { margin-right: -18px; margin-left: -18px; border-right: 0; border-left: 0; }
+  .web-terminal { width: calc(100% + 36px); height: min(58dvh, 460px); min-height: 220px; margin-right: -18px; margin-left: -18px; border-right: 0; border-left: 0; }
   .native-handoff-link { display: flex; justify-content: center; }
 }
 

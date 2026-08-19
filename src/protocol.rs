@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 42;
+pub const PROTOCOL_VERSION: u32 = 43;
 pub const MIN_PROTOCOL_VERSION: u32 = 6;
 pub const MAX_CONTROL_FRAME: usize = 8 * 1024 * 1024;
 pub const MAX_ATTACH_FRAME: usize = 1024 * 1024;
@@ -189,6 +189,13 @@ define_protocol_features! {
     OpenCodeSharedRuntimeClaims => (42, "OpenCode shared runtime claims", [
         "protocol_42",
         "opencode_shared_runtime_claims",
+    ]),
+    ReversibleAttachmentTakeover => (43, "reversible attachment takeover", [
+        "protocol_43",
+        "reversible_attachment_takeover",
+    ]),
+    TerminalReconstructionRead => (43, "terminal reconstruction read", [
+        "terminal_reconstruction_read",
     ]),
 }
 
@@ -1935,6 +1942,19 @@ pub struct TerminalProfile {
     pub pixel_height: u16,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachmentControllerKind {
+    #[default]
+    Legacy,
+    Native,
+    Web,
+}
+
+fn is_legacy_attachment_controller_kind(kind: &AttachmentControllerKind) -> bool {
+    *kind == AttachmentControllerKind::Legacy
+}
+
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnixEnvironment {
     pub variables: Vec<UnixEnvironmentVariable>,
@@ -2377,6 +2397,10 @@ pub enum Request {
         #[serde(default)]
         wait_ms: u32,
     },
+    ReadTerminalReconstruction {
+        shell_id: String,
+        run_id: String,
+    },
     Events {
         #[serde(default)]
         after: Option<EventCursor>,
@@ -2474,6 +2498,8 @@ pub enum Request {
         environment: Option<UnixEnvironment>,
         #[serde(default, skip_serializing_if = "is_false")]
         owner_environment: bool,
+        #[serde(default, skip_serializing_if = "is_legacy_attachment_controller_kind")]
+        controller_kind: AttachmentControllerKind,
     },
     AttachNode {
         identity: QualifiedIdentity,
@@ -2573,6 +2599,11 @@ impl Request {
             | Self::RouteNodeHostService { .. }
             | Self::ResumeAgentSession { .. }
             | Self::ResumeNodeAgentSession { .. } => Some(ProtocolFeature::NodeHostServices),
+            Self::Attach {
+                controller_kind, ..
+            } if *controller_kind != AttachmentControllerKind::Legacy => {
+                Some(ProtocolFeature::ReversibleAttachmentTakeover)
+            }
             Self::AttachNode { .. }
             | Self::Attach {
                 owner_environment: true,
@@ -2663,6 +2694,9 @@ impl Request {
             | Self::RemoveLauncher { .. } => Some(ProtocolFeature::WorkspaceLaunchers),
             Self::ReadShellAt { .. } | Self::Events { .. } => {
                 Some(ProtocolFeature::AtomicOutputReads)
+            }
+            Self::ReadTerminalReconstruction { .. } => {
+                Some(ProtocolFeature::TerminalReconstructionRead)
             }
             Self::Ping
             | Self::Restart
@@ -2807,6 +2841,12 @@ pub enum Response {
         changed: bool,
         status: ShellStatus,
     },
+    TerminalReconstruction {
+        bytes: Vec<u8>,
+        output_revision: u64,
+        rows: u16,
+        cols: u16,
+    },
     Events {
         stream_id: String,
         cursor: EventCursor,
@@ -2889,6 +2929,7 @@ pub enum AttachFrame {
     Reconnect,
     ReconnectAck,
     FocusGained,
+    Suspended,
 }
 
 impl AttachFrame {
@@ -2899,6 +2940,7 @@ impl AttachFrame {
     const RECONNECT: u8 = 5;
     const RECONNECT_ACK: u8 = 6;
     const FOCUS_GAINED: u8 = 7;
+    const SUSPENDED: u8 = 8;
 
     pub fn write_to(&self, writer: &mut impl Write) -> io::Result<()> {
         let (kind, payload): (u8, &[u8]) = match self {
@@ -2921,6 +2963,7 @@ impl AttachFrame {
             Self::Reconnect => (Self::RECONNECT, &[]),
             Self::ReconnectAck => (Self::RECONNECT_ACK, &[]),
             Self::FocusGained => (Self::FOCUS_GAINED, &[]),
+            Self::Suspended => (Self::SUSPENDED, &[]),
         };
         if payload.len() > MAX_ATTACH_FRAME {
             return Err(io::Error::new(
@@ -2960,6 +3003,7 @@ impl AttachFrame {
             Self::RECONNECT if payload.is_empty() => Ok(Self::Reconnect),
             Self::RECONNECT_ACK if payload.is_empty() => Ok(Self::ReconnectAck),
             Self::FOCUS_GAINED if payload.is_empty() => Ok(Self::FocusGained),
+            Self::SUSPENDED if payload.is_empty() => Ok(Self::Suspended),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid attach frame",
@@ -3178,6 +3222,7 @@ mod tests {
                 }],
             }),
             owner_environment: false,
+            controller_kind: AttachmentControllerKind::Legacy,
         });
         let mut bytes = Vec::new();
         write_message(&mut bytes, &value).unwrap();
@@ -3363,8 +3408,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_forty_two_with_minimum_six() {
-        assert_eq!(PROTOCOL_VERSION, 42);
+    fn protocol_version_is_forty_three_with_minimum_six() {
+        assert_eq!(PROTOCOL_VERSION, 43);
         assert_eq!(MIN_PROTOCOL_VERSION, 6);
     }
 
@@ -4513,6 +4558,7 @@ mod tests {
                         profile: test_profile(),
                         environment: None,
                         owner_environment: false,
+                        controller_kind: AttachmentControllerKind::Legacy,
                     },
                 ],
             ),
@@ -4596,6 +4642,7 @@ mod tests {
                         profile: test_profile(),
                         environment: None,
                         owner_environment: false,
+                        controller_kind: AttachmentControllerKind::Legacy,
                     },
                 ],
             ),
@@ -4646,6 +4693,7 @@ mod tests {
                         variables: Vec::new(),
                     }),
                     owner_environment: false,
+                    controller_kind: AttachmentControllerKind::Legacy,
                 }],
             ),
             (
@@ -4658,6 +4706,7 @@ mod tests {
                     profile: test_profile(),
                     environment: None,
                     owner_environment: false,
+                    controller_kind: AttachmentControllerKind::Legacy,
                 }],
             ),
             (
@@ -4686,6 +4735,7 @@ mod tests {
                         profile: test_profile(),
                         environment: None,
                         owner_environment: true,
+                        controller_kind: AttachmentControllerKind::Legacy,
                     },
                     Request::AttachNode {
                         identity: QualifiedIdentity::new("node-1", "s1"),
@@ -4768,6 +4818,25 @@ mod tests {
                             cwd: "/owner/work".into(),
                             command: Vec::new(),
                         },
+                    },
+                ],
+            ),
+            (
+                43,
+                vec![
+                    Request::Attach {
+                        shell_id: "s1".into(),
+                        takeover: true,
+                        restart_exited: false,
+                        expected_run_id: Some("r1".into()),
+                        profile: test_profile(),
+                        environment: None,
+                        owner_environment: false,
+                        controller_kind: AttachmentControllerKind::Web,
+                    },
+                    Request::ReadTerminalReconstruction {
+                        shell_id: "s1".into(),
+                        run_id: "r1".into(),
                     },
                 ],
             ),
@@ -4947,6 +5016,8 @@ mod tests {
             (41, &["protocol_41", "observed_node_helper_version"][..]),
             (41, &["node_upgrade_coordination"][..]),
             (42, &["protocol_42", "opencode_shared_runtime_claims"][..]),
+            (43, &["protocol_43", "reversible_attachment_takeover"][..]),
+            (43, &["terminal_reconstruction_read"][..]),
         ];
 
         let actual = ProtocolFeature::ALL
@@ -4974,6 +5045,7 @@ mod tests {
             Request::Attach {
                 environment: None,
                 expected_run_id: None,
+                controller_kind: AttachmentControllerKind::Legacy,
                 ..
             }
         ));
@@ -5217,6 +5289,7 @@ mod tests {
             AttachFrame::Reconnect,
             AttachFrame::ReconnectAck,
             AttachFrame::FocusGained,
+            AttachFrame::Suspended,
         ];
         for frame in frames {
             let mut bytes = Vec::new();
@@ -5229,6 +5302,9 @@ mod tests {
         let mut bytes = Vec::new();
         AttachFrame::FocusGained.write_to(&mut bytes).unwrap();
         assert_eq!(bytes, [7, 0, 0, 0, 0]);
+        bytes.clear();
+        AttachFrame::Suspended.write_to(&mut bytes).unwrap();
+        assert_eq!(bytes, [8, 0, 0, 0, 0]);
     }
 
     #[test]

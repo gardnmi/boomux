@@ -834,6 +834,7 @@ fn attach_with_environment(
                 profile: profile(),
                 environment: Some(environment),
                 owner_environment: false,
+                controller_kind: protocol::AttachmentControllerKind::Legacy,
             },
         ),
     )
@@ -883,6 +884,7 @@ fn owner_environment_attach_rejects_an_arbitrary_unix_environment() {
                     variables: Vec::new(),
                 }),
                 owner_environment: true,
+                controller_kind: protocol::AttachmentControllerKind::Legacy,
             },
         ),
     )

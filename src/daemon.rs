@@ -46,20 +46,20 @@ use crate::protocol::{
     AgentObservationSnapshot, AgentRegistrationSpec, AgentReport, AgentScheduleInspection,
     AgentScheduleOverlapPolicy, AgentScheduleSession, AgentScheduleSnapshot, AgentScheduleSpec,
     AgentScheduleState, AgentScheduleTrigger, AgentScheduleUpdate, AgentState, AttachFrame,
-    DaemonEvent, DaemonEventKind, Envelope, ErrorCode, EventCursor, FocusedTerminalSnapshot,
-    HostIntegrationMutationPreview, HostServiceOperation, HostServiceResult, NodeProjectionAgent,
-    NodeProjectionAttention, NodeProjectionExecution, NodeProjectionLauncher,
-    NodeProjectionSchedule, NodeProjectionShell, NodeProjectionSnapshot, NodeProjectionSync,
-    NodeProjectionSyncMode, NodeProjectionTransition, NodeProjectionTransitionKind,
-    NodeProjectionWorkspace, NotificationDeliveryConfig, OpenCodeSessionClaimSnapshot,
-    OpenCodeSharedRuntimeSnapshot, QualifiedFocusedTerminalSnapshot, QualifiedIdentity, Request,
-    Response, RoutedOperation, RoutedOperationResult, ScheduledExecutionDispatchKind,
-    ScheduledExecutionOutcome, ScheduledExecutionReason, ScheduledExecutionScheduleProjection,
-    ScheduledExecutionSnapshot, ScheduledExecutionState, ScheduledOccurrence,
-    ScheduledRunnerResult, SchedulerHealth, SchedulerState, ShellOwner, ShellRunExitReason,
-    ShellRunSnapshot, ShellSnapshot, ShellSpec, ShellStatus, Snapshot, TerminalPreview,
-    TerminalProfile, UnixEnvironment, UnixEnvironmentVariable, WorkspaceLauncherSnapshot,
-    WorkspaceLauncherSpec, WorkspaceSnapshot,
+    AttachmentControllerKind, DaemonEvent, DaemonEventKind, Envelope, ErrorCode, EventCursor,
+    FocusedTerminalSnapshot, HostIntegrationMutationPreview, HostServiceOperation,
+    HostServiceResult, NodeProjectionAgent, NodeProjectionAttention, NodeProjectionExecution,
+    NodeProjectionLauncher, NodeProjectionSchedule, NodeProjectionShell, NodeProjectionSnapshot,
+    NodeProjectionSync, NodeProjectionSyncMode, NodeProjectionTransition,
+    NodeProjectionTransitionKind, NodeProjectionWorkspace, NotificationDeliveryConfig,
+    OpenCodeSessionClaimSnapshot, OpenCodeSharedRuntimeSnapshot, QualifiedFocusedTerminalSnapshot,
+    QualifiedIdentity, Request, Response, RoutedOperation, RoutedOperationResult,
+    ScheduledExecutionDispatchKind, ScheduledExecutionOutcome, ScheduledExecutionReason,
+    ScheduledExecutionScheduleProjection, ScheduledExecutionSnapshot, ScheduledExecutionState,
+    ScheduledOccurrence, ScheduledRunnerResult, SchedulerHealth, SchedulerState, ShellOwner,
+    ShellRunExitReason, ShellRunSnapshot, ShellSnapshot, ShellSpec, ShellStatus, Snapshot,
+    TerminalPreview, TerminalProfile, UnixEnvironment, UnixEnvironmentVariable,
+    WorkspaceLauncherSnapshot, WorkspaceLauncherSpec, WorkspaceSnapshot,
 };
 use crate::ssh_bootstrap::{self, RemoteBootstrapPlan, SshAuthenticationMode, SshTarget};
 use crate::state_store::{
@@ -75,6 +75,7 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 const RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 const RESTART_TIMEOUT: Duration = Duration::from_secs(10);
 const IO_RETRY_DELAY: Duration = Duration::from_millis(2);
+const CONTROLLER_INPUT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const OUTPUT_PUBLICATION_INTERVAL: Duration = Duration::from_millis(16);
 const PERSIST_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const SCHEDULER_RETRY_MIN: Duration = Duration::from_millis(50);
@@ -1119,7 +1120,7 @@ fn inject_opencode_shim_environment(environment: &UnixEnvironment) -> io::Result
                 "OpenCode executable is unavailable",
             )
         })?;
-    let boomux = env::current_exe()?.canonicalize()?;
+    let boomux = replacement_executable()?.canonicalize()?;
     let boomux_metadata = fs::metadata(&boomux)?;
     if !boomux.is_absolute()
         || !boomux_metadata.is_file()
@@ -1675,6 +1676,7 @@ fn handle_connection_inner(
         profile,
         environment,
         owner_environment,
+        controller_kind,
     } = request.message
     {
         return registry.runtimes.handle_attach(
@@ -1689,6 +1691,7 @@ fn handle_connection_inner(
                 profile,
                 environment,
                 owner_environment,
+                controller_kind,
             },
         );
     }
@@ -6715,6 +6718,65 @@ impl ShellRuntimeManager {
         ))
     }
 
+    fn read_terminal_reconstruction(
+        &self,
+        shell: &Shell,
+        expected_run_id: &str,
+    ) -> DaemonResult<Response> {
+        loop {
+            let lifecycle = lock(&shell.lifecycle)?;
+            let (run, terminal) = match &*lifecycle {
+                ShellLifecycle::Running { run, runtime, .. } => {
+                    (Arc::clone(run), Arc::clone(&runtime.terminal))
+                }
+                ShellLifecycle::Exited { run, terminal, .. } => {
+                    (Arc::clone(run), Arc::clone(terminal))
+                }
+                ShellLifecycle::Pending | ShellLifecycle::Closed => {
+                    return Err(DaemonError::lifecycle(
+                        ErrorCode::RunChanged,
+                        "shell no longer has the requested run",
+                    ));
+                }
+            };
+            drop(lifecycle);
+            if run.id != expected_run_id {
+                return Err(DaemonError::lifecycle(
+                    ErrorCode::RunChanged,
+                    "shell run identity changed",
+                ));
+            }
+            let output_revision = run.output_revision.load(Ordering::Acquire);
+            let terminal_state = lock(&terminal)?;
+            let (rows, cols) = terminal_state.dimensions();
+            let bytes = terminal_state.reconstruction();
+            drop(terminal_state);
+            let lifecycle = lock(&shell.lifecycle)?;
+            let current = match &*lifecycle {
+                ShellLifecycle::Running {
+                    run: current_run,
+                    runtime,
+                    ..
+                } => Arc::ptr_eq(current_run, &run) && Arc::ptr_eq(&runtime.terminal, &terminal),
+                ShellLifecycle::Exited {
+                    run: current_run,
+                    terminal: current_terminal,
+                    ..
+                } => Arc::ptr_eq(current_run, &run) && Arc::ptr_eq(current_terminal, &terminal),
+                ShellLifecycle::Pending | ShellLifecycle::Closed => false,
+            };
+            drop(lifecycle);
+            if current {
+                return Ok(Response::TerminalReconstruction {
+                    bytes,
+                    output_revision,
+                    rows,
+                    cols,
+                });
+            }
+        }
+    }
+
     fn read_shell_at(
         &self,
         service: &DaemonService,
@@ -7125,6 +7187,49 @@ impl ShellRuntimeManager {
             controller.take();
         }
         Ok(())
+    }
+
+    fn suspend_native_controller(runtime: &ShellRuntime) -> io::Result<()> {
+        let written = {
+            let mut controller = lock(&runtime.controller)?;
+            let current = controller.as_mut().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "active controller disappeared")
+            })?;
+            if current.kind != AttachmentControllerKind::Native {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "active controller cannot be suspended",
+                ));
+            }
+            let (acknowledge, written) = mpsc::sync_channel(1);
+            current
+                .output
+                .try_send(ControllerOutput::Suspended(acknowledge))
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "active controller could not enter standby",
+                    )
+                })?;
+            written
+        };
+        if !written.recv_timeout(HANDSHAKE_TIMEOUT).unwrap_or(false) {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "active controller did not receive standby request",
+            ));
+        }
+        let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+        while Instant::now() < deadline {
+            if lock(&runtime.controller)?.is_none() {
+                return Ok(());
+            }
+            thread::sleep(IO_RETRY_DELAY);
+        }
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "active controller did not enter standby",
+        ))
     }
 
     fn quiesce_controllers(&self, runtimes: &[Arc<ShellRuntime>]) -> io::Result<()> {
@@ -7604,11 +7709,13 @@ struct Controller {
     output: SyncSender<ControllerOutput>,
     connection: UnixStream,
     reconnect_ack: Option<SyncSender<()>>,
+    kind: AttachmentControllerKind,
 }
 
 enum ControllerOutput {
     Data(Vec<u8>),
     Reconnect(SyncSender<bool>),
+    Suspended(SyncSender<bool>),
 }
 
 struct PtyMaster {
@@ -8860,7 +8967,7 @@ impl DaemonService {
                 })?,
                 Ok(AttachFrame::FocusGained) => {}
                 Ok(AttachFrame::Detached | AttachFrame::ReconnectAck) => break Ok(()),
-                Ok(AttachFrame::Output(_) | AttachFrame::Reconnect) => {
+                Ok(AttachFrame::Output(_) | AttachFrame::Reconnect | AttachFrame::Suspended) => {
                     break Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "invalid client frame during Agent Session resume",
@@ -9203,6 +9310,7 @@ impl DaemonService {
             profile,
             environment: None,
             owner_environment,
+            controller_kind: AttachmentControllerKind::Legacy,
         };
         let (response, mut remote_reader, mut remote_writer) =
             remote.open_attachment(request, HANDSHAKE_TIMEOUT)?;
@@ -13246,6 +13354,9 @@ impl DaemonService {
                 after_revision,
                 wait_ms,
             ),
+            Request::ReadTerminalReconstruction { shell_id, run_id } => {
+                self.read_terminal_reconstruction(&shell_id, &run_id)
+            }
             Request::Events {
                 after,
                 limit,
@@ -15560,6 +15671,11 @@ impl DaemonService {
             .read_shell_preview(&shell, max_bytes, max_lines)
     }
 
+    fn read_terminal_reconstruction(&self, shell_id: &str, run_id: &str) -> DaemonResult<Response> {
+        let shell = self.shell(shell_id)?;
+        self.runtimes.read_terminal_reconstruction(&shell, run_id)
+    }
+
     fn wait_agent(
         &self,
         agent_id: &str,
@@ -16840,6 +16956,7 @@ struct AttachRequestOptions {
     profile: TerminalProfile,
     environment: Option<UnixEnvironment>,
     owner_environment: bool,
+    controller_kind: AttachmentControllerKind,
 }
 
 impl ShellRuntimeManager {
@@ -16858,6 +16975,7 @@ impl ShellRuntimeManager {
             profile,
             environment,
             owner_environment,
+            controller_kind,
         } = options;
         if let Err(error) = validate_terminal_profile(&profile) {
             return send_daemon_error(&mut stream, response_version, error.into());
@@ -17177,7 +17295,7 @@ impl ShellRuntimeManager {
         let attached_run = attached_run.expect("running shell has a run");
         let runtime = runtime.expect("running shell has a runtime");
         let control = lock(&runtime.control)?;
-        {
+        let existing_controller_kind = {
             let controller = lock(&runtime.controller)?;
             if controller.is_some() && !takeover {
                 return send_response(
@@ -17188,6 +17306,29 @@ impl ShellRuntimeManager {
                         "shell already has an active controller; use takeover",
                     )
                     .into_response(),
+                );
+            }
+            controller.as_ref().map(|controller| controller.kind)
+        };
+        if controller_kind == AttachmentControllerKind::Web
+            && let Some(existing_kind) = existing_controller_kind
+        {
+            if existing_kind != AttachmentControllerKind::Native {
+                return send_response(
+                    &mut stream,
+                    response_version,
+                    DaemonError::lifecycle(
+                        ErrorCode::Busy,
+                        "web control requires a reconnectable native controller",
+                    )
+                    .into_response(),
+                );
+            }
+            if let Err(error) = Self::suspend_native_controller(&runtime) {
+                return send_response(
+                    &mut stream,
+                    response_version,
+                    DaemonError::lifecycle(ErrorCode::Busy, error.to_string()).into_response(),
                 );
             }
         }
@@ -17229,6 +17370,7 @@ impl ShellRuntimeManager {
                 output,
                 connection,
                 reconnect_ack: None,
+                kind: controller_kind,
             });
         }
         let output_runtime = Arc::clone(&runtime);
@@ -17236,7 +17378,7 @@ impl ShellRuntimeManager {
         let output_worker = match thread::Builder::new()
             .name(format!("boomux-attachment-{}", shell.id))
             .spawn(move || {
-                let mut reconnect = false;
+                let mut terminal_control_frame = false;
                 while let Ok(output) = receiver.recv() {
                     match output {
                         ControllerOutput::Data(bytes) => {
@@ -17248,7 +17390,7 @@ impl ShellRuntimeManager {
                             }
                         }
                         ControllerOutput::Reconnect(acknowledge) => {
-                            reconnect = true;
+                            terminal_control_frame = true;
                             let result = AttachFrame::Reconnect.write_to(&mut output_stream);
                             let _ = acknowledge.send(result.is_ok());
                             if result.is_ok() {
@@ -17256,9 +17398,15 @@ impl ShellRuntimeManager {
                             }
                             break;
                         }
+                        ControllerOutput::Suspended(acknowledge) => {
+                            terminal_control_frame = true;
+                            let result = AttachFrame::Suspended.write_to(&mut output_stream);
+                            let _ = acknowledge.send(result.is_ok());
+                            break;
+                        }
                     }
                 }
-                if !reconnect {
+                if !terminal_control_frame {
                     let _ = AttachFrame::Detached.write_to(&mut output_stream);
                 }
                 let _ = output_stream.shutdown(std::net::Shutdown::Both);
@@ -17345,12 +17493,13 @@ impl ShellRuntimeManager {
                     }
                     AttachFrame::Detached => return Ok(()),
                     AttachFrame::FocusGained => unreachable!(),
-                    AttachFrame::Output(_) | AttachFrame::Reconnect | AttachFrame::ReconnectAck => {
-                        Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "client sent a daemon-only attach frame",
-                        ))
-                    }
+                    AttachFrame::Output(_)
+                    | AttachFrame::Reconnect
+                    | AttachFrame::ReconnectAck
+                    | AttachFrame::Suspended => Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "client sent a daemon-only attach frame",
+                    )),
                 };
                 drop(control);
                 result?;
@@ -17372,6 +17521,7 @@ impl ShellRuntimeManager {
         bytes: &[u8],
     ) -> io::Result<bool> {
         let mut offset = 0;
+        let deadline = Instant::now() + CONTROLLER_INPUT_WRITE_TIMEOUT;
         while offset < bytes.len() {
             let control = lock(&runtime.control)?;
             let authorized = lock(&runtime.controller)?
@@ -17387,6 +17537,12 @@ impl ShellRuntimeManager {
                 Ok(count) => offset += count,
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "PTY input remained blocked",
+                        ));
+                    }
                     thread::sleep(IO_RETRY_DELAY);
                 }
                 Err(error) => return Err(error),
@@ -19239,6 +19395,7 @@ mod tests {
             output,
             connection,
             reconnect_ack: None,
+            kind: AttachmentControllerKind::Legacy,
         });
     }
 

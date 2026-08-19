@@ -5,13 +5,14 @@ edition = "2024"
 license = "MIT"
 
 [dependencies]
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }
 chrono = "0.4"
 chrono-tz = "0.10"
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.29"
 iana-time-zone = "0.1"
 libc = "0.2"
+futures-util = { version = "0.3", features = ["sink"] }
 nix = { version = "0.28", default-features = false, features = ["socket", "uio"] }
 portable-pty = "0.9"
 ratatui = { version = "0.30", default-features = false, features = ["crossterm", "layout-cache"] }
@@ -19,7 +20,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 toml = "0.9"
-tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync"] }
 uuid = { version = "1", features = ["v4", "v5"] }
 unicode-width = "0.2"
 vt100 = "=0.16.2"
+
+[dev-dependencies]
+tungstenite = "0.29"
