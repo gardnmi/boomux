@@ -2,15 +2,16 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
-use std::os::unix::ffi::OsStringExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child as StdChild, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError, Weak};
@@ -18,7 +19,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -50,14 +51,15 @@ use crate::protocol::{
     NodeProjectionAttention, NodeProjectionExecution, NodeProjectionLauncher,
     NodeProjectionSchedule, NodeProjectionShell, NodeProjectionSnapshot, NodeProjectionSync,
     NodeProjectionSyncMode, NodeProjectionTransition, NodeProjectionTransitionKind,
-    NodeProjectionWorkspace, NotificationDeliveryConfig, QualifiedFocusedTerminalSnapshot,
-    QualifiedIdentity, Request, Response, RoutedOperation, RoutedOperationResult,
-    ScheduledExecutionDispatchKind, ScheduledExecutionOutcome, ScheduledExecutionReason,
-    ScheduledExecutionScheduleProjection, ScheduledExecutionSnapshot, ScheduledExecutionState,
-    ScheduledOccurrence, ScheduledRunnerResult, SchedulerHealth, SchedulerState, ShellOwner,
-    ShellRunExitReason, ShellRunSnapshot, ShellSnapshot, ShellSpec, ShellStatus, Snapshot,
-    TerminalPreview, TerminalProfile, UnixEnvironment, UnixEnvironmentVariable,
-    WorkspaceLauncherSnapshot, WorkspaceLauncherSpec, WorkspaceSnapshot,
+    NodeProjectionWorkspace, NotificationDeliveryConfig, OpenCodeSessionClaimSnapshot,
+    OpenCodeSharedRuntimeSnapshot, QualifiedFocusedTerminalSnapshot, QualifiedIdentity, Request,
+    Response, RoutedOperation, RoutedOperationResult, ScheduledExecutionDispatchKind,
+    ScheduledExecutionOutcome, ScheduledExecutionReason, ScheduledExecutionScheduleProjection,
+    ScheduledExecutionSnapshot, ScheduledExecutionState, ScheduledOccurrence,
+    ScheduledRunnerResult, SchedulerHealth, SchedulerState, ShellOwner, ShellRunExitReason,
+    ShellRunSnapshot, ShellSnapshot, ShellSpec, ShellStatus, Snapshot, TerminalPreview,
+    TerminalProfile, UnixEnvironment, UnixEnvironmentVariable, WorkspaceLauncherSnapshot,
+    WorkspaceLauncherSpec, WorkspaceSnapshot,
 };
 use crate::ssh_bootstrap::{self, RemoteBootstrapPlan, SshAuthenticationMode, SshTarget};
 use crate::state_store::{
@@ -105,6 +107,53 @@ const TRANSITION_REKEY: u8 = 3;
 const NODE_REKEY_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 const NODE_REGISTRATION_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 const NODE_UPGRADE_MAINTENANCE_LEASE: Duration = Duration::from_secs(10 * 60);
+const OPENCODE_CLAIM_HOLDER_TTL: Duration = Duration::from_secs(5 * 60);
+const OPENCODE_RUNTIME_READINESS_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_UNIX_ENVIRONMENT_VARIABLES: usize = 4_096;
+const MAX_UNIX_ENVIRONMENT_BYTES: usize = 1024 * 1024;
+const MAX_OPENCODE_CLAIM_ROOTS: usize = 1_024;
+const MAX_OPENCODE_CLAIM_HOLDERS: usize = 4_096;
+const OPENCODE_TUI: &[u8] = include_bytes!("../integrations/opencode/boomux-tui.tsx");
+const OPENCODE_TUI_CORE: &[u8] = include_bytes!("../integrations/opencode/boomux-tui-core.js");
+const OPENCODE_TUI_RUNNER: &[u8] = include_bytes!("../integrations/opencode/boomux-tui-runner.js");
+const OPENCODE_SHIM: &[u8] = br#"#!/bin/sh
+if [ "$#" -eq 0 ] && [ -t 0 ] && [ -t 1 ] && [ -n "${BOOMUX_SHELL_ID-}" ] && [ -n "${BOOMUX_RUN_ID-}" ]; then
+  exec "$BOOMUX_SHIM_EXECUTABLE" opencode shared
+fi
+exec "$BOOMUX_REAL_OPENCODE" "$@"
+"#;
+const OPENCODE_BASH_RC: &[u8] = br#"if [ -r "${HOME}/.bashrc" ]; then
+  . "${HOME}/.bashrc"
+fi
+_boomux_path=()
+IFS=: read -r -a _boomux_path <<< "${PATH-}"
+_boomux_filtered=()
+for _boomux_entry in "${_boomux_path[@]}"; do
+  if [ "$_boomux_entry" != "$BOOMUX_OPENCODE_SHIM_DIR" ]; then
+    _boomux_filtered+=("$_boomux_entry")
+  fi
+done
+BOOMUX_ORIGINAL_PATH="$(IFS=:; printf '%s' "${_boomux_filtered[*]}")"
+PATH="$BOOMUX_OPENCODE_SHIM_DIR${BOOMUX_ORIGINAL_PATH:+:$BOOMUX_ORIGINAL_PATH}"
+export BOOMUX_ORIGINAL_PATH PATH
+unset _boomux_entry _boomux_filtered _boomux_path
+"#;
+const OPENCODE_ZSH_ENV: &[u8] = br#"if [[ -r "$BOOMUX_USER_ZDOTDIR/.zshenv" ]]; then
+  source "$BOOMUX_USER_ZDOTDIR/.zshenv"
+fi
+typeset -gx BOOMUX_USER_ZDOTDIR="${ZDOTDIR:-$HOME}"
+typeset -gx ZDOTDIR="$BOOMUX_OPENCODE_SHIM_DIR"
+"#;
+const OPENCODE_ZSH_RC: &[u8] = br#"if [[ -r "$BOOMUX_USER_ZDOTDIR/.zshrc" ]]; then
+  source "$BOOMUX_USER_ZDOTDIR/.zshrc"
+fi
+path=("${(@)path:#$BOOMUX_OPENCODE_SHIM_DIR}")
+typeset -gx BOOMUX_ORIGINAL_PATH="${(j/:/)path}"
+path=("$BOOMUX_OPENCODE_SHIM_DIR" "${path[@]}")
+typeset -gx ZDOTDIR="$BOOMUX_USER_ZDOTDIR"
+unset BOOMUX_USER_ZDOTDIR
+"#;
+const OPENCODE_FISH_INIT: &str = "set -l boomux_path; for entry in $PATH; test \"$entry\" = \"$BOOMUX_OPENCODE_SHIM_DIR\"; or set -a boomux_path \"$entry\"; end; set -gx BOOMUX_ORIGINAL_PATH (string join : $boomux_path); set -gx PATH $BOOMUX_OPENCODE_SHIM_DIR $boomux_path; set -e boomux_path";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NotificationSettings {
@@ -266,6 +315,7 @@ pub fn receive_handoff_with_notification_delivery(
             notifications,
             focused_terminal,
             presented_focused_terminal,
+            opencode_runtime,
         } => {
             let store = StateStore::from_transferred_lock(state_lock)?;
             let socket_path = client::socket_path()?;
@@ -280,9 +330,10 @@ pub fn receive_handoff_with_notification_delivery(
                     events: Some(*event_stream),
                     focused_terminal: focused_terminal.map(|focused| *focused),
                     presented_focused_terminal: presented_focused_terminal.map(|focused| *focused),
+                    opencode_runtime,
                 },
                 Some(&mut channel),
-                notifications
+                (*notifications)
                     .map(Into::into)
                     .unwrap_or(notification_settings),
             )
@@ -337,6 +388,7 @@ struct TransferredState {
     events: Option<handoff::EventStreamManifest>,
     focused_terminal: Option<FocusedTerminalSnapshot>,
     presented_focused_terminal: Option<QualifiedFocusedTerminalSnapshot>,
+    opencode_runtime: Option<handoff::TransferredOpenCodeRuntime>,
 }
 
 fn run_daemon(
@@ -377,7 +429,8 @@ fn run_daemon(
             None
         }
     };
-    registry.startup_environment = capture_current_environment();
+    registry.startup_environment =
+        sanitize_opencode_shim_environment(&capture_current_environment());
     registry.configure_scheduler_clock()?;
     registry.notification_settings = notification_settings.clone();
     if !registry.notification_settings.persist_terminal_history {
@@ -398,6 +451,9 @@ fn run_daemon(
     }
     registry.import_focused_terminal(transferred.focused_terminal)?;
     registry.import_presented_focused_terminal(transferred.presented_focused_terminal)?;
+    registry
+        .opencode
+        .import_handoff(transferred.opencode_runtime)?;
     if let Some(channel) = committed {
         {
             registry.events.transaction()?.reserve(1)?;
@@ -467,6 +523,7 @@ fn run_daemon(
             let _ = registry.flush_pending();
             last_persistence_retry = Instant::now();
         }
+        registry.opencode.reap_exited()?;
         match restart_receiver.try_recv() {
             Ok(request) => {
                 registry.stop_scheduler()?;
@@ -708,6 +765,234 @@ fn secure_runtime_dir(path: &Path) -> io::Result<()> {
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))
 }
 
+fn opencode_runtime_registration_path() -> io::Result<PathBuf> {
+    client::socket_path()?
+        .parent()
+        .map(|directory| directory.join("opencode-runtime.json"))
+        .ok_or_else(|| io::Error::other("Boomux socket path has no parent"))
+}
+
+fn process_start_time(stat: &str) -> Option<u64> {
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()
+}
+
+fn process_argv(pid: u32) -> io::Result<Vec<Vec<u8>>> {
+    let bytes = fs::read(format!("/proc/{pid}/cmdline"))?;
+    Ok(bytes
+        .split(|byte| *byte == 0)
+        .filter(|argument| !argument.is_empty())
+        .map(<[u8]>::to_vec)
+        .collect())
+}
+
+fn process_has_environment(pid: u32, name: &[u8], value: &[u8]) -> io::Result<bool> {
+    Ok(process_environment_value(pid, name)?.as_deref() == Some(value))
+}
+
+fn process_environment_value(pid: u32, name: &[u8]) -> io::Result<Option<Vec<u8>>> {
+    let bytes = fs::read(format!("/proc/{pid}/environ"))?;
+    Ok(bytes.split(|byte| *byte == 0).find_map(|variable| {
+        let separator = variable.iter().position(|byte| *byte == b'=')?;
+        (variable[..separator] == *name).then(|| variable[separator + 1..].to_vec())
+    }))
+}
+
+fn opencode_process_evidence(pid: u32) -> io::Result<(u64, Vec<u8>, Vec<Vec<u8>>)> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    let start_time = process_start_time(&stat)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid process start time"))?;
+    let executable = fs::read_link(format!("/proc/{pid}/exe"))?
+        .as_os_str()
+        .as_bytes()
+        .to_vec();
+    Ok((start_time, executable, process_argv(pid)?))
+}
+
+fn write_opencode_runtime_registration(generation_id: &str, pid: u32, port: u16) -> io::Result<()> {
+    let (start_time, executable, argv) = opencode_process_evidence(pid)?;
+    let registration = OpenCodeRuntimeRegistration {
+        generation_id: generation_id.into(),
+        pid,
+        port,
+        start_time,
+        executable,
+        argv,
+    };
+    let bytes = serde_json::to_vec(&registration).map_err(io::Error::other)?;
+    atomic_runtime_asset(&opencode_runtime_registration_path()?, &bytes, 0o600)
+}
+
+fn remove_opencode_runtime_registration() -> io::Result<()> {
+    match fs::remove_file(opencode_runtime_registration_path()?) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn read_opencode_runtime_registration() -> io::Result<Option<OpenCodeRuntimeRegistration>> {
+    let path = opencode_runtime_registration_path()?;
+    let mut file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let metadata = file.metadata()?;
+    if !metadata.is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o077 != 0
+        || metadata.len() > 64 * 1024
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "OpenCode runtime registration is not an owner-only bounded file",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.read_to_end(&mut bytes)?;
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+fn adopt_registered_opencode_runtime() -> io::Result<Option<OpenCodeRuntime>> {
+    let registration = match read_opencode_runtime_registration() {
+        Ok(Some(registration)) => registration,
+        Ok(None) => return Ok(None),
+        Err(_) => {
+            let _ = remove_opencode_runtime_registration();
+            return Ok(None);
+        }
+    };
+    let valid_static = registration.port != 0
+        && registration.pid != 0
+        && Uuid::parse_str(&registration.generation_id).is_ok();
+    let evidence = opencode_process_evidence(registration.pid);
+    let valid_process = evidence.is_ok_and(|(start_time, executable, argv)| {
+        start_time == registration.start_time
+            && executable == registration.executable
+            && argv == registration.argv
+            && is_opencode_serve_argv(&argv, registration.port)
+    });
+    let stat = fs::read_to_string(format!("/proc/{}/stat", registration.pid));
+    let valid_session = stat
+        .as_deref()
+        .ok()
+        .is_some_and(|stat| proc_session_id(stat) == Some(registration.pid as libc::pid_t));
+    let valid_generation = process_has_environment(
+        registration.pid,
+        b"BOOMUX_OPENCODE_SHARED_GENERATION",
+        registration.generation_id.as_bytes(),
+    )
+    .unwrap_or(false);
+    if !valid_static || !valid_process || !valid_session || !valid_generation {
+        let _ = remove_opencode_runtime_registration();
+        return Ok(None);
+    }
+    let process = ImportedProcess {
+        pid: registration.pid,
+        pidfd: open_pidfd(registration.pid)?,
+    };
+    let revalidated = !process.has_exited()?
+        && opencode_process_evidence(registration.pid).is_ok_and(
+            |(start_time, executable, argv)| {
+                start_time == registration.start_time
+                    && executable == registration.executable
+                    && argv == registration.argv
+                    && is_opencode_serve_argv(&argv, registration.port)
+            },
+        )
+        && TcpStream::connect(("127.0.0.1", registration.port)).is_ok()
+        && opencode_listener_belongs_to_session(registration.port, registration.pid);
+    if !revalidated {
+        let _ = remove_opencode_runtime_registration();
+        return Ok(None);
+    }
+    Ok(Some(OpenCodeRuntime {
+        generation_id: registration.generation_id,
+        port: registration.port,
+        pid: registration.pid,
+        process: OpenCodeRuntimeProcess::Imported(process),
+    }))
+}
+
+fn is_opencode_serve_argv(argv: &[Vec<u8>], port: u16) -> bool {
+    let port = port.to_string();
+    argv.windows(5).any(|arguments| {
+        arguments[0] == b"serve"
+            && arguments[1] == b"--hostname"
+            && arguments[2] == b"127.0.0.1"
+            && arguments[3] == b"--port"
+            && arguments[4] == port.as_bytes()
+    })
+}
+
+fn discover_unregistered_opencode_runtime(port: u16) -> io::Result<Option<OpenCodeRuntime>> {
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return Ok(None);
+    };
+    let mut discovered = None;
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(stat) = fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        if proc_session_id(&stat) != Some(pid as libc::pid_t)
+            || !process_argv(pid).is_ok_and(|argv| is_opencode_serve_argv(&argv, port))
+            || !opencode_listener_belongs_to_session(port, pid)
+        {
+            continue;
+        }
+        let Some(generation_id) =
+            process_environment_value(pid, b"BOOMUX_OPENCODE_SHARED_GENERATION")
+                .ok()
+                .flatten()
+                .and_then(|value| String::from_utf8(value).ok())
+                .filter(|value| Uuid::parse_str(value).is_ok())
+        else {
+            continue;
+        };
+        let process = ImportedProcess {
+            pid,
+            pidfd: open_pidfd(pid)?,
+        };
+        if process.has_exited()?
+            || !process_argv(pid).is_ok_and(|argv| is_opencode_serve_argv(&argv, port))
+            || !opencode_listener_belongs_to_session(port, pid)
+        {
+            continue;
+        }
+        if discovered.is_some() {
+            return Ok(None);
+        }
+        discovered = Some(OpenCodeRuntime {
+            generation_id,
+            port,
+            pid,
+            process: OpenCodeRuntimeProcess::Imported(process),
+        });
+    }
+    if let Some(runtime) = &discovered {
+        write_opencode_runtime_registration(&runtime.generation_id, runtime.pid, runtime.port)?;
+    }
+    Ok(discovered)
+}
+
 fn capture_current_environment() -> UnixEnvironment {
     UnixEnvironment {
         variables: env::vars_os()
@@ -717,6 +1002,243 @@ fn capture_current_environment() -> UnixEnvironment {
             })
             .collect(),
     }
+}
+
+fn environment_value(environment: &UnixEnvironment, name: &[u8]) -> Option<std::ffi::OsString> {
+    environment
+        .variables
+        .iter()
+        .find(|variable| variable.name == name)
+        .map(|variable| std::ffi::OsString::from_vec(variable.value.clone()))
+}
+
+fn set_environment_value(
+    environment: &mut UnixEnvironment,
+    name: &[u8],
+    value: impl Into<std::ffi::OsString>,
+) {
+    environment
+        .variables
+        .retain(|variable| variable.name != name);
+    environment.variables.push(UnixEnvironmentVariable {
+        name: name.to_vec(),
+        value: value.into().into_vec(),
+    });
+}
+
+fn sanitize_opencode_shim_environment(environment: &UnixEnvironment) -> UnixEnvironment {
+    let shim_dir = environment_value(environment, b"BOOMUX_OPENCODE_SHIM_DIR");
+    let original_path = environment_value(environment, b"BOOMUX_ORIGINAL_PATH");
+    let private_tui_config = environment_value(environment, b"BOOMUX_OPENCODE_TUI_CONFIG");
+    let user_zdotdir = environment_value(environment, b"BOOMUX_USER_ZDOTDIR");
+    let mut sanitized = environment.clone();
+    const PRIVATE_NAMES: &[&[u8]] = &[
+        b"BOOMUX_REAL_OPENCODE",
+        b"BOOMUX_ORIGINAL_PATH",
+        b"BOOMUX_OPENCODE_SHIM_DIR",
+        b"BOOMUX_OPENCODE_TUI_CONFIG",
+        b"BOOMUX_SHIM_EXECUTABLE",
+        b"BOOMUX_OPENCODE_SHARED_GENERATION",
+        b"BOOMUX_OPENCODE_CLAIM_HOLDER",
+        b"BOOMUX_USER_ZDOTDIR",
+    ];
+    sanitized
+        .variables
+        .retain(|variable| !PRIVATE_NAMES.contains(&variable.name.as_slice()));
+    if let Some(original_path) = original_path {
+        set_environment_value(&mut sanitized, b"PATH", original_path);
+    } else if let (Some(path), Some(shim_dir)) =
+        (environment_value(&sanitized, b"PATH"), shim_dir.as_deref())
+    {
+        let filtered = env::split_paths(&path)
+            .filter(|entry| entry.as_os_str() != shim_dir)
+            .collect::<Vec<_>>();
+        if let Ok(path) = env::join_paths(filtered) {
+            set_environment_value(&mut sanitized, b"PATH", path);
+        }
+    }
+    if let Some(user_zdotdir) = user_zdotdir {
+        set_environment_value(&mut sanitized, b"ZDOTDIR", user_zdotdir);
+    }
+    if let Some(private_tui_config) = private_tui_config {
+        sanitized.variables.retain(|variable| {
+            variable.name != b"OPENCODE_TUI_CONFIG"
+                || std::ffi::OsStr::from_bytes(&variable.value) != private_tui_config
+        });
+    }
+    sanitized
+}
+
+fn resolve_opencode_executable(
+    environment: &UnixEnvironment,
+    excluded_directory: Option<&Path>,
+) -> Option<PathBuf> {
+    let path = environment_value(environment, b"PATH")?;
+    let current_executable = env::current_exe()
+        .ok()
+        .and_then(|path| path.canonicalize().ok());
+    env::split_paths(&path).find_map(|directory| {
+        if !directory.is_absolute() || excluded_directory == Some(directory.as_path()) {
+            return None;
+        }
+        let candidate = directory.join("opencode");
+        let metadata = fs::metadata(&candidate).ok()?;
+        if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
+            return None;
+        }
+        let candidate = candidate.canonicalize().ok()?;
+        (Some(&candidate) != current_executable.as_ref()).then_some(candidate)
+    })
+}
+
+fn opencode_shim_eligible(shell: &Shell, effective_command: &[String]) -> bool {
+    matches!(shell.owner, ShellOwner::User)
+        && shell.command.is_empty()
+        && effective_command.is_empty()
+}
+
+fn inject_opencode_shim_environment(environment: &UnixEnvironment) -> io::Result<UnixEnvironment> {
+    let runtime_root = PathBuf::from(
+        environment_value(environment, b"XDG_RUNTIME_DIR").ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "XDG_RUNTIME_DIR is unavailable")
+        })?,
+    );
+    if !runtime_root.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "XDG_RUNTIME_DIR must be absolute",
+        ));
+    }
+    let shim_dir = runtime_root.join("boomux/shims");
+    secure_runtime_dir(&runtime_root.join("boomux"))?;
+    secure_runtime_dir(&shim_dir)?;
+    let real_opencode =
+        resolve_opencode_executable(environment, Some(&shim_dir)).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "OpenCode executable is unavailable",
+            )
+        })?;
+    let boomux = env::current_exe()?.canonicalize()?;
+    let boomux_metadata = fs::metadata(&boomux)?;
+    if !boomux.is_absolute()
+        || !boomux_metadata.is_file()
+        || boomux_metadata.permissions().mode() & 0o111 == 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Boomux executable is not an absolute regular executable",
+        ));
+    }
+
+    atomic_runtime_asset(&shim_dir.join("opencode"), OPENCODE_SHIM, 0o700)?;
+    atomic_runtime_asset(&shim_dir.join("boomux.bashrc"), OPENCODE_BASH_RC, 0o600)?;
+    atomic_runtime_asset(&shim_dir.join(".zshenv"), OPENCODE_ZSH_ENV, 0o600)?;
+    atomic_runtime_asset(&shim_dir.join(".zshrc"), OPENCODE_ZSH_RC, 0o600)?;
+    atomic_runtime_asset(&shim_dir.join("boomux-tui.tsx"), OPENCODE_TUI, 0o600)?;
+    atomic_runtime_asset(
+        &shim_dir.join("boomux-tui-core.js"),
+        OPENCODE_TUI_CORE,
+        0o600,
+    )?;
+    atomic_runtime_asset(
+        &shim_dir.join("boomux-tui-runner.js"),
+        OPENCODE_TUI_RUNNER,
+        0o600,
+    )?;
+    atomic_runtime_asset(
+        &shim_dir.join("tui.json"),
+        b"{\n  \"$schema\": \"https://opencode.ai/tui.json\",\n  \"plugin\": [[\"./boomux-tui.tsx\", {}]]\n}\n",
+        0o600,
+    )?;
+
+    let original_path = environment_value(environment, b"PATH").unwrap_or_default();
+    let mut paths = vec![shim_dir.clone()];
+    paths.extend(env::split_paths(&original_path));
+    let prefixed_path = env::join_paths(paths)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    let mut injected = environment.clone();
+    set_environment_value(&mut injected, b"PATH", prefixed_path);
+    set_environment_value(
+        &mut injected,
+        b"BOOMUX_REAL_OPENCODE",
+        real_opencode.into_os_string(),
+    );
+    set_environment_value(&mut injected, b"BOOMUX_ORIGINAL_PATH", original_path);
+    set_environment_value(
+        &mut injected,
+        b"BOOMUX_OPENCODE_SHIM_DIR",
+        shim_dir.as_os_str(),
+    );
+    set_environment_value(
+        &mut injected,
+        b"BOOMUX_OPENCODE_TUI_CONFIG",
+        shim_dir.join("tui.json").into_os_string(),
+    );
+    set_environment_value(
+        &mut injected,
+        b"BOOMUX_SHIM_EXECUTABLE",
+        boomux.into_os_string(),
+    );
+    Ok(injected)
+}
+
+fn configure_opencode_shell_startup(
+    client_shell: &std::ffi::OsStr,
+    environment: &mut UnixEnvironment,
+) -> Vec<std::ffi::OsString> {
+    let Some(shim_dir) = environment_value(environment, b"BOOMUX_OPENCODE_SHIM_DIR") else {
+        return Vec::new();
+    };
+    let shell_name = Path::new(client_shell).file_name();
+    match shell_name.and_then(std::ffi::OsStr::to_str) {
+        Some("bash") => vec![
+            "--rcfile".into(),
+            PathBuf::from(shim_dir)
+                .join("boomux.bashrc")
+                .into_os_string(),
+        ],
+        Some("zsh") => {
+            let user_zdotdir = environment_value(environment, b"ZDOTDIR")
+                .or_else(|| environment_value(environment, b"HOME"))
+                .unwrap_or_else(|| "/".into());
+            set_environment_value(environment, b"BOOMUX_USER_ZDOTDIR", user_zdotdir);
+            set_environment_value(environment, b"ZDOTDIR", shim_dir);
+            Vec::new()
+        }
+        Some("fish") => vec!["--init-command".into(), OPENCODE_FISH_INIT.into()],
+        _ => Vec::new(),
+    }
+}
+
+fn atomic_runtime_asset(path: &Path, content: &[u8], mode: u32) -> io::Result<()> {
+    if let Ok(metadata) = fs::symlink_metadata(path)
+        && (metadata.file_type().is_symlink() || !metadata.is_file())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("runtime asset is not a regular file: {}", path.display()),
+        ));
+    }
+    let directory = path.parent().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "runtime asset has no parent")
+    })?;
+    let temporary = directory.join(format!(".asset-{}", Uuid::new_v4()));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(&temporary)?;
+    let result = (|| {
+        file.write_all(content)?;
+        file.sync_all()?;
+        fs::set_permissions(&temporary, fs::Permissions::from_mode(mode))?;
+        fs::rename(&temporary, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 fn acquire_daemon_lock(runtime_dir: &Path) -> io::Result<File> {
@@ -768,6 +1290,7 @@ fn launch_replacement(
         let state_lock = registry.state_lock_descriptor()?;
         let focused_terminal = registry.focused_terminal_for_handoff()?;
         let presented_focused_terminal = registry.runtimes.presented_focused_terminal()?;
+        let opencode_runtime = registry.opencode.prepare_handoff()?;
         launch_replacement_process(
             listener.as_fd(),
             daemon_lock.as_fd(),
@@ -780,6 +1303,7 @@ fn launch_replacement(
                 presented_focused_terminal,
                 notification_settings,
                 startup_environment,
+                opencode_runtime,
             },
         )
         .map_err(DaemonError::from)
@@ -798,6 +1322,7 @@ struct ReplacementOptions {
     presented_focused_terminal: Option<QualifiedFocusedTerminalSnapshot>,
     notification_settings: Option<NotificationDeliverySettings>,
     startup_environment: Option<UnixEnvironment>,
+    opencode_runtime: Option<OutgoingOpenCodeRuntime>,
 }
 
 fn launch_replacement_process(
@@ -814,6 +1339,7 @@ fn launch_replacement_process(
         presented_focused_terminal,
         notification_settings,
         startup_environment,
+        opencode_runtime,
     } = options;
     let (mut channel, child_channel) = UnixStream::pair()?;
     let child_channel_fd = child_channel.as_raw_fd();
@@ -867,11 +1393,21 @@ fn launch_replacement_process(
                 notifications: notification_settings.map(Into::into),
                 focused_terminal,
                 presented_focused_terminal,
+                opencode_runtime: opencode_runtime
+                    .as_ref()
+                    .map(|runtime| runtime.manifest.clone()),
             },
         )?;
         send_descriptor(&channel, listener, handoff::LISTENER_MARKER)?;
         send_descriptor(&channel, runtime_lock, handoff::RUNTIME_LOCK_MARKER)?;
         send_descriptor(&channel, state_lock, handoff::STATE_LOCK_MARKER)?;
+        if let Some(runtime) = &opencode_runtime {
+            send_descriptor(
+                &channel,
+                runtime.pidfd.as_fd(),
+                handoff::OPENCODE_PIDFD_MARKER,
+            )?;
+        }
         for runtime in runtimes {
             send_descriptor(&channel, runtime.pty.as_fd(), handoff::PTY_MARKER)?;
             send_descriptor(&channel, runtime.pidfd.as_fd(), handoff::PIDFD_MARKER)?;
@@ -1385,6 +1921,16 @@ fn validate_notification_delivery_settings(
             ),
         ))
     }
+}
+
+fn validate_opencode_uuid(label: &str, value: &str) -> DaemonResult<()> {
+    Uuid::parse_str(value)
+        .map(|_| ())
+        .map_err(|_| DaemonError::validation(format!("{label} must be a UUID")))
+}
+
+fn validate_opencode_claim_id(label: &str, value: &str) -> DaemonResult<()> {
+    validate_required_agent_string(label, value, MAX_NAME_BYTES).map_err(DaemonError::from)
 }
 
 fn unsupported_request_message(feature: protocol::ProtocolFeature) -> String {
@@ -2297,6 +2843,7 @@ struct DaemonService {
     durable: DurableRegistry,
     events: EventStream,
     runtimes: ShellRuntimeManager,
+    opencode: OpenCodeCoordinator,
     remote_attachments: RemoteAttachmentManager,
     host_service_previews: Mutex<HashMap<String, HostServicePreview>>,
     workspace_operation_locks: Mutex<HashMap<String, Weak<Mutex<()>>>>,
@@ -2316,6 +2863,434 @@ struct DaemonService {
 struct HostServicePreview {
     created_at: Instant,
     prepared: PreparedIntegrationMutation,
+}
+
+#[derive(Default)]
+struct OpenCodeCoordinator {
+    state: Mutex<OpenCodeCoordinatorState>,
+}
+
+#[derive(Default)]
+struct OpenCodeCoordinatorState {
+    runtime: Option<OpenCodeRuntime>,
+    claims: HashMap<String, OpenCodeRootClaim>,
+}
+
+struct OpenCodeRuntime {
+    generation_id: String,
+    port: u16,
+    pid: u32,
+    process: OpenCodeRuntimeProcess,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OpenCodeRuntimeRegistration {
+    generation_id: String,
+    pid: u32,
+    port: u16,
+    start_time: u64,
+    executable: Vec<u8>,
+    argv: Vec<Vec<u8>>,
+}
+
+enum OpenCodeRuntimeProcess {
+    Owned(StdChild),
+    Imported(ImportedProcess),
+}
+
+#[derive(Clone)]
+struct OpenCodeRootClaim {
+    claim_id: String,
+    workspace_id: String,
+    shell_id: String,
+    run_id: String,
+    agent_id: String,
+    selected_holder_id: String,
+    holders: HashMap<String, OpenCodeClaimHolder>,
+}
+
+#[derive(Clone)]
+struct OpenCodeClaimHolder {
+    expires_at: Instant,
+    expires_at_ms: u64,
+}
+
+struct OpenCodeClaimsMutation<'a> {
+    state: MutexGuard<'a, OpenCodeCoordinatorState>,
+    previous: Option<HashMap<String, OpenCodeRootClaim>>,
+}
+
+impl OpenCodeClaimsMutation<'_> {
+    fn new(state: MutexGuard<'_, OpenCodeCoordinatorState>) -> OpenCodeClaimsMutation<'_> {
+        let previous = state.claims.clone();
+        OpenCodeClaimsMutation {
+            state,
+            previous: Some(previous),
+        }
+    }
+
+    fn commit(mut self) {
+        self.previous = None;
+    }
+}
+
+impl Drop for OpenCodeClaimsMutation<'_> {
+    fn drop(&mut self) {
+        if let Some(previous) = self.previous.take() {
+            self.state.claims = previous;
+        }
+    }
+}
+
+struct OutgoingOpenCodeRuntime {
+    manifest: handoff::OpenCodeRuntimeManifest,
+    pidfd: OwnedFd,
+}
+
+impl OpenCodeRuntimeProcess {
+    fn has_exited(&mut self) -> io::Result<bool> {
+        match self {
+            Self::Owned(child) => child.try_wait().map(|status| status.is_some()),
+            Self::Imported(process) => process.has_exited(),
+        }
+    }
+
+    fn pidfd(&mut self, pid: u32) -> io::Result<OwnedFd> {
+        match self {
+            Self::Owned(child) => {
+                if child.try_wait()?.is_some() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "OpenCode shared runtime exited",
+                    ));
+                }
+                open_pidfd(pid)
+            }
+            Self::Imported(process) => process.pidfd.try_clone(),
+        }
+    }
+
+    fn wait(&mut self) -> io::Result<()> {
+        match self {
+            Self::Owned(child) => child.wait().map(|_| ()),
+            Self::Imported(process) => process.wait(),
+        }
+    }
+}
+
+impl OpenCodeCoordinatorState {
+    fn reap_exited(&mut self) -> io::Result<()> {
+        let exited = match self.runtime.as_mut() {
+            Some(runtime) => runtime.process.has_exited()?,
+            None => false,
+        };
+        if exited {
+            self.runtime = None;
+            self.claims.clear();
+        }
+        Ok(())
+    }
+
+    fn prune_claims(&mut self, now: Instant) {
+        self.claims.retain(|_, claim| {
+            claim.holders.retain(|_, holder| holder.expires_at > now);
+            if !claim.holders.contains_key(&claim.selected_holder_id) {
+                claim.selected_holder_id = claim.holders.keys().min().cloned().unwrap_or_default();
+            }
+            !claim.holders.is_empty()
+        });
+    }
+
+    fn require_generation(&mut self, generation_id: &str) -> DaemonResult<()> {
+        self.reap_exited()?;
+        if self
+            .runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.generation_id == generation_id)
+        {
+            Ok(())
+        } else {
+            Err(DaemonError::lifecycle(
+                ErrorCode::NotFound,
+                "OpenCode shared runtime generation is not active",
+            ))
+        }
+    }
+
+    fn holder_count(&self) -> usize {
+        self.claims.values().map(|claim| claim.holders.len()).sum()
+    }
+
+    fn snapshot(
+        &self,
+        generation_id: &str,
+        root_session_id: &str,
+        holder_id: &str,
+    ) -> io::Result<OpenCodeSessionClaimSnapshot> {
+        let claim = self
+            .claims
+            .get(root_session_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "OpenCode claim not found"))?;
+        let holder = claim.holders.get(holder_id).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "OpenCode claim holder not found")
+        })?;
+        Ok(OpenCodeSessionClaimSnapshot {
+            generation_id: generation_id.into(),
+            claim_id: claim.claim_id.clone(),
+            holder_id: holder_id.into(),
+            root_session_id: root_session_id.into(),
+            workspace_id: claim.workspace_id.clone(),
+            shell_id: claim.shell_id.clone(),
+            run_id: claim.run_id.clone(),
+            agent_id: claim.agent_id.clone(),
+            holder_count: u32::try_from(claim.holders.len()).unwrap_or(u32::MAX),
+            holder_expires_at_ms: holder.expires_at_ms,
+        })
+    }
+}
+
+impl OpenCodeCoordinator {
+    fn reap_exited(&self) -> io::Result<()> {
+        lock(&self.state)?.reap_exited()
+    }
+
+    fn ensure_runtime(
+        &self,
+        port: u16,
+        environment: Option<&UnixEnvironment>,
+    ) -> DaemonResult<OpenCodeSharedRuntimeSnapshot> {
+        if port == 0 {
+            return Err(DaemonError::validation(
+                "OpenCode shared runtime port must be nonzero",
+            ));
+        }
+        let mut state = lock(&self.state)?;
+        state.reap_exited()?;
+        if let Some(runtime) = &state.runtime {
+            if runtime.port != port {
+                return Err(DaemonError::lifecycle(
+                    ErrorCode::Busy,
+                    "OpenCode shared runtime is active on a different port",
+                ));
+            }
+            return Ok(Self::runtime_snapshot(runtime));
+        }
+        if let Some(runtime) = adopt_registered_opencode_runtime()? {
+            let adopted_port = runtime.port;
+            state.claims.clear();
+            state.runtime = Some(runtime);
+            if adopted_port != port {
+                return Err(DaemonError::lifecycle(
+                    ErrorCode::Busy,
+                    "OpenCode shared runtime is active on a different port",
+                ));
+            }
+            return Ok(Self::runtime_snapshot(
+                state
+                    .runtime
+                    .as_ref()
+                    .expect("adopted runtime was inserted"),
+            ));
+        }
+        if let Some(runtime) = discover_unregistered_opencode_runtime(port)? {
+            state.claims.clear();
+            state.runtime = Some(runtime);
+            return Ok(Self::runtime_snapshot(
+                state
+                    .runtime
+                    .as_ref()
+                    .expect("discovered runtime was inserted"),
+            ));
+        }
+        let probe = TcpListener::bind(("127.0.0.1", port)).map_err(|error| {
+            DaemonError::lifecycle(
+                ErrorCode::Busy,
+                format!("OpenCode shared runtime port {port} is unavailable: {error}"),
+            )
+        })?;
+        drop(probe);
+
+        if let Some(environment) = environment {
+            validate_unix_environment(environment)?;
+        }
+        let inherited_environment = environment
+            .cloned()
+            .unwrap_or_else(capture_current_environment);
+        let sanitized_environment = sanitize_opencode_shim_environment(&inherited_environment);
+        let executable =
+            resolve_opencode_executable(&sanitized_environment, None).ok_or_else(|| {
+                DaemonError::lifecycle(
+                    ErrorCode::NotFound,
+                    "OpenCode executable is unavailable outside the Boomux shim",
+                )
+            })?;
+        let generation_id = Uuid::new_v4().to_string();
+        let port_argument = port.to_string();
+        let mut command = Command::new(&executable);
+        command
+            .args(["serve", "--hostname", "127.0.0.1", "--port", &port_argument])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .env_clear();
+        for variable in sanitized_environment.variables {
+            if !variable.name.starts_with(b"BOOMUX_") {
+                command.env(
+                    std::ffi::OsString::from_vec(variable.name),
+                    std::ffi::OsString::from_vec(variable.value),
+                );
+            }
+        }
+        command.env("BOOMUX_OPENCODE_SHARED_GENERATION", &generation_id);
+        // The child has not executed user code; setsid creates the process-tree
+        // boundary used by explicit daemon shutdown.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+        let mut child = command.spawn()?;
+        let pid = child.id();
+        let deadline = Instant::now() + OPENCODE_RUNTIME_READINESS_TIMEOUT;
+        loop {
+            if child.try_wait()?.is_some() {
+                return Err(DaemonError::lifecycle(
+                    ErrorCode::Busy,
+                    "OpenCode shared runtime exited before becoming ready",
+                ));
+            }
+            if TcpStream::connect(("127.0.0.1", port)).is_ok()
+                && child.try_wait()?.is_none()
+                && opencode_listener_belongs_to_session(port, pid)
+            {
+                break;
+            }
+            if Instant::now() >= deadline {
+                signal_session(pid as libc::pid_t, libc::SIGKILL);
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(DaemonError::lifecycle(
+                    ErrorCode::Timeout,
+                    "OpenCode shared runtime did not become ready",
+                ));
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        if let Err(error) = write_opencode_runtime_registration(&generation_id, pid, port) {
+            signal_session(pid as libc::pid_t, libc::SIGKILL);
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error.into());
+        }
+        state.claims.clear();
+        state.runtime = Some(OpenCodeRuntime {
+            generation_id,
+            port,
+            pid,
+            process: OpenCodeRuntimeProcess::Owned(child),
+        });
+        Ok(Self::runtime_snapshot(
+            state.runtime.as_ref().expect("runtime was inserted"),
+        ))
+    }
+
+    fn get_runtime(&self) -> DaemonResult<Option<OpenCodeSharedRuntimeSnapshot>> {
+        let mut state = lock(&self.state)?;
+        state.reap_exited()?;
+        Ok(state.runtime.as_ref().map(Self::runtime_snapshot))
+    }
+
+    fn runtime_snapshot(runtime: &OpenCodeRuntime) -> OpenCodeSharedRuntimeSnapshot {
+        OpenCodeSharedRuntimeSnapshot {
+            generation_id: runtime.generation_id.clone(),
+            url: format!("http://127.0.0.1:{}", runtime.port),
+            port: runtime.port,
+            pid: Some(runtime.pid),
+        }
+    }
+
+    fn prepare_handoff(&self) -> io::Result<Option<OutgoingOpenCodeRuntime>> {
+        let mut state = lock(&self.state)?;
+        state.reap_exited()?;
+        state
+            .runtime
+            .as_mut()
+            .map(|runtime| {
+                Ok(OutgoingOpenCodeRuntime {
+                    manifest: handoff::OpenCodeRuntimeManifest {
+                        generation_id: runtime.generation_id.clone(),
+                        port: runtime.port,
+                        pid: runtime.pid,
+                    },
+                    pidfd: runtime.process.pidfd(runtime.pid)?,
+                })
+            })
+            .transpose()
+    }
+
+    fn import_handoff(
+        &self,
+        transferred: Option<handoff::TransferredOpenCodeRuntime>,
+    ) -> io::Result<()> {
+        let mut state = lock(&self.state)?;
+        state.runtime = transferred
+            .map(|transferred| {
+                let manifest = transferred.manifest;
+                let stat = fs::read_to_string(format!("/proc/{}/stat", manifest.pid))?;
+                if proc_session_id(&stat) != Some(manifest.pid as libc::pid_t) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "transferred OpenCode process is not its session leader",
+                    ));
+                }
+                let process = ImportedProcess {
+                    pid: manifest.pid,
+                    pidfd: transferred.pidfd,
+                };
+                if process.has_exited()? {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "transferred OpenCode process exited before import",
+                    ));
+                }
+                Ok(OpenCodeRuntime {
+                    generation_id: manifest.generation_id,
+                    port: manifest.port,
+                    pid: manifest.pid,
+                    process: OpenCodeRuntimeProcess::Imported(process),
+                })
+            })
+            .transpose()?;
+        state.claims.clear();
+        Ok(())
+    }
+
+    fn shutdown(&self) -> io::Result<()> {
+        let mut state = lock(&self.state)?;
+        let Some(mut runtime) = state.runtime.take() else {
+            state.claims.clear();
+            remove_opencode_runtime_registration()?;
+            return Ok(());
+        };
+        state.claims.clear();
+        signal_session(runtime.pid as libc::pid_t, libc::SIGKILL);
+        match &mut runtime.process {
+            OpenCodeRuntimeProcess::Owned(child) => {
+                if child.try_wait()?.is_none() {
+                    child.kill()?;
+                }
+            }
+            OpenCodeRuntimeProcess::Imported(process) => process.send_signal(libc::SIGKILL)?,
+        }
+        let waited = runtime.process.wait();
+        let removed = remove_opencode_runtime_registration();
+        waited.and(removed)
+    }
 }
 
 #[derive(Default)]
@@ -6321,6 +7296,7 @@ impl Default for DaemonService {
                 focus: Mutex::new(FocusState::default()),
                 stopping: AtomicBool::new(false),
             },
+            opencode: OpenCodeCoordinator::default(),
             remote_attachments: RemoteAttachmentManager::default(),
             host_service_previews: Mutex::new(HashMap::new()),
             workspace_operation_locks: Mutex::new(HashMap::new()),
@@ -10857,6 +11833,351 @@ impl DaemonService {
         }
     }
 
+    fn ensure_opencode_session_claim(
+        &self,
+        generation_id: String,
+        holder_id: String,
+        root_session_id: String,
+        shell_id: String,
+        run_id: String,
+        spec: AgentRegistrationSpec,
+    ) -> DaemonResult<Response> {
+        validate_opencode_uuid("OpenCode runtime generation ID", &generation_id)?;
+        validate_opencode_claim_id("OpenCode claim holder ID", &holder_id)?;
+        validate_opencode_claim_id("OpenCode root session ID", &root_session_id)?;
+        validate_id("shell", &shell_id)?;
+        validate_id("run", &run_id)?;
+        if spec.integration != "opencode"
+            || spec.external_session_id.as_deref() != Some(root_session_id.as_str())
+        {
+            return Err(DaemonError::validation(
+                "OpenCode claim spec must use integration opencode and the exact root session ID",
+            ));
+        }
+        validate_agent_registration(&spec)?;
+        validate_external_agent_authority(spec.report.authority)?;
+        if spec.report.state == AgentState::Done {
+            return Err(DaemonError::validation(
+                "OpenCode claim spec must describe a non-completed Agent",
+            ));
+        }
+
+        let now = Instant::now();
+        let ((claim, agent), claims) = self.durable_mutation_outcome(|undo| {
+            let coordinator = lock(&self.opencode.state)?;
+            let mut claims = OpenCodeClaimsMutation::new(coordinator);
+            claims.state.require_generation(&generation_id)?;
+            claims.state.prune_claims(now);
+            if let Some(existing) = claims.state.claims.get(&root_session_id).cloned() {
+                let authority = {
+                    let durable = lock(&self.durable.state)?;
+                    Self::opencode_claim_authority(&durable, &root_session_id, &existing)
+                };
+                if authority.is_err() {
+                    claims.state.claims.remove(&root_session_id);
+                } else if existing.shell_id != shell_id || existing.run_id != run_id {
+                    return Err(DaemonError::lifecycle(
+                        ErrorCode::Busy,
+                        "OpenCode root session is claimed by a different ShellRun",
+                    ));
+                }
+            }
+            Self::validate_current_running_shell(&self.durable, &shell_id, &run_id)?;
+            let holder_already_present = claims
+                .state
+                .claims
+                .values()
+                .any(|claim| claim.holders.contains_key(&holder_id));
+            let new_root = !claims.state.claims.contains_key(&root_session_id);
+            let old_holder_only_root = claims.state.claims.values().any(|claim| {
+                claim.holders.len() == 1
+                    && claim.holders.contains_key(&holder_id)
+                    && !claims.state.claims.contains_key(&root_session_id)
+            });
+            let projected_roots = claims.state.claims.len() + usize::from(new_root)
+                - usize::from(old_holder_only_root);
+            if projected_roots > MAX_OPENCODE_CLAIM_ROOTS
+                || (claims.state.holder_count() >= MAX_OPENCODE_CLAIM_HOLDERS
+                    && !holder_already_present)
+            {
+                return Err(DaemonError::lifecycle(
+                    ErrorCode::Busy,
+                    "OpenCode claim capacity is exhausted",
+                ));
+            }
+            let (agent, created, record) = self.durable.ensure_agent(&shell_id, &run_id, spec)?;
+            if let Some(record) = record {
+                undo.record(record);
+            }
+            if agent.ended_at_ms.is_some() || agent.observation.state == AgentState::Done {
+                return Err(DaemonError::lifecycle(
+                    ErrorCode::NotFound,
+                    "exact active OpenCode Agent was not found",
+                ));
+            }
+            let mut events = Vec::new();
+            if created {
+                events.push(DaemonEventKind::AgentRegistered {
+                    workspace_id: agent.workspace_id.clone(),
+                    shell_id: agent.shell_id.clone(),
+                    agent: agent.clone(),
+                });
+            }
+            if let Some((execution, record)) = self.durable.link_agent_execution(&agent)? {
+                undo.record(record);
+                events.push(DaemonEventKind::ScheduledExecutionChanged {
+                    workspace_id: execution.workspace_id.clone(),
+                    execution,
+                });
+            }
+            for claim in claims.state.claims.values_mut() {
+                claim.holders.remove(&holder_id);
+            }
+            claims
+                .state
+                .claims
+                .retain(|root, claim| root == &root_session_id || !claim.holders.is_empty());
+            let expires_at_ms = unix_time_ms().saturating_add(
+                u64::try_from(OPENCODE_CLAIM_HOLDER_TTL.as_millis()).unwrap_or(u64::MAX),
+            );
+            let claim = claims
+                .state
+                .claims
+                .entry(root_session_id.clone())
+                .or_insert_with(|| OpenCodeRootClaim {
+                    claim_id: Uuid::new_v4().to_string(),
+                    workspace_id: agent.workspace_id.clone(),
+                    shell_id: shell_id.clone(),
+                    run_id: run_id.clone(),
+                    agent_id: agent.id.clone(),
+                    selected_holder_id: holder_id.clone(),
+                    holders: HashMap::new(),
+                });
+            claim.workspace_id = agent.workspace_id.clone();
+            claim.agent_id = agent.id.clone();
+            claim.selected_holder_id = holder_id.clone();
+            claim.holders.insert(
+                holder_id.clone(),
+                OpenCodeClaimHolder {
+                    expires_at: now + OPENCODE_CLAIM_HOLDER_TTL,
+                    expires_at_ms,
+                },
+            );
+            let claim = claims
+                .state
+                .snapshot(&generation_id, &root_session_id, &holder_id)?;
+            let value = ((claim, agent), claims);
+            if events.is_empty() {
+                Ok(DurableMutation::Unchanged(value))
+            } else {
+                Ok(DurableMutation::Changed(value, events))
+            }
+        })?;
+        claims.commit();
+        Ok(Response::OpenCodeSessionClaim { claim, agent })
+    }
+
+    fn resolve_opencode_session_claim(
+        &self,
+        generation_id: &str,
+        root_session_id: &str,
+    ) -> DaemonResult<Response> {
+        validate_opencode_uuid("OpenCode runtime generation ID", generation_id)?;
+        validate_opencode_claim_id("OpenCode root session ID", root_session_id)?;
+        let mut coordinator = lock(&self.opencode.state)?;
+        coordinator.require_generation(generation_id)?;
+        coordinator.prune_claims(Instant::now());
+        let claim = coordinator
+            .claims
+            .get(root_session_id)
+            .cloned()
+            .ok_or_else(|| {
+                DaemonError::lifecycle(ErrorCode::NotFound, "OpenCode session claim not found")
+            })?;
+        let agent = {
+            let durable = lock(&self.durable.state)?;
+            Self::opencode_claim_authority(&durable, root_session_id, &claim)
+        };
+        let agent = match agent {
+            Ok(agent) => agent,
+            Err(error) => {
+                coordinator.claims.remove(root_session_id);
+                return Err(error);
+            }
+        };
+        let snapshot =
+            coordinator.snapshot(generation_id, root_session_id, &claim.selected_holder_id)?;
+        Ok(Response::OpenCodeSessionClaim {
+            claim: snapshot,
+            agent,
+        })
+    }
+
+    fn release_opencode_session_claim(
+        &self,
+        generation_id: &str,
+        holder_id: &str,
+        claim_id: &str,
+    ) -> DaemonResult<Response> {
+        validate_opencode_uuid("OpenCode runtime generation ID", generation_id)?;
+        validate_opencode_claim_id("OpenCode claim holder ID", holder_id)?;
+        validate_opencode_uuid("OpenCode claim ID", claim_id)?;
+        let mut coordinator = lock(&self.opencode.state)?;
+        coordinator.require_generation(generation_id)?;
+        coordinator.prune_claims(Instant::now());
+        let root = coordinator.claims.iter().find_map(|(root, claim)| {
+            (claim.claim_id == claim_id && claim.holders.contains_key(holder_id))
+                .then(|| root.clone())
+        });
+        let released = if let Some(root) = root {
+            let claim = coordinator
+                .claims
+                .get_mut(&root)
+                .expect("matching claim disappeared while locked");
+            claim.holders.remove(holder_id);
+            if claim.holders.is_empty() {
+                coordinator.claims.remove(&root);
+            } else if claim.selected_holder_id == holder_id {
+                claim.selected_holder_id = claim.holders.keys().min().cloned().unwrap();
+            }
+            true
+        } else {
+            false
+        };
+        Ok(Response::OpenCodeSessionClaimReleased {
+            holder_id: holder_id.into(),
+            released,
+        })
+    }
+
+    fn report_claimed_opencode_agent(
+        &self,
+        generation_id: &str,
+        root_session_id: &str,
+        report: AgentReport,
+    ) -> DaemonResult<Response> {
+        validate_opencode_uuid("OpenCode runtime generation ID", generation_id)?;
+        validate_opencode_claim_id("OpenCode root session ID", root_session_id)?;
+        let (response, claims) = self.durable_mutation_outcome(|undo| {
+            let coordinator = lock(&self.opencode.state)?;
+            let mut claims = OpenCodeClaimsMutation::new(coordinator);
+            claims.state.require_generation(generation_id)?;
+            claims.state.prune_claims(Instant::now());
+            let claim = claims
+                .state
+                .claims
+                .get(root_session_id)
+                .cloned()
+                .ok_or_else(|| {
+                    DaemonError::lifecycle(ErrorCode::NotFound, "OpenCode session claim not found")
+                })?;
+            {
+                let durable = lock(&self.durable.state)?;
+                if let Err(error) =
+                    Self::opencode_claim_authority(&durable, root_session_id, &claim)
+                {
+                    claims.state.claims.remove(root_session_id);
+                    return Ok(DurableMutation::Unchanged((Err(error), claims)));
+                }
+            }
+            // Revalidate the exact current run while the mutation gate remains
+            // held, immediately before changing the claimed Agent.
+            Self::validate_current_running_shell(&self.durable, &claim.shell_id, &claim.run_id)?;
+            let (agent, changed, completed) =
+                self.report_agent_mutation(undo, &claim.agent_id, &claim.run_id, report)?;
+            if completed {
+                claims.state.claims.remove(root_session_id);
+            }
+            let value = (Ok((agent.clone(), completed)), claims);
+            if !changed {
+                return Ok(DurableMutation::Unchanged(value));
+            }
+            let event = if completed {
+                DaemonEventKind::AgentCompleted {
+                    workspace_id: agent.workspace_id.clone(),
+                    shell_id: agent.shell_id.clone(),
+                    agent: agent.clone(),
+                }
+            } else {
+                DaemonEventKind::AgentStateChanged {
+                    workspace_id: agent.workspace_id.clone(),
+                    shell_id: agent.shell_id.clone(),
+                    agent: agent.clone(),
+                }
+            };
+            Ok(DurableMutation::Changed(value, vec![event]))
+        })?;
+        claims.commit();
+        let (agent, _completed) = response?;
+        Ok(Response::Agent { agent })
+    }
+
+    fn validate_current_running_shell(
+        durable: &DurableRegistry,
+        shell_id: &str,
+        run_id: &str,
+    ) -> DaemonResult<()> {
+        let state = lock(&durable.state)?;
+        let shell = state.shells.get(shell_id).ok_or_else(|| {
+            DaemonError::lifecycle(ErrorCode::RunChanged, "OpenCode claim shell does not exist")
+        })?;
+        if matches!(&*lock(&shell.lifecycle)?, ShellLifecycle::Running { run, .. } if run.id == run_id)
+        {
+            Ok(())
+        } else {
+            Err(DaemonError::lifecycle(
+                ErrorCode::RunChanged,
+                "OpenCode claim does not match the current running ShellRun",
+            ))
+        }
+    }
+
+    fn opencode_claim_authority(
+        state: &DurableState,
+        root_session_id: &str,
+        claim: &OpenCodeRootClaim,
+    ) -> DaemonResult<AgentInstanceSnapshot> {
+        let shell = state.shells.get(&claim.shell_id).ok_or_else(|| {
+            DaemonError::lifecycle(
+                ErrorCode::RunChanged,
+                "OpenCode claim shell no longer exists",
+            )
+        })?;
+        if !matches!(&*lock(&shell.lifecycle)?, ShellLifecycle::Running { run, .. } if run.id == claim.run_id)
+        {
+            return Err(DaemonError::lifecycle(
+                ErrorCode::RunChanged,
+                "OpenCode claim no longer matches the current running ShellRun",
+            ));
+        }
+        let mut active = Vec::new();
+        for agent in state.agents.values().filter(|agent| {
+            agent.integration == "opencode"
+                && agent.external_session_id.as_deref() == Some(root_session_id)
+                && agent.shell_id == claim.shell_id
+                && agent.run_id == claim.run_id
+        }) {
+            let agent_state = lock(&agent.state)?;
+            let is_active = agent_state.ended_at_ms.is_none()
+                && agent_state.observation.state != AgentState::Done;
+            drop(agent_state);
+            if is_active {
+                active.push(agent.snapshot()?);
+            }
+        }
+        match active.as_slice() {
+            [agent] if agent.id == claim.agent_id => Ok(agent.clone()),
+            [] => Err(DaemonError::lifecycle(
+                ErrorCode::NotFound,
+                "exact active OpenCode Agent for claim was not found",
+            )),
+            _ => Err(DaemonError::lifecycle(
+                ErrorCode::AlreadyExists,
+                "OpenCode claim Agent is missing or ambiguous",
+            )),
+        }
+    }
+
     fn dispatch(&self, request: Request) -> DaemonResult<Response> {
         let (workspace_request_fingerprint, workspace_semantic_fingerprint) =
             workspace_operation_fingerprints(&request)?;
@@ -10864,6 +12185,8 @@ impl DaemonService {
             &request,
             Request::RegisterAgent { .. }
                 | Request::EnsureAgent { .. }
+                | Request::EnsureOpenCodeSessionClaim { .. }
+                | Request::ReportClaimedOpenCodeAgent { .. }
                 | Request::ReportAgent { .. }
         )
         .then(|| lock(&self.schedule_dispatch_lock))
@@ -11831,6 +13154,47 @@ impl DaemonService {
                     Ok(DurableMutation::Changed(Response::Agent { agent }, events))
                 }
             }),
+            Request::EnsureOpenCodeSharedRuntime { port, environment } => {
+                self.ensure_running()?;
+                self.opencode
+                    .ensure_runtime(port, environment.as_ref())
+                    .map(|runtime| Response::OpenCodeSharedRuntime {
+                        runtime: Some(runtime),
+                    })
+            }
+            Request::GetOpenCodeSharedRuntime => self
+                .opencode
+                .get_runtime()
+                .map(|runtime| Response::OpenCodeSharedRuntime { runtime }),
+            Request::EnsureOpenCodeSessionClaim {
+                generation_id,
+                holder_id,
+                root_session_id,
+                shell_id,
+                run_id,
+                spec,
+            } => self.ensure_opencode_session_claim(
+                generation_id,
+                holder_id,
+                root_session_id,
+                shell_id,
+                run_id,
+                spec,
+            ),
+            Request::ReleaseOpenCodeSessionClaim {
+                generation_id,
+                holder_id,
+                claim_id,
+            } => self.release_opencode_session_claim(&generation_id, &holder_id, &claim_id),
+            Request::ResolveOpenCodeSessionClaim {
+                generation_id,
+                root_session_id,
+            } => self.resolve_opencode_session_claim(&generation_id, &root_session_id),
+            Request::ReportClaimedOpenCodeAgent {
+                generation_id,
+                root_session_id,
+                report,
+            } => self.report_claimed_opencode_agent(&generation_id, &root_session_id, report),
             Request::ReportAgent {
                 agent_id,
                 run_id,
@@ -12414,6 +13778,7 @@ impl DaemonService {
                 focus: Mutex::new(FocusState::default()),
                 stopping: AtomicBool::new(false),
             },
+            opencode: OpenCodeCoordinator::default(),
             remote_attachments: RemoteAttachmentManager::default(),
             host_service_previews: Mutex::new(HashMap::new()),
             workspace_operation_locks: Mutex::new(HashMap::new()),
@@ -13775,7 +15140,9 @@ impl DaemonService {
                 Ok(())
             },
             |_| Vec::new(),
-        )
+        )?;
+        self.opencode.shutdown()?;
+        Ok(())
     }
 
     fn workspace(&self, id: &str) -> io::Result<Arc<Workspace>> {
@@ -15063,38 +16430,40 @@ impl ShellRuntimeManager {
         let master = PtyMaster::duplicate(pty.master.as_ref())?;
         let reader = master.try_clone_reader()?;
 
-        let client_shell = environment
-            .and_then(|environment| {
-                environment
-                    .variables
-                    .iter()
-                    .find(|variable| variable.name == b"SHELL")
-                    .map(|variable| std::ffi::OsString::from_vec(variable.value.clone()))
-            })
-            .or_else(|| {
-                environment
-                    .is_none()
-                    .then(|| env::var_os("SHELL"))
-                    .flatten()
-            })
-            .unwrap_or_else(|| "/bin/sh".into());
         let selected_command = recovery.effective_command.unwrap_or(&shell.command);
+        let original_environment = environment
+            .cloned()
+            .unwrap_or_else(capture_current_environment);
+        let mut child_environment = sanitize_opencode_shim_environment(&original_environment);
+        if opencode_shim_eligible(shell, selected_command)
+            && let Ok(injected) = inject_opencode_shim_environment(&child_environment)
+        {
+            child_environment = injected;
+        }
+        let client_shell = child_environment
+            .variables
+            .iter()
+            .find(|variable| variable.name == b"SHELL")
+            .map(|variable| std::ffi::OsString::from_vec(variable.value.clone()))
+            .unwrap_or_else(|| "/bin/sh".into());
         let mut command = if selected_command.is_empty() {
-            CommandBuilder::new(client_shell)
+            let startup_arguments =
+                configure_opencode_shell_startup(&client_shell, &mut child_environment);
+            let mut command = CommandBuilder::new(client_shell);
+            command.args(startup_arguments);
+            command
         } else {
             let mut command = CommandBuilder::new(&selected_command[0]);
             command.args(&selected_command[1..]);
             command
         };
         command.cwd(&shell.cwd);
-        if let Some(environment) = environment {
-            command.env_clear();
-            for variable in &environment.variables {
-                command.env(
-                    std::ffi::OsString::from_vec(variable.name.clone()),
-                    std::ffi::OsString::from_vec(variable.value.clone()),
-                );
-            }
+        command.env_clear();
+        for variable in &child_environment.variables {
+            command.env(
+                std::ffi::OsString::from_vec(variable.name.clone()),
+                std::ffi::OsString::from_vec(variable.value.clone()),
+            );
         }
         for name in ["TERM", "COLORTERM", "TERM_PROGRAM", "TERM_PROGRAM_VERSION"] {
             command.env_remove(name);
@@ -16088,8 +17457,30 @@ fn validate_terminal_profile(profile: &TerminalProfile) -> io::Result<()> {
 }
 
 fn validate_unix_environment(environment: &UnixEnvironment) -> io::Result<()> {
+    if environment.variables.len() > MAX_UNIX_ENVIRONMENT_VARIABLES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "client environment contains too many variables",
+        ));
+    }
     let mut names = HashSet::new();
+    let mut bytes = 0_usize;
     for variable in &environment.variables {
+        bytes = bytes
+            .checked_add(variable.name.len())
+            .and_then(|bytes| bytes.checked_add(variable.value.len()))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "client environment is too large",
+                )
+            })?;
+        if bytes > MAX_UNIX_ENVIRONMENT_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "client environment is too large",
+            ));
+        }
         if variable.name.is_empty()
             || variable.name.contains(&0)
             || variable.name.contains(&b'=')
@@ -16215,6 +17606,46 @@ fn session_processes(session_id: libc::pid_t) -> Vec<libc::pid_t> {
         }
     }
     processes
+}
+
+fn opencode_listener_belongs_to_session(port: u16, session_id: u32) -> bool {
+    let Ok(table) = fs::read_to_string("/proc/net/tcp") else {
+        return false;
+    };
+    let port = format!("{port:04X}");
+    let inodes = table
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            let local_port = fields.get(1)?.rsplit_once(':')?.1;
+            (local_port == port && fields.get(3) == Some(&"0A"))
+                .then(|| fields.get(9).copied())
+                .flatten()
+        })
+        .collect::<HashSet<_>>();
+    if inodes.is_empty() {
+        return false;
+    }
+    session_processes(session_id as libc::pid_t)
+        .into_iter()
+        .any(|pid| {
+            let Ok(descriptors) = fs::read_dir(format!("/proc/{pid}/fd")) else {
+                return false;
+            };
+            descriptors.flatten().any(|descriptor| {
+                fs::read_link(descriptor.path())
+                    .ok()
+                    .and_then(|target| target.into_os_string().into_string().ok())
+                    .and_then(|target| {
+                        target
+                            .strip_prefix("socket:[")
+                            .and_then(|target| target.strip_suffix(']'))
+                            .map(|inode| inodes.contains(inode))
+                    })
+                    .unwrap_or(false)
+            })
+        })
 }
 
 fn wait_for_session_descendants(session_id: libc::pid_t) -> io::Result<()> {
@@ -17053,6 +18484,240 @@ mod tests {
         assert!(text.find("old output").unwrap() < text.find("Boomux: project/agent").unwrap());
     }
 
+    fn test_environment(values: &[(&str, &Path)]) -> UnixEnvironment {
+        UnixEnvironment {
+            variables: values
+                .iter()
+                .map(|(name, value)| UnixEnvironmentVariable {
+                    name: name.as_bytes().to_vec(),
+                    value: value.as_os_str().as_bytes().to_vec(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn opencode_shim_eligibility_is_limited_to_user_login_shells() {
+        let login =
+            create_pending_shell("workspace", ShellSpec::login("login", env::temp_dir())).unwrap();
+        assert!(opencode_shim_eligible(&login, &[]));
+        assert!(!opencode_shim_eligible(
+            &login,
+            &["opencode".into(), "--continue".into()]
+        ));
+
+        let command = create_pending_shell(
+            "workspace",
+            ShellSpec {
+                name: "command".into(),
+                cwd: env::temp_dir(),
+                command: vec!["opencode".into()],
+            },
+        )
+        .unwrap();
+        assert!(!opencode_shim_eligible(&command, &command.command));
+
+        let mut scheduled =
+            create_pending_shell("workspace", ShellSpec::login("scheduled", env::temp_dir()))
+                .unwrap();
+        Arc::get_mut(&mut scheduled).unwrap().owner = ShellOwner::Schedule {
+            schedule_id: "schedule-1".into(),
+        };
+        assert!(!opencode_shim_eligible(&scheduled, &[]));
+    }
+
+    #[test]
+    fn inherited_opencode_shim_provenance_is_stripped_without_losing_identity() {
+        let mut environment = test_environment(&[
+            ("PATH", Path::new("/runtime/boomux/shims:/usr/bin")),
+            ("BOOMUX_ORIGINAL_PATH", Path::new("/usr/local/bin:/usr/bin")),
+            (
+                "BOOMUX_OPENCODE_SHIM_DIR",
+                Path::new("/runtime/boomux/shims"),
+            ),
+            ("BOOMUX_REAL_OPENCODE", Path::new("/usr/bin/opencode")),
+            (
+                "BOOMUX_OPENCODE_TUI_CONFIG",
+                Path::new("/runtime/boomux/shims/tui.json"),
+            ),
+            (
+                "OPENCODE_TUI_CONFIG",
+                Path::new("/runtime/boomux/shims/tui.json"),
+            ),
+            ("BOOMUX_SHIM_EXECUTABLE", Path::new("/usr/bin/boomux")),
+            ("BOOMUX_OPENCODE_SHARED_GENERATION", Path::new("generation")),
+            ("BOOMUX_OPENCODE_CLAIM_HOLDER", Path::new("holder")),
+            ("BOOMUX_USER_ZDOTDIR", Path::new("/home/user")),
+            ("ZDOTDIR", Path::new("/runtime/boomux/shims")),
+            ("BOOMUX_SHELL_ID", Path::new("shell-1")),
+            ("BOOMUX_RUN_ID", Path::new("run-1")),
+        ]);
+        environment.variables.push(UnixEnvironmentVariable {
+            name: b"KEEP".to_vec(),
+            value: b"value".to_vec(),
+        });
+
+        let sanitized = sanitize_opencode_shim_environment(&environment);
+        assert_eq!(
+            environment_value(&sanitized, b"PATH").as_deref(),
+            Some(std::ffi::OsStr::new("/usr/local/bin:/usr/bin"))
+        );
+        for name in [
+            b"BOOMUX_ORIGINAL_PATH".as_slice(),
+            b"BOOMUX_OPENCODE_SHIM_DIR",
+            b"BOOMUX_REAL_OPENCODE",
+            b"BOOMUX_OPENCODE_TUI_CONFIG",
+            b"BOOMUX_SHIM_EXECUTABLE",
+            b"BOOMUX_OPENCODE_SHARED_GENERATION",
+            b"BOOMUX_OPENCODE_CLAIM_HOLDER",
+            b"BOOMUX_USER_ZDOTDIR",
+            b"OPENCODE_TUI_CONFIG",
+        ] {
+            assert!(
+                environment_value(&sanitized, name).is_none(),
+                "retained {name:?}"
+            );
+        }
+        assert_eq!(
+            environment_value(&sanitized, b"BOOMUX_SHELL_ID").unwrap(),
+            "shell-1"
+        );
+        assert_eq!(
+            environment_value(&sanitized, b"BOOMUX_RUN_ID").unwrap(),
+            "run-1"
+        );
+        assert_eq!(environment_value(&sanitized, b"KEEP").unwrap(), "value");
+        assert_eq!(
+            environment_value(&sanitized, b"ZDOTDIR").unwrap(),
+            "/home/user"
+        );
+    }
+
+    #[test]
+    fn common_shell_startup_adapters_reassert_the_scoped_shim_after_user_config() {
+        let mut environment = test_environment(&[
+            (
+                "BOOMUX_OPENCODE_SHIM_DIR",
+                Path::new("/runtime/boomux/shims"),
+            ),
+            ("HOME", Path::new("/home/user")),
+            ("ZDOTDIR", Path::new("/home/user/custom-zsh")),
+        ]);
+
+        assert_eq!(
+            configure_opencode_shell_startup(Path::new("/bin/bash").as_os_str(), &mut environment),
+            vec![
+                std::ffi::OsString::from("--rcfile"),
+                std::ffi::OsString::from("/runtime/boomux/shims/boomux.bashrc"),
+            ]
+        );
+
+        assert!(
+            configure_opencode_shell_startup(
+                Path::new("/usr/bin/zsh").as_os_str(),
+                &mut environment
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            environment_value(&environment, b"BOOMUX_USER_ZDOTDIR").unwrap(),
+            "/home/user/custom-zsh"
+        );
+        assert_eq!(
+            environment_value(&environment, b"ZDOTDIR").unwrap(),
+            "/runtime/boomux/shims"
+        );
+
+        let fish = configure_opencode_shell_startup(
+            Path::new("/usr/bin/fish").as_os_str(),
+            &mut environment,
+        );
+        assert_eq!(fish[0], "--init-command");
+        assert!(fish[1].to_string_lossy().contains("BOOMUX_ORIGINAL_PATH"));
+        assert!(
+            configure_opencode_shell_startup(
+                Path::new("/usr/bin/unknown-shell").as_os_str(),
+                &mut environment
+            )
+            .is_empty()
+        );
+        for source in [OPENCODE_BASH_RC, OPENCODE_ZSH_ENV, OPENCODE_ZSH_RC] {
+            assert!(
+                std::str::from_utf8(source)
+                    .unwrap()
+                    .contains("BOOMUX_OPENCODE_SHIM_DIR")
+            );
+        }
+    }
+
+    #[test]
+    fn shim_assets_are_private_and_forward_exact_arguments() {
+        let directory = env::temp_dir().join(format!("boomux-opencode-shim-{}", Uuid::new_v4()));
+        let runtime = directory.join("runtime");
+        let bin = directory.join("bin");
+        fs::create_dir_all(&runtime).unwrap();
+        fs::create_dir_all(&bin).unwrap();
+        let host = bin.join("opencode");
+        fs::write(&host, b"#!/bin/sh\nprintf '<%s>\\n' \"$@\"\n").unwrap();
+        fs::set_permissions(&host, fs::Permissions::from_mode(0o700)).unwrap();
+        let environment = test_environment(&[("XDG_RUNTIME_DIR", &runtime), ("PATH", &bin)]);
+
+        let injected = inject_opencode_shim_environment(&environment).unwrap();
+        let shim =
+            PathBuf::from(environment_value(&injected, b"BOOMUX_OPENCODE_SHIM_DIR").unwrap())
+                .join("opencode");
+        assert_eq!(
+            fs::metadata(&shim).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(shim.with_file_name("tui.json"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        let output = Command::new(&shim)
+            .args(["", "$(touch should-not-exist)", "semi;colon", "two words"])
+            .env("BOOMUX_REAL_OPENCODE", &host)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            "<>\n<$(touch should-not-exist)>\n<semi;colon>\n<two words>\n"
+        );
+        let noninteractive = Command::new(&shim)
+            .env("BOOMUX_REAL_OPENCODE", &host)
+            .env("BOOMUX_SHELL_ID", "shell-1")
+            .env("BOOMUX_RUN_ID", "run-1")
+            .output()
+            .unwrap();
+        assert!(noninteractive.status.success());
+        assert_eq!(noninteractive.stdout, b"<>\n");
+        assert!(
+            std::str::from_utf8(OPENCODE_SHIM)
+                .unwrap()
+                .contains("exec \"$BOOMUX_SHIM_EXECUTABLE\" opencode shared")
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn missing_real_opencode_leaves_the_sanitized_environment_usable() {
+        let directory = env::temp_dir().join(format!("boomux-opencode-missing-{}", Uuid::new_v4()));
+        let runtime = directory.join("runtime");
+        let empty_bin = directory.join("bin");
+        fs::create_dir_all(&runtime).unwrap();
+        fs::create_dir_all(&empty_bin).unwrap();
+        let environment = test_environment(&[("XDG_RUNTIME_DIR", &runtime), ("PATH", &empty_bin)]);
+        let sanitized = sanitize_opencode_shim_environment(&environment);
+        assert!(inject_opencode_shim_environment(&sanitized).is_err());
+        assert_eq!(sanitized, environment);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
     fn add_recovery_agent(
         registry: &DaemonService,
         shell: &Shell,
@@ -17237,6 +18902,20 @@ mod tests {
         }
     }
 
+    fn opencode_agent_spec(external_session_id: &str, state: AgentState) -> AgentRegistrationSpec {
+        AgentRegistrationSpec {
+            name: "opencode-agent".into(),
+            integration: "opencode".into(),
+            external_session_id: Some(external_session_id.into()),
+            report: AgentReport {
+                state,
+                authority: AgentAuthority::LifecycleIntegration,
+                evidence: "OpenCode attachment test".into(),
+                confidence: 100,
+            },
+        }
+    }
+
     fn agent_report(state: AgentState, authority: AgentAuthority, evidence: &str) -> AgentReport {
         AgentReport {
             state,
@@ -17278,6 +18957,281 @@ mod tests {
             runtime: Arc::clone(&runtime),
         };
         (workspace, shell, runtime)
+    }
+
+    fn install_test_opencode_runtime(registry: &DaemonService) -> String {
+        let mut command = Command::new("/bin/sleep");
+        command.arg("30");
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+        let child = command.spawn().unwrap();
+        let generation_id = Uuid::new_v4().to_string();
+        *lock(&registry.opencode.state).unwrap() = OpenCodeCoordinatorState {
+            runtime: Some(OpenCodeRuntime {
+                generation_id: generation_id.clone(),
+                port: 4096,
+                pid: child.id(),
+                process: OpenCodeRuntimeProcess::Owned(child),
+            }),
+            claims: HashMap::new(),
+        };
+        generation_id
+    }
+
+    #[test]
+    fn opencode_claims_support_renewal_multiple_holders_switch_and_safe_release() {
+        let registry = DaemonService::default();
+        let (_, shell, _runtime) = running_shell(&registry);
+        let generation_id = install_test_opencode_runtime(&registry);
+        let run_id = match &*lock(&shell.lifecycle).unwrap() {
+            ShellLifecycle::Running { run, .. } => run.id.clone(),
+            _ => unreachable!(),
+        };
+        let holder_one = Uuid::new_v4().to_string();
+        let holder_two = Uuid::new_v4().to_string();
+        let ensure = |holder_id: &str, root_session_id: &str| match registry
+            .dispatch(Request::EnsureOpenCodeSessionClaim {
+                generation_id: generation_id.clone(),
+                holder_id: holder_id.into(),
+                root_session_id: root_session_id.into(),
+                shell_id: shell.id.clone(),
+                run_id: run_id.clone(),
+                spec: opencode_agent_spec(root_session_id, AgentState::Working),
+            })
+            .unwrap()
+        {
+            Response::OpenCodeSessionClaim { claim, agent } => (claim, agent),
+            response => panic!("unexpected response: {response:?}"),
+        };
+
+        let (first, first_agent) = ensure(&holder_one, "ses_shared");
+        let (renewed, _) = ensure(&holder_one, "ses_shared");
+        assert_eq!(renewed.claim_id, first.claim_id);
+        let (shared, _) = ensure(&holder_two, "ses_shared");
+        assert_eq!(shared.claim_id, first.claim_id);
+        assert_eq!(shared.holder_count, 2);
+
+        let (switched, _) = ensure(&holder_one, "ses_new");
+        assert_ne!(switched.claim_id, first.claim_id);
+        let stale_release = registry
+            .dispatch(Request::ReleaseOpenCodeSessionClaim {
+                generation_id: generation_id.clone(),
+                holder_id: holder_one.clone(),
+                claim_id: first.claim_id,
+            })
+            .unwrap();
+        assert!(matches!(
+            stale_release,
+            Response::OpenCodeSessionClaimReleased {
+                released: false,
+                ..
+            }
+        ));
+        let resolved = registry
+            .dispatch(Request::ResolveOpenCodeSessionClaim {
+                generation_id: generation_id.clone(),
+                root_session_id: "ses_shared".into(),
+            })
+            .unwrap();
+        assert!(matches!(
+            resolved,
+            Response::OpenCodeSessionClaim { agent, .. } if agent.id == first_agent.id
+        ));
+
+        registry
+            .dispatch(Request::ReportClaimedOpenCodeAgent {
+                generation_id: generation_id.clone(),
+                root_session_id: "ses_shared".into(),
+                report: agent_report(
+                    AgentState::Blocked,
+                    AgentAuthority::LifecycleIntegration,
+                    "claimed report",
+                ),
+            })
+            .unwrap();
+        registry
+            .dispatch(Request::ReportClaimedOpenCodeAgent {
+                generation_id: generation_id.clone(),
+                root_session_id: "ses_shared".into(),
+                report: agent_report(
+                    AgentState::Done,
+                    AgentAuthority::LifecycleIntegration,
+                    "claimed completion",
+                ),
+            })
+            .unwrap();
+        let completed = registry
+            .dispatch(Request::ResolveOpenCodeSessionClaim {
+                generation_id: generation_id.clone(),
+                root_session_id: "ses_shared".into(),
+            })
+            .unwrap_err();
+        assert_eq!(completed.wire_code(), ErrorCode::NotFound);
+        registry.opencode.shutdown().unwrap();
+    }
+
+    #[test]
+    fn opencode_claim_expiry_reclaims_roots_and_holders() {
+        let mut state = OpenCodeCoordinatorState::default();
+        state.claims.insert(
+            "ses_expired".into(),
+            OpenCodeRootClaim {
+                claim_id: Uuid::new_v4().to_string(),
+                workspace_id: Uuid::new_v4().to_string(),
+                shell_id: Uuid::new_v4().to_string(),
+                run_id: Uuid::new_v4().to_string(),
+                agent_id: Uuid::new_v4().to_string(),
+                selected_holder_id: "holder".into(),
+                holders: HashMap::from([(
+                    "holder".into(),
+                    OpenCodeClaimHolder {
+                        expires_at: Instant::now(),
+                        expires_at_ms: 0,
+                    },
+                )]),
+            },
+        );
+
+        state.prune_claims(Instant::now());
+
+        assert!(state.claims.is_empty());
+        assert_eq!(state.holder_count(), 0);
+    }
+
+    #[test]
+    fn failed_claim_ensure_leaves_ephemeral_selection_unchanged() {
+        let registry = DaemonService::default();
+        let (_, shell, _runtime) = running_shell(&registry);
+        let generation_id = install_test_opencode_runtime(&registry);
+        let run_id = match &*lock(&shell.lifecycle).unwrap() {
+            ShellLifecycle::Running { run, .. } => run.id.clone(),
+            _ => unreachable!(),
+        };
+        registry.fail_after_mutation.store(true, Ordering::Release);
+
+        let error = registry
+            .dispatch(Request::EnsureOpenCodeSessionClaim {
+                generation_id,
+                holder_id: Uuid::new_v4().to_string(),
+                root_session_id: "ses_rollback".into(),
+                shell_id: shell.id.clone(),
+                run_id,
+                spec: opencode_agent_spec("ses_rollback", AgentState::Working),
+            })
+            .unwrap_err();
+
+        assert_eq!(error.wire_code(), ErrorCode::Internal);
+        assert!(lock(&registry.opencode.state).unwrap().claims.is_empty());
+        registry.opencode.shutdown().unwrap();
+    }
+
+    #[test]
+    fn invalid_or_failed_claim_ensure_rolls_back_all_durable_effects() {
+        let registry = DaemonService::default();
+        let (workspace, shell, _runtime) = running_shell(&registry);
+        let generation_id = install_test_opencode_runtime(&registry);
+        let run_id = shell.snapshot().unwrap().run.unwrap().id;
+        let baseline = registry.capture_persisted_state().unwrap();
+        let baseline_json = serde_json::to_value(&baseline.state).unwrap();
+        let baseline_revision = registry
+            .workspace(&workspace.id)
+            .unwrap()
+            .snapshot(&registry.durable)
+            .unwrap()
+            .revision;
+        let baseline_event = lock(&registry.events.state).unwrap().latest_id;
+
+        for (state, inject_failure) in [(AgentState::Done, false), (AgentState::Working, true)] {
+            registry
+                .fail_after_mutation
+                .store(inject_failure, Ordering::Release);
+            let result = registry.dispatch(Request::EnsureOpenCodeSessionClaim {
+                generation_id: generation_id.clone(),
+                holder_id: Uuid::new_v4().to_string(),
+                root_session_id: format!("ses_rollback_{state:?}"),
+                shell_id: shell.id.clone(),
+                run_id: run_id.clone(),
+                spec: opencode_agent_spec(&format!("ses_rollback_{state:?}"), state),
+            });
+            assert!(result.is_err());
+            assert_eq!(registry.snapshot().unwrap().workspaces[0].agents.len(), 0);
+            assert_eq!(
+                registry
+                    .workspace(&workspace.id)
+                    .unwrap()
+                    .snapshot(&registry.durable)
+                    .unwrap()
+                    .revision,
+                baseline_revision
+            );
+            assert_eq!(
+                lock(&registry.events.state).unwrap().latest_id,
+                baseline_event
+            );
+            assert_eq!(
+                serde_json::to_value(&registry.capture_persisted_state().unwrap().state).unwrap(),
+                baseline_json
+            );
+            assert!(lock(&registry.opencode.state).unwrap().claims.is_empty());
+        }
+        registry.opencode.shutdown().unwrap();
+    }
+
+    #[test]
+    fn claimed_report_revalidates_run_after_waiting_for_mutation_gate() {
+        let registry = Arc::new(DaemonService::default());
+        let (workspace, shell, runtime) = running_shell(&registry);
+        let generation_id = install_test_opencode_runtime(&registry);
+        let run_id = shell.snapshot().unwrap().run.unwrap().id;
+        registry
+            .dispatch(Request::EnsureOpenCodeSessionClaim {
+                generation_id: generation_id.clone(),
+                holder_id: Uuid::new_v4().to_string(),
+                root_session_id: "ses_stale_report".into(),
+                shell_id: shell.id.clone(),
+                run_id: run_id.clone(),
+                spec: opencode_agent_spec("ses_stale_report", AgentState::Working),
+            })
+            .unwrap();
+
+        let mutation = lock(&registry.mutation_lock).unwrap();
+        let reporting_registry = Arc::clone(&registry);
+        let report = thread::spawn(move || {
+            reporting_registry.dispatch(Request::ReportClaimedOpenCodeAgent {
+                generation_id,
+                root_session_id: "ses_stale_report".into(),
+                report: agent_report(
+                    AgentState::Blocked,
+                    AgentAuthority::LifecycleIntegration,
+                    "must be rejected",
+                ),
+            })
+        });
+        thread::sleep(Duration::from_millis(20));
+        assert!(registry.opencode.state.try_lock().is_ok());
+        let replacement = Arc::new(ShellRun::new(2));
+        *lock(&shell.lifecycle).unwrap() = ShellLifecycle::Running {
+            profile: profile(),
+            run: replacement,
+            runtime,
+        };
+        drop(mutation);
+
+        assert_eq!(
+            report.join().unwrap().unwrap_err().wire_code(),
+            ErrorCode::RunChanged
+        );
+        assert!(lock(&registry.opencode.state).unwrap().claims.is_empty());
+        registry.opencode.shutdown().unwrap();
+        shell.kill().unwrap();
+        registry.close_workspace(&workspace.id).unwrap();
     }
 
     fn install_test_controller(runtime: &ShellRuntime, token: &str) {
@@ -17831,6 +19785,16 @@ mod tests {
             }],
         };
         assert!(validate_unix_environment(&bytes).is_ok());
+    }
+
+    #[test]
+    fn listener_ownership_requires_the_exact_process_session() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let session = unsafe { libc::getsid(0) } as u32;
+
+        assert!(opencode_listener_belongs_to_session(port, session));
+        assert!(!opencode_listener_belongs_to_session(port, u32::MAX));
     }
 
     #[test]

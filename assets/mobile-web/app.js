@@ -1,7 +1,5 @@
 "use strict";
 
-import { reconcileAgentCompletions } from "./mobile-model.js";
-
 const POLL_INTERVAL_MS = 2_000;
 const state = {
   snapshot: null,
@@ -11,9 +9,6 @@ const state = {
   snapshotRequest: null,
   detailRequest: null,
   online: true,
-  previousAgentStates: new Map(),
-  completedAgents: new Set(),
-  agentBaselineReady: false,
 };
 
 const elements = {
@@ -73,10 +68,6 @@ function relativeTime(timestamp) {
 
 function isActive(agent) {
   return agent.node_current && agent.run_current && (agent.state === "working" || agent.state === "blocked");
-}
-
-function agentKey(agent) {
-  return `${agent.node_id}\u0000${agent.agent_id}`;
 }
 
 function agentDisplayName(agent) {
@@ -234,18 +225,12 @@ async function refreshSnapshot() {
   state.snapshotRequest = controller;
   try {
     const snapshot = await fetchJson("/api/snapshot", controller.signal);
-    const completion = reconcileAgentCompletions({
-      agents: Array.isArray(snapshot.agents) ? snapshot.agents : [],
-      previousStates: state.previousAgentStates,
-      completedAgents: state.completedAgents,
-      baselineReady: state.agentBaselineReady,
-    });
-    state.previousAgentStates = completion.previousStates;
-    state.completedAgents = completion.completedAgents;
-    state.agentBaselineReady = true;
     state.snapshot = snapshot;
-    state.online = true;
-    updateConnection("online", "Live");
+    state.online = snapshot.daemon_connected;
+    updateConnection(
+      snapshot.daemon_connected ? "online" : "offline",
+      snapshot.daemon_connected ? "Live" : "Daemon offline",
+    );
     renderSnapshot();
   } catch (error) {
     if (error.name === "AbortError") return;
@@ -262,7 +247,6 @@ async function refreshSnapshot() {
 
 function renderDetail(payload) {
   const agent = payload.agent;
-  agent.just_completed = state.completedAgents.has(agentKey(agent));
   document.title = `${agentDisplayName(agent)} · Boomux Agents`;
   document.querySelector("#detail-title").textContent = agentDisplayName(agent);
   document.querySelector("#detail-integration").textContent = agent.integration || "Agent";
@@ -300,6 +284,18 @@ function renderDetail(payload) {
     timeline.append(empty);
   }
 
+  const nativeWeb = payload.native_web;
+  const nativeLink = document.querySelector("#native-handoff-link");
+  const nativeNotice = document.querySelector("#native-handoff-notice");
+  if (nativeLink && nativeNotice) {
+    nativeNotice.textContent = payload.native_web_notice || "Native web handoff is unavailable.";
+    const nativeUrl = nativeWeb?.url || derivedNativeUrl(nativeWeb);
+    nativeLink.hidden = !nativeUrl;
+    nativeLink.removeAttribute("href");
+    nativeLink.textContent = nativeWeb?.label || "Open native interface";
+    if (nativeUrl) nativeLink.href = nativeUrl;
+  }
+
   const terminal = document.querySelector("#terminal-output");
   const terminalSection = document.querySelector("#terminal-section");
   const notice = document.querySelector("#terminal-notice");
@@ -312,6 +308,23 @@ function renderDetail(payload) {
 
   elements.detailState.hidden = true;
   elements.detailContent.hidden = false;
+}
+
+function derivedNativeUrl(nativeWeb) {
+  if (!nativeWeb?.port || !nativeWeb?.path) return null;
+  const url = new URL(window.location.href);
+  url.hash = "";
+  url.search = "";
+  url.port = String(nativeWeb.port);
+  url.pathname = nativeWeb.path;
+  return url.href;
+}
+
+function clearNativeHandoff() {
+  const nativeLink = document.querySelector("#native-handoff-link");
+  if (!nativeLink) return;
+  nativeLink.hidden = true;
+  nativeLink.removeAttribute("href");
 }
 
 function fact(label, value, note) {
@@ -350,6 +363,7 @@ async function refreshDetail({ announceLoading = false } = {}) {
     if (routeDetail()?.nodeId === route.nodeId && routeDetail()?.agentId === route.agentId) renderDetail(payload);
   } catch (error) {
     if (error.name === "AbortError") return;
+    clearNativeHandoff();
     if (elements.detailContent.hidden) {
       showState(elements.detailState, "Agent detail unavailable", "The run may have ended or the node cannot be reached. Return to the fleet or try again.", "error");
     }
@@ -374,8 +388,9 @@ function applyRoute() {
 
 async function poll() {
   if (document.visibilityState !== "visible") return;
-  await refreshSnapshot();
-  if (routeDetail()) await refreshDetail();
+  const requests = [refreshSnapshot()];
+  if (routeDetail()) requests.push(refreshDetail());
+  await Promise.all(requests);
 }
 
 function restartPolling() {
@@ -423,7 +438,10 @@ window.addEventListener("appinstalled", () => {
 });
 
 if ("serviceWorker" in navigator) {
-  window.addEventListener("load", () => navigator.serviceWorker.register("service-worker.js"));
+  window.addEventListener("load", async () => {
+    const registration = await navigator.serviceWorker.register("service-worker.js");
+    registration.update();
+  });
 }
 
 applyRoute();

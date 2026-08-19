@@ -1,10 +1,10 @@
 ---
 name: boomux
-description: Inspect and manage Boomux Nodes, coordinated persistent terminal Workspaces, launchers, shells, run-scoped agent instances, attention, projected sessions, recurring Agent schedules, notifications, process supervision, and integrations. Use when asked to discover Nodes, shells, agents, sessions, or schedules, read terminal output, manage explicitly authorized recurring Agent prompts, supervise an explicitly identified external session, report agent lifecycle state, configure or test notifications, install or remove the OpenCode or Pi integration, create or open Workspaces and shells, inspect status, rename or close targets, or manage the local Boomux daemon.
+description: Inspect and manage Boomux Nodes, coordinated persistent terminal Workspaces, launchers, shells, run-scoped agent instances, attention, projected sessions, recurring Agent schedules, notifications, the OpenCode Shared Harness Runtime, process supervision, and integrations. Use when asked to discover Nodes, shells, agents, sessions, or schedules, read terminal output, manage explicitly authorized recurring Agent prompts, supervise an explicitly identified external session, report agent lifecycle state, configure or test notifications, install or remove the OpenCode or Pi integration, create or open Workspaces and shells, inspect status, rename or close targets, or manage the local Boomux daemon.
 compatibility: Requires boomux on PATH. Federated resource identity is the pair of owning Node ID and Node-local inner ID. Some name operations require Workspace context or an explicit --workspace/--node; agent mutation and supervision require exact shell-run context, and continuation schedules or supervision require caller-supplied exact canonical session identity.
 metadata:
   author: boomux
-  version: "15"
+  version: "16"
 ---
 
 # Boomux
@@ -523,15 +523,25 @@ boomux doctor
 when `BOOMUX_SHELL_ID` is set. `boomux doctor` can run in either context.
 
 `boomux web` serves an experimental read-only Agent PWA on
-`127.0.0.1:3737`. Use `--port` to change the loopback port and
-`--trusted-user LOGIN` to require the exact `Tailscale-User-Login` inserted by
-Tailscale Serve. It uses the Omarchy presentation model: one current user-Shell
+`127.0.0.1:3737`. Use `--port` to change the loopback port. Boomux leaves remote
+transport, TLS, identity, and access policy to the user's private access layer.
+It uses the Omarchy presentation model: one current user-Shell
 Agent per exact run plus historical Agents with durable attention, excluding
 schedule-owned Agents. It also presents local working-to-idle transitions as
-ephemeral finished alerts. It displays bounded output for an exact current local
-Shell run, but cannot send terminal input, acknowledge attention, resume a
-Session, or expose remote terminal output. Never present its rendered terminal
-view as a structured conversation transcript.
+gateway-owned ephemeral finished alerts, refreshed even without a connected
+browser. It displays bounded output for an exact current local Shell run, but
+cannot send terminal input, acknowledge attention, or expose remote terminal
+output. It ensures the Node's loopback Shared Harness Runtime and links exact
+local Sessions only while a current Agent Session Claim binds that runtime
+generation to the exact ShellRun. `--opencode-web-url URL` is the public origin
+for that same local runtime, never an unrelated server. `--no-opencode-web`
+disables web-triggered runtime startup and native links. Boomux does not proxy or
+authenticate that full-control service. The private access layer owns TLS,
+authentication, and ACLs. Remote Agents remain unlinked. Never present rendered
+terminal output as a structured conversation transcript.
+`OPENCODE_SERVER_PASSWORD` and `OPENCODE_SERVER_USERNAME` are ephemeral
+first-start runtime environment, are never persisted by Boomux, and must remain
+consistent for attached clients.
 
 The dashboard has Workspaces, Agents, Shells, Schedules, and Nodes views. `/` or
 `:` opens its action and search palette, `?` shows contextual help, `Enter`
@@ -737,9 +747,11 @@ boomux daemon stop
 
 These commands affect only this Node. `restart` performs a transactional graceful handoff that preserves pending,
 running, and exited shells, including final exited terminal state, and reconnects
-active clients. It does not start a new process for an exited shell. `stop`
-terminates every managed process session and stops the daemon, but durable
-definitions remain. A later daemon-backed command can start Boomux again;
+active clients. It also preserves the Shared Harness Runtime PID and generation;
+TUI holders reacquire non-transferred Agent Session Claims. It does not start a
+new process for an exited shell. `stop` terminates every managed process session
+and the Shared Harness Runtime, then stops the daemon; durable definitions
+remain. A later daemon-backed command can start Boomux again;
 recovered shells are pending and opening them starts new processes. Process
 memory, PTYs, and mutated environments do not survive. Confirm before either
 operation when the user did not request it explicitly. They do not restart or
@@ -767,8 +779,10 @@ restart, and verification guidance. `boomux opencode install` is an equivalent
 immediate-write shortcut; use it only after the user authorizes installation at
 the resolved global target.
 
-The bundled plugin is validated against `opencode-ai` `1.18.15`; this is a
-compatibility test point rather than a runtime pin.
+The paired bundled plugins target the source-visible OpenCode TUI and server APIs
+at the `opencode-ai` `1.18.18` compatibility point. TUI behavior is version-gated
+because that API is not stable. This is not a runtime pin or a claim of live
+shared-runtime validation.
 
 ```console
 boomux opencode install
@@ -782,15 +796,25 @@ content is left alone, different content requires `--force`, and detected
 symlinks or non-regular path targets are rejected. Quit and restart OpenCode after
 installing or replacing the plugin.
 
-The plugin activates only in a managed shell run. It identifies one agent by the
-root OpenCode session and aggregates child/subagent activity. Work, tool, chat,
+For seamless use, create or open an ordinary Boomux login Shell and type bare,
+zero-argument interactive `opencode`. Only there, the scoped runtime `PATH` shim
+redirects internally to stock `opencode attach` for the Node's Shared Harness
+Runtime. Arguments, subcommands, noninteractive calls, calls outside Boomux,
+absolute paths, and calls after modifying `PATH` execute real OpenCode unchanged.
+Do not ask for an Agent ID or invoke a special Boomux attach command.
+
+The TUI plugin reactively claims selected root Sessions and updates claims after
+switches and forks. The server plugin identifies one Agent by the claimed root
+OpenCode Session and aggregates child/subagent activity. Work, tool, chat,
 and compaction events map to `working`; outstanding permission/questions and
 errors map to `blocked`; only root idle maps to `idle`; and only explicit root
 session deletion maps to `done`. Repeated working activity is coalesced until a
 meaningful state transition, so tool bursts do not create evidence-only durable
 reports. Child deletion and process exit do not report completion. Unmanaged or
-unavailable Boomux is fail-open. If Boomux returns `run_changed`, reporting for
-that root is disabled rather than redirected.
+unavailable Boomux is fail-open. `--pure`, `--mini`, absolute paths, modified
+`PATH`, and conflicting same-Session Shells fail closed without a claim or web
+link. If Boomux returns `run_changed` or the runtime generation changes,
+reporting for that root is disabled rather than redirected.
 
 ## Direct Pi Install Shortcut
 

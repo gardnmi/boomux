@@ -49,6 +49,9 @@
   transactional graceful daemon restart.
 - [x] Search workspaces, items, blocked agents, attention, and typed actions from
   a dashboard command palette with contextual kind, state, and keybinding help.
+- [x] Share one daemon-supervised Node-local OpenCode runtime across eligible
+  native TUIs and OpenCode Web, with exact ShellRun claims for lifecycle and
+  native Session links.
 
 ## Workspace Control
 
@@ -66,6 +69,16 @@ terminal handshake, VT reconstruction, and restart-persistence plan.
 - Give each Boomux workspace a consistent border color.
 - Focus an existing terminal attachment instead of opening another window.
 - Offer the dashboard as an optional Hyprland special workspace.
+
+## Mobile Web Terminal
+
+- Explore a real browser terminal for an exact ShellRun as a separate workstream
+  from harness-native OpenCode and Pi web handoff. Keep the daemon authoritative
+  for PTY ownership, run identity, reconstruction, and controller leases; begin
+  with a bounded read-only observer before considering input or takeover. Compare
+  `ghostty-web`, xterm.js, and future upstream `libghostty` browser support while
+  keeping renderer choice independent from transport. See
+  [`brainstorms/2026-08-18-mobile-web-terminal.md`](brainstorms/2026-08-18-mobile-web-terminal.md).
 
 ## Agent Workflows
 

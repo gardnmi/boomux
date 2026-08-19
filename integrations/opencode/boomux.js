@@ -413,6 +413,28 @@ function reportArgv(agentID, shellID, runID, state, evidence) {
   ];
 }
 
+function sharedReportArgv(generation, rootID, state, evidence) {
+  return [
+    "boomux",
+    "opencode",
+    "claim",
+    "report",
+    "--generation",
+    generation,
+    "--root-session-id",
+    rootID,
+    "--state",
+    state,
+    "--authority",
+    "lifecycle-integration",
+    "--evidence",
+    boundedEvidence(evidence),
+    "--confidence",
+    "100",
+    "--json",
+  ];
+}
+
 function agentFromJSON(result) {
   return result?.data?.agent ?? result?.agent ?? result?.data;
 }
@@ -456,9 +478,10 @@ function rateLimitedLogger(log, now = Date.now) {
 }
 
 function createLifecycle({ client, env, run, log = console.error, now }) {
-  const shellID = text(env?.BOOMUX_SHELL_ID);
-  const runID = text(env?.BOOMUX_RUN_ID);
-  if (!shellID || !runID) return undefined;
+  const environmentShellID = text(env?.BOOMUX_SHELL_ID);
+  const environmentRunID = text(env?.BOOMUX_RUN_ID);
+  const generation = text(env?.BOOMUX_OPENCODE_SHARED_GENERATION);
+  const standalone = Boolean(environmentShellID && environmentRunID);
 
   const resolver = createRootResolver(client);
   const roots = new Map();
@@ -470,9 +493,9 @@ function createLifecycle({ client, env, run, log = console.error, now }) {
     if (!value) {
       value = {
         reducer: createReducerState(),
-        agentID: undefined,
         disabled: false,
       };
+      if (standalone) value.agentID = undefined;
       roots.set(rootID, value);
     }
     return value;
@@ -482,9 +505,26 @@ function createLifecycle({ client, env, run, log = console.error, now }) {
     const item = tracked(rootID);
     if (item.disabled) return;
     try {
+      if (!standalone) {
+        await run(
+          sharedReportArgv(
+            generation,
+            rootID,
+            derived.state,
+            derived.evidence,
+          ),
+        );
+        return;
+      }
       if (!item.agentID) {
         const result = await run(
-          ensureArgv(shellID, runID, rootID, derived.state, derived.evidence),
+          ensureArgv(
+            environmentShellID,
+            environmentRunID,
+            rootID,
+            derived.state,
+            derived.evidence,
+          ),
         );
         const agent = agentFromJSON(result);
         item.agentID = text(agent?.id);
@@ -508,14 +548,17 @@ function createLifecycle({ client, env, run, log = console.error, now }) {
       await run(
         reportArgv(
           item.agentID,
-          shellID,
-          runID,
+          environmentShellID,
+          environmentRunID,
           derived.state,
           derived.evidence,
         ),
       );
     } catch (error) {
-      if (error?.code === "run_changed") item.disabled = true;
+      if (error?.code === "run_changed") {
+        item.agentID = undefined;
+        if (standalone) item.disabled = true;
+      }
       throw error;
     }
   }
@@ -570,13 +613,15 @@ function hookEvent(type, input) {
 }
 
 export async function BoomuxOpenCodePlugin({ client }) {
+  const env = globalThis.process?.env ?? {};
+  const standalone = text(env.BOOMUX_SHELL_ID) && text(env.BOOMUX_RUN_ID);
+  const shared = text(env.BOOMUX_OPENCODE_SHARED_GENERATION);
+  if (!standalone && !shared) return {};
   const lifecycle = createLifecycle({
     client,
-    env: globalThis.process?.env ?? {},
+    env,
     run: createProcessRunner(),
   });
-  if (!lifecycle) return {};
-
   return {
     event: ({ event }) => lifecycle.enqueue(event),
     "chat.message": (input) =>
@@ -599,4 +644,5 @@ BoomuxOpenCodePlugin.__internal = Object.freeze({
   createProcessRunner,
   createReducerState,
   reduce,
+  sharedReportArgv,
 });

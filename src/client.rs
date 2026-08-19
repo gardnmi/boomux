@@ -17,10 +17,11 @@ use crate::protocol::{
     self, AgentInstanceSnapshot, AgentRegistrationSpec, AgentReport, AgentScheduleInspection,
     AgentScheduleSnapshot, AgentScheduleSpec, AgentScheduleUpdate, CombinedNodeSnapshot,
     DaemonEvent, Envelope, ErrorCode, EventCursor, FocusedTerminalSnapshot, NodeProjectionHealth,
-    NodeRegistrationSnapshot, NotificationDeliveryConfig, Request, Response, RoutedOperation,
-    RoutedOperationResult, ScheduledExecutionScheduleProjection, ScheduledExecutionSnapshot,
-    ScheduledOccurrence, ScheduledRunnerResult, ShellSnapshot, ShellSpec, ShellStatus, Snapshot,
-    TerminalPreview, TerminalPreviewLine, TerminalPreviewSpan, TerminalProfile, UnixEnvironment,
+    NodeRegistrationSnapshot, NotificationDeliveryConfig, OpenCodeSessionClaimSnapshot,
+    OpenCodeSharedRuntimeSnapshot, Request, Response, RoutedOperation, RoutedOperationResult,
+    ScheduledExecutionScheduleProjection, ScheduledExecutionSnapshot, ScheduledOccurrence,
+    ScheduledRunnerResult, ShellSnapshot, ShellSpec, ShellStatus, Snapshot, TerminalPreview,
+    TerminalPreviewLine, TerminalPreviewSpan, TerminalProfile, UnixEnvironment,
     UnixEnvironmentVariable, WorkspaceLauncherSnapshot, WorkspaceLauncherSpec, WorkspaceSnapshot,
 };
 
@@ -1529,6 +1530,96 @@ impl Client {
         }
     }
 
+    pub fn ensure_opencode_shared_runtime(
+        &self,
+        port: u16,
+    ) -> Result<OpenCodeSharedRuntimeSnapshot> {
+        match self.request(Request::EnsureOpenCodeSharedRuntime {
+            port,
+            environment: Some(current_environment()),
+        })? {
+            Response::OpenCodeSharedRuntime {
+                runtime: Some(runtime),
+            } => Ok(runtime),
+            other => unexpected(other),
+        }
+    }
+
+    pub fn get_opencode_shared_runtime(&self) -> Result<Option<OpenCodeSharedRuntimeSnapshot>> {
+        match self.request(Request::GetOpenCodeSharedRuntime)? {
+            Response::OpenCodeSharedRuntime { runtime } => Ok(runtime),
+            other => unexpected(other),
+        }
+    }
+
+    pub fn ensure_opencode_session_claim(
+        &self,
+        generation_id: impl Into<String>,
+        holder_id: impl Into<String>,
+        root_session_id: impl Into<String>,
+        shell_id: impl Into<String>,
+        run_id: impl Into<String>,
+        spec: AgentRegistrationSpec,
+    ) -> Result<(OpenCodeSessionClaimSnapshot, AgentInstanceSnapshot)> {
+        match self.request(Request::EnsureOpenCodeSessionClaim {
+            generation_id: generation_id.into(),
+            holder_id: holder_id.into(),
+            root_session_id: root_session_id.into(),
+            shell_id: shell_id.into(),
+            run_id: run_id.into(),
+            spec,
+        })? {
+            Response::OpenCodeSessionClaim { claim, agent } => Ok((claim, agent)),
+            other => unexpected(other),
+        }
+    }
+
+    pub fn release_opencode_session_claim(
+        &self,
+        generation_id: impl Into<String>,
+        holder_id: impl Into<String>,
+        claim_id: impl Into<String>,
+    ) -> Result<bool> {
+        match self.request(Request::ReleaseOpenCodeSessionClaim {
+            generation_id: generation_id.into(),
+            holder_id: holder_id.into(),
+            claim_id: claim_id.into(),
+        })? {
+            Response::OpenCodeSessionClaimReleased { released, .. } => Ok(released),
+            other => unexpected(other),
+        }
+    }
+
+    pub fn resolve_opencode_session_claim(
+        &self,
+        generation_id: impl Into<String>,
+        root_session_id: impl Into<String>,
+    ) -> Result<(OpenCodeSessionClaimSnapshot, AgentInstanceSnapshot)> {
+        match self.request(Request::ResolveOpenCodeSessionClaim {
+            generation_id: generation_id.into(),
+            root_session_id: root_session_id.into(),
+        })? {
+            Response::OpenCodeSessionClaim { claim, agent } => Ok((claim, agent)),
+            other => unexpected(other),
+        }
+    }
+
+    pub fn report_claimed_opencode_agent(
+        &self,
+        generation_id: impl Into<String>,
+        root_session_id: impl Into<String>,
+        report: AgentReport,
+    ) -> Result<AgentInstanceSnapshot> {
+        match self.request(Request::ReportClaimedOpenCodeAgent {
+            generation_id: generation_id.into(),
+            root_session_id: root_session_id.into(),
+            report,
+        })? {
+            Response::Agent { agent } => Ok(agent),
+            other => unexpected(other),
+        }
+    }
+
     pub fn report_agent(
         &self,
         agent_id: impl Into<String>,
@@ -2015,10 +2106,15 @@ mod tests {
     use super::*;
     use std::fs;
     use std::os::unix::net::UnixListener;
+    use std::sync::mpsc;
 
     use uuid::Uuid;
 
     fn reject_protocol(listener: &UnixListener, attempted: u32, supported: u32) {
+        reject_protocol_once(listener, attempted, supported);
+    }
+
+    fn reject_protocol_once(listener: &UnixListener, attempted: u32, supported: u32) {
         let (mut stream, _) = listener.accept().unwrap();
         let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
         assert_eq!(request.version, attempted);
@@ -2037,6 +2133,44 @@ mod tests {
             ),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn protocol_forty_one_daemon_rejects_shared_runtime_before_request() {
+        let directory = env::temp_dir().join(format!("boomux-client-runtime-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let socket = directory.join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let (client_done_sender, client_done_receiver) = mpsc::channel();
+        let server = thread::spawn(move || {
+            for _ in 0..2 {
+                reject_protocol_once(&listener, 42, 41);
+                let (mut stream, _) = listener.accept().unwrap();
+                let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+                assert_eq!(request.version, 41);
+                assert!(matches!(request.message, Request::Ping));
+                protocol::write_message(&mut stream, &Envelope::with_version(41, Response::Pong))
+                    .unwrap();
+            }
+
+            client_done_receiver.recv().unwrap();
+            listener.set_nonblocking(true).unwrap();
+            assert!(
+                matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
+            );
+        });
+        let client = Client::from_socket_path(socket);
+
+        assert_eq!(client.protocol_version().unwrap(), 41);
+        let error = client.ensure_opencode_shared_runtime(4096).unwrap_err();
+        assert!(matches!(
+            error,
+            ClientError::Protocol(ProtocolError::UnsupportedVersion(_))
+        ));
+        client_done_sender.send(()).unwrap();
+
+        server.join().unwrap();
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -2417,7 +2551,8 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
-            reject_protocol(&listener, protocol::PROTOCOL_VERSION, 40);
+            reject_protocol(&listener, protocol::PROTOCOL_VERSION, 41);
+            reject_protocol(&listener, 41, 40);
             reject_protocol(&listener, 40, 39);
             reject_protocol(&listener, 39, 38);
             reject_protocol(&listener, 38, 37);
@@ -2593,7 +2728,8 @@ mod tests {
             )
             .unwrap();
 
-            reject_protocol(&listener, protocol::PROTOCOL_VERSION, 40);
+            reject_protocol(&listener, protocol::PROTOCOL_VERSION, 41);
+            reject_protocol(&listener, 41, 40);
             reject_protocol(&listener, 40, 39);
             reject_protocol(&listener, 39, 38);
             reject_protocol(&listener, 38, 37);
@@ -2663,7 +2799,8 @@ mod tests {
             )
             .unwrap();
 
-            reject_protocol(&listener, protocol::PROTOCOL_VERSION, 40);
+            reject_protocol(&listener, protocol::PROTOCOL_VERSION, 41);
+            reject_protocol(&listener, 41, 40);
             reject_protocol(&listener, 40, 39);
             reject_protocol(&listener, 39, 38);
             reject_protocol(&listener, 38, 37);
@@ -2715,7 +2852,8 @@ mod tests {
                 ),
             )
             .unwrap();
-            reject_protocol(&listener, protocol::PROTOCOL_VERSION, 40);
+            reject_protocol(&listener, protocol::PROTOCOL_VERSION, 41);
+            reject_protocol(&listener, 41, 40);
             reject_protocol(&listener, 40, 39);
             reject_protocol(&listener, 39, 38);
             reject_protocol(&listener, 38, 37);
@@ -2897,7 +3035,8 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
-            reject_protocol(&listener, protocol::PROTOCOL_VERSION, 40);
+            reject_protocol(&listener, protocol::PROTOCOL_VERSION, 41);
+            reject_protocol(&listener, 41, 40);
             reject_protocol(&listener, 40, 39);
             reject_protocol(&listener, 39, 38);
             reject_protocol(&listener, 38, 37);
@@ -2974,7 +3113,8 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
-            reject_protocol(&listener, protocol::PROTOCOL_VERSION, 40);
+            reject_protocol(&listener, protocol::PROTOCOL_VERSION, 41);
+            reject_protocol(&listener, 41, 40);
             reject_protocol(&listener, 40, 39);
             reject_protocol(&listener, 39, 38);
             reject_protocol(&listener, 38, 37);
