@@ -1,7 +1,9 @@
 use std::fs::{self, OpenOptions};
 use std::io::{self, IoSlice, Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
@@ -9,13 +11,17 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use boomux::protocol::{self, AttachFrame, ErrorCode, ShellSpec, ShellStatus};
+use boomux::protocol::{
+    self, AgentAuthority, AgentRegistrationSpec, AgentReport, AgentState, AttachFrame, ErrorCode,
+    ShellSpec, ShellStatus,
+};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use uuid::Uuid;
 
 use crate::support::{
-    TIMEOUT, TestDaemon, acknowledge_reconnect, assert_remote_code, contains, parse_pid, profile,
-    read_until, wait_for_attach_with_profile, wait_until,
+    TIMEOUT, TestDaemon, acknowledge_reconnect, assert_remote_code, contains,
+    ensure_test_opencode_runtime, parse_pid, process_exists, profile, read_until,
+    wait_for_attach_with_profile, wait_until,
 };
 
 const HANDOFF_CHANNEL_FD: RawFd = 198;
@@ -333,6 +339,104 @@ fn graceful_restart_preserves_exited_run_and_terminal_state() {
 
     daemon.client.close_workspace(&workspace.id).unwrap();
     daemon.stop_with_cli();
+}
+
+#[test]
+fn graceful_restart_preserves_opencode_shared_runtime_and_stop_cleans_it_up() {
+    let mut daemon = TestDaemon::start_with(|command, runtime_dir| {
+        let bin = runtime_dir.join("bin");
+        fs::create_dir(&bin).unwrap();
+        let opencode = bin.join("opencode");
+        fs::write(
+            &opencode,
+            "#!/bin/sh\nexec python3 -c 'import socket,sys,time; assert sys.argv[1:4] == [\"serve\", \"--hostname\", \"127.0.0.1\"]; assert sys.argv[4] == \"--port\"; s=socket.socket(); s.bind((\"127.0.0.1\", int(sys.argv[5]))); s.listen(); time.sleep(60)' \"$@\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&opencode, fs::Permissions::from_mode(0o700)).unwrap();
+        command.env(
+            "PATH",
+            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+        );
+    });
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let before = ensure_test_opencode_runtime(&daemon, port).unwrap();
+    let pid = before.pid.unwrap() as libc::pid_t;
+    let workspace = daemon
+        .client
+        .create_workspace(
+            "opencode-handoff",
+            vec![ShellSpec::login("claim", std::env::temp_dir())],
+        )
+        .unwrap();
+    let shell_id = workspace.shells[0].id.clone();
+    let attachment = daemon.client.attach(&shell_id, false, profile()).unwrap();
+    let run_id = daemon.client.get_shell(&shell_id).unwrap().run.unwrap().id;
+    let root_session_id = "ses_handoff_claim";
+    daemon
+        .client
+        .ensure_opencode_session_claim(
+            &before.generation_id,
+            Uuid::new_v4().to_string(),
+            root_session_id,
+            &shell_id,
+            &run_id,
+            AgentRegistrationSpec {
+                name: "handoff-agent".into(),
+                integration: "opencode".into(),
+                external_session_id: Some(root_session_id.into()),
+                report: AgentReport {
+                    state: AgentState::Working,
+                    authority: AgentAuthority::LifecycleIntegration,
+                    evidence: "handoff claim".into(),
+                    confidence: 100,
+                },
+            },
+        )
+        .unwrap();
+    drop(attachment);
+
+    let state_path = daemon.runtime_dir.join("state/boomux/state.json");
+    let valid_state = fs::read(&state_path).unwrap();
+    fs::write(&state_path, b"invalid OpenCode handoff state").unwrap();
+    let failed = daemon
+        .command()
+        .args(["daemon", "restart"])
+        .output()
+        .unwrap();
+    assert!(!failed.status.success());
+    fs::write(&state_path, valid_state).unwrap();
+    assert_eq!(
+        daemon.client.get_opencode_shared_runtime().unwrap(),
+        Some(before.clone())
+    );
+    daemon
+        .client
+        .resolve_opencode_session_claim(&before.generation_id, root_session_id)
+        .unwrap();
+    assert!(process_exists(pid));
+
+    daemon.client.restart().unwrap();
+
+    let after = daemon
+        .client
+        .get_opencode_shared_runtime()
+        .unwrap()
+        .expect("shared runtime was not transferred");
+    assert_eq!(after, before);
+    assert!(process_exists(pid));
+    assert!(TcpStream::connect(("127.0.0.1", port)).is_ok());
+    let cleared = daemon
+        .client
+        .resolve_opencode_session_claim(&before.generation_id, root_session_id)
+        .unwrap_err();
+    assert_remote_code(&cleared, ErrorCode::NotFound);
+    daemon.stop_with_cli();
+    wait_until(
+        || !process_exists(pid),
+        "transferred OpenCode runtime survived daemon stop",
+    );
 }
 
 #[test]

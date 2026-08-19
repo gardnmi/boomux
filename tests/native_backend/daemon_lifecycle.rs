@@ -57,7 +57,7 @@ fn native_daemon_lifecycle() {
     );
     assert_eq!(
         capabilities["data"]["integration_hosts"]["opencode"]["validated_version"],
-        "1.18.15"
+        "1.18.18"
     );
     assert_eq!(
         capabilities["data"]["integration_hosts"]["opencode"]["package"],
@@ -94,6 +94,13 @@ fn native_daemon_lifecycle() {
         "schedule.remove",
     ] {
         assert!(json_commands.iter().any(|current| current == command));
+    }
+    for command in [
+        "opencode.claim.ensure",
+        "opencode.claim.release",
+        "opencode.claim.report",
+    ] {
+        assert!(!json_commands.iter().any(|current| current == command));
     }
     assert!(
         capabilities["data"]["integration_hosts"]["opencode"]
@@ -133,6 +140,8 @@ fn native_daemon_lifecycle() {
         "protocol_38",
         "protocol_39",
         "protocol_40",
+        "protocol_42",
+        "opencode_shared_runtime_claims",
         "node_registration_management",
         "node_projection_sync",
         "bounded_remote_node_projections",

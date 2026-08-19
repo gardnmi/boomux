@@ -246,7 +246,7 @@ fn integration_management_reports_and_installs_bundled_hosts() {
     let runtime = root.join("runtime");
     fs::create_dir_all(&bin).unwrap();
     fs::create_dir_all(&runtime).unwrap();
-    for (name, version) in [("opencode", "1.18.15"), ("pi", "0.84.1")] {
+    for (name, version) in [("opencode", "1.18.18"), ("pi", "0.84.1")] {
         let executable = bin.join(name);
         fs::write(
             &executable,

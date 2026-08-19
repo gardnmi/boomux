@@ -237,6 +237,9 @@ The following commands support `--json`:
 - `boomux integration uninstall <opencode|pi>`
 - `boomux integration uninstall --all`
 - `boomux integration verify <opencode|pi>`
+- `boomux opencode claim ensure`
+- `boomux opencode claim release`
+- `boomux opencode claim report`
 - `boomux daemon status`
 
 JSON mutations are deliberately narrow. Node registration add, rename, retarget,
@@ -363,6 +366,10 @@ Command payloads are:
 - `integration.verify`: `integration`, `verified`, exact `shell_id` and `run_id`,
   plus the nonempty authoritative `agents` array. Failure uses typed
   `not_found`, `ambiguous_target`, `run_changed`, or `timeout` errors.
+- `opencode.claim.ensure`: the complete ephemeral `claim` and ensured durable
+  `agent`; `opencode.claim.release`: exact `claim_id` and `released`;
+  `opencode.claim.report`: the resulting durable `agent`. These are paired-plugin
+  operations, not general Agent-control APIs.
 - `read`: shell/run identity, observed output revision, and rendered output.
 - `events`: stream identity, reconnect cursor, optional baseline snapshot, and a
   bounded event array.
@@ -437,6 +444,8 @@ Protocol 40 adds `protocol_40`, `recovered_agent_presentation`, and
 `cached_projection_dismissal`.
 Protocol 41 adds `protocol_41`, `observed_node_helper_version`, and
 `node_upgrade_coordination`.
+Protocol 42 adds `protocol_42` and
+`opencode_shared_runtime_claims`.
 
 Protocol-38 `workspace create` creates empty coordinator metadata without a
 default Node or cwd. First global `shell create`, `launcher create`, or
@@ -641,6 +650,74 @@ already identifies a unique record, ensure returns the stored snapshot without
 applying the supplied name or report. This is the intended identity-recovery
 path after an integration reload. Otherwise it creates the record with the same
 shape and validation as `agent.register`.
+
+Protocol-42 OpenCode coordination is plugin-facing, not a stable public CLI
+automation surface. The hidden shared launcher is likewise an implementation
+detail and is absent from `capabilities.data.json_commands`. Paired TUI and
+server plugins exchange bounded `boomux.cli/v1` envelopes with these command
+descriptors and data shapes:
+
+```json
+{
+  "schema": "boomux.cli/v1",
+  "command": "opencode.claim.ensure",
+  "data": {
+    "claim": {
+      "generation_id": "00000000-0000-0000-0000-000000000000",
+      "claim_id": "00000000-0000-0000-0000-000000000000",
+      "holder_id": "00000000-0000-0000-0000-000000000000",
+      "root_session_id": "ses_exact",
+      "workspace_id": "00000000-0000-0000-0000-000000000000",
+      "shell_id": "00000000-0000-0000-0000-000000000000",
+      "run_id": "00000000-0000-0000-0000-000000000000",
+      "agent_id": "00000000-0000-0000-0000-000000000000",
+      "holder_count": 1,
+      "holder_expires_at_ms": 0
+    },
+    "agent": {}
+  }
+}
+```
+
+Ensure takes `--generation`, `--holder`, `--root-session-id`, and exact Shell/run
+context from arguments or `BOOMUX_SHELL_ID` and `BOOMUX_RUN_ID`. The response
+contains the complete bounded `claim` and ensured durable `agent`. Repeating the
+exact mapping renews that holder. Another holder may join the same mapping, but a
+current mapping to another ShellRun returns `busy`.
+
+```json
+{
+  "schema": "boomux.cli/v1",
+  "command": "opencode.claim.release",
+  "data": {
+    "claim_id": "00000000-0000-0000-0000-000000000000",
+    "released": true
+  }
+}
+```
+
+Release takes exact `--generation`, `--holder`, and `--claim-id`, addresses one
+holder, and is idempotent. The final holder removes report authority, not durable
+Agent history.
+
+```json
+{
+  "schema": "boomux.cli/v1",
+  "command": "opencode.claim.report",
+  "data": {
+    "agent": {}
+  }
+}
+```
+
+Report takes `--generation`, `--root-session-id`, lifecycle state, authority,
+bounded evidence, and confidence from the server plugin. The daemon resolves the
+exact current claim and response `agent`; the plugin cannot supply or move Agent
+identity. These requests contain no prompts,
+transcripts, credentials, server password, or username. Claim state expires and
+is discarded on run or runtime-generation replacement. It is not persisted,
+projected, event-published, or transferred during graceful handoff; connected
+TUI holders reacquire it afterward.
 
 `agent.wait` requires protocol 14, an exact Agent ID, and
 `--after-revision`. A current revision greater than the supplied revision returns

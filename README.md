@@ -113,6 +113,8 @@ boomux . --name my-project --new -- sh -lc 'cargo test | tee test.log'
 | **Managed shell** | A persistent terminal session, usually running your login shell. |
 | **Command** | A managed terminal session that runs one command instead of a login shell. |
 | **Launcher** | A desktop command run when its workspace opens. Boomux does not retain its output or process. |
+| **Shared Harness Runtime** | One ephemeral daemon-supervised Node-local external harness server generation shared by eligible native clients; it is not a durable Boomux resource. |
+| **Agent Session Claim** | A bounded ephemeral binding from one exact root Session in one runtime generation to one exact current ShellRun and ensured Agent Instance while TUI holders maintain it. |
 | **Agent schedule** | A durable workspace-owned recurring Agent prompt. New schedules are paused until explicitly enabled. |
 
 ### What Keeps Running
@@ -123,7 +125,7 @@ boomux . --name my-project --new -- sh -lc 'cargo test | tee test.log'
 | Quit the dashboard | All managed processes keep running. |
 | Close a shell in Boomux | That shell's process is terminated. |
 | Close a workspace in Boomux | Its shells are terminated; schedules, persisted prompts, and workspace metadata are removed. |
-| Run `boomux daemon restart` | Live shells are handed to the replacement daemon. |
+| Run `boomux daemon restart` | Live shells and the Shared Harness Runtime are handed to the replacement daemon. |
 | System reboot or unexpected daemon loss | Live processes are lost; workspace and shell definitions remain, and reopening them starts new processes. |
 
 ## Common Workflows
@@ -254,23 +256,29 @@ outstanding attention item.
 bounded projections of registered Nodes, keeps stale ownership visible, and
 shows the same current user-Shell Agents and outstanding durable attention as
 the Omarchy Boomux plugin. A locally observed `working` to `idle` transition is
-kept as a transient finished alert while that Agent remains idle. Local Agent
-details can show up to 256 KiB of rendered output only while the Agent's exact
-Shell run is still current. Remote projections never expose terminal output.
+kept by the gateway as a transient finished alert while that Agent remains idle,
+even when no browser is connected. Local Agent details can show up to 256 KiB of
+rendered output only while the Agent's exact Shell run is still current. Remote
+projections never expose terminal output. The command also ensures the Node's
+Shared Harness Runtime on `127.0.0.1:4097`, so an exact claimed local OpenCode
+Agent links to the same live Session used by its desktop TUI. The TUI can be
+detached while phone events continue; on return it receives those events and is
+synchronized with the phone.
 
-Publish the loopback service privately with Tailscale Serve:
+Publish both loopback services through a private access layer. For example:
 
 ```console
-boomux web --trusted-user you@example.com
-tailscale serve --bg http://127.0.0.1:3737
+boomux web
+tailscale serve --https=443 --bg http://127.0.0.1:3737
+tailscale serve --https=4097 --bg http://127.0.0.1:4097
 ```
 
-`--trusted-user` requires the exact `Tailscale-User-Login` header inserted by
-Tailscale Serve while preserving direct local access through an exact loopback
-Host. Without it, access relies on loopback isolation and tailnet access policy.
-The MVP has no terminal input, attention acknowledgment, session resume,
-transcript parsing, or cloud service. Add the Serve URL to the phone's home
-screen to install the progressive web app. See
+Boomux does not configure or authenticate the private access layer, which owns
+TLS, authentication, and ACLs. The MVP has
+no terminal input, attention acknowledgment, transcript parsing, or cloud
+service. Native OpenCode links leave Boomux and open a full-control service whose
+origin must be protected separately. Add the remote URL
+to the phone's home screen to install the progressive web app. See
 [`docs/mobile-web.md`](docs/mobile-web.md) for the security and privacy boundary.
 
 | Key | Action |
@@ -347,8 +355,27 @@ boomux integration setup opencode
 boomux integration setup pi
 ```
 
-Restart OpenCode or Pi after installation, launch it inside a Boomux-managed
-shell, then verify reporting from another terminal:
+Restart OpenCode or Pi after installation. For the seamless OpenCode workflow,
+create or open an ordinary managed login Shell and type the bare, zero-argument
+interactive command:
+
+```console
+opencode
+```
+
+Only in an eligible Boomux login Shell, a scoped runtime `PATH` shim redirects
+that exact invocation internally to stock `opencode attach` for the Node's
+Shared Harness Runtime. Boomux reapplies the shim after normal bash, zsh, or fish
+interactive startup configuration. Invocations with arguments or subcommands,
+noninteractive invocations, commands outside Boomux, absolute binary paths, and
+calls made after subsequently modifying `PATH` execute the real OpenCode
+unchanged. No Boomux ID or special attach command is part of the workflow.
+
+The TUI plugin reactively claims selected root Sessions and updates claims after
+switches and forks. The paired server plugin uses those claims for lifecycle
+reporting. An exact claimed Session opens in OpenCode Web on the phone; a
+detached desktop TUI receives phone events from the shared runtime and is
+synchronized when it returns. Verify reporting from another terminal:
 
 ```console
 boomux integration verify opencode --wait-ms 30000
@@ -357,6 +384,11 @@ boomux integration verify opencode --wait-ms 30000
 Integrated agents can report `working`, `blocked`, `idle`, `inactive`, and
 `done`. An `untracked` row means a supported coding agent is visible but its
 integration is not currently reporting lifecycle state.
+
+The seamless path deliberately fails closed for `opencode --pure`,
+`opencode --mini`, absolute binary paths, a modified `PATH`, and conflicting
+Shells that select the same root Session. Those cases run without a claim or
+native web link rather than guessing authority. Remote Agents remain unlinked.
 
 ![Boomux Agents view showing task, branch, worktree, and session metadata](assets/dashboard-agents.png)
 
@@ -607,6 +639,9 @@ Revision-aware output reads and daemon event cursors are documented in
   another window disconnects the previous window from that shell.
 - The mobile dashboard is read-only and displays bounded rendered terminal
   output, not structured Agent conversation history.
+- Seamless shared OpenCode requires a bare zero-argument interactive invocation
+  in an eligible managed login Shell; `--pure`, `--mini`, absolute paths,
+  modified `PATH`, and conflicting same-Session Shells fail closed.
 - Slow viewers may miss live output rather than block the managed process.
 - The native backend currently targets Unix/Linux desktop environments and is
   primarily exercised on Omarchy.

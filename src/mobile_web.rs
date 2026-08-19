@@ -1,43 +1,66 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::header::{
-    CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE, HOST, HeaderName, HeaderValue,
-    REFERRER_POLICY, X_CONTENT_TYPE_OPTIONS,
+    CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE, HeaderValue, REFERRER_POLICY,
+    X_CONTENT_TYPE_OPTIONS,
 };
-use axum::http::uri::Authority;
-use axum::http::{HeaderMap, Request, StatusCode};
+use axum::http::{Request, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use boomux::client::{self, Client};
 use boomux::protocol::{
-    AgentAttentionReason, AgentState, CombinedNodeSnapshot, NodeProjectionHealthCode, ShellOwner,
+    AgentAttentionReason, AgentInstanceSnapshot, AgentState, CombinedNodeSnapshot,
+    NodeProjectionHealthCode, OpenCodeSessionClaimSnapshot, OpenCodeSharedRuntimeSnapshot,
+    ShellOwner,
 };
 use serde::Serialize;
 
 const TERMINAL_OUTPUT_BYTES: usize = 256 * 1024;
+const PROJECTION_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+const PROJECTION_STOP_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const INDEX_HTML: &str = include_str!("../assets/mobile-web/index.html");
 const APP_JS: &str = include_str!("../assets/mobile-web/app.js");
-const MOBILE_MODEL_JS: &str = include_str!("../assets/mobile-web/mobile-model.js");
 const STYLES_CSS: &str = include_str!("../assets/mobile-web/styles.css");
 const MANIFEST: &str = include_str!("../assets/mobile-web/manifest.webmanifest");
 const SERVICE_WORKER: &str = include_str!("../assets/mobile-web/service-worker.js");
 const ICON: &str = include_str!("../assets/mobile-web/icon.svg");
 const ICON_192: &[u8] = include_bytes!("../assets/mobile-web/icon-192.png");
 const ICON_512: &[u8] = include_bytes!("../assets/mobile-web/icon-512.png");
-const TAILSCALE_LOGIN: HeaderName = HeaderName::from_static("tailscale-user-login");
-
 #[derive(Clone)]
 struct AppState {
     client: Client,
-    trusted_user: Option<Arc<str>>,
+    presentation: Arc<Mutex<PresentationState>>,
+    opencode_web_url: Option<Arc<str>>,
+    opencode_runtime_hint: Option<OpenCodeRuntimeHint>,
+}
+
+#[derive(Clone)]
+struct OpenCodeRuntimeHint {
+    generation_id: Arc<str>,
+    port: u16,
+}
+
+struct OpenCodeWebConfiguration {
+    public_url: Option<String>,
+    runtime_port: Option<u16>,
+}
+
+#[derive(Default)]
+struct PresentationState {
+    snapshot: Option<MobileSnapshot>,
+    previous_states: HashMap<(String, String), AgentState>,
+    completed_agents: HashSet<(String, String)>,
+    baseline_ready: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -70,11 +93,12 @@ struct AgentCard {
     started_at_ms: u64,
     ended_at_ms: Option<u64>,
     attention: Option<AttentionView>,
+    just_completed: bool,
     #[serde(skip)]
     schedule_owned: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct SnapshotCounts {
     agents: usize,
     attention: usize,
@@ -82,9 +106,10 @@ struct SnapshotCounts {
     stale_nodes: usize,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct MobileSnapshot {
     generated_at_ms: u64,
+    daemon_connected: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     viewer: Option<String>,
     counts: SnapshotCounts,
@@ -104,9 +129,22 @@ struct TimelineEntry {
 struct AgentDetail {
     agent: AgentCard,
     timeline: Vec<TimelineEntry>,
+    native_web: Option<NativeWebHandoff>,
+    native_web_notice: String,
     terminal_output: Option<String>,
     terminal_available: bool,
     notice: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct NativeWebHandoff {
+    integration: &'static str,
+    label: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    port: Option<u16>,
+    path: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -163,28 +201,72 @@ impl IntoResponse for ApiError {
     }
 }
 
-pub(crate) fn run(port: u16, trusted_user: Option<&str>) -> Result<(), Box<dyn Error>> {
-    let trusted_user = trusted_user.map(str::trim);
-    if trusted_user.is_some_and(|value| value.is_empty() || value.len() > 320 || !value.is_ascii())
-    {
-        return Err("--trusted-user must be a nonempty ASCII login of at most 320 bytes".into());
-    }
+pub(crate) fn run(
+    port: u16,
+    opencode_web_url: Option<&str>,
+    opencode_web_port: u16,
+    no_opencode_web: bool,
+) -> Result<(), Box<dyn Error>> {
+    let configuration =
+        opencode_web_configuration(port, opencode_web_url, opencode_web_port, no_opencode_web)?;
     let client = client::connect_or_start()?;
+    let opencode_runtime = configuration
+        .runtime_port
+        .map(|port| client.ensure_opencode_shared_runtime(port))
+        .transpose()?;
+    let mut presentation = PresentationState::default();
+    presentation.update(client.combined_node_snapshot(None)?);
     let state = AppState {
         client,
-        trusted_user: trusted_user.map(Arc::from),
+        presentation: Arc::new(Mutex::new(presentation)),
+        opencode_web_url: configuration.public_url.map(Arc::from),
+        opencode_runtime_hint: opencode_runtime.map(|runtime| OpenCodeRuntimeHint {
+            generation_id: Arc::from(runtime.generation_id),
+            port: runtime.port,
+        }),
     };
     let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(serve(address, state))
 }
 
+fn opencode_web_configuration(
+    dashboard_port: u16,
+    public_url: Option<&str>,
+    runtime_port: u16,
+    disabled: bool,
+) -> Result<OpenCodeWebConfiguration, Box<dyn Error>> {
+    let public_url = public_url.map(normalize_native_web_url).transpose()?;
+    if !disabled && dashboard_port == runtime_port {
+        return Err("--port and --opencode-web-port must be different".into());
+    }
+    Ok(OpenCodeWebConfiguration {
+        public_url,
+        runtime_port: (!disabled).then_some(runtime_port),
+    })
+}
+
 async fn serve(address: SocketAddr, state: AppState) -> Result<(), Box<dyn Error>> {
+    let listener = tokio::net::TcpListener::bind(address).await?;
+    let stopping = Arc::new(AtomicBool::new(false));
+    let worker = spawn_projection_worker(
+        state.client.clone(),
+        Arc::clone(&state.presentation),
+        Arc::clone(&stopping),
+    )?;
+    println!("Boomux mobile dashboard: http://{address}");
+    if let Some(url) = state.opencode_web_url.as_deref() {
+        println!("OpenCode shared runtime public handoff: {url}");
+    } else if let Some(runtime) = &state.opencode_runtime_hint {
+        println!(
+            "OpenCode shared runtime handoff: http://127.0.0.1:{}",
+            runtime.port
+        );
+    }
     let app = Router::new()
         .route("/", get(index))
         .route("/index.html", get(index))
         .route("/app.js", get(app_js))
-        .route("/mobile-model.js", get(mobile_model_js))
         .route("/styles.css", get(styles))
         .route("/manifest.webmanifest", get(manifest))
         .route("/service-worker.js", get(service_worker))
@@ -195,16 +277,54 @@ async fn serve(address: SocketAddr, state: AppState) -> Result<(), Box<dyn Error
         .route("/api/agents/{node_id}/{agent_id}", get(agent_detail))
         .layer(middleware::from_fn_with_state(
             state.clone(),
-            secure_request,
+            security_headers,
         ))
         .with_state(state);
-    let listener = tokio::net::TcpListener::bind(address).await?;
-    println!("Boomux mobile dashboard: http://{address}");
-    println!("Tailnet proxy: tailscale serve --bg http://{address}");
-    axum::serve(listener, app)
+    let result = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
-        .await?;
+        .await;
+    stopping.store(true, Ordering::Release);
+    worker
+        .join()
+        .map_err(|_| "mobile projection worker panicked")?;
+    result?;
     Ok(())
+}
+
+fn spawn_projection_worker(
+    client: Client,
+    presentation: Arc<Mutex<PresentationState>>,
+    stopping: Arc<AtomicBool>,
+) -> Result<thread::JoinHandle<()>, Box<dyn Error>> {
+    Ok(thread::Builder::new()
+        .name("boomux-mobile-projection".into())
+        .spawn(move || {
+            while !stopping.load(Ordering::Acquire) {
+                match client.combined_node_snapshot(None) {
+                    Ok(combined) => match presentation.lock() {
+                        Ok(mut state) => state.update(combined),
+                        Err(_) => return,
+                    },
+                    Err(error) => match presentation.lock() {
+                        Ok(mut state) => {
+                            if state.mark_disconnected() {
+                                eprintln!(
+                                    "boomux: mobile Agent projection refresh failed: {error}"
+                                );
+                            }
+                        }
+                        Err(_) => return,
+                    },
+                }
+                let started = std::time::Instant::now();
+                while started.elapsed() < PROJECTION_REFRESH_INTERVAL {
+                    if stopping.load(Ordering::Acquire) {
+                        return;
+                    }
+                    thread::sleep(PROJECTION_STOP_POLL_INTERVAL);
+                }
+            }
+        })?)
 }
 
 async fn shutdown_signal() {
@@ -228,29 +348,8 @@ async fn shutdown_signal() {
     }
 }
 
-async fn secure_request(
-    State(state): State<AppState>,
-    request: Request<Body>,
-    next: Next,
-) -> Response {
-    let mut response = if !authorized(request.headers(), state.trusted_user.as_deref()) {
-        let mut response = (
-            StatusCode::UNAUTHORIZED,
-            Json(ErrorEnvelope {
-                error: ErrorBody {
-                    code: "unauthorized",
-                    message: "This Tailscale identity is not authorized",
-                },
-            }),
-        )
-            .into_response();
-        response
-            .headers_mut()
-            .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
-        response
-    } else {
-        next.run(request).await
-    };
+async fn security_headers(request: Request<Body>, next: Next) -> Response {
+    let mut response = next.run(request).await;
     let headers = response.headers_mut();
     headers.insert(
         CONTENT_SECURITY_POLICY,
@@ -263,25 +362,87 @@ async fn secure_request(
     response
 }
 
-fn authorized(headers: &HeaderMap, trusted_user: Option<&str>) -> bool {
-    let Some(trusted_user) = trusted_user else {
-        return true;
-    };
-    match headers
-        .get(&TAILSCALE_LOGIN)
-        .and_then(|value| value.to_str().ok())
-    {
-        Some(login) => login == trusted_user,
-        None => loopback_host(headers),
+fn normalize_native_web_url(value: &str) -> Result<String, Box<dyn Error>> {
+    let value = value.trim();
+    let uri = value
+        .parse::<axum::http::Uri>()
+        .map_err(|_| "--opencode-web-url must be an absolute HTTP or HTTPS URL")?;
+    let scheme = uri
+        .scheme_str()
+        .filter(|scheme| matches!(*scheme, "http" | "https"))
+        .ok_or("--opencode-web-url must use http or https")?;
+    let authority = uri
+        .authority()
+        .ok_or("--opencode-web-url must include a host")?;
+    if authority.as_str().contains('@') {
+        return Err("--opencode-web-url must not include credentials".into());
+    }
+    if !matches!(uri.path(), "" | "/") || uri.query().is_some() {
+        return Err("--opencode-web-url must not include a path or query".into());
+    }
+    if scheme == "http" && !matches!(authority.host(), "127.0.0.1" | "localhost" | "::1") {
+        return Err("--opencode-web-url requires https except for a loopback origin".into());
+    }
+    Ok(format!("{scheme}://{authority}"))
+}
+
+fn opencode_handoff(
+    base_url: Option<&str>,
+    port: Option<u16>,
+    directory: &str,
+    session_id: &str,
+) -> NativeWebHandoff {
+    let path = format!(
+        "/{}/session/{}",
+        base64_url(directory.as_bytes()),
+        percent_encode_path_segment(session_id)
+    );
+    NativeWebHandoff {
+        integration: "opencode",
+        label: "Open in OpenCode",
+        url: base_url.map(|base_url| format!("{base_url}{path}")),
+        port,
+        path,
     }
 }
 
-fn loopback_host(headers: &HeaderMap) -> bool {
-    headers
-        .get(HOST)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<Authority>().ok())
-        .is_some_and(|authority| matches!(authority.host(), "127.0.0.1" | "localhost"))
+fn base64_url(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        encoded.push(ALPHABET[(chunk[0] >> 2) as usize] as char);
+        encoded.push(
+            ALPHABET
+                [(((chunk[0] & 0x03) << 4) | (chunk.get(1).copied().unwrap_or(0) >> 4)) as usize]
+                as char,
+        );
+        if let Some(second) = chunk.get(1) {
+            encoded.push(
+                ALPHABET
+                    [(((second & 0x0f) << 2) | (chunk.get(2).copied().unwrap_or(0) >> 6)) as usize]
+                    as char,
+            );
+        }
+        if let Some(third) = chunk.get(2) {
+            encoded.push(ALPHABET[(third & 0x3f) as usize] as char);
+        }
+    }
+    encoded
+}
+
+fn percent_encode_path_segment(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push('%');
+            encoded.push(HEX[(byte >> 4) as usize] as char);
+            encoded.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+    }
+    encoded
 }
 
 async fn index() -> impl IntoResponse {
@@ -289,34 +450,18 @@ async fn index() -> impl IntoResponse {
 }
 
 async fn app_js() -> Response {
-    asset(
-        APP_JS,
-        "text/javascript; charset=utf-8",
-        "public, max-age=3600",
-    )
-}
-
-async fn mobile_model_js() -> Response {
-    asset(
-        MOBILE_MODEL_JS,
-        "text/javascript; charset=utf-8",
-        "public, max-age=3600",
-    )
+    asset(APP_JS, "text/javascript; charset=utf-8", "no-cache")
 }
 
 async fn styles() -> Response {
-    asset(
-        STYLES_CSS,
-        "text/css; charset=utf-8",
-        "public, max-age=3600",
-    )
+    asset(STYLES_CSS, "text/css; charset=utf-8", "no-cache")
 }
 
 async fn manifest() -> Response {
     asset(
         MANIFEST,
         "application/manifest+json; charset=utf-8",
-        "public, max-age=3600",
+        "no-cache",
     )
 }
 
@@ -361,17 +506,15 @@ fn binary_asset(body: &'static [u8], content_type: &'static str) -> Response {
         .into_response()
 }
 
-async fn snapshot(State(state): State<AppState>, headers: HeaderMap) -> Result<Response, ApiError> {
-    let viewer = headers
-        .get(&TAILSCALE_LOGIN)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
-    let client = state.client.clone();
-    let combined = tokio::task::spawn_blocking(move || client.combined_node_snapshot(None))
-        .await
+async fn snapshot(State(state): State<AppState>) -> Result<Response, ApiError> {
+    let snapshot = state
+        .presentation
+        .lock()
         .map_err(|_| ApiError::daemon())?
-        .map_err(|_| ApiError::daemon())?;
-    let mut response = Json(project_snapshot(combined, viewer)).into_response();
+        .snapshot
+        .clone()
+        .ok_or_else(ApiError::daemon)?;
+    let mut response = Json(snapshot).into_response();
     response
         .headers_mut()
         .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
@@ -386,14 +529,29 @@ async fn agent_detail(
         return Err(ApiError::not_found());
     }
     let client = state.client.clone();
-    let detail = tokio::task::spawn_blocking(move || {
+    let opencode_web_url = state.opencode_web_url.clone();
+    let opencode_runtime_hint = state.opencode_runtime_hint.clone();
+    let mut detail = tokio::task::spawn_blocking(move || {
         let combined = client
             .combined_node_snapshot(None)
             .map_err(|_| ApiError::daemon())?;
-        build_agent_detail(&client, &combined, &node_id, &agent_id)
+        build_agent_detail(
+            &client,
+            &combined,
+            &node_id,
+            &agent_id,
+            opencode_web_url.as_deref(),
+            opencode_runtime_hint.as_ref(),
+        )
     })
     .await
     .map_err(|_| ApiError::daemon())??;
+    detail.agent.just_completed = state
+        .presentation
+        .lock()
+        .map_err(|_| ApiError::daemon())?
+        .completed_agents
+        .contains(&(detail.agent.node_id.clone(), detail.agent.agent_id.clone()));
     let mut response = Json(detail).into_response();
     response
         .headers_mut()
@@ -429,9 +587,57 @@ fn project_snapshot(combined: CombinedNodeSnapshot, viewer: Option<String>) -> M
     };
     MobileSnapshot {
         generated_at_ms: unix_time_ms(),
+        daemon_connected: true,
         viewer,
         counts,
         agents,
+    }
+}
+
+impl PresentationState {
+    fn update(&mut self, combined: CombinedNodeSnapshot) {
+        let mut snapshot = project_snapshot(combined, None);
+        let mut next_states = HashMap::new();
+        let mut next_completed = HashSet::new();
+        for agent in &mut snapshot.agents {
+            let key = (agent.node_id.clone(), agent.agent_id.clone());
+            next_states.insert(key.clone(), agent.state);
+            let retained = self.completed_agents.contains(&key)
+                && agent.node_local
+                && agent.run_current
+                && agent.state == AgentState::Idle;
+            let transitioned = self.baseline_ready
+                && agent.node_local
+                && agent.run_current
+                && self.previous_states.get(&key) == Some(&AgentState::Working)
+                && agent.state == AgentState::Idle;
+            agent.just_completed = retained || transitioned;
+            if agent.just_completed {
+                next_completed.insert(key);
+            }
+        }
+        snapshot.agents.sort_by(|left, right| {
+            agent_priority(left)
+                .cmp(&agent_priority(right))
+                .then_with(|| right.observed_at_ms.cmp(&left.observed_at_ms))
+                .then_with(|| left.name.cmp(&right.name))
+                .then_with(|| left.node_id.cmp(&right.node_id))
+        });
+        self.previous_states = next_states;
+        self.completed_agents = next_completed;
+        self.baseline_ready = true;
+        self.snapshot = Some(snapshot);
+    }
+
+    fn mark_disconnected(&mut self) -> bool {
+        let was_connected = self
+            .snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.daemon_connected);
+        if let Some(snapshot) = &mut self.snapshot {
+            snapshot.daemon_connected = false;
+        }
+        was_connected
     }
 }
 
@@ -497,6 +703,7 @@ fn project_agents(combined: &CombinedNodeSnapshot) -> Vec<AgentCard> {
                             observation_revision: attention.observation.revision,
                             observed_at_ms: attention.observation.observed_at_ms,
                         }),
+                        just_completed: false,
                         schedule_owned: schedule_owned
                             .get(agent.shell_id.as_str())
                             .copied()
@@ -571,6 +778,7 @@ fn project_agents(combined: &CombinedNodeSnapshot) -> Vec<AgentCard> {
                         observation_revision: attention.observation_revision,
                         observed_at_ms: attention.observed_at_ms,
                     }),
+                    just_completed: false,
                     schedule_owned: schedule_owned
                         .get(agent.shell_id.as_str())
                         .copied()
@@ -638,16 +846,21 @@ fn build_agent_detail(
     combined: &CombinedNodeSnapshot,
     node_id: &str,
     agent_id: &str,
+    opencode_web_url: Option<&str>,
+    opencode_runtime_hint: Option<&OpenCodeRuntimeHint>,
 ) -> Result<AgentDetail, ApiError> {
+    // Runtime state is deliberately fetched for every detail. The startup value
+    // is only a generation hint and cannot authorize a stale browser link.
+    let current_opencode_runtime = client.get_opencode_shared_runtime().ok().flatten();
     let agent = project_visible_agents(combined)
         .into_iter()
         .find(|agent| agent.node_id == node_id && agent.agent_id == agent_id)
         .ok_or_else(ApiError::not_found)?;
     let mut timeline = Vec::new();
-    let evidence = combined
+    let local_agent = combined
         .nodes
         .iter()
-        .find(|node| node.node_id == node_id)
+        .find(|node| node.node_id == agent.node_id)
         .and_then(|node| node.local_snapshot.as_ref())
         .and_then(|snapshot| {
             snapshot
@@ -656,6 +869,9 @@ fn build_agent_detail(
                 .flat_map(|workspace| &workspace.agents)
                 .find(|candidate| candidate.id == agent_id)
         })
+        .cloned();
+    let evidence = local_agent
+        .as_ref()
         .map(|candidate| candidate.observation.evidence.clone());
     timeline.push(TimelineEntry {
         kind: "status",
@@ -687,10 +903,147 @@ fn build_agent_detail(
     }
     timeline.sort_by_key(|entry| entry.at_ms);
 
+    let (native_web, native_web_notice) = if !agent.node_local {
+        (
+            None,
+            "Native Session links remain on the owning Node and are not stored in remote projections."
+                .into(),
+        )
+    } else if agent.integration != "opencode" {
+        (
+            None,
+            format!(
+                "Native web handoff is not configured for {} Agents.",
+                agent.integration
+            ),
+        )
+    } else if let Some(runtime_hint) = opencode_runtime_hint {
+        if let Some((directory, external_session_id)) = local_agent
+            .as_ref()
+            .and_then(|agent| Some((agent.cwd.as_deref()?, agent.external_session_id.as_deref()?)))
+        {
+            let Some(runtime) = current_opencode_runtime.as_ref().filter(|runtime| {
+                runtime.generation_id.as_str() == runtime_hint.generation_id.as_ref()
+                    && runtime.port == runtime_hint.port
+            }) else {
+                return Ok(agent_detail_without_native_web(
+                    client,
+                    combined,
+                    agent,
+                    timeline,
+                    "The daemon-owned OpenCode shared runtime is unavailable or has been replaced.",
+                ));
+            };
+            let claim = client
+                .resolve_opencode_session_claim(runtime.generation_id.clone(), external_session_id);
+            if !claim.is_ok_and(|(claim, resolved_agent)| {
+                opencode_claim_matches_agent(
+                    runtime_hint,
+                    runtime,
+                    external_session_id,
+                    Some((&claim, &resolved_agent)),
+                    &agent,
+                )
+            }) {
+                (
+                    None,
+                    "This Session is not claimed by the shared runtime. The desktop TUI must be running through a Boomux-managed bare `opencode` launch."
+                        .into(),
+                )
+            } else {
+                match directory.to_str() {
+                Some(directory) => (
+                    Some(opencode_handoff(
+                        opencode_web_url,
+                        opencode_web_url.is_none().then_some(runtime.port),
+                        directory,
+                        external_session_id,
+                    )),
+                    "Open this Session to continue chatting, review tool activity, and respond to OpenCode prompts."
+                        .into(),
+                ),
+                None => (
+                    None,
+                    "This OpenCode Session's working directory cannot be represented in a browser URL."
+                        .into(),
+                ),
+                }
+            }
+        } else {
+            (
+                None,
+                "This Agent has no retained canonical OpenCode Session identity and working directory."
+                    .into(),
+            )
+        }
+    } else {
+        (
+            None,
+            "Native OpenCode Session handoff is disabled for this dashboard.".into(),
+        )
+    };
+
+    Ok(agent_detail_with_terminal(
+        client,
+        combined,
+        agent,
+        timeline,
+        native_web,
+        native_web_notice,
+    ))
+}
+
+fn opencode_claim_matches_agent(
+    runtime_hint: &OpenCodeRuntimeHint,
+    runtime: &OpenCodeSharedRuntimeSnapshot,
+    root_session_id: &str,
+    resolved: Option<(&OpenCodeSessionClaimSnapshot, &AgentInstanceSnapshot)>,
+    agent: &AgentCard,
+) -> bool {
+    let Some((claim, resolved_agent)) = resolved else {
+        return false;
+    };
+    runtime.generation_id == runtime_hint.generation_id.as_ref()
+        && runtime.port == runtime_hint.port
+        && claim.generation_id == runtime.generation_id
+        && claim.root_session_id == root_session_id
+        && claim.agent_id == agent.agent_id
+        && claim.shell_id == agent.shell_id
+        && claim.run_id == agent.run_id
+        && resolved_agent.id == agent.agent_id
+        && resolved_agent.shell_id == agent.shell_id
+        && resolved_agent.run_id == agent.run_id
+}
+
+fn agent_detail_without_native_web(
+    client: &Client,
+    combined: &CombinedNodeSnapshot,
+    agent: AgentCard,
+    timeline: Vec<TimelineEntry>,
+    native_web_notice: &str,
+) -> AgentDetail {
+    agent_detail_with_terminal(
+        client,
+        combined,
+        agent,
+        timeline,
+        None,
+        native_web_notice.into(),
+    )
+}
+
+fn agent_detail_with_terminal(
+    client: &Client,
+    combined: &CombinedNodeSnapshot,
+    agent: AgentCard,
+    timeline: Vec<TimelineEntry>,
+    native_web: Option<NativeWebHandoff>,
+    native_web_notice: String,
+) -> AgentDetail {
     let current_run = combined
         .nodes
         .iter()
-        .find(|node| node.node_id == node_id)
+        .find(|node| node.node_id == agent.node_id)
         .and_then(|node| node.local_snapshot.as_ref())
         .and_then(|snapshot| {
             snapshot
@@ -725,30 +1078,32 @@ fn build_agent_detail(
         (None, false)
     };
     let terminal_available = terminal_output.is_some();
-    Ok(AgentDetail {
+    let notice = if terminal_available {
+        "Rendered Shell output is a bounded terminal view, not a structured conversation transcript."
+    } else if terminal_read_failed {
+        "The exact run-scoped terminal read failed. Refresh after checking the Boomux server log."
+    } else if current_run {
+        "Rendered terminal output is currently unavailable for this local Shell run."
+    } else if agent.node_local {
+        "The Agent's exact Shell run is no longer current, so Boomux will not substitute output from a later run."
+    } else {
+        "Remote cached projections do not contain terminal output; the owning Node remains authoritative."
+    };
+    AgentDetail {
         agent,
         timeline,
+        native_web,
+        native_web_notice,
         terminal_output,
         terminal_available,
-        notice: if terminal_available {
-            "Rendered Shell output is a bounded terminal view, not a structured conversation transcript."
-        } else if terminal_read_failed {
-            "The exact run-scoped terminal read failed. Refresh after checking the Boomux server log."
-        } else if current_run {
-            "Rendered terminal output is currently unavailable for this local Shell run."
-        } else if combined
-            .nodes
-            .iter()
-            .any(|node| node.node_id == node_id && node.local)
-        {
-            "The Agent's exact Shell run is no longer current, so Boomux will not substitute output from a later run."
-        } else {
-            "Remote cached projections do not contain terminal output; the owning Node remains authoritative."
-        },
-    })
+        notice,
+    }
 }
 
 fn agent_priority(agent: &AgentCard) -> u8 {
+    if agent.just_completed {
+        return 1;
+    }
     match agent.attention.as_ref().map(|attention| attention.reason) {
         Some(AgentAttentionReason::Blocked) => 0,
         Some(AgentAttentionReason::Completed) => 1,
@@ -796,7 +1151,6 @@ fn unix_time_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::HeaderValue;
     use boomux::protocol::{
         AgentAttentionSnapshot, AgentAuthority, AgentInstanceSnapshot, AgentObservationSnapshot,
         CombinedNode, NodeProjectionAgent, NodeProjectionAttention, NodeProjectionShell,
@@ -967,35 +1321,189 @@ mod tests {
     }
 
     #[test]
-    fn trusted_user_requires_the_exact_serve_identity() {
-        let mut headers = HeaderMap::new();
-        assert!(authorized(&headers, None));
-        assert!(!authorized(&headers, Some("owner@example.com")));
-        headers.insert(HOST, HeaderValue::from_static("127.0.0.1:3737"));
-        assert!(authorized(&headers, Some("owner@example.com")));
-        headers.insert(HOST, HeaderValue::from_static("desktop.tailnet.ts.net"));
-        assert!(!authorized(&headers, Some("owner@example.com")));
-        headers.insert(
-            &TAILSCALE_LOGIN,
-            HeaderValue::from_static("owner@example.com"),
-        );
-        assert!(authorized(&headers, Some("owner@example.com")));
-        assert!(!authorized(&headers, Some("other@example.com")));
-        headers.insert(
-            &TAILSCALE_LOGIN,
-            HeaderValue::from_static("other@example.com"),
-        );
-        headers.insert(HOST, HeaderValue::from_static("localhost:3737"));
-        assert!(!authorized(&headers, Some("owner@example.com")));
-    }
-
-    #[test]
     fn app_shell_is_installable_and_has_no_inline_code() {
         assert!(INDEX_HTML.contains("rel=\"manifest\""));
         assert!(INDEX_HTML.contains("type=\"module\" src=\"app.js\""));
         assert!(!INDEX_HTML.contains("<script>"));
         assert!(MANIFEST.contains("\"display\": \"standalone\""));
         assert!(SERVICE_WORKER.contains("/api/"));
+        assert!(INDEX_HTML.contains("id=\"native-handoff-link\""));
+        assert!(APP_JS.contains("payload.native_web"));
+        assert!(APP_JS.contains("if (routeDetail()) requests.push(refreshDetail())"));
+        assert!(APP_JS.contains("clearNativeHandoff();"));
+        assert!(
+            APP_JS
+                .matches("nativeLink.removeAttribute(\"href\");")
+                .count()
+                >= 2
+        );
+    }
+
+    #[test]
+    fn mobile_web_has_no_process_ownership() {
+        let implementation = include_str!("mobile_web.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        assert!(!implementation.contains("std::process"));
+        assert!(!implementation.contains("Command::new"));
+    }
+
+    #[test]
+    fn native_web_url_requires_an_origin_without_a_path() {
+        assert_eq!(
+            normalize_native_web_url(" https://desktop.example.ts.net:4097/ ").unwrap(),
+            "https://desktop.example.ts.net:4097"
+        );
+        assert!(normalize_native_web_url("desktop.example.ts.net:4097").is_err());
+        assert!(normalize_native_web_url("ftp://desktop.example.ts.net").is_err());
+        assert!(normalize_native_web_url("http://desktop.example.ts.net:4097").is_err());
+        assert!(normalize_native_web_url("http://127.0.0.1:4097").is_ok());
+        assert!(normalize_native_web_url("https://desktop.example.ts.net/opencode").is_err());
+        assert!(normalize_native_web_url("https://desktop.example.ts.net/?token=secret").is_err());
+        assert!(normalize_native_web_url("https://user:password@desktop.example.ts.net").is_err());
+    }
+
+    #[test]
+    fn native_web_configuration_always_ensures_unless_disabled() {
+        let default = opencode_web_configuration(3737, None, 4097, false).unwrap();
+        assert_eq!(default.public_url, None);
+        assert_eq!(default.runtime_port, Some(4097));
+
+        let public = opencode_web_configuration(
+            3737,
+            Some("https://desktop.example.ts.net:4097"),
+            4097,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            public.public_url.as_deref(),
+            Some("https://desktop.example.ts.net:4097")
+        );
+        assert_eq!(public.runtime_port, Some(4097));
+
+        let disabled = opencode_web_configuration(4097, None, 4097, true).unwrap();
+        assert_eq!(disabled.runtime_port, None);
+        assert!(opencode_web_configuration(4097, None, 4097, false).is_err());
+    }
+
+    #[test]
+    fn opencode_handoff_targets_the_exact_directory_and_session() {
+        let handoff = opencode_handoff(
+            Some("https://desktop.example.ts.net:4097"),
+            None,
+            "/home/user/My Project",
+            "session/with spaces",
+        );
+
+        assert_eq!(handoff.integration, "opencode");
+        assert_eq!(handoff.label, "Open in OpenCode");
+        assert_eq!(
+            handoff.url,
+            Some("https://desktop.example.ts.net:4097/L2hvbWUvdXNlci9NeSBQcm9qZWN0/session/session%2Fwith%20spaces".into())
+        );
+        assert_eq!(handoff.port, None);
+        assert_eq!(
+            handoff.path,
+            "/L2hvbWUvdXNlci9NeSBQcm9qZWN0/session/session%2Fwith%20spaces"
+        );
+
+        let managed = opencode_handoff(None, Some(4097), "/work", "session-local");
+        assert_eq!(managed.url, None);
+        assert_eq!(managed.port, Some(4097));
+        assert_eq!(managed.path, "/L3dvcms/session/session-local");
+    }
+
+    #[test]
+    fn opencode_handoff_requires_exact_generation_and_claim_identity() {
+        let combined = combined_snapshot();
+        let agent = project_visible_agents(&combined)
+            .into_iter()
+            .find(|agent| agent.node_local)
+            .unwrap();
+        let resolved_agent = combined.nodes[0]
+            .local_snapshot
+            .as_ref()
+            .unwrap()
+            .workspaces[0]
+            .agents[0]
+            .clone();
+        let hint = OpenCodeRuntimeHint {
+            generation_id: Arc::from("generation-current"),
+            port: 4097,
+        };
+        let runtime = OpenCodeSharedRuntimeSnapshot {
+            generation_id: "generation-current".into(),
+            url: "http://127.0.0.1:4097".into(),
+            port: 4097,
+            pid: Some(42),
+        };
+        let claim = OpenCodeSessionClaimSnapshot {
+            generation_id: runtime.generation_id.clone(),
+            claim_id: "claim-current".into(),
+            holder_id: "holder-current".into(),
+            root_session_id: "session-local".into(),
+            workspace_id: agent.workspace_id.clone(),
+            shell_id: agent.shell_id.clone(),
+            run_id: agent.run_id.clone(),
+            agent_id: agent.agent_id.clone(),
+            holder_count: 1,
+            holder_expires_at_ms: 100,
+        };
+
+        assert!(opencode_claim_matches_agent(
+            &hint,
+            &runtime,
+            "session-local",
+            Some((&claim, &resolved_agent)),
+            &agent,
+        ));
+        assert!(!opencode_claim_matches_agent(
+            &hint,
+            &runtime,
+            "session-local",
+            None,
+            &agent,
+        ));
+
+        let mut stale_runtime = runtime.clone();
+        stale_runtime.generation_id = "generation-replaced".into();
+        assert!(!opencode_claim_matches_agent(
+            &hint,
+            &stale_runtime,
+            "session-local",
+            Some((&claim, &resolved_agent)),
+            &agent,
+        ));
+
+        for mismatch in ["agent", "shell", "run", "root"] {
+            let mut mismatched_claim = claim.clone();
+            match mismatch {
+                "agent" => mismatched_claim.agent_id = "different-agent".into(),
+                "shell" => mismatched_claim.shell_id = "different-shell".into(),
+                "run" => mismatched_claim.run_id = "different-run".into(),
+                "root" => mismatched_claim.root_session_id = "different-root".into(),
+                _ => unreachable!(),
+            }
+            assert!(!opencode_claim_matches_agent(
+                &hint,
+                &runtime,
+                "session-local",
+                Some((&mismatched_claim, &resolved_agent)),
+                &agent,
+            ));
+        }
+
+        let mut mismatched_agent = resolved_agent;
+        mismatched_agent.run_id = "different-run".into();
+        assert!(!opencode_claim_matches_agent(
+            &hint,
+            &runtime,
+            "session-local",
+            Some((&claim, &mismatched_agent)),
+            &agent,
+        ));
     }
 
     #[test]
@@ -1103,5 +1611,84 @@ mod tests {
         assert!(!names.contains(&"local-active"));
         assert!(!names.contains(&"historical-blocked"));
         assert!(!names.contains(&"scheduled-attention"));
+    }
+
+    #[test]
+    fn presentation_tracks_local_completion_only_after_working_baseline() {
+        let mut presentation = PresentationState::default();
+        presentation.update(combined_snapshot());
+        assert!(
+            presentation
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .agents
+                .iter()
+                .all(|agent| !agent.just_completed)
+        );
+
+        let mut idle = combined_snapshot();
+        let agent = &mut idle.nodes[0].local_snapshot.as_mut().unwrap().workspaces[0].agents[0];
+        agent.observation.state = AgentState::Idle;
+        agent.observation.revision += 1;
+        agent.observation.observed_at_ms += 10;
+
+        let mut idle_baseline = PresentationState::default();
+        idle_baseline.update(idle.clone());
+        assert!(
+            idle_baseline
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .agents
+                .iter()
+                .all(|agent| !agent.just_completed)
+        );
+
+        presentation.update(idle.clone());
+        let completed = presentation
+            .snapshot
+            .as_ref()
+            .unwrap()
+            .agents
+            .iter()
+            .find(|agent| agent.name == "local-active")
+            .unwrap();
+        assert!(completed.just_completed);
+
+        presentation.update(idle);
+        assert!(
+            presentation
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .agents
+                .iter()
+                .find(|agent| agent.name == "local-active")
+                .unwrap()
+                .just_completed
+        );
+
+        let mut resumed = combined_snapshot();
+        resumed.nodes[0].local_snapshot.as_mut().unwrap().workspaces[0].agents[0]
+            .observation
+            .observed_at_ms += 20;
+        presentation.update(resumed);
+        assert!(presentation.completed_agents.is_empty());
+    }
+
+    #[test]
+    fn presentation_retains_snapshot_across_disconnect() {
+        let mut presentation = PresentationState::default();
+        presentation.update(combined_snapshot());
+
+        assert!(presentation.mark_disconnected());
+        let snapshot = presentation.snapshot.as_ref().unwrap();
+        assert!(!snapshot.daemon_connected);
+        assert_eq!(snapshot.counts.agents, 2);
+        assert!(!presentation.mark_disconnected());
+
+        presentation.update(combined_snapshot());
+        assert!(presentation.snapshot.as_ref().unwrap().daemon_connected);
     }
 }

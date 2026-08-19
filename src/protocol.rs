@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 41;
+pub const PROTOCOL_VERSION: u32 = 42;
 pub const MIN_PROTOCOL_VERSION: u32 = 6;
 pub const MAX_CONTROL_FRAME: usize = 8 * 1024 * 1024;
 pub const MAX_ATTACH_FRAME: usize = 1024 * 1024;
@@ -185,6 +185,10 @@ define_protocol_features! {
     ]),
     NodeUpgradeCoordination => (41, "Node upgrade coordination", [
         "node_upgrade_coordination",
+    ]),
+    OpenCodeSharedRuntimeClaims => (42, "OpenCode shared runtime claims", [
+        "protocol_42",
+        "opencode_shared_runtime_claims",
     ]),
 }
 
@@ -1226,6 +1230,30 @@ pub struct AgentInstanceSnapshot {
     pub observation: AgentObservationSnapshot,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attention: Option<AgentAttentionSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpenCodeSharedRuntimeSnapshot {
+    pub generation_id: String,
+    pub url: String,
+    pub port: u16,
+    pub pid: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpenCodeSessionClaimSnapshot {
+    pub generation_id: String,
+    pub claim_id: String,
+    pub holder_id: String,
+    pub root_session_id: String,
+    pub workspace_id: String,
+    pub shell_id: String,
+    pub run_id: String,
+    pub agent_id: String,
+    pub holder_count: u32,
+    pub holder_expires_at_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2293,6 +2321,34 @@ pub enum Request {
         run_id: String,
         spec: AgentRegistrationSpec,
     },
+    EnsureOpenCodeSharedRuntime {
+        port: u16,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        environment: Option<UnixEnvironment>,
+    },
+    GetOpenCodeSharedRuntime,
+    EnsureOpenCodeSessionClaim {
+        generation_id: String,
+        holder_id: String,
+        root_session_id: String,
+        shell_id: String,
+        run_id: String,
+        spec: AgentRegistrationSpec,
+    },
+    ReleaseOpenCodeSessionClaim {
+        generation_id: String,
+        holder_id: String,
+        claim_id: String,
+    },
+    ResolveOpenCodeSessionClaim {
+        generation_id: String,
+        root_session_id: String,
+    },
+    ReportClaimedOpenCodeAgent {
+        generation_id: String,
+        root_session_id: String,
+        report: AgentReport,
+    },
     ReportAgent {
         agent_id: String,
         run_id: String,
@@ -2440,6 +2496,12 @@ pub enum Request {
 }
 
 impl Request {
+    pub fn minimum_protocol_version(&self) -> u32 {
+        self.required_feature()
+            .map(ProtocolFeature::minimum_version)
+            .unwrap_or(MIN_PROTOCOL_VERSION)
+    }
+
     pub fn required_feature(&self) -> Option<ProtocolFeature> {
         match self {
             Self::GetNodeIdentity => Some(ProtocolFeature::NodeIdentity),
@@ -2584,6 +2646,14 @@ impl Request {
                 ..
             } => Some(ProtocolFeature::RestartableExitedShells),
             Self::EnsureAgent { .. } => Some(ProtocolFeature::IdempotentAgentEnsure),
+            Self::EnsureOpenCodeSharedRuntime { .. }
+            | Self::GetOpenCodeSharedRuntime
+            | Self::EnsureOpenCodeSessionClaim { .. }
+            | Self::ReleaseOpenCodeSessionClaim { .. }
+            | Self::ResolveOpenCodeSessionClaim { .. }
+            | Self::ReportClaimedOpenCodeAgent { .. } => {
+                Some(ProtocolFeature::OpenCodeSharedRuntimeClaims)
+            }
             Self::GetAgent { .. } | Self::RegisterAgent { .. } | Self::ReportAgent { .. } => {
                 Some(ProtocolFeature::AgentInstances)
             }
@@ -2674,6 +2744,16 @@ pub enum Response {
     },
     Agent {
         agent: AgentInstanceSnapshot,
+    },
+    OpenCodeSharedRuntime {
+        runtime: Option<OpenCodeSharedRuntimeSnapshot>,
+    },
+    OpenCodeSessionClaim {
+        claim: OpenCodeSessionClaimSnapshot,
+        agent: AgentInstanceSnapshot,
+    },
+    OpenCodeSessionClaimReleased {
+        released: bool,
     },
     AgentSchedule {
         schedule: AgentScheduleSnapshot,
@@ -3283,8 +3363,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_forty_one_with_minimum_six() {
-        assert_eq!(PROTOCOL_VERSION, 41);
+    fn protocol_version_is_forty_two_with_minimum_six() {
+        assert_eq!(PROTOCOL_VERSION, 42);
         assert_eq!(MIN_PROTOCOL_VERSION, 6);
     }
 
@@ -3423,6 +3503,140 @@ mod tests {
             serde_json::from_value::<Response>(encoded).unwrap(),
             response
         );
+    }
+
+    #[test]
+    fn opencode_shared_runtime_claim_messages_require_protocol_forty_two() {
+        let generation_id = uuid::Uuid::from_u128(1).to_string();
+        let holder_id = uuid::Uuid::from_u128(2).to_string();
+        let root_session_id = "ses_root".to_string();
+        let shell_id = uuid::Uuid::from_u128(3).to_string();
+        let run_id = uuid::Uuid::from_u128(4).to_string();
+        let claim_id = uuid::Uuid::from_u128(5).to_string();
+        let report = AgentReport {
+            state: AgentState::Working,
+            authority: AgentAuthority::LifecycleIntegration,
+            evidence: "opencode-event".into(),
+            confidence: 100,
+        };
+        for request in [
+            Request::EnsureOpenCodeSharedRuntime {
+                port: 4096,
+                environment: Some(UnixEnvironment {
+                    variables: vec![UnixEnvironmentVariable {
+                        name: b"OPENCODE_SERVER_PASSWORD".to_vec(),
+                        value: b"secret".to_vec(),
+                    }],
+                }),
+            },
+            Request::GetOpenCodeSharedRuntime,
+            Request::EnsureOpenCodeSessionClaim {
+                generation_id: generation_id.clone(),
+                holder_id: holder_id.clone(),
+                root_session_id: root_session_id.clone(),
+                shell_id: shell_id.clone(),
+                run_id: run_id.clone(),
+                spec: AgentRegistrationSpec {
+                    name: "opencode".into(),
+                    integration: "opencode-plugin".into(),
+                    external_session_id: Some(root_session_id.clone()),
+                    report: report.clone(),
+                },
+            },
+            Request::ReleaseOpenCodeSessionClaim {
+                generation_id: generation_id.clone(),
+                holder_id: holder_id.clone(),
+                claim_id: claim_id.clone(),
+            },
+            Request::ResolveOpenCodeSessionClaim {
+                generation_id: generation_id.clone(),
+                root_session_id: root_session_id.clone(),
+            },
+            Request::ReportClaimedOpenCodeAgent {
+                generation_id: generation_id.clone(),
+                root_session_id: root_session_id.clone(),
+                report: report.clone(),
+            },
+        ] {
+            let encoded = serde_json::to_value(&request).unwrap();
+            assert!(!format!("{request:?}").contains("secret"));
+            assert_eq!(serde_json::from_value::<Request>(encoded).unwrap(), request);
+            assert_eq!(
+                request.required_feature(),
+                Some(ProtocolFeature::OpenCodeSharedRuntimeClaims)
+            );
+            assert_eq!(request.minimum_protocol_version(), 42);
+        }
+
+        let old_request: Request = serde_json::from_value(serde_json::json!({
+            "request": "ensure_open_code_shared_runtime",
+            "port": 4096
+        }))
+        .unwrap();
+        assert!(matches!(
+            old_request,
+            Request::EnsureOpenCodeSharedRuntime {
+                port: 4096,
+                environment: None
+            }
+        ));
+
+        let claim = OpenCodeSessionClaimSnapshot {
+            generation_id: generation_id.clone(),
+            claim_id,
+            holder_id: holder_id.clone(),
+            root_session_id: root_session_id.clone(),
+            workspace_id: uuid::Uuid::from_u128(6).to_string(),
+            shell_id: shell_id.clone(),
+            run_id: run_id.clone(),
+            agent_id: uuid::Uuid::from_u128(7).to_string(),
+            holder_count: 2,
+            holder_expires_at_ms: 123,
+        };
+        let agent = AgentInstanceSnapshot {
+            id: claim.agent_id.clone(),
+            workspace_id: claim.workspace_id.clone(),
+            shell_id,
+            run_id,
+            name: "opencode".into(),
+            integration: "opencode-plugin".into(),
+            external_session_id: Some(root_session_id),
+            cwd: Some("/tmp/project".into()),
+            started_at_ms: 100,
+            ended_at_ms: None,
+            observation: AgentObservationSnapshot {
+                revision: 1,
+                state: report.state,
+                authority: report.authority,
+                evidence: report.evidence,
+                confidence: report.confidence,
+                observed_at_ms: 101,
+            },
+            attention: None,
+        };
+        for response in [
+            Response::OpenCodeSharedRuntime {
+                runtime: Some(OpenCodeSharedRuntimeSnapshot {
+                    generation_id,
+                    url: "http://127.0.0.1:4096".into(),
+                    port: 4096,
+                    pid: Some(42),
+                }),
+            },
+            Response::OpenCodeSharedRuntime { runtime: None },
+            Response::OpenCodeSessionClaim {
+                claim,
+                agent: agent.clone(),
+            },
+            Response::OpenCodeSessionClaimReleased { released: true },
+            Response::Agent { agent },
+        ] {
+            let encoded = serde_json::to_value(&response).unwrap();
+            assert_eq!(
+                serde_json::from_value::<Response>(encoded).unwrap(),
+                response
+            );
+        }
     }
 
     #[test]
@@ -4732,6 +4946,7 @@ mod tests {
             (40, &["cached_projection_dismissal"][..]),
             (41, &["protocol_41", "observed_node_helper_version"][..]),
             (41, &["node_upgrade_coordination"][..]),
+            (42, &["protocol_42", "opencode_shared_runtime_claims"][..]),
         ];
 
         let actual = ProtocolFeature::ALL

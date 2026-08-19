@@ -8,6 +8,7 @@ const {
   createProcessRunner,
   createReducerState,
   reduce,
+  sharedReportArgv,
 } = BoomuxOpenCodePlugin.__internal;
 
 const env = {
@@ -736,7 +737,7 @@ describe("Boomux commands", () => {
     expect(calls).toHaveLength(1);
   });
 
-  test("run_changed permanently disables that tracked root", async () => {
+  test("run_changed permanently disables an environment-bound root", async () => {
     const calls = [];
     const lifecycle = createLifecycle({
       client: {
@@ -756,6 +757,42 @@ describe("Boomux commands", () => {
     );
     await lifecycle.enqueue(event("session.idle", { sessionID: "root" }));
     expect(calls).toHaveLength(1);
+  });
+
+  test("shared server reports through the generation claim atomically", async () => {
+    const calls = [];
+    const lifecycle = createLifecycle({
+      client: {
+        session: { get: async ({ path }) => ({ data: { id: path.id } }) },
+      },
+      env: { BOOMUX_OPENCODE_SHARED_GENERATION: "generation;literal" },
+      run: async (argv) => {
+        calls.push(argv);
+        return { data: { agent: { id: "daemon-resolved" } } };
+      },
+      log: () => {},
+    });
+
+    await lifecycle.enqueue(
+      event("session.status", { sessionID: "root", status: "busy" }),
+    );
+    await lifecycle.enqueue(event("session.idle", { sessionID: "root" }));
+
+    expect(calls).toEqual([
+      sharedReportArgv(
+        "generation;literal",
+        "root",
+        "working",
+        "OpenCode session busy",
+      ),
+      sharedReportArgv(
+        "generation;literal",
+        "root",
+        "idle",
+        "OpenCode root session idle",
+      ),
+    ]);
+    expect(lifecycle.roots.get("root").agentID).toBeUndefined();
   });
 });
 
@@ -788,14 +825,13 @@ describe("queue and activation", () => {
     expect(order).toEqual(["start1", "end1", "start2", "end2"]);
   });
 
-  test("missing environment is a no-op", async () => {
-    expect(
-      createLifecycle({ client: {}, env: {}, run: async () => {} }),
-    ).toBeUndefined();
+  test("identity-neutral server is inert without a shared generation", async () => {
     const oldShell = process.env.BOOMUX_SHELL_ID;
     const oldRun = process.env.BOOMUX_RUN_ID;
+    const oldGeneration = process.env.BOOMUX_OPENCODE_SHARED_GENERATION;
     delete process.env.BOOMUX_SHELL_ID;
     delete process.env.BOOMUX_RUN_ID;
+    delete process.env.BOOMUX_OPENCODE_SHARED_GENERATION;
     try {
       expect(await BoomuxOpenCodePlugin({ client: {} })).toEqual({});
     } finally {
@@ -803,6 +839,9 @@ describe("queue and activation", () => {
       else process.env.BOOMUX_SHELL_ID = oldShell;
       if (oldRun === undefined) delete process.env.BOOMUX_RUN_ID;
       else process.env.BOOMUX_RUN_ID = oldRun;
+      if (oldGeneration === undefined)
+        delete process.env.BOOMUX_OPENCODE_SHARED_GENERATION;
+      else process.env.BOOMUX_OPENCODE_SHARED_GENERATION = oldGeneration;
     }
   });
 });

@@ -375,9 +375,15 @@ enum Commands {
         /// Loopback port for the HTTP server
         #[arg(long, default_value_t = 3737, value_parser = clap::value_parser!(u16).range(1..))]
         port: u16,
-        /// Require this exact Tailscale Serve login header
-        #[arg(long, value_name = "LOGIN")]
-        trusted_user: Option<String>,
+        /// Public base URL of an authenticated OpenCode Web server
+        #[arg(long, value_name = "URL")]
+        opencode_web_url: Option<String>,
+        /// Loopback port for the managed OpenCode Web server
+        #[arg(long, default_value_t = 4097, value_parser = clap::value_parser!(u16).range(1..))]
+        opencode_web_port: u16,
+        /// Do not start or advertise OpenCode Web
+        #[arg(long, conflicts_with = "opencode_web_url")]
+        no_opencode_web: bool,
     },
     /// Check that Boomux's dependencies and daemon are available
     Doctor,
@@ -1144,6 +1150,56 @@ enum OpenCodeCommands {
         #[arg(long)]
         force: bool,
     },
+    /// Internal entry point for a scoped bare OpenCode invocation
+    #[command(hide = true)]
+    Shared,
+    /// Coordinate OpenCode TUI selection claims
+    #[command(hide = true)]
+    Claim {
+        #[command(subcommand)]
+        command: OpenCodeClaimCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum OpenCodeClaimCommands {
+    /// Ensure a claim for the selected root OpenCode Session
+    Ensure {
+        #[arg(long)]
+        generation: String,
+        #[arg(long)]
+        holder: String,
+        #[arg(long)]
+        root_session_id: String,
+        #[arg(long)]
+        shell_id: Option<String>,
+        #[arg(long)]
+        run_id: Option<String>,
+    },
+    /// Release one exact claim holder
+    Release {
+        #[arg(long)]
+        generation: String,
+        #[arg(long)]
+        holder: String,
+        #[arg(long)]
+        claim_id: String,
+    },
+    /// Report lifecycle state through the selected root Session claim
+    Report {
+        #[arg(long)]
+        generation: String,
+        #[arg(long)]
+        root_session_id: String,
+        #[arg(long, value_enum)]
+        state: CliAgentState,
+        #[arg(long, value_enum)]
+        authority: CliAgentAuthority,
+        #[arg(long)]
+        evidence: String,
+        #[arg(long, value_parser = clap::value_parser!(u8).range(0..=100))]
+        confidence: u8,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1236,6 +1292,7 @@ enum DaemonCommands {
 enum OutputMode {
     HumanOnly,
     Json,
+    PrivateJson,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1328,6 +1385,9 @@ command_keys! {
     ExecutionCancel => ("execution.cancel", Json),
     Skill => ("skill", HumanOnly),
     Opencode => ("opencode", HumanOnly),
+    OpencodeClaimEnsure => ("opencode.claim.ensure", PrivateJson),
+    OpencodeClaimRelease => ("opencode.claim.release", PrivateJson),
+    OpencodeClaimReport => ("opencode.claim.report", PrivateJson),
     Pi => ("pi", HumanOnly),
     Open => ("open", HumanOnly),
     Prompt => ("prompt", HumanOnly),
@@ -1531,8 +1591,24 @@ impl Cli {
                 command: SkillCommands::Install { .. },
             }) => CommandKey::Skill,
             Some(Commands::Opencode {
-                command: OpenCodeCommands::Install { .. },
-            }) => CommandKey::Opencode,
+                command:
+                    OpenCodeCommands::Claim {
+                        command: OpenCodeClaimCommands::Ensure { .. },
+                    },
+            }) => CommandKey::OpencodeClaimEnsure,
+            Some(Commands::Opencode {
+                command:
+                    OpenCodeCommands::Claim {
+                        command: OpenCodeClaimCommands::Release { .. },
+                    },
+            }) => CommandKey::OpencodeClaimRelease,
+            Some(Commands::Opencode {
+                command:
+                    OpenCodeCommands::Claim {
+                        command: OpenCodeClaimCommands::Report { .. },
+                    },
+            }) => CommandKey::OpencodeClaimReport,
+            Some(Commands::Opencode { .. }) => CommandKey::Opencode,
             Some(Commands::Pi {
                 command: PiCommands::Install { .. },
             }) => CommandKey::Pi,
@@ -1637,7 +1713,7 @@ fn requests_json(arguments: impl IntoIterator<Item = OsString>) -> bool {
 
 fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
     let descriptor = cli.command_descriptor();
-    if cli.json && descriptor.output != OutputMode::Json {
+    if cli.json && descriptor.output == OutputMode::HumanOnly {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("--json is not supported for {}", descriptor.key),
@@ -1677,8 +1753,18 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
             )?;
             return Ok(CliExit::Success);
         }
-        Some(Commands::Web { port, trusted_user }) => {
-            mobile_web::run(*port, trusted_user.as_deref())?;
+        Some(Commands::Web {
+            port,
+            opencode_web_url,
+            opencode_web_port,
+            no_opencode_web,
+        }) => {
+            mobile_web::run(
+                *port,
+                opencode_web_url.as_deref(),
+                *opencode_web_port,
+                *no_opencode_web,
+            )?;
             return Ok(CliExit::Success);
         }
         Some(Commands::Attach {
@@ -1810,6 +1896,12 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
         Some(Commands::Opencode {
             command: OpenCodeCommands::Install { force },
         }) => install_opencode(force),
+        Some(Commands::Opencode {
+            command: OpenCodeCommands::Shared,
+        }) => launch_shared_opencode(),
+        Some(Commands::Opencode {
+            command: OpenCodeCommands::Claim { command },
+        }) => opencode_claim_command(command, cli.json),
         Some(Commands::Pi {
             command: PiCommands::Install { force },
         }) => install_pi(force),
@@ -8734,6 +8826,7 @@ fn scheduled_runner(schedule_id: &str) -> Result<process_adapter::ProcessExit, B
         )
         .ok_or_else(|| io::Error::other("scheduled integration mode is unavailable"))?;
     let mut command = Command::new(&dispatch.argv[0]);
+    sanitize_inherited_opencode_shim(&mut command);
     command
         .args(&dispatch.argv[1..])
         .current_dir(&claim.execution.cwd)
@@ -10203,6 +10296,7 @@ fn invoke_workspace_launcher(
         .split_first()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "launcher command is empty"))?;
     let mut command = Command::new(executable);
+    sanitize_inherited_opencode_shim(&mut command);
     command
         .args(arguments)
         .current_dir(&launcher.cwd)
@@ -10235,6 +10329,38 @@ fn invoke_workspace_launcher(
         })
         .map_err(|error| io::Error::other(format!("could not start launcher reaper: {error}")))?;
     Ok(())
+}
+
+fn sanitize_inherited_opencode_shim(command: &mut Command) {
+    let shim_dir = env::var_os("BOOMUX_OPENCODE_SHIM_DIR");
+    let original_path = env::var_os("BOOMUX_ORIGINAL_PATH");
+    let private_tui_config = env::var_os("BOOMUX_OPENCODE_TUI_CONFIG");
+    if let Some(original_path) = original_path {
+        command.env("PATH", original_path);
+    } else if let (Some(path), Some(shim_dir)) = (env::var_os("PATH"), shim_dir.as_deref()) {
+        let filtered = env::split_paths(&path)
+            .filter(|entry| entry.as_os_str() != shim_dir)
+            .collect::<Vec<_>>();
+        if let Ok(path) = env::join_paths(filtered) {
+            command.env("PATH", path);
+        }
+    }
+    for name in [
+        "BOOMUX_REAL_OPENCODE",
+        "BOOMUX_ORIGINAL_PATH",
+        "BOOMUX_OPENCODE_SHIM_DIR",
+        "BOOMUX_OPENCODE_TUI_CONFIG",
+        "BOOMUX_SHIM_EXECUTABLE",
+        "BOOMUX_OPENCODE_SHARED_GENERATION",
+        "BOOMUX_OPENCODE_CLAIM_HOLDER",
+    ] {
+        command.env_remove(name);
+    }
+    if private_tui_config.is_some()
+        && env::var_os("OPENCODE_TUI_CONFIG").as_ref() == private_tui_config.as_ref()
+    {
+        command.env_remove("OPENCODE_TUI_CONFIG");
+    }
 }
 
 fn open_shell(
@@ -10383,6 +10509,225 @@ fn install_opencode(force: bool) -> Result<(), Box<dyn Error>> {
         false,
         false,
     )
+}
+
+fn opencode_claim_command(
+    command: OpenCodeClaimCommands,
+    json: bool,
+) -> Result<(), Box<dyn Error>> {
+    let client = client::connect_or_start()?;
+    match command {
+        OpenCodeClaimCommands::Ensure {
+            generation,
+            holder,
+            root_session_id,
+            shell_id,
+            run_id,
+        } => {
+            let (shell_id, run_id) = resolve_agent_context(
+                shell_id,
+                run_id,
+                env::var("BOOMUX_SHELL_ID").ok(),
+                env::var("BOOMUX_RUN_ID").ok(),
+            )?;
+            let spec = opencode_claim_registration(&root_session_id);
+            let (claim, agent) = client.ensure_opencode_session_claim(
+                generation,
+                holder,
+                root_session_id,
+                shell_id,
+                run_id,
+                spec,
+            )?;
+            if json {
+                let workspace = client.get_workspace(&agent.workspace_id)?;
+                return print_json(
+                    CommandKey::OpencodeClaimEnsure,
+                    serde_json::json!({
+                        "claim": claim,
+                        "agent": cli_output::agent(&agent, Some(&workspace.name)),
+                    }),
+                );
+            }
+            println!("CLAIM ID\t{}", claim.claim_id);
+            println!("AGENT ID\t{}", agent.id);
+        }
+        OpenCodeClaimCommands::Release {
+            generation,
+            holder,
+            claim_id,
+        } => {
+            let released =
+                client.release_opencode_session_claim(generation, holder, claim_id.clone())?;
+            if json {
+                return print_json(
+                    CommandKey::OpencodeClaimRelease,
+                    serde_json::json!({ "claim_id": claim_id, "released": released }),
+                );
+            }
+            println!("RELEASED\t{released}");
+        }
+        OpenCodeClaimCommands::Report {
+            generation,
+            root_session_id,
+            state,
+            authority,
+            evidence,
+            confidence,
+        } => {
+            let agent = client.report_claimed_opencode_agent(
+                generation,
+                root_session_id,
+                AgentReport {
+                    state: state.into(),
+                    authority: authority.into(),
+                    evidence,
+                    confidence,
+                },
+            )?;
+            if json {
+                let workspace = client.get_workspace(&agent.workspace_id)?;
+                return print_json(
+                    CommandKey::OpencodeClaimReport,
+                    serde_json::json!({
+                        "agent": cli_output::agent(&agent, Some(&workspace.name)),
+                    }),
+                );
+            }
+            println!("AGENT ID\t{}", agent.id);
+        }
+    }
+    Ok(())
+}
+
+fn opencode_claim_registration(root_session_id: &str) -> AgentRegistrationSpec {
+    AgentRegistrationSpec {
+        name: "OpenCode".into(),
+        integration: "opencode".into(),
+        external_session_id: Some(root_session_id.into()),
+        report: AgentReport {
+            state: AgentState::Unknown,
+            authority: AgentAuthority::LifecycleIntegration,
+            evidence: "direct TUI selection".into(),
+            confidence: 100,
+        },
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SharedOpenCodeLaunch {
+    executable: PathBuf,
+    url: String,
+    cwd: PathBuf,
+    generation: String,
+    holder: String,
+    tui_config: PathBuf,
+    original_path: Option<OsString>,
+}
+
+impl SharedOpenCodeLaunch {
+    fn argv(&self) -> Vec<OsString> {
+        vec![
+            "attach".into(),
+            self.url.clone().into(),
+            "--dir".into(),
+            self.cwd.clone().into_os_string(),
+        ]
+    }
+}
+
+fn shared_opencode_launch(
+    shell_id: Option<OsString>,
+    run_id: Option<OsString>,
+    executable: Option<OsString>,
+    tui_config: Option<OsString>,
+    original_path: Option<OsString>,
+    cwd: PathBuf,
+    runtime: protocol::OpenCodeSharedRuntimeSnapshot,
+) -> Result<SharedOpenCodeLaunch, Box<dyn Error>> {
+    for (name, value) in [("BOOMUX_SHELL_ID", shell_id), ("BOOMUX_RUN_ID", run_id)] {
+        if value.as_ref().is_none_or(|value| value.is_empty()) {
+            return Err(format!("{name} is required").into());
+        }
+    }
+    let executable = PathBuf::from(executable.ok_or("BOOMUX_REAL_OPENCODE is required")?);
+    let tui_config = PathBuf::from(tui_config.ok_or("BOOMUX_OPENCODE_TUI_CONFIG is required")?);
+    for (name, path, executable_required) in [
+        ("BOOMUX_REAL_OPENCODE", &executable, true),
+        ("BOOMUX_OPENCODE_TUI_CONFIG", &tui_config, false),
+    ] {
+        if !path.is_absolute() {
+            return Err(format!("{name} must be absolute").into());
+        }
+        let metadata = fs::metadata(path)?;
+        if !metadata.is_file()
+            || (executable_required && metadata.permissions().mode() & 0o111 == 0)
+        {
+            return Err(format!(
+                "{name} must name a regular{} file",
+                if executable_required {
+                    " executable"
+                } else {
+                    ""
+                }
+            )
+            .into());
+        }
+    }
+    if !cwd.is_absolute() {
+        return Err("current working directory must be absolute".into());
+    }
+    Ok(SharedOpenCodeLaunch {
+        executable,
+        url: runtime.url,
+        cwd,
+        generation: runtime.generation_id,
+        holder: Uuid::new_v4().to_string(),
+        tui_config,
+        original_path,
+    })
+}
+
+fn launch_shared_opencode() -> Result<(), Box<dyn Error>> {
+    let shell_id = env::var_os("BOOMUX_SHELL_ID");
+    let run_id = env::var_os("BOOMUX_RUN_ID");
+    for (name, value) in [
+        ("BOOMUX_SHELL_ID", shell_id.as_ref()),
+        ("BOOMUX_RUN_ID", run_id.as_ref()),
+    ] {
+        if value.is_none_or(|value| value.is_empty()) {
+            return Err(format!("{name} is required").into());
+        }
+    }
+    let client = client::connect_or_start()?;
+    let runtime = match client.get_opencode_shared_runtime()? {
+        Some(runtime) => runtime,
+        None => client.ensure_opencode_shared_runtime(4097)?,
+    };
+    let launch = shared_opencode_launch(
+        shell_id,
+        run_id,
+        env::var_os("BOOMUX_REAL_OPENCODE"),
+        env::var_os("BOOMUX_OPENCODE_TUI_CONFIG"),
+        env::var_os("BOOMUX_ORIGINAL_PATH"),
+        env::current_dir()?,
+        runtime,
+    )?;
+    let mut command = Command::new(&launch.executable);
+    command
+        .args(launch.argv())
+        .env("BOOMUX_OPENCODE_SHARED_GENERATION", &launch.generation)
+        .env("BOOMUX_OPENCODE_CLAIM_HOLDER", &launch.holder)
+        .env("OPENCODE_TUI_CONFIG", &launch.tui_config)
+        .env_remove("BOOMUX_REAL_OPENCODE")
+        .env_remove("BOOMUX_ORIGINAL_PATH")
+        .env_remove("BOOMUX_OPENCODE_SHIM_DIR")
+        .env_remove("BOOMUX_OPENCODE_TUI_CONFIG")
+        .env_remove("BOOMUX_SHIM_EXECUTABLE");
+    if let Some(path) = launch.original_path {
+        command.env("PATH", path);
+    }
+    Err(command.exec().into())
 }
 
 #[cfg(test)]
@@ -12312,6 +12657,86 @@ mod tests {
         assert_eq!(ensure.command_descriptor().key, "agent.ensure");
         assert_eq!(ensure.command_descriptor().output, OutputMode::Json);
 
+        let claim = Cli::try_parse_from([
+            "boomux",
+            "opencode",
+            "claim",
+            "ensure",
+            "--generation",
+            "generation-1",
+            "--holder",
+            "holder-1",
+            "--root-session-id",
+            "ses_exact",
+            "--shell-id",
+            "s1",
+            "--run-id",
+            "r1",
+            "--json",
+        ])
+        .unwrap();
+        assert_eq!(claim.command_descriptor().key, "opencode.claim.ensure");
+        assert_eq!(claim.command_descriptor().output, OutputMode::PrivateJson);
+        assert!(matches!(
+            claim.command,
+            Some(Commands::Opencode {
+                command: OpenCodeCommands::Claim {
+                    command: OpenCodeClaimCommands::Ensure {
+                        generation,
+                        holder,
+                        root_session_id,
+                        shell_id: Some(shell_id),
+                        run_id: Some(run_id),
+                    },
+                },
+            }) if generation == "generation-1" && holder == "holder-1"
+                && root_session_id == "ses_exact" && shell_id == "s1" && run_id == "r1"
+        ));
+        for (arguments, key) in [
+            (
+                vec![
+                    "boomux",
+                    "opencode",
+                    "claim",
+                    "release",
+                    "--generation",
+                    "generation-1",
+                    "--holder",
+                    "holder-1",
+                    "--claim-id",
+                    "claim-1",
+                    "--json",
+                ],
+                "opencode.claim.release",
+            ),
+            (
+                vec![
+                    "boomux",
+                    "opencode",
+                    "claim",
+                    "report",
+                    "--generation",
+                    "generation-1",
+                    "--root-session-id",
+                    "ses_exact",
+                    "--state",
+                    "idle",
+                    "--authority",
+                    "lifecycle-integration",
+                    "--evidence",
+                    "session.idle",
+                    "--confidence",
+                    "100",
+                    "--json",
+                ],
+                "opencode.claim.report",
+            ),
+        ] {
+            let command = Cli::try_parse_from(arguments).unwrap();
+            assert_eq!(command.command_descriptor().key, key);
+            assert_eq!(command.command_descriptor().output, OutputMode::PrivateJson);
+        }
+
         let cli = Cli::try_parse_from([
             "boomux",
             "agent",
@@ -13641,6 +14066,73 @@ mod tests {
         );
         assert!(opencode_config_root(Some("relative".into()), None).is_err());
         assert!(install_opencode_at(Path::new("relative"), false).is_err());
+
+        let shared = Cli::try_parse_from(["boomux", "opencode", "shared"]).unwrap();
+        assert!(matches!(
+            shared.command,
+            Some(Commands::Opencode {
+                command: OpenCodeCommands::Shared,
+            })
+        ));
+        assert!(Cli::try_parse_from(["boomux", "opencode", "attach", "agent-exact"]).is_err());
+    }
+
+    #[test]
+    fn opencode_claim_registration_and_shared_launch_are_exact() {
+        assert_eq!(
+            opencode_claim_registration("session-root"),
+            AgentRegistrationSpec {
+                name: "OpenCode".into(),
+                integration: "opencode".into(),
+                external_session_id: Some("session-root".into()),
+                report: AgentReport {
+                    state: AgentState::Unknown,
+                    authority: AgentAuthority::LifecycleIntegration,
+                    evidence: "direct TUI selection".into(),
+                    confidence: 100,
+                },
+            }
+        );
+
+        let directory = env::temp_dir().join(format!("boomux-shared-plan-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let executable = directory.join("opencode");
+        let tui_config = directory.join("tui.json");
+        fs::write(&executable, b"#!/bin/sh\n").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(&tui_config, b"{}\n").unwrap();
+        let launch = shared_opencode_launch(
+            Some("shell-1".into()),
+            Some("run-1".into()),
+            Some(executable.clone().into_os_string()),
+            Some(tui_config.clone().into_os_string()),
+            Some("/original/bin".into()),
+            directory.clone(),
+            protocol::OpenCodeSharedRuntimeSnapshot {
+                generation_id: "generation-1".into(),
+                url: "http://127.0.0.1:4097".into(),
+                port: 4097,
+                pid: Some(42),
+            },
+        )
+        .unwrap();
+        assert_eq!(launch.executable, executable);
+        assert_eq!(launch.url, "http://127.0.0.1:4097");
+        assert_eq!(launch.cwd, directory);
+        assert_eq!(launch.generation, "generation-1");
+        assert!(Uuid::parse_str(&launch.holder).is_ok());
+        assert_eq!(launch.tui_config, tui_config);
+        assert_eq!(launch.original_path, Some("/original/bin".into()));
+        assert_eq!(
+            launch.argv(),
+            [
+                OsString::from("attach"),
+                OsString::from("http://127.0.0.1:4097"),
+                OsString::from("--dir"),
+                launch.cwd.clone().into_os_string(),
+            ]
+        );
+        fs::remove_dir_all(&launch.cwd).unwrap();
     }
 
     #[test]
@@ -13831,7 +14323,7 @@ mod tests {
         assert_eq!(
             format_integration_list(&integrations),
             "NAME      PACKAGE                          VALIDATED VERSION\n\
-             opencode  opencode-ai                      1.18.15\n\
+             opencode  opencode-ai                      1.18.18\n\
              pi        @earendil-works/pi-coding-agent  0.84.1\n"
         );
 
@@ -13839,11 +14331,11 @@ mod tests {
             name: "opencode",
             display_name: "OpenCode",
             package: "opencode-ai",
-            validated_version: "1.18.15",
+            validated_version: "1.18.18",
             host: integration_management::HostStatus {
                 state: integration_management::HostState::Available,
                 executable: Some("/usr/bin/opencode".into()),
-                version: Some("1.18.15".into()),
+                version: Some("1.18.18".into()),
                 compatibility: "validated",
                 error: None,
             },
@@ -14214,7 +14706,7 @@ mod tests {
             integration_management::IntegrationId::Opencode
                 .installation()
                 .validated_version,
-            "1.18.15"
+            "1.18.18"
         );
         assert_eq!(
             integration_management::IntegrationId::Pi
@@ -14222,7 +14714,7 @@ mod tests {
                 .validated_version,
             "0.84.1"
         );
-        assert_eq!(protocol::PROTOCOL_VERSION, 41);
+        assert_eq!(protocol::PROTOCOL_VERSION, 42);
     }
 
     #[test]
