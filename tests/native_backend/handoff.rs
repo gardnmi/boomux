@@ -19,8 +19,9 @@ use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use uuid::Uuid;
 
 use crate::support::{
-    TIMEOUT, TestDaemon, acknowledge_reconnect, assert_remote_code, contains, parse_pid,
-    process_exists, profile, read_until, wait_for_attach_with_profile, wait_until,
+    TIMEOUT, TestDaemon, acknowledge_reconnect, assert_remote_code, contains,
+    ensure_test_opencode_runtime, parse_pid, process_exists, profile, read_until,
+    wait_for_attach_with_profile, wait_until,
 };
 
 const HANDOFF_CHANNEL_FD: RawFd = 198;
@@ -360,7 +361,7 @@ fn graceful_restart_preserves_opencode_shared_runtime_and_stop_cleans_it_up() {
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let port = listener.local_addr().unwrap().port();
     drop(listener);
-    let before = daemon.client.ensure_opencode_shared_runtime(port).unwrap();
+    let before = ensure_test_opencode_runtime(&daemon, port).unwrap();
     let pid = before.pid.unwrap() as libc::pid_t;
     let workspace = daemon
         .client

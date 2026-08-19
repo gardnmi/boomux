@@ -6,8 +6,11 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use boomux::client::{Attachment, Client, ClientError, RemoteError};
-use boomux::protocol::{AttachFrame, ErrorCode, TerminalProfile};
+use boomux::client::{self, Attachment, Client, ClientError, RemoteError};
+use boomux::protocol::{
+    AttachFrame, ErrorCode, OpenCodeSharedRuntimeSnapshot, Request, Response, TerminalProfile,
+    UnixEnvironment, UnixEnvironmentVariable,
+};
 use uuid::Uuid;
 
 pub(crate) const TIMEOUT: Duration = Duration::from_secs(10);
@@ -187,6 +190,33 @@ pub(crate) fn profile() -> TerminalProfile {
         cols: 80,
         pixel_width: 800,
         pixel_height: 600,
+    }
+}
+
+pub(crate) fn ensure_test_opencode_runtime(
+    daemon: &TestDaemon,
+    port: u16,
+) -> client::Result<OpenCodeSharedRuntimeSnapshot> {
+    let path = format!(
+        "{}:{}",
+        daemon.runtime_dir.join("bin").display(),
+        std::env::var("PATH").unwrap()
+    );
+    match daemon
+        .client
+        .request(Request::EnsureOpenCodeSharedRuntime {
+            port,
+            environment: Some(UnixEnvironment {
+                variables: vec![UnixEnvironmentVariable {
+                    name: b"PATH".to_vec(),
+                    value: path.as_bytes().to_vec(),
+                }],
+            }),
+        })? {
+        Response::OpenCodeSharedRuntime {
+            runtime: Some(runtime),
+        } => Ok(runtime),
+        response => panic!("unexpected OpenCode runtime response: {response:?}"),
     }
 }
 
