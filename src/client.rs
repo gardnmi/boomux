@@ -1585,7 +1585,7 @@ impl Client {
             holder_id: holder_id.into(),
             claim_id: claim_id.into(),
         })? {
-            Response::OpenCodeSessionClaimReleased { released, .. } => Ok(released),
+            Response::OpenCodeSessionClaimReleased { released } => Ok(released),
             other => unexpected(other),
         }
     }

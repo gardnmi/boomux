@@ -80,9 +80,6 @@ fn native_daemon_lifecycle() {
         "agent.ensure",
         "agent.report",
         "agent.wait",
-        "opencode.claim.ensure",
-        "opencode.claim.release",
-        "opencode.claim.report",
         "attention.list",
         "attention.acknowledge",
         "integration.list",
@@ -97,6 +94,13 @@ fn native_daemon_lifecycle() {
         "schedule.remove",
     ] {
         assert!(json_commands.iter().any(|current| current == command));
+    }
+    for command in [
+        "opencode.claim.ensure",
+        "opencode.claim.release",
+        "opencode.claim.report",
+    ] {
+        assert!(!json_commands.iter().any(|current| current == command));
     }
     assert!(
         capabilities["data"]["integration_hosts"]["opencode"]

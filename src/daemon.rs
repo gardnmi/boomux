@@ -12044,10 +12044,7 @@ impl DaemonService {
         } else {
             false
         };
-        Ok(Response::OpenCodeSessionClaimReleased {
-            holder_id: holder_id.into(),
-            released,
-        })
+        Ok(Response::OpenCodeSessionClaimReleased { released })
     }
 
     fn report_claimed_opencode_agent(

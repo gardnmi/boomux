@@ -1154,6 +1154,7 @@ enum OpenCodeCommands {
     #[command(hide = true)]
     Shared,
     /// Coordinate OpenCode TUI selection claims
+    #[command(hide = true)]
     Claim {
         #[command(subcommand)]
         command: OpenCodeClaimCommands,
@@ -1291,6 +1292,7 @@ enum DaemonCommands {
 enum OutputMode {
     HumanOnly,
     Json,
+    PrivateJson,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1383,9 +1385,9 @@ command_keys! {
     ExecutionCancel => ("execution.cancel", Json),
     Skill => ("skill", HumanOnly),
     Opencode => ("opencode", HumanOnly),
-    OpencodeClaimEnsure => ("opencode.claim.ensure", Json),
-    OpencodeClaimRelease => ("opencode.claim.release", Json),
-    OpencodeClaimReport => ("opencode.claim.report", Json),
+    OpencodeClaimEnsure => ("opencode.claim.ensure", PrivateJson),
+    OpencodeClaimRelease => ("opencode.claim.release", PrivateJson),
+    OpencodeClaimReport => ("opencode.claim.report", PrivateJson),
     Pi => ("pi", HumanOnly),
     Open => ("open", HumanOnly),
     Prompt => ("prompt", HumanOnly),
@@ -1711,7 +1713,7 @@ fn requests_json(arguments: impl IntoIterator<Item = OsString>) -> bool {
 
 fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
     let descriptor = cli.command_descriptor();
-    if cli.json && descriptor.output != OutputMode::Json {
+    if cli.json && descriptor.output == OutputMode::HumanOnly {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("--json is not supported for {}", descriptor.key),
@@ -12674,7 +12676,7 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(claim.command_descriptor().key, "opencode.claim.ensure");
-        assert_eq!(claim.command_descriptor().output, OutputMode::Json);
+        assert_eq!(claim.command_descriptor().output, OutputMode::PrivateJson);
         assert!(matches!(
             claim.command,
             Some(Commands::Opencode {
@@ -12732,7 +12734,7 @@ mod tests {
         ] {
             let command = Cli::try_parse_from(arguments).unwrap();
             assert_eq!(command.command_descriptor().key, key);
-            assert_eq!(command.command_descriptor().output, OutputMode::Json);
+            assert_eq!(command.command_descriptor().output, OutputMode::PrivateJson);
         }
 
         let cli = Cli::try_parse_from([
@@ -14805,9 +14807,6 @@ mod tests {
                 "execution.wait",
                 "execution.open",
                 "execution.cancel",
-                "opencode.claim.ensure",
-                "opencode.claim.release",
-                "opencode.claim.report",
                 "daemon.status",
             ]
         );
