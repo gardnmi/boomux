@@ -35,7 +35,8 @@
 | `src/integration_management.rs` | Integration inventory, status, setup, verification, install, and uninstall workflows |
 | `src/process_adapter.rs` | Exact-argv child supervision and fail-open process-bound Agent observation |
 | `src/scheduling.rs` | Bounded canonical cron parsing and occurrence evaluation, IANA timezone and DST policy, prompt bounds, and schedule identity validation |
-| `src/config.rs`, `src/projects.rs`, `src/git.rs` | Layered configuration, bounded project discovery, and asynchronous Git metadata |
+| `src/config.rs` | Layered configuration resolution, source-aware structured settings, bounded validation, and transactional active-layer editing |
+| `src/projects.rs`, `src/git.rs` | Bounded project discovery and asynchronous Git metadata |
 | `src/cli_output.rs` | Stable `boomux.cli/v1` output and error presentation |
 | `src/desktop_notifications.rs` | Bounded fail-open desktop and sound delivery |
 
@@ -54,8 +55,8 @@
 - **Ephemeral attachment environment:** Daemon and Runtime Semantics sections
   below; startup environment is validated but never persisted or projected.
 - **Exact argument vectors:** workspace launchers, process adapters, terminal
-  launch, and integration management execute argv directly without shell
-  interpretation.
+  launch, integration management, and configuration editor launch execute argv
+  directly without shell interpretation.
 - **Scheduled Agent authority:** [`scheduled-agent-work.md`](scheduled-agent-work.md)
   defines the boundary between manual and timed dispatch, concurrency policy,
   process outcome, and authoritative Agent lifecycle.
@@ -244,6 +245,30 @@ every available placement, using local attachment for the local owner and typed
 Node host services plus Node-qualified attachment for remote owners. Failures are
 reported per Node and do not replay an ambiguous launcher invocation.
 
+### Configuration
+
+`src/config.rs` resolves the global XDG config file first and an optional
+`BOOMUX_CONFIG` file second, merging tables field by field. When present,
+`BOOMUX_CONFIG` is the active writable layer; otherwise the global file is. A
+missing setting inherits from the lower layer or the built-in default. Settings
+inspection retains each field's effective value, active override, and source
+label (`default`, `global`, or `BOOMUX_CONFIG`). Configuration is local Node
+state: it is neither daemon protocol state nor a remotely routable mutation.
+
+`boomux config path`, `validate`, and `edit` are human-only local commands and do
+not start the daemon. Validation parses and semantically resolves all configured
+layers. Editing chooses `VISUAL`, then `EDITOR`, then `sensible-editor` with a
+`vi` fallback. The selected command is parsed into an exact argument vector and
+spawned directly, without a shell.
+
+Both external and SETTINGS edits use a bounded candidate and owner-only temporary
+files. Commit requires an owner-validated regular target and verifies its bytes
+against the edit baseline immediately before one atomic rename. New targets use
+atomic no-replace creation. The candidate is fully validated before commit;
+symlinks and detected changes to either loaded layer are rejected, new files are
+mode `0600`, existing target mode is preserved, and file plus parent directory
+are synchronized after commit.
+
 ### Daemon
 
 `src/daemon.rs` owns all PTY masters and child processes. Its runtime directory
@@ -419,6 +444,24 @@ creates empty coordinator metadata without retaining its path. Older peers
 retain empty local Workspace creation. Git information is still collected
 independently from item directories and cached. Paths do not create
 Workspace-level Git identity, and mixed-directory Workspaces remain valid.
+
+SETTINGS is the sixth top-level dashboard tab and is directly selectable with
+`6`. It edits only this local Node's active writable layer and groups every
+current setting under Terminal, Projects, Dashboard, Recovery, Scheduling,
+Notifications, and Sound. Rows show effective values and per-field sources;
+Delete removes the active override to restore inheritance. Space toggles
+booleans, Enter edits text and integers, Ctrl-S validates and atomically saves,
+and Esc cancels an edit or discards unsaved changes.
+
+Client-owned terminal selection, project discovery, and focused-terminal
+following are refreshed in the running dashboard after save. Recovery,
+Scheduling, desktop notification, and sound settings are daemon-owned. A saved
+change to any of them opens an explicit confirmation before graceful restart of
+the local daemon; declining retains a visible restart requirement. Runtime
+scheduler concurrency is observable, but applied recovery settings are not, so a
+restart that applies disabled terminal-history persistence conservatively warns
+that retained history will be cleared. No SETTINGS action reads or mutates
+configuration on a registered remote Node.
 
 The dashboard establishes an atomic event-stream baseline and treats later
 events as invalidation signals for authoritative snapshot reprojection. It also

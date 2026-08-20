@@ -20,6 +20,7 @@ use ratatui::widgets::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::agent_attention_projection::AgentStateCounts;
+use crate::config::{ConfigOverrides, ConfigSettings, ConfigSource, ConfigValues};
 use crate::protocol::{
     NodeProjectionHealthCode, QualifiedIdentity, SchedulerHealth, TerminalColor, TerminalPreview,
     TerminalPreviewLine, TerminalStyle,
@@ -897,6 +898,8 @@ pub(crate) enum DashboardEffect {
     RefreshNode(String),
     RestoreDismissedShells(String),
     Refresh,
+    SaveSettings(ConfigOverrides),
+    RestartDaemon(ConfigValues),
     RunSchedule(QualifiedIdentity),
     PauseSchedule(QualifiedIdentity),
     ResumeSchedule(QualifiedIdentity),
@@ -950,6 +953,11 @@ pub(crate) enum DashboardEvent {
     OperationCompleted(Result<String, String>),
     ShellCreationCompleted(Result<String, String>),
     RefreshCompleted(Result<DashboardState, String>),
+    SettingsSaved(Box<Result<(ConfigSettings, ProjectContext), String>>),
+    DaemonRestarted {
+        applied: ConfigValues,
+        result: Result<String, String>,
+    },
     ScheduleHistoryCompleted {
         schedule_id: QualifiedIdentity,
         result: Result<(Vec<ExecutionView>, bool), String>,
@@ -1098,6 +1106,7 @@ struct App {
     item_state: TableState,
     global_state: TableState,
     node_state: TableState,
+    settings: Option<SettingsState>,
     primary_tab: PrimaryTab,
     focus: Focus,
     mode: Mode,
@@ -1132,15 +1141,17 @@ enum PrimaryTab {
     Shells,
     Schedules,
     Nodes,
+    Settings,
 }
 
 impl PrimaryTab {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::Workspaces,
         Self::Agents,
         Self::Shells,
         Self::Schedules,
         Self::Nodes,
+        Self::Settings,
     ];
 
     fn kind(self) -> Option<ItemKind> {
@@ -1150,6 +1161,7 @@ impl PrimaryTab {
             Self::Shells => Some(ItemKind::Shell),
             Self::Schedules => None,
             Self::Nodes => None,
+            Self::Settings => None,
         }
     }
 
@@ -1160,6 +1172,7 @@ impl PrimaryTab {
             Self::Shells => "SHELLS",
             Self::Schedules => "SCHEDULES",
             Self::Nodes => "NODES",
+            Self::Settings => "SETTINGS",
         }
     }
 }
@@ -1253,6 +1266,541 @@ enum Mode {
     },
     ConfirmForgetNode(NodeView),
     EditSchedule(ScheduleEditor),
+    ConfirmDaemonRestart {
+        clears_history: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SettingsField {
+    Terminal,
+    ProjectRoot(usize),
+    AddProjectRoot,
+    ProjectMaxDepth,
+    FollowFocusedTerminal,
+    ResumeAgents,
+    PersistTerminalHistory,
+    SchedulingMaxConcurrent,
+    NotificationsEnabled,
+    NotificationsBlocked,
+    NotificationsCompleted,
+    NotificationsScheduledDispatchFailed,
+    NotificationsScheduledInterrupted,
+    SoundEnabled,
+    SoundBlocked,
+    SoundCompleted,
+    SoundScheduledDispatchFailed,
+    SoundScheduledInterrupted,
+}
+
+struct SettingsEdit {
+    field: SettingsField,
+    input: String,
+}
+
+struct SettingsState {
+    loaded: ConfigSettings,
+    daemon_applied: ConfigValues,
+    working: ConfigOverrides,
+    selected: usize,
+    edit: Option<SettingsEdit>,
+    error: Option<String>,
+    saving: bool,
+    restart_required: bool,
+    restart_clears_history: bool,
+}
+
+impl SettingsState {
+    fn new(loaded: ConfigSettings, running_scheduler_maximum: Option<u16>) -> Self {
+        let mut daemon_applied = loaded.effective.clone();
+        if let Some(maximum) = running_scheduler_maximum {
+            daemon_applied.scheduling_max_concurrent = maximum;
+        }
+        let restart_required = daemon_settings_changed(&daemon_applied, &loaded.effective);
+        let restart_clears_history = restart_required && !loaded.effective.persist_terminal_history;
+        Self {
+            daemon_applied,
+            working: loaded.overrides.clone(),
+            loaded,
+            selected: 0,
+            edit: None,
+            error: None,
+            saving: false,
+            restart_required,
+            restart_clears_history,
+        }
+    }
+
+    fn roots(&self) -> &[String] {
+        self.working
+            .project_roots
+            .as_deref()
+            .unwrap_or(&self.loaded.inherited.project_roots)
+    }
+
+    fn fields(&self) -> Vec<SettingsField> {
+        let mut fields = vec![SettingsField::Terminal];
+        fields.extend((0..self.roots().len()).map(SettingsField::ProjectRoot));
+        fields.extend([
+            SettingsField::AddProjectRoot,
+            SettingsField::ProjectMaxDepth,
+            SettingsField::FollowFocusedTerminal,
+            SettingsField::ResumeAgents,
+            SettingsField::PersistTerminalHistory,
+            SettingsField::SchedulingMaxConcurrent,
+            SettingsField::NotificationsEnabled,
+            SettingsField::NotificationsBlocked,
+            SettingsField::NotificationsCompleted,
+            SettingsField::NotificationsScheduledDispatchFailed,
+            SettingsField::NotificationsScheduledInterrupted,
+            SettingsField::SoundEnabled,
+            SettingsField::SoundBlocked,
+            SettingsField::SoundCompleted,
+            SettingsField::SoundScheduledDispatchFailed,
+            SettingsField::SoundScheduledInterrupted,
+        ]);
+        fields
+    }
+
+    fn selected_field(&self) -> SettingsField {
+        let fields = self.fields();
+        fields[self.selected.min(fields.len() - 1)]
+    }
+
+    fn move_selection(&mut self, forwards: bool) {
+        let count = self.fields().len();
+        self.selected = if forwards {
+            (self.selected + 1) % count
+        } else if self.selected == 0 {
+            count - 1
+        } else {
+            self.selected - 1
+        };
+        self.error = None;
+    }
+
+    fn dirty(&self) -> bool {
+        self.working != self.loaded.overrides
+    }
+
+    fn discard(&mut self) {
+        self.working = self.loaded.overrides.clone();
+        self.edit = None;
+        self.error = None;
+    }
+
+    fn begin_save(&mut self) -> Option<DashboardEffect> {
+        if self.saving || !self.dirty() {
+            return None;
+        }
+        self.saving = true;
+        self.error = None;
+        Some(DashboardEffect::SaveSettings(self.working.clone()))
+    }
+
+    fn effective_bool(&self, field: SettingsField) -> bool {
+        let inherited = &self.loaded.inherited;
+        match field {
+            SettingsField::FollowFocusedTerminal => self
+                .working
+                .follow_focused_terminal
+                .unwrap_or(inherited.follow_focused_terminal),
+            SettingsField::ResumeAgents => self
+                .working
+                .resume_agents
+                .unwrap_or(inherited.resume_agents),
+            SettingsField::PersistTerminalHistory => self
+                .working
+                .persist_terminal_history
+                .unwrap_or(inherited.persist_terminal_history),
+            SettingsField::NotificationsEnabled => self
+                .working
+                .notifications_enabled
+                .unwrap_or(inherited.notifications_enabled),
+            SettingsField::NotificationsBlocked => self
+                .working
+                .notifications_blocked
+                .unwrap_or(inherited.notifications_blocked),
+            SettingsField::NotificationsCompleted => self
+                .working
+                .notifications_completed
+                .unwrap_or(inherited.notifications_completed),
+            SettingsField::NotificationsScheduledDispatchFailed => self
+                .working
+                .notifications_scheduled_dispatch_failed
+                .unwrap_or(inherited.notifications_scheduled_dispatch_failed),
+            SettingsField::NotificationsScheduledInterrupted => self
+                .working
+                .notifications_scheduled_interrupted
+                .unwrap_or(inherited.notifications_scheduled_interrupted),
+            SettingsField::SoundEnabled => self
+                .working
+                .sound_enabled
+                .unwrap_or(inherited.sound_enabled),
+            _ => false,
+        }
+    }
+
+    fn toggle_selected(&mut self) {
+        let field = self.selected_field();
+        let value = !self.effective_bool(field);
+        match field {
+            SettingsField::FollowFocusedTerminal => {
+                self.working.follow_focused_terminal = Some(value)
+            }
+            SettingsField::ResumeAgents => self.working.resume_agents = Some(value),
+            SettingsField::PersistTerminalHistory => {
+                self.working.persist_terminal_history = Some(value)
+            }
+            SettingsField::NotificationsEnabled => self.working.notifications_enabled = Some(value),
+            SettingsField::NotificationsBlocked => self.working.notifications_blocked = Some(value),
+            SettingsField::NotificationsCompleted => {
+                self.working.notifications_completed = Some(value)
+            }
+            SettingsField::NotificationsScheduledDispatchFailed => {
+                self.working.notifications_scheduled_dispatch_failed = Some(value);
+            }
+            SettingsField::NotificationsScheduledInterrupted => {
+                self.working.notifications_scheduled_interrupted = Some(value);
+            }
+            SettingsField::SoundEnabled => self.working.sound_enabled = Some(value),
+            _ => return,
+        }
+        self.error = None;
+    }
+
+    fn begin_edit(&mut self) {
+        let field = self.selected_field();
+        let inherited = &self.loaded.inherited;
+        let input = match field {
+            SettingsField::Terminal => self
+                .working
+                .terminal
+                .clone()
+                .or_else(|| inherited.terminal.clone())
+                .unwrap_or_default(),
+            SettingsField::ProjectRoot(index) => {
+                self.roots().get(index).cloned().unwrap_or_default()
+            }
+            SettingsField::AddProjectRoot => String::new(),
+            SettingsField::ProjectMaxDepth => self
+                .working
+                .project_max_depth
+                .unwrap_or(inherited.project_max_depth)
+                .to_string(),
+            SettingsField::SchedulingMaxConcurrent => self
+                .working
+                .scheduling_max_concurrent
+                .unwrap_or(inherited.scheduling_max_concurrent)
+                .to_string(),
+            SettingsField::SoundBlocked => self
+                .working
+                .sound_blocked
+                .clone()
+                .unwrap_or_else(|| inherited.sound_blocked.clone()),
+            SettingsField::SoundCompleted => self
+                .working
+                .sound_completed
+                .clone()
+                .unwrap_or_else(|| inherited.sound_completed.clone()),
+            SettingsField::SoundScheduledDispatchFailed => self
+                .working
+                .sound_scheduled_dispatch_failed
+                .clone()
+                .unwrap_or_else(|| inherited.sound_scheduled_dispatch_failed.clone()),
+            SettingsField::SoundScheduledInterrupted => self
+                .working
+                .sound_scheduled_interrupted
+                .clone()
+                .unwrap_or_else(|| inherited.sound_scheduled_interrupted.clone()),
+            _ => return,
+        };
+        self.edit = Some(SettingsEdit { field, input });
+        self.error = None;
+    }
+
+    fn apply_edit(&mut self) -> bool {
+        let Some(edit) = self.edit.take() else {
+            return true;
+        };
+        let result = match edit.field {
+            SettingsField::Terminal => {
+                let value = edit.input.trim();
+                if value.is_empty() {
+                    Err("Terminal desktop entry cannot be empty; use Delete to inherit".into())
+                } else if let Err(error) = crate::terminal::validate_desktop_entry(value) {
+                    Err(error.to_string())
+                } else {
+                    self.working.terminal = Some(value.into());
+                    Ok(())
+                }
+            }
+            SettingsField::ProjectRoot(_) | SettingsField::AddProjectRoot => {
+                let value = edit.input.trim();
+                if value.is_empty()
+                    || !(value == "~"
+                        || value.starts_with("~/")
+                        || PathBuf::from(value).is_absolute())
+                {
+                    Err("Project root must be absolute or start with ~".into())
+                } else {
+                    let mut roots = self.roots().to_vec();
+                    if let SettingsField::ProjectRoot(index) = edit.field {
+                        if let Some(root) = roots.get_mut(index) {
+                            *root = value.into();
+                        }
+                    } else {
+                        roots.push(value.into());
+                        self.selected = self.selected.saturating_add(1);
+                    }
+                    self.working.project_roots = Some(roots);
+                    Ok(())
+                }
+            }
+            SettingsField::ProjectMaxDepth => match edit.input.parse::<usize>() {
+                Ok(value @ 1..=10) => {
+                    self.working.project_max_depth = Some(value);
+                    Ok(())
+                }
+                _ => Err("Project max depth must be an integer from 1 to 10".into()),
+            },
+            SettingsField::SchedulingMaxConcurrent => match edit.input.parse::<u16>() {
+                Ok(value @ 1..=64) => {
+                    self.working.scheduling_max_concurrent = Some(value);
+                    Ok(())
+                }
+                _ => Err("Scheduling max concurrent must be an integer from 1 to 64".into()),
+            },
+            SettingsField::SoundBlocked
+            | SettingsField::SoundCompleted
+            | SettingsField::SoundScheduledDispatchFailed
+            | SettingsField::SoundScheduledInterrupted => {
+                let value = edit.input.trim();
+                if value.is_empty() || value.chars().any(char::is_control) {
+                    Err("Sound event ID must be nonempty and contain no control characters".into())
+                } else {
+                    match edit.field {
+                        SettingsField::SoundBlocked => {
+                            self.working.sound_blocked = Some(value.into())
+                        }
+                        SettingsField::SoundCompleted => {
+                            self.working.sound_completed = Some(value.into())
+                        }
+                        SettingsField::SoundScheduledDispatchFailed => {
+                            self.working.sound_scheduled_dispatch_failed = Some(value.into());
+                        }
+                        SettingsField::SoundScheduledInterrupted => {
+                            self.working.sound_scheduled_interrupted = Some(value.into());
+                        }
+                        _ => unreachable!(),
+                    }
+                    Ok(())
+                }
+            }
+            _ => Ok(()),
+        };
+        match result {
+            Ok(()) => {
+                self.error = None;
+                true
+            }
+            Err(error) => {
+                self.error = Some(error);
+                self.edit = Some(edit);
+                false
+            }
+        }
+    }
+
+    fn reset_selected(&mut self) {
+        match self.selected_field() {
+            SettingsField::Terminal => self.working.terminal = None,
+            SettingsField::ProjectRoot(index) => {
+                let mut roots = self.roots().to_vec();
+                if index < roots.len() {
+                    roots.remove(index);
+                    self.working.project_roots = Some(roots);
+                    self.selected = self.selected.min(self.fields().len() - 1);
+                }
+            }
+            SettingsField::AddProjectRoot => self.working.project_roots = None,
+            SettingsField::ProjectMaxDepth => self.working.project_max_depth = None,
+            SettingsField::FollowFocusedTerminal => self.working.follow_focused_terminal = None,
+            SettingsField::ResumeAgents => self.working.resume_agents = None,
+            SettingsField::PersistTerminalHistory => self.working.persist_terminal_history = None,
+            SettingsField::SchedulingMaxConcurrent => self.working.scheduling_max_concurrent = None,
+            SettingsField::NotificationsEnabled => self.working.notifications_enabled = None,
+            SettingsField::NotificationsBlocked => self.working.notifications_blocked = None,
+            SettingsField::NotificationsCompleted => self.working.notifications_completed = None,
+            SettingsField::NotificationsScheduledDispatchFailed => {
+                self.working.notifications_scheduled_dispatch_failed = None;
+            }
+            SettingsField::NotificationsScheduledInterrupted => {
+                self.working.notifications_scheduled_interrupted = None;
+            }
+            SettingsField::SoundEnabled => self.working.sound_enabled = None,
+            SettingsField::SoundBlocked => self.working.sound_blocked = None,
+            SettingsField::SoundCompleted => self.working.sound_completed = None,
+            SettingsField::SoundScheduledDispatchFailed => {
+                self.working.sound_scheduled_dispatch_failed = None;
+            }
+            SettingsField::SoundScheduledInterrupted => {
+                self.working.sound_scheduled_interrupted = None
+            }
+        }
+        self.error = None;
+    }
+
+    fn overridden(&self, field: SettingsField) -> bool {
+        overrides_field(&self.working, field)
+    }
+
+    fn inherited_overridden(&self, field: SettingsField) -> bool {
+        overrides_field(&self.loaded.inherited_overrides, field)
+    }
+
+    fn source(&self, field: SettingsField) -> ConfigSource {
+        if self.overridden(field) {
+            self.loaded.active_source
+        } else if self.inherited_overridden(field) {
+            self.loaded.inherited_source
+        } else {
+            ConfigSource::Default
+        }
+    }
+
+    fn value(&self, field: SettingsField) -> String {
+        let inherited = &self.loaded.inherited;
+        match field {
+            SettingsField::Terminal => self
+                .working
+                .terminal
+                .as_ref()
+                .or(inherited.terminal.as_ref())
+                .cloned()
+                .unwrap_or_else(|| "automatic".into()),
+            SettingsField::ProjectRoot(index) => {
+                self.roots().get(index).cloned().unwrap_or_default()
+            }
+            SettingsField::AddProjectRoot => "+ add root".into(),
+            SettingsField::ProjectMaxDepth => self
+                .working
+                .project_max_depth
+                .unwrap_or(inherited.project_max_depth)
+                .to_string(),
+            SettingsField::SchedulingMaxConcurrent => self
+                .working
+                .scheduling_max_concurrent
+                .unwrap_or(inherited.scheduling_max_concurrent)
+                .to_string(),
+            SettingsField::SoundBlocked => self
+                .working
+                .sound_blocked
+                .as_ref()
+                .unwrap_or(&inherited.sound_blocked)
+                .clone(),
+            SettingsField::SoundCompleted => self
+                .working
+                .sound_completed
+                .as_ref()
+                .unwrap_or(&inherited.sound_completed)
+                .clone(),
+            SettingsField::SoundScheduledDispatchFailed => self
+                .working
+                .sound_scheduled_dispatch_failed
+                .as_ref()
+                .unwrap_or(&inherited.sound_scheduled_dispatch_failed)
+                .clone(),
+            SettingsField::SoundScheduledInterrupted => self
+                .working
+                .sound_scheduled_interrupted
+                .as_ref()
+                .unwrap_or(&inherited.sound_scheduled_interrupted)
+                .clone(),
+            field => if self.effective_bool(field) {
+                "on"
+            } else {
+                "off"
+            }
+            .into(),
+        }
+    }
+}
+
+fn overrides_field(overrides: &ConfigOverrides, field: SettingsField) -> bool {
+    match field {
+        SettingsField::Terminal => overrides.terminal.is_some(),
+        SettingsField::ProjectRoot(_) | SettingsField::AddProjectRoot => {
+            overrides.project_roots.is_some()
+        }
+        SettingsField::ProjectMaxDepth => overrides.project_max_depth.is_some(),
+        SettingsField::FollowFocusedTerminal => overrides.follow_focused_terminal.is_some(),
+        SettingsField::ResumeAgents => overrides.resume_agents.is_some(),
+        SettingsField::PersistTerminalHistory => overrides.persist_terminal_history.is_some(),
+        SettingsField::SchedulingMaxConcurrent => overrides.scheduling_max_concurrent.is_some(),
+        SettingsField::NotificationsEnabled => overrides.notifications_enabled.is_some(),
+        SettingsField::NotificationsBlocked => overrides.notifications_blocked.is_some(),
+        SettingsField::NotificationsCompleted => overrides.notifications_completed.is_some(),
+        SettingsField::NotificationsScheduledDispatchFailed => {
+            overrides.notifications_scheduled_dispatch_failed.is_some()
+        }
+        SettingsField::NotificationsScheduledInterrupted => {
+            overrides.notifications_scheduled_interrupted.is_some()
+        }
+        SettingsField::SoundEnabled => overrides.sound_enabled.is_some(),
+        SettingsField::SoundBlocked => overrides.sound_blocked.is_some(),
+        SettingsField::SoundCompleted => overrides.sound_completed.is_some(),
+        SettingsField::SoundScheduledDispatchFailed => {
+            overrides.sound_scheduled_dispatch_failed.is_some()
+        }
+        SettingsField::SoundScheduledInterrupted => overrides.sound_scheduled_interrupted.is_some(),
+    }
+}
+
+fn settings_field_labels(field: SettingsField) -> (&'static str, String) {
+    match field {
+        SettingsField::Terminal => ("Terminal", "desktop entry".into()),
+        SettingsField::ProjectRoot(index) => ("Projects", format!("root {}", index + 1)),
+        SettingsField::AddProjectRoot => ("Projects", "roots".into()),
+        SettingsField::ProjectMaxDepth => ("Projects", "max depth".into()),
+        SettingsField::FollowFocusedTerminal => ("Dashboard", "follow focused terminal".into()),
+        SettingsField::ResumeAgents => ("Recovery", "resume agents".into()),
+        SettingsField::PersistTerminalHistory => ("Recovery", "persist terminal history".into()),
+        SettingsField::SchedulingMaxConcurrent => ("Scheduling", "max concurrent".into()),
+        SettingsField::NotificationsEnabled => ("Notifications", "enabled".into()),
+        SettingsField::NotificationsBlocked => ("Notifications", "blocked".into()),
+        SettingsField::NotificationsCompleted => ("Notifications", "completed".into()),
+        SettingsField::NotificationsScheduledDispatchFailed => {
+            ("Notifications", "scheduled dispatch failed".into())
+        }
+        SettingsField::NotificationsScheduledInterrupted => {
+            ("Notifications", "scheduled interrupted".into())
+        }
+        SettingsField::SoundEnabled => ("Sound", "enabled".into()),
+        SettingsField::SoundBlocked => ("Sound", "blocked event ID".into()),
+        SettingsField::SoundCompleted => ("Sound", "completed event ID".into()),
+        SettingsField::SoundScheduledDispatchFailed => {
+            ("Sound", "scheduled dispatch failed ID".into())
+        }
+        SettingsField::SoundScheduledInterrupted => ("Sound", "scheduled interrupted ID".into()),
+    }
+}
+
+fn daemon_settings_changed(before: &ConfigValues, after: &ConfigValues) -> bool {
+    before.resume_agents != after.resume_agents
+        || before.persist_terminal_history != after.persist_terminal_history
+        || before.scheduling_max_concurrent != after.scheduling_max_concurrent
+        || before.notifications_enabled != after.notifications_enabled
+        || before.notifications_blocked != after.notifications_blocked
+        || before.notifications_completed != after.notifications_completed
+        || before.notifications_scheduled_dispatch_failed
+            != after.notifications_scheduled_dispatch_failed
+        || before.notifications_scheduled_interrupted != after.notifications_scheduled_interrupted
+        || before.sound_enabled != after.sound_enabled
+        || before.sound_blocked != after.sound_blocked
+        || before.sound_completed != after.sound_completed
+        || before.sound_scheduled_dispatch_failed != after.sound_scheduled_dispatch_failed
+        || before.sound_scheduled_interrupted != after.sound_scheduled_interrupted
 }
 
 struct LinkWorkspacePicker {
@@ -1708,6 +2256,7 @@ enum PaletteKindGroup {
     Schedules,
     ScheduleNotices,
     Dashboard,
+    Settings,
 }
 
 impl PaletteKindGroup {
@@ -1724,6 +2273,7 @@ impl PaletteKindGroup {
             Self::Schedules => "SCHEDULES",
             Self::ScheduleNotices => "SCHEDULE NOTICES",
             Self::Dashboard => "DASHBOARD",
+            Self::Settings => "SETTINGS",
         }
     }
 }
@@ -1733,6 +2283,7 @@ enum PaletteCommand {
     AddNode,
     CreateWorkspace,
     ShowHelp,
+    ShowSettings,
     Workspace {
         workspace_id: QualifiedIdentity,
         action: WorkspacePaletteAction,
@@ -1927,6 +2478,14 @@ impl CommandPalette {
                 detail: "keys, kinds, states, and attention".into(),
                 keywords: "explain keyboard shortcuts question".into(),
                 command: PaletteCommand::ShowHelp,
+            },
+            PaletteEntry {
+                action_group: PaletteActionGroup::GoTo,
+                kind_group: PaletteKindGroup::Settings,
+                label: "Open settings".into(),
+                detail: "edit local Node configuration".into(),
+                keywords: "config preferences terminal notifications recovery scheduling".into(),
+                command: PaletteCommand::ShowSettings,
             },
         ];
         let mut attention_entries = Vec::new();
@@ -2349,6 +2908,7 @@ impl App {
             item_state,
             global_state: TableState::default(),
             node_state: TableState::default().with_selected(has_nodes.then_some(0)),
+            settings: None,
             primary_tab: PrimaryTab::Workspaces,
             focus: Focus::Workspaces,
             mode: Mode::Normal,
@@ -2614,6 +3174,11 @@ impl App {
             self.message = None;
             return;
         }
+        if tab == PrimaryTab::Settings {
+            self.focus = Focus::Items;
+            self.message = None;
+            return;
+        }
         self.focus = if tab == PrimaryTab::Schedules {
             Focus::Workspaces
         } else {
@@ -2641,6 +3206,12 @@ impl App {
     }
 
     fn next(&mut self) {
+        if self.primary_tab == PrimaryTab::Settings {
+            if let Some(settings) = &mut self.settings {
+                settings.move_selection(true);
+            }
+            return;
+        }
         if self.primary_tab == PrimaryTab::Schedules && self.focus == Focus::Items {
             self.cycle_execution(true);
             return;
@@ -2699,6 +3270,12 @@ impl App {
     }
 
     fn previous(&mut self) {
+        if self.primary_tab == PrimaryTab::Settings {
+            if let Some(settings) = &mut self.settings {
+                settings.move_selection(false);
+            }
+            return;
+        }
         if self.primary_tab == PrimaryTab::Schedules && self.focus == Focus::Items {
             self.cycle_execution(false);
             return;
@@ -3392,6 +3969,59 @@ impl App {
                         .collect();
                 }
             }
+            DashboardEvent::SettingsSaved(result) => match *result {
+                Ok((loaded, project_context)) => {
+                    let Some(settings) = &mut self.settings else {
+                        return Vec::new();
+                    };
+                    let daemon_changed =
+                        daemon_settings_changed(&settings.daemon_applied, &loaded.effective);
+                    let clears_history =
+                        daemon_changed && !loaded.effective.persist_terminal_history;
+                    settings.saving = false;
+                    settings.loaded = loaded;
+                    settings.working = settings.loaded.overrides.clone();
+                    settings.error = None;
+                    self.project_context = project_context;
+                    self.follow_focused_terminal =
+                        settings.loaded.effective.follow_focused_terminal;
+                    if !self.follow_focused_terminal {
+                        self.selection_pinned = false;
+                    }
+                    settings.restart_required = daemon_changed;
+                    settings.restart_clears_history = clears_history;
+                    if daemon_changed {
+                        self.mode = Mode::ConfirmDaemonRestart { clears_history };
+                    } else {
+                        self.message = Some(Message {
+                            text: "Settings saved and applied to this dashboard".into(),
+                            error: false,
+                        });
+                    }
+                }
+                Err(text) => {
+                    if let Some(settings) = &mut self.settings {
+                        settings.saving = false;
+                        settings.error = Some(text.clone());
+                    }
+                    self.message = Some(Message { text, error: true });
+                }
+            },
+            DashboardEvent::DaemonRestarted { applied, result } => {
+                if result.is_ok()
+                    && let Some(settings) = &mut self.settings
+                {
+                    settings.daemon_applied = applied;
+                    settings.restart_required = daemon_settings_changed(
+                        &settings.daemon_applied,
+                        &settings.loaded.effective,
+                    );
+                    settings.restart_clears_history = settings.restart_required
+                        && !settings.loaded.effective.persist_terminal_history;
+                }
+                self.message = Some(Message::from_result(result));
+                return vec![DashboardEffect::Refresh];
+            }
             DashboardEvent::ScheduleHistoryCompleted {
                 schedule_id,
                 result,
@@ -3461,6 +4091,13 @@ impl App {
             DashboardEvent::TextPasted(text) => {
                 if let Mode::EditSchedule(editor) = &mut self.mode {
                     editor.insert_text(&text);
+                } else if let Some(edit) = self
+                    .settings
+                    .as_mut()
+                    .filter(|settings| !settings.saving)
+                    .and_then(|settings| settings.edit.as_mut())
+                {
+                    edit.input.push_str(&text.replace(['\n', '\r'], ""));
                 }
             }
             DashboardEvent::TerminalPreviewCompleted {
@@ -3476,6 +4113,14 @@ impl App {
     fn update_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Option<DashboardEffect> {
         if modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('c') {
             return Some(DashboardEffect::Quit);
+        }
+        if self.primary_tab == PrimaryTab::Settings
+            && self
+                .settings
+                .as_ref()
+                .is_some_and(|settings| settings.edit.is_some())
+        {
+            return self.handle_settings_edit_key(code, modifiers);
         }
         if self.pending_close.is_some() {
             if !modifiers.is_empty() {
@@ -3501,7 +4146,67 @@ impl App {
         if !matches!(self.mode, Mode::Normal) {
             return handle_mode_key(self, code, modifiers);
         }
+        if self
+            .settings
+            .as_ref()
+            .is_some_and(|settings| settings.dirty())
+            && (code == KeyCode::Char('q')
+                || (code == KeyCode::Esc && self.primary_tab != PrimaryTab::Settings))
+        {
+            self.select_tab(PrimaryTab::Settings);
+            self.message = Some(Message {
+                text: "Unsaved settings: Ctrl-S saves; Esc discards; Ctrl-C force quits".into(),
+                error: false,
+            });
+            return None;
+        }
         if !normal_mode_modifiers_supported(code, modifiers) {
+            if self.primary_tab == PrimaryTab::Settings
+                && modifiers == KeyModifiers::CONTROL
+                && code == KeyCode::Char('s')
+            {
+                let settings = self.settings.as_mut()?;
+                if settings.dirty() {
+                    return settings.begin_save();
+                }
+                if settings.restart_required {
+                    self.mode = Mode::ConfirmDaemonRestart {
+                        clears_history: settings.restart_clears_history,
+                    };
+                }
+                return None;
+            }
+            return None;
+        }
+        if self.primary_tab == PrimaryTab::Settings {
+            let settings = self.settings.as_mut()?;
+            if settings.saving {
+                return None;
+            }
+            match code {
+                KeyCode::Char('q') => return Some(DashboardEffect::Quit),
+                KeyCode::Esc if settings.dirty() => {
+                    settings.discard();
+                    self.message = Some(Message {
+                        text: "Discarded unsaved settings changes".into(),
+                        error: false,
+                    });
+                }
+                KeyCode::Esc => {}
+                KeyCode::Down | KeyCode::Char('j') => settings.move_selection(true),
+                KeyCode::Up | KeyCode::Char('k') => settings.move_selection(false),
+                KeyCode::Char(' ') => settings.toggle_selected(),
+                KeyCode::Enter => settings.begin_edit(),
+                KeyCode::Delete => settings.reset_selected(),
+                KeyCode::Char('/' | ':') => self.open_palette(),
+                KeyCode::Char('?') => self.mode = Mode::Help,
+                KeyCode::Tab => self.cycle_tab(false),
+                KeyCode::BackTab => self.cycle_tab(true),
+                KeyCode::Char(key) if shortcut_tab(key).is_some() => {
+                    self.select_tab(shortcut_tab(key).expect("validated tab shortcut"));
+                }
+                _ => {}
+            }
             return None;
         }
         match code {
@@ -3637,6 +4342,45 @@ impl App {
                 return self.selected_schedule_history_effect();
             }
             key if self.handle_focus_key(key) => {}
+            _ => {}
+        }
+        None
+    }
+
+    fn handle_settings_edit_key(
+        &mut self,
+        code: KeyCode,
+        modifiers: KeyModifiers,
+    ) -> Option<DashboardEffect> {
+        let settings = self.settings.as_mut()?;
+        if settings.saving {
+            return None;
+        }
+        let save = modifiers == KeyModifiers::CONTROL && code == KeyCode::Char('s');
+        if save {
+            if settings.apply_edit() {
+                return settings.begin_save();
+            }
+            return None;
+        }
+        if !modifiers.difference(KeyModifiers::SHIFT).is_empty() {
+            return None;
+        }
+        match code {
+            KeyCode::Esc => settings.edit = None,
+            KeyCode::Enter => {
+                settings.apply_edit();
+            }
+            KeyCode::Backspace => {
+                if let Some(edit) = &mut settings.edit {
+                    edit.input.pop();
+                }
+            }
+            KeyCode::Char(character) => {
+                if let Some(edit) = &mut settings.edit {
+                    edit.input.push(character);
+                }
+            }
             _ => {}
         }
         None
@@ -4076,6 +4820,7 @@ pub(crate) fn run<B: DashboardBackend + Send + 'static>(
     state: DashboardState,
     follow_focused_terminal: bool,
     project_context: ProjectContext,
+    settings: ConfigSettings,
     play_intro: bool,
     backend: B,
 ) -> io::Result<()> {
@@ -4090,6 +4835,19 @@ pub(crate) fn run<B: DashboardBackend + Send + 'static>(
         return Err(error);
     }
     let mut app = App::new(state.workspaces, project_context);
+    app.settings = Some(SettingsState::new(
+        settings,
+        match &state.scheduling {
+            SchedulingView::Active { maximum, .. } | SchedulingView::Offline { maximum, .. }
+                if *maximum > 0 =>
+            {
+                Some(*maximum)
+            }
+            SchedulingView::Unsupported { .. }
+            | SchedulingView::Active { .. }
+            | SchedulingView::Offline { .. } => None,
+        },
+    ));
     app.nodes = state.nodes;
     app.node_state.select((!app.nodes.is_empty()).then_some(0));
     app.all_schedules = state.schedules.clone();
@@ -4197,6 +4955,10 @@ fn execute_palette_command(app: &mut App, command: PaletteCommand) -> Option<Das
         }
         PaletteCommand::ShowHelp => {
             app.mode = Mode::Help;
+            None
+        }
+        PaletteCommand::ShowSettings => {
+            app.select_tab(PrimaryTab::Settings);
             None
         }
         PaletteCommand::Workspace {
@@ -4547,6 +5309,27 @@ fn handle_mode_key(
                 None
             }
         },
+        Mode::ConfirmDaemonRestart { clears_history } => {
+            match key {
+                KeyCode::Char('y') => app.settings.as_ref().map(|settings| {
+                    DashboardEffect::RestartDaemon(settings.loaded.effective.clone())
+                }),
+                KeyCode::Char('n') | KeyCode::Esc => {
+                    if let Some(settings) = &mut app.settings {
+                        settings.restart_required = true;
+                    }
+                    app.message = Some(Message {
+                    text: "Settings saved; daemon restart still required to apply daemon-owned fields".into(),
+                    error: false,
+                });
+                    None
+                }
+                _ => {
+                    app.mode = Mode::ConfirmDaemonRestart { clears_history };
+                    None
+                }
+            }
+        }
         Mode::Rename { target, mut input } => match key {
             KeyCode::Enter if !input.trim().is_empty() => {
                 let name = input.trim().to_owned();
@@ -4677,6 +5460,8 @@ fn render(frame: &mut Frame, app: &mut App) {
         render_nodes(frame, dashboard_area, app);
     } else if app.primary_tab == PrimaryTab::Schedules {
         render_schedules(frame, dashboard_area, app);
+    } else if app.primary_tab == PrimaryTab::Settings {
+        render_settings(frame, dashboard_area, app);
     } else if app.primary_tab != PrimaryTab::Workspaces {
         render_global_items(frame, dashboard_area, app);
     } else if dashboard_area.width >= 114 {
@@ -4702,8 +5487,121 @@ fn render(frame: &mut Frame, app: &mut App) {
         Mode::RetargetNode { input, .. } => render_node_retarget(frame, area, input),
         Mode::ConfirmForgetNode(node) => render_node_forget_confirmation(frame, area, node),
         Mode::EditSchedule(editor) => render_schedule_editor(frame, area, editor),
+        Mode::ConfirmDaemonRestart { clears_history } => {
+            render_daemon_restart_confirmation(frame, area, *clears_history)
+        }
         Mode::Normal | Mode::Rename { .. } => {}
     }
+}
+
+fn render_daemon_restart_confirmation(frame: &mut Frame, area: Rect, clears_history: bool) {
+    let popup = centered_rect(area, 68, 28);
+    frame.render_widget(Clear, popup);
+    let warning = if clears_history {
+        "\n\nWARNING: applying disabled persist_terminal_history clears retained terminal history."
+    } else {
+        ""
+    };
+    frame.render_widget(
+        Paragraph::new(format!(
+            "Daemon-owned settings changed. Gracefully restart the local Boomux daemon now?{warning}\n\ny restart  n/esc keep restart required"
+        ))
+        .block(
+            Block::bordered()
+                .title(" Apply daemon settings ")
+                .border_style(Style::new().fg(YELLOW)),
+        )
+        .wrap(Wrap { trim: false }),
+        popup,
+    );
+}
+
+fn render_settings(frame: &mut Frame, area: Rect, app: &mut App) {
+    let Some(settings) = &mut app.settings else {
+        frame.render_widget(Paragraph::new("Settings unavailable"), area);
+        return;
+    };
+    let [source_area, table_area, status_area] = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Fill(1),
+        Constraint::Length(2),
+    ])
+    .areas(area);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(vec![
+                Span::styled("Writable local Node layer  ", Style::new().fg(SUBTEXT)),
+                Span::styled(settings.loaded.active_source.label(), Style::new().fg(TEAL)),
+                Span::raw("  "),
+                Span::raw(settings.loaded.active_path.display().to_string()),
+            ]),
+            Line::from(Span::styled(
+                "Values marked default/global are inherited; Delete removes the active override.",
+                Style::new().fg(SUBTEXT),
+            )),
+        ]),
+        source_area,
+    );
+    let fields = settings.fields();
+    let rows = fields.iter().map(|field| {
+        let (group, name) = settings_field_labels(*field);
+        let source = if *field == SettingsField::AddProjectRoot {
+            if settings.overridden(*field) {
+                settings.loaded.active_source.label()
+            } else {
+                "action"
+            }
+        } else {
+            settings.source(*field).label()
+        };
+        Row::new([
+            group.to_owned(),
+            name,
+            settings.value(*field),
+            source.to_owned(),
+        ])
+    });
+    let mut state = TableState::default().with_selected(Some(settings.selected));
+    frame.render_stateful_widget(
+        Table::new(
+            rows,
+            [
+                Constraint::Length(16),
+                Constraint::Length(30),
+                Constraint::Min(24),
+                Constraint::Length(14),
+            ],
+        )
+        .header(Row::new(["GROUP", "SETTING", "VALUE", "SOURCE"]).style(Style::new().fg(BLUE)))
+        .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED))
+        .highlight_symbol("> "),
+        table_area,
+        &mut state,
+    );
+    let status = if let Some(edit) = &settings.edit {
+        format!(
+            "Edit: {}_  Enter apply  Ctrl-S apply and save  Esc cancel",
+            edit.input
+        )
+    } else if let Some(error) = &settings.error {
+        error.clone()
+    } else if settings.saving {
+        "Saving settings...".into()
+    } else if settings.restart_required {
+        "Daemon restart required; Ctrl-S saves further changes, then confirm restart".into()
+    } else if settings.dirty() {
+        "Unsaved changes".into()
+    } else {
+        "All settings saved".into()
+    };
+    frame.render_widget(
+        Paragraph::new(status).style(Style::new().fg(if settings.error.is_some() {
+            RED
+        } else {
+            YELLOW
+        })),
+        status_area,
+    );
 }
 
 fn render_node_inspection(frame: &mut Frame, area: Rect, node: &NodeView) {
@@ -5679,7 +6577,7 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
         Line::from("  attention filter palette results to outstanding durable attention"),
         Line::from("  Enter    restore a workspace, open an item, or inspect a schedule"),
         Line::from("  a/e/x    add, rename, or request confirmed close/remove"),
-        Line::from("  Tab/1-4 change view; h/l change pane; j/k navigate"),
+        Line::from("  Tab/1-6 change view; h/l change pane; j/k navigate"),
         Line::from(""),
         Line::from(Span::styled(
             "SELECTED CONTEXT",
@@ -5696,7 +6594,15 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
             }),
         );
     }
-    if app.primary_tab == PrimaryTab::Schedules {
+    if app.primary_tab == PrimaryTab::Settings {
+        lines.extend([
+            Line::from("  SETTINGS edits the active writable layer for this local Node."),
+            Line::from("  Space toggles booleans; Enter edits text and integers."),
+            Line::from("  Project roots provide add/edit rows; Delete removes a root or resets a field."),
+            Line::from("  Ctrl-S validates and atomically saves; Esc cancels editing or discards dirty changes."),
+            Line::from("  Daemon-owned changes offer an explicit graceful restart after save."),
+        ]);
+    } else if app.primary_tab == PrimaryTab::Schedules {
         if let Some(schedule) = app.selected_schedule() {
             lines.extend([
                 Line::from(format!("  schedule: {} / {}", schedule.workspace, schedule.name)),
@@ -5913,6 +6819,7 @@ fn render_tabs(frame: &mut Frame, area: Rect, app: &App) {
                     }
                     PrimaryTab::Schedules => app.schedules.len(),
                     PrimaryTab::Nodes => app.nodes.len(),
+                    PrimaryTab::Settings => 0,
                     PrimaryTab::Workspaces => unreachable!("workspace tab is rendered separately"),
                 };
                 let style = if *tab == app.primary_tab {
@@ -5921,7 +6828,14 @@ fn render_tabs(frame: &mut Frame, area: Rect, app: &App) {
                     Style::new().fg(SUBTEXT)
                 };
                 [
-                    Span::styled(format!("{} {} {count}", index + 1, tab.label()), style),
+                    Span::styled(
+                        if *tab == PrimaryTab::Settings {
+                            format!("{} {}", index + 1, tab.label())
+                        } else {
+                            format!("{} {} {count}", index + 1, tab.label())
+                        },
+                        style,
+                    ),
                     Span::raw("  "),
                 ]
             }),
@@ -7526,6 +8440,34 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
             Style::new().fg(if message.error { RED } else { GREEN }),
         ))
     } else {
+        if app.primary_tab == PrimaryTab::Settings {
+            let dirty = app.settings.as_ref().is_some_and(SettingsState::dirty);
+            let line = Line::from(vec![
+                Span::styled(" j/k", Style::new().fg(TEAL)),
+                Span::styled(" navigate  ", Style::new().fg(SUBTEXT)),
+                Span::styled("space", Style::new().fg(BLUE)),
+                Span::styled(" toggle  ", Style::new().fg(SUBTEXT)),
+                Span::styled("enter", Style::new().fg(GREEN)),
+                Span::styled(" edit/add  ", Style::new().fg(SUBTEXT)),
+                Span::styled("delete", Style::new().fg(RED)),
+                Span::styled(" remove/reset  ", Style::new().fg(SUBTEXT)),
+                Span::styled(
+                    "Ctrl-S",
+                    Style::new().fg(if dirty { GREEN } else { SUBTEXT }),
+                ),
+                Span::styled(" save  ", Style::new().fg(SUBTEXT)),
+                Span::styled("esc", Style::new().fg(RED)),
+                Span::styled(" discard  ", Style::new().fg(SUBTEXT)),
+                Span::styled("?", Style::new().fg(BLUE)),
+                Span::styled(" help  ", Style::new().fg(SUBTEXT)),
+                Span::styled("1-6", Style::new().fg(TEAL)),
+                Span::styled(" views  ", Style::new().fg(SUBTEXT)),
+                Span::styled("q", Style::new().fg(RED)),
+                Span::styled(" quit", Style::new().fg(SUBTEXT)),
+            ]);
+            frame.render_widget(Paragraph::new(line), area);
+            return;
+        }
         let launcher_selected = matches!(app.selected_item(), Some(WorkspaceItemView::Launcher(_)));
         let offline_shell_selected =
             app.selected_item_location()
@@ -7567,7 +8509,7 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
                 Span::styled(" forget  ", Style::new().fg(SUBTEXT)),
                 Span::styled("tab/shift-tab", Style::new().fg(TEAL)),
                 Span::styled(" views  ", Style::new().fg(SUBTEXT)),
-                Span::styled("1-5", Style::new().fg(TEAL)),
+                Span::styled("1-6", Style::new().fg(TEAL)),
                 Span::styled(" select view  ", Style::new().fg(SUBTEXT)),
                 Span::styled("/", Style::new().fg(TEAL)),
                 Span::styled(" palette  ", Style::new().fg(SUBTEXT)),
@@ -7670,7 +8612,7 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
                 if app.primary_tab == PrimaryTab::Workspaces {
                     " navigate  tab/shift-tab views  h/l panes  "
                 } else {
-                    " navigate  tab/shift-tab views  1-5 select view  "
+                    " navigate  tab/shift-tab views  1-6 select view  "
                 },
                 Style::new().fg(SUBTEXT),
             ),
@@ -7814,7 +8756,346 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     fn app() -> App {
-        App::new(vec![workspace("w1", "boomux")], project_context())
+        let mut app = App::new(vec![workspace("w1", "boomux")], project_context());
+        app.settings = Some(SettingsState::new(crate::config::test_settings(), None));
+        app
+    }
+
+    fn select_setting(app: &mut App, field: SettingsField) {
+        app.select_tab(PrimaryTab::Settings);
+        let settings = app.settings.as_mut().unwrap();
+        settings.selected = settings
+            .fields()
+            .iter()
+            .position(|candidate| *candidate == field)
+            .unwrap();
+    }
+
+    #[test]
+    fn settings_is_the_sixth_tab_and_renders_grouped_source_aware_fields() {
+        let mut app = app();
+        app.update(DashboardEvent::KeyPressed {
+            code: KeyCode::Char('6'),
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.primary_tab, PrimaryTab::Settings);
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 34)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let text = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        for expected in [
+            "6 SETTINGS",
+            "Writable local Node layer",
+            "/tmp/boomux-test-config.toml",
+            "Projects",
+            "Dashboard",
+            "Recovery",
+            "Scheduling",
+            "Notifications",
+            "Sound",
+            "default",
+        ] {
+            assert!(text.contains(expected), "missing {expected:?}\n{text}");
+        }
+    }
+
+    #[test]
+    fn settings_sources_are_tracked_per_field() {
+        let mut app = app();
+        let settings = app.settings.as_mut().unwrap();
+        settings.loaded.active_source = ConfigSource::Environment;
+        settings.loaded.inherited_source = ConfigSource::Global;
+        settings.loaded.inherited_overrides.follow_focused_terminal = Some(true);
+
+        assert_eq!(
+            settings.source(SettingsField::FollowFocusedTerminal),
+            ConfigSource::Global
+        );
+        assert_eq!(
+            settings.source(SettingsField::NotificationsEnabled),
+            ConfigSource::Default
+        );
+        settings.working.notifications_enabled = Some(true);
+        assert_eq!(
+            settings.source(SettingsField::NotificationsEnabled),
+            ConfigSource::Environment
+        );
+    }
+
+    #[test]
+    fn settings_boolean_toggle_save_and_discard_are_typed() {
+        let mut app = app();
+        select_setting(&mut app, SettingsField::FollowFocusedTerminal);
+        app.update(DashboardEvent::KeyPressed {
+            code: KeyCode::Char(' '),
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(
+            app.settings
+                .as_ref()
+                .unwrap()
+                .working
+                .follow_focused_terminal,
+            Some(false)
+        );
+        let effects = app.update(DashboardEvent::KeyPressed {
+            code: KeyCode::Char('s'),
+            modifiers: KeyModifiers::CONTROL,
+        });
+        assert!(
+            matches!(effects.as_slice(), [DashboardEffect::SaveSettings(overrides)] if overrides.follow_focused_terminal == Some(false))
+        );
+        assert!(app.settings.as_ref().unwrap().saving);
+
+        app.update(DashboardEvent::KeyPressed {
+            code: KeyCode::Char(' '),
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(
+            app.settings
+                .as_ref()
+                .unwrap()
+                .working
+                .follow_focused_terminal,
+            Some(false)
+        );
+        let mut terminal = Terminal::new(TestBackend::new(120, 34)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let text = (0..buffer.area.height)
+            .flat_map(|y| (0..buffer.area.width).map(move |x| buffer[(x, y)].symbol()))
+            .collect::<String>();
+        assert!(text.contains("Saving settings..."));
+
+        app.update(DashboardEvent::SettingsSaved(Box::new(Err(
+            "save failed".into()
+        ))));
+        assert!(!app.settings.as_ref().unwrap().saving);
+
+        app.update(DashboardEvent::KeyPressed {
+            code: KeyCode::Esc,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(!app.settings.as_ref().unwrap().dirty());
+    }
+
+    #[test]
+    fn dirty_settings_redirect_quit_and_escape_until_explicitly_discarded() {
+        let mut app = app();
+        select_setting(&mut app, SettingsField::FollowFocusedTerminal);
+        app.update(DashboardEvent::KeyPressed {
+            code: KeyCode::Char(' '),
+            modifiers: KeyModifiers::NONE,
+        });
+        app.select_tab(PrimaryTab::Workspaces);
+
+        let effects = app.update(DashboardEvent::KeyPressed {
+            code: KeyCode::Char('q'),
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(effects.is_empty());
+        assert_eq!(app.primary_tab, PrimaryTab::Settings);
+        assert!(app.message.as_ref().unwrap().text.contains("Ctrl-S saves"));
+
+        let effects = app.update(DashboardEvent::KeyPressed {
+            code: KeyCode::Char('q'),
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(effects.is_empty());
+        assert!(app.settings.as_ref().unwrap().dirty());
+
+        app.select_tab(PrimaryTab::Workspaces);
+        app.update(DashboardEvent::KeyPressed {
+            code: KeyCode::Esc,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.primary_tab, PrimaryTab::Settings);
+        assert!(app.settings.as_ref().unwrap().dirty());
+
+        app.update(DashboardEvent::KeyPressed {
+            code: KeyCode::Esc,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(!app.settings.as_ref().unwrap().dirty());
+    }
+
+    #[test]
+    fn running_scheduler_difference_requires_restart_at_startup() {
+        let settings = SettingsState::new(crate::config::test_settings(), Some(2));
+        assert_eq!(settings.daemon_applied.scheduling_max_concurrent, 2);
+        assert_eq!(settings.loaded.effective.scheduling_max_concurrent, 4);
+        assert!(settings.restart_required);
+        assert!(settings.restart_clears_history);
+    }
+
+    #[test]
+    fn unknown_applied_recovery_state_warns_before_disabling_history() {
+        let mut app = app();
+        let mut saved = crate::config::test_settings();
+        saved.effective.notifications_enabled = true;
+        saved.effective.persist_terminal_history = false;
+
+        app.update(DashboardEvent::SettingsSaved(Box::new(Ok((
+            saved,
+            project_context(),
+        )))));
+
+        assert!(matches!(
+            app.mode,
+            Mode::ConfirmDaemonRestart {
+                clears_history: true
+            }
+        ));
+    }
+
+    #[test]
+    fn settings_text_and_numeric_editing_validate_before_save() {
+        let mut app = app();
+        select_setting(&mut app, SettingsField::Terminal);
+        app.settings.as_mut().unwrap().begin_edit();
+        app.settings.as_mut().unwrap().edit.as_mut().unwrap().input = "invalid".into();
+        assert!(!app.settings.as_mut().unwrap().apply_edit());
+        assert!(app.settings.as_ref().unwrap().error.is_some());
+        app.settings.as_mut().unwrap().edit.as_mut().unwrap().input = "Alacritty.desktop".into();
+        assert!(app.settings.as_mut().unwrap().apply_edit());
+
+        select_setting(&mut app, SettingsField::ProjectMaxDepth);
+        app.settings.as_mut().unwrap().begin_edit();
+        app.settings.as_mut().unwrap().edit.as_mut().unwrap().input = "11".into();
+        assert!(!app.settings.as_mut().unwrap().apply_edit());
+        app.settings.as_mut().unwrap().edit.as_mut().unwrap().input = "4".into();
+        assert!(app.settings.as_mut().unwrap().apply_edit());
+        assert_eq!(
+            app.settings.as_ref().unwrap().working.project_max_depth,
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn project_roots_support_add_edit_remove_and_reset_to_inheritance() {
+        let mut app = app();
+        select_setting(&mut app, SettingsField::AddProjectRoot);
+        app.settings.as_mut().unwrap().begin_edit();
+        app.settings.as_mut().unwrap().edit.as_mut().unwrap().input = "~/Code".into();
+        assert!(app.settings.as_mut().unwrap().apply_edit());
+        assert_eq!(app.settings.as_ref().unwrap().roots(), ["~/Code"]);
+
+        select_setting(&mut app, SettingsField::ProjectRoot(0));
+        app.settings.as_mut().unwrap().begin_edit();
+        app.settings.as_mut().unwrap().edit.as_mut().unwrap().input = "/srv/code".into();
+        assert!(app.settings.as_mut().unwrap().apply_edit());
+        assert_eq!(app.settings.as_ref().unwrap().roots(), ["/srv/code"]);
+        app.settings.as_mut().unwrap().reset_selected();
+        assert!(app.settings.as_ref().unwrap().roots().is_empty());
+
+        select_setting(&mut app, SettingsField::AddProjectRoot);
+        app.settings.as_mut().unwrap().reset_selected();
+        assert!(
+            app.settings
+                .as_ref()
+                .unwrap()
+                .working
+                .project_roots
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn settings_save_failure_and_restart_confirmation_are_explicit() {
+        let mut app = app();
+        app.update(DashboardEvent::SettingsSaved(Box::new(Err(
+            "config target changed while it was being edited".into(),
+        ))));
+        assert!(app.message.as_ref().is_some_and(|message| message.error));
+        assert!(
+            app.settings
+                .as_ref()
+                .unwrap()
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("changed"))
+        );
+
+        app.settings
+            .as_mut()
+            .unwrap()
+            .daemon_applied
+            .persist_terminal_history = true;
+        let mut saved = crate::config::test_settings();
+        saved.effective.persist_terminal_history = false;
+        saved.effective.notifications_enabled = true;
+        app.update(DashboardEvent::SettingsSaved(Box::new(Ok((
+            saved,
+            project_context(),
+        )))));
+        assert!(matches!(
+            app.mode,
+            Mode::ConfirmDaemonRestart {
+                clears_history: true
+            }
+        ));
+        app.update(DashboardEvent::KeyPressed {
+            code: KeyCode::Char('n'),
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(app.settings.as_ref().unwrap().restart_required);
+        assert!(
+            app.message
+                .as_ref()
+                .unwrap()
+                .text
+                .contains("restart still required")
+        );
+
+        app.mode = Mode::ConfirmDaemonRestart {
+            clears_history: false,
+        };
+        let effects = app.update(DashboardEvent::KeyPressed {
+            code: KeyCode::Char('y'),
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(matches!(
+            effects.as_slice(),
+            [DashboardEffect::RestartDaemon(settings)]
+                if !settings.persist_terminal_history && settings.notifications_enabled
+        ));
+        let DashboardEffect::RestartDaemon(applied) = effects.into_iter().next().unwrap() else {
+            unreachable!();
+        };
+        app.update(DashboardEvent::DaemonRestarted {
+            applied: applied.clone(),
+            result: Ok("restarted".into()),
+        });
+        assert_eq!(app.settings.as_ref().unwrap().daemon_applied, applied);
+        assert!(!app.settings.as_ref().unwrap().restart_required);
+    }
+
+    #[test]
+    fn reverting_pending_daemon_settings_clears_restart_requirement() {
+        let mut app = app();
+        let mut changed = crate::config::test_settings();
+        changed.effective.notifications_enabled = true;
+        app.update(DashboardEvent::SettingsSaved(Box::new(Ok((
+            changed,
+            project_context(),
+        )))));
+        assert!(app.settings.as_ref().unwrap().restart_required);
+
+        app.mode = Mode::Normal;
+        app.update(DashboardEvent::SettingsSaved(Box::new(Ok((
+            crate::config::test_settings(),
+            project_context(),
+        )))));
+        assert!(!app.settings.as_ref().unwrap().restart_required);
+        assert!(matches!(app.mode, Mode::Normal));
     }
 
     #[test]
@@ -9298,11 +10579,11 @@ mod tests {
     #[test]
     fn numeric_shortcuts_match_primary_tab_order() {
         assert_eq!(
-            ('1'..='5').filter_map(shortcut_tab).collect::<Vec<_>>(),
+            ('1'..='6').filter_map(shortcut_tab).collect::<Vec<_>>(),
             PrimaryTab::ALL
         );
         assert_eq!(shortcut_tab('0'), None);
-        assert_eq!(shortcut_tab('6'), None);
+        assert_eq!(shortcut_tab('7'), None);
     }
 
     #[test]
