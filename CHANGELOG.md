@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.23.0](https://github.com/gardnmi/boomux/compare/v0.22.0...v0.23.0) (2026-08-20)
+
+
+### Features
+
+* **claude:** add lifecycle and remote control integration ([#230](https://github.com/gardnmi/boomux/issues/230)) ([7a5ee76](https://github.com/gardnmi/boomux/commit/7a5ee765ed2aacfd981ab3cffcf732dc948e4afc))
+* **codex:** add lifecycle integration ([#233](https://github.com/gardnmi/boomux/issues/233)) ([2fac119](https://github.com/gardnmi/boomux/commit/2fac119fe4af05479234b257f60d166b9074375e))
+* **config:** add configuration management commands ([#229](https://github.com/gardnmi/boomux/issues/229)) ([fbe4b20](https://github.com/gardnmi/boomux/commit/fbe4b209cc4ed9d48a9559af76924f6180d0085c))
+
+
+### Bug Fixes
+
+* **tui:** distinguish inactive and observed agent states ([#232](https://github.com/gardnmi/boomux/issues/232)) ([bb9acee](https://github.com/gardnmi/boomux/commit/bb9acee7439453e2645d2c1a2a06c7238e9cd0b3))
+* **web:** allow dismissing agent attention ([#227](https://github.com/gardnmi/boomux/issues/227)) ([11e5dc5](https://github.com/gardnmi/boomux/commit/11e5dc563638a25e841cadd5b4a5dd42ba8fcfe0))
+* **web:** make opencode hosting resilient ([#231](https://github.com/gardnmi/boomux/issues/231)) ([2665852](https://github.com/gardnmi/boomux/commit/2665852078cd152c76ae918b098b50415f1062e9))
+
 ## [0.22.0](https://github.com/gardnmi/boomux/compare/v0.21.1...v0.22.0) (2026-08-19)
 
 
