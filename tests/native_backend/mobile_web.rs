@@ -82,6 +82,47 @@ fn web_starts_without_opencode_and_repeats_idempotently() {
     .unwrap();
     assert!(hook.wait().unwrap().success());
 
+    let codex_workspace = daemon
+        .client
+        .create_workspace(
+            "codex-web-without-handoff",
+            vec![ShellSpec {
+                name: "codex".into(),
+                command: vec!["/bin/sleep".into(), "30".into()],
+                cwd: std::env::temp_dir(),
+            }],
+        )
+        .unwrap();
+    let codex_shell_id = codex_workspace.shells[0].id.clone();
+    let _codex_attachment = daemon
+        .client
+        .attach(&codex_shell_id, false, profile())
+        .unwrap();
+    let codex_run_id = daemon
+        .client
+        .get_shell(&codex_shell_id)
+        .unwrap()
+        .run
+        .unwrap()
+        .id;
+    let mut codex_hook = daemon.command();
+    codex_hook
+        .args(["codex", "hook"])
+        .env("BOOMUX_SHELL_ID", &codex_shell_id)
+        .env("BOOMUX_RUN_ID", &codex_run_id)
+        .env("BOOMUX_CODEX_RUN_SCOPED", "1")
+        .stdin(Stdio::piped());
+    let mut codex_hook = codex_hook.spawn().unwrap();
+    codex_hook
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(
+            b"{\"session_id\":\"codex-without-handoff\",\"hook_event_name\":\"SessionStart\"}",
+        )
+        .unwrap();
+    assert!(codex_hook.wait().unwrap().success());
+
     let dashboard_port = unused_port();
     let opencode_port = unused_port();
     assert_ne!(dashboard_port, opencode_port);
@@ -146,6 +187,13 @@ fn web_starts_without_opencode_and_repeats_idempotently() {
         claude["native_web"]["url"],
         "https://claude.ai/code/bridge-without-opencode"
     );
+    let codex = snapshot["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|agent| agent["integration"] == "codex")
+        .unwrap();
+    assert!(codex.get("native_web").is_none());
 
     let repeated = run_web(&daemon, &arguments, &empty_path);
     assert!(repeated.status.success());

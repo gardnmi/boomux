@@ -245,6 +245,7 @@ fn integration_management_reports_and_installs_bundled_hosts() {
     let pi = root.join("pi");
     let claude = root.join("claude");
     let claude_manifest = claude.join("skills/boomux/.claude-plugin/plugin.json");
+    let codex_hooks = root.join(".codex/hooks.json");
     let runtime = root.join("runtime");
     fs::create_dir_all(&bin).unwrap();
     fs::create_dir_all(&runtime).unwrap();
@@ -252,6 +253,7 @@ fn integration_management_reports_and_installs_bundled_hosts() {
         ("opencode", "1.18.18"),
         ("pi", "0.84.1"),
         ("claude", "2.1.236"),
+        ("codex", "0.147.0"),
     ] {
         let executable = bin.join(name);
         fs::write(
@@ -288,7 +290,7 @@ fn integration_management_reports_and_installs_bundled_hosts() {
             .iter()
             .map(|integration| integration["name"].as_str().unwrap())
             .collect::<Vec<_>>(),
-        ["opencode", "pi", "claude"]
+        ["opencode", "pi", "claude", "codex"]
     );
 
     let missing = command()
@@ -315,6 +317,7 @@ fn integration_management_reports_and_installs_bundled_hosts() {
     assert!(!preflight_refused.status.success());
     assert!(!config.join("opencode/plugins/boomux.js").exists());
     assert!(!claude_manifest.exists());
+    assert!(!codex_hooks.exists());
     fs::remove_file(pi.join("extensions/boomux.js")).unwrap();
 
     let installed = command()
@@ -335,9 +338,16 @@ fn integration_management_reports_and_installs_bundled_hosts() {
     assert!(config.join("opencode/plugins/boomux.js").is_file());
     assert!(pi.join("extensions/boomux.js").is_file());
     assert!(claude_manifest.is_file());
+    assert!(codex_hooks.is_file());
     let manifest: serde_json::Value =
         serde_json::from_slice(&fs::read(&claude_manifest).unwrap()).unwrap();
     assert_eq!(manifest["name"], "boomux");
+    let hooks: serde_json::Value =
+        serde_json::from_slice(&fs::read(&codex_hooks).unwrap()).unwrap();
+    assert_eq!(
+        hooks["hooks"]["SessionStart"][0]["hooks"][0]["command"],
+        "boomux codex hook"
+    );
 
     for arguments in [["opencode", "install"], ["pi", "install"]] {
         let shortcut = command().args(arguments).output().unwrap();
@@ -386,6 +396,7 @@ fn integration_management_reports_and_installs_bundled_hosts() {
     assert!(!uninstall_refused.status.success());
     assert!(config.join("opencode/plugins/boomux.js").is_file());
     assert!(claude_manifest.is_file());
+    assert!(codex_hooks.is_file());
     assert_eq!(
         fs::read_to_string(pi.join("extensions/boomux.js")).unwrap(),
         "custom extension"
@@ -405,9 +416,11 @@ fn integration_management_reports_and_installs_bundled_hosts() {
     assert!(!config.join("opencode/plugins/boomux.js").exists());
     assert!(!pi.join("extensions/boomux.js").exists());
     assert!(!claude_manifest.exists());
+    assert!(!codex_hooks.exists());
     assert!(config.join("opencode/plugins").is_dir());
     assert!(pi.join("extensions").is_dir());
     assert!(claude.join("skills/boomux/.claude-plugin").is_dir());
+    assert!(root.join(".codex").is_dir());
 
     let absent = command()
         .args(["integration", "uninstall", "pi", "--json"])
@@ -472,6 +485,70 @@ fn integration_management_reports_and_installs_bundled_hosts() {
     let invalid_environment: serde_json::Value =
         serde_json::from_slice(&invalid_environment.stderr).unwrap();
     assert_eq!(invalid_environment["error"]["code"], "invalid_argument");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn codex_hidden_launcher_scopes_chat_hooks_and_passes_service_commands_through() {
+    let root = std::env::temp_dir().join(format!(
+        "boomux-codex-launcher-{}-{}",
+        std::process::id(),
+        Uuid::new_v4()
+    ));
+    let bin = root.join("bin");
+    let codex_home = root.join("codex-home");
+    fs::create_dir_all(&bin).unwrap();
+    fs::create_dir(&codex_home).unwrap();
+    fs::write(
+        codex_home.join("hooks.json"),
+        include_str!("../../integrations/codex/hooks.json"),
+    )
+    .unwrap();
+    let codex = bin.join("codex");
+    fs::write(
+        &codex,
+        "#!/bin/sh\n: > \"$BOOMUX_CODEX_CAPTURE\"\nfor arg do printf '%s\\0' \"$arg\" >> \"$BOOMUX_CODEX_CAPTURE\"; done\nprintf '%s' \"${BOOMUX_CODEX_RUN_SCOPED-unset}\" > \"$BOOMUX_CODEX_MARKER\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&codex, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let run = |arguments: &[&str], case: &str| {
+        let capture = root.join(format!("{case}-argv"));
+        let marker = root.join(format!("{case}-marker"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_boomux"));
+        command
+            .args(["codex", "launch", "--"])
+            .args(arguments)
+            .env("PATH", &bin)
+            .env("CODEX_HOME", &codex_home)
+            .env("BOOMUX_CODEX_CAPTURE", &capture)
+            .env("BOOMUX_CODEX_MARKER", &marker)
+            .env("BOOMUX_SHELL_ID", "shell-1")
+            .env("BOOMUX_RUN_ID", "run-1");
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        (
+            fs::read(capture).unwrap(),
+            fs::read_to_string(marker).unwrap(),
+        )
+    };
+
+    let (argv, marker) = run(&["resume", "thread; literal"], "resume");
+    assert_eq!(argv, b"--enable\0hooks\0resume\0thread; literal\0");
+    assert_eq!(marker, "1");
+
+    let (argv, marker) = run(&["remote-control", "start", "--json"], "service");
+    assert_eq!(argv, b"remote-control\0start\0--json\0");
+    assert_eq!(marker, "unset");
+
+    let (argv, marker) = run(&["--remote", "unix:///tmp/codex.sock"], "remote");
+    assert_eq!(argv, b"--remote\0unix:///tmp/codex.sock\0");
+    assert_eq!(marker, "unset");
 
     fs::remove_dir_all(root).unwrap();
 }

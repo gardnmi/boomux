@@ -33,7 +33,7 @@
 | `src/host_session_titles.rs` and children | Shared title/catalog policy and host-specific discovery adapters |
 | `src/host_session_source.rs` and children | Canonical host source paths, normalization, and secure source lookup |
 | `src/integration_management.rs` | Integration inventory, status, setup, verification, install, and uninstall workflows |
-| `src/claude_hooks.rs` | Bounded Claude Code hook decoding and root Session lifecycle reduction |
+| `src/claude_hooks.rs`, `src/codex_hooks.rs` | Bounded Claude Code and Codex hook decoding and root Session lifecycle reduction |
 | `src/process_adapter.rs` | Exact-argv child supervision and fail-open process-bound Agent observation |
 | `src/scheduling.rs` | Bounded canonical cron parsing and occurrence evaluation, IANA timezone and DST policy, prompt bounds, and schedule identity validation |
 | `src/config.rs` | Layered configuration resolution, bounded validation, and transactional active-layer editing |
@@ -671,7 +671,7 @@ external ID. It retains original shell/run identity and observations even when a
 shell no longer exists. UUID v5 IDs use a fixed namespace and a versioned,
 length-prefixed encoding of workspace ID, integration, and the external-or-agent
 grouping identity. IDs are globally unique and deterministic but opaque to
-consumers. Bounded OpenCode root-session catalogs add historical, `unknown`
+consumers. Bounded OpenCode root-session and Codex thread catalogs add historical, `unknown`
 sessions without fabricating Agent occurrences and merge with a later durable
 registration under the same stable ID. Catalog records associate to each
 workspace that references their exact normalized directory. The dashboard maps
@@ -682,7 +682,7 @@ The integration descriptor registry is the authority for integration keys,
 display names, and optional typed capabilities. A title capability selects its
 host adapter and independently declares catalog support. The shared title layer
 owns asynchronous cache, refresh, deduplication, sanitization, and fallback
-policy; OpenCode and Pi modules own host command execution and title extraction.
+policy; OpenCode, Pi, and Codex modules own host command execution and title extraction.
 Neutral host source modules own shared path normalization and secure catalog
 discovery. Title and catalog support remain independent from installation,
 foreground recognition, and recovery eligibility, so a future harness can
@@ -704,7 +704,8 @@ active instances match one run, the most recently observed instance is shown
 with an Agent-ID tie-break. Completed, stale-run, and orphaned Agent records
 remain available through CLI inspection but do not occupy dashboard rows. A
 running shell snapshot may also expose its PTY foreground process name. The
-dashboard recognizes exact `opencode` and `pi` as presentation-only agent-shell hints
+dashboard recognizes exact registered host processes, including `opencode`, `pi`,
+`claude`, and `codex`, as presentation-only agent-shell hints
 before a canonical Agent session exists; this hint creates no AgentInstance,
 durable state observation, persistence, or events. It displays `untracked` until
 lifecycle data exists, then yields to that authoritative observation. `doctor`
@@ -1168,6 +1169,49 @@ exercise only the host fields and ordering Boomux consumes; the record
 deliberately distinguishes those tests from transitions observed in real
 managed sessions.
 
+### Codex Lifecycle Integration
+
+The Codex descriptor targets `@openai/codex` `0.147.0` as a compatibility test
+point. Installation merges exact `boomux codex hook` handlers into
+`${CODEX_HOME:-$HOME/.codex}/hooks.json`. Unrelated top-level fields, event
+groups, and handlers remain untouched. Reads are bounded and reject symlinks and
+non-regular targets; writes atomically verify the inspected baseline and retain
+the existing mode. A modified Boomux handler requires force repair. Uninstall
+removes only Boomux handlers and deletes the file only when no unrelated content
+remains. Codex must be restarted and the hook reviewed and trusted with `/hooks`.
+
+Eligible managed Codex invocations pass through a Shell-scoped executable shim
+and hidden launcher. Bare chat, `resume`, and `exec` are considered managed chat;
+when the installed handlers are current, the launcher prepends `--enable hooks`
+and exports `BOOMUX_CODEX_RUN_SCOPED=1`. Option-led invocations including
+explicit `--remote`, other Codex subcommands, an absent or modified installation,
+and use outside Boomux remain untracked. An exact configured primary executable
+is forwarded through `BOOMUX_REAL_CODEX`; typing an absolute path in a login
+Shell bypasses the scoped shim. Hooks silently do nothing unless the run-scoped
+marker and exact `BOOMUX_SHELL_ID` and `BOOMUX_RUN_ID` are present. An explicitly
+remote TUI therefore cannot claim authority inherited from its app-server.
+
+Codex hook `session_id` is the canonical thread identity and ensures the exact
+`(codex, thread, shell, run)` Agent key. SessionStart reports Idle, except compact
+starts remain Working; prompt, tool, compaction, and subagent activity report
+Working; PermissionRequest reports Blocked; Stop reports Idle; and SessionEnd
+reports Inactive. Codex hooks never report Done. Input, identity, and reporting
+are bounded and fail open for the host.
+
+Exact resume uses `codex resume <thread-id>`. Scheduled fresh and continuation
+work use `codex exec -` and `codex exec resume <thread-id> -`, respectively,
+with exact prompt bytes on stdin; the internal launcher supplies hook enablement
+without changing the persisted descriptor argv. The experimental catalog
+adapter starts bounded `codex app-server --stdio`, completes `initialize` and
+`initialized`, then requests `thread/list` for the exact normalized workspace
+directory. It filters ephemeral or invalid threads, sanitizes name or preview
+titles, bounds output, count, and runtime, and fails open without changing Agent
+authority. These additions reuse existing protocol Agent, schedule, session,
+and capability shapes, so they require no protocol or durable-state version
+change. Boomux exposes no Codex Remote handoff because Codex documents no exact
+thread-specific Remote URL; it does not reinterpret `codex://threads/ID` as a
+phone-accessible Remote destination.
+
 ### Claude Code Lifecycle Integration
 
 The Claude Code descriptor targets `@anthropic-ai/claude-code` `2.1.236` as a
@@ -1531,8 +1575,8 @@ and last terminal profiles survive restart. The last run record also preserves
 its identity and outcome. Recovered shells are pending: Boomux does not claim
 that arbitrary processes, mutated environments, or PTYs survive daemon restart
 or crash. When enabled, cold recovery substitutes an integration-native resume
-command for a uniquely identified, lifecycle-authoritative OpenCode, Pi, or
-Claude Agent from an interrupted run. Ambiguous or invalid candidates use the
+command for a uniquely identified, lifecycle-authoritative OpenCode, Pi, Claude,
+or Codex Agent from an interrupted run. Ambiguous or invalid candidates use the
 shell's normal command instead. OpenCode recovery routes the exact Session
 through the Shared Harness Runtime so its replacement ShellRun can establish a
 fresh claim; shared-launch preparation failure retains the standalone native

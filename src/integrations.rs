@@ -5,6 +5,7 @@ pub enum InstallTargetKind {
     OpenCode,
     Pi,
     Claude,
+    Codex,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -22,6 +23,7 @@ pub struct InstallationCapability {
 pub enum TitleProvider {
     OpenCode,
     Pi,
+    Codex,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,7 +35,7 @@ pub struct TitleCapability {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ResumeCapability {
     pub executable: &'static str,
-    pub session_argument: &'static str,
+    pub arguments_before_session: &'static [&'static str],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,9 +45,16 @@ pub enum PromptTransport {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScheduleArgument {
+    Literal(&'static str),
+    ExternalSessionId,
+    Prompt,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScheduleDispatchCapability {
-    pub fresh: bool,
-    pub continuation: bool,
+    pub fresh: Option<&'static [ScheduleArgument]>,
+    pub continuation: Option<&'static [ScheduleArgument]>,
     pub prompt_transport: PromptTransport,
 }
 
@@ -64,56 +73,19 @@ impl ScheduleDispatchCapability {
     ) -> Option<ScheduleDispatchCommand> {
         use crate::protocol::AgentScheduleSession;
 
+        let (template, external_session_id) = match session {
+            AgentScheduleSession::Fresh => (self.fresh?, None),
+            AgentScheduleSession::Continue {
+                external_session_id,
+            } => (self.continuation?, Some(external_session_id.as_str())),
+        };
         let mut argv = vec![integration.to_owned()];
-        match (integration, session) {
-            ("opencode", AgentScheduleSession::Fresh) if self.fresh => {
-                argv.extend(["run".into(), "--".into(), prompt.into()]);
-            }
-            (
-                "opencode",
-                AgentScheduleSession::Continue {
-                    external_session_id,
-                },
-            ) if self.continuation => {
-                argv.extend([
-                    "run".into(),
-                    "--session".into(),
-                    external_session_id.clone(),
-                    "--".into(),
-                    prompt.into(),
-                ]);
-            }
-            ("pi", AgentScheduleSession::Fresh) if self.fresh => {
-                argv.push("--print".into());
-            }
-            (
-                "pi",
-                AgentScheduleSession::Continue {
-                    external_session_id,
-                },
-            ) if self.continuation => {
-                argv.extend([
-                    "--session".into(),
-                    external_session_id.clone(),
-                    "--print".into(),
-                ]);
-            }
-            ("claude", AgentScheduleSession::Fresh) if self.fresh => {
-                argv.push("--print".into());
-            }
-            (
-                "claude",
-                AgentScheduleSession::Continue {
-                    external_session_id,
-                },
-            ) if self.continuation => {
-                argv.extend([
-                    "--print".into(),
-                    "--resume".into(),
-                    external_session_id.clone(),
-                ]);
-            }
-            _ => return None,
+        for argument in template {
+            argv.push(match argument {
+                ScheduleArgument::Literal(value) => (*value).to_owned(),
+                ScheduleArgument::ExternalSessionId => external_session_id?.to_owned(),
+                ScheduleArgument::Prompt => prompt.to_owned(),
+            });
         }
         Some(ScheduleDispatchCommand {
             argv,
@@ -141,11 +113,14 @@ impl ResumeCapability {
         } else {
             return None;
         };
-        Some(vec![
-            executable,
-            self.session_argument.to_owned(),
-            external_session_id.to_owned(),
-        ])
+        let mut command = vec![executable];
+        command.extend(
+            self.arguments_before_session
+                .iter()
+                .map(|argument| (*argument).to_owned()),
+        );
+        command.push(external_session_id.to_owned());
+        Some(command)
     }
 }
 
@@ -183,11 +158,21 @@ pub const OPENCODE: IntegrationDescriptor = IntegrationDescriptor {
     }),
     resume: Some(ResumeCapability {
         executable: "opencode",
-        session_argument: "--session",
+        arguments_before_session: &["--session"],
     }),
     schedule_dispatch: Some(ScheduleDispatchCapability {
-        fresh: true,
-        continuation: true,
+        fresh: Some(&[
+            ScheduleArgument::Literal("run"),
+            ScheduleArgument::Literal("--"),
+            ScheduleArgument::Prompt,
+        ]),
+        continuation: Some(&[
+            ScheduleArgument::Literal("run"),
+            ScheduleArgument::Literal("--session"),
+            ScheduleArgument::ExternalSessionId,
+            ScheduleArgument::Literal("--"),
+            ScheduleArgument::Prompt,
+        ]),
         prompt_transport: PromptTransport::Argument,
     }),
     foreground: Some(ForegroundCapability {
@@ -213,11 +198,15 @@ pub const PI: IntegrationDescriptor = IntegrationDescriptor {
     }),
     resume: Some(ResumeCapability {
         executable: "pi",
-        session_argument: "--session",
+        arguments_before_session: &["--session"],
     }),
     schedule_dispatch: Some(ScheduleDispatchCapability {
-        fresh: true,
-        continuation: true,
+        fresh: Some(&[ScheduleArgument::Literal("--print")]),
+        continuation: Some(&[
+            ScheduleArgument::Literal("--session"),
+            ScheduleArgument::ExternalSessionId,
+            ScheduleArgument::Literal("--print"),
+        ]),
         prompt_transport: PromptTransport::Stdin,
     }),
     foreground: Some(ForegroundCapability { process_name: "pi" }),
@@ -238,11 +227,15 @@ pub const CLAUDE: IntegrationDescriptor = IntegrationDescriptor {
     titles: None,
     resume: Some(ResumeCapability {
         executable: "claude",
-        session_argument: "--resume",
+        arguments_before_session: &["--resume"],
     }),
     schedule_dispatch: Some(ScheduleDispatchCapability {
-        fresh: true,
-        continuation: true,
+        fresh: Some(&[ScheduleArgument::Literal("--print")]),
+        continuation: Some(&[
+            ScheduleArgument::Literal("--print"),
+            ScheduleArgument::Literal("--resume"),
+            ScheduleArgument::ExternalSessionId,
+        ]),
         prompt_transport: PromptTransport::Stdin,
     }),
     foreground: Some(ForegroundCapability {
@@ -250,7 +243,45 @@ pub const CLAUDE: IntegrationDescriptor = IntegrationDescriptor {
     }),
 };
 
-pub const ALL: &[IntegrationDescriptor] = &[OPENCODE, PI, CLAUDE];
+pub const CODEX: IntegrationDescriptor = IntegrationDescriptor {
+    key: "codex",
+    display_name: "Codex",
+    installation: Some(InstallationCapability {
+        package: "@openai/codex",
+        validated_version: "0.147.0",
+        asset_name: "hooks",
+        content: include_str!("../integrations/codex/hooks.json"),
+        executable: "codex",
+        reload_message: "Restart Codex, then review and trust the Boomux hook with /hooks",
+        target: InstallTargetKind::Codex,
+    }),
+    titles: Some(TitleCapability {
+        provider: TitleProvider::Codex,
+        provides_catalog: true,
+    }),
+    resume: Some(ResumeCapability {
+        executable: "codex",
+        arguments_before_session: &["resume"],
+    }),
+    schedule_dispatch: Some(ScheduleDispatchCapability {
+        fresh: Some(&[
+            ScheduleArgument::Literal("exec"),
+            ScheduleArgument::Literal("-"),
+        ]),
+        continuation: Some(&[
+            ScheduleArgument::Literal("exec"),
+            ScheduleArgument::Literal("resume"),
+            ScheduleArgument::ExternalSessionId,
+            ScheduleArgument::Literal("-"),
+        ]),
+        prompt_transport: PromptTransport::Stdin,
+    }),
+    foreground: Some(ForegroundCapability {
+        process_name: "codex",
+    }),
+};
+
+pub const ALL: &[IntegrationDescriptor] = &[OPENCODE, PI, CLAUDE, CODEX];
 
 pub fn by_key(key: &str) -> Option<&'static IntegrationDescriptor> {
     descriptor_by_key(ALL, key)
@@ -365,8 +396,8 @@ mod tests {
             assert_eq!(by_key(descriptor.key), Some(descriptor));
             assert_eq!(display_name(descriptor.key), descriptor.display_name);
             let dispatch = descriptor.schedule_dispatch.expect("dispatch capability");
-            assert!(dispatch.fresh);
-            assert!(dispatch.continuation);
+            assert!(dispatch.fresh.is_some());
+            assert!(dispatch.continuation.is_some());
         }
     }
 
@@ -379,7 +410,7 @@ mod tests {
             titles: None,
             resume: Some(ResumeCapability {
                 executable: "resume-only",
-                session_argument: "--session",
+                arguments_before_session: &["--session"],
             }),
             schedule_dispatch: None,
             foreground: None,
@@ -408,6 +439,14 @@ mod tests {
         assert_eq!(
             CLAUDE.resume.unwrap().command(&[], "session-2"),
             Some(vec!["claude".into(), "--resume".into(), "session-2".into()])
+        );
+        assert_eq!(
+            CODEX.resume.unwrap().command(&[], "thread-literal"),
+            Some(vec![
+                "codex".into(),
+                "resume".into(),
+                "thread-literal".into()
+            ])
         );
     }
 
@@ -466,6 +505,29 @@ mod tests {
                     "--print".into(),
                     "--resume".into(),
                     "exact-id".into(),
+                ],
+                stdin: Some(prompt.as_bytes().to_vec()),
+            }
+        );
+        assert_eq!(
+            CODEX
+                .schedule_dispatch
+                .unwrap()
+                .command(
+                    "codex",
+                    &AgentScheduleSession::Continue {
+                        external_session_id: "thread; literal".into(),
+                    },
+                    prompt,
+                )
+                .unwrap(),
+            ScheduleDispatchCommand {
+                argv: vec![
+                    "codex".into(),
+                    "exec".into(),
+                    "resume".into(),
+                    "thread; literal".into(),
+                    "-".into(),
                 ],
                 stdin: Some(prompt.as_bytes().to_vec()),
             }

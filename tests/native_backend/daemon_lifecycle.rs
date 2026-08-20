@@ -71,6 +71,14 @@ fn native_daemon_lifecycle() {
         capabilities["data"]["integration_hosts"]["pi"]["package"],
         "@earendil-works/pi-coding-agent"
     );
+    assert_eq!(
+        capabilities["data"]["integration_hosts"]["codex"]["validated_version"],
+        "0.147.0"
+    );
+    assert_eq!(
+        capabilities["data"]["integration_hosts"]["codex"]["package"],
+        "@openai/codex"
+    );
     let json_commands = capabilities["data"]["json_commands"].as_array().unwrap();
     for command in [
         "events",

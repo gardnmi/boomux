@@ -47,7 +47,7 @@ exercise process, socket, PTY, and daemon lifecycle behavior.
 | PTY, attachment, or process lifecycle | Colocated unit tests plus serial `native_backend` scenarios |
 | Graceful handoff | Serial native tests covering rollback, reconnect, PID preservation, and later cleanup |
 | TUI state or rendering | Focused `tui.rs` model, input, and rendering tests |
-| OpenCode or Pi reducer | The corresponding Bun integration test, including `boomux-tui.test.js` for OpenCode TUI claims |
+| OpenCode, Pi, Claude, or Codex reducer | The corresponding focused reducer tests, including `boomux-tui.test.js` for OpenCode TUI claims |
 | Host compatibility claim | Focused fixtures plus an update to `docs/lifecycle-validation.md` when validated live |
 
 ## Safety And Compatibility
