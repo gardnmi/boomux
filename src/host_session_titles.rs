@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use boomux::integrations::{self, TitleProvider};
 
+mod codex;
 mod opencode;
 mod pi;
 
@@ -197,6 +198,7 @@ fn adapter(integration: &str) -> Option<&'static dyn TitleAdapter> {
     match integrations::by_key(integration)?.titles?.provider {
         TitleProvider::OpenCode => Some(opencode::ADAPTER),
         TitleProvider::Pi => Some(pi::ADAPTER),
+        TitleProvider::Codex => Some(codex::ADAPTER),
     }
 }
 
@@ -576,7 +578,10 @@ mod tests {
 
     #[test]
     fn adapters_declare_catalog_support() {
-        assert_eq!(catalog_integrations().collect::<Vec<_>>(), ["opencode"]);
+        assert_eq!(
+            catalog_integrations().collect::<Vec<_>>(),
+            ["opencode", "codex"]
+        );
         assert!(catalog("pi", Path::new("/repo")).is_none());
         assert!(adapter("missing").is_none());
     }

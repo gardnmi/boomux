@@ -42,6 +42,8 @@ fn remove_boomux_shim_environment(command: &mut Command) {
     for name in [
         "BOOMUX_CLAUDE_REMOTE_CONTROL",
         "BOOMUX_REAL_CLAUDE",
+        "BOOMUX_REAL_CODEX",
+        "BOOMUX_CODEX_RUN_SCOPED",
         "BOOMUX_REAL_OPENCODE",
         "BOOMUX_ORIGINAL_PATH",
         "BOOMUX_OPENCODE_SHIM_DIR",

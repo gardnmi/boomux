@@ -36,6 +36,7 @@ use crate::integration_management::{
 mod agent_attention_projection;
 mod claude_hooks;
 mod cli_output;
+mod codex_hooks;
 mod config;
 mod dashboard_projection;
 mod generated_names;
@@ -511,6 +512,12 @@ enum Commands {
     Claude {
         #[command(subcommand)]
         command: ClaudeCommands,
+    },
+    /// Receive Codex lifecycle hooks
+    #[command(hide = true)]
+    Codex {
+        #[command(subcommand)]
+        command: CodexCommands,
     },
     /// Open a shell in a new terminal window
     Open {
@@ -1289,6 +1296,19 @@ enum ClaudeCommands {
 }
 
 #[derive(Subcommand)]
+enum CodexCommands {
+    /// Receive one lifecycle event on standard input
+    #[command(hide = true)]
+    Hook,
+    /// Launch Codex with run-scoped lifecycle authority
+    #[command(hide = true)]
+    Launch {
+        #[arg(last = true, allow_hyphen_values = true)]
+        arguments: Vec<OsString>,
+    },
+}
+
+#[derive(Subcommand)]
 enum IntegrationCommands {
     /// List integrations bundled with this Boomux binary
     List,
@@ -1473,6 +1493,8 @@ command_keys! {
     OpencodeClaimReport => ("opencode.claim.report", PrivateJson),
     Pi => ("pi", HumanOnly),
     ClaudeHook => ("claude.hook", HumanOnly),
+    CodexHook => ("codex.hook", HumanOnly),
+    CodexLaunch => ("codex.launch", HumanOnly),
     Open => ("open", HumanOnly),
     Prompt => ("prompt", HumanOnly),
     DaemonStatus => ("daemon.status", Json),
@@ -1720,6 +1742,12 @@ impl Cli {
             Some(Commands::Claude {
                 command: ClaudeCommands::Hook,
             }) => CommandKey::ClaudeHook,
+            Some(Commands::Codex {
+                command: CodexCommands::Hook,
+            }) => CommandKey::CodexHook,
+            Some(Commands::Codex {
+                command: CodexCommands::Launch { .. },
+            }) => CommandKey::CodexLaunch,
             Some(Commands::Open { .. }) => CommandKey::Open,
             Some(Commands::Prompt) => CommandKey::Prompt,
             Some(Commands::Attach { .. }) => CommandKey::Attach,
@@ -2073,6 +2101,17 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
             }
             Ok(())
         }
+        Some(Commands::Codex {
+            command: CodexCommands::Hook,
+        }) => {
+            if let Err(error) = codex_hook_command() {
+                eprintln!("boomux codex hook: {error}");
+            }
+            Ok(())
+        }
+        Some(Commands::Codex {
+            command: CodexCommands::Launch { arguments },
+        }) => launch_codex(arguments),
         Some(Commands::Open {
             shell_id,
             node,
@@ -9179,8 +9218,16 @@ fn scheduled_runner(schedule_id: &str) -> Result<process_adapter::ProcessExit, B
             &claim.prompt,
         )
         .ok_or_else(|| io::Error::other("scheduled integration mode is unavailable"))?;
-    let mut command = Command::new(&dispatch.argv[0]);
+    let codex_dispatch = claim.execution.integration == "codex";
+    let mut command = if codex_dispatch {
+        Command::new(env::current_exe()?)
+    } else {
+        Command::new(&dispatch.argv[0])
+    };
     sanitize_inherited_opencode_shim(&mut command);
+    if codex_dispatch {
+        command.args(["codex", "launch", "--"]);
+    }
     command
         .args(&dispatch.argv[1..])
         .current_dir(&claim.execution.cwd)
@@ -9394,7 +9441,7 @@ fn create_coordinated_schedule(
         boomux::scheduling::validate_external_session_id(&external_session_id)?;
         if !integration
             .schedule_dispatch
-            .is_some_and(|dispatch| dispatch.continuation)
+            .is_some_and(|dispatch| dispatch.continuation.is_some())
         {
             return Err(cli_output::failure(
                 "unsupported_integration",
@@ -9407,7 +9454,7 @@ fn create_coordinated_schedule(
     } else {
         if !integration
             .schedule_dispatch
-            .is_some_and(|dispatch| dispatch.fresh)
+            .is_some_and(|dispatch| dispatch.fresh.is_some())
         {
             return Err(cli_output::failure(
                 "unsupported_integration",
@@ -9527,7 +9574,7 @@ fn create_schedule(
         boomux::scheduling::validate_external_session_id(external_session_id)?;
         if !integration
             .schedule_dispatch
-            .is_some_and(|dispatch| dispatch.continuation)
+            .is_some_and(|dispatch| dispatch.continuation.is_some())
         {
             return Err(cli_output::failure(
                 "unsupported_integration",
@@ -9540,7 +9587,7 @@ fn create_schedule(
     } else {
         if !integration
             .schedule_dispatch
-            .is_some_and(|dispatch| dispatch.fresh)
+            .is_some_and(|dispatch| dispatch.fresh.is_some())
         {
             return Err(cli_output::failure(
                 "unsupported_integration",
@@ -10125,6 +10172,100 @@ fn claude_hook_command() -> Result<(), Box<dyn Error>> {
     };
     client.set_claude_remote_control_binding(agent.id, shell_id, run_id, bridge_session_id)?;
     Ok(())
+}
+
+fn codex_hook_command() -> Result<(), Box<dyn Error>> {
+    if env::var("BOOMUX_CODEX_RUN_SCOPED").as_deref() != Ok("1") {
+        return Ok(());
+    }
+    let (shell_id, run_id) = match (
+        env::var("BOOMUX_SHELL_ID").ok(),
+        env::var("BOOMUX_RUN_ID").ok(),
+    ) {
+        (Some(shell_id), Some(run_id)) => {
+            resolve_agent_context(None, None, Some(shell_id), Some(run_id))?
+        }
+        _ => return Ok(()),
+    };
+    let update = codex_hooks::read_update(io::stdin().lock())?;
+    let observation = update.observation;
+    let report = AgentReport {
+        state: observation.state,
+        authority: AgentAuthority::LifecycleIntegration,
+        evidence: observation.evidence.into(),
+        confidence: 100,
+    };
+    let client = client::connect_or_start()?;
+    let agent = client.ensure_agent(
+        &shell_id,
+        &run_id,
+        AgentRegistrationSpec {
+            name: "Codex".into(),
+            integration: "codex".into(),
+            external_session_id: Some(update.session_id),
+            report: report.clone(),
+        },
+    )?;
+    if agent.ended_at_ms.is_none()
+        && (agent.observation.state != report.state
+            || agent.observation.authority != report.authority
+            || agent.observation.evidence != report.evidence
+            || agent.observation.confidence != report.confidence)
+    {
+        client.report_agent(&agent.id, &run_id, report)?;
+    }
+    Ok(())
+}
+
+fn launch_codex(arguments: Vec<OsString>) -> Result<(), Box<dyn Error>> {
+    let executable = resolve_real_codex()?;
+    let managed_chat = arguments.is_empty()
+        || arguments
+            .first()
+            .is_some_and(|argument| argument == "resume" || argument == "exec");
+    let environment = integration_management::Environment::from_process();
+    let hooks_current = integration_management::inspect_without_host_probe(
+        integration_management::IntegrationId::CODEX,
+        &environment,
+        None,
+    )
+    .asset
+    .state
+        == integration_management::AssetState::Current;
+    let mut command = Command::new(executable);
+    sanitize_inherited_opencode_shim(&mut command);
+    if managed_chat && hooks_current {
+        command
+            .args(["--enable", "hooks"])
+            .env("BOOMUX_CODEX_RUN_SCOPED", "1");
+    } else {
+        command.env_remove("BOOMUX_CODEX_RUN_SCOPED");
+    }
+    command.args(arguments);
+    Err(command.exec().into())
+}
+
+fn resolve_real_codex() -> io::Result<PathBuf> {
+    if let Some(path) = env::var_os("BOOMUX_REAL_CODEX").map(PathBuf::from) {
+        let metadata = fs::metadata(&path)?;
+        if path.is_absolute() && metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 {
+            return Ok(path);
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "BOOMUX_REAL_CODEX must identify an absolute regular executable",
+        ));
+    }
+    let shim_dir = env::var_os("BOOMUX_OPENCODE_SHIM_DIR").map(PathBuf::from);
+    env::split_paths(&env::var_os("PATH").unwrap_or_default())
+        .filter(|directory| shim_dir.as_deref() != Some(directory.as_path()))
+        .map(|directory| directory.join("codex"))
+        .find(|candidate| {
+            fs::metadata(candidate).is_ok_and(|metadata| {
+                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+            })
+        })
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Codex executable was not found"))
 }
 
 fn resolve_agent_context(
@@ -10756,6 +10897,8 @@ fn sanitize_inherited_opencode_shim(command: &mut Command) {
     }
     for name in [
         "BOOMUX_REAL_OPENCODE",
+        "BOOMUX_REAL_CODEX",
+        "BOOMUX_CODEX_RUN_SCOPED",
         "BOOMUX_ORIGINAL_PATH",
         "BOOMUX_OPENCODE_SHIM_DIR",
         "BOOMUX_OPENCODE_TUI_CONFIG",
@@ -13625,6 +13768,40 @@ mod tests {
     }
 
     #[test]
+    fn parses_hidden_codex_hook_command() {
+        let cli = Cli::try_parse_from(["boomux", "codex", "hook"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Codex {
+                command: CodexCommands::Hook,
+            })
+        ));
+        assert_eq!(cli.command_descriptor().key, "codex.hook");
+        assert_eq!(cli.command_descriptor().output, OutputMode::HumanOnly);
+    }
+
+    #[test]
+    fn parses_hidden_codex_launch_command_without_interpreting_arguments() {
+        let cli = Cli::try_parse_from([
+            "boomux",
+            "codex",
+            "launch",
+            "--",
+            "resume",
+            "thread; literal",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Codex {
+                command: CodexCommands::Launch { ref arguments },
+            }) if arguments.as_slice()
+                == [OsString::from("resume"), OsString::from("thread; literal")].as_slice()
+        ));
+        assert_eq!(cli.command_descriptor().key, "codex.launch");
+    }
+
+    #[test]
     fn event_snapshot_json_includes_stable_agent_data() {
         let mut project = workspace("w1", "project", vec![shell("s1", "w1", "shell")]);
         project.agents.push(agent("a1", "w1", "s1"));
@@ -14121,6 +14298,21 @@ mod tests {
     }
 
     #[test]
+    fn workspace_view_hints_exact_codex_foreground_process_before_first_prompt() {
+        let mut hinted = shell("s1", "w1", "terminal");
+        hinted.foreground_process = Some("codex".into());
+        let workspace = workspace("w1", "project", vec![hinted]);
+
+        let views = dashboard_views(&[workspace], &mut git::Cache::default());
+
+        let tui::WorkspaceItemView::AgentShell(item) = &views[0].items[0] else {
+            panic!("expected hinted agent-shell item");
+        };
+        assert_eq!(item.shell.name, "terminal");
+        assert!(item.agent.is_none());
+    }
+
+    #[test]
     fn workspace_view_does_not_hint_an_inactive_pi_session() {
         let mut hinted = shell("s1", "w1", "terminal");
         hinted.foreground_process = Some("pi".into());
@@ -14459,6 +14651,10 @@ mod tests {
         session.integration = "claude".into();
         let (_, command) = dashboard_session_resume_plan(&session).unwrap();
         assert_eq!(command, ["claude", "--resume", "ses_exact"]);
+
+        session.integration = "codex".into();
+        let (_, command) = dashboard_session_resume_plan(&session).unwrap();
+        assert_eq!(command, ["codex", "resume", "ses_exact"]);
 
         session.state_is_current = true;
         assert!(
@@ -14975,7 +15171,8 @@ mod tests {
             "NAME      PACKAGE                          VALIDATED VERSION\n\
              opencode  opencode-ai                      1.18.18\n\
              pi        @earendil-works/pi-coding-agent  0.84.1\n\
-             claude    @anthropic-ai/claude-code        2.1.236\n"
+             claude    @anthropic-ai/claude-code        2.1.236\n\
+             codex     @openai/codex                    0.147.0\n"
         );
 
         let status = integration_management::IntegrationStatus {

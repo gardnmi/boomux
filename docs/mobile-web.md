@@ -163,6 +163,9 @@ the intended authentication boundary.
   Agent whose exact Agent/ShellRun has a protocol-43 Remote Control binding
   observed directly by a hook. Its opaque bridge ID is percent-encoded into
   `https://claude.ai/code/<bridge-id>`. No transcript content is read or proxied.
+- Codex Agents have no native handoff. Codex does not document an authoritative
+  thread-specific Remote URL, and `codex://threads/<thread-id>` is not treated as
+  a phone-accessible Remote destination.
 - Native links are not produced for projected remote Agents because their
   external Session identity and working directory intentionally remain on the
   owner Node. Remote Agents remain unlinked to this Node's runtime.
@@ -206,7 +209,8 @@ reverse proxy so this boundary remains visible.
 ## MVP Endpoints
 
 - `GET /api/snapshot` returns the current Node-qualified Agent cards, counts, and
-  optional exact native OpenCode or Claude handoffs.
+  optional exact native OpenCode or Claude handoffs. Codex cards are deliberately
+  unlinked.
 - `POST /api/attention/dismiss` requires JSON containing the exact local
   `node_id`, `agent_id`, and `observation_revision`. It clears a matching
   ephemeral marker or acknowledges matching durable attention.

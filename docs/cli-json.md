@@ -241,12 +241,12 @@ The following commands support `--json`:
 - `boomux execution open`
 - `boomux execution cancel`
 - `boomux integration list`
-- `boomux integration status [opencode|pi|claude]`
-- `boomux integration install <opencode|pi|claude>`
+- `boomux integration status [opencode|pi|claude|codex]`
+- `boomux integration install <opencode|pi|claude|codex>`
 - `boomux integration install --all`
-- `boomux integration uninstall <opencode|pi|claude>`
+- `boomux integration uninstall <opencode|pi|claude|codex>`
 - `boomux integration uninstall --all`
-- `boomux integration verify <opencode|pi|claude>`
+- `boomux integration verify <opencode|pi|claude|codex>`
 - `boomux opencode claim ensure`
 - `boomux opencode claim release`
 - `boomux opencode claim report`
@@ -260,7 +260,8 @@ integration install and uninstall support the contract. Other mutation commands
 retain human output. Passing `--json` to an unsupported command fails with
 `invalid_argument` before performing the operation.
 
-`boomux integration setup <opencode|pi|claude>` is intentionally human-oriented
+`boomux integration setup <opencode|pi|claude|codex>` is intentionally
+human-oriented
 and does not support `--json`. It composes status inspection, an exact install
 preview, confirmation, installation when needed, and restart/verification
 guidance. `--yes` skips confirmation for automation; replacing modified content
@@ -369,7 +370,9 @@ Command payloads are:
   instead contains `current_state`, the planned `action`, `path`, and
   `restart_required`. Each target is changed atomically; `--all` is not a
   transaction across hosts, but every target is preflighted before the first
-  write.
+  write. Codex merges only exact Boomux handlers into
+  `${CODEX_HOME:-$HOME/.codex}/hooks.json`, preserving unrelated fields and
+  handlers; modified Boomux handlers require `--force`.
 - `integration.uninstall`: an `integrations` array containing `removed` or
   `not_installed` results, target paths, and whether a host restart is required.
   Every target is preflighted before the first removal.
@@ -415,8 +418,9 @@ generated name is currently in use, suggestion fails with `already_exists`.
 
 ## Integration Data
 
-Integration arrays are ordered `opencode`, then `pi`, then `claude`. List entries
-contain `name`, `display_name`, `package`, and `validated_version`.
+Integration arrays are ordered `opencode`, then `pi`, then `claude`, then
+`codex`. List entries contain `name`, `display_name`, `package`, and
+`validated_version`.
 
 Protocol 22 advertises `protocol_22`, `agent_schedule_management`, and
 `durable_agent_schedules`. Protocol 23 adds `protocol_23`,
@@ -748,8 +752,8 @@ Session summaries contain `id`, `workspace_id`, `workspace_name`, `description`,
 `integration`, `external_session_id`, `state`, `state_is_current`,
 `started_at_ms`, `last_at_ms`, and `occurrence_count`. Registered-session
 `description` is the latest stored Boomux Agent registration name. Catalog-only
-OpenCode sessions use the sanitized host title, state `unknown`, and zero
-occurrences. Missing optional values are JSON `null`.
+OpenCode or Codex sessions use the sanitized host title, state `unknown`, and
+zero occurrences. Missing optional values are JSON `null`.
 
 Inspect includes all summary fields, session-level `source_cwd`, and ordered
 `occurrences`. Each occurrence
@@ -764,8 +768,8 @@ use the same spellings documented for Agent observations.
 
 Projection groups Agent instances only when workspace, integration, and external
 session ID match. An Agent without an external session ID forms its own session.
-Bounded OpenCode catalogs add root sessions to workspaces that reference the
-same normalized directory. A matching durable Agent merges into the same stable
+Bounded OpenCode and Codex catalogs add root sessions to workspaces that
+reference the same normalized directory. A matching durable Agent merges into the same stable
 ID and supplies authoritative lifecycle state and occurrences.
 Current state is selected from occurrences that are incomplete, non-inactive,
 and bound to the current run of a running retained shell; otherwise state is the

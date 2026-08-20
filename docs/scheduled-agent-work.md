@@ -136,6 +136,12 @@ errors. Setup and inspection must disclose the selected adapter's transport.
 Boomux never places prompt text in the stable internal runner argv or an
 environment variable, and it does not claim to redact host-owned content.
 
+Codex receives the exact prompt on stdin. Fresh work executes `codex exec -`;
+continuation executes `codex exec resume <thread-id> -`. Both are routed through
+the same internal launcher as managed Codex chat so hooks are enabled and bound
+to the exact schedule-owned ShellRun. The external thread ID is an argv element,
+never shell-interpolated or selected by recency.
+
 Every manual or timed Scheduled Execution uses the daemon's startup environment
 as ephemeral process input. It is validated for child startup but never
 persisted, projected, copied into a schedule revision, or replaced by the
@@ -454,7 +460,7 @@ blocked work attaches to its exact run, while completed work resumes only its
 exact canonical Agent Session; neither path selects a newest or nearby identity.
 Durable Agent attention remains independent. Canonical session identity requires
 the exact linked Agent occurrence. Boomux does not read or
-project host transcript and tool content; OpenCode, Pi, or Claude Code remains
+project host transcript and tool content; OpenCode, Pi, Claude Code, or Codex remains
 the interface for that content.
 
 ## User Control And Permissions

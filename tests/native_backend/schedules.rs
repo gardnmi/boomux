@@ -735,15 +735,27 @@ fn assert_stdin_dispatch_preserves_exact_argv_stdin_eof_and_continuation_identit
 ) {
     let mut daemon = TestDaemon::start_with(|command, runtime_dir| {
         let bin = runtime_dir.join("bin");
+        let codex_home = runtime_dir.join("codex-home");
         fs::create_dir(&bin).unwrap();
+        fs::create_dir(&codex_home).unwrap();
+        fs::write(
+            codex_home.join("hooks.json"),
+            include_str!("../../integrations/codex/hooks.json"),
+        )
+        .unwrap();
         let host = bin.join(integration);
         fs::write(
             &host,
-            "#!/bin/sh\nprintf '%s\\0' \"$@\" > \"$BOOMUX_DISPATCH_ARGV_DIR/$BOOMUX_DISPATCH_CASE\"\ncat > \"$BOOMUX_DISPATCH_STDIN_DIR/$BOOMUX_DISPATCH_CASE\"\nprintf '%s' \"${BOOMUX_SCHEDULE_RUNNER_TOKEN-unset}\" > \"$BOOMUX_DISPATCH_TOKEN_DIR/$BOOMUX_DISPATCH_CASE\"\n",
+            "#!/bin/sh\nprintf '%s\\0' \"$@\" > \"$BOOMUX_DISPATCH_ARGV_DIR/$BOOMUX_DISPATCH_CASE\"\ncat > \"$BOOMUX_DISPATCH_STDIN_DIR/$BOOMUX_DISPATCH_CASE\"\nprintf '%s' \"${BOOMUX_SCHEDULE_RUNNER_TOKEN-unset}\" > \"$BOOMUX_DISPATCH_TOKEN_DIR/$BOOMUX_DISPATCH_CASE\"\nprintf '%s' \"${BOOMUX_CODEX_RUN_SCOPED-unset}\" > \"$BOOMUX_DISPATCH_CODEX_MARKER_DIR/$BOOMUX_DISPATCH_CASE\"\n",
         )
         .unwrap();
         fs::set_permissions(&host, fs::Permissions::from_mode(0o755)).unwrap();
-        for directory in ["dispatch-argv", "dispatch-stdin", "dispatch-token"] {
+        for directory in [
+            "dispatch-argv",
+            "dispatch-stdin",
+            "dispatch-token",
+            "dispatch-codex-marker",
+        ] {
             fs::create_dir(runtime_dir.join(directory)).unwrap();
         }
         let mut paths = vec![bin];
@@ -764,6 +776,11 @@ fn assert_stdin_dispatch_preserves_exact_argv_stdin_eof_and_continuation_identit
                 "BOOMUX_DISPATCH_TOKEN_DIR",
                 runtime_dir.join("dispatch-token"),
             )
+            .env(
+                "BOOMUX_DISPATCH_CODEX_MARKER_DIR",
+                runtime_dir.join("dispatch-codex-marker"),
+            )
+            .env("CODEX_HOME", codex_home)
             .env("BOOMUX_DISPATCH_CASE", "fresh");
     });
     let workspace = daemon
@@ -802,6 +819,10 @@ fn assert_stdin_dispatch_preserves_exact_argv_stdin_eof_and_continuation_identit
         fs::read_to_string(daemon.runtime_dir.join("dispatch-token/fresh")).unwrap(),
         "unset"
     );
+    assert_eq!(
+        fs::read_to_string(daemon.runtime_dir.join("dispatch-codex-marker/fresh")).unwrap(),
+        if integration == "codex" { "1" } else { "unset" }
+    );
 
     let restart = daemon
         .command()
@@ -825,6 +846,11 @@ fn assert_stdin_dispatch_preserves_exact_argv_stdin_eof_and_continuation_identit
             "BOOMUX_DISPATCH_TOKEN_DIR",
             daemon.runtime_dir.join("dispatch-token"),
         )
+        .env(
+            "BOOMUX_DISPATCH_CODEX_MARKER_DIR",
+            daemon.runtime_dir.join("dispatch-codex-marker"),
+        )
+        .env("CODEX_HOME", daemon.runtime_dir.join("codex-home"))
         .env("BOOMUX_DISPATCH_CASE", "continue")
         .output()
         .unwrap();
@@ -868,6 +894,10 @@ fn assert_stdin_dispatch_preserves_exact_argv_stdin_eof_and_continuation_identit
         fs::read_to_string(daemon.runtime_dir.join("dispatch-token/continue")).unwrap(),
         "unset"
     );
+    assert_eq!(
+        fs::read_to_string(daemon.runtime_dir.join("dispatch-codex-marker/continue")).unwrap(),
+        if integration == "codex" { "1" } else { "unset" }
+    );
     daemon.stop_with_cli();
 }
 
@@ -888,6 +918,16 @@ fn claude_dispatch_preserves_exact_argv_stdin_eof_and_continuation_identity() {
         "exact-id",
         b"--print\0",
         b"--print\0--resume\0exact-id\0",
+    );
+}
+
+#[test]
+fn codex_dispatch_preserves_exact_exec_argv_stdin_eof_and_thread_identity() {
+    assert_stdin_dispatch_preserves_exact_argv_stdin_eof_and_continuation_identity(
+        "codex",
+        "exact-codex-thread",
+        b"--enable\0hooks\0exec\0-\0",
+        b"--enable\0hooks\0exec\0resume\0exact-codex-thread\0-\0",
     );
 }
 

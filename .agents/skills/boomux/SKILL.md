@@ -1,6 +1,6 @@
 ---
 name: boomux
-description: Inspect and manage Boomux Nodes, coordinated persistent terminal Workspaces, launchers, shells, run-scoped agent instances, attention, projected sessions, recurring Agent schedules, local configuration, notifications, the OpenCode Shared Harness Runtime, process supervision, and integrations. Use when asked to discover Nodes, shells, agents, sessions, or schedules, read terminal output, inspect, validate, or edit local Boomux configuration, manage explicitly authorized recurring Agent prompts, supervise an explicitly identified external session, report agent lifecycle state, configure or test notifications, install or remove the OpenCode or Pi integration, create or open Workspaces and shells, inspect status, rename or close targets, or manage the local Boomux daemon.
+description: Inspect and manage Boomux Nodes, coordinated persistent terminal Workspaces, launchers, shells, run-scoped agent instances, attention, projected sessions, recurring Agent schedules, local configuration, notifications, the OpenCode Shared Harness Runtime, process supervision, and integrations. Use when asked to discover Nodes, shells, agents, sessions, or schedules, read terminal output, inspect, validate, or edit local Boomux configuration, manage explicitly authorized recurring Agent prompts, supervise an explicitly identified external session, report agent lifecycle state, configure or test notifications, install or remove an OpenCode, Pi, Claude Code, or Codex integration, create or open Workspaces and shells, inspect status, rename or close targets, or manage the local Boomux daemon.
 compatibility: Requires boomux on PATH. Federated resource identity is the pair of owning Node ID and Node-local inner ID. Some name operations require Workspace context or an explicit --workspace/--node; agent mutation and supervision require exact shell-run context, and continuation schedules or supervision require caller-supplied exact canonical session identity.
 metadata:
   author: boomux
@@ -119,6 +119,7 @@ Inspect bundled lifecycle integrations with:
 boomux integration list --json
 boomux integration status --json
 boomux integration status opencode --json
+boomux integration status codex --json
 ```
 
 Mutation commands include:
@@ -130,6 +131,8 @@ boomux integration uninstall opencode --json
 boomux integration uninstall --all --json
 boomux integration setup opencode
 boomux integration verify opencode --json
+boomux integration setup codex
+boomux integration verify codex --json
 ```
 
 Host, asset, and runtime status are independent. `unvalidated` compatibility is
@@ -139,7 +142,8 @@ are untrusted.
 
 Never install, replace, or remove integration files unless the user explicitly
 asks. With that authorization, use `boomux integration install opencode --json`,
-`boomux integration install pi --json`, or `boomux integration install --all
+`boomux integration install pi --json`, `boomux integration install codex
+--json`, or `boomux integration install --all
 --json`; add `--force` only when the user also authorizes replacing a modified
 asset. Use `--dry-run` to inspect exact paths and actions. Previewing replacement
 of modified content requires `--force --dry-run`, which does not write files.
@@ -159,7 +163,8 @@ after an explicit yes response; noninteractive replacement requires both
 `--yes` and `--force`.
 
 After the user restarts a host, verify authoritative reporting with `boomux
-integration verify opencode --json` or `boomux integration verify pi --json`.
+integration verify opencode --json`, `boomux integration verify pi --json`, or
+`boomux integration verify codex --json`.
 Verification requires a running foreground host and current-run
 `lifecycle-integration` evidence. If multiple hosts match, pass `--shell
 "<exact-shell-id>"`; shell names are not accepted.
@@ -247,8 +252,8 @@ blocked = "message-new-instant"
 completed = "complete"
 ```
 
-Cold recovery resumes only a unique OpenCode or Pi external session reported by
-the lifecycle integration. An eligible recovered OpenCode Session attaches to
+Cold recovery resumes only a unique OpenCode, Pi, Claude, or Codex external
+session reported by the lifecycle integration. An eligible recovered OpenCode Session attaches to
 the Shared Harness Runtime and establishes a fresh claim for its replacement
 ShellRun; if shared launch preparation is unavailable, exact Session recovery
 continues standalone without a web link. Persisted terminal history is disabled by default
@@ -271,8 +276,8 @@ the invoking client's resolved notification settings, even when the old daemon
 inherited a different config environment.
 
 Session discovery is not limited to daemon metadata. It may execute the
-PATH-resolved OpenCode CLI and inspect host catalogs in workspace-derived
-directories, exposing sanitized but potentially private session titles.
+PATH-resolved OpenCode or Codex CLI and inspect host catalogs in
+workspace-derived directories, exposing sanitized but potentially private session titles.
 Require authorization appropriate to the host-history metadata before listing
 or inspecting sessions.
 
@@ -292,8 +297,8 @@ Use the exact opaque session ID returned by `session list`. Never guess or
 resolve it from an external session ID, description, shell ID, or Agent ID.
 Session state is marked current only when an occurrence is active on the current
 run of a running retained shell; otherwise it is last-known. Catalog-only
-OpenCode history has state `unknown`, no fabricated occurrence, and a sanitized
-host title. Registered-session descriptions remain durable Agent names.
+OpenCode or Codex history has state `unknown`, no fabricated occurrence, and a
+sanitized host title. Registered-session descriptions remain durable Agent names.
 Protocol-13 sessions retain a `source_cwd` after shell removal so an exact
 canonical session can be resumed in its original context. Resume launches a
 native host process and requires authorization. A remote Session ID is exact
@@ -586,8 +591,8 @@ workspace rows and process counts.
 In Schedules, Left/Right changes between the schedule and history panes, `j`/`k`
 navigates the focused pane, and `[`/`]` also selects retained executions by exact
 execution ID. `Enter` attaches an exact Starting or Active run. For a completed
-execution with a canonical session, it resumes that exact OpenCode or Pi session
-in an unmanaged native terminal without adding a workspace row. `u` runs now with a fresh dispatch key, `p`
+execution with a canonical session, it resumes that exact OpenCode, Pi, Claude,
+or Codex session in an unmanaged native terminal without adding a workspace row. `u` runs now with a fresh dispatch key, `p`
 pauses or resumes future timed work, `c` then
 `y` confirms cancellation of the selected exact active execution. Selecting a
 schedule automatically loads bounded exact-schedule history. `x` then `y`
@@ -693,7 +698,7 @@ establish membership.
 Schedules and persisted prompts, retained terminal state, and Agent/attention
 records after each owner confirms removal. A coordinated close can remain
 `closing`; unresolved membership is retained until `workspace retry` or repeated
-close succeeds. Canonical OpenCode or Pi host data is not deleted. A Workspace
+close succeeds. Canonical OpenCode, Pi, or Codex host data is not deleted. A Workspace
 cannot close itself from one of its own Shells. Confirm the exact target and full
 multi-Node removal scope first.
 
@@ -886,6 +891,29 @@ final assistant error reports `blocked` and a successful settle reports `idle`.
 Session shutdown reports `inactive` because Pi sessions are resumable and makes
 one bounded retry. Inactive records remain durable but do not occupy dashboard
 Agent rows. Reporting is serialized and fail-open.
+
+## Codex Integration
+
+Use `boomux integration setup codex` for status, preview, consent, restart, and
+verification guidance. The target is `${CODEX_HOME:-$HOME/.codex}/hooks.json`.
+Installation and uninstall merge only exact `boomux codex hook` handlers and
+preserve unrelated JSON and hooks. Modified Boomux handlers require explicitly
+authorized `--force`; never replace the whole file. Restart Codex after a change,
+then review and trust the Boomux hook with `/hooks`.
+
+In a managed ShellRun, bare Codex chat, `codex resume`, and `codex exec` are
+routed through an internal launcher that enables hooks only while the installed
+handlers are current. The hook's `session_id` is the canonical thread identity.
+Prompt, tool, compaction, and subagent activity report `working`; permission
+waits report `blocked`; Stop reports `idle`; SessionEnd reports `inactive`; no
+Codex hook reports `done`. Other subcommands and unscoped processes remain
+untracked rather than guessing ownership.
+
+Codex catalog discovery may execute the experimental PATH-resolved `codex
+app-server --stdio` interface in workspace-derived directories. It is bounded,
+sanitizes names or previews, excludes ephemeral threads, and fails open. Exact
+resume uses `codex resume <thread-id>`. Boomux exposes no Codex Remote link because
+there is no documented exact thread-specific Remote URL.
 
 ## Environment And Integration
 

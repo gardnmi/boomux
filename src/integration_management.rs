@@ -3,7 +3,7 @@ use std::error::Error;
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -11,6 +11,7 @@ use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 use serde::{Serialize, Serializer};
+use serde_json::{Map, Value};
 use uuid::Uuid;
 
 use boomux::integrations::{InstallTargetKind, InstallationCapability, IntegrationDescriptor};
@@ -18,6 +19,21 @@ use boomux::protocol::{AgentAuthority, ShellStatus, Snapshot};
 
 const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_VERSION_OUTPUT_BYTES: u64 = 4096;
+const MAX_CODEX_HOOKS_BYTES: u64 = 1024 * 1024;
+const CODEX_HOOK_COMMAND: &str = "boomux codex hook";
+const CODEX_HOOK_EVENTS: &[&str] = &[
+    "SessionStart",
+    "SessionEnd",
+    "UserPromptSubmit",
+    "PreToolUse",
+    "PermissionRequest",
+    "PostToolUse",
+    "PreCompact",
+    "PostCompact",
+    "SubagentStart",
+    "SubagentStop",
+    "Stop",
+];
 
 #[cfg(test)]
 pub(crate) const OPENCODE_ASSET: &str = boomux::integrations::OPENCODE
@@ -37,6 +53,12 @@ pub(crate) const CLAUDE_ASSET: &str = boomux::integrations::CLAUDE
     .as_ref()
     .expect("Claude installation capability")
     .content;
+#[cfg(test)]
+pub(crate) const CODEX_ASSET: &str = boomux::integrations::CODEX
+    .installation
+    .as_ref()
+    .expect("Codex installation capability")
+    .content;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct IntegrationId(&'static IntegrationDescriptor);
@@ -44,10 +66,14 @@ pub(crate) struct IntegrationId(&'static IntegrationDescriptor);
 impl IntegrationId {
     pub(crate) const OPENCODE: Self = Self(&boomux::integrations::OPENCODE);
     pub(crate) const PI: Self = Self(&boomux::integrations::PI);
+    pub(crate) const CODEX: Self = Self(&boomux::integrations::CODEX);
     #[allow(non_upper_case_globals)]
     pub(crate) const Opencode: Self = Self::OPENCODE;
     #[allow(non_upper_case_globals)]
     pub(crate) const Pi: Self = Self::PI;
+    #[cfg(test)]
+    #[allow(non_upper_case_globals)]
+    pub(crate) const Codex: Self = Self::CODEX;
     #[cfg(test)]
     #[allow(non_upper_case_globals)]
     pub(crate) const Claude: Self = Self(&boomux::integrations::CLAUDE);
@@ -94,6 +120,7 @@ pub(crate) struct Environment {
     xdg_config_home: Option<OsString>,
     pi_coding_agent_dir: Option<OsString>,
     claude_config_dir: Option<OsString>,
+    codex_home: Option<OsString>,
     path: Option<OsString>,
 }
 
@@ -104,6 +131,7 @@ impl Environment {
             xdg_config_home: env::var_os("XDG_CONFIG_HOME"),
             pi_coding_agent_dir: env::var_os("PI_CODING_AGENT_DIR"),
             claude_config_dir: env::var_os("CLAUDE_CONFIG_DIR"),
+            codex_home: env::var_os("CODEX_HOME"),
             path: env::var_os("PATH"),
         }
     }
@@ -121,6 +149,7 @@ impl Environment {
             xdg_config_home,
             pi_coding_agent_dir,
             claude_config_dir,
+            codex_home: None,
             path,
         }
     }
@@ -428,7 +457,13 @@ fn inspect_asset(
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "install path has no parent"))
         .and_then(validate_existing_directory_chain)
-        .and_then(|()| inspect_existing_asset(&path, installation.content));
+        .and_then(|()| {
+            if id == IntegrationId::CODEX {
+                inspect_codex_hooks(&path)
+            } else {
+                inspect_existing_asset(&path, installation.content)
+            }
+        });
     match result {
         Ok(ExistingAsset::Missing) => AssetStatus {
             state: AssetState::Missing,
@@ -749,7 +784,11 @@ pub(crate) fn install(
     let installation = id.installation();
     let target = install_target(id, environment)?;
     let directory = ensure_safe_directory(&target.directory)?;
-    let result = install_asset_at(&directory, &target.path, installation.content, force)?;
+    let result = if id == IntegrationId::CODEX {
+        install_codex_hooks(&directory, &target.path, force)?
+    } else {
+        install_asset_at(&directory, &target.path, installation.content, force)?
+    };
     Ok(InstallResult {
         integration: id,
         name: descriptor.key,
@@ -768,7 +807,11 @@ pub(crate) fn plan_install(
     let installation = id.installation();
     let target = install_target(id, environment)?;
     validate_existing_directory_chain(&target.directory)?;
-    let existing = inspect_existing_asset(&target.path, installation.content)?;
+    let existing = if id == IntegrationId::CODEX {
+        inspect_codex_hooks(&target.path)?
+    } else {
+        inspect_existing_asset(&target.path, installation.content)?
+    };
     let (current_state, action) = match existing {
         ExistingAsset::Missing => (AssetState::Missing, InstallAction::Install),
         ExistingAsset::Current => (AssetState::Current, InstallAction::Unchanged),
@@ -793,9 +836,12 @@ pub(crate) fn preflight_uninstall(
     let installation = id.installation();
     let target = install_target(id, environment)?;
     validate_existing_directory_chain(&target.directory)?;
-    if inspect_existing_asset(&target.path, installation.content)? == ExistingAsset::Modified
-        && !force
-    {
+    let existing = if id == IntegrationId::CODEX {
+        inspect_codex_hooks(&target.path)?
+    } else {
+        inspect_existing_asset(&target.path, installation.content)?
+    };
+    if existing == ExistingAsset::Modified && !force {
         return Err(modified_uninstall_error(&target.path).into());
     }
     Ok(())
@@ -810,11 +856,19 @@ pub(crate) fn uninstall(
     let installation = id.installation();
     let target = install_target(id, environment)?;
     validate_existing_directory_chain(&target.directory)?;
-    let existing = inspect_existing_asset(&target.path, installation.content)?;
+    let existing = if id == IntegrationId::CODEX {
+        inspect_codex_hooks(&target.path)?
+    } else {
+        inspect_existing_asset(&target.path, installation.content)?
+    };
     let result = match existing {
         ExistingAsset::Missing => UninstallOutcome::NotInstalled,
         ExistingAsset::Modified if !force => {
             return Err(modified_uninstall_error(&target.path).into());
+        }
+        ExistingAsset::Current | ExistingAsset::Modified if id == IntegrationId::CODEX => {
+            uninstall_codex_hooks(&target.directory, &target.path)?;
+            UninstallOutcome::Removed
         }
         ExistingAsset::Current | ExistingAsset::Modified => {
             fs::remove_file(&target.path)?;
@@ -841,7 +895,11 @@ pub(crate) fn install_at(
     let installation = id.installation();
     let target = target_at(id, config_root);
     let directory = ensure_safe_directory(&target.directory)?;
-    let result = install_asset_at(&directory, &target.path, installation.content, force)?;
+    let result = if id == IntegrationId::CODEX {
+        install_codex_hooks(&directory, &target.path, force)?
+    } else {
+        install_asset_at(&directory, &target.path, installation.content, force)?
+    };
     Ok(InstallResult {
         integration: id,
         name: descriptor.key,
@@ -883,6 +941,9 @@ fn config_root(id: IntegrationId, environment: &Environment) -> Result<PathBuf, 
             environment.claude_config_dir.clone(),
             environment.home.clone(),
         ),
+        InstallTargetKind::Codex => {
+            codex_config_root(environment.codex_home.clone(), environment.home.clone())
+        }
     }
 }
 
@@ -900,6 +961,10 @@ fn target_at(id: IntegrationId, config_root: &Path) -> InstallTarget {
             directory: config_root.join("skills/boomux/.claude-plugin"),
             path: config_root.join("skills/boomux/.claude-plugin/plugin.json"),
         },
+        InstallTargetKind::Codex => InstallTarget {
+            directory: config_root.to_owned(),
+            path: config_root.join("hooks.json"),
+        },
     }
 }
 
@@ -909,6 +974,7 @@ const fn config_root_name(id: IntegrationId) -> &'static str {
         InstallTargetKind::OpenCode => "XDG configuration root",
         InstallTargetKind::Pi => "Pi configuration root",
         InstallTargetKind::Claude => "Claude configuration root",
+        InstallTargetKind::Codex => "Codex configuration root",
     }
 }
 
@@ -973,6 +1039,24 @@ pub(crate) fn claude_config_root(
         .join(".claude"),
     };
     require_absolute_root(&root, "Claude configuration root")?;
+    Ok(root)
+}
+
+pub(crate) fn codex_config_root(
+    codex_home: Option<OsString>,
+    home: Option<OsString>,
+) -> Result<PathBuf, Box<dyn Error>> {
+    let root = match codex_home.filter(|value| !value.is_empty()) {
+        Some(root) => PathBuf::from(root),
+        None => PathBuf::from(home.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "HOME must be set to install the Boomux Codex hooks",
+            )
+        })?)
+        .join(".codex"),
+    };
+    require_absolute_root(&root, "Codex configuration root")?;
     Ok(root)
 }
 
@@ -1042,6 +1126,327 @@ enum ExistingAsset {
     Missing,
     Current,
     Modified,
+}
+
+fn inspect_codex_hooks(path: &Path) -> io::Result<ExistingAsset> {
+    let Some((document, _, _)) = read_codex_hooks(path)? else {
+        return Ok(ExistingAsset::Missing);
+    };
+    codex_hooks_state(&document)
+}
+
+fn read_codex_hooks(path: &Path) -> io::Result<Option<(Value, Vec<u8>, u32)>> {
+    let mut file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("install path is not a regular file: {}", path.display()),
+        ));
+    }
+    if metadata.len() > MAX_CODEX_HOOKS_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Codex hooks file exceeds {MAX_CODEX_HOOKS_BYTES} bytes: {}",
+                path.display()
+            ),
+        ));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    Read::by_ref(&mut file)
+        .take(MAX_CODEX_HOOKS_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_CODEX_HOOKS_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Codex hooks file exceeded its size limit while reading",
+        ));
+    }
+    let document = serde_json::from_slice::<Value>(&bytes).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid Codex hooks JSON: {error}"),
+        )
+    })?;
+    if !document.is_object() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Codex hooks file must contain a JSON object",
+        ));
+    }
+    Ok(Some((
+        document,
+        bytes,
+        metadata.permissions().mode() & 0o777,
+    )))
+}
+
+fn codex_hooks_state(document: &Value) -> io::Result<ExistingAsset> {
+    let Some(hooks) = document.get("hooks") else {
+        return Ok(ExistingAsset::Missing);
+    };
+    let hooks = hooks.as_object().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Codex hooks field must contain a JSON object",
+        )
+    })?;
+    let mut found = false;
+    let mut invalid = false;
+    let mut valid_events = std::collections::HashSet::new();
+    for (event, groups) in hooks {
+        let Some(groups) = groups.as_array() else {
+            if CODEX_HOOK_EVENTS.contains(&event.as_str()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Codex {event} hooks must contain an array"),
+                ));
+            }
+            continue;
+        };
+        for group in groups {
+            let Some(handlers) = group.get("hooks").and_then(Value::as_array) else {
+                continue;
+            };
+            for handler in handlers {
+                if handler.get("command").and_then(Value::as_str) != Some(CODEX_HOOK_COMMAND) {
+                    continue;
+                }
+                found = true;
+                if CODEX_HOOK_EVENTS.contains(&event.as_str())
+                    && group.get("matcher").is_none()
+                    && handler == &codex_hook_handler(event)
+                    && valid_events.insert(event.as_str())
+                {
+                    continue;
+                }
+                invalid = true;
+            }
+        }
+    }
+    Ok(if !found {
+        ExistingAsset::Missing
+    } else if !invalid && valid_events.len() == CODEX_HOOK_EVENTS.len() {
+        ExistingAsset::Current
+    } else {
+        ExistingAsset::Modified
+    })
+}
+
+fn codex_hook_handler(event: &str) -> Value {
+    serde_json::json!({
+        "type": "command",
+        "command": CODEX_HOOK_COMMAND,
+        "timeout": if event == "SessionEnd" { 3 } else { 5 },
+    })
+}
+
+fn install_codex_hooks(
+    directory: &Path,
+    path: &Path,
+    force: bool,
+) -> Result<InstallOutcome, Box<dyn Error>> {
+    let existing = read_codex_hooks(path)?;
+    let state = existing
+        .as_ref()
+        .map(|(document, _, _)| codex_hooks_state(document))
+        .transpose()?
+        .unwrap_or(ExistingAsset::Missing);
+    match state {
+        ExistingAsset::Current => return Ok(InstallOutcome::Unchanged),
+        ExistingAsset::Modified if !force => return Err(existing_asset_error(path).into()),
+        ExistingAsset::Missing | ExistingAsset::Modified => {}
+    }
+    let outcome = match state {
+        ExistingAsset::Missing => InstallOutcome::Installed,
+        ExistingAsset::Modified => InstallOutcome::Replaced,
+        ExistingAsset::Current => unreachable!("current Codex hooks returned early"),
+    };
+    let (mut document, baseline, mode) = existing.unwrap_or_else(|| {
+        (
+            serde_json::from_str(CODEX_ASSET_FALLBACK).expect("bundled Codex hooks are valid"),
+            Vec::new(),
+            0o600,
+        )
+    });
+    replace_codex_handlers(&mut document)?;
+    let content = codex_hooks_content(&document)?;
+    write_merged_asset_atomically(
+        directory,
+        path,
+        &content,
+        (!baseline.is_empty()).then_some(baseline.as_slice()),
+        mode,
+    )?;
+    Ok(outcome)
+}
+
+const CODEX_ASSET_FALLBACK: &str = include_str!("../integrations/codex/hooks.json");
+
+fn replace_codex_handlers(document: &mut Value) -> io::Result<()> {
+    let root = document
+        .as_object_mut()
+        .expect("validated Codex hooks object");
+    let hooks = root
+        .entry("hooks")
+        .or_insert_with(|| Value::Object(Map::new()))
+        .as_object_mut()
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Codex hooks field must contain a JSON object",
+            )
+        })?;
+    for groups in hooks.values_mut() {
+        let Some(groups) = groups.as_array_mut() else {
+            continue;
+        };
+        for group in groups.iter_mut() {
+            if let Some(handlers) = group.get_mut("hooks").and_then(Value::as_array_mut) {
+                handlers.retain(|handler| {
+                    handler.get("command").and_then(Value::as_str) != Some(CODEX_HOOK_COMMAND)
+                });
+            }
+        }
+        groups.retain(|group| {
+            group
+                .get("hooks")
+                .and_then(Value::as_array)
+                .is_none_or(|handlers| !handlers.is_empty())
+        });
+    }
+    for event in CODEX_HOOK_EVENTS {
+        let groups = hooks
+            .entry((*event).to_owned())
+            .or_insert_with(|| Value::Array(Vec::new()))
+            .as_array_mut()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Codex {event} hooks must contain an array"),
+                )
+            })?;
+        groups.push(serde_json::json!({ "hooks": [codex_hook_handler(event)] }));
+    }
+    Ok(())
+}
+
+fn uninstall_codex_hooks(directory: &Path, path: &Path) -> io::Result<()> {
+    let Some((mut document, baseline, mode)) = read_codex_hooks(path)? else {
+        return Ok(());
+    };
+    remove_codex_handlers(&mut document)?;
+    if codex_document_is_boomux_only(&document) {
+        verify_asset_baseline(path, Some(&baseline))?;
+        fs::remove_file(path)?;
+        fs::File::open(directory)?.sync_all()?;
+        return Ok(());
+    }
+    let content = codex_hooks_content(&document)?;
+    write_merged_asset_atomically(directory, path, &content, Some(&baseline), mode)
+}
+
+fn remove_codex_handlers(document: &mut Value) -> io::Result<()> {
+    let Some(hooks) = document.get_mut("hooks") else {
+        return Ok(());
+    };
+    let hooks = hooks.as_object_mut().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Codex hooks field must contain a JSON object",
+        )
+    })?;
+    for groups in hooks.values_mut() {
+        let Some(groups) = groups.as_array_mut() else {
+            continue;
+        };
+        for group in groups.iter_mut() {
+            if let Some(handlers) = group.get_mut("hooks").and_then(Value::as_array_mut) {
+                handlers.retain(|handler| {
+                    handler.get("command").and_then(Value::as_str) != Some(CODEX_HOOK_COMMAND)
+                });
+            }
+        }
+        groups.retain(|group| {
+            group
+                .get("hooks")
+                .and_then(Value::as_array)
+                .is_none_or(|handlers| !handlers.is_empty())
+        });
+    }
+    hooks.retain(|_, groups| groups.as_array().is_none_or(|groups| !groups.is_empty()));
+    Ok(())
+}
+
+fn codex_document_is_boomux_only(document: &Value) -> bool {
+    let Some(root) = document.as_object() else {
+        return false;
+    };
+    root.iter().all(|(key, value)| match key.as_str() {
+        "description" => {
+            value.as_str() == Some("Report Codex lifecycle state to Boomux for managed ShellRuns.")
+        }
+        "hooks" => value.as_object().is_some_and(Map::is_empty),
+        _ => false,
+    })
+}
+
+fn codex_hooks_content(document: &Value) -> io::Result<String> {
+    let mut content = serde_json::to_string_pretty(document)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    content.push('\n');
+    Ok(content)
+}
+
+fn write_merged_asset_atomically(
+    directory: &Path,
+    path: &Path,
+    content: &str,
+    baseline: Option<&[u8]>,
+    mode: u32,
+) -> io::Result<()> {
+    let temporary = directory.join(format!(".boomux-install-{}.tmp", Uuid::new_v4()));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .open(&temporary)?;
+        file.set_permissions(fs::Permissions::from_mode(mode))?;
+        file.write_all(content.as_bytes())?;
+        file.sync_all()?;
+        verify_asset_baseline(path, baseline)?;
+        fs::rename(&temporary, path)?;
+        fs::File::open(directory)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn verify_asset_baseline(path: &Path, baseline: Option<&[u8]>) -> io::Result<()> {
+    let current = read_codex_hooks(path)?.map(|(_, bytes, _)| bytes);
+    if current.as_deref() != baseline {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "{} changed while the integration was being updated",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn regular_file_matches(path: &Path, expected: &str) -> io::Result<Option<bool>> {
@@ -1202,6 +1607,11 @@ mod tests {
             IntegrationId::Claude.installation().validated_version,
             "2.1.236"
         );
+        assert_eq!(IntegrationId::Codex.installation().package, "@openai/codex");
+        assert_eq!(
+            IntegrationId::Codex.installation().validated_version,
+            "0.147.0"
+        );
         assert!(IntegrationId::Claude.spec().titles.is_none());
         assert_eq!(
             IntegrationId::Claude
@@ -1240,6 +1650,15 @@ mod tests {
             Path::new("/home/example/.claude")
         );
         assert!(claude_config_root(Some("relative".into()), None).is_err());
+        assert_eq!(
+            codex_config_root(Some("/codex".into()), Some("/home/example".into())).unwrap(),
+            Path::new("/codex")
+        );
+        assert_eq!(
+            codex_config_root(Some(OsString::new()), Some("/home/example".into())).unwrap(),
+            Path::new("/home/example/.codex")
+        );
+        assert!(codex_config_root(Some("relative".into()), None).is_err());
     }
 
     #[test]
@@ -1306,6 +1725,138 @@ mod tests {
         let removed = uninstall(IntegrationId::Claude, &environment, false).unwrap();
         assert_eq!(removed.result, UninstallOutcome::Removed);
         assert!(!expected.exists());
+    }
+
+    #[test]
+    fn codex_asset_defines_required_non_deciding_hooks() {
+        let document: Value = serde_json::from_str(CODEX_ASSET).unwrap();
+        assert_eq!(
+            codex_hooks_state(&document).unwrap(),
+            ExistingAsset::Current
+        );
+        let hooks = document["hooks"].as_object().unwrap();
+        assert_eq!(hooks.len(), CODEX_HOOK_EVENTS.len());
+        for event in CODEX_HOOK_EVENTS {
+            let handler = &hooks[*event][0]["hooks"][0];
+            assert_eq!(handler["type"], "command");
+            assert_eq!(handler["command"], CODEX_HOOK_COMMAND);
+            assert_eq!(
+                handler["timeout"],
+                if *event == "SessionEnd" { 3 } else { 5 }
+            );
+        }
+    }
+
+    #[test]
+    fn codex_asset_requires_each_hook_event_exactly_once() {
+        let mut document: Value = serde_json::from_str(CODEX_ASSET).unwrap();
+        let duplicate = document["hooks"]["PreToolUse"][0].clone();
+        document["hooks"]["PermissionRequest"] = Value::Array(Vec::new());
+        document["hooks"]["PreToolUse"]
+            .as_array_mut()
+            .unwrap()
+            .push(duplicate);
+
+        assert_eq!(
+            codex_hooks_state(&document).unwrap(),
+            ExistingAsset::Modified
+        );
+    }
+
+    #[test]
+    fn codex_install_and_uninstall_preserve_unrelated_hooks() {
+        let home = TestDirectory::new("codex-merge");
+        let config = home.0.join("codex-home");
+        fs::create_dir(&config).unwrap();
+        let path = config.join("hooks.json");
+        fs::write(
+            &path,
+            r#"{
+  "description": "user hooks",
+  "custom": true,
+  "hooks": {
+    "PreToolUse": [{"matcher":"Bash","hooks":[{"type":"command","command":"user policy","timeout":30}]}]
+  }
+}
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        let mut environment = environment(&home.0);
+        environment.codex_home = Some(config.clone().into_os_string());
+
+        let before = inspect(IntegrationId::Codex, &environment, None);
+        assert_eq!(before.asset.state, AssetState::Missing);
+        let installed = install(IntegrationId::Codex, &environment, false).unwrap();
+        assert_eq!(installed.result, InstallOutcome::Installed);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        let installed_document: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(installed_document["description"], "user hooks");
+        assert_eq!(installed_document["custom"], true);
+        assert_eq!(
+            installed_document["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+            "user policy"
+        );
+        assert_eq!(
+            codex_hooks_state(&installed_document).unwrap(),
+            ExistingAsset::Current
+        );
+        assert_eq!(
+            install(IntegrationId::Codex, &environment, false)
+                .unwrap()
+                .result,
+            InstallOutcome::Unchanged
+        );
+
+        let removed = uninstall(IntegrationId::Codex, &environment, false).unwrap();
+        assert_eq!(removed.result, UninstallOutcome::Removed);
+        let remaining: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(remaining["description"], "user hooks");
+        assert_eq!(remaining["custom"], true);
+        assert_eq!(
+            remaining["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+            "user policy"
+        );
+        assert_eq!(
+            codex_hooks_state(&remaining).unwrap(),
+            ExistingAsset::Missing
+        );
+    }
+
+    #[test]
+    fn codex_force_repairs_only_boomux_handlers_and_standalone_uninstall_removes_file() {
+        let home = TestDirectory::new("codex-repair");
+        let mut environment = environment(&home.0);
+        environment.codex_home = Some(home.0.join("codex-home").into_os_string());
+        let installed = install(IntegrationId::Codex, &environment, false).unwrap();
+        let path = PathBuf::from(&installed.path);
+        let mut document: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        document["hooks"]["Stop"][0]["hooks"][0]["timeout"] = Value::from(99);
+        fs::write(&path, codex_hooks_content(&document).unwrap()).unwrap();
+
+        assert_eq!(
+            inspect(IntegrationId::Codex, &environment, None)
+                .asset
+                .state,
+            AssetState::Modified
+        );
+        assert!(install(IntegrationId::Codex, &environment, false).is_err());
+        assert_eq!(
+            install(IntegrationId::Codex, &environment, true)
+                .unwrap()
+                .result,
+            InstallOutcome::Replaced
+        );
+        assert_eq!(
+            uninstall(IntegrationId::Codex, &environment, false)
+                .unwrap()
+                .result,
+            UninstallOutcome::Removed
+        );
+        assert!(!path.exists());
     }
 
     #[test]

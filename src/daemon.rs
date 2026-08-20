@@ -129,6 +129,9 @@ if [ "${BOOMUX_CLAUDE_REMOTE_CONTROL-0}" = 1 ] && [ "$#" -eq 0 ] && [ -t 0 ] && 
 fi
 exec "$BOOMUX_REAL_CLAUDE" "$@"
 "#;
+const CODEX_SHIM: &[u8] = br#"#!/bin/sh
+exec "$BOOMUX_SHIM_EXECUTABLE" codex launch -- "$@"
+"#;
 const OPENCODE_BASH_RC: &[u8] = br#"if [ -r "${HOME}/.bashrc" ]; then
   . "${HOME}/.bashrc"
 fi
@@ -1052,7 +1055,9 @@ fn sanitize_opencode_shim_environment(environment: &UnixEnvironment) -> UnixEnvi
     const PRIVATE_NAMES: &[&[u8]] = &[
         b"BOOMUX_CLAUDE_REMOTE_CONTROL",
         b"BOOMUX_REAL_CLAUDE",
+        b"BOOMUX_REAL_CODEX",
         b"BOOMUX_REAL_OPENCODE",
+        b"BOOMUX_CODEX_RUN_SCOPED",
         b"BOOMUX_ORIGINAL_PATH",
         b"BOOMUX_OPENCODE_SHIM_DIR",
         b"BOOMUX_OPENCODE_TUI_CONFIG",
@@ -1095,6 +1100,13 @@ fn resolve_opencode_executable(
     resolve_executable(environment, excluded_directory, "opencode")
 }
 
+fn resolve_codex_executable(
+    environment: &UnixEnvironment,
+    excluded_directory: Option<&Path>,
+) -> Option<PathBuf> {
+    resolve_executable(environment, excluded_directory, "codex")
+}
+
 fn resolve_executable(
     environment: &UnixEnvironment,
     excluded_directory: Option<&Path>,
@@ -1122,6 +1134,20 @@ fn opencode_shim_eligible(shell: &Shell, effective_command: &[String]) -> bool {
     matches!(shell.owner, ShellOwner::User)
         && shell.command.is_empty()
         && effective_command.is_empty()
+}
+
+fn codex_launch_eligible(shell: &Shell, effective_command: &[String]) -> bool {
+    matches!(shell.owner, ShellOwner::User)
+        && effective_command.first().is_some_and(|executable| {
+            Path::new(executable)
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                == Some("codex")
+        })
+        && (effective_command.len() == 1
+            || effective_command
+                .get(1)
+                .is_some_and(|argument| matches!(argument.as_str(), "resume" | "exec")))
 }
 
 fn claude_remote_control_command(
@@ -1161,7 +1187,8 @@ fn inject_opencode_shim_environment(
     secure_runtime_dir(&shim_dir)?;
     let real_opencode = resolve_opencode_executable(environment, Some(&shim_dir));
     let real_claude = resolve_executable(environment, Some(&shim_dir), "claude");
-    if real_opencode.is_none() && real_claude.is_none() {
+    let real_codex = resolve_codex_executable(environment, Some(&shim_dir));
+    if real_opencode.is_none() && real_claude.is_none() && real_codex.is_none() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
             "supported Agent executables are unavailable",
@@ -1204,6 +1231,9 @@ fn inject_opencode_shim_environment(
     if real_claude.is_some() {
         atomic_runtime_asset(&shim_dir.join("claude"), CLAUDE_SHIM, 0o700)?;
     }
+    if real_codex.is_some() {
+        atomic_runtime_asset(&shim_dir.join("codex"), CODEX_SHIM, 0o700)?;
+    }
 
     let original_path = environment_value(environment, b"PATH").unwrap_or_default();
     let mut paths = vec![shim_dir.clone()];
@@ -1212,16 +1242,16 @@ fn inject_opencode_shim_environment(
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
     let mut injected = environment.clone();
     set_environment_value(&mut injected, b"PATH", prefixed_path);
+    set_environment_value(
+        &mut injected,
+        b"BOOMUX_SHIM_EXECUTABLE",
+        boomux.into_os_string(),
+    );
     if let Some(real_opencode) = real_opencode {
         set_environment_value(
             &mut injected,
             b"BOOMUX_REAL_OPENCODE",
             real_opencode.into_os_string(),
-        );
-        set_environment_value(
-            &mut injected,
-            b"BOOMUX_SHIM_EXECUTABLE",
-            boomux.into_os_string(),
         );
     }
     if let Some(real_claude) = real_claude {
@@ -1234,6 +1264,13 @@ fn inject_opencode_shim_environment(
             &mut injected,
             b"BOOMUX_CLAUDE_REMOTE_CONTROL",
             if claude_remote_control { "1" } else { "0" },
+        );
+    }
+    if let Some(real_codex) = real_codex {
+        set_environment_value(
+            &mut injected,
+            b"BOOMUX_REAL_CODEX",
+            real_codex.into_os_string(),
         );
     }
     set_environment_value(&mut injected, b"BOOMUX_ORIGINAL_PATH", original_path);
@@ -16648,11 +16685,13 @@ impl ShellRuntimeManager {
             claude_remote_control,
         );
         let selected_command = claude_command.as_deref().unwrap_or(selected_command);
+        let codex_launch = codex_launch_eligible(shell, selected_command);
         let original_environment = environment
             .cloned()
             .unwrap_or_else(capture_current_environment);
         let mut child_environment = sanitize_opencode_shim_environment(&original_environment);
         let mut shared_recovery_command = None;
+        let mut codex_launch_command = None;
         if let Some(session_id) = recovery.opencode_session_id
             && let Ok(injected) =
                 inject_opencode_shim_environment(&child_environment, claude_remote_control)
@@ -16684,6 +16723,38 @@ impl ShellRuntimeManager {
                     session_id.into(),
                 ]);
             }
+        } else if codex_launch
+            && let Ok(injected) =
+                inject_opencode_shim_environment(&child_environment, claude_remote_control)
+        {
+            child_environment = injected;
+            let selected_executable = Path::new(&selected_command[0]);
+            let exact_executable = if selected_executable.is_absolute() {
+                Some(selected_executable.to_path_buf())
+            } else if selected_executable.components().count() > 1 {
+                Some(shell.cwd.join(selected_executable))
+            } else {
+                None
+            };
+            if let Some(executable) = exact_executable {
+                set_environment_value(
+                    &mut child_environment,
+                    b"BOOMUX_REAL_CODEX",
+                    executable.into_os_string(),
+                );
+            }
+            if let Some(executable) =
+                environment_value(&child_environment, b"BOOMUX_SHIM_EXECUTABLE")
+            {
+                let mut command = vec![
+                    executable.to_string_lossy().into_owned(),
+                    "codex".into(),
+                    "launch".into(),
+                    "--".into(),
+                ];
+                command.extend(selected_command[1..].iter().cloned());
+                codex_launch_command = Some(command);
+            }
         } else if opencode_shim_eligible(shell, selected_command)
             && let Ok(injected) =
                 inject_opencode_shim_environment(&child_environment, claude_remote_control)
@@ -16692,6 +16763,7 @@ impl ShellRuntimeManager {
         }
         let selected_command = shared_recovery_command
             .as_deref()
+            .or(codex_launch_command.as_deref())
             .unwrap_or(selected_command);
         let client_shell = child_environment
             .variables
@@ -18056,8 +18128,8 @@ fn validate_schedule_capability(
             )
         })?;
     let supported = match session {
-        AgentScheduleSession::Fresh => capability.fresh,
-        AgentScheduleSession::Continue { .. } => capability.continuation,
+        AgentScheduleSession::Fresh => capability.fresh.is_some(),
+        AgentScheduleSession::Continue { .. } => capability.continuation.is_some(),
     };
     if !supported {
         return Err(io::Error::new(
@@ -18957,6 +19029,33 @@ mod tests {
     }
 
     #[test]
+    fn codex_launcher_accepts_only_managed_chat_shapes() {
+        let shell = create_pending_shell(
+            "workspace",
+            ShellSpec {
+                name: "codex".into(),
+                cwd: env::temp_dir(),
+                command: vec!["/opt/openai/codex".into()],
+            },
+        )
+        .unwrap();
+        for argv in [
+            vec!["/opt/openai/codex".into()],
+            vec!["/opt/openai/codex".into(), "resume".into(), "exact".into()],
+            vec!["/opt/openai/codex".into(), "exec".into(), "-".into()],
+        ] {
+            assert!(codex_launch_eligible(&shell, &argv));
+        }
+        for argv in [
+            vec!["codex".into(), "remote-control".into()],
+            vec!["codex".into(), "--remote".into(), "unix://".into()],
+            vec!["codex-wrapper".into()],
+        ] {
+            assert!(!codex_launch_eligible(&shell, &argv));
+        }
+    }
+
+    #[test]
     fn inherited_opencode_shim_provenance_is_stripped_without_losing_identity() {
         let mut environment = test_environment(&[
             ("PATH", Path::new("/runtime/boomux/shims:/usr/bin")),
@@ -18967,6 +19066,8 @@ mod tests {
             ),
             ("BOOMUX_REAL_OPENCODE", Path::new("/usr/bin/opencode")),
             ("BOOMUX_REAL_CLAUDE", Path::new("/usr/bin/claude")),
+            ("BOOMUX_REAL_CODEX", Path::new("/usr/bin/codex")),
+            ("BOOMUX_CODEX_RUN_SCOPED", Path::new("1")),
             ("BOOMUX_CLAUDE_REMOTE_CONTROL", Path::new("1")),
             (
                 "BOOMUX_OPENCODE_TUI_CONFIG",
@@ -18999,6 +19100,8 @@ mod tests {
             b"BOOMUX_OPENCODE_SHIM_DIR",
             b"BOOMUX_REAL_OPENCODE",
             b"BOOMUX_REAL_CLAUDE",
+            b"BOOMUX_REAL_CODEX",
+            b"BOOMUX_CODEX_RUN_SCOPED",
             b"BOOMUX_CLAUDE_REMOTE_CONTROL",
             b"BOOMUX_OPENCODE_TUI_CONFIG",
             b"BOOMUX_SHIM_EXECUTABLE",
@@ -19097,6 +19200,9 @@ mod tests {
         let claude = bin.join("claude");
         fs::write(&claude, b"#!/bin/sh\nprintf '[%s]\\n' \"$@\"\n").unwrap();
         fs::set_permissions(&claude, fs::Permissions::from_mode(0o700)).unwrap();
+        let codex = bin.join("codex");
+        fs::write(&codex, b"#!/bin/sh\nprintf '{%s}\\n' \"$@\"\n").unwrap();
+        fs::set_permissions(&codex, fs::Permissions::from_mode(0o700)).unwrap();
         let environment = test_environment(&[("XDG_RUNTIME_DIR", &runtime), ("PATH", &bin)]);
 
         let injected = inject_opencode_shim_environment(&environment, true).unwrap();
@@ -19151,6 +19257,20 @@ mod tests {
             std::str::from_utf8(CLAUDE_SHIM)
                 .unwrap()
                 .contains("exec \"$BOOMUX_REAL_CLAUDE\" --remote-control")
+        );
+        let codex_shim = shim.with_file_name("codex");
+        assert_eq!(
+            fs::metadata(&codex_shim).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            environment_value(&injected, b"BOOMUX_REAL_CODEX").as_deref(),
+            Some(codex.as_os_str())
+        );
+        assert!(
+            std::str::from_utf8(CODEX_SHIM)
+                .unwrap()
+                .contains("codex launch -- \"$@\"")
         );
         fs::remove_dir_all(directory).unwrap();
     }
@@ -19313,6 +19433,25 @@ mod tests {
         assert_eq!(
             resumable.command,
             ["/opt/bin/claude", "--resume", "claude-exact"]
+        );
+    }
+
+    #[test]
+    fn interrupted_codex_agent_builds_exact_resume_subcommand() {
+        let registry = DaemonService::default();
+        let (shell, run) = recovery_shell(&registry, vec!["/opt/bin/codex".into()]);
+        let agent_id = add_recovery_agent(&registry, &shell, &run.id, "codex", "codex-exact");
+
+        let resumable = registry
+            .resumable_agent(&shell, Some(&run))
+            .unwrap()
+            .unwrap();
+        assert_eq!(resumable.agent_id, agent_id);
+        assert_eq!(resumable.integration, "codex");
+        assert_eq!(resumable.external_session_id, "codex-exact");
+        assert_eq!(
+            resumable.command,
+            ["/opt/bin/codex", "resume", "codex-exact"]
         );
     }
 

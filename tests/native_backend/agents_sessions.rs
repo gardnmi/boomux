@@ -129,6 +129,218 @@ fn claude_hook_reports_lifecycle_and_synchronizes_ephemeral_bridge_binding() {
 }
 
 #[test]
+fn codex_hook_requires_run_scoped_launch_and_reuses_exact_thread_agent() {
+    let mut daemon = TestDaemon::start();
+    let workspace = daemon
+        .client
+        .create_workspace(
+            "codex-hook",
+            vec![ShellSpec {
+                name: "codex".into(),
+                command: vec!["/bin/sleep".into(), "30".into()],
+                cwd: std::env::temp_dir(),
+            }],
+        )
+        .unwrap();
+    let shell_id = workspace.shells[0].id.clone();
+    let _attachment = daemon.client.attach(&shell_id, false, profile()).unwrap();
+    let run_id = daemon.client.get_shell(&shell_id).unwrap().run.unwrap().id;
+
+    let run_hook = |event: &str, run_scoped: bool| {
+        let mut command = daemon.command();
+        command
+            .args(["codex", "hook"])
+            .env("BOOMUX_SHELL_ID", &shell_id)
+            .env("BOOMUX_RUN_ID", &run_id)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped());
+        if run_scoped {
+            command.env("BOOMUX_CODEX_RUN_SCOPED", "1");
+        } else {
+            command.env_remove("BOOMUX_CODEX_RUN_SCOPED");
+        }
+        let mut child = command.spawn().unwrap();
+        write!(
+            child.stdin.take().unwrap(),
+            "{{\"session_id\":\"codex-thread\",\"hook_event_name\":\"{event}\"}}"
+        )
+        .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success());
+        assert!(output.stdout.is_empty());
+    };
+
+    run_hook("SessionStart", false);
+    assert!(
+        daemon.client.snapshot().unwrap().workspaces[0]
+            .agents
+            .is_empty()
+    );
+
+    for (event, expected) in [
+        ("SessionStart", AgentState::Idle),
+        ("UserPromptSubmit", AgentState::Working),
+        ("PermissionRequest", AgentState::Blocked),
+        ("PostToolUse", AgentState::Working),
+        ("Stop", AgentState::Idle),
+        ("SessionEnd", AgentState::Inactive),
+    ] {
+        run_hook(event, true);
+        let agents = &daemon.client.snapshot().unwrap().workspaces[0].agents;
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].integration, "codex");
+        assert_eq!(
+            agents[0].external_session_id.as_deref(),
+            Some("codex-thread")
+        );
+        assert_eq!(agents[0].observation.state, expected, "{event}");
+        assert_ne!(agents[0].observation.state, AgentState::Done);
+    }
+
+    daemon.stop_with_cli();
+}
+
+#[test]
+fn codex_app_server_catalog_projects_named_historical_threads_without_agents() {
+    let mut daemon = TestDaemon::start();
+    let bin = daemon.runtime_dir.join("codex-catalog-bin");
+    fs::create_dir(&bin).unwrap();
+    let codex = bin.join("codex");
+    fs::write(
+        &codex,
+        "#!/bin/sh\n[ \"$1\" = app-server ] || exit 64\nIFS= read -r line || exit 65\nprintf '%s\\n' '{\"id\":1,\"result\":{}}'\nIFS= read -r line || exit 66\nIFS= read -r line || exit 67\nprintf '%s\\n' '{\"id\":2,\"result\":{\"data\":[{\"id\":\"codex-history\",\"name\":\"Historical Codex thread\",\"preview\":\"fallback\",\"ephemeral\":false,\"createdAt\":10,\"updatedAt\":20}],\"nextCursor\":null}}'\n",
+    )
+    .unwrap();
+    fs::set_permissions(&codex, fs::Permissions::from_mode(0o755)).unwrap();
+    let workspace = daemon
+        .client
+        .create_workspace(
+            "codex-catalog",
+            vec![ShellSpec::login("shell", &daemon.runtime_dir)],
+        )
+        .unwrap();
+
+    let output = daemon
+        .command()
+        .args(["session", "list", "--workspace", &workspace.id, "--json"])
+        .env("PATH", &bin)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let sessions = output["data"]["sessions"].as_array().unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0]["integration"], "codex");
+    assert_eq!(sessions[0]["external_session_id"], "codex-history");
+    assert_eq!(sessions[0]["description"], "Historical Codex thread");
+    assert_eq!(sessions[0]["state"], "unknown");
+    assert_eq!(sessions[0]["occurrence_count"], 0);
+
+    daemon.stop_with_cli();
+}
+
+#[test]
+fn cold_recovery_resumes_exact_codex_thread_with_run_scoped_hooks() {
+    let mut daemon = TestDaemon::start_with(|command, runtime_dir| {
+        let bin = runtime_dir.join("codex-bin");
+        let codex_home = runtime_dir.join("codex-home");
+        fs::create_dir(&bin).unwrap();
+        fs::create_dir(&codex_home).unwrap();
+        fs::write(
+            codex_home.join("hooks.json"),
+            include_str!("../../integrations/codex/hooks.json"),
+        )
+        .unwrap();
+        let codex = bin.join("codex");
+        fs::write(
+            &codex,
+            "#!/bin/sh\n: > \"$CODEX_RECOVERY_CAPTURE\"\nfor arg do printf '%s\\0' \"$arg\" >> \"$CODEX_RECOVERY_CAPTURE\"; done\n[ \"${3-unset}\" = resume ] || /bin/sleep 30\n",
+        )
+        .unwrap();
+        fs::set_permissions(&codex, fs::Permissions::from_mode(0o700)).unwrap();
+        command
+            .env("PATH", &bin)
+            .env("CODEX_HOME", &codex_home)
+            .env(
+                "CODEX_RECOVERY_CAPTURE",
+                runtime_dir.join("codex-recovery-argv"),
+            );
+    });
+    let codex = daemon.runtime_dir.join("codex-bin/codex");
+    let workspace = daemon
+        .client
+        .create_workspace(
+            "codex-recovery",
+            vec![ShellSpec {
+                name: "codex".into(),
+                command: vec![codex.display().to_string()],
+                cwd: daemon.runtime_dir.clone(),
+            }],
+        )
+        .unwrap();
+    let shell_id = workspace.shells[0].id.clone();
+    let attachment = daemon.client.attach(&shell_id, false, profile()).unwrap();
+    wait_until(
+        || fs::read(daemon.runtime_dir.join("codex-recovery-argv")).is_ok(),
+        "initial Codex run did not launch",
+    );
+    let first_run = daemon.client.get_shell(&shell_id).unwrap().run.unwrap();
+    let agent = daemon
+        .client
+        .register_agent(
+            &shell_id,
+            &first_run.id,
+            AgentRegistrationSpec {
+                name: "Codex".into(),
+                integration: "codex".into(),
+                external_session_id: Some("exact-recovery-thread".into()),
+                report: AgentReport {
+                    state: AgentState::Idle,
+                    authority: AgentAuthority::LifecycleIntegration,
+                    evidence: "Codex session idle".into(),
+                    confidence: 100,
+                },
+            },
+        )
+        .unwrap();
+
+    daemon.crash();
+    drop(attachment.stream);
+    let bin = daemon.runtime_dir.join("codex-bin");
+    let codex_home = daemon.runtime_dir.join("codex-home");
+    let capture = daemon.runtime_dir.join("codex-recovery-argv");
+    daemon.restart_with(move |command| {
+        command
+            .env("PATH", bin)
+            .env("CODEX_HOME", codex_home)
+            .env("CODEX_RECOVERY_CAPTURE", capture);
+    });
+    let recovered = daemon.client.get_shell(&shell_id).unwrap();
+    assert_eq!(
+        recovered.recovered_agent_id.as_deref(),
+        Some(agent.id.as_str())
+    );
+
+    let recovered_attachment = daemon.client.attach(&shell_id, false, profile()).unwrap();
+    wait_until(
+        || {
+            fs::read(daemon.runtime_dir.join("codex-recovery-argv"))
+                .is_ok_and(|argv| argv == b"--enable\0hooks\0resume\0exact-recovery-thread\0")
+        },
+        "recovered Codex run did not resume the exact thread with hooks",
+    );
+    let second_run = daemon.client.get_shell(&shell_id).unwrap().run.unwrap();
+    assert_ne!(second_run.id, first_run.id);
+
+    drop(recovered_attachment);
+    daemon.stop_with_cli();
+}
+
+#[test]
 fn opencode_shared_runtime_and_claims_are_node_wide_and_ephemeral() {
     let mut daemon = TestDaemon::start_with(|command, runtime_dir| {
         let bin = runtime_dir.join("bin");

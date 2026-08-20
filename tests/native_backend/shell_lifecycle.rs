@@ -71,6 +71,67 @@ fn bare_claude_command_uses_owner_remote_control_policy_without_rewriting_stored
 }
 
 #[test]
+fn bare_codex_command_uses_run_scoped_hooks_without_rewriting_stored_argv() {
+    let mut daemon = TestDaemon::start_with(|command, runtime_dir| {
+        let bin = runtime_dir.join("codex-bin");
+        let codex_home = runtime_dir.join("codex-home");
+        fs::create_dir(&bin).unwrap();
+        fs::create_dir(&codex_home).unwrap();
+        fs::write(
+            codex_home.join("hooks.json"),
+            include_str!("../../integrations/codex/hooks.json"),
+        )
+        .unwrap();
+        let codex = bin.join("codex");
+        fs::write(
+            &codex,
+            format!(
+                "#!/bin/sh\n: > '{}'\nfor arg do printf '%s\\0' \"$arg\" >> '{}'; done\nprintf '%s' \"${{BOOMUX_CODEX_RUN_SCOPED-unset}}\" > '{}'\nprintf '%s' \"${{CODEX_HOME-unset}}\" > '{}'\n",
+                runtime_dir.join("codex-argv").display(),
+                runtime_dir.join("codex-argv").display(),
+                runtime_dir.join("codex-marker").display(),
+                runtime_dir.join("codex-home-value").display(),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&codex, fs::Permissions::from_mode(0o700)).unwrap();
+        command.env("CODEX_HOME", codex_home).env("PATH", &bin);
+    });
+    let codex = daemon.runtime_dir.join("codex-bin/codex");
+    let workspace = daemon
+        .client
+        .create_workspace(
+            "codex",
+            vec![ShellSpec {
+                name: "codex".into(),
+                command: vec![codex.display().to_string()],
+                cwd: daemon.runtime_dir.clone(),
+            }],
+        )
+        .unwrap();
+    let shell_id = &workspace.shells[0].id;
+    let attachment = daemon.client.attach(shell_id, false, profile()).unwrap();
+    wait_until(
+        || fs::read(daemon.runtime_dir.join("codex-marker")).is_ok(),
+        "Codex command did not capture its launch",
+    );
+    let marker = fs::read_to_string(daemon.runtime_dir.join("codex-marker")).unwrap();
+    let codex_home = fs::read_to_string(daemon.runtime_dir.join("codex-home-value")).unwrap();
+    assert_eq!(
+        fs::read(daemon.runtime_dir.join("codex-argv")).unwrap(),
+        b"--enable\0hooks\0",
+        "marker={marker} CODEX_HOME={codex_home}"
+    );
+    assert_eq!(marker, "1");
+    assert_eq!(
+        daemon.client.get_shell(shell_id).unwrap().command,
+        [codex.display().to_string()]
+    );
+    drop(attachment);
+    daemon.stop_with_cli();
+}
+
+#[test]
 fn bare_claude_typed_in_managed_login_shell_uses_remote_control_shim() {
     let mut daemon = TestDaemon::start();
     let bin = daemon.runtime_dir.join("claude-bin");
@@ -123,6 +184,76 @@ fn bare_claude_typed_in_managed_login_shell_uses_remote_control_shim() {
         "typed Claude command did not capture argv",
     );
     assert_eq!(fs::read(output).unwrap(), b"--remote-control\0");
+    AttachFrame::Input(b"exit\n".to_vec())
+        .write_to(&mut attachment.stream)
+        .unwrap();
+    drop(attachment);
+    daemon.stop_with_cli();
+}
+
+#[test]
+fn bare_codex_typed_in_managed_login_shell_uses_run_scoped_hooks() {
+    let mut daemon = TestDaemon::start();
+    let bin = daemon.runtime_dir.join("codex-login-bin");
+    let home = daemon.runtime_dir.join("codex-login-home");
+    let codex_home = home.join(".codex");
+    let argv_output = daemon.runtime_dir.join("typed-codex-argv");
+    let marker_output = daemon.runtime_dir.join("typed-codex-marker");
+    fs::create_dir(&bin).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    fs::write(
+        codex_home.join("hooks.json"),
+        include_str!("../../integrations/codex/hooks.json"),
+    )
+    .unwrap();
+    let codex = bin.join("codex");
+    fs::write(
+        &codex,
+        format!(
+            "#!/bin/sh\n: > '{}'\nfor arg do printf '%s\\0' \"$arg\" >> '{}'; done\nprintf '%s' \"${{BOOMUX_CODEX_RUN_SCOPED-unset}}\" > '{}'\n",
+            argv_output.display(),
+            argv_output.display(),
+            marker_output.display(),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&codex, fs::Permissions::from_mode(0o700)).unwrap();
+    let workspace = daemon
+        .client
+        .create_workspace(
+            "codex-login",
+            vec![ShellSpec::login("login", &daemon.runtime_dir)],
+        )
+        .unwrap();
+    let environment = UnixEnvironment {
+        variables: [
+            (b"SHELL".as_slice(), std::ffi::OsStr::new("/bin/bash")),
+            (b"HOME".as_slice(), home.as_os_str()),
+            (b"CODEX_HOME".as_slice(), codex_home.as_os_str()),
+            (b"PATH".as_slice(), bin.as_os_str()),
+            (
+                b"XDG_RUNTIME_DIR".as_slice(),
+                daemon.runtime_dir.as_os_str(),
+            ),
+        ]
+        .into_iter()
+        .map(|(name, value)| UnixEnvironmentVariable {
+            name: name.to_vec(),
+            value: value.as_encoded_bytes().to_vec(),
+        })
+        .collect(),
+    };
+    let mut attachment =
+        attach_with_environment(&daemon.client, &workspace.shells[0].id, false, environment);
+    AttachFrame::Input(b"codex\n".to_vec())
+        .write_to(&mut attachment.stream)
+        .unwrap();
+    wait_until(
+        || fs::read(&marker_output).is_ok(),
+        "typed Codex command did not capture its launch",
+    );
+    assert_eq!(fs::read(argv_output).unwrap(), b"--enable\0hooks\0");
+    assert_eq!(fs::read_to_string(marker_output).unwrap(), "1");
     AttachFrame::Input(b"exit\n".to_vec())
         .write_to(&mut attachment.stream)
         .unwrap();

@@ -317,8 +317,8 @@ In Schedules, Left/Right changes between the schedule and history panes, `j`/`k`
 navigates the focused pane, and `[`/`]` also selects retained executions by exact
 execution ID. `Enter` attaches a selected exact Starting or Active run. For a
 completed execution with a canonical session, it resumes that exact session with
-OpenCode, Pi, or Claude Code in an unmanaged native terminal, without adding a
-workspace row.
+OpenCode, Pi, Claude Code, or Codex in an unmanaged native terminal, without
+adding a workspace row.
 `e` opens the private definition editor for a paused schedule; it supports name,
 prompt, trigger presets or custom cron, and a searchable IANA timezone selector.
 Type to filter timezone names and use the arrow keys to choose a valid match.
@@ -366,7 +366,7 @@ and troubleshooting.
 
 ## Coding-Agent Integrations
 
-Boomux includes optional integrations for OpenCode, Pi, and Claude Code. Guided
+Boomux includes optional integrations for OpenCode, Pi, Claude Code, and Codex. Guided
 setup previews every file change and asks before installing anything:
 
 ```console
@@ -375,6 +375,8 @@ boomux integration setup opencode
 boomux integration setup pi
 # or
 boomux integration setup claude
+# or
+boomux integration setup codex
 ```
 
 Restart the selected host after installation. For the seamless OpenCode workflow,
@@ -391,6 +393,14 @@ mobile dashboard shows **Open in Claude** and links directly to its
 `claude.ai/code` session. Boomux does not host or proxy Claude's web interface or
 read its transcript. Existing sessions can enable the bridge with
 `/remote-control`; organization policy and Claude authentication still apply.
+
+Managed Codex chat, resume, and `exec` launches enable Codex hooks through an
+internal run-scoped launcher. The hook's canonical `session_id` is the Codex
+thread ID used for lifecycle identity and exact resume. After installation,
+restart Codex and review and trust the Boomux hook with `/hooks`. Other Codex
+commands run unchanged and untracked; Boomux does not invent a Codex Remote URL.
+Explicit `codex --remote` clients are also untracked because their app-server
+environment does not prove the current Boomux ShellRun.
 
 Only in an eligible Boomux login Shell, a scoped runtime `PATH` shim redirects
 that exact invocation internally to stock `opencode attach` for the Node's
@@ -439,8 +449,8 @@ matching workspace.
 A projected session groups every Boomux Agent occurrence for the same external
 root session. `current` means an occurrence belongs to the current run of a
 running retained shell; `last known` means the session is historical.
-Catalog-only host history can appear without a fabricated Boomux Agent
-occurrence.
+Catalog-only OpenCode and Codex host history can appear without a fabricated
+Boomux Agent occurrence.
 
 Discover and inspect sessions with exact IDs returned by `session list`:
 
@@ -516,8 +526,10 @@ max_concurrent = 4
 remote_control = true
 ```
 
-OpenCode receives the prompt as the final argument after `--`; Pi and Claude Code
-receive the exact prompt on stdin. Process exit, dispatch failure, cancellation,
+OpenCode receives the prompt as the final argument after `--`; Pi, Claude Code,
+and Codex receive the exact prompt on stdin. Codex dispatch uses `codex exec -`
+for fresh work and `codex exec resume <thread-id> -` for continuation. Process
+exit, dispatch failure, cancellation,
 and cold interruption are execution outcomes and never report an Agent as done. Timed
 work runs only while the Boomux daemon and user session are active; inspect
 `boomux daemon status` and `boomux doctor` for scheduler health and sampled
@@ -634,7 +646,7 @@ the currently focused terminal. Set
 `dashboard.follow_focused_terminal` to `false` to disable this behavior.
 
 After a cold daemon restart, Boomux resumes a uniquely identified OpenCode, Pi,
-or Claude session when its interrupted shell is next started. Recovery requires
+Claude, or Codex session when its interrupted shell is next started. Recovery requires
 a retained external session ID reported by the lifecycle integration; ambiguous,
 completed, or heuristic-only Agents fall back to the shell's configured command.
 Recovered OpenCode Sessions attach to the Shared Harness Runtime and establish a
@@ -718,6 +730,10 @@ Revision-aware output reads and daemon event cursors are documented in
 - Seamless shared OpenCode requires a bare zero-argument interactive invocation
   in an eligible managed login Shell; `--pure`, `--mini`, absolute paths,
   modified `PATH`, and conflicting same-Session Shells fail closed.
+- Pi and Codex Agents have no Open Web action in the mobile dashboard. Pi has
+  no native web handoff, while Codex Remote does not document an exact
+  thread-specific browser or mobile deep link that Boomux can derive
+  authoritatively.
 - Slow viewers may miss live output rather than block the managed process.
 - The native backend currently targets Unix/Linux desktop environments and is
   primarily exercised on Omarchy.

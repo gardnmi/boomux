@@ -53,6 +53,9 @@
 - [x] Share one daemon-supervised Node-local OpenCode runtime across eligible
   native TUIs and OpenCode Web, with exact ShellRun claims for lifecycle and
   native Session links.
+- [x] Add first-class Codex hooks, run-scoped managed launches, exact resume and
+  scheduling, bounded thread catalogs, foreground hints, and safe merged
+  installation without fabricating a Codex Remote handoff.
 
 ## Workspace Control
 
@@ -121,7 +124,8 @@ eternal process.
 
 ### Near-Term Priorities
 
-1. [Partially validated; see `lifecycle-validation.md`] Validate the OpenCode and Pi lifecycle integrations during normal work before
+1. [Partially validated; see `lifecycle-validation.md`] Validate the OpenCode,
+   Pi, Claude Code, and Codex lifecycle integrations during normal work before
    expanding the observation model. Confirm reload identity, session switching,
    root/subagent aggregation where available, blocked prompts, idle transitions,
    explicit completion semantics, and graceful daemon replacement against real
@@ -156,9 +160,10 @@ eternal process.
    in the Boomux UI without attaching directory-wide history to untracked
    process hints. Keep full inactive and completed workspace history available
    through the session CLI with integration, canonical identity, associated
-   shell and run, lifecycle state, and timestamps. Bounded host catalogs also project pre-registration OpenCode
-   root-session history without fabricated Agent occurrences, while asynchronous
-   adapters provide OpenCode generated titles and Pi names or first-user-message summaries.
+   shell and run, lifecycle state, and timestamps. Bounded host catalogs also
+   project pre-registration OpenCode and Codex root-session history without
+   fabricated Agent occurrences, while asynchronous adapters provide OpenCode
+   and Codex generated titles and Pi names or first-user-message summaries.
 8. [Complete, transcript portion later removed] Separate OpenCode and Pi title and transcript adapters from shared
    cache, pagination, cursor, and output policy so future harness support can be
    added through isolated modules and explicit capability registries.

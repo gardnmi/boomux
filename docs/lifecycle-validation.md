@@ -9,6 +9,14 @@ output, or database recency.
 
 ## 2026-08-20
 
+Codex CLI `0.147.0` was inspected against the documented hooks and experimental
+app-server interfaces. Repository tests validate bounded hook decoding,
+run-scoped authority, lifecycle reduction, exact schedule and recovery argv,
+merged hook installation, and catalog projection. This is fixture and interface
+compatibility evidence only: no live authenticated Codex turn, permission wait,
+hook trust flow, or app-server catalog was exercised. No Codex Remote handoff is
+claimed because the host does not document an exact thread-specific Remote URL.
+
 Claude Code `2.1.236` was live-validated with the protocol-43 lifecycle plugin
 and Remote Control binding. After the skills-directory plugin was installed and
 Claude was restarted inside an existing managed Bash ShellRun, Claude's
