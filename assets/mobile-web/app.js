@@ -167,14 +167,23 @@ function renderAgentCard(agent) {
   }
   body.append(meta);
   const nativeUrl = agent.native_web?.url || derivedNativeUrl(agent.native_web);
-  if (nativeUrl) {
+  const dismissible = agent.node_local && hasAlert(agent);
+  if (nativeUrl || dismissible) {
     const actions = el("div", "card-actions");
-    const nativeLink = el("a", "card-native-link", agent.native_web.label || "Open in OpenCode");
-    nativeLink.href = nativeUrl;
-    nativeLink.target = "_blank";
-    nativeLink.rel = "noreferrer";
-    nativeLink.referrerPolicy = "no-referrer";
-    actions.append(nativeLink);
+    if (nativeUrl) {
+      const nativeLink = el("a", "card-native-link", agent.native_web.label || "Open in OpenCode");
+      nativeLink.href = nativeUrl;
+      nativeLink.target = "_blank";
+      nativeLink.rel = "noreferrer";
+      nativeLink.referrerPolicy = "no-referrer";
+      actions.append(nativeLink);
+    }
+    if (dismissible) {
+      const dismissButton = el("button", "card-dismiss-button", "Dismiss");
+      dismissButton.type = "button";
+      dismissButton.addEventListener("click", () => dismissAttention(agent, dismissButton));
+      actions.append(dismissButton);
+    }
     body.append(actions);
   }
   content.append(rail, body);
@@ -196,6 +205,31 @@ async function fetchJson(url, signal) {
   });
   if (!response.ok) throw new Error(`Request failed (${response.status})`);
   return response.json();
+}
+
+async function dismissAttention(agent, button) {
+  button.disabled = true;
+  button.textContent = "Dismissing...";
+  try {
+    const response = await fetch("/api/attention/dismiss", {
+      method: "POST",
+      cache: "no-store",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        node_id: agent.node_id,
+        agent_id: agent.agent_id,
+        observation_revision: agent.attention?.observation_revision ?? agent.observation_revision,
+      }),
+    });
+    if (!response.ok) throw new Error(`Request failed (${response.status})`);
+    await refreshSnapshot();
+  } catch (_) {
+    button.disabled = false;
+    button.textContent = "Retry dismiss";
+  }
 }
 
 async function refreshSnapshot() {

@@ -251,13 +251,15 @@ outstanding attention item.
 
 ### Mobile Dashboard
 
-`boomux web` serves an installable, read-only Agent dashboard at
+`boomux web` serves an installable Agent dashboard at
 `http://127.0.0.1:3737`. It combines local authoritative Agent state with the
 bounded projections of registered Nodes, keeps stale ownership visible, and
 shows the same current user-Shell Agents and outstanding durable attention as
 the Omarchy Boomux plugin. A locally observed `working` to `idle` transition is
 kept by the gateway as a transient finished alert while that Agent remains idle,
-even when no browser is connected. The home page is the complete dashboard; an
+even when no browser is connected. Local alert cards provide an exact
+revision-conditional **Dismiss** action; remote attention remains read-only. The
+home page is the complete dashboard; an
 eligible local OpenCode Agent card links directly to the same live Session used
 by its desktop TUI through the Node's Shared Harness Runtime on
 `127.0.0.1:4097`. Remote Agents remain unlinked. The TUI can be detached while
@@ -283,9 +285,9 @@ Boomux reuses compatible Serve routes, rejects conflicts, records only routes it
 creates, and removes those exact routes on graceful exit or `boomux web stop`.
 It does not reset unrelated Serve configuration or define Tailscale grants and
 ACLs. Without `--tailscale`, remote publication remains external. The MVP has
-no terminal input, attention acknowledgment, transcript parsing, or cloud
-service. Native OpenCode links leave Boomux and open a full-control service whose
-origin must be protected separately. Add the remote URL
+no terminal input, transcript parsing, or cloud service. Its only mutation is
+exact local attention dismissal. Native OpenCode links leave Boomux and open a
+full-control service whose origin must be protected separately. Add the remote URL
 to the phone's home screen to install the progressive web app. See
 [`docs/mobile-web.md`](docs/mobile-web.md) for the security and privacy boundary.
 
@@ -645,8 +647,8 @@ Revision-aware output reads and daemon event cursors are documented in
   reconstructed when a terminal reconnects.
 - One terminal window controls input for a shell at a time. Taking control from
   another window disconnects the previous window from that shell.
-- The mobile dashboard is read-only and displays bounded rendered terminal
-  output, not structured Agent conversation history.
+- The mobile dashboard does not expose terminal output or structured Agent
+  conversation history; its only mutation is exact local attention dismissal.
 - Seamless shared OpenCode requires a bare zero-argument interactive invocation
   in an eligible managed login Shell; `--pure`, `--mini`, absolute paths,
   modified `PATH`, and conflicting same-Session Shells fail closed.
