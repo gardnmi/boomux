@@ -56,6 +56,9 @@
 - [x] Add first-class Codex hooks, run-scoped managed launches, exact resume and
   scheduling, bounded thread catalogs, foreground hints, and safe merged
   installation without fabricating a Codex Remote handoff.
+- [x] Add first-class Kiro v3 hooks, run-scoped managed launches, exact resume
+  and scheduling, and dedicated hook installation without fabricating
+  local-to-cloud lifecycle or web handoff authority.
 
 ## Workspace Control
 

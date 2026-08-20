@@ -729,24 +729,33 @@ fn manual_execution_succeeds_and_duplicate_key_never_spawns_twice() {
 
 fn assert_stdin_dispatch_preserves_exact_argv_stdin_eof_and_continuation_identity(
     integration: &'static str,
+    executable: &'static str,
     continuation_id: &str,
     expected_fresh_argv: &[u8],
     expected_continuation_argv: &[u8],
+    prompt_on_stdin: bool,
 ) {
     let mut daemon = TestDaemon::start_with(|command, runtime_dir| {
         let bin = runtime_dir.join("bin");
         let codex_home = runtime_dir.join("codex-home");
+        let kiro_home = runtime_dir.join("kiro-home");
         fs::create_dir(&bin).unwrap();
         fs::create_dir(&codex_home).unwrap();
+        fs::create_dir_all(kiro_home.join("hooks")).unwrap();
         fs::write(
             codex_home.join("hooks.json"),
             include_str!("../../integrations/codex/hooks.json"),
         )
         .unwrap();
-        let host = bin.join(integration);
+        fs::write(
+            kiro_home.join("hooks/boomux.json"),
+            include_str!("../../integrations/kiro/boomux.json"),
+        )
+        .unwrap();
+        let host = bin.join(executable);
         fs::write(
             &host,
-            "#!/bin/sh\nprintf '%s\\0' \"$@\" > \"$BOOMUX_DISPATCH_ARGV_DIR/$BOOMUX_DISPATCH_CASE\"\ncat > \"$BOOMUX_DISPATCH_STDIN_DIR/$BOOMUX_DISPATCH_CASE\"\nprintf '%s' \"${BOOMUX_SCHEDULE_RUNNER_TOKEN-unset}\" > \"$BOOMUX_DISPATCH_TOKEN_DIR/$BOOMUX_DISPATCH_CASE\"\nprintf '%s' \"${BOOMUX_CODEX_RUN_SCOPED-unset}\" > \"$BOOMUX_DISPATCH_CODEX_MARKER_DIR/$BOOMUX_DISPATCH_CASE\"\n",
+            "#!/bin/sh\nprintf '%s\\0' \"$@\" > \"$BOOMUX_DISPATCH_ARGV_DIR/$BOOMUX_DISPATCH_CASE\"\nif [ \"$BOOMUX_DISPATCH_READ_STDIN\" = 1 ]; then cat > \"$BOOMUX_DISPATCH_STDIN_DIR/$BOOMUX_DISPATCH_CASE\"; else : > \"$BOOMUX_DISPATCH_STDIN_DIR/$BOOMUX_DISPATCH_CASE\"; fi\nprintf '%s' \"${BOOMUX_SCHEDULE_RUNNER_TOKEN-unset}\" > \"$BOOMUX_DISPATCH_TOKEN_DIR/$BOOMUX_DISPATCH_CASE\"\nprintf '%s' \"${BOOMUX_CODEX_RUN_SCOPED-unset}\" > \"$BOOMUX_DISPATCH_CODEX_MARKER_DIR/$BOOMUX_DISPATCH_CASE\"\nprintf '%s' \"${BOOMUX_KIRO_RUN_SCOPED-unset}\" > \"$BOOMUX_DISPATCH_KIRO_MARKER_DIR/$BOOMUX_DISPATCH_CASE\"\n",
         )
         .unwrap();
         fs::set_permissions(&host, fs::Permissions::from_mode(0o755)).unwrap();
@@ -755,6 +764,7 @@ fn assert_stdin_dispatch_preserves_exact_argv_stdin_eof_and_continuation_identit
             "dispatch-stdin",
             "dispatch-token",
             "dispatch-codex-marker",
+            "dispatch-kiro-marker",
         ] {
             fs::create_dir(runtime_dir.join(directory)).unwrap();
         }
@@ -780,7 +790,16 @@ fn assert_stdin_dispatch_preserves_exact_argv_stdin_eof_and_continuation_identit
                 "BOOMUX_DISPATCH_CODEX_MARKER_DIR",
                 runtime_dir.join("dispatch-codex-marker"),
             )
+            .env(
+                "BOOMUX_DISPATCH_KIRO_MARKER_DIR",
+                runtime_dir.join("dispatch-kiro-marker"),
+            )
             .env("CODEX_HOME", codex_home)
+            .env("KIRO_HOME", kiro_home)
+            .env(
+                "BOOMUX_DISPATCH_READ_STDIN",
+                if prompt_on_stdin { "1" } else { "0" },
+            )
             .env("BOOMUX_DISPATCH_CASE", "fresh");
     });
     let workspace = daemon
@@ -813,7 +832,11 @@ fn assert_stdin_dispatch_preserves_exact_argv_stdin_eof_and_continuation_identit
     );
     assert_eq!(
         fs::read(daemon.runtime_dir.join("dispatch-stdin/fresh")).unwrap(),
-        prompt.as_bytes()
+        if prompt_on_stdin {
+            prompt.as_bytes()
+        } else {
+            b""
+        }
     );
     assert_eq!(
         fs::read_to_string(daemon.runtime_dir.join("dispatch-token/fresh")).unwrap(),
@@ -822,6 +845,10 @@ fn assert_stdin_dispatch_preserves_exact_argv_stdin_eof_and_continuation_identit
     assert_eq!(
         fs::read_to_string(daemon.runtime_dir.join("dispatch-codex-marker/fresh")).unwrap(),
         if integration == "codex" { "1" } else { "unset" }
+    );
+    assert_eq!(
+        fs::read_to_string(daemon.runtime_dir.join("dispatch-kiro-marker/fresh")).unwrap(),
+        if integration == "kiro" { "1" } else { "unset" }
     );
 
     let restart = daemon
@@ -850,7 +877,16 @@ fn assert_stdin_dispatch_preserves_exact_argv_stdin_eof_and_continuation_identit
             "BOOMUX_DISPATCH_CODEX_MARKER_DIR",
             daemon.runtime_dir.join("dispatch-codex-marker"),
         )
+        .env(
+            "BOOMUX_DISPATCH_KIRO_MARKER_DIR",
+            daemon.runtime_dir.join("dispatch-kiro-marker"),
+        )
         .env("CODEX_HOME", daemon.runtime_dir.join("codex-home"))
+        .env("KIRO_HOME", daemon.runtime_dir.join("kiro-home"))
+        .env(
+            "BOOMUX_DISPATCH_READ_STDIN",
+            if prompt_on_stdin { "1" } else { "0" },
+        )
         .env("BOOMUX_DISPATCH_CASE", "continue")
         .output()
         .unwrap();
@@ -888,7 +924,11 @@ fn assert_stdin_dispatch_preserves_exact_argv_stdin_eof_and_continuation_identit
     );
     assert_eq!(
         fs::read(daemon.runtime_dir.join("dispatch-stdin/continue")).unwrap(),
-        continuation_prompt.as_bytes()
+        if prompt_on_stdin {
+            continuation_prompt.as_bytes()
+        } else {
+            b""
+        }
     );
     assert_eq!(
         fs::read_to_string(daemon.runtime_dir.join("dispatch-token/continue")).unwrap(),
@@ -898,6 +938,10 @@ fn assert_stdin_dispatch_preserves_exact_argv_stdin_eof_and_continuation_identit
         fs::read_to_string(daemon.runtime_dir.join("dispatch-codex-marker/continue")).unwrap(),
         if integration == "codex" { "1" } else { "unset" }
     );
+    assert_eq!(
+        fs::read_to_string(daemon.runtime_dir.join("dispatch-kiro-marker/continue")).unwrap(),
+        if integration == "kiro" { "1" } else { "unset" }
+    );
     daemon.stop_with_cli();
 }
 
@@ -905,9 +949,11 @@ fn assert_stdin_dispatch_preserves_exact_argv_stdin_eof_and_continuation_identit
 fn pi_dispatch_preserves_exact_argv_stdin_eof_and_continuation_identity() {
     assert_stdin_dispatch_preserves_exact_argv_stdin_eof_and_continuation_identity(
         "pi",
+        "pi",
         "exact-pi-session",
         b"--print\0",
         b"--session\0exact-pi-session\0--print\0",
+        true,
     );
 }
 
@@ -915,9 +961,11 @@ fn pi_dispatch_preserves_exact_argv_stdin_eof_and_continuation_identity() {
 fn claude_dispatch_preserves_exact_argv_stdin_eof_and_continuation_identity() {
     assert_stdin_dispatch_preserves_exact_argv_stdin_eof_and_continuation_identity(
         "claude",
+        "claude",
         "exact-id",
         b"--print\0",
         b"--print\0--resume\0exact-id\0",
+        true,
     );
 }
 
@@ -925,9 +973,23 @@ fn claude_dispatch_preserves_exact_argv_stdin_eof_and_continuation_identity() {
 fn codex_dispatch_preserves_exact_exec_argv_stdin_eof_and_thread_identity() {
     assert_stdin_dispatch_preserves_exact_argv_stdin_eof_and_continuation_identity(
         "codex",
+        "codex",
         "exact-codex-thread",
         b"--enable\0hooks\0exec\0-\0",
         b"--enable\0hooks\0exec\0resume\0exact-codex-thread\0-\0",
+        true,
+    );
+}
+
+#[test]
+fn kiro_dispatch_preserves_exact_v3_argv_and_continuation_identity() {
+    assert_stdin_dispatch_preserves_exact_argv_stdin_eof_and_continuation_identity(
+        "kiro",
+        "kiro-cli",
+        "exact-kiro-session",
+        b"--v3\0chat\0--no-interactive\0--\0-@leading\nsecond line\n\0",
+        b"--v3\0chat\0--no-interactive\0--resume-id\0exact-kiro-session\0--\0continued\nexact bytes\0",
+        false,
     );
 }
 

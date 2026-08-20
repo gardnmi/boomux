@@ -9,6 +9,16 @@ output, or database recency.
 
 ## 2026-08-20
 
+Kiro CLI `2.18.0` was inspected with its opt-in v3 harness (`kiro-cli --v3`).
+The documented standalone hook schema and installed command help establish the
+five consumed lifecycle events, canonical `session_id`, exact resume command,
+and headless dispatch surface. Repository tests validate bounded hook decoding,
+run-scoped authority, bare v3 launch selection, exact schedule and recovery argv,
+dedicated hook installation, and safe ambiguity handling. This is fixture and
+interface compatibility evidence only: no live authenticated Kiro turn,
+permission wait, cloud Session, or Kiro Web handoff was exercised. No Blocked,
+Inactive, Done, cloud lifecycle, catalog, or native web capability is claimed.
+
 Codex CLI `0.147.0` was inspected against the documented hooks and experimental
 app-server interfaces. Repository tests validate bounded hook decoding,
 run-scoped authority, lifecycle reduction, exact schedule and recovery argv,

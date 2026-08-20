@@ -142,6 +142,12 @@ the same internal launcher as managed Codex chat so hooks are enabled and bound
 to the exact schedule-owned ShellRun. The external thread ID is an argv element,
 never shell-interpolated or selected by recency.
 
+Kiro receives the exact prompt as one argv element. Fresh work executes
+`kiro-cli --v3 chat --no-interactive -- <prompt>`; continuation inserts
+`--resume-id <session-id>` before the option terminator and prompt. Both use the run-scoped Kiro
+launcher, and Boomux does not add trust or permission overrides. The prompt can
+therefore be visible in host process listings as disclosed above.
+
 Every manual or timed Scheduled Execution uses the daemon's startup environment
 as ephemeral process input. It is validated for child startup but never
 persisted, projected, copied into a schedule revision, or replaced by the
@@ -460,7 +466,7 @@ blocked work attaches to its exact run, while completed work resumes only its
 exact canonical Agent Session; neither path selects a newest or nearby identity.
 Durable Agent attention remains independent. Canonical session identity requires
 the exact linked Agent occurrence. Boomux does not read or
-project host transcript and tool content; OpenCode, Pi, Claude Code, or Codex remains
+project host transcript and tool content; OpenCode, Pi, Claude Code, Codex, or Kiro remains
 the interface for that content.
 
 ## User Control And Permissions

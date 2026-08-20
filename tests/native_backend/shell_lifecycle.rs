@@ -132,6 +132,66 @@ fn bare_codex_command_uses_run_scoped_hooks_without_rewriting_stored_argv() {
 }
 
 #[test]
+fn bare_kiro_command_selects_v3_without_rewriting_stored_argv() {
+    let mut daemon = TestDaemon::start_with(|command, runtime_dir| {
+        let bin = runtime_dir.join("kiro-bin");
+        let kiro_home = runtime_dir.join("kiro-home");
+        fs::create_dir(&bin).unwrap();
+        fs::create_dir_all(kiro_home.join("hooks")).unwrap();
+        fs::write(
+            kiro_home.join("hooks/boomux.json"),
+            include_str!("../../integrations/kiro/boomux.json"),
+        )
+        .unwrap();
+        let kiro = bin.join("kiro-cli");
+        fs::write(
+            &kiro,
+            format!(
+                "#!/bin/sh\n: > '{}'\nfor arg do printf '%s\\0' \"$arg\" >> '{}'; done\nprintf '%s' \"${{BOOMUX_KIRO_RUN_SCOPED-unset}}\" > '{}'\n",
+                runtime_dir.join("kiro-argv").display(),
+                runtime_dir.join("kiro-argv").display(),
+                runtime_dir.join("kiro-marker").display(),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&kiro, fs::Permissions::from_mode(0o700)).unwrap();
+        command.env("KIRO_HOME", kiro_home).env("PATH", &bin);
+    });
+    let kiro = daemon.runtime_dir.join("kiro-bin/kiro-cli");
+    let workspace = daemon
+        .client
+        .create_workspace(
+            "kiro",
+            vec![ShellSpec {
+                name: "kiro".into(),
+                command: vec![kiro.display().to_string()],
+                cwd: daemon.runtime_dir.clone(),
+            }],
+        )
+        .unwrap();
+    let shell_id = &workspace.shells[0].id;
+    let attachment = daemon.client.attach(shell_id, false, profile()).unwrap();
+    wait_until(
+        || fs::read(daemon.runtime_dir.join("kiro-marker")).is_ok(),
+        "Kiro command did not capture its launch",
+    );
+    assert_eq!(
+        fs::read(daemon.runtime_dir.join("kiro-argv")).unwrap(),
+        b"--v3\0"
+    );
+    assert_eq!(
+        fs::read_to_string(daemon.runtime_dir.join("kiro-marker")).unwrap(),
+        "1"
+    );
+    assert_eq!(
+        daemon.client.get_shell(shell_id).unwrap().command,
+        [kiro.display().to_string()]
+    );
+    drop(attachment);
+    daemon.stop_with_cli();
+}
+
+#[test]
 fn bare_claude_typed_in_managed_login_shell_uses_remote_control_shim() {
     let mut daemon = TestDaemon::start();
     let bin = daemon.runtime_dir.join("claude-bin");
@@ -253,6 +313,76 @@ fn bare_codex_typed_in_managed_login_shell_uses_run_scoped_hooks() {
         "typed Codex command did not capture its launch",
     );
     assert_eq!(fs::read(argv_output).unwrap(), b"--enable\0hooks\0");
+    assert_eq!(fs::read_to_string(marker_output).unwrap(), "1");
+    AttachFrame::Input(b"exit\n".to_vec())
+        .write_to(&mut attachment.stream)
+        .unwrap();
+    drop(attachment);
+    daemon.stop_with_cli();
+}
+
+#[test]
+fn bare_kiro_typed_in_managed_login_shell_selects_v3() {
+    let mut daemon = TestDaemon::start();
+    let bin = daemon.runtime_dir.join("kiro-login-bin");
+    let home = daemon.runtime_dir.join("kiro-login-home");
+    let kiro_home = home.join(".kiro");
+    let argv_output = daemon.runtime_dir.join("typed-kiro-argv");
+    let marker_output = daemon.runtime_dir.join("typed-kiro-marker");
+    fs::create_dir(&bin).unwrap();
+    fs::create_dir_all(kiro_home.join("hooks")).unwrap();
+    fs::write(
+        kiro_home.join("hooks/boomux.json"),
+        include_str!("../../integrations/kiro/boomux.json"),
+    )
+    .unwrap();
+    let kiro = bin.join("kiro-cli");
+    fs::write(
+        &kiro,
+        format!(
+            "#!/bin/sh\n: > '{}'\nfor arg do printf '%s\\0' \"$arg\" >> '{}'; done\nprintf '%s' \"${{BOOMUX_KIRO_RUN_SCOPED-unset}}\" > '{}'\n",
+            argv_output.display(),
+            argv_output.display(),
+            marker_output.display(),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&kiro, fs::Permissions::from_mode(0o700)).unwrap();
+    let workspace = daemon
+        .client
+        .create_workspace(
+            "kiro-login",
+            vec![ShellSpec::login("login", &daemon.runtime_dir)],
+        )
+        .unwrap();
+    let environment = UnixEnvironment {
+        variables: [
+            (b"SHELL".as_slice(), std::ffi::OsStr::new("/bin/bash")),
+            (b"HOME".as_slice(), home.as_os_str()),
+            (b"KIRO_HOME".as_slice(), kiro_home.as_os_str()),
+            (b"PATH".as_slice(), bin.as_os_str()),
+            (
+                b"XDG_RUNTIME_DIR".as_slice(),
+                daemon.runtime_dir.as_os_str(),
+            ),
+        ]
+        .into_iter()
+        .map(|(name, value)| UnixEnvironmentVariable {
+            name: name.to_vec(),
+            value: value.as_encoded_bytes().to_vec(),
+        })
+        .collect(),
+    };
+    let mut attachment =
+        attach_with_environment(&daemon.client, &workspace.shells[0].id, false, environment);
+    AttachFrame::Input(b"kiro-cli\n".to_vec())
+        .write_to(&mut attachment.stream)
+        .unwrap();
+    wait_until(
+        || fs::read(&marker_output).is_ok(),
+        "typed Kiro command did not capture its launch",
+    );
+    assert_eq!(fs::read(argv_output).unwrap(), b"--v3\0");
     assert_eq!(fs::read_to_string(marker_output).unwrap(), "1");
     AttachFrame::Input(b"exit\n".to_vec())
         .write_to(&mut attachment.stream)

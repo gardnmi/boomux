@@ -201,6 +201,80 @@ fn codex_hook_requires_run_scoped_launch_and_reuses_exact_thread_agent() {
 }
 
 #[test]
+fn kiro_hook_requires_v3_run_scope_and_reuses_exact_session_agent() {
+    let mut daemon = TestDaemon::start();
+    let workspace = daemon
+        .client
+        .create_workspace(
+            "kiro-hook",
+            vec![ShellSpec {
+                name: "kiro".into(),
+                command: vec!["/bin/sleep".into(), "30".into()],
+                cwd: std::env::temp_dir(),
+            }],
+        )
+        .unwrap();
+    let shell_id = workspace.shells[0].id.clone();
+    let _attachment = daemon.client.attach(&shell_id, false, profile()).unwrap();
+    let run_id = daemon.client.get_shell(&shell_id).unwrap().run.unwrap().id;
+
+    let run_hook = |event: &str, run_scoped: bool| {
+        let mut command = daemon.command();
+        command
+            .args(["kiro", "hook"])
+            .env("BOOMUX_SHELL_ID", &shell_id)
+            .env("BOOMUX_RUN_ID", &run_id)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped());
+        if run_scoped {
+            command.env("BOOMUX_KIRO_RUN_SCOPED", "1");
+        } else {
+            command.env_remove("BOOMUX_KIRO_RUN_SCOPED");
+        }
+        let mut child = command.spawn().unwrap();
+        write!(
+            child.stdin.take().unwrap(),
+            "{{\"session_id\":\"kiro-session\",\"hook_event_name\":\"{event}\"}}"
+        )
+        .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success());
+        assert!(output.stdout.is_empty());
+    };
+
+    run_hook("SessionStart", false);
+    assert!(
+        daemon.client.snapshot().unwrap().workspaces[0]
+            .agents
+            .is_empty()
+    );
+
+    for (event, expected) in [
+        ("SessionStart", AgentState::Idle),
+        ("UserPromptSubmit", AgentState::Working),
+        ("PreToolUse", AgentState::Working),
+        ("PostToolUse", AgentState::Working),
+        ("Stop", AgentState::Idle),
+    ] {
+        run_hook(event, true);
+        let agents = &daemon.client.snapshot().unwrap().workspaces[0].agents;
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].integration, "kiro");
+        assert_eq!(
+            agents[0].external_session_id.as_deref(),
+            Some("kiro-session")
+        );
+        assert_eq!(agents[0].observation.state, expected, "{event}");
+        assert!(!matches!(
+            agents[0].observation.state,
+            AgentState::Blocked | AgentState::Inactive | AgentState::Done
+        ));
+    }
+
+    daemon.stop_with_cli();
+}
+
+#[test]
 fn codex_app_server_catalog_projects_named_historical_threads_without_agents() {
     let mut daemon = TestDaemon::start();
     let bin = daemon.runtime_dir.join("codex-catalog-bin");
@@ -332,6 +406,120 @@ fn cold_recovery_resumes_exact_codex_thread_with_run_scoped_hooks() {
                 .is_ok_and(|argv| argv == b"--enable\0hooks\0resume\0exact-recovery-thread\0")
         },
         "recovered Codex run did not resume the exact thread with hooks",
+    );
+    let second_run = daemon.client.get_shell(&shell_id).unwrap().run.unwrap();
+    assert_ne!(second_run.id, first_run.id);
+
+    drop(recovered_attachment);
+    daemon.stop_with_cli();
+}
+
+#[test]
+fn cold_recovery_resumes_exact_kiro_v3_session_with_run_scoped_hooks() {
+    let mut daemon = TestDaemon::start_with(|command, runtime_dir| {
+        let bin = runtime_dir.join("kiro-bin");
+        let kiro_home = runtime_dir.join("kiro-home");
+        fs::create_dir(&bin).unwrap();
+        fs::create_dir_all(kiro_home.join("hooks")).unwrap();
+        fs::write(
+            kiro_home.join("hooks/boomux.json"),
+            include_str!("../../integrations/kiro/boomux.json"),
+        )
+        .unwrap();
+        let kiro = bin.join("kiro-cli");
+        fs::write(
+            &kiro,
+            "#!/bin/sh\n: > \"$KIRO_RECOVERY_CAPTURE\"\nfor arg do printf '%s\\0' \"$arg\" >> \"$KIRO_RECOVERY_CAPTURE\"; done\nprintf '%s' \"${BOOMUX_KIRO_RUN_SCOPED-unset}\" > \"$KIRO_RECOVERY_MARKER\"\ncase \" $* \" in *' --resume-id '*) exit 0 ;; esac\n/bin/sleep 30\n",
+        )
+        .unwrap();
+        fs::set_permissions(&kiro, fs::Permissions::from_mode(0o700)).unwrap();
+        command
+            .env("PATH", &bin)
+            .env("KIRO_HOME", &kiro_home)
+            .env(
+                "KIRO_RECOVERY_CAPTURE",
+                runtime_dir.join("kiro-recovery-argv"),
+            )
+            .env(
+                "KIRO_RECOVERY_MARKER",
+                runtime_dir.join("kiro-recovery-marker"),
+            );
+    });
+    let kiro = daemon.runtime_dir.join("kiro-bin/kiro-cli");
+    let workspace = daemon
+        .client
+        .create_workspace(
+            "kiro-recovery",
+            vec![ShellSpec {
+                name: "kiro".into(),
+                command: vec![kiro.display().to_string()],
+                cwd: daemon.runtime_dir.clone(),
+            }],
+        )
+        .unwrap();
+    let shell_id = workspace.shells[0].id.clone();
+    let attachment = daemon.client.attach(&shell_id, false, profile()).unwrap();
+    wait_until(
+        || {
+            fs::read(daemon.runtime_dir.join("kiro-recovery-argv"))
+                .is_ok_and(|argv| argv == b"--v3\0")
+        },
+        "initial Kiro run did not launch v3",
+    );
+    assert_eq!(
+        fs::read_to_string(daemon.runtime_dir.join("kiro-recovery-marker")).unwrap(),
+        "1"
+    );
+    let first_run = daemon.client.get_shell(&shell_id).unwrap().run.unwrap();
+    let agent = daemon
+        .client
+        .register_agent(
+            &shell_id,
+            &first_run.id,
+            AgentRegistrationSpec {
+                name: "Kiro CLI".into(),
+                integration: "kiro".into(),
+                external_session_id: Some("exact-kiro-session".into()),
+                report: AgentReport {
+                    state: AgentState::Idle,
+                    authority: AgentAuthority::LifecycleIntegration,
+                    evidence: "Kiro session idle".into(),
+                    confidence: 100,
+                },
+            },
+        )
+        .unwrap();
+
+    daemon.crash();
+    drop(attachment.stream);
+    let bin = daemon.runtime_dir.join("kiro-bin");
+    let kiro_home = daemon.runtime_dir.join("kiro-home");
+    let capture = daemon.runtime_dir.join("kiro-recovery-argv");
+    let marker = daemon.runtime_dir.join("kiro-recovery-marker");
+    daemon.restart_with(move |command| {
+        command
+            .env("PATH", bin)
+            .env("KIRO_HOME", kiro_home)
+            .env("KIRO_RECOVERY_CAPTURE", capture)
+            .env("KIRO_RECOVERY_MARKER", marker);
+    });
+    let recovered = daemon.client.get_shell(&shell_id).unwrap();
+    assert_eq!(
+        recovered.recovered_agent_id.as_deref(),
+        Some(agent.id.as_str())
+    );
+
+    let recovered_attachment = daemon.client.attach(&shell_id, false, profile()).unwrap();
+    wait_until(
+        || {
+            fs::read(daemon.runtime_dir.join("kiro-recovery-argv"))
+                .is_ok_and(|argv| argv == b"--v3\0chat\0--resume-id\0exact-kiro-session\0")
+        },
+        "recovered Kiro run did not resume the exact v3 session",
+    );
+    assert_eq!(
+        fs::read_to_string(daemon.runtime_dir.join("kiro-recovery-marker")).unwrap(),
+        "1"
     );
     let second_run = daemon.client.get_shell(&shell_id).unwrap().run.unwrap();
     assert_ne!(second_run.id, first_run.id);
