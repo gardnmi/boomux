@@ -1,3 +1,4 @@
+use std::env;
 use std::fs;
 use std::io;
 use std::os::unix::net::UnixStream;
@@ -33,6 +34,43 @@ pub(crate) struct TestDaemon {
     pub(crate) client: Client,
 }
 
+fn remove_boomux_shim_environment(command: &mut Command) {
+    let original_path = env::var_os("BOOMUX_ORIGINAL_PATH");
+    let shim_dir = env::var_os("BOOMUX_OPENCODE_SHIM_DIR").map(PathBuf::from);
+    let user_zdotdir = env::var_os("BOOMUX_USER_ZDOTDIR");
+    let private_tui_config = env::var_os("BOOMUX_OPENCODE_TUI_CONFIG");
+    for name in [
+        "BOOMUX_CLAUDE_REMOTE_CONTROL",
+        "BOOMUX_REAL_CLAUDE",
+        "BOOMUX_REAL_OPENCODE",
+        "BOOMUX_ORIGINAL_PATH",
+        "BOOMUX_OPENCODE_SHIM_DIR",
+        "BOOMUX_OPENCODE_TUI_CONFIG",
+        "BOOMUX_SHIM_EXECUTABLE",
+        "BOOMUX_OPENCODE_SHARED_GENERATION",
+        "BOOMUX_OPENCODE_CLAIM_HOLDER",
+        "BOOMUX_USER_ZDOTDIR",
+    ] {
+        command.env_remove(name);
+    }
+    if let Some(path) = original_path {
+        command.env("PATH", path);
+    } else if let (Some(path), Some(shim_dir)) = (env::var_os("PATH"), shim_dir) {
+        let filtered = env::split_paths(&path)
+            .filter(|entry| entry != &shim_dir)
+            .collect::<Vec<_>>();
+        if let Ok(path) = env::join_paths(filtered) {
+            command.env("PATH", path);
+        }
+    }
+    if let Some(zdotdir) = user_zdotdir {
+        command.env("ZDOTDIR", zdotdir);
+    }
+    if private_tui_config.is_some() && env::var_os("OPENCODE_TUI_CONFIG") == private_tui_config {
+        command.env_remove("OPENCODE_TUI_CONFIG");
+    }
+}
+
 impl TestDaemon {
     pub(crate) fn start() -> Self {
         Self::start_with(|command, _| {
@@ -64,6 +102,7 @@ impl TestDaemon {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        remove_boomux_shim_environment(&mut command);
         configure(&mut command, &runtime_dir);
         let child = command.spawn().unwrap();
         let client = Client::from_socket_path(runtime_dir.join("boomux/daemon.sock"));
@@ -82,6 +121,7 @@ impl TestDaemon {
         command.env("XDG_CONFIG_HOME", self.runtime_dir.join("config"));
         command.env("XDG_STATE_HOME", self.runtime_dir.join("state"));
         command.env("BOOMUX_NATIVE_TEST_HOOKS", "1");
+        remove_boomux_shim_environment(&mut command);
         command
     }
 

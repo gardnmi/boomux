@@ -1542,7 +1542,31 @@ impl Client {
             Response::OpenCodeSharedRuntime {
                 runtime: Some(runtime),
             } => Ok(runtime),
+            Response::OpenCodeSharedRuntime { runtime: None } => {
+                Err(ClientError::Validation(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "OpenCode executable is unavailable",
+                )))
+            }
             other => unexpected(other),
+        }
+    }
+
+    pub fn try_ensure_opencode_shared_runtime(
+        &self,
+        port: u16,
+    ) -> Result<Option<OpenCodeSharedRuntimeSnapshot>> {
+        match self.request(Request::EnsureOpenCodeSharedRuntime {
+            port,
+            environment: Some(current_environment()),
+        }) {
+            Ok(Response::OpenCodeSharedRuntime { runtime }) => Ok(runtime),
+            Err(ClientError::Remote(RemoteError {
+                code: Some(ErrorCode::NotFound),
+                ..
+            })) => Ok(None),
+            Err(error) => Err(error),
+            Ok(other) => unexpected(other),
         }
     }
 
@@ -2171,6 +2195,50 @@ mod tests {
             ),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn optional_runtime_accepts_legacy_typed_absence_without_changing_required_callers() {
+        let directory = env::temp_dir().join(format!("boomux-client-runtime-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let socket = directory.join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+                assert_eq!(request.version, protocol::PROTOCOL_VERSION);
+                assert!(matches!(
+                    request.message,
+                    Request::EnsureOpenCodeSharedRuntime { .. }
+                ));
+                protocol::write_message(
+                    &mut stream,
+                    &Envelope::new(Response::Error {
+                        message: "OpenCode executable is unavailable outside the Boomux shim"
+                            .into(),
+                        code: Some(ErrorCode::NotFound),
+                    }),
+                )
+                .unwrap();
+            }
+        });
+        let client = Client::from_socket_path(socket);
+
+        assert_eq!(
+            client.try_ensure_opencode_shared_runtime(4097).unwrap(),
+            None
+        );
+        assert!(matches!(
+            client.ensure_opencode_shared_runtime(4097).unwrap_err(),
+            ClientError::Remote(RemoteError {
+                code: Some(ErrorCode::NotFound),
+                ..
+            })
+        ));
+
+        server.join().unwrap();
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

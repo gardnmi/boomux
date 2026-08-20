@@ -36,15 +36,21 @@ boomux web status
 All lifecycle subcommands support the stable JSON envelope with commands
 `web.start`, `web.status`, and `web.stop`. Background start requires an already
 running daemon and never resurrects a stopped daemon. Repeating an equivalent
-start is idempotent; different options on the same HTTP port are rejected.
+start is idempotent, including when the requested OpenCode host is unavailable;
+different options on the same HTTP port are rejected. Status reports requested
+OpenCode port/URL separately from the active runtime port/URL.
 
 The default URL is `http://127.0.0.1:3737`. Select another loopback port with
-`--port`. The command also ensures one daemon-supervised Shared Harness Runtime
-generation on `127.0.0.1:4097`; choose another stable loopback port with
-`--opencode-web-port`. The same Node-local generation is used by eligible native
-OpenCode TUIs and the phone. Restarting `boomux web` does not replace that
-generation. Runtime exit withdraws native links until the daemon starts or
-strictly cold-adopts a replacement generation.
+`--port`. The command also attempts to ensure one daemon-supervised Shared
+Harness Runtime generation on `127.0.0.1:4097`; choose another stable loopback
+port with `--opencode-web-port`. If the OpenCode executable is absent, the
+dashboard starts without OpenCode links and continues to expose other eligible
+native handoffs such as Claude Remote Control. Port conflicts, installed-runtime
+startup failures, readiness timeouts, and daemon/protocol failures remain fatal.
+The same Node-local generation is used by eligible native OpenCode TUIs and the
+phone. Restarting `boomux web` does not replace that generation. Runtime exit
+withdraws native links until the daemon starts or strictly cold-adopts a
+replacement generation.
 
 Stop the default gateway without stopping the Boomux daemon or any managed
 processes:
@@ -87,8 +93,17 @@ events, and is synchronized when the terminal returns. `--pure`, `--mini`,
 absolute paths, modified `PATH`, and otherwise ineligible invocations receive no
 claim or native link.
 
-To publish both loopback services to the current Tailscale tailnet, opt in when
-starting the foreground or background gateway:
+An interrupted ShellRun never transfers its claim to a replacement run. When
+cold recovery has one exact resumable OpenCode Agent, Boomux instead resumes its
+canonical Session through the Shared Harness Runtime and the replacement TUI
+establishes a fresh claim for the new run. If shared launch preparation is
+unavailable, exact Session recovery remains fail-open as a standalone TUI and
+the native link remains absent. User-entered argument-bearing commands such as
+`opencode --continue` and `opencode --session ID` continue to bypass the scoped
+shim.
+
+To publish the dashboard and any active OpenCode runtime to the current
+Tailscale tailnet, opt in when starting the foreground or background gateway:
 
 ```console
 boomux web --tailscale
@@ -98,7 +113,8 @@ boomux web start --tailscale
 Boomux requires a connected PATH-resolved Tailscale CLI and MagicDNS name. It
 reuses compatible existing Serve routes, rejects conflicts before mutation, and
 adds only missing root routes for dashboard HTTPS 443 and OpenCode HTTPS on the
-configured runtime port. `Ctrl-C` and `boomux web stop` remove only routes that
+active runtime port. When OpenCode is unavailable, only the dashboard route is
+published. `Ctrl-C` and `boomux web stop` remove only routes that
 invocation created; unrelated and compatible pre-existing Serve routes remain.
 A later stop reconciles exact owned routes after a gateway crash. Boomux does
 not configure tailnet grants or ACLs.

@@ -266,9 +266,12 @@ revision-conditional **Dismiss** action; remote attention remains read-only. The
 home page is the complete dashboard; an
 eligible local OpenCode Agent card links directly to the same live Session used
 by its desktop TUI through the Node's Shared Harness Runtime on
-`127.0.0.1:4097`. Remote Agents remain unlinked. The TUI can be detached while
-phone events continue; on return it receives those events and is synchronized
-with the phone.
+`127.0.0.1:4097`. Missing OpenCode is treated as an optional capability: the
+dashboard still starts, reports no active OpenCode runtime, and retains other
+native links such as **Open in Claude**. Port conflicts, runtime failures, and
+protocol or transport errors remain startup failures. Remote Agents remain
+unlinked. The TUI can be detached while phone events continue; on return it
+receives those events and is synchronized with the phone.
 
 Stop only the default web gateway with `boomux web stop`. If it was started with
 another HTTP port, use `boomux web stop --port PORT`. This leaves the daemon,
@@ -278,7 +281,8 @@ Use `boomux web start` for detached background operation and `boomux web status`
 for passive inspection. Start requires the daemon to already be running and is
 idempotent for equivalent options. All three lifecycle commands support `--json`.
 
-Publish both loopback services to a connected Tailscale tailnet explicitly:
+Publish the dashboard and any active OpenCode runtime to a connected Tailscale
+tailnet explicitly:
 
 ```console
 boomux web --tailscale
@@ -287,6 +291,7 @@ boomux web start --tailscale
 
 Boomux reuses compatible Serve routes, rejects conflicts, records only routes it
 creates, and removes those exact routes on graceful exit or `boomux web stop`.
+When OpenCode is unavailable, only the dashboard route is published.
 It does not reset unrelated Serve configuration or define Tailscale grants and
 ACLs. Without `--tailscale`, remote publication remains external. The MVP has
 no terminal input, transcript parsing, or cloud service. Its only mutation is
@@ -632,6 +637,10 @@ After a cold daemon restart, Boomux resumes a uniquely identified OpenCode, Pi,
 or Claude session when its interrupted shell is next started. Recovery requires
 a retained external session ID reported by the lifecycle integration; ambiguous,
 completed, or heuristic-only Agents fall back to the shell's configured command.
+Recovered OpenCode Sessions attach to the Shared Harness Runtime and establish a
+fresh claim for the replacement ShellRun, preserving eligible OpenCode Web
+handoffs across run generations. If shared preparation is unavailable, recovery
+continues with the standalone exact-Session command.
 Set `recovery.resume_agents` to `false` to disable this behavior.
 
 Terminal history persistence is opt-in because terminal output can contain

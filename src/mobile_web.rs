@@ -50,6 +50,7 @@ const ICON_512: &[u8] = include_bytes!("../assets/mobile-web/icon-512.png");
 struct AppState {
     client: Client,
     presentation: Arc<Mutex<PresentationState>>,
+    opencode_requested_port: Option<u16>,
     opencode_web_url: Option<Arc<str>>,
     opencode_runtime_hint: Option<OpenCodeRuntimeHint>,
 }
@@ -71,6 +72,10 @@ pub(crate) struct WebStatus {
     pub(crate) port: u16,
     pub(crate) tailscale: bool,
     pub(crate) dashboard_url: String,
+    #[serde(default)]
+    pub(crate) opencode_requested_port: Option<u16>,
+    #[serde(default)]
+    pub(crate) opencode_requested_url: Option<String>,
     pub(crate) opencode_port: Option<u16>,
     pub(crate) opencode_url: Option<String>,
 }
@@ -336,10 +341,13 @@ pub(crate) fn run(
     } else {
         client::connect_or_start()?
     };
-    let opencode_runtime = configuration
-        .runtime_port
-        .map(|port| client.ensure_opencode_shared_runtime(port))
-        .transpose()?;
+    let opencode_runtime = match configuration.runtime_port {
+        Some(port) => client.try_ensure_opencode_shared_runtime(port)?,
+        None => None,
+    };
+    if configuration.runtime_port.is_some() && opencode_runtime.is_none() {
+        eprintln!("boomux: OpenCode is unavailable; continuing without OpenCode handoffs");
+    }
     let opencode_web_url = configuration.public_url.map(Arc::from);
     let opencode_runtime_hint = opencode_runtime.map(|runtime| OpenCodeRuntimeHint {
         generation_id: Arc::from(runtime.generation_id),
@@ -357,6 +365,7 @@ pub(crate) fn run(
     let state = AppState {
         client,
         presentation: Arc::new(Mutex::new(presentation)),
+        opencode_requested_port: configuration.runtime_port,
         opencode_web_url,
         opencode_runtime_hint,
     };
@@ -491,6 +500,15 @@ async fn serve(
             || format!("http://{address}"),
             crate::tailscale_serve::Exposure::dashboard_url,
         ),
+        opencode_requested_port: state.opencode_requested_port,
+        opencode_requested_url: state.opencode_requested_port.and_then(|port| {
+            (!tailscale).then(|| {
+                state
+                    .opencode_web_url
+                    .as_deref()
+                    .map_or_else(|| format!("http://127.0.0.1:{port}"), ToOwned::to_owned)
+            })
+        }),
         opencode_port: state
             .opencode_runtime_hint
             .as_ref()
@@ -1633,6 +1651,8 @@ mod tests {
             port: 3737,
             tailscale: true,
             dashboard_url: "https://host.example.ts.net".into(),
+            opencode_requested_port: Some(4097),
+            opencode_requested_url: None,
             opencode_port: Some(4097),
             opencode_url: Some("https://host.example.ts.net:4097".into()),
         };
@@ -1647,10 +1667,22 @@ mod tests {
 
         let status = status_control_socket(&path).unwrap().unwrap();
         assert_eq!(status.dashboard_url, expected.dashboard_url);
+        assert_eq!(status.opencode_requested_port, Some(4097));
         assert_eq!(status.opencode_port, Some(4097));
         server.join().unwrap();
         fs::remove_file(path).unwrap();
         fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn old_web_status_defaults_requested_opencode_configuration() {
+        let status: WebStatus = serde_json::from_str(
+            r#"{"running":true,"port":3737,"tailscale":false,"dashboard_url":"http://127.0.0.1:3737","opencode_port":4097,"opencode_url":"http://127.0.0.1:4097"}"#,
+        )
+        .unwrap();
+        assert_eq!(status.opencode_requested_port, None);
+        assert_eq!(status.opencode_requested_url, None);
+        assert_eq!(status.opencode_port, Some(4097));
     }
 
     #[test]

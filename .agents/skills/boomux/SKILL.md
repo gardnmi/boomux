@@ -248,7 +248,10 @@ completed = "complete"
 ```
 
 Cold recovery resumes only a unique OpenCode or Pi external session reported by
-the lifecycle integration. Persisted terminal history is disabled by default
+the lifecycle integration. An eligible recovered OpenCode Session attaches to
+the Shared Harness Runtime and establishes a fresh claim for its replacement
+ShellRun; if shared launch preparation is unavailable, exact Session recovery
+continues standalone without a web link. Persisted terminal history is disabled by default
 because output can contain secrets; enabling it stores up to 256 KiB of
 plain-text history per shell in Boomux's user-only state file.
 
@@ -535,9 +538,12 @@ Agent per exact run plus historical Agents with durable attention, excluding
 schedule-owned Agents. It also presents local working-to-idle transitions as
 gateway-owned ephemeral finished alerts, refreshed even without a connected
 browser. Its home page is the complete dashboard and cannot send terminal input
-or acknowledge attention. It ensures the Node's loopback Shared Harness Runtime
-and links exact local Sessions directly from eligible Agent cards only while a
-current Agent Session Claim binds that runtime generation to the exact ShellRun.
+or acknowledge attention. It attempts to ensure the Node's loopback Shared
+Harness Runtime and links exact local Sessions directly from eligible Agent cards
+only while a current Agent Session Claim binds that runtime generation to the
+exact ShellRun. If OpenCode is not installed, web startup continues without that
+runtime or its Tailscale route; Claude and other presentation remain available.
+Conflicts and failures from an installed runtime remain fatal.
 `--opencode-web-url URL` is the public origin for that same local runtime, never
 an unrelated server. `--no-opencode-web` disables web-triggered runtime startup
 and native links. Boomux does not proxy or authenticate that full-control

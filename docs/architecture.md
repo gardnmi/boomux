@@ -374,6 +374,12 @@ and web-client restart. Graceful handoff transfers its strict PID/start/runtime
 identity and generation; cold startup adopts only an exactly matching runtime.
 Daemon stop terminates it. A hidden shared launcher establishes a scoped `PATH`
 only for eligible Boomux login Shells and is not stable public automation.
+When cold recovery selects one exact resumable OpenCode Agent, the replacement
+ShellRun uses that same hidden launcher with the canonical Session ID. The TUI
+therefore attaches to the current Shared Harness Runtime generation and creates
+a fresh exact-run claim. Failure to prepare the shared launch falls back to the
+existing standalone exact-Session recovery rather than making the Shell
+unopenable. Explicit argument-bearing user invocations remain unchanged.
 
 ### Attachment
 
@@ -583,10 +589,10 @@ stop the Shared Harness Runtime.
 PATH-resolved Tailscale CLI with exact argument vectors, requires a connected
 Node with a MagicDNS name, and preflights the current Serve JSON before changing
 it. A compatible existing route is reused but never claimed. A conflicting root
-handler fails startup before mutation. Missing dashboard HTTPS 443 and OpenCode
-HTTPS runtime-port routes are added independently, and only routes created by
-that gateway are recorded in an owner-only, versioned runtime record. Graceful
-exit removes those exact root routes; `boomux web stop` also reconciles a record
+handler fails startup before mutation. Missing dashboard HTTPS 443 and an active
+OpenCode HTTPS runtime-port route are added independently, and only routes
+created by that gateway are recorded in an owner-only, versioned runtime record.
+Graceful exit removes those exact root routes; `boomux web stop` also reconciles a record
 left by a crashed gateway. Changed or externally owned routes are never removed,
 and Boomux never resets unrelated Serve configuration. Tailscale remains
 responsible for certificates, tailnet identity, grants, and ACL policy.
@@ -614,9 +620,15 @@ daemon-protocol pass-through, terminal attachment, input, Session resume,
 rendered terminal output, Agent detail route, or harness transcript adapter.
 The home-page snapshot is the complete HTTP Agent projection.
 
-`boomux web` ensures the same daemon-supervised Shared Harness Runtime used by
-eligible native OpenCode TUIs. For an authoritative claimed local OpenCode Agent
-with a canonical external Session ID and UTF-8 working directory, Boomux
+`boomux web` attempts to ensure the same daemon-supervised Shared Harness Runtime
+used by eligible native OpenCode TUIs. A typed missing OpenCode executable is an
+optional-capability result: the dashboard starts without a runtime or OpenCode
+route, while Claude and other presentation remain available. Port conflicts,
+runtime exit or timeout, protocol incompatibility, and daemon transport failures
+still fail startup. Requested OpenCode configuration is retained separately from
+actual runtime availability so detached equivalent starts remain idempotent.
+For an authoritative claimed local OpenCode Agent with a canonical external
+Session ID and UTF-8 working directory, Boomux
 base64url-encodes the directory and constructs OpenCode's exact
 `/<directory>/session/<session-id>` route on that Agent's home-page card. The
 browser derives a default public origin from its current scheme and hostname plus
@@ -1521,7 +1533,10 @@ that arbitrary processes, mutated environments, or PTYs survive daemon restart
 or crash. When enabled, cold recovery substitutes an integration-native resume
 command for a uniquely identified, lifecycle-authoritative OpenCode, Pi, or
 Claude Agent from an interrupted run. Ambiguous or invalid candidates use the
-shell's normal command instead.
+shell's normal command instead. OpenCode recovery routes the exact Session
+through the Shared Harness Runtime so its replacement ShellRun can establish a
+fresh claim; shared-launch preparation failure retains the standalone native
+resume fallback.
 
 Plain-text terminal history is a separate opt-in recovery field because output
 can contain secrets. The shadow terminal checkpoints a UTF-8-safe suffix of at

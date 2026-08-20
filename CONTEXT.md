@@ -109,9 +109,11 @@ external session identity, but it owns no process, PTY, or lifecycle observation
 One ephemeral Node-local, daemon-supervised generation of an external harness
 server shared by native clients. It is not a Shell, Command, Launcher, Agent,
 Session, or durable resource. The first bare interactive `opencode` in an
-eligible managed login Shell, or `boomux web`, starts it. It survives terminal
-detach, `boomux web` restart, and graceful daemon handoff. Cold adoption requires
-strict runtime identity, and `boomux daemon stop` stops it.
+eligible managed login Shell starts it. `boomux web` also starts it when the
+OpenCode host is available, but remains a complete Agent dashboard when that
+optional host is absent. The runtime survives terminal detach, `boomux web`
+restart, and graceful daemon handoff. Cold adoption requires strict runtime
+identity, and `boomux daemon stop` stops it.
 
 ## Agent Session Claim
 
@@ -123,7 +125,10 @@ Session, process, controller, projection, event, or durable identity.
 Expiry, final-holder release, ShellRun replacement, or runtime-generation
 replacement removes authority without deleting or moving durable Agent history.
 Claims are not persisted, projected, event-published, or transferred during
-daemon handoff; surviving TUIs reacquire them from the replacement daemon.
+daemon handoff; surviving TUIs reacquire them from the replacement daemon. When
+cold recovery resumes one exact OpenCode Session on a replacement ShellRun, its
+daemon-generated launch attaches to the Shared Harness Runtime so the new TUI
+can establish a fresh claim rather than inheriting the invalid prior-run claim.
 
 ## Claude Remote Control Binding
 

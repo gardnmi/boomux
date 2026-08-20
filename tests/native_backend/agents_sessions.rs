@@ -324,6 +324,194 @@ fn opencode_runtime_receives_exact_ephemeral_environment_and_cold_adopts() {
 }
 
 #[test]
+fn cold_recovery_attaches_opencode_session_to_shared_runtime_and_new_run() {
+    let mut daemon = TestDaemon::start_with(|command, runtime_dir| {
+        let runtime_bin = runtime_dir.join("bin");
+        let shell_bin = runtime_dir.join("shell-bin");
+        fs::create_dir(&runtime_bin).unwrap();
+        fs::create_dir(&shell_bin).unwrap();
+        let runtime_opencode = runtime_bin.join("opencode");
+        fs::write(
+            &runtime_opencode,
+            "#!/bin/sh\ncase \"${1-}\" in\n  serve) exec python3 -c 'import socket,sys,time; s=socket.socket(); s.bind((\"127.0.0.1\", int(sys.argv[5]))); s.listen(); time.sleep(60)' \"$@\" ;;\n  attach) printf 'path-decoy\\n' > \"$CAPTURE\"; exit 1 ;;\n  *) while :; do sleep 60; done ;;\nesac\n",
+        )
+        .unwrap();
+        fs::set_permissions(&runtime_opencode, fs::Permissions::from_mode(0o700)).unwrap();
+        let shell_opencode = shell_bin.join("opencode");
+        fs::write(
+            &shell_opencode,
+            "#!/bin/sh\ncase \"${1-}\" in\n  attach) { for arg do printf 'arg:%s\\n' \"$arg\"; done; printf 'generation:%s\\nholder:%s\\nshell:%s\\nrun:%s\\n' \"$BOOMUX_OPENCODE_SHARED_GENERATION\" \"$BOOMUX_OPENCODE_CLAIM_HOLDER\" \"$BOOMUX_SHELL_ID\" \"$BOOMUX_RUN_ID\"; } > \"$CAPTURE\"; while :; do sleep 60; done ;;\n  *) while :; do sleep 60; done ;;\nesac\n",
+        )
+        .unwrap();
+        fs::set_permissions(&shell_opencode, fs::Permissions::from_mode(0o700)).unwrap();
+        command
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    runtime_bin.display(),
+                    std::env::var("PATH").unwrap()
+                ),
+            )
+            .env("CAPTURE", runtime_dir.join("recovered-opencode"));
+    });
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let runtime = ensure_test_opencode_runtime(&daemon, port).unwrap();
+    let opencode_directory = daemon.runtime_dir.join("shell-bin");
+    let workspace = daemon
+        .client
+        .create_workspace(
+            "recover-shared-opencode",
+            vec![ShellSpec {
+                name: "opencode".into(),
+                command: vec!["./opencode".into()],
+                cwd: opencode_directory,
+            }],
+        )
+        .unwrap();
+    let shell_id = workspace.shells[0].id.clone();
+    let attachment = daemon.client.attach(&shell_id, false, profile()).unwrap();
+    let first_run = daemon.client.get_shell(&shell_id).unwrap().run.unwrap();
+    daemon
+        .client
+        .register_agent(
+            &shell_id,
+            &first_run.id,
+            AgentRegistrationSpec {
+                name: "OpenCode".into(),
+                integration: "opencode".into(),
+                external_session_id: Some("ses_recovered_exact".into()),
+                report: AgentReport {
+                    state: AgentState::Idle,
+                    authority: AgentAuthority::LifecycleIntegration,
+                    evidence: "idle before interruption".into(),
+                    confidence: 100,
+                },
+            },
+        )
+        .unwrap();
+
+    daemon.crash();
+    drop(attachment.stream);
+    let path = format!(
+        "{}:{}",
+        daemon.runtime_dir.join("bin").display(),
+        std::env::var("PATH").unwrap()
+    );
+    let capture = daemon.runtime_dir.join("recovered-opencode");
+    let restart_capture = capture.clone();
+    daemon.restart_with(|command| {
+        command.env("PATH", path).env("CAPTURE", restart_capture);
+    });
+    let recovered_attachment = daemon.client.attach(&shell_id, false, profile()).unwrap();
+    wait_until(
+        || capture.is_file(),
+        "recovered OpenCode did not attach to the shared runtime",
+    );
+    let second_run = daemon.client.get_shell(&shell_id).unwrap().run.unwrap();
+    assert_eq!(second_run.generation, first_run.generation + 1);
+    assert_ne!(second_run.id, first_run.id);
+    let captured = fs::read_to_string(&capture).unwrap();
+    assert!(captured.contains("arg:attach\n"));
+    assert!(captured.contains(&format!("arg:{}\n", runtime.url)));
+    assert!(captured.contains("arg:--session\narg:ses_recovered_exact\n"));
+    assert!(captured.contains(&format!("generation:{}\n", runtime.generation_id)));
+    assert!(captured.contains(&format!("shell:{shell_id}\n")));
+    assert!(captured.contains(&format!("run:{}\n", second_run.id)));
+    let holder = captured
+        .lines()
+        .find_map(|line| line.strip_prefix("holder:"))
+        .filter(|holder| !holder.is_empty())
+        .unwrap();
+    let registration = AgentRegistrationSpec {
+        name: "OpenCode".into(),
+        integration: "opencode".into(),
+        external_session_id: Some("ses_recovered_exact".into()),
+        report: AgentReport {
+            state: AgentState::Unknown,
+            authority: AgentAuthority::LifecycleIntegration,
+            evidence: "direct recovered TUI selection".into(),
+            confidence: 100,
+        },
+    };
+    let (claim, agent) = daemon
+        .client
+        .ensure_opencode_session_claim(
+            &runtime.generation_id,
+            holder,
+            "ses_recovered_exact",
+            &shell_id,
+            &second_run.id,
+            registration,
+        )
+        .unwrap();
+    assert_eq!(claim.run_id, second_run.id);
+    assert_eq!(agent.run_id, second_run.id);
+    assert_eq!(
+        daemon
+            .client
+            .resolve_opencode_session_claim(&runtime.generation_id, "ses_recovered_exact")
+            .unwrap()
+            .0,
+        claim
+    );
+
+    drop(recovered_attachment);
+    daemon.stop_with_cli();
+}
+
+#[test]
+fn recovered_opencode_fallback_preserves_user_environment_and_exact_session() {
+    let mut daemon = TestDaemon::start();
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let empty_bin = daemon.runtime_dir.join("empty-bin");
+    fs::create_dir(&empty_bin).unwrap();
+    let capture = daemon.runtime_dir.join("standalone-recovery");
+    let fallback = daemon.runtime_dir.join("fallback-opencode");
+    fs::write(
+        &fallback,
+        "#!/bin/sh\n{ for arg do printf 'arg:%s\\n' \"$arg\"; done; printf 'path:%s\\ntui:%s\\nreal:%s\\noriginal:%s\\nshim:%s\\nprivate-tui:%s\\nclaude:%s\\nclaude-policy:%s\\nzdot:%s\\n' \"$PATH\" \"${OPENCODE_TUI_CONFIG-unset}\" \"${BOOMUX_REAL_OPENCODE-unset}\" \"${BOOMUX_ORIGINAL_PATH-unset}\" \"${BOOMUX_SHIM_EXECUTABLE-unset}\" \"${BOOMUX_OPENCODE_TUI_CONFIG-unset}\" \"${BOOMUX_REAL_CLAUDE-unset}\" \"${BOOMUX_CLAUDE_REMOTE_CONTROL-unset}\" \"${BOOMUX_USER_ZDOTDIR-unset}\"; } > \"$CAPTURE\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fallback, fs::Permissions::from_mode(0o700)).unwrap();
+    let output = daemon
+        .command()
+        .args([
+            "opencode",
+            "shared",
+            "--session",
+            "ses_fallback_exact",
+            "--port",
+            &port.to_string(),
+        ])
+        .env("PATH", &empty_bin)
+        .env("CAPTURE", &capture)
+        .env("BOOMUX_SHELL_ID", "shell-exact")
+        .env("BOOMUX_RUN_ID", "run-exact")
+        .env("BOOMUX_REAL_OPENCODE", &fallback)
+        .env("BOOMUX_ORIGINAL_PATH", "/user/original-bin")
+        .env("BOOMUX_SHIM_EXECUTABLE", &daemon.executable)
+        .env("BOOMUX_OPENCODE_TUI_CONFIG", "/private/tui.json")
+        .env("OPENCODE_TUI_CONFIG", "/user/tui.json")
+        .env("BOOMUX_REAL_CLAUDE", "/private/claude")
+        .env("BOOMUX_CLAUDE_REMOTE_CONTROL", "1")
+        .env("BOOMUX_USER_ZDOTDIR", "/user/zdotdir")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("continuing standalone"));
+    assert_eq!(
+        fs::read_to_string(capture).unwrap(),
+        "arg:--session\narg:ses_fallback_exact\npath:/user/original-bin\ntui:/user/tui.json\nreal:unset\noriginal:unset\nshim:unset\nprivate-tui:unset\nclaude:unset\nclaude-policy:unset\nzdot:unset\n"
+    );
+    daemon.stop_with_cli();
+}
+
+#[test]
 fn agent_runtime_is_revisioned_durable_and_version_compatible() {
     let mut daemon = TestDaemon::start();
     let workspace = daemon
