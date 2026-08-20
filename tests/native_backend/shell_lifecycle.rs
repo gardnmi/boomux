@@ -15,6 +15,122 @@ use crate::support::{
 };
 
 #[test]
+fn bare_claude_command_uses_owner_remote_control_policy_without_rewriting_stored_argv() {
+    for (enabled, expected) in [
+        (true, b"--remote-control\0".as_slice()),
+        (false, b"".as_slice()),
+    ] {
+        let mut daemon = TestDaemon::start_with(|command, runtime_dir| {
+            let output = runtime_dir.join("claude-argv");
+            let claude = runtime_dir.join("claude");
+            fs::write(
+                &claude,
+                format!(
+                    "#!/bin/sh\n: > '{}'\nfor arg do printf '%s\\0' \"$arg\" >> '{}'; done\n",
+                    output.display(),
+                    output.display()
+                ),
+            )
+            .unwrap();
+            fs::set_permissions(&claude, fs::Permissions::from_mode(0o700)).unwrap();
+            if !enabled {
+                let config = runtime_dir.join("config.toml");
+                fs::write(&config, "[claude]\nremote_control = false\n").unwrap();
+                command.env("BOOMUX_CONFIG", config);
+            }
+        });
+        let claude = daemon.runtime_dir.join("claude");
+        let workspace = daemon
+            .client
+            .create_workspace(
+                if enabled { "claude-on" } else { "claude-off" },
+                vec![ShellSpec {
+                    name: "claude".into(),
+                    command: vec![claude.display().to_string()],
+                    cwd: daemon.runtime_dir.clone(),
+                }],
+            )
+            .unwrap();
+        let shell_id = &workspace.shells[0].id;
+        let attachment = daemon.client.attach(shell_id, false, profile()).unwrap();
+        wait_until(
+            || fs::read(daemon.runtime_dir.join("claude-argv")).is_ok(),
+            "Claude command did not capture argv",
+        );
+        assert_eq!(
+            fs::read(daemon.runtime_dir.join("claude-argv")).unwrap(),
+            expected
+        );
+        assert_eq!(
+            daemon.client.get_shell(shell_id).unwrap().command,
+            [claude.display().to_string()]
+        );
+        drop(attachment);
+        daemon.stop_with_cli();
+    }
+}
+
+#[test]
+fn bare_claude_typed_in_managed_login_shell_uses_remote_control_shim() {
+    let mut daemon = TestDaemon::start();
+    let bin = daemon.runtime_dir.join("claude-bin");
+    let home = daemon.runtime_dir.join("home");
+    let output = daemon.runtime_dir.join("typed-claude-argv");
+    fs::create_dir(&bin).unwrap();
+    fs::create_dir(&home).unwrap();
+    let claude = bin.join("claude");
+    fs::write(
+        &claude,
+        format!(
+            "#!/bin/sh\n: > '{}'\nfor arg do printf '%s\\0' \"$arg\" >> '{}'; done\n",
+            output.display(),
+            output.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&claude, fs::Permissions::from_mode(0o700)).unwrap();
+    let workspace = daemon
+        .client
+        .create_workspace(
+            "claude-login",
+            vec![ShellSpec::login("login", &daemon.runtime_dir)],
+        )
+        .unwrap();
+    let environment = UnixEnvironment {
+        variables: [
+            (b"SHELL".as_slice(), std::ffi::OsStr::new("/bin/bash")),
+            (b"HOME".as_slice(), home.as_os_str()),
+            (b"PATH".as_slice(), bin.as_os_str()),
+            (
+                b"XDG_RUNTIME_DIR".as_slice(),
+                daemon.runtime_dir.as_os_str(),
+            ),
+        ]
+        .into_iter()
+        .map(|(name, value)| UnixEnvironmentVariable {
+            name: name.to_vec(),
+            value: value.as_encoded_bytes().to_vec(),
+        })
+        .collect(),
+    };
+    let mut attachment =
+        attach_with_environment(&daemon.client, &workspace.shells[0].id, false, environment);
+    AttachFrame::Input(b"claude\n".to_vec())
+        .write_to(&mut attachment.stream)
+        .unwrap();
+    wait_until(
+        || fs::read(&output).is_ok(),
+        "typed Claude command did not capture argv",
+    );
+    assert_eq!(fs::read(output).unwrap(), b"--remote-control\0");
+    AttachFrame::Input(b"exit\n".to_vec())
+        .write_to(&mut attachment.stream)
+        .unwrap();
+    drop(attachment);
+    daemon.stop_with_cli();
+}
+
+#[test]
 fn legacy_workspace_default_cwd_is_inherited_and_survives_handoff() {
     let mut daemon = TestDaemon::start();
     let project = daemon.runtime_dir.join("project");

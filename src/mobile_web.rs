@@ -733,6 +733,17 @@ fn opencode_handoff(
     }
 }
 
+fn claude_handoff(bridge_session_id: &str) -> NativeWebHandoff {
+    let path = format!("/code/{}", percent_encode_path_segment(bridge_session_id));
+    NativeWebHandoff {
+        integration: "claude",
+        label: "Open in Claude",
+        url: Some(format!("https://claude.ai{path}")),
+        port: None,
+        path,
+    }
+}
+
 fn base64_url(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
@@ -1246,8 +1257,30 @@ fn project_native_web_handoffs(
     opencode_web_url: Option<&str>,
     opencode_runtime_hint: Option<&OpenCodeRuntimeHint>,
 ) -> HashMap<(String, String), NativeWebHandoff> {
+    let visible_agents = project_visible_agents(combined);
+    let mut handoffs = HashMap::new();
+    for agent in visible_agents.iter().filter(|agent| {
+        agent.node_local && agent.node_current && agent.run_current && agent.integration == "claude"
+    }) {
+        let binding = client.get_claude_remote_control_binding(
+            &agent.agent_id,
+            &agent.shell_id,
+            &agent.run_id,
+        );
+        if let Ok(Some(binding)) = binding
+            && binding.agent_id == agent.agent_id
+            && binding.shell_id == agent.shell_id
+            && binding.run_id == agent.run_id
+        {
+            handoffs.insert(
+                (agent.node_id.clone(), agent.agent_id.clone()),
+                claude_handoff(&binding.bridge_session_id),
+            );
+        }
+    }
+
     let Some(runtime_hint) = opencode_runtime_hint else {
-        return HashMap::new();
+        return handoffs;
     };
     // The startup value is only a generation hint and cannot authorize a stale link.
     let Some(runtime) = client
@@ -1259,11 +1292,10 @@ fn project_native_web_handoffs(
                 && runtime.port == runtime_hint.port
         })
     else {
-        return HashMap::new();
+        return handoffs;
     };
 
-    let mut handoffs = HashMap::new();
-    for agent in project_visible_agents(combined)
+    for agent in visible_agents
         .into_iter()
         .filter(|agent| agent.node_local && agent.integration == "opencode")
     {
@@ -1695,6 +1727,19 @@ mod tests {
         assert_eq!(managed.url, None);
         assert_eq!(managed.port, Some(4097));
         assert_eq!(managed.path, "/L3dvcms/session/session-local");
+    }
+
+    #[test]
+    fn claude_handoff_targets_the_exact_encoded_bridge_session() {
+        let handoff = claude_handoff("bridge/with spaces");
+        assert_eq!(handoff.integration, "claude");
+        assert_eq!(handoff.label, "Open in Claude");
+        assert_eq!(
+            handoff.url.as_deref(),
+            Some("https://claude.ai/code/bridge%2Fwith%20spaces")
+        );
+        assert_eq!(handoff.port, None);
+        assert_eq!(handoff.path, "/code/bridge%2Fwith%20spaces");
     }
 
     #[test]

@@ -11,15 +11,15 @@ use serde::{Deserialize, Serialize};
 use crate::client;
 use crate::fd_transfer::receive_descriptor;
 use crate::protocol::{
-    self, DaemonEvent, FocusedTerminalSnapshot, NotificationDeliveryConfig,
-    QualifiedFocusedTerminalSnapshot, TerminalProfile,
+    self, ClaudeRemoteControlBindingSnapshot, DaemonEvent, FocusedTerminalSnapshot,
+    NotificationDeliveryConfig, QualifiedFocusedTerminalSnapshot, TerminalProfile,
 };
 use crate::state_store;
 
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 pub(crate) const CHANNEL_FD: RawFd = 198;
-pub(crate) const HEADER: &[u8; 8] = b"BOOMUXH5";
-pub(crate) const OLD_HEADER: &[u8; 8] = b"BOOMUXH4";
+pub(crate) const HEADER: &[u8; 8] = b"BOOMUXH6";
+pub(crate) const OLD_HEADER: &[u8; 8] = b"BOOMUXH5";
 pub(crate) const LISTENER_MARKER: u8 = 1;
 pub(crate) const RUNTIME_LOCK_MARKER: u8 = 2;
 pub(crate) const STATE_LOCK_MARKER: u8 = 3;
@@ -46,6 +46,8 @@ pub(crate) struct Manifest {
     pub(crate) presented_focused_terminal: Option<QualifiedFocusedTerminalSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) opencode_runtime: Option<OpenCodeRuntimeManifest>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) claude_remote_control_bindings: Vec<ClaudeRemoteControlBindingSnapshot>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -116,6 +118,7 @@ pub(crate) enum Bootstrap {
         focused_terminal: Option<Box<FocusedTerminalSnapshot>>,
         presented_focused_terminal: Option<Box<QualifiedFocusedTerminalSnapshot>>,
         opencode_runtime: Option<TransferredOpenCodeRuntime>,
+        claude_remote_control_bindings: Vec<ClaudeRemoteControlBindingSnapshot>,
     },
 }
 
@@ -135,6 +138,7 @@ pub(crate) fn receive_bootstrap(channel: RawFd) -> io::Result<Bootstrap> {
     validate_manifest(&manifest)?;
     let event_stream = manifest.event_stream.clone();
     let notifications = manifest.notifications.clone();
+    let claude_remote_control_bindings = manifest.claude_remote_control_bindings.clone();
     let focused_terminal = manifest.focused_terminal.clone().map(Box::new);
     let presented_focused_terminal = manifest.presented_focused_terminal.clone().map(Box::new);
     let listener = receive_descriptor(&channel, LISTENER_MARKER)?;
@@ -217,6 +221,7 @@ pub(crate) fn receive_bootstrap(channel: RawFd) -> io::Result<Bootstrap> {
             focused_terminal,
             presented_focused_terminal,
             opencode_runtime,
+            claude_remote_control_bindings,
         }),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -314,6 +319,31 @@ fn validate_manifest(manifest: &Manifest) -> io::Result<()> {
             io::ErrorKind::InvalidData,
             "handoff manifest contains too many runtimes",
         ));
+    }
+    if manifest.claude_remote_control_bindings.len() > protocol::MAX_CLAUDE_REMOTE_CONTROL_BINDINGS
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "handoff manifest contains too many Claude Remote Control bindings",
+        ));
+    }
+    let mut binding_agent_ids = std::collections::HashSet::new();
+    let mut binding_bridge_ids = std::collections::HashSet::new();
+    for binding in &manifest.claude_remote_control_bindings {
+        if uuid::Uuid::parse_str(&binding.agent_id).is_err()
+            || uuid::Uuid::parse_str(&binding.shell_id).is_err()
+            || uuid::Uuid::parse_str(&binding.run_id).is_err()
+            || binding.bridge_session_id.is_empty()
+            || binding.bridge_session_id.len() > protocol::MAX_CLAUDE_BRIDGE_SESSION_ID_BYTES
+            || binding.bridge_session_id.chars().any(char::is_control)
+            || !binding_agent_ids.insert(&binding.agent_id)
+            || !binding_bridge_ids.insert(&binding.bridge_session_id)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "handoff manifest contains an invalid Claude Remote Control binding",
+            ));
+        }
     }
     let mut shell_ids = std::collections::HashSet::new();
     let mut run_ids = std::collections::HashSet::new();
@@ -500,13 +530,14 @@ mod tests {
         assert!(manifest.focused_terminal.is_none());
         assert!(manifest.presented_focused_terminal.is_none());
         assert!(manifest.opencode_runtime.is_none());
+        assert!(manifest.claude_remote_control_bindings.is_empty());
     }
 
     #[test]
-    fn h4_and_h5_bootstrap_headers_remain_accepted() {
+    fn h5_and_h6_bootstrap_headers_remain_accepted() {
         assert!(supported_header(OLD_HEADER));
         assert!(supported_header(HEADER));
-        assert!(!supported_header(b"BOOMUXH3"));
+        assert!(!supported_header(b"BOOMUXH4"));
     }
 
     #[test]
@@ -531,6 +562,7 @@ mod tests {
                 ),
             }),
             opencode_runtime: None,
+            claude_remote_control_bindings: Vec::new(),
         };
 
         let decoded: Manifest =
@@ -555,6 +587,7 @@ mod tests {
                 port: 4096,
                 pid: 42,
             }),
+            claude_remote_control_bindings: Vec::new(),
         };
 
         validate_manifest(&manifest).unwrap();
@@ -565,6 +598,30 @@ mod tests {
         assert_eq!(runtime.generation_id, generation_id);
         assert_eq!(runtime.port, 4096);
         assert_eq!(runtime.pid, 42);
+    }
+
+    #[test]
+    fn manifest_round_trips_bounded_claude_remote_control_binding() {
+        let binding = ClaudeRemoteControlBindingSnapshot {
+            agent_id: uuid::Uuid::new_v4().to_string(),
+            shell_id: uuid::Uuid::new_v4().to_string(),
+            run_id: uuid::Uuid::new_v4().to_string(),
+            bridge_session_id: "bridge/exact".into(),
+        };
+        let manifest = Manifest {
+            runtimes: Vec::new(),
+            exited: Vec::new(),
+            event_stream: event_stream(),
+            notifications: None,
+            focused_terminal: None,
+            presented_focused_terminal: None,
+            opencode_runtime: None,
+            claude_remote_control_bindings: vec![binding.clone()],
+        };
+        validate_manifest(&manifest).unwrap();
+        let decoded: Manifest =
+            serde_json::from_value(serde_json::to_value(manifest).unwrap()).unwrap();
+        assert_eq!(decoded.claude_remote_control_bindings, [binding]);
     }
 
     #[test]
@@ -589,6 +646,7 @@ mod tests {
                 focused_terminal: None,
                 presented_focused_terminal: None,
                 opencode_runtime: None,
+                claude_remote_control_bindings: Vec::new(),
             };
             assert_eq!(
                 validate_manifest(&manifest).unwrap_err().kind(),

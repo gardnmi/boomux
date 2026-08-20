@@ -31,6 +31,12 @@ pub(crate) const PI_ASSET: &str = boomux::integrations::PI
     .as_ref()
     .expect("Pi installation capability")
     .content;
+#[cfg(test)]
+pub(crate) const CLAUDE_ASSET: &str = boomux::integrations::CLAUDE
+    .installation
+    .as_ref()
+    .expect("Claude installation capability")
+    .content;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct IntegrationId(&'static IntegrationDescriptor);
@@ -42,6 +48,9 @@ impl IntegrationId {
     pub(crate) const Opencode: Self = Self::OPENCODE;
     #[allow(non_upper_case_globals)]
     pub(crate) const Pi: Self = Self::PI;
+    #[cfg(test)]
+    #[allow(non_upper_case_globals)]
+    pub(crate) const Claude: Self = Self(&boomux::integrations::CLAUDE);
 
     pub(crate) const fn spec(self) -> &'static IntegrationDescriptor {
         self.0
@@ -84,6 +93,7 @@ pub(crate) struct Environment {
     home: Option<OsString>,
     xdg_config_home: Option<OsString>,
     pi_coding_agent_dir: Option<OsString>,
+    claude_config_dir: Option<OsString>,
     path: Option<OsString>,
 }
 
@@ -93,6 +103,7 @@ impl Environment {
             home: env::var_os("HOME"),
             xdg_config_home: env::var_os("XDG_CONFIG_HOME"),
             pi_coding_agent_dir: env::var_os("PI_CODING_AGENT_DIR"),
+            claude_config_dir: env::var_os("CLAUDE_CONFIG_DIR"),
             path: env::var_os("PATH"),
         }
     }
@@ -102,12 +113,14 @@ impl Environment {
         home: Option<OsString>,
         xdg_config_home: Option<OsString>,
         pi_coding_agent_dir: Option<OsString>,
+        claude_config_dir: Option<OsString>,
         path: Option<OsString>,
     ) -> Self {
         Self {
             home,
             xdg_config_home,
             pi_coding_agent_dir,
+            claude_config_dir,
             path,
         }
     }
@@ -866,6 +879,10 @@ fn config_root(id: IntegrationId, environment: &Environment) -> Result<PathBuf, 
             environment.pi_coding_agent_dir.clone(),
             environment.home.clone(),
         ),
+        InstallTargetKind::Claude => claude_config_root(
+            environment.claude_config_dir.clone(),
+            environment.home.clone(),
+        ),
     }
 }
 
@@ -879,6 +896,10 @@ fn target_at(id: IntegrationId, config_root: &Path) -> InstallTarget {
             directory: config_root.join("extensions"),
             path: config_root.join("extensions/boomux.js"),
         },
+        InstallTargetKind::Claude => InstallTarget {
+            directory: config_root.join("skills/boomux/.claude-plugin"),
+            path: config_root.join("skills/boomux/.claude-plugin/plugin.json"),
+        },
     }
 }
 
@@ -887,6 +908,7 @@ const fn config_root_name(id: IntegrationId) -> &'static str {
     match id.installation().target {
         InstallTargetKind::OpenCode => "XDG configuration root",
         InstallTargetKind::Pi => "Pi configuration root",
+        InstallTargetKind::Claude => "Claude configuration root",
     }
 }
 
@@ -933,6 +955,24 @@ pub(crate) fn pi_config_root(
         None => home()?.join(".pi/agent"),
     };
     require_absolute_root(&root, "Pi configuration root")?;
+    Ok(root)
+}
+
+pub(crate) fn claude_config_root(
+    claude_config_dir: Option<OsString>,
+    home: Option<OsString>,
+) -> Result<PathBuf, Box<dyn Error>> {
+    let root = match claude_config_dir.filter(|value| !value.is_empty()) {
+        Some(root) => PathBuf::from(root),
+        None => PathBuf::from(home.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "HOME must be set to install the Boomux Claude Code plugin",
+            )
+        })?)
+        .join(".claude"),
+    };
+    require_absolute_root(&root, "Claude configuration root")?;
     Ok(root)
 }
 
@@ -1142,6 +1182,7 @@ mod tests {
             Some(home.as_os_str().to_owned()),
             None,
             None,
+            None,
             Some(OsString::new()),
         )
     }
@@ -1153,6 +1194,22 @@ mod tests {
             "opencode-ai"
         );
         assert_eq!(IntegrationId::Pi.installation().validated_version, "0.84.1");
+        assert_eq!(
+            IntegrationId::Claude.installation().package,
+            "@anthropic-ai/claude-code"
+        );
+        assert_eq!(
+            IntegrationId::Claude.installation().validated_version,
+            "2.1.236"
+        );
+        assert!(IntegrationId::Claude.spec().titles.is_none());
+        assert_eq!(
+            IntegrationId::Claude
+                .spec()
+                .foreground
+                .map(|capability| capability.process_name),
+            Some("claude")
+        );
         assert_ne!(
             IntegrationId::Opencode.spec().key,
             IntegrationId::Pi.spec().key
@@ -1174,6 +1231,81 @@ mod tests {
             Path::new("/home/example/.config/pi")
         );
         assert!(pi_config_root(Some("relative".into()), None).is_err());
+        assert_eq!(
+            claude_config_root(Some("/claude".into()), Some("/home/example".into())).unwrap(),
+            Path::new("/claude")
+        );
+        assert_eq!(
+            claude_config_root(Some(OsString::new()), Some("/home/example".into())).unwrap(),
+            Path::new("/home/example/.claude")
+        );
+        assert!(claude_config_root(Some("relative".into()), None).is_err());
+    }
+
+    #[test]
+    fn claude_plugin_manifest_uses_exec_hooks_for_required_events() {
+        let manifest: serde_json::Value = serde_json::from_str(CLAUDE_ASSET).unwrap();
+        assert_eq!(manifest["name"], "boomux");
+        let hooks = manifest["hooks"].as_object().unwrap();
+        assert_eq!(
+            hooks.keys().map(String::as_str).collect::<Vec<_>>(),
+            [
+                "Notification",
+                "PermissionDenied",
+                "PermissionRequest",
+                "PostToolUse",
+                "PostToolUseFailure",
+                "PreToolUse",
+                "SessionEnd",
+                "SessionStart",
+                "Stop",
+                "StopFailure",
+                "SubagentStart",
+                "SubagentStop",
+                "UserPromptSubmit",
+            ]
+        );
+        for groups in hooks.values() {
+            let handlers = groups[0]["hooks"].as_array().unwrap();
+            assert_eq!(handlers.len(), 1);
+            assert_eq!(handlers[0]["type"], "command");
+            assert_eq!(handlers[0]["command"], "boomux");
+            assert_eq!(handlers[0]["args"], serde_json::json!(["claude", "hook"]));
+            assert_eq!(handlers[0]["timeout"], 5);
+        }
+    }
+
+    #[test]
+    fn claude_status_install_and_uninstall_use_skills_directory_plugin() {
+        let home = TestDirectory::new("claude-install");
+        let config = home.0.join("claude-config");
+        let environment = Environment::for_test(
+            Some(home.0.as_os_str().to_owned()),
+            None,
+            None,
+            Some(config.as_os_str().to_owned()),
+            Some(OsString::new()),
+        );
+        let expected = config.join("skills/boomux/.claude-plugin/plugin.json");
+
+        let missing = inspect(IntegrationId::Claude, &environment, None);
+        assert_eq!(missing.asset.state, AssetState::Missing);
+        assert_eq!(missing.asset.path.as_deref(), expected.to_str());
+
+        let installed = install(IntegrationId::Claude, &environment, false).unwrap();
+        assert_eq!(installed.result, InstallOutcome::Installed);
+        assert_eq!(Path::new(&installed.path), expected);
+        assert_eq!(fs::read_to_string(&expected).unwrap(), CLAUDE_ASSET);
+        assert_eq!(
+            inspect(IntegrationId::Claude, &environment, None)
+                .asset
+                .state,
+            AssetState::Current
+        );
+
+        let removed = uninstall(IntegrationId::Claude, &environment, false).unwrap();
+        assert_eq!(removed.result, UninstallOutcome::Removed);
+        assert!(!expected.exists());
     }
 
     #[test]

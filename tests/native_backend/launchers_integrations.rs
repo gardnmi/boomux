@@ -243,10 +243,16 @@ fn integration_management_reports_and_installs_bundled_hosts() {
     let bin = root.join("bin");
     let config = root.join("config");
     let pi = root.join("pi");
+    let claude = root.join("claude");
+    let claude_manifest = claude.join("skills/boomux/.claude-plugin/plugin.json");
     let runtime = root.join("runtime");
     fs::create_dir_all(&bin).unwrap();
     fs::create_dir_all(&runtime).unwrap();
-    for (name, version) in [("opencode", "1.18.18"), ("pi", "0.84.1")] {
+    for (name, version) in [
+        ("opencode", "1.18.18"),
+        ("pi", "0.84.1"),
+        ("claude", "2.1.236"),
+    ] {
         let executable = bin.join(name);
         fs::write(
             &executable,
@@ -261,6 +267,7 @@ fn integration_management_reports_and_installs_bundled_hosts() {
             .env("HOME", &root)
             .env("XDG_CONFIG_HOME", &config)
             .env("PI_CODING_AGENT_DIR", &pi)
+            .env("CLAUDE_CONFIG_DIR", &claude)
             .env("XDG_RUNTIME_DIR", &runtime)
             .env("PATH", &bin);
         command
@@ -274,7 +281,15 @@ fn integration_management_reports_and_installs_bundled_hosts() {
     let listed: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
     assert_eq!(listed["schema"], "boomux.cli/v1");
     assert_eq!(listed["command"], "integration.list");
-    assert_eq!(listed["data"]["integrations"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        listed["data"]["integrations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|integration| integration["name"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["opencode", "pi", "claude"]
+    );
 
     let missing = command()
         .args(["integration", "status", "--json"])
@@ -299,6 +314,7 @@ fn integration_management_reports_and_installs_bundled_hosts() {
         .unwrap();
     assert!(!preflight_refused.status.success());
     assert!(!config.join("opencode/plugins/boomux.js").exists());
+    assert!(!claude_manifest.exists());
     fs::remove_file(pi.join("extensions/boomux.js")).unwrap();
 
     let installed = command()
@@ -318,6 +334,10 @@ fn integration_management_reports_and_installs_bundled_hosts() {
     }
     assert!(config.join("opencode/plugins/boomux.js").is_file());
     assert!(pi.join("extensions/boomux.js").is_file());
+    assert!(claude_manifest.is_file());
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&claude_manifest).unwrap()).unwrap();
+    assert_eq!(manifest["name"], "boomux");
 
     for arguments in [["opencode", "install"], ["pi", "install"]] {
         let shortcut = command().args(arguments).output().unwrap();
@@ -333,6 +353,20 @@ fn integration_management_reports_and_installs_bundled_hosts() {
     assert_eq!(
         current["data"]["integrations"][0]["asset"]["state"],
         "current"
+    );
+    let claude_current = command()
+        .args(["integration", "status", "claude", "--json"])
+        .output()
+        .unwrap();
+    assert!(claude_current.status.success());
+    let claude_current: serde_json::Value = serde_json::from_slice(&claude_current.stdout).unwrap();
+    assert_eq!(
+        claude_current["data"]["integrations"][0]["asset"]["state"],
+        "current"
+    );
+    assert_eq!(
+        claude_current["data"]["integrations"][0]["asset"]["path"],
+        claude_manifest.to_str().unwrap()
     );
 
     fs::write(pi.join("extensions/boomux.js"), "custom extension").unwrap();
@@ -351,6 +385,7 @@ fn integration_management_reports_and_installs_bundled_hosts() {
         .unwrap();
     assert!(!uninstall_refused.status.success());
     assert!(config.join("opencode/plugins/boomux.js").is_file());
+    assert!(claude_manifest.is_file());
     assert_eq!(
         fs::read_to_string(pi.join("extensions/boomux.js")).unwrap(),
         "custom extension"
@@ -369,8 +404,10 @@ fn integration_management_reports_and_installs_bundled_hosts() {
     }
     assert!(!config.join("opencode/plugins/boomux.js").exists());
     assert!(!pi.join("extensions/boomux.js").exists());
+    assert!(!claude_manifest.exists());
     assert!(config.join("opencode/plugins").is_dir());
     assert!(pi.join("extensions").is_dir());
+    assert!(claude.join("skills/boomux/.claude-plugin").is_dir());
 
     let absent = command()
         .args(["integration", "uninstall", "pi", "--json"])

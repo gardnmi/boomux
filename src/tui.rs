@@ -5703,7 +5703,7 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
                 Line::from("  Left/Right changes schedule/history pane; j/k moves within the focused pane."),
                 Line::from("  [ and ] also select newer/older retained executions by exact execution ID."),
                 Line::from("  The selected schedule's bounded history loads automatically."),
-                Line::from("  Enter attaches an active run or resumes a completed exact OpenCode/Pi session."),
+                Line::from("  Enter attaches an active run or resumes a completed exact Agent Session."),
                 Line::from("  e edits the exact private definition while paused; Ctrl-S saves with revision protection."),
                 Line::from("  u runs now; p pauses/resumes; c cancels only its exact active execution."),
                 Line::from("  No skip-next action exists in protocol 25."),

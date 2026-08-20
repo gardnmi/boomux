@@ -29,10 +29,11 @@
 | `src/mobile_web.rs`, `assets/mobile-web/` | Loopback-only HTTP gateway, Node-qualified Agent projection, exact local attention dismissal, native harness web handoff, and embedded installable web assets |
 | `src/tailscale_serve.rs` | Explicit Tailscale Serve preflight, conflict detection, exact route mutation, and ephemeral ownership cleanup for `boomux web --tailscale` |
 | `src/session_projection.rs` | Projection of daemon Agent state and host catalogs into client-visible sessions |
-| `src/integrations.rs` | Integration identity, display metadata, and optional installation, title/catalog, resume, and foreground capabilities |
+| `src/integrations.rs` | Integration identity, display metadata, and optional installation, title/catalog, resume, schedule-dispatch, and foreground capabilities |
 | `src/host_session_titles.rs` and children | Shared title/catalog policy and host-specific discovery adapters |
 | `src/host_session_source.rs` and children | Canonical host source paths, normalization, and secure source lookup |
 | `src/integration_management.rs` | Integration inventory, status, setup, verification, install, and uninstall workflows |
+| `src/claude_hooks.rs` | Bounded Claude Code hook decoding and root Session lifecycle reduction |
 | `src/process_adapter.rs` | Exact-argv child supervision and fail-open process-bound Agent observation |
 | `src/scheduling.rs` | Bounded canonical cron parsing and occurrence evaluation, IANA timezone and DST policy, prompt bounds, and schedule identity validation |
 | `src/config.rs` | Layered configuration resolution, bounded validation, and transactional active-layer editing |
@@ -156,6 +157,13 @@ projections, events, and handoff; a surviving TUI reacquires after graceful
 replacement. The runtime process identity and generation do transfer.
 Handoff generation 5 accepts generation 4, whose manifest has no shared-runtime
 record.
+Protocol 43 adds `claude_remote_control_bindings`. Claude hooks may associate a
+directly observed bridge session with one exact active local Claude Agent and
+ShellRun. Set and exact-get requests are Node-local and unavailable to routed
+operations. Bindings are bounded, ephemeral, absent from durable state,
+snapshots, events, and remote projections, and add no old-response transform.
+Handoff generation 6 accepts generation 5 and transfers valid bindings without
+descriptors; generation-5 manifests default to no bindings.
 Remote notification presentation reuses protocol-32 atomic reduced transitions,
 so it does not require a later protocol. Node-cache schema 2 adds bounded local
 at-most-once individual and reconnect-digest claims with an explicit schema-1
@@ -253,6 +261,15 @@ reported per Node and do not replay an ambiguous launcher invocation.
 missing setting inherits from the lower layer or the built-in default.
 Configuration is local Node state: it is neither daemon protocol state nor a
 remotely routable mutation.
+
+The Node-local `claude.remote_control` launch policy defaults on and is sampled
+at daemon start. The owning daemon adds `--remote-control` only to an exact
+one-element user Shell command whose executable basename is `claude`; its
+private login-Shell shim applies the same rule only to a zero-argument
+interactive invocation. Stored argv remains unchanged. Schedule-owned work,
+launchers, explicit Claude arguments, and recovery or Session resume vectors
+never receive the flag, and a coordinator's setting cannot govern a remote
+owner's launch.
 
 `boomux config path`, `validate`, and `edit` are human-only local commands and do
 not start the daemon. Validation parses and semantically resolves all configured
@@ -734,10 +751,10 @@ schedule ID. The runner resolves the exact schedule, `BOOMUX_SHELL_ID`, and
 integration-owned argv builders without shell interpretation. The capability is
 persisted with private dispatch input, supplied only to that runner's ephemeral
 environment, removed before the external host is spawned, and required for claim
-resolution and outcome reports. OpenCode
-uses `opencode run [--session exact-id] -- prompt`.
-Pi uses `pi [--session exact-full-id] --print`, receives the exact prompt on
-stdin, and closes stdin; host stdout and stderr remain on the PTY. The runner
+resolution and outcome reports. OpenCode uses `opencode run [--session exact-id]
+-- prompt`. Pi uses `pi [--session exact-full-id] --print`, while Claude Code
+uses `claude --print [--resume exact-id]`; both receive the exact prompt on stdin
+and close stdin. Host stdout and stderr remain on the PTY. The runner
 retries daemon connections through handoff without starting a daemon.
 
 Scheduling is process orchestration, not lifecycle observation. Spawn failure,
@@ -1139,6 +1156,44 @@ exercise only the host fields and ordering Boomux consumes; the record
 deliberately distinguishes those tests from transitions observed in real
 managed sessions.
 
+### Claude Code Lifecycle Integration
+
+The Claude Code descriptor targets `@anthropic-ai/claude-code` `2.1.236` as a
+compatibility test point. It installs the single bundled
+`integrations/claude/.claude-plugin/plugin.json` asset at
+`${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/boomux/.claude-plugin/plugin.json`.
+Claude Code discovers that user-scoped skills-directory plugin in place. Its
+inline lifecycle hooks use exec-form `boomux claude hook`, receive bounded JSON
+on stdin, and make no stdout decision. Outside a managed ShellRun the hook is a
+silent no-op. Inside one, Claude's canonical `session_id` and the authoritative
+Boomux environment ensure the exact `(claude, session, shell, run)` Agent key.
+Subagent hooks retain the root `session_id` and therefore reduce into that Agent
+Instance rather than creating separate Agents.
+
+Session start, a completed foreground turn, and an API-error turn report Idle;
+prompts, tool work, denied tool permissions, and subagent activity report
+Working; permission or user-input waits report Blocked; session end reports
+Inactive and never Done. A Stop with reported background tasks or session crons
+remains Working. Reports use LifecycleIntegration authority and reuse the existing
+protocol Agent operations, so lifecycle reporting needs no Claude-specific wire
+request or durable state. Hook failures are fail-open for Claude Code and are
+written only to stderr.
+
+While Remote Control is connected, Claude exposes
+`CLAUDE_CODE_BRIDGE_SESSION_ID` only to hook subprocesses. The hook synchronizes
+that opaque value through protocol 43 after ensuring the exact Agent. Absence
+clears the exact binding, and root SessionEnd always clears it. The daemon
+validates the Claude integration and current Agent/ShellRun, rejects bridge
+collisions, and never persists, event-publishes, or projects the value to another
+Node. A graceful handoff revalidates and transfers bindings after importing the
+surviving ShellRuns; cold startup has none.
+
+The descriptor recognizes the exact `claude` executable and foreground process,
+resumes an exact canonical Session with `claude --resume ID`, and dispatches
+fresh and continuation schedules as `claude --print` and `claude --print
+--resume ID`, respectively, with the prompt on stdin. It advertises no title or
+catalog capability.
+
 ### OpenCode Lifecycle Plugins
 
 The paired bundled plugins target the source-visible OpenCode TUI API and server
@@ -1464,9 +1519,9 @@ and last terminal profiles survive restart. The last run record also preserves
 its identity and outcome. Recovered shells are pending: Boomux does not claim
 that arbitrary processes, mutated environments, or PTYs survive daemon restart
 or crash. When enabled, cold recovery substitutes an integration-native resume
-command for a uniquely identified, lifecycle-authoritative OpenCode or Pi Agent
-from an interrupted run. Ambiguous or invalid candidates use the shell's normal
-command instead.
+command for a uniquely identified, lifecycle-authoritative OpenCode, Pi, or
+Claude Agent from an interrupted run. Ambiguous or invalid candidates use the
+shell's normal command instead.
 
 Plain-text terminal history is a separate opt-in recovery field because output
 can contain secrets. The shadow terminal checkpoints a UTF-8-safe suffix of at

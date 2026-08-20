@@ -1,7 +1,9 @@
 use std::fs;
+use std::io::Write;
 use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
+use std::process::Stdio;
 use std::thread;
 use std::time::Duration;
 
@@ -15,6 +17,116 @@ use crate::support::{
     TestDaemon, assert_generated_name, assert_remote_code, contains, ensure_test_opencode_runtime,
     process_exists, profile, wait_until,
 };
+
+#[test]
+fn claude_hook_reports_lifecycle_and_synchronizes_ephemeral_bridge_binding() {
+    let mut daemon = TestDaemon::start();
+    let workspace = daemon
+        .client
+        .create_workspace(
+            "claude-hook",
+            vec![ShellSpec {
+                name: "claude".into(),
+                command: vec!["/bin/sleep".into(), "30".into()],
+                cwd: std::env::temp_dir(),
+            }],
+        )
+        .unwrap();
+    let shell_id = workspace.shells[0].id.clone();
+    let attachment = daemon.client.attach(&shell_id, false, profile()).unwrap();
+    let run_id = daemon.client.get_shell(&shell_id).unwrap().run.unwrap().id;
+
+    let run_hook = |event: &str, bridge: Option<&str>| {
+        let mut command = daemon.command();
+        command
+            .args(["claude", "hook"])
+            .env("BOOMUX_SHELL_ID", &shell_id)
+            .env("BOOMUX_RUN_ID", &run_id)
+            .stdin(Stdio::piped());
+        if let Some(bridge) = bridge {
+            command.env("CLAUDE_CODE_BRIDGE_SESSION_ID", bridge);
+        } else {
+            command.env_remove("CLAUDE_CODE_BRIDGE_SESSION_ID");
+        }
+        let mut child = command.spawn().unwrap();
+        write!(
+            child.stdin.take().unwrap(),
+            "{{\"session_id\":\"claude-session\",\"hook_event_name\":\"{event}\"}}"
+        )
+        .unwrap();
+        assert!(child.wait().unwrap().success());
+    };
+
+    let event_cursor = daemon.client.events(None, 256, 0).unwrap().cursor;
+    run_hook("SessionStart", Some("bridge-exact"));
+    let snapshot = daemon.client.snapshot().unwrap();
+    let agent = snapshot.workspaces[0].agents[0].clone();
+    assert_eq!(agent.integration, "claude");
+    assert_eq!(agent.external_session_id.as_deref(), Some("claude-session"));
+    assert_eq!(agent.observation.state, AgentState::Idle);
+    assert_eq!(
+        daemon
+            .client
+            .get_claude_remote_control_binding(&agent.id, &shell_id, &run_id)
+            .unwrap()
+            .unwrap()
+            .bridge_session_id,
+        "bridge-exact"
+    );
+    let persisted = fs::read(daemon.runtime_dir.join("state/boomux/state.json")).unwrap();
+    let events = daemon.client.events(Some(event_cursor), 256, 0).unwrap();
+    let events = serde_json::to_vec(&events.events).unwrap();
+    for public_or_durable in [serde_json::to_vec(&snapshot).unwrap(), events, persisted] {
+        assert!(
+            !public_or_durable
+                .windows(b"bridge-exact".len())
+                .any(|window| window == b"bridge-exact")
+        );
+    }
+
+    drop(attachment);
+    daemon.client.restart().unwrap();
+    assert_eq!(
+        daemon
+            .client
+            .get_claude_remote_control_binding(&agent.id, &shell_id, &run_id)
+            .unwrap()
+            .unwrap()
+            .bridge_session_id,
+        "bridge-exact"
+    );
+
+    run_hook("SessionEnd", Some("ignored-on-session-end"));
+    assert_eq!(
+        daemon
+            .client
+            .get_agent(&agent.id)
+            .unwrap()
+            .observation
+            .state,
+        AgentState::Inactive
+    );
+
+    run_hook("UserPromptSubmit", None);
+    assert_eq!(
+        daemon
+            .client
+            .get_agent(&agent.id)
+            .unwrap()
+            .observation
+            .state,
+        AgentState::Working
+    );
+    assert!(
+        daemon
+            .client
+            .get_claude_remote_control_binding(&agent.id, &shell_id, &run_id)
+            .unwrap()
+            .is_none()
+    );
+
+    daemon.stop_with_cli();
+}
 
 #[test]
 fn opencode_shared_runtime_and_claims_are_node_wide_and_ephemeral() {

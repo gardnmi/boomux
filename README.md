@@ -312,7 +312,8 @@ In Schedules, Left/Right changes between the schedule and history panes, `j`/`k`
 navigates the focused pane, and `[`/`]` also selects retained executions by exact
 execution ID. `Enter` attaches a selected exact Starting or Active run. For a
 completed execution with a canonical session, it resumes that exact session with
-OpenCode or Pi in an unmanaged native terminal, without adding a workspace row.
+OpenCode, Pi, or Claude Code in an unmanaged native terminal, without adding a
+workspace row.
 `e` opens the private definition editor for a paused schedule; it supports name,
 prompt, trigger presets or custom cron, and a searchable IANA timezone selector.
 Type to filter timezone names and use the arrow keys to choose a valid match.
@@ -360,22 +361,31 @@ and troubleshooting.
 
 ## Coding-Agent Integrations
 
-Boomux includes optional lifecycle integrations for OpenCode and Pi. Guided
+Boomux includes optional integrations for OpenCode, Pi, and Claude Code. Guided
 setup previews every file change and asks before installing anything:
 
 ```console
 boomux integration setup opencode
 # or
 boomux integration setup pi
+# or
+boomux integration setup claude
 ```
 
-Restart OpenCode or Pi after installation. For the seamless OpenCode workflow,
+Restart the selected host after installation. For the seamless OpenCode workflow,
 create or open an ordinary managed login Shell and type the bare, zero-argument
 interactive command:
 
 ```console
 opencode
 ```
+
+Eligible bare interactive Claude Code launches enable Remote Control by default.
+When Claude reports an active bridge from an exact current managed Agent, the
+mobile dashboard shows **Open in Claude** and links directly to its
+`claude.ai/code` session. Boomux does not host or proxy Claude's web interface or
+read its transcript. Existing sessions can enable the bridge with
+`/remote-control`; organization policy and Claude authentication still apply.
 
 Only in an eligible Boomux login Shell, a scoped runtime `PATH` shim redirects
 that exact invocation internally to stock `opencode attach` for the Node's
@@ -419,7 +429,8 @@ compatibility test points, not runtime pins.
 
 ### Agent Sessions
 
-Boomux projects canonical OpenCode and Pi sessions into each matching workspace.
+Boomux projects canonical Sessions reported by supported integrations into each
+matching workspace.
 A projected session groups every Boomux Agent occurrence for the same external
 root session. `current` means an occurrence belongs to the current run of a
 running retained shell; `last known` means the session is historical.
@@ -495,11 +506,14 @@ last bound, from 1 through 64, and apply changes with a graceful restart:
 ```toml
 [scheduling]
 max_concurrent = 4
+
+[claude]
+remote_control = true
 ```
 
-OpenCode receives the prompt as the final argument after `--`; Pi receives the
-exact prompt on stdin. Process exit, dispatch failure, cancellation, and cold
-interruption are execution outcomes and never report an Agent as done. Timed
+OpenCode receives the prompt as the final argument after `--`; Pi and Claude Code
+receive the exact prompt on stdin. Process exit, dispatch failure, cancellation,
+and cold interruption are execution outcomes and never report an Agent as done. Timed
 work runs only while the Boomux daemon and user session are active; inspect
 `boomux daemon status` and `boomux doctor` for scheduler health and sampled
 configuration.
@@ -581,6 +595,14 @@ Configuration management is local to this Node. The `boomux config` commands
 never read or mutate a registered remote Node's config; use an interactive Boomux
 client on that owning Node to manage it.
 
+`claude.remote_control` defaults to `true`. On the owning Node, future bare
+interactive Claude Code launches in managed user Shells start with
+`--remote-control`; explicit Claude arguments, scheduled work, launchers, and
+exact recovery or Session resume commands are unchanged. Set it to `false` and
+restart the owning daemon to opt out. Claude Code can still decline Remote
+Control because of authentication, provider, organization, or managed-policy
+restrictions without preventing the local interactive session from starting.
+
 Project roots provide Workspace-name suggestions in the dashboard. Selecting one
 creates empty coordinator metadata using its name; it does not assign a Node or
 persist the discovered path. Choose the Node and working directory when adding
@@ -606,11 +628,11 @@ current selection and pause following; press it again to unpin and catch up to
 the currently focused terminal. Set
 `dashboard.follow_focused_terminal` to `false` to disable this behavior.
 
-After a cold daemon restart, Boomux resumes a uniquely identified OpenCode or Pi
-session when its interrupted shell is next started. Recovery requires a retained
-external session ID reported by the lifecycle integration; ambiguous, completed,
-or heuristic-only Agents fall back to the shell's configured command. Set
-`recovery.resume_agents` to `false` to disable this behavior.
+After a cold daemon restart, Boomux resumes a uniquely identified OpenCode, Pi,
+or Claude session when its interrupted shell is next started. Recovery requires
+a retained external session ID reported by the lifecycle integration; ambiguous,
+completed, or heuristic-only Agents fall back to the shell's configured command.
+Set `recovery.resume_agents` to `false` to disable this behavior.
 
 Terminal history persistence is opt-in because terminal output can contain
 secrets. With `recovery.persist_terminal_history = true`, Boomux checkpoints up

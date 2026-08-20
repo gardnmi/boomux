@@ -34,6 +34,7 @@ use crate::integration_management::{
 };
 
 mod agent_attention_projection;
+mod claude_hooks;
 mod cli_output;
 mod config;
 mod dashboard_projection;
@@ -280,6 +281,7 @@ const MAX_HOST_CATALOG_DIRECTORIES: usize = 8;
 const NON_PROTOCOL_FEATURES: &[&str] = &[
     "opencode_lifecycle_plugin",
     "pi_lifecycle_extension",
+    "claude_lifecycle_plugin",
     "process_adapters",
     "desktop_notifications",
     "sound_notifications",
@@ -503,6 +505,12 @@ enum Commands {
     Pi {
         #[command(subcommand)]
         command: PiCommands,
+    },
+    /// Receive Claude Code lifecycle hooks
+    #[command(hide = true)]
+    Claude {
+        #[command(subcommand)]
+        command: ClaudeCommands,
     },
     /// Open a shell in a new terminal window
     Open {
@@ -1269,6 +1277,13 @@ enum PiCommands {
 }
 
 #[derive(Subcommand)]
+enum ClaudeCommands {
+    /// Receive one lifecycle event on standard input
+    #[command(hide = true)]
+    Hook,
+}
+
+#[derive(Subcommand)]
 enum IntegrationCommands {
     /// List integrations bundled with this Boomux binary
     List,
@@ -1452,6 +1467,7 @@ command_keys! {
     OpencodeClaimRelease => ("opencode.claim.release", PrivateJson),
     OpencodeClaimReport => ("opencode.claim.report", PrivateJson),
     Pi => ("pi", HumanOnly),
+    ClaudeHook => ("claude.hook", HumanOnly),
     Open => ("open", HumanOnly),
     Prompt => ("prompt", HumanOnly),
     DaemonStatus => ("daemon.status", Json),
@@ -1696,6 +1712,9 @@ impl Cli {
             Some(Commands::Pi {
                 command: PiCommands::Install { .. },
             }) => CommandKey::Pi,
+            Some(Commands::Claude {
+                command: ClaudeCommands::Hook,
+            }) => CommandKey::ClaudeHook,
             Some(Commands::Open { .. }) => CommandKey::Open,
             Some(Commands::Prompt) => CommandKey::Prompt,
             Some(Commands::Attach { .. }) => CommandKey::Attach,
@@ -2041,6 +2060,14 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
         Some(Commands::Pi {
             command: PiCommands::Install { force },
         }) => install_pi(force),
+        Some(Commands::Claude {
+            command: ClaudeCommands::Hook,
+        }) => {
+            if let Err(error) = claude_hook_command() {
+                eprintln!("boomux claude hook: {error}");
+            }
+            Ok(())
+        }
         Some(Commands::Open {
             shell_id,
             node,
@@ -10029,6 +10056,61 @@ fn register_or_ensure_agent(
     Ok(())
 }
 
+fn claude_hook_command() -> Result<(), Box<dyn Error>> {
+    let (shell_id, run_id) = match (
+        env::var("BOOMUX_SHELL_ID").ok(),
+        env::var("BOOMUX_RUN_ID").ok(),
+    ) {
+        (Some(shell_id), Some(run_id)) => {
+            resolve_agent_context(None, None, Some(shell_id), Some(run_id))?
+        }
+        _ => return Ok(()),
+    };
+    let update = claude_hooks::read_update(io::stdin().lock())?;
+    let initial = update.observation.as_ref();
+    let report = AgentReport {
+        state: initial.map_or(AgentState::Unknown, |observation| observation.state),
+        authority: AgentAuthority::LifecycleIntegration,
+        evidence: initial
+            .map_or("Claude lifecycle event", |observation| observation.evidence)
+            .into(),
+        confidence: 100,
+    };
+    let client = client::connect_or_start()?;
+    let agent = client.ensure_agent(
+        &shell_id,
+        &run_id,
+        AgentRegistrationSpec {
+            name: "Claude Code".into(),
+            integration: "claude".into(),
+            external_session_id: Some(update.session_id),
+            report: report.clone(),
+        },
+    )?;
+    if initial.is_some()
+        && agent.ended_at_ms.is_none()
+        && (agent.observation.state != report.state
+            || agent.observation.authority != report.authority
+            || agent.observation.evidence != report.evidence
+            || agent.observation.confidence != report.confidence)
+    {
+        client.report_agent(&agent.id, &run_id, report)?;
+    }
+    let bridge_session_id = if update.session_ended {
+        None
+    } else {
+        match env::var("CLAUDE_CODE_BRIDGE_SESSION_ID") {
+            Ok(value) => Some(value),
+            Err(env::VarError::NotPresent) => None,
+            Err(env::VarError::NotUnicode(_)) => {
+                return Err("CLAUDE_CODE_BRIDGE_SESSION_ID must be valid UTF-8".into());
+            }
+        }
+    };
+    client.set_claude_remote_control_binding(agent.id, shell_id, run_id, bridge_session_id)?;
+    Ok(())
+}
+
 fn resolve_agent_context(
     shell_id: Option<String>,
     run_id: Option<String>,
@@ -13439,6 +13521,19 @@ mod tests {
     }
 
     #[test]
+    fn parses_hidden_claude_hook_command() {
+        let cli = Cli::try_parse_from(["boomux", "claude", "hook"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Claude {
+                command: ClaudeCommands::Hook,
+            })
+        ));
+        assert_eq!(cli.command_descriptor().key, "claude.hook");
+        assert_eq!(cli.command_descriptor().output, OutputMode::HumanOnly);
+    }
+
+    #[test]
     fn event_snapshot_json_includes_stable_agent_data() {
         let mut project = workspace("w1", "project", vec![shell("s1", "w1", "shell")]);
         project.agents.push(agent("a1", "w1", "s1"));
@@ -14270,6 +14365,10 @@ mod tests {
         let (_, command) = dashboard_session_resume_plan(&session).unwrap();
         assert_eq!(command, ["opencode", "--session", "ses_exact"]);
 
+        session.integration = "claude".into();
+        let (_, command) = dashboard_session_resume_plan(&session).unwrap();
+        assert_eq!(command, ["claude", "--resume", "ses_exact"]);
+
         session.state_is_current = true;
         assert!(
             dashboard_session_resume_plan(&session)
@@ -14527,6 +14626,62 @@ mod tests {
         ));
         assert_eq!(list.command_descriptor().key, "integration.list");
 
+        for command in ["status", "setup", "install", "uninstall"] {
+            let parsed = Cli::try_parse_from(["boomux", "integration", command, "claude"])
+                .unwrap_or_else(|error| panic!("failed to parse integration {command}: {error}"));
+            match parsed.command.unwrap() {
+                Commands::Integration {
+                    command:
+                        IntegrationCommands::Status {
+                            integration: Some(integration_management::IntegrationId::Claude),
+                            ..
+                        },
+                }
+                | Commands::Integration {
+                    command:
+                        IntegrationCommands::Setup {
+                            integration: integration_management::IntegrationId::Claude,
+                            ..
+                        },
+                }
+                | Commands::Integration {
+                    command:
+                        IntegrationCommands::Install {
+                            integration: Some(integration_management::IntegrationId::Claude),
+                            ..
+                        },
+                }
+                | Commands::Integration {
+                    command:
+                        IntegrationCommands::Uninstall {
+                            integration: Some(integration_management::IntegrationId::Claude),
+                            ..
+                        },
+                } => {}
+                _ => panic!("unexpected parsed Claude integration command"),
+            }
+        }
+
+        let verify = Cli::try_parse_from([
+            "boomux",
+            "integration",
+            "verify",
+            "claude",
+            "--shell",
+            "shell-1",
+        ])
+        .unwrap();
+        assert!(matches!(
+            verify.command,
+            Some(Commands::Integration {
+                command: IntegrationCommands::Verify {
+                    integration: integration_management::IntegrationId::Claude,
+                    shell: Some(shell),
+                    ..
+                }
+            }) if shell == "shell-1"
+        ));
+
         let status = Cli::try_parse_from(["boomux", "integration", "status", "pi"]).unwrap();
         assert!(matches!(
             status.command,
@@ -14705,7 +14860,8 @@ mod tests {
             format_integration_list(&integrations),
             "NAME      PACKAGE                          VALIDATED VERSION\n\
              opencode  opencode-ai                      1.18.18\n\
-             pi        @earendil-works/pi-coding-agent  0.84.1\n"
+             pi        @earendil-works/pi-coding-agent  0.84.1\n\
+             claude    @anthropic-ai/claude-code        2.1.236\n"
         );
 
         let status = integration_management::IntegrationStatus {
@@ -15095,7 +15251,13 @@ mod tests {
                 .validated_version,
             "0.84.1"
         );
-        assert_eq!(protocol::PROTOCOL_VERSION, 42);
+        assert_eq!(
+            integration_management::IntegrationId::Claude
+                .installation()
+                .validated_version,
+            "2.1.236"
+        );
+        assert_eq!(protocol::PROTOCOL_VERSION, 43);
     }
 
     #[test]
