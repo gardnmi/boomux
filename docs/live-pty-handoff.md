@@ -40,15 +40,17 @@ The private handoff channel carries a versioned manifest followed by Unix
   revision, including an external Node Shell when that was focused most recently
 - The Shared Harness Runtime generation, strict PID/start/runtime identity, and
   supervision state, without Agent Session Claims
+- Bounded Claude Remote Control bindings for exact transferred Agent/ShellRuns,
+  without additional descriptors
 
 The PTY master is full duplex, so reader and writer duplicates do not need to be
 transferred separately. The replacement cannot inherit Unix parenthood; process
 monitoring and cleanup therefore need an imported-process representation, with
 a Linux pidfd where available.
 
-Bootstrap version 5 starts with the `BOOMUXH5` header, accepts an H4 sender for
-compatibility, and has bounded read/write deadlines. An H4 transfer has no
-Shared Harness Runtime record. The receiver validates the listener path/type,
+Bootstrap version 6 starts with the `BOOMUXH6` header, accepts an H5 sender for
+compatibility, and has bounded read/write deadlines. An H5 transfer has no
+Claude Remote Control binding records. The receiver validates the listener path/type,
 forces nonblocking mode, matches both lock-file inodes, and establishes exclusive
 flock ownership before acknowledging readiness. Explicit abort closes every
 received duplicate without affecting descriptors retained by the old daemon.
@@ -88,6 +90,10 @@ Surviving TUI holders reacquire claims after reconnect; until then the server
 plugin has no ShellRun lifecycle authority. Rollback leaves runtime supervision
 with the old daemon. Cold startup adopts an existing runtime only when every
 identity check matches, and `boomux daemon stop` terminates it.
+Handoff 6 transfers only Claude Remote Control bindings that still identify an
+exact active Claude Agent and transferred ShellRun. The replacement revalidates
+them before `PREPARED`; rollback leaves the old daemon's map intact. The map is
+not durable, and cold startup begins without bindings.
 
 ## Accepted Remote Node Boundary
 

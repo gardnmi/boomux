@@ -7,6 +7,26 @@ This record separates observed host behavior from reducer fixtures and intended
 semantics. Host compatibility is not inferred from process names, terminal
 output, or database recency.
 
+## 2026-08-20
+
+Claude Code `2.1.236` was live-validated with the protocol-43 lifecycle plugin
+and Remote Control binding. After the skills-directory plugin was installed and
+Claude was restarted inside an existing managed Bash ShellRun, Claude's
+canonical Session ID produced one exact current Agent at
+`lifecycle_integration` authority and confidence 100. Session start, one user
+prompt, and the completed turn advanced the observation to revision 3 `idle`;
+`boomux integration verify claude --shell ID --json` reported the integration
+as verified with one tracked and zero untracked processes.
+
+The same Claude process enabled Remote Control in-session. A later hook observed
+the ephemeral bridge identity, and the owner-local Boomux web snapshot exposed
+an **Open in Claude** native handoff only on that exact current Agent. The
+gateway then published its dashboard and OpenCode routes through Tailscale, and
+`tailscale serve status --json` confirmed both owner-managed HTTPS proxies.
+The bridge identity itself was not copied into this record. Default-on bare
+launch injection, SessionEnd cleanup, cold absence, and graceful binding
+transfer remain compatibility-test evidence rather than live host validation.
+
 ## 2026-08-19
 
 OpenCode `1.18.18` was live-validated with the protocol-42 Shared Harness

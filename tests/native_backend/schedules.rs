@@ -727,19 +727,23 @@ fn manual_execution_succeeds_and_duplicate_key_never_spawns_twice() {
     daemon.stop_with_cli();
 }
 
-#[test]
-fn pi_dispatch_preserves_exact_argv_stdin_eof_and_continuation_identity() {
+fn assert_stdin_dispatch_preserves_exact_argv_stdin_eof_and_continuation_identity(
+    integration: &'static str,
+    continuation_id: &str,
+    expected_fresh_argv: &[u8],
+    expected_continuation_argv: &[u8],
+) {
     let mut daemon = TestDaemon::start_with(|command, runtime_dir| {
         let bin = runtime_dir.join("bin");
         fs::create_dir(&bin).unwrap();
-        let host = bin.join("pi");
+        let host = bin.join(integration);
         fs::write(
             &host,
-            "#!/bin/sh\nprintf '%s\\0' \"$@\" > \"$BOOMUX_PI_ARGV_DIR/$BOOMUX_PI_CASE\"\ncat > \"$BOOMUX_PI_STDIN_DIR/$BOOMUX_PI_CASE\"\nprintf '%s' \"${BOOMUX_SCHEDULE_RUNNER_TOKEN-unset}\" > \"$BOOMUX_PI_TOKEN_DIR/$BOOMUX_PI_CASE\"\n",
+            "#!/bin/sh\nprintf '%s\\0' \"$@\" > \"$BOOMUX_DISPATCH_ARGV_DIR/$BOOMUX_DISPATCH_CASE\"\ncat > \"$BOOMUX_DISPATCH_STDIN_DIR/$BOOMUX_DISPATCH_CASE\"\nprintf '%s' \"${BOOMUX_SCHEDULE_RUNNER_TOKEN-unset}\" > \"$BOOMUX_DISPATCH_TOKEN_DIR/$BOOMUX_DISPATCH_CASE\"\n",
         )
         .unwrap();
         fs::set_permissions(&host, fs::Permissions::from_mode(0o755)).unwrap();
-        for directory in ["pi-argv", "pi-stdin", "pi-token"] {
+        for directory in ["dispatch-argv", "dispatch-stdin", "dispatch-token"] {
             fs::create_dir(runtime_dir.join(directory)).unwrap();
         }
         let mut paths = vec![bin];
@@ -748,15 +752,27 @@ fn pi_dispatch_preserves_exact_argv_stdin_eof_and_continuation_identity() {
         ));
         command
             .env("PATH", std::env::join_paths(paths).unwrap())
-            .env("BOOMUX_PI_ARGV_DIR", runtime_dir.join("pi-argv"))
-            .env("BOOMUX_PI_STDIN_DIR", runtime_dir.join("pi-stdin"))
-            .env("BOOMUX_PI_TOKEN_DIR", runtime_dir.join("pi-token"))
-            .env("BOOMUX_PI_CASE", "fresh");
+            .env(
+                "BOOMUX_DISPATCH_ARGV_DIR",
+                runtime_dir.join("dispatch-argv"),
+            )
+            .env(
+                "BOOMUX_DISPATCH_STDIN_DIR",
+                runtime_dir.join("dispatch-stdin"),
+            )
+            .env(
+                "BOOMUX_DISPATCH_TOKEN_DIR",
+                runtime_dir.join("dispatch-token"),
+            )
+            .env("BOOMUX_DISPATCH_CASE", "fresh");
     });
-    let workspace = daemon.client.create_workspace("pi", Vec::new()).unwrap();
+    let workspace = daemon
+        .client
+        .create_workspace(integration, Vec::new())
+        .unwrap();
     let prompt = "-@leading\nsecond line\n";
-    let mut fresh_spec = schedule_spec(&daemon, "pi-fresh", prompt);
-    fresh_spec.integration = "pi".into();
+    let mut fresh_spec = schedule_spec(&daemon, &format!("{integration}-fresh"), prompt);
+    fresh_spec.integration = integration.into();
     let fresh = daemon
         .client
         .create_agent_schedule(&workspace.id, fresh_spec)
@@ -772,18 +788,18 @@ fn pi_dispatch_preserves_exact_argv_stdin_eof_and_continuation_identity() {
                 .get_scheduled_execution(&execution.id)
                 .is_ok_and(|execution| execution.state == ScheduledExecutionState::Exited)
         },
-        "fresh Pi execution did not exit",
+        "fresh stdin dispatch did not exit",
     );
     assert_eq!(
-        fs::read(daemon.runtime_dir.join("pi-argv/fresh")).unwrap(),
-        b"--print\0"
+        fs::read(daemon.runtime_dir.join("dispatch-argv/fresh")).unwrap(),
+        expected_fresh_argv
     );
     assert_eq!(
-        fs::read(daemon.runtime_dir.join("pi-stdin/fresh")).unwrap(),
+        fs::read(daemon.runtime_dir.join("dispatch-stdin/fresh")).unwrap(),
         prompt.as_bytes()
     );
     assert_eq!(
-        fs::read_to_string(daemon.runtime_dir.join("pi-token/fresh")).unwrap(),
+        fs::read_to_string(daemon.runtime_dir.join("dispatch-token/fresh")).unwrap(),
         "unset"
     );
 
@@ -797,18 +813,31 @@ fn pi_dispatch_preserves_exact_argv_stdin_eof_and_continuation_identity() {
             ));
             std::env::join_paths(paths).unwrap()
         })
-        .env("BOOMUX_PI_ARGV_DIR", daemon.runtime_dir.join("pi-argv"))
-        .env("BOOMUX_PI_STDIN_DIR", daemon.runtime_dir.join("pi-stdin"))
-        .env("BOOMUX_PI_TOKEN_DIR", daemon.runtime_dir.join("pi-token"))
-        .env("BOOMUX_PI_CASE", "continue")
+        .env(
+            "BOOMUX_DISPATCH_ARGV_DIR",
+            daemon.runtime_dir.join("dispatch-argv"),
+        )
+        .env(
+            "BOOMUX_DISPATCH_STDIN_DIR",
+            daemon.runtime_dir.join("dispatch-stdin"),
+        )
+        .env(
+            "BOOMUX_DISPATCH_TOKEN_DIR",
+            daemon.runtime_dir.join("dispatch-token"),
+        )
+        .env("BOOMUX_DISPATCH_CASE", "continue")
         .output()
         .unwrap();
     assert!(restart.status.success());
-    let external_id = "exact-pi-session";
-    let mut continuation_spec = schedule_spec(&daemon, "pi-continue", "continued");
-    continuation_spec.integration = "pi".into();
+    let continuation_prompt = "continued\nexact bytes";
+    let mut continuation_spec = schedule_spec(
+        &daemon,
+        &format!("{integration}-continue"),
+        continuation_prompt,
+    );
+    continuation_spec.integration = integration.into();
     continuation_spec.session = AgentScheduleSession::Continue {
-        external_session_id: external_id.into(),
+        external_session_id: continuation_id.into(),
     };
     let continuation = daemon
         .client
@@ -825,17 +854,41 @@ fn pi_dispatch_preserves_exact_argv_stdin_eof_and_continuation_identity() {
                 .get_scheduled_execution(&execution.id)
                 .is_ok_and(|execution| execution.state == ScheduledExecutionState::Exited)
         },
-        "continued Pi execution did not exit",
+        "continued stdin dispatch did not exit",
     );
     assert_eq!(
-        fs::read(daemon.runtime_dir.join("pi-argv/continue")).unwrap(),
-        b"--session\0exact-pi-session\0--print\0"
+        fs::read(daemon.runtime_dir.join("dispatch-argv/continue")).unwrap(),
+        expected_continuation_argv
     );
     assert_eq!(
-        fs::read(daemon.runtime_dir.join("pi-stdin/continue")).unwrap(),
-        b"continued"
+        fs::read(daemon.runtime_dir.join("dispatch-stdin/continue")).unwrap(),
+        continuation_prompt.as_bytes()
+    );
+    assert_eq!(
+        fs::read_to_string(daemon.runtime_dir.join("dispatch-token/continue")).unwrap(),
+        "unset"
     );
     daemon.stop_with_cli();
+}
+
+#[test]
+fn pi_dispatch_preserves_exact_argv_stdin_eof_and_continuation_identity() {
+    assert_stdin_dispatch_preserves_exact_argv_stdin_eof_and_continuation_identity(
+        "pi",
+        "exact-pi-session",
+        b"--print\0",
+        b"--session\0exact-pi-session\0--print\0",
+    );
+}
+
+#[test]
+fn claude_dispatch_preserves_exact_argv_stdin_eof_and_continuation_identity() {
+    assert_stdin_dispatch_preserves_exact_argv_stdin_eof_and_continuation_identity(
+        "claude",
+        "exact-id",
+        b"--print\0",
+        b"--print\0--resume\0exact-id\0",
+    );
 }
 
 #[test]

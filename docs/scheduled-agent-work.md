@@ -454,8 +454,8 @@ blocked work attaches to its exact run, while completed work resumes only its
 exact canonical Agent Session; neither path selects a newest or nearby identity.
 Durable Agent attention remains independent. Canonical session identity requires
 the exact linked Agent occurrence. Boomux does not read or
-project host transcript and tool content; OpenCode or Pi remains the interface
-for that content.
+project host transcript and tool content; OpenCode, Pi, or Claude Code remains
+the interface for that content.
 
 ## User Control And Permissions
 

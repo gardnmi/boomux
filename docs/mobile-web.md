@@ -137,12 +137,16 @@ the intended authentication boundary.
   current attention or lifecycle observation revision. Durable attention stays
   visible until the daemon confirms acknowledgment; remote and stale requests
   fail closed.
-- An exact native link is included on a card only for a local OpenCode Agent with
+- An exact native OpenCode link is included on a card only for a local OpenCode Agent with
   a canonical external Session ID, UTF-8 working directory, and current Agent
   Session Claim for the Agent's exact ShellRun and Shared Harness Runtime
   generation. The directory is
   base64url-encoded for OpenCode's
   `/<directory>/session/<session-id>` route.
+- An exact **Open in Claude** link is included only for a current local Claude
+  Agent whose exact Agent/ShellRun has a protocol-43 Remote Control binding
+  observed directly by a hook. Its opaque bridge ID is percent-encoded into
+  `https://claude.ai/code/<bridge-id>`. No transcript content is read or proxied.
 - Native links are not produced for projected remote Agents because their
   external Session identity and working directory intentionally remain on the
   owner Node. Remote Agents remain unlinked to this Node's runtime.
@@ -161,8 +165,9 @@ the private access layer. That layer owns TLS, authentication, and ACLs
 appropriate for both the bounded dashboard and OpenCode's
 full-control origin. Public exposure is outside this design.
 
-Native handoff URLs expose the local working-directory encoding and canonical
-Session ID to the authorized dashboard client and destination OpenCode origin.
+Native handoff URLs expose either the local working-directory encoding and
+canonical Session ID to the destination OpenCode origin, or the opaque Claude
+bridge ID to `claude.ai`.
 API responses carry
 `Cache-Control: no-store`. The service worker caches only HTML, JavaScript, CSS,
 the manifest, and the icon; it never handles `/api/` requests. Browser storage
@@ -185,7 +190,7 @@ reverse proxy so this boundary remains visible.
 ## MVP Endpoints
 
 - `GET /api/snapshot` returns the current Node-qualified Agent cards, counts, and
-  optional exact native OpenCode Web handoffs.
+  optional exact native OpenCode or Claude handoffs.
 - `POST /api/attention/dismiss` requires JSON containing the exact local
   `node_id`, `agent_id`, and `observation_revision`. It clears a matching
   ephemeral marker or acknowledges matching durable attention.

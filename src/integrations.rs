@@ -4,6 +4,7 @@ use std::path::Path;
 pub enum InstallTargetKind {
     OpenCode,
     Pi,
+    Claude,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -95,6 +96,21 @@ impl ScheduleDispatchCapability {
                     "--session".into(),
                     external_session_id.clone(),
                     "--print".into(),
+                ]);
+            }
+            ("claude", AgentScheduleSession::Fresh) if self.fresh => {
+                argv.push("--print".into());
+            }
+            (
+                "claude",
+                AgentScheduleSession::Continue {
+                    external_session_id,
+                },
+            ) if self.continuation => {
+                argv.extend([
+                    "--print".into(),
+                    "--resume".into(),
+                    external_session_id.clone(),
                 ]);
             }
             _ => return None,
@@ -207,7 +223,34 @@ pub const PI: IntegrationDescriptor = IntegrationDescriptor {
     foreground: Some(ForegroundCapability { process_name: "pi" }),
 };
 
-pub const ALL: &[IntegrationDescriptor] = &[OPENCODE, PI];
+pub const CLAUDE: IntegrationDescriptor = IntegrationDescriptor {
+    key: "claude",
+    display_name: "Claude Code",
+    installation: Some(InstallationCapability {
+        package: "@anthropic-ai/claude-code",
+        validated_version: "2.1.236",
+        asset_name: "plugin manifest",
+        content: include_str!("../integrations/claude/.claude-plugin/plugin.json"),
+        executable: "claude",
+        reload_message: "Restart any running Claude Code process to activate the plugin",
+        target: InstallTargetKind::Claude,
+    }),
+    titles: None,
+    resume: Some(ResumeCapability {
+        executable: "claude",
+        session_argument: "--resume",
+    }),
+    schedule_dispatch: Some(ScheduleDispatchCapability {
+        fresh: true,
+        continuation: true,
+        prompt_transport: PromptTransport::Stdin,
+    }),
+    foreground: Some(ForegroundCapability {
+        process_name: "claude",
+    }),
+};
+
+pub const ALL: &[IntegrationDescriptor] = &[OPENCODE, PI, CLAUDE];
 
 pub fn by_key(key: &str) -> Option<&'static IntegrationDescriptor> {
     descriptor_by_key(ALL, key)
@@ -362,6 +405,10 @@ mod tests {
                 .command(&["opencode".into(), "--continue".into()], "session-1")
                 .is_none()
         );
+        assert_eq!(
+            CLAUDE.resume.unwrap().command(&[], "session-2"),
+            Some(vec!["claude".into(), "--resume".into(), "session-2".into()])
+        );
     }
 
     #[test]
@@ -398,6 +445,39 @@ mod tests {
                     "exact-full-id".into(),
                     "--print".into(),
                 ],
+                stdin: Some(prompt.as_bytes().to_vec()),
+            }
+        );
+        assert_eq!(
+            CLAUDE
+                .schedule_dispatch
+                .unwrap()
+                .command(
+                    "claude",
+                    &AgentScheduleSession::Continue {
+                        external_session_id: "exact-id".into(),
+                    },
+                    prompt,
+                )
+                .unwrap(),
+            ScheduleDispatchCommand {
+                argv: vec![
+                    "claude".into(),
+                    "--print".into(),
+                    "--resume".into(),
+                    "exact-id".into(),
+                ],
+                stdin: Some(prompt.as_bytes().to_vec()),
+            }
+        );
+        assert_eq!(
+            CLAUDE
+                .schedule_dispatch
+                .unwrap()
+                .command("claude", &AgentScheduleSession::Fresh, prompt)
+                .unwrap(),
+            ScheduleDispatchCommand {
+                argv: vec!["claude".into(), "--print".into()],
                 stdin: Some(prompt.as_bytes().to_vec()),
             }
         );

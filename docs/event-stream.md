@@ -51,6 +51,9 @@ ephemeral refresh remains the fallback for legacy or missed invalidations.
 Remote notification presentation adds no protocol or event kind. It consumes the
 protocol-32 reduced transition batch at the projection-cache boundary and never
 copies owner events into the presenting Node's domain journal.
+Protocol 43 likewise adds no event kind or baseline field. Claude Remote Control
+bindings are ephemeral local handoff presentation state, not durable Agent state
+or reduced Node projection data.
 
 `boomux agent wait <id> --after-revision <revision>` is the preferred way to
 await one Agent. It returns on a newer accepted durable observation, returns

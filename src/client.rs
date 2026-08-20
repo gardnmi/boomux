@@ -15,10 +15,11 @@ use std::time::Duration;
 
 use crate::protocol::{
     self, AgentInstanceSnapshot, AgentRegistrationSpec, AgentReport, AgentScheduleInspection,
-    AgentScheduleSnapshot, AgentScheduleSpec, AgentScheduleUpdate, CombinedNodeSnapshot,
-    DaemonEvent, Envelope, ErrorCode, EventCursor, FocusedTerminalSnapshot, NodeProjectionHealth,
-    NodeRegistrationSnapshot, NotificationDeliveryConfig, OpenCodeSessionClaimSnapshot,
-    OpenCodeSharedRuntimeSnapshot, Request, Response, RoutedOperation, RoutedOperationResult,
+    AgentScheduleSnapshot, AgentScheduleSpec, AgentScheduleUpdate,
+    ClaudeRemoteControlBindingSnapshot, CombinedNodeSnapshot, DaemonEvent, Envelope, ErrorCode,
+    EventCursor, FocusedTerminalSnapshot, NodeProjectionHealth, NodeRegistrationSnapshot,
+    NotificationDeliveryConfig, OpenCodeSessionClaimSnapshot, OpenCodeSharedRuntimeSnapshot,
+    Request, Response, RoutedOperation, RoutedOperationResult,
     ScheduledExecutionScheduleProjection, ScheduledExecutionSnapshot, ScheduledOccurrence,
     ScheduledRunnerResult, ShellSnapshot, ShellSpec, ShellStatus, Snapshot, TerminalPreview,
     TerminalPreviewLine, TerminalPreviewSpan, TerminalProfile, UnixEnvironment,
@@ -1620,6 +1621,40 @@ impl Client {
         }
     }
 
+    pub fn set_claude_remote_control_binding(
+        &self,
+        agent_id: impl Into<String>,
+        shell_id: impl Into<String>,
+        run_id: impl Into<String>,
+        bridge_session_id: Option<String>,
+    ) -> Result<Option<ClaudeRemoteControlBindingSnapshot>> {
+        match self.request(Request::SetClaudeRemoteControlBinding {
+            agent_id: agent_id.into(),
+            shell_id: shell_id.into(),
+            run_id: run_id.into(),
+            bridge_session_id,
+        })? {
+            Response::ClaudeRemoteControlBinding { binding } => Ok(binding),
+            other => unexpected(other),
+        }
+    }
+
+    pub fn get_claude_remote_control_binding(
+        &self,
+        agent_id: impl Into<String>,
+        shell_id: impl Into<String>,
+        run_id: impl Into<String>,
+    ) -> Result<Option<ClaudeRemoteControlBindingSnapshot>> {
+        match self.request(Request::GetClaudeRemoteControlBinding {
+            agent_id: agent_id.into(),
+            shell_id: shell_id.into(),
+            run_id: run_id.into(),
+        })? {
+            Response::ClaudeRemoteControlBinding { binding } => Ok(binding),
+            other => unexpected(other),
+        }
+    }
+
     pub fn report_agent(
         &self,
         agent_id: impl Into<String>,
@@ -2112,6 +2147,9 @@ mod tests {
 
     fn reject_protocol(listener: &UnixListener, attempted: u32, supported: u32) {
         reject_protocol_once(listener, attempted, supported);
+        if attempted == protocol::PROTOCOL_VERSION && supported == 41 {
+            reject_protocol_once(listener, 42, supported);
+        }
     }
 
     fn reject_protocol_once(listener: &UnixListener, attempted: u32, supported: u32) {
@@ -2144,7 +2182,7 @@ mod tests {
         let (client_done_sender, client_done_receiver) = mpsc::channel();
         let server = thread::spawn(move || {
             for _ in 0..2 {
-                reject_protocol_once(&listener, 42, 41);
+                reject_protocol(&listener, protocol::PROTOCOL_VERSION, 41);
                 let (mut stream, _) = listener.accept().unwrap();
                 let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
                 assert_eq!(request.version, 41);
@@ -2167,6 +2205,54 @@ mod tests {
             error,
             ClientError::Protocol(ProtocolError::UnsupportedVersion(_))
         ));
+        client_done_sender.send(()).unwrap();
+
+        server.join().unwrap();
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn protocol_forty_two_daemon_rejects_claude_bindings_before_request() {
+        let directory =
+            env::temp_dir().join(format!("boomux-client-claude-binding-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let socket = directory.join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let (client_done_sender, client_done_receiver) = mpsc::channel();
+        let server = thread::spawn(move || {
+            for _ in 0..3 {
+                reject_protocol_once(&listener, 43, 42);
+                let (mut stream, _) = listener.accept().unwrap();
+                let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+                assert_eq!(request.version, 42);
+                assert!(matches!(request.message, Request::Ping));
+                protocol::write_message(&mut stream, &Envelope::with_version(42, Response::Pong))
+                    .unwrap();
+            }
+
+            client_done_receiver.recv().unwrap();
+            listener.set_nonblocking(true).unwrap();
+            assert!(
+                matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
+            );
+        });
+        let client = Client::from_socket_path(socket);
+
+        assert_eq!(client.protocol_version().unwrap(), 42);
+        for result in [
+            client.set_claude_remote_control_binding(
+                "agent-1",
+                "shell-1",
+                "run-1",
+                Some("bridge-1".into()),
+            ),
+            client.get_claude_remote_control_binding("agent-1", "shell-1", "run-1"),
+        ] {
+            assert!(matches!(
+                result,
+                Err(ClientError::Protocol(ProtocolError::UnsupportedVersion(_)))
+            ));
+        }
         client_done_sender.send(()).unwrap();
 
         server.join().unwrap();

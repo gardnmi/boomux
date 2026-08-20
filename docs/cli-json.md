@@ -241,12 +241,12 @@ The following commands support `--json`:
 - `boomux execution open`
 - `boomux execution cancel`
 - `boomux integration list`
-- `boomux integration status [opencode|pi]`
-- `boomux integration install <opencode|pi>`
+- `boomux integration status [opencode|pi|claude]`
+- `boomux integration install <opencode|pi|claude>`
 - `boomux integration install --all`
-- `boomux integration uninstall <opencode|pi>`
+- `boomux integration uninstall <opencode|pi|claude>`
 - `boomux integration uninstall --all`
-- `boomux integration verify <opencode|pi>`
+- `boomux integration verify <opencode|pi|claude>`
 - `boomux opencode claim ensure`
 - `boomux opencode claim release`
 - `boomux opencode claim report`
@@ -260,8 +260,8 @@ integration install and uninstall support the contract. Other mutation commands
 retain human output. Passing `--json` to an unsupported command fails with
 `invalid_argument` before performing the operation.
 
-`boomux integration setup <opencode|pi>` is intentionally human-oriented and
-does not support `--json`. It composes status inspection, an exact install
+`boomux integration setup <opencode|pi|claude>` is intentionally human-oriented
+and does not support `--json`. It composes status inspection, an exact install
 preview, confirmation, installation when needed, and restart/verification
 guidance. `--yes` skips confirmation for automation; replacing modified content
 also requires `--force`.
@@ -415,8 +415,8 @@ generated name is currently in use, suggestion fails with `already_exists`.
 
 ## Integration Data
 
-Integration arrays are ordered `opencode`, then `pi`. List entries contain
-`name`, `display_name`, `package`, and `validated_version`.
+Integration arrays are ordered `opencode`, then `pi`, then `claude`. List entries
+contain `name`, `display_name`, `package`, and `validated_version`.
 
 Protocol 22 advertises `protocol_22`, `agent_schedule_management`, and
 `durable_agent_schedules`. Protocol 23 adds `protocol_23`,
@@ -456,6 +456,9 @@ Protocol 41 adds `protocol_41`, `observed_node_helper_version`, and
 `node_upgrade_coordination`.
 Protocol 42 adds `protocol_42` and
 `opencode_shared_runtime_claims`.
+Protocol 43 adds `protocol_43` and `claude_remote_control_bindings`. The binding
+operations are private local protocol requests and add no public CLI JSON field,
+snapshot field, event, or remote Node projection field.
 
 Protocol-38 `workspace create` creates empty coordinator metadata without a
 default Node or cwd. First global `shell create`, `launcher create`, or

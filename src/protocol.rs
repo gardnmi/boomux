@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 42;
+pub const PROTOCOL_VERSION: u32 = 43;
 pub const MIN_PROTOCOL_VERSION: u32 = 6;
 pub const MAX_CONTROL_FRAME: usize = 8 * 1024 * 1024;
 pub const MAX_ATTACH_FRAME: usize = 1024 * 1024;
@@ -190,6 +190,10 @@ define_protocol_features! {
         "protocol_42",
         "opencode_shared_runtime_claims",
     ]),
+    ClaudeRemoteControlBindings => (43, "Claude Remote Control bindings", [
+        "protocol_43",
+        "claude_remote_control_bindings",
+    ]),
 }
 
 pub const DEFAULT_SCHEDULED_EXECUTION_LIST_LIMIT: u16 = 100;
@@ -200,6 +204,8 @@ pub const MAX_NODE_PROJECTION_TRANSITIONS: u16 = 256;
 pub const MAX_HOST_SERVICE_PROJECTS: usize = 2_000;
 pub const MAX_HOST_SERVICE_WARNINGS: usize = 64;
 pub const MAX_HOST_SERVICE_SESSIONS: usize = 1_000;
+pub const MAX_CLAUDE_REMOTE_CONTROL_BINDINGS: usize = 4_096;
+pub const MAX_CLAUDE_BRIDGE_SESSION_ID_BYTES: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1254,6 +1260,14 @@ pub struct OpenCodeSessionClaimSnapshot {
     pub agent_id: String,
     pub holder_count: u32,
     pub holder_expires_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaudeRemoteControlBindingSnapshot {
+    pub agent_id: String,
+    pub shell_id: String,
+    pub run_id: String,
+    pub bridge_session_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2349,6 +2363,18 @@ pub enum Request {
         root_session_id: String,
         report: AgentReport,
     },
+    SetClaudeRemoteControlBinding {
+        agent_id: String,
+        shell_id: String,
+        run_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bridge_session_id: Option<String>,
+    },
+    GetClaudeRemoteControlBinding {
+        agent_id: String,
+        shell_id: String,
+        run_id: String,
+    },
     ReportAgent {
         agent_id: String,
         run_id: String,
@@ -2654,6 +2680,10 @@ impl Request {
             | Self::ReportClaimedOpenCodeAgent { .. } => {
                 Some(ProtocolFeature::OpenCodeSharedRuntimeClaims)
             }
+            Self::SetClaudeRemoteControlBinding { .. }
+            | Self::GetClaudeRemoteControlBinding { .. } => {
+                Some(ProtocolFeature::ClaudeRemoteControlBindings)
+            }
             Self::GetAgent { .. } | Self::RegisterAgent { .. } | Self::ReportAgent { .. } => {
                 Some(ProtocolFeature::AgentInstances)
             }
@@ -2754,6 +2784,9 @@ pub enum Response {
     },
     OpenCodeSessionClaimReleased {
         released: bool,
+    },
+    ClaudeRemoteControlBinding {
+        binding: Option<ClaudeRemoteControlBindingSnapshot>,
     },
     AgentSchedule {
         schedule: AgentScheduleSnapshot,
@@ -3363,8 +3396,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_forty_two_with_minimum_six() {
-        assert_eq!(PROTOCOL_VERSION, 42);
+    fn protocol_version_is_forty_three_with_minimum_six() {
+        assert_eq!(PROTOCOL_VERSION, 43);
         assert_eq!(MIN_PROTOCOL_VERSION, 6);
     }
 
@@ -3640,6 +3673,76 @@ mod tests {
     }
 
     #[test]
+    fn claude_remote_control_binding_messages_require_protocol_forty_three() {
+        let binding = ClaudeRemoteControlBindingSnapshot {
+            agent_id: "agent-1".into(),
+            shell_id: "shell-1".into(),
+            run_id: "run-1".into(),
+            bridge_session_id: "bridge-1".into(),
+        };
+        for request in [
+            Request::SetClaudeRemoteControlBinding {
+                agent_id: binding.agent_id.clone(),
+                shell_id: binding.shell_id.clone(),
+                run_id: binding.run_id.clone(),
+                bridge_session_id: Some(binding.bridge_session_id.clone()),
+            },
+            Request::SetClaudeRemoteControlBinding {
+                agent_id: binding.agent_id.clone(),
+                shell_id: binding.shell_id.clone(),
+                run_id: binding.run_id.clone(),
+                bridge_session_id: None,
+            },
+            Request::GetClaudeRemoteControlBinding {
+                agent_id: binding.agent_id.clone(),
+                shell_id: binding.shell_id.clone(),
+                run_id: binding.run_id.clone(),
+            },
+        ] {
+            let encoded = serde_json::to_value(&request).unwrap();
+            assert!(matches!(
+                encoded["request"].as_str(),
+                Some("set_claude_remote_control_binding" | "get_claude_remote_control_binding")
+            ));
+            if matches!(
+                &request,
+                Request::SetClaudeRemoteControlBinding {
+                    bridge_session_id: None,
+                    ..
+                }
+            ) {
+                assert!(encoded.get("bridge_session_id").is_none());
+            }
+            assert_eq!(serde_json::from_value::<Request>(encoded).unwrap(), request);
+            assert_eq!(
+                request.required_feature(),
+                Some(ProtocolFeature::ClaudeRemoteControlBindings)
+            );
+            assert_eq!(request.minimum_protocol_version(), 43);
+        }
+
+        for response in [
+            Response::ClaudeRemoteControlBinding {
+                binding: Some(binding),
+            },
+            Response::ClaudeRemoteControlBinding { binding: None },
+        ] {
+            let encoded = serde_json::to_value(&response).unwrap();
+            assert_eq!(encoded["response"], "claude_remote_control_binding");
+            assert_eq!(
+                serde_json::from_value::<Response>(encoded).unwrap(),
+                response
+            );
+        }
+        assert_eq!(
+            ProtocolFeature::ClaudeRemoteControlBindings.capability_names(),
+            &["protocol_43", "claude_remote_control_bindings"]
+        );
+        assert_eq!(MAX_CLAUDE_REMOTE_CONTROL_BINDINGS, 4_096);
+        assert_eq!(MAX_CLAUDE_BRIDGE_SESSION_ID_BYTES, 256);
+    }
+
+    #[test]
     fn node_projection_sync_is_protocol_thirty_two_and_privacy_allowlisted() {
         let request = Request::SyncNodeProjection {
             after: Some(EventCursor {
@@ -3683,6 +3786,7 @@ mod tests {
             "environment",
             "external_session_id",
             "runner_token",
+            "bridge_session_id",
         ] {
             assert!(!serialized.contains(private));
         }
@@ -4947,6 +5051,7 @@ mod tests {
             (41, &["protocol_41", "observed_node_helper_version"][..]),
             (41, &["node_upgrade_coordination"][..]),
             (42, &["protocol_42", "opencode_shared_runtime_claims"][..]),
+            (43, &["protocol_43", "claude_remote_control_bindings"][..]),
         ];
 
         let actual = ProtocolFeature::ALL

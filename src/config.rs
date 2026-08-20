@@ -51,6 +51,9 @@ pub(crate) const CONFIG_TEMPLATE: &str = r#"# Boomux configuration
 
 [scheduling]
 # max_concurrent = 4
+
+[claude]
+# remote_control = true
 "#;
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -62,6 +65,7 @@ struct RawConfig {
     dashboard: Option<RawDashboardConfig>,
     recovery: Option<RawRecoveryConfig>,
     scheduling: Option<RawSchedulingConfig>,
+    claude: Option<RawClaudeConfig>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -109,6 +113,12 @@ struct RawRecoveryConfig {
 #[serde(default, deny_unknown_fields)]
 struct RawSchedulingConfig {
     max_concurrent: Option<i64>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RawClaudeConfig {
+    remote_control: Option<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -193,7 +203,7 @@ pub(crate) fn load_snapshot() -> Result<ConfigSnapshot, Box<dyn Error>> {
 pub(crate) fn load_notification_settings()
 -> Result<boomux::daemon::NotificationDeliverySettings, Box<dyn Error>> {
     let (raw, _) = load_raw()?;
-    resolve_daemon_settings(raw.notifications, raw.recovery, raw.scheduling)
+    resolve_daemon_settings(raw.notifications, raw.recovery, raw.scheduling, raw.claude)
 }
 
 fn load_raw() -> Result<(RawConfig, Option<PathBuf>), Box<dyn Error>> {
@@ -736,6 +746,12 @@ fn merge(base: &mut RawConfig, next: RawConfig) {
             scheduling.max_concurrent = next_scheduling.max_concurrent;
         }
     }
+    if let Some(next_claude) = next.claude {
+        let claude = base.claude.get_or_insert_default();
+        if next_claude.remote_control.is_some() {
+            claude.remote_control = next_claude.remote_control;
+        }
+    }
 }
 
 fn resolve(raw: RawConfig, path: Option<PathBuf>) -> Result<Config, Box<dyn Error>> {
@@ -766,7 +782,12 @@ fn resolve(raw: RawConfig, path: Option<PathBuf>) -> Result<Config, Box<dyn Erro
         terminal,
         projects: ProjectsConfig { roots, max_depth },
         path,
-        notifications: resolve_daemon_settings(raw.notifications, raw.recovery, raw.scheduling)?,
+        notifications: resolve_daemon_settings(
+            raw.notifications,
+            raw.recovery,
+            raw.scheduling,
+            raw.claude,
+        )?,
         dashboard: DashboardConfig {
             follow_focused_terminal: raw
                 .dashboard
@@ -781,13 +802,14 @@ fn resolve(raw: RawConfig, path: Option<PathBuf>) -> Result<Config, Box<dyn Erro
 fn resolve_notifications(
     raw: Option<RawNotificationsConfig>,
 ) -> boomux::daemon::NotificationDeliverySettings {
-    resolve_daemon_settings(raw, None, None).expect("default scheduling config is valid")
+    resolve_daemon_settings(raw, None, None, None).expect("default scheduling config is valid")
 }
 
 fn resolve_daemon_settings(
     notifications: Option<RawNotificationsConfig>,
     recovery: Option<RawRecoveryConfig>,
     scheduling: Option<RawSchedulingConfig>,
+    claude: Option<RawClaudeConfig>,
 ) -> Result<boomux::daemon::NotificationDeliverySettings, Box<dyn Error>> {
     let raw = notifications.unwrap_or_default();
     let recovery = recovery.unwrap_or_default();
@@ -827,6 +849,7 @@ fn resolve_daemon_settings(
         resume_agents: recovery.resume_agents.unwrap_or(true),
         persist_terminal_history: recovery.persist_terminal_history.unwrap_or(false),
         max_scheduled_execution_concurrency: max_concurrent as u16,
+        claude_remote_control: claude.unwrap_or_default().remote_control.unwrap_or(true),
     })
 }
 
@@ -1032,7 +1055,7 @@ mod tests {
 
     #[test]
     fn recovery_settings_default_and_merge_per_field() {
-        let defaults = resolve_daemon_settings(None, None, None).unwrap();
+        let defaults = resolve_daemon_settings(None, None, None, None).unwrap();
         assert!(defaults.resume_agents);
         assert!(!defaults.persist_terminal_history);
 
@@ -1042,11 +1065,36 @@ mod tests {
         let next: RawConfig = toml::from_str("[recovery]\nresume_agents = true").unwrap();
         merge(&mut base, next);
 
-        let settings =
-            resolve_daemon_settings(base.notifications, base.recovery, base.scheduling).unwrap();
+        let settings = resolve_daemon_settings(
+            base.notifications,
+            base.recovery,
+            base.scheduling,
+            base.claude,
+        )
+        .unwrap();
         assert!(settings.resume_agents);
         assert!(settings.persist_terminal_history);
         assert!(toml::from_str::<RawConfig>("[recovery]\nunknown = true").is_err());
+    }
+
+    #[test]
+    fn claude_remote_control_defaults_on_and_can_be_disabled_per_layer() {
+        let defaults = resolve_daemon_settings(None, None, None, None).unwrap();
+        assert!(defaults.claude_remote_control);
+
+        let mut base: RawConfig = toml::from_str("[claude]\nremote_control = false").unwrap();
+        let next: RawConfig =
+            toml::from_str("[dashboard]\nfollow_focused_terminal = false").unwrap();
+        merge(&mut base, next);
+        let settings = resolve_daemon_settings(
+            base.notifications,
+            base.recovery,
+            base.scheduling,
+            base.claude,
+        )
+        .unwrap();
+        assert!(!settings.claude_remote_control);
+        assert!(toml::from_str::<RawConfig>("[claude]\nunknown = true").is_err());
     }
 
     #[test]
@@ -1079,6 +1127,7 @@ mod tests {
                 resume_agents: true,
                 persist_terminal_history: false,
                 max_scheduled_execution_concurrency: 4,
+                claude_remote_control: true,
             }
         );
     }

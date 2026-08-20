@@ -41,6 +41,7 @@ use crate::node_projection::{
     RemoteNotificationCategory, RemoteNotificationClaim,
 };
 use crate::node_registration::NodeRegistrationManager;
+use crate::protocol::ClaudeRemoteControlBindingSnapshot;
 use crate::protocol::{
     self, AgentAttentionReason, AgentAttentionSnapshot, AgentAuthority, AgentInstanceSnapshot,
     AgentObservationSnapshot, AgentRegistrationSpec, AgentReport, AgentScheduleInspection,
@@ -121,6 +122,12 @@ if [ "$#" -eq 0 ] && [ -t 0 ] && [ -t 1 ] && [ -n "${BOOMUX_SHELL_ID-}" ] && [ -
   exec "$BOOMUX_SHIM_EXECUTABLE" opencode shared
 fi
 exec "$BOOMUX_REAL_OPENCODE" "$@"
+"#;
+const CLAUDE_SHIM: &[u8] = br#"#!/bin/sh
+if [ "${BOOMUX_CLAUDE_REMOTE_CONTROL-0}" = 1 ] && [ "$#" -eq 0 ] && [ -t 0 ] && [ -t 1 ] && [ -n "${BOOMUX_SHELL_ID-}" ] && [ -n "${BOOMUX_RUN_ID-}" ]; then
+  exec "$BOOMUX_REAL_CLAUDE" --remote-control
+fi
+exec "$BOOMUX_REAL_CLAUDE" "$@"
 "#;
 const OPENCODE_BASH_RC: &[u8] = br#"if [ -r "${HOME}/.bashrc" ]; then
   . "${HOME}/.bashrc"
@@ -205,6 +212,7 @@ impl From<NotificationDeliveryConfig> for NotificationDeliverySettings {
             resume_agents: config.resume_agents,
             persist_terminal_history: config.persist_terminal_history,
             max_scheduled_execution_concurrency: config.max_scheduled_execution_concurrency,
+            claude_remote_control: true,
         }
     }
 }
@@ -236,6 +244,7 @@ pub struct NotificationDeliverySettings {
     pub resume_agents: bool,
     pub persist_terminal_history: bool,
     pub max_scheduled_execution_concurrency: u16,
+    pub claude_remote_control: bool,
 }
 
 impl Default for NotificationDeliverySettings {
@@ -246,6 +255,7 @@ impl Default for NotificationDeliverySettings {
             resume_agents: true,
             persist_terminal_history: false,
             max_scheduled_execution_concurrency: 4,
+            claude_remote_control: true,
         }
     }
 }
@@ -316,8 +326,14 @@ pub fn receive_handoff_with_notification_delivery(
             focused_terminal,
             presented_focused_terminal,
             opencode_runtime,
+            claude_remote_control_bindings,
         } => {
             let store = StateStore::from_transferred_lock(state_lock)?;
+            let claude_remote_control = notification_settings.claude_remote_control;
+            let mut notification_settings = (*notifications)
+                .map(Into::into)
+                .unwrap_or(notification_settings);
+            notification_settings.claude_remote_control = claude_remote_control;
             let socket_path = client::socket_path()?;
             run_daemon(
                 listener,
@@ -331,11 +347,10 @@ pub fn receive_handoff_with_notification_delivery(
                     focused_terminal: focused_terminal.map(|focused| *focused),
                     presented_focused_terminal: presented_focused_terminal.map(|focused| *focused),
                     opencode_runtime,
+                    claude_remote_control_bindings,
                 },
                 Some(&mut channel),
-                (*notifications)
-                    .map(Into::into)
-                    .unwrap_or(notification_settings),
+                notification_settings,
             )
         }
     }
@@ -389,6 +404,7 @@ struct TransferredState {
     focused_terminal: Option<FocusedTerminalSnapshot>,
     presented_focused_terminal: Option<QualifiedFocusedTerminalSnapshot>,
     opencode_runtime: Option<handoff::TransferredOpenCodeRuntime>,
+    claude_remote_control_bindings: Vec<ClaudeRemoteControlBindingSnapshot>,
 }
 
 fn run_daemon(
@@ -454,6 +470,7 @@ fn run_daemon(
     registry
         .opencode
         .import_handoff(transferred.opencode_runtime)?;
+    registry.import_claude_remote_control_bindings(transferred.claude_remote_control_bindings)?;
     if let Some(channel) = committed {
         {
             registry.events.transaction()?.reserve(1)?;
@@ -1033,6 +1050,8 @@ fn sanitize_opencode_shim_environment(environment: &UnixEnvironment) -> UnixEnvi
     let user_zdotdir = environment_value(environment, b"BOOMUX_USER_ZDOTDIR");
     let mut sanitized = environment.clone();
     const PRIVATE_NAMES: &[&[u8]] = &[
+        b"BOOMUX_CLAUDE_REMOTE_CONTROL",
+        b"BOOMUX_REAL_CLAUDE",
         b"BOOMUX_REAL_OPENCODE",
         b"BOOMUX_ORIGINAL_PATH",
         b"BOOMUX_OPENCODE_SHIM_DIR",
@@ -1073,6 +1092,14 @@ fn resolve_opencode_executable(
     environment: &UnixEnvironment,
     excluded_directory: Option<&Path>,
 ) -> Option<PathBuf> {
+    resolve_executable(environment, excluded_directory, "opencode")
+}
+
+fn resolve_executable(
+    environment: &UnixEnvironment,
+    excluded_directory: Option<&Path>,
+    executable: &str,
+) -> Option<PathBuf> {
     let path = environment_value(environment, b"PATH")?;
     let current_executable = env::current_exe()
         .ok()
@@ -1081,7 +1108,7 @@ fn resolve_opencode_executable(
         if !directory.is_absolute() || excluded_directory == Some(directory.as_path()) {
             return None;
         }
-        let candidate = directory.join("opencode");
+        let candidate = directory.join(executable);
         let metadata = fs::metadata(&candidate).ok()?;
         if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
             return None;
@@ -1097,7 +1124,27 @@ fn opencode_shim_eligible(shell: &Shell, effective_command: &[String]) -> bool {
         && effective_command.is_empty()
 }
 
-fn inject_opencode_shim_environment(environment: &UnixEnvironment) -> io::Result<UnixEnvironment> {
+fn claude_remote_control_command(
+    shell: &Shell,
+    effective_command: &[String],
+    recovery_override: bool,
+    enabled: bool,
+) -> Option<Vec<String>> {
+    (enabled
+        && !recovery_override
+        && matches!(shell.owner, ShellOwner::User)
+        && effective_command.len() == 1
+        && Path::new(&effective_command[0])
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            == Some("claude"))
+    .then(|| vec![effective_command[0].clone(), "--remote-control".into()])
+}
+
+fn inject_opencode_shim_environment(
+    environment: &UnixEnvironment,
+    claude_remote_control: bool,
+) -> io::Result<UnixEnvironment> {
     let runtime_root = PathBuf::from(
         environment_value(environment, b"XDG_RUNTIME_DIR").ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, "XDG_RUNTIME_DIR is unavailable")
@@ -1112,13 +1159,14 @@ fn inject_opencode_shim_environment(environment: &UnixEnvironment) -> io::Result
     let shim_dir = runtime_root.join("boomux/shims");
     secure_runtime_dir(&runtime_root.join("boomux"))?;
     secure_runtime_dir(&shim_dir)?;
-    let real_opencode =
-        resolve_opencode_executable(environment, Some(&shim_dir)).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                "OpenCode executable is unavailable",
-            )
-        })?;
+    let real_opencode = resolve_opencode_executable(environment, Some(&shim_dir));
+    let real_claude = resolve_executable(environment, Some(&shim_dir), "claude");
+    if real_opencode.is_none() && real_claude.is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "supported Agent executables are unavailable",
+        ));
+    }
     let boomux = env::current_exe()?.canonicalize()?;
     let boomux_metadata = fs::metadata(&boomux)?;
     if !boomux.is_absolute()
@@ -1131,26 +1179,31 @@ fn inject_opencode_shim_environment(environment: &UnixEnvironment) -> io::Result
         ));
     }
 
-    atomic_runtime_asset(&shim_dir.join("opencode"), OPENCODE_SHIM, 0o700)?;
     atomic_runtime_asset(&shim_dir.join("boomux.bashrc"), OPENCODE_BASH_RC, 0o600)?;
     atomic_runtime_asset(&shim_dir.join(".zshenv"), OPENCODE_ZSH_ENV, 0o600)?;
     atomic_runtime_asset(&shim_dir.join(".zshrc"), OPENCODE_ZSH_RC, 0o600)?;
-    atomic_runtime_asset(&shim_dir.join("boomux-tui.tsx"), OPENCODE_TUI, 0o600)?;
-    atomic_runtime_asset(
-        &shim_dir.join("boomux-tui-core.js"),
-        OPENCODE_TUI_CORE,
-        0o600,
-    )?;
-    atomic_runtime_asset(
-        &shim_dir.join("boomux-tui-runner.js"),
-        OPENCODE_TUI_RUNNER,
-        0o600,
-    )?;
-    atomic_runtime_asset(
-        &shim_dir.join("tui.json"),
-        b"{\n  \"$schema\": \"https://opencode.ai/tui.json\",\n  \"plugin\": [[\"./boomux-tui.tsx\", {}]]\n}\n",
-        0o600,
-    )?;
+    if real_opencode.is_some() {
+        atomic_runtime_asset(&shim_dir.join("opencode"), OPENCODE_SHIM, 0o700)?;
+        atomic_runtime_asset(&shim_dir.join("boomux-tui.tsx"), OPENCODE_TUI, 0o600)?;
+        atomic_runtime_asset(
+            &shim_dir.join("boomux-tui-core.js"),
+            OPENCODE_TUI_CORE,
+            0o600,
+        )?;
+        atomic_runtime_asset(
+            &shim_dir.join("boomux-tui-runner.js"),
+            OPENCODE_TUI_RUNNER,
+            0o600,
+        )?;
+        atomic_runtime_asset(
+            &shim_dir.join("tui.json"),
+            b"{\n  \"$schema\": \"https://opencode.ai/tui.json\",\n  \"plugin\": [[\"./boomux-tui.tsx\", {}]]\n}\n",
+            0o600,
+        )?;
+    }
+    if real_claude.is_some() {
+        atomic_runtime_asset(&shim_dir.join("claude"), CLAUDE_SHIM, 0o700)?;
+    }
 
     let original_path = environment_value(environment, b"PATH").unwrap_or_default();
     let mut paths = vec![shim_dir.clone()];
@@ -1159,11 +1212,30 @@ fn inject_opencode_shim_environment(environment: &UnixEnvironment) -> io::Result
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
     let mut injected = environment.clone();
     set_environment_value(&mut injected, b"PATH", prefixed_path);
-    set_environment_value(
-        &mut injected,
-        b"BOOMUX_REAL_OPENCODE",
-        real_opencode.into_os_string(),
-    );
+    if let Some(real_opencode) = real_opencode {
+        set_environment_value(
+            &mut injected,
+            b"BOOMUX_REAL_OPENCODE",
+            real_opencode.into_os_string(),
+        );
+        set_environment_value(
+            &mut injected,
+            b"BOOMUX_SHIM_EXECUTABLE",
+            boomux.into_os_string(),
+        );
+    }
+    if let Some(real_claude) = real_claude {
+        set_environment_value(
+            &mut injected,
+            b"BOOMUX_REAL_CLAUDE",
+            real_claude.into_os_string(),
+        );
+        set_environment_value(
+            &mut injected,
+            b"BOOMUX_CLAUDE_REMOTE_CONTROL",
+            if claude_remote_control { "1" } else { "0" },
+        );
+    }
     set_environment_value(&mut injected, b"BOOMUX_ORIGINAL_PATH", original_path);
     set_environment_value(
         &mut injected,
@@ -1174,11 +1246,6 @@ fn inject_opencode_shim_environment(environment: &UnixEnvironment) -> io::Result
         &mut injected,
         b"BOOMUX_OPENCODE_TUI_CONFIG",
         shim_dir.join("tui.json").into_os_string(),
-    );
-    set_environment_value(
-        &mut injected,
-        b"BOOMUX_SHIM_EXECUTABLE",
-        boomux.into_os_string(),
     );
     Ok(injected)
 }
@@ -1291,6 +1358,7 @@ fn launch_replacement(
         let focused_terminal = registry.focused_terminal_for_handoff()?;
         let presented_focused_terminal = registry.runtimes.presented_focused_terminal()?;
         let opencode_runtime = registry.opencode.prepare_handoff()?;
+        let claude_remote_control_bindings = registry.export_claude_remote_control_bindings()?;
         launch_replacement_process(
             listener.as_fd(),
             daemon_lock.as_fd(),
@@ -1304,6 +1372,7 @@ fn launch_replacement(
                 notification_settings,
                 startup_environment,
                 opencode_runtime,
+                claude_remote_control_bindings,
             },
         )
         .map_err(DaemonError::from)
@@ -1323,6 +1392,7 @@ struct ReplacementOptions {
     notification_settings: Option<NotificationDeliverySettings>,
     startup_environment: Option<UnixEnvironment>,
     opencode_runtime: Option<OutgoingOpenCodeRuntime>,
+    claude_remote_control_bindings: Vec<ClaudeRemoteControlBindingSnapshot>,
 }
 
 fn launch_replacement_process(
@@ -1340,6 +1410,7 @@ fn launch_replacement_process(
         notification_settings,
         startup_environment,
         opencode_runtime,
+        claude_remote_control_bindings,
     } = options;
     let (mut channel, child_channel) = UnixStream::pair()?;
     let child_channel_fd = child_channel.as_raw_fd();
@@ -1396,6 +1467,7 @@ fn launch_replacement_process(
                 opencode_runtime: opencode_runtime
                     .as_ref()
                     .map(|runtime| runtime.manifest.clone()),
+                claude_remote_control_bindings,
             },
         )?;
         send_descriptor(&channel, listener, handoff::LISTENER_MARKER)?;
@@ -2844,6 +2916,7 @@ struct DaemonService {
     events: EventStream,
     runtimes: ShellRuntimeManager,
     opencode: OpenCodeCoordinator,
+    claude_remote_control: ClaudeRemoteControlBindings,
     remote_attachments: RemoteAttachmentManager,
     host_service_previews: Mutex<HashMap<String, HostServicePreview>>,
     workspace_operation_locks: Mutex<HashMap<String, Weak<Mutex<()>>>>,
@@ -2863,6 +2936,11 @@ struct DaemonService {
 struct HostServicePreview {
     created_at: Instant,
     prepared: PreparedIntegrationMutation,
+}
+
+#[derive(Default)]
+struct ClaudeRemoteControlBindings {
+    state: Mutex<HashMap<String, ClaudeRemoteControlBindingSnapshot>>,
 }
 
 #[derive(Default)]
@@ -7297,6 +7375,7 @@ impl Default for DaemonService {
                 stopping: AtomicBool::new(false),
             },
             opencode: OpenCodeCoordinator::default(),
+            claude_remote_control: ClaudeRemoteControlBindings::default(),
             remote_attachments: RemoteAttachmentManager::default(),
             host_service_previews: Mutex::new(HashMap::new()),
             workspace_operation_locks: Mutex::new(HashMap::new()),
@@ -11392,6 +11471,7 @@ impl DaemonService {
                 profile: &profile,
                 environment: Some(&runner_environment),
                 recovery: RuntimeRecovery::default(),
+                claude_remote_control: false,
             },
         ) {
             Ok(runtime) => runtime,
@@ -12173,6 +12253,118 @@ impl DaemonService {
                 "OpenCode claim Agent is missing or ambiguous",
             )),
         }
+    }
+
+    fn set_claude_remote_control_binding(
+        &self,
+        agent_id: &str,
+        shell_id: &str,
+        run_id: &str,
+        bridge_session_id: Option<String>,
+    ) -> DaemonResult<Option<ClaudeRemoteControlBindingSnapshot>> {
+        if let Some(bridge_session_id) = bridge_session_id.as_deref() {
+            validate_claude_bridge_session_id(bridge_session_id)?;
+        }
+        let _mutation = lock(&self.mutation_lock)?;
+        let durable = lock(&self.durable.state)?;
+        if bridge_session_id.is_some() {
+            validate_claude_binding_authority(&durable, agent_id, shell_id, run_id)?;
+        } else {
+            validate_claude_binding_identity(&durable, agent_id, shell_id, run_id)?;
+        }
+        let mut bindings = lock(&self.claude_remote_control.state)?;
+        prune_claude_bindings(&durable, &mut bindings)?;
+        let Some(bridge_session_id) = bridge_session_id else {
+            bindings.remove(agent_id);
+            return Ok(None);
+        };
+        if bindings.iter().any(|(candidate_agent_id, binding)| {
+            candidate_agent_id != agent_id && binding.bridge_session_id == bridge_session_id
+        }) {
+            return Err(DaemonError::lifecycle(
+                ErrorCode::Busy,
+                "Claude Remote Control session is already bound to another Agent",
+            ));
+        }
+        if !bindings.contains_key(agent_id)
+            && bindings.len() >= protocol::MAX_CLAUDE_REMOTE_CONTROL_BINDINGS
+        {
+            return Err(DaemonError::lifecycle(
+                ErrorCode::Busy,
+                "Claude Remote Control binding capacity is exhausted",
+            ));
+        }
+        let binding = ClaudeRemoteControlBindingSnapshot {
+            agent_id: agent_id.into(),
+            shell_id: shell_id.into(),
+            run_id: run_id.into(),
+            bridge_session_id,
+        };
+        bindings.insert(agent_id.into(), binding.clone());
+        Ok(Some(binding))
+    }
+
+    fn get_claude_remote_control_binding(
+        &self,
+        agent_id: &str,
+        shell_id: &str,
+        run_id: &str,
+    ) -> DaemonResult<Option<ClaudeRemoteControlBindingSnapshot>> {
+        let _mutation = lock(&self.mutation_lock)?;
+        let durable = lock(&self.durable.state)?;
+        validate_claude_binding_authority(&durable, agent_id, shell_id, run_id)?;
+        let mut bindings = lock(&self.claude_remote_control.state)?;
+        prune_claude_bindings(&durable, &mut bindings)?;
+        Ok(bindings
+            .get(agent_id)
+            .cloned()
+            .filter(|binding| binding.shell_id == shell_id && binding.run_id == run_id))
+    }
+
+    fn export_claude_remote_control_bindings(
+        &self,
+    ) -> DaemonResult<Vec<ClaudeRemoteControlBindingSnapshot>> {
+        let durable = lock(&self.durable.state)?;
+        let mut bindings = lock(&self.claude_remote_control.state)?;
+        prune_claude_bindings(&durable, &mut bindings)?;
+        let mut bindings = bindings.values().cloned().collect::<Vec<_>>();
+        bindings.sort_by(|left, right| left.agent_id.cmp(&right.agent_id));
+        Ok(bindings)
+    }
+
+    fn import_claude_remote_control_bindings(
+        &self,
+        transferred: Vec<ClaudeRemoteControlBindingSnapshot>,
+    ) -> io::Result<()> {
+        let durable = lock(&self.durable.state)?;
+        let mut bindings = lock(&self.claude_remote_control.state)?;
+        if !bindings.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "replacement daemon already has Claude Remote Control bindings",
+            ));
+        }
+        for binding in transferred {
+            validate_claude_bridge_session_id(&binding.bridge_session_id)?;
+            validate_claude_binding_authority(
+                &durable,
+                &binding.agent_id,
+                &binding.shell_id,
+                &binding.run_id,
+            )
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+            if bindings
+                .values()
+                .any(|existing| existing.bridge_session_id == binding.bridge_session_id)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "duplicate Claude bridge session ID in handoff",
+                ));
+            }
+            bindings.insert(binding.agent_id.clone(), binding);
+        }
+        Ok(())
     }
 
     fn dispatch(&self, request: Request) -> DaemonResult<Response> {
@@ -13192,6 +13384,21 @@ impl DaemonService {
                 root_session_id,
                 report,
             } => self.report_claimed_opencode_agent(&generation_id, &root_session_id, report),
+            Request::SetClaudeRemoteControlBinding {
+                agent_id,
+                shell_id,
+                run_id,
+                bridge_session_id,
+            } => self
+                .set_claude_remote_control_binding(&agent_id, &shell_id, &run_id, bridge_session_id)
+                .map(|binding| Response::ClaudeRemoteControlBinding { binding }),
+            Request::GetClaudeRemoteControlBinding {
+                agent_id,
+                shell_id,
+                run_id,
+            } => self
+                .get_claude_remote_control_binding(&agent_id, &shell_id, &run_id)
+                .map(|binding| Response::ClaudeRemoteControlBinding { binding }),
             Request::ReportAgent {
                 agent_id,
                 run_id,
@@ -13776,6 +13983,7 @@ impl DaemonService {
                 stopping: AtomicBool::new(false),
             },
             opencode: OpenCodeCoordinator::default(),
+            claude_remote_control: ClaudeRemoteControlBindings::default(),
             remote_attachments: RemoteAttachmentManager::default(),
             host_service_previews: Mutex::new(HashMap::new()),
             workspace_operation_locks: Mutex::new(HashMap::new()),
@@ -16400,6 +16608,7 @@ struct RuntimeStart<'a> {
     profile: &'a TerminalProfile,
     environment: Option<&'a UnixEnvironment>,
     recovery: RuntimeRecovery<'a>,
+    claude_remote_control: bool,
 }
 
 impl ShellRuntimeManager {
@@ -16415,6 +16624,7 @@ impl ShellRuntimeManager {
             profile,
             environment,
             recovery,
+            claude_remote_control,
         } = start;
         let pty = native_pty_system()
             .openpty(PtySize {
@@ -16428,12 +16638,20 @@ impl ShellRuntimeManager {
         let reader = master.try_clone_reader()?;
 
         let selected_command = recovery.effective_command.unwrap_or(&shell.command);
+        let claude_command = claude_remote_control_command(
+            shell,
+            selected_command,
+            recovery.effective_command.is_some(),
+            claude_remote_control,
+        );
+        let selected_command = claude_command.as_deref().unwrap_or(selected_command);
         let original_environment = environment
             .cloned()
             .unwrap_or_else(capture_current_environment);
         let mut child_environment = sanitize_opencode_shim_environment(&original_environment);
         if opencode_shim_eligible(shell, selected_command)
-            && let Ok(injected) = inject_opencode_shim_environment(&child_environment)
+            && let Ok(injected) =
+                inject_opencode_shim_environment(&child_environment, claude_remote_control)
         {
             child_environment = injected;
         }
@@ -17013,6 +17231,7 @@ impl ShellRuntimeManager {
                             effective_command: resume_command.as_deref(),
                             history: restored_history.as_deref(),
                         },
+                        claude_remote_control: registry.notification_settings.claude_remote_control,
                     },
                 ) {
                     Ok(runtime) => runtime,
@@ -18249,6 +18468,124 @@ fn validate_required_agent_string(kind: &str, value: &str, max_bytes: usize) -> 
     Ok(())
 }
 
+fn validate_claude_bridge_session_id(bridge_session_id: &str) -> io::Result<()> {
+    if bridge_session_id.is_empty()
+        || bridge_session_id.len() > protocol::MAX_CLAUDE_BRIDGE_SESSION_ID_BYTES
+        || bridge_session_id.chars().any(char::is_control)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "Claude bridge session ID must be nonempty, control-free, and at most {} bytes",
+                protocol::MAX_CLAUDE_BRIDGE_SESSION_ID_BYTES
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_claude_binding_authority(
+    state: &DurableState,
+    agent_id: &str,
+    shell_id: &str,
+    run_id: &str,
+) -> DaemonResult<()> {
+    validate_claude_binding_identity(state, agent_id, shell_id, run_id)?;
+    if !claude_binding_is_current(
+        state,
+        &ClaudeRemoteControlBindingSnapshot {
+            agent_id: agent_id.into(),
+            shell_id: shell_id.into(),
+            run_id: run_id.into(),
+            bridge_session_id: String::new(),
+        },
+    )? {
+        return Err(DaemonError::lifecycle(
+            ErrorCode::RunChanged,
+            "Claude Remote Control binding does not match an active current ShellRun",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_claude_binding_identity(
+    state: &DurableState,
+    agent_id: &str,
+    shell_id: &str,
+    run_id: &str,
+) -> DaemonResult<()> {
+    validate_uuid(agent_id, "Claude Agent ID")?;
+    validate_uuid(shell_id, "Claude Shell ID")?;
+    validate_uuid(run_id, "Claude ShellRun ID")?;
+    let agent = state
+        .agents
+        .get(agent_id)
+        .ok_or_else(|| not_found("agent", agent_id))?;
+    if agent.integration != "claude" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Claude Remote Control binding requires a Claude Agent",
+        )
+        .into());
+    }
+    if agent.shell_id != shell_id || agent.run_id != run_id {
+        return Err(DaemonError::lifecycle(
+            ErrorCode::RunChanged,
+            "Claude Remote Control binding does not match the Agent ShellRun",
+        ));
+    }
+    Ok(())
+}
+
+fn claude_binding_is_current(
+    state: &DurableState,
+    binding: &ClaudeRemoteControlBindingSnapshot,
+) -> io::Result<bool> {
+    let Some(agent) = state.agents.get(&binding.agent_id) else {
+        return Ok(false);
+    };
+    if agent.integration != "claude"
+        || agent.shell_id != binding.shell_id
+        || agent.run_id != binding.run_id
+    {
+        return Ok(false);
+    }
+    let agent_state = lock(&agent.state)?;
+    if agent_state.ended_at_ms.is_some()
+        || matches!(
+            agent_state.observation.state,
+            AgentState::Inactive | AgentState::Done
+        )
+    {
+        return Ok(false);
+    }
+    drop(agent_state);
+    let Some(shell) = state.shells.get(&binding.shell_id) else {
+        return Ok(false);
+    };
+    Ok(matches!(
+        &*lock(&shell.lifecycle)?,
+        ShellLifecycle::Running { run, .. } if run.id == binding.run_id
+    ))
+}
+
+fn prune_claude_bindings(
+    state: &DurableState,
+    bindings: &mut HashMap<String, ClaudeRemoteControlBindingSnapshot>,
+) -> io::Result<()> {
+    let stale = bindings
+        .iter()
+        .map(|(agent_id, binding)| {
+            claude_binding_is_current(state, binding)
+                .map(|current| (!current).then(|| agent_id.clone()))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    for agent_id in stale.into_iter().flatten() {
+        bindings.remove(&agent_id);
+    }
+    Ok(())
+}
+
 fn validate_persisted_agent(agent: &PersistedAgentInstance) -> io::Result<()> {
     validate_persisted_name(&agent.name)?;
     validate_agent_registration(&AgentRegistrationSpec {
@@ -18404,6 +18741,7 @@ mod tests {
                 profile,
                 environment,
                 recovery,
+                claude_remote_control: true,
             },
         )
     }
@@ -18524,6 +18862,57 @@ mod tests {
     }
 
     #[test]
+    fn claude_remote_control_rewrites_only_bare_user_commands() {
+        let command = create_pending_shell(
+            "workspace",
+            ShellSpec {
+                name: "claude".into(),
+                cwd: env::temp_dir(),
+                command: vec!["/opt/anthropic/bin/claude".into()],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            claude_remote_control_command(&command, &command.command, false, true),
+            Some(vec![
+                "/opt/anthropic/bin/claude".into(),
+                "--remote-control".into(),
+            ])
+        );
+        for (argv, recovery, enabled) in [
+            (
+                vec!["claude".into(), "--resume".into(), "id".into()],
+                false,
+                true,
+            ),
+            (vec!["claude".into()], true, true),
+            (vec!["claude".into()], false, false),
+            (vec!["claude-wrapper".into()], false, true),
+        ] {
+            assert!(
+                claude_remote_control_command(&command, &argv, recovery, enabled).is_none(),
+                "rewrote {argv:?}"
+            );
+        }
+
+        let mut scheduled = create_pending_shell(
+            "workspace",
+            ShellSpec {
+                name: "scheduled".into(),
+                cwd: env::temp_dir(),
+                command: vec!["claude".into()],
+            },
+        )
+        .unwrap();
+        Arc::get_mut(&mut scheduled).unwrap().owner = ShellOwner::Schedule {
+            schedule_id: "schedule-1".into(),
+        };
+        assert!(
+            claude_remote_control_command(&scheduled, &scheduled.command, false, true).is_none()
+        );
+    }
+
+    #[test]
     fn inherited_opencode_shim_provenance_is_stripped_without_losing_identity() {
         let mut environment = test_environment(&[
             ("PATH", Path::new("/runtime/boomux/shims:/usr/bin")),
@@ -18533,6 +18922,8 @@ mod tests {
                 Path::new("/runtime/boomux/shims"),
             ),
             ("BOOMUX_REAL_OPENCODE", Path::new("/usr/bin/opencode")),
+            ("BOOMUX_REAL_CLAUDE", Path::new("/usr/bin/claude")),
+            ("BOOMUX_CLAUDE_REMOTE_CONTROL", Path::new("1")),
             (
                 "BOOMUX_OPENCODE_TUI_CONFIG",
                 Path::new("/runtime/boomux/shims/tui.json"),
@@ -18563,6 +18954,8 @@ mod tests {
             b"BOOMUX_ORIGINAL_PATH".as_slice(),
             b"BOOMUX_OPENCODE_SHIM_DIR",
             b"BOOMUX_REAL_OPENCODE",
+            b"BOOMUX_REAL_CLAUDE",
+            b"BOOMUX_CLAUDE_REMOTE_CONTROL",
             b"BOOMUX_OPENCODE_TUI_CONFIG",
             b"BOOMUX_SHIM_EXECUTABLE",
             b"BOOMUX_OPENCODE_SHARED_GENERATION",
@@ -18657,9 +19050,12 @@ mod tests {
         let host = bin.join("opencode");
         fs::write(&host, b"#!/bin/sh\nprintf '<%s>\\n' \"$@\"\n").unwrap();
         fs::set_permissions(&host, fs::Permissions::from_mode(0o700)).unwrap();
+        let claude = bin.join("claude");
+        fs::write(&claude, b"#!/bin/sh\nprintf '[%s]\\n' \"$@\"\n").unwrap();
+        fs::set_permissions(&claude, fs::Permissions::from_mode(0o700)).unwrap();
         let environment = test_environment(&[("XDG_RUNTIME_DIR", &runtime), ("PATH", &bin)]);
 
-        let injected = inject_opencode_shim_environment(&environment).unwrap();
+        let injected = inject_opencode_shim_environment(&environment, true).unwrap();
         let shim =
             PathBuf::from(environment_value(&injected, b"BOOMUX_OPENCODE_SHIM_DIR").unwrap())
                 .join("opencode");
@@ -18698,6 +19094,20 @@ mod tests {
                 .unwrap()
                 .contains("exec \"$BOOMUX_SHIM_EXECUTABLE\" opencode shared")
         );
+        let claude_shim = shim.with_file_name("claude");
+        let explicit = Command::new(&claude_shim)
+            .args(["--resume", "exact; id"])
+            .env("BOOMUX_REAL_CLAUDE", &claude)
+            .env("BOOMUX_CLAUDE_REMOTE_CONTROL", "1")
+            .output()
+            .unwrap();
+        assert!(explicit.status.success());
+        assert_eq!(explicit.stdout, b"[--resume]\n[exact; id]\n");
+        assert!(
+            std::str::from_utf8(CLAUDE_SHIM)
+                .unwrap()
+                .contains("exec \"$BOOMUX_REAL_CLAUDE\" --remote-control")
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -18710,7 +19120,7 @@ mod tests {
         fs::create_dir_all(&empty_bin).unwrap();
         let environment = test_environment(&[("XDG_RUNTIME_DIR", &runtime), ("PATH", &empty_bin)]);
         let sanitized = sanitize_opencode_shim_environment(&environment);
-        assert!(inject_opencode_shim_environment(&sanitized).is_err());
+        assert!(inject_opencode_shim_environment(&sanitized, true).is_err());
         assert_eq!(sanitized, environment);
         fs::remove_dir_all(directory).unwrap();
     }
@@ -18832,6 +19242,28 @@ mod tests {
                 .is_none()
         );
         assert!(registry.recovery_presentation(&shell.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn interrupted_claude_agent_builds_exact_resume_command() {
+        let registry = DaemonService::default();
+        let (shell, run) = recovery_shell(&registry, vec!["/opt/bin/claude".into()]);
+        let agent_id = add_recovery_agent(&registry, &shell, &run.id, "claude", "claude-exact");
+
+        assert_eq!(
+            registry.snapshot().unwrap().workspaces[0].shells[0]
+                .recovered_agent_id
+                .as_deref(),
+            Some(agent_id.as_str())
+        );
+        assert_eq!(
+            registry.agent_resume_command(&shell, Some(&run)).unwrap(),
+            Some(vec![
+                "/opt/bin/claude".into(),
+                "--resume".into(),
+                "claude-exact".into(),
+            ])
+        );
     }
 
     #[test]
@@ -18980,6 +19412,110 @@ mod tests {
             claims: HashMap::new(),
         };
         generation_id
+    }
+
+    #[test]
+    fn claude_remote_control_binding_requires_exact_active_claude_agent() {
+        let registry = DaemonService::default();
+        let (_, shell, _runtime) = running_shell(&registry);
+        let run_id = match &*lock(&shell.lifecycle).unwrap() {
+            ShellLifecycle::Running { run, .. } => run.id.clone(),
+            _ => unreachable!(),
+        };
+        let Response::Agent { agent } = registry
+            .dispatch(Request::EnsureAgent {
+                shell_id: shell.id.clone(),
+                run_id: run_id.clone(),
+                spec: AgentRegistrationSpec {
+                    name: "Claude Code".into(),
+                    integration: "claude".into(),
+                    external_session_id: Some("claude-session".into()),
+                    report: agent_report(
+                        AgentState::Idle,
+                        AgentAuthority::LifecycleIntegration,
+                        "Claude session idle",
+                    ),
+                },
+            })
+            .unwrap()
+        else {
+            panic!("unexpected Agent ensure response");
+        };
+        let binding = registry
+            .set_claude_remote_control_binding(
+                &agent.id,
+                &shell.id,
+                &run_id,
+                Some("bridge/exact".into()),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(binding.bridge_session_id, "bridge/exact");
+        assert_eq!(
+            registry
+                .get_claude_remote_control_binding(&agent.id, &shell.id, &run_id)
+                .unwrap(),
+            Some(binding)
+        );
+        assert!(
+            registry
+                .set_claude_remote_control_binding(
+                    &agent.id,
+                    &shell.id,
+                    &Uuid::new_v4().to_string(),
+                    Some("other".into()),
+                )
+                .is_err()
+        );
+        assert!(
+            registry
+                .set_claude_remote_control_binding(
+                    &agent.id,
+                    &shell.id,
+                    &run_id,
+                    Some("bad\nbridge".into()),
+                )
+                .is_err()
+        );
+        registry
+            .dispatch(Request::ReportAgent {
+                agent_id: agent.id.clone(),
+                run_id: run_id.clone(),
+                report: agent_report(
+                    AgentState::Inactive,
+                    AgentAuthority::LifecycleIntegration,
+                    "Claude session inactive",
+                ),
+            })
+            .unwrap();
+        assert!(
+            registry
+                .set_claude_remote_control_binding(
+                    &agent.id,
+                    &shell.id,
+                    &run_id,
+                    Some("inactive".into()),
+                )
+                .is_err()
+        );
+        assert_eq!(
+            registry
+                .set_claude_remote_control_binding(&agent.id, &shell.id, &run_id, None)
+                .unwrap(),
+            None
+        );
+        assert!(
+            lock(&registry.claude_remote_control.state)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            registry
+                .get_claude_remote_control_binding(&agent.id, &shell.id, &run_id)
+                .unwrap_err()
+                .wire_code(),
+            ErrorCode::RunChanged
+        );
     }
 
     #[test]
