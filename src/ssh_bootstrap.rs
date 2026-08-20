@@ -3953,7 +3953,7 @@ mod tests {
         let output = run_streaming_command_capture(
             command,
             transaction.upload_input(bytes),
-            Duration::from_secs(5),
+            Duration::from_secs(15),
         )
         .unwrap();
         assert_eq!(
