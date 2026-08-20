@@ -8,10 +8,10 @@
 
 `boomux web` provides a phone-friendly, installable view of the current Agents
 and outstanding Agent attention known to one coordinating Boomux Node. It is a
-read-only presentation layer inspired by mobile agent dashboards: durable
-attention is first and active work remains easy to scan. Eligible Agent cards
-offer a native handoff that opens the exact authoritative local OpenCode Session
-in OpenCode Web.
+bounded presentation layer inspired by mobile agent dashboards: durable
+attention is first and active work remains easy to scan. Its only mutation
+dismisses an exact local alert. Eligible Agent cards offer a native handoff that
+opens the exact authoritative local OpenCode Session in OpenCode Web.
 
 Boomux is not an interactive chat client. It does not parse or normalize harness
 transcripts and does not send messages, commands, permission responses, or
@@ -132,6 +132,11 @@ the intended authentication boundary.
   merely because their state label remains active-looking.
 - Opening a native Agent link does not acknowledge attention or change lifecycle
   state.
+- Dismiss is available only for a local Agent with durable attention or a
+  gateway-owned finished marker. It carries the exact Node ID, Agent ID, and
+  current attention or lifecycle observation revision. Durable attention stays
+  visible until the daemon confirms acknowledgment; remote and stale requests
+  fail closed.
 - An exact native link is included on a card only for a local OpenCode Agent with
   a canonical external Session ID, UTF-8 working directory, and current Agent
   Session Claim for the Agent's exact ShellRun and Shared Harness Runtime
@@ -153,7 +158,7 @@ the intended authentication boundary.
 The gateway and Shared Harness Runtime bind only to `127.0.0.1`; there is no
 option to bind a LAN or tailnet address. Boomux does not configure or authenticate
 the private access layer. That layer owns TLS, authentication, and ACLs
-appropriate for both the read-only dashboard and OpenCode's
+appropriate for both the bounded dashboard and OpenCode's
 full-control origin. Public exposure is outside this design.
 
 Native handoff URLs expose the local working-directory encoding and canonical
@@ -163,9 +168,13 @@ API responses carry
 the manifest, and the icon; it never handles `/api/` requests. Browser storage
 does not persist Agent snapshots.
 
-The HTTP API is an allowlisted projection. It cannot forward arbitrary daemon
-requests, send terminal input, acquire a Shell controller, resume a Session,
-acknowledge attention, stop processes, or mutate Node registration.
+The HTTP API is allowlisted. Its sole mutation accepts same-origin JSON and
+either clears the gateway's exact local finished marker or submits the existing
+revision-conditional daemon attention acknowledgment. Cross-origin JSON receives
+no CORS authorization, non-JSON requests are rejected, and remote projected
+Agents cannot be mutated. The API cannot forward arbitrary daemon requests, send
+terminal input, acquire a Shell controller, resume a Session, stop processes, or
+mutate Node registration.
 
 The OpenCode origin is a separate full-control application. Set a nonempty
 `OPENCODE_SERVER_PASSWORD` unless the private access layer provides the intended
@@ -177,6 +186,9 @@ reverse proxy so this boundary remains visible.
 
 - `GET /api/snapshot` returns the current Node-qualified Agent cards, counts, and
   optional exact native OpenCode Web handoffs.
+- `POST /api/attention/dismiss` requires JSON containing the exact local
+  `node_id`, `agent_id`, and `observation_revision`. It clears a matching
+  ephemeral marker or acknowledges matching durable attention.
 
 These shapes are intentionally experimental. Future native handoff for other
 harnesses must preserve each harness's runtime ownership and exact Session

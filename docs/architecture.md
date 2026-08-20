@@ -26,7 +26,7 @@
 | `src/terminal_state.rs` | Shadow VT parsing, bounded reconstruction, logical output, and structured previews |
 | `src/terminal_focus.rs` | Stateful parsing and restoration of child focus-reporting mode |
 | `src/tui.rs` | Dashboard state, interaction, palette, polling, and Ratatui rendering; no direct daemon transport |
-| `src/mobile_web.rs`, `assets/mobile-web/` | Loopback-only read-only HTTP gateway, Node-qualified Agent projection, native harness web handoff, and embedded installable web assets |
+| `src/mobile_web.rs`, `assets/mobile-web/` | Loopback-only HTTP gateway, Node-qualified Agent projection, exact local attention dismissal, native harness web handoff, and embedded installable web assets |
 | `src/tailscale_serve.rs` | Explicit Tailscale Serve preflight, conflict detection, exact route mutation, and ephemeral ownership cleanup for `boomux web --tailscale` |
 | `src/session_projection.rs` | Projection of daemon Agent state and host catalogs into client-visible sessions |
 | `src/integrations.rs` | Integration identity, display metadata, and optional installation, title/catalog, resume, and foreground capabilities |
@@ -563,10 +563,15 @@ when the Agent leaves idle, ceases to own the exact current run, or the gateway
 process restarts. A temporary daemon failure marks the cached response
 disconnected without discarding its last bounded projection or finished markers.
 
-All Boomux routes are read-only. The server has no arbitrary daemon-protocol
-pass-through, terminal attachment, input, attention acknowledgment, Session
-resume, rendered terminal output, Agent detail route, or harness transcript
-adapter. The home-page snapshot is the complete HTTP Agent projection.
+The only mutation route dismisses an exact local Agent alert. It requires a
+same-origin JSON request carrying the exact Node ID, Agent ID, and current
+attention or lifecycle observation revision. Durable attention is hidden only
+after the daemon confirms revision-conditional acknowledgment; an ephemeral
+finished marker is cleared only in the gateway that observed it. Remote
+projected attention and stale revisions fail closed. The server has no arbitrary
+daemon-protocol pass-through, terminal attachment, input, Session resume,
+rendered terminal output, Agent detail route, or harness transcript adapter.
+The home-page snapshot is the complete HTTP Agent projection.
 
 `boomux web` ensures the same daemon-supervised Shared Harness Runtime used by
 eligible native OpenCode TUIs. For an authoritative claimed local OpenCode Agent

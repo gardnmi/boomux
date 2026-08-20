@@ -20,7 +20,7 @@ use axum::http::header::{
 use axum::http::{Request, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use boomux::client::{self, Client};
 use boomux::protocol::{
@@ -198,6 +198,25 @@ struct MobileSnapshot {
     agents: Vec<AgentCard>,
 }
 
+#[derive(Debug, Deserialize)]
+struct DismissAttentionRequest {
+    node_id: String,
+    agent_id: String,
+    observation_revision: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct DismissAttentionResponse {
+    changed: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DismissTarget {
+    None,
+    Marker,
+    DurableAttention,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct NativeWebHandoff {
     integration: &'static str,
@@ -220,6 +239,7 @@ struct ErrorBody {
     message: &'static str,
 }
 
+#[derive(Debug)]
 struct ApiError {
     status: StatusCode,
     code: &'static str,
@@ -232,6 +252,52 @@ impl ApiError {
             status: StatusCode::BAD_GATEWAY,
             code: "daemon_unavailable",
             message: "Boomux could not refresh Agent state",
+        }
+    }
+
+    fn not_found() -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            code: "agent_not_found",
+            message: "The Agent is no longer available",
+        }
+    }
+
+    fn local_only() -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            code: "local_agent_required",
+            message: "Attention can be dismissed only on a local Agent",
+        }
+    }
+
+    fn revision_changed() -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            code: "revision_changed",
+            message: "Agent attention changed; refresh before dismissing it",
+        }
+    }
+
+    fn from_client(error: client::ClientError) -> Self {
+        match error {
+            client::ClientError::Remote(remote)
+                if remote.code == Some(boomux::protocol::ErrorCode::NotFound) =>
+            {
+                Self::not_found()
+            }
+            client::ClientError::Remote(remote)
+                if matches!(
+                    remote.code,
+                    Some(
+                        boomux::protocol::ErrorCode::RevisionAhead
+                            | boomux::protocol::ErrorCode::RevisionChanged
+                    )
+                ) =>
+            {
+                Self::revision_changed()
+            }
+            _ => Self::daemon(),
         }
     }
 }
@@ -478,6 +544,7 @@ async fn serve(
         .route("/icon-192.png", get(icon_192))
         .route("/icon-512.png", get(icon_512))
         .route("/api/snapshot", get(snapshot))
+        .route("/api/attention/dismiss", post(dismiss_attention))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             security_headers,
@@ -781,6 +848,43 @@ async fn snapshot(State(state): State<AppState>) -> Result<Response, ApiError> {
     Ok(response)
 }
 
+async fn dismiss_attention(
+    State(state): State<AppState>,
+    Json(request): Json<DismissAttentionRequest>,
+) -> Result<Json<DismissAttentionResponse>, ApiError> {
+    {
+        let mut presentation = state.presentation.lock().map_err(|_| ApiError::daemon())?;
+        match presentation.dismiss_target(&request)? {
+            DismissTarget::None => {
+                return Ok(Json(DismissAttentionResponse { changed: false }));
+            }
+            DismissTarget::Marker => {
+                let changed = presentation.clear_alert(&request);
+                return Ok(Json(DismissAttentionResponse { changed }));
+            }
+            DismissTarget::DurableAttention => {}
+        }
+    }
+
+    let client = state.client.clone();
+    let agent_id = request.agent_id.clone();
+    let observation_revision = request.observation_revision;
+    let acknowledgement = tokio::task::spawn_blocking(move || {
+        client.acknowledge_agent_attention(agent_id, observation_revision)
+    })
+    .await
+    .map_err(|_| ApiError::daemon())?
+    .map_err(ApiError::from_client)?;
+    let presentation_changed = state
+        .presentation
+        .lock()
+        .map_err(|_| ApiError::daemon())?
+        .clear_alert(&request);
+    Ok(Json(DismissAttentionResponse {
+        changed: acknowledgement.changed || presentation_changed,
+    }))
+}
+
 fn project_snapshot(combined: CombinedNodeSnapshot, viewer: Option<String>) -> MobileSnapshot {
     let stale_nodes = combined.nodes.iter().filter(|node| node.stale).count();
     let mut agents = project_visible_agents(&combined);
@@ -817,6 +921,69 @@ fn project_snapshot(combined: CombinedNodeSnapshot, viewer: Option<String>) -> M
 }
 
 impl PresentationState {
+    fn dismiss_target(&self, request: &DismissAttentionRequest) -> Result<DismissTarget, ApiError> {
+        let agent = self
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| {
+                snapshot.agents.iter().find(|agent| {
+                    agent.node_id == request.node_id && agent.agent_id == request.agent_id
+                })
+            })
+            .ok_or_else(ApiError::not_found)?;
+        if !agent.node_local {
+            return Err(ApiError::local_only());
+        }
+        let current_revision = agent
+            .attention
+            .as_ref()
+            .map_or(agent.observation_revision, |attention| {
+                attention.observation_revision
+            });
+        if request.observation_revision != current_revision {
+            return Err(ApiError::revision_changed());
+        }
+        if agent.attention.is_some() {
+            Ok(DismissTarget::DurableAttention)
+        } else if agent.just_completed {
+            Ok(DismissTarget::Marker)
+        } else {
+            Ok(DismissTarget::None)
+        }
+    }
+
+    fn clear_alert(&mut self, request: &DismissAttentionRequest) -> bool {
+        let Some(snapshot) = &mut self.snapshot else {
+            return false;
+        };
+        let Some(agent) = snapshot
+            .agents
+            .iter_mut()
+            .find(|agent| agent.node_id == request.node_id && agent.agent_id == request.agent_id)
+        else {
+            return false;
+        };
+        let current_revision = agent
+            .attention
+            .as_ref()
+            .map_or(agent.observation_revision, |attention| {
+                attention.observation_revision
+            });
+        if !agent.node_local || request.observation_revision != current_revision {
+            return false;
+        }
+        let changed = agent.attention.take().is_some() || agent.just_completed;
+        agent.just_completed = false;
+        self.completed_agents
+            .remove(&(request.node_id.clone(), request.agent_id.clone()));
+        snapshot.counts.attention = snapshot
+            .agents
+            .iter()
+            .filter(|agent| agent.attention.is_some())
+            .count();
+        changed
+    }
+
     fn update(
         &mut self,
         combined: CombinedNodeSnapshot,
@@ -1387,6 +1554,10 @@ mod tests {
         assert!(ICON.contains("Boomux pixel bomb"));
         assert!(STYLES_CSS.contains(".brand-wordmark"));
         assert!(STYLES_CSS.contains("flex: 0 0 28ch"));
+        assert!(APP_JS.contains("/api/attention/dismiss"));
+        assert!(APP_JS.contains("method: \"POST\""));
+        assert!(APP_JS.contains("\"Content-Type\": \"application/json\""));
+        assert!(APP_JS.contains("card-dismiss-button"));
     }
 
     #[test]
@@ -1820,6 +1991,93 @@ mod tests {
             .observed_at_ms += 20;
         presentation.update(resumed, HashMap::new());
         assert!(presentation.completed_agents.is_empty());
+    }
+
+    #[test]
+    fn presentation_dismisses_only_exact_local_alerts() {
+        let mut presentation = PresentationState::default();
+        presentation.update(combined_snapshot(), HashMap::new());
+        let mut idle = combined_snapshot();
+        let agent = &mut idle.nodes[0].local_snapshot.as_mut().unwrap().workspaces[0].agents[0];
+        agent.observation.state = AgentState::Idle;
+        agent.observation.revision = 3;
+        agent.observation.observed_at_ms += 10;
+        presentation.update(idle.clone(), HashMap::new());
+
+        let request = DismissAttentionRequest {
+            node_id: "00000000-0000-0000-0000-000000000001".into(),
+            agent_id: "00000000-0000-0000-0000-000000000003".into(),
+            observation_revision: 3,
+        };
+        assert_eq!(
+            presentation.dismiss_target(&request).unwrap(),
+            DismissTarget::Marker
+        );
+        assert!(presentation.clear_alert(&request));
+        assert_eq!(
+            presentation.dismiss_target(&request).unwrap(),
+            DismissTarget::None
+        );
+        presentation.update(idle, HashMap::new());
+        assert!(
+            !presentation
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .agents
+                .iter()
+                .find(|agent| agent.agent_id == request.agent_id)
+                .unwrap()
+                .just_completed
+        );
+
+        let stale = DismissAttentionRequest {
+            observation_revision: 2,
+            ..request
+        };
+        assert_eq!(
+            presentation.dismiss_target(&stale).unwrap_err().status,
+            StatusCode::CONFLICT
+        );
+
+        let remote = DismissAttentionRequest {
+            node_id: "00000000-0000-0000-0000-000000000008".into(),
+            agent_id: "00000000-0000-0000-0000-000000000012".into(),
+            observation_revision: 3,
+        };
+        assert_eq!(
+            presentation.dismiss_target(&remote).unwrap_err().status,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[test]
+    fn presentation_routes_durable_attention_to_daemon_acknowledgement() {
+        let mut combined = combined_snapshot();
+        let agent = &mut combined.nodes[0]
+            .local_snapshot
+            .as_mut()
+            .unwrap()
+            .workspaces[0]
+            .agents[0];
+        agent.attention = Some(AgentAttentionSnapshot {
+            reason: AgentAttentionReason::Blocked,
+            observation: agent.observation.clone(),
+        });
+        let mut presentation = PresentationState::default();
+        presentation.update(combined, HashMap::new());
+        let request = DismissAttentionRequest {
+            node_id: "00000000-0000-0000-0000-000000000001".into(),
+            agent_id: "00000000-0000-0000-0000-000000000003".into(),
+            observation_revision: 2,
+        };
+
+        assert_eq!(
+            presentation.dismiss_target(&request).unwrap(),
+            DismissTarget::DurableAttention
+        );
+        assert!(presentation.clear_alert(&request));
+        assert_eq!(presentation.snapshot.unwrap().counts.attention, 1);
     }
 
     #[test]

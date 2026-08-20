@@ -303,9 +303,12 @@ h1 {
 .meta-item small, .meta-item strong { display: block; }
 .meta-item small { margin-bottom: 4px; color: var(--muted); font-size: .57rem; font-weight: 800; letter-spacing: .12em; text-transform: uppercase; }
 .meta-item strong { max-width: 220px; overflow: hidden; color: var(--paper-dim); font-size: .72rem; text-overflow: ellipsis; white-space: nowrap; }
-.card-actions { display: flex; margin-top: 18px; }
+.card-actions { display: flex; margin-top: 18px; flex-wrap: wrap; gap: 9px; }
 .card-native-link { display: inline-flex; min-height: 42px; padding: 0 16px; border: 1px solid var(--acid); align-items: center; color: var(--ink); background: var(--acid); box-shadow: inset 0 -4px rgba(168, 90, 18, .42); font-size: .7rem; font-weight: 900; letter-spacing: .09em; text-decoration: none; text-transform: uppercase; }
 .card-native-link:hover { color: var(--acid); background: transparent; }
+.card-dismiss-button { min-height: 42px; padding: 0 16px; border: 1px solid var(--line); color: var(--paper-dim); background: transparent; cursor: pointer; font: inherit; font-size: .7rem; font-weight: 900; letter-spacing: .09em; text-transform: uppercase; }
+.card-dismiss-button:hover { border-color: var(--ember); color: var(--rose); }
+.card-dismiss-button:disabled { cursor: wait; opacity: .55; }
 
 .state-panel {
   display: grid;
@@ -363,7 +366,7 @@ h1 {
   .attention-callout { display: block; }
   .attention-callout strong, .attention-callout span { display: block; }
   .attention-callout span { margin-top: 4px; white-space: normal; }
-  .card-native-link { display: flex; width: 100%; justify-content: center; }
+  .card-native-link, .card-dismiss-button { display: flex; width: 100%; align-items: center; justify-content: center; }
 }
 
 @media (prefers-reduced-motion: reduce) {
