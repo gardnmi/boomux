@@ -7112,10 +7112,11 @@ fn agent_session_preview(app: &App, agent_shell: &AgentShellView) -> Option<Cont
             "removed shell"
         });
     let occurrences = session.runs.len();
-    let currency = if session.state_is_current {
-        "current"
+    let state = agent_shell.state();
+    let currency = if state == AgentDisplayState::Inactive {
+        "resumable"
     } else {
-        "last known"
+        "current"
     };
     let root_directory = session
         .source_cwd
@@ -7126,9 +7127,9 @@ fn agent_session_preview(app: &App, agent_shell: &AgentShellView) -> Option<Cont
         Line::from(vec![
             preview_label("STATUS"),
             Span::styled(
-                session.state.label(),
+                state.label(),
                 Style::new()
-                    .fg(session_state_color(session.state))
+                    .fg(session_state_color(state))
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
@@ -7139,6 +7140,26 @@ fn agent_session_preview(app: &App, agent_shell: &AgentShellView) -> Option<Cont
                 Style::new().fg(SUBTEXT),
             ),
         ]),
+    ];
+    if !session.state_is_current {
+        lines.push(Line::from(vec![
+            preview_label("OBSERVED"),
+            Span::styled(
+                session.state.label(),
+                Style::new()
+                    .fg(session_state_color(session.state))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(
+                    "  ·  last known  ·  updated {}",
+                    compact_recency(session.last_at_ms)
+                ),
+                Style::new().fg(SUBTEXT),
+            ),
+        ]));
+    }
+    lines.extend([
         preview_field(
             "SESSION",
             format!(
@@ -7147,7 +7168,7 @@ fn agent_session_preview(app: &App, agent_shell: &AgentShellView) -> Option<Cont
             ),
         ),
         preview_field("ROOT", root_directory),
-    ];
+    ]);
     if agent.root_branch != "-" || agent.root_worktree != "-" {
         lines.push(preview_field(
             "GIT",
@@ -10668,7 +10689,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_session_preview_labels_historical_and_missing_context() {
+    fn agent_session_preview_distinguishes_inactive_from_last_observed_idle() {
         let mut workspace = workspace("w1", "boomux");
         workspace.items[0] = WorkspaceItemView::AgentShell(agent_shell());
         let mut catalog = session("catalog", AgentDisplayState::Idle);
@@ -10684,8 +10705,10 @@ mod tests {
                 unreachable!();
             };
             let agent = agent_shell.agent.as_mut().expect("durable Agent");
+            agent.state = AgentDisplayState::Inactive;
             agent.root_branch = "-".into();
             agent.root_worktree = "-".into();
+            agent_shell.shell.status = "pending".into();
         }
 
         let WorkspaceItemView::AgentShell(agent_shell) = &app.workspaces[0].items[0] else {
@@ -10703,8 +10726,9 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        assert_eq!(preview.content_height, 6);
-        assert!(text.contains("STATUS    idle  ·  last known"));
+        assert_eq!(preview.content_height, 7);
+        assert!(text.contains("STATUS    inactive  ·  resumable"));
+        assert!(text.contains("OBSERVED  idle  ·  last known"));
         assert!(text.contains("SESSION   external  ·  0 occurrences  ·  shell catalog only"));
         assert!(text.contains("ROOT      -"));
         assert!(!text.contains("GIT"));
@@ -10721,7 +10745,7 @@ mod tests {
         };
         let preview = agent_session_preview(&app, agent_shell).expect("session preview");
         let PreviewContent::Lines(lines) = preview.content;
-        let session_line = lines[2]
+        let session_line = lines[3]
             .spans
             .iter()
             .map(|span| span.content.as_ref())
@@ -10730,14 +10754,44 @@ mod tests {
     }
 
     #[test]
+    fn current_idle_session_uses_idle_as_the_primary_status() {
+        let mut workspace = workspace("w1", "boomux");
+        let mut shell = agent_shell();
+        shell.agent.as_mut().unwrap().state = AgentDisplayState::Idle;
+        workspace.items[0] = WorkspaceItemView::AgentShell(shell);
+        let mut current = session("active", AgentDisplayState::Idle);
+        current.external_session_id = Some("external-active".into());
+        workspace.sessions = vec![current];
+        let mut app = App::new(vec![workspace], project_context());
+        focus_items(&mut app);
+
+        let WorkspaceItemView::AgentShell(agent_shell) = &app.workspaces[0].items[0] else {
+            unreachable!();
+        };
+        let preview = agent_session_preview(&app, agent_shell).expect("session preview");
+        let PreviewContent::Lines(lines) = preview.content;
+        let text = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(text.contains("STATUS    idle  ·  current"));
+        assert!(!text.contains("OBSERVED"));
+    }
+
+    #[test]
     fn narrow_agent_session_preview_keeps_all_labels_visible() {
         let backend = TestBackend::new(80, 34);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = app();
-        app.workspaces[0].items[0] = WorkspaceItemView::AgentShell(agent_shell());
-        app.workspaces[0]
-            .sessions
-            .push(session("active", AgentDisplayState::Working));
+        let mut shell = agent_shell();
+        shell.agent.as_mut().unwrap().state = AgentDisplayState::Inactive;
+        shell.shell.status = "pending".into();
+        app.workspaces[0].items[0] = WorkspaceItemView::AgentShell(shell);
+        let mut historical = session("active", AgentDisplayState::Idle);
+        historical.state_is_current = false;
+        app.workspaces[0].sessions.push(historical);
         focus_items(&mut app);
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
@@ -10749,7 +10803,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         for label in [
-            "TASK", "STATUS", "SESSION", "ROOT", "GIT", "EVIDENCE", "SOURCE",
+            "TASK", "STATUS", "OBSERVED", "SESSION", "ROOT", "GIT", "EVIDENCE", "SOURCE",
         ] {
             assert!(text.contains(label), "missing {label}");
         }
