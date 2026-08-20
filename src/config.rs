@@ -10,7 +10,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 
 use serde::Deserialize;
-use toml_edit::{Array, DocumentMut, Item, Table, TableLike, Value};
 
 const DEFAULT_PROJECT_SEARCH_DEPTH: usize = 3;
 const MAX_PROJECT_SEARCH_DEPTH: usize = 10;
@@ -140,19 +139,8 @@ struct ConfigCommittedError(String);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ConfigSource {
-    Default,
     Global,
     Environment,
-}
-
-impl ConfigSource {
-    pub(crate) const fn label(self) -> &'static str {
-        match self {
-            Self::Default => "default",
-            Self::Global => "global",
-            Self::Environment => "BOOMUX_CONFIG",
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -168,107 +156,6 @@ pub(crate) struct ConfigSnapshot {
     pub(crate) active_path: PathBuf,
     pub(crate) active_source: ConfigSource,
     pub(crate) layers: Vec<ConfigLayer>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ConfigValues {
-    pub(crate) terminal: Option<String>,
-    pub(crate) project_roots: Vec<String>,
-    pub(crate) project_max_depth: usize,
-    pub(crate) follow_focused_terminal: bool,
-    pub(crate) resume_agents: bool,
-    pub(crate) persist_terminal_history: bool,
-    pub(crate) scheduling_max_concurrent: u16,
-    pub(crate) notifications_enabled: bool,
-    pub(crate) notifications_blocked: bool,
-    pub(crate) notifications_completed: bool,
-    pub(crate) notifications_scheduled_dispatch_failed: bool,
-    pub(crate) notifications_scheduled_interrupted: bool,
-    pub(crate) sound_enabled: bool,
-    pub(crate) sound_blocked: String,
-    pub(crate) sound_completed: String,
-    pub(crate) sound_scheduled_dispatch_failed: String,
-    pub(crate) sound_scheduled_interrupted: String,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct ConfigOverrides {
-    pub(crate) terminal: Option<String>,
-    pub(crate) project_roots: Option<Vec<String>>,
-    pub(crate) project_max_depth: Option<usize>,
-    pub(crate) follow_focused_terminal: Option<bool>,
-    pub(crate) resume_agents: Option<bool>,
-    pub(crate) persist_terminal_history: Option<bool>,
-    pub(crate) scheduling_max_concurrent: Option<u16>,
-    pub(crate) notifications_enabled: Option<bool>,
-    pub(crate) notifications_blocked: Option<bool>,
-    pub(crate) notifications_completed: Option<bool>,
-    pub(crate) notifications_scheduled_dispatch_failed: Option<bool>,
-    pub(crate) notifications_scheduled_interrupted: Option<bool>,
-    pub(crate) sound_enabled: Option<bool>,
-    pub(crate) sound_blocked: Option<String>,
-    pub(crate) sound_completed: Option<String>,
-    pub(crate) sound_scheduled_dispatch_failed: Option<String>,
-    pub(crate) sound_scheduled_interrupted: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ConfigSettings {
-    pub(crate) active_path: PathBuf,
-    pub(crate) active_source: ConfigSource,
-    pub(crate) inherited_source: ConfigSource,
-    pub(crate) inherited: ConfigValues,
-    pub(crate) inherited_overrides: ConfigOverrides,
-    pub(crate) effective: ConfigValues,
-    pub(crate) overrides: ConfigOverrides,
-    baseline: Option<Vec<u8>>,
-    inherited_baseline: Option<Vec<u8>>,
-}
-
-impl ConfigValues {
-    pub(crate) fn daemon_settings(&self) -> boomux::daemon::NotificationDeliverySettings {
-        boomux::daemon::NotificationDeliverySettings {
-            desktop: boomux::daemon::NotificationSettings {
-                enabled: self.notifications_enabled,
-                blocked: self.notifications_blocked,
-                completed: self.notifications_completed,
-                scheduled_dispatch_failed: self.notifications_scheduled_dispatch_failed,
-                scheduled_interrupted: self.notifications_scheduled_interrupted,
-            },
-            sound: boomux::daemon::NotificationSoundSettings {
-                enabled: self.sound_enabled,
-                blocked: self.sound_blocked.clone(),
-                completed: self.sound_completed.clone(),
-                scheduled_dispatch_failed: self.sound_scheduled_dispatch_failed.clone(),
-                scheduled_interrupted: self.sound_scheduled_interrupted.clone(),
-            },
-            resume_agents: self.resume_agents,
-            persist_terminal_history: self.persist_terminal_history,
-            max_scheduled_execution_concurrency: self.scheduling_max_concurrent,
-        }
-    }
-}
-
-impl ConfigSettings {
-    pub(crate) fn effective_config(&self) -> Result<Config, Box<dyn Error>> {
-        Ok(Config {
-            terminal: self.effective.terminal.clone(),
-            projects: ProjectsConfig {
-                roots: self
-                    .effective
-                    .project_roots
-                    .iter()
-                    .map(|root| expand_root(root))
-                    .collect::<Result<_, _>>()?,
-                max_depth: self.effective.project_max_depth,
-            },
-            path: Some(self.active_path.clone()),
-            notifications: self.effective.daemon_settings(),
-            dashboard: DashboardConfig {
-                follow_focused_terminal: self.effective.follow_focused_terminal,
-            },
-        })
-    }
 }
 
 impl fmt::Display for ConfigError {
@@ -303,52 +190,6 @@ pub(crate) fn load_snapshot() -> Result<ConfigSnapshot, Box<dyn Error>> {
     })
 }
 
-pub(crate) fn load_settings() -> Result<ConfigSettings, Box<dyn Error>> {
-    let paths = ConfigPaths::from_environment()?;
-    let active_path = paths.active()?.to_owned();
-    let baseline = match fs::metadata(&active_path) {
-        Ok(_) => Some(read_bounded(&active_path)?),
-        Err(error) if error.kind() == io::ErrorKind::NotFound && paths.environment.is_none() => {
-            None
-        }
-        Err(error) => return Err(error.into()),
-    };
-    settings_from_paths(&paths, active_path, baseline)
-}
-
-fn settings_from_paths(
-    paths: &ConfigPaths,
-    active_path: PathBuf,
-    baseline: Option<Vec<u8>>,
-) -> Result<ConfigSettings, Box<dyn Error>> {
-    let active_raw = baseline
-        .as_deref()
-        .map(|bytes| parse(&active_path, bytes))
-        .transpose()?
-        .unwrap_or_default();
-    let (effective_raw, loaded_path, _) = load_raw_from_paths(paths, baseline.as_deref())?;
-    let (inherited_raw, inherited_baseline) = load_inherited_raw(paths)?;
-    let effective = resolve(effective_raw.clone(), loaded_path)?;
-    let inherited = preview_values(&inherited_raw);
-    Ok(ConfigSettings {
-        active_path,
-        active_source: paths.active_source(),
-        inherited_source: if paths.has_distinct_environment_layer()
-            && paths.global.as_deref().is_some_and(Path::is_file)
-        {
-            ConfigSource::Global
-        } else {
-            ConfigSource::Default
-        },
-        inherited,
-        inherited_overrides: preview_overrides(inherited_raw),
-        effective: values_from_raw_and_config(effective_raw, &effective),
-        overrides: overrides_from_raw(active_raw)?,
-        baseline,
-        inherited_baseline,
-    })
-}
-
 pub(crate) fn load_notification_settings()
 -> Result<boomux::daemon::NotificationDeliverySettings, Box<dyn Error>> {
     let (raw, _) = load_raw()?;
@@ -368,7 +209,6 @@ struct ConfigPaths {
 }
 
 type RawLoad = (RawConfig, Option<PathBuf>, Vec<ConfigLayer>);
-type InheritedLoad = (RawConfig, Option<Vec<u8>>);
 
 impl ConfigPaths {
     fn from_environment() -> Result<Self, Box<dyn Error>> {
@@ -467,15 +307,14 @@ fn load_raw_from_paths(
     Ok((raw, loaded_path, layers))
 }
 
-fn load_inherited_raw(paths: &ConfigPaths) -> Result<InheritedLoad, Box<dyn Error>> {
+fn load_inherited_baseline(paths: &ConfigPaths) -> Result<Option<Vec<u8>>, Box<dyn Error>> {
     if paths.has_distinct_environment_layer()
         && let Some(global) = paths.global.as_deref()
         && global.is_file()
     {
-        let bytes = read_bounded(global)?;
-        return Ok((parse(global, &bytes)?, Some(bytes)));
+        return read_bounded(global).map(Some);
     }
-    Ok((RawConfig::default(), None))
+    Ok(None)
 }
 
 fn verify_inherited_baseline(
@@ -562,60 +401,6 @@ pub(crate) fn validate() -> Result<ConfigSnapshot, Box<dyn Error>> {
     load_snapshot()
 }
 
-pub(crate) fn save_settings(
-    expected: &ConfigSettings,
-    overrides: &ConfigOverrides,
-) -> Result<ConfigSettings, Box<dyn Error>> {
-    let paths = ConfigPaths::from_environment()?;
-    save_settings_with_paths(&paths, expected, overrides)
-}
-
-fn save_settings_with_paths(
-    paths: &ConfigPaths,
-    expected: &ConfigSettings,
-    overrides: &ConfigOverrides,
-) -> Result<ConfigSettings, Box<dyn Error>> {
-    if paths.active()? != expected.active_path || paths.active_source() != expected.active_source {
-        return Err(
-            ConfigError("active config source changed; reload settings and retry".into()).into(),
-        );
-    }
-    let original = expected
-        .baseline
-        .as_deref()
-        .unwrap_or(CONFIG_TEMPLATE.as_bytes());
-    let text = std::str::from_utf8(original).map_err(|error| {
-        ConfigError(format!(
-            "invalid config {}: {error}",
-            expected.active_path.display()
-        ))
-    })?;
-    let mut document = text.parse::<DocumentMut>().map_err(|error| {
-        ConfigError(format!(
-            "invalid config {}: {error}",
-            expected.active_path.display()
-        ))
-    })?;
-    apply_overrides(&mut document, overrides);
-    let candidate = document.to_string().into_bytes();
-    if candidate.len() as u64 > MAX_CONFIG_BYTES {
-        return Err(ConfigError(format!(
-            "config {} exceeds the {} byte limit",
-            expected.active_path.display(),
-            MAX_CONFIG_BYTES
-        ))
-        .into());
-    }
-    let saved = settings_from_paths(paths, expected.active_path.clone(), Some(candidate.clone()))?;
-    verify_inherited_baseline(paths, expected.inherited_baseline.as_deref())?;
-    commit_candidate(
-        &expected.active_path,
-        expected.baseline.as_deref(),
-        &candidate,
-    )?;
-    Ok(saved)
-}
-
 pub(crate) fn edit() -> Result<(), Box<dyn Error>> {
     let paths = ConfigPaths::from_environment()?;
     let editor = editor_argv()?;
@@ -681,7 +466,7 @@ fn edit_with(
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
         Err(error) => return Err(error.into()),
     };
-    let (_, inherited_baseline) = load_inherited_raw(paths)?;
+    let inherited_baseline = load_inherited_baseline(paths)?;
 
     let mut builder = fs::DirBuilder::new();
     builder.recursive(true).mode(0o700);
@@ -786,306 +571,6 @@ fn validate_layers(
     let (raw, loaded_path, _) = load_raw_from_paths(paths, active_candidate)?;
     resolve(raw, loaded_path)?;
     Ok(())
-}
-
-fn values_from_raw_and_config(raw: RawConfig, config: &Config) -> ConfigValues {
-    let roots = raw.projects.unwrap_or_default().roots.unwrap_or_default();
-    let notifications = &config.notifications;
-    ConfigValues {
-        terminal: config.terminal.clone(),
-        project_roots: roots,
-        project_max_depth: config.projects.max_depth,
-        follow_focused_terminal: config.dashboard.follow_focused_terminal,
-        resume_agents: notifications.resume_agents,
-        persist_terminal_history: notifications.persist_terminal_history,
-        scheduling_max_concurrent: notifications.max_scheduled_execution_concurrency,
-        notifications_enabled: notifications.desktop.enabled,
-        notifications_blocked: notifications.desktop.blocked,
-        notifications_completed: notifications.desktop.completed,
-        notifications_scheduled_dispatch_failed: notifications.desktop.scheduled_dispatch_failed,
-        notifications_scheduled_interrupted: notifications.desktop.scheduled_interrupted,
-        sound_enabled: notifications.sound.enabled,
-        sound_blocked: notifications.sound.blocked.clone(),
-        sound_completed: notifications.sound.completed.clone(),
-        sound_scheduled_dispatch_failed: notifications.sound.scheduled_dispatch_failed.clone(),
-        sound_scheduled_interrupted: notifications.sound.scheduled_interrupted.clone(),
-    }
-}
-
-fn preview_values(raw: &RawConfig) -> ConfigValues {
-    let defaults = resolve(RawConfig::default(), None).expect("built-in config is valid");
-    let mut values = values_from_raw_and_config(RawConfig::default(), &defaults);
-    if let Some(terminal) = &raw.terminal {
-        values.terminal = Some(terminal.trim().to_owned());
-    }
-    if let Some(projects) = &raw.projects {
-        if let Some(roots) = &projects.roots {
-            values.project_roots.clone_from(roots);
-        }
-        if let Some(max_depth) = projects.max_depth {
-            values.project_max_depth = max_depth;
-        }
-    }
-    if let Some(dashboard) = &raw.dashboard
-        && let Some(value) = dashboard.follow_focused_terminal
-    {
-        values.follow_focused_terminal = value;
-    }
-    if let Some(recovery) = &raw.recovery {
-        values.resume_agents = recovery.resume_agents.unwrap_or(values.resume_agents);
-        values.persist_terminal_history = recovery
-            .persist_terminal_history
-            .unwrap_or(values.persist_terminal_history);
-    }
-    if let Some(max_concurrent) = raw
-        .scheduling
-        .as_ref()
-        .and_then(|scheduling| scheduling.max_concurrent)
-    {
-        values.scheduling_max_concurrent = u16::try_from(max_concurrent).unwrap_or_else(|_| {
-            if max_concurrent.is_negative() {
-                0
-            } else {
-                u16::MAX
-            }
-        });
-    }
-    if let Some(notifications) = &raw.notifications {
-        values.notifications_enabled = notifications
-            .enabled
-            .unwrap_or(values.notifications_enabled);
-        values.notifications_blocked = notifications
-            .blocked
-            .unwrap_or(values.notifications_blocked);
-        values.notifications_completed = notifications
-            .completed
-            .unwrap_or(values.notifications_completed);
-        values.notifications_scheduled_dispatch_failed = notifications
-            .scheduled_dispatch_failed
-            .unwrap_or(values.notifications_scheduled_dispatch_failed);
-        values.notifications_scheduled_interrupted = notifications
-            .scheduled_interrupted
-            .unwrap_or(values.notifications_scheduled_interrupted);
-        if let Some(sound) = &notifications.sound {
-            values.sound_enabled = sound.enabled.unwrap_or(values.sound_enabled);
-            if let Some(value) = &sound.blocked {
-                values.sound_blocked.clone_from(value);
-            }
-            if let Some(value) = &sound.completed {
-                values.sound_completed.clone_from(value);
-            }
-            if let Some(value) = &sound.scheduled_dispatch_failed {
-                values.sound_scheduled_dispatch_failed.clone_from(value);
-            }
-            if let Some(value) = &sound.scheduled_interrupted {
-                values.sound_scheduled_interrupted.clone_from(value);
-            }
-        }
-    }
-    values
-}
-
-fn preview_overrides(raw: RawConfig) -> ConfigOverrides {
-    let projects = raw.projects.unwrap_or_default();
-    let dashboard = raw.dashboard.unwrap_or_default();
-    let recovery = raw.recovery.unwrap_or_default();
-    let scheduling = raw.scheduling.unwrap_or_default();
-    let notifications = raw.notifications.unwrap_or_default();
-    let sound = notifications.sound.unwrap_or_default();
-    ConfigOverrides {
-        terminal: raw.terminal,
-        project_roots: projects.roots,
-        project_max_depth: projects.max_depth,
-        follow_focused_terminal: dashboard.follow_focused_terminal,
-        resume_agents: recovery.resume_agents,
-        persist_terminal_history: recovery.persist_terminal_history,
-        scheduling_max_concurrent: scheduling.max_concurrent.map(|value| {
-            u16::try_from(value).unwrap_or_else(|_| if value.is_negative() { 0 } else { u16::MAX })
-        }),
-        notifications_enabled: notifications.enabled,
-        notifications_blocked: notifications.blocked,
-        notifications_completed: notifications.completed,
-        notifications_scheduled_dispatch_failed: notifications.scheduled_dispatch_failed,
-        notifications_scheduled_interrupted: notifications.scheduled_interrupted,
-        sound_enabled: sound.enabled,
-        sound_blocked: sound.blocked,
-        sound_completed: sound.completed,
-        sound_scheduled_dispatch_failed: sound.scheduled_dispatch_failed,
-        sound_scheduled_interrupted: sound.scheduled_interrupted,
-    }
-}
-
-fn overrides_from_raw(raw: RawConfig) -> Result<ConfigOverrides, Box<dyn Error>> {
-    let projects = raw.projects.unwrap_or_default();
-    let dashboard = raw.dashboard.unwrap_or_default();
-    let recovery = raw.recovery.unwrap_or_default();
-    let scheduling = raw.scheduling.unwrap_or_default();
-    let notifications = raw.notifications.unwrap_or_default();
-    let sound = notifications.sound.unwrap_or_default();
-    Ok(ConfigOverrides {
-        terminal: raw.terminal,
-        project_roots: projects.roots,
-        project_max_depth: projects.max_depth,
-        follow_focused_terminal: dashboard.follow_focused_terminal,
-        resume_agents: recovery.resume_agents,
-        persist_terminal_history: recovery.persist_terminal_history,
-        scheduling_max_concurrent: scheduling
-            .max_concurrent
-            .map(u16::try_from)
-            .transpose()
-            .map_err(|_| ConfigError("scheduling.max_concurrent must fit in u16".into()))?,
-        notifications_enabled: notifications.enabled,
-        notifications_blocked: notifications.blocked,
-        notifications_completed: notifications.completed,
-        notifications_scheduled_dispatch_failed: notifications.scheduled_dispatch_failed,
-        notifications_scheduled_interrupted: notifications.scheduled_interrupted,
-        sound_enabled: sound.enabled,
-        sound_blocked: sound.blocked,
-        sound_completed: sound.completed,
-        sound_scheduled_dispatch_failed: sound.scheduled_dispatch_failed,
-        sound_scheduled_interrupted: sound.scheduled_interrupted,
-    })
-}
-
-fn apply_overrides(document: &mut DocumentMut, overrides: &ConfigOverrides) {
-    set_string(document, &["terminal"], overrides.terminal.as_deref());
-    set_strings(
-        document,
-        &["projects", "roots"],
-        overrides.project_roots.as_deref(),
-    );
-    set_integer(
-        document,
-        &["projects", "max_depth"],
-        overrides.project_max_depth.map(|value| value as i64),
-    );
-    set_bool(
-        document,
-        &["dashboard", "follow_focused_terminal"],
-        overrides.follow_focused_terminal,
-    );
-    set_bool(
-        document,
-        &["recovery", "resume_agents"],
-        overrides.resume_agents,
-    );
-    set_bool(
-        document,
-        &["recovery", "persist_terminal_history"],
-        overrides.persist_terminal_history,
-    );
-    set_integer(
-        document,
-        &["scheduling", "max_concurrent"],
-        overrides.scheduling_max_concurrent.map(i64::from),
-    );
-    for (key, setting) in [
-        ("enabled", overrides.notifications_enabled),
-        ("blocked", overrides.notifications_blocked),
-        ("completed", overrides.notifications_completed),
-        (
-            "scheduled_dispatch_failed",
-            overrides.notifications_scheduled_dispatch_failed,
-        ),
-        (
-            "scheduled_interrupted",
-            overrides.notifications_scheduled_interrupted,
-        ),
-    ] {
-        set_bool(document, &["notifications", key], setting);
-    }
-    set_bool(
-        document,
-        &["notifications", "sound", "enabled"],
-        overrides.sound_enabled,
-    );
-    for (key, setting) in [
-        ("blocked", overrides.sound_blocked.as_deref()),
-        ("completed", overrides.sound_completed.as_deref()),
-        (
-            "scheduled_dispatch_failed",
-            overrides.sound_scheduled_dispatch_failed.as_deref(),
-        ),
-        (
-            "scheduled_interrupted",
-            overrides.sound_scheduled_interrupted.as_deref(),
-        ),
-    ] {
-        set_string(document, &["notifications", "sound", key], setting);
-    }
-}
-
-fn table_for_path<'a>(document: &'a mut DocumentMut, path: &[&str]) -> &'a mut dyn TableLike {
-    let mut table: &mut dyn TableLike = document.as_table_mut();
-    for key in path {
-        let item = table
-            .entry(key)
-            .or_insert_with(|| Item::Table(Table::new()));
-        if !item.is_table_like() {
-            *item = Item::Table(Table::new());
-        }
-        table = item.as_table_like_mut().expect("created table-like item");
-    }
-    table
-}
-
-fn remove_key(document: &mut DocumentMut, path: &[&str]) {
-    let Some((key, parents)) = path.split_last() else {
-        return;
-    };
-    let mut table: &mut dyn TableLike = document.as_table_mut();
-    for parent in parents {
-        let Some(next) = table.get_mut(parent).and_then(Item::as_table_like_mut) else {
-            return;
-        };
-        table = next;
-    }
-    table.remove(key);
-}
-
-fn set_value(document: &mut DocumentMut, path: &[&str], setting: Option<Value>) {
-    let Some((key, parents)) = path.split_last() else {
-        return;
-    };
-    match setting {
-        Some(setting) => {
-            let table = table_for_path(document, parents);
-            let mut setting = setting;
-            if let Some(existing) = table.get_mut(key).and_then(Item::as_value_mut) {
-                setting.decor_mut().clone_from(existing.decor());
-                *existing = setting;
-                return;
-            }
-            table.insert(key, Item::Value(setting));
-        }
-        None => remove_key(document, path),
-    }
-}
-
-fn set_string(document: &mut DocumentMut, path: &[&str], setting: Option<&str>) {
-    set_value(document, path, setting.map(Value::from));
-}
-
-fn set_bool(document: &mut DocumentMut, path: &[&str], setting: Option<bool>) {
-    set_value(document, path, setting.map(Value::from));
-}
-
-fn set_integer(document: &mut DocumentMut, path: &[&str], setting: Option<i64>) {
-    set_value(document, path, setting.map(Value::from));
-}
-
-fn set_strings(document: &mut DocumentMut, path: &[&str], setting: Option<&[String]>) {
-    set_value(
-        document,
-        path,
-        setting.map(|strings| {
-            let mut array = Array::new();
-            for string in strings {
-                array.push(string.as_str());
-            }
-            Value::Array(array)
-        }),
-    );
 }
 
 fn validate_regular_owner(
@@ -1367,23 +852,6 @@ fn home_directory() -> Result<PathBuf, Box<dyn Error>> {
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
         .ok_or_else(|| ConfigError("HOME must be an absolute path to expand ~".into()).into())
-}
-
-#[cfg(test)]
-pub(crate) fn test_settings() -> ConfigSettings {
-    let effective = resolve(RawConfig::default(), None).expect("default config");
-    let values = values_from_raw_and_config(RawConfig::default(), &effective);
-    ConfigSettings {
-        active_path: PathBuf::from("/tmp/boomux-test-config.toml"),
-        active_source: ConfigSource::Global,
-        inherited_source: ConfigSource::Default,
-        inherited: values.clone(),
-        inherited_overrides: ConfigOverrides::default(),
-        effective: values,
-        overrides: ConfigOverrides::default(),
-        baseline: None,
-        inherited_baseline: None,
-    }
 }
 
 #[cfg(test)]
@@ -1673,63 +1141,6 @@ mod tests {
     }
 
     #[test]
-    fn structured_edits_preserve_comments_and_unrelated_formatting() {
-        let original = r#"# owner note
-terminal = "Alacritty.desktop" # keep inline
-
-[projects] # project note
-roots = [ "/old" ]
-max_depth = 2
-
-[dashboard]
-follow_focused_terminal = true
-"#;
-        let mut document = original.parse::<DocumentMut>().unwrap();
-        let overrides = ConfigOverrides {
-            terminal: Some("com.mitchellh.ghostty.desktop".into()),
-            project_roots: Some(vec!["~/Code".into(), "/srv/work".into()]),
-            project_max_depth: Some(2),
-            follow_focused_terminal: Some(false),
-            ..Default::default()
-        };
-
-        apply_overrides(&mut document, &overrides);
-        let edited = document.to_string();
-
-        assert!(edited.contains("# owner note"));
-        assert!(edited.contains("# keep inline"));
-        assert!(edited.contains("# project note"));
-        assert!(edited.contains("max_depth = 2"));
-        assert!(!edited.contains("follow_focused_terminal = true"));
-        assert!(edited.contains("follow_focused_terminal = false"));
-        assert!(edited.contains("~/Code"));
-        assert!(edited.contains("/srv/work"));
-    }
-
-    #[test]
-    fn structured_edits_preserve_unrelated_inline_table_values() {
-        let original = r#"notifications = { blocked = false, sound = { blocked = "old", completed = "keep" } }
-"#;
-        let mut document = original.parse::<DocumentMut>().unwrap();
-        let overrides = ConfigOverrides {
-            notifications_enabled: Some(true),
-            notifications_blocked: Some(false),
-            sound_blocked: Some("new".into()),
-            sound_completed: Some("keep".into()),
-            ..Default::default()
-        };
-
-        apply_overrides(&mut document, &overrides);
-        let raw: RawConfig = toml::from_str(&document.to_string()).unwrap();
-        let notifications = raw.notifications.unwrap();
-        assert_eq!(notifications.enabled, Some(true));
-        assert_eq!(notifications.blocked, Some(false));
-        let sound = notifications.sound.unwrap();
-        assert_eq!(sound.blocked.as_deref(), Some("new"));
-        assert_eq!(sound.completed.as_deref(), Some("keep"));
-    }
-
-    #[test]
     fn layered_semantics_are_resolved_only_after_field_merge() {
         let mut base: RawConfig =
             toml::from_str("[projects]\nmax_depth = 99\n[scheduling]\nmax_concurrent = 100")
@@ -1745,129 +1156,6 @@ follow_focused_terminal = true
             resolved.notifications.max_scheduled_execution_concurrency,
             8
         );
-    }
-
-    #[test]
-    fn source_labels_distinguish_default_global_and_environment() {
-        assert_eq!(ConfigSource::Default.label(), "default");
-        assert_eq!(ConfigSource::Global.label(), "global");
-        assert_eq!(ConfigSource::Environment.label(), "BOOMUX_CONFIG");
-
-        let global = ConfigPaths {
-            global: Some(PathBuf::from("/tmp/global.toml")),
-            environment: None,
-        };
-        assert_eq!(global.active_source(), ConfigSource::Global);
-        let environment = ConfigPaths {
-            global: global.global,
-            environment: Some(PathBuf::from("/tmp/override.toml")),
-        };
-        assert_eq!(environment.active_source(), ConfigSource::Environment);
-        assert_eq!(
-            environment.active().unwrap(),
-            Path::new("/tmp/override.toml")
-        );
-    }
-
-    #[test]
-    fn settings_load_and_save_allow_active_layer_to_correct_invalid_lower_semantics() {
-        let test = TestDirectory::new();
-        let global = test.0.join("global.toml");
-        let environment = test.0.join("environment.toml");
-        fs::write(
-            &global,
-            "[projects]\nmax_depth = 99\n[scheduling]\nmax_concurrent = 100\n",
-        )
-        .unwrap();
-        fs::write(
-            &environment,
-            "[projects]\nmax_depth = 2\n[scheduling]\nmax_concurrent = 8\n",
-        )
-        .unwrap();
-        fs::set_permissions(&environment, fs::Permissions::from_mode(0o640)).unwrap();
-        let paths = ConfigPaths {
-            global: Some(global.clone()),
-            environment: Some(environment.clone()),
-        };
-
-        let settings = settings_from_paths(
-            &paths,
-            environment.clone(),
-            Some(read_bounded(&environment).unwrap()),
-        )
-        .unwrap();
-        assert_eq!(settings.inherited.project_max_depth, 99);
-        assert_eq!(settings.inherited.scheduling_max_concurrent, 100);
-        assert_eq!(settings.effective.project_max_depth, 2);
-        assert_eq!(settings.effective.scheduling_max_concurrent, 8);
-
-        let mut overrides = settings.overrides.clone();
-        overrides.project_max_depth = Some(3);
-        let saved = save_settings_with_paths(&paths, &settings, &overrides).unwrap();
-        assert_eq!(saved.effective.project_max_depth, 3);
-        assert_eq!(saved.effective.scheduling_max_concurrent, 8);
-        assert_eq!(
-            fs::metadata(&environment).unwrap().permissions().mode() & 0o777,
-            0o640
-        );
-        assert!(
-            fs::read_to_string(global)
-                .unwrap()
-                .contains("max_depth = 99")
-        );
-    }
-
-    #[test]
-    fn settings_save_rejects_a_changed_inherited_layer() {
-        let test = TestDirectory::new();
-        let global = test.0.join("global.toml");
-        let environment = test.0.join("environment.toml");
-        fs::write(&global, "[projects]\nmax_depth = 2\n").unwrap();
-        fs::write(&environment, "[notifications]\nenabled = false\n").unwrap();
-        let paths = ConfigPaths {
-            global: Some(global.clone()),
-            environment: Some(environment.clone()),
-        };
-        let settings = settings_from_paths(
-            &paths,
-            environment.clone(),
-            Some(read_bounded(&environment).unwrap()),
-        )
-        .unwrap();
-        fs::write(&global, "[projects]\nmax_depth = 3\n").unwrap();
-
-        let mut overrides = settings.overrides.clone();
-        overrides.notifications_enabled = Some(true);
-        let error = save_settings_with_paths(&paths, &settings, &overrides)
-            .unwrap_err()
-            .to_string();
-
-        assert!(error.contains("inherited config changed"), "{error}");
-        assert!(fs::read_to_string(environment).unwrap().contains("false"));
-    }
-
-    #[test]
-    fn settings_read_symlink_but_refuse_to_mutate_it() {
-        let test = TestDirectory::new();
-        let real = test.0.join("real.toml");
-        let linked = test.0.join("linked.toml");
-        fs::write(&real, "[projects]\nmax_depth = 2\n").unwrap();
-        std::os::unix::fs::symlink(&real, &linked).unwrap();
-        let paths = ConfigPaths {
-            global: None,
-            environment: Some(linked.clone()),
-        };
-        let settings =
-            settings_from_paths(&paths, linked, Some(read_bounded(&real).unwrap())).unwrap();
-        assert_eq!(settings.effective.project_max_depth, 2);
-
-        let mut overrides = settings.overrides.clone();
-        overrides.project_max_depth = Some(3);
-        let error = save_settings_with_paths(&paths, &settings, &overrides)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("not a regular file"), "{error}");
-        assert!(fs::read_to_string(real).unwrap().contains("max_depth = 2"));
     }
 
     #[test]
@@ -1900,11 +1188,5 @@ follow_focused_terminal = true
         assert_eq!(resolve(raw, loaded_path).unwrap().projects.max_depth, 2);
         assert_eq!(layers.len(), 1);
         assert_eq!(layers[0].source, ConfigSource::Environment);
-
-        let settings =
-            settings_from_paths(&paths, alias, Some(read_bounded(&path).unwrap())).unwrap();
-        assert_eq!(settings.active_source, ConfigSource::Environment);
-        assert_eq!(settings.inherited_source, ConfigSource::Default);
-        assert_eq!(settings.inherited_overrides, ConfigOverrides::default());
     }
 }

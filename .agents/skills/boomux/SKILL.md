@@ -555,8 +555,7 @@ stop support `--json` as `web.start`, `web.status`, and `web.stop`.
 first-start runtime environment, are never persisted by Boomux, and must remain
 consistent for attached clients.
 
-The dashboard has Workspaces, Agents, Shells, Schedules, Nodes, and Settings
-views; `6` opens SETTINGS. `/` or
+The dashboard has Workspaces, Agents, Shells, Schedules, and Nodes views. `/` or
 `:` opens its action and search palette, `?` shows contextual help, `Enter`
 restores the selected workspace or opens the selected entry, and `x` followed
 by `y` confirms close or removal. Shell previews are bounded and read-only.
@@ -639,24 +638,10 @@ an owner-validated atomic replacement. Symlinks, non-regular or wrong-owner
 targets, concurrent target changes, oversized files, and invalid merged config
 are rejected. New files are mode `0600`.
 
-SETTINGS shows `default`, `global`, and `BOOMUX_CONFIG` source labels and writes
-only the active layer. Use `Space` for booleans, `Enter` for text and integers,
-`Delete` to remove an override and inherit again, `Ctrl-S` to validate and save,
-and `Esc` to cancel editing or discard unsaved changes. Project roots have
-separate add/edit rows; Delete removes one root, while Delete on the add row
-resets the list to inheritance.
-
-Terminal, Projects, and Dashboard settings apply live to the current client.
-Recovery, Scheduling, Notifications, and Sound are daemon-owned; saving a change
-offers an explicit graceful restart of the local daemon. Declining leaves a
-restart required. If disabling terminal-history persistence would clear retained
-history, Boomux warns before confirmation. Never infer authorization to restart
-from authorization to save settings.
-
-Configuration management is local Node only. Neither these commands nor SETTINGS
-can inspect or mutate a registered remote Node's config; use an interactive
-Boomux client on the owning Node. Do not attempt remote config mutation through
-SSH, federation, or another public Boomux command.
+Configuration management is local Node only. These commands cannot inspect or
+mutate a registered remote Node's config; use an interactive Boomux client on the
+owning Node. Do not attempt remote config mutation through SSH, federation, or
+another public Boomux command.
 
 Discover the same configured projects locally without starting the daemon:
 

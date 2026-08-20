@@ -17,8 +17,7 @@
   `workspace-N` container.
 - [x] Load field-layered TOML configuration from the XDG config directory and an
   optional `BOOMUX_CONFIG` override, expose local path/validation/transactional
-  editing commands, and manage source-aware settings from the dashboard with
-  live client application or explicitly confirmed graceful daemon restart.
+  editing commands, and preserve local Node ownership boundaries.
 - [x] Add plain shells, assign durable shell names, and carry those names into
   the dashboard, window titles, and dynamic Starship prompts.
 - [x] Rename focused workspaces and shells from the dashboard.

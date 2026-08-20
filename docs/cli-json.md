@@ -195,8 +195,7 @@ support `--json`; it cannot be routed through federation.
 
 Configuration follows the same local authority boundary. The active writable
 layer is `BOOMUX_CONFIG` when set and the global XDG config file otherwise.
-Neither the config commands nor the dashboard SETTINGS tab can target a
-registered remote Node.
+The config commands cannot target a registered remote Node.
 
 The following commands support `--json`:
 

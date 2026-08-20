@@ -219,8 +219,8 @@ management surface.
 
 ## Dashboard
 
-The dashboard has six primary views: Workspaces, Agents, Shells, Schedules, Nodes, and
-Settings. The
+The dashboard has five primary views: Workspaces, Agents, Shells, Schedules, and
+Nodes. The
 Workspaces view combines the selected workspace's Agents, shells, commands,
 launchers, and schedule definitions in one item table. A `schedule` row represents
 the durable definition, opens its specialized history and controls, and never
@@ -577,27 +577,9 @@ oversized file, invalid TOML, or invalid merged setting is rejected. New config
 files are mode `0600`. These commands are human-only and do not support
 `--json`.
 
-The sixth dashboard tab, SETTINGS (shortcut `6`), exposes Terminal, Projects,
-Dashboard, Recovery, Scheduling, Notifications, and Sound groups for the local
-Node. It shows each effective value's `default`, `global`, or `BOOMUX_CONFIG`
-source and writes only the active layer. `Delete` removes an active override so
-the field inherits again; for project roots it removes the selected root, while
-Delete on the add row resets the roots list to inheritance. Use `Space` to toggle
-booleans, `Enter` to edit text or integers, `Ctrl-S` to validate and atomically
-save, and `Esc` to cancel editing or discard unsaved changes.
-
-Client-owned terminal selection, project discovery, and dashboard focus-following
-settings apply live to the current dashboard. Changes to daemon-owned Recovery,
-Scheduling, Notifications, and Sound settings are saved first, then require an
-explicit confirmation before Boomux gracefully restarts the local daemon. Because
-the running recovery setting is not observable, a restart that applies disabled
-`recovery.persist_terminal_history` conservatively warns that retained terminal
-history will be cleared. Declining leaves the saved setting pending for a later
-restart.
-
-Configuration management is local to this Node. The SETTINGS tab and `boomux
-config` commands never read or mutate a registered remote Node's config; use an
-interactive Boomux client on that owning Node to manage it.
+Configuration management is local to this Node. The `boomux config` commands
+never read or mutate a registered remote Node's config; use an interactive Boomux
+client on that owning Node to manage it.
 
 Project roots provide Workspace-name suggestions in the dashboard. Selecting one
 creates empty coordinator metadata using its name; it does not assign a Node or

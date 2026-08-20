@@ -3196,7 +3196,6 @@ fn config_command(command: ConfigCommands) -> Result<(), Box<dyn Error>> {
             let snapshot = config::validate()?;
             let loaded = snapshot.layers.iter().filter(|layer| layer.loaded).count();
             let source = match snapshot.active_source {
-                config::ConfigSource::Default => "default",
                 config::ConfigSource::Global => "global",
                 config::ConfigSource::Environment => "BOOMUX_CONFIG",
             };
@@ -3234,34 +3233,27 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
     let mut refresh = DashboardRefresh::baseline(&client)?;
     let snapshot = refresh.snapshot().clone();
     let combined = combined_node_snapshot_for_dashboard(&client)?;
-    let settings = config::load_settings()?;
-    let config = settings.effective_config()?;
-    let terminal_is_overridden = terminal_override.is_some();
-    let mut terminal = terminal_override
+    let config = config::load()?;
+    let terminal = terminal_override
         .map(str::to_owned)
         .or_else(|| config.terminal.clone());
-    let project_context = dashboard_project_context(&config);
-    let mut settings_snapshot = settings.clone();
-
-    fn dashboard_project_context(config: &config::Config) -> tui::ProjectContext {
-        let roots_configured = !config.projects.roots.is_empty();
-        let discovery = projects::discover(&config.projects);
-        tui::ProjectContext {
-            projects: discovery
-                .projects
-                .into_iter()
-                .map(|project| tui::ProjectView {
-                    name: project.name,
-                    path: project.path,
-                    group: project.group,
-                    group_order: project.group_order,
-                })
-                .collect(),
-            config_path: config.path.clone().or_else(config::global_config_path),
-            warning: (!discovery.warnings.is_empty()).then(|| discovery.warnings.join("; ")),
-            roots_configured,
-        }
-    }
+    let roots_configured = !config.projects.roots.is_empty();
+    let discovery = projects::discover(&config.projects);
+    let project_context = tui::ProjectContext {
+        projects: discovery
+            .projects
+            .into_iter()
+            .map(|project| tui::ProjectView {
+                name: project.name,
+                path: project.path,
+                group: project.group,
+                group_order: project.group_order,
+            })
+            .collect(),
+        config_path: config.path.or_else(config::global_config_path),
+        warning: (!discovery.warnings.is_empty()).then(|| discovery.warnings.join("; ")),
+        roots_configured,
+    };
 
     let initial_state = dashboard_state(
         snapshot,
@@ -3275,7 +3267,6 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
         initial_state,
         config.dashboard.follow_focused_terminal,
         project_context,
-        settings,
         true,
         move |effect| match effect {
             tui::DashboardEffect::Quit => unreachable!("quit is handled by the dashboard runtime"),
@@ -3767,34 +3758,6 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
                     ))
                 })();
                 tui::DashboardEvent::RefreshCompleted(result)
-            }
-            tui::DashboardEffect::SaveSettings(overrides) => {
-                let result = (|| {
-                    let saved = match config::save_settings(&settings_snapshot, &overrides) {
-                        Ok(saved) => saved,
-                        Err(error) => match config::load_settings() {
-                            Ok(current) if current.overrides == overrides => current,
-                            _ => return Err(error.to_string()),
-                        },
-                    };
-                    let effective = saved
-                        .effective_config()
-                        .map_err(|error| error.to_string())?;
-                    if !terminal_is_overridden {
-                        terminal = effective.terminal.clone();
-                    }
-                    let project_context = dashboard_project_context(&effective);
-                    settings_snapshot = saved.clone();
-                    Ok((saved, project_context))
-                })();
-                tui::DashboardEvent::SettingsSaved(Box::new(result))
-            }
-            tui::DashboardEffect::RestartDaemon(applied) => {
-                let result = client
-                    .restart_with_notification_config(applied.daemon_settings().into())
-                    .map_err(|error| error.to_string())
-                    .map(|()| "Gracefully restarted daemon with saved settings".into());
-                tui::DashboardEvent::DaemonRestarted { applied, result }
             }
             tui::DashboardEffect::RunSchedule(schedule_id) => {
                 let result =
