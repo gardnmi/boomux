@@ -424,6 +424,11 @@ enum Commands {
     },
     /// Close a shell by name or shell ID
     Close { target: String },
+    /// Inspect and edit layered Boomux configuration
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommands,
+    },
     /// Discover configured projects
     Project {
         #[command(subcommand)]
@@ -597,6 +602,16 @@ enum ProjectCommands {
         #[arg(long)]
         node: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum ConfigCommands {
+    /// Print the active writable configuration path
+    Path,
+    /// Validate all configured layers
+    Validate,
+    /// Edit and transactionally replace the active writable layer
+    Edit,
 }
 
 #[derive(Subcommand)]
@@ -1378,6 +1393,9 @@ command_keys! {
     Read => ("read", Json),
     Events => ("events", Json),
     Close => ("close", HumanOnly),
+    ConfigPath => ("config.path", HumanOnly),
+    ConfigValidate => ("config.validate", HumanOnly),
+    ConfigEdit => ("config.edit", HumanOnly),
     ProjectList => ("project.list", Json),
     WorkspaceList => ("workspace.list", Json),
     WorkspaceInspect => ("workspace.inspect", Json),
@@ -1467,6 +1485,15 @@ impl Cli {
             Some(Commands::Shells) => CommandKey::Shells,
             Some(Commands::Read { .. }) => CommandKey::Read,
             Some(Commands::Events { .. }) => CommandKey::Events,
+            Some(Commands::Config {
+                command: ConfigCommands::Path,
+            }) => CommandKey::ConfigPath,
+            Some(Commands::Config {
+                command: ConfigCommands::Validate,
+            }) => CommandKey::ConfigValidate,
+            Some(Commands::Config {
+                command: ConfigCommands::Edit,
+            }) => CommandKey::ConfigEdit,
             Some(Commands::Project {
                 command: ProjectCommands::List { .. },
             }) => CommandKey::ProjectList,
@@ -1975,6 +2002,7 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
             wait_ms,
         }) => read_events(after.as_deref(), limit, wait_ms, cli.json),
         Some(Commands::Close { target }) => close_shell(&target),
+        Some(Commands::Config { command }) => config_command(command),
         Some(Commands::Project {
             command: ProjectCommands::List { node },
         }) => list_projects(cli.json, node.as_deref()),
@@ -3159,6 +3187,32 @@ fn bootstrap_activate(
 
 fn should_open_new_window(new_window: bool, terminal: Option<&str>) -> bool {
     new_window || terminal.is_some()
+}
+
+fn config_command(command: ConfigCommands) -> Result<(), Box<dyn Error>> {
+    match command {
+        ConfigCommands::Path => println!("{}", config::active_path()?.display()),
+        ConfigCommands::Validate => {
+            let snapshot = config::validate()?;
+            let loaded = snapshot.layers.iter().filter(|layer| layer.loaded).count();
+            let source = match snapshot.active_source {
+                config::ConfigSource::Global => "global",
+                config::ConfigSource::Environment => "BOOMUX_CONFIG",
+            };
+            let effective = snapshot
+                .effective
+                .path
+                .as_deref()
+                .map_or_else(|| "defaults".into(), |path| path.display().to_string());
+            println!(
+                "Configuration is valid ({loaded} loaded layer{}; effective: {effective}; active {source}: {})",
+                if loaded == 1 { "" } else { "s" },
+                snapshot.active_path.display()
+            );
+        }
+        ConfigCommands::Edit => config::edit()?,
+    }
+    Ok(())
 }
 
 fn effective_terminal(override_entry: Option<&str>) -> Result<Option<String>, Box<dyn Error>> {
@@ -12166,6 +12220,19 @@ mod tests {
                 ..
             }) if run_id == "r1"
         ));
+    }
+
+    #[test]
+    fn config_commands_are_human_only() {
+        for (subcommand, key) in [
+            ("path", "config.path"),
+            ("validate", "config.validate"),
+            ("edit", "config.edit"),
+        ] {
+            let cli = Cli::try_parse_from(["boomux", "config", subcommand]).unwrap();
+            assert_eq!(cli.command_descriptor().key, key);
+            assert_eq!(cli.command_descriptor().output, OutputMode::HumanOnly);
+        }
     }
 
     #[test]

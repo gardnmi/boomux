@@ -149,6 +149,9 @@ boomux . --name my-project --new -- sh -lc 'cargo test | tee test.log'
 | Open the dashboard | `boomux` or `boomux ui` |
 | Open the mobile dashboard | `boomux web` |
 | Inspect daemon health | `boomux doctor` |
+| Show the writable config file | `boomux config path` |
+| Validate merged configuration | `boomux config validate` |
+| Edit the writable config layer | `boomux config edit` |
 | List recurring Agent work | `boomux schedule list --workspace feature-x` |
 
 Without `--name`, Boomux creates the next `workspace-N` and stores the selected
@@ -216,7 +219,8 @@ management surface.
 
 ## Dashboard
 
-The dashboard has five primary views: Workspaces, Agents, Shells, Schedules, and Nodes. The
+The dashboard has five primary views: Workspaces, Agents, Shells, Schedules, and
+Nodes. The
 Workspaces view combines the selected workspace's Agents, shells, commands,
 launchers, and schedule definitions in one item table. A `schedule` row represents
 the durable definition, opens its specialized history and controls, and never
@@ -293,7 +297,7 @@ to the phone's home screen to install the progressive web app. See
 
 | Key | Action |
 | --- | --- |
-| `Tab`, `Shift-Tab`, `1`-`5` | Change view. |
+| `Tab`, `Shift-Tab`, `1`-`6` | Change view. |
 | `/` or `:` | Search actions, workspaces, and entries. |
 | `?` | Explain keys plus the selected kind and state. |
 | `h`, `l`, left, right | Move between workspace and entry tables. |
@@ -515,8 +519,10 @@ overwrites local changes to an existing installation.
 ## Configuration
 
 Boomux reads `$XDG_CONFIG_HOME/boomux/config.toml`, falling back to
-`~/.config/boomux/config.toml`. `BOOMUX_CONFIG` can point to an additional file
-that is loaded last and takes precedence.
+`~/.config/boomux/config.toml`. When `BOOMUX_CONFIG` is set, that file is loaded
+after the global file and overrides it field by field. The active writable layer
+is `BOOMUX_CONFIG` when set and the global file otherwise; lower-layer values
+remain inherited when the active layer omits them.
 
 ```toml
 terminal = "Alacritty.desktop"
@@ -532,6 +538,9 @@ follow_focused_terminal = true
 resume_agents = true
 persist_terminal_history = false
 
+[scheduling]
+max_concurrent = 4
+
 [notifications]
 enabled = false
 blocked = true
@@ -546,6 +555,31 @@ completed = "complete"
 scheduled_dispatch_failed = "dialog-warning"
 scheduled_interrupted = "dialog-warning"
 ```
+
+Manage the active writable layer without starting the daemon:
+
+```console
+boomux config path
+boomux config validate
+boomux config edit
+```
+
+`config path` prints the active writable path. `config validate` parses and
+semantically validates the complete layered result. `config edit` selects
+`VISUAL`, then `EDITOR`, then `sensible-editor` with a `vi` fallback. Editor
+settings are split into an exact argument vector and executed directly without
+shell interpretation. Editing uses an owner-only temporary working copy,
+validates the bounded candidate and every layer, and atomically replaces an
+owner-validated regular target. Existing targets are checked for changes
+immediately before replacement, while new targets use atomic no-replace
+creation. A detected target change, symlink, non-regular file, wrong owner,
+oversized file, invalid TOML, or invalid merged setting is rejected. New config
+files are mode `0600`. These commands are human-only and do not support
+`--json`.
+
+Configuration management is local to this Node. The `boomux config` commands
+never read or mutate a registered remote Node's config; use an interactive Boomux
+client on that owning Node to manage it.
 
 Project roots provide Workspace-name suggestions in the dashboard. Selecting one
 creates empty coordinator metadata using its name; it does not assign a Node or
@@ -631,6 +665,7 @@ boomux session --help
 boomux schedule --help
 boomux notification --help
 boomux integration --help
+boomux config --help
 ```
 
 Supported automation commands use the stable `boomux.cli/v1` JSON envelope. See

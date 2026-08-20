@@ -1,10 +1,10 @@
 ---
 name: boomux
-description: Inspect and manage Boomux Nodes, coordinated persistent terminal Workspaces, launchers, shells, run-scoped agent instances, attention, projected sessions, recurring Agent schedules, notifications, the OpenCode Shared Harness Runtime, process supervision, and integrations. Use when asked to discover Nodes, shells, agents, sessions, or schedules, read terminal output, manage explicitly authorized recurring Agent prompts, supervise an explicitly identified external session, report agent lifecycle state, configure or test notifications, install or remove the OpenCode or Pi integration, create or open Workspaces and shells, inspect status, rename or close targets, or manage the local Boomux daemon.
+description: Inspect and manage Boomux Nodes, coordinated persistent terminal Workspaces, launchers, shells, run-scoped agent instances, attention, projected sessions, recurring Agent schedules, local configuration, notifications, the OpenCode Shared Harness Runtime, process supervision, and integrations. Use when asked to discover Nodes, shells, agents, sessions, or schedules, read terminal output, inspect, validate, or edit local Boomux configuration, manage explicitly authorized recurring Agent prompts, supervise an explicitly identified external session, report agent lifecycle state, configure or test notifications, install or remove the OpenCode or Pi integration, create or open Workspaces and shells, inspect status, rename or close targets, or manage the local Boomux daemon.
 compatibility: Requires boomux on PATH. Federated resource identity is the pair of owning Node ID and Node-local inner ID. Some name operations require Workspace context or an explicit --workspace/--node; agent mutation and supervision require exact shell-run context, and continuation schedules or supervision require caller-supplied exact canonical session identity.
 metadata:
   author: boomux
-  version: "16"
+  version: "17"
 ---
 
 # Boomux
@@ -607,9 +607,11 @@ retain their captured definition.
 
 Boomux reads `$XDG_CONFIG_HOME/boomux/config.toml`, falling back to
 `~/.config/boomux/config.toml`. `BOOMUX_CONFIG` points to an additional
-field-level override loaded last. Configuration controls terminal selection,
-project discovery roots and depth, dashboard focus following, schedule
-concurrency, and desktop and sound notifications. Unknown fields are rejected.
+field-level override loaded last. The override is the active writable layer when
+set; otherwise the global file is writable. Omitted active-layer fields inherit
+from the global file or defaults. Configuration controls Terminal, Projects,
+Dashboard, Recovery, Scheduling, Notifications, and Sound groups. Unknown fields
+are rejected.
 Scheduled dispatch-failure and cold-interruption notification categories are
 configured independently as `[notifications] scheduled_dispatch_failed` and
 `scheduled_interrupted`; both default to false and never disclose schedule
@@ -618,6 +620,28 @@ Selecting a discovered project in the dashboard uses its name only and creates
 empty coordinator metadata. Set
 `[dashboard] follow_focused_terminal = false` to disable the default
 focus-following behavior.
+
+Inspect or manage the active local layer without starting the daemon:
+
+```console
+boomux config path
+boomux config validate
+boomux config edit
+```
+
+These commands are human-only and do not support `--json`. `path` prints the
+active writable file and `validate` checks the complete layered result. `edit`
+uses `VISUAL`, then `EDITOR`, then `sensible-editor` with a `vi` fallback. The
+editor setting is parsed into an exact argv and executed without a shell. Boomux
+edits an owner-only temporary copy, validates the bounded candidate, and performs
+an owner-validated atomic replacement. Symlinks, non-regular or wrong-owner
+targets, concurrent target changes, oversized files, and invalid merged config
+are rejected. New files are mode `0600`.
+
+Configuration management is local Node only. These commands cannot inspect or
+mutate a registered remote Node's config; use an interactive Boomux client on the
+owning Node. Do not attempt remote config mutation through SSH, federation, or
+another public Boomux command.
 
 Discover the same configured projects locally without starting the daemon:
 

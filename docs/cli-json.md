@@ -41,6 +41,12 @@ The `sound_notifications` feature similarly advertises optional direct sound
 delivery through `canberra-gtk-play`. `boomux notification test` is a human-facing
 delivery diagnostic and does not support `--json`.
 
+`boomux config path`, `boomux config validate`, and `boomux config edit` are
+also human-only local configuration commands. They do not support `--json`, do
+not appear in `json_commands`, and do not provide remote configuration mutation.
+`config validate` covers the complete global plus optional `BOOMUX_CONFIG`
+layered result without starting the daemon.
+
 ### Accepted Remote Node Compatibility
 
 Remote Node federation is an incremental extension tracked by #173. Protocol 31
@@ -186,6 +192,10 @@ in [`remote-nodes.md`](remote-nodes.md).
 `boomux node rekey` is an implemented local identity-administration command. It
 requires an interactive terminal and exact current-ID confirmation, and does not
 support `--json`; it cannot be routed through federation.
+
+Configuration follows the same local authority boundary. The active writable
+layer is `BOOMUX_CONFIG` when set and the global XDG config file otherwise.
+The config commands cannot target a registered remote Node.
 
 The following commands support `--json`:
 

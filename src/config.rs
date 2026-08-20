@@ -1,8 +1,13 @@
 use std::env;
 use std::error::Error;
+use std::ffi::{CString, OsStr, OsString};
 use std::fmt;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Write};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::process::{Command, ExitStatus, Stdio};
 
 use serde::Deserialize;
 
@@ -10,6 +15,43 @@ const DEFAULT_PROJECT_SEARCH_DEPTH: usize = 3;
 const MAX_PROJECT_SEARCH_DEPTH: usize = 10;
 const DEFAULT_MAX_SCHEDULED_EXECUTION_CONCURRENCY: u16 = 4;
 const MAX_SCHEDULED_EXECUTION_CONCURRENCY: i64 = 64;
+const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
+const TEMPORARY_CREATE_ATTEMPTS: u8 = 16;
+
+pub(crate) const CONFIG_TEMPLATE: &str = r#"# Boomux configuration
+# Uncomment settings to override their defaults.
+
+# XDG desktop entry used when Boomux opens terminal windows.
+# terminal = "Alacritty.desktop"
+
+[projects]
+# roots = ["~/Projects"]
+# max_depth = 3
+
+[dashboard]
+# follow_focused_terminal = true
+
+[notifications]
+# enabled = false
+# blocked = true
+# completed = true
+# scheduled_dispatch_failed = false
+# scheduled_interrupted = false
+
+[notifications.sound]
+# enabled = false
+# blocked = "message-new-instant"
+# completed = "complete"
+# scheduled_dispatch_failed = "dialog-warning"
+# scheduled_interrupted = "dialog-warning"
+
+[recovery]
+# resume_agents = true
+# persist_terminal_history = false
+
+[scheduling]
+# max_concurrent = 4
+"#;
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -69,7 +111,7 @@ struct RawSchedulingConfig {
     max_concurrent: Option<i64>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Config {
     pub(crate) terminal: Option<String>,
     pub(crate) projects: ProjectsConfig,
@@ -78,19 +120,43 @@ pub(crate) struct Config {
     pub(crate) dashboard: DashboardConfig,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ProjectsConfig {
     pub(crate) roots: Vec<PathBuf>,
     pub(crate) max_depth: usize,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DashboardConfig {
     pub(crate) follow_focused_terminal: bool,
 }
 
 #[derive(Debug)]
 struct ConfigError(String);
+
+#[derive(Debug)]
+struct ConfigCommittedError(String);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConfigSource {
+    Global,
+    Environment,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ConfigLayer {
+    pub(crate) source: ConfigSource,
+    pub(crate) path: PathBuf,
+    pub(crate) loaded: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ConfigSnapshot {
+    pub(crate) effective: Config,
+    pub(crate) active_path: PathBuf,
+    pub(crate) active_source: ConfigSource,
+    pub(crate) layers: Vec<ConfigLayer>,
+}
 
 impl fmt::Display for ConfigError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -100,9 +166,28 @@ impl fmt::Display for ConfigError {
 
 impl Error for ConfigError {}
 
+impl fmt::Display for ConfigCommittedError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl Error for ConfigCommittedError {}
+
 pub(crate) fn load() -> Result<Config, Box<dyn Error>> {
     let (raw, loaded_path) = load_raw()?;
     resolve(raw, loaded_path)
+}
+
+pub(crate) fn load_snapshot() -> Result<ConfigSnapshot, Box<dyn Error>> {
+    let paths = ConfigPaths::from_environment()?;
+    let (raw, loaded_path, layers) = load_raw_from_paths(&paths, None)?;
+    Ok(ConfigSnapshot {
+        effective: resolve(raw, loaded_path)?,
+        active_path: paths.active()?.to_owned(),
+        active_source: paths.active_source(),
+        layers,
+    })
 }
 
 pub(crate) fn load_notification_settings()
@@ -112,27 +197,149 @@ pub(crate) fn load_notification_settings()
 }
 
 fn load_raw() -> Result<(RawConfig, Option<PathBuf>), Box<dyn Error>> {
-    let global_path = global_config_path();
+    let paths = ConfigPaths::from_environment()?;
+    let (raw, loaded_path, _) = load_raw_from_paths(&paths, None)?;
+    Ok((raw, loaded_path))
+}
+
+#[derive(Clone, Debug)]
+struct ConfigPaths {
+    global: Option<PathBuf>,
+    environment: Option<PathBuf>,
+}
+
+type RawLoad = (RawConfig, Option<PathBuf>, Vec<ConfigLayer>);
+
+impl ConfigPaths {
+    fn from_environment() -> Result<Self, Box<dyn Error>> {
+        let environment = env::var_os("BOOMUX_CONFIG")
+            .map(|path| {
+                if path.is_empty() {
+                    Err(ConfigError("BOOMUX_CONFIG cannot be empty".into()))
+                } else {
+                    Ok(PathBuf::from(path))
+                }
+            })
+            .transpose()?;
+        Ok(Self {
+            global: global_config_path(),
+            environment,
+        })
+    }
+
+    fn active(&self) -> Result<&Path, Box<dyn Error>> {
+        self.environment
+            .as_deref()
+            .or(self.global.as_deref())
+            .ok_or_else(|| {
+                ConfigError(
+                    "cannot resolve config path: XDG_CONFIG_HOME or HOME must be absolute".into(),
+                )
+                .into()
+            })
+    }
+
+    fn active_source(&self) -> ConfigSource {
+        if self.environment.is_some() {
+            ConfigSource::Environment
+        } else {
+            ConfigSource::Global
+        }
+    }
+
+    fn has_distinct_environment_layer(&self) -> bool {
+        let (Some(global), Some(environment)) = (&self.global, &self.environment) else {
+            return false;
+        };
+        if global == environment {
+            return false;
+        }
+        match (fs::metadata(global), fs::metadata(environment)) {
+            (Ok(global), Ok(environment)) => {
+                global.dev() != environment.dev() || global.ino() != environment.ino()
+            }
+            _ => true,
+        }
+    }
+}
+
+fn load_raw_from_paths(
+    paths: &ConfigPaths,
+    active_candidate: Option<&[u8]>,
+) -> Result<RawLoad, Box<dyn Error>> {
     let mut raw = RawConfig::default();
     let mut loaded_path = None;
+    let mut layers = Vec::new();
 
-    if let Some(path) = global_path.as_deref()
-        && path.is_file()
+    if let Some(path) = paths
+        .global
+        .as_deref()
+        .filter(|_| !paths.environment.is_some() || paths.has_distinct_environment_layer())
     {
-        merge(&mut raw, read(path)?);
-        loaded_path = Some(path.to_owned());
-    }
-
-    if let Some(path) = env::var_os("BOOMUX_CONFIG") {
-        let path = PathBuf::from(path);
-        if path.as_os_str().is_empty() {
-            return Err(ConfigError("BOOMUX_CONFIG cannot be empty".into()).into());
+        let loaded = active_candidate.is_some() && paths.environment.is_none() || path.is_file();
+        if loaded {
+            let next = if paths.environment.is_none() {
+                active_candidate.map_or_else(|| read(path), |bytes| parse(path, bytes))?
+            } else {
+                read(path)?
+            };
+            merge(&mut raw, next);
+            loaded_path = Some(path.to_owned());
         }
-        merge(&mut raw, read(&path)?);
-        loaded_path = Some(path);
+        layers.push(ConfigLayer {
+            source: ConfigSource::Global,
+            path: path.to_owned(),
+            loaded,
+        });
     }
 
-    Ok((raw, loaded_path))
+    if let Some(path) = paths.environment.as_deref() {
+        let next = active_candidate.map_or_else(|| read(path), |bytes| parse(path, bytes))?;
+        merge(&mut raw, next);
+        loaded_path = Some(path.to_owned());
+        layers.push(ConfigLayer {
+            source: ConfigSource::Environment,
+            path: path.to_owned(),
+            loaded: true,
+        });
+    }
+
+    Ok((raw, loaded_path, layers))
+}
+
+fn load_inherited_baseline(paths: &ConfigPaths) -> Result<Option<Vec<u8>>, Box<dyn Error>> {
+    if paths.has_distinct_environment_layer()
+        && let Some(global) = paths.global.as_deref()
+        && global.is_file()
+    {
+        return read_bounded(global).map(Some);
+    }
+    Ok(None)
+}
+
+fn verify_inherited_baseline(
+    paths: &ConfigPaths,
+    baseline: Option<&[u8]>,
+) -> Result<(), Box<dyn Error>> {
+    if !paths.has_distinct_environment_layer() {
+        return Ok(());
+    }
+    let Some(global) = paths.global.as_deref() else {
+        return Ok(());
+    };
+    let current = if global.is_file() {
+        Some(read_bounded(global)?)
+    } else {
+        None
+    };
+    if current.as_deref() != baseline {
+        return Err(ConfigError(format!(
+            "inherited config changed while settings were being edited: {}",
+            global.display()
+        ))
+        .into());
+    }
+    Ok(())
 }
 
 pub(crate) fn global_config_path() -> Option<PathBuf> {
@@ -149,10 +356,314 @@ pub(crate) fn global_config_path() -> Option<PathBuf> {
 }
 
 fn read(path: &Path) -> Result<RawConfig, Box<dyn Error>> {
-    let contents = fs::read_to_string(path)
-        .map_err(|error| ConfigError(format!("could not read {}: {error}", path.display())))?;
-    toml::from_str(&contents)
+    let bytes = read_bounded(path)?;
+    parse(path, &bytes)
+}
+
+fn parse(path: &Path, bytes: &[u8]) -> Result<RawConfig, Box<dyn Error>> {
+    let contents = std::str::from_utf8(bytes)
+        .map_err(|error| ConfigError(format!("invalid config {}: {error}", path.display())))?;
+    toml::from_str(contents)
         .map_err(|error| ConfigError(format!("invalid config {}: {error}", path.display())).into())
+}
+
+fn read_bounded(path: &Path) -> Result<Vec<u8>, Box<dyn Error>> {
+    let file = File::open(path)
+        .map_err(|error| ConfigError(format!("could not read {}: {error}", path.display())))?;
+    if file.metadata()?.len() > MAX_CONFIG_BYTES {
+        return Err(ConfigError(format!(
+            "config {} exceeds the {} byte limit",
+            path.display(),
+            MAX_CONFIG_BYTES
+        ))
+        .into());
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_CONFIG_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_CONFIG_BYTES {
+        return Err(ConfigError(format!(
+            "config {} exceeds the {} byte limit",
+            path.display(),
+            MAX_CONFIG_BYTES
+        ))
+        .into());
+    }
+    Ok(bytes)
+}
+
+pub(crate) fn active_path() -> Result<PathBuf, Box<dyn Error>> {
+    Ok(ConfigPaths::from_environment()?.active()?.to_owned())
+}
+
+pub(crate) fn validate() -> Result<ConfigSnapshot, Box<dyn Error>> {
+    let paths = ConfigPaths::from_environment()?;
+    validate_layers(&paths, None)?;
+    load_snapshot()
+}
+
+pub(crate) fn edit() -> Result<(), Box<dyn Error>> {
+    let paths = ConfigPaths::from_environment()?;
+    let editor = editor_argv()?;
+    edit_with(&paths, |working| run_editor(&editor, working), || {})
+}
+
+fn editor_argv() -> Result<Vec<OsString>, Box<dyn Error>> {
+    for name in ["VISUAL", "EDITOR"] {
+        if let Some(value) = env::var_os(name) {
+            let value = value.into_string().map_err(|_| {
+                ConfigError(format!("{name} must contain valid UTF-8 command arguments"))
+            })?;
+            let words = shell_words::split(&value)
+                .map_err(|error| ConfigError(format!("invalid {name}: {error}")))?;
+            if words.is_empty() {
+                return Err(ConfigError(format!("{name} cannot be empty")).into());
+            }
+            return Ok(words.into_iter().map(OsString::from).collect());
+        }
+    }
+    Ok(vec![OsString::from("sensible-editor")])
+}
+
+fn run_editor(editor: &[OsString], working: &Path) -> Result<ExitStatus, Box<dyn Error>> {
+    let mut command = Command::new(&editor[0]);
+    command
+        .args(&editor[1..])
+        .arg(working)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    match command.status() {
+        Err(error)
+            if error.kind() == io::ErrorKind::NotFound
+                && editor.first().is_some_and(|word| word == "sensible-editor") =>
+        {
+            Ok(Command::new("vi")
+                .arg(working)
+                .stdin(Stdio::inherit())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit())
+                .status()?)
+        }
+        result => Ok(result?),
+    }
+}
+
+fn edit_with(
+    paths: &ConfigPaths,
+    run: impl FnOnce(&Path) -> Result<ExitStatus, Box<dyn Error>>,
+    before_commit: impl FnOnce(),
+) -> Result<(), Box<dyn Error>> {
+    let target = paths.active()?;
+    let parent = target
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let baseline = match fs::symlink_metadata(target) {
+        Ok(metadata) => {
+            validate_regular_owner(target, &metadata, "config target")?;
+            Some(read_bounded(target)?)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    let inherited_baseline = load_inherited_baseline(paths)?;
+
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true).mode(0o700);
+    builder.create(parent)?;
+    let (mut working_file, working_path) = create_working_file(parent, target.file_name())?;
+    let working = TemporaryPath(Some(working_path));
+    working_file.write_all(baseline.as_deref().unwrap_or(CONFIG_TEMPLATE.as_bytes()))?;
+    working_file.sync_all()?;
+    drop(working_file);
+
+    let status = run(working.path())?;
+    if !status.success() {
+        return Err(ConfigError(format!("editor exited with {status}")).into());
+    }
+    let candidate_metadata = fs::symlink_metadata(working.path())?;
+    validate_regular_owner(working.path(), &candidate_metadata, "edited config")?;
+    let candidate = read_bounded(working.path())?;
+    validate_layers(paths, Some(&candidate))?;
+
+    before_commit();
+    verify_inherited_baseline(paths, inherited_baseline.as_deref())?;
+    match commit_candidate(target, baseline.as_deref(), &candidate) {
+        Ok(()) => Ok(()),
+        Err(error) if error.downcast_ref::<ConfigCommittedError>().is_some() => {
+            if read_bounded(target).ok().as_deref() == Some(candidate.as_slice()) {
+                Ok(())
+            } else {
+                Err(error)
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn commit_candidate(
+    target: &Path,
+    baseline: Option<&[u8]>,
+    candidate: &[u8],
+) -> Result<(), Box<dyn Error>> {
+    let parent = target
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true).mode(0o700);
+    builder.create(parent)?;
+    let (mut working_file, working_path) = create_working_file(parent, target.file_name())?;
+    let mut working = TemporaryPath(Some(working_path));
+    working_file.write_all(candidate)?;
+    working_file.sync_all()?;
+    drop(working_file);
+
+    match baseline {
+        None => {
+            fs::set_permissions(working.path(), fs::Permissions::from_mode(0o600))?;
+            rename_noreplace(working.path(), target).map_err(|error| {
+                if error.raw_os_error() == Some(libc::EEXIST) {
+                    ConfigError(format!(
+                        "config target changed while it was being edited: {}",
+                        target.display()
+                    ))
+                    .into()
+                } else {
+                    Box::<dyn Error>::from(error)
+                }
+            })?;
+            working.disarm();
+        }
+        Some(baseline) => {
+            let current = fs::symlink_metadata(target)?;
+            validate_regular_owner(target, &current, "config target")?;
+            if read_bounded(target)? != baseline {
+                return Err(ConfigError(format!(
+                    "config target changed while it was being edited: {}",
+                    target.display()
+                ))
+                .into());
+            }
+            fs::set_permissions(
+                working.path(),
+                fs::Permissions::from_mode(current.mode() & 0o7777),
+            )?;
+            fs::rename(working.path(), target)?;
+            working.disarm();
+        }
+    }
+    File::open(target)
+        .and_then(|file| file.sync_all())
+        .and_then(|()| File::open(parent)?.sync_all())
+        .map_err(|error| {
+            ConfigCommittedError(format!(
+                "config was committed but could not be synchronized: {error}"
+            ))
+        })?;
+    Ok(())
+}
+
+fn validate_layers(
+    paths: &ConfigPaths,
+    active_candidate: Option<&[u8]>,
+) -> Result<(), Box<dyn Error>> {
+    let (raw, loaded_path, _) = load_raw_from_paths(paths, active_candidate)?;
+    resolve(raw, loaded_path)?;
+    Ok(())
+}
+
+fn validate_regular_owner(
+    path: &Path,
+    metadata: &fs::Metadata,
+    description: &str,
+) -> Result<(), Box<dyn Error>> {
+    if !metadata.file_type().is_file() {
+        return Err(ConfigError(format!(
+            "{description} is not a regular file: {}",
+            path.display()
+        ))
+        .into());
+    }
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        return Err(ConfigError(format!(
+            "{description} is not owned by the current user: {}",
+            path.display()
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+fn create_working_file(
+    parent: &Path,
+    target_name: Option<&OsStr>,
+) -> Result<(File, PathBuf), Box<dyn Error>> {
+    let target_name = target_name.unwrap_or_else(|| OsStr::new("config.toml"));
+    for _ in 0..TEMPORARY_CREATE_ATTEMPTS {
+        let name = format!(
+            ".{}.edit-{}",
+            target_name.to_string_lossy(),
+            uuid::Uuid::new_v4()
+        );
+        let path = parent.join(name);
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+        {
+            Ok(file) => return Ok((file, path)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(ConfigError("could not allocate a temporary config working copy".into()).into())
+}
+
+struct TemporaryPath(Option<PathBuf>);
+
+impl TemporaryPath {
+    fn path(&self) -> &Path {
+        self.0.as_deref().expect("temporary path is armed")
+    }
+
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for TemporaryPath {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
+    renameat2(from, to, libc::RENAME_NOREPLACE)
+}
+
+fn renameat2(from: &Path, to: &Path, flags: u32) -> io::Result<()> {
+    let from = CString::new(from.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))?;
+    let to = CString::new(to.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))?;
+    let result = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            from.as_ptr(),
+            libc::AT_FDCWD,
+            to.as_ptr(),
+            flags,
+        )
+    };
+    if result == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 fn merge(base: &mut RawConfig, next: RawConfig) {
@@ -346,6 +857,26 @@ fn home_directory() -> Result<PathBuf, Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let path = env::temp_dir().join(format!(
+                "boomux-config-test-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4()
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
 
     #[test]
     fn parses_project_settings() {
@@ -607,5 +1138,55 @@ mod tests {
             assert!(resolve(raw, None).is_err());
         }
         assert!(toml::from_str::<RawConfig>("[scheduling]\nunknown = 1").is_err());
+    }
+
+    #[test]
+    fn layered_semantics_are_resolved_only_after_field_merge() {
+        let mut base: RawConfig =
+            toml::from_str("[projects]\nmax_depth = 99\n[scheduling]\nmax_concurrent = 100")
+                .unwrap();
+        let override_layer: RawConfig =
+            toml::from_str("[projects]\nmax_depth = 4\n[scheduling]\nmax_concurrent = 8").unwrap();
+
+        assert!(resolve(base.clone(), None).is_err());
+        merge(&mut base, override_layer);
+        let resolved = resolve(base, None).unwrap();
+        assert_eq!(resolved.projects.max_depth, 4);
+        assert_eq!(
+            resolved.notifications.max_scheduled_execution_concurrency,
+            8
+        );
+    }
+
+    #[test]
+    fn readable_non_owned_files_are_readable_but_not_mutable() {
+        let path = Path::new("/etc/passwd");
+        let metadata = fs::metadata(path).unwrap();
+        if metadata.uid() == unsafe { libc::geteuid() } {
+            return;
+        }
+
+        assert!(!read_bounded(path).unwrap().is_empty());
+        let error = validate_regular_owner(path, &metadata, "config target")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not owned by the current user"), "{error}");
+    }
+
+    #[test]
+    fn canonical_global_environment_path_is_loaded_once_as_environment() {
+        let test = TestDirectory::new();
+        let path = test.0.join("config.toml");
+        fs::write(&path, "[projects]\nmax_depth = 2\n").unwrap();
+        let alias = path.parent().unwrap().join(".").join("config.toml");
+        let paths = ConfigPaths {
+            global: Some(path.clone()),
+            environment: Some(alias.clone()),
+        };
+
+        let (raw, loaded_path, layers) = load_raw_from_paths(&paths, None).unwrap();
+        assert_eq!(resolve(raw, loaded_path).unwrap().projects.max_depth, 2);
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].source, ConfigSource::Environment);
     }
 }
