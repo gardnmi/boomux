@@ -8,6 +8,8 @@ mod daemon_lifecycle;
 mod handoff;
 #[path = "native_backend/launchers_integrations.rs"]
 mod launchers_integrations;
+#[path = "native_backend/mobile_web.rs"]
+mod mobile_web;
 #[path = "native_backend/node_registration.rs"]
 mod node_registration;
 #[path = "native_backend/notifications.rs"]

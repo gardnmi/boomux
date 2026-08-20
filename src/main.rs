@@ -1217,7 +1217,12 @@ enum OpenCodeCommands {
     },
     /// Internal entry point for a scoped bare OpenCode invocation
     #[command(hide = true)]
-    Shared,
+    Shared {
+        #[arg(long, hide = true)]
+        session: Option<String>,
+        #[arg(long, hide = true, default_value_t = 4097)]
+        port: u16,
+    },
     /// Coordinate OpenCode TUI selection claims
     #[command(hide = true)]
     Claim {
@@ -2052,8 +2057,8 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
             command: OpenCodeCommands::Install { force },
         }) => install_opencode(force),
         Some(Commands::Opencode {
-            command: OpenCodeCommands::Shared,
-        }) => launch_shared_opencode(),
+            command: OpenCodeCommands::Shared { session, port },
+        }) => launch_shared_opencode(session.as_deref(), port),
         Some(Commands::Opencode {
             command: OpenCodeCommands::Claim { command },
         }) => opencode_claim_command(command, cli.json),
@@ -2873,6 +2878,8 @@ fn web_status(port: u16, json: bool) -> Result<(), Box<dyn Error>> {
         println!("running ({})", status.dashboard_url);
         if let Some(url) = status.opencode_url {
             println!("OpenCode Web: {url}");
+        } else if status.opencode_requested_port.is_some() {
+            println!("OpenCode Web: unavailable");
         }
     } else {
         println!("not running (port {port})");
@@ -2900,11 +2907,17 @@ fn web_start(
                 ))
             }
         });
+        let status_requested_opencode_port =
+            status.opencode_requested_port.or(status.opencode_port);
+        let status_requested_opencode_url = status
+            .opencode_requested_url
+            .as_deref()
+            .or(status.opencode_url.as_deref());
         if status.tailscale != tailscale
-            || status.opencode_port != requested_opencode_port
+            || status_requested_opencode_port != requested_opencode_port
             || expected_opencode_url
                 .as_deref()
-                .is_some_and(|expected| status.opencode_url.as_deref() != Some(expected))
+                .is_some_and(|expected| status_requested_opencode_url != Some(expected))
         {
             return Err(io::Error::new(
                 io::ErrorKind::AddrInUse,
@@ -3004,6 +3017,9 @@ fn print_web_start(
         println!("Started Boomux web: {}", status.dashboard_url);
     } else {
         println!("Boomux web is already running: {}", status.dashboard_url);
+    }
+    if !json && status.opencode_requested_port.is_some() && status.opencode_port.is_none() {
+        eprintln!("boomux: OpenCode is unavailable; continuing without OpenCode handoffs");
     }
     Ok(())
 }
@@ -11016,28 +11032,48 @@ struct SharedOpenCodeLaunch {
     holder: String,
     tui_config: PathBuf,
     original_path: Option<OsString>,
+    session: Option<String>,
 }
 
-impl SharedOpenCodeLaunch {
-    fn argv(&self) -> Vec<OsString> {
-        vec![
-            "attach".into(),
-            self.url.clone().into(),
-            "--dir".into(),
-            self.cwd.clone().into_os_string(),
-        ]
-    }
-}
-
-fn shared_opencode_launch(
+struct SharedOpenCodeLaunchInput {
     shell_id: Option<OsString>,
     run_id: Option<OsString>,
     executable: Option<OsString>,
     tui_config: Option<OsString>,
     original_path: Option<OsString>,
     cwd: PathBuf,
+    session: Option<String>,
     runtime: protocol::OpenCodeSharedRuntimeSnapshot,
+}
+
+impl SharedOpenCodeLaunch {
+    fn argv(&self) -> Vec<OsString> {
+        let mut argv = vec![
+            "attach".into(),
+            self.url.clone().into(),
+            "--dir".into(),
+            self.cwd.clone().into_os_string(),
+        ];
+        if let Some(session) = &self.session {
+            argv.extend(["--session".into(), session.into()]);
+        }
+        argv
+    }
+}
+
+fn shared_opencode_launch(
+    input: SharedOpenCodeLaunchInput,
 ) -> Result<SharedOpenCodeLaunch, Box<dyn Error>> {
+    let SharedOpenCodeLaunchInput {
+        shell_id,
+        run_id,
+        executable,
+        tui_config,
+        original_path,
+        cwd,
+        session,
+        runtime,
+    } = input;
     for (name, value) in [("BOOMUX_SHELL_ID", shell_id), ("BOOMUX_RUN_ID", run_id)] {
         if value.as_ref().is_none_or(|value| value.is_empty()) {
             return Err(format!("{name} is required").into());
@@ -11070,6 +11106,9 @@ fn shared_opencode_launch(
     if !cwd.is_absolute() {
         return Err("current working directory must be absolute".into());
     }
+    if session.as_deref().is_some_and(str::is_empty) {
+        return Err("OpenCode Session ID must not be empty".into());
+    }
     Ok(SharedOpenCodeLaunch {
         executable,
         url: runtime.url,
@@ -11078,10 +11117,42 @@ fn shared_opencode_launch(
         holder: Uuid::new_v4().to_string(),
         tui_config,
         original_path,
+        session,
     })
 }
 
-fn launch_shared_opencode() -> Result<(), Box<dyn Error>> {
+fn launch_standalone_recovered_opencode(
+    session: &str,
+    shared_error: &dyn std::fmt::Display,
+) -> Result<(), Box<dyn Error>> {
+    if session.is_empty() {
+        return Err("OpenCode Session ID must not be empty".into());
+    }
+    let executable = env::var_os("BOOMUX_REAL_OPENCODE")
+        .ok_or("BOOMUX_REAL_OPENCODE is required for standalone recovery")?;
+    eprintln!(
+        "boomux: shared OpenCode recovery is unavailable ({shared_error}); continuing standalone"
+    );
+    let mut command = Command::new(executable);
+    command
+        .args(["--session", session])
+        .env_remove("BOOMUX_OPENCODE_SHARED_GENERATION")
+        .env_remove("BOOMUX_OPENCODE_CLAIM_HOLDER")
+        .env_remove("BOOMUX_REAL_OPENCODE")
+        .env_remove("BOOMUX_ORIGINAL_PATH")
+        .env_remove("BOOMUX_OPENCODE_SHIM_DIR")
+        .env_remove("BOOMUX_OPENCODE_TUI_CONFIG")
+        .env_remove("BOOMUX_SHIM_EXECUTABLE")
+        .env_remove("BOOMUX_REAL_CLAUDE")
+        .env_remove("BOOMUX_CLAUDE_REMOTE_CONTROL")
+        .env_remove("BOOMUX_USER_ZDOTDIR");
+    if let Some(path) = env::var_os("BOOMUX_ORIGINAL_PATH") {
+        command.env("PATH", path);
+    }
+    Err(command.exec().into())
+}
+
+fn launch_shared_opencode(session: Option<&str>, port: u16) -> Result<(), Box<dyn Error>> {
     let shell_id = env::var_os("BOOMUX_SHELL_ID");
     let run_id = env::var_os("BOOMUX_RUN_ID");
     for (name, value) in [
@@ -11092,20 +11163,40 @@ fn launch_shared_opencode() -> Result<(), Box<dyn Error>> {
             return Err(format!("{name} is required").into());
         }
     }
-    let client = client::connect_or_start()?;
-    let runtime = match client.get_opencode_shared_runtime()? {
-        Some(runtime) => runtime,
-        None => client.ensure_opencode_shared_runtime(4097)?,
+    let runtime = (|| {
+        let client = client::connect_or_start()?;
+        match client.get_opencode_shared_runtime()? {
+            Some(runtime) => Ok(runtime),
+            None => match client.ensure_opencode_shared_runtime(port) {
+                Ok(runtime) => Ok(runtime),
+                Err(error) => client.get_opencode_shared_runtime()?.ok_or(error),
+            },
+        }
+    })();
+    let runtime = match runtime {
+        Ok(runtime) => runtime,
+        Err(error) if session.is_some() => {
+            return launch_standalone_recovered_opencode(session.unwrap(), &error);
+        }
+        Err(error) => return Err(error.into()),
     };
-    let launch = shared_opencode_launch(
+    let launch = shared_opencode_launch(SharedOpenCodeLaunchInput {
         shell_id,
         run_id,
-        env::var_os("BOOMUX_REAL_OPENCODE"),
-        env::var_os("BOOMUX_OPENCODE_TUI_CONFIG"),
-        env::var_os("BOOMUX_ORIGINAL_PATH"),
-        env::current_dir()?,
+        executable: env::var_os("BOOMUX_REAL_OPENCODE"),
+        tui_config: env::var_os("BOOMUX_OPENCODE_TUI_CONFIG"),
+        original_path: env::var_os("BOOMUX_ORIGINAL_PATH"),
+        cwd: env::current_dir()?,
+        session: session.map(str::to_owned),
         runtime,
-    )?;
+    });
+    let launch = match launch {
+        Ok(launch) => launch,
+        Err(error) if session.is_some() => {
+            return launch_standalone_recovered_opencode(session.unwrap(), error.as_ref());
+        }
+        Err(error) => return Err(error),
+    };
     let mut command = Command::new(&launch.executable);
     command
         .args(launch.argv())
@@ -14551,8 +14642,28 @@ mod tests {
         assert!(matches!(
             shared.command,
             Some(Commands::Opencode {
-                command: OpenCodeCommands::Shared,
+                command: OpenCodeCommands::Shared {
+                    session: None,
+                    port: 4097,
+                },
             })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from([
+                "boomux",
+                "opencode",
+                "shared",
+                "--session",
+                "session-exact"
+            ])
+            .unwrap()
+            .command,
+            Some(Commands::Opencode {
+                command: OpenCodeCommands::Shared {
+                    session: Some(ref session),
+                    port: 4097,
+                },
+            }) if session == "session-exact"
         ));
         assert!(Cli::try_parse_from(["boomux", "opencode", "attach", "agent-exact"]).is_err());
     }
@@ -14581,20 +14692,21 @@ mod tests {
         fs::write(&executable, b"#!/bin/sh\n").unwrap();
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
         fs::write(&tui_config, b"{}\n").unwrap();
-        let launch = shared_opencode_launch(
-            Some("shell-1".into()),
-            Some("run-1".into()),
-            Some(executable.clone().into_os_string()),
-            Some(tui_config.clone().into_os_string()),
-            Some("/original/bin".into()),
-            directory.clone(),
-            protocol::OpenCodeSharedRuntimeSnapshot {
+        let launch = shared_opencode_launch(SharedOpenCodeLaunchInput {
+            shell_id: Some("shell-1".into()),
+            run_id: Some("run-1".into()),
+            executable: Some(executable.clone().into_os_string()),
+            tui_config: Some(tui_config.clone().into_os_string()),
+            original_path: Some("/original/bin".into()),
+            cwd: directory.clone(),
+            session: Some("session-exact".into()),
+            runtime: protocol::OpenCodeSharedRuntimeSnapshot {
                 generation_id: "generation-1".into(),
                 url: "http://127.0.0.1:4097".into(),
                 port: 4097,
                 pid: Some(42),
             },
-        )
+        })
         .unwrap();
         assert_eq!(launch.executable, executable);
         assert_eq!(launch.url, "http://127.0.0.1:4097");
@@ -14610,6 +14722,8 @@ mod tests {
                 OsString::from("http://127.0.0.1:4097"),
                 OsString::from("--dir"),
                 launch.cwd.clone().into_os_string(),
+                OsString::from("--session"),
+                OsString::from("session-exact"),
             ]
         );
         fs::remove_dir_all(&launch.cwd).unwrap();

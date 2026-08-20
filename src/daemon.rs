@@ -4991,7 +4991,7 @@ impl DurableRegistry {
         &self,
         shell: &Shell,
         previous_run: &PersistedShellRun,
-    ) -> io::Result<Option<(String, Vec<String>)>> {
+    ) -> io::Result<Option<ResumableAgent>> {
         let state = lock(&self.state)?;
         let mut candidates = Vec::new();
         for agent in state.agents.values() {
@@ -5034,7 +5034,12 @@ impl DurableRegistry {
         Ok(crate::integrations::by_key(integration)
             .and_then(|descriptor| descriptor.resume)
             .and_then(|resume| resume.command(&shell.command, external_session_id))
-            .map(|command| (agent_id.clone(), command)))
+            .map(|command| ResumableAgent {
+                agent_id: agent_id.clone(),
+                integration: integration.clone(),
+                external_session_id: external_session_id.clone(),
+                command,
+            }))
     }
 
     fn notification_context(&self, workspace_id: &str, shell_id: &str) -> (String, String) {
@@ -11156,21 +11161,11 @@ impl DaemonService {
     #[cfg(not(debug_assertions))]
     fn wait_for_native_outcome_barrier(&self) {}
 
-    fn agent_resume_command(
-        &self,
-        shell: &Shell,
-        previous_run: Option<&PersistedShellRun>,
-    ) -> io::Result<Option<Vec<String>>> {
-        Ok(self
-            .resumable_agent(shell, previous_run)?
-            .map(|(_, command)| command))
-    }
-
     fn resumable_agent(
         &self,
         shell: &Shell,
         previous_run: Option<&PersistedShellRun>,
-    ) -> io::Result<Option<(String, Vec<String>)>> {
+    ) -> io::Result<Option<ResumableAgent>> {
         if !self.notification_settings.resume_agents {
             return Ok(None);
         }
@@ -14919,14 +14914,14 @@ impl DaemonService {
         let Some(previous_run) = previous_run.as_ref() else {
             return Ok(None);
         };
-        let Some((agent_id, _)) = self.resumable_agent(&shell, Some(previous_run))? else {
+        let Some(resumable) = self.resumable_agent(&shell, Some(previous_run))? else {
             return Ok(None);
         };
         if !matches!(*lock(&shell.lifecycle)?, ShellLifecycle::Pending) {
             return Ok(None);
         }
         Ok(Some((
-            agent_id,
+            resumable.agent_id,
             ShellRunSnapshot {
                 id: previous_run.id.clone(),
                 generation: previous_run.generation,
@@ -16599,7 +16594,15 @@ fn initial_terminal_state(
 #[derive(Default)]
 struct RuntimeRecovery<'a> {
     effective_command: Option<&'a [String]>,
+    opencode_session_id: Option<&'a str>,
     history: Option<&'a str>,
+}
+
+struct ResumableAgent {
+    agent_id: String,
+    integration: String,
+    external_session_id: String,
+    command: Vec<String>,
 }
 
 struct RuntimeStart<'a> {
@@ -16649,12 +16652,47 @@ impl ShellRuntimeManager {
             .cloned()
             .unwrap_or_else(capture_current_environment);
         let mut child_environment = sanitize_opencode_shim_environment(&original_environment);
-        if opencode_shim_eligible(shell, selected_command)
+        let mut shared_recovery_command = None;
+        if let Some(session_id) = recovery.opencode_session_id
+            && let Ok(injected) =
+                inject_opencode_shim_environment(&child_environment, claude_remote_control)
+        {
+            child_environment = injected;
+            let selected_executable = Path::new(&selected_command[0]);
+            let exact_executable = if selected_executable.is_absolute() {
+                Some(selected_executable.to_path_buf())
+            } else if selected_executable.components().count() > 1 {
+                Some(shell.cwd.join(selected_executable))
+            } else {
+                None
+            };
+            if let Some(executable) = exact_executable {
+                set_environment_value(
+                    &mut child_environment,
+                    b"BOOMUX_REAL_OPENCODE",
+                    executable.into_os_string(),
+                );
+            }
+            if let Some(executable) =
+                environment_value(&child_environment, b"BOOMUX_SHIM_EXECUTABLE")
+            {
+                shared_recovery_command = Some(vec![
+                    executable.to_string_lossy().into_owned(),
+                    "opencode".into(),
+                    "shared".into(),
+                    "--session".into(),
+                    session_id.into(),
+                ]);
+            }
+        } else if opencode_shim_eligible(shell, selected_command)
             && let Ok(injected) =
                 inject_opencode_shim_environment(&child_environment, claude_remote_control)
         {
             child_environment = injected;
         }
+        let selected_command = shared_recovery_command
+            .as_deref()
+            .unwrap_or(selected_command);
         let client_shell = child_environment
             .variables
             .iter()
@@ -17177,8 +17215,8 @@ impl ShellRuntimeManager {
         }
         let previous_run = lock(&shell.last_run)?.clone();
         let needs_start = matches!(*lock(&shell.lifecycle)?, ShellLifecycle::Pending);
-        let resume_command = needs_start
-            .then(|| registry.agent_resume_command(&shell, previous_run.as_ref()))
+        let resumable_agent = needs_start
+            .then(|| registry.resumable_agent(&shell, previous_run.as_ref()))
             .transpose()?
             .flatten();
         let restored_history = needs_start
@@ -17228,7 +17266,13 @@ impl ShellRuntimeManager {
                             environment.as_ref()
                         },
                         recovery: RuntimeRecovery {
-                            effective_command: resume_command.as_deref(),
+                            effective_command: resumable_agent
+                                .as_ref()
+                                .map(|resumable| resumable.command.as_slice()),
+                            opencode_session_id: resumable_agent
+                                .as_ref()
+                                .filter(|resumable| resumable.integration == "opencode")
+                                .map(|resumable| resumable.external_session_id.as_str()),
                             history: restored_history.as_deref(),
                         },
                         claude_remote_control: registry.notification_settings.claude_remote_control,
@@ -19219,13 +19263,16 @@ mod tests {
             Some(agent_id.as_str())
         );
 
+        let resumable = registry
+            .resumable_agent(&shell, Some(&run))
+            .unwrap()
+            .unwrap();
+        assert_eq!(resumable.agent_id, agent_id);
+        assert_eq!(resumable.integration, "opencode");
+        assert_eq!(resumable.external_session_id, "session-1");
         assert_eq!(
-            registry.agent_resume_command(&shell, Some(&run)).unwrap(),
-            Some(vec![
-                "/opt/bin/opencode".into(),
-                "--session".into(),
-                "session-1".into()
-            ])
+            resumable.command,
+            ["/opt/bin/opencode", "--session", "session-1"]
         );
 
         let agent = lock(&registry.durable.state)
@@ -19237,7 +19284,7 @@ mod tests {
         lock(&agent.state).unwrap().observation.authority = AgentAuthority::TerminalHeuristic;
         assert!(
             registry
-                .agent_resume_command(&shell, Some(&run))
+                .resumable_agent(&shell, Some(&run))
                 .unwrap()
                 .is_none()
         );
@@ -19256,13 +19303,16 @@ mod tests {
                 .as_deref(),
             Some(agent_id.as_str())
         );
+        let resumable = registry
+            .resumable_agent(&shell, Some(&run))
+            .unwrap()
+            .unwrap();
+        assert_eq!(resumable.agent_id, agent_id);
+        assert_eq!(resumable.integration, "claude");
+        assert_eq!(resumable.external_session_id, "claude-exact");
         assert_eq!(
-            registry.agent_resume_command(&shell, Some(&run)).unwrap(),
-            Some(vec![
-                "/opt/bin/claude".into(),
-                "--resume".into(),
-                "claude-exact".into(),
-            ])
+            resumable.command,
+            ["/opt/bin/claude", "--resume", "claude-exact"]
         );
     }
 
@@ -19275,7 +19325,7 @@ mod tests {
 
         assert!(
             registry
-                .agent_resume_command(&shell, Some(&run))
+                .resumable_agent(&shell, Some(&run))
                 .unwrap()
                 .is_none()
         );
@@ -19288,7 +19338,7 @@ mod tests {
         registry.notification_settings.resume_agents = false;
         assert!(
             registry
-                .agent_resume_command(&shell, Some(&run))
+                .resumable_agent(&shell, Some(&run))
                 .unwrap()
                 .is_none()
         );

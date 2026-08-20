@@ -462,4 +462,47 @@ mod tests {
         assert!(!commands.contains("--https=443 http://127.0.0.1:3737"));
         fs::remove_dir_all(directory).unwrap();
     }
+
+    #[test]
+    fn exposure_without_opencode_publishes_only_the_dashboard() {
+        let directory = std::env::temp_dir().join(format!(
+            "boomux-tailscale-dashboard-only-test-{}",
+            Uuid::new_v4()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let executable = directory.join("tailscale");
+        let log = directory.join("commands.log");
+        let marker = directory.join("dashboard-enabled");
+        let script = format!(
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> '{log}'\n\
+             case \"$*\" in\n\
+               'status --json') printf '%s' '{{\"BackendState\":\"Running\",\"Self\":{{\"Online\":true,\"DNSName\":\"host.example.ts.net.\"}}}}' ;;\n\
+               'serve status --json')\n\
+                 if [ -e '{marker}' ]; then\n\
+                   printf '%s' '{{\"TCP\":{{\"443\":{{\"HTTPS\":true}}}},\"Web\":{{\"host.example.ts.net:443\":{{\"Handlers\":{{\"/\":{{\"Proxy\":\"http://127.0.0.1:3737\"}}}}}}}}}}'\n\
+                 else\n\
+                   printf '%s' '{{\"TCP\":{{}},\"Web\":{{}}}}'\n\
+                 fi ;;\n\
+               'serve --bg --yes --https=443 http://127.0.0.1:3737') : > '{marker}' ;;\n\
+               'serve --https=443 --set-path=/ off') rm -f '{marker}' ;;\n\
+               *) exit 64 ;;\n\
+             esac\n",
+            log = log.display(),
+            marker = marker.display(),
+        );
+        fs::write(&executable, script).unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        let record = directory.join("ownership.json");
+
+        let exposure = Exposure::enable_with(executable.as_os_str(), record, 3737, None).unwrap();
+        assert_eq!(exposure.dashboard_url(), "https://host.example.ts.net");
+        drop(exposure);
+
+        let commands = fs::read_to_string(log).unwrap();
+        assert!(commands.contains("serve --bg --yes --https=443 http://127.0.0.1:3737"));
+        assert!(commands.contains("serve --https=443 --set-path=/ off"));
+        assert!(!commands.contains("4097"));
+        fs::remove_dir_all(directory).unwrap();
+    }
 }

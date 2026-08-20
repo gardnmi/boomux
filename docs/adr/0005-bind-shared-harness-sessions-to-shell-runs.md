@@ -47,3 +47,10 @@ and generation but not claims; TUI holders reacquire them. Cold adoption require
 strict identity, and daemon stop terminates the runtime. The loopback OpenCode
 origin remains full-control and must sit behind a private access layer that owns
 TLS, authentication, and ACLs.
+
+Cold recovery of one exact resumable OpenCode Agent starts a replacement
+ShellRun through the internal shared launcher with that canonical Session ID.
+The prior claim remains invalid; the replacement TUI establishes a new claim for
+the new run. If shared preparation is unavailable, recovery falls back to the
+standalone exact-Session command. This does not broaden the scoped user shim:
+argument-bearing user invocations still execute stock OpenCode unchanged.
