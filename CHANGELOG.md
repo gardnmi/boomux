@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.24.0](https://github.com/gardnmi/boomux/compare/v0.23.0...v0.24.0) (2026-08-21)
+
+
+### Features
+
+* **kiro:** add lifecycle integration ([#235](https://github.com/gardnmi/boomux/issues/235)) ([f23d809](https://github.com/gardnmi/boomux/commit/f23d809ff9d25b0d24de77ee7359b342c0b09af5))
+
 ## [0.23.0](https://github.com/gardnmi/boomux/compare/v0.22.0...v0.23.0) (2026-08-20)
 
 
