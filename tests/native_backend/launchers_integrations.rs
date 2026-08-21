@@ -246,6 +246,7 @@ fn integration_management_reports_and_installs_bundled_hosts() {
     let claude = root.join("claude");
     let claude_manifest = claude.join("skills/boomux/.claude-plugin/plugin.json");
     let codex_hooks = root.join(".codex/hooks.json");
+    let kiro_hooks = root.join(".kiro/hooks/boomux.json");
     let runtime = root.join("runtime");
     fs::create_dir_all(&bin).unwrap();
     fs::create_dir_all(&runtime).unwrap();
@@ -254,6 +255,7 @@ fn integration_management_reports_and_installs_bundled_hosts() {
         ("pi", "0.84.1"),
         ("claude", "2.1.236"),
         ("codex", "0.147.0"),
+        ("kiro-cli", "2.18.0"),
     ] {
         let executable = bin.join(name);
         fs::write(
@@ -290,7 +292,7 @@ fn integration_management_reports_and_installs_bundled_hosts() {
             .iter()
             .map(|integration| integration["name"].as_str().unwrap())
             .collect::<Vec<_>>(),
-        ["opencode", "pi", "claude", "codex"]
+        ["opencode", "pi", "claude", "codex", "kiro"]
     );
 
     let missing = command()
@@ -318,6 +320,7 @@ fn integration_management_reports_and_installs_bundled_hosts() {
     assert!(!config.join("opencode/plugins/boomux.js").exists());
     assert!(!claude_manifest.exists());
     assert!(!codex_hooks.exists());
+    assert!(!kiro_hooks.exists());
     fs::remove_file(pi.join("extensions/boomux.js")).unwrap();
 
     let installed = command()
@@ -339,6 +342,7 @@ fn integration_management_reports_and_installs_bundled_hosts() {
     assert!(pi.join("extensions/boomux.js").is_file());
     assert!(claude_manifest.is_file());
     assert!(codex_hooks.is_file());
+    assert!(kiro_hooks.is_file());
     let manifest: serde_json::Value =
         serde_json::from_slice(&fs::read(&claude_manifest).unwrap()).unwrap();
     assert_eq!(manifest["name"], "boomux");
@@ -348,6 +352,9 @@ fn integration_management_reports_and_installs_bundled_hosts() {
         hooks["hooks"]["SessionStart"][0]["hooks"][0]["command"],
         "boomux codex hook"
     );
+    let kiro: serde_json::Value = serde_json::from_slice(&fs::read(&kiro_hooks).unwrap()).unwrap();
+    assert_eq!(kiro["version"], "v1");
+    assert_eq!(kiro["hooks"][0]["action"]["command"], "boomux kiro hook");
 
     for arguments in [["opencode", "install"], ["pi", "install"]] {
         let shortcut = command().args(arguments).output().unwrap();
@@ -397,6 +404,7 @@ fn integration_management_reports_and_installs_bundled_hosts() {
     assert!(config.join("opencode/plugins/boomux.js").is_file());
     assert!(claude_manifest.is_file());
     assert!(codex_hooks.is_file());
+    assert!(kiro_hooks.is_file());
     assert_eq!(
         fs::read_to_string(pi.join("extensions/boomux.js")).unwrap(),
         "custom extension"
@@ -417,10 +425,12 @@ fn integration_management_reports_and_installs_bundled_hosts() {
     assert!(!pi.join("extensions/boomux.js").exists());
     assert!(!claude_manifest.exists());
     assert!(!codex_hooks.exists());
+    assert!(!kiro_hooks.exists());
     assert!(config.join("opencode/plugins").is_dir());
     assert!(pi.join("extensions").is_dir());
     assert!(claude.join("skills/boomux/.claude-plugin").is_dir());
     assert!(root.join(".codex").is_dir());
+    assert!(root.join(".kiro/hooks").is_dir());
 
     let absent = command()
         .args(["integration", "uninstall", "pi", "--json"])
@@ -548,6 +558,79 @@ fn codex_hidden_launcher_scopes_chat_hooks_and_passes_service_commands_through()
 
     let (argv, marker) = run(&["--remote", "unix:///tmp/codex.sock"], "remote");
     assert_eq!(argv, b"--remote\0unix:///tmp/codex.sock\0");
+    assert_eq!(marker, "unset");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn kiro_hidden_launcher_selects_v3_and_preserves_explicit_arguments() {
+    let root = std::env::temp_dir().join(format!(
+        "boomux-kiro-launcher-{}-{}",
+        std::process::id(),
+        Uuid::new_v4()
+    ));
+    let bin = root.join("bin");
+    let kiro_home = root.join("kiro-home");
+    fs::create_dir_all(&bin).unwrap();
+    fs::create_dir_all(kiro_home.join("hooks")).unwrap();
+    fs::write(
+        kiro_home.join("hooks/boomux.json"),
+        include_str!("../../integrations/kiro/boomux.json"),
+    )
+    .unwrap();
+    let kiro = bin.join("kiro-cli");
+    fs::write(
+        &kiro,
+        "#!/bin/sh\n: > \"$BOOMUX_KIRO_CAPTURE\"\nfor arg do printf '%s\\0' \"$arg\" >> \"$BOOMUX_KIRO_CAPTURE\"; done\nprintf '%s' \"${BOOMUX_KIRO_RUN_SCOPED-unset}\" > \"$BOOMUX_KIRO_MARKER\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&kiro, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let run = |arguments: &[&str], case: &str| {
+        let capture = root.join(format!("{case}-argv"));
+        let marker = root.join(format!("{case}-marker"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_boomux"));
+        command
+            .args(["kiro", "launch", "--"])
+            .args(arguments)
+            .env("PATH", &bin)
+            .env("KIRO_HOME", &kiro_home)
+            .env("BOOMUX_KIRO_CAPTURE", &capture)
+            .env("BOOMUX_KIRO_MARKER", &marker)
+            .env("BOOMUX_SHELL_ID", "shell-1")
+            .env("BOOMUX_RUN_ID", "run-1");
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        (
+            fs::read(capture).unwrap(),
+            fs::read_to_string(marker).unwrap(),
+        )
+    };
+
+    let (argv, marker) = run(&[], "bare");
+    assert_eq!(argv, b"--v3\0");
+    assert_eq!(marker, "1");
+
+    let (argv, marker) = run(&["--v3", "chat", "two words", "semi;colon"], "v3");
+    assert_eq!(argv, b"--v3\0chat\0two words\0semi;colon\0");
+    assert_eq!(marker, "1");
+
+    let (argv, marker) = run(&["chat", "legacy"], "v2");
+    assert_eq!(argv, b"chat\0legacy\0");
+    assert_eq!(marker, "unset");
+
+    let (argv, marker) = run(&["--v3", "chat", "--cloud"], "cloud");
+    assert_eq!(argv, b"--v3\0chat\0--cloud\0");
+    assert_eq!(marker, "unset");
+
+    fs::write(kiro_home.join("hooks/boomux.json"), "custom").unwrap();
+    let (argv, marker) = run(&[], "modified");
+    assert!(argv.is_empty());
     assert_eq!(marker, "unset");
 
     fs::remove_dir_all(root).unwrap();

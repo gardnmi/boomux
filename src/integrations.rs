@@ -6,6 +6,7 @@ pub enum InstallTargetKind {
     Pi,
     Claude,
     Codex,
+    Kiro,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -53,6 +54,7 @@ pub enum ScheduleArgument {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScheduleDispatchCapability {
+    pub executable: &'static str,
     pub fresh: Option<&'static [ScheduleArgument]>,
     pub continuation: Option<&'static [ScheduleArgument]>,
     pub prompt_transport: PromptTransport,
@@ -67,7 +69,6 @@ pub struct ScheduleDispatchCommand {
 impl ScheduleDispatchCapability {
     pub fn command(
         self,
-        integration: &str,
         session: &crate::protocol::AgentScheduleSession,
         prompt: &str,
     ) -> Option<ScheduleDispatchCommand> {
@@ -79,7 +80,7 @@ impl ScheduleDispatchCapability {
                 external_session_id,
             } => (self.continuation?, Some(external_session_id.as_str())),
         };
-        let mut argv = vec![integration.to_owned()];
+        let mut argv = vec![self.executable.to_owned()];
         for argument in template {
             argv.push(match argument {
                 ScheduleArgument::Literal(value) => (*value).to_owned(),
@@ -130,6 +131,12 @@ pub struct ForegroundCapability {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunScopedLauncher {
+    Codex,
+    Kiro,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IntegrationDescriptor {
     pub key: &'static str,
     pub display_name: &'static str,
@@ -138,6 +145,7 @@ pub struct IntegrationDescriptor {
     pub resume: Option<ResumeCapability>,
     pub schedule_dispatch: Option<ScheduleDispatchCapability>,
     pub foreground: Option<ForegroundCapability>,
+    pub run_scoped_launcher: Option<RunScopedLauncher>,
 }
 
 pub const OPENCODE: IntegrationDescriptor = IntegrationDescriptor {
@@ -161,6 +169,7 @@ pub const OPENCODE: IntegrationDescriptor = IntegrationDescriptor {
         arguments_before_session: &["--session"],
     }),
     schedule_dispatch: Some(ScheduleDispatchCapability {
+        executable: "opencode",
         fresh: Some(&[
             ScheduleArgument::Literal("run"),
             ScheduleArgument::Literal("--"),
@@ -178,6 +187,7 @@ pub const OPENCODE: IntegrationDescriptor = IntegrationDescriptor {
     foreground: Some(ForegroundCapability {
         process_name: "opencode",
     }),
+    run_scoped_launcher: None,
 };
 
 pub const PI: IntegrationDescriptor = IntegrationDescriptor {
@@ -201,6 +211,7 @@ pub const PI: IntegrationDescriptor = IntegrationDescriptor {
         arguments_before_session: &["--session"],
     }),
     schedule_dispatch: Some(ScheduleDispatchCapability {
+        executable: "pi",
         fresh: Some(&[ScheduleArgument::Literal("--print")]),
         continuation: Some(&[
             ScheduleArgument::Literal("--session"),
@@ -210,6 +221,7 @@ pub const PI: IntegrationDescriptor = IntegrationDescriptor {
         prompt_transport: PromptTransport::Stdin,
     }),
     foreground: Some(ForegroundCapability { process_name: "pi" }),
+    run_scoped_launcher: None,
 };
 
 pub const CLAUDE: IntegrationDescriptor = IntegrationDescriptor {
@@ -230,6 +242,7 @@ pub const CLAUDE: IntegrationDescriptor = IntegrationDescriptor {
         arguments_before_session: &["--resume"],
     }),
     schedule_dispatch: Some(ScheduleDispatchCapability {
+        executable: "claude",
         fresh: Some(&[ScheduleArgument::Literal("--print")]),
         continuation: Some(&[
             ScheduleArgument::Literal("--print"),
@@ -241,6 +254,7 @@ pub const CLAUDE: IntegrationDescriptor = IntegrationDescriptor {
     foreground: Some(ForegroundCapability {
         process_name: "claude",
     }),
+    run_scoped_launcher: None,
 };
 
 pub const CODEX: IntegrationDescriptor = IntegrationDescriptor {
@@ -264,6 +278,7 @@ pub const CODEX: IntegrationDescriptor = IntegrationDescriptor {
         arguments_before_session: &["resume"],
     }),
     schedule_dispatch: Some(ScheduleDispatchCapability {
+        executable: "codex",
         fresh: Some(&[
             ScheduleArgument::Literal("exec"),
             ScheduleArgument::Literal("-"),
@@ -279,9 +294,53 @@ pub const CODEX: IntegrationDescriptor = IntegrationDescriptor {
     foreground: Some(ForegroundCapability {
         process_name: "codex",
     }),
+    run_scoped_launcher: Some(RunScopedLauncher::Codex),
 };
 
-pub const ALL: &[IntegrationDescriptor] = &[OPENCODE, PI, CLAUDE, CODEX];
+pub const KIRO: IntegrationDescriptor = IntegrationDescriptor {
+    key: "kiro",
+    display_name: "Kiro CLI",
+    installation: Some(InstallationCapability {
+        package: "kiro-cli",
+        validated_version: "2.18.0",
+        asset_name: "hooks",
+        content: include_str!("../integrations/kiro/boomux.json"),
+        executable: "kiro-cli",
+        reload_message: "Restart Kiro CLI in v3 mode to activate the hooks",
+        target: InstallTargetKind::Kiro,
+    }),
+    titles: None,
+    resume: Some(ResumeCapability {
+        executable: "kiro-cli",
+        arguments_before_session: &["--v3", "chat", "--resume-id"],
+    }),
+    schedule_dispatch: Some(ScheduleDispatchCapability {
+        executable: "kiro-cli",
+        fresh: Some(&[
+            ScheduleArgument::Literal("--v3"),
+            ScheduleArgument::Literal("chat"),
+            ScheduleArgument::Literal("--no-interactive"),
+            ScheduleArgument::Literal("--"),
+            ScheduleArgument::Prompt,
+        ]),
+        continuation: Some(&[
+            ScheduleArgument::Literal("--v3"),
+            ScheduleArgument::Literal("chat"),
+            ScheduleArgument::Literal("--no-interactive"),
+            ScheduleArgument::Literal("--resume-id"),
+            ScheduleArgument::ExternalSessionId,
+            ScheduleArgument::Literal("--"),
+            ScheduleArgument::Prompt,
+        ]),
+        prompt_transport: PromptTransport::Argument,
+    }),
+    foreground: Some(ForegroundCapability {
+        process_name: "kiro-cli",
+    }),
+    run_scoped_launcher: Some(RunScopedLauncher::Kiro),
+};
+
+pub const ALL: &[IntegrationDescriptor] = &[OPENCODE, PI, CLAUDE, CODEX, KIRO];
 
 pub fn by_key(key: &str) -> Option<&'static IntegrationDescriptor> {
     descriptor_by_key(ALL, key)
@@ -344,6 +403,7 @@ mod tests {
             foreground: Some(ForegroundCapability {
                 process_name: "partial-agent",
             }),
+            run_scoped_launcher: None,
         };
 
         let descriptors = [OPENCODE, PARTIAL];
@@ -414,6 +474,7 @@ mod tests {
             }),
             schedule_dispatch: None,
             foreground: None,
+            run_scoped_launcher: None,
         };
 
         assert!(RESUME_ONLY.resume.is_some());
@@ -448,6 +509,16 @@ mod tests {
                 "thread-literal".into()
             ])
         );
+        assert_eq!(
+            KIRO.resume.unwrap().command(&[], "session-3"),
+            Some(vec![
+                "kiro-cli".into(),
+                "--v3".into(),
+                "chat".into(),
+                "--resume-id".into(),
+                "session-3".into()
+            ])
+        );
     }
 
     #[test]
@@ -459,7 +530,7 @@ mod tests {
             OPENCODE
                 .schedule_dispatch
                 .unwrap()
-                .command("opencode", &AgentScheduleSession::Fresh, prompt)
+                .command(&AgentScheduleSession::Fresh, prompt)
                 .unwrap(),
             ScheduleDispatchCommand {
                 argv: vec!["opencode".into(), "run".into(), "--".into(), prompt.into()],
@@ -470,7 +541,6 @@ mod tests {
             PI.schedule_dispatch
                 .unwrap()
                 .command(
-                    "pi",
                     &AgentScheduleSession::Continue {
                         external_session_id: "exact-full-id".into(),
                     },
@@ -492,7 +562,6 @@ mod tests {
                 .schedule_dispatch
                 .unwrap()
                 .command(
-                    "claude",
                     &AgentScheduleSession::Continue {
                         external_session_id: "exact-id".into(),
                     },
@@ -514,7 +583,6 @@ mod tests {
                 .schedule_dispatch
                 .unwrap()
                 .command(
-                    "codex",
                     &AgentScheduleSession::Continue {
                         external_session_id: "thread; literal".into(),
                     },
@@ -536,11 +604,35 @@ mod tests {
             CLAUDE
                 .schedule_dispatch
                 .unwrap()
-                .command("claude", &AgentScheduleSession::Fresh, prompt)
+                .command(&AgentScheduleSession::Fresh, prompt)
                 .unwrap(),
             ScheduleDispatchCommand {
                 argv: vec!["claude".into(), "--print".into()],
                 stdin: Some(prompt.as_bytes().to_vec()),
+            }
+        );
+        assert_eq!(
+            KIRO.schedule_dispatch
+                .unwrap()
+                .command(
+                    &AgentScheduleSession::Continue {
+                        external_session_id: "session literal".into(),
+                    },
+                    prompt,
+                )
+                .unwrap(),
+            ScheduleDispatchCommand {
+                argv: vec![
+                    "kiro-cli".into(),
+                    "--v3".into(),
+                    "chat".into(),
+                    "--no-interactive".into(),
+                    "--resume-id".into(),
+                    "session literal".into(),
+                    "--".into(),
+                    prompt.into(),
+                ],
+                stdin: None,
             }
         );
     }

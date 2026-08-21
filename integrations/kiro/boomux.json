@@ -1,0 +1,35 @@
+{
+  "version": "v1",
+  "hooks": [
+    {
+      "name": "Report Kiro session start to Boomux",
+      "trigger": "SessionStart",
+      "action": { "type": "command", "command": "boomux kiro hook" },
+      "timeout": 5
+    },
+    {
+      "name": "Report Kiro prompt submission to Boomux",
+      "trigger": "UserPromptSubmit",
+      "action": { "type": "command", "command": "boomux kiro hook" },
+      "timeout": 5
+    },
+    {
+      "name": "Report Kiro tool start to Boomux",
+      "trigger": "PreToolUse",
+      "action": { "type": "command", "command": "boomux kiro hook" },
+      "timeout": 5
+    },
+    {
+      "name": "Report Kiro tool completion to Boomux",
+      "trigger": "PostToolUse",
+      "action": { "type": "command", "command": "boomux kiro hook" },
+      "timeout": 5
+    },
+    {
+      "name": "Report Kiro turn completion to Boomux",
+      "trigger": "Stop",
+      "action": { "type": "command", "command": "boomux kiro hook" },
+      "timeout": 5
+    }
+  ]
+}

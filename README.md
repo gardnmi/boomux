@@ -317,7 +317,7 @@ In Schedules, Left/Right changes between the schedule and history panes, `j`/`k`
 navigates the focused pane, and `[`/`]` also selects retained executions by exact
 execution ID. `Enter` attaches a selected exact Starting or Active run. For a
 completed execution with a canonical session, it resumes that exact session with
-OpenCode, Pi, Claude Code, or Codex in an unmanaged native terminal, without
+OpenCode, Pi, Claude Code, Codex, or Kiro in an unmanaged native terminal, without
 adding a workspace row.
 `e` opens the private definition editor for a paused schedule; it supports name,
 prompt, trigger presets or custom cron, and a searchable IANA timezone selector.
@@ -366,7 +366,7 @@ and troubleshooting.
 
 ## Coding-Agent Integrations
 
-Boomux includes optional integrations for OpenCode, Pi, Claude Code, and Codex. Guided
+Boomux includes optional integrations for OpenCode, Pi, Claude Code, Codex, and Kiro CLI. Guided
 setup previews every file change and asks before installing anything:
 
 ```console
@@ -377,6 +377,8 @@ boomux integration setup pi
 boomux integration setup claude
 # or
 boomux integration setup codex
+# or
+boomux integration setup kiro
 ```
 
 Restart the selected host after installation. For the seamless OpenCode workflow,
@@ -401,6 +403,14 @@ restart Codex and review and trust the Boomux hook with `/hooks`. Other Codex
 commands run unchanged and untracked; Boomux does not invent a Codex Remote URL.
 Explicit `codex --remote` clients are also untracked because their app-server
 environment does not prove the current Boomux ShellRun.
+
+Managed Kiro CLI launches use the v3 harness. After the Kiro hooks are installed,
+a bare `kiro-cli` in an eligible managed Shell runs as `kiro-cli --v3`; an
+explicit leading `--v3` is preserved. Kiro v2, service commands, absolute paths,
+modified `PATH`, and missing or modified hook installations remain unchanged and
+untracked. Kiro reports canonical session identity plus working and idle turn
+state; cloud launches remain untracked, and its hooks do not expose authoritative
+permission-wait, inactivity, or permanent-completion events.
 
 Only in an eligible Boomux login Shell, a scoped runtime `PATH` shim redirects
 that exact invocation internally to stock `opencode attach` for the Node's
@@ -526,8 +536,10 @@ max_concurrent = 4
 remote_control = true
 ```
 
-OpenCode receives the prompt as the final argument after `--`; Pi, Claude Code,
-and Codex receive the exact prompt on stdin. Codex dispatch uses `codex exec -`
+OpenCode and Kiro receive the prompt as an argument; Pi, Claude Code, and Codex
+receive the exact prompt on stdin. Kiro uses
+`kiro-cli --v3 chat --no-interactive [--resume-id <session-id>] -- <prompt>` and
+does not add trust overrides. Codex dispatch uses `codex exec -`
 for fresh work and `codex exec resume <thread-id> -` for continuation. Process
 exit, dispatch failure, cancellation,
 and cold interruption are execution outcomes and never report an Agent as done. Timed
@@ -646,7 +658,7 @@ the currently focused terminal. Set
 `dashboard.follow_focused_terminal` to `false` to disable this behavior.
 
 After a cold daemon restart, Boomux resumes a uniquely identified OpenCode, Pi,
-Claude, or Codex session when its interrupted shell is next started. Recovery requires
+Claude, Codex, or Kiro session when its interrupted shell is next started. Recovery requires
 a retained external session ID reported by the lifecycle integration; ambiguous,
 completed, or heuristic-only Agents fall back to the shell's configured command.
 Recovered OpenCode Sessions attach to the Shared Harness Runtime and establish a
@@ -730,10 +742,11 @@ Revision-aware output reads and daemon event cursors are documented in
 - Seamless shared OpenCode requires a bare zero-argument interactive invocation
   in an eligible managed login Shell; `--pure`, `--mini`, absolute paths,
   modified `PATH`, and conflicting same-Session Shells fail closed.
-- Pi and Codex Agents have no Open Web action in the mobile dashboard. Pi has
-  no native web handoff, while Codex Remote does not document an exact
+- Pi, Codex, and Kiro Agents have no Open Web action in the mobile dashboard. Pi
+  has no native web handoff, Codex Remote does not document an exact
   thread-specific browser or mobile deep link that Boomux can derive
-  authoritatively.
+  authoritatively, and Kiro does not document an exact cloud-session URL that
+  can be derived from a local CLI session ID.
 - Slow viewers may miss live output rather than block the managed process.
 - The native backend currently targets Unix/Linux desktop environments and is
   primarily exercised on Omarchy.

@@ -79,6 +79,14 @@ fn native_daemon_lifecycle() {
         capabilities["data"]["integration_hosts"]["codex"]["package"],
         "@openai/codex"
     );
+    assert_eq!(
+        capabilities["data"]["integration_hosts"]["kiro"]["validated_version"],
+        "2.18.0"
+    );
+    assert_eq!(
+        capabilities["data"]["integration_hosts"]["kiro"]["package"],
+        "kiro-cli"
+    );
     let json_commands = capabilities["data"]["json_commands"].as_array().unwrap();
     for command in [
         "events",

@@ -59,6 +59,12 @@ pub(crate) const CODEX_ASSET: &str = boomux::integrations::CODEX
     .as_ref()
     .expect("Codex installation capability")
     .content;
+#[cfg(test)]
+pub(crate) const KIRO_ASSET: &str = boomux::integrations::KIRO
+    .installation
+    .as_ref()
+    .expect("Kiro installation capability")
+    .content;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct IntegrationId(&'static IntegrationDescriptor);
@@ -67,6 +73,7 @@ impl IntegrationId {
     pub(crate) const OPENCODE: Self = Self(&boomux::integrations::OPENCODE);
     pub(crate) const PI: Self = Self(&boomux::integrations::PI);
     pub(crate) const CODEX: Self = Self(&boomux::integrations::CODEX);
+    pub(crate) const KIRO: Self = Self(&boomux::integrations::KIRO);
     #[allow(non_upper_case_globals)]
     pub(crate) const Opencode: Self = Self::OPENCODE;
     #[allow(non_upper_case_globals)]
@@ -74,6 +81,9 @@ impl IntegrationId {
     #[cfg(test)]
     #[allow(non_upper_case_globals)]
     pub(crate) const Codex: Self = Self::CODEX;
+    #[cfg(test)]
+    #[allow(non_upper_case_globals)]
+    pub(crate) const Kiro: Self = Self::KIRO;
     #[cfg(test)]
     #[allow(non_upper_case_globals)]
     pub(crate) const Claude: Self = Self(&boomux::integrations::CLAUDE);
@@ -121,6 +131,7 @@ pub(crate) struct Environment {
     pi_coding_agent_dir: Option<OsString>,
     claude_config_dir: Option<OsString>,
     codex_home: Option<OsString>,
+    kiro_home: Option<OsString>,
     path: Option<OsString>,
 }
 
@@ -132,6 +143,7 @@ impl Environment {
             pi_coding_agent_dir: env::var_os("PI_CODING_AGENT_DIR"),
             claude_config_dir: env::var_os("CLAUDE_CONFIG_DIR"),
             codex_home: env::var_os("CODEX_HOME"),
+            kiro_home: env::var_os("KIRO_HOME"),
             path: env::var_os("PATH"),
         }
     }
@@ -150,6 +162,7 @@ impl Environment {
             pi_coding_agent_dir,
             claude_config_dir,
             codex_home: None,
+            kiro_home: None,
             path,
         }
     }
@@ -944,6 +957,9 @@ fn config_root(id: IntegrationId, environment: &Environment) -> Result<PathBuf, 
         InstallTargetKind::Codex => {
             codex_config_root(environment.codex_home.clone(), environment.home.clone())
         }
+        InstallTargetKind::Kiro => {
+            kiro_config_root(environment.kiro_home.clone(), environment.home.clone())
+        }
     }
 }
 
@@ -965,6 +981,10 @@ fn target_at(id: IntegrationId, config_root: &Path) -> InstallTarget {
             directory: config_root.to_owned(),
             path: config_root.join("hooks.json"),
         },
+        InstallTargetKind::Kiro => InstallTarget {
+            directory: config_root.join("hooks"),
+            path: config_root.join("hooks/boomux.json"),
+        },
     }
 }
 
@@ -975,6 +995,7 @@ const fn config_root_name(id: IntegrationId) -> &'static str {
         InstallTargetKind::Pi => "Pi configuration root",
         InstallTargetKind::Claude => "Claude configuration root",
         InstallTargetKind::Codex => "Codex configuration root",
+        InstallTargetKind::Kiro => "Kiro configuration root",
     }
 }
 
@@ -1057,6 +1078,24 @@ pub(crate) fn codex_config_root(
         .join(".codex"),
     };
     require_absolute_root(&root, "Codex configuration root")?;
+    Ok(root)
+}
+
+pub(crate) fn kiro_config_root(
+    kiro_home: Option<OsString>,
+    home: Option<OsString>,
+) -> Result<PathBuf, Box<dyn Error>> {
+    let root = match kiro_home.filter(|value| !value.is_empty()) {
+        Some(root) => PathBuf::from(root),
+        None => PathBuf::from(home.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "HOME must be set to install the Boomux Kiro hooks",
+            )
+        })?)
+        .join(".kiro"),
+    };
+    require_absolute_root(&root, "Kiro configuration root")?;
     Ok(root)
 }
 
@@ -1542,6 +1581,7 @@ fn write_asset_atomically(directory: &Path, path: &Path, content: &str) -> io::R
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use boomux::protocol::{
@@ -1612,6 +1652,11 @@ mod tests {
             IntegrationId::Codex.installation().validated_version,
             "0.147.0"
         );
+        assert_eq!(IntegrationId::Kiro.installation().package, "kiro-cli");
+        assert_eq!(
+            IntegrationId::Kiro.installation().validated_version,
+            "2.18.0"
+        );
         assert!(IntegrationId::Claude.spec().titles.is_none());
         assert_eq!(
             IntegrationId::Claude
@@ -1659,6 +1704,43 @@ mod tests {
             Path::new("/home/example/.codex")
         );
         assert!(codex_config_root(Some("relative".into()), None).is_err());
+        assert_eq!(
+            kiro_config_root(Some("/kiro".into()), Some("/home/example".into())).unwrap(),
+            Path::new("/kiro")
+        );
+        assert_eq!(
+            kiro_config_root(Some(OsString::new()), Some("/home/example".into())).unwrap(),
+            Path::new("/home/example/.kiro")
+        );
+        assert!(kiro_config_root(Some("relative".into()), None).is_err());
+    }
+
+    #[test]
+    fn kiro_asset_defines_required_non_deciding_hooks() {
+        let document: Value = serde_json::from_str(KIRO_ASSET).unwrap();
+        assert_eq!(document["version"], "v1");
+        let hooks = document["hooks"].as_array().unwrap();
+        assert_eq!(hooks.len(), 5);
+        let triggers = hooks
+            .iter()
+            .map(|hook| hook["trigger"].as_str().unwrap())
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            triggers,
+            HashSet::from([
+                "SessionStart",
+                "UserPromptSubmit",
+                "PreToolUse",
+                "PostToolUse",
+                "Stop",
+            ])
+        );
+        for hook in hooks {
+            assert_eq!(hook["action"]["type"], "command");
+            assert_eq!(hook["action"]["command"], "boomux kiro hook");
+            assert_eq!(hook["timeout"], 5);
+            assert!(hook.get("confirm").is_none());
+        }
     }
 
     #[test]
@@ -1908,6 +1990,40 @@ mod tests {
                 .result,
             InstallOutcome::Replaced
         );
+    }
+
+    #[test]
+    fn kiro_install_owns_only_its_dedicated_hook_file() {
+        let home = TestDirectory::new("kiro-install");
+        let mut environment = environment(&home.0);
+        environment.kiro_home = Some(home.0.join("kiro-home").into_os_string());
+        let installed = install(IntegrationId::Kiro, &environment, false).unwrap();
+        let path = PathBuf::from(&installed.path);
+        assert_eq!(path, home.0.join("kiro-home/hooks/boomux.json"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), KIRO_ASSET);
+        assert_eq!(
+            install(IntegrationId::Kiro, &environment, false)
+                .unwrap()
+                .result,
+            InstallOutcome::Unchanged
+        );
+
+        fs::write(&path, "custom").unwrap();
+        assert!(install(IntegrationId::Kiro, &environment, false).is_err());
+        assert_eq!(
+            install(IntegrationId::Kiro, &environment, true)
+                .unwrap()
+                .result,
+            InstallOutcome::Replaced
+        );
+        assert_eq!(
+            uninstall(IntegrationId::Kiro, &environment, false)
+                .unwrap()
+                .result,
+            UninstallOutcome::Removed
+        );
+        assert!(!path.exists());
+        assert!(path.parent().unwrap().is_dir());
     }
 
     #[test]

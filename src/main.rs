@@ -44,6 +44,7 @@ mod git;
 mod host_session_source;
 mod host_session_titles;
 mod integration_management;
+mod kiro_hooks;
 mod mobile_web;
 mod process_adapter;
 mod projects;
@@ -518,6 +519,12 @@ enum Commands {
     Codex {
         #[command(subcommand)]
         command: CodexCommands,
+    },
+    /// Receive Kiro CLI lifecycle hooks
+    #[command(hide = true)]
+    Kiro {
+        #[command(subcommand)]
+        command: KiroCommands,
     },
     /// Open a shell in a new terminal window
     Open {
@@ -1309,6 +1316,19 @@ enum CodexCommands {
 }
 
 #[derive(Subcommand)]
+enum KiroCommands {
+    /// Receive one lifecycle event on standard input
+    #[command(hide = true)]
+    Hook,
+    /// Launch Kiro v3 with run-scoped lifecycle authority
+    #[command(hide = true)]
+    Launch {
+        #[arg(last = true, allow_hyphen_values = true)]
+        arguments: Vec<OsString>,
+    },
+}
+
+#[derive(Subcommand)]
 enum IntegrationCommands {
     /// List integrations bundled with this Boomux binary
     List,
@@ -1495,6 +1515,8 @@ command_keys! {
     ClaudeHook => ("claude.hook", HumanOnly),
     CodexHook => ("codex.hook", HumanOnly),
     CodexLaunch => ("codex.launch", HumanOnly),
+    KiroHook => ("kiro.hook", HumanOnly),
+    KiroLaunch => ("kiro.launch", HumanOnly),
     Open => ("open", HumanOnly),
     Prompt => ("prompt", HumanOnly),
     DaemonStatus => ("daemon.status", Json),
@@ -1748,6 +1770,12 @@ impl Cli {
             Some(Commands::Codex {
                 command: CodexCommands::Launch { .. },
             }) => CommandKey::CodexLaunch,
+            Some(Commands::Kiro {
+                command: KiroCommands::Hook,
+            }) => CommandKey::KiroHook,
+            Some(Commands::Kiro {
+                command: KiroCommands::Launch { .. },
+            }) => CommandKey::KiroLaunch,
             Some(Commands::Open { .. }) => CommandKey::Open,
             Some(Commands::Prompt) => CommandKey::Prompt,
             Some(Commands::Attach { .. }) => CommandKey::Attach,
@@ -2112,6 +2140,17 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
         Some(Commands::Codex {
             command: CodexCommands::Launch { arguments },
         }) => launch_codex(arguments),
+        Some(Commands::Kiro {
+            command: KiroCommands::Hook,
+        }) => {
+            if let Err(error) = kiro_hook_command() {
+                eprintln!("boomux kiro hook: {error}");
+            }
+            Ok(())
+        }
+        Some(Commands::Kiro {
+            command: KiroCommands::Launch { arguments },
+        }) => launch_kiro(arguments),
         Some(Commands::Open {
             shell_id,
             node,
@@ -9208,25 +9247,25 @@ fn scheduled_runner(schedule_id: &str) -> Result<process_adapter::ProcessExit, B
     let claim = retry_runner_request(|client| {
         client.resolve_scheduled_execution_claim(schedule_id, &shell_id, &run_id, &runner_token)
     })?;
-    let descriptor = boomux::integrations::by_key(&claim.execution.integration)
-        .and_then(|descriptor| descriptor.schedule_dispatch)
+    let integration = boomux::integrations::by_key(&claim.execution.integration)
+        .ok_or_else(|| io::Error::other("scheduled integration dispatch is unavailable"))?;
+    let descriptor = integration
+        .schedule_dispatch
         .ok_or_else(|| io::Error::other("scheduled integration dispatch is unavailable"))?;
     let dispatch = descriptor
-        .command(
-            &claim.execution.integration,
-            &claim.execution.session,
-            &claim.prompt,
-        )
+        .command(&claim.execution.session, &claim.prompt)
         .ok_or_else(|| io::Error::other("scheduled integration mode is unavailable"))?;
-    let codex_dispatch = claim.execution.integration == "codex";
-    let mut command = if codex_dispatch {
+    let mut command = if integration.run_scoped_launcher.is_some() {
         Command::new(env::current_exe()?)
     } else {
         Command::new(&dispatch.argv[0])
     };
     sanitize_inherited_opencode_shim(&mut command);
-    if codex_dispatch {
-        command.args(["codex", "launch", "--"]);
+    if let Some(launcher) = integration.run_scoped_launcher {
+        command.args(match launcher {
+            boomux::integrations::RunScopedLauncher::Codex => ["codex", "launch", "--"],
+            boomux::integrations::RunScopedLauncher::Kiro => ["kiro", "launch", "--"],
+        });
     }
     command
         .args(&dispatch.argv[1..])
@@ -10268,6 +10307,100 @@ fn resolve_real_codex() -> io::Result<PathBuf> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Codex executable was not found"))
 }
 
+fn kiro_hook_command() -> Result<(), Box<dyn Error>> {
+    if env::var("BOOMUX_KIRO_RUN_SCOPED").as_deref() != Ok("1") {
+        return Ok(());
+    }
+    let (shell_id, run_id) = match (
+        env::var("BOOMUX_SHELL_ID").ok(),
+        env::var("BOOMUX_RUN_ID").ok(),
+    ) {
+        (Some(shell_id), Some(run_id)) => {
+            resolve_agent_context(None, None, Some(shell_id), Some(run_id))?
+        }
+        _ => return Ok(()),
+    };
+    let update = kiro_hooks::read_update(io::stdin().lock())?;
+    let observation = update.observation;
+    let report = AgentReport {
+        state: observation.state,
+        authority: AgentAuthority::LifecycleIntegration,
+        evidence: observation.evidence.into(),
+        confidence: 100,
+    };
+    let client = client::connect_or_start()?;
+    let agent = client.ensure_agent(
+        &shell_id,
+        &run_id,
+        AgentRegistrationSpec {
+            name: "Kiro CLI".into(),
+            integration: "kiro".into(),
+            external_session_id: Some(update.session_id),
+            report: report.clone(),
+        },
+    )?;
+    if agent.ended_at_ms.is_none()
+        && (agent.observation.state != report.state
+            || agent.observation.authority != report.authority
+            || agent.observation.evidence != report.evidence
+            || agent.observation.confidence != report.confidence)
+    {
+        client.report_agent(&agent.id, &run_id, report)?;
+    }
+    Ok(())
+}
+
+fn launch_kiro(arguments: Vec<OsString>) -> Result<(), Box<dyn Error>> {
+    let executable = resolve_real_kiro()?;
+    let explicit_v3 = arguments.first().is_some_and(|argument| argument == "--v3")
+        && !arguments.iter().any(|argument| argument == "--cloud");
+    let managed_v3 = arguments.is_empty() || explicit_v3;
+    let environment = integration_management::Environment::from_process();
+    let hooks_current = integration_management::inspect_without_host_probe(
+        integration_management::IntegrationId::KIRO,
+        &environment,
+        None,
+    )
+    .asset
+    .state
+        == integration_management::AssetState::Current;
+    let mut command = Command::new(executable);
+    sanitize_inherited_opencode_shim(&mut command);
+    if managed_v3 && hooks_current {
+        if arguments.is_empty() {
+            command.arg("--v3");
+        }
+        command.env("BOOMUX_KIRO_RUN_SCOPED", "1");
+    } else {
+        command.env_remove("BOOMUX_KIRO_RUN_SCOPED");
+    }
+    command.args(arguments);
+    Err(command.exec().into())
+}
+
+fn resolve_real_kiro() -> io::Result<PathBuf> {
+    if let Some(path) = env::var_os("BOOMUX_REAL_KIRO").map(PathBuf::from) {
+        let metadata = fs::metadata(&path)?;
+        if path.is_absolute() && metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 {
+            return Ok(path);
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "BOOMUX_REAL_KIRO must identify an absolute regular executable",
+        ));
+    }
+    let shim_dir = env::var_os("BOOMUX_OPENCODE_SHIM_DIR").map(PathBuf::from);
+    env::split_paths(&env::var_os("PATH").unwrap_or_default())
+        .filter(|directory| shim_dir.as_deref() != Some(directory.as_path()))
+        .map(|directory| directory.join("kiro-cli"))
+        .find(|candidate| {
+            fs::metadata(candidate).is_ok_and(|metadata| {
+                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+            })
+        })
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Kiro executable was not found"))
+}
+
 fn resolve_agent_context(
     shell_id: Option<String>,
     run_id: Option<String>,
@@ -10898,7 +11031,9 @@ fn sanitize_inherited_opencode_shim(command: &mut Command) {
     for name in [
         "BOOMUX_REAL_OPENCODE",
         "BOOMUX_REAL_CODEX",
+        "BOOMUX_REAL_KIRO",
         "BOOMUX_CODEX_RUN_SCOPED",
+        "BOOMUX_KIRO_RUN_SCOPED",
         "BOOMUX_ORIGINAL_PATH",
         "BOOMUX_OPENCODE_SHIM_DIR",
         "BOOMUX_OPENCODE_TUI_CONFIG",
@@ -13802,6 +13937,41 @@ mod tests {
     }
 
     #[test]
+    fn parses_hidden_kiro_commands_without_interpreting_arguments() {
+        let hook = Cli::try_parse_from(["boomux", "kiro", "hook"]).unwrap();
+        assert!(matches!(
+            hook.command,
+            Some(Commands::Kiro {
+                command: KiroCommands::Hook,
+            })
+        ));
+        assert_eq!(hook.command_descriptor().key, "kiro.hook");
+
+        let launch = Cli::try_parse_from([
+            "boomux",
+            "kiro",
+            "launch",
+            "--",
+            "--v3",
+            "chat",
+            "session; literal",
+        ])
+        .unwrap();
+        assert!(matches!(
+            launch.command,
+            Some(Commands::Kiro {
+                command: KiroCommands::Launch { ref arguments },
+            }) if arguments.as_slice()
+                == [
+                    OsString::from("--v3"),
+                    OsString::from("chat"),
+                    OsString::from("session; literal"),
+                ].as_slice()
+        ));
+        assert_eq!(launch.command_descriptor().key, "kiro.launch");
+    }
+
+    #[test]
     fn event_snapshot_json_includes_stable_agent_data() {
         let mut project = workspace("w1", "project", vec![shell("s1", "w1", "shell")]);
         project.agents.push(agent("a1", "w1", "s1"));
@@ -14301,6 +14471,21 @@ mod tests {
     fn workspace_view_hints_exact_codex_foreground_process_before_first_prompt() {
         let mut hinted = shell("s1", "w1", "terminal");
         hinted.foreground_process = Some("codex".into());
+        let workspace = workspace("w1", "project", vec![hinted]);
+
+        let views = dashboard_views(&[workspace], &mut git::Cache::default());
+
+        let tui::WorkspaceItemView::AgentShell(item) = &views[0].items[0] else {
+            panic!("expected hinted agent-shell item");
+        };
+        assert_eq!(item.shell.name, "terminal");
+        assert!(item.agent.is_none());
+    }
+
+    #[test]
+    fn workspace_view_hints_exact_kiro_foreground_process_before_first_prompt() {
+        let mut hinted = shell("s1", "w1", "terminal");
+        hinted.foreground_process = Some("kiro-cli".into());
         let workspace = workspace("w1", "project", vec![hinted]);
 
         let views = dashboard_views(&[workspace], &mut git::Cache::default());
@@ -15172,7 +15357,8 @@ mod tests {
              opencode  opencode-ai                      1.18.18\n\
              pi        @earendil-works/pi-coding-agent  0.84.1\n\
              claude    @anthropic-ai/claude-code        2.1.236\n\
-             codex     @openai/codex                    0.147.0\n"
+             codex     @openai/codex                    0.147.0\n\
+             kiro      kiro-cli                         2.18.0\n"
         );
 
         let status = integration_management::IntegrationStatus {

@@ -33,7 +33,7 @@
 | `src/host_session_titles.rs` and children | Shared title/catalog policy and host-specific discovery adapters |
 | `src/host_session_source.rs` and children | Canonical host source paths, normalization, and secure source lookup |
 | `src/integration_management.rs` | Integration inventory, status, setup, verification, install, and uninstall workflows |
-| `src/claude_hooks.rs`, `src/codex_hooks.rs` | Bounded Claude Code and Codex hook decoding and root Session lifecycle reduction |
+| `src/claude_hooks.rs`, `src/codex_hooks.rs`, `src/kiro_hooks.rs` | Bounded Claude Code, Codex, and Kiro hook decoding and root Session lifecycle reduction |
 | `src/process_adapter.rs` | Exact-argv child supervision and fail-open process-bound Agent observation |
 | `src/scheduling.rs` | Bounded canonical cron parsing and occurrence evaluation, IANA timezone and DST policy, prompt bounds, and schedule identity validation |
 | `src/config.rs` | Layered configuration resolution, bounded validation, and transactional active-layer editing |
@@ -705,7 +705,7 @@ with an Agent-ID tie-break. Completed, stale-run, and orphaned Agent records
 remain available through CLI inspection but do not occupy dashboard rows. A
 running shell snapshot may also expose its PTY foreground process name. The
 dashboard recognizes exact registered host processes, including `opencode`, `pi`,
-`claude`, and `codex`, as presentation-only agent-shell hints
+`claude`, `codex`, and `kiro-cli`, as presentation-only agent-shell hints
 before a canonical Agent session exists; this hint creates no AgentInstance,
 durable state observation, persistence, or events. It displays `untracked` until
 lifecycle data exists, then yields to that authoritative observation. `doctor`
@@ -765,9 +765,11 @@ integration-owned argv builders without shell interpretation. The capability is
 persisted with private dispatch input, supplied only to that runner's ephemeral
 environment, removed before the external host is spawned, and required for claim
 resolution and outcome reports. OpenCode uses `opencode run [--session exact-id]
--- prompt`. Pi uses `pi [--session exact-full-id] --print`, while Claude Code
-uses `claude --print [--resume exact-id]`; both receive the exact prompt on stdin
-and close stdin. Host stdout and stderr remain on the PTY. The runner
+-- prompt`. Kiro uses `kiro-cli --v3 chat --no-interactive [--resume-id exact-id]
+prompt`; both expose the prompt as one exact argv element. Pi uses `pi [--session
+exact-full-id] --print`, while Claude Code uses `claude --print [--resume
+exact-id]`; Pi, Claude Code, and Codex receive exact prompt bytes on stdin and
+close stdin. Host stdout and stderr remain on the PTY. The runner
 retries daemon connections through handoff without starting a daemon.
 
 Scheduling is process orchestration, not lifecycle observation. Spawn failure,
@@ -1211,6 +1213,45 @@ and capability shapes, so they require no protocol or durable-state version
 change. Boomux exposes no Codex Remote handoff because Codex documents no exact
 thread-specific Remote URL; it does not reinterpret `codex://threads/ID` as a
 phone-accessible Remote destination.
+
+### Kiro CLI Lifecycle Integration
+
+The Kiro descriptor targets `kiro-cli` `2.18.0` with its opt-in v3 harness as a
+compatibility point. Installation owns the dedicated
+`${KIRO_HOME:-$HOME/.kiro}/hooks/boomux.json` file and registers non-deciding
+SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, and Stop command hooks.
+The ordinary bounded, symlink-safe, atomic integration installer applies because
+Boomux does not share that file with unrelated Kiro configuration.
+
+Eligible managed Kiro invocations pass through the common Shell-scoped shim and
+hidden launcher. A bare `kiro-cli` becomes `kiro-cli --v3`, while an explicit
+leading `--v3` is preserved. Both receive `BOOMUX_KIRO_RUN_SCOPED=1` only while
+the installed asset is current. Kiro v2 and service invocations, absolute paths
+typed in a login Shell,
+modified PATHs, absent or modified assets, and use outside Boomux execute stock
+Kiro unchanged and untracked. Exact configured executable paths are retained
+through `BOOMUX_REAL_KIRO`; private launcher provenance is removed from unrelated
+children.
+
+Kiro hook `session_id` is the canonical Session identity and ensures the exact
+`(kiro, session, shell, run)` Agent key. SessionStart and Stop report Idle;
+prompt and tool events report Working. The documented hooks expose no
+authoritative permission-wait, session-inactivity, error, or permanent-completion
+event, so Boomux never derives Blocked, Inactive, or Done for Kiro. If one Kiro
+process switches canonical Sessions without ending the old one, both histories
+remain truthful and cold recovery refuses the resulting ambiguity rather than
+guessing.
+
+Exact resume uses `kiro-cli --v3 chat --resume-id <session-id>`. Scheduled work
+uses `kiro-cli --v3 chat --no-interactive --` with the exact prompt as one argv
+element and an optional exact `--resume-id`; Boomux adds no trust override.
+Scheduled and cold-recovery launches use the run-scoped launcher. Kiro title and
+cloud catalogs are not projected. Although Kiro cloud sessions can be viewed in
+Kiro Web and Mobile, Kiro documents no exact browser URL derivable from a local
+CLI Session ID, and cloud hooks execute in Kiro's sandbox rather than under the
+local ShellRun. Boomux therefore exposes no Kiro native web handoff or cloud
+lifecycle authority. Existing Agent, Session, Schedule, and recovery shapes are
+reused without a protocol or durable-state version change.
 
 ### Claude Code Lifecycle Integration
 
