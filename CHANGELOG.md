@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.25.1](https://github.com/gardnmi/boomux/compare/v0.25.0...v0.25.1) (2026-08-22)
+
+
+### Code Refactoring
+
+* remove dead code and consolidate shared paths ([#239](https://github.com/gardnmi/boomux/issues/239)) ([d85b025](https://github.com/gardnmi/boomux/commit/d85b025f85da9b67376460917518cefe0de79855))
+
 ## [0.25.0](https://github.com/gardnmi/boomux/compare/v0.24.0...v0.25.0) (2026-08-22)
 
 
