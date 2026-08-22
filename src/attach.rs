@@ -20,6 +20,12 @@ const DISABLE_FOCUS_REPORTING: &[u8] = b"\x1b[?1004l";
 
 struct RawMode;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PumpOutcome {
+    Detached,
+    Reconnect,
+}
+
 const FOCUS_GAINED: &[u8] = b"\x1b[I";
 const FOCUS_LOST: &[u8] = b"\x1b[O";
 
@@ -169,14 +175,15 @@ pub fn run(
             let mut stream = attachment.stream;
             resynchronize_terminal_size(&mut stream, size)?;
 
-            if !pump_attachment(
+            let outcome = pump_attachment(
                 &mut stream,
                 &mut stdin,
                 &mut stdout,
                 &mut input,
                 &mut size,
                 &mut focus,
-            )? {
+            )?;
+            if outcome == PumpOutcome::Detached {
                 return Ok(());
             }
             if let Ok((rows, cols, pixel_width, pixel_height)) = dimensions() {
@@ -186,14 +193,7 @@ pub fn run(
                 profile.pixel_width = pixel_width;
                 profile.pixel_height = pixel_height;
             }
-            attachment = reconnect(
-                &client,
-                shell_id,
-                node_id,
-                takeover,
-                expected_run_id,
-                &profile,
-            )?;
+            attachment = reconnect(&client, shell_id, node_id, false, expected_run_id, &profile)?;
         }
     })();
     if focus_reporting {
@@ -275,8 +275,8 @@ fn reconnect(
     expected_run_id: Option<&str>,
     profile: &TerminalProfile,
 ) -> client::Result<client::Attachment> {
-    let mut last_error = None;
-    for _ in 0..RECONNECT_ATTEMPTS {
+    let mut attempts = 0;
+    let error = loop {
         match attach_once(
             client,
             shell_id,
@@ -290,13 +290,29 @@ fn reconnect(
             Err(error) if exact_reconnect_error_is_permanent(expected_run_id, &error) => {
                 return Err(error);
             }
-            Err(error) => last_error = Some(error),
+            Err(error) if controller_busy(&error) => {}
+            Err(error) => {
+                attempts += 1;
+                if attempts >= RECONNECT_ATTEMPTS {
+                    break error;
+                }
+            }
         }
         thread::sleep(RECONNECT_DELAY);
-    }
+    };
     Err(client::ClientError::Lifecycle(
-        client::LifecycleError::AttachmentReconnectTimeout(last_error.map(Box::new)),
+        client::LifecycleError::AttachmentReconnectTimeout(Some(Box::new(error))),
     ))
+}
+
+fn controller_busy(error: &client::ClientError) -> bool {
+    matches!(
+        error,
+        client::ClientError::Remote(client::RemoteError {
+            code: Some(crate::protocol::ErrorCode::Busy),
+            ..
+        })
+    )
 }
 
 fn exact_reconnect_error_is_permanent(
@@ -307,7 +323,9 @@ fn exact_reconnect_error_is_permanent(
         && matches!(
             error,
             client::ClientError::Remote(client::RemoteError {
-                code: Some(crate::protocol::ErrorCode::RunChanged),
+                code: Some(
+                    crate::protocol::ErrorCode::RunChanged | crate::protocol::ErrorCode::NotFound
+                ),
                 ..
             })
         )
@@ -357,7 +375,7 @@ fn pump_attachment(
     input: &mut [u8],
     size: &mut (u16, u16, u16, u16),
     focus: &mut FocusTracking,
-) -> io::Result<bool> {
+) -> io::Result<PumpOutcome> {
     loop {
         let mut descriptors = [
             libc::pollfd {
@@ -400,14 +418,14 @@ fn pump_attachment(
                     }
                     stdout.flush()?;
                 }
-                Ok(AttachFrame::Detached) => return Ok(false),
+                Ok(AttachFrame::Detached) => return Ok(PumpOutcome::Detached),
                 Ok(AttachFrame::Reconnect) => {
                     let pending = focus.input.flush_pending();
                     if !pending.is_empty() {
                         AttachFrame::Input(pending).write_to(stream)?;
                     }
                     let _ = AttachFrame::ReconnectAck.write_to(stream);
-                    return Ok(true);
+                    return Ok(PumpOutcome::Reconnect);
                 }
                 Ok(_) => {
                     return Err(io::Error::new(
@@ -415,7 +433,9 @@ fn pump_attachment(
                         "daemon sent an invalid attach frame",
                     ));
                 }
-                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(false),
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
+                    return Ok(PumpOutcome::Detached);
+                }
                 Err(error) => return Err(error),
             }
         }
@@ -427,7 +447,7 @@ fn pump_attachment(
                     AttachFrame::Input(pending).write_to(stream)?;
                 }
                 AttachFrame::Detached.write_to(stream)?;
-                return Ok(false);
+                return Ok(PumpOutcome::Detached);
             }
             if focus.enabled {
                 let (forwarded, gained) = focus
@@ -605,7 +625,7 @@ mod tests {
         .unwrap();
 
         sender.join().unwrap();
-        assert!(reconnect);
+        assert_eq!(reconnect, PumpOutcome::Reconnect);
         assert_eq!(stdout, b"before-reconnect");
     }
 
@@ -656,7 +676,7 @@ mod tests {
         .unwrap();
 
         sender.join().unwrap();
-        assert!(!reconnect);
+        assert_eq!(reconnect, PumpOutcome::Detached);
     }
 
     #[test]
@@ -697,7 +717,7 @@ mod tests {
         .unwrap();
 
         sender.join().unwrap();
-        assert!(!reconnect);
+        assert_eq!(reconnect, PumpOutcome::Detached);
         assert_eq!(stdout, b"before\x1b[?1004;2004lafter\x1b[?1004h");
     }
 

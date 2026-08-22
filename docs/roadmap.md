@@ -79,12 +79,14 @@ terminal handshake, VT reconstruction, and restart-persistence plan.
 
 ## Mobile Web Terminal
 
-- Explore a real browser terminal for an exact ShellRun as a separate workstream
-  from harness-native OpenCode and Pi web handoff. Keep the daemon authoritative
-  for PTY ownership, run identity, reconstruction, and controller leases; begin
-  with a bounded read-only observer before considering input or takeover. Compare
-  `ghostty-web`, xterm.js, and future upstream `libghostty` browser support while
-  keeping renderer choice independent from transport. See
+- [x] Add integration-independent exact-run browser control for current local
+  Agents with one-use same-origin grants, self-hosted terminal assets, bounded
+  PTY transport, and native-controller reacquisition after browser release.
+- Add a bounded read-only observer contract before presenting passive views and
+  evaluate owner-routed remote Agent terminals separately. Track upstream
+  `libghostty` browser distribution and renderer alternatives to the current
+  `ghostty-web` integration while keeping renderer choice independent from
+  transport. See
   [`brainstorms/2026-08-18-mobile-web-terminal.md`](brainstorms/2026-08-18-mobile-web-terminal.md).
 
 ## Agent Workflows

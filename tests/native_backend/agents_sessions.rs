@@ -250,11 +250,11 @@ fn kiro_hook_requires_v3_run_scope_and_reuses_exact_session_agent() {
     );
 
     for (event, expected) in [
-        ("SessionStart", AgentState::Idle),
+        ("SessionStart", AgentState::Unknown),
         ("UserPromptSubmit", AgentState::Working),
         ("PreToolUse", AgentState::Working),
         ("PostToolUse", AgentState::Working),
-        ("Stop", AgentState::Idle),
+        ("Stop", AgentState::Unknown),
     ] {
         run_hook(event, true);
         let agents = &daemon.client.snapshot().unwrap().workspaces[0].agents;
@@ -267,7 +267,7 @@ fn kiro_hook_requires_v3_run_scope_and_reuses_exact_session_agent() {
         assert_eq!(agents[0].observation.state, expected, "{event}");
         assert!(!matches!(
             agents[0].observation.state,
-            AgentState::Blocked | AgentState::Inactive | AgentState::Done
+            AgentState::Blocked | AgentState::Idle | AgentState::Inactive | AgentState::Done
         ));
     }
 

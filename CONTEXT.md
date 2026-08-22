@@ -141,6 +141,16 @@ Bindings transfer during graceful daemon handoff while the exact process and
 ShellRun survive, but are absent after cold recovery and disappear when later
 hook evidence clears them or their exact Agent/ShellRun is no longer current.
 
+## Web Terminal Grant
+
+A bounded, one-use, short-lived gateway authorization for one exact current local
+Agent, Shell, and ShellRun. It permits the same-origin browser to request the
+existing daemon-owned terminal controller; it is not a Shell controller, Agent
+Session claim, lifecycle authority, credential, durable resource, or remote Node
+projection. Consumption or expiry removes the grant. The daemon independently
+revalidates the exact ShellRun when the browser joins as a collaborative terminal
+participant. The primary native controller remains resize authority.
+
 ## Agent Schedule
 
 A durable workspace-owned definition for recurring prompt-driven Agent work with fixed execution

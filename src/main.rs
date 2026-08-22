@@ -52,6 +52,7 @@ mod session_projection;
 mod tailscale_serve;
 mod terminal;
 mod tui;
+mod web_terminal;
 
 const DASHBOARD_FALLBACK_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const DASHBOARD_EXECUTION_CACHE_LIMIT: u16 = 1_000;
@@ -15754,7 +15755,7 @@ mod tests {
                 .validated_version,
             "2.1.236"
         );
-        assert_eq!(protocol::PROTOCOL_VERSION, 43);
+        assert_eq!(protocol::PROTOCOL_VERSION, 44);
     }
 
     #[test]

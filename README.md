@@ -408,9 +408,21 @@ Managed Kiro CLI launches use the v3 harness. After the Kiro hooks are installed
 a bare `kiro-cli` in an eligible managed Shell runs as `kiro-cli --v3`; an
 explicit leading `--v3` is preserved. Kiro v2, service commands, absolute paths,
 modified `PATH`, and missing or modified hook installations remain unchanged and
-untracked. Kiro reports canonical session identity plus working and idle turn
-state; cloud launches remain untracked, and its hooks do not expose authoritative
-permission-wait, inactivity, or permanent-completion events.
+untracked. Kiro reports canonical session identity and working activity. Its
+standalone hooks do not distinguish root from sub-agent start and stop events, so
+those boundaries report unknown rather than idle and cannot produce completion
+notifications. Cloud launches remain untracked, and Kiro exposes no authoritative
+permission-wait, inactivity, or permanent-completion hook events.
+
+The mobile dashboard offers **Open in Web Terminal** for every exact current
+local Agent, independent of harness integration. It opens a self-hosted browser
+terminal for that Agent's existing ShellRun in addition to any available native
+web handoff; it does not translate the conversation or connect local and cloud
+Sessions.
+The browser joins the daemon's protocol-44 collaborative exact-run attachment.
+The current desktop terminal stays attached and writable, both participants
+receive output, and either may submit whole input frames. The native primary
+controller remains the sole PTY resize authority.
 
 Only in an eligible Boomux login Shell, a scoped runtime `PATH` shim redirects
 that exact invocation internally to stock `opencode attach` for the Node's
@@ -735,15 +747,16 @@ Revision-aware output reads and daemon event cursors are documented in
   mutated process environments are not restored.
 - Graphical terminal content and alternate-screen history cannot be fully
   reconstructed when a terminal reconnects.
-- One terminal window controls input for a shell at a time. Taking control from
-  another window disconnects the previous window from that shell.
-- The mobile dashboard does not expose terminal output or structured Agent
-  conversation history; its only mutation is exact local attention dismissal.
+- One ordinary native attachment is the primary controller. An explicit native
+  takeover disconnects that primary and every browser collaborator.
+- The mobile dashboard does not expose structured Agent conversation history.
+  Its browser terminal is exact current-run PTY access, not a transcript API.
 - Seamless shared OpenCode requires a bare zero-argument interactive invocation
   in an eligible managed login Shell; `--pure`, `--mini`, absolute paths,
   modified `PATH`, and conflicting same-Session Shells fail closed.
-- Pi, Codex, and Kiro Agents have no Open Web action in the mobile dashboard. Pi
-  has no native web handoff, Codex Remote does not document an exact
+- Pi, Codex, and Kiro Agents have no harness-native Open Web action in the mobile
+  dashboard. They still offer the generic web terminal while Pi has no native
+  web handoff, Codex Remote does not document an exact
   thread-specific browser or mobile deep link that Boomux can derive
   authoritatively, and Kiro does not document an exact cloud-session URL that
   can be derived from a local CLI session ID.

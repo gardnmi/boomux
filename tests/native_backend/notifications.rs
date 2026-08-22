@@ -89,6 +89,8 @@ fn desktop_notifications_are_deduplicated_private_and_survive_handoff() {
 
     for (state, evidence, expected) in [
         (AgentState::Working, "resumed", 1),
+        (AgentState::Unknown, "ambiguous execution boundary", 1),
+        (AgentState::Working, "resumed after boundary", 1),
         (AgentState::Idle, "turn completed", 2),
         (AgentState::Working, "next turn", 2),
         (AgentState::Blocked, "blocked again", 3),

@@ -16,16 +16,21 @@ paths, modified PATHs, and missing or modified hook assets run unchanged and
 untracked. The launcher preserves an exact configured executable through
 `BOOMUX_REAL_KIRO` and strips private provenance from unrelated children.
 
-SessionStart and Stop establish Idle; prompt and tool events establish Working.
-Kiro exposes no authoritative permission-wait, inactivity, or permanent root
-Session completion event through these hooks, so Boomux does not infer Blocked,
-Inactive, or Done. If a process switches canonical Sessions without an end event,
-Boomux preserves both histories and refuses ambiguous cold recovery.
+Prompt and tool events establish Working. Kiro runs hooks in isolated sub-agent
+executions, while standalone SessionStart and Stop payloads do not identify the
+root execution. Those boundary events therefore establish Unknown rather than
+Idle and cannot cause completion notifications. Kiro exposes no authoritative
+permission-wait, inactivity, or permanent root Session completion event through
+these hooks, so Boomux does not infer Blocked, Idle, Inactive, or Done. If a
+process switches canonical Sessions without an end event, Boomux preserves both
+histories and refuses ambiguous cold recovery.
 
 Kiro cloud sessions are a separate remote execution environment. Local global
 hooks do not establish cloud lifecycle authority, and Kiro documents no stable
 exact-session browser URL that Boomux can derive from a local Session ID. Boomux
-therefore adds no cloud catalog or native web handoff.
+therefore adds no cloud catalog or native Kiro web handoff. The separate Boomux
+browser-terminal controller is bound to an exact local ShellRun and does not
+claim cloud or Kiro Session handoff authority.
 
 Rejected alternatives were:
 

@@ -1223,12 +1223,14 @@ fn attach_with_environment(
             token,
             reconstruction,
             warning,
+            profile,
         } => Attachment {
             stream,
             token,
             reconstruction,
             warning,
             protocol_version: 16,
+            profile,
         },
         response => panic!("unexpected attach response: {response:?}"),
     }

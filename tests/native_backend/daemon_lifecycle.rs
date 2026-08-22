@@ -822,6 +822,10 @@ fn native_daemon_lifecycle() {
     loop {
         match AttachFrame::read_from(&mut second) {
             Ok(AttachFrame::Output(_)) => continue,
+            Ok(AttachFrame::Reconnect) => {
+                let _ = AttachFrame::ReconnectAck.write_to(&mut second);
+                break;
+            }
             Err(_) => break,
             Ok(frame) => panic!("old controller received unexpected frame: {frame:?}"),
         }

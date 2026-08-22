@@ -5,12 +5,13 @@
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
     <meta name="theme-color" content="#0b0d17">
     <meta name="color-scheme" content="dark">
-    <meta name="description" content="A read-only view of Boomux agents across connected nodes.">
-    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; manifest-src 'self'; worker-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'">
+    <meta name="description" content="Monitor Boomux agents and control their current terminals remotely.">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; font-src 'self' data:; img-src 'self' data:; connect-src 'self'; manifest-src 'self'; worker-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'">
     <link rel="manifest" href="manifest.webmanifest">
     <link rel="icon" href="icon.svg" type="image/svg+xml">
     <link rel="apple-touch-icon" href="icon-192.png">
     <link rel="stylesheet" href="styles.css">
+    <link rel="stylesheet" href="terminal.css">
     <title>Boomux Agents</title>
   </head>
   <body>
@@ -68,6 +69,8 @@
       </section>
 
     </main>
+
+    <footer class="site-footer"><a href="third-party-notices.txt">Third-party notices</a></footer>
 
     <noscript><p class="noscript">JavaScript is required to view the live agent dashboard.</p></noscript>
     <script type="module" src="app.js"></script>

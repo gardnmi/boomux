@@ -74,11 +74,11 @@ fn read_bounded_input(mut reader: impl Read) -> io::Result<Vec<u8>> {
 
 fn reduce(event: HookEvent) -> LifecycleObservation {
     let (state, evidence) = match event {
-        HookEvent::SessionStart => (AgentState::Idle, "Kiro session idle"),
+        HookEvent::SessionStart => (AgentState::Unknown, "Kiro hook execution started"),
         HookEvent::UserPromptSubmit => (AgentState::Working, "Kiro processing prompt"),
         HookEvent::PreToolUse => (AgentState::Working, "Kiro using tool"),
         HookEvent::PostToolUse => (AgentState::Working, "Kiro tool completed"),
-        HookEvent::Stop => (AgentState::Idle, "Kiro session idle"),
+        HookEvent::Stop => (AgentState::Unknown, "Kiro hook execution stopped"),
     };
     LifecycleObservation { state, evidence }
 }
@@ -98,11 +98,11 @@ mod tests {
     #[test]
     fn lifecycle_events_reduce_without_inventing_unsupported_states() {
         let cases = [
-            ("SessionStart", AgentState::Idle),
+            ("SessionStart", AgentState::Unknown),
             ("UserPromptSubmit", AgentState::Working),
             ("PreToolUse", AgentState::Working),
             ("PostToolUse", AgentState::Working),
-            ("Stop", AgentState::Idle),
+            ("Stop", AgentState::Unknown),
         ];
         for (event, state) in cases {
             let update = update(event);
@@ -110,7 +110,7 @@ mod tests {
             assert_eq!(update.observation.state, state, "{event}");
             assert!(!matches!(
                 update.observation.state,
-                AgentState::Blocked | AgentState::Inactive | AgentState::Done
+                AgentState::Blocked | AgentState::Idle | AgentState::Inactive | AgentState::Done
             ));
         }
     }
@@ -118,11 +118,11 @@ mod tests {
     #[test]
     fn documented_legacy_payload_names_remain_decodable() {
         for (event, state) in [
-            ("agentSpawn", AgentState::Idle),
+            ("agentSpawn", AgentState::Unknown),
             ("userPromptSubmit", AgentState::Working),
             ("preToolUse", AgentState::Working),
             ("postToolUse", AgentState::Working),
-            ("stop", AgentState::Idle),
+            ("stop", AgentState::Unknown),
         ] {
             assert_eq!(update(event).observation.state, state, "{event}");
         }

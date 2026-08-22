@@ -6,18 +6,19 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
 use axum::extract::State;
+use axum::extract::ws::WebSocketUpgrade;
 use axum::http::header::{
-    CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE, HeaderValue, REFERRER_POLICY,
-    X_CONTENT_TYPE_OPTIONS,
+    CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE, HeaderValue, ORIGIN, REFERRER_POLICY,
+    SEC_WEBSOCKET_PROTOCOL, X_CONTENT_TYPE_OPTIONS,
 };
-use axum::http::{Request, StatusCode};
+use axum::http::{HeaderMap, Request, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
@@ -25,8 +26,8 @@ use axum::{Json, Router};
 use boomux::client::{self, Client};
 use boomux::protocol::{
     AgentAttentionReason, AgentInstanceSnapshot, AgentState, CombinedNodeSnapshot,
-    NodeProjectionHealthCode, OpenCodeSessionClaimSnapshot, OpenCodeSharedRuntimeSnapshot,
-    ShellOwner,
+    MAX_ATTACH_FRAME, NodeProjectionHealthCode, OpenCodeSessionClaimSnapshot,
+    OpenCodeSharedRuntimeSnapshot, ShellOwner, TerminalProfile,
 };
 use serde::{Deserialize, Serialize};
 use tokio::net::UnixListener;
@@ -38,9 +39,19 @@ const WEB_STOP_REQUEST: &[u8] = b"boomux-web-stop-v1\n";
 const WEB_STOP_ACK: &[u8] = b"boomux-web-stopping-v1\n";
 const WEB_STATUS_REQUEST: &[u8] = b"boomux-web-status-v1\n";
 const MAX_WEB_CONTROL_RESPONSE: u64 = 16 * 1024;
+const TERMINAL_GRANT_TTL: Duration = Duration::from_secs(30);
+const MAX_TERMINAL_GRANTS: usize = 64;
+const MAX_ACTIVE_TERMINALS: usize = 4;
+const TERMINAL_PROTOCOL: &str = "boomux.terminal.v1";
+const TERMINAL_TOKEN_PREFIX: &str = "boomux.token.";
+const CONTENT_SECURITY_POLICY_VALUE: &str = "default-src 'self'; base-uri 'none'; connect-src 'self'; font-src 'self' data:; img-src 'self' data:; manifest-src 'self'; object-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; frame-ancestors 'none'";
 const INDEX_HTML: &str = include_str!("../assets/mobile-web/index.html");
 const APP_JS: &str = include_str!("../assets/mobile-web/app.js");
 const STYLES_CSS: &str = include_str!("../assets/mobile-web/styles.css");
+const TERMINAL_JS: &str = include_str!("../assets/mobile-web/terminal.js");
+const TERMINAL_CSS: &str = include_str!("../assets/mobile-web/terminal.css");
+const GHOSTTY_WASM: &[u8] = include_bytes!("../assets/mobile-web/ghostty-vt.wasm");
+const THIRD_PARTY_NOTICES: &str = include_str!("../THIRD_PARTY_NOTICES.md");
 const MANIFEST: &str = include_str!("../assets/mobile-web/manifest.webmanifest");
 const SERVICE_WORKER: &str = include_str!("../assets/mobile-web/service-worker.js");
 const ICON: &str = include_str!("../assets/mobile-web/icon.svg");
@@ -50,9 +61,27 @@ const ICON_512: &[u8] = include_bytes!("../assets/mobile-web/icon-512.png");
 struct AppState {
     client: Client,
     presentation: Arc<Mutex<PresentationState>>,
+    terminal_grants: Arc<Mutex<HashMap<String, TerminalGrant>>>,
+    terminal_origins: Arc<HashSet<String>>,
+    active_terminals: Arc<AtomicUsize>,
     opencode_requested_port: Option<u16>,
     opencode_web_url: Option<Arc<str>>,
     opencode_runtime_hint: Option<OpenCodeRuntimeHint>,
+}
+
+#[derive(Clone, Debug)]
+struct TerminalGrant {
+    target: crate::web_terminal::Grant,
+    expires_at: Instant,
+}
+
+#[derive(Debug)]
+struct ActiveTerminalGuard(Arc<AtomicUsize>);
+
+impl Drop for ActiveTerminalGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 #[derive(Clone)]
@@ -215,6 +244,26 @@ struct DismissAttentionResponse {
     changed: bool,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TerminalAuthorizationRequest {
+    node_id: String,
+    agent_id: String,
+    shell_id: String,
+    run_id: String,
+    rows: u16,
+    cols: u16,
+    pixel_width: u16,
+    pixel_height: u16,
+}
+
+#[derive(Debug, Serialize)]
+struct TerminalAuthorizationResponse {
+    path: &'static str,
+    protocol: &'static str,
+    token: String,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DismissTarget {
     None,
@@ -281,6 +330,30 @@ impl ApiError {
             status: StatusCode::CONFLICT,
             code: "revision_changed",
             message: "Agent attention changed; refresh before dismissing it",
+        }
+    }
+
+    fn terminal_unavailable() -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            code: "terminal_unavailable",
+            message: "The Agent ShellRun is no longer available for terminal control",
+        }
+    }
+
+    fn terminal_forbidden() -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            code: "terminal_forbidden",
+            message: "Terminal control is available only for a current local Agent",
+        }
+    }
+
+    fn terminal_capacity() -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "terminal_capacity",
+            message: "Too many terminal handoffs are pending",
         }
     }
 
@@ -365,6 +438,9 @@ pub(crate) fn run(
     let state = AppState {
         client,
         presentation: Arc::new(Mutex::new(presentation)),
+        terminal_grants: Arc::new(Mutex::new(HashMap::new())),
+        terminal_origins: Arc::new(HashSet::new()),
+        active_terminals: Arc::new(AtomicUsize::new(0)),
         opencode_requested_port: configuration.runtime_port,
         opencode_web_url,
         opencode_runtime_hint,
@@ -476,7 +552,7 @@ fn opencode_web_configuration(
 
 async fn serve(
     address: SocketAddr,
-    state: AppState,
+    mut state: AppState,
     tailscale: bool,
 ) -> Result<(), Box<dyn Error>> {
     let listener = tokio::net::TcpListener::bind(address).await?;
@@ -525,6 +601,14 @@ async fn serve(
             )
         }),
     });
+    let mut terminal_origins = HashSet::from([
+        format!("http://127.0.0.1:{}", address.port()),
+        format!("http://localhost:{}", address.port()),
+    ]);
+    if let Some(exposure) = &tailscale_exposure {
+        terminal_origins.insert(exposure.dashboard_url());
+    }
+    state.terminal_origins = Arc::new(terminal_origins);
     let stopping = Arc::new(AtomicBool::new(false));
     let worker = spawn_projection_worker(
         state.client.clone(),
@@ -556,6 +640,10 @@ async fn serve(
         .route("/index.html", get(index))
         .route("/app.js", get(app_js))
         .route("/styles.css", get(styles))
+        .route("/terminal.js", get(terminal_js))
+        .route("/terminal.css", get(terminal_css))
+        .route("/ghostty-vt.wasm", get(ghostty_wasm))
+        .route("/third-party-notices.txt", get(third_party_notices))
         .route("/manifest.webmanifest", get(manifest))
         .route("/service-worker.js", get(service_worker))
         .route("/icon.svg", get(icon))
@@ -563,6 +651,8 @@ async fn serve(
         .route("/icon-512.png", get(icon_512))
         .route("/api/snapshot", get(snapshot))
         .route("/api/attention/dismiss", post(dismiss_attention))
+        .route("/api/terminal/authorize", post(authorize_terminal))
+        .route("/api/terminal", get(connect_terminal))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             security_headers,
@@ -698,9 +788,7 @@ async fn security_headers(request: Request<Body>, next: Next) -> Response {
     let headers = response.headers_mut();
     headers.insert(
         CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static(
-            "default-src 'self'; base-uri 'none'; connect-src 'self'; img-src 'self' data:; manifest-src 'self'; object-src 'none'; script-src 'self'; style-src 'self'; frame-ancestors 'none'",
-        ),
+        HeaderValue::from_static(CONTENT_SECURITY_POLICY_VALUE),
     );
     headers.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
     headers.insert(REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
@@ -813,6 +901,22 @@ async fn styles() -> Response {
     asset(STYLES_CSS, "text/css; charset=utf-8", "no-cache")
 }
 
+async fn terminal_js() -> Response {
+    asset(TERMINAL_JS, "text/javascript; charset=utf-8", "no-cache")
+}
+
+async fn terminal_css() -> Response {
+    asset(TERMINAL_CSS, "text/css; charset=utf-8", "no-cache")
+}
+
+async fn ghostty_wasm() -> Response {
+    binary_asset(GHOSTTY_WASM, "application/wasm")
+}
+
+async fn third_party_notices() -> Response {
+    asset(THIRD_PARTY_NOTICES, "text/plain; charset=utf-8", "no-cache")
+}
+
 async fn manifest() -> Response {
     asset(
         MANIFEST,
@@ -914,6 +1018,114 @@ async fn dismiss_attention(
     }))
 }
 
+async fn authorize_terminal(
+    State(state): State<AppState>,
+    Json(request): Json<TerminalAuthorizationRequest>,
+) -> Result<Response, ApiError> {
+    let target = state
+        .presentation
+        .lock()
+        .map_err(|_| ApiError::daemon())?
+        .terminal_target(&request)?;
+    let token = uuid::Uuid::new_v4().to_string();
+    let now = Instant::now();
+    let mut grants = state
+        .terminal_grants
+        .lock()
+        .map_err(|_| ApiError::daemon())?;
+    grants.retain(|_, grant| grant.expires_at > now);
+    if grants.len() >= MAX_TERMINAL_GRANTS {
+        return Err(ApiError::terminal_capacity());
+    }
+    grants.insert(
+        token.clone(),
+        TerminalGrant {
+            target,
+            expires_at: now + TERMINAL_GRANT_TTL,
+        },
+    );
+    let mut response = Json(TerminalAuthorizationResponse {
+        path: "/api/terminal",
+        protocol: TERMINAL_PROTOCOL,
+        token,
+    })
+    .into_response();
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(response)
+}
+
+async fn connect_terminal(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    websocket: WebSocketUpgrade,
+) -> Result<Response, ApiError> {
+    let origin = headers
+        .get(ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .filter(|origin| state.terminal_origins.contains(*origin))
+        .ok_or_else(ApiError::terminal_forbidden)?;
+    let _ = origin;
+    let protocols = headers
+        .get(SEC_WEBSOCKET_PROTOCOL)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(ApiError::terminal_forbidden)?;
+    if !protocols
+        .split(',')
+        .map(str::trim)
+        .any(|protocol| protocol == TERMINAL_PROTOCOL)
+    {
+        return Err(ApiError::terminal_forbidden());
+    }
+    let token = protocols
+        .split(',')
+        .map(str::trim)
+        .find_map(|protocol| protocol.strip_prefix(TERMINAL_TOKEN_PREFIX))
+        .filter(|token| !token.is_empty())
+        .ok_or_else(ApiError::terminal_forbidden)?;
+    let active_terminal = acquire_terminal(&state.active_terminals)?;
+    let now = Instant::now();
+    let grant = {
+        let mut grants = state
+            .terminal_grants
+            .lock()
+            .map_err(|_| ApiError::daemon())?;
+        grants.retain(|_, grant| grant.expires_at > now);
+        grants
+            .remove(token)
+            .filter(|grant| grant.expires_at > now)
+            .ok_or_else(ApiError::terminal_forbidden)?
+    };
+    let client = state.client.clone();
+    Ok(websocket
+        .max_message_size(MAX_ATTACH_FRAME)
+        .max_frame_size(MAX_ATTACH_FRAME)
+        .protocols([TERMINAL_PROTOCOL])
+        .on_upgrade(move |socket| async move {
+            let _active_terminal = active_terminal;
+            crate::web_terminal::run(socket, client, grant.target).await;
+        }))
+}
+
+fn acquire_terminal(active: &Arc<AtomicUsize>) -> Result<ActiveTerminalGuard, ApiError> {
+    let mut current = active.load(Ordering::Acquire);
+    loop {
+        if current >= MAX_ACTIVE_TERMINALS {
+            return Err(ApiError::terminal_capacity());
+        }
+        match active.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return Ok(ActiveTerminalGuard(Arc::clone(active))),
+            Err(actual) => current = actual,
+        }
+    }
+}
+
 fn project_snapshot(combined: CombinedNodeSnapshot, viewer: Option<String>) -> MobileSnapshot {
     let stale_nodes = combined.nodes.iter().filter(|node| node.stale).count();
     let mut agents = project_visible_agents(&combined);
@@ -950,6 +1162,46 @@ fn project_snapshot(combined: CombinedNodeSnapshot, viewer: Option<String>) -> M
 }
 
 impl PresentationState {
+    fn terminal_target(
+        &self,
+        request: &TerminalAuthorizationRequest,
+    ) -> Result<crate::web_terminal::Grant, ApiError> {
+        let agent = self
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| {
+                snapshot.agents.iter().find(|agent| {
+                    agent.node_id == request.node_id && agent.agent_id == request.agent_id
+                })
+            })
+            .ok_or_else(ApiError::not_found)?;
+        if !agent.node_local || !agent.node_current {
+            return Err(ApiError::terminal_forbidden());
+        }
+        if !agent.run_current
+            || agent.shell_id != request.shell_id
+            || agent.run_id != request.run_id
+            || request.rows == 0
+            || request.cols == 0
+        {
+            return Err(ApiError::terminal_unavailable());
+        }
+        Ok(crate::web_terminal::Grant {
+            shell_id: agent.shell_id.clone(),
+            run_id: agent.run_id.clone(),
+            profile: TerminalProfile {
+                term: Some("xterm-256color".into()),
+                colorterm: Some("truecolor".into()),
+                term_program: Some("boomux-web".into()),
+                term_program_version: Some(env!("CARGO_PKG_VERSION").into()),
+                rows: request.rows,
+                cols: request.cols,
+                pixel_width: request.pixel_width,
+                pixel_height: request.pixel_height,
+            },
+        })
+    }
+
     fn dismiss_target(&self, request: &DismissAttentionRequest) -> Result<DismissTarget, ApiError> {
         let agent = self
             .snapshot
@@ -1608,6 +1860,135 @@ mod tests {
         assert!(APP_JS.contains("method: \"POST\""));
         assert!(APP_JS.contains("\"Content-Type\": \"application/json\""));
         assert!(APP_JS.contains("card-dismiss-button"));
+        assert!(APP_JS.contains("/api/terminal/authorize"));
+        assert!(APP_JS.contains("boomux.token."));
+        assert!(APP_JS.contains("Open in Web Terminal"));
+        assert!(APP_JS.contains("function canOpenWebTerminal(agent)"));
+        assert!(!APP_JS.contains("agent.integration === \"kiro\""));
+        assert!(APP_JS.contains("history.pushState"));
+        assert!(APP_JS.contains("pointerdown"));
+        assert!(APP_JS.contains("terminal.resize(message)"));
+        assert!(APP_JS.contains("message.type === \"resize\""));
+        assert!(!APP_JS.contains("terminal-composer"));
+        assert!(!APP_JS.contains("terminal-controls"));
+        assert!(
+            APP_JS.contains("document.visibilityState !== \"visible\" || state.activeTerminal")
+        );
+        assert!(INDEX_HTML.contains("terminal.css"));
+        assert!(TERMINAL_JS.contains("ghostty-vt.wasm"));
+        assert!(TERMINAL_JS.contains("beforeinput"));
+        assert!(TERMINAL_JS.contains("enterKeyHint"));
+        assert!(TERMINAL_JS.contains("Math.min"));
+        assert!(TERMINAL_JS.contains("Math.round"));
+        assert!(TERMINAL_JS.contains("#1e1e2e"));
+        assert!(TERMINAL_CSS.contains("JetBrains Mono"));
+        assert!(GHOSTTY_WASM.starts_with(b"\0asm"));
+        assert!(INDEX_HTML.contains("third-party-notices.txt"));
+        assert!(THIRD_PARTY_NOTICES.contains("Copyright (c) 2025 Coder"));
+        assert!(THIRD_PARTY_NOTICES.contains("SIL OPEN FONT LICENSE Version 1.1"));
+        assert!(INDEX_HTML.contains("'wasm-unsafe-eval'"));
+        assert!(CONTENT_SECURITY_POLICY_VALUE.contains("'wasm-unsafe-eval'"));
+        assert!(INDEX_HTML.contains("font-src 'self' data:"));
+        assert!(CONTENT_SECURITY_POLICY_VALUE.contains("font-src 'self' data:"));
+        assert!(SERVICE_WORKER.contains("./terminal.js"));
+        assert!(SERVICE_WORKER.contains("./ghostty-vt.wasm"));
+    }
+
+    #[test]
+    fn terminal_grant_accepts_any_current_local_harness_and_requires_the_exact_run() {
+        let request = TerminalAuthorizationRequest {
+            node_id: "00000000-0000-0000-0000-000000000001".into(),
+            agent_id: "00000000-0000-0000-0000-000000000003".into(),
+            shell_id: "00000000-0000-0000-0000-000000000004".into(),
+            run_id: "00000000-0000-0000-0000-000000000005".into(),
+            rows: 30,
+            cols: 100,
+            pixel_width: 1_000,
+            pixel_height: 600,
+        };
+
+        for integration in [
+            "opencode",
+            "pi",
+            "claude",
+            "codex",
+            "kiro",
+            "future-harness",
+        ] {
+            let mut combined = combined_snapshot();
+            combined.nodes[0]
+                .local_snapshot
+                .as_mut()
+                .unwrap()
+                .workspaces[0]
+                .agents[0]
+                .integration = integration.into();
+            let mut presentation = PresentationState::default();
+            presentation.update(combined, HashMap::new());
+
+            let grant = presentation.terminal_target(&request).unwrap();
+            assert_eq!(grant.shell_id, request.shell_id);
+            assert_eq!(grant.run_id, request.run_id);
+            assert_eq!(grant.profile.term.as_deref(), Some("xterm-256color"));
+            assert_eq!(grant.profile.rows, 30);
+            assert_eq!(grant.profile.cols, 100);
+        }
+
+        let mut presentation = PresentationState::default();
+        presentation.update(combined_snapshot(), HashMap::new());
+
+        let mut mismatched = request;
+        mismatched.run_id = "different-run".into();
+        assert_eq!(
+            presentation.terminal_target(&mismatched).unwrap_err().code,
+            "terminal_unavailable"
+        );
+
+        let mut stale = combined_snapshot();
+        stale.nodes[0].current = false;
+        let mut stale_presentation = PresentationState::default();
+        stale_presentation.update(stale, HashMap::new());
+        mismatched.run_id = "00000000-0000-0000-0000-000000000005".into();
+        assert_eq!(
+            stale_presentation
+                .terminal_target(&mismatched)
+                .unwrap_err()
+                .code,
+            "terminal_forbidden"
+        );
+
+        let mut remote = combined_snapshot();
+        remote.nodes.remove(0);
+        let mut remote_presentation = PresentationState::default();
+        remote_presentation.update(remote, HashMap::new());
+        mismatched.node_id = "00000000-0000-0000-0000-000000000008".into();
+        mismatched.agent_id = "00000000-0000-0000-0000-000000000012".into();
+        mismatched.shell_id = "00000000-0000-0000-0000-000000000010".into();
+        mismatched.run_id = "00000000-0000-0000-0000-000000000011".into();
+        assert_eq!(
+            remote_presentation
+                .terminal_target(&mismatched)
+                .unwrap_err()
+                .code,
+            "terminal_forbidden"
+        );
+    }
+
+    #[test]
+    fn browser_terminal_admission_is_bounded_and_released() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let guards = (0..MAX_ACTIVE_TERMINALS)
+            .map(|_| acquire_terminal(&active).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(active.load(Ordering::Acquire), MAX_ACTIVE_TERMINALS);
+        assert_eq!(
+            acquire_terminal(&active).unwrap_err().code,
+            "terminal_capacity"
+        );
+
+        drop(guards);
+        assert_eq!(active.load(Ordering::Acquire), 0);
+        assert!(acquire_terminal(&active).is_ok());
     }
 
     #[test]

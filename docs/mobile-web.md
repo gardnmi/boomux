@@ -9,13 +9,16 @@
 `boomux web` provides a phone-friendly, installable view of the current Agents
 and outstanding Agent attention known to one coordinating Boomux Node. It is a
 bounded presentation layer inspired by mobile agent dashboards: durable
-attention is first and active work remains easy to scan. Its only mutation
-dismisses an exact local alert. Eligible Agent cards offer a native handoff that
-opens the exact authoritative local OpenCode Session in OpenCode Web.
+attention is first and active work remains easy to scan. Attention can be
+dismissed explicitly. Eligible Agent cards offer native handoffs such as the
+exact authoritative local OpenCode Session in OpenCode Web. Every current local
+Agent card also offers a self-hosted browser terminal for its exact existing
+ShellRun.
 
 Boomux is not an interactive chat client. It does not parse or normalize harness
-transcripts and does not send messages, commands, permission responses, or
-question answers. OpenCode's separate native interface owns those interactions.
+transcripts. Harness-native interfaces own those interactions. Web terminal
+control instead forwards unchanged terminal bytes under the existing daemon PTY
+and controller contract.
 
 ## Start It
 
@@ -169,6 +172,13 @@ the intended authentication boundary.
 - Kiro Agents have no native handoff. Kiro cloud sessions are available through
   Kiro Web and Mobile, but Kiro does not document an exact browser URL derivable
   from a local CLI Session ID, and local hooks do not establish cloud authority.
+- Every current local Agent, independent of its current or future integration
+  name, offers **Open in Web Terminal** in addition to any native handoff.
+  Authorization binds its exact Node, Agent, Shell, and run identities. Opening
+  it joins a protocol-44 collaborative exact-run attachment without starting or
+  resuming a Session.
+  The native primary remains attached, writable, and the sole PTY resize
+  authority while both participants receive output and may submit input.
 - Native links are not produced for projected remote Agents because their
   external Session identity and working directory intentionally remain on the
   owner Node. Remote Agents remain unlinked to this Node's runtime.
@@ -192,16 +202,33 @@ canonical Session ID to the destination OpenCode origin, or the opaque Claude
 bridge ID to `claude.ai`.
 API responses carry
 `Cache-Control: no-store`. The service worker caches only HTML, JavaScript, CSS,
-the manifest, and the icon; it never handles `/api/` requests. Browser storage
-does not persist Agent snapshots.
+the Ghostty VT WebAssembly module, the manifest, and the icon; it never handles
+`/api/` requests. Browser storage does not persist Agent snapshots.
 
-The HTTP API is allowlisted. Its sole mutation accepts same-origin JSON and
+The HTTP API is allowlisted. Attention dismissal accepts same-origin JSON and
 either clears the gateway's exact local finished marker or submits the existing
 revision-conditional daemon attention acknowledgment. Cross-origin JSON receives
 no CORS authorization, non-JSON requests are rejected, and remote projected
-Agents cannot be mutated. The API cannot forward arbitrary daemon requests, send
-terminal input, acquire a Shell controller, resume a Session, stop processes, or
-mutate Node registration.
+Agents cannot be mutated.
+
+Terminal authorization accepts exact identity and dimensions only for a current
+local Agent card. The gateway retains at most 64 grants for 30 seconds.
+The browser sends the one-use token as a secondary WebSocket subprotocol; it is
+never put in the URL. Upgrade requires the fixed protocol and an exact loopback
+or active Tailscale dashboard Origin. The gateway requests protocol-44
+collaborative exact-run attachment with no restart or environment payload and
+never downgrades to takeover on an older daemon. It translates only terminal
+input, output, resize, focus, detach, and reconnect and never exposes the daemon
+attachment token. The daemon's attached profile and later primary resize frames
+set the browser renderer's logical grid. Browser-originated resize frames cannot
+change the daemon PTY. Frames are bounded to 1 MiB, each
+bridge queue to eight entries, and the gateway to four active browser terminals;
+the daemon independently admits at most four collaborators per Shell.
+
+Terminal control is equivalent to remote shell access. Restrict the dashboard to
+trusted users through the private access layer. Terminal bytes are not included
+in HTTP snapshots, browser storage, service-worker caches, logs, Agent state, or
+remote Node projections, and they are never lifecycle evidence.
 
 The OpenCode origin is a separate full-control application. Set a nonempty
 `OPENCODE_SERVER_PASSWORD` unless the private access layer provides the intended
@@ -212,22 +239,26 @@ reverse proxy so this boundary remains visible.
 ## MVP Endpoints
 
 - `GET /api/snapshot` returns the current Node-qualified Agent cards, counts, and
-  optional exact native OpenCode or Claude handoffs. Codex and Kiro cards are
-  deliberately unlinked.
+  optional exact native OpenCode or Claude handoffs. Every current local Agent
+  may independently qualify for terminal control.
 - `POST /api/attention/dismiss` requires JSON containing the exact local
   `node_id`, `agent_id`, and `observation_revision`. It clears a matching
   ephemeral marker or acknowledges matching durable attention.
+- `POST /api/terminal/authorize` requires exact Node, Agent, Shell, and run
+  identities plus bounded terminal dimensions and returns one short-lived grant.
+- `GET /api/terminal` upgrades only with an allowlisted Origin, the
+  `boomux.terminal.v1` subprotocol, and the one-use grant subprotocol.
 
-These shapes are intentionally experimental. Future native handoff for other
-harnesses must preserve each harness's runtime ownership and exact Session
-identity rather than introducing transcript adapters or treating terminal
-screens as authoritative messages.
+These shapes are intentionally experimental. Future native handoffs must
+preserve each harness's runtime ownership and exact Session identity rather than
+introducing transcript adapters or treating terminal screens as authoritative
+messages.
 
 ## Future Terminal Work
 
-A real browser terminal is tracked separately from native harness web handoff.
-Any implementation must bind to an
-exact ShellRun, preserve daemon PTY and controller authority, start as a bounded
-read-only observer, and keep remote terminal bytes out of cached projections.
-See
+The exact-run browser terminal is available to every current local Agent,
+independent of integration name. Generalizing it to owner-routed remote Nodes
+remains separate work. Read-only observers would require a distinct daemon
+observer contract; collaborative participants are writable and must not be
+treated as observers. See
 [`brainstorms/2026-08-18-mobile-web-terminal.md`](brainstorms/2026-08-18-mobile-web-terminal.md).

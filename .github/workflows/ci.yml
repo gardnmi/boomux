@@ -50,5 +50,11 @@ jobs:
         with:
           bun-version: 1.3.14
 
+      - name: Verify embedded web terminal assets
+        run: |
+          bun install --frozen-lockfile
+          bun run build:web-terminal
+          git diff --exit-code -- assets/mobile-web/terminal.js assets/mobile-web/terminal.css assets/mobile-web/ghostty-vt.wasm
+
       - name: Run integration tests
         run: bun test integrations/opencode/boomux.test.js integrations/opencode/boomux-tui.test.js integrations/pi/boomux.test.js
