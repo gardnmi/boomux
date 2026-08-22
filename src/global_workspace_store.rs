@@ -341,62 +341,6 @@ impl GlobalWorkspaceStore {
         })
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn establish_placement(
-        &self,
-        global_id: &str,
-        expected_global_revision: u64,
-        node_id: &str,
-        owner: &WorkspaceSnapshot,
-    ) -> io::Result<GlobalWorkspaceSnapshot> {
-        self.mutate(|state| {
-            ensure_owner_unlinked_except(state, global_id, node_id, &owner.id)?;
-            let workspace = state
-                .workspaces
-                .iter_mut()
-                .find(|workspace| workspace.id == global_id)
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::NotFound, "global Workspace not found")
-                })?;
-            if let Some(existing) = workspace
-                .placements
-                .iter_mut()
-                .find(|placement| placement.node_id == node_id)
-            {
-                if existing.workspace_id != owner.id {
-                    return Err(io::Error::new(
-                        io::ErrorKind::AlreadyExists,
-                        "Workspace already has a different placement on this Node",
-                    ));
-                }
-                existing.owner_workspace_name = Some(owner.name.clone());
-                existing.owner_revision = owner.revision;
-                existing.default_cwd.clone_from(&owner.default_cwd);
-                existing.state = WorkspacePlacementState::Active;
-                return Ok(workspace.clone());
-            }
-            require_revision(
-                workspace.revision,
-                expected_global_revision,
-                "global Workspace",
-            )?;
-            if workspace.closing {
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "global Workspace close is in progress",
-                ));
-            }
-            workspace.revision = next(workspace.revision)?;
-            workspace
-                .placements
-                .push(placement(node_id, owner, WorkspacePlacementState::Active));
-            workspace
-                .placements
-                .sort_by(|left, right| left.node_id.cmp(&right.node_id));
-            Ok(workspace.clone())
-        })
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn prepare_resource(
         &self,
@@ -1712,47 +1656,6 @@ mod tests {
         assert!(closing.closing);
         store.confirm_empty_closed(&global.id).unwrap();
         assert!(store.list().unwrap().is_empty());
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn first_placement_is_revision_guarded_and_exact_replay_is_idempotent() {
-        let root = std::env::temp_dir().join(format!("boomux-global-establish-{}", Uuid::new_v4()));
-        let store =
-            GlobalWorkspaceStore::load_at(root.join("boomux/global_workspaces.json")).unwrap();
-        store
-            .initialize_local_once(
-                &Uuid::from_u128(1).to_string(),
-                &daemon_snapshot(Vec::new()),
-            )
-            .unwrap();
-        let global = store.create("work".into()).unwrap();
-        let node = Uuid::from_u128(2).to_string();
-        let owner = snapshot(&Uuid::from_u128(3).to_string(), "work", 2);
-        assert!(
-            store
-                .establish_placement(&global.id, global.revision + 1, &node, &owner)
-                .is_err()
-        );
-        let established = store
-            .establish_placement(&global.id, global.revision, &node, &owner)
-            .unwrap();
-        assert_eq!(established.placements.len(), 1);
-        let mut replay = owner.clone();
-        replay.revision = 3;
-        let replayed = store
-            .establish_placement(&global.id, global.revision, &node, &replay)
-            .unwrap();
-        assert_eq!(replayed.revision, established.revision);
-        assert_eq!(replayed.placements[0].owner_revision, 3);
-        let collision = snapshot(&Uuid::from_u128(4).to_string(), "work", 1);
-        assert_eq!(
-            store
-                .establish_placement(&global.id, replayed.revision, &node, &collision)
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::AlreadyExists
-        );
         fs::remove_dir_all(root).unwrap();
     }
 

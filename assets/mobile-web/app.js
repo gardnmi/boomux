@@ -9,7 +9,6 @@ const state = {
   deferredInstallPrompt: null,
   pollTimer: null,
   snapshotRequest: null,
-  online: true,
   activeTerminal: null,
 };
 
@@ -284,9 +283,11 @@ async function openWebTerminal(agent) {
     socket = new WebSocket(url, [grant.protocol, `boomux.token.${grant.token}`]);
     socket.binaryType = "arraybuffer";
     socket.addEventListener("open", () => {
+      if (closed) return;
       terminal.focus();
     });
     socket.addEventListener("message", (event) => {
+      if (closed) return;
       if (typeof event.data !== "string") {
         terminal.write(new Uint8Array(event.data));
         return;
@@ -306,12 +307,12 @@ async function openWebTerminal(agent) {
       }
     });
     socket.addEventListener("close", () => {
-      if (!closed) {
-        notice.textContent = "Terminal control ended. The Agent may still be running.";
-        terminal.write(`\r\n${notice.textContent}\r\n`);
-      }
+      if (closed) return;
+      notice.textContent = "Terminal control ended. The Agent may still be running.";
+      terminal.write(`\r\n${notice.textContent}\r\n`);
     });
     socket.addEventListener("error", () => {
+      if (closed) return;
       notice.textContent = "Could not connect to the Agent terminal.";
     });
   } catch (error) {
@@ -372,7 +373,6 @@ async function refreshSnapshot() {
   try {
     const snapshot = await fetchJson("/api/snapshot", controller.signal);
     state.snapshot = snapshot;
-    state.online = snapshot.daemon_connected;
     updateConnection(
       snapshot.daemon_connected ? "online" : "offline",
       snapshot.daemon_connected ? "Live" : "Daemon offline",
@@ -380,7 +380,6 @@ async function refreshSnapshot() {
     renderSnapshot();
   } catch (error) {
     if (error.name === "AbortError") return;
-    state.online = false;
     updateConnection("offline", "Disconnected");
     if (!state.snapshot) {
       showState(elements.dashboardState, "Snapshot unavailable", "The dashboard could not reach the Boomux API. It will retry automatically.", "error");

@@ -91,7 +91,9 @@ export async function createTerminal(container, callbacks) {
   const resizeDisposable = terminal.onResize(() => {
     if (!dimensionsLocked) callbacks.resize(dimensions());
   });
-  requestAnimationFrame(() => {
+  let disposed = false;
+  const initialFitFrame = requestAnimationFrame(() => {
+    if (disposed) return;
     fit.fit();
     callbacks.resize(dimensions());
   });
@@ -104,9 +106,10 @@ export async function createTerminal(container, callbacks) {
       terminal.resize(cols, rows);
     },
     focus: () => textarea?.focus() || terminal.focus(),
-    input: (data) => terminal.input(data, true),
     write: (data) => terminal.write(data),
     dispose: () => {
+      disposed = true;
+      cancelAnimationFrame(initialFitFrame);
       textarea?.removeEventListener("compositionstart", handleCompositionStart);
       textarea?.removeEventListener("compositionend", handleCompositionEnd);
       textarea?.removeEventListener("input", handleInput);
