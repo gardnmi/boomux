@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.25.0](https://github.com/gardnmi/boomux/compare/v0.24.0...v0.25.0) (2026-08-22)
+
+
+### Features
+
+* **web:** add collaborative agent terminals ([#237](https://github.com/gardnmi/boomux/issues/237)) ([c997740](https://github.com/gardnmi/boomux/commit/c9977408218681443d40e81dfdb768f16bb5a8f1))
+
 ## [0.24.0](https://github.com/gardnmi/boomux/compare/v0.23.0...v0.24.0) (2026-08-21)
 
 
