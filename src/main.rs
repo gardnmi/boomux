@@ -41,6 +41,7 @@ mod config;
 mod dashboard_projection;
 mod generated_names;
 mod git;
+mod hook_input;
 mod host_session_source;
 mod host_session_titles;
 mod integration_management;
@@ -10286,26 +10287,39 @@ fn launch_codex(arguments: Vec<OsString>) -> Result<(), Box<dyn Error>> {
 }
 
 fn resolve_real_codex() -> io::Result<PathBuf> {
-    if let Some(path) = env::var_os("BOOMUX_REAL_CODEX").map(PathBuf::from) {
+    resolve_real_harness("BOOMUX_REAL_CODEX", "codex", "Codex")
+}
+
+fn resolve_real_harness(
+    environment_variable: &str,
+    executable_name: &str,
+    display_name: &str,
+) -> io::Result<PathBuf> {
+    if let Some(path) = env::var_os(environment_variable).map(PathBuf::from) {
         let metadata = fs::metadata(&path)?;
         if path.is_absolute() && metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 {
             return Ok(path);
         }
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "BOOMUX_REAL_CODEX must identify an absolute regular executable",
+            format!("{environment_variable} must identify an absolute regular executable"),
         ));
     }
     let shim_dir = env::var_os("BOOMUX_OPENCODE_SHIM_DIR").map(PathBuf::from);
     env::split_paths(&env::var_os("PATH").unwrap_or_default())
         .filter(|directory| shim_dir.as_deref() != Some(directory.as_path()))
-        .map(|directory| directory.join("codex"))
+        .map(|directory| directory.join(executable_name))
         .find(|candidate| {
             fs::metadata(candidate).is_ok_and(|metadata| {
                 metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
             })
         })
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Codex executable was not found"))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("{display_name} executable was not found"),
+            )
+        })
 }
 
 fn kiro_hook_command() -> Result<(), Box<dyn Error>> {
@@ -10380,26 +10394,7 @@ fn launch_kiro(arguments: Vec<OsString>) -> Result<(), Box<dyn Error>> {
 }
 
 fn resolve_real_kiro() -> io::Result<PathBuf> {
-    if let Some(path) = env::var_os("BOOMUX_REAL_KIRO").map(PathBuf::from) {
-        let metadata = fs::metadata(&path)?;
-        if path.is_absolute() && metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 {
-            return Ok(path);
-        }
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "BOOMUX_REAL_KIRO must identify an absolute regular executable",
-        ));
-    }
-    let shim_dir = env::var_os("BOOMUX_OPENCODE_SHIM_DIR").map(PathBuf::from);
-    env::split_paths(&env::var_os("PATH").unwrap_or_default())
-        .filter(|directory| shim_dir.as_deref() != Some(directory.as_path()))
-        .map(|directory| directory.join("kiro-cli"))
-        .find(|candidate| {
-            fs::metadata(candidate).is_ok_and(|metadata| {
-                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
-            })
-        })
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Kiro executable was not found"))
+    resolve_real_harness("BOOMUX_REAL_KIRO", "kiro-cli", "Kiro")
 }
 
 fn resolve_agent_context(

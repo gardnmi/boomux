@@ -2,7 +2,6 @@
   color-scheme: dark;
   --ink: #0b0d17;
   --ink-raised: #151823;
-  --ink-soft: #202432;
   --paper: #f5f2df;
   --paper-dim: #b9b8b2;
   --acid: #ffb21c;
@@ -373,7 +372,7 @@ h1 {
   .brand-logo { width: 38px; height: 38px; }
   .brand-wordmark { font-size: 1.05rem; }
   .brand-copy small { font-size: .48rem; }
-  .connection-label { display: none; }
+  #connection-label { display: none; }
   .hero { display: block; padding-top: 34px; }
   .hero h1 { max-width: 330px; }
   .last-updated { width: auto; margin: 20px 0 0; text-align: left; }

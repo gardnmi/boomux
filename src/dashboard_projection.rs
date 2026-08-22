@@ -2,9 +2,9 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use boomux::protocol::{
-    AgentAttentionReason, AgentScheduleState, AgentState, ScheduledExecutionOutcome,
-    ScheduledExecutionReason, ScheduledExecutionSnapshot, ScheduledExecutionState,
-    ShellRunExitReason, ShellStatus, Snapshot, WorkspaceSnapshot,
+    AgentAttentionReason, AgentScheduleState, AgentState, NodeProjectionExecution,
+    ScheduledExecutionOutcome, ScheduledExecutionReason, ScheduledExecutionSnapshot,
+    ScheduledExecutionState, ShellRunExitReason, ShellStatus, Snapshot, WorkspaceSnapshot,
 };
 
 use crate::agent_attention_projection;
@@ -125,85 +125,54 @@ pub(crate) fn project_schedules(
 pub(crate) fn project_remote_executions(
     executions: &[ScheduledExecutionSnapshot],
 ) -> Vec<ExecutionView> {
-    executions
-        .iter()
-        .map(|execution| ExecutionView {
-            id: execution.id.clone(),
-            state: match execution.state {
-                ScheduledExecutionState::Skipped => ExecutionDisplayState::Skipped,
-                ScheduledExecutionState::Claimed => ExecutionDisplayState::Claimed,
-                ScheduledExecutionState::Starting => ExecutionDisplayState::Starting,
-                ScheduledExecutionState::Active => ExecutionDisplayState::Active,
-                ScheduledExecutionState::DispatchFailed => ExecutionDisplayState::DispatchFailed,
-                ScheduledExecutionState::Exited => ExecutionDisplayState::Exited,
-                ScheduledExecutionState::Cancelled => ExecutionDisplayState::Cancelled,
-                ScheduledExecutionState::Interrupted => ExecutionDisplayState::Interrupted,
-            },
-            reason: execution.reason.map(|reason| match reason {
-                ScheduledExecutionReason::Overlap => ExecutionReasonDisplay::Overlap,
-                ScheduledExecutionReason::ActiveSession => ExecutionReasonDisplay::ActiveSession,
-                ScheduledExecutionReason::WorkspaceCapacity => {
-                    ExecutionReasonDisplay::WorkspaceCapacity
-                }
-                ScheduledExecutionReason::GlobalCapacity => ExecutionReasonDisplay::GlobalCapacity,
-                ScheduledExecutionReason::Missed => ExecutionReasonDisplay::Missed,
-                ScheduledExecutionReason::PausedRace => ExecutionReasonDisplay::PausedRace,
-                ScheduledExecutionReason::InvalidTarget => ExecutionReasonDisplay::InvalidTarget,
-                ScheduledExecutionReason::RunnerStartFailed => {
-                    ExecutionReasonDisplay::RunnerStartFailed
-                }
-                ScheduledExecutionReason::HostSpawnFailed => {
-                    ExecutionReasonDisplay::HostSpawnFailed
-                }
-                ScheduledExecutionReason::CancelledByUser => {
-                    ExecutionReasonDisplay::CancelledByUser
-                }
-                ScheduledExecutionReason::ColdDaemonRecovery => {
-                    ExecutionReasonDisplay::ColdDaemonRecovery
-                }
-                ScheduledExecutionReason::RunnerExitedWithoutReport => {
-                    ExecutionReasonDisplay::RunnerExitedWithoutReport
-                }
-                ScheduledExecutionReason::DaemonShutdown => ExecutionReasonDisplay::DaemonShutdown,
-            }),
-            outcome: execution.outcome.as_ref().map(|outcome| match outcome {
-                ScheduledExecutionOutcome::ExitCode { code } => {
-                    ExecutionOutcomeDisplay::ExitCode(*code)
-                }
-                ScheduledExecutionOutcome::Signal { signal } => {
-                    ExecutionOutcomeDisplay::Signal(*signal)
-                }
-            }),
-            requested_at_ms: execution.requested_at_ms,
-            shell_id: execution.shell_id.clone(),
-            run_id: execution.run_id.clone(),
-            agent_id: execution.agent_id.clone(),
-            agent_state: None,
-            session_id: None,
-        })
-        .collect()
+    executions.iter().map(execution_view_base).collect()
 }
 
-fn execution_view(
-    workspace: &WorkspaceSnapshot,
-    sessions: &[SessionProjection],
-    execution: &ScheduledExecutionSnapshot,
-) -> ExecutionView {
-    let agent = execution
-        .agent_id
-        .as_deref()
-        .and_then(|agent_id| workspace.agents.iter().find(|agent| agent.id == agent_id));
-    let session = execution.agent_id.as_deref().and_then(|agent_id| {
-        sessions.iter().find(|session| {
-            session.workspace_id == workspace.id
-                && session
-                    .occurrences
-                    .iter()
-                    .any(|occurrence| occurrence.agent_id == agent_id)
-        })
-    });
+struct ExecutionViewFields<'a> {
+    id: &'a str,
+    state: ScheduledExecutionState,
+    reason: Option<ScheduledExecutionReason>,
+    outcome: Option<&'a ScheduledExecutionOutcome>,
+    requested_at_ms: u64,
+    shell_id: Option<&'a str>,
+    run_id: Option<&'a str>,
+    agent_id: Option<&'a str>,
+}
+
+impl<'a> From<&'a ScheduledExecutionSnapshot> for ExecutionViewFields<'a> {
+    fn from(execution: &'a ScheduledExecutionSnapshot) -> Self {
+        Self {
+            id: &execution.id,
+            state: execution.state,
+            reason: execution.reason,
+            outcome: execution.outcome.as_ref(),
+            requested_at_ms: execution.requested_at_ms,
+            shell_id: execution.shell_id.as_deref(),
+            run_id: execution.run_id.as_deref(),
+            agent_id: execution.agent_id.as_deref(),
+        }
+    }
+}
+
+impl<'a> From<&'a NodeProjectionExecution> for ExecutionViewFields<'a> {
+    fn from(execution: &'a NodeProjectionExecution) -> Self {
+        Self {
+            id: &execution.id,
+            state: execution.state,
+            reason: execution.reason,
+            outcome: execution.outcome.as_ref(),
+            requested_at_ms: execution.requested_at_ms,
+            shell_id: execution.shell_id.as_deref(),
+            run_id: execution.run_id.as_deref(),
+            agent_id: execution.agent_id.as_deref(),
+        }
+    }
+}
+
+fn execution_view_base<'a>(execution: impl Into<ExecutionViewFields<'a>>) -> ExecutionView {
+    let execution = execution.into();
     ExecutionView {
-        id: execution.id.clone(),
+        id: execution.id.into(),
         state: match execution.state {
             ScheduledExecutionState::Skipped => ExecutionDisplayState::Skipped,
             ScheduledExecutionState::Claimed => ExecutionDisplayState::Claimed,
@@ -237,7 +206,7 @@ fn execution_view(
             }
             ScheduledExecutionReason::DaemonShutdown => ExecutionReasonDisplay::DaemonShutdown,
         }),
-        outcome: execution.outcome.as_ref().map(|outcome| match outcome {
+        outcome: execution.outcome.map(|outcome| match outcome {
             ScheduledExecutionOutcome::ExitCode { code } => {
                 ExecutionOutcomeDisplay::ExitCode(*code)
             }
@@ -246,12 +215,36 @@ fn execution_view(
             }
         }),
         requested_at_ms: execution.requested_at_ms,
-        shell_id: execution.shell_id.clone(),
-        run_id: execution.run_id.clone(),
-        agent_id: execution.agent_id.clone(),
-        agent_state: agent.map(|agent| agent.observation.state.into()),
-        session_id: session.map(|session| session.id.clone()),
+        shell_id: execution.shell_id.map(Into::into),
+        run_id: execution.run_id.map(Into::into),
+        agent_id: execution.agent_id.map(Into::into),
+        agent_state: None,
+        session_id: None,
     }
+}
+
+fn execution_view(
+    workspace: &WorkspaceSnapshot,
+    sessions: &[SessionProjection],
+    execution: &ScheduledExecutionSnapshot,
+) -> ExecutionView {
+    let agent = execution
+        .agent_id
+        .as_deref()
+        .and_then(|agent_id| workspace.agents.iter().find(|agent| agent.id == agent_id));
+    let session = execution.agent_id.as_deref().and_then(|agent_id| {
+        sessions.iter().find(|session| {
+            session.workspace_id == workspace.id
+                && session
+                    .occurrences
+                    .iter()
+                    .any(|occurrence| occurrence.agent_id == agent_id)
+        })
+    });
+    let mut view = execution_view_base(execution);
+    view.agent_state = agent.map(|agent| agent.observation.state.into());
+    view.session_id = session.map(|session| session.id.clone());
+    view
 }
 
 fn friendly_trigger(cron: &str) -> String {
@@ -535,75 +528,16 @@ pub(crate) fn project_remote_node(
                 .executions
                 .iter()
                 .filter(|execution| execution.schedule_id == schedule.id)
-                .map(|execution| ExecutionView {
-                    id: execution.id.clone(),
-                    state: match execution.state {
-                        ScheduledExecutionState::Skipped => ExecutionDisplayState::Skipped,
-                        ScheduledExecutionState::Claimed => ExecutionDisplayState::Claimed,
-                        ScheduledExecutionState::Starting => ExecutionDisplayState::Starting,
-                        ScheduledExecutionState::Active => ExecutionDisplayState::Active,
-                        ScheduledExecutionState::DispatchFailed => {
-                            ExecutionDisplayState::DispatchFailed
-                        }
-                        ScheduledExecutionState::Exited => ExecutionDisplayState::Exited,
-                        ScheduledExecutionState::Cancelled => ExecutionDisplayState::Cancelled,
-                        ScheduledExecutionState::Interrupted => ExecutionDisplayState::Interrupted,
-                    },
-                    reason: execution.reason.map(|reason| match reason {
-                        ScheduledExecutionReason::Overlap => ExecutionReasonDisplay::Overlap,
-                        ScheduledExecutionReason::ActiveSession => {
-                            ExecutionReasonDisplay::ActiveSession
-                        }
-                        ScheduledExecutionReason::WorkspaceCapacity => {
-                            ExecutionReasonDisplay::WorkspaceCapacity
-                        }
-                        ScheduledExecutionReason::GlobalCapacity => {
-                            ExecutionReasonDisplay::GlobalCapacity
-                        }
-                        ScheduledExecutionReason::Missed => ExecutionReasonDisplay::Missed,
-                        ScheduledExecutionReason::PausedRace => ExecutionReasonDisplay::PausedRace,
-                        ScheduledExecutionReason::InvalidTarget => {
-                            ExecutionReasonDisplay::InvalidTarget
-                        }
-                        ScheduledExecutionReason::RunnerStartFailed => {
-                            ExecutionReasonDisplay::RunnerStartFailed
-                        }
-                        ScheduledExecutionReason::HostSpawnFailed => {
-                            ExecutionReasonDisplay::HostSpawnFailed
-                        }
-                        ScheduledExecutionReason::CancelledByUser => {
-                            ExecutionReasonDisplay::CancelledByUser
-                        }
-                        ScheduledExecutionReason::ColdDaemonRecovery => {
-                            ExecutionReasonDisplay::ColdDaemonRecovery
-                        }
-                        ScheduledExecutionReason::RunnerExitedWithoutReport => {
-                            ExecutionReasonDisplay::RunnerExitedWithoutReport
-                        }
-                        ScheduledExecutionReason::DaemonShutdown => {
-                            ExecutionReasonDisplay::DaemonShutdown
-                        }
-                    }),
-                    outcome: execution.outcome.as_ref().map(|outcome| match outcome {
-                        ScheduledExecutionOutcome::ExitCode { code } => {
-                            ExecutionOutcomeDisplay::ExitCode(*code)
-                        }
-                        ScheduledExecutionOutcome::Signal { signal } => {
-                            ExecutionOutcomeDisplay::Signal(*signal)
-                        }
-                    }),
-                    requested_at_ms: execution.requested_at_ms,
-                    shell_id: execution.shell_id.clone(),
-                    run_id: execution.run_id.clone(),
-                    agent_id: execution.agent_id.clone(),
-                    agent_state: execution.agent_id.as_deref().and_then(|agent_id| {
+                .map(|execution| {
+                    let mut view = execution_view_base(execution);
+                    view.agent_state = execution.agent_id.as_deref().and_then(|agent_id| {
                         projection
                             .agents
                             .iter()
                             .find(|agent| agent.id == agent_id)
                             .map(|agent| agent.state.into())
-                    }),
-                    session_id: None,
+                    });
+                    view
                 })
                 .collect::<Vec<_>>();
             executions.sort_by(|left, right| {

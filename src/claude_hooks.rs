@@ -3,7 +3,9 @@ use std::io::{self, Read};
 use boomux::protocol::AgentState;
 use serde::Deserialize;
 
-pub(crate) const MAX_HOOK_INPUT_BYTES: usize = 1024 * 1024;
+#[cfg(test)]
+use crate::hook_input::MAX_HOOK_INPUT_BYTES;
+use crate::hook_input::read_bounded_hook_input;
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 enum HookEvent {
@@ -50,7 +52,7 @@ pub(crate) struct HookUpdate {
 }
 
 pub(crate) fn read_update(reader: impl Read) -> Result<HookUpdate, Box<dyn std::error::Error>> {
-    let input = read_bounded_input(reader)?;
+    let input = read_bounded_hook_input(reader, "Claude")?;
     let input: HookInput = serde_json::from_slice(&input).map_err(|error| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -70,21 +72,6 @@ pub(crate) fn read_update(reader: impl Read) -> Result<HookUpdate, Box<dyn std::
         observation: reduce(input),
         session_ended,
     })
-}
-
-fn read_bounded_input(mut reader: impl Read) -> io::Result<Vec<u8>> {
-    let mut input = Vec::new();
-    reader
-        .by_ref()
-        .take((MAX_HOOK_INPUT_BYTES + 1) as u64)
-        .read_to_end(&mut input)?;
-    if input.len() > MAX_HOOK_INPUT_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("Claude hook input exceeds {MAX_HOOK_INPUT_BYTES} bytes"),
-        ));
-    }
-    Ok(input)
 }
 
 fn reduce(input: HookInput) -> Option<LifecycleObservation> {
