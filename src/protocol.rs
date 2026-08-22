@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 43;
+pub const PROTOCOL_VERSION: u32 = 44;
 pub const MIN_PROTOCOL_VERSION: u32 = 6;
 pub const MAX_CONTROL_FRAME: usize = 8 * 1024 * 1024;
 pub const MAX_ATTACH_FRAME: usize = 1024 * 1024;
@@ -193,6 +193,10 @@ define_protocol_features! {
     ClaudeRemoteControlBindings => (43, "Claude Remote Control bindings", [
         "protocol_43",
         "claude_remote_control_bindings",
+    ]),
+    CollaborativeExactRunAttachment => (44, "collaborative exact run attachment", [
+        "protocol_44",
+        "collaborative_exact_run_attachment",
     ]),
 }
 
@@ -2501,6 +2505,11 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "is_false")]
         owner_environment: bool,
     },
+    AttachCollaborative {
+        shell_id: String,
+        expected_run_id: String,
+        profile: TerminalProfile,
+    },
     AttachNode {
         identity: QualifiedIdentity,
         takeover: bool,
@@ -2599,6 +2608,9 @@ impl Request {
             | Self::RouteNodeHostService { .. }
             | Self::ResumeAgentSession { .. }
             | Self::ResumeNodeAgentSession { .. } => Some(ProtocolFeature::NodeHostServices),
+            Self::AttachCollaborative { .. } => {
+                Some(ProtocolFeature::CollaborativeExactRunAttachment)
+            }
             Self::AttachNode { .. }
             | Self::Attach {
                 owner_environment: true,
@@ -2850,6 +2862,8 @@ pub enum Response {
         token: String,
         reconstruction: Vec<u8>,
         warning: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        profile: Option<TerminalProfile>,
     },
     Ok,
     Error {
@@ -3396,9 +3410,31 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_forty_three_with_minimum_six() {
-        assert_eq!(PROTOCOL_VERSION, 43);
+    fn protocol_version_is_forty_four_with_minimum_six() {
+        assert_eq!(PROTOCOL_VERSION, 44);
         assert_eq!(MIN_PROTOCOL_VERSION, 6);
+    }
+
+    #[test]
+    fn collaborative_exact_run_attachment_is_protocol_forty_four() {
+        let request = Request::AttachCollaborative {
+            shell_id: "shell-1".into(),
+            expected_run_id: "run-1".into(),
+            profile: test_profile(),
+        };
+        let encoded = serde_json::to_value(&request).unwrap();
+
+        assert_eq!(encoded["request"], "attach_collaborative");
+        assert_eq!(serde_json::from_value::<Request>(encoded).unwrap(), request);
+        assert_eq!(
+            request.required_feature(),
+            Some(ProtocolFeature::CollaborativeExactRunAttachment)
+        );
+        assert_eq!(request.minimum_protocol_version(), 44);
+        assert_eq!(
+            ProtocolFeature::CollaborativeExactRunAttachment.capability_names(),
+            &["protocol_44", "collaborative_exact_run_attachment"]
+        );
     }
 
     #[test]
@@ -5052,6 +5088,10 @@ mod tests {
             (41, &["node_upgrade_coordination"][..]),
             (42, &["protocol_42", "opencode_shared_runtime_claims"][..]),
             (43, &["protocol_43", "claude_remote_control_bindings"][..]),
+            (
+                44,
+                &["protocol_44", "collaborative_exact_run_attachment"][..],
+            ),
         ];
 
         let actual = ProtocolFeature::ALL

@@ -464,6 +464,10 @@ Protocol 42 adds `protocol_42` and
 Protocol 43 adds `protocol_43` and `claude_remote_control_bindings`. The binding
 operations are private local protocol requests and add no public CLI JSON field,
 snapshot field, event, or remote Node projection field.
+Protocol 44 adds `protocol_44` and `collaborative_exact_run_attachment`. The
+attachment request and terminal profile response are private local protocol
+messages and add no public CLI JSON field, snapshot field, event, or remote Node
+projection field.
 
 Protocol-38 `workspace create` creates empty coordinator metadata without a
 default Node or cwd. First global `shell create`, `launcher create`, or

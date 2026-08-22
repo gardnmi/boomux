@@ -166,6 +166,7 @@ pub struct Attachment {
     pub token: String,
     pub reconstruction: Vec<u8>,
     pub warning: Option<String>,
+    pub profile: Option<TerminalProfile>,
 }
 
 #[derive(Debug)]
@@ -526,7 +527,22 @@ impl Client {
     }
 
     fn send_with_version(&self, request: Request, version: u32) -> Result<(UnixStream, Response)> {
+        self.send_with_version_timeout(request, version, None)
+    }
+
+    fn send_with_version_timeout(
+        &self,
+        request: Request,
+        version: u32,
+        timeout: Option<Duration>,
+    ) -> Result<(UnixStream, Response)> {
         let mut stream = UnixStream::connect(&self.socket_path).map_err(ClientError::Transport)?;
+        stream
+            .set_read_timeout(timeout)
+            .map_err(ClientError::Transport)?;
+        stream
+            .set_write_timeout(timeout)
+            .map_err(ClientError::Transport)?;
         protocol::write_message(&mut stream, &Envelope::with_version(version, request))
             .map_err(classify_wire_error)?;
         let response: Envelope<Response> =
@@ -2007,6 +2023,84 @@ impl Client {
         )
     }
 
+    pub fn attach_exact_run(
+        &self,
+        shell_id: impl Into<String>,
+        expected_run_id: impl Into<String>,
+        takeover: bool,
+        profile: TerminalProfile,
+    ) -> Result<Attachment> {
+        self.attach_with_restart(
+            shell_id.into(),
+            takeover,
+            false,
+            Some(expected_run_id.into()),
+            profile,
+            None,
+        )
+    }
+
+    pub fn attach_exact_run_with_timeout(
+        &self,
+        shell_id: impl Into<String>,
+        expected_run_id: impl Into<String>,
+        takeover: bool,
+        profile: TerminalProfile,
+        timeout: Duration,
+    ) -> Result<Attachment> {
+        let request = Request::Attach {
+            shell_id: shell_id.into(),
+            takeover,
+            restart_exited: false,
+            expected_run_id: Some(expected_run_id.into()),
+            profile,
+            environment: None,
+            owner_environment: false,
+        };
+        let version = self.protocol_version.load(Ordering::Acquire);
+        if !protocol::ProtocolFeature::ExactRunAttachment.is_supported_by(version) {
+            return Err(unsupported_version(
+                "daemon does not support exact run attachment",
+            ));
+        }
+        let (stream, response) = self.send_with_version_timeout(request, version, Some(timeout))?;
+        stream
+            .set_read_timeout(None)
+            .map_err(ClientError::Transport)?;
+        stream
+            .set_write_timeout(None)
+            .map_err(ClientError::Transport)?;
+        attachment_from_response(stream, version, response)
+    }
+
+    pub fn attach_collaborative_exact_run_with_timeout(
+        &self,
+        shell_id: impl Into<String>,
+        expected_run_id: impl Into<String>,
+        profile: TerminalProfile,
+        timeout: Duration,
+    ) -> Result<Attachment> {
+        let version = self.protocol_version.load(Ordering::Acquire);
+        if !protocol::ProtocolFeature::CollaborativeExactRunAttachment.is_supported_by(version) {
+            return Err(unsupported_version(
+                "daemon does not support collaborative exact run attachment",
+            ));
+        }
+        let request = Request::AttachCollaborative {
+            shell_id: shell_id.into(),
+            expected_run_id: expected_run_id.into(),
+            profile,
+        };
+        let (stream, response) = self.send_with_version_timeout(request, version, Some(timeout))?;
+        stream
+            .set_read_timeout(None)
+            .map_err(ClientError::Transport)?;
+        stream
+            .set_write_timeout(None)
+            .map_err(ClientError::Transport)?;
+        attachment_from_response(stream, version, response)
+    }
+
     pub fn attach_node(
         &self,
         identity: protocol::QualifiedIdentity,
@@ -2079,12 +2173,14 @@ fn attachment_from_response(
             token,
             reconstruction,
             warning,
+            profile,
         } => Ok(Attachment {
             stream,
             protocol_version,
             token,
             reconstruction,
             warning,
+            profile,
         }),
         other => unexpected(other),
     }
@@ -2172,6 +2268,7 @@ mod tests {
     fn reject_protocol(listener: &UnixListener, attempted: u32, supported: u32) {
         reject_protocol_once(listener, attempted, supported);
         if attempted == protocol::PROTOCOL_VERSION && supported == 41 {
+            reject_protocol_once(listener, 43, supported);
             reject_protocol_once(listener, 42, supported);
         }
     }
@@ -2289,6 +2386,7 @@ mod tests {
         let (client_done_sender, client_done_receiver) = mpsc::channel();
         let server = thread::spawn(move || {
             for _ in 0..3 {
+                reject_protocol_once(&listener, 44, 42);
                 reject_protocol_once(&listener, 43, 42);
                 let (mut stream, _) = listener.accept().unwrap();
                 let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
@@ -3103,6 +3201,7 @@ mod tests {
                         token: "token".into(),
                         reconstruction: Vec::new(),
                         warning: None,
+                        profile: None,
                     },
                 ),
             )
@@ -3116,6 +3215,118 @@ mod tests {
 
         assert_eq!(attachment.token, "token");
         server.join().unwrap();
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn exact_run_attachment_can_omit_gateway_environment_and_restart_authority() {
+        let directory = env::temp_dir().join(format!("boomux-client-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let socket = directory.join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+            assert_eq!(request.version, protocol::PROTOCOL_VERSION);
+            assert_eq!(
+                request.message,
+                Request::Attach {
+                    shell_id: "shell-1".into(),
+                    takeover: true,
+                    restart_exited: false,
+                    expected_run_id: Some("run-1".into()),
+                    profile: test_profile(),
+                    environment: None,
+                    owner_environment: false,
+                }
+            );
+            protocol::write_message(
+                &mut stream,
+                &Envelope::with_version(
+                    protocol::PROTOCOL_VERSION,
+                    Response::Attached {
+                        token: "token".into(),
+                        reconstruction: Vec::new(),
+                        warning: None,
+                        profile: None,
+                    },
+                ),
+            )
+            .unwrap();
+        });
+        let client = Client::from_socket_path(socket);
+
+        let attachment = client
+            .attach_exact_run_with_timeout(
+                "shell-1",
+                "run-1",
+                true,
+                test_profile(),
+                Duration::from_secs(1),
+            )
+            .unwrap();
+
+        assert_eq!(attachment.token, "token");
+        assert_eq!(attachment.stream.read_timeout().unwrap(), None);
+        assert_eq!(attachment.stream.write_timeout().unwrap(), None);
+        server.join().unwrap();
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn exact_run_attachment_timeout_bounds_a_stalled_gateway_request() {
+        let directory = env::temp_dir().join(format!("boomux-client-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let socket = directory.join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+            thread::sleep(Duration::from_millis(100));
+        });
+        let client = Client::from_socket_path(socket);
+
+        let error = client
+            .attach_exact_run_with_timeout(
+                "shell-1",
+                "run-1",
+                true,
+                test_profile(),
+                Duration::from_millis(10),
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ClientError::Transport(ref error)
+                if matches!(error.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock)
+        ));
+        server.join().unwrap();
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn collaborative_attachment_never_downgrades_to_takeover() {
+        let directory = env::temp_dir().join(format!("boomux-client-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let socket = directory.join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let client = Client::from_socket_path(socket);
+        client.protocol_version.store(43, Ordering::Release);
+
+        assert!(matches!(
+            client.attach_collaborative_exact_run_with_timeout(
+                "shell-1",
+                "run-1",
+                test_profile(),
+                Duration::from_secs(1),
+            ),
+            Err(ClientError::Protocol(ProtocolError::UnsupportedVersion(_)))
+        ));
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -3163,6 +3374,7 @@ mod tests {
                                     token: "token".into(),
                                     reconstruction: Vec::new(),
                                     warning: None,
+                                    profile: None,
                                 },
                             ),
                         )

@@ -1,0 +1,13 @@
+{
+  "private": true,
+  "scripts": {
+    "build:web-terminal": "bun build assets/mobile-web/terminal-source.js --outdir assets/mobile-web --entry-naming terminal.[ext] --target browser --format esm --minify && cp node_modules/ghostty-web/ghostty-vt.wasm assets/mobile-web/ghostty-vt.wasm"
+  },
+  "dependencies": {
+    "@fontsource/jetbrains-mono": "5.3.0",
+    "ghostty-web": "0.4.0-next.20.g1858a59"
+  },
+  "patchedDependencies": {
+    "ghostty-web@0.4.0-next.20.g1858a59": "patches/ghostty-web@0.4.0-next.20.g1858a59.patch"
+  }
+}

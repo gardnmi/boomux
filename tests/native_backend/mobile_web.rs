@@ -1,12 +1,18 @@
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
-use boomux::protocol::ShellSpec;
+use boomux::protocol::{AgentAuthority, AgentRegistrationSpec, AgentReport, AgentState, ShellSpec};
+use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+use tungstenite::client::IntoClientRequest;
+use tungstenite::http::{HeaderValue, header};
+use tungstenite::{Message, connect};
 
-use crate::support::{TestDaemon, profile};
+use crate::support::{TIMEOUT, TestDaemon, contains, profile, wait_until};
 
 struct WebCleanup {
     executable: PathBuf,
@@ -47,6 +53,68 @@ fn run_web(daemon: &TestDaemon, arguments: &[&str], path: &Path) -> std::process
     let mut command = daemon.command();
     command.args(arguments).env("PATH", path);
     command.output().unwrap()
+}
+
+fn http_json(port: u16, request: &[u8]) -> serde_json::Value {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream.write_all(request).unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).unwrap();
+    let header_end = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .unwrap();
+    assert!(response[..header_end].starts_with(b"HTTP/1.1 200"));
+    serde_json::from_slice(&response[header_end + 4..]).unwrap()
+}
+
+fn terminal_websocket_request(
+    port: u16,
+    token: &str,
+    origin: &str,
+) -> tungstenite::handshake::client::Request {
+    let mut request = format!("ws://127.0.0.1:{port}/api/terminal")
+        .into_client_request()
+        .unwrap();
+    request
+        .headers_mut()
+        .insert(header::ORIGIN, HeaderValue::from_str(origin).unwrap());
+    request.headers_mut().insert(
+        header::SEC_WEBSOCKET_PROTOCOL,
+        HeaderValue::from_str(&format!("boomux.terminal.v1, boomux.token.{token}")).unwrap(),
+    );
+    request
+}
+
+fn read_terminal_until(reader: &mut dyn Read, needle: &[u8]) -> Vec<u8> {
+    let deadline = Instant::now() + TIMEOUT;
+    let mut output = Vec::new();
+    let mut buffer = [0; 16 * 1024];
+    while Instant::now() < deadline {
+        match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => {
+                output.extend_from_slice(&buffer[..count]);
+                if contains(&output, needle) {
+                    return output;
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) =>
+            {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("terminal read failed: {error}"),
+        }
+    }
+    panic!(
+        "did not receive {:?}; terminal output was {:?}",
+        String::from_utf8_lossy(needle),
+        String::from_utf8_lossy(&output)
+    );
 }
 
 #[test]
@@ -243,6 +311,305 @@ fn web_keeps_an_opencode_port_conflict_fatal() {
             .contains("exited before becoming ready")
     );
 
+    drop(cleanup);
+    daemon.stop_with_cli();
+}
+
+#[test]
+fn current_local_agent_from_any_harness_can_collaborate_from_web_terminal() {
+    let mut daemon = TestDaemon::start();
+    let empty_path = daemon.runtime_dir.join("empty-path");
+    fs::create_dir(&empty_path).unwrap();
+    let workspace = daemon
+        .client
+        .create_workspace(
+            "kiro-web-terminal",
+            vec![ShellSpec {
+                name: "kiro".into(),
+                command: vec!["/bin/sh".into()],
+                cwd: std::env::temp_dir(),
+            }],
+        )
+        .unwrap();
+    let shell_id = workspace.shells[0].id.clone();
+    let attachment = daemon.client.attach(&shell_id, false, profile()).unwrap();
+    let run_id = daemon.client.get_shell(&shell_id).unwrap().run.unwrap().id;
+    daemon
+        .client
+        .register_agent(
+            &shell_id,
+            &run_id,
+            AgentRegistrationSpec {
+                name: "future-agent".into(),
+                integration: "future-harness".into(),
+                external_session_id: Some("future-session".into()),
+                report: AgentReport {
+                    state: AgentState::Working,
+                    authority: AgentAuthority::LifecycleIntegration,
+                    evidence: "future harness started".into(),
+                    confidence: 100,
+                },
+            },
+        )
+        .unwrap();
+
+    drop(attachment);
+    let pty = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 480,
+        })
+        .unwrap();
+    let descriptor = pty.master.as_raw_fd().unwrap();
+    let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+    assert_ne!(flags, -1);
+    assert_ne!(
+        unsafe { libc::fcntl(descriptor, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        -1
+    );
+    let mut command = CommandBuilder::new(&daemon.executable);
+    command.args([
+        "__attach",
+        &shell_id,
+        "--takeover",
+        "--expected-run-id",
+        &run_id,
+    ]);
+    command.env("XDG_RUNTIME_DIR", &daemon.runtime_dir);
+    command.env("XDG_STATE_HOME", daemon.runtime_dir.join("state"));
+    command.env("TERM", "xterm-256color");
+    command.env("COLORTERM", "truecolor");
+    command.env("TERM_PROGRAM", "kiro-web-test");
+    command.env("SHELL", "/bin/sh");
+    let mut native_attachment = pty.slave.spawn_command(command).unwrap();
+    drop(pty.slave);
+    let mut native_reader = pty.master.try_clone_reader().unwrap();
+    let mut native_writer = pty.master.take_writer().unwrap();
+    native_writer
+        .write_all(b"printf 'native-before-web\\n'\n")
+        .unwrap();
+    read_terminal_until(native_reader.as_mut(), b"native-before-web");
+
+    let dashboard_port = unused_port();
+    let opencode_port = unused_port();
+    let dashboard_port_text = dashboard_port.to_string();
+    let opencode_port_text = opencode_port.to_string();
+    let cleanup = WebCleanup::new(&daemon, dashboard_port_text.clone());
+    let started = run_web(
+        &daemon,
+        &[
+            "web",
+            "start",
+            "--port",
+            &dashboard_port_text,
+            "--opencode-web-port",
+            &opencode_port_text,
+            "--json",
+        ],
+        &empty_path,
+    );
+    assert!(
+        started.status.success(),
+        "web start failed: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+
+    let snapshot_request = format!(
+        "GET /api/snapshot HTTP/1.1\r\nHost: 127.0.0.1:{dashboard_port}\r\nConnection: close\r\n\r\n"
+    );
+    let snapshot = http_json(dashboard_port, snapshot_request.as_bytes());
+    let agent = snapshot["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|agent| agent["integration"] == "future-harness")
+        .unwrap();
+    let body = serde_json::json!({
+        "node_id": agent["node_id"],
+        "agent_id": agent["agent_id"],
+        "shell_id": shell_id,
+        "run_id": run_id,
+        "rows": 40,
+        "cols": 100,
+        "pixel_width": 1000,
+        "pixel_height": 800
+    })
+    .to_string();
+    let authorization_request = format!(
+        "POST /api/terminal/authorize HTTP/1.1\r\nHost: 127.0.0.1:{dashboard_port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let authorization = http_json(dashboard_port, authorization_request.as_bytes());
+    let token = authorization["token"].as_str().unwrap();
+    let origin = format!("http://127.0.0.1:{dashboard_port}");
+    let request = terminal_websocket_request(dashboard_port, token, &origin);
+    let (mut socket, response) = connect(request).unwrap();
+    assert_eq!(
+        response
+            .headers()
+            .get(header::SEC_WEBSOCKET_PROTOCOL)
+            .unwrap(),
+        "boomux.terminal.v1"
+    );
+    if let tungstenite::stream::MaybeTlsStream::Plain(stream) = socket.get_mut() {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+    }
+    assert!(matches!(
+        connect(terminal_websocket_request(dashboard_port, token, &origin)),
+        Err(tungstenite::Error::Http(response)) if response.status() == tungstenite::http::StatusCode::FORBIDDEN
+    ));
+
+    let second_authorization = http_json(dashboard_port, authorization_request.as_bytes());
+    let second_token = second_authorization["token"].as_str().unwrap();
+    assert!(matches!(
+        connect(terminal_websocket_request(
+            dashboard_port,
+            second_token,
+            "https://foreign.example"
+        )),
+        Err(tungstenite::Error::Http(response)) if response.status() == tungstenite::http::StatusCode::FORBIDDEN
+    ));
+
+    let Message::Text(message) = socket.read().unwrap() else {
+        panic!("terminal did not report its attachment profile");
+    };
+    let attached: serde_json::Value = serde_json::from_str(message.as_ref()).unwrap();
+    assert_eq!(attached["type"], "attached");
+    assert_eq!(attached["rows"], 24);
+    assert_eq!(attached["cols"], 80);
+    let _reconstruction = socket.read().unwrap();
+    socket
+        .send(Message::Binary(
+            b"printf 'kiro-web-ok\\n'\n".to_vec().into(),
+        ))
+        .unwrap();
+    let mut output = Vec::new();
+    while !output
+        .windows(b"kiro-web-ok".len())
+        .any(|window| window == b"kiro-web-ok")
+    {
+        if let Message::Binary(bytes) = socket.read().unwrap() {
+            output.extend_from_slice(&bytes);
+        }
+    }
+    read_terminal_until(native_reader.as_mut(), b"kiro-web-ok");
+
+    native_writer
+        .write_all(b"printf 'native-while-web-open\\n'\n")
+        .unwrap();
+    read_terminal_until(native_reader.as_mut(), b"native-while-web-open");
+    let mut output = Vec::new();
+    while !output
+        .windows(b"native-while-web-open".len())
+        .any(|window| window == b"native-while-web-open")
+    {
+        if let Message::Binary(bytes) = socket.read().unwrap() {
+            output.extend_from_slice(&bytes);
+        }
+    }
+
+    socket
+        .send(Message::Text(
+            r#"{"type":"resize","rows":50,"cols":120,"pixel_width":1200,"pixel_height":1000}"#
+                .into(),
+        ))
+        .unwrap();
+    socket
+        .send(Message::Binary(b"stty size\n".to_vec().into()))
+        .unwrap();
+    let mut output = Vec::new();
+    while !output
+        .windows(b"24 80".len())
+        .any(|window| window == b"24 80")
+    {
+        if let Message::Binary(bytes) = socket.read().unwrap() {
+            output.extend_from_slice(&bytes);
+        }
+    }
+
+    pty.master
+        .resize(PtySize {
+            rows: 30,
+            cols: 100,
+            pixel_width: 1000,
+            pixel_height: 600,
+        })
+        .unwrap();
+    loop {
+        match socket.read().unwrap() {
+            Message::Text(message) => {
+                let message: serde_json::Value = serde_json::from_str(message.as_ref()).unwrap();
+                if message["type"] == "resize" {
+                    assert_eq!(message["rows"], 30);
+                    assert_eq!(message["cols"], 100);
+                    break;
+                }
+            }
+            Message::Binary(_) => {}
+            message => panic!("unexpected terminal resize message: {message:?}"),
+        }
+    }
+
+    let restart = daemon
+        .command()
+        .args(["daemon", "restart"])
+        .output()
+        .unwrap();
+    assert!(
+        restart.status.success(),
+        "daemon restart failed: {}",
+        String::from_utf8_lossy(&restart.stderr)
+    );
+    wait_until(
+        || daemon.client.ping().is_ok(),
+        "replacement daemon did not accept requests",
+    );
+    let mut reconnecting = false;
+    let mut reattached = false;
+    while !reattached {
+        match socket.read().unwrap() {
+            Message::Text(message) if message.contains("\"type\":\"reconnecting\"") => {
+                reconnecting = true;
+            }
+            Message::Text(message) if message.contains("\"type\":\"attached\"") => {
+                reattached = true;
+            }
+            Message::Binary(_) => {}
+            message => panic!("unexpected terminal reconnect message: {message:?}"),
+        }
+    }
+    assert!(reconnecting);
+    socket
+        .send(Message::Binary(
+            b"printf 'kiro-web-after-restart\\n'\n".to_vec().into(),
+        ))
+        .unwrap();
+    let mut output = Vec::new();
+    while !output
+        .windows(b"kiro-web-after-restart".len())
+        .any(|window| window == b"kiro-web-after-restart")
+    {
+        if let Message::Binary(bytes) = socket.read().unwrap() {
+            output.extend_from_slice(&bytes);
+        }
+    }
+    read_terminal_until(native_reader.as_mut(), b"kiro-web-after-restart");
+    socket.close(None).unwrap();
+    native_writer
+        .write_all(b"printf 'native-after-web\\n'\n")
+        .unwrap();
+    read_terminal_until(native_reader.as_mut(), b"native-after-web");
+    assert_eq!(
+        daemon.client.get_shell(&shell_id).unwrap().run.unwrap().id,
+        run_id
+    );
+
+    daemon.client.close_shell(&shell_id).unwrap();
+    let _ = native_attachment.wait();
     drop(cleanup);
     daemon.stop_with_cli();
 }

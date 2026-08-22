@@ -1,0 +1,55 @@
+diff --git a/dist/ghostty-web.js b/dist/ghostty-web.js
+index bb02e76..4006941 100644
+--- a/dist/ghostty-web.js
++++ b/dist/ghostty-web.js
+@@ -1645,7 +1645,7 @@ class BA {
+     const g = A.getContext("2d", { alpha: !0 });
+     if (!g)
+       throw new Error("Failed to get 2D rendering context");
+-    this.ctx = g, this.fontSize = Q.fontSize ?? 15, this.fontFamily = Q.fontFamily ?? "monospace", this.cursorStyle = Q.cursorStyle ?? "block", this.cursorBlink = Q.cursorBlink ?? !1, this.theme = { ...b, ...Q.theme }, this.devicePixelRatio = Q.devicePixelRatio ?? window.devicePixelRatio ?? 1, this.palette = [
++    this.ctx = g, this.fontSize = Q.fontSize ?? 15, this.fontFamily = Q.fontFamily ?? "monospace", this.cursorStyle = Q.cursorStyle ?? "block", this.cursorBlink = Q.cursorBlink ?? !1, this.theme = { ...b, ...Q.theme }, this.devicePixelRatio = Math.min(Q.devicePixelRatio ?? window.devicePixelRatio ?? 1, 2), this.palette = [
+       this.theme.black,
+       this.theme.red,
+       this.theme.green,
+@@ -1692,8 +1692,8 @@ class BA {
+    * Resize canvas to fit terminal dimensions
+    */
+   resize(A, Q) {
+-    const g = A * this.metrics.width, E = Q * this.metrics.height;
+-    this.canvas.style.width = `${g}px`, this.canvas.style.height = `${E}px`, this.canvas.width = g * this.devicePixelRatio, this.canvas.height = E * this.devicePixelRatio, this.ctx.scale(this.devicePixelRatio, this.devicePixelRatio), this.ctx.textBaseline = "alphabetic", this.ctx.textAlign = "left", this.ctx.fillStyle = this.theme.background, this.ctx.fillRect(0, 0, g, E);
++    const g = A * this.metrics.width, E = Q * this.metrics.height, C = Math.round(g * this.devicePixelRatio), I = Math.round(E * this.devicePixelRatio);
++    this.canvas.style.width = `${g}px`, this.canvas.style.height = `${E}px`, this.canvas.width = C, this.canvas.height = I, this.ctx.scale(this.devicePixelRatio, this.devicePixelRatio), this.ctx.textBaseline = "alphabetic", this.ctx.textAlign = "left", this.ctx.fillStyle = this.theme.background, this.ctx.fillRect(0, 0, g, E);
+   }
+   // ==========================================================================
+   // Main Rendering
+@@ -1705,7 +1705,7 @@ class BA {
+     var U;
+     this.currentBuffer = A;
+     const I = A.getCursor(), D = A.getDimensions(), o = E ? E.getScrollbackLength() : 0;
+-    (U = A.needsFullRedraw) != null && U.call(A) && (Q = !0), (this.canvas.width !== D.cols * this.metrics.width * this.devicePixelRatio || this.canvas.height !== D.rows * this.metrics.height * this.devicePixelRatio) && (this.resize(D.cols, D.rows), Q = !0), g !== this.lastViewportY && (Q = !0, this.lastViewportY = g);
++    (U = A.needsFullRedraw) != null && U.call(A) && (Q = !0), (this.canvas.width !== Math.round(D.cols * this.metrics.width * this.devicePixelRatio) || this.canvas.height !== Math.round(D.rows * this.metrics.height * this.devicePixelRatio)) && (this.resize(D.cols, D.rows), Q = !0), g !== this.lastViewportY && (Q = !0, this.lastViewportY = g);
+     const s = I.x !== this.lastCursorPosition.x || I.y !== this.lastCursorPosition.y;
+     if (s || this.cursorBlink) {
+       if (!Q && !A.isRowDirty(I.y)) {
+@@ -2655,9 +2655,7 @@ class iA {
+   handleFontChange() {
+     if (!this.renderer || !this.wasmTerm || !this.canvas)
+       return;
+-    this.selectionManager && this.selectionManager.clearSelection(), this.renderer.resize(this.cols, this.rows);
+-    const A = this.renderer.getMetrics();
+-    this.canvas.width = A.width * this.cols, this.canvas.height = A.height * this.rows, this.canvas.style.width = `${A.width * this.cols}px`, this.canvas.style.height = `${A.height * this.rows}px`, this.renderer.render(this.wasmTerm, !0, this.viewportY, this);
++    this.selectionManager && this.selectionManager.clearSelection(), this.renderer.resize(this.cols, this.rows), this.renderer.render(this.wasmTerm, !0, this.viewportY, this);
+   }
+   /**
+    * Parse a CSS color string to 0xRRGGBB format.
+@@ -2839,9 +2837,7 @@ class iA {
+     if (this.assertOpen(), !(A === this.cols && Q === this.rows)) {
+       this.cancelRenderLoop();
+       try {
+-        this.cols = A, this.rows = Q, this.wasmTerm.resize(A, Q), this.renderer.resize(A, Q);
+-        const g = this.renderer.getMetrics();
+-        this.canvas.width = g.width * A, this.canvas.height = g.height * Q, this.canvas.style.width = `${g.width * A}px`, this.canvas.style.height = `${g.height * Q}px`, this.resizeEmitter.fire({ cols: A, rows: Q }), this.renderer.render(this.wasmTerm, !0, this.viewportY, this);
++        this.cols = A, this.rows = Q, this.wasmTerm.resize(A, Q), this.renderer.resize(A, Q), this.resizeEmitter.fire({ cols: A, rows: Q }), this.renderer.render(this.wasmTerm, !0, this.viewportY, this);
+       } catch (g) {
+         console.error("Terminal resize failed:", g);
+       }

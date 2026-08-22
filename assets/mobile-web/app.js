@@ -1,5 +1,7 @@
 "use strict";
 
+import { createTerminal } from "./terminal.js";
+
 const POLL_INTERVAL_MS = 2_000;
 const state = {
   snapshot: null,
@@ -8,6 +10,7 @@ const state = {
   pollTimer: null,
   snapshotRequest: null,
   online: true,
+  activeTerminal: null,
 };
 
 const elements = {
@@ -167,8 +170,9 @@ function renderAgentCard(agent) {
   }
   body.append(meta);
   const nativeUrl = agent.native_web?.url || derivedNativeUrl(agent.native_web);
+  const webTerminal = canOpenWebTerminal(agent);
   const dismissible = agent.node_local && hasAlert(agent);
-  if (nativeUrl || dismissible) {
+  if (nativeUrl || webTerminal || dismissible) {
     const actions = el("div", "card-actions");
     if (nativeUrl) {
       const nativeLink = el("a", "card-native-link", agent.native_web.label || "Open in OpenCode");
@@ -177,6 +181,12 @@ function renderAgentCard(agent) {
       nativeLink.rel = "noreferrer";
       nativeLink.referrerPolicy = "no-referrer";
       actions.append(nativeLink);
+    }
+    if (webTerminal) {
+      const terminalButton = el("button", "card-native-link", "Open in Web Terminal");
+      terminalButton.type = "button";
+      terminalButton.addEventListener("click", () => openWebTerminal(agent));
+      actions.append(terminalButton);
     }
     if (dismissible) {
       const dismissButton = el("button", "card-dismiss-button", "Dismiss");
@@ -189,6 +199,129 @@ function renderAgentCard(agent) {
   content.append(rail, body);
   item.append(content);
   return item;
+}
+
+function canOpenWebTerminal(agent) {
+  return agent.node_local && agent.node_current && agent.run_current;
+}
+
+async function openWebTerminal(agent) {
+  state.activeTerminal?.close();
+  const dialog = el("dialog", "terminal-dialog");
+  dialog.setAttribute("aria-label", `Web terminal for ${agentDisplayName(agent)}`);
+  const shell = el("section", "terminal-shell");
+  const notice = el("p", "terminal-notice", "This browser is joining the Agent's current terminal without disconnecting the desktop.");
+  notice.setAttribute("aria-live", "polite");
+  const viewport = el("div", "terminal-viewport");
+  shell.append(notice, viewport);
+  dialog.append(shell);
+  document.body.append(dialog);
+  dialog.showModal();
+  const historyId = crypto.randomUUID();
+
+  let socket = null;
+  let terminal = null;
+  let closed = false;
+  const sendJson = (message) => {
+    if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify(message));
+  };
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    const ownsHistory = history.state?.boomuxTerminal === historyId;
+    window.removeEventListener("popstate", close);
+    sendJson({ type: "detach" });
+    socket?.close(1000, "terminal closed");
+    terminal?.dispose();
+    if (dialog.open) dialog.close();
+    dialog.remove();
+    if (state.activeTerminal?.dialog === dialog) state.activeTerminal = null;
+    if (document.visibilityState === "visible") restartPolling();
+    if (ownsHistory) history.back();
+  };
+  state.activeTerminal = { dialog, terminal, close };
+  state.snapshotRequest?.abort();
+  clearInterval(state.pollTimer);
+  state.pollTimer = null;
+  window.addEventListener("popstate", close);
+  dialog.addEventListener("cancel", (event) => {
+    event.preventDefault();
+    close();
+  });
+  viewport.addEventListener("focusin", () => sendJson({ type: "focus" }));
+  viewport.addEventListener("pointerdown", () => terminal?.focus());
+
+  try {
+    terminal = await createTerminal(viewport, {
+      input: (bytes) => {
+        if (socket?.readyState === WebSocket.OPEN) socket.send(bytes);
+      },
+      resize: (dimensions) => sendJson({ type: "resize", ...dimensions }),
+    });
+    if (closed) {
+      terminal.dispose();
+      return;
+    }
+    state.activeTerminal.terminal = terminal;
+    history.pushState({ ...history.state, boomuxTerminal: historyId }, "", "#web-terminal");
+    const authorization = await fetch("/api/terminal/authorize", {
+      method: "POST",
+      cache: "no-store",
+      headers: { Accept: "application/json", "Content-Type": "application/json" },
+      body: JSON.stringify({
+        node_id: agent.node_id,
+        agent_id: agent.agent_id,
+        shell_id: agent.shell_id,
+        run_id: agent.run_id,
+        ...terminal.dimensions(),
+      }),
+    });
+    if (!authorization.ok) throw new Error(`Authorization failed (${authorization.status})`);
+    const grant = await authorization.json();
+    if (closed) return;
+    const url = new URL(grant.path, window.location.href);
+    url.protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    socket = new WebSocket(url, [grant.protocol, `boomux.token.${grant.token}`]);
+    socket.binaryType = "arraybuffer";
+    socket.addEventListener("open", () => {
+      terminal.focus();
+    });
+    socket.addEventListener("message", (event) => {
+      if (typeof event.data !== "string") {
+        terminal.write(new Uint8Array(event.data));
+        return;
+      }
+      const message = JSON.parse(event.data);
+      if (message.type === "attached") {
+        terminal.resize(message);
+        notice.textContent = message.warning || "This browser has terminal control. Closing it leaves the Agent running.";
+        if (message.warning) terminal.write(`\r\n${message.warning}\r\n`);
+      } else if (message.type === "resize") {
+        terminal.resize(message);
+      } else if (message.type === "reconnecting") {
+        notice.textContent = "Reconnecting to the same Agent terminal.";
+      } else if (message.type === "closed" || message.type === "error") {
+        notice.textContent = message.message || "The terminal attachment ended.";
+        terminal.write(`\r\n${notice.textContent}\r\n`);
+      }
+    });
+    socket.addEventListener("close", () => {
+      if (!closed) {
+        notice.textContent = "Terminal control ended. The Agent may still be running.";
+        terminal.write(`\r\n${notice.textContent}\r\n`);
+      }
+    });
+    socket.addEventListener("error", () => {
+      notice.textContent = "Could not connect to the Agent terminal.";
+    });
+  } catch (error) {
+    if (!terminal) {
+      close();
+      return;
+    }
+    notice.textContent = error.message || "Could not open the Agent terminal.";
+    terminal.write(`\r\n${notice.textContent}\r\n`);
+  }
 }
 
 function metaItem(label, value) {
@@ -269,12 +402,16 @@ function derivedNativeUrl(nativeWeb) {
 }
 
 async function poll() {
-  if (document.visibilityState !== "visible") return;
+  if (document.visibilityState !== "visible" || state.activeTerminal) return;
   await refreshSnapshot();
 }
 
 function restartPolling() {
   clearInterval(state.pollTimer);
+  if (state.activeTerminal) {
+    state.pollTimer = null;
+    return;
+  }
   poll();
   state.pollTimer = setInterval(poll, POLL_INTERVAL_MS);
 }
@@ -293,7 +430,11 @@ document.querySelectorAll(".filter-button").forEach((button) => {
 
 window.addEventListener("focus", restartPolling);
 document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "visible") restartPolling();
+  if (document.visibilityState === "visible") {
+    restartPolling();
+  } else {
+    state.activeTerminal?.close();
+  }
 });
 
 window.addEventListener("beforeinstallprompt", (event) => {

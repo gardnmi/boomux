@@ -70,6 +70,7 @@ use crate::state_store::{
 use crate::terminal_state::TerminalState;
 
 const CONTROLLER_QUEUE: usize = 64;
+const MAX_COLLABORATORS_PER_SHELL: usize = 4;
 const MAX_CONNECTION_HANDLERS: usize = 64;
 const SHUTDOWN_GRACE: Duration = Duration::from_millis(50);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -1839,6 +1840,29 @@ fn handle_connection_inner(
                 profile,
                 environment,
                 owner_environment,
+                collaborative: false,
+            },
+        );
+    }
+    if let Request::AttachCollaborative {
+        shell_id,
+        expected_run_id,
+        profile,
+    } = request.message
+    {
+        return registry.runtimes.handle_attach(
+            stream,
+            response_version,
+            &registry,
+            &shell_id,
+            AttachRequestOptions {
+                takeover: false,
+                restart_exited: false,
+                expected_run_id: Some(expected_run_id),
+                profile,
+                environment: None,
+                owner_environment: false,
+                collaborative: true,
             },
         );
     }
@@ -7045,6 +7069,9 @@ impl ShellRuntimeManager {
         if let Some(controller) = lock(&runtime.controller)?.take() {
             let _ = controller.connection.shutdown(std::net::Shutdown::Both);
         }
+        for (_, collaborator) in lock(&runtime.collaborators)?.drain() {
+            let _ = collaborator.connection.shutdown(std::net::Shutdown::Both);
+        }
         self.pause_reader(&runtime)?;
         let result = (|| {
             let mut process = lock(&runtime.process)?;
@@ -7284,7 +7311,74 @@ impl ShellRuntimeManager {
             .is_some_and(|current| current.token == token)
         {
             controller.take();
+            return Ok(());
         }
+        drop(controller);
+        lock(&runtime.collaborators)?.remove(token);
+        Ok(())
+    }
+
+    fn participant_is_authorized(runtime: &ShellRuntime, token: &str) -> io::Result<bool> {
+        if Self::participant_is_primary(runtime, token)? {
+            return Ok(true);
+        }
+        Ok(lock(&runtime.collaborators)?.contains_key(token))
+    }
+
+    fn participant_is_primary(runtime: &ShellRuntime, token: &str) -> io::Result<bool> {
+        Ok(lock(&runtime.controller)?
+            .as_ref()
+            .is_some_and(|controller| controller.token == token))
+    }
+
+    fn fanout_output(runtime: &ShellRuntime, bytes: &[u8]) {
+        if let Ok(mut controller) = runtime.controller.lock() {
+            let disconnect = controller.as_ref().is_some_and(|current| {
+                current
+                    .output
+                    .try_send(ControllerOutput::Data(bytes.to_vec()))
+                    .is_err()
+            });
+            if disconnect && let Some(current) = controller.take() {
+                let _ = current.connection.shutdown(std::net::Shutdown::Both);
+            }
+        }
+        if let Ok(mut collaborators) = runtime.collaborators.lock() {
+            collaborators.retain(|_, collaborator| {
+                let connected = collaborator
+                    .output
+                    .try_send(ControllerOutput::Data(bytes.to_vec()))
+                    .is_ok();
+                if !connected {
+                    let _ = collaborator.connection.shutdown(std::net::Shutdown::Both);
+                }
+                connected
+            });
+        }
+    }
+
+    fn fanout_collaborator_resize(runtime: &ShellRuntime, size: PtySize) {
+        if let Ok(mut collaborators) = runtime.collaborators.lock() {
+            collaborators.retain(|_, collaborator| {
+                let connected = collaborator
+                    .output
+                    .try_send(ControllerOutput::Resize {
+                        rows: size.rows,
+                        cols: size.cols,
+                        pixel_width: size.pixel_width,
+                        pixel_height: size.pixel_height,
+                    })
+                    .is_ok();
+                if !connected {
+                    let _ = collaborator.connection.shutdown(std::net::Shutdown::Both);
+                }
+                connected
+            });
+        }
+    }
+
+    fn displace_collaborators(runtime: &ShellRuntime) -> io::Result<()> {
+        lock(&runtime.collaborators)?.clear();
         Ok(())
     }
 
@@ -7292,27 +7386,29 @@ impl ShellRuntimeManager {
         let mut acknowledgements = Vec::new();
         for runtime in runtimes {
             let mut controller = lock(&runtime.controller)?;
-            let Some(current) = controller.as_mut() else {
-                continue;
-            };
-            let (written, write_acknowledged) = mpsc::sync_channel(1);
-            let (client_acknowledge, client_acknowledged) = mpsc::sync_channel(1);
-            current.reconnect_ack = Some(client_acknowledge);
-            match current
-                .output
-                .try_send(ControllerOutput::Reconnect(written))
-            {
-                Ok(()) => acknowledgements.push((write_acknowledged, client_acknowledged)),
-                Err(TrySendError::Disconnected(_)) => {
-                    if let Some(current) = controller.take() {
-                        let _ = current.connection.shutdown(std::net::Shutdown::Both);
+            if let Some(current) = controller.as_mut() {
+                match Self::quiesce_participant(current)? {
+                    Some(acknowledgement) => acknowledgements.push(acknowledgement),
+                    None => {
+                        if let Some(current) = controller.take() {
+                            let _ = current.connection.shutdown(std::net::Shutdown::Both);
+                        }
                     }
                 }
-                Err(TrySendError::Full(_)) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::WouldBlock,
-                        "active controller output queue is full",
-                    ));
+            }
+            drop(controller);
+
+            let mut collaborators = lock(&runtime.collaborators)?;
+            let mut disconnected = Vec::new();
+            for (token, collaborator) in collaborators.iter_mut() {
+                match Self::quiesce_participant(collaborator)? {
+                    Some(acknowledgement) => acknowledgements.push(acknowledgement),
+                    None => disconnected.push(token.clone()),
+                }
+            }
+            for token in disconnected {
+                if let Some(collaborator) = collaborators.remove(&token) {
+                    let _ = collaborator.connection.shutdown(std::net::Shutdown::Both);
                 }
             }
         }
@@ -7337,6 +7433,7 @@ impl ShellRuntimeManager {
             let mut active = false;
             for runtime in runtimes {
                 active |= lock(&runtime.controller)?.is_some();
+                active |= !lock(&runtime.collaborators)?.is_empty();
             }
             if !active {
                 return Ok(());
@@ -7347,6 +7444,25 @@ impl ShellRuntimeManager {
             io::ErrorKind::TimedOut,
             "active controllers did not reconnect",
         ))
+    }
+
+    fn quiesce_participant(
+        participant: &mut Controller,
+    ) -> io::Result<Option<(mpsc::Receiver<bool>, mpsc::Receiver<()>)>> {
+        let (written, write_acknowledged) = mpsc::sync_channel(1);
+        let (client_acknowledge, client_acknowledged) = mpsc::sync_channel(1);
+        participant.reconnect_ack = Some(client_acknowledge);
+        match participant
+            .output
+            .try_send(ControllerOutput::Reconnect(written))
+        {
+            Ok(()) => Ok(Some((write_acknowledged, client_acknowledged))),
+            Err(TrySendError::Disconnected(_)) => Ok(None),
+            Err(TrySendError::Full(_)) => Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "active attachment output queue is full",
+            )),
+        }
     }
 
     fn prepare_handoff(&self, shells: Vec<Arc<Shell>>) -> io::Result<PreparedHandoff> {
@@ -7728,6 +7844,7 @@ struct ShellRuntime {
     process: Mutex<ManagedProcess>,
     terminal: Arc<Mutex<TerminalState>>,
     controller: Mutex<Option<Controller>>,
+    collaborators: Mutex<HashMap<String, Controller>>,
     reader: Mutex<Option<ReaderTask>>,
     output_changed: Condvar,
     output_wait: Mutex<()>,
@@ -7770,6 +7887,12 @@ struct Controller {
 
 enum ControllerOutput {
     Data(Vec<u8>),
+    Resize {
+        rows: u16,
+        cols: u16,
+        pixel_width: u16,
+        pixel_height: u16,
+    },
     Reconnect(SyncSender<bool>),
 }
 
@@ -8970,6 +9093,7 @@ impl DaemonService {
                 token: Uuid::new_v4().to_string(),
                 reconstruction: Vec::new(),
                 warning: None,
+                profile: None,
             },
         )?;
         let mut output_stream = stream.try_clone()?;
@@ -13703,6 +13827,7 @@ impl DaemonService {
                 ))
             }),
             Request::Attach { .. }
+            | Request::AttachCollaborative { .. }
             | Request::AttachNode { .. }
             | Request::ResumeAgentSession { .. }
             | Request::ResumeNodeAgentSession { .. } => {
@@ -14160,6 +14285,7 @@ impl ShellRuntimeManager {
                 process: Mutex::new(ManagedProcess::Imported(process)),
                 terminal: Arc::new(Mutex::new(terminal)),
                 controller: Mutex::new(None),
+                collaborators: Mutex::new(HashMap::new()),
                 reader: Mutex::new(None),
                 output_changed: Condvar::new(),
                 output_wait: Mutex::new(()),
@@ -15167,9 +15293,7 @@ impl DaemonService {
         }
         let run_id = current_run.id.clone();
         drop(lifecycle);
-        let authorized = lock(&runtime.controller)?
-            .as_ref()
-            .is_some_and(|controller| controller.token == token);
+        let authorized = ShellRuntimeManager::participant_is_authorized(runtime, token)?;
         if !authorized {
             return Ok(false);
         }
@@ -16906,6 +17030,7 @@ impl ShellRuntimeManager {
                 process: Mutex::new(ManagedProcess::Owned(child)),
                 terminal: Arc::new(Mutex::new(terminal)),
                 controller: Mutex::new(None),
+                collaborators: Mutex::new(HashMap::new()),
                 reader: Mutex::new(None),
                 output_changed: Condvar::new(),
                 output_wait: Mutex::new(()),
@@ -17046,19 +17171,7 @@ impl ShellRuntimeManager {
                             {
                                 last_run.output_revision = revision;
                             }
-                            if let Ok(mut controller) = reader_runtime.controller.lock() {
-                                let disconnect = controller.as_ref().is_some_and(|current| {
-                                    matches!(
-                                        current
-                                            .output
-                                            .try_send(ControllerOutput::Data(bytes.to_vec())),
-                                        Err(TrySendError::Full(_) | TrySendError::Disconnected(_))
-                                    )
-                                });
-                                if disconnect && let Some(current) = controller.take() {
-                                    let _ = current.connection.shutdown(std::net::Shutdown::Both);
-                                }
-                            }
+                            Self::fanout_output(&reader_runtime, bytes);
                             drop(terminal);
                             reader_runtime.output_changed.notify_all();
                             drop(_output_wait);
@@ -17181,6 +17294,10 @@ impl ShellRuntimeManager {
                     .controller
                     .lock()
                     .map(|mut controller| controller.take());
+                let _ = reader_runtime
+                    .collaborators
+                    .lock()
+                    .map(|mut collaborators| collaborators.clear());
                 Ok(())
             })?;
         *lock(&runtime.reader)? = Some(ReaderTask {
@@ -17244,6 +17361,7 @@ struct AttachRequestOptions {
     profile: TerminalProfile,
     environment: Option<UnixEnvironment>,
     owner_environment: bool,
+    collaborative: bool,
 }
 
 impl ShellRuntimeManager {
@@ -17262,6 +17380,7 @@ impl ShellRuntimeManager {
             profile,
             environment,
             owner_environment,
+            collaborative,
         } = options;
         if let Err(error) = validate_terminal_profile(&profile) {
             return send_daemon_error(&mut stream, response_version, error.into());
@@ -17581,6 +17700,7 @@ impl ShellRuntimeManager {
                     token,
                     reconstruction: lock(&terminal)?.reconstruction(),
                     warning,
+                    profile: None,
                 },
             )?;
             return AttachFrame::Detached.write_to(&mut stream);
@@ -17588,7 +17708,19 @@ impl ShellRuntimeManager {
         let attached_run = attached_run.expect("running shell has a run");
         let runtime = runtime.expect("running shell has a runtime");
         let control = lock(&runtime.control)?;
-        {
+        if collaborative {
+            if lock(&runtime.collaborators)?.len() >= MAX_COLLABORATORS_PER_SHELL {
+                return send_response(
+                    &mut stream,
+                    response_version,
+                    DaemonError::lifecycle(
+                        ErrorCode::Busy,
+                        "shell has reached its collaborative attachment limit",
+                    )
+                    .into_response(),
+                );
+            }
+        } else {
             let controller = lock(&runtime.controller)?;
             if controller.is_some() && !takeover {
                 return send_response(
@@ -17602,9 +17734,11 @@ impl ShellRuntimeManager {
                 );
             }
         }
-        lock(&runtime.master)?.resize(Self::profile_size(&profile))?;
-        Self::update_runtime_dimensions(&shell, &runtime, Self::profile_size(&profile))?;
-        lock(&terminal)?.resize(profile.rows, profile.cols);
+        if !collaborative {
+            lock(&runtime.master)?.resize(Self::profile_size(&profile))?;
+            Self::update_runtime_dimensions(&shell, &runtime, Self::profile_size(&profile))?;
+            lock(&terminal)?.resize(profile.rows, profile.cols);
+        }
         // Keep terminal state locked until the controller is installed so the
         // reconstruction ends exactly where live delivery begins.
         let terminal = lock(&terminal)?;
@@ -17615,6 +17749,7 @@ impl ShellRuntimeManager {
                 token: token.clone(),
                 reconstruction: terminal.reconstruction(),
                 warning,
+                profile: collaborative.then_some(startup_profile),
             },
         )?;
         let lifecycle = lock(&shell.lifecycle)?;
@@ -17630,10 +17765,30 @@ impl ShellRuntimeManager {
         }
         let mut output_stream = stream.try_clone()?;
         output_stream.set_write_timeout(Some(RESPONSE_WRITE_TIMEOUT))?;
-        {
+        if collaborative {
+            lock(&runtime.collaborators)?.insert(
+                token.clone(),
+                Controller {
+                    token: token.clone(),
+                    output,
+                    connection,
+                    reconnect_ack: None,
+                },
+            );
+        } else {
             let mut controller = lock(&runtime.controller)?;
             if let Some(previous) = controller.take() {
-                let _ = previous.connection.shutdown(std::net::Shutdown::Both);
+                let (written, _) = mpsc::sync_channel(1);
+                if previous
+                    .output
+                    .try_send(ControllerOutput::Reconnect(written))
+                    .is_err()
+                {
+                    let _ = previous.connection.shutdown(std::net::Shutdown::Both);
+                }
+            }
+            if takeover {
+                Self::displace_collaborators(&runtime)?;
             }
             *controller = Some(Controller {
                 token: token.clone(),
@@ -17654,6 +17809,24 @@ impl ShellRuntimeManager {
                             if AttachFrame::Output(bytes)
                                 .write_to(&mut output_stream)
                                 .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        ControllerOutput::Resize {
+                            rows,
+                            cols,
+                            pixel_width,
+                            pixel_height,
+                        } => {
+                            if (AttachFrame::Resize {
+                                rows,
+                                cols,
+                                pixel_width,
+                                pixel_height,
+                            })
+                            .write_to(&mut output_stream)
+                            .is_err()
                             {
                                 break;
                             }
@@ -17696,10 +17869,17 @@ impl ShellRuntimeManager {
                 if matches!(frame, AttachFrame::ReconnectAck) {
                     let acknowledge = {
                         let mut controller = lock(&runtime.controller)?;
-                        controller
+                        let acknowledge = controller
                             .as_mut()
                             .filter(|controller| controller.token == token)
-                            .and_then(|controller| controller.reconnect_ack.take())
+                            .and_then(|controller| controller.reconnect_ack.take());
+                        drop(controller);
+                        acknowledge.or_else(|| {
+                            lock(&runtime.collaborators)
+                                .ok()?
+                                .get_mut(&token)
+                                .and_then(|collaborator| collaborator.reconnect_ack.take())
+                        })
                     };
                     if let Some(acknowledge) = acknowledge {
                         let _ = acknowledge.send(());
@@ -17725,9 +17905,8 @@ impl ShellRuntimeManager {
                     continue;
                 }
                 let control = lock(&runtime.control)?;
-                let authorized = lock(&runtime.controller)?
-                    .as_ref()
-                    .is_some_and(|controller| controller.token == token);
+                let primary = Self::participant_is_primary(&runtime, &token)?;
+                let authorized = primary || lock(&runtime.collaborators)?.contains_key(&token);
                 if !authorized {
                     return Ok(());
                 }
@@ -17739,7 +17918,9 @@ impl ShellRuntimeManager {
                         pixel_width,
                         pixel_height,
                     } => {
-                        if let Err(error) = validate_terminal_dimensions(rows, cols) {
+                        if !primary {
+                            Ok(())
+                        } else if let Err(error) = validate_terminal_dimensions(rows, cols) {
                             Err(error)
                         } else {
                             let size = PtySize {
@@ -17751,6 +17932,7 @@ impl ShellRuntimeManager {
                             lock(&runtime.terminal)?.resize(rows, cols);
                             lock(&runtime.master)?.resize(size)?;
                             Self::update_runtime_dimensions(&shell, &runtime, size)?;
+                            Self::fanout_collaborator_resize(&runtime, size);
                             Ok(())
                         }
                     }
@@ -17782,17 +17964,13 @@ impl ShellRuntimeManager {
         token: &str,
         bytes: &[u8],
     ) -> io::Result<bool> {
+        let control = lock(&runtime.control)?;
+        if !Self::participant_is_authorized(runtime, token)? {
+            return Ok(false);
+        }
         let mut offset = 0;
         while offset < bytes.len() {
-            let control = lock(&runtime.control)?;
-            let authorized = lock(&runtime.controller)?
-                .as_ref()
-                .is_some_and(|controller| controller.token == token);
-            if !authorized {
-                return Ok(false);
-            }
             let result = lock(&runtime.master)?.write(&bytes[offset..]);
-            drop(control);
             match result {
                 Ok(0) => return Err(io::Error::new(io::ErrorKind::WriteZero, "PTY input closed")),
                 Ok(count) => offset += count,
@@ -17803,6 +17981,7 @@ impl ShellRuntimeManager {
                 Err(error) => return Err(error),
             }
         }
+        drop(control);
         Ok(true)
     }
 
@@ -20108,15 +20287,136 @@ mod tests {
         registry.close_workspace(&workspace.id).unwrap();
     }
 
-    fn install_test_controller(runtime: &ShellRuntime, token: &str) {
+    fn install_test_controller(
+        runtime: &ShellRuntime,
+        token: &str,
+    ) -> mpsc::Receiver<ControllerOutput> {
         let (connection, _peer) = UnixStream::pair().unwrap();
-        let (output, _receiver) = mpsc::sync_channel(1);
+        let (output, receiver) = mpsc::sync_channel(1);
         *lock(&runtime.controller).unwrap() = Some(Controller {
             token: token.into(),
             output,
             connection,
             reconnect_ack: None,
         });
+        receiver
+    }
+
+    fn install_test_collaborator(
+        runtime: &ShellRuntime,
+        token: &str,
+        capacity: usize,
+    ) -> mpsc::Receiver<ControllerOutput> {
+        let (connection, _peer) = UnixStream::pair().unwrap();
+        let (output, receiver) = mpsc::sync_channel(capacity);
+        lock(&runtime.collaborators).unwrap().insert(
+            token.into(),
+            Controller {
+                token: token.into(),
+                output,
+                connection,
+                reconnect_ack: None,
+            },
+        );
+        receiver
+    }
+
+    #[test]
+    fn collaborative_participants_fan_out_release_and_preserve_primary_authority() {
+        let registry = DaemonService::default();
+        let (workspace, shell, runtime) = running_shell(&registry);
+        let _primary = install_test_controller(&runtime, "primary");
+        let collaborator = install_test_collaborator(&runtime, "collaborator", 2);
+
+        assert!(ShellRuntimeManager::participant_is_authorized(&runtime, "primary").unwrap());
+        assert!(ShellRuntimeManager::participant_is_authorized(&runtime, "collaborator").unwrap());
+        assert!(ShellRuntimeManager::participant_is_primary(&runtime, "primary").unwrap());
+        assert!(!ShellRuntimeManager::participant_is_primary(&runtime, "collaborator").unwrap());
+
+        ShellRuntimeManager::fanout_output(&runtime, b"shared-output");
+        assert!(matches!(
+            collaborator.recv().unwrap(),
+            ControllerOutput::Data(bytes) if bytes == b"shared-output"
+        ));
+        ShellRuntimeManager::release_controller(&runtime, "collaborator").unwrap();
+        assert!(lock(&runtime.collaborators).unwrap().is_empty());
+        assert!(lock(&runtime.controller).unwrap().is_some());
+
+        shell.kill().unwrap();
+        registry.close_workspace(&workspace.id).unwrap();
+    }
+
+    #[test]
+    fn primary_resize_fans_out_to_collaborators_only() {
+        let registry = DaemonService::default();
+        let (workspace, shell, runtime) = running_shell(&registry);
+        let primary = install_test_controller(&runtime, "primary");
+        let collaborator = install_test_collaborator(&runtime, "collaborator", 1);
+        let size = PtySize {
+            rows: 30,
+            cols: 100,
+            pixel_width: 1_000,
+            pixel_height: 600,
+        };
+
+        ShellRuntimeManager::fanout_collaborator_resize(&runtime, size);
+
+        assert!(matches!(
+            collaborator.recv().unwrap(),
+            ControllerOutput::Resize {
+                rows: 30,
+                cols: 100,
+                pixel_width: 1_000,
+                pixel_height: 600,
+            }
+        ));
+        assert!(matches!(primary.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        shell.kill().unwrap();
+        registry.close_workspace(&workspace.id).unwrap();
+    }
+
+    #[test]
+    fn slow_collaborator_is_removed_without_displacing_primary() {
+        let registry = DaemonService::default();
+        let (workspace, shell, runtime) = running_shell(&registry);
+        let _primary = install_test_controller(&runtime, "primary");
+        let collaborator = install_test_collaborator(&runtime, "slow", 1);
+        lock(&runtime.collaborators)
+            .unwrap()
+            .get("slow")
+            .unwrap()
+            .output
+            .try_send(ControllerOutput::Data(b"queued".to_vec()))
+            .unwrap();
+
+        ShellRuntimeManager::fanout_output(&runtime, b"new-output");
+
+        assert!(lock(&runtime.collaborators).unwrap().is_empty());
+        assert!(lock(&runtime.controller).unwrap().is_some());
+        assert!(matches!(
+            collaborator.recv().unwrap(),
+            ControllerOutput::Data(bytes) if bytes == b"queued"
+        ));
+        shell.kill().unwrap();
+        registry.close_workspace(&workspace.id).unwrap();
+    }
+
+    #[test]
+    fn exclusive_takeover_detaches_all_collaborators() {
+        let registry = DaemonService::default();
+        let (workspace, shell, runtime) = running_shell(&registry);
+        let _primary = install_test_controller(&runtime, "primary");
+        let first = install_test_collaborator(&runtime, "first", 1);
+        let second = install_test_collaborator(&runtime, "second", 1);
+
+        ShellRuntimeManager::displace_collaborators(&runtime).unwrap();
+
+        assert!(first.recv().is_err());
+        assert!(second.recv().is_err());
+        assert!(lock(&runtime.collaborators).unwrap().is_empty());
+        assert!(lock(&runtime.controller).unwrap().is_some());
+        shell.kill().unwrap();
+        registry.close_workspace(&workspace.id).unwrap();
     }
 
     #[test]
@@ -20233,7 +20533,7 @@ mod tests {
         );
         assert!(registry.snapshot().unwrap().focused_terminal.is_none());
 
-        install_test_controller(&runtime, "controller");
+        let _ = install_test_controller(&runtime, "controller");
         assert!(
             registry
                 .record_focus_gained(18, &shell, &run, &runtime, "controller")
@@ -20303,13 +20603,13 @@ mod tests {
             _ => panic!("expected running shell"),
         };
 
-        install_test_controller(&runtime, "old-controller");
+        let _ = install_test_controller(&runtime, "old-controller");
         assert!(
             registry
                 .record_focus_gained(18, &shell, &run, &runtime, "old-controller")
                 .unwrap()
         );
-        install_test_controller(&runtime, "current-controller");
+        let _ = install_test_controller(&runtime, "current-controller");
         assert!(
             !registry
                 .record_focus_gained(18, &shell, &run, &runtime, "old-controller")
@@ -20339,6 +20639,35 @@ mod tests {
                 .revision,
             2
         );
+    }
+
+    #[test]
+    fn focus_reports_accept_current_collaborators() {
+        let registry = DaemonService::default();
+        let (workspace, shell, runtime) = running_shell(&registry);
+        let run = match &*lock(&shell.lifecycle).unwrap() {
+            ShellLifecycle::Running { run, .. } => Arc::clone(run),
+            _ => panic!("expected running shell"),
+        };
+        let _receiver = install_test_collaborator(&runtime, "collaborator", 1);
+
+        assert!(
+            registry
+                .record_focus_gained(44, &shell, &run, &runtime, "collaborator")
+                .unwrap()
+        );
+        assert_eq!(
+            registry
+                .snapshot()
+                .unwrap()
+                .focused_terminal
+                .unwrap()
+                .shell_id,
+            shell.id
+        );
+
+        shell.kill().unwrap();
+        registry.close_workspace(&workspace.id).unwrap();
     }
 
     #[test]

@@ -18,7 +18,8 @@ handoff is an explicit, acknowledged upgrade path.
 - The listener socket and both daemon lock file descriptions keep their existing
   ownership across the transition.
 - A failed replacement resumes the old daemon without killing shells.
-- Active controllers acknowledge a reconnect boundary before PTY transfer.
+- Every active primary controller and collaborator acknowledges a reconnect
+  boundary before PTY transfer.
 - Received descriptors are close-on-exec, strictly typed by marker, and closed
   on every malformed transfer.
 
@@ -55,8 +56,8 @@ forces nonblocking mode, matches both lock-file inodes, and establishes exclusiv
 flock ownership before acknowledging readiness. Explicit abort closes every
 received duplicate without affecting descriptors retained by the old daemon.
 
-For each running shell, any active controller first acknowledges its reconnect
-boundary and the old reader pauses before the manifest is captured. The
+For each running shell, every active primary controller and collaborator first
+acknowledges its reconnect boundary and the old reader pauses before the manifest is captured. The
 replacement validates the session leader and pidfd, reconstructs terminal state,
 and waits at `PREPARED`; it does not begin reading the PTY until `FINALIZE`, so
 rollback cannot consume output belonging to the old daemon.

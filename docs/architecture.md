@@ -21,19 +21,19 @@
 | `src/federation.rs` | Independently versioned federation handshake and verified stdio daemon bridging |
 | `src/ssh_bootstrap.rs` | Validated SSH targets, private invocation configuration, bounded interactive authentication presentation, deadline-bound remote discovery, and helper compatibility selection |
 | `src/handoff.rs`, `src/fd_transfer.rs` | Graceful daemon replacement records and Unix descriptor transfer |
-| `src/attach.rs` | Terminal-side raw mode, control frames, live input/output, resize, focus, and reconnect handling |
+| `src/attach.rs` | Terminal-side raw mode, control frames, live input/output, resize, focus, takeover waiting, and reconnect handling |
 | `src/terminal.rs` | Selection and launch of native terminal windows through `xdg-terminal-exec` |
 | `src/terminal_state.rs` | Shadow VT parsing, bounded reconstruction, logical output, and structured previews |
 | `src/terminal_focus.rs` | Stateful parsing and restoration of child focus-reporting mode |
 | `src/tui.rs` | Dashboard state, interaction, palette, polling, and Ratatui rendering; no direct daemon transport |
-| `src/mobile_web.rs`, `assets/mobile-web/` | Loopback-only HTTP gateway, Node-qualified Agent projection, exact local attention dismissal, native harness web handoff, and embedded installable web assets |
+| `src/mobile_web.rs`, `src/web_terminal.rs`, `assets/mobile-web/` | Loopback-only HTTP gateway, Node-qualified Agent projection, exact local attention dismissal, native harness handoff, integration-independent exact-run terminal control, and embedded installable web assets |
 | `src/tailscale_serve.rs` | Explicit Tailscale Serve preflight, conflict detection, exact route mutation, and ephemeral ownership cleanup for `boomux web --tailscale` |
 | `src/session_projection.rs` | Projection of daemon Agent state and host catalogs into client-visible sessions |
 | `src/integrations.rs` | Integration identity, display metadata, and optional installation, title/catalog, resume, schedule-dispatch, and foreground capabilities |
 | `src/host_session_titles.rs` and children | Shared title/catalog policy and host-specific discovery adapters |
 | `src/host_session_source.rs` and children | Canonical host source paths, normalization, and secure source lookup |
 | `src/integration_management.rs` | Integration inventory, status, setup, verification, install, and uninstall workflows |
-| `src/claude_hooks.rs`, `src/codex_hooks.rs`, `src/kiro_hooks.rs` | Bounded Claude Code, Codex, and Kiro hook decoding and root Session lifecycle reduction |
+| `src/claude_hooks.rs`, `src/codex_hooks.rs`, `src/kiro_hooks.rs` | Bounded Claude Code, Codex, and Kiro hook decoding and lifecycle reduction |
 | `src/process_adapter.rs` | Exact-argv child supervision and fail-open process-bound Agent observation |
 | `src/scheduling.rs` | Bounded canonical cron parsing and occurrence evaluation, IANA timezone and DST policy, prompt bounds, and schedule identity validation |
 | `src/config.rs` | Layered configuration resolution, bounded validation, and transactional active-layer editing |
@@ -70,12 +70,13 @@
 
 ## Product Boundary
 
-Boomux is a native-terminal session manager, not a terminal emulator or an
-embedded multiplexer UI. Each Boomux shell is rendered by one ordinary terminal
-window selected through `xdg-terminal-exec`.
+Boomux is a terminal session manager, not a harness-specific transcript UI or an
+embedded multiplexer. Each ordinary Boomux shell is rendered by a native
+terminal selected through `xdg-terminal-exec`; the optional web gateway embeds a
+bounded renderer as another attachment client for exact current Agent runs.
 
 ```text
-terminal emulator
+native terminal or web renderer
   -> boomux attachment client
   -> Unix socket
   -> Boomux daemon
@@ -83,9 +84,10 @@ terminal emulator
   -> child process
 ```
 
-The terminal emulator remains responsible for rendering, fonts, themes,
-selection, clipboard integration, and window behavior. Boomux provides process
-persistence across attachment disconnects, naming, grouping, and orchestration.
+The attachment client remains responsible for rendering, fonts, themes,
+selection, clipboard integration, and viewport behavior. Boomux provides
+process persistence across attachment disconnects, naming, grouping, and
+orchestration.
 
 ### Accepted Federation Boundary
 
@@ -164,6 +166,13 @@ operations. Bindings are bounded, ephemeral, absent from durable state,
 snapshots, events, and remote projections, and add no old-response transform.
 Handoff generation 6 accepts generation 5 and transfers valid bindings without
 descriptors; generation-5 manifests default to no bindings.
+Protocol 44 adds `collaborative_exact_run_attachment`. A distinct exact-run-only
+request adds a bounded writable participant without replacing the ordinary
+primary controller. It cannot start or resize a PTY, and clients never downgrade
+it to takeover on an older daemon. The runtime-only participant map requires no
+state or handoff format change. Its `Attached` response includes the primary
+terminal profile, and later primary resize frames are copied to collaborators so
+their local renderers retain the authoritative PTY grid.
 Remote notification presentation reuses protocol-32 atomic reduced transitions,
 so it does not require a later protocol. Node-cache schema 2 adds bounded local
 at-most-once individual and reconnect-digest claims with an explicit schema-1
@@ -325,8 +334,10 @@ The daemon supports:
 - Shell and workspace rename operations
 - Shell and workspace closure
 - Bounded VT state and sanitized reconnect reconstruction
-- One writable attachment with explicit takeover
-- PTY input and resize forwarding
+- One primary writable attachment with explicit takeover and up to four
+  collaborative exact-run attachments
+- Serialized whole-frame PTY input from every participant, with resize authority
+  retained exclusively by the primary
 - Pending shell metadata and first-attachment terminal negotiation
 - Run-scoped agent registration, idempotent ensure, inspection, and explicit
   state reports
@@ -391,11 +402,23 @@ only while the child has requested focus mode; otherwise they are consumed so
 ordinary shells do not receive synthetic escape input. Child mode changes are
 tracked across output chunks and reconstruction while Boomux keeps physical
 reporting enabled. Each focus gain is also reported through the
-controller-authorized attach stream. RAII cleanup restores terminal and
-focus-reporting modes when the attachment exits.
+participant-authorized attach stream. RAII cleanup restores terminal and
+focus-reporting modes when the attachment exits. Explicit takeover sends the
+existing reconnect boundary to the displaced controller. Its automatic
+reacquisition never requests takeover; a `busy` response means the new attachment
+still owns control, so the native client waits without displacing it and
+reconstructs terminal state when control becomes available. Other transport
+failures retain the bounded reconnect deadline, and an exact-run change remains
+permanent.
 
-The daemon keeps a bounded output queue per active controller. A slow client
-drops output rather than blocking the PTY reader and child process.
+The daemon keeps a bounded output queue per active primary and collaborator. PTY
+output fans out without blocking; a slow or disconnected collaborator removes
+only itself, while a slow primary retains the existing primary-disconnect
+behavior. Primary and collaborator input frames are written under one runtime
+serialization boundary so bytes within a frame cannot interleave. Collaborative
+resize is ignored; only the primary can update the PTY and retained terminal
+dimensions. Explicit takeover reconnects the prior primary and detaches all
+collaborators; graceful handoff instead reconnects and awaits every participant.
 The listener admits at most 64 concurrent connection handlers and closes newly
 accepted sockets while that capacity is exhausted. Management responses and
 attachment output use bounded write deadlines. Attachments retain one admission
@@ -610,15 +633,34 @@ when the Agent leaves idle, ceases to own the exact current run, or the gateway
 process restarts. A temporary daemon failure marks the cached response
 disconnected without discarding its last bounded projection or finished markers.
 
-The only mutation route dismisses an exact local Agent alert. It requires a
+The attention mutation route dismisses an exact local Agent alert. It requires a
 same-origin JSON request carrying the exact Node ID, Agent ID, and current
 attention or lifecycle observation revision. Durable attention is hidden only
 after the daemon confirms revision-conditional acknowledgment; an ephemeral
 finished marker is cleared only in the gateway that observed it. Remote
-projected attention and stale revisions fail closed. The server has no arbitrary
-daemon-protocol pass-through, terminal attachment, input, Session resume,
-rendered terminal output, Agent detail route, or harness transcript adapter.
-The home-page snapshot is the complete HTTP Agent projection.
+projected attention and stale revisions fail closed. A separate route authorizes
+terminal control only when the exact Node, Agent, Shell, and ShellRun still
+identify a current local Agent card, independent of integration name. It stores
+at most 64 one-use grants for 30 seconds. The WebSocket upgrade requires an
+allowlisted loopback or active Tailscale dashboard Origin and carries the grant
+in a secondary WebSocket subprotocol rather than a URL. Consumption removes the
+grant before attachment.
+At most four browser terminal bridges may remain active, and each bridge uses
+eight-entry transport queues plus a bounded browser write deadline. Protocol 44
+also bounds daemon collaborators to four per Shell.
+The gateway requests collaborative exact-run attachment without restart or
+environment authority and fails closed instead of downgrading on an older daemon,
+then translates only bounded PTY input/output, resize, focus, detach, and daemon
+reconnect frames. Browser viewport changes cannot resize the PTY or alter the
+local logical grid. The renderer initializes from the primary terminal profile,
+follows later primary resize frames, and permits viewport scrolling when that
+grid exceeds the phone display. It never exposes the daemon attachment token or
+arbitrary daemon protocol. The self-hosted `ghostty-web` canvas renderer uses Ghostty's
+WASM VT implementation and a self-hosted terminal font; the Agent handoff is a
+terminal-only browser history entry, and direct terminal focus is its only input
+surface. Browser Back or page backgrounding releases only that collaborator.
+Boomux does not parse harness transcripts or infer lifecycle from terminal bytes.
+The home-page snapshot remains the complete HTTP Agent projection.
 
 `boomux web` attempts to ensure the same daemon-supervised Shared Harness Runtime
 used by eligible native OpenCode TUIs. A typed missing OpenCode executable is an
@@ -663,6 +705,10 @@ peers from bypassing that external boundary. API responses use `no-store`,
 the service worker caches only the public application shell, and a restrictive
 content security policy prevents external script, style, object, and framing
 origins. This edge does not expose the owner-only daemon socket over TCP.
+Web terminal input is remote shell access. WebSocket frames and queues are
+bounded to the attachment limit, browser backgrounding releases control, and all
+terminal API responses remain outside service-worker and HTTP caches. The
+external private access layer must restrict the dashboard to trusted users.
 
 Agent sessions are a client-side projection, not a sixth durable daemon
 identity. The projection groups stored Agent instances by workspace,
@@ -1234,10 +1280,13 @@ through `BOOMUX_REAL_KIRO`; private launcher provenance is removed from unrelate
 children.
 
 Kiro hook `session_id` is the canonical Session identity and ensures the exact
-`(kiro, session, shell, run)` Agent key. SessionStart and Stop report Idle;
-prompt and tool events report Working. The documented hooks expose no
-authoritative permission-wait, session-inactivity, error, or permanent-completion
-event, so Boomux never derives Blocked, Inactive, or Done for Kiro. If one Kiro
+`(kiro, session, shell, run)` Agent key. Prompt and tool events report Working.
+Kiro runs hooks in isolated sub-agent executions, but the standalone SessionStart
+and Stop payloads do not identify whether the event belongs to the root execution.
+Those boundaries therefore report Unknown rather than Idle and cannot produce a
+completion notification. The documented hooks expose no authoritative
+permission-wait, session-inactivity, error, or permanent-completion event, so
+Boomux never derives Blocked, Idle, Inactive, or Done for Kiro. If one Kiro
 process switches canonical Sessions without ending the old one, both histories
 remain truthful and cold recovery refuses the resulting ambiguity rather than
 guessing.
@@ -1568,7 +1617,7 @@ terminated last run, while an already-exited shell recovers its exact exited
 lifecycle and terminal state.
 
 While a persistence generation is in flight, PTY readers continue parsing bytes,
-advancing output revisions, and delivering controller output. Their runtime
+advancing output revisions, and delivering participant output. Their runtime
 events wait in the ordered publication frontier behind the durable generation.
 Writer success publishes the durable batch and then those runtime events; a
 rollback removes the rejected durable transition and releases the runtime events.
@@ -1578,7 +1627,7 @@ older generation was captured remains eligible for a later retry.
 Baseline reads capture their snapshot and event cursor inside the durable
 transition boundary, so the cursor describes the exact published cut represented
 by the snapshot. Each PTY reader parses bytes, advances its run revision, updates
-retained run metadata, and attempts bounded controller delivery using only
+retained run metadata, and attempts bounded participant delivery using only
 per-shell synchronization. It publishes the latest revision at most once per
 16-millisecond window, with forced publication at pause, stop, and exit
 boundaries. Output events may therefore skip intermediate revisions and event
@@ -1598,11 +1647,13 @@ locks are released.
 ## Runtime Semantics
 
 Closing a terminal window closes only its socket attachment. The daemon retains
-the PTY master and child. Reopening a window acquires the controller and first
-receives sanitized reconstructed terminal state followed by live output.
+the PTY master and child. Reopening a native window acquires the primary
+controller and first receives sanitized reconstructed terminal state followed by
+live output. Closing a collaborator removes only its own token, queue, and
+connection.
 
 Closing a pending shell removes only metadata. Closing a running shell terminates
-its child and disconnects its controller. Closing a workspace terminates its
+its child and disconnects every attachment participant. Closing a workspace terminates its
 shells before removing the workspace from the registry.
 On Linux, cleanup signals every process still belonging to the shell's session
 before reaping the session leader. `boomux daemon stop` applies the same cleanup

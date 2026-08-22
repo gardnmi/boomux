@@ -17,7 +17,10 @@ run-scoped authority, bare v3 launch selection, exact schedule and recovery argv
 dedicated hook installation, and safe ambiguity handling. This is fixture and
 interface compatibility evidence only: no live authenticated Kiro turn,
 permission wait, cloud Session, or Kiro Web handoff was exercised. No Blocked,
-Inactive, Done, cloud lifecycle, catalog, or native web capability is claimed.
+Idle, Inactive, Done, cloud lifecycle, catalog, or native web capability is
+claimed. Kiro documents isolated sub-agent hook execution but no root-execution
+field in standalone SessionStart or Stop payloads, so fixtures reduce those
+ambiguous boundaries to Unknown.
 
 Codex CLI `0.147.0` was inspected against the documented hooks and experimental
 app-server interfaces. Repository tests validate bounded hook decoding,
