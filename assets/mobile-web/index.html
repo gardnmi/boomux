@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-    <meta name="theme-color" content="#0b0d17">
+    <meta name="theme-color" content="#1e1e2e">
     <meta name="color-scheme" content="dark">
     <meta name="description" content="Monitor Boomux agents and control their current terminals remotely.">
     <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; font-src 'self' data:; img-src 'self' data:; connect-src 'self'; manifest-src 'self'; worker-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'">
@@ -11,6 +11,7 @@
     <link rel="icon" href="icon.svg" type="image/svg+xml">
     <link rel="apple-touch-icon" href="icon-192.png">
     <link rel="stylesheet" href="styles.css">
+    <link rel="stylesheet" href="themes.css">
     <link rel="stylesheet" href="terminal.css">
     <title>Boomux Agents</title>
   </head>
@@ -18,46 +19,38 @@
     <a class="skip-link" href="#main-content">Skip to content</a>
     <header class="site-header">
       <a class="brand" href="/" aria-label="Boomux Agents home">
-        <img class="brand-logo" src="icon.svg" alt="" width="44" height="44">
-        <span class="brand-copy">
-          <strong class="brand-wordmark">BOOMUX</strong>
-          <small>AGENT OPERATIONS</small>
-        </span>
+        <strong class="brand-wordmark">BOOMUX</strong>
+        <span class="brand-section">AGENTS</span>
       </a>
       <div class="header-actions">
         <span class="connection" id="connection-status" role="status">
           <span class="connection-dot" aria-hidden="true"></span>
           <span id="connection-label">Connecting</span>
         </span>
+        <button class="theme-button" id="theme-button" type="button" aria-haspopup="dialog">Theme</button>
         <button class="install-button" id="install-button" type="button" hidden>Install</button>
       </div>
     </header>
 
     <main id="main-content" tabindex="-1">
-      <section aria-labelledby="dashboard-title">
-        <div class="hero">
-          <div>
-            <p class="eyebrow"><span aria-hidden="true">◆</span> Boomux web</p>
-            <h1 id="dashboard-title">Agent activity.</h1>
-            <p class="hero-copy" id="viewer-copy">Current work and attention across your Boomux nodes.</p>
-          </div>
-          <p class="last-updated" id="last-updated">Waiting for first snapshot</p>
-        </div>
+      <section class="agent-console" aria-labelledby="dashboard-title">
+        <header class="console-heading">
+          <h1 id="dashboard-title">Agents (<span id="count-agents">—</span>)</h1>
+        </header>
 
-        <section class="metrics" aria-label="Fleet summary">
-          <div class="metric metric-primary"><strong id="count-attention">—</strong><span>Attention</span></div>
-          <div class="metric"><strong id="count-active">—</strong><span>Active</span></div>
-          <div class="metric"><strong id="count-agents">—</strong><span>Agents</span></div>
-          <div class="metric"><strong id="count-stale">—</strong><span>Stale nodes</span></div>
-        </section>
+        <p class="viewer-copy" id="viewer-copy">Current agents across your Boomux nodes.</p>
 
         <div class="list-toolbar">
           <div class="filters" role="group" aria-label="Filter agents">
             <button class="filter-button is-selected" type="button" data-filter="all" aria-pressed="true">All</button>
-            <button class="filter-button" type="button" data-filter="attention" aria-pressed="false">Attention</button>
-            <button class="filter-button" type="button" data-filter="active" aria-pressed="false">Active</button>
+            <button class="filter-button" type="button" data-filter="attention" aria-pressed="false">Attention <strong id="count-attention">—</strong></button>
+            <button class="filter-button" type="button" data-filter="active" aria-pressed="false">Active <strong id="count-active">—</strong></button>
           </div>
-          <p id="result-count" aria-live="polite"></p>
+          <div class="list-status">
+            <span>Stale <strong id="count-stale">—</strong></span>
+            <span class="last-updated" id="last-updated">Waiting for snapshot</span>
+            <span class="visually-hidden" id="result-count" aria-live="polite"></span>
+          </div>
         </div>
 
         <div id="dashboard-state" class="state-panel" role="status">
@@ -69,6 +62,19 @@
       </section>
 
     </main>
+
+    <dialog class="theme-dialog" id="theme-dialog" aria-labelledby="theme-dialog-title">
+      <section class="theme-panel">
+        <header class="theme-heading">
+          <div>
+            <p class="theme-kicker">Appearance</p>
+            <h2 id="theme-dialog-title">Choose theme</h2>
+          </div>
+          <button class="theme-close" id="theme-close" type="button" aria-label="Close theme picker">Close</button>
+        </header>
+        <div class="theme-list" id="theme-list" role="group" aria-label="Available themes"></div>
+      </section>
+    </dialog>
 
     <footer class="site-footer"><a href="third-party-notices.txt">Third-party notices</a></footer>
 

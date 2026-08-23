@@ -1,6 +1,7 @@
 "use strict";
 
 import { createTerminal } from "./terminal.js";
+import { THEMES, applyTheme, savedTheme } from "./themes.js";
 
 const POLL_INTERVAL_MS = 2_000;
 const state = {
@@ -21,6 +22,10 @@ const elements = {
   connectionStatus: document.querySelector("#connection-status"),
   connectionLabel: document.querySelector("#connection-label"),
   installButton: document.querySelector("#install-button"),
+  themeButton: document.querySelector("#theme-button"),
+  themeDialog: document.querySelector("#theme-dialog"),
+  themeClose: document.querySelector("#theme-close"),
+  themeList: document.querySelector("#theme-list"),
   counts: {
     attention: document.querySelector("#count-attention"),
     active: document.querySelector("#count-active"),
@@ -29,12 +34,47 @@ const elements = {
   },
 };
 
+let activeTheme = applyTheme(savedTheme(), false);
+
 function el(tag, className, text) {
   const node = document.createElement(tag);
   if (className) node.className = className;
   if (text !== undefined && text !== null) node.textContent = text;
   return node;
 }
+
+function unavailableAction(label, accessibleLabel) {
+  const button = el("button", "card-action-unavailable", label);
+  button.type = "button";
+  button.disabled = true;
+  button.setAttribute("aria-label", accessibleLabel);
+  return button;
+}
+
+function renderThemePicker() {
+  elements.themeList.replaceChildren(...THEMES.map((theme) => {
+    const button = el("button", "theme-option");
+    button.type = "button";
+    button.dataset.theme = theme.slug;
+    button.setAttribute("aria-pressed", String(theme.slug === activeTheme.slug));
+    const swatches = el("span", "theme-swatches");
+    for (let index = 0; index < 3; index += 1) {
+      const swatch = el("span", "theme-swatch");
+      swatches.append(swatch);
+    }
+    button.append(swatches, el("span", "theme-name", theme.name));
+    button.addEventListener("click", () => {
+      activeTheme = applyTheme(theme.slug);
+      elements.themeButton.title = `Theme: ${theme.name}`;
+      renderThemePicker();
+      elements.themeDialog.close();
+    });
+    return button;
+  }));
+}
+
+elements.themeButton.title = `Theme: ${activeTheme.name}`;
+renderThemePicker();
 
 function formatState(value) {
   return String(value || "unknown").replaceAll("_", " ");
@@ -105,9 +145,9 @@ function renderSnapshot() {
   elements.counts.agents.textContent = counts.agents ?? snapshot.agents?.length ?? 0;
   elements.counts.stale.textContent = counts.stale_nodes ?? 0;
   elements.viewerCopy.textContent = snapshot.viewer
-    ? `Current work and attention for ${snapshot.viewer}.`
-    : "Current work and attention across your Boomux nodes.";
-  elements.lastUpdated.textContent = `Snapshot ${relativeTime(snapshot.generated_at_ms)}`;
+    ? `Current agents for ${snapshot.viewer}.`
+    : "Current agents across your Boomux nodes.";
+  elements.lastUpdated.textContent = `Updated ${relativeTime(snapshot.generated_at_ms)}`;
 
   const filtered = agents.filter((agent) => {
     if (state.filter === "attention") return hasAlert(agent);
@@ -135,21 +175,21 @@ function renderAgentCard(agent) {
   const item = el("li", `agent-card tone-${toneFor(agent)}`);
   const content = el("article", "agent-card-content");
 
-  const rail = el("span", "card-rail");
-  rail.setAttribute("aria-hidden", "true");
   const body = el("div", "card-body");
   const top = el("div", "card-top");
   const identity = el("div", "card-identity");
   identity.append(el("h2", "", agentDisplayName(agent)));
   identity.append(el("p", "", `${agent.workspace_name || "Unnamed workspace"} / ${agent.shell_name || "Unnamed shell"}`));
+  const status = el("div", "card-status");
   const badge = el("span", "state-badge", formatState(agent.state));
   badge.dataset.tone = toneFor(agent);
-  top.append(identity, badge);
+  badge.dataset.state = agent.state || "unknown";
+  status.append(badge, el("time", "card-updated", relativeTime(agent.observed_at_ms)));
+  top.append(status, identity);
 
   const meta = el("div", "card-meta");
   meta.append(metaItem("Node", agent.node_alias || agent.node_id));
   meta.append(metaItem("Integration", agent.integration || "unknown"));
-  meta.append(metaItem("Observed", relativeTime(agent.observed_at_ms)));
 
   body.append(top);
   if (agent.attention) {
@@ -171,31 +211,38 @@ function renderAgentCard(agent) {
   const nativeUrl = agent.native_web?.url || derivedNativeUrl(agent.native_web);
   const webTerminal = canOpenWebTerminal(agent);
   const dismissible = agent.node_local && hasAlert(agent);
-  if (nativeUrl || webTerminal || dismissible) {
-    const actions = el("div", "card-actions");
-    if (nativeUrl) {
-      const nativeLink = el("a", "card-native-link", agent.native_web.label || "Open in OpenCode");
-      nativeLink.href = nativeUrl;
-      nativeLink.target = "_blank";
-      nativeLink.rel = "noreferrer";
-      nativeLink.referrerPolicy = "no-referrer";
-      actions.append(nativeLink);
-    }
-    if (webTerminal) {
-      const terminalButton = el("button", "card-native-link", "Open in Web Terminal");
-      terminalButton.type = "button";
-      terminalButton.addEventListener("click", () => openWebTerminal(agent));
-      actions.append(terminalButton);
-    }
-    if (dismissible) {
-      const dismissButton = el("button", "card-dismiss-button", "Dismiss");
-      dismissButton.type = "button";
-      dismissButton.addEventListener("click", () => dismissAttention(agent, dismissButton));
-      actions.append(dismissButton);
-    }
-    body.append(actions);
+  const actions = el("div", "card-actions");
+  if (webTerminal) {
+    const terminalButton = el("button", "card-native-link", "Terminal");
+    terminalButton.type = "button";
+    terminalButton.setAttribute("aria-label", "Open in Web Terminal");
+    terminalButton.addEventListener("click", () => openWebTerminal(agent));
+    actions.append(terminalButton);
+  } else {
+    actions.append(unavailableAction("Terminal", "Web Terminal unavailable"));
   }
-  content.append(rail, body);
+  if (nativeUrl) {
+    const nativeLabel = agent.native_web.label || "Open in OpenCode";
+    const nativeLink = el("a", "card-native-link", nativeLabel.replace(/^Open in /, ""));
+    nativeLink.href = nativeUrl;
+    nativeLink.target = "_blank";
+    nativeLink.rel = "noreferrer";
+    nativeLink.referrerPolicy = "no-referrer";
+    nativeLink.setAttribute("aria-label", nativeLabel);
+    actions.append(nativeLink);
+  } else {
+    actions.append(unavailableAction("Native UI", "Native Agent interface unavailable"));
+  }
+  if (dismissible) {
+    const dismissButton = el("button", "card-dismiss-button", "Dismiss");
+    dismissButton.type = "button";
+    dismissButton.addEventListener("click", () => dismissAttention(agent, dismissButton));
+    actions.append(dismissButton);
+  } else {
+    actions.append(unavailableAction("Dismiss", "No attention to dismiss"));
+  }
+  body.append(actions);
+  content.append(body);
   item.append(content);
   return item;
 }
@@ -425,6 +472,12 @@ document.querySelectorAll(".filter-button").forEach((button) => {
     });
     renderSnapshot();
   });
+});
+
+elements.themeButton.addEventListener("click", () => elements.themeDialog.showModal());
+elements.themeClose.addEventListener("click", () => elements.themeDialog.close());
+elements.themeDialog.addEventListener("click", (event) => {
+  if (event.target === elements.themeDialog) elements.themeDialog.close();
 });
 
 window.addEventListener("focus", restartPolling);
