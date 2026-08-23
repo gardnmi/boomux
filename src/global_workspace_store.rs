@@ -26,6 +26,12 @@ const COMPLETION_RESERVATION_OVERHEAD: usize = 64 * 1024;
 pub(crate) struct GlobalWorkspaceStore {
     path: PathBuf,
     state: Mutex<PersistedGlobalWorkspaces>,
+    persist: bool,
+}
+
+pub(crate) struct GlobalWorkspaceTransaction<'a> {
+    target: std::sync::MutexGuard<'a, PersistedGlobalWorkspaces>,
+    staged: GlobalWorkspaceStore,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -151,7 +157,24 @@ impl GlobalWorkspaceStore {
         Ok(Self {
             path,
             state: Mutex::new(state),
+            persist: true,
         })
+    }
+
+    pub(crate) fn transaction(&self) -> io::Result<GlobalWorkspaceTransaction<'_>> {
+        let target = self.lock()?;
+        let staged = Self {
+            path: self.path.clone(),
+            state: Mutex::new(target.clone()),
+            persist: false,
+        };
+        Ok(GlobalWorkspaceTransaction { target, staged })
+    }
+
+    pub(crate) fn checkpoint(&self) -> io::Result<()> {
+        let state = self.lock()?;
+        validate(&state)?;
+        save(&self.path, &state)
     }
 
     pub(crate) fn initialize_local_once(
@@ -356,6 +379,69 @@ impl GlobalWorkspaceStore {
         resource_id: &str,
         kind: PendingResourceKind,
     ) -> io::Result<PreparedWorkspaceResource> {
+        self.prepare_resource_inner(
+            global_id,
+            operation_id,
+            request_fingerprint,
+            request_bytes,
+            expected_global_revision,
+            node_id,
+            requested_owner_workspace_id,
+            owner_workspace_name,
+            default_cwd,
+            resource_id,
+            kind,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prepare_resource_for_attempt(
+        &self,
+        global_id: &str,
+        operation_id: &str,
+        request_fingerprint: &str,
+        request_bytes: usize,
+        expected_global_revision: u64,
+        node_id: &str,
+        requested_owner_workspace_id: &str,
+        owner_workspace_name: &str,
+        default_cwd: Option<PathBuf>,
+        resource_id: &str,
+        kind: PendingResourceKind,
+    ) -> io::Result<PreparedWorkspaceResource> {
+        self.prepare_resource_inner(
+            global_id,
+            operation_id,
+            request_fingerprint,
+            request_bytes,
+            expected_global_revision,
+            node_id,
+            requested_owner_workspace_id,
+            owner_workspace_name,
+            default_cwd,
+            resource_id,
+            kind,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_resource_inner(
+        &self,
+        global_id: &str,
+        operation_id: &str,
+        request_fingerprint: &str,
+        request_bytes: usize,
+        expected_global_revision: u64,
+        node_id: &str,
+        requested_owner_workspace_id: &str,
+        owner_workspace_name: &str,
+        default_cwd: Option<PathBuf>,
+        resource_id: &str,
+        kind: PendingResourceKind,
+        owner_attempted: bool,
+    ) -> io::Result<PreparedWorkspaceResource> {
         validate_name(owner_workspace_name)?;
         self.mutate(|state| {
             if let Some(completed) = state
@@ -408,6 +494,9 @@ impl GlobalWorkspaceStore {
                     let reservation = completion_reservation_bytes(&projected, request_bytes)?;
                     state.pending_resources[index].completion_reservation = " ".repeat(reservation);
                     compact_prepared_state(state)?;
+                }
+                if owner_attempted {
+                    state.pending_resources[index].owner_attempted = true;
                 }
                 return Ok(PreparedWorkspaceResource::Pending {
                     pending: Box::new(state.pending_resources[index].clone()),
@@ -475,7 +564,7 @@ impl GlobalWorkspaceStore {
                 request_fingerprint: Some(request_fingerprint.to_owned()),
                 semantic_fingerprint: None,
                 completion_reservation: String::new(),
-                owner_attempted: false,
+                owner_attempted,
                 global_workspace_id: global_id.to_owned(),
                 expected_global_revision,
                 node_id: node_id.to_owned(),
@@ -760,29 +849,6 @@ impl GlobalWorkspaceStore {
         })
     }
 
-    pub(crate) fn mark_owner_attempted(
-        &self,
-        pending: &PendingWorkspaceResource,
-    ) -> io::Result<PendingWorkspaceResource> {
-        self.mutate(|state| {
-            let index = state
-                .pending_resources
-                .iter()
-                .position(|candidate| candidate.operation_id == pending.operation_id)
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::NotFound,
-                        "pending Workspace resource not found",
-                    )
-                })?;
-            if state.pending_resources[index].request_fingerprint != pending.request_fingerprint {
-                return Err(operation_conflict());
-            }
-            state.pending_resources[index].owner_attempted = true;
-            Ok(state.pending_resources[index].clone())
-        })
-    }
-
     pub(crate) fn complete_resource(
         &self,
         pending: &PendingWorkspaceResource,
@@ -889,6 +955,29 @@ impl GlobalWorkspaceStore {
             state.pending_resources.remove(pending_index);
             push_completed(state, completed.clone())?;
             Ok(completed)
+        })
+    }
+
+    pub(crate) fn mark_owner_attempted(
+        &self,
+        pending: &PendingWorkspaceResource,
+    ) -> io::Result<PendingWorkspaceResource> {
+        self.mutate(|state| {
+            let index = state
+                .pending_resources
+                .iter()
+                .position(|candidate| candidate.operation_id == pending.operation_id)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "pending Workspace resource not found",
+                    )
+                })?;
+            if state.pending_resources[index].request_fingerprint != pending.request_fingerprint {
+                return Err(operation_conflict());
+            }
+            state.pending_resources[index].owner_attempted = true;
+            Ok(state.pending_resources[index].clone())
         })
     }
 
@@ -1032,7 +1121,9 @@ impl GlobalWorkspaceStore {
         let mut replacement = state.clone();
         let result = operation(&mut replacement)?;
         validate(&replacement)?;
-        save(&self.path, &replacement)?;
+        if self.persist {
+            save(&self.path, &replacement)?;
+        }
         *state = replacement;
         Ok(result)
     }
@@ -1041,6 +1132,62 @@ impl GlobalWorkspaceStore {
         self.state
             .lock()
             .map_err(|_| io::Error::other("global Workspace store lock is poisoned"))
+    }
+}
+
+impl GlobalWorkspaceTransaction<'_> {
+    pub(crate) fn get(&self, id: &str) -> io::Result<GlobalWorkspaceSnapshot> {
+        self.staged.get(id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prepare_resource_for_attempt(
+        &self,
+        global_id: &str,
+        operation_id: &str,
+        request_fingerprint: &str,
+        request_bytes: usize,
+        expected_global_revision: u64,
+        node_id: &str,
+        requested_owner_workspace_id: &str,
+        owner_workspace_name: &str,
+        default_cwd: Option<PathBuf>,
+        resource_id: &str,
+        kind: PendingResourceKind,
+    ) -> io::Result<PreparedWorkspaceResource> {
+        self.staged.prepare_resource_for_attempt(
+            global_id,
+            operation_id,
+            request_fingerprint,
+            request_bytes,
+            expected_global_revision,
+            node_id,
+            requested_owner_workspace_id,
+            owner_workspace_name,
+            default_cwd,
+            resource_id,
+            kind,
+        )
+    }
+
+    pub(crate) fn complete_resource(
+        &self,
+        pending: &PendingWorkspaceResource,
+        owner: &WorkspaceSnapshot,
+        resource: &RoutedOperationResult,
+    ) -> io::Result<CompletedWorkspaceOperation> {
+        self.staged.complete_resource(pending, owner, resource)
+    }
+
+    pub(crate) fn commit(mut self) -> io::Result<()> {
+        let replacement = self
+            .staged
+            .state
+            .into_inner()
+            .map_err(|_| io::Error::other("staged global Workspace lock is poisoned"))?;
+        validate(&replacement)?;
+        *self.target = replacement;
+        Ok(())
     }
 }
 
@@ -1934,6 +2081,194 @@ mod tests {
     }
 
     #[test]
+    fn preparation_for_dispatch_persists_attempted_boundary_once() {
+        let root = std::env::temp_dir().join(format!("boomux-global-attempt-{}", Uuid::new_v4()));
+        let path = root.join("boomux/global_workspaces.json");
+        let node = Uuid::from_u128(1).to_string();
+        let owner = snapshot(&Uuid::from_u128(2).to_string(), "owner", 1);
+        let store = GlobalWorkspaceStore::load_at(path.clone()).unwrap();
+        store
+            .initialize_local_once(&node, &daemon_snapshot(vec![owner.clone()]))
+            .unwrap();
+        let global = store.list().unwrap().remove(0);
+        let prepared = store
+            .prepare_resource_for_attempt(
+                &global.id,
+                &Uuid::from_u128(3).to_string(),
+                &fingerprint(4),
+                1024,
+                global.revision,
+                &node,
+                &owner.id,
+                &owner.name,
+                owner.default_cwd.clone(),
+                &Uuid::from_u128(5).to_string(),
+                PendingResourceKind::Shell,
+            )
+            .unwrap();
+        let PreparedWorkspaceResource::Pending { pending, .. } = prepared else {
+            panic!("expected pending operation");
+        };
+        assert!(pending.owner_attempted);
+        drop(store);
+        assert!(
+            GlobalWorkspaceStore::load_at(path)
+                .unwrap()
+                .pending_resources()
+                .unwrap()[0]
+                .owner_attempted
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn compound_alias_retry_uses_its_original_guard_after_revision_advances() {
+        let root = std::env::temp_dir().join(format!("boomux-global-alias-{}", Uuid::new_v4()));
+        let store =
+            GlobalWorkspaceStore::load_at(root.join("boomux/global_workspaces.json")).unwrap();
+        store
+            .initialize_local_once(
+                &Uuid::from_u128(1).to_string(),
+                &daemon_snapshot(Vec::new()),
+            )
+            .unwrap();
+        let node = Uuid::from_u128(2).to_string();
+        let operation_a = Uuid::from_u128(3).to_string();
+        let global_a = Uuid::from_u128(4).to_string();
+        let owner_a = Uuid::from_u128(5).to_string();
+        let shell_a = Uuid::from_u128(6).to_string();
+        let semantic = fingerprint(7);
+        let prepared_a = store
+            .prepare_workspace_shell(
+                &operation_a,
+                &fingerprint(8),
+                1024,
+                &semantic,
+                &global_a,
+                "project",
+                &node,
+                &owner_a,
+                "/owner/project".into(),
+                &shell_a,
+            )
+            .unwrap();
+        let PreparedWorkspaceShell::Pending {
+            pending: pending_a, ..
+        } = prepared_a
+        else {
+            panic!("expected first pending operation");
+        };
+        let operation_b = Uuid::from_u128(9).to_string();
+        let prepared_b = store
+            .prepare_workspace_shell(
+                &operation_b,
+                &fingerprint(10),
+                1024,
+                &semantic,
+                &Uuid::from_u128(11).to_string(),
+                "project",
+                &node,
+                &Uuid::from_u128(12).to_string(),
+                "/owner/project".into(),
+                &Uuid::from_u128(13).to_string(),
+            )
+            .unwrap();
+        let PreparedWorkspaceShell::Pending {
+            workspace,
+            pending: pending_b,
+        } = prepared_b
+        else {
+            panic!("expected alias pending operation");
+        };
+        let attempted_b = store
+            .prepare_resource_for_attempt(
+                &pending_b.global_workspace_id,
+                &pending_b.operation_id,
+                pending_b.request_fingerprint.as_deref().unwrap(),
+                1024,
+                pending_b.expected_global_revision,
+                &pending_b.node_id,
+                &pending_b.requested_owner_workspace_id,
+                &pending_b.owner_workspace_name,
+                pending_b.default_cwd.clone(),
+                &pending_b.resource_id,
+                pending_b.kind,
+            )
+            .unwrap();
+        let PreparedWorkspaceResource::Pending {
+            pending: attempted_b,
+            ..
+        } = attempted_b
+        else {
+            panic!("expected attempted alias");
+        };
+        let owner = snapshot(&attempted_b.owner_workspace_id, "project", 1);
+        let resource = shell_result(&attempted_b.resource_id, &owner.id);
+        let completed_b = store
+            .complete_resource(&attempted_b, &owner, &resource)
+            .unwrap();
+        assert!(completed_b.workspace.revision > workspace.revision);
+
+        let retried_a = store
+            .prepare_workspace_shell(
+                &operation_a,
+                &fingerprint(8),
+                1024,
+                &semantic,
+                &global_a,
+                "project",
+                &node,
+                &owner_a,
+                "/owner/project".into(),
+                &shell_a,
+            )
+            .unwrap();
+        let PreparedWorkspaceShell::Pending {
+            workspace,
+            pending: retried_a,
+        } = retried_a
+        else {
+            panic!("expected exact pending retry");
+        };
+        assert_eq!(
+            retried_a.expected_global_revision,
+            pending_a.expected_global_revision
+        );
+        assert!(workspace.revision > retried_a.expected_global_revision);
+        let attempted_a = store
+            .prepare_resource_for_attempt(
+                &retried_a.global_workspace_id,
+                &retried_a.operation_id,
+                retried_a.request_fingerprint.as_deref().unwrap(),
+                1024,
+                retried_a.expected_global_revision,
+                &retried_a.node_id,
+                &retried_a.requested_owner_workspace_id,
+                &retried_a.owner_workspace_name,
+                retried_a.default_cwd.clone(),
+                &retried_a.resource_id,
+                retried_a.kind,
+            )
+            .unwrap();
+        let PreparedWorkspaceResource::Pending {
+            pending: attempted_a,
+            ..
+        } = attempted_a
+        else {
+            panic!("expected attempted exact retry");
+        };
+        assert!(attempted_a.owner_attempted);
+        assert_eq!(
+            store
+                .complete_resource(&attempted_a, &owner, &resource)
+                .unwrap()
+                .resource,
+            resource
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn malformed_future_and_insecure_stores_fail_closed_without_replacement() {
         for (label, bytes, mode) in [
             ("malformed", b"not-json".to_vec(), 0o600),
@@ -2441,7 +2776,28 @@ mod tests {
         let PreparedWorkspaceShell::Pending { pending, .. } = prepared else {
             panic!("expected pending project");
         };
-        let attempted = store.mark_owner_attempted(&pending).unwrap();
+        let attempted = store
+            .prepare_resource_for_attempt(
+                &pending.global_workspace_id,
+                &pending.operation_id,
+                pending.request_fingerprint.as_deref().unwrap(),
+                1024,
+                pending.expected_global_revision,
+                &pending.node_id,
+                &pending.requested_owner_workspace_id,
+                &pending.owner_workspace_name,
+                pending.default_cwd.clone(),
+                &pending.resource_id,
+                pending.kind,
+            )
+            .unwrap();
+        let PreparedWorkspaceResource::Pending {
+            pending: attempted, ..
+        } = attempted
+        else {
+            panic!("expected pending attempted project");
+        };
+        let attempted = *attempted;
         assert!(attempted.owner_attempted);
 
         // A later capability, admission, identity, or not-found failure cannot

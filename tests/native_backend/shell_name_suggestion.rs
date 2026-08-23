@@ -1,8 +1,98 @@
 use std::collections::BTreeSet;
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
 
 use boomux::protocol::ShellSpec;
 
-use crate::support::{TestDaemon, assert_generated_name};
+use crate::support::{TestDaemon, assert_generated_name, wait_until};
+
+#[test]
+fn create_and_open_releases_terminal_only_after_durable_creation() {
+    let daemon = TestDaemon::start();
+    daemon.client.create_global_workspace("gated-open").unwrap();
+    let bin = daemon.runtime_dir.join("bin");
+    fs::create_dir(&bin).unwrap();
+    let resolver = bin.join("xdg-terminal-exec");
+    fs::write(
+        &resolver,
+        "#!/bin/sh\nwhile [ \"$#\" -gt 0 ] && [ \"$1\" != -- ]; do shift; done\nshift\ngate=\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = --gate ]; then shift; gate=$1; break; fi\n  shift\ndone\nprintf '%s\\0' python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); status=s.recv(1); open(sys.argv[2], \"wb\").write(status)' \"$gate\" \"$BOOMUX_GATE_MARKER\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&resolver, fs::Permissions::from_mode(0o700)).unwrap();
+    let marker = daemon.runtime_dir.join("gate-status");
+    let output = daemon
+        .command()
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .env("BOOMUX_GATE_MARKER", &marker)
+        .args([
+            "shell",
+            "create",
+            "gated-open",
+            "--name",
+            "gated",
+            "--cwd",
+            "/tmp",
+            "--open",
+            "--",
+            "/bin/sh",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "create and open failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    wait_until(
+        || fs::read(&marker).is_ok_and(|status| status == [1]),
+        "terminal did not observe the successful creation gate",
+    );
+    let snapshot = daemon.client.snapshot().unwrap();
+    let shell = snapshot
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.name == "gated-open")
+        .unwrap()
+        .shells
+        .iter()
+        .find(|shell| shell.name == "gated")
+        .unwrap();
+    assert!(shell.run.is_none(), "the gate observer must not attach");
+
+    fs::write(&resolver, "#!/bin/sh\nexit 64\n").unwrap();
+    let output = daemon
+        .command()
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .args([
+            "shell",
+            "create",
+            "gated-open",
+            "--name",
+            "terminal-failed",
+            "--open",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        daemon
+            .client
+            .snapshot()
+            .unwrap()
+            .workspaces
+            .iter()
+            .flat_map(|workspace| &workspace.shells)
+            .all(|shell| shell.name != "terminal-failed"),
+        "terminal preparation failure must happen before Shell creation"
+    );
+
+    let output = daemon
+        .command()
+        .args(["workspace", "close", "gated-open"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+}
 
 #[test]
 fn shell_name_suggestion_is_stable_non_mutating_cli_data() {

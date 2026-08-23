@@ -15,6 +15,7 @@
 | `src/daemon.rs` | `DaemonService` coordination over durable registry, event-stream, shell-runtime, persistence, and handoff owners |
 | `src/state_store.rs` | Versioned durable schemas, validation, atomic state storage, and migrations |
 | `src/global_workspace_store.rs` | Independently versioned coordinator Workspace metadata, placement membership, initialization and schema migration, prepared resource recovery, and resumable close progress |
+| `src/local_shell_journal.rs` | Checksummed owner-only commit journal for local coordinated Shell creation and initial run start across owner and coordinator checkpoints |
 | `src/node_identity.rs` | Stable Node identity persistence, federation admission leases, and bounded rekey drain |
 | `src/node_registration.rs` | Independently versioned remote Node registrations, identity pinning, admission drain, validation, and atomic storage |
 | `src/node_projection.rs` | Disposable owner-only remote projection cache, deterministic bounds, health, generation CAS, quarantine, and atomic storage |
@@ -328,6 +329,11 @@ transition frontier, retained event state, durable collection, then applicable
 shell/runtime locks. Paths that need only a suffix of that order start at the
 first required owner; PTY output releases runtime locks before entering the
 `EventStream` publication boundary.
+The local coordinated Shell transaction extends the nested order with the
+global Workspace stage before durable collection mutation and the journal append
+after both staged projections are validated. Checkpointing retains the mutation
+and persistence gates but captures durable and global snapshots without nesting
+their internal locks before clearing the journal.
 
 Request handling uses `DaemonError` to retain validation, lifecycle, persistence,
 protocol, and internal failure classes until the wire boundary. Stable protocol
@@ -460,6 +466,13 @@ the attachment handshake. While holding the ordinary attachment mutation and
 shell lifecycle boundary, the daemon returns `run_changed` unless the shell is
 currently running that exact run. It cannot restart or take over a later run.
 Ordinary shell attachments retain their existing restart behavior.
+
+`shell create --open` prepares and spawns the terminal before the coordinated
+creation request so window presentation overlaps durable coordinator work. The
+hidden attachment waits on an owner-only runtime socket and receives success
+only after the parent has received the completed creation response. Creation
+failure closes the gate without attaching, so a ShellRun cannot start before
+coordinator completion and the waiter never polls or interprets `not_found`.
 
 Node-qualified opens still launch local `xdg-terminal-exec` presentation. Their
 hidden `__attach` command carries the exact owner Node ID and unchanged inner
@@ -952,8 +965,13 @@ evicts oldest completed outcomes as needed and rejects insufficient capacity
 before owner mutation. Preparing a distinct placement atomically expands every
 related pending reservation for the additional possible placement, preserving
 concurrent shared-revision creation without under-reserving either completion.
-Schema 6 adds a durable `owner_attempted` dispatch boundary. It is persisted
-within the completion reservation immediately before owner mutation. Schemas 1
+Schema 6 adds a durable `owner_attempted` dispatch boundary. Creating a resource
+in an existing Workspace persists it in the same prepared-state replacement,
+after owner preflight and immediately before owner mutation. Retried schema-6
+records that still carry `owner_attempted = false` cross that boundary before
+dispatch. The retained compound first-Workspace-and-Shell primitive keeps its
+separate preparation and attempted replacements so a proven pre-dispatch failure
+can still remove newly reserved Workspace metadata. Schemas 1
 through 5 migrate explicitly to schema 6;
 unknown legacy owner names are learned from a fresh owner read,
 schema-2 pending resource UUIDs become their operation identities, and a
@@ -976,7 +994,8 @@ owner-revision-guarded closes. Confirmed and already-absent owners are removed
 from coordinator metadata individually. Unreachable or ambiguous outcomes remain
 persisted for explicit retry, and the global record is removed only after every
 owner is confirmed. A Workspace with no placements completes close immediately.
-Resource creation first persists a prompt-free prepared operation containing
+Remote owner creation and non-Shell resource creation first persist a prompt-free
+prepared-and-attempted operation containing
 stable operation, requested and effective owner Workspace, and resource UUIDs,
 plus a hash of the complete request. Concurrent operations retain separate
 pending records; cancellation and completion target only the exact operation
@@ -1003,6 +1022,32 @@ observed. A definitive synchronous owner rejection may cancel only its serialize
 operation. Schedule
 prompts remain only in the transient owner request, and launcher and Shell argv
 remain arrays throughout routing.
+
+When the coordinator and selected owner are the same Node, ordinary coordinated
+Shell creation uses the independently versioned
+`local_shell_transactions.log` as its cross-owner commit authority. The daemon
+stages the exact owner Workspace/Shell and coordinator completion under the
+mutation, persistence, event, and global-store lock order, appends one
+checksummed bounded creation record to the pre-created owner-only journal, and
+calls `fdatasync` before installing either staged result or publishing creation
+events. If immediate attachment starts that still-journaled Shell, a contiguous
+run-start record is likewise synchronized before `RunStarted` publication or
+attachment success; cold replay records that untransferred run as interrupted.
+`state.json` and `global_workspaces.json` are asynchronous checkpoints for that
+committed record. A delayed worker checkpoints and clears committed records; any
+later ordinary request establishes the same replay frontier before applying new
+semantics. Protocol negotiation, snapshots, event reads, and a combined snapshot
+with no pending coordinator reconciliation may proceed without checkpointing, so
+an immediate fresh attachment can consume the run-start journal path despite
+dashboard or web projection reads. Graceful restart establishes the frontier
+before handoff. Cold startup
+validates and replays exact records into both checkpoints before one-time local Workspace
+migration and before accepting requests, then clears the journal without
+publishing historical creation events. A torn unterminated final append is
+discarded, while a malformed, unsupported, insecure, oversized, or
+checksum-invalid committed record fails startup closed. Remote owner creation
+retains the prepared coordinator and exact owner readback protocol because no
+local journal can commit another Node's authority.
 Protocol 39 adds an optional Node-qualified focused Shell and presentation
 revision to the combined Node snapshot. Protocol-38 responses omit the field.
 The value is live daemon memory, is returned only while the selected combined

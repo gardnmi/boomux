@@ -9,12 +9,13 @@ use std::time::Duration;
 use boomux::client::{ClientError, RemoteError};
 use boomux::protocol::{
     AgentScheduleOverlapPolicy, AgentScheduleSession, AgentScheduleSpec, AgentScheduleState,
-    AgentScheduleTrigger, ErrorCode, Request, Response, ShellSpec, WorkspaceLauncherSpec,
+    AgentScheduleTrigger, ErrorCode, Request, Response, ShellRunExitReason, ShellSpec,
+    WorkspaceLauncherSpec,
 };
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::support::{CONTROL_MASTER_PREFIX, TestDaemon};
+use crate::support::{CONTROL_MASTER_PREFIX, TestDaemon, profile};
 
 fn node_id(value: u128) -> String {
     Uuid::from_u128(value).to_string()
@@ -299,6 +300,234 @@ fn first_resources_atomically_establish_one_exact_owner_placement() {
 }
 
 #[test]
+fn committed_local_shell_journal_replays_before_cold_start_serves_requests() {
+    let mut daemon = TestDaemon::start_with(|command, _| {
+        command.env(
+            "BOOMUX_NATIVE_TEST_LOCAL_SHELL_CHECKPOINT_DELAY_MS",
+            "60000",
+        );
+    });
+    let global = daemon
+        .client
+        .create_global_workspace("journal-recovery")
+        .unwrap();
+    let node_id = daemon.client.node_identity().unwrap();
+    let operation_id = Uuid::new_v4().to_string();
+    let owner_workspace_id = Uuid::new_v4().to_string();
+    let shell_id = Uuid::new_v4().to_string();
+    let shell = ShellSpec {
+        name: "recovered".into(),
+        command: vec!["/bin/sh".into()],
+        cwd: std::env::temp_dir(),
+    };
+    let created = daemon
+        .client
+        .create_global_workspace_shell(
+            &operation_id,
+            &global.id,
+            global.revision,
+            &node_id,
+            &owner_workspace_id,
+            Some(std::env::temp_dir()),
+            &shell_id,
+            shell.clone(),
+        )
+        .unwrap();
+    let journal = daemon
+        .runtime_dir
+        .join("state/boomux/local_shell_transactions.log");
+    assert!(fs::metadata(&journal).unwrap().len() > 0);
+
+    daemon.crash();
+    daemon.restart_with(|command| {
+        command.env(
+            "BOOMUX_NATIVE_TEST_LOCAL_SHELL_CHECKPOINT_DELAY_MS",
+            "60000",
+        );
+    });
+    assert_eq!(fs::metadata(&journal).unwrap().len(), 0);
+    let snapshot = daemon.client.snapshot().unwrap();
+    let owner = snapshot
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.id == owner_workspace_id)
+        .unwrap();
+    assert_eq!(owner.shells.len(), 1);
+    assert_eq!(owner.shells[0].id, shell_id);
+    let replayed = daemon
+        .client
+        .create_global_workspace_shell(
+            operation_id,
+            &global.id,
+            global.revision,
+            node_id,
+            owner_workspace_id,
+            Some(std::env::temp_dir()),
+            shell_id,
+            shell,
+        )
+        .unwrap();
+    assert_eq!(replayed, created);
+}
+
+#[test]
+fn journaled_initial_shell_run_recovers_as_interrupted_after_cold_crash() {
+    let mut daemon = TestDaemon::start_with(|command, _| {
+        command.env(
+            "BOOMUX_NATIVE_TEST_LOCAL_SHELL_CHECKPOINT_DELAY_MS",
+            "60000",
+        );
+    });
+    let global = daemon
+        .client
+        .create_global_workspace("journaled-start")
+        .unwrap();
+    let node_id = daemon.client.node_identity().unwrap();
+    let owner_workspace_id = Uuid::new_v4().to_string();
+    let shell_id = Uuid::new_v4().to_string();
+    daemon
+        .client
+        .create_global_workspace_shell(
+            Uuid::new_v4().to_string(),
+            &global.id,
+            global.revision,
+            node_id,
+            &owner_workspace_id,
+            Some(std::env::temp_dir()),
+            &shell_id,
+            ShellSpec {
+                name: "journaled-start".into(),
+                command: vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
+                cwd: std::env::temp_dir(),
+            },
+        )
+        .unwrap();
+    let journal = daemon
+        .runtime_dir
+        .join("state/boomux/local_shell_transactions.log");
+    let create_bytes = fs::metadata(&journal).unwrap().len();
+    let fresh_client =
+        boomux::client::Client::from_socket_path(daemon.client.socket_path().to_path_buf());
+    fresh_client.snapshot().unwrap();
+    fresh_client.combined_node_snapshot(None).unwrap();
+    assert_eq!(fs::metadata(&journal).unwrap().len(), create_bytes);
+    let attachment = fresh_client.attach(&shell_id, false, profile()).unwrap();
+    assert!(fs::metadata(&journal).unwrap().len() > create_bytes);
+    drop(attachment);
+
+    daemon.crash();
+    daemon.restart_with(|command| {
+        command.env(
+            "BOOMUX_NATIVE_TEST_LOCAL_SHELL_CHECKPOINT_DELAY_MS",
+            "60000",
+        );
+    });
+    assert_eq!(fs::metadata(&journal).unwrap().len(), 0);
+    let recovered = daemon.client.get_shell(&shell_id).unwrap();
+    assert!(recovered.run.is_none());
+    let state: serde_json::Value = serde_json::from_slice(
+        &fs::read(daemon.runtime_dir.join("state/boomux/state.json")).unwrap(),
+    )
+    .unwrap();
+    let recovered_run = state["workspaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|workspace| workspace["shells"].as_array().unwrap())
+        .find(|shell| shell["id"] == shell_id)
+        .unwrap()["last_run"]
+        .clone();
+    assert_eq!(recovered_run["generation"], 1);
+    assert_eq!(
+        serde_json::from_value::<Option<ShellRunExitReason>>(recovered_run["exit_reason"].clone())
+            .unwrap(),
+        Some(ShellRunExitReason::Interrupted)
+    );
+}
+
+#[test]
+fn later_shell_mutations_checkpoint_creation_before_changing_recovery_semantics() {
+    let mut daemon = TestDaemon::start_with(|command, _| {
+        command.env(
+            "BOOMUX_NATIVE_TEST_LOCAL_SHELL_CHECKPOINT_DELAY_MS",
+            "60000",
+        );
+    });
+    let mut global = daemon
+        .client
+        .create_global_workspace("journal-frontier")
+        .unwrap();
+    let node_id = daemon.client.node_identity().unwrap();
+    let owner_workspace_id = Uuid::new_v4().to_string();
+    let journal = daemon
+        .runtime_dir
+        .join("state/boomux/local_shell_transactions.log");
+    for (operation_id, shell_id, name) in [
+        (Uuid::new_v4(), Uuid::new_v4(), "rename-me"),
+        (Uuid::new_v4(), Uuid::new_v4(), "close-me"),
+    ] {
+        global = daemon
+            .client
+            .create_global_workspace_shell(
+                operation_id.to_string(),
+                &global.id,
+                global.revision,
+                &node_id,
+                &owner_workspace_id,
+                Some(std::env::temp_dir()),
+                shell_id.to_string(),
+                ShellSpec::login(name, std::env::temp_dir()),
+            )
+            .unwrap()
+            .0;
+    }
+    assert!(fs::metadata(&journal).unwrap().len() > 0);
+
+    let output = daemon
+        .command()
+        .args([
+            "shell",
+            "rename",
+            "rename-me",
+            "renamed",
+            "--workspace",
+            "journal-frontier",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(fs::metadata(&journal).unwrap().len(), 0);
+    let output = daemon
+        .command()
+        .args([
+            "shell",
+            "close",
+            "close-me",
+            "--workspace",
+            "journal-frontier",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    daemon.crash();
+    daemon.restart_with(|command| {
+        command.env(
+            "BOOMUX_NATIVE_TEST_LOCAL_SHELL_CHECKPOINT_DELAY_MS",
+            "60000",
+        );
+    });
+    let snapshot = daemon.client.snapshot().unwrap();
+    let owner = snapshot
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.id == owner_workspace_id)
+        .unwrap();
+    assert!(owner.shells.iter().any(|shell| shell.name == "renamed"));
+    assert!(owner.shells.iter().all(|shell| shell.name != "close-me"));
+}
+
+#[test]
 fn concurrent_first_resources_with_distinct_requested_owners_replay_canonical_successes() {
     let daemon = TestDaemon::start();
     let global = daemon
@@ -313,6 +542,11 @@ fn concurrent_first_resources_with_distinct_requested_owners_replay_canonical_su
         let operation_id = Uuid::from_u128(100 + offset).to_string();
         let requested_owner_id = Uuid::from_u128(200 + offset).to_string();
         let shell_id = Uuid::from_u128(300 + offset).to_string();
+        let requested_default_cwd = if offset == 0 {
+            std::env::temp_dir()
+        } else {
+            std::env::current_dir().unwrap()
+        };
         let shell = ShellSpec {
             name: format!("shell-{offset}"),
             command: Vec::new(),
@@ -323,6 +557,7 @@ fn concurrent_first_resources_with_distinct_requested_owners_replay_canonical_su
             requested_owner_id.clone(),
             shell_id.clone(),
             shell.clone(),
+            requested_default_cwd.clone(),
         ));
         let client = daemon.client.clone();
         let barrier = Arc::clone(&barrier);
@@ -337,7 +572,7 @@ fn concurrent_first_resources_with_distinct_requested_owners_replay_canonical_su
                     global.revision,
                     node_id,
                     requested_owner_id,
-                    Some(std::env::temp_dir()),
+                    Some(requested_default_cwd),
                     shell_id,
                     shell,
                 )
@@ -361,7 +596,7 @@ fn concurrent_first_resources_with_distinct_requested_owners_replay_canonical_su
             .any(|request| request.1 == first.1.workspace_id)
     );
 
-    for (index, (operation_id, requested_owner_id, shell_id, shell)) in
+    for (index, (operation_id, requested_owner_id, shell_id, shell, default_cwd)) in
         requests.into_iter().enumerate()
     {
         let replay = daemon
@@ -372,7 +607,7 @@ fn concurrent_first_resources_with_distinct_requested_owners_replay_canonical_su
                 global.revision,
                 &node_id,
                 requested_owner_id,
-                Some(std::env::temp_dir()),
+                Some(default_cwd),
                 shell_id,
                 shell,
             )
