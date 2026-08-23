@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.28.0](https://github.com/gardnmi/boomux/compare/v0.27.1...v0.28.0) (2026-08-23)
+
+
+### Features
+
+* **tui:** select default workspace ([#249](https://github.com/gardnmi/boomux/issues/249)) ([897e47e](https://github.com/gardnmi/boomux/commit/897e47e6239f6ed93a6e10d06377de092db5989a))
+
 ## [0.27.1](https://github.com/gardnmi/boomux/compare/v0.27.0...v0.27.1) (2026-08-23)
 
 
