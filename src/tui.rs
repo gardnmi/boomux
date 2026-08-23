@@ -851,6 +851,9 @@ pub(crate) enum DashboardEffect {
     Quit,
     AddNode,
     UpgradeNode(String),
+    SelectWorkspace {
+        workspace_id: String,
+    },
     RestoreWorkspace(QualifiedIdentity),
     Open(OpenTarget),
     Close(CloseTarget),
@@ -949,6 +952,10 @@ pub(crate) enum DashboardEvent {
     PreviewRequested,
     UpdateCheckCompleted,
     OperationCompleted(Result<String, String>),
+    WorkspaceSelectionCompleted {
+        workspace_id: String,
+        result: Result<String, String>,
+    },
     ShellCreationCompleted(Result<String, String>),
     RefreshCompleted(Result<DashboardState, String>),
     ScheduleHistoryCompleted {
@@ -1109,6 +1116,7 @@ struct App {
     terminal_preview: Option<TerminalPreviewState>,
     follow_focused_terminal: bool,
     selection_pinned: bool,
+    selected_workspace_id: Option<String>,
     observed_focus_revision: Option<u64>,
 }
 
@@ -2360,6 +2368,7 @@ impl App {
             terminal_preview: None,
             follow_focused_terminal: false,
             selection_pinned: false,
+            selected_workspace_id: None,
             observed_focus_revision: None,
         }
     }
@@ -3364,6 +3373,23 @@ impl App {
         });
     }
 
+    fn select_workspace_as_default(&self) -> Option<DashboardEffect> {
+        if self.primary_tab != PrimaryTab::Workspaces || self.focus != Focus::Workspaces {
+            return None;
+        }
+        let workspace = self.selected()?;
+        if !matches!(
+            workspace.coordination,
+            WorkspaceCoordinationView::Global { closing: false, .. }
+        ) || self.selected_workspace_id.as_deref() == Some(&workspace.id)
+        {
+            return None;
+        }
+        Some(DashboardEffect::SelectWorkspace {
+            workspace_id: workspace.id.clone(),
+        })
+    }
+
     fn update(&mut self, event: DashboardEvent) -> Vec<DashboardEffect> {
         match event {
             DashboardEvent::KeyPressed { code, modifiers } => {
@@ -3377,6 +3403,15 @@ impl App {
             DashboardEvent::OperationCompleted(result) => {
                 self.message = Some(Message::from_result(result));
                 return vec![DashboardEffect::Refresh];
+            }
+            DashboardEvent::WorkspaceSelectionCompleted {
+                workspace_id,
+                result,
+            } => {
+                if result.is_ok() {
+                    self.selected_workspace_id = Some(workspace_id);
+                }
+                self.message = Some(Message::from_result(result));
             }
             DashboardEvent::ShellCreationCompleted(result) => {
                 self.pending_shell_creation = None;
@@ -3612,6 +3647,7 @@ impl App {
             }
             KeyCode::Char('x') => self.request_close(),
             KeyCode::Char('a') => return self.request_add(),
+            KeyCode::Char('s') => return self.select_workspace_as_default(),
             KeyCode::Char('d') if self.primary_tab == PrimaryTab::Workspaces => {
                 return self.adopt_selected_external();
             }
@@ -4074,6 +4110,7 @@ fn item_pending_removal(
 
 pub(crate) fn run<B: DashboardBackend + Send + 'static>(
     state: DashboardState,
+    selected_workspace_id: Option<String>,
     follow_focused_terminal: bool,
     project_context: ProjectContext,
     play_intro: bool,
@@ -4090,6 +4127,7 @@ pub(crate) fn run<B: DashboardBackend + Send + 'static>(
         return Err(error);
     }
     let mut app = App::new(state.workspaces, project_context);
+    app.selected_workspace_id = selected_workspace_id;
     app.nodes = state.nodes;
     app.node_state.select((!app.nodes.is_empty()).then_some(0));
     app.all_schedules = state.schedules.clone();
@@ -5720,6 +5758,18 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
                 Line::from("  Enter restores its launchers and terminal windows."),
                 Line::from("  Closing it terminates retained shells and removes launchers."),
             ]);
+            if matches!(
+                workspace.coordination,
+                WorkspaceCoordinationView::Global { closing: false, .. }
+            ) {
+                lines.push(Line::from(
+                    if app.selected_workspace_id.as_deref() == Some(&workspace.id) {
+                        "  This is the default Workspace for context-free commands."
+                    } else {
+                        "  s sets this as the default Workspace for context-free commands."
+                    },
+                ));
+            }
             if workspace.attention_count > 0 {
                 lines.push(Line::from(format!(
                     "  attention: {} unseen blocked/completed observation(s)",
@@ -7732,6 +7782,35 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
             ]);
         }
         if app.primary_tab == PrimaryTab::Workspaces {
+            if app.focus == Focus::Workspaces
+                && let Some(workspace) = app.selected()
+                && matches!(
+                    workspace.coordination,
+                    WorkspaceCoordinationView::Global { closing: false, .. }
+                )
+            {
+                let selected = app.selected_workspace_id.as_deref() == Some(&workspace.id);
+                spans.extend([
+                    Span::styled(
+                        if selected { "DEFAULT" } else { "s" },
+                        Style::new()
+                            .fg(if selected { YELLOW } else { GREEN })
+                            .add_modifier(if selected {
+                                Modifier::BOLD
+                            } else {
+                                Modifier::empty()
+                            }),
+                    ),
+                    Span::styled(
+                        if selected {
+                            " selected  "
+                        } else {
+                            " set default  "
+                        },
+                        Style::new().fg(SUBTEXT),
+                    ),
+                ]);
+            }
             spans.extend([
                 Span::styled("a", Style::new().fg(GREEN)),
                 Span::styled(
@@ -10030,6 +10109,89 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect();
         assert!(pinned_text.contains("unpin selection and resume focused-terminal following"));
+    }
+
+    #[test]
+    fn workspace_default_action_selects_only_an_active_coordinated_workspace() {
+        let mut app = app();
+        assert!(
+            app.update(DashboardEvent::KeyPressed {
+                code: KeyCode::Char('s'),
+                modifiers: KeyModifiers::NONE,
+            })
+            .is_empty()
+        );
+        app.workspaces[0].coordination = WorkspaceCoordinationView::Global {
+            revision: 1,
+            closing: true,
+            placements: Vec::new(),
+        };
+        assert!(
+            app.update(DashboardEvent::KeyPressed {
+                code: KeyCode::Char('s'),
+                modifiers: KeyModifiers::NONE,
+            })
+            .is_empty()
+        );
+        let WorkspaceCoordinationView::Global { closing, .. } = &mut app.workspaces[0].coordination
+        else {
+            unreachable!();
+        };
+        *closing = false;
+
+        assert_eq!(
+            app.update(DashboardEvent::KeyPressed {
+                code: KeyCode::Char('s'),
+                modifiers: KeyModifiers::NONE,
+            }),
+            vec![DashboardEffect::SelectWorkspace {
+                workspace_id: "w1".into(),
+            }]
+        );
+        assert!(
+            app.update(DashboardEvent::WorkspaceSelectionCompleted {
+                workspace_id: "w1".into(),
+                result: Ok("Set boomux as the default Workspace".into()),
+            })
+            .is_empty()
+        );
+        assert_eq!(app.selected_workspace_id.as_deref(), Some("w1"));
+        assert!(app.message.as_ref().is_some_and(|message| {
+            !message.error && message.text == "Set boomux as the default Workspace"
+        }));
+        assert!(
+            app.update(DashboardEvent::KeyPressed {
+                code: KeyCode::Char('s'),
+                modifiers: KeyModifiers::NONE,
+            })
+            .is_empty()
+        );
+
+        app.message = None;
+        let rendered = rendered_text(&mut app, 180, 34);
+        assert!(rendered.contains("DEFAULT selected"));
+        assert!(help_lines(&app).iter().any(|line| {
+            line.to_string()
+                .contains("default Workspace for context-free commands")
+        }));
+    }
+
+    #[test]
+    fn failed_workspace_default_action_preserves_the_previous_selection() {
+        let mut app = app();
+        app.selected_workspace_id = Some("previous".into());
+
+        app.update(DashboardEvent::WorkspaceSelectionCompleted {
+            workspace_id: "w1".into(),
+            result: Err("selection failed".into()),
+        });
+
+        assert_eq!(app.selected_workspace_id.as_deref(), Some("previous"));
+        assert!(
+            app.message
+                .as_ref()
+                .is_some_and(|message| { message.error && message.text == "selection failed" })
+        );
     }
 
     #[test]
