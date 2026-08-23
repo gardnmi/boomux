@@ -327,6 +327,7 @@ to the phone's home screen to install the progressive web app. See
 | `h`, `l`, left, right | Move between workspace and entry tables. |
 | `j`, `k`, up, down | Navigate rows. |
 | `Enter` | Open the selected workspace or entry. |
+| `s` | Set the selected coordinated Workspace as the default for context-free commands. |
 | `a` | Create a workspace or add a shell, depending on focus. |
 | `e` | Rename the selection. |
 | `x`, then `y` | Confirm closing or removing the selection. |

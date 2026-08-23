@@ -3420,8 +3420,13 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
         &mut title_cache,
         false,
     );
+    let selected_workspace_id = workspace_selection::load_from_environment()
+        .ok()
+        .flatten()
+        .map(|selection| selection.workspace_id().to_owned());
     tui::run(
         initial_state,
+        selected_workspace_id,
         config.dashboard.follow_focused_terminal,
         project_context,
         true,
@@ -3432,6 +3437,28 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
                     .map(|()| "Opened guided Node setup".into())
                     .map_err(|error| error.to_string()),
             ),
+            tui::DashboardEffect::SelectWorkspace { workspace_id } => {
+                let result = (|| {
+                    let combined = client
+                        .combined_node_snapshot(None)
+                        .map_err(|error| error.to_string())?;
+                    let workspace =
+                        find_global_workspace_by_id(&combined.workspaces, &workspace_id)
+                            .ok_or_else(|| "Workspace is no longer retained".to_owned())?;
+                    if workspace.closing {
+                        return Err("a closing Workspace cannot be selected".into());
+                    }
+                    let selection = workspace_selection::WorkspaceSelection::new(&workspace.id)
+                        .map_err(|error| error.to_string())?;
+                    workspace_selection::save_from_environment(&selection)
+                        .map_err(|error| error.to_string())?;
+                    Ok(format!("Set {} as the default Workspace", workspace.name))
+                })();
+                tui::DashboardEvent::WorkspaceSelectionCompleted {
+                    workspace_id,
+                    result,
+                }
+            }
             tui::DashboardEffect::UpgradeNode(node_id) => tui::DashboardEvent::OperationCompleted(
                 terminal::open_node_upgrade(terminal.as_deref(), &node_id)
                     .map(|()| "Opened Node upgrade".into())

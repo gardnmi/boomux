@@ -569,7 +569,9 @@ consistent for attached clients.
 The dashboard has Workspaces, Agents, Shells, Schedules, and Nodes views. `/` or
 `:` opens its action and search palette, `?` shows contextual help, `Enter`
 restores the selected workspace or opens the selected entry, and `x` followed
-by `y` confirms close or removal. Shell previews are bounded and read-only.
+by `y` confirms close or removal. On an active coordinated Workspace row, `s`
+stores that Workspace as the default context for later context-free commands.
+Shell previews are bounded and read-only.
 Restoring a workspace has the same launcher, takeover, restart, and
 partial-success behavior as `workspace open`. By default, a newly focused
 managed terminal selects its owning workspace and shell or Agent row once;
