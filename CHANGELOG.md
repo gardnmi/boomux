@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.27.1](https://github.com/gardnmi/boomux/compare/v0.27.0...v0.27.1) (2026-08-23)
+
+
+### Performance Improvements
+
+* **shell:** accelerate local create and open ([#246](https://github.com/gardnmi/boomux/issues/246)) ([9588723](https://github.com/gardnmi/boomux/commit/9588723bfc3271b1739bf0dfb2dce50a37c666dc))
+
 ## [0.27.0](https://github.com/gardnmi/boomux/compare/v0.26.0...v0.27.0) (2026-08-23)
 
 
