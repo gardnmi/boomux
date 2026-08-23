@@ -3854,8 +3854,7 @@ impl App {
                         })
                     })
                     .or_else(|| {
-                        (!self.schedules.is_empty())
-                            .then_some(previous.min(self.schedules.len() - 1))
+                        (!self.schedules.is_empty()).then(|| previous.min(self.schedules.len() - 1))
                     }),
             );
             self.sync_selected_execution();
@@ -12029,6 +12028,16 @@ mod tests {
             app.pending_close,
             Some(PendingClose { target: CloseTarget::Execution(ref id), .. }) if id == "execution-2"
         ));
+    }
+
+    #[test]
+    fn schedule_refresh_clears_selection_when_the_last_schedule_disappears() {
+        let mut app = schedule_app();
+
+        app.replace_schedules(Vec::new());
+
+        assert_eq!(app.global_state.selected(), None);
+        assert_eq!(app.selected_execution(), None);
     }
 
     #[test]

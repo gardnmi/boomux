@@ -18,6 +18,7 @@ mod host_session_titles;
 #[allow(dead_code)]
 mod integration_management;
 pub mod integrations;
+mod local_shell_journal;
 mod node_identity;
 mod node_projection;
 mod node_registration;

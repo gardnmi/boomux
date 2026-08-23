@@ -4,11 +4,83 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
 use std::os::unix::process::CommandExt;
+use std::os::unix::{fs::PermissionsExt, net::UnixListener, net::UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
+use uuid::Uuid;
 
 static TEMPORARY_DIRECTORY_ID: AtomicU64 = AtomicU64::new(0);
+const OPEN_GATE_TIMEOUT: Duration = Duration::from_secs(10);
+const OPEN_GATE_RETRY: Duration = Duration::from_millis(10);
+
+pub(crate) struct OpenGate {
+    listener: UnixListener,
+    path: PathBuf,
+    released: bool,
+}
+
+impl OpenGate {
+    fn new() -> io::Result<Self> {
+        let parent = crate::client::socket_path()?
+            .parent()
+            .ok_or_else(|| io::Error::other("Boomux runtime socket has no parent"))?
+            .to_owned();
+        let id = Uuid::new_v4().simple().to_string();
+        let path = parent.join(format!("open-{}.sock", &id[..16]));
+        Self::bind(path)
+    }
+
+    fn bind(path: PathBuf) -> io::Result<Self> {
+        let listener = UnixListener::bind(&path)?;
+        let gate = Self {
+            listener,
+            path,
+            released: false,
+        };
+        fs::set_permissions(&gate.path, fs::Permissions::from_mode(0o600))?;
+        gate.listener.set_nonblocking(true)?;
+        Ok(gate)
+    }
+
+    pub(crate) fn release(mut self) -> io::Result<()> {
+        let deadline = Instant::now() + OPEN_GATE_TIMEOUT;
+        loop {
+            match self.listener.accept() {
+                Ok((mut stream, _)) => {
+                    use std::io::Write;
+                    stream.write_all(&[1])?;
+                    self.released = true;
+                    return Ok(());
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "terminal did not become ready for the created Shell",
+                        ));
+                    }
+                    thread::sleep(OPEN_GATE_RETRY);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+}
+
+impl Drop for OpenGate {
+    fn drop(&mut self) {
+        if !self.released
+            && let Ok((mut stream, _)) = self.listener.accept()
+        {
+            use std::io::Write;
+            let _ = stream.write_all(&[0]);
+        }
+        let _ = fs::remove_file(&self.path);
+    }
+}
 
 pub(crate) fn validate_desktop_entry(entry: &str) -> Result<(), Box<dyn Error>> {
     let (desktop_entry, action) = entry
@@ -57,6 +129,38 @@ pub(crate) fn open_remote(
         takeover,
         None,
     )
+}
+
+pub(crate) fn open_waiting(
+    desktop_entry: Option<&str>,
+    node_id: Option<&str>,
+    shell_id: &str,
+    title: &str,
+) -> Result<OpenGate, Box<dyn Error>> {
+    let gate = OpenGate::new()?;
+    let executable = attachment_executable()?;
+    let arguments = waiting_attachment_arguments(&gate.path, shell_id, node_id);
+    launch(
+        desktop_entry,
+        title,
+        None,
+        executable.as_os_str(),
+        &arguments,
+    )?;
+    Ok(gate)
+}
+
+pub(crate) fn await_open_gate(path: &Path) -> io::Result<()> {
+    use std::io::Read;
+
+    let mut stream = UnixStream::connect(path)?;
+    let mut status = [0];
+    stream.read_exact(&mut status)?;
+    if status == [1] {
+        Ok(())
+    } else {
+        Err(io::Error::other("Shell creation failed before attachment"))
+    }
 }
 
 pub(crate) fn open_exact_run(
@@ -201,7 +305,11 @@ fn launch(
     arguments: &[OsString],
 ) -> Result<(), Box<dyn Error>> {
     let preference = desktop_entry.map(TemporaryPreference::new).transpose()?;
-    let selected = selected_with_preference(desktop_entry, preference.as_ref())?;
+    let selected = if desktop_entry.is_some() {
+        selected_with_preference(desktop_entry, preference.as_ref())?
+    } else {
+        "configured terminal".to_owned()
+    };
     let mut resolver = configured_command(preference.as_ref());
     resolver
         .arg(r"--print-cmd=\0")
@@ -260,6 +368,23 @@ fn attachment_arguments(
         arguments.extend(["--expected-run-id".into(), expected_run_id.into()]);
     } else {
         arguments.push("--restart-exited".into());
+    }
+    arguments
+}
+
+fn waiting_attachment_arguments(
+    gate: &Path,
+    shell_id: &str,
+    node_id: Option<&str>,
+) -> Vec<OsString> {
+    let mut arguments = vec![
+        "__await-attach".into(),
+        shell_id.into(),
+        "--gate".into(),
+        gate.as_os_str().to_owned(),
+    ];
+    if let Some(node_id) = node_id {
+        arguments.extend(["--node".into(), node_id.into()]);
     }
     arguments
 }
@@ -431,6 +556,79 @@ mod tests {
             .map(OsStr::new)
             .map(OsStr::to_owned)
         );
+    }
+
+    #[test]
+    fn waiting_attachment_is_exact_and_node_qualified() {
+        assert_eq!(
+            waiting_attachment_arguments(Path::new("/run/user/1/gate"), "shell-1", Some("node-1")),
+            [
+                "__await-attach",
+                "shell-1",
+                "--gate",
+                "/run/user/1/gate",
+                "--node",
+                "node-1",
+            ]
+            .map(OsStr::new)
+            .map(OsStr::to_owned)
+        );
+    }
+
+    #[test]
+    fn open_gate_releases_only_after_success() {
+        let path = env::temp_dir().join(format!("boomux-open-gate-{}", process::id()));
+        let listener = UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let gate = OpenGate {
+            listener,
+            path: path.clone(),
+            released: false,
+        };
+        let waiter = thread::spawn(move || await_open_gate(&path));
+
+        gate.release().unwrap();
+        waiter.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn bound_open_gate_is_owner_only_and_removed_on_drop() {
+        use std::os::unix::fs::MetadataExt;
+
+        let path = env::temp_dir().join(format!("boomux-owned-open-gate-{}", process::id()));
+        let gate = OpenGate::bind(path.clone()).unwrap();
+        let metadata = fs::symlink_metadata(&path).unwrap();
+        assert_eq!(metadata.mode() & 0o777, 0o600);
+
+        drop(gate);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn dropped_open_gate_rejects_attachment() {
+        use std::io::Read;
+        use std::sync::mpsc;
+
+        let path = env::temp_dir().join(format!("boomux-failed-open-gate-{}", process::id()));
+        let listener = UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let gate = OpenGate {
+            listener,
+            path: path.clone(),
+            released: false,
+        };
+        let (connected_tx, connected_rx) = mpsc::channel();
+        let waiter = thread::spawn(move || {
+            let mut stream = UnixStream::connect(path).unwrap();
+            connected_tx.send(()).unwrap();
+            let mut status = [1];
+            stream.read_exact(&mut status).unwrap();
+            status
+        });
+        connected_rx.recv().unwrap();
+
+        drop(gate);
+        assert_eq!(waiter.join().unwrap(), [0]);
     }
 
     #[test]

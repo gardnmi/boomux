@@ -89,11 +89,27 @@ eligibility alone cannot authorize either mutation. The retained internal
 compound first-placement request performs the same live capability preflight
 before persisting empty metadata; definitive
 pre-owner rejection cancels only an existing exact preparation durably marked as
-never attempted. Immediately before owner mutation the coordinator persists an
-attempted phase. Once set, later capability, registration, identity, owner-error,
+never attempted. After preflight, remote creation persists preparation, then
+crosses the attempted boundary in a separate replacement immediately before
+owner mutation. The compound first-Workspace-and-Shell primitive uses the same
+separate boundaries so proven pre-dispatch failure can remove its newly reserved
+metadata. A retry of an older never-attempted
+preparation crosses the durable attempted boundary before dispatch. Once set,
+later capability, registration, identity, owner-error,
 or exact-absence results retain the pending operation and Workspace name because
 they cannot disprove an earlier transport-ambiguous mutation. Ambiguous or
 network outcomes likewise retain any already-prepared recovery state.
+
+An ordinary Shell whose coordinator and owner are the same Node may instead use
+the local cross-owner transaction journal. One checksummed synchronized creation
+record commits the owner Shell and coordinator completion; an immediately
+attached initial run uses a second synchronized record before attachment
+success. The two JSON stores are replayable checkpoints. Subsequent ordinary
+requests and graceful handoff checkpoint earlier records before changing their
+semantics; protocol negotiation, snapshots, event reads, and mutation-free
+combined projection reads are the exceptions needed by immediate attachment. This local
+optimization does not apply to remote owner mutations, which retain the durable
+prepared-operation and exact-readback sequence above.
 
 ## Identity And Ownership
 

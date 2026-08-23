@@ -35,6 +35,9 @@ use crate::global_workspace_store::{
 };
 use crate::handoff;
 use crate::host_services::{self, PreparedIntegrationMutation};
+use crate::local_shell_journal::{
+    LocalShellJournal, LocalShellJournalRecord, LocalShellStartTransaction, LocalShellTransaction,
+};
 use crate::node_identity::{NodeIdentityLease, NodeIdentityManager};
 use crate::node_projection::{
     NodeProjectionCache, ProjectionCommit, ProjectionObservation, RemoteDigestClaim,
@@ -440,18 +443,21 @@ fn run_daemon(
     registry.node_registrations = Some(registrations);
     registry.node_projection_cache = Some(NodeProjectionCache::load_from_environment());
     registry.global_workspaces = match GlobalWorkspaceStore::load_from_environment() {
-        Ok(store) => {
-            if let Some(identity) = registry.node_identity.as_ref() {
-                let node_id = identity.id()?;
-                store.initialize_local_once(&node_id, &registry.snapshot()?)?;
-            }
-            Some(store)
-        }
+        Ok(store) => Some(store),
         Err(error) => {
             eprintln!("boomux: global Workspace coordination disabled: {error}");
             None
         }
     };
+    registry.local_shell_journal = Some(LocalShellJournal::load_from_environment()?);
+    registry.replay_local_shell_transactions()?;
+    if let (Some(identity), Some(global_workspaces)) = (
+        registry.node_identity.as_ref(),
+        registry.global_workspaces.as_ref(),
+    ) {
+        let node_id = identity.id()?;
+        global_workspaces.initialize_local_once(&node_id, &registry.snapshot()?)?;
+    }
     registry.startup_environment =
         sanitize_opencode_shim_environment(&capture_current_environment());
     registry.configure_scheduler_clock()?;
@@ -1995,6 +2001,18 @@ fn handle_connection_inner(
                 return send_response(&mut stream, response_version, error.into_response());
             }
         }
+        if let Err(error) = registry.checkpoint_local_shell_transactions() {
+            transition.store(TRANSITION_IDLE, Ordering::Release);
+            return send_response(
+                &mut stream,
+                response_version,
+                DaemonError::persistence_context(
+                    error,
+                    "could not checkpoint local Shell transactions before restart",
+                )
+                .into_response(),
+            );
+        }
         let (reply, response) = mpsc::sync_channel(1);
         if restart_sender
             .send(RestartRequest {
@@ -2067,7 +2085,7 @@ fn handle_connection_inner(
     if schedule_semantics_changed && !matches!(response, Response::Error { .. }) {
         registry.wake_scheduler();
     }
-    send_response(
+    let result = send_response(
         &mut stream,
         response_version,
         response_for_version_with_schedule_shells(
@@ -2077,7 +2095,23 @@ fn handle_connection_inner(
                 .schedule_shell_ids_for_downgrade()
                 .unwrap_or_default(),
         ),
-    )
+    );
+    if result.is_ok()
+        && registry
+            .local_shell_journal
+            .as_ref()
+            .is_some_and(|journal| journal.is_empty().is_ok_and(|empty| !empty))
+    {
+        let registry = Arc::clone(&registry);
+        let delay = registry.local_shell_checkpoint_delay();
+        thread::spawn(move || {
+            thread::sleep(delay);
+            if let Err(error) = registry.checkpoint_local_shell_transactions() {
+                eprintln!("boomux: local Shell transaction checkpoint failed: {error}");
+            }
+        });
+    }
+    result
 }
 
 fn validate_notification_delivery_settings(
@@ -3014,6 +3048,7 @@ struct DaemonService {
     node_registrations: Option<NodeRegistrationManager>,
     node_projection_cache: Option<NodeProjectionCache>,
     global_workspaces: Option<GlobalWorkspaceStore>,
+    local_shell_journal: Option<LocalShellJournal>,
     durable: DurableRegistry,
     events: EventStream,
     runtimes: ShellRuntimeManager,
@@ -5393,6 +5428,69 @@ impl DurableRegistry {
         ))
     }
 
+    fn replay_interrupted_shell_start(
+        &self,
+        shell_id: &str,
+        mut run: PersistedShellRun,
+    ) -> io::Result<()> {
+        validate_uuid(shell_id, "journal Shell ID")?;
+        validate_uuid(&run.id, "journal ShellRun ID")?;
+        validate_terminal_profile(&run.profile)?;
+        if run.generation == 0 || run.ended_at_ms.is_some() || run.exit_reason.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "local Shell start journal contains an invalid active run",
+            ));
+        }
+        let state = lock(&self.state)?;
+        let shell = state
+            .shells
+            .get(shell_id)
+            .cloned()
+            .ok_or_else(|| not_found("journal Shell", shell_id))?;
+        let shells = state.shells.values().cloned().collect::<Vec<_>>();
+        drop(state);
+        if shells.iter().any(|candidate| {
+            candidate.id != shell_id
+                && candidate
+                    .last_run
+                    .lock()
+                    .is_ok_and(|last_run| last_run.as_ref().is_some_and(|last| last.id == run.id))
+        }) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "local Shell start journal reuses a ShellRun ID",
+            ));
+        }
+        let mut last_run = lock(&shell.last_run)?;
+        if let Some(existing) = last_run.as_ref() {
+            if existing.generation == run.generation {
+                if existing.id == run.id
+                    && existing.started_at_ms == run.started_at_ms
+                    && existing.output_revision >= run.output_revision
+                    && existing.environment_has_run_id == run.environment_has_run_id
+                    && existing.profile.term == run.profile.term
+                    && existing.profile.colorterm == run.profile.colorterm
+                    && existing.profile.term_program == run.profile.term_program
+                    && existing.profile.term_program_version == run.profile.term_program_version
+                {
+                    return Ok(());
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "local Shell start journal conflicts with persisted run history",
+                ));
+            }
+            if existing.generation > run.generation {
+                return Ok(());
+            }
+        }
+        run.ended_at_ms = Some(unix_time_ms().max(run.started_at_ms));
+        run.exit_reason = Some(ShellRunExitReason::Interrupted);
+        *last_run = Some(run);
+        Ok(())
+    }
+
     fn create_schedule_shell(
         &self,
         schedule: &Arc<AgentSchedule>,
@@ -7560,6 +7658,7 @@ impl Default for DaemonService {
             node_registrations: None,
             node_projection_cache: None,
             global_workspaces: None,
+            local_shell_journal: None,
             durable: DurableRegistry {
                 state: Mutex::new(DurableState::default()),
                 store: None,
@@ -9008,6 +9107,141 @@ impl DaemonService {
         })
     }
 
+    fn local_shell_journal(&self) -> DaemonResult<&LocalShellJournal> {
+        self.local_shell_journal.as_ref().ok_or_else(|| {
+            DaemonError::lifecycle(
+                ErrorCode::PersistenceFailed,
+                "local Shell transaction journal is unavailable",
+            )
+        })
+    }
+
+    fn local_shell_checkpoint_delay(&self) -> Duration {
+        #[cfg(debug_assertions)]
+        if self.native_test_hooks_enabled()
+            && let Some(variable) = self.startup_environment.variables.iter().find(|variable| {
+                variable.name == b"BOOMUX_NATIVE_TEST_LOCAL_SHELL_CHECKPOINT_DELAY_MS"
+            })
+            && let Ok(value) = std::str::from_utf8(&variable.value)
+            && let Ok(milliseconds) = value.parse::<u64>()
+        {
+            return Duration::from_millis(milliseconds.min(60_000));
+        }
+        Duration::from_millis(100)
+    }
+
+    fn replay_local_shell_transactions(&self) -> io::Result<()> {
+        let Some(journal) = &self.local_shell_journal else {
+            return Ok(());
+        };
+        let records = journal.records()?;
+        if records.is_empty() {
+            return Ok(());
+        }
+        let global_workspaces = self
+            .global_workspaces()
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        for record in records.iter().filter_map(|record| match record {
+            LocalShellJournalRecord::Create(record) => Some(record),
+            LocalShellJournalRecord::Start(_) => None,
+        }) {
+            let (_, workspace_undo) = self.durable.create_workspace_exact(
+                &record.owner_workspace_id,
+                record.owner_workspace_name.clone(),
+                record.default_cwd.clone(),
+            )?;
+            let (_, shell_undo) = self.durable.create_shell_exact(
+                &record.owner_workspace_id,
+                &record.shell_id,
+                record.shell.clone(),
+            )?;
+            drop(workspace_undo);
+            drop(shell_undo);
+        }
+        let mut latest_starts = HashMap::new();
+        for record in records.iter().filter_map(|record| match record {
+            LocalShellJournalRecord::Create(_) => None,
+            LocalShellJournalRecord::Start(record) => Some(record.as_ref()),
+        }) {
+            latest_starts.insert(record.shell_id.as_str(), record);
+        }
+        for record in latest_starts.into_values() {
+            self.durable
+                .replay_interrupted_shell_start(&record.shell_id, record.run.clone())?;
+        }
+        let saved = self.durable.capture_persisted_state()?;
+        self.durable.write_persisted_state(saved)?;
+        for record in records.iter().filter_map(|record| match record {
+            LocalShellJournalRecord::Create(record) => Some(record),
+            LocalShellJournalRecord::Start(_) => None,
+        }) {
+            let mut owner = self
+                .durable
+                .workspace(&record.owner_workspace_id)?
+                .snapshot(&self.durable)?;
+            owner.revision = record.owner_revision;
+            let resource = RoutedOperationResult::Shell {
+                shell: record.result_shell.clone(),
+            };
+            let transaction = global_workspaces.transaction()?;
+            match transaction.prepare_resource_for_attempt(
+                &record.global_workspace_id,
+                &record.operation_id,
+                &record.request_fingerprint,
+                record.request_bytes,
+                record.expected_global_revision,
+                &record.node_id,
+                &record.requested_owner_workspace_id,
+                &record.owner_workspace_name,
+                record.default_cwd.clone(),
+                &record.shell_id,
+                PendingResourceKind::Shell,
+            )? {
+                PreparedWorkspaceResource::Completed(_) => {}
+                PreparedWorkspaceResource::Pending { pending, .. } => {
+                    if pending.owner_workspace_id != record.owner_workspace_id {
+                        return Err(io::Error::new(
+                            io::ErrorKind::AlreadyExists,
+                            "journal owner Workspace conflicts with coordinator preparation",
+                        ));
+                    }
+                    transaction.complete_resource(&pending, &owner, &resource)?;
+                }
+            }
+            transaction.commit()?;
+        }
+        global_workspaces.checkpoint()?;
+        journal.clear()
+    }
+
+    fn checkpoint_local_shell_transactions(&self) -> io::Result<()> {
+        let Some(journal) = &self.local_shell_journal else {
+            return Ok(());
+        };
+        if journal.is_empty()? {
+            return Ok(());
+        }
+        let _mutation = lock(&self.mutation_lock)?;
+        self.checkpoint_local_shell_transactions_with_mutation()
+    }
+
+    fn checkpoint_local_shell_transactions_with_mutation(&self) -> io::Result<()> {
+        let Some(journal) = &self.local_shell_journal else {
+            return Ok(());
+        };
+        if journal.is_empty()? {
+            return Ok(());
+        }
+        let _persistence = lock(&self.durable.persist_lock)?;
+        let saved = self.durable.capture_persisted_state()?;
+        self.durable.write_persisted_state(saved)?;
+        self.global_workspaces()
+            .map_err(|error| io::Error::other(error.to_string()))?
+            .checkpoint()?;
+        journal.clear()?;
+        Ok(())
+    }
+
     fn handle_session_resume(
         &self,
         mut stream: UnixStream,
@@ -10108,6 +10342,269 @@ impl DaemonService {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn create_local_global_workspace_shell(
+        &self,
+        operation_id: &str,
+        request_fingerprint: &str,
+        request_bytes: usize,
+        global_workspace_id: &str,
+        expected_global_revision: u64,
+        node_id: &str,
+        requested_owner_workspace_id: &str,
+        default_cwd: Option<PathBuf>,
+        shell_id: &str,
+        shell_spec: ShellSpec,
+    ) -> DaemonResult<(protocol::GlobalWorkspaceSnapshot, RoutedOperationResult)> {
+        self.with_workspace_operation_lock(operation_id, || {
+            if let Some(completed) = self
+                .global_workspaces()?
+                .completed_operation(operation_id, request_fingerprint)
+                .map_err(global_workspace_error)?
+            {
+                return Ok((completed.workspace, completed.resource));
+            }
+            // Admit the revision guard before the slower Node eligibility probe so
+            // concurrent first resources can share the owner chosen by the winner.
+            let global = self
+                .global_workspaces()?
+                .get(global_workspace_id)
+                .map_err(global_workspace_error)?;
+            require_guard(
+                global.revision,
+                expected_global_revision,
+                "global Workspace",
+            )?;
+            if global.closing {
+                return Err(DaemonError::lifecycle(
+                    ErrorCode::Busy,
+                    "global Workspace close is in progress",
+                ));
+            }
+            let selected = self.combined_node_snapshot(Some(node_id))?;
+            let node = selected
+                .nodes
+                .iter()
+                .find(|node| node.node_id == node_id)
+                .ok_or_else(|| {
+                    DaemonError::lifecycle(ErrorCode::NotFound, "selected Node not found")
+                })?;
+            if !node.workspace_owner_eligible {
+                return Err(DaemonError::lifecycle(
+                    ErrorCode::Busy,
+                    node.workspace_owner_unavailable_reason
+                        .clone()
+                        .unwrap_or_else(|| "selected Node is unavailable".into()),
+                ));
+            }
+            let existing = global
+                .placements
+                .iter()
+                .find(|placement| placement.node_id == node_id);
+            let owner = existing
+                .map(|placement| {
+                    self.owner_workspace(&protocol::QualifiedIdentity::new(
+                        node_id,
+                        &placement.workspace_id,
+                    ))
+                })
+                .transpose()?;
+            let owner_name = owner
+                .as_ref()
+                .map(|owner| owner.name.as_str())
+                .unwrap_or(&global.name)
+                .to_owned();
+            let owner_cwd = owner
+                .as_ref()
+                .map(|owner| owner.default_cwd.clone())
+                .unwrap_or(default_cwd);
+
+            let _mutation = lock(&self.mutation_lock)?;
+            self.ensure_running()?;
+            self.flush_pending()?;
+            let _persistence = lock(&self.durable.persist_lock)?;
+            let mut event_transaction = self.events.transaction()?;
+            let global_transaction = self.global_workspaces()?.transaction()?;
+            let current_global = global_transaction
+                .get(global_workspace_id)
+                .map_err(global_workspace_error)?;
+            let concurrent_first_placement = current_global.revision
+                == global.revision.saturating_add(1)
+                && current_global.name == global.name
+                && current_global.closing == global.closing
+                && current_global.placements.len() == global.placements.len() + 1
+                && global
+                    .placements
+                    .iter()
+                    .all(|placement| current_global.placements.contains(placement))
+                && current_global.placements.iter().any(|placement| {
+                    placement.node_id == node_id && !global.placements.contains(placement)
+                });
+            let concurrent_owner = concurrent_first_placement.then(|| {
+                current_global
+                    .placements
+                    .iter()
+                    .find(|placement| {
+                        placement.node_id == node_id && !global.placements.contains(placement)
+                    })
+                    .expect("concurrent placement was validated")
+            });
+            let admitted_revision = concurrent_owner
+                .map(|_| current_global.revision)
+                .unwrap_or(expected_global_revision);
+            let admitted_owner_name = concurrent_owner
+                .and_then(|placement| placement.owner_workspace_name.as_deref())
+                .unwrap_or(&owner_name);
+            let admitted_owner_cwd = concurrent_owner
+                .map(|placement| placement.default_cwd.clone())
+                .unwrap_or(owner_cwd);
+            let prepared = global_transaction
+                .prepare_resource_for_attempt(
+                    global_workspace_id,
+                    operation_id,
+                    request_fingerprint,
+                    request_bytes,
+                    admitted_revision,
+                    node_id,
+                    requested_owner_workspace_id,
+                    admitted_owner_name,
+                    admitted_owner_cwd,
+                    shell_id,
+                    PendingResourceKind::Shell,
+                )
+                .map_err(global_workspace_error)?;
+            let pending = match prepared {
+                PreparedWorkspaceResource::Completed(completed) => {
+                    let completed = *completed;
+                    return Ok((completed.workspace, completed.resource));
+                }
+                PreparedWorkspaceResource::Pending { pending, .. } => *pending,
+            };
+            let mut undo = DurableUndoLog::default();
+            let (workspace, workspace_undo) = self.durable.create_workspace_exact(
+                &pending.owner_workspace_id,
+                pending.owner_workspace_name.clone(),
+                pending.default_cwd.clone(),
+            )?;
+            let workspace_created = workspace_undo.is_some();
+            if let Some(record) = workspace_undo {
+                undo.record(record);
+            }
+            let (shell, shell_undo) = match self.durable.create_shell_exact(
+                &pending.owner_workspace_id,
+                &pending.resource_id,
+                shell_spec.clone(),
+            ) {
+                Ok(created) => created,
+                Err(error) => {
+                    return Err(Self::mutation_failure(
+                        error.into(),
+                        undo.rollback(&self.durable),
+                    ));
+                }
+            };
+            let shell_created = shell_undo.is_some();
+            if let Some(record) = shell_undo {
+                undo.record(record);
+            }
+            let mut events = Vec::new();
+            if workspace_created {
+                events.push(DaemonEventKind::WorkspaceCreated {
+                    workspace_id: workspace.id,
+                    name: workspace.name,
+                });
+            }
+            if shell_created {
+                events.push(DaemonEventKind::ShellCreated {
+                    workspace_id: pending.owner_workspace_id.clone(),
+                    shell_id: shell.id.clone(),
+                    name: shell.name.clone(),
+                });
+            }
+            if let Err(error) = event_transaction.reserve_with_pending(events.len()) {
+                return Err(Self::mutation_failure(
+                    error.into(),
+                    undo.rollback(&self.durable),
+                ));
+            }
+            let owner = match self
+                .durable
+                .workspace(&pending.owner_workspace_id)
+                .and_then(|workspace| workspace.snapshot(&self.durable))
+            {
+                Ok(owner) => owner,
+                Err(error) => {
+                    return Err(Self::mutation_failure(
+                        error.into(),
+                        undo.rollback(&self.durable),
+                    ));
+                }
+            };
+            let resource = RoutedOperationResult::Shell {
+                shell: shell.clone(),
+            };
+            let completed = match global_transaction.complete_resource(&pending, &owner, &resource)
+            {
+                Ok(completed) => completed,
+                Err(error) => {
+                    return Err(Self::mutation_failure(
+                        global_workspace_error(error),
+                        undo.rollback(&self.durable),
+                    ));
+                }
+            };
+            let saved = match self.capture_persisted_state() {
+                Ok(saved) => saved,
+                Err(error) => {
+                    return Err(Self::mutation_failure(
+                        error.into(),
+                        undo.rollback(&self.durable),
+                    ));
+                }
+            };
+            event_transaction.begin_persistence(events.len());
+            drop(event_transaction);
+            let transaction = LocalShellTransaction {
+                operation_id: operation_id.to_owned(),
+                request_fingerprint: request_fingerprint.to_owned(),
+                request_bytes,
+                global_workspace_id: global_workspace_id.to_owned(),
+                expected_global_revision: admitted_revision,
+                node_id: node_id.to_owned(),
+                requested_owner_workspace_id: requested_owner_workspace_id.to_owned(),
+                owner_workspace_id: pending.owner_workspace_id.clone(),
+                owner_workspace_name: pending.owner_workspace_name.clone(),
+                owner_revision: owner.revision,
+                default_cwd: pending.default_cwd.clone(),
+                shell_id: shell_id.to_owned(),
+                shell: shell_spec,
+                result_shell: shell.clone(),
+            };
+            if let Err(error) = self
+                .local_shell_journal()?
+                .append(LocalShellJournalRecord::Create(Box::new(transaction)))
+            {
+                let error = Self::mutation_failure(
+                    DaemonError::persistence(error),
+                    undo.rollback(&self.durable),
+                );
+                let mut transaction = self.events.transaction()?;
+                transaction.finish_persistence();
+                return Err(error);
+            }
+            global_transaction
+                .commit()
+                .map_err(DaemonError::persistence)?;
+            let mut transaction = self.events.transaction()?;
+            transaction.replace_committed_executions(saved.executions);
+            transaction.append_batch(events);
+            transaction.finish_persistence();
+            drop(transaction);
+            self.events.notify();
+            Ok((completed.workspace, completed.resource))
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn create_global_workspace_resource_inner(
         &self,
         operation_id: &str,
@@ -10134,17 +10631,6 @@ impl DaemonService {
             .global_workspaces()?
             .get(global_workspace_id)
             .map_err(global_workspace_error)?;
-        require_guard(
-            global.revision,
-            expected_global_revision,
-            "global Workspace",
-        )?;
-        if global.closing {
-            return Err(DaemonError::lifecycle(
-                ErrorCode::Busy,
-                "global Workspace close is in progress",
-            ));
-        }
         if !owner_preflight_complete {
             let selected = self.combined_node_snapshot(Some(node_id))?;
             let node = selected
@@ -10183,6 +10669,7 @@ impl DaemonService {
             .as_ref()
             .map(|owner| owner.default_cwd.clone())
             .unwrap_or(default_cwd);
+        let local_node_id = self.node_identity()?.id()?;
         let prepared = self
             .global_workspaces()?
             .prepare_resource(
@@ -10221,7 +10708,6 @@ impl DaemonService {
                 .map_err(global_workspace_error)?;
             return Ok((completed.workspace, completed.resource));
         }
-        let local_node_id = self.node_identity()?.id()?;
         pending = self
             .global_workspaces()?
             .mark_owner_attempted(&pending)
@@ -12565,6 +13051,26 @@ impl DaemonService {
     }
 
     fn dispatch(&self, request: Request) -> DaemonResult<Response> {
+        let reconcile_combined_snapshot =
+            if matches!(&request, Request::GetCombinedNodeSnapshot { .. }) {
+                self.global_workspaces
+                    .as_ref()
+                    .map(|store| store.pending_resources().map(|pending| !pending.is_empty()))
+                    .transpose()
+                    .map_err(global_workspace_error)?
+                    .unwrap_or(false)
+            } else {
+                false
+            };
+        let skip_local_shell_frontier = match &request {
+            Request::Ping | Request::Snapshot | Request::Events { .. } => true,
+            Request::GetCombinedNodeSnapshot { .. } => !reconcile_combined_snapshot,
+            _ => false,
+        };
+        if !skip_local_shell_frontier {
+            self.checkpoint_local_shell_transactions()
+                .map_err(DaemonError::persistence)?;
+        }
         let (workspace_request_fingerprint, workspace_semantic_fingerprint) =
             workspace_operation_fingerprints(&request)?;
         let _dispatch_eligibility = matches!(
@@ -12723,7 +13229,9 @@ impl DaemonService {
                 Ok(Response::NodeProjectionHealth { health })
             }
             Request::GetCombinedNodeSnapshot { selector } => {
-                self.reconcile_pending_workspace_resources();
+                if reconcile_combined_snapshot {
+                    self.reconcile_pending_workspace_resources();
+                }
                 Ok(Response::CombinedNodeSnapshot {
                     snapshot: self.combined_node_snapshot(selector.as_deref())?,
                 })
@@ -12840,25 +13348,40 @@ impl DaemonService {
                 let request = workspace_request_fingerprint
                     .as_ref()
                     .expect("Workspace resource request has a fingerprint");
-                let (workspace, resource) = self.create_global_workspace_resource(
-                    &operation_id,
-                    &request.digest,
-                    request.bytes,
-                    &global_workspace_id,
-                    expected_global_revision,
-                    &node_id,
-                    &owner_workspace_id,
-                    default_cwd,
-                    &shell_id,
-                    PendingResourceKind::Shell,
-                    move |pending| RoutedOperation::CreateWorkspaceShell {
-                        workspace_id: pending.owner_workspace_id.clone(),
-                        workspace_name: pending.owner_workspace_name.clone(),
-                        default_cwd: pending.default_cwd.clone(),
-                        shell_id: pending.resource_id.clone(),
+                let (workspace, resource) = if self.node_identity()?.id()? == node_id {
+                    self.create_local_global_workspace_shell(
+                        &operation_id,
+                        &request.digest,
+                        request.bytes,
+                        &global_workspace_id,
+                        expected_global_revision,
+                        &node_id,
+                        &owner_workspace_id,
+                        default_cwd,
+                        &shell_id,
                         shell,
-                    },
-                )?;
+                    )?
+                } else {
+                    self.create_global_workspace_resource(
+                        &operation_id,
+                        &request.digest,
+                        request.bytes,
+                        &global_workspace_id,
+                        expected_global_revision,
+                        &node_id,
+                        &owner_workspace_id,
+                        default_cwd,
+                        &shell_id,
+                        PendingResourceKind::Shell,
+                        move |pending| RoutedOperation::CreateWorkspaceShell {
+                            workspace_id: pending.owner_workspace_id.clone(),
+                            workspace_name: pending.owner_workspace_name.clone(),
+                            default_cwd: pending.default_cwd.clone(),
+                            shell_id: pending.resource_id.clone(),
+                            shell,
+                        },
+                    )?
+                };
                 Ok(Response::GlobalWorkspaceResource {
                     workspace,
                     resource,
@@ -12931,7 +13454,9 @@ impl DaemonService {
                             request.bytes,
                             true,
                             &prepared_workspace.id,
-                            prepared_workspace.revision,
+                            // Equivalent compound requests retain the revision that
+                            // originally authorized their shared preparation.
+                            pending.expected_global_revision,
                             &pending.node_id,
                             &pending.requested_owner_workspace_id,
                             pending.default_cwd.clone(),
@@ -14167,6 +14692,7 @@ impl DaemonService {
             node_registrations: None,
             node_projection_cache: None,
             global_workspaces: None,
+            local_shell_journal: None,
             durable: DurableRegistry {
                 state: Mutex::new(state),
                 store: Some(store),
@@ -14402,6 +14928,8 @@ impl DaemonService {
         operation: impl FnOnce(&mut DurableUndoLog) -> DaemonResult<DurableMutation<T>>,
     ) -> DaemonResult<T> {
         let mutation = lock(&self.mutation_lock)?;
+        self.checkpoint_local_shell_transactions_with_mutation()
+            .map_err(DaemonError::persistence)?;
         self.ensure_running()?;
         self.flush_pending()?;
         let persistence = lock(&self.durable.persist_lock)?;
@@ -15359,6 +15887,8 @@ impl DaemonService {
         committed_events: impl FnOnce(&[Arc<Shell>]) -> Vec<DaemonEventKind>,
     ) -> DaemonResult<()> {
         let _mutation = lock(&self.mutation_lock)?;
+        self.checkpoint_local_shell_transactions_with_mutation()
+            .map_err(DaemonError::persistence)?;
         if stopping {
             if !self.runtimes.begin_stopping() {
                 return Ok(());
@@ -17495,6 +18025,16 @@ impl ShellRuntimeManager {
                     .flatten()
             })
             .flatten();
+        let journaled_start = if needs_start {
+            registry
+                .local_shell_journal
+                .as_ref()
+                .map(|journal| journal.contains_create(shell_id))
+                .transpose()?
+                .unwrap_or(false)
+        } else {
+            false
+        };
         if needs_start && let Err(error) = registry.flush_pending() {
             return send_daemon_error(&mut stream, response_version, error);
         }
@@ -17633,34 +18173,79 @@ impl ShellRuntimeManager {
         };
         let mut committed_executions = None;
         if started {
-            let saved = registry.capture_persisted_state()?;
             event_transaction
                 .as_mut()
                 .expect("start event transaction is locked")
                 .begin_persistence(1);
             drop(event_transaction);
-            committed_executions = Some(match registry.write_persisted_state(saved) {
-                Ok(committed) => committed,
-                Err(error) => {
-                    let cleanup = self.kill(&shell);
-                    self.reset_pending(&shell)?;
-                    let mut transaction = registry.events.transaction()?;
-                    transaction.finish_persistence();
-                    let message = cleanup.map_or_else(
-                        |cleanup| {
-                            format!(
-                                "could not persist started shell: {error}; process cleanup also failed: {cleanup}"
-                            )
+            let persistence_result = if journaled_start {
+                let run = lock(&shell.last_run)?
+                    .clone()
+                    .ok_or_else(|| io::Error::other("started shell has no persisted run"))?;
+                let journal_result = registry
+                    .local_shell_journal
+                    .as_ref()
+                    .ok_or_else(|| io::Error::other("local Shell journal is unavailable"))?
+                    .append(LocalShellJournalRecord::Start(Box::new(
+                        LocalShellStartTransaction {
+                            shell_id: shell.id.clone(),
+                            run,
                         },
-                        |()| format!("could not persist started shell: {error}"),
-                    );
-                    return send_daemon_error(
-                        &mut stream,
-                        response_version,
-                        DaemonError::persistence_context(error, message),
-                    );
+                    )));
+                match journal_result {
+                    Ok(()) => Ok(()),
+                    Err(journal_error) => (|| {
+                        let saved = registry.capture_persisted_state()?;
+                        let committed = registry.write_persisted_state(saved)?;
+                        registry
+                            .global_workspaces
+                            .as_ref()
+                            .ok_or_else(|| io::Error::other("global Workspace store is unavailable"))?
+                            .checkpoint()?;
+                        registry
+                            .local_shell_journal
+                            .as_ref()
+                            .ok_or_else(|| io::Error::other("local Shell journal is unavailable"))?
+                            .reset_after_full_checkpoint()?;
+                        Ok(committed)
+                    })()
+                        .map(|committed| {
+                            committed_executions = Some(committed);
+                        })
+                        .map_err(|state_error: io::Error| {
+                            io::Error::new(
+                                state_error.kind(),
+                                format!(
+                                    "local Shell start journal failed: {journal_error}; state fallback also failed: {state_error}"
+                                ),
+                            )
+                        }),
                 }
-            });
+            } else {
+                let saved = registry.capture_persisted_state()?;
+                registry.write_persisted_state(saved).map(|committed| {
+                    committed_executions = Some(committed);
+                })
+            };
+            if let Err(error) = persistence_result {
+                let cleanup = self.kill(&shell);
+                self.reset_pending(&shell)?;
+                let mut transaction = registry.events.transaction()?;
+                transaction.finish_persistence();
+                let message = cleanup.map_or_else(
+                    |cleanup| {
+                        format!(
+                            "could not persist started shell: {error}; process cleanup also failed: {cleanup}"
+                        )
+                    },
+                    |()| format!("could not persist started shell: {error}"),
+                );
+                return send_daemon_error(
+                    &mut stream,
+                    response_version,
+                    DaemonError::persistence_context(error, message),
+                );
+            }
             event_transaction = Some(registry.events.transaction()?);
         }
         if started {
@@ -17671,9 +18256,9 @@ impl ShellRuntimeManager {
             let transaction = event_transaction
                 .as_mut()
                 .expect("start event transaction is locked");
-            transaction.replace_committed_executions(
-                committed_executions.expect("persisted shell start has committed executions"),
-            );
+            if let Some(committed_executions) = committed_executions {
+                transaction.replace_committed_executions(committed_executions);
+            }
             transaction.append_batch(vec![DaemonEventKind::RunStarted {
                 workspace_id: shell.workspace_id.clone(),
                 shell_id: shell.id.clone(),
@@ -17778,14 +18363,7 @@ impl ShellRuntimeManager {
         } else {
             let mut controller = lock(&runtime.controller)?;
             if let Some(previous) = controller.take() {
-                let (written, _) = mpsc::sync_channel(1);
-                if previous
-                    .output
-                    .try_send(ControllerOutput::Reconnect(written))
-                    .is_err()
-                {
-                    let _ = previous.connection.shutdown(std::net::Shutdown::Both);
-                }
+                drop(previous);
             }
             if takeover {
                 Self::displace_collaborators(&runtime)?;

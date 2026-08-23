@@ -157,6 +157,11 @@ boomux . --name my-project --new -- sh -lc 'cargo test | tee test.log'
 | Edit the writable config layer | `boomux config edit` |
 | List recurring Agent work | `boomux schedule list --workspace feature-x` |
 
+`shell create --open` starts presenting the native terminal while coordinated
+creation is being durably committed. Attachment remains gated until creation
+succeeds, so a failed create cannot start a ShellRun. The initial local ShellRun
+uses the same bounded journal rather than waiting for a full state-file rewrite.
+
 Without `--name`, Boomux creates the next `workspace-N` and stores the selected
 path as its default for later shells. With `--name`, it adds a shell to an
 existing exact-name Node-local workspace or creates one with that default. This

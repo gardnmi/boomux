@@ -562,6 +562,14 @@ enum Commands {
         #[arg(long)]
         expected_run_id: Option<String>,
     },
+    #[command(name = "__await-attach", hide = true)]
+    AwaitAttach {
+        shell_id: String,
+        #[arg(long)]
+        gate: PathBuf,
+        #[arg(long)]
+        node: Option<String>,
+    },
     #[command(name = "__scheduled-runner", hide = true)]
     ScheduledRunner { schedule_id: String },
     #[command(name = "__resume-session", hide = true)]
@@ -1795,7 +1803,7 @@ impl Cli {
             }) => CommandKey::KiroLaunch,
             Some(Commands::Open { .. }) => CommandKey::Open,
             Some(Commands::Prompt) => CommandKey::Prompt,
-            Some(Commands::Attach { .. }) => CommandKey::Attach,
+            Some(Commands::Attach { .. } | Commands::AwaitAttach { .. }) => CommandKey::Attach,
             Some(Commands::ResumeSession { .. }) => CommandKey::ResumeSessionInternal,
             Some(Commands::ScheduledRunner { .. }) => CommandKey::Attach,
             Some(Commands::FederationStdio) => CommandKey::Attach,
@@ -2015,6 +2023,15 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
             )?;
             return Ok(CliExit::Success);
         }
+        Some(Commands::AwaitAttach {
+            shell_id,
+            gate,
+            node,
+        }) => {
+            terminal::await_open_gate(gate)?;
+            attach::run(shell_id, node.as_deref(), false, true, None)?;
+            return Ok(CliExit::Success);
+        }
         Some(Commands::ScheduledRunner { schedule_id }) => {
             return scheduled_runner(schedule_id).map(CliExit::Child);
         }
@@ -2187,7 +2204,7 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
         }
         Some(Commands::Prompt) => print_prompt_label(),
         Some(Commands::Daemon { command }) => daemon_control(command, cli.json),
-        Some(Commands::Attach { .. }) => unreachable!(),
+        Some(Commands::Attach { .. } | Commands::AwaitAttach { .. }) => unreachable!(),
         Some(Commands::ResumeSession { .. }) => unreachable!(),
         Some(Commands::ScheduledRunner { .. }) => unreachable!(),
         Some(Commands::FederationStdio) => unreachable!(),
@@ -5318,42 +5335,6 @@ fn selected_workspace_id() -> Result<Option<String>, Box<dyn Error>> {
         .map(|selection| selection.workspace_id().to_owned()))
 }
 
-fn required_workspace_target(
-    client: &client::Client,
-    explicit: Option<&str>,
-    node_requested: bool,
-) -> Result<String, Box<dyn Error>> {
-    if let Some(explicit) = explicit {
-        return Ok(explicit.to_owned());
-    }
-    if let Some(owner_workspace_id) = managed_owner_workspace_id(client)? {
-        if !node_requested {
-            return Ok(owner_workspace_id);
-        }
-        let workspace = coordinated_workspace_for_local_owner(client, &owner_workspace_id)?
-            .ok_or_else(|| {
-                cli_output::failure(
-                    "context_required",
-                    "the current owner Workspace is not linked to a coordinated Workspace; provide one explicitly",
-                )
-            })?;
-        return Ok(workspace.id);
-    }
-    let workspace = selected_global_workspace(client)?.ok_or_else(|| {
-        cli_output::failure(
-            "context_required",
-            "workspace is required; provide it explicitly or run `boomux workspace select WORKSPACE`",
-        )
-    })?;
-    if workspace.closing {
-        return Err(cli_output::failure(
-            "invalid_argument",
-            "the selected Workspace is closing",
-        ));
-    }
-    Ok(workspace.id)
-}
-
 fn managed_owner_workspace_id(client: &client::Client) -> Result<Option<String>, Box<dyn Error>> {
     if let Some(shell_id) = env::var("BOOMUX_SHELL_ID")
         .ok()
@@ -5700,6 +5681,139 @@ struct CoordinatedOwnerSelection {
     default_cwd: Option<PathBuf>,
 }
 
+struct WorkspaceCreationContext {
+    global_workspaces_supported: bool,
+    combined: Option<protocol::CombinedNodeSnapshot>,
+}
+
+impl WorkspaceCreationContext {
+    fn load(client: &client::Client) -> Result<Self, Box<dyn Error>> {
+        let global_workspaces_supported =
+            client.supports(protocol::ProtocolFeature::GlobalWorkspaces)?;
+        let combined = global_workspaces_supported
+            .then(|| client.combined_node_snapshot(None))
+            .transpose()?;
+        Ok(Self {
+            global_workspaces_supported,
+            combined,
+        })
+    }
+
+    fn required_target(
+        &self,
+        client: &client::Client,
+        explicit: Option<&str>,
+        node_requested: bool,
+    ) -> Result<String, Box<dyn Error>> {
+        if let Some(explicit) = explicit {
+            return Ok(explicit.to_owned());
+        }
+        if let Some(owner_workspace_id) = managed_owner_workspace_id(client)? {
+            if !node_requested {
+                return Ok(owner_workspace_id);
+            }
+            let workspace = self
+                .coordinated_workspace_for_local_owner(&owner_workspace_id)?
+                .ok_or_else(|| {
+                    cli_output::failure(
+                        "context_required",
+                        "the current owner Workspace is not linked to a coordinated Workspace; provide one explicitly",
+                    )
+                })?;
+            return Ok(workspace.id.clone());
+        }
+        let selected_id = selected_workspace_id()?.ok_or_else(|| {
+            cli_output::failure(
+                "context_required",
+                "workspace is required; provide it explicitly or run `boomux workspace select WORKSPACE`",
+            )
+        })?;
+        if !self.global_workspaces_supported {
+            return Err(cli_output::failure(
+                "unsupported_version",
+                format!(
+                    "{} requires daemon protocol {} or newer",
+                    protocol::ProtocolFeature::GlobalWorkspaces.requirement(),
+                    protocol::ProtocolFeature::GlobalWorkspaces.minimum_version()
+                ),
+            ));
+        }
+        let workspace = find_global_workspace_by_id(
+            &self.combined.as_ref().expect("supported snapshot").workspaces,
+            &selected_id,
+        )
+        .ok_or_else(|| {
+            cli_output::failure(
+                "not_found",
+                format!(
+                    "selected Workspace {selected_id} no longer exists; run `boomux workspace clear`"
+                ),
+            )
+        })?;
+        if workspace.closing {
+            return Err(cli_output::failure(
+                "invalid_argument",
+                "the selected Workspace is closing",
+            ));
+        }
+        Ok(workspace.id.clone())
+    }
+
+    fn coordinated_workspace_for_local_owner(
+        &self,
+        owner_workspace_id: &str,
+    ) -> Result<Option<&protocol::GlobalWorkspaceSnapshot>, Box<dyn Error>> {
+        let combined = self.combined.as_ref().ok_or_else(|| {
+            cli_output::failure(
+                "unsupported_version",
+                "cross-Node Workspace placement requires global Workspace support",
+            )
+        })?;
+        let local_node_id = combined
+            .nodes
+            .iter()
+            .find(|node| node.local)
+            .map(|node| node.node_id.as_str())
+            .ok_or_else(|| cli_output::failure("internal", "local Node identity is unavailable"))?;
+        Ok(combined.workspaces.iter().find(|workspace| {
+            workspace.placements.iter().any(|placement| {
+                placement.node_id == local_node_id && placement.workspace_id == owner_workspace_id
+            })
+        }))
+    }
+
+    fn coordinated_owner(
+        &self,
+        workspace_target: &str,
+        node_selector: Option<&str>,
+    ) -> Result<Option<CoordinatedOwnerSelection>, Box<dyn Error>> {
+        let Some(combined) = &self.combined else {
+            return Ok(None);
+        };
+        let Some(workspace) =
+            resolve_global_workspace_target(&combined.workspaces, workspace_target).cloned()
+        else {
+            return Ok(None);
+        };
+        let node = select_eligible_workspace_owner(&combined.nodes, node_selector)?;
+        let placement = workspace
+            .placements
+            .iter()
+            .find(|placement| placement.node_id == node.node_id);
+        let owner_workspace_id = placement.map_or_else(
+            || Uuid::new_v4().to_string(),
+            |placement| placement.workspace_id.clone(),
+        );
+        let default_cwd = placement.and_then(|placement| placement.default_cwd.clone());
+        Ok(Some(CoordinatedOwnerSelection {
+            workspace,
+            node,
+            owner_workspace_id,
+            default_cwd,
+        }))
+    }
+}
+
 fn require_protocol_feature(
     client: &client::Client,
     feature: protocol::ProtocolFeature,
@@ -5738,38 +5852,6 @@ fn require_explicit_coordinated_owner<T>(
         "invalid_argument",
         "--node can create a Shell or launcher only in a coordinated Workspace; adopt or link an external Workspace first",
     ))
-}
-
-fn select_coordinated_owner(
-    client: &client::Client,
-    workspace_target: &str,
-    node_selector: Option<&str>,
-) -> Result<Option<CoordinatedOwnerSelection>, Box<dyn Error>> {
-    if !client.supports(protocol::ProtocolFeature::GlobalWorkspaces)? {
-        return Ok(None);
-    }
-    let combined = client.combined_node_snapshot(None)?;
-    let Some(workspace) =
-        resolve_global_workspace_target(&combined.workspaces, workspace_target).cloned()
-    else {
-        return Ok(None);
-    };
-    let node = select_eligible_workspace_owner(&combined.nodes, node_selector)?;
-    let placement = workspace
-        .placements
-        .iter()
-        .find(|placement| placement.node_id == node.node_id);
-    let owner_workspace_id = placement.map_or_else(
-        || Uuid::new_v4().to_string(),
-        |placement| placement.workspace_id.clone(),
-    );
-    let default_cwd = placement.and_then(|placement| placement.default_cwd.clone());
-    Ok(Some(CoordinatedOwnerSelection {
-        workspace,
-        node,
-        owner_workspace_id,
-        default_cwd,
-    }))
 }
 
 fn resolve_owner_directory(
@@ -7748,15 +7830,14 @@ fn shell_command(
             open,
             command,
         } => {
+            let context = WorkspaceCreationContext::load(&client)?;
             let workspace =
-                required_workspace_target(&client, workspace.as_deref(), node.is_some())?;
-            let global_workspaces_supported =
-                client.supports(protocol::ProtocolFeature::GlobalWorkspaces)?;
-            let selection = select_coordinated_owner(&client, &workspace, node.as_deref())?;
+                context.required_target(&client, workspace.as_deref(), node.is_some())?;
+            let selection = context.coordinated_owner(&workspace, node.as_deref())?;
             if let Some(selection) = require_explicit_coordinated_owner(
                 selection,
                 node.as_deref(),
-                global_workspaces_supported,
+                context.global_workspaces_supported,
             )? {
                 let requested_cwd = cwd
                     .or_else(|| selection.default_cwd.clone())
@@ -7766,6 +7847,25 @@ fn shell_command(
                     Some(name) => cli_name(name, "shell")?,
                     None => generated_shell_name(std::iter::empty())?,
                 };
+                let shell_id = Uuid::new_v4().to_string();
+                let title = if selection.node.local {
+                    format!("{} - {name}", selection.workspace.name)
+                } else {
+                    format!(
+                        "[{}] {} - {name}",
+                        selection.node.alias, selection.workspace.name
+                    )
+                };
+                let gate = open
+                    .then(|| {
+                        terminal::open_waiting(
+                            terminal_override,
+                            (!selection.node.local).then_some(selection.node.node_id.as_str()),
+                            &shell_id,
+                            &title,
+                        )
+                    })
+                    .transpose()?;
                 let owner_default_cwd = selection.default_cwd.clone().or_else(|| Some(cwd.clone()));
                 let (_, shell) = client.create_global_workspace_shell(
                     Uuid::new_v4().to_string(),
@@ -7774,33 +7874,21 @@ fn shell_command(
                     &selection.node.node_id,
                     selection.owner_workspace_id,
                     owner_default_cwd,
-                    Uuid::new_v4().to_string(),
+                    shell_id,
                     shell_spec(name, &cwd, &command),
                 )?;
                 println!(
                     "Created pending shell {} ({}) in {} on Node {}",
                     shell.name, shell.id, selection.workspace.name, selection.node.alias
                 );
-                if open {
-                    let title = if selection.node.local {
-                        format!("{} - {}", selection.workspace.name, shell.name)
-                    } else {
-                        format!(
-                            "[{}] {} - {}",
-                            selection.node.alias, selection.workspace.name, shell.name
-                        )
-                    };
-                    if selection.node.local {
-                        open_terminal(&shell.id, &title, false, terminal_override)?;
-                    } else {
-                        terminal::open_remote(
-                            terminal_override,
-                            &selection.node.node_id,
-                            &shell.id,
-                            &title,
-                            false,
-                        )?;
-                    }
+                if let Some(gate) = gate
+                    && let Err(error) = gate.release()
+                {
+                    return Err(format!(
+                        "Shell {} was created but its terminal could not attach: {error}",
+                        shell.id
+                    )
+                    .into());
                 }
                 return Ok(());
             }
@@ -7939,16 +8027,15 @@ fn launcher_command(command: LauncherCommands, json: bool) -> Result<(), Box<dyn
             cwd,
             command,
         } => {
+            let context = WorkspaceCreationContext::load(&client)?;
             let workspace =
-                required_workspace_target(&client, workspace.as_deref(), node.is_some())?;
+                context.required_target(&client, workspace.as_deref(), node.is_some())?;
             let name = cli_name(name, "workspace launcher")?;
-            let global_workspaces_supported =
-                client.supports(protocol::ProtocolFeature::GlobalWorkspaces)?;
-            let selection = select_coordinated_owner(&client, &workspace, node.as_deref())?;
+            let selection = context.coordinated_owner(&workspace, node.as_deref())?;
             if let Some(selection) = require_explicit_coordinated_owner(
                 selection,
                 node.as_deref(),
-                global_workspaces_supported,
+                context.global_workspaces_supported,
             )? {
                 let cwd = resolve_owner_directory(&client, &selection.node, cwd)?;
                 let owner_default_cwd = selection.default_cwd.clone().or_else(|| Some(cwd.clone()));
@@ -8561,22 +8648,34 @@ fn remote_session_command(
 
 fn schedule_command(mut command: ScheduleCommands, json: bool) -> Result<(), Box<dyn Error>> {
     let client = client::connect_or_start()?;
+    let creation_context = if matches!(&command, ScheduleCommands::Create(_)) {
+        Some(WorkspaceCreationContext::load(&client)?)
+    } else {
+        None
+    };
     if let ScheduleCommands::Create(arguments) = &mut command {
-        arguments.workspace = Some(required_workspace_target(
-            &client,
-            arguments.workspace.as_deref(),
-            arguments.node.is_some(),
-        )?);
+        arguments.workspace = Some(
+            creation_context
+                .as_ref()
+                .expect("create context was loaded")
+                .required_target(
+                    &client,
+                    arguments.workspace.as_deref(),
+                    arguments.node.is_some(),
+                )?,
+        );
     }
     if let ScheduleCommands::Create(arguments) = &command
-        && let Some(selection) = select_coordinated_owner(
-            &client,
-            arguments
-                .workspace
-                .as_deref()
-                .expect("create workspace was resolved"),
-            arguments.node.as_deref(),
-        )?
+        && let Some(selection) = creation_context
+            .as_ref()
+            .expect("create context was loaded")
+            .coordinated_owner(
+                arguments
+                    .workspace
+                    .as_deref()
+                    .expect("create workspace was resolved"),
+                arguments.node.as_deref(),
+            )?
     {
         let ScheduleCommands::Create(arguments) = command else {
             unreachable!()
@@ -13077,6 +13176,24 @@ mod tests {
                 ..
             }) if run_id == "r1"
         ));
+        let cli = Cli::try_parse_from([
+            "boomux",
+            "__await-attach",
+            "s1",
+            "--gate",
+            "/run/user/1/gate",
+            "--node",
+            "node-1",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::AwaitAttach {
+                shell_id,
+                gate,
+                node: Some(node),
+            }) if shell_id == "s1" && gate == Path::new("/run/user/1/gate") && node == "node-1"
+        ));
     }
 
     #[test]
@@ -13602,6 +13719,56 @@ mod tests {
                 .node_id,
             "remote-id"
         );
+
+        let context = WorkspaceCreationContext {
+            global_workspaces_supported: true,
+            combined: Some(protocol::CombinedNodeSnapshot {
+                nodes: vec![
+                    combined_node("local-id", "local", true),
+                    combined_node("remote-id", "work", true),
+                ],
+                workspaces: vec![protocol::GlobalWorkspaceSnapshot {
+                    id: "global-id".into(),
+                    revision: 2,
+                    name: "project".into(),
+                    closing: false,
+                    placements: vec![
+                        protocol::WorkspacePlacementSnapshot {
+                            node_id: "local-id".into(),
+                            workspace_id: "local-owner".into(),
+                            owner_workspace_name: Some("project".into()),
+                            owner_revision: 1,
+                            default_cwd: Some("/local".into()),
+                            state: protocol::WorkspacePlacementState::Active,
+                        },
+                        protocol::WorkspacePlacementSnapshot {
+                            node_id: "remote-id".into(),
+                            workspace_id: "remote-owner".into(),
+                            owner_workspace_name: Some("project".into()),
+                            owner_revision: 1,
+                            default_cwd: Some("/remote".into()),
+                            state: protocol::WorkspacePlacementState::Active,
+                        },
+                    ],
+                }],
+                external_workspaces: Vec::new(),
+                focused_terminal: None,
+            }),
+        };
+        assert_eq!(
+            context
+                .coordinated_workspace_for_local_owner("local-owner")
+                .unwrap()
+                .unwrap()
+                .id,
+            "global-id"
+        );
+        let selected = context
+            .coordinated_owner("project", Some("work"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected.owner_workspace_id, "remote-owner");
+        assert_eq!(selected.default_cwd.as_deref(), Some(Path::new("/remote")));
     }
 
     #[test]
