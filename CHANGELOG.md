@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.27.0](https://github.com/gardnmi/boomux/compare/v0.26.0...v0.27.0) (2026-08-23)
+
+
+### Features
+
+* **cli:** add selected workspace context ([#244](https://github.com/gardnmi/boomux/issues/244)) ([3830d06](https://github.com/gardnmi/boomux/commit/3830d0647aaa6a2afac55a0f7a64536abc953896))
+
 ## [0.26.0](https://github.com/gardnmi/boomux/compare/v0.25.1...v0.26.0) (2026-08-23)
 
 
