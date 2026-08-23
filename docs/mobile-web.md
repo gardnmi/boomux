@@ -186,6 +186,9 @@ the intended authentication boundary.
   absent from remote cached projections.
 - Browser polling stops while the page is hidden and resumes on visibility or
   focus; the gateway's background projection refresh continues independently.
+- The browser theme picker includes the stock Omarchy color palettes without
+  depending on an Omarchy installation. It stores only the selected theme slug
+  in browser-local storage and defaults to Catppuccin.
 - A temporary daemon failure retains the last bounded projection with
   `daemon_connected: false` until a later refresh succeeds.
 

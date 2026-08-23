@@ -47,7 +47,9 @@ const TERMINAL_TOKEN_PREFIX: &str = "boomux.token.";
 const CONTENT_SECURITY_POLICY_VALUE: &str = "default-src 'self'; base-uri 'none'; connect-src 'self'; font-src 'self' data:; img-src 'self' data:; manifest-src 'self'; object-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; frame-ancestors 'none'";
 const INDEX_HTML: &str = include_str!("../assets/mobile-web/index.html");
 const APP_JS: &str = include_str!("../assets/mobile-web/app.js");
+const THEMES_JS: &str = include_str!("../assets/mobile-web/themes.js");
 const STYLES_CSS: &str = include_str!("../assets/mobile-web/styles.css");
+const THEMES_CSS: &str = include_str!("../assets/mobile-web/themes.css");
 const TERMINAL_JS: &str = include_str!("../assets/mobile-web/terminal.js");
 const TERMINAL_CSS: &str = include_str!("../assets/mobile-web/terminal.css");
 const GHOSTTY_WASM: &[u8] = include_bytes!("../assets/mobile-web/ghostty-vt.wasm");
@@ -639,7 +641,9 @@ async fn serve(
         .route("/", get(index))
         .route("/index.html", get(index))
         .route("/app.js", get(app_js))
+        .route("/themes.js", get(themes_js))
         .route("/styles.css", get(styles))
+        .route("/themes.css", get(themes_css))
         .route("/terminal.js", get(terminal_js))
         .route("/terminal.css", get(terminal_css))
         .route("/ghostty-vt.wasm", get(ghostty_wasm))
@@ -897,8 +901,16 @@ async fn app_js() -> Response {
     asset(APP_JS, "text/javascript; charset=utf-8", "no-cache")
 }
 
+async fn themes_js() -> Response {
+    asset(THEMES_JS, "text/javascript; charset=utf-8", "no-cache")
+}
+
 async fn styles() -> Response {
     asset(STYLES_CSS, "text/css; charset=utf-8", "no-cache")
+}
+
+async fn themes_css() -> Response {
+    asset(THEMES_CSS, "text/css; charset=utf-8", "no-cache")
 }
 
 async fn terminal_js() -> Response {
@@ -1850,16 +1862,30 @@ mod tests {
         assert!(APP_JS.contains("agent.native_web"));
         assert!(APP_JS.contains("filter: \"all\""));
         assert!(INDEX_HTML.contains("data-filter=\"all\" aria-pressed=\"true\""));
-        assert!(INDEX_HTML.contains("Agent activity."));
+        assert!(INDEX_HTML.contains("Agents (<span id=\"count-agents\">"));
         assert!(!INDEX_HTML.contains("Agents in motion."));
-        assert!(INDEX_HTML.contains("class=\"brand-logo\""));
+        assert!(INDEX_HTML.contains("class=\"brand-section\">AGENTS"));
+        assert!(INDEX_HTML.contains("id=\"theme-dialog\""));
+        assert!(INDEX_HTML.contains("href=\"themes.css\""));
+        assert!(APP_JS.contains("applyTheme(savedTheme(), false)"));
+        assert!(THEMES_JS.contains("export const DEFAULT_THEME = \"catppuccin\""));
+        assert!(THEMES_JS.contains("localStorage.setItem"));
+        assert!(THEMES_JS.contains("Catppuccin Latte"));
+        assert!(THEMES_JS.contains("Tokyo Night"));
+        assert!(THEMES_JS.contains("Vantablack"));
+        assert!(THEMES_CSS.contains(":root[data-theme=\"white\"]"));
+        assert!(THEMES_CSS.contains("color-scheme: light"));
         assert!(ICON.contains("Boomux pixel bomb"));
         assert!(STYLES_CSS.contains(".brand-wordmark"));
-        assert!(STYLES_CSS.contains("flex: 0 0 28ch"));
+        assert!(STYLES_CSS.contains("--border-active: #94e2d5"));
+        assert!(STYLES_CSS.contains("min-height: 46px"));
+        assert!(!STYLES_CSS.contains("Impact"));
         assert!(APP_JS.contains("/api/attention/dismiss"));
         assert!(APP_JS.contains("method: \"POST\""));
         assert!(APP_JS.contains("\"Content-Type\": \"application/json\""));
         assert!(APP_JS.contains("card-dismiss-button"));
+        assert!(APP_JS.contains("card-action-unavailable"));
+        assert!(APP_JS.contains("No attention to dismiss"));
         assert!(APP_JS.contains("/api/terminal/authorize"));
         assert!(APP_JS.contains("boomux.token."));
         assert!(APP_JS.contains("Open in Web Terminal"));
@@ -1891,6 +1917,8 @@ mod tests {
         assert!(INDEX_HTML.contains("font-src 'self' data:"));
         assert!(CONTENT_SECURITY_POLICY_VALUE.contains("font-src 'self' data:"));
         assert!(SERVICE_WORKER.contains("./terminal.js"));
+        assert!(SERVICE_WORKER.contains("./themes.js"));
+        assert!(SERVICE_WORKER.contains("./themes.css"));
         assert!(SERVICE_WORKER.contains("./ghostty-vt.wasm"));
     }
 

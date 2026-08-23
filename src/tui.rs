@@ -53,12 +53,13 @@ const BOOMUX_SMOKE: [&str; 5] = [
 const TERMINAL_PREVIEW_ROWS: usize = 16;
 const TERMINAL_PREVIEW_SCROLL_STEP: usize = 12;
 const PREVIEW_RESERVED_ITEM_HEIGHT: u16 = 6;
-const AGENT_TABLE_HEADERS: [&str; 8] = [
+const AGENT_TABLE_HEADERS: [&str; 9] = [
     "STATUS",
     "UPDATED",
     "WORKSPACE",
     "NODE",
     "SHELL",
+    "HARNESS",
     "TASK",
     "ROOT BRANCH",
     "ROOT WORKTREE",
@@ -6357,7 +6358,7 @@ fn render_global_items(frame: &mut Frame, area: Rect, app: &mut App) {
         (items_area, Some(preview_area))
     });
     let (rows, widths, header) = if app.primary_tab == PrimaryTab::Agents {
-        let values: Vec<[String; 8]> = app
+        let values: Vec<[String; 9]> = app
             .workspaces
             .iter()
             .flat_map(|workspace| {
@@ -6372,22 +6373,25 @@ fn render_global_items(frame: &mut Frame, area: Rect, app: &mut App) {
                         let task = matched_agent_session(workspace, agent)
                             .and_then(session_task_label)
                             .unwrap_or("-");
-                        let (updated, branch, worktree) = agent.agent.as_ref().map_or_else(
-                            || ("-".into(), "-".into(), "-".into()),
-                            |view| {
-                                (
-                                    compact_recency(view.updated_at_ms),
-                                    view.root_branch.clone(),
-                                    view.root_worktree.clone(),
-                                )
-                            },
-                        );
+                        let (updated, integration, branch, worktree) =
+                            agent.agent.as_ref().map_or_else(
+                                || ("-".into(), "-".into(), "-".into(), "-".into()),
+                                |view| {
+                                    (
+                                        compact_recency(view.updated_at_ms),
+                                        view.integration.clone(),
+                                        view.root_branch.clone(),
+                                        view.root_worktree.clone(),
+                                    )
+                                },
+                            );
                         Some([
                             agent.state().label().to_owned(),
                             updated,
                             workspace_display_name(workspace),
                             workspace.item_owner(item_index).0.alias.clone(),
                             agent.shell.name.clone(),
+                            integration,
                             task.to_owned(),
                             branch,
                             worktree,
@@ -6405,6 +6409,7 @@ fn render_global_items(frame: &mut Frame, area: Rect, app: &mut App) {
                     workspace,
                     node,
                     shell,
+                    integration,
                     task,
                     branch,
                     worktree,
@@ -6418,6 +6423,7 @@ fn render_global_items(frame: &mut Frame, area: Rect, app: &mut App) {
                         Cell::from(workspace),
                         Cell::from(node),
                         Cell::from(shell),
+                        Cell::from(integration),
                         Cell::from(task),
                         Cell::from(branch),
                         Cell::from(worktree),
@@ -7407,18 +7413,18 @@ fn global_column_widths(width: u16) -> Vec<Constraint> {
     ]
 }
 
-fn agent_column_widths(width: u16, rows: &[[String; 8]]) -> Vec<Constraint> {
+fn agent_column_widths(width: u16, rows: &[[String; 9]]) -> Vec<Constraint> {
     let caps = if width >= 160 {
-        [10, 9, 24, 14, 16, 52, 36, 24]
+        [10, 9, 24, 14, 16, 16, 52, 36, 24]
     } else if width >= 140 {
-        [10, 9, 20, 12, 16, 44, 28, 20]
+        [10, 9, 20, 12, 16, 16, 44, 28, 20]
     } else if width >= 100 {
-        [9, 8, 14, 10, 12, 32, 18, 16]
+        [9, 8, 14, 10, 12, 14, 32, 18, 16]
     } else {
-        [8, 7, 11, 8, 10, 24, 12, 13]
+        [8, 7, 11, 8, 10, 13, 24, 12, 13]
     };
     let minimums = AGENT_TABLE_HEADERS.map(|header| header.len() as u16);
-    let mut widths: [u16; 8] = std::array::from_fn(|index| {
+    let mut widths: [u16; 9] = std::array::from_fn(|index| {
         rows.iter()
             .map(|row| row[index].chars().count() as u16)
             .max()
@@ -7428,10 +7434,10 @@ fn agent_column_widths(width: u16, rows: &[[String; 8]]) -> Vec<Constraint> {
             .min(caps[index])
     });
 
-    // Seven column gaps and the highlight marker also consume table width.
-    let available = width.saturating_sub(9);
+    // Eight column gaps and the highlight marker also consume table width.
+    let available = width.saturating_sub(10);
     let mut overflow = widths.iter().sum::<u16>().saturating_sub(available);
-    for index in [5, 2, 6, 4, 7, 3, 0, 1] {
+    for index in [6, 2, 7, 4, 8, 5, 3, 0, 1] {
         let reduction = widths[index].saturating_sub(minimums[index]).min(overflow);
         widths[index] -= reduction;
         overflow -= reduction;
@@ -9229,6 +9235,7 @@ mod tests {
             "edge-datapipe-support",
             "work",
             "agent",
+            "opencode",
             "Check Slack tickets against GitHub releases",
             "fix/confluent-direct-download",
             "primary",
@@ -9242,21 +9249,23 @@ mod tests {
                 Constraint::Length(23),
                 Constraint::Length(6),
                 Constraint::Length(7),
+                Constraint::Length(10),
                 Constraint::Length(45),
                 Constraint::Length(31),
                 Constraint::Length(15),
             ]
         );
         assert_eq!(
-            agent_column_widths(80, &rows),
+            agent_column_widths(78, &rows),
             vec![
                 Constraint::Length(8),
                 Constraint::Length(7),
+                Constraint::Length(9),
+                Constraint::Length(4),
+                Constraint::Length(5),
+                Constraint::Length(7),
+                Constraint::Length(4),
                 Constraint::Length(11),
-                Constraint::Length(6),
-                Constraint::Length(7),
-                Constraint::Length(7),
-                Constraint::Length(12),
                 Constraint::Length(13),
             ]
         );
@@ -10871,6 +10880,32 @@ mod tests {
     }
 
     #[test]
+    fn narrow_global_agent_view_keeps_all_headers_visible() {
+        let backend = TestBackend::new(80, 20);
+        let mut terminal_backend = Terminal::new(backend).unwrap();
+        let mut workspace = workspace("w1", "one");
+        workspace.items = vec![WorkspaceItemView::AgentShell(agent_shell())];
+        let mut app = App::new(vec![workspace], project_context());
+        app.select_tab(PrimaryTab::Agents);
+
+        terminal_backend
+            .draw(|frame| render(frame, &mut app))
+            .unwrap();
+        let text: String = terminal_backend
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+
+        assert!(text.contains("STATUS"));
+        assert!(text.contains("HARNESS"));
+        assert!(text.contains("ROOT BRANCH"));
+        assert!(text.contains("ROOT WORKTREE"));
+    }
+
+    #[test]
     fn refresh_preserves_global_selection_by_workspace_and_item_identity() {
         let mut one = workspace("w1", "one");
         one.items = vec![terminal("same-id", "first", "")];
@@ -10940,10 +10975,12 @@ mod tests {
         assert!(text.contains("UPDATED"));
         assert!(text.contains("WORKSPACE"));
         assert!(text.contains("SHELL"));
+        assert!(text.contains("HARNESS"));
         assert!(text.contains("TASK"));
         assert!(text.contains("ROOT BRANCH"));
         assert!(text.contains("ROOT WORKTREE"));
         assert!(row.contains("Owning workspace session"));
+        assert!(row.contains("opencode"));
         assert!(row.contains("feat/agents"));
         assert!(row.contains("linked:agents"));
         assert!(!text.contains("Wrong workspace session"));

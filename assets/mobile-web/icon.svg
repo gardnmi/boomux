@@ -1,24 +1,24 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc" shape-rendering="crispEdges">
   <title id="title">Boomux pixel bomb</title>
-  <desc id="desc">A dark pixel-art bomb with a red and gold lit fuse.</desc>
+  <desc id="desc">A dark pixel-art bomb with a pink and gold lit fuse.</desc>
   <defs>
     <linearGradient id="shell" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#3d3e49"/>
-      <stop offset=".55" stop-color="#242633"/>
-      <stop offset="1" stop-color="#090b16"/>
+      <stop offset="0" stop-color="#585b70"/>
+      <stop offset=".55" stop-color="#313244"/>
+      <stop offset="1" stop-color="#181825"/>
     </linearGradient>
   </defs>
-  <rect width="512" height="512" rx="72" fill="#0b0d17"/>
-  <path d="M32 32h448v448H32z" fill="none" stroke="#222636" stroke-width="16"/>
-  <path d="M128 176h32v-32h128v16h32v32h32v32h16v128h-32v32h-32v32H160v-16h-32v-32H96v-32H80V224h16v-32h32z" fill="url(#shell)" stroke="#05060b" stroke-width="16"/>
-  <path d="M144 192h64v16h-32v32h-32z" fill="#f8f6e8"/>
-  <path d="M128 256h24v24h-24z" fill="#d9dbe3"/>
-  <path d="M288 176h32v32h32v32h-32v-16h-32z" fill="#111424"/>
-  <path d="M288 160v-32h32V96h32V64h24v48h-32v32h-32v32z" fill="#0a0b12"/>
-  <path d="M344 72h24v24h-24z" fill="#f5f2df"/>
-  <path d="M368 32h24v40h40v24h32v24h-32v24h48v24h-48v40h-24v-40h-40v-24h-40v-24h40V96h-24V72h24z" fill="#e52322"/>
-  <path d="M384 72h24v24h24v24h-24v24h-40v-24h-24V96h40z" fill="#ff8a19"/>
-  <path d="M384 96h24v24h24v24h-24v24h-24v-24h-24v-24h24z" fill="#ffd329"/>
-  <path d="M392 104h16v16h16v16h-16v16h-16v-16h-16v-16h16z" fill="#fff9d6"/>
-  <path d="M128 352h32v32h128v-16h32v-32h32v32h-32v32h-32v16H160v-16h-32z" fill="#080a14" opacity=".75"/>
+  <rect width="512" height="512" rx="72" fill="#1e1e2e"/>
+  <path d="M32 32h448v448H32z" fill="none" stroke="#45475a" stroke-width="16"/>
+  <path d="M128 176h32v-32h128v16h32v32h32v32h16v128h-32v32h-32v32H160v-16h-32v-32H96v-32H80V224h16v-32h32z" fill="url(#shell)" stroke="#11111b" stroke-width="16"/>
+  <path d="M144 192h64v16h-32v32h-32z" fill="#cdd6f4"/>
+  <path d="M128 256h24v24h-24z" fill="#b4befe"/>
+  <path d="M288 176h32v32h32v32h-32v-16h-32z" fill="#181825"/>
+  <path d="M288 160v-32h32V96h32V64h24v48h-32v32h-32v32z" fill="#11111b"/>
+  <path d="M344 72h24v24h-24z" fill="#cdd6f4"/>
+  <path d="M368 32h24v40h40v24h32v24h-32v24h48v24h-48v40h-24v-40h-40v-24h-40v-24h40V96h-24V72h24z" fill="#f38ba8"/>
+  <path d="M384 72h24v24h24v24h-24v24h-40v-24h-24V96h40z" fill="#fab387"/>
+  <path d="M384 96h24v24h24v24h-24v24h-24v-24h-24v-24h24z" fill="#f9e2af"/>
+  <path d="M392 104h16v16h16v16h-16v16h-16v-16h-16v-16h16z" fill="#f5e0dc"/>
+  <path d="M128 352h32v32h128v-16h32v-32h32v32h-32v32h-32v16H160v-16h-32z" fill="#11111b" opacity=".75"/>
 </svg>
