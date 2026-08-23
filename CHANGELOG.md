@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.26.0](https://github.com/gardnmi/boomux/compare/v0.25.1...v0.26.0) (2026-08-23)
+
+
+### Features
+
+* **web:** add configurable agent dashboard themes ([#242](https://github.com/gardnmi/boomux/issues/242)) ([1ba546f](https://github.com/gardnmi/boomux/commit/1ba546fcb17f2771a1a133b183fc979ff699dec2))
+
 ## [0.25.1](https://github.com/gardnmi/boomux/compare/v0.25.0...v0.25.1) (2026-08-22)
 
 
