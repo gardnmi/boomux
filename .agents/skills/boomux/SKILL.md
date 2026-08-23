@@ -671,6 +671,9 @@ list with `roots_configured: false` means no roots are configured; inspect
 ```console
 boomux workspace list
 boomux workspace create "<name>"
+boomux workspace select "<name-or-id>"
+boomux workspace current
+boomux workspace clear
 boomux workspace open "<name-or-id>"
 boomux workspace inspect "<name-or-id>"
 boomux workspace rename "<name-or-id>" "<new-name>"
@@ -688,6 +691,17 @@ Nodes require explicit `--node`, while zero means creation is unavailable.
 Filesystem paths are interpreted only
 by that owner, and its first hosted resource establishes the placement. An
 explicit `--node` never falls back to local Shell or launcher creation.
+
+On protocol 38 or newer, `workspace select` persists the exact coordinator
+Workspace ID as local owner-only CLI preference state; Node-local owner
+Workspace IDs are not selectable. For commands that require workspace context, explicit input
+wins, then the current managed Workspace, then the selection. Shell, launcher,
+and Schedule creation may omit their workspace while selected, but Node
+selection remains independent. Exact resource IDs need no workspace, and an
+omitted filter on Agent, attention, Session, Schedule, or execution lists still
+means all Workspaces. Agent registration still requires an exact ShellRun.
+Selection survives rename, fails visibly after close, and is removed only by
+`workspace clear` or replacement with another selection.
 
 Adopt creates a coordinated Workspace from one unlinked owner Workspace. Link's
 argument order is global Workspace first, owner Workspace second. Both require a

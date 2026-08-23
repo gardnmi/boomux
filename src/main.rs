@@ -54,6 +54,7 @@ mod tailscale_serve;
 mod terminal;
 mod tui;
 mod web_terminal;
+mod workspace_selection;
 
 const DASHBOARD_FALLBACK_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const DASHBOARD_EXECUTION_CACHE_LIMIT: u16 = 1_000;
@@ -290,6 +291,8 @@ const NON_PROTOCOL_FEATURES: &[&str] = &[
     "desktop_notifications",
     "sound_notifications",
     "integration_management",
+    "persistent_workspace_selection",
+    "create_and_open_shell",
 ];
 const LEGACY_BOOMUX_SHELLS_SKILL: &str = r#"---
 name: boomux-shells
@@ -677,6 +680,12 @@ enum NodeCommands {
 enum WorkspaceCommands {
     /// List workspaces
     List,
+    /// Select the workspace used when context-required commands omit one
+    Select { target: String },
+    /// Show the persistently selected CLI workspace
+    Current,
+    /// Clear the persistently selected CLI workspace
+    Clear,
     /// Create an empty workspace
     Create { name: String },
     /// Open terminal windows and invoke launchers
@@ -724,14 +733,14 @@ enum LauncherCommands {
     /// List launchers in a workspace
     List {
         #[arg(long, value_name = "NAME_OR_ID")]
-        workspace: String,
+        workspace: Option<String>,
     },
     /// Create a launcher in a workspace
     Create {
         name: String,
         /// Coordinated Workspace name or ID when --node is used
         #[arg(long, value_name = "WORKSPACE")]
-        workspace: String,
+        workspace: Option<String>,
         /// Exact eligible Node alias or Node ID
         #[arg(long)]
         node: Option<String>,
@@ -778,7 +787,7 @@ enum ShellCommands {
     SuggestName {
         /// Workspace name/ID locally, or exact owner Workspace ID with --node
         #[arg(value_name = "WORKSPACE")]
-        workspace: String,
+        workspace: Option<String>,
         /// Exact registered Node alias or Node ID
         #[arg(long)]
         node: Option<String>,
@@ -787,7 +796,7 @@ enum ShellCommands {
     Create {
         /// Coordinated Workspace name or ID when --node is used
         #[arg(value_name = "WORKSPACE")]
-        workspace: String,
+        workspace: Option<String>,
         /// Exact eligible Node alias or Node ID
         #[arg(long)]
         node: Option<String>,
@@ -795,6 +804,9 @@ enum ShellCommands {
         name: Option<String>,
         #[arg(long)]
         cwd: Option<PathBuf>,
+        /// Open the exact newly created shell in a native terminal
+        #[arg(long)]
+        open: bool,
         #[arg(last = true, num_args = 1.., value_name = "COMMAND")]
         command: Vec<String>,
     },
@@ -1091,7 +1103,7 @@ struct ScheduleCreateArgs {
     name: String,
     /// Owning workspace name or ID
     #[arg(long, value_name = "NAME_OR_ID")]
-    workspace: String,
+    workspace: Option<String>,
     /// Existing working directory to snapshot
     #[arg(long, value_name = "PATH")]
     cwd: PathBuf,
@@ -1707,7 +1719,10 @@ impl Cli {
             }) => CommandKey::DaemonStatus,
             Some(Commands::Workspace {
                 command:
-                    WorkspaceCommands::Create { .. }
+                    WorkspaceCommands::Select { .. }
+                    | WorkspaceCommands::Current
+                    | WorkspaceCommands::Clear
+                    | WorkspaceCommands::Create { .. }
                     | WorkspaceCommands::Open { .. }
                     | WorkspaceCommands::Rename { .. }
                     | WorkspaceCommands::Adopt { .. }
@@ -2092,7 +2107,9 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
             workspace_command(command, cli.json, cli.terminal.as_deref())
         }
         Some(Commands::Node { command }) => node_command(command, cli.json),
-        Some(Commands::Shell { command }) => shell_command(command, cli.json),
+        Some(Commands::Shell { command }) => {
+            shell_command(command, cli.json, cli.terminal.as_deref())
+        }
         Some(Commands::Launcher { command }) => launcher_command(command, cli.json),
         Some(Commands::Agent {
             command: AgentCommands::Supervise(arguments),
@@ -5287,6 +5304,267 @@ fn resolve_global_workspace_target<'a>(
         .or_else(|| workspaces.iter().find(|workspace| workspace.name == target))
 }
 
+fn find_global_workspace_by_id<'a>(
+    workspaces: &'a [protocol::GlobalWorkspaceSnapshot],
+    workspace_id: &str,
+) -> Option<&'a protocol::GlobalWorkspaceSnapshot> {
+    workspaces
+        .iter()
+        .find(|workspace| workspace.id == workspace_id)
+}
+
+fn selected_workspace_id() -> Result<Option<String>, Box<dyn Error>> {
+    Ok(workspace_selection::load_from_environment()?
+        .map(|selection| selection.workspace_id().to_owned()))
+}
+
+fn required_workspace_target(
+    client: &client::Client,
+    explicit: Option<&str>,
+    node_requested: bool,
+) -> Result<String, Box<dyn Error>> {
+    if let Some(explicit) = explicit {
+        return Ok(explicit.to_owned());
+    }
+    if let Some(owner_workspace_id) = managed_owner_workspace_id(client)? {
+        if !node_requested {
+            return Ok(owner_workspace_id);
+        }
+        let workspace = coordinated_workspace_for_local_owner(client, &owner_workspace_id)?
+            .ok_or_else(|| {
+                cli_output::failure(
+                    "context_required",
+                    "the current owner Workspace is not linked to a coordinated Workspace; provide one explicitly",
+                )
+            })?;
+        return Ok(workspace.id);
+    }
+    let workspace = selected_global_workspace(client)?.ok_or_else(|| {
+        cli_output::failure(
+            "context_required",
+            "workspace is required; provide it explicitly or run `boomux workspace select WORKSPACE`",
+        )
+    })?;
+    if workspace.closing {
+        return Err(cli_output::failure(
+            "invalid_argument",
+            "the selected Workspace is closing",
+        ));
+    }
+    Ok(workspace.id)
+}
+
+fn managed_owner_workspace_id(client: &client::Client) -> Result<Option<String>, Box<dyn Error>> {
+    if let Some(shell_id) = env::var("BOOMUX_SHELL_ID")
+        .ok()
+        .filter(|shell_id| !shell_id.is_empty())
+    {
+        return Ok(Some(client.get_shell(shell_id)?.workspace_id));
+    }
+    Ok(env::var("BOOMUX_WORKSPACE_ID")
+        .ok()
+        .filter(|workspace_id| !workspace_id.is_empty()))
+}
+
+fn coordinated_workspace_for_local_owner(
+    client: &client::Client,
+    owner_workspace_id: &str,
+) -> Result<Option<protocol::GlobalWorkspaceSnapshot>, Box<dyn Error>> {
+    require_protocol_feature(client, protocol::ProtocolFeature::GlobalWorkspaces)?;
+    let combined = client.combined_node_snapshot(None)?;
+    let local_node_id = combined
+        .nodes
+        .iter()
+        .find(|node| node.local)
+        .map(|node| node.node_id.as_str())
+        .ok_or_else(|| cli_output::failure("internal", "local Node identity is unavailable"))?;
+    Ok(combined
+        .workspaces
+        .iter()
+        .find(|workspace| {
+            workspace.placements.iter().any(|placement| {
+                placement.node_id == local_node_id && placement.workspace_id == owner_workspace_id
+            })
+        })
+        .cloned())
+}
+
+fn selected_global_workspace(
+    client: &client::Client,
+) -> Result<Option<protocol::GlobalWorkspaceSnapshot>, Box<dyn Error>> {
+    let Some(selected_id) = selected_workspace_id()? else {
+        return Ok(None);
+    };
+    require_protocol_feature(client, protocol::ProtocolFeature::GlobalWorkspaces)?;
+    let combined = client.combined_node_snapshot(None)?;
+    match find_global_workspace_by_id(&combined.workspaces, &selected_id) {
+        Some(workspace) => Ok(Some(workspace.clone())),
+        None => Err(cli_output::failure(
+            "not_found",
+            format!(
+                "selected Workspace {selected_id} no longer exists; run `boomux workspace clear`"
+            ),
+        )),
+    }
+}
+
+fn selected_owner_workspace_id(client: &client::Client) -> Result<Option<String>, Box<dyn Error>> {
+    let Some(workspace) = selected_global_workspace(client)? else {
+        return Ok(None);
+    };
+    if workspace.closing {
+        return Err(cli_output::failure(
+            "invalid_argument",
+            "the selected Workspace is closing",
+        ));
+    }
+    let combined = client.combined_node_snapshot(None)?;
+    let local_node_id = combined
+        .nodes
+        .iter()
+        .find(|node| node.local)
+        .map(|node| node.node_id.as_str())
+        .ok_or_else(|| cli_output::failure("internal", "local Node identity is unavailable"))?;
+    workspace
+        .placements
+        .iter()
+        .find(|placement| placement.node_id == local_node_id)
+        .map(|placement| Some(placement.workspace_id.clone()))
+        .ok_or_else(|| {
+            cli_output::failure(
+                "context_required",
+                format!(
+                    "selected Workspace {} has no local placement; provide --node for creation or an explicit owner Workspace",
+                    workspace.name
+                ),
+            )
+        })
+}
+
+fn selected_owner_workspace_id_for_node(
+    client: &client::Client,
+    node_id: &str,
+) -> Result<Option<String>, Box<dyn Error>> {
+    let Some(workspace) = selected_global_workspace(client)? else {
+        return Ok(None);
+    };
+    if workspace.closing {
+        return Err(cli_output::failure(
+            "invalid_argument",
+            "the selected Workspace is closing",
+        ));
+    }
+    workspace
+        .placements
+        .iter()
+        .find(|placement| placement.node_id == node_id)
+        .map(|placement| Some(placement.workspace_id.clone()))
+        .ok_or_else(|| {
+            cli_output::failure(
+                "context_required",
+                format!(
+                    "selected Workspace {} has no placement on the requested Node",
+                    workspace.name
+                ),
+            )
+        })
+}
+
+fn required_owner_workspace_target(
+    client: &client::Client,
+    explicit: Option<&str>,
+    node_id: &str,
+) -> Result<String, Box<dyn Error>> {
+    if let Some(explicit) = explicit {
+        return Ok(explicit.to_owned());
+    }
+    owner_workspace_context_for_node(client, node_id)?.ok_or_else(|| {
+        cli_output::failure(
+            "context_required",
+            "owner Workspace is required; provide it explicitly, run inside a coordinated Workspace, or select one with a placement on this Node",
+        )
+    })
+}
+
+fn owner_workspace_context_for_node(
+    client: &client::Client,
+    node_id: &str,
+) -> Result<Option<String>, Box<dyn Error>> {
+    if let Some(owner_workspace_id) = managed_owner_workspace_id(client)? {
+        let workspace = coordinated_workspace_for_local_owner(client, &owner_workspace_id)?
+            .ok_or_else(|| {
+                cli_output::failure(
+                    "context_required",
+                    "the current owner Workspace is not linked to a coordinated Workspace",
+                )
+            })?;
+        return workspace
+            .placements
+            .iter()
+            .find(|placement| placement.node_id == node_id)
+            .map(|placement| Some(placement.workspace_id.clone()))
+            .ok_or_else(|| {
+                cli_output::failure(
+                    "context_required",
+                    format!(
+                        "current Workspace {} has no placement on the requested Node",
+                        workspace.name
+                    ),
+                )
+            });
+    }
+    selected_owner_workspace_id_for_node(client, node_id)
+}
+
+fn local_workspace_argument(
+    client: &client::Client,
+    explicit: Option<&str>,
+) -> Result<Option<String>, Box<dyn Error>> {
+    if let Some(explicit) = explicit {
+        return Ok(Some(explicit.to_owned()));
+    }
+    if env::var_os("BOOMUX_SHELL_ID").is_some() || env::var_os("BOOMUX_WORKSPACE_ID").is_some() {
+        return Ok(None);
+    }
+    selected_owner_workspace_id(client)
+}
+
+fn resource_workspace_argument(
+    client: &client::Client,
+    explicit: Option<&str>,
+    exact_resource: bool,
+) -> Result<Option<String>, Box<dyn Error>> {
+    if exact_resource {
+        return Ok(explicit.map(str::to_owned));
+    }
+    local_workspace_argument(client, explicit)
+}
+
+fn resolve_context_workspace<'a>(
+    snapshot: &'a Snapshot,
+    explicit: Option<&str>,
+) -> Result<&'a WorkspaceSnapshot, Box<dyn Error>> {
+    if let Some(explicit) = explicit {
+        return resolve_workspace_target(&snapshot.workspaces, explicit);
+    }
+    if let Ok(shell_id) = env::var("BOOMUX_SHELL_ID") {
+        let shell = find_shell(snapshot, &shell_id).ok_or_else(|| {
+            cli_output::failure("not_found", "current Boomux shell no longer exists")
+        })?;
+        return resolve_workspace_target(&snapshot.workspaces, &shell.workspace_id);
+    }
+    if let Some(workspace_id) = env::var("BOOMUX_WORKSPACE_ID")
+        .ok()
+        .filter(|workspace_id| !workspace_id.is_empty())
+    {
+        return resolve_workspace_target(&snapshot.workspaces, &workspace_id);
+    }
+    Err(cli_output::failure(
+        "context_required",
+        "workspace context is required; provide --workspace or run `boomux workspace select WORKSPACE`",
+    ))
+}
+
 fn resolve_combined_node<'a>(
     nodes: &'a [protocol::CombinedNode],
     selector: &str,
@@ -6785,6 +7063,25 @@ fn workspace_command(
     json: bool,
     terminal_override: Option<&str>,
 ) -> Result<(), Box<dyn Error>> {
+    if matches!(&command, WorkspaceCommands::Clear) {
+        if workspace_selection::clear_from_environment()? {
+            println!("Cleared selected workspace");
+        } else {
+            println!("No workspace was selected");
+        }
+        return Ok(());
+    }
+    let current_selection = if matches!(&command, WorkspaceCommands::Current) {
+        match workspace_selection::load_from_environment()? {
+            Some(selection) => Some(selection),
+            None => {
+                println!("No workspace selected");
+                return Ok(());
+            }
+        }
+    } else {
+        None
+    };
     let client = client::connect_or_start()?;
     match command {
         WorkspaceCommands::List => {
@@ -6872,6 +7169,43 @@ fn workspace_command(
                 );
             }
         }
+        WorkspaceCommands::Select { target } => {
+            require_protocol_feature(&client, protocol::ProtocolFeature::GlobalWorkspaces)?;
+            let combined = client.combined_node_snapshot(None)?;
+            let workspace = resolve_global_workspace_target(&combined.workspaces, &target)
+                .ok_or_else(|| {
+                    cli_output::failure("not_found", format!("Workspace not found: {target}"))
+                })?;
+            if workspace.closing {
+                return Err(cli_output::failure(
+                    "invalid_argument",
+                    "a closing Workspace cannot be selected",
+                ));
+            }
+            let selection = workspace_selection::WorkspaceSelection::new(&workspace.id)?;
+            workspace_selection::save_from_environment(&selection)?;
+            println!("Selected workspace {} ({})", workspace.name, workspace.id);
+        }
+        WorkspaceCommands::Current => {
+            let selection = current_selection.expect("selection was loaded before connecting");
+            require_protocol_feature(&client, protocol::ProtocolFeature::GlobalWorkspaces)?;
+            let combined = client.combined_node_snapshot(None)?;
+            let workspace = find_global_workspace_by_id(
+                &combined.workspaces,
+                selection.workspace_id(),
+            )
+            .ok_or_else(|| {
+                cli_output::failure(
+                    "not_found",
+                    format!(
+                        "selected Workspace {} no longer exists; run `boomux workspace clear`",
+                        selection.workspace_id()
+                    ),
+                )
+            })?;
+            println!("Selected workspace {} ({})", workspace.name, workspace.id);
+        }
+        WorkspaceCommands::Clear => unreachable!(),
         WorkspaceCommands::Create { name } => {
             let name = cli_name(name, "workspace")?;
             if client.supports(protocol::ProtocolFeature::GlobalWorkspaces)? {
@@ -7326,12 +7660,21 @@ fn workspace_command(
     Ok(())
 }
 
-fn shell_command(command: ShellCommands, json: bool) -> Result<(), Box<dyn Error>> {
+fn shell_command(
+    command: ShellCommands,
+    json: bool,
+    terminal_override: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
     let client = client::connect_or_start()?;
     match command {
         ShellCommands::SuggestName { workspace, node } => {
             if let Some(node) = node {
                 let registration = client.node_registration(node)?;
+                let workspace = required_owner_workspace_target(
+                    &client,
+                    workspace.as_deref(),
+                    &registration.node_id,
+                )?;
                 let result = client.route_node_host_service(
                     &registration.node_id,
                     protocol::HostServiceOperation::SuggestShellName {
@@ -7361,7 +7704,8 @@ fn shell_command(command: ShellCommands, json: bool) -> Result<(), Box<dyn Error
                 return Ok(());
             }
             let snapshot = client.snapshot()?;
-            let workspace = resolve_workspace_target(&snapshot.workspaces, &workspace)?;
+            let workspace = local_workspace_argument(&client, workspace.as_deref())?;
+            let workspace = resolve_context_workspace(&snapshot, workspace.as_deref())?;
             let name =
                 generated_shell_name(workspace.shells.iter().map(|shell| shell.name.as_str()))?;
             if json {
@@ -7401,8 +7745,11 @@ fn shell_command(command: ShellCommands, json: bool) -> Result<(), Box<dyn Error
             node,
             name,
             cwd,
+            open,
             command,
         } => {
+            let workspace =
+                required_workspace_target(&client, workspace.as_deref(), node.is_some())?;
             let global_workspaces_supported =
                 client.supports(protocol::ProtocolFeature::GlobalWorkspaces)?;
             let selection = select_coordinated_owner(&client, &workspace, node.as_deref())?;
@@ -7434,6 +7781,27 @@ fn shell_command(command: ShellCommands, json: bool) -> Result<(), Box<dyn Error
                     "Created pending shell {} ({}) in {} on Node {}",
                     shell.name, shell.id, selection.workspace.name, selection.node.alias
                 );
+                if open {
+                    let title = if selection.node.local {
+                        format!("{} - {}", selection.workspace.name, shell.name)
+                    } else {
+                        format!(
+                            "[{}] {} - {}",
+                            selection.node.alias, selection.workspace.name, shell.name
+                        )
+                    };
+                    if selection.node.local {
+                        open_terminal(&shell.id, &title, false, terminal_override)?;
+                    } else {
+                        terminal::open_remote(
+                            terminal_override,
+                            &selection.node.node_id,
+                            &shell.id,
+                            &title,
+                            false,
+                        )?;
+                    }
+                }
                 return Ok(());
             }
             let snapshot = client.snapshot()?;
@@ -7452,9 +7820,22 @@ fn shell_command(command: ShellCommands, json: bool) -> Result<(), Box<dyn Error
                 create_generated_shell(&client, &workspace.id, &cwd, &command)?
             };
             println!("Created pending shell {} ({})", shell.name, shell.id);
+            if open {
+                open_terminal(
+                    &shell.id,
+                    &format!("{} - {}", workspace.name, shell.name),
+                    false,
+                    terminal_override,
+                )?;
+            }
         }
         ShellCommands::Inspect { target, workspace } => {
             let snapshot = client.snapshot()?;
+            let workspace = resource_workspace_argument(
+                &client,
+                workspace.as_deref(),
+                find_shell(&snapshot, &target).is_some(),
+            )?;
             let shell = resolve_cli_shell(&snapshot, &target, workspace.as_deref())?;
             let workspace = snapshot
                 .workspaces
@@ -7502,6 +7883,11 @@ fn shell_command(command: ShellCommands, json: bool) -> Result<(), Box<dyn Error
         } => {
             let name = cli_name(name, "shell")?;
             let snapshot = client.snapshot()?;
+            let workspace = resource_workspace_argument(
+                &client,
+                workspace.as_deref(),
+                find_shell(&snapshot, &target).is_some(),
+            )?;
             let shell = resolve_cli_shell(&snapshot, &target, workspace.as_deref())?;
             client.rename_shell(&shell.id, &name)?;
             println!("Renamed shell {} to {name}", shell.name);
@@ -7518,7 +7904,8 @@ fn launcher_command(command: LauncherCommands, json: bool) -> Result<(), Box<dyn
     match command {
         LauncherCommands::List { workspace } => {
             let snapshot = client.snapshot()?;
-            let workspace = resolve_workspace_target(&snapshot.workspaces, &workspace)?;
+            let workspace = local_workspace_argument(&client, workspace.as_deref())?;
+            let workspace = resolve_context_workspace(&snapshot, workspace.as_deref())?;
             if json {
                 let launchers = workspace
                     .launchers
@@ -7552,6 +7939,8 @@ fn launcher_command(command: LauncherCommands, json: bool) -> Result<(), Box<dyn
             cwd,
             command,
         } => {
+            let workspace =
+                required_workspace_target(&client, workspace.as_deref(), node.is_some())?;
             let name = cli_name(name, "workspace launcher")?;
             let global_workspaces_supported =
                 client.supports(protocol::ProtocolFeature::GlobalWorkspaces)?;
@@ -7596,6 +7985,11 @@ fn launcher_command(command: LauncherCommands, json: bool) -> Result<(), Box<dyn
         }
         LauncherCommands::Inspect { target, workspace } => {
             let snapshot = client.snapshot()?;
+            let workspace = resource_workspace_argument(
+                &client,
+                workspace.as_deref(),
+                find_launcher(&snapshot, &target).is_some(),
+            )?;
             let launcher = resolve_cli_launcher(&snapshot, &target, workspace.as_deref())?;
             let workspace = snapshot
                 .workspaces
@@ -7665,6 +8059,11 @@ fn launcher_command(command: LauncherCommands, json: bool) -> Result<(), Box<dyn
                 return Ok(());
             }
             let snapshot = client.snapshot()?;
+            let workspace = resource_workspace_argument(
+                &client,
+                workspace.as_deref(),
+                find_launcher(&snapshot, &target).is_some(),
+            )?;
             let launcher = resolve_cli_launcher(&snapshot, &target, workspace.as_deref())?;
             let workspace = snapshot
                 .workspaces
@@ -7683,12 +8082,22 @@ fn launcher_command(command: LauncherCommands, json: bool) -> Result<(), Box<dyn
         } => {
             let name = cli_name(name, "workspace launcher")?;
             let snapshot = client.snapshot()?;
+            let workspace = resource_workspace_argument(
+                &client,
+                workspace.as_deref(),
+                find_launcher(&snapshot, &target).is_some(),
+            )?;
             let launcher = resolve_cli_launcher(&snapshot, &target, workspace.as_deref())?;
             client.rename_launcher(&launcher.id, &name)?;
             println!("Renamed launcher {} to {name}", launcher.name);
         }
         LauncherCommands::Remove { target, workspace } => {
             let snapshot = client.snapshot()?;
+            let workspace = resource_workspace_argument(
+                &client,
+                workspace.as_deref(),
+                find_launcher(&snapshot, &target).is_some(),
+            )?;
             let launcher = resolve_cli_launcher(&snapshot, &target, workspace.as_deref())?;
             client.remove_launcher(&launcher.id)?;
             println!("Removed launcher {}", launcher.name);
@@ -8150,11 +8559,24 @@ fn remote_session_command(
     Ok(())
 }
 
-fn schedule_command(command: ScheduleCommands, json: bool) -> Result<(), Box<dyn Error>> {
+fn schedule_command(mut command: ScheduleCommands, json: bool) -> Result<(), Box<dyn Error>> {
     let client = client::connect_or_start()?;
+    if let ScheduleCommands::Create(arguments) = &mut command {
+        arguments.workspace = Some(required_workspace_target(
+            &client,
+            arguments.workspace.as_deref(),
+            arguments.node.is_some(),
+        )?);
+    }
     if let ScheduleCommands::Create(arguments) = &command
-        && let Some(selection) =
-            select_coordinated_owner(&client, &arguments.workspace, arguments.node.as_deref())?
+        && let Some(selection) = select_coordinated_owner(
+            &client,
+            arguments
+                .workspace
+                .as_deref()
+                .expect("create workspace was resolved"),
+            arguments.node.as_deref(),
+        )?
     {
         let ScheduleCommands::Create(arguments) = command else {
             unreachable!()
@@ -8233,6 +8655,11 @@ fn schedule_command(command: ScheduleCommands, json: bool) -> Result<(), Box<dyn
             target, workspace, ..
         } => {
             let snapshot = client.snapshot()?;
+            let workspace = resource_workspace_argument(
+                &client,
+                workspace.as_deref(),
+                find_schedule(&snapshot, &target).is_some(),
+            )?;
             let schedule = resolve_cli_schedule(&snapshot, &target, workspace.as_deref())?;
             let workspace_name = schedule_workspace_name(&snapshot, schedule);
             let inspection = client.get_agent_schedule(&schedule.id)?;
@@ -8255,6 +8682,11 @@ fn schedule_command(command: ScheduleCommands, json: bool) -> Result<(), Box<dyn
             target, workspace, ..
         } => {
             let snapshot = client.snapshot()?;
+            let workspace = resource_workspace_argument(
+                &client,
+                workspace.as_deref(),
+                find_schedule(&snapshot, &target).is_some(),
+            )?;
             let schedule = resolve_cli_schedule(&snapshot, &target, workspace.as_deref())?;
             let workspace_name = schedule_workspace_name(&snapshot, schedule).map(str::to_owned);
             let schedule = client.pause_agent_schedule(&schedule.id)?;
@@ -8273,6 +8705,11 @@ fn schedule_command(command: ScheduleCommands, json: bool) -> Result<(), Box<dyn
             target, workspace, ..
         } => {
             let snapshot = client.snapshot()?;
+            let workspace = resource_workspace_argument(
+                &client,
+                workspace.as_deref(),
+                find_schedule(&snapshot, &target).is_some(),
+            )?;
             let schedule = resolve_cli_schedule(&snapshot, &target, workspace.as_deref())?;
             let workspace_name = schedule_workspace_name(&snapshot, schedule).map(str::to_owned);
             let schedule = client.resume_agent_schedule(&schedule.id)?;
@@ -8294,6 +8731,11 @@ fn schedule_command(command: ScheduleCommands, json: bool) -> Result<(), Box<dyn
             target, workspace, ..
         } => {
             let snapshot = client.snapshot()?;
+            let workspace = resource_workspace_argument(
+                &client,
+                workspace.as_deref(),
+                find_schedule(&snapshot, &target).is_some(),
+            )?;
             let schedule = resolve_cli_schedule(&snapshot, &target, workspace.as_deref())?;
             let removed =
                 cli_output::schedule(schedule, schedule_workspace_name(&snapshot, schedule));
@@ -8328,6 +8770,11 @@ fn schedule_command(command: ScheduleCommands, json: bool) -> Result<(), Box<dyn
                 ));
             }
             let snapshot = client.snapshot()?;
+            let workspace = resource_workspace_argument(
+                &client,
+                workspace.as_deref(),
+                find_schedule(&snapshot, &target).is_some(),
+            )?;
             let schedule = resolve_cli_schedule(&snapshot, &target, workspace.as_deref())?;
             let execution = client.run_agent_schedule(
                 &schedule.id,
@@ -8398,10 +8845,15 @@ fn remote_schedule_inspection(
     let schedule_id = if uuid::Uuid::parse_str(target).is_ok() {
         target.to_owned()
     } else {
-        let workspace = workspace.ok_or_else(|| {
+        let selected_workspace = if workspace.is_none() {
+            owner_workspace_context_for_node(client, &node.node_id)?
+        } else {
+            None
+        };
+        let workspace = workspace.or(selected_workspace.as_deref()).ok_or_else(|| {
             cli_output::failure(
-                "invalid_argument",
-                "remote schedule names require --workspace; exact schedule IDs do not",
+                "context_required",
+                "remote schedule names require --workspace or a selected Workspace placement; exact schedule IDs do not",
             )
         })?;
         let workspace = remote_workspace_from_projection(client, node, workspace)?;
@@ -8549,7 +9001,14 @@ fn remote_schedule_command(
             Ok(())
         }
         ScheduleCommands::Create(arguments) => {
-            let workspace = remote_workspace_from_projection(client, &node, &arguments.workspace)?;
+            let workspace = remote_workspace_from_projection(
+                client,
+                &node,
+                arguments
+                    .workspace
+                    .as_deref()
+                    .expect("create workspace was resolved"),
+            )?;
             let name = cli_name(arguments.name, "schedule")?;
             let resolved = client.route_node_host_service(
                 &node.node_id,
@@ -8794,6 +9253,14 @@ fn execution_command(
             ..
         } => {
             let snapshot = client.snapshot()?;
+            let schedule_workspace = match schedule.as_deref() {
+                Some(target)
+                    if workspace.is_none() && find_schedule(&snapshot, target).is_none() =>
+                {
+                    local_workspace_argument(&client, None)?
+                }
+                _ => None,
+            };
             let workspace = workspace
                 .as_deref()
                 .map(|target| resolve_workspace_target(&snapshot.workspaces, target))
@@ -8804,7 +9271,9 @@ fn execution_command(
                     resolve_cli_schedule(
                         &snapshot,
                         target,
-                        workspace.map(|workspace| workspace.id.as_str()),
+                        workspace
+                            .map(|workspace| workspace.id.as_str())
+                            .or(schedule_workspace.as_deref()),
                     )
                     .map(|schedule| schedule.id.clone())
                 })
@@ -9556,7 +10025,13 @@ fn create_schedule(
     json: bool,
 ) -> Result<(), Box<dyn Error>> {
     let snapshot = client.snapshot()?;
-    let workspace = resolve_workspace_target(&snapshot.workspaces, &arguments.workspace)?;
+    let workspace = resolve_workspace_target(
+        &snapshot.workspaces,
+        arguments
+            .workspace
+            .as_deref()
+            .expect("create workspace was resolved"),
+    )?;
     let name = cli_name(arguments.name, "schedule")?;
     let cwd = resolve_directory(&arguments.cwd).map_err(|error| {
         cli_output::failure(
@@ -9914,23 +10389,7 @@ fn resolve_cli_schedule<'a>(
     if let Some(schedule) = find_schedule(snapshot, target) {
         return Ok(schedule);
     }
-    let workspace_id = if let Some(workspace) = workspace {
-        resolve_workspace_target(&snapshot.workspaces, workspace)?
-            .id
-            .clone()
-    } else {
-        env::var("BOOMUX_WORKSPACE_ID").map_err(|_| {
-            cli_output::failure(
-                "context_required",
-                format!("schedule name {target:?} requires --workspace or BOOMUX_WORKSPACE_ID"),
-            )
-        })?
-    };
-    let workspace = snapshot
-        .workspaces
-        .iter()
-        .find(|workspace| workspace.id == workspace_id)
-        .ok_or_else(|| cli_output::failure("not_found", "current workspace no longer exists"))?;
+    let workspace = resolve_context_workspace(snapshot, workspace)?;
     workspace
         .schedules
         .iter()
@@ -10467,8 +10926,9 @@ fn print_agent(agent: &AgentInstanceSnapshot, workspace_name: &str) {
 
 fn list_workspace_shells(json: bool) -> Result<(), Box<dyn Error>> {
     let client = client::connect_or_start()?;
-    let shell = current_shell(&client)?;
-    let workspace = client.get_workspace(&shell.workspace_id)?;
+    let snapshot = client.snapshot()?;
+    let workspace = local_workspace_argument(&client, None)?;
+    let workspace = resolve_context_workspace(&snapshot, workspace.as_deref())?;
     if json {
         let shells = workspace
             .shells
@@ -10485,7 +10945,7 @@ fn list_workspace_shells(json: bool) -> Result<(), Box<dyn Error>> {
         );
     }
     println!("NAME\tSHELL ID\tRUN ID\tSTATUS");
-    for shell in workspace.shells {
+    for shell in &workspace.shells {
         println!(
             "{}\t{}\t{}\t{}",
             shell.name,
@@ -10599,10 +11059,9 @@ fn read_shell(
 ) -> Result<(), Box<dyn Error>> {
     let client = client::connect_or_start()?;
     let snapshot = client.snapshot()?;
-    let current_workspace_id = env::var("BOOMUX_SHELL_ID")
-        .ok()
-        .and_then(|id| find_shell(&snapshot, &id).map(|shell| shell.workspace_id.clone()));
-    let shell = resolve_shell_target(&snapshot, current_workspace_id.as_deref(), target)?;
+    let workspace =
+        resource_workspace_argument(&client, None, find_shell(&snapshot, target).is_some())?;
+    let shell = resolve_cli_shell(&snapshot, target, workspace.as_deref())?;
     if json || run_id.is_some() {
         let state = client.read_shell_at(
             &shell.id,
@@ -10653,7 +11112,9 @@ fn close_shell_with_workspace(
 ) -> Result<(), Box<dyn Error>> {
     let snapshot = client.snapshot()?;
     let current_shell_id = env::var("BOOMUX_SHELL_ID").ok();
-    let shell = resolve_cli_shell(&snapshot, target, workspace)?;
+    let workspace =
+        resource_workspace_argument(client, workspace, find_shell(&snapshot, target).is_some())?;
+    let shell = resolve_cli_shell(&snapshot, target, workspace.as_deref())?;
     if current_shell_id.as_deref() == Some(shell.id.as_str()) {
         return Err(
             "cannot close the current shell from inside it; use the dashboard or another shell"
@@ -10679,26 +11140,8 @@ fn resolve_cli_shell<'a>(
     if let Some(shell) = find_shell(snapshot, target) {
         return Ok(shell);
     }
-    let workspace_id = if let Some(workspace) = workspace {
-        resolve_workspace_target(&snapshot.workspaces, workspace)?
-            .id
-            .as_str()
-    } else {
-        let current_shell_id = env::var("BOOMUX_SHELL_ID").map_err(|_| {
-            cli_output::failure(
-                "context_required",
-                format!(
-                    "shell name {target:?} requires --workspace outside a Boomux-managed shell"
-                ),
-            )
-        })?;
-        find_shell(snapshot, &current_shell_id)
-            .map(|shell| shell.workspace_id.as_str())
-            .ok_or_else(|| {
-                cli_output::failure("not_found", "current Boomux shell no longer exists")
-            })?
-    };
-    resolve_shell_target(snapshot, Some(workspace_id), target)
+    let workspace = resolve_context_workspace(snapshot, workspace)?;
+    resolve_shell_target(snapshot, Some(&workspace.id), target)
 }
 
 fn resolve_cli_launcher<'a>(
@@ -10709,30 +11152,7 @@ fn resolve_cli_launcher<'a>(
     if let Some(launcher) = find_launcher(snapshot, target) {
         return Ok(launcher);
     }
-    let workspace_id = if let Some(workspace) = workspace {
-        resolve_workspace_target(&snapshot.workspaces, workspace)?
-            .id
-            .as_str()
-    } else {
-        let current_shell_id = env::var("BOOMUX_SHELL_ID").map_err(|_| {
-            cli_output::failure(
-                "context_required",
-                format!(
-                    "launcher name {target:?} requires --workspace outside a Boomux-managed shell"
-                ),
-            )
-        })?;
-        find_shell(snapshot, &current_shell_id)
-            .map(|shell| shell.workspace_id.as_str())
-            .ok_or_else(|| {
-                cli_output::failure("not_found", "current Boomux shell no longer exists")
-            })?
-    };
-    let workspace = snapshot
-        .workspaces
-        .iter()
-        .find(|workspace| workspace.id == workspace_id)
-        .ok_or_else(|| cli_output::failure("not_found", "current workspace no longer exists"))?;
+    let workspace = resolve_context_workspace(snapshot, workspace)?;
     workspace
         .launchers
         .iter()
@@ -10821,16 +11241,6 @@ fn find_launcher<'a>(snapshot: &'a Snapshot, id: &str) -> Option<&'a WorkspaceLa
         .iter()
         .flat_map(|workspace| &workspace.launchers)
         .find(|launcher| launcher.id == id)
-}
-
-fn current_shell(client: &client::Client) -> Result<ShellSnapshot, Box<dyn Error>> {
-    let shell_id = env::var("BOOMUX_SHELL_ID").map_err(|_| {
-        cli_output::failure(
-            "context_required",
-            "this command must run inside a Boomux-managed shell",
-        )
-    })?;
-    Ok(client.get_shell(shell_id)?)
 }
 
 fn shell_status(status: &ShellStatus) -> &'static str {
@@ -13321,6 +13731,14 @@ mod tests {
 
     #[test]
     fn parses_workspace_and_shell_lifecycle_commands() {
+        for arguments in [
+            ["boomux", "workspace", "select", "project"].as_slice(),
+            ["boomux", "workspace", "current"].as_slice(),
+            ["boomux", "workspace", "clear"].as_slice(),
+        ] {
+            let cli = Cli::try_parse_from(arguments).unwrap();
+            assert_eq!(cli.command_descriptor().output, OutputMode::HumanOnly);
+        }
         assert!(matches!(
             Cli::try_parse_from(["boomux", "workspace", "create", "project"])
                 .unwrap()
@@ -13358,7 +13776,7 @@ mod tests {
                     ..
                 }
             }) if name == "editor"
-                && workspace == "project"
+                && workspace.as_deref() == Some("project")
                 && cwd == Path::new("/tmp")
                 && command == ["zeditor", "."]
         ));
@@ -13391,8 +13809,8 @@ mod tests {
             }) if target == "project"
         ));
         let cli = Cli::try_parse_from([
-            "boomux", "shell", "create", "project", "--name", "tests", "--cwd", "/tmp", "--",
-            "cargo", "test",
+            "boomux", "shell", "create", "project", "--name", "tests", "--cwd", "/tmp", "--open",
+            "--", "cargo", "test",
         ])
         .unwrap();
         assert!(matches!(
@@ -13402,12 +13820,14 @@ mod tests {
                     workspace,
                     name: Some(name),
                     cwd,
+                    open,
                     command,
                     ..
                 }
-            }) if workspace == "project"
+            }) if workspace.as_deref() == Some("project")
                 && name == "tests"
                 && cwd.as_deref() == Some(Path::new("/tmp"))
+                && open
                 && command == ["cargo", "test"]
         ));
         assert!(matches!(
@@ -13416,7 +13836,7 @@ mod tests {
                 .command,
             Some(Commands::Shell {
                 command: ShellCommands::SuggestName { workspace, .. }
-            }) if workspace == "project"
+            }) if workspace.as_deref() == Some("project")
         ));
         assert!(matches!(
             Cli::try_parse_from(["boomux", "shell", "create", "project"])
@@ -13424,6 +13844,29 @@ mod tests {
                 .command,
             Some(Commands::Shell {
                 command: ShellCommands::Create { cwd: None, .. }
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["boomux", "shell", "create", "--name", "tests"])
+                .unwrap()
+                .command,
+            Some(Commands::Shell {
+                command: ShellCommands::Create {
+                    workspace: None,
+                    name: Some(name),
+                    ..
+                }
+            }) if name == "tests"
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["boomux", "launcher", "create", "editor", "--", "editor"])
+                .unwrap()
+                .command,
+            Some(Commands::Launcher {
+                command: LauncherCommands::Create {
+                    workspace: None,
+                    ..
+                }
             })
         ));
     }
@@ -14025,6 +14468,23 @@ mod tests {
             "editor"
         );
         assert!(resolve_workspace_target(&snapshot.workspaces, "missing").is_err());
+    }
+
+    #[test]
+    fn persisted_workspace_selection_resolves_only_exact_global_id() {
+        let stale_id = Uuid::from_u128(1).to_string();
+        let workspace = protocol::GlobalWorkspaceSnapshot {
+            id: Uuid::from_u128(2).to_string(),
+            revision: 1,
+            name: stale_id.clone(),
+            closing: false,
+            placements: Vec::new(),
+        };
+
+        assert!(
+            resolve_global_workspace_target(std::slice::from_ref(&workspace), &stale_id).is_some()
+        );
+        assert!(find_global_workspace_by_id(&[workspace], &stale_id).is_none());
     }
 
     #[test]

@@ -107,6 +107,19 @@ never by its display alias `local`, so an unlinked local owner Workspace cannot
 be confused with a same-ID global Workspace. Registered remote Nodes retain
 documented exact-ID or alias resolution.
 
+Human-only `workspace select TARGET`, `workspace current`, and `workspace clear`
+manage one local selected coordinator Workspace by exact ID on protocol 38 or
+newer; Node-local owner Workspace IDs are not selectable. For commands that otherwise
+require workspace context, precedence is explicit workspace, managed-shell or
+launcher `BOOMUX_WORKSPACE_ID`, then the selected Workspace. Shell and launcher
+name resolution continues to derive the exact current Shell's Workspace before
+using the broader environment value. The selection allows workspace omission
+for shell, launcher, and Schedule creation but never selects a Node. It does not
+change unscoped `agent.list`, `attention.list`, `session.list`, `schedule.list`,
+or `execution.list` result sets. Exact resource IDs continue to bypass workspace
+context. This is a CLI-only behavior and does not change the wire protocol or
+the `boomux.cli/v1` envelope.
+
 Cached remote projections can satisfy only documented prompt-free summary reads.
 Exact private inspection, terminal output, revision waits, and all mutations
 require a live identity-verified connection to the owning Node. Offline writes
