@@ -135,6 +135,8 @@ boomux . --name my-project --new -- sh -lc 'cargo test | tee test.log'
 | Create a generated workspace | `boomux .` |
 | Create or add to a named workspace | `boomux . --name feature-x` |
 | Create an empty workspace | `boomux workspace create feature-x` |
+| Select a workspace for later CLI commands | `boomux workspace select feature-x` |
+| Show or clear the CLI selection | `boomux workspace current` / `boomux workspace clear` |
 | Add a shell on one Node | `boomux shell create feature-x --node laptop --cwd /path/to/project` |
 | Register a remote Node | `boomux node add laptop user@host` |
 | Upgrade a registered Node | `boomux node upgrade laptop` |
@@ -143,6 +145,7 @@ boomux . --name my-project --new -- sh -lc 'cargo test | tee test.log'
 | Retry an incomplete close | `boomux workspace retry <workspace-id>` |
 | Suggest an unused shell name | `boomux shell suggest-name feature-x` |
 | Add a randomly named shell | `boomux shell create feature-x` |
+| Add and open a randomly named shell | `boomux shell create feature-x --open` |
 | Open the new shell in another terminal | `boomux . --name feature-x --new` |
 | Run one command | `boomux . --name feature-x --new -- lazygit` |
 | Choose a terminal | `boomux . --terminal Alacritty.desktop` |
@@ -162,6 +165,16 @@ path-opening shorthand is a local terminal workflow. In the coordinated CLI,
 path; the first `shell`, `launcher`, or `schedule` creation selects a Node and
 establishes that Node's placement-specific filesystem context. A sole eligible
 Node is selected automatically, while multiple eligible Nodes require `--node`.
+On protocol 38 or newer, `workspace select` stores the exact coordinator
+Workspace ID in local owner-only state. Node-local owner Workspaces cannot be
+selected directly. For
+commands that require workspace context, an explicit workspace wins, followed
+by the current managed Workspace and then this selection. With a selection,
+commands such as `shell create`, `launcher create`, and `schedule create` can
+omit their workspace argument. The selection never chooses a Node, never narrows
+an unscoped list command, and does not replace the exact ShellRun required by
+Agent registration. Workspace renames are safe because only the ID is stored;
+a closed selection fails visibly until `workspace clear` or another selection.
 Shells created without an explicit shell name receive a memorable lowercase
 `adjective-noun` name such as `quiet-otter`; that concrete name is retained like
 any explicit name. `shell suggest-name` exposes the same collision-aware naming
@@ -178,9 +191,10 @@ not need a retained terminal:
 
 ```console
 boomux workspace create boomux
-boomux launcher create editor --workspace boomux --cwd . -- zeditor .
-boomux launcher create browser --workspace boomux -- firefox http://localhost:3000
-boomux launcher invoke editor --workspace boomux
+boomux workspace select boomux
+boomux launcher create editor --cwd . -- zeditor .
+boomux launcher create browser -- firefox http://localhost:3000
+boomux launcher invoke editor
 boomux workspace open boomux
 ```
 

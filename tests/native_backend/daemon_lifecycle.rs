@@ -413,20 +413,81 @@ fn native_daemon_lifecycle() {
     assert_eq!(output["data"]["workspace"]["name"], "cli-test");
     let output = daemon
         .command()
+        .args(["workspace", "select", "cli-test"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Selected workspace cli-test"));
+    let output = daemon
+        .command()
         .args(["workspace", "rename", "cli-test", "cli-renamed"])
         .output()
         .unwrap();
     assert!(output.status.success());
     let output = daemon
         .command()
+        .args(["workspace", "current"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Selected workspace cli-renamed"));
+    let output = daemon
+        .command()
+        .env_remove("BOOMUX_WORKSPACE_ID")
+        .env_remove("BOOMUX_SHELL_ID")
+        .args(["launcher", "create", "selected-launcher", "--cwd"])
+        .arg(std::env::temp_dir())
+        .args(["--", "/bin/true"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "launcher create failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = daemon
+        .command()
+        .env_remove("BOOMUX_WORKSPACE_ID")
+        .env_remove("BOOMUX_SHELL_ID")
+        .args(["launcher", "list"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("selected-launcher"));
+    let output = daemon
+        .command()
+        .env_remove("BOOMUX_WORKSPACE_ID")
+        .env_remove("BOOMUX_SHELL_ID")
+        .args(["schedule", "create", "selected-schedule", "--cwd"])
+        .arg(std::env::temp_dir())
         .args([
-            "shell",
-            "create",
-            "cli-renamed",
-            "--name",
-            "checks",
-            "--cwd",
+            "--integration",
+            "opencode",
+            "--prompt",
+            "selected context",
+            "--daily",
+            "09:00",
         ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "schedule create failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = daemon
+        .command()
+        .env_remove("BOOMUX_WORKSPACE_ID")
+        .env_remove("BOOMUX_SHELL_ID")
+        .args(["schedule", "remove", "selected-schedule"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let output = daemon
+        .command()
+        .env_remove("BOOMUX_WORKSPACE_ID")
+        .env_remove("BOOMUX_SHELL_ID")
+        .args(["shell", "create", "--name", "checks", "--cwd"])
         .arg(std::env::temp_dir())
         .args(["--", "/bin/sh", "-c", "printf lifecycle"])
         .output()
@@ -447,7 +508,9 @@ fn native_daemon_lifecycle() {
     assert_eq!(cli_workspace.shells[0].status, ShellStatus::Pending);
     let output = daemon
         .command()
-        .args(["shell", "inspect", "checks", "--workspace", "cli-renamed"])
+        .env_remove("BOOMUX_WORKSPACE_ID")
+        .env_remove("BOOMUX_SHELL_ID")
+        .args(["shell", "inspect", "checks"])
         .output()
         .unwrap();
     assert!(output.status.success());
@@ -470,7 +533,9 @@ fn native_daemon_lifecycle() {
     assert!(output["data"]["shell"]["run"].is_null());
     let output = daemon
         .command()
-        .args(["shell", "create", "cli-renamed", "--cwd"])
+        .env_remove("BOOMUX_WORKSPACE_ID")
+        .env_remove("BOOMUX_SHELL_ID")
+        .args(["shell", "create", "--cwd"])
         .arg(std::env::temp_dir())
         .output()
         .unwrap();
@@ -491,20 +556,17 @@ fn native_daemon_lifecycle() {
     assert_eq!(generated.status, ShellStatus::Pending);
     let output = daemon
         .command()
-        .args([
-            "shell",
-            "rename",
-            "checks",
-            "tests",
-            "--workspace",
-            "cli-renamed",
-        ])
+        .env_remove("BOOMUX_WORKSPACE_ID")
+        .env_remove("BOOMUX_SHELL_ID")
+        .args(["shell", "rename", "checks", "tests"])
         .output()
         .unwrap();
     assert!(output.status.success());
     let output = daemon
         .command()
-        .args(["shell", "close", "tests", "--workspace", "cli-renamed"])
+        .env_remove("BOOMUX_WORKSPACE_ID")
+        .env_remove("BOOMUX_SHELL_ID")
+        .args(["shell", "close", "tests"])
         .output()
         .unwrap();
     assert!(output.status.success());
@@ -514,6 +576,67 @@ fn native_daemon_lifecycle() {
         .output()
         .unwrap();
     assert!(output.status.success());
+    let output = daemon
+        .command()
+        .args(["workspace", "current"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no longer exists"));
+    let output = daemon
+        .command()
+        .args(["workspace", "create", "exact-context"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let output = daemon
+        .command()
+        .env_remove("BOOMUX_WORKSPACE_ID")
+        .env_remove("BOOMUX_SHELL_ID")
+        .args([
+            "shell",
+            "create",
+            "exact-context",
+            "--name",
+            "exact-shell",
+            "--cwd",
+        ])
+        .arg(std::env::temp_dir())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let exact_shell_id = daemon
+        .client
+        .snapshot()
+        .unwrap()
+        .workspaces
+        .into_iter()
+        .find(|workspace| workspace.name == "exact-context")
+        .unwrap()
+        .shells[0]
+        .id
+        .clone();
+    let output = daemon
+        .command()
+        .env_remove("BOOMUX_WORKSPACE_ID")
+        .env_remove("BOOMUX_SHELL_ID")
+        .args(["shell", "inspect", &exact_shell_id])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let output = daemon
+        .command()
+        .args(["workspace", "close", "exact-context"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let output = daemon
+        .command()
+        .args(["workspace", "clear"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Cleared selected workspace"));
 
     let generated_shell = daemon
         .client

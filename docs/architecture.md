@@ -37,6 +37,7 @@
 | `src/process_adapter.rs` | Exact-argv child supervision and fail-open process-bound Agent observation |
 | `src/scheduling.rs` | Bounded canonical cron parsing and occurrence evaluation, IANA timezone and DST policy, prompt bounds, and schedule identity validation |
 | `src/config.rs` | Layered configuration resolution, bounded validation, and transactional active-layer editing |
+| `src/workspace_selection.rs` | Owner-only local CLI Workspace selection, validation, locking, and atomic persistence |
 | `src/projects.rs`, `src/git.rs` | Bounded project discovery and asynchronous Git metadata |
 | `src/cli_output.rs` | Stable `boomux.cli/v1` output and error presentation |
 | `src/desktop_notifications.rs` | Bounded fail-open desktop and sound delivery |
@@ -261,6 +262,18 @@ per-placement availability. The client then performs the same owner-side open on
 every available placement, using local attachment for the local owner and typed
 Node host services plus Node-qualified attachment for remote owners. Failures are
 reported per Node and do not replay an ambiguous launcher invocation.
+
+On protocol 38 or newer, the CLI may persist one selected coordinator Workspace ID in
+`$XDG_STATE_HOME/boomux/selected-workspace.json`. This is local user preference
+state; Node-local owner Workspace IDs are rejected. It is not coordinator
+metadata, Node-owned runtime state, or a default
+placement. Context-required commands resolve an explicit workspace first, then
+the current managed Workspace, then the selected ID. A selected global
+Workspace is mapped through a fresh combined snapshot to its exact local owner
+Workspace for local name resolution. Creation still independently requires a
+sole eligible Node or `--node`; cached remote state never authorizes mutation.
+Exact resource IDs remain context-free, and omitted list filters retain their
+existing all-workspaces meaning.
 
 ### Configuration
 
