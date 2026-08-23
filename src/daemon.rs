@@ -18363,14 +18363,7 @@ impl ShellRuntimeManager {
         } else {
             let mut controller = lock(&runtime.controller)?;
             if let Some(previous) = controller.take() {
-                let (written, _) = mpsc::sync_channel(1);
-                if previous
-                    .output
-                    .try_send(ControllerOutput::Reconnect(written))
-                    .is_err()
-                {
-                    let _ = previous.connection.shutdown(std::net::Shutdown::Both);
-                }
+                drop(previous);
             }
             if takeover {
                 Self::displace_collaborators(&runtime)?;

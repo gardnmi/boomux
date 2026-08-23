@@ -26,7 +26,7 @@ may submit serialized whole input frames. The primary remains sole PTY resize
 authority; browser viewport changes do not alter its logical grid and browser
 resize frames are ignored. Browser background or closure releases only that
 collaborator without stopping the Agent or displacing the native terminal.
-Explicit ordinary takeover reconnects the prior primary and detaches every
+Explicit ordinary takeover detaches the prior primary and every
 collaborator. Daemon graceful replacement quiesces every participant through the
 existing reconnect boundary and each browser reacquires only the same exact
 ShellRun.

@@ -422,13 +422,11 @@ ordinary shells do not receive synthetic escape input. Child mode changes are
 tracked across output chunks and reconstruction while Boomux keeps physical
 reporting enabled. Each focus gain is also reported through the
 participant-authorized attach stream. RAII cleanup restores terminal and
-focus-reporting modes when the attachment exits. Explicit takeover sends the
-existing reconnect boundary to the displaced controller. Its automatic
-reacquisition never requests takeover; a `busy` response means the new attachment
-still owns control, so the native client waits without displacing it and
-reconstructs terminal state when control becomes available. Other transport
-failures retain the bounded reconnect deadline, and an exact-run change remains
-permanent.
+focus-reporting modes when the attachment exits. Explicit takeover detaches the
+displaced controller so only the newly opened native terminal remains. Graceful
+daemon handoff uses the reconnect boundary and reconstructs terminal state after
+the replacement daemon becomes available. Other transport failures retain the
+bounded reconnect deadline, and an exact-run change remains permanent.
 
 The daemon keeps a bounded output queue per active primary and collaborator. PTY
 output fans out without blocking; a slow or disconnected collaborator removes
@@ -436,7 +434,7 @@ only itself, while a slow primary retains the existing primary-disconnect
 behavior. Primary and collaborator input frames are written under one runtime
 serialization boundary so bytes within a frame cannot interleave. Collaborative
 resize is ignored; only the primary can update the PTY and retained terminal
-dimensions. Explicit takeover reconnects the prior primary and detaches all
+dimensions. Explicit takeover detaches the prior primary and all
 collaborators; graceful handoff instead reconnects and awaits every participant.
 The listener admits at most 64 concurrent connection handlers and closes newly
 accepted sockets while that capacity is exhausted. Management responses and
