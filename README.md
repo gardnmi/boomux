@@ -146,6 +146,7 @@ boomux . --name my-project --new -- sh -lc 'cargo test | tee test.log'
 | Suggest an unused shell name | `boomux shell suggest-name feature-x` |
 | Add a randomly named shell | `boomux shell create feature-x` |
 | Add and open a randomly named shell | `boomux shell create feature-x --open` |
+| Close the most recently focused Boomux terminal | `boomux close --focused` |
 | Open the new shell in another terminal | `boomux . --name feature-x --new` |
 | Run one command | `boomux . --name feature-x --new -- lazygit` |
 | Choose a terminal | `boomux . --terminal Alacritty.desktop` |

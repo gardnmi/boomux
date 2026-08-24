@@ -515,5 +515,43 @@ fn two_daemon_remote_attachment_keeps_environment_and_runtime_on_owner() {
     );
     assert!(crate::support::process_exists(pid));
 
+    AttachFrame::FocusGained
+        .write_to(&mut after_remote_handoff.stream)
+        .unwrap();
+    wait_until(
+        || {
+            local
+                .client
+                .combined_node_snapshot(None)
+                .ok()
+                .and_then(|snapshot| snapshot.focused_terminal)
+                .is_some_and(|focused| {
+                    focused.shell == QualifiedIdentity::new(&remote_node, &shell.id)
+                })
+        },
+        "remote Shell did not regain presented focus before close",
+    );
+    let focused_close = local
+        .command()
+        .env(
+            "PATH",
+            format!("{}:/usr/bin:/bin", local.runtime_dir.display()),
+        )
+        .env_remove("BOOMUX_SHELL_ID")
+        .env_remove("BOOMUX_WORKSPACE_ID")
+        .args(["close", "--focused"])
+        .output()
+        .unwrap();
+    assert!(
+        focused_close.status.success(),
+        "focused remote close failed: {}",
+        String::from_utf8_lossy(&focused_close.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&focused_close.stdout)
+            .contains("Closed focused shell remote-shell from remote-workspace")
+    );
+    assert!(remote.client.get_shell(&shell.id).is_err());
+
     remote.stop_with_cli();
 }
