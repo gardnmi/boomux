@@ -392,8 +392,10 @@ timed work even when the daemon still answers other requests.
 
 Exact shell IDs are global only within one Node. Shell names resolve in the current workspace,
 or through `--workspace` for `shell inspect`, `shell rename`, and `shell close`.
-`boomux read` and top-level `boomux close` require an exact shell ID outside a
-managed shell. If a name remains ambiguous, ask the user to select a target.
+`boomux read` and targeted top-level `boomux close` require an exact shell ID
+outside a managed shell. `boomux close --focused` instead resolves the most
+recently focused Boomux terminal, which can remain selected while a non-Boomux
+window is active. If a name remains ambiguous, ask the user to select a target.
 
 Shell status meanings:
 
@@ -780,7 +782,13 @@ The contextual close shorthand is:
 
 ```console
 boomux close "<shell-name-or-shell-id>"
+boomux close --focused
 ```
+
+Focused close revalidates the exact Shell and routes a remote focused Shell to
+its owning Node. It requires daemon protocol 39, fails when no Boomux terminal
+has reported focus, and never allows a managed Shell to close itself from inside
+that Shell.
 
 ## Open Shells
 

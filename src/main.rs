@@ -431,8 +431,14 @@ enum Commands {
         #[arg(long, default_value_t = 0)]
         wait_ms: u32,
     },
-    /// Close a shell by name or shell ID
-    Close { target: String },
+    /// Close a shell by name, shell ID, or latest focused Boomux terminal
+    Close {
+        #[arg(required_unless_present = "focused", conflicts_with = "focused")]
+        target: Option<String>,
+        /// Close the most recently focused Boomux terminal
+        #[arg(long)]
+        focused: bool,
+    },
     /// Inspect and edit layered Boomux configuration
     Config {
         #[command(subcommand)]
@@ -2115,7 +2121,13 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
             limit,
             wait_ms,
         }) => read_events(after.as_deref(), limit, wait_ms, cli.json),
-        Some(Commands::Close { target }) => close_shell(&target),
+        Some(Commands::Close { target, focused }) => {
+            if focused {
+                close_focused_shell()
+            } else {
+                close_shell(target.as_deref().expect("clap requires a close target"))
+            }
+        }
         Some(Commands::Config { command }) => config_command(command),
         Some(Commands::Project {
             command: ProjectCommands::List { node },
@@ -11231,6 +11243,70 @@ fn close_shell(target: &str) -> Result<(), Box<dyn Error>> {
     close_shell_with_workspace(&client, target, None)
 }
 
+fn close_focused_shell() -> Result<(), Box<dyn Error>> {
+    let client = client::connect_or_start()?;
+    let message = close_focused_shell_with_client(&client).map_err(io::Error::other)?;
+    println!("{message}");
+    Ok(())
+}
+
+fn close_focused_shell_with_client(client: &client::Client) -> Result<String, String> {
+    if !client
+        .supports(protocol::ProtocolFeature::QualifiedFocusedTerminal)
+        .map_err(|error| error.to_string())?
+    {
+        return Err("focused Shell close requires daemon protocol 39 or newer".into());
+    }
+    let combined = client
+        .combined_node_snapshot(None)
+        .map_err(|error| error.to_string())?;
+    let local_node_id = combined
+        .nodes
+        .iter()
+        .find(|node| node.local)
+        .map(|node| node.node_id.clone())
+        .ok_or_else(|| "local Node identity is unavailable".to_owned())?;
+    let identity = combined
+        .focused_terminal
+        .ok_or_else(|| "no Boomux terminal has reported focus; focus one and retry".to_owned())?
+        .shell;
+    let local = identity.node_id == local_node_id;
+    let shell = routed_dashboard_shell(client, &identity, &local_node_id)?;
+    if local && env::var("BOOMUX_SHELL_ID").ok().as_deref() == Some(shell.id.as_str()) {
+        return Err(
+            "cannot close the current shell from inside it; use the dashboard or another shell"
+                .into(),
+        );
+    }
+    let workspace = routed_dashboard_workspace(
+        client,
+        &protocol::QualifiedIdentity::new(&identity.node_id, &shell.workspace_id),
+        &local_node_id,
+    )?;
+    if local {
+        client
+            .close_shell(&shell.id)
+            .map_err(|error| error.to_string())?;
+    } else {
+        match routed_dashboard_operation(
+            client,
+            &identity,
+            &local_node_id,
+            protocol::RoutedOperation::CloseShell {
+                shell_id: shell.id.clone(),
+                expected_revision: shell.revision,
+            },
+        )? {
+            protocol::RoutedOperationResult::Ok => {}
+            _ => return Err("remote Node returned an unexpected shell close response".into()),
+        }
+    }
+    Ok(format!(
+        "Closed focused shell {} from {}",
+        shell.name, workspace.name
+    ))
+}
+
 fn close_shell_with_workspace(
     client: &client::Client,
     target: &str,
@@ -13695,8 +13771,19 @@ mod tests {
             Cli::try_parse_from(["boomux", "close", "tests"])
                 .unwrap()
                 .command,
-            Some(Commands::Close { target }) if target == "tests"
+            Some(Commands::Close { target: Some(target), focused: false }) if target == "tests"
         ));
+        assert!(matches!(
+            Cli::try_parse_from(["boomux", "close", "--focused"])
+                .unwrap()
+                .command,
+            Some(Commands::Close {
+                target: None,
+                focused: true
+            })
+        ));
+        assert!(Cli::try_parse_from(["boomux", "close"]).is_err());
+        assert!(Cli::try_parse_from(["boomux", "close", "tests", "--focused"]).is_err());
     }
 
     #[test]

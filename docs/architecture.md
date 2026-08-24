@@ -563,6 +563,13 @@ frontier. A replaced event stream or a handoff that changes the negotiated
 protocol resets it once. Same-version handoff retains the exact presentation
 frontier, while 39-to-38 and 38-to-39 transitions deliberately start the active
 protocol's revision domain without suppressing later physical focus gains.
+`boomux close --focused` resolves this latest reported Boomux focus, revalidates
+the authoritative Shell, and performs a local close or revision-guarded remote
+close on its owning Node. It requires protocol 39 so resolution always uses a
+Node-qualified identity. It is not an operating-system active-window query: if
+a non-Boomux window is active, the latest retained Boomux focus remains the
+target. The command fails when no focus has been reported and retains the normal
+prohibition against closing the invoking managed Shell from inside itself.
 
 Selected-kind previews remain read-only. Workspace, launcher, and run metadata
 come from the polled snapshot. Shell output uses a bounded plain-text read only

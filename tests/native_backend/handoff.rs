@@ -236,6 +236,75 @@ fn focused_attachment_is_exposed_in_daemon_snapshots() {
 }
 
 #[test]
+fn focused_shell_can_be_closed_from_the_cli() {
+    let mut daemon = TestDaemon::start();
+    let no_focus = daemon
+        .command()
+        .args(["close", "--focused"])
+        .env_remove("BOOMUX_SHELL_ID")
+        .env_remove("BOOMUX_WORKSPACE_ID")
+        .output()
+        .unwrap();
+    assert!(!no_focus.status.success());
+    assert!(String::from_utf8_lossy(&no_focus.stderr).contains("has reported focus"));
+
+    let workspace = daemon
+        .client
+        .create_workspace(
+            "focused-close",
+            vec![ShellSpec::login("shell", std::env::temp_dir())],
+        )
+        .unwrap();
+    let shell_id = workspace.shells[0].id.clone();
+    let mut attachment = daemon.client.attach(&shell_id, false, profile()).unwrap();
+    AttachFrame::FocusGained
+        .write_to(&mut attachment.stream)
+        .unwrap();
+    wait_until(
+        || {
+            daemon
+                .client
+                .focused_terminal()
+                .ok()
+                .flatten()
+                .is_some_and(|focused| focused.shell_id == shell_id)
+        },
+        "daemon did not expose the focused Shell before close",
+    );
+
+    let self_close = daemon
+        .command()
+        .args(["close", "--focused"])
+        .env("BOOMUX_SHELL_ID", &shell_id)
+        .env("BOOMUX_WORKSPACE_ID", &workspace.id)
+        .output()
+        .unwrap();
+    assert!(!self_close.status.success());
+    assert!(String::from_utf8_lossy(&self_close.stderr).contains("cannot close the current shell"));
+    assert!(daemon.client.get_shell(&shell_id).is_ok());
+
+    let close = daemon
+        .command()
+        .args(["close", "--focused"])
+        .env_remove("BOOMUX_SHELL_ID")
+        .env_remove("BOOMUX_WORKSPACE_ID")
+        .output()
+        .unwrap();
+    assert!(
+        close.status.success(),
+        "focused close failed: {}",
+        String::from_utf8_lossy(&close.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&close.stdout)
+            .contains("Closed focused shell shell from focused-close")
+    );
+    assert!(daemon.client.get_shell(&shell_id).is_err());
+    drop(attachment);
+    daemon.stop_with_cli();
+}
+
+#[test]
 fn graceful_restart_preserves_exited_run_and_terminal_state() {
     let mut daemon = TestDaemon::start();
     let workspace = daemon
