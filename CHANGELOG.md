@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.29.0](https://github.com/gardnmi/boomux/compare/v0.28.0...v0.29.0) (2026-08-24)
+
+
+### Features
+
+* **cli:** close focused shell ([#251](https://github.com/gardnmi/boomux/issues/251)) ([7abbe38](https://github.com/gardnmi/boomux/commit/7abbe384ba141cedfe974ea395df90a63a3dc900))
+
 ## [0.28.0](https://github.com/gardnmi/boomux/compare/v0.27.1...v0.28.0) (2026-08-23)
 
 
