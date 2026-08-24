@@ -479,10 +479,13 @@ fn two_daemon_remote_attachment_keeps_environment_and_runtime_on_owner() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    assert_eq!(
-        AttachFrame::read_from(&mut after_handoff.stream).unwrap(),
-        AttachFrame::Reconnect
-    );
+    loop {
+        match AttachFrame::read_from(&mut after_handoff.stream).unwrap() {
+            AttachFrame::Reconnect => break,
+            AttachFrame::Output(_) => {}
+            frame => panic!("expected reconnect after queued output, got {frame:?}"),
+        }
+    }
     AttachFrame::ReconnectAck
         .write_to(&mut after_handoff.stream)
         .unwrap();
