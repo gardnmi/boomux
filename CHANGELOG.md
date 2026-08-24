@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.29.1](https://github.com/gardnmi/boomux/compare/v0.29.0...v0.29.1) (2026-08-24)
+
+
+### Bug Fixes
+
+* **claude:** preserve mise shim dispatch ([#254](https://github.com/gardnmi/boomux/issues/254)) ([e3a8075](https://github.com/gardnmi/boomux/commit/e3a80756f6852c309d834ca8efe2be60efe34d29))
+
 ## [0.29.0](https://github.com/gardnmi/boomux/compare/v0.28.0...v0.29.0) (2026-08-24)
 
 
