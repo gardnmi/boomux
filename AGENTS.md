@@ -29,7 +29,7 @@ Run the same checks as CI:
 ```console
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features --locked -- -D warnings
-cargo test --lib --bins --locked
+cargo test --lib --bins --locked -- --test-threads=1
 cargo test --test native_backend --locked -- --test-threads=1
 bun test integrations/opencode/boomux.test.js integrations/opencode/boomux-tui.test.js integrations/pi/boomux.test.js
 ```

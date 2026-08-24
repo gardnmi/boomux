@@ -33,7 +33,7 @@ jobs:
         run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
       - name: Run Rust unit tests
-        run: cargo test --lib --bins --locked
+        run: cargo test --lib --bins --locked -- --test-threads=1
 
       - name: Run native backend tests
         run: cargo test --test native_backend --locked -- --test-threads=1
