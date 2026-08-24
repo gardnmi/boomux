@@ -952,6 +952,7 @@ pub(crate) enum DashboardEvent {
     PreviewRequested,
     UpdateCheckCompleted,
     OperationCompleted(Result<String, String>),
+    WorkspaceOpened(Result<String, String>),
     WorkspaceSelectionCompleted {
         workspace_id: String,
         result: Result<String, String>,
@@ -3401,6 +3402,10 @@ impl App {
             }
             DashboardEvent::UpdateCheckCompleted => {}
             DashboardEvent::OperationCompleted(result) => {
+                self.message = Some(Message::from_result(result));
+                return vec![DashboardEffect::Refresh];
+            }
+            DashboardEvent::WorkspaceOpened(result) => {
                 self.message = Some(Message::from_result(result));
                 return vec![DashboardEffect::Refresh];
             }
@@ -10436,6 +10441,42 @@ mod tests {
         let message = app.message.expect("restore message");
         assert_eq!(message.text, "Restored workspace");
         assert!(!message.error);
+    }
+
+    #[test]
+    fn coordinated_workspace_open_keeps_app_active_and_reports_results() {
+        let mut app = app();
+        app.workspaces[0].coordination = WorkspaceCoordinationView::Global {
+            revision: 7,
+            closing: false,
+            placements: Vec::new(),
+        };
+        assert_eq!(
+            app.restore_selected(),
+            Some(DashboardEffect::OpenGlobalWorkspace {
+                workspace_id: "w1".into(),
+                expected_revision: 7,
+            })
+        );
+        assert_eq!(
+            app.update(DashboardEvent::WorkspaceOpened(Ok("opened".into()))),
+            vec![DashboardEffect::Refresh]
+        );
+        assert!(
+            app.message
+                .as_ref()
+                .is_some_and(|message| !message.error && message.text == "opened")
+        );
+
+        assert_eq!(
+            app.update(DashboardEvent::WorkspaceOpened(Err("failed".into()))),
+            vec![DashboardEffect::Refresh]
+        );
+        assert!(
+            app.message
+                .as_ref()
+                .is_some_and(|message| message.error && message.text == "failed")
+        );
     }
 
     #[test]

@@ -47,6 +47,16 @@ not appear in `json_commands`, and do not provide remote configuration mutation.
 `config validate` covers the complete global plus optional `BOOMUX_CONFIG`
 layered result without starting the daemon.
 
+`boomux desktop toggle`, `desktop show TARGET`, `desktop next`, `desktop previous`, `desktop terminal`,
+`desktop close`, `desktop pop`, `desktop return`, and `desktop gather` are also
+human-only. They orchestrate optional local Hyprland
+presentation and do not appear in `json_commands`, add a wire request, or expose
+compositor window identities through `boomux.cli/v1`.
+The static `hyprland_special_workspaces`, `contextual_desktop_terminal`,
+`coordinated_shell_desktop_placement`, and `desktop_workspace_show`
+features advertise that the installed CLI contains these human-facing paths;
+they do not claim that Hyprland is running or that the adapter is enabled.
+
 ### Accepted Remote Node Compatibility
 
 Remote Node federation is an incremental extension tracked by #173. Protocol 31

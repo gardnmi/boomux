@@ -72,9 +72,9 @@ terminal handshake, VT reconstruction, and restart-persistence plan.
 ## Desktop Integration
 
 - Restore shells into optional Hyprland layout presets.
-- Place workspace groups on selected Hyprland workspaces or monitors.
+- [x] Present coordinated Workspaces as navigable Hyprland special workspaces.
 - Give each Boomux workspace a consistent border color.
-- Focus an existing terminal attachment instead of opening another window.
+- [x] Reuse existing adapter-opened terminal attachments instead of duplicating them.
 - Offer the dashboard as an optional Hyprland special workspace.
 
 ## Mobile Web Terminal

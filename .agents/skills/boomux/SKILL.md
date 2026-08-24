@@ -495,6 +495,35 @@ are not retained.
 
 ## Create And Enter Workspaces
 
+When the optional local Hyprland special-workspace layer is configured, these
+human-only commands are suitable for desktop keybindings:
+
+```console
+boomux desktop toggle
+boomux desktop show "<workspace-name-or-id>"
+boomux desktop next
+boomux desktop previous
+boomux desktop terminal
+boomux desktop close
+boomux desktop pop
+boomux desktop return
+boomux desktop gather
+```
+
+`toggle` shows or hides the selected coordinated Workspace. `show` targets one
+coordinated Workspace by exact name or ID. While that Boomux
+layer is visible, next/previous cycle coordinated Workspaces; otherwise they
+delegate to ordinary Hyprland workspace navigation. `terminal` creates a Shell
+on the local Node in the visible Boomux Workspace, or opens a normal terminal
+outside the layer. These are local presentation actions, do not support JSON,
+do not invoke Workspace launchers, and do not change remote ownership.
+`close` closes the exact focused Boomux Shell in a visible Boomux layer after
+qualified focus validation, or closes the ordinary active window outside it.
+`pop` floats or tiles the active window without pinning inside a Boomux layer;
+outside the layer it retains ordinary float-and-pin behavior.
+`return` moves the exact active identity-marked terminal back to its unique
+active coordinated Workspace placement without opening or restarting the Shell.
+
 From a fresh host terminal, create a shell for a directory and attach to it:
 
 ```console
@@ -580,6 +609,11 @@ managed terminal selects its owning workspace and shell or Agent row once;
 manual navigation remains until another focus change. Press `Space` to pin the
 current dashboard selection and pause focus following; press it again to unpin
 and catch up to the currently focused terminal.
+With the Hyprland desktop layer enabled, Enter on a coordinated Workspace shows
+its layer while restoring all items; the dashboard remains active in its
+terminal and refreshes for when focus returns. Enter on an Agent or Shell shows
+that same owning layer and opens only the selected terminal. Unavailable
+placement operations are reported as a warning when at least one item restored.
 
 The Nodes view inspects and refreshes registrations, starts guided setup,
 revision-safely renames or retargets routes, and forgets a registration after
@@ -679,6 +713,7 @@ boomux workspace select "<name-or-id>"
 boomux workspace current
 boomux workspace clear
 boomux workspace open "<name-or-id>"
+boomux workspace open "<name-or-id>" --show
 boomux workspace inspect "<name-or-id>"
 boomux workspace rename "<name-or-id>" "<new-name>"
 boomux workspace adopt "<external-workspace-name-or-id>" --node "<node>"
@@ -729,6 +764,9 @@ restarts as a new run. `workspace open OWNER_ID --node NODE` instead addresses
 one owner-local Workspace and requires the exact owner Workspace ID remotely.
 Obtain explicit authorization before opening. A launcher-only Workspace is
 valid, but an empty Workspace cannot be opened.
+For a coordinated Workspace, `--show` reveals its optional desktop layer before
+the restore so terminal and launcher windows are presented there. It cannot be
+combined with `--node`.
 
 ## Manage Workspace Launchers
 
@@ -796,6 +834,7 @@ Open an exact shell ID in a new native terminal window:
 
 ```console
 boomux open "<shell-id>"
+boomux open "<shell-id>" --workspace "<coordinated-workspace>"
 boomux open "<shell-id>" --title "<window-title>"
 boomux open "<shell-id>" --takeover
 boomux open "<exact-shell-id>" --node "<node>"
@@ -807,6 +846,10 @@ the user's consent. Opening an exited shell explicitly restarts its stored
 command as a new run on the same durable shell identity; use `boomux read` when
 the goal is only to inspect retained output. Remote open requires the exact
 Node-local Shell ID plus its owning `--node`; never infer either from a name.
+`--workspace` validates that the Shell belongs to an active placement in the
+named coordinated Workspace. When the Hyprland desktop layer is enabled, it
+shows that Workspace and places or reuses only the requested terminal there;
+it does not invoke launchers or open sibling Shells.
 
 ## Manage The Daemon
 

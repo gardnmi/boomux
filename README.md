@@ -151,6 +151,13 @@ boomux . --name my-project --new -- sh -lc 'cargo test | tee test.log'
 | Run one command | `boomux . --name feature-x --new -- lazygit` |
 | Choose a terminal | `boomux . --terminal Alacritty.desktop` |
 | Open the dashboard | `boomux` or `boomux ui` |
+| Toggle the selected Hyprland Workspace layer | `boomux desktop toggle` |
+| Cycle the visible Boomux Workspace layer | `boomux desktop next` / `boomux desktop previous` |
+| Open a context-sensitive terminal | `boomux desktop terminal` |
+| Permanently close the focused Boomux Shell | `boomux desktop close` |
+| Float or tile a window without losing its Boomux layer | `boomux desktop pop` |
+| Return a moved terminal to its Boomux Workspace | `boomux desktop return` |
+| Gather all terminal windows into a Boomux Workspace | `boomux desktop gather` |
 | Open the mobile dashboard | `boomux web` |
 | Inspect daemon health | `boomux doctor` |
 | Show the writable config file | `boomux config path` |
@@ -189,6 +196,98 @@ later creation can still fail with `already_exists` if another operation claims
 the name first.
 `--terminal` implies `--new`. Terminal selection uses the CLI override, then
 Boomux configuration, then the normal `xdg-terminal-exec` policy.
+
+### Hyprland Workspace Layer
+
+Boomux can optionally present each coordinated Workspace as a named Hyprland
+special workspace. Coordinated Workspace opens, desktop-layer presentation, and
+coordinated `shell create --open` place their local terminal attachments
+together, including local presentation of Shells owned by remote Nodes. The
+special workspace name is derived from the immutable coordinator Workspace ID;
+Boomux names and Hyprland window addresses remain presentation metadata rather
+than resource identity.
+
+Enable the adapter locally:
+
+```toml
+[desktop]
+workspace_layer = "hyprland-special"
+```
+
+The human-only desktop commands are designed for compositor bindings:
+
+```console
+boomux desktop toggle
+boomux desktop show <workspace-name-or-id>
+boomux desktop next
+boomux desktop previous
+boomux desktop terminal
+boomux desktop close
+boomux desktop pop
+boomux desktop return
+boomux desktop gather
+```
+
+`toggle` shows the selected Workspace, restoring its terminal windows only when
+none are already present. `show` targets one exact Workspace by name or ID with
+the same presentation-only restore behavior. While a Boomux special workspace is visible, `next`
+and `previous` switch directly between coordinated Workspaces. Outside that
+layer they preserve ordinary Hyprland next/previous workspace navigation.
+`terminal` creates and opens a Shell on the local Node in the visible Boomux
+Workspace; outside the layer it opens the normally selected terminal. Keep the
+compositor's ordinary close-window binding for `Super+W`; closing a terminal
+window must not permanently close its Boomux Shell. The separate `desktop
+close` command permanently closes the exact focused Boomux Shell while the
+layer is visible and otherwise closes the ordinary active window. Boomux
+validates compositor identity against the daemon's qualified focus and
+Workspace membership before closing a Shell.
+Boomux special Workspaces always use Hyprland's `dwindle` layout without
+changing the layout of ordinary workspaces.
+`pop` floats and centers the active window without pinning it while a Boomux
+layer is visible, so a second invocation tiles it back into that same layer.
+Outside the layer it retains the ordinary float-and-pin behavior.
+`return` resolves the active terminal's exact Node/Shell placement and moves
+that stable window back to its coordinated Boomux Workspace without reopening
+or taking over the Shell. `gather` moves every existing terminal attachment
+back into the visible or selected Boomux Workspace layer and opens attachments
+for missing Shell windows. It does not invoke Workspace launchers.
+`desktop show WORKSPACE` is likewise presentation-only. Use `workspace open
+WORKSPACE --show` to reveal the layer and perform the normal explicit Workspace
+restore, including launchers and every available placement.
+The native TUI follows the same desktop ownership: Enter on a coordinated
+Workspace shows its layer and restores all available items, while Enter on an
+Agent or Shell shows that owning layer and opens only the selected terminal.
+The dashboard remains active in its terminal after desktop focus moves and
+refreshes its model for when focus returns.
+
+On Omarchy, the following user overrides provide a contextual workflow while
+leaving packaged defaults untouched:
+
+```lua
+hl.unbind("SUPER + B")
+hl.unbind("SUPER + TAB")
+hl.unbind("SUPER + SHIFT + TAB")
+hl.unbind("SUPER + RETURN")
+hl.unbind("SUPER + O")
+hl.unbind("SUPER + ALT + B")
+o.bind("SUPER + B", "Toggle Boomux workspace", "boomux desktop toggle")
+o.bind("SUPER + TAB", "Next workspace", "boomux desktop next")
+o.bind("SUPER + SHIFT + TAB", "Previous workspace", "boomux desktop previous")
+o.bind("SUPER + RETURN", "Contextual terminal", "boomux desktop terminal")
+o.bind("SUPER + O", "Pop window contextually", "boomux desktop pop")
+o.bind("SUPER + ALT + B", "Return terminal to Boomux workspace", "boomux desktop return")
+o.bind("SUPER + ALT + R", "Gather Boomux workspace terminals", "boomux desktop gather")
+```
+
+Terminal identity is carried only in the immutable initial window title. Boomux
+queries current Hyprland clients, targets exact ephemeral addresses, and reuses
+an attachment previously opened through this adapter instead of opening another
+window. Desktop-layer presentation does not invoke Workspace launchers. Direct
+Shell opens without `--workspace`, path-opening shorthand, and arbitrary launcher
+windows retain their existing unplaced behavior. The visible terminal title can
+continue changing normally. Missing or incompatible compositor integration never
+changes daemon state or Shell ownership; a terminal already spawned remains open
+when optional placement fails.
 
 ### Workspace Launchers
 
@@ -610,6 +709,9 @@ max_depth = 3
 [dashboard]
 follow_focused_terminal = true
 
+[desktop]
+# workspace_layer = "hyprland-special"
+
 [recovery]
 resume_agents = true
 persist_terminal_history = false
@@ -744,6 +846,7 @@ Use built-in help for the complete, current CLI:
 ```console
 boomux --help
 boomux workspace --help
+boomux desktop --help
 boomux node --help
 boomux shell --help
 boomux launcher --help

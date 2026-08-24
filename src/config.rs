@@ -31,6 +31,9 @@ pub(crate) const CONFIG_TEMPLATE: &str = r#"# Boomux configuration
 [dashboard]
 # follow_focused_terminal = true
 
+[desktop]
+# workspace_layer = "hyprland-special"
+
 [notifications]
 # enabled = false
 # blocked = true
@@ -63,6 +66,7 @@ struct RawConfig {
     projects: Option<RawProjectsConfig>,
     notifications: Option<RawNotificationsConfig>,
     dashboard: Option<RawDashboardConfig>,
+    desktop: Option<RawDesktopConfig>,
     recovery: Option<RawRecoveryConfig>,
     scheduling: Option<RawSchedulingConfig>,
     claude: Option<RawClaudeConfig>,
@@ -104,6 +108,12 @@ struct RawDashboardConfig {
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+struct RawDesktopConfig {
+    workspace_layer: Option<DesktopWorkspaceLayer>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 struct RawRecoveryConfig {
     resume_agents: Option<bool>,
     persist_terminal_history: Option<bool>,
@@ -128,6 +138,7 @@ pub(crate) struct Config {
     pub(crate) path: Option<PathBuf>,
     pub(crate) notifications: boomux::daemon::NotificationDeliverySettings,
     pub(crate) dashboard: DashboardConfig,
+    pub(crate) desktop: DesktopConfig,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -139,6 +150,18 @@ pub(crate) struct ProjectsConfig {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DashboardConfig {
     pub(crate) follow_focused_terminal: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DesktopConfig {
+    pub(crate) workspace_layer: DesktopWorkspaceLayer,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum DesktopWorkspaceLayer {
+    Disabled,
+    HyprlandSpecial,
 }
 
 #[derive(Debug)]
@@ -731,6 +754,12 @@ fn merge(base: &mut RawConfig, next: RawConfig) {
             dashboard.follow_focused_terminal = next_dashboard.follow_focused_terminal;
         }
     }
+    if let Some(next_desktop) = next.desktop {
+        let desktop = base.desktop.get_or_insert_default();
+        if next_desktop.workspace_layer.is_some() {
+            desktop.workspace_layer = next_desktop.workspace_layer;
+        }
+    }
     if let Some(next_recovery) = next.recovery {
         let recovery = base.recovery.get_or_insert_default();
         if next_recovery.resume_agents.is_some() {
@@ -794,6 +823,13 @@ fn resolve(raw: RawConfig, path: Option<PathBuf>) -> Result<Config, Box<dyn Erro
                 .unwrap_or_default()
                 .follow_focused_terminal
                 .unwrap_or(true),
+        },
+        desktop: DesktopConfig {
+            workspace_layer: raw
+                .desktop
+                .unwrap_or_default()
+                .workspace_layer
+                .unwrap_or(DesktopWorkspaceLayer::Disabled),
         },
     })
 }
@@ -952,6 +988,28 @@ mod tests {
         assert!(config.dashboard.follow_focused_terminal);
         assert_eq!(config.projects.max_depth, 2);
         assert!(toml::from_str::<RawConfig>("[dashboard]\nunknown = true").is_err());
+    }
+
+    #[test]
+    fn desktop_workspace_layer_is_opt_in_and_merges_independently() {
+        let default = resolve(RawConfig::default(), None).expect("resolved default config");
+        assert_eq!(
+            default.desktop.workspace_layer,
+            DesktopWorkspaceLayer::Disabled
+        );
+
+        let mut base: RawConfig = toml::from_str("[projects]\nmax_depth = 2").expect("valid base");
+        let next: RawConfig = toml::from_str("[desktop]\nworkspace_layer = \"hyprland-special\"")
+            .expect("valid override");
+        merge(&mut base, next);
+        let config = resolve(base, None).expect("resolved config");
+        assert_eq!(
+            config.desktop.workspace_layer,
+            DesktopWorkspaceLayer::HyprlandSpecial
+        );
+        assert_eq!(config.projects.max_depth, 2);
+        assert!(toml::from_str::<RawConfig>("[desktop]\nunknown = true").is_err());
+        assert!(toml::from_str::<RawConfig>("[desktop]\nworkspace_layer = \"sway\"").is_err());
     }
 
     #[test]
