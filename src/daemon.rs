@@ -1144,8 +1144,8 @@ fn resolve_executable(
         if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
             return None;
         }
-        let candidate = candidate.canonicalize().ok()?;
-        (Some(&candidate) != current_executable.as_ref()).then_some(candidate)
+        let canonical = candidate.canonicalize().ok()?;
+        (Some(&canonical) != current_executable.as_ref()).then_some(candidate)
     })
 }
 

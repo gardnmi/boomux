@@ -192,24 +192,25 @@ fn bare_kiro_command_selects_v3_without_rewriting_stored_argv() {
 }
 
 #[test]
-fn bare_claude_typed_in_managed_login_shell_uses_remote_control_shim() {
+fn claude_typed_in_managed_login_shell_preserves_dispatch_shim_and_arguments() {
     let mut daemon = TestDaemon::start();
     let bin = daemon.runtime_dir.join("claude-bin");
     let home = daemon.runtime_dir.join("home");
     let output = daemon.runtime_dir.join("typed-claude-argv");
     fs::create_dir(&bin).unwrap();
     fs::create_dir(&home).unwrap();
-    let claude = bin.join("claude");
+    let dispatcher = bin.join("mise");
     fs::write(
-        &claude,
+        &dispatcher,
         format!(
-            "#!/bin/sh\n: > '{}'\nfor arg do printf '%s\\0' \"$arg\" >> '{}'; done\n",
+            "#!/bin/sh\nprintf 'argv0:%s\\0' \"${{0##*/}}\" > '{}'\nfor arg do printf '%s\\0' \"$arg\" >> '{}'; done\n",
             output.display(),
             output.display()
         ),
     )
     .unwrap();
-    fs::set_permissions(&claude, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(&dispatcher, fs::Permissions::from_mode(0o700)).unwrap();
+    std::os::unix::fs::symlink(&dispatcher, bin.join("claude")).unwrap();
     let workspace = daemon
         .client
         .create_workspace(
@@ -243,7 +244,22 @@ fn bare_claude_typed_in_managed_login_shell_uses_remote_control_shim() {
         || fs::read(&output).is_ok(),
         "typed Claude command did not capture argv",
     );
-    assert_eq!(fs::read(output).unwrap(), b"--remote-control\0");
+    assert_eq!(
+        fs::read(&output).unwrap(),
+        b"argv0:claude\0--remote-control\0"
+    );
+    fs::remove_file(&output).unwrap();
+    AttachFrame::Input(b"claude --permission-mode bypassPermissions\n".to_vec())
+        .write_to(&mut attachment.stream)
+        .unwrap();
+    wait_until(
+        || fs::read(&output).is_ok(),
+        "typed Claude arguments did not capture argv",
+    );
+    assert_eq!(
+        fs::read(output).unwrap(),
+        b"argv0:claude\0--permission-mode\0bypassPermissions\0"
+    );
     AttachFrame::Input(b"exit\n".to_vec())
         .write_to(&mut attachment.stream)
         .unwrap();
