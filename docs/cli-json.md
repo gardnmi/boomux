@@ -49,7 +49,7 @@ layered result without starting the daemon.
 
 `boomux desktop toggle`, `desktop show TARGET`, `desktop next`, `desktop previous`, `desktop terminal`,
 `desktop close`, `desktop pop`, `desktop return`, and `desktop gather` are also
-human-only. They orchestrate optional local Hyprland
+human-only. They orchestrate the default local Hyprland
 presentation and do not appear in `json_commands`, add a wire request, or expose
 compositor window identities through `boomux.cli/v1`.
 The static `hyprland_special_workspaces`, `contextual_desktop_terminal`,

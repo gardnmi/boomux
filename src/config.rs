@@ -32,7 +32,7 @@ pub(crate) const CONFIG_TEMPLATE: &str = r#"# Boomux configuration
 # follow_focused_terminal = true
 
 [desktop]
-# workspace_layer = "hyprland-special"
+# workspace_layer = "disabled"
 
 [notifications]
 # enabled = false
@@ -829,7 +829,7 @@ fn resolve(raw: RawConfig, path: Option<PathBuf>) -> Result<Config, Box<dyn Erro
                 .desktop
                 .unwrap_or_default()
                 .workspace_layer
-                .unwrap_or(DesktopWorkspaceLayer::Disabled),
+                .unwrap_or(DesktopWorkspaceLayer::HyprlandSpecial),
         },
     })
 }
@@ -991,21 +991,21 @@ mod tests {
     }
 
     #[test]
-    fn desktop_workspace_layer_is_opt_in_and_merges_independently() {
+    fn desktop_workspace_layer_defaults_on_and_can_be_disabled_independently() {
         let default = resolve(RawConfig::default(), None).expect("resolved default config");
         assert_eq!(
             default.desktop.workspace_layer,
-            DesktopWorkspaceLayer::Disabled
+            DesktopWorkspaceLayer::HyprlandSpecial
         );
 
         let mut base: RawConfig = toml::from_str("[projects]\nmax_depth = 2").expect("valid base");
-        let next: RawConfig = toml::from_str("[desktop]\nworkspace_layer = \"hyprland-special\"")
-            .expect("valid override");
+        let next: RawConfig =
+            toml::from_str("[desktop]\nworkspace_layer = \"disabled\"").expect("valid override");
         merge(&mut base, next);
         let config = resolve(base, None).expect("resolved config");
         assert_eq!(
             config.desktop.workspace_layer,
-            DesktopWorkspaceLayer::HyprlandSpecial
+            DesktopWorkspaceLayer::Disabled
         );
         assert_eq!(config.projects.max_depth, 2);
         assert!(toml::from_str::<RawConfig>("[desktop]\nunknown = true").is_err());

@@ -495,8 +495,8 @@ are not retained.
 
 ## Create And Enter Workspaces
 
-When the optional local Hyprland special-workspace layer is configured, these
-human-only commands are suitable for desktop keybindings:
+The local Hyprland special-Workspace layer defaults on. These human-only
+commands are suitable for desktop keybindings:
 
 ```console
 boomux desktop toggle

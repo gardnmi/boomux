@@ -10,6 +10,15 @@ Ghostty, Alacritty, or another XDG terminal as ordinary native windows.
 Optional integrations show whether supported coding agents are working, blocked,
 idle, or untracked without trying to infer state from quiet terminal output.
 
+<p align="center">
+  <img src="assets/boomux-workspace-side-pane.png" width="32%" alt="Boomux side pane with an active Workspace and Agent">
+  <img src="assets/boomux-side-pane-settings.png" width="32%" alt="Boomux side pane settings">
+  <img src="assets/boomux-side-pane-nodes.png" width="32%" alt="Boomux side pane Node health view">
+</p>
+
+The native dashboard remains available for complete Workspace, Shell, Agent,
+Schedule, and Node management:
+
 ![Boomux Workspaces view showing mixed items and a labeled Agent session preview](assets/dashboard-workspaces.png)
 
 > [!WARNING]
@@ -199,19 +208,20 @@ Boomux configuration, then the normal `xdg-terminal-exec` policy.
 
 ### Hyprland Workspace Layer
 
-Boomux can optionally present each coordinated Workspace as a named Hyprland
-special workspace. Coordinated Workspace opens, desktop-layer presentation, and
+Boomux presents each coordinated Workspace as a named Hyprland special
+workspace by default. Coordinated Workspace opens, desktop-layer presentation, and
 coordinated `shell create --open` place their local terminal attachments
 together, including local presentation of Shells owned by remote Nodes. The
 special workspace name is derived from the immutable coordinator Workspace ID;
 Boomux names and Hyprland window addresses remain presentation metadata rather
 than resource identity.
 
-Enable the adapter locally:
+Disable the adapter locally when Boomux is used outside its Hyprland/Omarchy
+desktop environment:
 
 ```toml
 [desktop]
-workspace_layer = "hyprland-special"
+workspace_layer = "disabled"
 ```
 
 The human-only desktop commands are designed for compositor bindings:
@@ -710,7 +720,7 @@ max_depth = 3
 follow_focused_terminal = true
 
 [desktop]
-# workspace_layer = "hyprland-special"
+# workspace_layer = "disabled"
 
 [recovery]
 resume_agents = true

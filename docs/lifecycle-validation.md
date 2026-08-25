@@ -9,8 +9,8 @@ output, or database recency.
 
 ## 2026-08-24
 
-Hyprland `0.56.2` was live-validated with the opt-in special-Workspace desktop
-adapter and the Omarchy Quattro Boomux bar plugin `0.24.0`. An existing
+Hyprland `0.56.2` was live-validated with the special-Workspace desktop adapter,
+which now defaults on, and the Omarchy Quattro Boomux bar plugin `0.24.0`. An existing
 identity-marked terminal was presented in the coordinator-derived named special
 Workspace while ordinary Workspaces retained the configured `scrolling` layout;
 `hyprctl -j workspaces` reported `tiledLayout: "dwindle"` for the Boomux special

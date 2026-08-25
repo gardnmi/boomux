@@ -24,7 +24,7 @@
 | `src/handoff.rs`, `src/fd_transfer.rs` | Graceful daemon replacement records and Unix descriptor transfer |
 | `src/attach.rs` | Terminal-side raw mode, control frames, live input/output, resize, focus, takeover waiting, and reconnect handling |
 | `src/terminal.rs` | Selection and launch of native terminal windows through `xdg-terminal-exec` |
-| `src/hyprland.rs` | Optional bounded Hyprland client discovery, special-workspace navigation, and exact-address window placement |
+| `src/hyprland.rs` | Bounded Hyprland client discovery, special-workspace navigation, and exact-address window placement |
 | `src/terminal_state.rs` | Shadow VT parsing, bounded reconstruction, logical output, and structured previews |
 | `src/terminal_focus.rs` | Stateful parsing and restoration of child focus-reporting mode |
 | `src/tui.rs` | Dashboard state, interaction, palette, polling, and Ratatui rendering; no direct daemon transport |
@@ -492,7 +492,8 @@ owner's corresponding event remains owner-local and is excluded from reduced
 projection transitions.
 
 Baseline launching requires no emulator-specific adapter or compositor window
-ID. When `desktop.workspace_layer = "hyprland-special"` is enabled, the local
+ID. The local desktop layer defaults to `hyprland-special`; an explicit
+`desktop.workspace_layer = "disabled"` opts out. When enabled, the local
 client decorates initial titles for coordinated Workspace opens, desktop-layer
 presentation, and coordinated create-and-open with exact Node and Shell
 identity. Direct Shell, dashboard Shell/item, path, Session, and Scheduled
