@@ -24,6 +24,7 @@
 | `src/handoff.rs`, `src/fd_transfer.rs` | Graceful daemon replacement records and Unix descriptor transfer |
 | `src/attach.rs` | Terminal-side raw mode, control frames, live input/output, resize, focus, takeover waiting, and reconnect handling |
 | `src/terminal.rs` | Selection and launch of native terminal windows through `xdg-terminal-exec` |
+| `src/hyprland.rs` | Bounded Hyprland client discovery, special-workspace navigation, and exact-address window placement |
 | `src/terminal_state.rs` | Shadow VT parsing, bounded reconstruction, logical output, and structured previews |
 | `src/terminal_focus.rs` | Stateful parsing and restoration of child focus-reporting mode |
 | `src/tui.rs` | Dashboard state, interaction, palette, polling, and Ratatui rendering; no direct daemon transport |
@@ -490,7 +491,71 @@ recording so dashboards refresh the combined view on their next event poll. The
 owner's corresponding event remains owner-local and is excluded from reduced
 projection transitions.
 
-No emulator-specific adapter or compositor window ID is required.
+Baseline launching requires no emulator-specific adapter or compositor window
+ID. The local desktop layer defaults to `hyprland-special`; an explicit
+`desktop.workspace_layer = "disabled"` opts out. When enabled, the local
+client decorates initial titles for coordinated Workspace opens, desktop-layer
+presentation, and coordinated create-and-open with exact Node and Shell
+identity. Direct Shell, dashboard Shell/item, path, Session, and Scheduled
+Execution opens retain baseline launch behavior. `src/hyprland.rs` queries
+bounded `hyprctl` JSON, reuses matching adapter-opened windows, and moves current
+ephemeral window addresses to a special workspace derived from the immutable
+coordinator Workspace ID. It invokes `hyprctl` and
+the resolved terminal through exact argument vectors without `dispatch exec` or
+shell interpolation. Addresses are never persisted, projected, sent to an owner
+Node, or treated as resource identity. Query, correlation, or placement failure
+after spawn is presentation-only and leaves the terminal open.
+Before placement or visibility, the adapter applies an exact runtime Workspace
+rule selecting `dwindle` for that Boomux special Workspace; it never changes the
+global or ordinary-Workspace layout.
+
+The human-only `desktop toggle`, `desktop next`, `desktop previous`, `desktop
+show`, `desktop terminal`, `desktop close`, `desktop pop`, `desktop return`, and
+`desktop gather` commands provide compositor and UI entry points. Exact showing and cycling
+uses active non-closing coordinator Workspaces in deterministic name/ID order;
+outside a Boomux special workspace, next/previous retain ordinary Hyprland
+workspace navigation and terminal retains ordinary `xdg-terminal-exec`
+behavior. Desktop presentation attaches existing Shells but is not a Workspace
+open or restore and does not invoke launchers. No daemon protocol, persistence
+schema, or handoff state represents the desktop layer.
+Navigation dispatches the already-materialized compositor Workspace before
+durably updating the default Workspace selection, and identical selections are
+not rewritten, so selection fsync latency does not delay the visual transition.
+Contextual close uses the active Hyprland window's immutable initial-title
+identity only as correlation. Before lifecycle mutation it requires canonical
+Node/Shell IDs, an exact match with the daemon's qualified focused terminal, and
+active membership in the visible coordinator Workspace, then revalidates the
+captured ephemeral address and Hyprland stable window ID immediately before the
+close. A later focus change cannot retarget the action. It fails closed on an
+identity, window, or membership mismatch; outside the layer it delegates
+ordinary active window closure to Hyprland.
+Contextual pop avoids Hyprland pinning inside a Boomux special Workspace because
+unpinning a tiled window can return it to the underlying ordinary Workspace. It
+uses ordinary float-and-pin behavior outside the Boomux layer.
+Contextual return correlates the active window's stable Node/Shell identity,
+resolves its owner Workspace through the authoritative Node, requires one unique
+active coordinator placement, and moves only that exact window back. It does not
+open, restart, take over, or otherwise mutate the Shell. Return requires the
+exact qualified identity in the immutable initial title and does not fall back
+to matching a mutable human title.
+Desktop gather targets the visible Boomux Workspace, or the selected Workspace
+when none is visible. It moves matching terminal attachments back into that
+layer and opens missing attachments for user-owned Shells without invoking
+Workspace launchers.
+An exact `open --workspace` request validates the Shell's Node-qualified owner
+against an active placement in that coordinated Workspace before presentation.
+With the adapter enabled it shows the owning layer and places only that Shell's
+terminal; no sibling Shell or launcher is opened.
+An explicit coordinated `workspace open --show` reveals the target desktop
+layer before performing normal Workspace restore semantics. It therefore opens
+all user Shell attachments and invokes every launcher exactly as `workspace
+open` does, while keeping the restored presentation in the owning layer.
+The native TUI uses the same presentation for coordinated Workspace restore and
+for individual Agent/Shell opens. A restore with at least one opened or reused
+item reports unavailable placement operations as a nonfatal warning; an attempt
+with no successful item remains an error. The TUI remains active in its terminal
+after desktop focus moves to the revealed Hyprland Workspace, and refreshes its
+model so it is current when the user returns.
 Spawned terminal windows start in independent process sessions with null
 standard streams, so exiting the dashboard cannot close their attachments.
 The internal attachment process restarts an exited shell only after the terminal

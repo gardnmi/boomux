@@ -7,6 +7,64 @@ This record separates observed host behavior from reducer fixtures and intended
 semantics. Host compatibility is not inferred from process names, terminal
 output, or database recency.
 
+## 2026-08-24
+
+Hyprland `0.56.2` was live-validated with the special-Workspace desktop adapter,
+which now defaults on, and the Omarchy Quattro Boomux bar plugin `0.24.0`. An existing
+identity-marked terminal was presented in the coordinator-derived named special
+Workspace while ordinary Workspaces retained the configured `scrolling` layout;
+`hyprctl -j workspaces` reported `tiledLayout: "dwindle"` for the Boomux special
+Workspace. Hyprland accepted the exact runtime `hl.workspace_rule` expression,
+reported the focused monitor's special Workspace identity, and loaded the
+contextual keybindings without configuration errors.
+
+A disposable local Shell was then created through `boomux desktop terminal`.
+Hyprland reported its exact initial-title Node/Shell identity and stable window
+ID in the Boomux special Workspace, and `boomux desktop close` removed that
+exact focused Shell. Repository coverage additionally validates delayed
+concurrent window correlation, stale launch-token cleanup, canonical identity
+parsing, exact-window close revalidation, singleton cycling, and launcher-free
+desktop presentation. Multi-monitor bar placement and remote contextual close
+remain test evidence rather than live validation.
+
+The same stable terminal window was moved from its Boomux special Workspace to
+ordinary Workspace 2, then returned with `boomux desktop return`. Hyprland
+reported the unchanged address, stable window ID, initial-title identity, and
+coordinator-derived special Workspace after the move; no terminal or Shell was
+created, opened, restarted, or taken over.
+
+`boomux desktop gather` subsequently placed every available local terminal
+attachment for the selected `boomux` Workspace into its special Workspace and
+reported the unavailable unregistered remote placement as a partial failure.
+The focused `agent_boom` terminal was then moved to ordinary Workspace 2 and
+returned again with its address and stable window ID unchanged. Plugin `0.24.0`
+loaded without QML errors and correlated the active identity-marked terminal
+with its Workspace and Shell models.
+
+From ordinary Workspace 1, an exact Agent Shell open with its coordinated
+Workspace ID showed the owning Boomux special Workspace and reused the existing
+terminal with unchanged address, stable window ID, and PID. No sibling Shell or
+Workspace launcher was opened. The plugin generates this placement-aware open
+only when the CLI advertises `coordinated_shell_desktop_placement`.
+
+From ordinary Workspace 1, `workspace open boomux --show` revealed the
+coordinator-derived special Workspace before attempting every available item.
+The existing `agent_boom` terminal remained in that layer, and the unavailable
+remote placement was reported without suppressing the local restore. Plugin
+`0.24.0` loaded without QML errors; its persistent Workspace and Shell labels
+target the exact grouped Workspace model used by the Workspaces panel.
+
+The rebuilt native TUI was then launched in ordinary Workspace 1. Enter on the
+selected `agent_boom` item revealed its owning `boomux` special Workspace, and
+Enter on the `boomux` Workspace did the same before the full restore attempt.
+Repository coverage verifies that a restored local item plus an unavailable
+remote operation becomes a successful warning message rather than the red
+all-or-nothing error previously rendered in the footer.
+After navigation semantics were enabled, the test TUI window was moved to
+ordinary Workspace 1 and Enter was repeated on `boomux`; Hyprland showed the
+coordinator-derived special Workspace and the TUI window exited, leaving focus
+in the restored Workspace.
+
 ## 2026-08-20
 
 Kiro CLI `2.18.0` was inspected with its opt-in v3 harness (`kiro-cli --v3`).
