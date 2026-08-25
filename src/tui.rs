@@ -860,6 +860,10 @@ pub(crate) enum DashboardEffect {
     CreateWorkspace {
         name: String,
     },
+    CreateProjectWorkspace {
+        name: String,
+        default_cwd: PathBuf,
+    },
     CreateShell(QualifiedIdentity),
     CreateGlobalShell {
         workspace_id: String,
@@ -4442,7 +4446,11 @@ fn handle_mode_key(
             }
             KeyCode::Enter if picker.selected().is_some() => {
                 let project = picker.selected().expect("selected project").clone();
-                app.create_workspace(&project.name)
+                app.mode = Mode::Normal;
+                Some(DashboardEffect::CreateProjectWorkspace {
+                    name: project.name,
+                    default_cwd: project.path,
+                })
             }
             KeyCode::Enter => {
                 app.mode = Mode::PickProject(picker);
@@ -9650,7 +9658,7 @@ mod tests {
     }
 
     #[test]
-    fn project_suggestion_creates_an_empty_workspace_regardless_of_nodes() {
+    fn project_suggestion_preserves_its_local_path_regardless_of_remote_nodes() {
         let mut app = app();
         let mut remote = app.nodes[0].clone();
         remote.id = "remote-node".into();
@@ -9663,8 +9671,9 @@ mod tests {
         }
         assert_eq!(
             handle_mode_key(&mut app, KeyCode::Enter, KeyModifiers::NONE),
-            Some(DashboardEffect::CreateWorkspace {
+            Some(DashboardEffect::CreateProjectWorkspace {
                 name: "alpha".into(),
+                default_cwd: "/tmp/alpha".into(),
             })
         );
         assert!(matches!(app.mode, Mode::Normal));
