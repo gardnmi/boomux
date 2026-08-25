@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.31.1](https://github.com/gardnmi/boomux/compare/v0.31.0...v0.31.1) (2026-08-25)
+
+
+### Bug Fixes
+
+* **kiro:** report stop as idle ([#273](https://github.com/gardnmi/boomux/issues/273)) ([e3fac14](https://github.com/gardnmi/boomux/commit/e3fac14bad9dc9cd1b7528f118c39cdd15e9b1d9))
+
 ## [0.31.0](https://github.com/gardnmi/boomux/compare/v0.30.5...v0.31.0) (2026-08-25)
 
 
