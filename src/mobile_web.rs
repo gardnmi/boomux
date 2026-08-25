@@ -424,10 +424,8 @@ pub(crate) fn run(
         eprintln!("boomux: OpenCode is unavailable; continuing without OpenCode handoffs");
     }
     let opencode_web_url = configuration.public_url.map(Arc::from);
-    let opencode_runtime_hint = opencode_runtime.map(|runtime| OpenCodeRuntimeHint {
-        generation_id: Arc::from(runtime.generation_id),
-        port: runtime.port,
-    });
+    let opencode_runtime_hint =
+        runtime_hint_for_requested_port(configuration.runtime_port, opencode_runtime);
     let combined = client.combined_node_snapshot(None)?;
     let native_web = project_native_web_handoffs(
         &client,
@@ -616,7 +614,7 @@ async fn serve(
         state.client.clone(),
         Arc::clone(&state.presentation),
         state.opencode_web_url.clone(),
-        state.opencode_runtime_hint.clone(),
+        state.opencode_requested_port,
         Arc::clone(&stopping),
     )?;
     println!("Boomux mobile dashboard: http://{address}");
@@ -677,7 +675,7 @@ fn spawn_projection_worker(
     client: Client,
     presentation: Arc<Mutex<PresentationState>>,
     opencode_web_url: Option<Arc<str>>,
-    opencode_runtime_hint: Option<OpenCodeRuntimeHint>,
+    opencode_requested_port: Option<u16>,
     stopping: Arc<AtomicBool>,
 ) -> Result<thread::JoinHandle<()>, Box<dyn Error>> {
     Ok(thread::Builder::new()
@@ -686,6 +684,10 @@ fn spawn_projection_worker(
             while !stopping.load(Ordering::Acquire) {
                 match client.combined_node_snapshot(None) {
                     Ok(combined) => {
+                        let opencode_runtime_hint = runtime_hint_for_requested_port(
+                            opencode_requested_port,
+                            client.get_opencode_shared_runtime().ok().flatten(),
+                        );
                         let native_web = project_native_web_handoffs(
                             &client,
                             &combined,
@@ -717,6 +719,19 @@ fn spawn_projection_worker(
                 }
             }
         })?)
+}
+
+fn runtime_hint_for_requested_port(
+    requested_port: Option<u16>,
+    runtime: Option<OpenCodeSharedRuntimeSnapshot>,
+) -> Option<OpenCodeRuntimeHint> {
+    let requested_port = requested_port?;
+    runtime
+        .filter(|runtime| runtime.port == requested_port)
+        .map(|runtime| OpenCodeRuntimeHint {
+            generation_id: Arc::from(runtime.generation_id),
+            port: runtime.port,
+        })
 }
 
 async fn shutdown_signal(control: Arc<UnixListener>, status: Arc<WebStatus>) {
@@ -2141,6 +2156,31 @@ mod tests {
         let disabled = opencode_web_configuration(4097, None, 4097, true).unwrap();
         assert_eq!(disabled.runtime_port, None);
         assert!(opencode_web_configuration(4097, None, 4097, false).is_err());
+    }
+
+    #[test]
+    fn projection_runtime_hint_tracks_authoritative_generation_on_the_requested_port() {
+        let runtime = |generation: &str, port| OpenCodeSharedRuntimeSnapshot {
+            generation_id: generation.into(),
+            url: format!("http://127.0.0.1:{port}"),
+            port,
+            pid: Some(42),
+        };
+
+        let first =
+            runtime_hint_for_requested_port(Some(4097), Some(runtime("first", 4097))).unwrap();
+        let replacement =
+            runtime_hint_for_requested_port(Some(4097), Some(runtime("replacement", 4097)))
+                .unwrap();
+
+        assert_eq!(first.generation_id.as_ref(), "first");
+        assert_eq!(replacement.generation_id.as_ref(), "replacement");
+        assert_eq!(replacement.port, 4097);
+        assert!(
+            runtime_hint_for_requested_port(Some(4097), Some(runtime("wrong", 4098))).is_none()
+        );
+        assert!(runtime_hint_for_requested_port(Some(4097), None).is_none());
+        assert!(runtime_hint_for_requested_port(None, Some(runtime("disabled", 4097))).is_none());
     }
 
     #[test]
