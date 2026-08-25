@@ -1113,6 +1113,44 @@ pub struct BootstrapSession {
     stderr_reader: Option<MasterStderrReader>,
 }
 
+struct TerminalForegroundGuard {
+    terminal: fs::File,
+    original_group: i32,
+}
+
+impl TerminalForegroundGuard {
+    fn acquire(terminal: fs::File, group: i32) -> io::Result<Self> {
+        let original_group = unsafe { libc::tcgetpgrp(terminal.as_raw_fd()) };
+        if original_group == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        set_terminal_foreground(terminal.as_raw_fd(), group)?;
+        Ok(Self {
+            terminal,
+            original_group,
+        })
+    }
+}
+
+impl Drop for TerminalForegroundGuard {
+    fn drop(&mut self) {
+        let _ = set_terminal_foreground(self.terminal.as_raw_fd(), self.original_group);
+    }
+}
+
+fn set_terminal_foreground(fd: i32, group: i32) -> io::Result<()> {
+    unsafe {
+        let previous = libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+        let result = libc::tcsetpgrp(fd, group);
+        libc::signal(libc::SIGTTOU, previous);
+        if result == -1 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SshProbeOutput {
     pub stdout: Vec<u8>,
@@ -1124,6 +1162,8 @@ type BoundedReader = thread::JoinHandle<io::Result<(Vec<u8>, bool)>>;
 trait StderrMirror: Write + AsRawFd + Send {}
 
 impl<T: Write + AsRawFd + Send> StderrMirror for T {}
+
+type InteractiveTerminal = (Option<Box<dyn StderrMirror>>, Option<fs::File>);
 
 #[derive(Debug, Clone, Copy)]
 enum MasterStderrEvent {
@@ -1161,14 +1201,23 @@ impl BootstrapSession {
             .filter(|home| !home.is_empty())
             .map(PathBuf::from)
             .map(|home| home.join(".ssh/config"));
-        let stderr_mirror = match authentication {
-            SshAuthenticationMode::Interactive => Some(Box::new(
-                OpenOptions::new()
-                    .write(true)
-                    .custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK)
-                    .open("/dev/tty")?,
-            ) as Box<dyn StderrMirror>),
-            SshAuthenticationMode::Batch => None,
+        let (stderr_mirror, foreground_terminal) = match authentication {
+            SshAuthenticationMode::Interactive => (
+                Some(Box::new(
+                    OpenOptions::new()
+                        .write(true)
+                        .custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK)
+                        .open("/dev/tty")?,
+                ) as Box<dyn StderrMirror>),
+                Some(
+                    OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .custom_flags(libc::O_CLOEXEC)
+                        .open("/dev/tty")?,
+                ),
+            ),
+            SshAuthenticationMode::Batch => (None, None),
         };
         Self::open_at_with_mirror(
             runtime_directory,
@@ -1177,7 +1226,7 @@ impl BootstrapSession {
             authentication,
             timeout,
             OsStr::new("ssh"),
-            stderr_mirror,
+            (stderr_mirror, foreground_terminal),
         )
     }
 
@@ -1197,7 +1246,7 @@ impl BootstrapSession {
             authentication,
             timeout,
             program,
-            None,
+            (None, None),
         )
     }
 
@@ -1208,8 +1257,9 @@ impl BootstrapSession {
         authentication: SshAuthenticationMode,
         timeout: Duration,
         program: &OsStr,
-        stderr_mirror: Option<Box<dyn StderrMirror>>,
+        interactive_terminal: InteractiveTerminal,
     ) -> io::Result<Self> {
+        let (stderr_mirror, foreground_terminal) = interactive_terminal;
         if timeout.is_zero() || timeout > MAX_PROBE_TIMEOUT {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -1229,8 +1279,12 @@ impl BootstrapSession {
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
         unsafe {
-            command.pre_exec(|| {
-                if libc::setsid() == -1 {
+            command.pre_exec(move || {
+                let result = match authentication {
+                    SshAuthenticationMode::Interactive => libc::setpgid(0, 0),
+                    SshAuthenticationMode::Batch => libc::setsid(),
+                };
+                if result == -1 {
                     Err(io::Error::last_os_error())
                 } else {
                     Ok(())
@@ -1250,6 +1304,17 @@ impl BootstrapSession {
             let _ = fs::remove_dir_all(&directory);
             io::Error::other(format!("child PID overflow: {error}"))
         })?;
+        let _foreground = match foreground_terminal {
+            Some(terminal) => match TerminalForegroundGuard::acquire(terminal, master_pid) {
+                Ok(foreground) => Some(foreground),
+                Err(error) => {
+                    let _ = kill_process_group(master_pid, &mut master);
+                    let _ = fs::remove_dir_all(&directory);
+                    return Err(error);
+                }
+            },
+            None => None,
+        };
         let stderr = match master.stderr.take() {
             Some(stderr) => stderr,
             None => {
@@ -4896,7 +4961,7 @@ mod tests {
                 authentication,
                 Duration::from_secs(2),
                 ssh.as_os_str(),
-                Some(Box::new(mirror)),
+                (Some(Box::new(mirror)), None),
             )
             .unwrap();
 
@@ -4932,7 +4997,7 @@ mod tests {
             SshAuthenticationMode::Batch,
             Duration::from_secs(2),
             ssh.as_os_str(),
-            Some(Box::new(mirror)),
+            (Some(Box::new(mirror)), None),
         )
         .err()
         .expect("the fake master must fail authentication");
@@ -4962,7 +5027,7 @@ mod tests {
             SshAuthenticationMode::Interactive,
             Duration::from_secs(10),
             ssh.as_os_str(),
-            Some(Box::new(mirror)),
+            (Some(Box::new(mirror)), None),
         )
         .err()
         .expect("oversized master stderr must fail");

@@ -117,7 +117,6 @@ pub(crate) fn active_boomux_workspace() -> Result<Option<String>, HyprlandError>
 }
 
 pub(crate) fn toggle_special(workspace_id: &str) -> Result<(), HyprlandError> {
-    apply_workspace_layout(workspace_id)?;
     dispatch(toggle_expression(workspace_id)?)
 }
 
@@ -452,7 +451,7 @@ fn move_window(address: &str, workspace_id: &str) -> Result<(), HyprlandError> {
     dispatch(move_expression(address, workspace_id)?)
 }
 
-fn apply_workspace_layout(workspace_id: &str) -> Result<(), HyprlandError> {
+pub(crate) fn apply_workspace_layout(workspace_id: &str) -> Result<(), HyprlandError> {
     evaluate(layout_expression(workspace_id)?)
 }
 
