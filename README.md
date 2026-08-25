@@ -7,6 +7,12 @@ groups related work into named Workspaces that can span independently
 authoritative Nodes and reopen from one dashboard, while continuing to use
 Ghostty, Alacritty, or another XDG terminal as ordinary native windows.
 
+> [!IMPORTANT]
+> The Omarchy side pane shown below is provided by
+> [omarchy-boomux](https://github.com/gardnmi/omarchy-boomux). Install both
+> projects for that desktop integration. The Boomux CLI and native TUI continue
+> to work without the Omarchy plugin.
+
 Optional integrations show whether supported coding agents are working, blocked,
 idle, or untracked without trying to infer state from quiet terminal output.
 
