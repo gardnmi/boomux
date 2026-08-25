@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.30.0](https://github.com/gardnmi/boomux/compare/v0.29.1...v0.30.0) (2026-08-25)
+
+
+### Features
+
+* **desktop:** add Hyprland workspace presentation ([#257](https://github.com/gardnmi/boomux/issues/257)) ([9e1f7da](https://github.com/gardnmi/boomux/commit/9e1f7daa96ba6fde84cfe6a4f21355db03f103ea))
+
 ## [0.29.1](https://github.com/gardnmi/boomux/compare/v0.29.0...v0.29.1) (2026-08-24)
 
 
