@@ -189,6 +189,10 @@ generation 6 and transfers live holders and their exact Session/Agent
 associations; cold recovery starts with none. Capacity is 256 holders with 16
 Sessions per holder, whose maximal handoff encoding remains below the control
 frame bound.
+Protocol 46 adds `kiro_stop_idle`. Kiro v3 Stop hooks report Idle turn
+completion. Protocol-46 clients downgrade Stop to Unknown when connected to a
+protocol-45 daemon, preserving the original holder-report admission contract.
+The wire shape, durable state, events, and handoff generation are unchanged.
 Remote notification presentation reuses protocol-32 atomic reduced transitions,
 so it does not require a later protocol. Node-cache schema 2 adds bounded local
 at-most-once individual and reconnect-digest claims with an explicit schema-1
@@ -1434,20 +1438,18 @@ children.
 
 Kiro hook `session_id` is the canonical Session identity and ensures the exact
 `(kiro, session, shell, run)` Agent key through its live Launch Holder. Prompt and
-tool events report Working.
-Kiro runs hooks in isolated sub-agent executions, but the standalone SessionStart
-and Stop payloads do not identify whether the event belongs to the root execution.
-Those boundaries therefore report Unknown rather than Idle and cannot produce a
-completion notification. The documented hooks expose no authoritative
-permission-wait, session-inactivity, error, or permanent-completion event, so
-Boomux never derives Blocked, Idle, or Done for Kiro. Exact supervised process
-exit releases its holder; if no other live holder owns that canonical Session,
-Boomux reports Inactive at lifecycle integration authority. Concurrent holders
-for one Session keep it active until the final release. Late hooks from dead
-holders fail closed inside Boomux and remain fail-open to Kiro. If one Kiro
-process switches canonical Sessions without ending the old one, both histories
-remain truthful and cold recovery refuses the resulting ambiguity rather than
-guessing.
+tool events report Working. Kiro v3 documents Stop as the boundary where the
+agent completed its turn and finished responding, so Stop reports Idle for that
+exact Session. Idle is resumable turn completion, not permanent Session
+completion. The documented hooks expose no authoritative permission-wait,
+session-inactivity, error, or permanent-completion event, so Boomux never derives
+Blocked or Done for Kiro. Exact supervised process exit releases its holder; if
+no other live holder owns that canonical Session, Boomux reports Inactive at
+lifecycle integration authority. Concurrent holders for one Session keep it
+active until the final release. Late hooks from dead holders fail closed inside
+Boomux and remain fail-open to Kiro. If one Kiro process switches canonical
+Sessions without ending the old one, both histories remain truthful and cold
+recovery refuses the resulting ambiguity rather than guessing.
 
 Exact resume uses `kiro-cli --v3 chat --resume-id <session-id>`. Scheduled work
 uses `kiro-cli --v3 chat --no-interactive --` with the exact prompt as one argv

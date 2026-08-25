@@ -1,6 +1,6 @@
 # Bind Kiro V3 Hooks To Managed Runs
 
-Status: Accepted
+Status: Accepted; Stop lifecycle semantics superseded by ADR 0009
 
 Kiro CLI v3 supports global standalone hooks whose payload contains the
 canonical `session_id`, but a global hook alone does not establish which Boomux
