@@ -78,6 +78,7 @@ const MAX_CONNECTION_HANDLERS: usize = 64;
 const SHUTDOWN_GRACE: Duration = Duration::from_millis(50);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 const RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
+const KIRO_HOLDER_RECONCILE_INTERVAL: Duration = Duration::from_secs(1);
 const RESTART_TIMEOUT: Duration = Duration::from_secs(10);
 const IO_RETRY_DELAY: Duration = Duration::from_millis(2);
 const OUTPUT_PUBLICATION_INTERVAL: Duration = Duration::from_millis(16);
@@ -337,6 +338,7 @@ pub fn receive_handoff_with_notification_delivery(
             presented_focused_terminal,
             opencode_runtime,
             claude_remote_control_bindings,
+            kiro_launch_holders,
         } => {
             let store = StateStore::from_transferred_lock(state_lock)?;
             let claude_remote_control = notification_settings.claude_remote_control;
@@ -358,6 +360,7 @@ pub fn receive_handoff_with_notification_delivery(
                     presented_focused_terminal: presented_focused_terminal.map(|focused| *focused),
                     opencode_runtime,
                     claude_remote_control_bindings,
+                    kiro_launch_holders,
                 },
                 Some(&mut channel),
                 notification_settings,
@@ -415,6 +418,7 @@ struct TransferredState {
     presented_focused_terminal: Option<QualifiedFocusedTerminalSnapshot>,
     opencode_runtime: Option<handoff::TransferredOpenCodeRuntime>,
     claude_remote_control_bindings: Vec<ClaudeRemoteControlBindingSnapshot>,
+    kiro_launch_holders: Vec<handoff::KiroLaunchHolderManifest>,
 }
 
 fn run_daemon(
@@ -484,6 +488,7 @@ fn run_daemon(
         .opencode
         .import_handoff(transferred.opencode_runtime)?;
     registry.import_claude_remote_control_bindings(transferred.claude_remote_control_bindings)?;
+    registry.import_kiro_launch_holders(transferred.kiro_launch_holders)?;
     if let Some(channel) = committed {
         {
             registry.events.transaction()?.reserve(1)?;
@@ -537,8 +542,13 @@ fn run_daemon(
     let mut handlers: Vec<thread::JoinHandle<()>> = Vec::new();
     let mut handed_off = false;
     let mut last_persistence_retry = Instant::now();
+    let mut last_kiro_reconciliation = Instant::now();
 
     while !shutdown.load(Ordering::Acquire) {
+        if last_kiro_reconciliation.elapsed() >= KIRO_HOLDER_RECONCILE_INTERVAL {
+            let _ = registry.reconcile_dead_kiro_holders();
+            last_kiro_reconciliation = Instant::now();
+        }
         let mut index = 0;
         while index < handlers.len() {
             if handlers[index].is_finished() {
@@ -832,6 +842,125 @@ fn process_environment_value(pid: u32, name: &[u8]) -> io::Result<Option<Vec<u8>
     }))
 }
 
+fn kiro_holder_process_evidence(
+    pid: u32,
+    shell_id: &str,
+    run_id: &str,
+) -> DaemonResult<(u64, bool)> {
+    if pid == 0 {
+        return Err(DaemonError::validation(
+            "Kiro launch holder PID must be nonzero",
+        ));
+    }
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).map_err(|_| {
+        DaemonError::lifecycle(
+            ErrorCode::NotFound,
+            "Kiro launch holder process was not found",
+        )
+    })?;
+    let start_time = process_start_time(&stat).ok_or_else(|| {
+        DaemonError::validation("Kiro launch holder process has invalid start identity")
+    })?;
+    let argv = process_argv(pid).map_err(|_| {
+        DaemonError::lifecycle(
+            ErrorCode::NotFound,
+            "Kiro launch holder argv was not available",
+        )
+    })?;
+    let managed_launcher = argv
+        .windows(2)
+        .any(|arguments| arguments == [b"kiro".as_slice(), b"launch".as_slice()]);
+    let exact_environment = process_has_environment(pid, b"BOOMUX_SHELL_ID", shell_id.as_bytes())
+        .unwrap_or(false)
+        && process_has_environment(pid, b"BOOMUX_RUN_ID", run_id.as_bytes()).unwrap_or(false);
+    if !managed_launcher || !exact_environment {
+        return Err(DaemonError::validation(
+            "Kiro launch holder does not match the managed launcher ShellRun",
+        ));
+    }
+    Ok((
+        start_time,
+        proc_process_group(&stat) == Some(pid as libc::pid_t),
+    ))
+}
+
+fn kiro_holder_is_live(holder: &KiroLaunchHolder) -> bool {
+    fs::read_to_string(format!("/proc/{}/stat", holder.pid))
+        .ok()
+        .and_then(|stat| process_start_time(&stat))
+        == Some(holder.start_time)
+}
+
+fn proc_process_group(stat: &str) -> Option<libc::pid_t> {
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(2)?
+        .parse()
+        .ok()
+}
+
+fn terminate_dead_kiro_holder_group(holder_id: &str, holder: &KiroLaunchHolder) {
+    if !holder.process_group_leader {
+        return;
+    }
+    let group = holder.pid as libc::pid_t;
+    let authorized = fs::read_dir("/proc").is_ok_and(|entries| {
+        entries.filter_map(Result::ok).any(|entry| {
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<u32>().ok())
+            else {
+                return false;
+            };
+            fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|stat| proc_process_group(&stat))
+                == Some(group)
+                && process_has_environment(pid, b"BOOMUX_KIRO_LAUNCH_HOLDER", holder_id.as_bytes())
+                    .unwrap_or(false)
+        })
+    });
+    if authorized {
+        unsafe {
+            libc::kill(-group, libc::SIGTERM);
+            libc::kill(-group, libc::SIGKILL);
+        }
+    }
+}
+
+fn kiro_holder_matches_current_run(
+    state: &DurableState,
+    holder: &KiroLaunchHolder,
+) -> io::Result<bool> {
+    let Some(shell) = state.shells.get(&holder.shell_id) else {
+        return Ok(false);
+    };
+    Ok(matches!(
+        &*lock(&shell.lifecycle)?,
+        ShellLifecycle::Running { run, .. } if run.id == holder.run_id
+    ))
+}
+
+fn prune_dead_kiro_holders(
+    holders: &mut HashMap<String, KiroLaunchHolder>,
+) -> Vec<(String, KiroLaunchHolder)> {
+    let dead = holders
+        .iter()
+        .filter(|(_, holder)| !kiro_holder_is_live(holder))
+        .map(|(id, _)| id.clone())
+        .collect::<Vec<_>>();
+    dead.into_iter()
+        .filter_map(|id| {
+            holders.remove(&id).map(|holder| {
+                terminate_dead_kiro_holder_group(&id, &holder);
+                (id, holder)
+            })
+        })
+        .collect()
+}
+
 fn opencode_process_evidence(pid: u32) -> io::Result<(u64, Vec<u8>, Vec<Vec<u8>>)> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
     let start_time = process_start_time(&stat)
@@ -1070,6 +1199,7 @@ fn sanitize_opencode_shim_environment(environment: &UnixEnvironment) -> UnixEnvi
         b"BOOMUX_REAL_OPENCODE",
         b"BOOMUX_CODEX_RUN_SCOPED",
         b"BOOMUX_KIRO_RUN_SCOPED",
+        b"BOOMUX_KIRO_LAUNCH_HOLDER",
         b"BOOMUX_ORIGINAL_PATH",
         b"BOOMUX_OPENCODE_SHIM_DIR",
         b"BOOMUX_OPENCODE_TUI_CONFIG",
@@ -1409,6 +1539,7 @@ fn launch_replacement(
     notification_settings: Option<NotificationDeliverySettings>,
     startup_environment: Option<UnixEnvironment>,
 ) -> DaemonResult<()> {
+    registry.reconcile_dead_kiro_holders()?;
     let _mutation = lock(&registry.mutation_lock)?;
     registry.ensure_running()?;
     registry.runtimes.begin_stopping();
@@ -1432,6 +1563,7 @@ fn launch_replacement(
         let presented_focused_terminal = registry.runtimes.presented_focused_terminal()?;
         let opencode_runtime = registry.opencode.prepare_handoff()?;
         let claude_remote_control_bindings = registry.export_claude_remote_control_bindings()?;
+        let kiro_launch_holders = registry.export_kiro_launch_holders()?;
         launch_replacement_process(
             listener.as_fd(),
             daemon_lock.as_fd(),
@@ -1446,6 +1578,7 @@ fn launch_replacement(
                 startup_environment,
                 opencode_runtime,
                 claude_remote_control_bindings,
+                kiro_launch_holders,
             },
         )
         .map_err(DaemonError::from)
@@ -1466,6 +1599,7 @@ struct ReplacementOptions {
     startup_environment: Option<UnixEnvironment>,
     opencode_runtime: Option<OutgoingOpenCodeRuntime>,
     claude_remote_control_bindings: Vec<ClaudeRemoteControlBindingSnapshot>,
+    kiro_launch_holders: Vec<handoff::KiroLaunchHolderManifest>,
 }
 
 fn launch_replacement_process(
@@ -1484,6 +1618,7 @@ fn launch_replacement_process(
         startup_environment,
         opencode_runtime,
         claude_remote_control_bindings,
+        kiro_launch_holders,
     } = options;
     let (mut channel, child_channel) = UnixStream::pair()?;
     let child_channel_fd = child_channel.as_raw_fd();
@@ -1541,6 +1676,7 @@ fn launch_replacement_process(
                     .as_ref()
                     .map(|runtime| runtime.manifest.clone()),
                 claude_remote_control_bindings,
+                kiro_launch_holders,
             },
         )?;
         send_descriptor(&channel, listener, handoff::LISTENER_MARKER)?;
@@ -3041,6 +3177,7 @@ struct DaemonService {
     events: EventStream,
     runtimes: ShellRuntimeManager,
     opencode: OpenCodeCoordinator,
+    kiro: KiroLaunchHolders,
     claude_remote_control: ClaudeRemoteControlBindings,
     remote_attachments: RemoteAttachmentManager,
     host_service_previews: Mutex<HashMap<String, HostServicePreview>>,
@@ -3066,6 +3203,48 @@ struct HostServicePreview {
 #[derive(Default)]
 struct ClaudeRemoteControlBindings {
     state: Mutex<HashMap<String, ClaudeRemoteControlBindingSnapshot>>,
+}
+
+#[derive(Default)]
+struct KiroLaunchHolders {
+    state: Mutex<HashMap<String, KiroLaunchHolder>>,
+}
+
+#[derive(Clone)]
+struct KiroLaunchHolder {
+    pid: u32,
+    start_time: u64,
+    process_group_leader: bool,
+    shell_id: String,
+    run_id: String,
+    sessions: HashMap<String, String>,
+}
+
+struct KiroHoldersMutation<'a> {
+    state: MutexGuard<'a, HashMap<String, KiroLaunchHolder>>,
+    previous: Option<HashMap<String, KiroLaunchHolder>>,
+}
+
+impl KiroHoldersMutation<'_> {
+    fn new(state: MutexGuard<'_, HashMap<String, KiroLaunchHolder>>) -> KiroHoldersMutation<'_> {
+        let previous = state.clone();
+        KiroHoldersMutation {
+            state,
+            previous: Some(previous),
+        }
+    }
+
+    fn commit(mut self) {
+        self.previous = None;
+    }
+}
+
+impl Drop for KiroHoldersMutation<'_> {
+    fn drop(&mut self) {
+        if let Some(previous) = self.previous.take() {
+            *self.state = previous;
+        }
+    }
 }
 
 #[derive(Default)]
@@ -7661,6 +7840,7 @@ impl Default for DaemonService {
                 stopping: AtomicBool::new(false),
             },
             opencode: OpenCodeCoordinator::default(),
+            kiro: KiroLaunchHolders::default(),
             claude_remote_control: ClaudeRemoteControlBindings::default(),
             remote_attachments: RemoteAttachmentManager::default(),
             host_service_previews: Mutex::new(HashMap::new()),
@@ -12588,6 +12768,216 @@ impl DaemonService {
         }
     }
 
+    fn acquire_kiro_launch_holder(
+        &self,
+        pid: u32,
+        shell_id: String,
+        run_id: String,
+    ) -> DaemonResult<Response> {
+        validate_id("shell", &shell_id)?;
+        validate_id("run", &run_id)?;
+        Self::validate_current_running_shell(&self.durable, &shell_id, &run_id)?;
+        let (start_time, process_group_leader) =
+            kiro_holder_process_evidence(pid, &shell_id, &run_id)?;
+        let (response, holders) = self.durable_mutation_outcome(|undo| {
+            let state = lock(&self.kiro.state)?;
+            let mut holders = KiroHoldersMutation::new(state);
+            let removed = prune_dead_kiro_holders(&mut holders.state);
+            let events = self.inactivate_released_kiro_sessions(undo, &holders.state, removed)?;
+            if holders.state.len() >= protocol::MAX_KIRO_LAUNCH_HOLDERS {
+                return Err(DaemonError::lifecycle(
+                    ErrorCode::Busy,
+                    "Kiro launch holder capacity is exhausted",
+                ));
+            }
+            Self::validate_current_running_shell(&self.durable, &shell_id, &run_id)?;
+            if kiro_holder_process_evidence(pid, &shell_id, &run_id)?
+                != (start_time, process_group_leader)
+            {
+                return Err(DaemonError::lifecycle(
+                    ErrorCode::NotFound,
+                    "Kiro launch holder process identity changed before acquisition",
+                ));
+            }
+            let holder_id = Uuid::new_v4().to_string();
+            holders.state.insert(
+                holder_id.clone(),
+                KiroLaunchHolder {
+                    pid,
+                    start_time,
+                    process_group_leader,
+                    shell_id,
+                    run_id,
+                    sessions: HashMap::new(),
+                },
+            );
+            let value = (Response::KiroLaunchHolder { holder_id }, holders);
+            if events.is_empty() {
+                Ok(DurableMutation::Unchanged(value))
+            } else {
+                Ok(DurableMutation::Changed(value, events))
+            }
+        })?;
+        holders.commit();
+        Ok(response)
+    }
+
+    fn report_kiro_hook(
+        &self,
+        holder_id: &str,
+        session_id: String,
+        report: AgentReport,
+    ) -> DaemonResult<Response> {
+        validate_uuid(holder_id, "Kiro launch holder ID")?;
+        crate::scheduling::validate_external_session_id(&session_id)
+            .map_err(|error| DaemonError::validation(error.to_string()))?;
+        validate_agent_report(&report)?;
+        if report.authority != AgentAuthority::LifecycleIntegration
+            || !matches!(report.state, AgentState::Unknown | AgentState::Working)
+        {
+            return Err(DaemonError::validation(
+                "Kiro hooks may report only Unknown or Working at lifecycle integration authority",
+            ));
+        }
+        let (response, holders) = self.durable_mutation_outcome(|undo| {
+            let state = lock(&self.kiro.state)?;
+            let mut holders = KiroHoldersMutation::new(state);
+            let removed = prune_dead_kiro_holders(&mut holders.state);
+            let mut events =
+                self.inactivate_released_kiro_sessions(undo, &holders.state, removed)?;
+            let Some(holder) = holders.state.get(holder_id).cloned() else {
+                let error =
+                    DaemonError::lifecycle(ErrorCode::NotFound, "Kiro launch holder is not live");
+                let value = (Err(error), holders);
+                return if events.is_empty() {
+                    Ok(DurableMutation::Unchanged(value))
+                } else {
+                    Ok(DurableMutation::Changed(value, events))
+                };
+            };
+            Self::validate_current_running_shell(&self.durable, &holder.shell_id, &holder.run_id)?;
+            if !holder.sessions.contains_key(&session_id)
+                && holder.sessions.len() >= protocol::MAX_KIRO_HOLDER_SESSIONS
+            {
+                return Err(DaemonError::lifecycle(
+                    ErrorCode::Busy,
+                    "Kiro launch holder Session capacity is exhausted",
+                ));
+            }
+            let spec = AgentRegistrationSpec {
+                name: "Kiro CLI".into(),
+                integration: "kiro".into(),
+                external_session_id: Some(session_id.clone()),
+                report: report.clone(),
+            };
+            let (agent, created, record) =
+                self.durable
+                    .ensure_agent(&holder.shell_id, &holder.run_id, spec)?;
+            if let Some(record) = record {
+                undo.record(record);
+            }
+            if created {
+                events.push(DaemonEventKind::AgentRegistered {
+                    workspace_id: agent.workspace_id.clone(),
+                    shell_id: agent.shell_id.clone(),
+                    agent: agent.clone(),
+                });
+            }
+            holders
+                .state
+                .get_mut(holder_id)
+                .expect("live Kiro holder disappeared while locked")
+                .sessions
+                .insert(session_id, agent.id.clone());
+            let (agent, changed, completed) =
+                self.report_agent_mutation(undo, &agent.id, &holder.run_id, report)?;
+            debug_assert!(!completed);
+            if changed {
+                events.push(DaemonEventKind::AgentStateChanged {
+                    workspace_id: agent.workspace_id.clone(),
+                    shell_id: agent.shell_id.clone(),
+                    agent: agent.clone(),
+                });
+            }
+            let value = (Ok(Response::Agent { agent }), holders);
+            if events.is_empty() {
+                Ok(DurableMutation::Unchanged(value))
+            } else {
+                Ok(DurableMutation::Changed(value, events))
+            }
+        })?;
+        holders.commit();
+        response
+    }
+
+    fn release_kiro_launch_holder(&self, holder_id: &str) -> DaemonResult<Response> {
+        validate_uuid(holder_id, "Kiro launch holder ID")?;
+        let (released, holders) = self.durable_mutation_outcome(|undo| {
+            let state = lock(&self.kiro.state)?;
+            let mut holders = KiroHoldersMutation::new(state);
+            let mut removed = prune_dead_kiro_holders(&mut holders.state);
+            let released = holders.state.remove(holder_id);
+            let found = released.is_some() || removed.iter().any(|(id, _)| id == holder_id);
+            if let Some(holder) = released {
+                removed.push((holder_id.to_owned(), holder));
+            }
+            let events = self.inactivate_released_kiro_sessions(undo, &holders.state, removed)?;
+            let value = (found, holders);
+            if events.is_empty() {
+                Ok(DurableMutation::Unchanged(value))
+            } else {
+                Ok(DurableMutation::Changed(value, events))
+            }
+        })?;
+        holders.commit();
+        Ok(Response::KiroLaunchHolderReleased { released })
+    }
+
+    fn inactivate_released_kiro_sessions(
+        &self,
+        undo: &mut DurableUndoLog,
+        remaining: &HashMap<String, KiroLaunchHolder>,
+        removed: Vec<(String, KiroLaunchHolder)>,
+    ) -> DaemonResult<Vec<DaemonEventKind>> {
+        let mut events = Vec::new();
+        let mut handled = HashSet::new();
+        for (_, holder) in removed {
+            for (session_id, agent_id) in holder.sessions {
+                let key = (
+                    holder.shell_id.clone(),
+                    holder.run_id.clone(),
+                    session_id.clone(),
+                );
+                if !handled.insert(key)
+                    || remaining.values().any(|candidate| {
+                        candidate.shell_id == holder.shell_id
+                            && candidate.run_id == holder.run_id
+                            && candidate.sessions.contains_key(&session_id)
+                    })
+                {
+                    continue;
+                }
+                let report = AgentReport {
+                    state: AgentState::Inactive,
+                    authority: AgentAuthority::LifecycleIntegration,
+                    evidence: "Kiro managed process exited".into(),
+                    confidence: 100,
+                };
+                let (agent, changed, completed) =
+                    self.report_agent_mutation(undo, &agent_id, &holder.run_id, report)?;
+                debug_assert!(!completed);
+                if changed {
+                    events.push(DaemonEventKind::AgentStateChanged {
+                        workspace_id: agent.workspace_id.clone(),
+                        shell_id: agent.shell_id.clone(),
+                        agent,
+                    });
+                }
+            }
+        }
+        Ok(events)
+    }
+
     fn ensure_opencode_session_claim(
         &self,
         generation_id: String,
@@ -12871,7 +13261,7 @@ impl DaemonService {
     ) -> DaemonResult<()> {
         let state = lock(&durable.state)?;
         let shell = state.shells.get(shell_id).ok_or_else(|| {
-            DaemonError::lifecycle(ErrorCode::RunChanged, "OpenCode claim shell does not exist")
+            DaemonError::lifecycle(ErrorCode::RunChanged, "authority shell does not exist")
         })?;
         if matches!(&*lock(&shell.lifecycle)?, ShellLifecycle::Running { run, .. } if run.id == run_id)
         {
@@ -12879,7 +13269,7 @@ impl DaemonService {
         } else {
             Err(DaemonError::lifecycle(
                 ErrorCode::RunChanged,
-                "OpenCode claim does not match the current running ShellRun",
+                "authority does not match the current running ShellRun",
             ))
         }
     }
@@ -13042,6 +13432,105 @@ impl DaemonService {
         Ok(())
     }
 
+    fn reconcile_dead_kiro_holders(&self) -> DaemonResult<()> {
+        if lock(&self.kiro.state)?.is_empty() {
+            return Ok(());
+        }
+        let holders = self.durable_mutation_outcome(|undo| {
+            let state = lock(&self.kiro.state)?;
+            let mut holders = KiroHoldersMutation::new(state);
+            let removed = prune_dead_kiro_holders(&mut holders.state);
+            let events = self.inactivate_released_kiro_sessions(undo, &holders.state, removed)?;
+            if events.is_empty() {
+                Ok(DurableMutation::Unchanged(holders))
+            } else {
+                Ok(DurableMutation::Changed(holders, events))
+            }
+        })?;
+        holders.commit();
+        Ok(())
+    }
+
+    fn export_kiro_launch_holders(&self) -> io::Result<Vec<handoff::KiroLaunchHolderManifest>> {
+        let holders = lock(&self.kiro.state)?;
+        let mut manifests = holders
+            .iter()
+            .map(|(holder_id, holder)| handoff::KiroLaunchHolderManifest {
+                holder_id: holder_id.clone(),
+                pid: holder.pid,
+                start_time: holder.start_time,
+                process_group_leader: holder.process_group_leader,
+                shell_id: holder.shell_id.clone(),
+                run_id: holder.run_id.clone(),
+                sessions: holder
+                    .sessions
+                    .iter()
+                    .map(|(session, agent)| (session.clone(), agent.clone()))
+                    .collect(),
+            })
+            .collect::<Vec<_>>();
+        manifests.sort_by(|left, right| left.holder_id.cmp(&right.holder_id));
+        Ok(manifests)
+    }
+
+    fn import_kiro_launch_holders(
+        &self,
+        transferred: Vec<handoff::KiroLaunchHolderManifest>,
+    ) -> io::Result<()> {
+        let durable = lock(&self.durable.state)?;
+        let mut holders = lock(&self.kiro.state)?;
+        if !holders.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "replacement daemon already has Kiro launch holders",
+            ));
+        }
+        let mut imported = HashMap::with_capacity(transferred.len());
+        for manifest in transferred {
+            let holder = KiroLaunchHolder {
+                pid: manifest.pid,
+                start_time: manifest.start_time,
+                process_group_leader: manifest.process_group_leader,
+                shell_id: manifest.shell_id,
+                run_id: manifest.run_id,
+                sessions: manifest.sessions.into_iter().collect(),
+            };
+            if !kiro_holder_process_evidence(holder.pid, &holder.shell_id, &holder.run_id)
+                .is_ok_and(|evidence| evidence == (holder.start_time, holder.process_group_leader))
+                || !kiro_holder_matches_current_run(&durable, &holder)?
+                || holder.sessions.iter().any(|(session_id, agent_id)| {
+                    durable.agents.get(agent_id).is_none_or(|agent| {
+                        if agent.integration != "kiro"
+                            || agent.external_session_id.as_deref() != Some(session_id)
+                            || agent.shell_id != holder.shell_id
+                            || agent.run_id != holder.run_id
+                        {
+                            return true;
+                        }
+                        match lock(&agent.state) {
+                            Ok(state) => {
+                                state.ended_at_ms.is_some()
+                                    || matches!(
+                                        state.observation.state,
+                                        AgentState::Inactive | AgentState::Done
+                                    )
+                            }
+                            Err(_) => true,
+                        }
+                    })
+                })
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Kiro launch holder handoff authority is no longer valid",
+                ));
+            }
+            imported.insert(manifest.holder_id, holder);
+        }
+        *holders = imported;
+        Ok(())
+    }
+
     fn dispatch(&self, request: Request) -> DaemonResult<Response> {
         let reconcile_combined_snapshot =
             if matches!(&request, Request::GetCombinedNodeSnapshot { .. }) {
@@ -13069,6 +13558,9 @@ impl DaemonService {
             &request,
             Request::RegisterAgent { .. }
                 | Request::EnsureAgent { .. }
+                | Request::AcquireKiroLaunchHolder { .. }
+                | Request::ReportKiroHook { .. }
+                | Request::ReleaseKiroLaunchHolder { .. }
                 | Request::EnsureOpenCodeSessionClaim { .. }
                 | Request::ReportClaimedOpenCodeAgent { .. }
                 | Request::ReportAgent { .. }
@@ -14057,6 +14549,19 @@ impl DaemonService {
                     Ok(DurableMutation::Changed(Response::Agent { agent }, events))
                 }
             }),
+            Request::AcquireKiroLaunchHolder {
+                pid,
+                shell_id,
+                run_id,
+            } => self.acquire_kiro_launch_holder(pid, shell_id, run_id),
+            Request::ReportKiroHook {
+                holder_id,
+                session_id,
+                report,
+            } => self.report_kiro_hook(&holder_id, session_id, report),
+            Request::ReleaseKiroLaunchHolder { holder_id } => {
+                self.release_kiro_launch_holder(&holder_id)
+            }
             Request::EnsureOpenCodeSharedRuntime { port, environment } => {
                 self.ensure_running()?;
                 self.opencode
@@ -14699,6 +15204,7 @@ impl DaemonService {
                 stopping: AtomicBool::new(false),
             },
             opencode: OpenCodeCoordinator::default(),
+            kiro: KiroLaunchHolders::default(),
             claude_remote_control: ClaudeRemoteControlBindings::default(),
             remote_attachments: RemoteAttachmentManager::default(),
             host_service_previews: Mutex::new(HashMap::new()),
@@ -20469,6 +20975,245 @@ mod tests {
         }
     }
 
+    fn kiro_report(state: AgentState) -> AgentReport {
+        AgentReport {
+            state,
+            authority: AgentAuthority::LifecycleIntegration,
+            evidence: "Kiro test hook".into(),
+            confidence: 100,
+        }
+    }
+
+    fn test_kiro_holder(
+        registry: &DaemonService,
+        shell_id: &str,
+        run_id: &str,
+    ) -> (String, StdChild) {
+        let child = Command::new("/bin/sleep")
+            .arg("30")
+            .env("BOOMUX_SHELL_ID", shell_id)
+            .env("BOOMUX_RUN_ID", run_id)
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < deadline
+            && !process_has_environment(pid, b"BOOMUX_RUN_ID", run_id.as_bytes()).unwrap_or(false)
+        {
+            thread::sleep(Duration::from_millis(1));
+        }
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+        let holder_id = Uuid::new_v4().to_string();
+        lock(&registry.kiro.state).unwrap().insert(
+            holder_id.clone(),
+            KiroLaunchHolder {
+                pid,
+                start_time: process_start_time(&stat).unwrap(),
+                process_group_leader: proc_process_group(&stat) == Some(pid as libc::pid_t),
+                shell_id: shell_id.into(),
+                run_id: run_id.into(),
+                sessions: HashMap::new(),
+            },
+        );
+        (holder_id, child)
+    }
+
+    fn report_test_kiro(
+        registry: &DaemonService,
+        holder_id: &str,
+        session_id: &str,
+    ) -> AgentInstanceSnapshot {
+        let Response::Agent { agent } = registry
+            .dispatch(Request::ReportKiroHook {
+                holder_id: holder_id.into(),
+                session_id: session_id.into(),
+                report: kiro_report(AgentState::Working),
+            })
+            .unwrap()
+        else {
+            panic!("expected Kiro Agent");
+        };
+        agent
+    }
+
+    #[test]
+    fn kiro_sequential_processes_inactivate_exact_exited_holder_sessions() {
+        let registry = DaemonService::default();
+        let (_, shell, _) = running_shell(&registry);
+        let run_id = shell.snapshot().unwrap().run.unwrap().id;
+        let (holder_a, mut process_a) = test_kiro_holder(&registry, &shell.id, &run_id);
+        let agent_a = report_test_kiro(&registry, &holder_a, "session-a");
+        assert_eq!(agent_a.observation.state, AgentState::Working);
+
+        process_a.kill().unwrap();
+        process_a.wait().unwrap();
+        let Response::Snapshot { snapshot } = registry.dispatch(Request::Snapshot).unwrap() else {
+            panic!("expected snapshot");
+        };
+        assert_eq!(
+            snapshot.workspaces[0].agents[0].observation.state,
+            AgentState::Working
+        );
+        registry.fail_after_mutation.store(true, Ordering::Release);
+        assert!(registry.reconcile_dead_kiro_holders().is_err());
+        assert_eq!(
+            registry
+                .durable
+                .agent(&agent_a.id)
+                .unwrap()
+                .snapshot()
+                .unwrap()
+                .observation
+                .state,
+            AgentState::Working
+        );
+        assert!(lock(&registry.kiro.state).unwrap().contains_key(&holder_a));
+        registry.reconcile_dead_kiro_holders().unwrap();
+        let Response::Snapshot { snapshot } = registry.dispatch(Request::Snapshot).unwrap() else {
+            panic!("expected snapshot");
+        };
+        let inactive_a = snapshot.workspaces[0]
+            .agents
+            .iter()
+            .find(|agent| agent.id == agent_a.id)
+            .unwrap();
+        assert_eq!(inactive_a.observation.state, AgentState::Inactive);
+        assert!(inactive_a.attention.is_none());
+        assert!(
+            lock(&registry.events.state)
+                .unwrap()
+                .events
+                .iter()
+                .any(|event| {
+                    matches!(
+                        &event.kind,
+                        DaemonEventKind::AgentStateChanged { agent, .. }
+                            if agent.id == agent_a.id
+                                && agent.observation.state == AgentState::Inactive
+                    )
+                })
+        );
+        assert!(
+            registry
+                .dispatch(Request::ReportKiroHook {
+                    holder_id: holder_a.clone(),
+                    session_id: "session-a".into(),
+                    report: kiro_report(AgentState::Working),
+                })
+                .is_err()
+        );
+
+        let (holder_b, mut process_b) = test_kiro_holder(&registry, &shell.id, &run_id);
+        let agent_b = report_test_kiro(&registry, &holder_b, "session-b");
+        let agents = lock(&registry.durable.state)
+            .unwrap()
+            .agents
+            .values()
+            .map(|agent| agent.snapshot().unwrap())
+            .collect::<Vec<_>>();
+        let current = agents
+            .iter()
+            .filter(|agent| {
+                agent.run_id == run_id
+                    && !matches!(
+                        agent.observation.state,
+                        AgentState::Inactive | AgentState::Done
+                    )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0].id, agent_b.id);
+        assert!(
+            agents
+                .iter()
+                .all(|agent| agent.observation.state != AgentState::Done)
+        );
+        process_b.kill().unwrap();
+        process_b.wait().unwrap();
+    }
+
+    #[test]
+    fn kiro_sessions_follow_all_and_only_their_live_holders() {
+        let registry = DaemonService::default();
+        let (_, shell, _) = running_shell(&registry);
+        let run_id = shell.snapshot().unwrap().run.unwrap().id;
+        let (holder_a, mut process_a) = test_kiro_holder(&registry, &shell.id, &run_id);
+        let (holder_b, mut process_b) = test_kiro_holder(&registry, &shell.id, &run_id);
+        let shared = report_test_kiro(&registry, &holder_a, "shared-session");
+        let shared_again = report_test_kiro(&registry, &holder_b, "shared-session");
+        assert_eq!(shared.id, shared_again.id);
+        let separate = report_test_kiro(&registry, &holder_b, "separate-session");
+
+        registry
+            .dispatch(Request::ReleaseKiroLaunchHolder {
+                holder_id: holder_a.clone(),
+            })
+            .unwrap();
+        assert_eq!(
+            registry
+                .durable
+                .agent(&shared.id)
+                .unwrap()
+                .snapshot()
+                .unwrap()
+                .observation
+                .state,
+            AgentState::Working
+        );
+        registry
+            .dispatch(Request::ReleaseKiroLaunchHolder {
+                holder_id: holder_b.clone(),
+            })
+            .unwrap();
+        assert_eq!(
+            registry
+                .durable
+                .agent(&shared.id)
+                .unwrap()
+                .snapshot()
+                .unwrap()
+                .observation
+                .state,
+            AgentState::Inactive
+        );
+        assert_eq!(
+            registry
+                .durable
+                .agent(&separate.id)
+                .unwrap()
+                .snapshot()
+                .unwrap()
+                .observation
+                .state,
+            AgentState::Inactive
+        );
+
+        let (holder_c, mut process_c) = test_kiro_holder(&registry, &shell.id, &run_id);
+        let reactivated = report_test_kiro(&registry, &holder_c, "shared-session");
+        assert_eq!(reactivated.id, shared.id);
+        assert_eq!(reactivated.observation.state, AgentState::Working);
+        registry
+            .dispatch(Request::ReleaseKiroLaunchHolder {
+                holder_id: holder_c,
+            })
+            .unwrap();
+        assert_eq!(
+            registry
+                .durable
+                .agent(&shared.id)
+                .unwrap()
+                .snapshot()
+                .unwrap()
+                .observation
+                .state,
+            AgentState::Inactive
+        );
+        for process in [&mut process_a, &mut process_b, &mut process_c] {
+            process.kill().unwrap();
+            process.wait().unwrap();
+        }
+    }
+
     fn running_shell(
         registry: &DaemonService,
     ) -> (WorkspaceSnapshot, Arc<Shell>, Arc<ShellRuntime>) {
@@ -20878,6 +21623,82 @@ mod tests {
         );
         assert!(lock(&registry.opencode.state).unwrap().claims.is_empty());
         registry.opencode.shutdown().unwrap();
+        shell.kill().unwrap();
+        registry.close_workspace(&workspace.id).unwrap();
+    }
+
+    fn test_kiro_launcher_process(shell_id: &str, run_id: &str) -> StdChild {
+        let child = Command::new("python3")
+            .args(["-c", "import time; time.sleep(30)", "kiro", "launch"])
+            .env("BOOMUX_SHELL_ID", shell_id)
+            .env("BOOMUX_RUN_ID", run_id)
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < deadline
+            && !process_has_environment(child.id(), b"BOOMUX_RUN_ID", run_id.as_bytes())
+                .unwrap_or(false)
+        {
+            thread::sleep(Duration::from_millis(1));
+        }
+        child
+    }
+
+    #[test]
+    fn kiro_holder_acquire_revalidates_run_inside_the_mutation_gate() {
+        let registry = Arc::new(DaemonService::default());
+        let (workspace, shell, runtime) = running_shell(&registry);
+        let run_id = shell.snapshot().unwrap().run.unwrap().id;
+        let mut holder_process = test_kiro_launcher_process(&shell.id, &run_id);
+        let mutation = lock(&registry.mutation_lock).unwrap();
+        let acquiring = Arc::clone(&registry);
+        let shell_id = shell.id.clone();
+        let process_id = holder_process.id();
+        let acquire = thread::spawn(move || {
+            acquiring.dispatch(Request::AcquireKiroLaunchHolder {
+                pid: process_id,
+                shell_id,
+                run_id,
+            })
+        });
+        thread::sleep(Duration::from_millis(20));
+        *lock(&shell.lifecycle).unwrap() = ShellLifecycle::Running {
+            profile: profile(),
+            run: Arc::new(ShellRun::new(2)),
+            runtime,
+        };
+        drop(mutation);
+
+        assert_eq!(
+            acquire.join().unwrap().unwrap_err().wire_code(),
+            ErrorCode::RunChanged
+        );
+        assert!(lock(&registry.kiro.state).unwrap().is_empty());
+        holder_process.kill().unwrap();
+        holder_process.wait().unwrap();
+        shell.kill().unwrap();
+        registry.close_workspace(&workspace.id).unwrap();
+    }
+
+    #[test]
+    fn kiro_handoff_import_rejects_a_noncurrent_shell_run() {
+        let registry = DaemonService::default();
+        let (workspace, shell, runtime) = running_shell(&registry);
+        let run_id = shell.snapshot().unwrap().run.unwrap().id;
+        let (holder_id, mut process) = test_kiro_holder(&registry, &shell.id, &run_id);
+        report_test_kiro(&registry, &holder_id, "handoff-session");
+        let transferred = registry.export_kiro_launch_holders().unwrap();
+        lock(&registry.kiro.state).unwrap().clear();
+        *lock(&shell.lifecycle).unwrap() = ShellLifecycle::Running {
+            profile: profile(),
+            run: Arc::new(ShellRun::new(2)),
+            runtime,
+        };
+
+        assert!(registry.import_kiro_launch_holders(transferred).is_err());
+        assert!(lock(&registry.kiro.state).unwrap().is_empty());
+        process.kill().unwrap();
+        process.wait().unwrap();
         shell.kill().unwrap();
         registry.close_workspace(&workspace.id).unwrap();
     }
@@ -21477,6 +22298,10 @@ mod tests {
         assert_eq!(
             proc_foreground_process_group("123 (shell name) S 1 123 123 34826 456 0"),
             Some(456)
+        );
+        assert_eq!(
+            proc_process_group("123 (shell name) S 1 123 123 34826 456 0"),
+            Some(123)
         );
     }
 

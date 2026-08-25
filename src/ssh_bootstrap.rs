@@ -6389,7 +6389,8 @@ mod tests {
     fn current_published_release_is_selected_without_falling_back_to_stale_assets() {
         let release = select_published_release("x86_64-unknown-linux-gnu").unwrap();
         assert_eq!(release.tag, "v0.30.3");
-        assert_eq!(release.protocol_version, protocol::PROTOCOL_VERSION);
+        assert_eq!(release.protocol_version, 44);
+        assert!(release.protocol_version <= protocol::PROTOCOL_VERSION);
 
         let error = select_published_release("aarch64-unknown-linux-gnu").unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Unsupported);

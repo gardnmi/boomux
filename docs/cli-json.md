@@ -491,6 +491,9 @@ Protocol 44 adds `protocol_44` and `collaborative_exact_run_attachment`. The
 attachment request and terminal profile response are private local protocol
 messages and add no public CLI JSON field, snapshot field, event, or remote Node
 projection field.
+Protocol 45 adds `protocol_45` and `kiro_exact_launch_holders`. Holder acquire,
+hook report, and release are private local protocol messages and add no public
+CLI JSON field, snapshot field, event, or remote Node projection field.
 
 Protocol-38 `workspace create` creates empty coordinator metadata without a
 default Node or cwd. First global `shell create`, `launcher create`, or

@@ -5,7 +5,7 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
-use std::os::unix::process::CommandExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
@@ -28,8 +28,14 @@ const HANDOFF_CHANNEL_FD: RawFd = 198;
 
 #[test]
 fn replacement_bootstrap_rejects_invalid_inherited_descriptor() {
+    let config_home = std::env::temp_dir().join(format!(
+        "boomux-invalid-handoff-config-{}-{}",
+        std::process::id(),
+        Uuid::new_v4()
+    ));
     let output = Command::new(env!("CARGO_BIN_EXE_boomux"))
         .args(["daemon", "receive-handoff", "--channel", "999999"])
+        .env("XDG_CONFIG_HOME", &config_home)
         .output()
         .unwrap();
 
@@ -47,6 +53,7 @@ fn replacement_bootstrap_receives_listener_and_lock_ownership() {
     ));
     let runtime_home = root.join("runtime");
     let state_home = root.join("state");
+    let config_home = root.join("config");
     let runtime_directory = runtime_home.join("boomux");
     let state_directory = state_home.join("boomux");
     fs::create_dir_all(&runtime_directory).unwrap();
@@ -67,9 +74,10 @@ fn replacement_bootstrap_receives_listener_and_lock_ownership() {
         ])
         .env("XDG_RUNTIME_DIR", &runtime_home)
         .env("XDG_STATE_HOME", &state_home)
+        .env("XDG_CONFIG_HOME", &config_home)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
     // The child duplicates its socketpair endpoint to the explicit bootstrap fd
     // immediately before exec and clears close-on-exec on that duplicate.
     unsafe {
@@ -87,7 +95,7 @@ fn replacement_bootstrap_receives_listener_and_lock_ownership() {
 
     parent_channel.set_read_timeout(Some(TIMEOUT)).unwrap();
     parent_channel.set_write_timeout(Some(TIMEOUT)).unwrap();
-    parent_channel.write_all(b"BOOMUXH5").unwrap();
+    parent_channel.write_all(b"BOOMUXH6").unwrap();
     protocol::write_message(
         &mut parent_channel,
         &serde_json::json!({
@@ -105,7 +113,14 @@ fn replacement_bootstrap_receives_listener_and_lock_ownership() {
     send_descriptor(&parent_channel, runtime_lock.as_raw_fd(), 2);
     send_descriptor(&parent_channel, state_lock.as_raw_fd(), 3);
     let mut ready = [0];
-    parent_channel.read_exact(&mut ready).unwrap();
+    if let Err(error) = parent_channel.read_exact(&mut ready) {
+        let output = replacement.wait_with_output().unwrap();
+        panic!(
+            "H6 replacement closed before READY: {error}; status {}; stderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
     assert_eq!(ready, [4]);
 
     drop(listener);
@@ -506,6 +521,136 @@ fn graceful_restart_preserves_opencode_shared_runtime_and_stop_cleans_it_up() {
         || !process_exists(pid),
         "transferred OpenCode runtime survived daemon stop",
     );
+}
+
+#[test]
+fn graceful_restart_transfers_live_kiro_holder_authority_and_rolls_back_safely() {
+    let mut daemon = TestDaemon::start();
+    let kiro_home = daemon.runtime_dir.join("kiro-handoff-home");
+    fs::create_dir_all(kiro_home.join("hooks")).unwrap();
+    fs::write(
+        kiro_home.join("hooks/boomux.json"),
+        include_str!("../../integrations/kiro/boomux.json"),
+    )
+    .unwrap();
+    let kiro = daemon.runtime_dir.join("kiro-handoff-cli");
+    fs::write(
+        &kiro,
+        "#!/bin/sh\nprintf '%s' \"$$\" > \"$KIRO_CHILD_PID\"\nhook() { printf '{\"session_id\":\"handoff-session\",\"hook_event_name\":\"%s\"}' \"$1\" | \"$KIRO_BOOMUX\" kiro hook; }\nhook UserPromptSubmit\nwhile [ ! -e \"$KIRO_PHASE_ONE\" ]; do /bin/sleep 0.02; done\nhook SessionStart\nwhile [ ! -e \"$KIRO_PHASE_TWO\" ]; do /bin/sleep 0.02; done\nhook PreToolUse\nexec /bin/sleep 300\n",
+    )
+    .unwrap();
+    fs::set_permissions(&kiro, fs::Permissions::from_mode(0o700)).unwrap();
+    let workspace = daemon
+        .client
+        .create_workspace(
+            "kiro-holder-handoff",
+            vec![ShellSpec {
+                name: "shell".into(),
+                command: vec!["/bin/sleep".into(), "300".into()],
+                cwd: daemon.runtime_dir.clone(),
+            }],
+        )
+        .unwrap();
+    let shell_id = workspace.shells[0].id.clone();
+    let attachment = daemon.client.attach(&shell_id, false, profile()).unwrap();
+    let run_id = daemon.client.get_shell(&shell_id).unwrap().run.unwrap().id;
+    drop(attachment);
+    let child_pid_path = daemon.runtime_dir.join("kiro-handoff-child-pid");
+    let phase_one = daemon.runtime_dir.join("kiro-handoff-phase-one");
+    let phase_two = daemon.runtime_dir.join("kiro-handoff-phase-two");
+    let mut holder = daemon
+        .command()
+        .args(["kiro", "launch", "--"])
+        .env("KIRO_HOME", &kiro_home)
+        .env("BOOMUX_REAL_KIRO", &kiro)
+        .env("BOOMUX_SHELL_ID", &shell_id)
+        .env("BOOMUX_RUN_ID", &run_id)
+        .env("KIRO_CHILD_PID", &child_pid_path)
+        .env("KIRO_BOOMUX", env!("CARGO_BIN_EXE_boomux"))
+        .env("KIRO_PHASE_ONE", &phase_one)
+        .env("KIRO_PHASE_TWO", &phase_two)
+        .spawn()
+        .unwrap();
+    let holder_pid = holder.id() as libc::pid_t;
+    wait_until(
+        || kiro_agent_state(&daemon, "handoff-session") == Some(AgentState::Working),
+        "initial Kiro holder hook was not authorized",
+    );
+    let child_pid = fs::read_to_string(&child_pid_path)
+        .unwrap()
+        .parse::<libc::pid_t>()
+        .unwrap();
+
+    let state_path = daemon.runtime_dir.join("state/boomux/state.json");
+    let valid_state = fs::read(&state_path).unwrap();
+    fs::write(&state_path, b"invalid Kiro holder handoff state").unwrap();
+    let failed = daemon
+        .command()
+        .args(["daemon", "restart"])
+        .output()
+        .unwrap();
+    assert!(!failed.status.success());
+    fs::write(&state_path, valid_state).unwrap();
+    fs::write(&phase_one, b"").unwrap();
+    wait_until(
+        || kiro_agent_state(&daemon, "handoff-session") == Some(AgentState::Unknown),
+        "failed handoff did not retain old-daemon holder authority",
+    );
+
+    let restart = daemon
+        .command()
+        .args(["daemon", "restart"])
+        .output()
+        .unwrap();
+    assert!(
+        restart.status.success(),
+        "Kiro holder handoff failed: {}",
+        String::from_utf8_lossy(&restart.stderr)
+    );
+    assert!(process_exists(holder_pid));
+    assert!(process_exists(child_pid));
+    fs::write(&phase_two, b"").unwrap();
+    wait_until(
+        || kiro_agent_state(&daemon, "handoff-session") == Some(AgentState::Working),
+        "post-handoff Kiro hook lost holder authority",
+    );
+
+    let baseline = daemon.client.events(None, 256, 0).unwrap().cursor;
+    let event_client = daemon.client.clone();
+    let inactive_event =
+        thread::spawn(move || event_client.events(Some(baseline), 256, 2_000).unwrap());
+    assert_eq!(unsafe { libc::kill(holder_pid, libc::SIGTERM) }, 0);
+    assert_eq!(holder.wait().unwrap().signal(), Some(libc::SIGTERM));
+    assert!(inactive_event.join().unwrap().events.iter().any(|event| {
+        matches!(
+            &event.kind,
+            protocol::DaemonEventKind::AgentStateChanged { agent, .. }
+                if agent.external_session_id.as_deref() == Some("handoff-session")
+                    && agent.observation.state == AgentState::Inactive
+        )
+    }));
+    wait_until(
+        || kiro_agent_state(&daemon, "handoff-session") == Some(AgentState::Inactive),
+        "final transferred Kiro holder release did not become Inactive",
+    );
+    assert!(!process_exists(child_pid));
+    daemon.stop_with_cli();
+}
+
+fn kiro_agent_state(daemon: &TestDaemon, session_id: &str) -> Option<AgentState> {
+    daemon
+        .client
+        .snapshot()
+        .ok()?
+        .workspaces
+        .into_iter()
+        .find_map(|workspace| {
+            workspace.agents.into_iter().find_map(|agent| {
+                (agent.integration == "kiro"
+                    && agent.external_session_id.as_deref() == Some(session_id))
+                .then_some(agent.observation.state)
+            })
+        })
 }
 
 #[test]

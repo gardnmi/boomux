@@ -582,7 +582,7 @@ fn kiro_hidden_launcher_selects_v3_and_preserves_explicit_arguments() {
     let kiro = bin.join("kiro-cli");
     fs::write(
         &kiro,
-        "#!/bin/sh\n: > \"$BOOMUX_KIRO_CAPTURE\"\nfor arg do printf '%s\\0' \"$arg\" >> \"$BOOMUX_KIRO_CAPTURE\"; done\nprintf '%s' \"${BOOMUX_KIRO_RUN_SCOPED-unset}\" > \"$BOOMUX_KIRO_MARKER\"\n",
+        "#!/bin/sh\n: > \"$BOOMUX_KIRO_CAPTURE\"\nfor arg do printf '%s\\0' \"$arg\" >> \"$BOOMUX_KIRO_CAPTURE\"; done\nprintf '%s' \"${BOOMUX_KIRO_LAUNCH_HOLDER-unset}\" > \"$BOOMUX_KIRO_MARKER\"\n",
     )
     .unwrap();
     fs::set_permissions(&kiro, fs::Permissions::from_mode(0o755)).unwrap();
@@ -614,11 +614,11 @@ fn kiro_hidden_launcher_selects_v3_and_preserves_explicit_arguments() {
 
     let (argv, marker) = run(&[], "bare");
     assert_eq!(argv, b"--v3\0");
-    assert_eq!(marker, "1");
+    assert_eq!(marker, "unset");
 
     let (argv, marker) = run(&["--v3", "chat", "two words", "semi;colon"], "v3");
     assert_eq!(argv, b"--v3\0chat\0two words\0semi;colon\0");
-    assert_eq!(marker, "1");
+    assert_eq!(marker, "unset");
 
     let (argv, marker) = run(&["chat", "legacy"], "v2");
     assert_eq!(argv, b"chat\0legacy\0");

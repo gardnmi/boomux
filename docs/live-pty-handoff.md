@@ -43,15 +43,18 @@ The private handoff channel carries a versioned manifest followed by Unix
   supervision state, without Agent Session Claims
 - Bounded Claude Remote Control bindings for exact transferred Agent/ShellRuns,
   without additional descriptors
+- Bounded Kiro Launch Holders with exact PID/start identity and Session/Agent
+  associations, without additional descriptors; import also requires the exact
+  ShellRun and active Kiro Agent associations to remain current
 
 The PTY master is full duplex, so reader and writer duplicates do not need to be
 transferred separately. The replacement cannot inherit Unix parenthood; process
 monitoring and cleanup therefore need an imported-process representation, with
 a Linux pidfd where available.
 
-Bootstrap version 6 starts with the `BOOMUXH6` header, accepts an H5 sender for
-compatibility, and has bounded read/write deadlines. An H5 transfer has no
-Claude Remote Control binding records. The receiver validates the listener path/type,
+Bootstrap version 7 starts with the `BOOMUXH7` header, accepts an H6 sender for
+compatibility, and has bounded read/write deadlines. An H6 transfer has no Kiro
+Launch Holder records. The receiver validates the listener path/type,
 forces nonblocking mode, matches both lock-file inodes, and establishes exclusive
 flock ownership before acknowledging readiness. Explicit abort closes every
 received duplicate without affecting descriptors retained by the old daemon.

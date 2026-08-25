@@ -755,7 +755,7 @@ fn assert_stdin_dispatch_preserves_exact_argv_stdin_eof_and_continuation_identit
         let host = bin.join(executable);
         fs::write(
             &host,
-            "#!/bin/sh\nprintf '%s\\0' \"$@\" > \"$BOOMUX_DISPATCH_ARGV_DIR/$BOOMUX_DISPATCH_CASE\"\nif [ \"$BOOMUX_DISPATCH_READ_STDIN\" = 1 ]; then cat > \"$BOOMUX_DISPATCH_STDIN_DIR/$BOOMUX_DISPATCH_CASE\"; else : > \"$BOOMUX_DISPATCH_STDIN_DIR/$BOOMUX_DISPATCH_CASE\"; fi\nprintf '%s' \"${BOOMUX_SCHEDULE_RUNNER_TOKEN-unset}\" > \"$BOOMUX_DISPATCH_TOKEN_DIR/$BOOMUX_DISPATCH_CASE\"\nprintf '%s' \"${BOOMUX_CODEX_RUN_SCOPED-unset}\" > \"$BOOMUX_DISPATCH_CODEX_MARKER_DIR/$BOOMUX_DISPATCH_CASE\"\nprintf '%s' \"${BOOMUX_KIRO_RUN_SCOPED-unset}\" > \"$BOOMUX_DISPATCH_KIRO_MARKER_DIR/$BOOMUX_DISPATCH_CASE\"\n",
+            "#!/bin/sh\nprintf '%s\\0' \"$@\" > \"$BOOMUX_DISPATCH_ARGV_DIR/$BOOMUX_DISPATCH_CASE\"\nif [ \"$BOOMUX_DISPATCH_READ_STDIN\" = 1 ]; then cat > \"$BOOMUX_DISPATCH_STDIN_DIR/$BOOMUX_DISPATCH_CASE\"; else : > \"$BOOMUX_DISPATCH_STDIN_DIR/$BOOMUX_DISPATCH_CASE\"; fi\nprintf '%s' \"${BOOMUX_SCHEDULE_RUNNER_TOKEN-unset}\" > \"$BOOMUX_DISPATCH_TOKEN_DIR/$BOOMUX_DISPATCH_CASE\"\nprintf '%s' \"${BOOMUX_CODEX_RUN_SCOPED-unset}\" > \"$BOOMUX_DISPATCH_CODEX_MARKER_DIR/$BOOMUX_DISPATCH_CASE\"\nprintf '%s' \"${BOOMUX_KIRO_LAUNCH_HOLDER-unset}\" > \"$BOOMUX_DISPATCH_KIRO_MARKER_DIR/$BOOMUX_DISPATCH_CASE\"\n",
         )
         .unwrap();
         fs::set_permissions(&host, fs::Permissions::from_mode(0o755)).unwrap();
@@ -846,10 +846,13 @@ fn assert_stdin_dispatch_preserves_exact_argv_stdin_eof_and_continuation_identit
         fs::read_to_string(daemon.runtime_dir.join("dispatch-codex-marker/fresh")).unwrap(),
         if integration == "codex" { "1" } else { "unset" }
     );
-    assert_eq!(
-        fs::read_to_string(daemon.runtime_dir.join("dispatch-kiro-marker/fresh")).unwrap(),
-        if integration == "kiro" { "1" } else { "unset" }
-    );
+    let kiro_marker =
+        fs::read_to_string(daemon.runtime_dir.join("dispatch-kiro-marker/fresh")).unwrap();
+    if integration == "kiro" {
+        Uuid::parse_str(&kiro_marker).unwrap();
+    } else {
+        assert_eq!(kiro_marker, "unset");
+    }
 
     let restart = daemon
         .command()
@@ -938,10 +941,13 @@ fn assert_stdin_dispatch_preserves_exact_argv_stdin_eof_and_continuation_identit
         fs::read_to_string(daemon.runtime_dir.join("dispatch-codex-marker/continue")).unwrap(),
         if integration == "codex" { "1" } else { "unset" }
     );
-    assert_eq!(
-        fs::read_to_string(daemon.runtime_dir.join("dispatch-kiro-marker/continue")).unwrap(),
-        if integration == "kiro" { "1" } else { "unset" }
-    );
+    let kiro_marker =
+        fs::read_to_string(daemon.runtime_dir.join("dispatch-kiro-marker/continue")).unwrap();
+    if integration == "kiro" {
+        Uuid::parse_str(&kiro_marker).unwrap();
+    } else {
+        assert_eq!(kiro_marker, "unset");
+    }
     daemon.stop_with_cli();
 }
 

@@ -1547,6 +1547,47 @@ impl Client {
         }
     }
 
+    pub fn acquire_kiro_launch_holder(
+        &self,
+        pid: u32,
+        shell_id: impl Into<String>,
+        run_id: impl Into<String>,
+    ) -> Result<String> {
+        match self.request(Request::AcquireKiroLaunchHolder {
+            pid,
+            shell_id: shell_id.into(),
+            run_id: run_id.into(),
+        })? {
+            Response::KiroLaunchHolder { holder_id } => Ok(holder_id),
+            other => unexpected(other),
+        }
+    }
+
+    pub fn report_kiro_hook(
+        &self,
+        holder_id: impl Into<String>,
+        session_id: impl Into<String>,
+        report: AgentReport,
+    ) -> Result<AgentInstanceSnapshot> {
+        match self.request(Request::ReportKiroHook {
+            holder_id: holder_id.into(),
+            session_id: session_id.into(),
+            report,
+        })? {
+            Response::Agent { agent } => Ok(agent),
+            other => unexpected(other),
+        }
+    }
+
+    pub fn release_kiro_launch_holder(&self, holder_id: impl Into<String>) -> Result<bool> {
+        match self.request(Request::ReleaseKiroLaunchHolder {
+            holder_id: holder_id.into(),
+        })? {
+            Response::KiroLaunchHolderReleased { released } => Ok(released),
+            other => unexpected(other),
+        }
+    }
+
     pub fn ensure_opencode_shared_runtime(
         &self,
         port: u16,
@@ -2268,6 +2309,7 @@ mod tests {
     fn reject_protocol(listener: &UnixListener, attempted: u32, supported: u32) {
         reject_protocol_once(listener, attempted, supported);
         if attempted == protocol::PROTOCOL_VERSION && supported == 41 {
+            reject_protocol_once(listener, 44, supported);
             reject_protocol_once(listener, 43, supported);
             reject_protocol_once(listener, 42, supported);
         }
@@ -2386,6 +2428,7 @@ mod tests {
         let (client_done_sender, client_done_receiver) = mpsc::channel();
         let server = thread::spawn(move || {
             for _ in 0..3 {
+                reject_protocol_once(&listener, 45, 42);
                 reject_protocol_once(&listener, 44, 42);
                 reject_protocol_once(&listener, 43, 42);
                 let (mut stream, _) = listener.accept().unwrap();

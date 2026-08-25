@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 44;
+pub const PROTOCOL_VERSION: u32 = 45;
 pub const MIN_PROTOCOL_VERSION: u32 = 6;
 pub const MAX_CONTROL_FRAME: usize = 8 * 1024 * 1024;
 pub const MAX_ATTACH_FRAME: usize = 1024 * 1024;
@@ -198,6 +198,10 @@ define_protocol_features! {
         "protocol_44",
         "collaborative_exact_run_attachment",
     ]),
+    KiroLaunchHolders => (45, "Kiro exact launch holders", [
+        "protocol_45",
+        "kiro_exact_launch_holders",
+    ]),
 }
 
 pub const DEFAULT_SCHEDULED_EXECUTION_LIST_LIMIT: u16 = 100;
@@ -210,6 +214,9 @@ pub const MAX_HOST_SERVICE_WARNINGS: usize = 64;
 pub const MAX_HOST_SERVICE_SESSIONS: usize = 1_000;
 pub const MAX_CLAUDE_REMOTE_CONTROL_BINDINGS: usize = 4_096;
 pub const MAX_CLAUDE_BRIDGE_SESSION_ID_BYTES: usize = 256;
+pub const MAX_KIRO_LAUNCH_HOLDERS: usize = 256;
+pub const MAX_KIRO_HOLDER_SESSIONS: usize = 16;
+pub const MAX_KIRO_SESSION_ID_BYTES: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -2339,6 +2346,19 @@ pub enum Request {
         run_id: String,
         spec: AgentRegistrationSpec,
     },
+    AcquireKiroLaunchHolder {
+        pid: u32,
+        shell_id: String,
+        run_id: String,
+    },
+    ReportKiroHook {
+        holder_id: String,
+        session_id: String,
+        report: AgentReport,
+    },
+    ReleaseKiroLaunchHolder {
+        holder_id: String,
+    },
     EnsureOpenCodeSharedRuntime {
         port: u16,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2696,6 +2716,9 @@ impl Request {
             | Self::GetClaudeRemoteControlBinding { .. } => {
                 Some(ProtocolFeature::ClaudeRemoteControlBindings)
             }
+            Self::AcquireKiroLaunchHolder { .. }
+            | Self::ReportKiroHook { .. }
+            | Self::ReleaseKiroLaunchHolder { .. } => Some(ProtocolFeature::KiroLaunchHolders),
             Self::GetAgent { .. } | Self::RegisterAgent { .. } | Self::ReportAgent { .. } => {
                 Some(ProtocolFeature::AgentInstances)
             }
@@ -2786,6 +2809,12 @@ pub enum Response {
     },
     Agent {
         agent: AgentInstanceSnapshot,
+    },
+    KiroLaunchHolder {
+        holder_id: String,
+    },
+    KiroLaunchHolderReleased {
+        released: bool,
     },
     OpenCodeSharedRuntime {
         runtime: Option<OpenCodeSharedRuntimeSnapshot>,
@@ -3410,8 +3439,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_forty_four_with_minimum_six() {
-        assert_eq!(PROTOCOL_VERSION, 44);
+    fn protocol_version_is_forty_five_with_minimum_six() {
+        assert_eq!(PROTOCOL_VERSION, 45);
         assert_eq!(MIN_PROTOCOL_VERSION, 6);
     }
 
@@ -3776,6 +3805,54 @@ mod tests {
         );
         assert_eq!(MAX_CLAUDE_REMOTE_CONTROL_BINDINGS, 4_096);
         assert_eq!(MAX_CLAUDE_BRIDGE_SESSION_ID_BYTES, 256);
+    }
+
+    #[test]
+    fn kiro_launch_holder_messages_require_protocol_forty_five() {
+        let report = AgentReport {
+            state: AgentState::Working,
+            authority: AgentAuthority::LifecycleIntegration,
+            evidence: "Kiro processing prompt".into(),
+            confidence: 100,
+        };
+        for request in [
+            Request::AcquireKiroLaunchHolder {
+                pid: 42,
+                shell_id: "shell-1".into(),
+                run_id: "run-1".into(),
+            },
+            Request::ReportKiroHook {
+                holder_id: "holder-1".into(),
+                session_id: "session-1".into(),
+                report,
+            },
+            Request::ReleaseKiroLaunchHolder {
+                holder_id: "holder-1".into(),
+            },
+        ] {
+            let encoded = serde_json::to_value(&request).unwrap();
+            assert_eq!(serde_json::from_value::<Request>(encoded).unwrap(), request);
+            assert_eq!(
+                request.required_feature(),
+                Some(ProtocolFeature::KiroLaunchHolders)
+            );
+            assert_eq!(request.minimum_protocol_version(), 45);
+        }
+        for response in [
+            Response::KiroLaunchHolder {
+                holder_id: "holder-1".into(),
+            },
+            Response::KiroLaunchHolderReleased { released: true },
+        ] {
+            let encoded = serde_json::to_value(&response).unwrap();
+            assert_eq!(
+                serde_json::from_value::<Response>(encoded).unwrap(),
+                response
+            );
+        }
+        assert_eq!(MAX_KIRO_LAUNCH_HOLDERS, 256);
+        assert_eq!(MAX_KIRO_HOLDER_SESSIONS, 16);
+        assert_eq!(MAX_KIRO_SESSION_ID_BYTES, 256);
     }
 
     #[test]
@@ -5092,6 +5169,7 @@ mod tests {
                 44,
                 &["protocol_44", "collaborative_exact_run_attachment"][..],
             ),
+            (45, &["protocol_45", "kiro_exact_launch_holders"][..]),
         ];
 
         let actual = ProtocolFeature::ALL
