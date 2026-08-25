@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 45;
+pub const PROTOCOL_VERSION: u32 = 46;
 pub const MIN_PROTOCOL_VERSION: u32 = 6;
 pub const MAX_CONTROL_FRAME: usize = 8 * 1024 * 1024;
 pub const MAX_ATTACH_FRAME: usize = 1024 * 1024;
@@ -201,6 +201,10 @@ define_protocol_features! {
     KiroLaunchHolders => (45, "Kiro exact launch holders", [
         "protocol_45",
         "kiro_exact_launch_holders",
+    ]),
+    KiroStopIdle => (46, "Kiro Stop idle reporting", [
+        "protocol_46",
+        "kiro_stop_idle",
     ]),
 }
 
@@ -2716,6 +2720,9 @@ impl Request {
             | Self::GetClaudeRemoteControlBinding { .. } => {
                 Some(ProtocolFeature::ClaudeRemoteControlBindings)
             }
+            Self::ReportKiroHook { report, .. } if report.state == AgentState::Idle => {
+                Some(ProtocolFeature::KiroStopIdle)
+            }
             Self::AcquireKiroLaunchHolder { .. }
             | Self::ReportKiroHook { .. }
             | Self::ReleaseKiroLaunchHolder { .. } => Some(ProtocolFeature::KiroLaunchHolders),
@@ -3439,8 +3446,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_forty_five_with_minimum_six() {
-        assert_eq!(PROTOCOL_VERSION, 45);
+    fn protocol_version_is_forty_six_with_minimum_six() {
+        assert_eq!(PROTOCOL_VERSION, 46);
         assert_eq!(MIN_PROTOCOL_VERSION, 6);
     }
 
@@ -3853,6 +3860,27 @@ mod tests {
         assert_eq!(MAX_KIRO_LAUNCH_HOLDERS, 256);
         assert_eq!(MAX_KIRO_HOLDER_SESSIONS, 16);
         assert_eq!(MAX_KIRO_SESSION_ID_BYTES, 256);
+    }
+
+    #[test]
+    fn kiro_stop_idle_requires_protocol_forty_six() {
+        let request = Request::ReportKiroHook {
+            holder_id: "holder-1".into(),
+            session_id: "session-1".into(),
+            report: AgentReport {
+                state: AgentState::Idle,
+                authority: AgentAuthority::LifecycleIntegration,
+                evidence: "Kiro session idle".into(),
+                confidence: 100,
+            },
+        };
+        assert_eq!(
+            request.required_feature(),
+            Some(ProtocolFeature::KiroStopIdle)
+        );
+        assert_eq!(request.minimum_protocol_version(), 46);
+        let encoded = serde_json::to_value(&request).unwrap();
+        assert_eq!(serde_json::from_value::<Request>(encoded).unwrap(), request);
     }
 
     #[test]
@@ -5170,6 +5198,7 @@ mod tests {
                 &["protocol_44", "collaborative_exact_run_attachment"][..],
             ),
             (45, &["protocol_45", "kiro_exact_launch_holders"][..]),
+            (46, &["protocol_46", "kiro_stop_idle"][..]),
         ];
 
         let actual = ProtocolFeature::ALL

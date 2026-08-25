@@ -65,7 +65,7 @@ fn reduce(event: HookEvent) -> LifecycleObservation {
         HookEvent::UserPromptSubmit => (AgentState::Working, "Kiro processing prompt"),
         HookEvent::PreToolUse => (AgentState::Working, "Kiro using tool"),
         HookEvent::PostToolUse => (AgentState::Working, "Kiro tool completed"),
-        HookEvent::Stop => (AgentState::Unknown, "Kiro hook execution stopped"),
+        HookEvent::Stop => (AgentState::Idle, "Kiro session idle"),
     };
     LifecycleObservation { state, evidence }
 }
@@ -83,13 +83,13 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_events_reduce_without_inventing_unsupported_states() {
+    fn lifecycle_events_reduce_to_documented_states() {
         let cases = [
             ("SessionStart", AgentState::Unknown),
             ("UserPromptSubmit", AgentState::Working),
             ("PreToolUse", AgentState::Working),
             ("PostToolUse", AgentState::Working),
-            ("Stop", AgentState::Unknown),
+            ("Stop", AgentState::Idle),
         ];
         for (event, state) in cases {
             let update = update(event);
@@ -97,7 +97,7 @@ mod tests {
             assert_eq!(update.observation.state, state, "{event}");
             assert!(!matches!(
                 update.observation.state,
-                AgentState::Blocked | AgentState::Idle | AgentState::Inactive | AgentState::Done
+                AgentState::Blocked | AgentState::Inactive | AgentState::Done
             ));
         }
     }
@@ -109,7 +109,7 @@ mod tests {
             ("userPromptSubmit", AgentState::Working),
             ("preToolUse", AgentState::Working),
             ("postToolUse", AgentState::Working),
-            ("stop", AgentState::Unknown),
+            ("stop", AgentState::Idle),
         ] {
             assert_eq!(update(event).observation.state, state, "{event}");
         }

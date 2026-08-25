@@ -12833,10 +12833,13 @@ impl DaemonService {
             .map_err(|error| DaemonError::validation(error.to_string()))?;
         validate_agent_report(&report)?;
         if report.authority != AgentAuthority::LifecycleIntegration
-            || !matches!(report.state, AgentState::Unknown | AgentState::Working)
+            || !matches!(
+                report.state,
+                AgentState::Unknown | AgentState::Working | AgentState::Idle
+            )
         {
             return Err(DaemonError::validation(
-                "Kiro hooks may report only Unknown or Working at lifecycle integration authority",
+                "Kiro hooks may report only Unknown, Working, or Idle at lifecycle integration authority",
             ));
         }
         let (response, holders) = self.durable_mutation_outcome(|undo| {
@@ -21034,6 +21037,43 @@ mod tests {
             panic!("expected Kiro Agent");
         };
         agent
+    }
+
+    #[test]
+    fn kiro_hooks_accept_only_documented_lifecycle_states() {
+        let registry = DaemonService::default();
+        let (_, shell, _) = running_shell(&registry);
+        let run_id = shell.snapshot().unwrap().run.unwrap().id;
+        let (holder_id, mut process) = test_kiro_holder(&registry, &shell.id, &run_id);
+
+        for state in [AgentState::Unknown, AgentState::Working, AgentState::Idle] {
+            let Response::Agent { agent } = registry
+                .dispatch(Request::ReportKiroHook {
+                    holder_id: holder_id.clone(),
+                    session_id: "session-a".into(),
+                    report: kiro_report(state),
+                })
+                .unwrap()
+            else {
+                panic!("expected Kiro Agent");
+            };
+            assert_eq!(agent.observation.state, state);
+        }
+        for state in [AgentState::Blocked, AgentState::Inactive, AgentState::Done] {
+            assert!(
+                registry
+                    .dispatch(Request::ReportKiroHook {
+                        holder_id: holder_id.clone(),
+                        session_id: "session-a".into(),
+                        report: kiro_report(state),
+                    })
+                    .is_err(),
+                "accepted unsupported Kiro state {state:?}"
+            );
+        }
+
+        process.kill().unwrap();
+        process.wait().unwrap();
     }
 
     #[test]

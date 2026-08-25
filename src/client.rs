@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use crate::protocol::{
     self, AgentInstanceSnapshot, AgentRegistrationSpec, AgentReport, AgentScheduleInspection,
-    AgentScheduleSnapshot, AgentScheduleSpec, AgentScheduleUpdate,
+    AgentScheduleSnapshot, AgentScheduleSpec, AgentScheduleUpdate, AgentState,
     ClaudeRemoteControlBindingSnapshot, CombinedNodeSnapshot, DaemonEvent, Envelope, ErrorCode,
     EventCursor, FocusedTerminalSnapshot, NodeProjectionHealth, NodeRegistrationSnapshot,
     NotificationDeliveryConfig, OpenCodeSessionClaimSnapshot, OpenCodeSharedRuntimeSnapshot,
@@ -1567,13 +1567,27 @@ impl Client {
         &self,
         holder_id: impl Into<String>,
         session_id: impl Into<String>,
-        report: AgentReport,
+        mut report: AgentReport,
     ) -> Result<AgentInstanceSnapshot> {
-        match self.request(Request::ReportKiroHook {
-            holder_id: holder_id.into(),
-            session_id: session_id.into(),
-            report,
-        })? {
+        let holder_id = holder_id.into();
+        let session_id = session_id.into();
+        let response = match self.request(Request::ReportKiroHook {
+            holder_id: holder_id.clone(),
+            session_id: session_id.clone(),
+            report: report.clone(),
+        }) {
+            Err(ClientError::Protocol(ProtocolError::UnsupportedVersion(_)))
+                if downgrade_kiro_stop_report(&mut report) =>
+            {
+                self.request(Request::ReportKiroHook {
+                    holder_id,
+                    session_id,
+                    report,
+                })?
+            }
+            result => result?,
+        };
+        match response {
             Response::Agent { agent } => Ok(agent),
             other => unexpected(other),
         }
@@ -2283,6 +2297,15 @@ fn daemon_lock_available(socket_path: &Path) -> io::Result<bool> {
     }
 }
 
+fn downgrade_kiro_stop_report(report: &mut AgentReport) -> bool {
+    if report.state != AgentState::Idle {
+        return false;
+    }
+    report.state = AgentState::Unknown;
+    report.evidence = "Kiro hook execution stopped".into();
+    true
+}
+
 fn expect_ok(actual: Response, expected: Response) -> Result<()> {
     if actual == expected {
         Ok(())
@@ -2309,6 +2332,7 @@ mod tests {
     fn reject_protocol(listener: &UnixListener, attempted: u32, supported: u32) {
         reject_protocol_once(listener, attempted, supported);
         if attempted == protocol::PROTOCOL_VERSION && supported == 41 {
+            reject_protocol_once(listener, 45, supported);
             reject_protocol_once(listener, 44, supported);
             reject_protocol_once(listener, 43, supported);
             reject_protocol_once(listener, 42, supported);
@@ -2428,6 +2452,7 @@ mod tests {
         let (client_done_sender, client_done_receiver) = mpsc::channel();
         let server = thread::spawn(move || {
             for _ in 0..3 {
+                reject_protocol_once(&listener, 46, 42);
                 reject_protocol_once(&listener, 45, 42);
                 reject_protocol_once(&listener, 44, 42);
                 reject_protocol_once(&listener, 43, 42);
@@ -2463,6 +2488,96 @@ mod tests {
             ));
         }
         client_done_sender.send(()).unwrap();
+
+        server.join().unwrap();
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn kiro_stop_idle_downgrades_when_daemon_is_replaced_by_protocol_forty_five() {
+        let directory = env::temp_dir().join(format!("boomux-client-kiro-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let socket = directory.join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+            assert_eq!(request.version, 46);
+            assert!(matches!(
+                request.message,
+                Request::ReportKiroHook {
+                    report: AgentReport {
+                        state: AgentState::Idle,
+                        ..
+                    },
+                    ..
+                }
+            ));
+            protocol::write_message(
+                &mut stream,
+                &Envelope::with_version(
+                    45,
+                    Response::Error {
+                        message: "protocol 46 unsupported".into(),
+                        code: Some(ErrorCode::UnsupportedVersion),
+                    },
+                ),
+            )
+            .unwrap();
+            reject_protocol_once(&listener, 46, 45);
+            let (mut stream, _) = listener.accept().unwrap();
+            let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+            assert_eq!(request.version, 45);
+            assert!(matches!(request.message, Request::Ping));
+            protocol::write_message(&mut stream, &Envelope::with_version(45, Response::Pong))
+                .unwrap();
+
+            let (mut stream, _) = listener.accept().unwrap();
+            let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+            assert_eq!(request.version, 45);
+            assert!(matches!(
+                request.message,
+                Request::ReportKiroHook {
+                    report: AgentReport {
+                        state: AgentState::Unknown,
+                        ..
+                    },
+                    ..
+                }
+            ));
+            protocol::write_message(
+                &mut stream,
+                &Envelope::with_version(
+                    45,
+                    Response::Error {
+                        message: "test complete".into(),
+                        code: Some(ErrorCode::NotFound),
+                    },
+                ),
+            )
+            .unwrap();
+        });
+        let client = Client::from_socket_path(socket);
+
+        let error = client
+            .report_kiro_hook(
+                "holder-1",
+                "session-1",
+                AgentReport {
+                    state: AgentState::Idle,
+                    authority: protocol::AgentAuthority::LifecycleIntegration,
+                    evidence: "Kiro session idle".into(),
+                    confidence: 100,
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ClientError::Remote(RemoteError {
+                code: Some(ErrorCode::NotFound),
+                ..
+            })
+        ));
 
         server.join().unwrap();
         fs::remove_dir_all(directory).unwrap();

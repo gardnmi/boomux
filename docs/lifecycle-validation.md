@@ -7,6 +7,17 @@ This record separates observed host behavior from reducer fixtures and intended
 semantics. Host compatibility is not inferred from process names, terminal
 output, or database recency.
 
+## 2026-08-25
+
+Kiro CLI `2.18.0` was live-validated in a Boomux-managed ShellRun with the
+installed standalone v3 hook asset. Submitting `hi` produced authoritative
+`UserPromptSubmit` Working evidence for one canonical Session; after Kiro
+rendered its final assistant response and returned to the input prompt, the same
+Session produced a `Stop` event. Current Kiro v3 documentation defines Stop as
+firing when the agent has completed its turn and finished responding. Boomux
+therefore treats Stop as Idle turn completion while retaining final holder
+release as Inactive and making no Blocked or Done claim.
+
 ## 2026-08-24
 
 Hyprland `0.56.2` was live-validated with the special-Workspace desktop adapter,
@@ -78,7 +89,8 @@ permission wait, cloud Session, or Kiro Web handoff was exercised. No Blocked,
 Idle, Inactive, Done, cloud lifecycle, catalog, or native web capability is
 claimed. Kiro documents isolated sub-agent hook execution but no root-execution
 field in standalone SessionStart or Stop payloads, so fixtures reduce those
-ambiguous boundaries to Unknown.
+ambiguous boundaries to Unknown. The Stop mapping was superseded by the
+2026-08-25 live validation and current v3 hook contract above.
 
 Codex CLI `0.147.0` was inspected against the documented hooks and experimental
 app-server interfaces. Repository tests validate bounded hook decoding,

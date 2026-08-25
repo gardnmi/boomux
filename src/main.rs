@@ -11649,6 +11649,7 @@ fn kiro_hook_command() -> Result<(), Box<dyn Error>> {
         _ => return Ok(()),
     };
     let update = kiro_hooks::read_update(io::stdin().lock())?;
+    let client = client::connect_or_start()?;
     let observation = update.observation;
     let report = AgentReport {
         state: observation.state,
@@ -11656,7 +11657,6 @@ fn kiro_hook_command() -> Result<(), Box<dyn Error>> {
         evidence: observation.evidence.into(),
         confidence: 100,
     };
-    let client = client::connect_or_start()?;
     client.report_kiro_hook(holder_id, update.session_id, report)?;
     Ok(())
 }
@@ -17821,7 +17821,7 @@ mod tests {
                 .validated_version,
             "2.1.236"
         );
-        assert_eq!(protocol::PROTOCOL_VERSION, 45);
+        assert_eq!(protocol::PROTOCOL_VERSION, 46);
     }
 
     #[test]

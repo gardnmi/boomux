@@ -230,7 +230,7 @@ fn sequential_kiro_process_holders_inactivate_only_the_exited_session() {
     let kiro = daemon.runtime_dir.join("kiro-holder-cli");
     fs::write(
         &kiro,
-        "#!/bin/sh\nprintf '%s' \"$$\" > \"$KIRO_TEST_PID\"\nprintf '{\"session_id\":\"%s\",\"hook_event_name\":\"UserPromptSubmit\"}' \"$KIRO_TEST_SESSION\" | \"$KIRO_TEST_BOOMUX\" kiro hook\n/bin/sleep 300 &\nprintf '%s' \"$!\" > \"$KIRO_TEST_DESCENDANT_PID\"\nwait\n",
+        "#!/bin/sh\nprintf '%s' \"$$\" > \"$KIRO_TEST_PID\"\nprintf '{\"session_id\":\"%s\",\"hook_event_name\":\"UserPromptSubmit\"}' \"$KIRO_TEST_SESSION\" | \"$KIRO_TEST_BOOMUX\" kiro hook\nwhile [ ! -e \"$KIRO_TEST_STOP\" ]; do sleep 0.01; done\nprintf '{\"session_id\":\"%s\",\"hook_event_name\":\"Stop\"}' \"$KIRO_TEST_SESSION\" | \"$KIRO_TEST_BOOMUX\" kiro hook\n/bin/sleep 300 &\nprintf '%s' \"$!\" > \"$KIRO_TEST_DESCENDANT_PID\"\nwait\n",
     )
     .unwrap();
     fs::set_permissions(&kiro, fs::Permissions::from_mode(0o755)).unwrap();
@@ -263,6 +263,7 @@ fn sequential_kiro_process_holders_inactivate_only_the_exited_session() {
         let descendant_pid_file = daemon
             .runtime_dir
             .join(format!("kiro-{case}-descendant-pid"));
+        let stop_file = daemon.runtime_dir.join(format!("kiro-{case}-stop"));
         let mut command = daemon.command();
         command
             .args(["kiro", "launch", "--"])
@@ -273,6 +274,7 @@ fn sequential_kiro_process_holders_inactivate_only_the_exited_session() {
             .env("KIRO_TEST_SESSION", session)
             .env("KIRO_TEST_PID", &pid_file)
             .env("KIRO_TEST_DESCENDANT_PID", &descendant_pid_file)
+            .env("KIRO_TEST_STOP", &stop_file)
             .env("KIRO_TEST_BOOMUX", env!("CARGO_BIN_EXE_boomux"));
         command.process_group(0);
         let mut child = command.spawn().unwrap();
@@ -286,6 +288,18 @@ fn sequential_kiro_process_holders_inactivate_only_the_exited_session() {
                 })
             },
             "Kiro holder hook did not report Working",
+        );
+        fs::write(&stop_file, "").unwrap();
+        wait_until(
+            || {
+                daemon.client.snapshot().is_ok_and(|snapshot| {
+                    snapshot.workspaces[0].agents.iter().any(|agent| {
+                        agent.external_session_id.as_deref() == Some(session)
+                            && agent.observation.state == AgentState::Idle
+                    })
+                })
+            },
+            "Kiro Stop hook did not report Idle",
         );
         let pid = fs::read_to_string(pid_file)
             .unwrap()
