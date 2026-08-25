@@ -2370,6 +2370,15 @@ fn bootstrap_cli_failure(error: io::Error) -> Box<dyn Error> {
     cli_output::failure(ssh_bootstrap::error_code(&error), error.to_string())
 }
 
+const fn should_release_node_upgrade_maintenance(
+    recovery: ssh_bootstrap::BootstrapRecoveryDisposition,
+) -> bool {
+    !matches!(
+        recovery,
+        ssh_bootstrap::BootstrapRecoveryDisposition::OutcomeUnknown
+    )
+}
+
 fn upgrade_node(selector: &str) -> Result<(), Box<dyn Error>> {
     const TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -2417,23 +2426,42 @@ fn upgrade_node(selector: &str) -> Result<(), Box<dyn Error>> {
             "Node registration changed while upgrade authorization was pending; refresh and retry",
         ));
     }
-    let upgrade = session
-        .install_and_connect_guarded(&plan, TIMEOUT, || {
-            local
-                .renew_node_upgrade_maintenance(&registration.node_id, &maintenance_token)
-                .map_err(|error| io::Error::other(error.to_string()))
-        })
-        .map_err(bootstrap_cli_failure);
+    let upgrade = session.install_and_connect_guarded(&plan, TIMEOUT, || {
+        local
+            .renew_node_upgrade_maintenance(&registration.node_id, &maintenance_token)
+            .map_err(|error| io::Error::other(error.to_string()))
+    });
     let connection = match upgrade {
         Ok(connection) => {
             local.finish_node_upgrade_maintenance(&registration.node_id, maintenance_token)?;
             connection
         }
         Err(error) => {
-            eprintln!(
-                "boomux: Node upgrade maintenance remains active until bounded expiry while remote rollback settles"
-            );
-            return Err(error);
+            let recovery = ssh_bootstrap::recovery_disposition(&error);
+            if !should_release_node_upgrade_maintenance(recovery) {
+                eprintln!(
+                    "boomux: remote upgrade outcome is unknown; Node maintenance remains active until bounded expiry while watchdog recovery settles"
+                );
+            } else {
+                match local
+                    .finish_node_upgrade_maintenance(&registration.node_id, &maintenance_token)
+                {
+                    Ok(()) => eprintln!(
+                        "boomux: {}; Node maintenance was released",
+                        if recovery
+                            == ssh_bootstrap::BootstrapRecoveryDisposition::RollbackConfirmed
+                        {
+                            "remote rollback was confirmed"
+                        } else {
+                            "remote mutation did not begin"
+                        }
+                    ),
+                    Err(_) => eprintln!(
+                        "boomux: the upgrade reached a safe recovery state, but Node maintenance release could not be confirmed and remains bounded by expiry"
+                    ),
+                }
+            }
+            return Err(bootstrap_cli_failure(error));
         }
     };
     println!(
@@ -14421,6 +14449,15 @@ mod tests {
             Some(Commands::GuidedNodeUpgrade { selector }) if selector == "node-id"
         ));
         assert_eq!(cli.command_descriptor().key, "node.upgrade");
+        assert!(should_release_node_upgrade_maintenance(
+            ssh_bootstrap::BootstrapRecoveryDisposition::NoRemoteMutation
+        ));
+        assert!(should_release_node_upgrade_maintenance(
+            ssh_bootstrap::BootstrapRecoveryDisposition::RollbackConfirmed
+        ));
+        assert!(!should_release_node_upgrade_maintenance(
+            ssh_bootstrap::BootstrapRecoveryDisposition::OutcomeUnknown
+        ));
     }
 
     #[test]
