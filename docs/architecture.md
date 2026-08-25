@@ -151,8 +151,12 @@ handshake into the disposable Node projection and combined Node snapshot. The
 Nodes dashboard displays that observed version; protocol-40 responses omit it.
 It also adds bounded local Node-upgrade coordination so an explicitly authorized
 SSH replacement closes registration admission across activation and commit. The
-CLI renews that lease while the transaction runs, and local daemon restart or
-stop is rejected until the lease is released or expires.
+CLI renews that lease while the transaction runs, releases it after commit,
+pre-mutation failure, or confirmed rollback, and retains it across unknown
+outcomes. Local daemon restart or stop is rejected until the lease is released
+or expires. An uncommitted remote bootstrap lock projects as reconnecting rather
+than unsupported while watchdog recovery remains active; a lock without its
+exact live watchdog identity projects as stale and requires operator recovery.
 Protocol 42 adds the `opencode_shared_runtime_claims` feature. One ephemeral
 Node-local OpenCode server generation is daemon-supervised and shared by native
 clients. Bounded Agent Session Claims map an exact root Session in that generation

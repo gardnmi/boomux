@@ -199,9 +199,10 @@ retarget, forget, projection, and routed operations until remote commit or
 rollback completes. The lease expires fail-open if the upgrading client dies.
 The CLI renews it during a live transaction; local daemon restart and stop are
 busy while it remains active so handoff cannot silently reopen admission.
-Successful remote commit releases it immediately. Any failed or ambiguous
-upgrade leaves it closed until bounded expiry so the remote rollback watchdog
-settles before local routing resumes.
+Successful remote commit, failure before remote mutation, and a synchronously
+confirmed rollback release it immediately. Only an ambiguous upgrade or a
+rollback whose completion cannot be confirmed leaves it closed until bounded
+expiry so the remote watchdog settles before local routing resumes.
 Add and retarget complete verified bootstrap before submitting a registration
 mutation to the local daemon. The selected helper path is
 connection-local and is rediscovered on every later connection; it is not a
@@ -240,10 +241,10 @@ path. When it is absent on Linux, Boomux derives `/run/user/<numeric id -u>`;
 macOS retains the requirement for an explicit runtime directory. The selected
 directory must be a non-symlink directory owned by that numeric user with mode
 `0700`, and is exported only for that remote command. These rules cover helper
-probes, live federation and host-service channels, daemon status and restart,
-and rollback/watchdog daemon restoration. Missing, malformed, unsupported, or
-unsafe runtime discovery returns `bootstrap_runtime_unavailable` without
-including the path or raw remote stderr.
+probes, live federation and host-service channels, provisional proof-bound
+activation, daemon status and restart, and rollback/watchdog daemon restoration.
+Missing, malformed, unsupported, or unsafe runtime discovery returns
+`bootstrap_runtime_unavailable` without including the path or raw remote stderr.
 Slave argv also installs a deliberately failing direct-connection fallback, so a
 missing control socket cannot make OpenSSH resolve or connect to the target
 again. Master disappearance at any stage is therefore a transport failure, not a
@@ -260,7 +261,14 @@ malformed handshake, unsupported newer protocol, conflicting Node identity, or
 indeterminate transport/authentication failure is not version evidence and fails
 without an install plan. Interactive install or upgrade presents one plan and
 asks once. JSON and other noninteractive invocation returns `install_required`
-or `upgrade_required` and performs no remote mutation.
+or `upgrade_required` and performs no remote mutation. An uncommitted bootstrap
+lock suppresses only its provisional destination. If no alternate compatible
+helper is available, discovery returns typed `busy` rather than proposing
+another install; registered projection presents that bounded recovery interval
+as `reconnecting`, not `unsupported`. A lock whose recorded watchdog is absent
+or dead is reported separately as `upgrade_recovery_required` instead of being
+misrepresented as active recovery, and registered projection presents it as
+`stale` with the recovery-required error detail.
 After authorization, Boomux acquires the remote transaction lock and uploads the
 pinned bytes only to the private transaction `new` path. It validates and marks
 that executable and starts the rollback watchdog without replacing the discovered
@@ -321,6 +329,11 @@ After proof, an idempotent activation command acquires the same claim, validates
 the transaction and destination, copies and verifies the backup, records
 activation intent, and atomically renames `new` over the destination. It never
 renames the running old executable into the transaction.
+If activation fails after replacement, compensation first moves the provisional
+executable back to `new`, restores the prior destination, synchronizes both, and
+only then clears activation and backup markers. The transaction is therefore
+again uploaded-only and can be retried exactly; incomplete compensation retains
+its markers for explicit rollback or watchdog recovery.
 Consequently Linux exposes the old daemon's executable as the deleted prior
 destination, and graceful restart's installed-path fallback selects the new
 destination rather than the protocol-old backup.
@@ -341,7 +354,10 @@ explicit rollback, renewal, and watchdog expiry coordinate through the
 transaction lock and claim directory. Each claim records a unique owner token,
 PID, process-start identity, and heartbeat. A contender may reclaim it only after
 a complete unrenewed 180-second lease and proof that the recorded PID/start owner
-is gone; an active owner remains protected. Before commit, master or local-process
+is gone; a zombie is not treated as active, and only the exact recorded owner may
+release a claim. Claim metadata becomes ready only after every field is written;
+an interrupted publication can itself be reclaimed after the same bounded age.
+Before commit, master or local-process
 loss therefore lets the watchdog restore it automatically even when a healthy
 transaction spans several lease intervals. ABI/exec failure and every daemon-status, restart, helper,
 identity, live-handshake, or protocol-ping failure request rollback; a failed
@@ -352,7 +368,9 @@ recovery after filesystem restoration. If a provisional upgrade restarted the da
 rollback atomically renames the complete backup over the provisional destination.
 When a daemon existed before activation and provisional helper work could have
 affected it, rollback gracefully restarts through the restored helper regardless
-of later status observations. The explicit
+of later status observations. Rollback is confirmed only after that required
+restart succeeds. A restart failure retains the retryable transaction and leaves
+local maintenance bounded until watchdog recovery can complete. The explicit
 rollback and detached watchdog share the same complete-backup and
 activation-intent markers, so a partial backup is never installed.
 An uploaded-only transaction has no activation intent, so explicit rollback or

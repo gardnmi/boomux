@@ -8963,7 +8963,11 @@ fn fetch_node_projection(
 
 fn classify_node_sync_error(error: &io::Error) -> crate::protocol::NodeProjectionHealthCode {
     use crate::protocol::NodeProjectionHealthCode;
-    if error.kind() == io::ErrorKind::Unsupported {
+    if crate::ssh_bootstrap::error_code(error) == "upgrade_recovery_required" {
+        NodeProjectionHealthCode::Stale
+    } else if error.kind() == io::ErrorKind::WouldBlock {
+        NodeProjectionHealthCode::Reconnecting
+    } else if error.kind() == io::ErrorKind::Unsupported {
         NodeProjectionHealthCode::Unsupported
     } else if error.kind() == io::ErrorKind::PermissionDenied
         || error
@@ -19619,6 +19623,22 @@ fn lock<T>(mutex: &Mutex<T>) -> io::Result<MutexGuard<'_, T>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn active_remote_upgrade_projects_as_reconnecting() {
+        assert_eq!(
+            classify_node_sync_error(&io::Error::from(io::ErrorKind::WouldBlock)),
+            crate::protocol::NodeProjectionHealthCode::Reconnecting
+        );
+        assert_eq!(
+            classify_node_sync_error(&io::Error::from(io::ErrorKind::Unsupported)),
+            crate::protocol::NodeProjectionHealthCode::Unsupported
+        );
+        assert_eq!(
+            classify_node_sync_error(&crate::ssh_bootstrap::stale_upgrade_recovery()),
+            crate::protocol::NodeProjectionHealthCode::Stale
+        );
+    }
 
     struct FixedSchedulerClock(AtomicU64);
 
