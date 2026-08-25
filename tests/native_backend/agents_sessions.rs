@@ -3,6 +3,7 @@ use std::io::Write;
 use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::Stdio;
 use std::thread;
 use std::time::Duration;
@@ -10,8 +11,9 @@ use std::time::Duration;
 use boomux::client::Client;
 use boomux::protocol::{
     self, AgentAuthority, AgentRegistrationSpec, AgentReport, AgentState, ErrorCode, Request,
-    Response, ShellSpec, UnixEnvironment, UnixEnvironmentVariable,
+    Response, ShellSpec, ShellStatus, UnixEnvironment, UnixEnvironmentVariable,
 };
+use uuid::Uuid;
 
 use crate::support::{
     TestDaemon, assert_generated_name, assert_remote_code, contains, ensure_test_opencode_runtime,
@@ -27,7 +29,7 @@ fn claude_hook_reports_lifecycle_and_synchronizes_ephemeral_bridge_binding() {
             "claude-hook",
             vec![ShellSpec {
                 name: "claude".into(),
-                command: vec!["/bin/sleep".into(), "30".into()],
+                command: vec!["/bin/sleep".into(), "300".into()],
                 cwd: std::env::temp_dir(),
             }],
         )
@@ -201,7 +203,7 @@ fn codex_hook_requires_run_scoped_launch_and_reuses_exact_thread_agent() {
 }
 
 #[test]
-fn kiro_hook_requires_v3_run_scope_and_reuses_exact_session_agent() {
+fn sequential_kiro_process_holders_inactivate_only_the_exited_session() {
     let mut daemon = TestDaemon::start();
     let workspace = daemon
         .client
@@ -209,7 +211,7 @@ fn kiro_hook_requires_v3_run_scope_and_reuses_exact_session_agent() {
             "kiro-hook",
             vec![ShellSpec {
                 name: "kiro".into(),
-                command: vec!["/bin/sleep".into(), "30".into()],
+                command: vec!["/bin/sleep".into(), "300".into()],
                 cwd: std::env::temp_dir(),
             }],
         )
@@ -218,58 +220,160 @@ fn kiro_hook_requires_v3_run_scope_and_reuses_exact_session_agent() {
     let _attachment = daemon.client.attach(&shell_id, false, profile()).unwrap();
     let run_id = daemon.client.get_shell(&shell_id).unwrap().run.unwrap().id;
 
-    let run_hook = |event: &str, run_scoped: bool| {
+    let kiro_home = daemon.runtime_dir.join("kiro-holder-home");
+    fs::create_dir_all(kiro_home.join("hooks")).unwrap();
+    fs::write(
+        kiro_home.join("hooks/boomux.json"),
+        include_str!("../../integrations/kiro/boomux.json"),
+    )
+    .unwrap();
+    let kiro = daemon.runtime_dir.join("kiro-holder-cli");
+    fs::write(
+        &kiro,
+        "#!/bin/sh\nprintf '%s' \"$$\" > \"$KIRO_TEST_PID\"\nprintf '{\"session_id\":\"%s\",\"hook_event_name\":\"UserPromptSubmit\"}' \"$KIRO_TEST_SESSION\" | \"$KIRO_TEST_BOOMUX\" kiro hook\n/bin/sleep 300 &\nprintf '%s' \"$!\" > \"$KIRO_TEST_DESCENDANT_PID\"\nwait\n",
+    )
+    .unwrap();
+    fs::set_permissions(&kiro, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let run_unclaimed_hook = || {
         let mut command = daemon.command();
         command
             .args(["kiro", "hook"])
-            .env("BOOMUX_SHELL_ID", &shell_id)
-            .env("BOOMUX_RUN_ID", &run_id)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped());
-        if run_scoped {
-            command.env("BOOMUX_KIRO_RUN_SCOPED", "1");
-        } else {
-            command.env_remove("BOOMUX_KIRO_RUN_SCOPED");
-        }
         let mut child = command.spawn().unwrap();
         write!(
             child.stdin.take().unwrap(),
-            "{{\"session_id\":\"kiro-session\",\"hook_event_name\":\"{event}\"}}"
+            "{{\"session_id\":\"unclaimed\",\"hook_event_name\":\"UserPromptSubmit\"}}"
         )
         .unwrap();
         let output = child.wait_with_output().unwrap();
         assert!(output.status.success());
         assert!(output.stdout.is_empty());
     };
-
-    run_hook("SessionStart", false);
+    run_unclaimed_hook();
     assert!(
         daemon.client.snapshot().unwrap().workspaces[0]
             .agents
             .is_empty()
     );
 
-    for (event, expected) in [
-        ("SessionStart", AgentState::Unknown),
-        ("UserPromptSubmit", AgentState::Working),
-        ("PreToolUse", AgentState::Working),
-        ("PostToolUse", AgentState::Working),
-        ("Stop", AgentState::Unknown),
-    ] {
-        run_hook(event, true);
-        let agents = &daemon.client.snapshot().unwrap().workspaces[0].agents;
-        assert_eq!(agents.len(), 1);
-        assert_eq!(agents[0].integration, "kiro");
-        assert_eq!(
-            agents[0].external_session_id.as_deref(),
-            Some("kiro-session")
+    let run = |session: &str, case: &str, kill_holder: bool| {
+        let pid_file = daemon.runtime_dir.join(format!("kiro-{case}-pid"));
+        let descendant_pid_file = daemon
+            .runtime_dir
+            .join(format!("kiro-{case}-descendant-pid"));
+        let mut command = daemon.command();
+        command
+            .args(["kiro", "launch", "--"])
+            .env("KIRO_HOME", &kiro_home)
+            .env("BOOMUX_REAL_KIRO", &kiro)
+            .env("BOOMUX_SHELL_ID", &shell_id)
+            .env("BOOMUX_RUN_ID", &run_id)
+            .env("KIRO_TEST_SESSION", session)
+            .env("KIRO_TEST_PID", &pid_file)
+            .env("KIRO_TEST_DESCENDANT_PID", &descendant_pid_file)
+            .env("KIRO_TEST_BOOMUX", env!("CARGO_BIN_EXE_boomux"));
+        command.process_group(0);
+        let mut child = command.spawn().unwrap();
+        wait_until(
+            || {
+                daemon.client.snapshot().is_ok_and(|snapshot| {
+                    snapshot.workspaces[0].agents.iter().any(|agent| {
+                        agent.external_session_id.as_deref() == Some(session)
+                            && agent.observation.state == AgentState::Working
+                    })
+                })
+            },
+            "Kiro holder hook did not report Working",
         );
-        assert_eq!(agents[0].observation.state, expected, "{event}");
-        assert!(!matches!(
-            agents[0].observation.state,
-            AgentState::Blocked | AgentState::Idle | AgentState::Inactive | AgentState::Done
-        ));
-    }
+        let pid = fs::read_to_string(pid_file)
+            .unwrap()
+            .parse::<libc::pid_t>()
+            .unwrap();
+        wait_until(
+            || descendant_pid_file.exists(),
+            "Kiro launcher shim did not start its descendant",
+        );
+        let descendant_pid = fs::read_to_string(descendant_pid_file)
+            .unwrap()
+            .parse::<libc::pid_t>()
+            .unwrap();
+        let event_waiter = if kill_holder {
+            let baseline = daemon.client.events(None, 256, 0).unwrap().cursor;
+            let client = daemon.client.clone();
+            Some(thread::spawn(move || {
+                client.events(Some(baseline), 256, 2_000).unwrap()
+            }))
+        } else {
+            None
+        };
+        let status = if kill_holder {
+            assert_eq!(
+                unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) },
+                0
+            );
+            child.wait().unwrap()
+        } else {
+            assert_eq!(
+                unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGINT) },
+                0
+            );
+            child.wait().unwrap()
+        };
+        if kill_holder {
+            assert_eq!(status.signal(), Some(libc::SIGTERM));
+            wait_until(
+                || !process_exists(pid),
+                "directly terminated Kiro holder left its child orphaned",
+            );
+            wait_until(
+                || !process_exists(descendant_pid),
+                "directly terminated Kiro holder left a descendant orphaned",
+            );
+            let events = event_waiter.unwrap().join().unwrap().events;
+            assert!(events.iter().any(|event| {
+                matches!(
+                    &event.kind,
+                    protocol::DaemonEventKind::AgentStateChanged { agent, .. }
+                        if agent.external_session_id.as_deref() == Some(session)
+                            && agent.observation.state == AgentState::Inactive
+                )
+            }));
+        } else {
+            assert_eq!(status.signal(), Some(libc::SIGINT));
+            wait_until(
+                || !process_exists(pid),
+                "foreground Ctrl+C left the managed Kiro child alive",
+            );
+            wait_until(
+                || !process_exists(descendant_pid),
+                "foreground Ctrl+C left a Kiro descendant alive",
+            );
+        }
+        wait_until(
+            || {
+                daemon.client.snapshot().is_ok_and(|snapshot| {
+                    snapshot.workspaces[0].agents.iter().any(|agent| {
+                        agent.external_session_id.as_deref() == Some(session)
+                            && agent.observation.state == AgentState::Inactive
+                            && agent.attention.is_none()
+                    })
+                })
+            },
+            "Kiro final holder exit did not report Inactive",
+        );
+    };
+
+    run("session-a", "a", false);
+    run("session-b", "b", true);
+    let agents = &daemon.client.snapshot().unwrap().workspaces[0].agents;
+    assert_eq!(agents.len(), 2);
+    assert!(agents.iter().all(|agent| {
+        agent.observation.state == AgentState::Inactive
+            && agent.observation.state != AgentState::Done
+            && agent.attention.is_none()
+    }));
 
     daemon.stop_with_cli();
 }
@@ -394,10 +498,18 @@ fn cold_recovery_resumes_exact_codex_thread_with_run_scoped_hooks() {
             .env("CODEX_RECOVERY_CAPTURE", capture);
     });
     let recovered = daemon.client.get_shell(&shell_id).unwrap();
+    assert_eq!(recovered.status, ShellStatus::Pending);
     assert_eq!(
         recovered.recovered_agent_id.as_deref(),
         Some(agent.id.as_str())
     );
+    let retained = daemon.client.snapshot().unwrap().workspaces[0]
+        .agents
+        .iter()
+        .find(|candidate| candidate.id == agent.id)
+        .unwrap()
+        .clone();
+    assert_eq!(retained.run_id, first_run.id);
 
     let recovered_attachment = daemon.client.attach(&shell_id, false, profile()).unwrap();
     wait_until(
@@ -429,7 +541,7 @@ fn cold_recovery_resumes_exact_kiro_v3_session_with_run_scoped_hooks() {
         let kiro = bin.join("kiro-cli");
         fs::write(
             &kiro,
-            "#!/bin/sh\n: > \"$KIRO_RECOVERY_CAPTURE\"\nfor arg do printf '%s\\0' \"$arg\" >> \"$KIRO_RECOVERY_CAPTURE\"; done\nprintf '%s' \"${BOOMUX_KIRO_RUN_SCOPED-unset}\" > \"$KIRO_RECOVERY_MARKER\"\ncase \" $* \" in *' --resume-id '*) exit 0 ;; esac\n/bin/sleep 30\n",
+            "#!/bin/sh\n: > \"$KIRO_RECOVERY_CAPTURE\"\nfor arg do printf '%s\\0' \"$arg\" >> \"$KIRO_RECOVERY_CAPTURE\"; done\nprintf '%s' \"${BOOMUX_KIRO_LAUNCH_HOLDER-unset}\" > \"$KIRO_RECOVERY_MARKER\"\ncase \" $* \" in *' --resume-id '*) exit 0 ;; esac\n/bin/sleep 30\n",
         )
         .unwrap();
         fs::set_permissions(&kiro, fs::Permissions::from_mode(0o700)).unwrap();
@@ -466,10 +578,8 @@ fn cold_recovery_resumes_exact_kiro_v3_session_with_run_scoped_hooks() {
         },
         "initial Kiro run did not launch v3",
     );
-    assert_eq!(
-        fs::read_to_string(daemon.runtime_dir.join("kiro-recovery-marker")).unwrap(),
-        "1"
-    );
+    Uuid::parse_str(&fs::read_to_string(daemon.runtime_dir.join("kiro-recovery-marker")).unwrap())
+        .unwrap();
     let first_run = daemon.client.get_shell(&shell_id).unwrap().run.unwrap();
     let agent = daemon
         .client
@@ -517,10 +627,8 @@ fn cold_recovery_resumes_exact_kiro_v3_session_with_run_scoped_hooks() {
         },
         "recovered Kiro run did not resume the exact v3 session",
     );
-    assert_eq!(
-        fs::read_to_string(daemon.runtime_dir.join("kiro-recovery-marker")).unwrap(),
-        "1"
-    );
+    Uuid::parse_str(&fs::read_to_string(daemon.runtime_dir.join("kiro-recovery-marker")).unwrap())
+        .unwrap();
     let second_run = daemon.client.get_shell(&shell_id).unwrap().run.unwrap();
     assert_ne!(second_run.id, first_run.id);
 

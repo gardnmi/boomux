@@ -141,6 +141,22 @@ Bindings transfer during graceful daemon handoff while the exact process and
 ShellRun survive, but are absent after cold recovery and disappear when later
 hook evidence clears them or their exact Agent/ShellRun is no longer current.
 
+## Kiro Launch Holder
+
+A bounded ephemeral daemon-owned capability for one exact supervised Kiro
+launcher process in one current ShellRun. Hooks inherit its private identity and
+can ensure or report a canonical Kiro Session only while that holder remains
+live. A Session may be associated with multiple concurrent holders; only release
+or confirmed death of its final holder establishes Inactive at lifecycle
+integration authority. A holder is not an Agent Instance, Agent Session,
+process adapter, durable resource, event, or completion signal. Holders transfer
+only during graceful daemon handoff while their exact PID/start identity remains
+live and are absent after cold recovery. The daemon autonomously reaps dead
+holders. The supervised child receives a kernel parent-death signal if its holder
+dies directly; the daemon also terminates a surviving capability-proven exact
+holder process group. Ordinary foreground signals remain process-group terminal
+behavior.
+
 ## Web Terminal Grant
 
 A bounded, one-use, short-lived gateway authorization for one exact current local

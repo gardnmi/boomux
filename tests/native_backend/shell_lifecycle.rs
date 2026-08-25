@@ -147,7 +147,7 @@ fn bare_kiro_command_selects_v3_without_rewriting_stored_argv() {
         fs::write(
             &kiro,
             format!(
-                "#!/bin/sh\n: > '{}'\nfor arg do printf '%s\\0' \"$arg\" >> '{}'; done\nprintf '%s' \"${{BOOMUX_KIRO_RUN_SCOPED-unset}}\" > '{}'\n",
+                "#!/bin/sh\n: > '{}'\nfor arg do printf '%s\\0' \"$arg\" >> '{}'; done\nprintf '%s' \"${{BOOMUX_KIRO_LAUNCH_HOLDER-unset}}\" > '{}'\n",
                 runtime_dir.join("kiro-argv").display(),
                 runtime_dir.join("kiro-argv").display(),
                 runtime_dir.join("kiro-marker").display(),
@@ -179,10 +179,7 @@ fn bare_kiro_command_selects_v3_without_rewriting_stored_argv() {
         fs::read(daemon.runtime_dir.join("kiro-argv")).unwrap(),
         b"--v3\0"
     );
-    assert_eq!(
-        fs::read_to_string(daemon.runtime_dir.join("kiro-marker")).unwrap(),
-        "1"
-    );
+    Uuid::parse_str(&fs::read_to_string(daemon.runtime_dir.join("kiro-marker")).unwrap()).unwrap();
     assert_eq!(
         daemon.client.get_shell(shell_id).unwrap().command,
         [kiro.display().to_string()]
@@ -340,7 +337,7 @@ fn bare_kiro_typed_in_managed_login_shell_selects_v3() {
     fs::write(
         &kiro,
         format!(
-            "#!/bin/sh\n: > '{}'\nfor arg do printf '%s\\0' \"$arg\" >> '{}'; done\nprintf '%s' \"${{BOOMUX_KIRO_RUN_SCOPED-unset}}\" > '{}'\n",
+            "#!/bin/sh\n: > '{}'\nfor arg do printf '%s\\0' \"$arg\" >> '{}'; done\nprintf '%s' \"${{BOOMUX_KIRO_LAUNCH_HOLDER-unset}}\" > '{}'\n",
             argv_output.display(),
             argv_output.display(),
             marker_output.display(),
@@ -383,7 +380,7 @@ fn bare_kiro_typed_in_managed_login_shell_selects_v3() {
         "typed Kiro command did not capture its launch",
     );
     assert_eq!(fs::read(argv_output).unwrap(), b"--v3\0");
-    assert_eq!(fs::read_to_string(marker_output).unwrap(), "1");
+    Uuid::parse_str(&fs::read_to_string(marker_output).unwrap()).unwrap();
     AttachFrame::Input(b"exit\n".to_vec())
         .write_to(&mut attachment.stream)
         .unwrap();

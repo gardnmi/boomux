@@ -2198,7 +2198,7 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
         }
         Some(Commands::Kiro {
             command: KiroCommands::Launch { arguments },
-        }) => launch_kiro(arguments),
+        }) => return launch_kiro(arguments).map(CliExit::Child),
         Some(Commands::Open {
             shell_id,
             node,
@@ -2778,10 +2778,14 @@ fn guided_node_command_with(
         }
     )?;
     hold_guided_result(input, output, wait_for_newline)?;
-    Ok(match status.code() {
+    Ok(process_exit_from_status(status))
+}
+
+fn process_exit_from_status(status: std::process::ExitStatus) -> process_adapter::ProcessExit {
+    match status.code() {
         Some(code) => process_adapter::ProcessExit::Code(code),
         None => process_adapter::ProcessExit::Signal(status.signal().unwrap_or(0)),
-    })
+    }
 }
 
 fn hold_guided_result(
@@ -10920,16 +10924,8 @@ fn resolve_real_harness(
 }
 
 fn kiro_hook_command() -> Result<(), Box<dyn Error>> {
-    if env::var("BOOMUX_KIRO_RUN_SCOPED").as_deref() != Ok("1") {
-        return Ok(());
-    }
-    let (shell_id, run_id) = match (
-        env::var("BOOMUX_SHELL_ID").ok(),
-        env::var("BOOMUX_RUN_ID").ok(),
-    ) {
-        (Some(shell_id), Some(run_id)) => {
-            resolve_agent_context(None, None, Some(shell_id), Some(run_id))?
-        }
+    let holder_id = match env::var("BOOMUX_KIRO_LAUNCH_HOLDER") {
+        Ok(holder_id) if !holder_id.is_empty() => holder_id,
         _ => return Ok(()),
     };
     let update = kiro_hooks::read_update(io::stdin().lock())?;
@@ -10941,28 +10937,11 @@ fn kiro_hook_command() -> Result<(), Box<dyn Error>> {
         confidence: 100,
     };
     let client = client::connect_or_start()?;
-    let agent = client.ensure_agent(
-        &shell_id,
-        &run_id,
-        AgentRegistrationSpec {
-            name: "Kiro CLI".into(),
-            integration: "kiro".into(),
-            external_session_id: Some(update.session_id),
-            report: report.clone(),
-        },
-    )?;
-    if agent.ended_at_ms.is_none()
-        && (agent.observation.state != report.state
-            || agent.observation.authority != report.authority
-            || agent.observation.evidence != report.evidence
-            || agent.observation.confidence != report.confidence)
-    {
-        client.report_agent(&agent.id, &run_id, report)?;
-    }
+    client.report_kiro_hook(holder_id, update.session_id, report)?;
     Ok(())
 }
 
-fn launch_kiro(arguments: Vec<OsString>) -> Result<(), Box<dyn Error>> {
+fn launch_kiro(arguments: Vec<OsString>) -> Result<process_adapter::ProcessExit, Box<dyn Error>> {
     let executable = resolve_real_kiro()?;
     let explicit_v3 = arguments.first().is_some_and(|argument| argument == "--v3")
         && !arguments.iter().any(|argument| argument == "--cloud");
@@ -10976,18 +10955,70 @@ fn launch_kiro(arguments: Vec<OsString>) -> Result<(), Box<dyn Error>> {
     .asset
     .state
         == integration_management::AssetState::Current;
-    let mut command = Command::new(executable);
+    let argv = kiro_argv(executable, arguments, managed_v3 && hooks_current);
+    let mut command = Command::new(&argv[0]);
     sanitize_inherited_opencode_shim(&mut command);
-    if managed_v3 && hooks_current {
-        if arguments.is_empty() {
-            command.arg("--v3");
+    let holder = if managed_v3 && hooks_current {
+        match (
+            env::var("BOOMUX_SHELL_ID").ok(),
+            env::var("BOOMUX_RUN_ID").ok(),
+        ) {
+            (Some(shell_id), Some(run_id)) => client::connect_or_start()
+                .and_then(|client| {
+                    client
+                        .acquire_kiro_launch_holder(std::process::id(), shell_id, run_id)
+                        .map(|holder_id| (client, holder_id))
+                })
+                .map_err(|error| {
+                    eprintln!("boomux: warning: Kiro lifecycle tracking is unavailable: {error}");
+                })
+                .ok(),
+            _ => None,
         }
-        command.env("BOOMUX_KIRO_RUN_SCOPED", "1");
     } else {
-        command.env_remove("BOOMUX_KIRO_RUN_SCOPED");
+        None
+    };
+    if let Some((_, holder_id)) = &holder {
+        command.env("BOOMUX_KIRO_LAUNCH_HOLDER", holder_id);
+    } else {
+        command.env_remove("BOOMUX_KIRO_LAUNCH_HOLDER");
     }
-    command.args(arguments);
-    Err(command.exec().into())
+    command.args(&argv[1..]);
+    let holder_pid = std::process::id() as libc::pid_t;
+    // The child stays in the foreground process group for ordinary terminal
+    // signals. A direct holder death also terminates the exact managed child.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::getppid() != holder_pid {
+                libc::raise(libc::SIGTERM);
+                libc::_exit(128 + libc::SIGTERM);
+            }
+            Ok(())
+        });
+    }
+    let status = match command.spawn() {
+        Ok(mut child) => child.wait(),
+        Err(error) => Err(error),
+    };
+    if let Some((client, holder_id)) = holder
+        && let Err(error) = client.release_kiro_launch_holder(holder_id)
+    {
+        eprintln!("boomux: warning: Kiro lifecycle release failed: {error}");
+    }
+    let status = status?;
+    Ok(process_exit_from_status(status))
+}
+
+fn kiro_argv(executable: PathBuf, arguments: Vec<OsString>, managed_v3: bool) -> Vec<OsString> {
+    let mut argv = vec![executable.into_os_string()];
+    if managed_v3 && arguments.is_empty() {
+        argv.push("--v3".into());
+    }
+    argv.extend(arguments);
+    argv
 }
 
 fn resolve_real_kiro() -> io::Result<PathBuf> {
@@ -11642,6 +11673,7 @@ fn sanitize_inherited_opencode_shim(command: &mut Command) {
         "BOOMUX_REAL_KIRO",
         "BOOMUX_CODEX_RUN_SCOPED",
         "BOOMUX_KIRO_RUN_SCOPED",
+        "BOOMUX_KIRO_LAUNCH_HOLDER",
         "BOOMUX_ORIGINAL_PATH",
         "BOOMUX_OPENCODE_SHIM_DIR",
         "BOOMUX_OPENCODE_TUI_CONFIG",
@@ -14692,6 +14724,38 @@ mod tests {
     }
 
     #[test]
+    fn kiro_supervised_argv_and_exit_status_remain_exact() {
+        assert_eq!(
+            kiro_argv(
+                "/exact/kiro-cli".into(),
+                vec!["chat".into(), "literal; value".into()],
+                false,
+            ),
+            ["/exact/kiro-cli", "chat", "literal; value"].map(OsString::from)
+        );
+        assert_eq!(
+            kiro_argv("/exact/kiro-cli".into(), Vec::new(), true),
+            ["/exact/kiro-cli", "--v3"].map(OsString::from)
+        );
+        let status = Command::new("/bin/sh")
+            .args(["-c", "exit 23"])
+            .status()
+            .unwrap();
+        assert_eq!(
+            process_exit_from_status(status),
+            process_adapter::ProcessExit::Code(23)
+        );
+        let status = Command::new("/bin/sh")
+            .args(["-c", "kill -TERM $$"])
+            .status()
+            .unwrap();
+        assert_eq!(
+            process_exit_from_status(status),
+            process_adapter::ProcessExit::Signal(libc::SIGTERM)
+        );
+    }
+
+    #[test]
     fn event_snapshot_json_includes_stable_agent_data() {
         let mut project = workspace("w1", "project", vec![shell("s1", "w1", "shell")]);
         project.agents.push(agent("a1", "w1", "s1"));
@@ -16491,7 +16555,7 @@ mod tests {
                 .validated_version,
             "2.1.236"
         );
-        assert_eq!(protocol::PROTOCOL_VERSION, 44);
+        assert_eq!(protocol::PROTOCOL_VERSION, 45);
     }
 
     #[test]

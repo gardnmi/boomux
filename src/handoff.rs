@@ -18,8 +18,8 @@ use crate::state_store;
 
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 pub(crate) const CHANNEL_FD: RawFd = 198;
-pub(crate) const HEADER: &[u8; 8] = b"BOOMUXH6";
-pub(crate) const OLD_HEADER: &[u8; 8] = b"BOOMUXH5";
+pub(crate) const HEADER: &[u8; 8] = b"BOOMUXH7";
+pub(crate) const OLD_HEADER: &[u8; 8] = b"BOOMUXH6";
 pub(crate) const LISTENER_MARKER: u8 = 1;
 pub(crate) const RUNTIME_LOCK_MARKER: u8 = 2;
 pub(crate) const STATE_LOCK_MARKER: u8 = 3;
@@ -48,6 +48,8 @@ pub(crate) struct Manifest {
     pub(crate) opencode_runtime: Option<OpenCodeRuntimeManifest>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) claude_remote_control_bindings: Vec<ClaudeRemoteControlBindingSnapshot>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) kiro_launch_holders: Vec<KiroLaunchHolderManifest>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -87,6 +89,18 @@ pub(crate) struct OpenCodeRuntimeManifest {
     pub(crate) pid: u32,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct KiroLaunchHolderManifest {
+    pub(crate) holder_id: String,
+    pub(crate) pid: u32,
+    pub(crate) start_time: u64,
+    pub(crate) process_group_leader: bool,
+    pub(crate) shell_id: String,
+    pub(crate) run_id: String,
+    pub(crate) sessions: Vec<(String, String)>,
+}
+
 pub(crate) struct TransferredRuntime {
     pub(crate) manifest: RuntimeManifest,
     pub(crate) pty: OwnedFd,
@@ -119,6 +133,7 @@ pub(crate) enum Bootstrap {
         presented_focused_terminal: Option<Box<QualifiedFocusedTerminalSnapshot>>,
         opencode_runtime: Option<TransferredOpenCodeRuntime>,
         claude_remote_control_bindings: Vec<ClaudeRemoteControlBindingSnapshot>,
+        kiro_launch_holders: Vec<KiroLaunchHolderManifest>,
     },
 }
 
@@ -139,6 +154,7 @@ pub(crate) fn receive_bootstrap(channel: RawFd) -> io::Result<Bootstrap> {
     let event_stream = manifest.event_stream.clone();
     let notifications = manifest.notifications.clone();
     let claude_remote_control_bindings = manifest.claude_remote_control_bindings.clone();
+    let kiro_launch_holders = manifest.kiro_launch_holders.clone();
     let focused_terminal = manifest.focused_terminal.clone().map(Box::new);
     let presented_focused_terminal = manifest.presented_focused_terminal.clone().map(Box::new);
     let listener = receive_descriptor(&channel, LISTENER_MARKER)?;
@@ -222,6 +238,7 @@ pub(crate) fn receive_bootstrap(channel: RawFd) -> io::Result<Bootstrap> {
             presented_focused_terminal,
             opencode_runtime,
             claude_remote_control_bindings,
+            kiro_launch_holders,
         }),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -325,6 +342,31 @@ fn validate_manifest(manifest: &Manifest) -> io::Result<()> {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "handoff manifest contains too many Claude Remote Control bindings",
+        ));
+    }
+    let mut kiro_holder_ids = std::collections::HashSet::new();
+    if manifest.kiro_launch_holders.len() > protocol::MAX_KIRO_LAUNCH_HOLDERS
+        || manifest.kiro_launch_holders.iter().any(|holder| {
+            let mut session_ids = std::collections::HashSet::new();
+            holder.pid == 0
+                || holder.start_time == 0
+                || uuid::Uuid::parse_str(&holder.holder_id).is_err()
+                || !kiro_holder_ids.insert(&holder.holder_id)
+                || uuid::Uuid::parse_str(&holder.shell_id).is_err()
+                || uuid::Uuid::parse_str(&holder.run_id).is_err()
+                || holder.sessions.len() > protocol::MAX_KIRO_HOLDER_SESSIONS
+                || holder.sessions.iter().any(|(session_id, agent_id)| {
+                    session_id.is_empty()
+                        || session_id.len() > protocol::MAX_KIRO_SESSION_ID_BYTES
+                        || session_id.chars().any(char::is_control)
+                        || !session_ids.insert(session_id)
+                        || uuid::Uuid::parse_str(agent_id).is_err()
+                })
+        })
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "handoff manifest contains invalid Kiro launch holders",
         ));
     }
     let mut binding_agent_ids = std::collections::HashSet::new();
@@ -531,13 +573,14 @@ mod tests {
         assert!(manifest.presented_focused_terminal.is_none());
         assert!(manifest.opencode_runtime.is_none());
         assert!(manifest.claude_remote_control_bindings.is_empty());
+        assert!(manifest.kiro_launch_holders.is_empty());
     }
 
     #[test]
-    fn h5_and_h6_bootstrap_headers_remain_accepted() {
+    fn h6_and_h7_bootstrap_headers_remain_accepted() {
         assert!(supported_header(OLD_HEADER));
         assert!(supported_header(HEADER));
-        assert!(!supported_header(b"BOOMUXH4"));
+        assert!(!supported_header(b"BOOMUXH5"));
     }
 
     #[test]
@@ -563,6 +606,7 @@ mod tests {
             }),
             opencode_runtime: None,
             claude_remote_control_bindings: Vec::new(),
+            kiro_launch_holders: Vec::new(),
         };
 
         let decoded: Manifest =
@@ -588,6 +632,7 @@ mod tests {
                 pid: 42,
             }),
             claude_remote_control_bindings: Vec::new(),
+            kiro_launch_holders: Vec::new(),
         };
 
         validate_manifest(&manifest).unwrap();
@@ -617,11 +662,93 @@ mod tests {
             presented_focused_terminal: None,
             opencode_runtime: None,
             claude_remote_control_bindings: vec![binding.clone()],
+            kiro_launch_holders: Vec::new(),
         };
         validate_manifest(&manifest).unwrap();
         let decoded: Manifest =
             serde_json::from_value(serde_json::to_value(manifest).unwrap()).unwrap();
         assert_eq!(decoded.claude_remote_control_bindings, [binding]);
+    }
+
+    #[test]
+    fn manifest_round_trips_bounded_kiro_launch_holder() {
+        let holder = KiroLaunchHolderManifest {
+            holder_id: uuid::Uuid::new_v4().to_string(),
+            pid: 42,
+            start_time: 99,
+            process_group_leader: true,
+            shell_id: uuid::Uuid::new_v4().to_string(),
+            run_id: uuid::Uuid::new_v4().to_string(),
+            sessions: vec![("session-1".into(), uuid::Uuid::new_v4().to_string())],
+        };
+        let manifest = Manifest {
+            runtimes: Vec::new(),
+            exited: Vec::new(),
+            event_stream: event_stream(),
+            notifications: None,
+            focused_terminal: None,
+            presented_focused_terminal: None,
+            opencode_runtime: None,
+            claude_remote_control_bindings: Vec::new(),
+            kiro_launch_holders: vec![holder.clone()],
+        };
+        validate_manifest(&manifest).unwrap();
+        let decoded: Manifest =
+            serde_json::from_value(serde_json::to_value(manifest).unwrap()).unwrap();
+        assert_eq!(decoded.kiro_launch_holders[0].holder_id, holder.holder_id);
+        assert_eq!(decoded.kiro_launch_holders[0].sessions, holder.sessions);
+    }
+
+    #[test]
+    fn maximal_kiro_holder_manifest_fits_the_control_frame() {
+        let holders = (0..protocol::MAX_KIRO_LAUNCH_HOLDERS)
+            .map(|holder_index| KiroLaunchHolderManifest {
+                holder_id: uuid::Uuid::new_v4().to_string(),
+                pid: u32::MAX,
+                start_time: u64::MAX,
+                process_group_leader: false,
+                shell_id: uuid::Uuid::new_v4().to_string(),
+                run_id: uuid::Uuid::new_v4().to_string(),
+                sessions: (0..protocol::MAX_KIRO_HOLDER_SESSIONS)
+                    .map(|session_index| {
+                        let suffix = format!("-{holder_index}-{session_index}");
+                        let escaped = (0..protocol::MAX_KIRO_SESSION_ID_BYTES
+                            .saturating_sub(suffix.len()))
+                            .map(|index| if index % 2 == 0 { '"' } else { '\\' })
+                            .collect::<String>();
+                        (
+                            format!("{escaped}{suffix}"),
+                            uuid::Uuid::new_v4().to_string(),
+                        )
+                    })
+                    .collect(),
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            holders
+                .iter()
+                .flat_map(|holder| &holder.sessions)
+                .all(
+                    |(session_id, _)| session_id.len() == protocol::MAX_KIRO_SESSION_ID_BYTES
+                        && session_id.contains('"')
+                        && session_id.contains('\\')
+                )
+        );
+        let manifest = Manifest {
+            runtimes: Vec::new(),
+            exited: Vec::new(),
+            event_stream: event_stream(),
+            notifications: None,
+            focused_terminal: None,
+            presented_focused_terminal: None,
+            opencode_runtime: None,
+            claude_remote_control_bindings: Vec::new(),
+            kiro_launch_holders: holders,
+        };
+
+        validate_manifest(&manifest).unwrap();
+        let encoded = serde_json::to_vec(&manifest).unwrap();
+        assert!(encoded.len() + std::mem::size_of::<u32>() <= protocol::MAX_CONTROL_FRAME);
     }
 
     #[test]
@@ -647,6 +774,7 @@ mod tests {
                 presented_focused_terminal: None,
                 opencode_runtime: None,
                 claude_remote_control_bindings: Vec::new(),
+                kiro_launch_holders: Vec::new(),
             };
             assert_eq!(
                 validate_manifest(&manifest).unwrap_err().kind(),

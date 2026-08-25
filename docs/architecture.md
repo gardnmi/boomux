@@ -175,6 +175,15 @@ it to takeover on an older daemon. The runtime-only participant map requires no
 state or handoff format change. Its `Attached` response includes the primary
 terminal profile, and later primary resize frames are copied to collaborators so
 their local renderers retain the authoritative PTY grid.
+Protocol 45 adds `kiro_exact_launch_holders`. A supervised exact-argv Kiro
+launcher acquires one bounded ephemeral capability tied to its PID/start identity
+and exact current ShellRun. Kiro hooks can ensure and report canonical Sessions
+only through that live holder. Final-holder exit records Inactive at lifecycle
+integration authority without reporting Done. Handoff generation 7 accepts
+generation 6 and transfers live holders and their exact Session/Agent
+associations; cold recovery starts with none. Capacity is 256 holders with 16
+Sessions per holder, whose maximal handoff encoding remains below the control
+frame bound.
 Remote notification presentation reuses protocol-32 atomic reduced transitions,
 so it does not require a later protocol. Node-cache schema 2 adds bounded local
 at-most-once individual and reconnect-digest claims with an explicit schema-1
@@ -362,6 +371,7 @@ The daemon supports:
   state reports
 - One ephemeral Node-local Shared Harness Runtime generation and bounded exact-run
   OpenCode Agent Session Claims
+- Bounded exact-process Kiro Launch Holders and canonical Session associations
 
 An empty shell specification list remains empty. When an explicit populated
 creation is requested, the daemon stages every child before publishing any of
@@ -1334,8 +1344,11 @@ Boomux does not share that file with unrelated Kiro configuration.
 
 Eligible managed Kiro invocations pass through the common Shell-scoped shim and
 hidden launcher. A bare `kiro-cli` becomes `kiro-cli --v3`, while an explicit
-leading `--v3` is preserved. Both receive `BOOMUX_KIRO_RUN_SCOPED=1` only while
-the installed asset is current. Kiro v2 and service invocations, absolute paths
+leading `--v3` is preserved. The launcher supervises the exact argument vector
+with inherited terminal streams and foreground process-group behavior, and
+acquires a private daemon-owned Launch Holder
+only while the installed asset is current. Only that Kiro process tree receives
+the holder capability. Kiro v2 and service invocations, absolute paths
 typed in a login Shell,
 modified PATHs, absent or modified assets, and use outside Boomux execute stock
 Kiro unchanged and untracked. Exact configured executable paths are retained
@@ -1343,13 +1356,18 @@ through `BOOMUX_REAL_KIRO`; private launcher provenance is removed from unrelate
 children.
 
 Kiro hook `session_id` is the canonical Session identity and ensures the exact
-`(kiro, session, shell, run)` Agent key. Prompt and tool events report Working.
+`(kiro, session, shell, run)` Agent key through its live Launch Holder. Prompt and
+tool events report Working.
 Kiro runs hooks in isolated sub-agent executions, but the standalone SessionStart
 and Stop payloads do not identify whether the event belongs to the root execution.
 Those boundaries therefore report Unknown rather than Idle and cannot produce a
 completion notification. The documented hooks expose no authoritative
 permission-wait, session-inactivity, error, or permanent-completion event, so
-Boomux never derives Blocked, Idle, Inactive, or Done for Kiro. If one Kiro
+Boomux never derives Blocked, Idle, or Done for Kiro. Exact supervised process
+exit releases its holder; if no other live holder owns that canonical Session,
+Boomux reports Inactive at lifecycle integration authority. Concurrent holders
+for one Session keep it active until the final release. Late hooks from dead
+holders fail closed inside Boomux and remain fail-open to Kiro. If one Kiro
 process switches canonical Sessions without ending the old one, both histories
 remain truthful and cold recovery refuses the resulting ambiguity rather than
 guessing.
@@ -1362,8 +1380,33 @@ cloud catalogs are not projected. Although Kiro cloud sessions can be viewed in
 Kiro Web and Mobile, Kiro documents no exact browser URL derivable from a local
 CLI Session ID, and cloud hooks execute in Kiro's sandbox rather than under the
 local ShellRun. Boomux therefore exposes no Kiro native web handoff or cloud
-lifecycle authority. Existing Agent, Session, Schedule, and recovery shapes are
-reused without a protocol or durable-state version change.
+lifecycle authority. Protocol 45 carries holder acquire, hook report, and release
+operations. Holders remain absent from durable state, snapshots, projections, and
+events, so `STATE_VERSION` is unchanged. Graceful handoff generation 7 transfers
+only holders whose exact process identity remains live; cold recovery inherits no
+holder authority.
+
+The daemon checks holder liveness once per second, matching the ordinary UI
+observation cadence. Holder operations and graceful handoff reconcile
+immediately. Reconciliation uses the ordinary durable mutation coordinator, so
+Inactive persistence precedes event publication and wakes event waiters. Failed
+release after graceful replacement is therefore eventually observed by the
+replacement daemon without another Kiro launch. Routine checks read only exact
+PID/start identity; acquire and import retain strict argv and environment checks.
+Acquire revalidates the exact current
+ShellRun and unchanged process start identity inside that same mutation gate
+immediately before insertion. Handoff import independently requires a live
+process, a current running ShellRun, and active exact Kiro Agent associations.
+
+The launcher installs Linux `PR_SET_PDEATHSIG` on the exact Kiro child before
+exec. It does not install or replace signal handlers. Terminal Ctrl+C retains
+ordinary foreground process-group delivery and shell-visible `128 + signal`
+status. If the holder alone receives SIGTERM, SIGHUP, or another terminating
+signal, holder death causes the kernel to terminate the exact managed child so it
+cannot remain orphaned. If descendants survive that immediate child cleanup, the
+daemon signals only a process group whose original holder was confirmed as its
+leader and whose surviving member still carries the private holder capability;
+PID/start validation prevents treating a live or reused holder PID as dead.
 
 ### Claude Code Lifecycle Integration
 
