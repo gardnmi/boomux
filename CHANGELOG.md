@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.30.3](https://github.com/gardnmi/boomux/compare/v0.30.2...v0.30.3) (2026-08-25)
+
+
+### Bug Fixes
+
+* **kiro:** stage shim before host installation ([#264](https://github.com/gardnmi/boomux/issues/264)) ([9227525](https://github.com/gardnmi/boomux/commit/9227525f896136220ff3532bbd2ccfd65e5cbfb9))
+
 ## [0.30.2](https://github.com/gardnmi/boomux/compare/v0.30.1...v0.30.2) (2026-08-25)
 
 
