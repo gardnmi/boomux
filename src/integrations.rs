@@ -306,7 +306,7 @@ pub const KIRO: IntegrationDescriptor = IntegrationDescriptor {
         asset_name: "hooks",
         content: include_str!("../integrations/kiro/boomux.json"),
         executable: "kiro-cli",
-        reload_message: "Restart Kiro CLI in v3 mode to activate the hooks",
+        reload_message: "Reopen its managed ShellRun, then start Kiro CLI in v3 mode to activate the hooks",
         target: InstallTargetKind::Kiro,
     }),
     titles: None,

@@ -338,7 +338,7 @@ fn bare_codex_typed_in_managed_login_shell_uses_run_scoped_hooks() {
 }
 
 #[test]
-fn bare_kiro_typed_in_managed_login_shell_selects_v3() {
+fn kiro_installed_after_managed_login_shell_start_selects_v3() {
     let mut daemon = TestDaemon::start();
     let bin = daemon.runtime_dir.join("kiro-login-bin");
     let home = daemon.runtime_dir.join("kiro-login-home");
@@ -352,18 +352,6 @@ fn bare_kiro_typed_in_managed_login_shell_selects_v3() {
         include_str!("../../integrations/kiro/boomux.json"),
     )
     .unwrap();
-    let kiro = bin.join("kiro-cli");
-    fs::write(
-        &kiro,
-        format!(
-            "#!/bin/sh\n: > '{}'\nfor arg do printf '%s\\0' \"$arg\" >> '{}'; done\nprintf '%s' \"${{BOOMUX_KIRO_RUN_SCOPED-unset}}\" > '{}'\n",
-            argv_output.display(),
-            argv_output.display(),
-            marker_output.display(),
-        ),
-    )
-    .unwrap();
-    fs::set_permissions(&kiro, fs::Permissions::from_mode(0o700)).unwrap();
     let workspace = daemon
         .client
         .create_workspace(
@@ -391,6 +379,18 @@ fn bare_kiro_typed_in_managed_login_shell_selects_v3() {
     };
     let mut attachment =
         attach_with_environment(&daemon.client, &workspace.shells[0].id, false, environment);
+    let kiro = bin.join("kiro-cli");
+    fs::write(
+        &kiro,
+        format!(
+            "#!/bin/sh\n: > '{}'\nfor arg do printf '%s\\0' \"$arg\" >> '{}'; done\nprintf '%s' \"${{BOOMUX_KIRO_RUN_SCOPED-unset}}\" > '{}'\n",
+            argv_output.display(),
+            argv_output.display(),
+            marker_output.display(),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&kiro, fs::Permissions::from_mode(0o700)).unwrap();
     AttachFrame::Input(b"kiro-cli\n".to_vec())
         .write_to(&mut attachment.stream)
         .unwrap();
