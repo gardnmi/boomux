@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.30.2](https://github.com/gardnmi/boomux/compare/v0.30.1...v0.30.2) (2026-08-25)
+
+
+### Bug Fixes
+
+* **web:** follow replacement OpenCode runtime ([#261](https://github.com/gardnmi/boomux/issues/261)) ([2a3d67c](https://github.com/gardnmi/boomux/commit/2a3d67c2c62770e93b42412b07cfd9cf44dfdb2c))
+
 ## [0.30.1](https://github.com/gardnmi/boomux/compare/v0.30.0...v0.30.1) (2026-08-25)
 
 
