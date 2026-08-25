@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.30.1](https://github.com/gardnmi/boomux/compare/v0.30.0...v0.30.1) (2026-08-25)
+
+
+### Bug Fixes
+
+* preserve interactive node setup and workspace layout ([#259](https://github.com/gardnmi/boomux/issues/259)) ([4471794](https://github.com/gardnmi/boomux/commit/447179459b145b232cd3381aef0512931b81fc58))
+
 ## [0.30.0](https://github.com/gardnmi/boomux/compare/v0.29.1...v0.30.0) (2026-08-25)
 
 
