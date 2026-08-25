@@ -1222,16 +1222,6 @@ fn inject_opencode_shim_environment(
     let real_claude = resolve_executable(environment, Some(&shim_dir), "claude");
     let real_codex = resolve_codex_executable(environment, Some(&shim_dir));
     let real_kiro = resolve_kiro_executable(environment, Some(&shim_dir));
-    if real_opencode.is_none()
-        && real_claude.is_none()
-        && real_codex.is_none()
-        && real_kiro.is_none()
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "supported Agent executables are unavailable",
-        ));
-    }
     let boomux = env::current_exe()?.canonicalize()?;
     let boomux_metadata = fs::metadata(&boomux)?;
     if !boomux.is_absolute()
@@ -1272,9 +1262,7 @@ fn inject_opencode_shim_environment(
     if real_codex.is_some() {
         atomic_runtime_asset(&shim_dir.join("codex"), CODEX_SHIM, 0o700)?;
     }
-    if real_kiro.is_some() {
-        atomic_runtime_asset(&shim_dir.join("kiro-cli"), KIRO_SHIM, 0o700)?;
-    }
+    atomic_runtime_asset(&shim_dir.join("kiro-cli"), KIRO_SHIM, 0o700)?;
 
     let original_path = environment_value(environment, b"PATH").unwrap_or_default();
     let mut paths = vec![shim_dir.clone()];
@@ -20160,7 +20148,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_real_opencode_leaves_the_sanitized_environment_usable() {
+    fn missing_agent_hosts_still_prepare_the_late_install_kiro_shim() {
         let directory = env::temp_dir().join(format!("boomux-opencode-missing-{}", Uuid::new_v4()));
         let runtime = directory.join("runtime");
         let empty_bin = directory.join("bin");
@@ -20168,8 +20156,17 @@ mod tests {
         fs::create_dir_all(&empty_bin).unwrap();
         let environment = test_environment(&[("XDG_RUNTIME_DIR", &runtime), ("PATH", &empty_bin)]);
         let sanitized = sanitize_opencode_shim_environment(&environment);
-        assert!(inject_opencode_shim_environment(&sanitized, true).is_err());
-        assert_eq!(sanitized, environment);
+        let injected = inject_opencode_shim_environment(&sanitized, true).unwrap();
+        let shim_dir =
+            PathBuf::from(environment_value(&injected, b"BOOMUX_OPENCODE_SHIM_DIR").unwrap());
+        assert!(shim_dir.join("kiro-cli").is_file());
+        assert_eq!(environment_value(&injected, b"BOOMUX_REAL_KIRO"), None);
+        assert_eq!(
+            env::split_paths(&environment_value(&injected, b"PATH").unwrap())
+                .next()
+                .as_deref(),
+            Some(shim_dir.as_path())
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 

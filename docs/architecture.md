@@ -1400,8 +1400,10 @@ Boomux does not share that file with unrelated Kiro configuration.
 Eligible managed Kiro invocations pass through the common Shell-scoped shim and
 hidden launcher. A bare `kiro-cli` becomes `kiro-cli --v3`, while an explicit
 leading `--v3` is preserved. Both receive `BOOMUX_KIRO_RUN_SCOPED=1` only while
-the installed asset is current. Kiro v2 and service invocations, absolute paths
-typed in a login Shell,
+the installed asset is current. Eligible login ShellRuns stage the delegating
+shim even when Kiro is not yet installed, so a later installation into their
+existing executable search path does not bypass lifecycle integration. Kiro v2
+and service invocations, absolute paths typed in a login Shell,
 modified PATHs, absent or modified assets, and use outside Boomux execute stock
 Kiro unchanged and untracked. Exact configured executable paths are retained
 through `BOOMUX_REAL_KIRO`; private launcher provenance is removed from unrelated

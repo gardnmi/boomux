@@ -6684,7 +6684,7 @@ fn format_integration_statuses(statuses: &[integration_management::IntegrationSt
             output,
             "  {:<14}{}",
             "Action",
-            format_recommended_action(status.recommended_action)
+            format_recommended_action(status.name, status.recommended_action)
         )
         .expect("writing to a string cannot fail");
         writeln!(
@@ -6711,11 +6711,17 @@ fn format_runtime_status(status: &integration_management::RuntimeStatus) -> Stri
     )
 }
 
-fn format_recommended_action(action: integration_management::RecommendedAction) -> &'static str {
+fn format_recommended_action(
+    integration: &str,
+    action: integration_management::RecommendedAction,
+) -> &'static str {
     match action {
         integration_management::RecommendedAction::None => "none",
         integration_management::RecommendedAction::Install => "install integration",
         integration_management::RecommendedAction::Replace => "replace with --force",
+        integration_management::RecommendedAction::RestartHost if integration == "kiro" => {
+            "reopen managed ShellRun, then launch bare kiro-cli"
+        }
         integration_management::RecommendedAction::RestartHost => "restart host",
         integration_management::RecommendedAction::InspectError => "inspect reported error",
     }
@@ -13155,10 +13161,17 @@ fn print_integration_diagnostic(
         );
         true
     } else {
-        eprintln!(
-            "err {} integration: {} foreground process(es) are untracked; restart {} and verify it loads {path}",
-            spec.key, status.runtime.untracked_processes, spec.display_name
-        );
+        if integration == integration_management::IntegrationId::KIRO {
+            eprintln!(
+                "err {} integration: {} foreground process(es) are untracked; reopen the owning managed ShellRun, then launch bare kiro-cli and verify it loads {path}",
+                spec.key, status.runtime.untracked_processes
+            );
+        } else {
+            eprintln!(
+                "err {} integration: {} foreground process(es) are untracked; restart {} and verify it loads {path}",
+                spec.key, status.runtime.untracked_processes, spec.display_name
+            );
+        }
         false
     }
 }
@@ -17145,6 +17158,13 @@ mod tests {
             output.contains("  Runtime       untracked (3 running, 2 reporting, 1 untracked)\n")
         );
         assert!(output.contains("  Action        restart host\n"));
+        assert_eq!(
+            format_recommended_action(
+                "kiro",
+                integration_management::RecommendedAction::RestartHost
+            ),
+            "reopen managed ShellRun, then launch bare kiro-cli"
+        );
     }
 
     #[test]
