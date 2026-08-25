@@ -3,6 +3,7 @@ use std::error::Error;
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::process::CommandExt;
 use std::os::unix::{fs::PermissionsExt, net::UnixListener, net::UnixStream};
 use std::path::{Path, PathBuf};
@@ -15,6 +16,12 @@ use uuid::Uuid;
 static TEMPORARY_DIRECTORY_ID: AtomicU64 = AtomicU64::new(0);
 const OPEN_GATE_TIMEOUT: Duration = Duration::from_secs(10);
 const OPEN_GATE_RETRY: Duration = Duration::from_millis(10);
+
+pub(crate) struct HyprlandPlacement<'a> {
+    pub(crate) workspace_id: &'a str,
+    pub(crate) node_id: &'a str,
+    pub(crate) shell_id: &'a str,
+}
 
 pub(crate) struct OpenGate {
     listener: UnixListener,
@@ -114,6 +121,24 @@ pub(crate) fn open(
     open_with_expected_run(desktop_entry, shell_id, None, title, takeover, None)
 }
 
+pub(crate) fn open_placed(
+    desktop_entry: Option<&str>,
+    shell_id: &str,
+    title: &str,
+    takeover: bool,
+    placement: HyprlandPlacement<'_>,
+) -> Result<(), Box<dyn Error>> {
+    open_with_expected_run_and_placement(
+        desktop_entry,
+        shell_id,
+        None,
+        title,
+        takeover,
+        None,
+        Some(placement),
+    )
+}
+
 pub(crate) fn open_remote(
     desktop_entry: Option<&str>,
     node_id: &str,
@@ -128,6 +153,29 @@ pub(crate) fn open_remote(
         title,
         takeover,
         None,
+    )
+}
+
+pub(crate) fn open_remote_placed(
+    desktop_entry: Option<&str>,
+    node_id: &str,
+    shell_id: &str,
+    title: &str,
+    takeover: bool,
+    workspace_id: &str,
+) -> Result<(), Box<dyn Error>> {
+    open_with_expected_run_and_placement(
+        desktop_entry,
+        shell_id,
+        Some(node_id),
+        title,
+        takeover,
+        None,
+        Some(HyprlandPlacement {
+            workspace_id,
+            node_id,
+            shell_id,
+        }),
     )
 }
 
@@ -146,6 +194,35 @@ pub(crate) fn open_waiting(
         None,
         executable.as_os_str(),
         &arguments,
+        None,
+        false,
+    )?;
+    Ok(gate)
+}
+
+pub(crate) fn open_waiting_placed(
+    desktop_entry: Option<&str>,
+    remote_node_id: Option<&str>,
+    local_node_id: &str,
+    workspace_id: &str,
+    shell_id: &str,
+    title: &str,
+) -> Result<OpenGate, Box<dyn Error>> {
+    let gate = OpenGate::new()?;
+    let executable = attachment_executable()?;
+    let arguments = waiting_attachment_arguments(&gate.path, shell_id, remote_node_id);
+    launch(
+        desktop_entry,
+        title,
+        None,
+        executable.as_os_str(),
+        &arguments,
+        Some(HyprlandPlacement {
+            workspace_id,
+            node_id: remote_node_id.unwrap_or(local_node_id),
+            shell_id,
+        }),
+        false,
     )?;
     Ok(gate)
 }
@@ -212,6 +289,8 @@ pub(crate) fn open_command(
         Some(cwd),
         OsStr::new(program),
         &arguments,
+        None,
+        false,
     )
 }
 
@@ -232,6 +311,8 @@ pub(crate) fn open_agent_session(
         None,
         executable.as_os_str(),
         &arguments,
+        None,
+        false,
     )
 }
 
@@ -253,6 +334,26 @@ fn open_with_expected_run(
     takeover: bool,
     expected_run_id: Option<&str>,
 ) -> Result<(), Box<dyn Error>> {
+    open_with_expected_run_and_placement(
+        desktop_entry,
+        shell_id,
+        node_id,
+        title,
+        takeover,
+        expected_run_id,
+        None,
+    )
+}
+
+fn open_with_expected_run_and_placement(
+    desktop_entry: Option<&str>,
+    shell_id: &str,
+    node_id: Option<&str>,
+    title: &str,
+    takeover: bool,
+    expected_run_id: Option<&str>,
+    placement: Option<HyprlandPlacement<'_>>,
+) -> Result<(), Box<dyn Error>> {
     let executable = attachment_executable()?;
     let mut arguments = attachment_arguments(shell_id, node_id, expected_run_id);
     if takeover {
@@ -264,6 +365,8 @@ fn open_with_expected_run(
         None,
         executable.as_os_str(),
         &arguments,
+        placement,
+        true,
     )
 }
 
@@ -275,6 +378,8 @@ pub fn open_node_add(desktop_entry: Option<&str>) -> Result<(), Box<dyn Error>> 
         None,
         attachment_executable()?.as_os_str(),
         &arguments,
+        None,
+        false,
     )
 }
 
@@ -286,6 +391,8 @@ pub fn open_node_upgrade(desktop_entry: Option<&str>, node_id: &str) -> Result<(
         None,
         attachment_executable()?.as_os_str(),
         &arguments,
+        None,
+        false,
     )
 }
 
@@ -297,12 +404,31 @@ fn node_upgrade_arguments(node_id: &str) -> [OsString; 2] {
     ["__guided-node-upgrade".into(), node_id.into()]
 }
 
+pub(crate) fn open_plain(desktop_entry: Option<&str>) -> Result<(), Box<dyn Error>> {
+    let preference = desktop_entry.map(TemporaryPreference::new).transpose()?;
+    let selected = if desktop_entry.is_some() {
+        selected_with_preference(desktop_entry, preference.as_ref())?
+    } else {
+        "configured terminal".to_owned()
+    };
+    let output = configured_command(preference.as_ref())
+        .arg(r"--print-cmd=\0")
+        .output()?;
+    if !output.status.success() {
+        let message = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("could not prepare {selected}: {}", message.trim()).into());
+    }
+    spawn_terminal(parse_nul_arguments(&output.stdout)?, None, &selected, None)
+}
+
 fn launch(
     desktop_entry: Option<&str>,
     title: &str,
     cwd: Option<&Path>,
     program: &OsStr,
     arguments: &[OsString],
+    placement: Option<HyprlandPlacement<'_>>,
+    reuse_existing: bool,
 ) -> Result<(), Box<dyn Error>> {
     let preference = desktop_entry.map(TemporaryPreference::new).transpose()?;
     let selected = if desktop_entry.is_some() {
@@ -310,10 +436,46 @@ fn launch(
     } else {
         "configured terminal".to_owned()
     };
+    let resolved_title = placement
+        .as_ref()
+        .map(|placement| crate::hyprland::shell_title(placement.node_id, placement.shell_id, title))
+        .transpose()?;
+    let launch_lock = placement
+        .as_ref()
+        .map(|_| crate::hyprland::acquire_launch_lock())
+        .transpose()?;
+    if reuse_existing && let Some(placement) = placement.as_ref() {
+        match crate::hyprland::place_existing_shell_windows(
+            placement.node_id,
+            placement.shell_id,
+            placement.workspace_id,
+        ) {
+            Ok(crate::hyprland::ShellWindowReuse::Reused) => return Ok(()),
+            Ok(crate::hyprland::ShellWindowReuse::ExistingPlacementFailed(error)) => {
+                return Err(format!("existing terminal could not be moved: {error}").into());
+            }
+            Ok(crate::hyprland::ShellWindowReuse::Absent) => {}
+            Err(error) => return Err(format!("could not inspect Hyprland windows: {error}").into()),
+        }
+    }
+    let launch_token = if let Some(placement) = placement.as_ref() {
+        match crate::hyprland::acquire_launch_token(placement.node_id, placement.shell_id)? {
+            crate::hyprland::LaunchToken::Acquired(token) => Some(token),
+            crate::hyprland::LaunchToken::Held if reuse_existing => return Ok(()),
+            crate::hyprland::LaunchToken::Held => {
+                return Err("a terminal launch is already pending for this Shell".into());
+            }
+        }
+    } else {
+        None
+    };
     let mut resolver = configured_command(preference.as_ref());
     resolver
         .arg(r"--print-cmd=\0")
-        .arg(format!("--title={title}"))
+        .arg(format!(
+            "--title={}",
+            resolved_title.as_deref().unwrap_or(title)
+        ))
         .arg("--")
         .arg(program)
         .args(arguments);
@@ -325,7 +487,31 @@ fn launch(
         let message = String::from_utf8_lossy(&output.stderr);
         return Err(format!("could not prepare {selected}: {}", message.trim()).into());
     }
-    let arguments = parse_nul_arguments(&output.stdout)?;
+    spawn_terminal(
+        parse_nul_arguments(&output.stdout)?,
+        cwd,
+        &selected,
+        launch_token.as_ref(),
+    )?;
+    if let Some(placement) = placement
+        && let Err(error) = crate::hyprland::wait_and_place_shell_window(
+            placement.node_id,
+            placement.shell_id,
+            placement.workspace_id,
+        )
+    {
+        eprintln!("warning: terminal opened without Hyprland placement: {error}");
+    }
+    drop(launch_lock);
+    Ok(())
+}
+
+fn spawn_terminal(
+    arguments: Vec<OsString>,
+    cwd: Option<&Path>,
+    selected: &str,
+    launch_token: Option<&fs::File>,
+) -> Result<(), Box<dyn Error>> {
     let (program, arguments) = arguments
         .split_first()
         .ok_or("xdg-terminal-exec returned an empty terminal command")?;
@@ -338,20 +524,40 @@ fn launch(
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
-    // The child has not executed user code yet; `setsid` detaches the terminal
-    // window from the dashboard process and its controlling terminal.
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setsid() == -1 {
-                Err(std::io::Error::last_os_error())
+    let inherited_token = launch_token
+        .map(|token| {
+            let descriptor = unsafe { libc::fcntl(token.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+            if descriptor == -1 {
+                Err(io::Error::last_os_error())
             } else {
-                Ok(())
+                // The duplicate stays close-on-exec in the multithreaded parent.
+                Ok(unsafe { fs::File::from_raw_fd(descriptor) })
             }
+        })
+        .transpose()?;
+    let inherited_token_fd = inherited_token.as_ref().map(AsRawFd::as_raw_fd);
+    // The child has not executed user code yet; `setsid` detaches the terminal
+    // window, and only this child clears close-on-exec for the launch token.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if let Some(descriptor) = inherited_token_fd {
+                let flags = libc::fcntl(descriptor, libc::F_GETFD);
+                if flags == -1
+                    || libc::fcntl(descriptor, libc::F_SETFD, flags & !libc::FD_CLOEXEC) == -1
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
         });
     }
     command
         .spawn()
         .map_err(|error| format!("could not launch {selected}: {error}"))?;
+    drop(inherited_token);
     Ok(())
 }
 

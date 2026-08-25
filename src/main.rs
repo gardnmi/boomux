@@ -44,6 +44,7 @@ mod git;
 mod hook_input;
 mod host_session_source;
 mod host_session_titles;
+mod hyprland;
 mod integration_management;
 mod kiro_hooks;
 mod mobile_web;
@@ -293,6 +294,10 @@ const NON_PROTOCOL_FEATURES: &[&str] = &[
     "integration_management",
     "persistent_workspace_selection",
     "create_and_open_shell",
+    "hyprland_special_workspaces",
+    "contextual_desktop_terminal",
+    "coordinated_shell_desktop_placement",
+    "desktop_workspace_show",
 ];
 const LEGACY_BOOMUX_SHELLS_SKILL: &str = r#"---
 name: boomux-shells
@@ -454,6 +459,11 @@ enum Commands {
         #[command(subcommand)]
         command: WorkspaceCommands,
     },
+    /// Navigate Boomux Workspaces through an optional desktop layer
+    Desktop {
+        #[command(subcommand)]
+        command: DesktopCommands,
+    },
     /// Manage this Boomux Node identity
     Node {
         #[command(subcommand)]
@@ -543,6 +553,9 @@ enum Commands {
         /// Exact registered Node alias or Node ID
         #[arg(long)]
         node: Option<String>,
+        /// Coordinated Workspace to use for optional desktop placement
+        #[arg(long, value_name = "COORDINATED_WORKSPACE")]
+        workspace: Option<String>,
         #[arg(long)]
         title: Option<String>,
         #[arg(long)]
@@ -710,6 +723,9 @@ enum WorkspaceCommands {
         /// Exact registered Node alias or Node ID
         #[arg(long)]
         node: Option<String>,
+        /// Show the coordinated Workspace's desktop layer while restoring it
+        #[arg(long)]
+        show: bool,
     },
     /// Show a workspace and its shells
     Inspect { target: String },
@@ -740,6 +756,31 @@ enum WorkspaceCommands {
         #[arg(value_name = "CLOSING_GLOBAL_WORKSPACE")]
         target: String,
     },
+}
+
+#[derive(Clone, Subcommand)]
+enum DesktopCommands {
+    /// Show or hide the selected Boomux Workspace layer
+    Toggle,
+    /// Select the next Boomux Workspace, or the next regular desktop workspace
+    Next,
+    /// Select the previous Boomux Workspace, or the previous regular desktop workspace
+    Previous,
+    /// Select an exact coordinated Boomux Workspace without restoring it
+    Show {
+        #[arg(value_name = "WORKSPACE")]
+        target: String,
+    },
+    /// Create a Boomux Shell in the visible layer, or open a normal terminal
+    Terminal,
+    /// Close the focused Boomux Shell, or close the ordinary active window
+    Close,
+    /// Float the active window contextually without pinning it in a Boomux layer
+    Pop,
+    /// Return the active Boomux terminal to its coordinated Workspace layer
+    Return,
+    /// Gather all terminal windows into the selected or visible Boomux Workspace layer
+    Gather,
 }
 
 #[derive(Subcommand)]
@@ -1488,6 +1529,7 @@ command_keys! {
     WorkspaceList => ("workspace.list", Json),
     WorkspaceInspect => ("workspace.inspect", Json),
     Workspace => ("workspace", HumanOnly),
+    Desktop => ("desktop", HumanOnly),
     NodeAdd => ("node.add", Json),
     NodeUpgrade => ("node.upgrade", HumanOnly),
     NodeList => ("node.list", Json),
@@ -1744,6 +1786,7 @@ impl Cli {
                     | WorkspaceCommands::Close { .. }
                     | WorkspaceCommands::Retry { .. },
             }) => CommandKey::Workspace,
+            Some(Commands::Desktop { .. }) => CommandKey::Desktop,
             Some(Commands::Shell {
                 command:
                     ShellCommands::Create { .. }
@@ -2135,6 +2178,7 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
         Some(Commands::Workspace { command }) => {
             workspace_command(command, cli.json, cli.terminal.as_deref())
         }
+        Some(Commands::Desktop { command }) => desktop_command(command, cli.terminal.as_deref()),
         Some(Commands::Node { command }) => node_command(command, cli.json),
         Some(Commands::Shell { command }) => {
             shell_command(command, cli.json, cli.terminal.as_deref())
@@ -2202,6 +2246,7 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
         Some(Commands::Open {
             shell_id,
             node,
+            workspace,
             title,
             takeover,
         }) => {
@@ -2209,6 +2254,7 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
             open_shell(
                 &shell_id,
                 node.as_deref(),
+                workspace.as_deref(),
                 title.as_deref(),
                 takeover,
                 terminal.as_deref(),
@@ -2269,6 +2315,13 @@ fn verified_remote_connection(
     } else {
         ssh_bootstrap::SshAuthenticationMode::Batch
     };
+    if interactive {
+        println!(
+            "Connecting to {}. Complete any SSH authentication prompt or login URL shown in this terminal.",
+            target.as_str()
+        );
+        std::io::Write::flush(&mut io::stdout())?;
+    }
     let mut session = ssh_bootstrap::BootstrapSession::open(target, authentication, TIMEOUT)
         .map_err(bootstrap_cli_failure)?;
     // Both branches return a channel verified by exactly one protocol ping. An
@@ -2315,6 +2368,15 @@ fn verified_remote_connection(
 
 fn bootstrap_cli_failure(error: io::Error) -> Box<dyn Error> {
     cli_output::failure(ssh_bootstrap::error_code(&error), error.to_string())
+}
+
+const fn should_release_node_upgrade_maintenance(
+    recovery: ssh_bootstrap::BootstrapRecoveryDisposition,
+) -> bool {
+    !matches!(
+        recovery,
+        ssh_bootstrap::BootstrapRecoveryDisposition::OutcomeUnknown
+    )
 }
 
 fn upgrade_node(selector: &str) -> Result<(), Box<dyn Error>> {
@@ -2364,23 +2426,42 @@ fn upgrade_node(selector: &str) -> Result<(), Box<dyn Error>> {
             "Node registration changed while upgrade authorization was pending; refresh and retry",
         ));
     }
-    let upgrade = session
-        .install_and_connect_guarded(&plan, TIMEOUT, || {
-            local
-                .renew_node_upgrade_maintenance(&registration.node_id, &maintenance_token)
-                .map_err(|error| io::Error::other(error.to_string()))
-        })
-        .map_err(bootstrap_cli_failure);
+    let upgrade = session.install_and_connect_guarded(&plan, TIMEOUT, || {
+        local
+            .renew_node_upgrade_maintenance(&registration.node_id, &maintenance_token)
+            .map_err(|error| io::Error::other(error.to_string()))
+    });
     let connection = match upgrade {
         Ok(connection) => {
             local.finish_node_upgrade_maintenance(&registration.node_id, maintenance_token)?;
             connection
         }
         Err(error) => {
-            eprintln!(
-                "boomux: Node upgrade maintenance remains active until bounded expiry while remote rollback settles"
-            );
-            return Err(error);
+            let recovery = ssh_bootstrap::recovery_disposition(&error);
+            if !should_release_node_upgrade_maintenance(recovery) {
+                eprintln!(
+                    "boomux: remote upgrade outcome is unknown; Node maintenance remains active until bounded expiry while watchdog recovery settles"
+                );
+            } else {
+                match local
+                    .finish_node_upgrade_maintenance(&registration.node_id, &maintenance_token)
+                {
+                    Ok(()) => eprintln!(
+                        "boomux: {}; Node maintenance was released",
+                        if recovery
+                            == ssh_bootstrap::BootstrapRecoveryDisposition::RollbackConfirmed
+                        {
+                            "remote rollback was confirmed"
+                        } else {
+                            "remote mutation did not begin"
+                        }
+                    ),
+                    Err(_) => eprintln!(
+                        "boomux: the upgrade reached a safe recovery state, but Node maintenance release could not be confirmed and remains bounded by expiry"
+                    ),
+                }
+            }
+            return Err(bootstrap_cli_failure(error));
         }
     };
     println!(
@@ -3395,6 +3476,17 @@ fn effective_terminal(override_entry: Option<&str>) -> Result<Option<String>, Bo
     Ok(config::load()?.terminal)
 }
 
+fn hyprland_special_workspaces_enabled() -> Result<bool, Box<dyn Error>> {
+    Ok(hyprland_special_workspaces_configured()? && hyprland::session_available())
+}
+
+fn hyprland_special_workspaces_configured() -> Result<bool, Box<dyn Error>> {
+    Ok(matches!(
+        config::load()?.desktop.workspace_layer,
+        config::DesktopWorkspaceLayer::HyprlandSpecial
+    ))
+}
+
 fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
     ensure_host_terminal()?;
     validate_dashboard_terminal(io::stdin().is_terminal(), io::stdout().is_terminal())?;
@@ -3524,7 +3616,7 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
                     let workspace = client
                         .get_workspace(workspace_id)
                         .map_err(|error| error.to_string())?;
-                    open_workspace(&workspace, terminal.as_deref())
+                    open_workspace(&workspace, terminal.as_deref(), None, true)
                         .map_err(|error| error.to_string())?;
                     Ok(format!(
                         "Opened {} launcher(s) and {} shell(s) for {}",
@@ -3551,14 +3643,18 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
                     if workspace.revision != expected_revision {
                         return Err("global Workspace revision changed; refresh and retry".into());
                     }
-                    open_coordinated_workspace(&client, &combined, workspace, terminal.as_deref())
-                        .map_err(|error| error.to_string())?;
-                    Ok(format!(
-                        "Opened {} across available placements",
-                        workspace.name
-                    ))
+                    show_desktop_workspace(workspace).map_err(|error| error.to_string())?;
+                    let outcome = attempt_open_coordinated_workspace(
+                        &client,
+                        &combined,
+                        workspace,
+                        terminal.as_deref(),
+                        true,
+                    )
+                    .map_err(|error| error.to_string())?;
+                    tui_workspace_open_message(&workspace.name, &outcome)
                 })();
-                tui::DashboardEvent::OperationCompleted(result)
+                tui::DashboardEvent::WorkspaceOpened(result)
             }
             tui::DashboardEffect::RetryGlobalWorkspaceClose { workspace_id } => {
                 let result = client
@@ -3730,6 +3826,17 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
             tui::DashboardEffect::CreateWorkspace { name } => {
                 tui::DashboardEvent::OperationCompleted(
                     create_dashboard_workspace(&client, &name).map_err(|error| error.to_string()),
+                )
+            }
+            tui::DashboardEffect::CreateProjectWorkspace { name, default_cwd } => {
+                tui::DashboardEvent::OperationCompleted(
+                    create_dashboard_project_workspace(
+                        &client,
+                        &local_node_id,
+                        &name,
+                        &default_cwd,
+                    )
+                    .map_err(|error| error.to_string()),
                 )
             }
             tui::DashboardEffect::CreateShell(workspace_id) => {
@@ -5933,6 +6040,46 @@ fn create_dashboard_workspace(
     Ok(format!("Created empty workspace {name}"))
 }
 
+fn create_dashboard_project_workspace(
+    client: &client::Client,
+    local_node_id: &str,
+    name: &str,
+    project_cwd: &Path,
+) -> Result<String, Box<dyn Error>> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("workspace name cannot be empty".into());
+    }
+    let cwd = resolve_directory(project_cwd)?;
+    if !client.supports(protocol::ProtocolFeature::GlobalWorkspaces)? {
+        client.create_workspace_with_default_cwd(name, Some(cwd), Vec::new())?;
+        return Ok(format!("Created empty workspace {name}"));
+    }
+
+    let combined = client.combined_node_snapshot(Some(local_node_id.to_owned()))?;
+    let local = combined
+        .nodes
+        .iter()
+        .find(|node| node.local && node.node_id == local_node_id)
+        .filter(|node| node.workspace_owner_eligible)
+        .ok_or("local Node is not available for Workspace resources")?;
+    let shell_name = generated_names::stable(name);
+    let (workspace, shell) = client.create_global_workspace_with_shell(
+        Uuid::new_v4().to_string(),
+        Uuid::new_v4().to_string(),
+        name,
+        local.node_id.clone(),
+        Uuid::new_v4().to_string(),
+        cwd.clone(),
+        Uuid::new_v4().to_string(),
+        shell_spec(shell_name, &cwd, &[]),
+    )?;
+    Ok(format!(
+        "Created {} in {} on Node {}",
+        shell.name, workspace.name, local.alias
+    ))
+}
+
 fn create_dashboard_shell(
     client: &client::Client,
     workspace_id: &str,
@@ -6620,7 +6767,7 @@ fn format_integration_statuses(statuses: &[integration_management::IntegrationSt
             output,
             "  {:<14}{}",
             "Action",
-            format_recommended_action(status.recommended_action)
+            format_recommended_action(status.name, status.recommended_action)
         )
         .expect("writing to a string cannot fail");
         writeln!(
@@ -6647,11 +6794,17 @@ fn format_runtime_status(status: &integration_management::RuntimeStatus) -> Stri
     )
 }
 
-fn format_recommended_action(action: integration_management::RecommendedAction) -> &'static str {
+fn format_recommended_action(
+    integration: &str,
+    action: integration_management::RecommendedAction,
+) -> &'static str {
     match action {
         integration_management::RecommendedAction::None => "none",
         integration_management::RecommendedAction::Install => "install integration",
         integration_management::RecommendedAction::Replace => "replace with --force",
+        integration_management::RecommendedAction::RestartHost if integration == "kiro" => {
+            "reopen managed ShellRun, then launch bare kiro-cli"
+        }
         integration_management::RecommendedAction::RestartHost => "restart host",
         integration_management::RecommendedAction::InspectError => "inspect reported error",
     }
@@ -7080,14 +7233,46 @@ fn list_shells(json: bool) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn open_coordinated_workspace(
+struct CoordinatedWorkspaceOpenOutcome {
+    opened_launchers: usize,
+    opened_shells: usize,
+    failures: Vec<String>,
+}
+
+fn tui_workspace_open_message(
+    workspace_name: &str,
+    outcome: &CoordinatedWorkspaceOpenOutcome,
+) -> Result<String, String> {
+    if outcome.failures.is_empty() {
+        Ok(format!(
+            "Opened {} launcher(s) and {} shell(s) for {workspace_name}",
+            outcome.opened_launchers, outcome.opened_shells
+        ))
+    } else if outcome.opened_launchers + outcome.opened_shells > 0 {
+        Ok(format!(
+            "Opened {} launcher(s) and {} shell(s) for {workspace_name}; warning: {} operation(s) unavailable",
+            outcome.opened_launchers,
+            outcome.opened_shells,
+            outcome.failures.len()
+        ))
+    } else {
+        Err(format!(
+            "Workspace {workspace_name} could not be restored: {}",
+            outcome.failures.join("; ")
+        ))
+    }
+}
+
+fn attempt_open_coordinated_workspace(
     client: &client::Client,
     combined: &protocol::CombinedNodeSnapshot,
     workspace: &protocol::GlobalWorkspaceSnapshot,
     terminal_override: Option<&str>,
-) -> Result<(usize, usize), Box<dyn Error>> {
+    invoke_launchers: bool,
+) -> Result<CoordinatedWorkspaceOpenOutcome, Box<dyn Error>> {
     let operation = client.open_global_workspace(&workspace.id, workspace.revision)?;
     let terminal = effective_terminal(terminal_override)?;
+    let desktop_placement = hyprland_special_workspaces_enabled()?;
     let mut opened_launchers = 0;
     let mut opened_shells = 0;
     let mut failures = Vec::new();
@@ -7131,26 +7316,39 @@ fn open_coordinated_workspace(
             }
         };
         if node.is_some_and(|node| node.local) {
-            match open_workspace(&owner, terminal.as_deref()) {
-                Ok(()) => {
-                    opened_launchers += owner.launchers.len();
-                    opened_shells += workspace_user_shell_count(&owner);
+            match attempt_open_workspace(
+                &owner,
+                terminal.as_deref(),
+                desktop_placement.then_some((workspace.id.as_str(), placement.node_id.as_str())),
+                invoke_launchers,
+            ) {
+                Ok(outcome) => {
+                    opened_launchers += outcome.opened_launchers;
+                    opened_shells += outcome.opened_shells;
+                    failures.extend(
+                        outcome
+                            .failures
+                            .into_iter()
+                            .map(|failure| format!("Node {alias}: {failure}")),
+                    );
                 }
                 Err(error) => failures.push(format!("Node {alias}: {error}")),
             }
             continue;
         }
-        for launcher in &owner.launchers {
-            match client.route_node_host_service(
-                &placement.node_id,
-                protocol::HostServiceOperation::InvokeLauncher {
-                    workspace_id: owner.id.clone(),
-                    launcher_id: launcher.id.clone(),
-                },
-            ) {
-                Ok(_) => opened_launchers += 1,
-                Err(error) => {
-                    failures.push(format!("Node {alias} launcher {}: {error}", launcher.name))
+        if invoke_launchers {
+            for launcher in &owner.launchers {
+                match client.route_node_host_service(
+                    &placement.node_id,
+                    protocol::HostServiceOperation::InvokeLauncher {
+                        workspace_id: owner.id.clone(),
+                        launcher_id: launcher.id.clone(),
+                    },
+                ) {
+                    Ok(_) => opened_launchers += 1,
+                    Err(error) => {
+                        failures.push(format!("Node {alias} launcher {}: {error}", launcher.name))
+                    }
                 }
             }
         }
@@ -7159,28 +7357,415 @@ fn open_coordinated_workspace(
             .iter()
             .filter(|shell| matches!(shell.owner, protocol::ShellOwner::User))
         {
-            match terminal::open_remote(
-                terminal.as_deref(),
-                &placement.node_id,
-                &shell.id,
-                &format!("[{alias}] {} - {}", workspace.name, shell.name),
-                true,
-            ) {
+            let opened = if desktop_placement {
+                terminal::open_remote_placed(
+                    terminal.as_deref(),
+                    &placement.node_id,
+                    &shell.id,
+                    &format!("[{alias}] {} - {}", workspace.name, shell.name),
+                    true,
+                    &workspace.id,
+                )
+            } else {
+                terminal::open_remote(
+                    terminal.as_deref(),
+                    &placement.node_id,
+                    &shell.id,
+                    &format!("[{alias}] {} - {}", workspace.name, shell.name),
+                    true,
+                )
+            };
+            match opened {
                 Ok(()) => opened_shells += 1,
                 Err(error) => failures.push(format!("Node {alias} shell {}: {error}", shell.name)),
             }
         }
     }
-    if failures.is_empty() {
-        Ok((opened_launchers, opened_shells))
+    Ok(CoordinatedWorkspaceOpenOutcome {
+        opened_launchers,
+        opened_shells,
+        failures,
+    })
+}
+
+fn open_coordinated_workspace(
+    client: &client::Client,
+    combined: &protocol::CombinedNodeSnapshot,
+    workspace: &protocol::GlobalWorkspaceSnapshot,
+    terminal_override: Option<&str>,
+    invoke_launchers: bool,
+) -> Result<(usize, usize), Box<dyn Error>> {
+    let outcome = attempt_open_coordinated_workspace(
+        client,
+        combined,
+        workspace,
+        terminal_override,
+        invoke_launchers,
+    )?;
+    if outcome.failures.is_empty() {
+        Ok((outcome.opened_launchers, outcome.opened_shells))
     } else {
         Err(io::Error::other(format!(
             "Workspace {} opened with per-Node failures: {}",
             workspace.name,
-            failures.join("; ")
+            outcome.failures.join("; ")
         ))
         .into())
     }
+}
+
+fn desktop_command(
+    command: DesktopCommands,
+    terminal_override: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
+    let configured = hyprland_special_workspaces_configured()?;
+    let enabled = configured && hyprland::session_available();
+    let move_forward = matches!(&command, DesktopCommands::Next);
+    match &command {
+        DesktopCommands::Next if !enabled => {
+            return hyprland::move_regular_workspace(1).map_err(Into::into);
+        }
+        DesktopCommands::Previous if !enabled => {
+            return hyprland::move_regular_workspace(-1).map_err(Into::into);
+        }
+        DesktopCommands::Terminal if !enabled => {
+            let terminal = effective_terminal(terminal_override)?;
+            return terminal::open_plain(terminal.as_deref());
+        }
+        DesktopCommands::Close if !enabled => {
+            return hyprland::close_active_window().map_err(Into::into);
+        }
+        DesktopCommands::Pop if !hyprland::session_available() => {
+            return Err("no active Hyprland session was detected".into());
+        }
+        DesktopCommands::Toggle | DesktopCommands::Show { .. } | DesktopCommands::Gather
+            if !enabled =>
+        {
+            return Err(if configured {
+                cli_output::failure("unavailable", "no active Hyprland session was detected")
+            } else {
+                cli_output::failure(
+                    "invalid_argument",
+                    "Hyprland special Workspaces are disabled; set desktop.workspace_layer = \"hyprland-special\"",
+                )
+            });
+        }
+        DesktopCommands::Return if !enabled => {
+            return Err(if configured {
+                cli_output::failure("unavailable", "no active Hyprland session was detected")
+            } else {
+                cli_output::failure(
+                    "invalid_argument",
+                    "Hyprland special Workspaces are disabled; set desktop.workspace_layer = \"hyprland-special\"",
+                )
+            });
+        }
+        _ => {}
+    }
+
+    let active = hyprland::active_boomux_workspace()?;
+    match command {
+        DesktopCommands::Toggle => {
+            if let Some(workspace_id) = active {
+                hyprland::toggle_special(&workspace_id)?;
+                return Ok(());
+            }
+            let client = client::connect_or_start()?;
+            require_protocol_feature(&client, protocol::ProtocolFeature::GlobalWorkspaces)?;
+            let combined = client.combined_node_snapshot(None)?;
+            let workspaces = desktop_workspaces(&combined.workspaces);
+            let workspace = selected_desktop_workspace(&workspaces)?;
+            ensure_desktop_workspace(&client, &combined, workspace, terminal_override)?;
+            hyprland::toggle_special(&workspace.id)?;
+            select_desktop_workspace(workspace)?;
+            println!("Showing Boomux Workspace {}", workspace.name);
+        }
+        DesktopCommands::Next | DesktopCommands::Previous => {
+            let Some(active_id) = active else {
+                return hyprland::move_regular_workspace(if move_forward { 1 } else { -1 })
+                    .map_err(Into::into);
+            };
+            let client = client::connect_or_start()?;
+            require_protocol_feature(&client, protocol::ProtocolFeature::GlobalWorkspaces)?;
+            let combined = client.combined_node_snapshot(None)?;
+            let workspaces = desktop_workspaces(&combined.workspaces);
+            let current = workspaces
+                .iter()
+                .position(|workspace| workspace.id == active_id)
+                .ok_or_else(|| {
+                    cli_output::failure(
+                        "not_found",
+                        format!("visible Boomux Workspace {active_id} no longer exists"),
+                    )
+                })?;
+            let Some(target) = cycle_desktop_workspace(&workspaces, current, move_forward) else {
+                return Ok(());
+            };
+            ensure_desktop_workspace(&client, &combined, target, terminal_override)?;
+            hyprland::toggle_special(&target.id)?;
+            select_desktop_workspace(target)?;
+            println!("Showing Boomux Workspace {}", target.name);
+        }
+        DesktopCommands::Show { target } => {
+            let client = client::connect_or_start()?;
+            require_protocol_feature(&client, protocol::ProtocolFeature::GlobalWorkspaces)?;
+            let combined = client.combined_node_snapshot(None)?;
+            let workspace = resolve_global_workspace_target(&combined.workspaces, &target)
+                .filter(|workspace| !workspace.closing)
+                .ok_or_else(|| {
+                    cli_output::failure("not_found", format!("Workspace not found: {target}"))
+                })?;
+            ensure_desktop_workspace(&client, &combined, workspace, terminal_override)?;
+            if active.as_deref() != Some(workspace.id.as_str()) {
+                hyprland::toggle_special(&workspace.id)?;
+            }
+            select_desktop_workspace(workspace)?;
+            println!("Showing Boomux Workspace {}", workspace.name);
+        }
+        DesktopCommands::Terminal => {
+            let Some(workspace_id) = active else {
+                let terminal = effective_terminal(terminal_override)?;
+                return terminal::open_plain(terminal.as_deref());
+            };
+            let client = client::connect_or_start()?;
+            require_protocol_feature(&client, protocol::ProtocolFeature::GlobalWorkspaces)?;
+            let combined = client.combined_node_snapshot(None)?;
+            let workspace = find_global_workspace_by_id(&combined.workspaces, &workspace_id)
+                .filter(|workspace| !workspace.closing)
+                .ok_or_else(|| {
+                    cli_output::failure(
+                        "not_found",
+                        format!("visible Boomux Workspace {workspace_id} is unavailable"),
+                    )
+                })?;
+            let local_node = combined
+                .nodes
+                .iter()
+                .find(|node| node.local)
+                .ok_or_else(|| cli_output::failure("internal", "local Node is unavailable"))?;
+            select_desktop_workspace(workspace)?;
+            shell_command(
+                ShellCommands::Create {
+                    workspace: Some(workspace.id.clone()),
+                    node: Some(local_node.node_id.clone()),
+                    name: None,
+                    cwd: None,
+                    open: true,
+                    command: Vec::new(),
+                },
+                false,
+                terminal_override,
+            )?;
+        }
+        DesktopCommands::Close => {
+            let Some(workspace_id) = active else {
+                return hyprland::close_active_window().map_err(Into::into);
+            };
+            let active_shell = hyprland::active_boomux_shell(&workspace_id)?;
+            let identity =
+                protocol::QualifiedIdentity::new(&active_shell.node_id, &active_shell.shell_id);
+            let client = client::connect_or_start()?;
+            if !client.supports(protocol::ProtocolFeature::QualifiedFocusedTerminal)? {
+                return Err("contextual Shell close requires daemon protocol 39 or newer".into());
+            }
+            let combined = client.combined_node_snapshot(None)?;
+            if combined
+                .focused_terminal
+                .as_ref()
+                .map(|focused| &focused.shell)
+                != Some(&identity)
+            {
+                return Err("active Hyprland window does not match Boomux's focused terminal; focus it and retry".into());
+            }
+            let message = close_qualified_shell_with_client(
+                &client,
+                &combined,
+                &identity,
+                Some((&workspace_id, &active_shell)),
+            )
+            .map_err(io::Error::other)?;
+            println!("{message}");
+        }
+        DesktopCommands::Pop => {
+            hyprland::pop_active_window(active.is_none())?;
+        }
+        DesktopCommands::Return => {
+            let client = client::connect_or_start()?;
+            require_protocol_feature(&client, protocol::ProtocolFeature::GlobalWorkspaces)?;
+            let combined = client.combined_node_snapshot(None)?;
+            let local_node_id = combined
+                .nodes
+                .iter()
+                .find(|node| node.local)
+                .map(|node| node.node_id.as_str())
+                .ok_or_else(|| cli_output::failure("internal", "local Node is unavailable"))?;
+            let active_shell = hyprland::active_shell_window()?;
+            let identity =
+                protocol::QualifiedIdentity::new(&active_shell.node_id, &active_shell.shell_id);
+            let shell = routed_dashboard_shell(&client, &identity, local_node_id)
+                .map_err(io::Error::other)?;
+            let mut matching = combined.workspaces.iter().filter(|workspace| {
+                !workspace.closing
+                    && workspace.placements.iter().any(|placement| {
+                        placement.node_id == identity.node_id
+                            && placement.workspace_id == shell.workspace_id
+                            && placement.state == protocol::WorkspacePlacementState::Active
+                    })
+            });
+            let workspace = matching.next().ok_or_else(|| {
+                cli_output::failure(
+                    "not_found",
+                    "the active terminal does not belong to an active coordinated Workspace",
+                )
+            })?;
+            if matching.next().is_some() {
+                return Err(cli_output::failure(
+                    "internal",
+                    "the active terminal belongs to more than one coordinated Workspace",
+                ));
+            }
+            hyprland::return_shell_window(&active_shell, &workspace.id)?;
+            select_desktop_workspace(workspace)?;
+            println!("Returned terminal to Boomux Workspace {}", workspace.name);
+        }
+        DesktopCommands::Gather => {
+            let client = client::connect_or_start()?;
+            require_protocol_feature(&client, protocol::ProtocolFeature::GlobalWorkspaces)?;
+            let combined = client.combined_node_snapshot(None)?;
+            let workspaces = desktop_workspaces(&combined.workspaces);
+            let workspace = if let Some(active_id) = active.as_deref() {
+                workspaces
+                    .iter()
+                    .copied()
+                    .find(|workspace| workspace.id == active_id)
+                    .ok_or_else(|| {
+                        cli_output::failure(
+                            "not_found",
+                            format!("visible Boomux Workspace {active_id} no longer exists"),
+                        )
+                    })?
+            } else {
+                selected_desktop_workspace(&workspaces)?
+            };
+            gather_desktop_workspace(&client, &combined, workspace, terminal_override)?;
+            if active.is_none() {
+                hyprland::toggle_special(&workspace.id)?;
+            }
+            select_desktop_workspace(workspace)?;
+            println!("Gathered terminals in Boomux Workspace {}", workspace.name);
+        }
+    }
+    Ok(())
+}
+
+fn desktop_workspaces(
+    workspaces: &[protocol::GlobalWorkspaceSnapshot],
+) -> Vec<&protocol::GlobalWorkspaceSnapshot> {
+    let mut workspaces = workspaces
+        .iter()
+        .filter(|workspace| !workspace.closing)
+        .collect::<Vec<_>>();
+    workspaces.sort_by(|left, right| left.name.cmp(&right.name).then(left.id.cmp(&right.id)));
+    workspaces
+}
+
+fn selected_desktop_workspace<'a>(
+    workspaces: &'a [&protocol::GlobalWorkspaceSnapshot],
+) -> Result<&'a protocol::GlobalWorkspaceSnapshot, Box<dyn Error>> {
+    if workspaces.is_empty() {
+        return Err(cli_output::failure(
+            "not_found",
+            "no active coordinated Workspaces are available",
+        ));
+    }
+    let Some(selection) = workspace_selection::load_from_environment()? else {
+        return Ok(workspaces[0]);
+    };
+    Ok(workspaces
+        .iter()
+        .copied()
+        .find(|workspace| workspace.id == selection.workspace_id())
+        .unwrap_or(workspaces[0]))
+}
+
+fn cycle_desktop_workspace<'a>(
+    workspaces: &'a [&protocol::GlobalWorkspaceSnapshot],
+    current: usize,
+    forward: bool,
+) -> Option<&'a protocol::GlobalWorkspaceSnapshot> {
+    if workspaces.len() < 2 {
+        return None;
+    }
+    let next = if forward {
+        (current + 1) % workspaces.len()
+    } else if current == 0 {
+        workspaces.len() - 1
+    } else {
+        current - 1
+    };
+    Some(workspaces[next])
+}
+
+fn select_desktop_workspace(
+    workspace: &protocol::GlobalWorkspaceSnapshot,
+) -> Result<(), Box<dyn Error>> {
+    let selection = workspace_selection::WorkspaceSelection::new(&workspace.id)?;
+    if workspace_selection::load_from_environment()?.as_ref() == Some(&selection) {
+        return Ok(());
+    }
+    workspace_selection::save_from_environment(&selection)?;
+    Ok(())
+}
+
+fn ensure_desktop_workspace(
+    client: &client::Client,
+    combined: &protocol::CombinedNodeSnapshot,
+    workspace: &protocol::GlobalWorkspaceSnapshot,
+    terminal_override: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
+    hyprland::apply_workspace_layout(&workspace.id)?;
+    if hyprland::workspace_has_windows(&workspace.id)? {
+        return Ok(());
+    }
+    gather_desktop_workspace(client, combined, workspace, terminal_override)
+}
+
+fn gather_desktop_workspace(
+    client: &client::Client,
+    combined: &protocol::CombinedNodeSnapshot,
+    workspace: &protocol::GlobalWorkspaceSnapshot,
+    terminal_override: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
+    if let Err(error) =
+        open_coordinated_workspace(client, combined, workspace, terminal_override, false)
+    {
+        if hyprland::wait_for_workspace_window(&workspace.id).is_err() {
+            return Err(error);
+        }
+        eprintln!("warning: Workspace restored with partial failures: {error}");
+    }
+    if hyprland::wait_for_workspace_window(&workspace.id).is_err() {
+        return Err(cli_output::failure(
+            "not_found",
+            format!(
+                "Workspace {} has no terminal windows to show in the Boomux desktop layer",
+                workspace.name
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn show_desktop_workspace(
+    workspace: &protocol::GlobalWorkspaceSnapshot,
+) -> Result<(), Box<dyn Error>> {
+    if !hyprland_special_workspaces_enabled()? {
+        return Ok(());
+    }
+    if hyprland::active_boomux_workspace()?.as_deref() != Some(workspace.id.as_str()) {
+        hyprland::toggle_special(&workspace.id)?;
+    }
+    select_desktop_workspace(workspace)
 }
 
 fn workspace_command(
@@ -7341,15 +7926,21 @@ fn workspace_command(
             let workspace = client.create_workspace_with_default_cwd(name, None, Vec::new())?;
             println!("Created workspace {} ({})", workspace.name, workspace.id);
         }
-        WorkspaceCommands::Open { target, node } => {
+        WorkspaceCommands::Open { target, node, show } => {
             if let Some(node_selector) = node {
+                if show {
+                    return Err(cli_output::failure(
+                        "invalid_argument",
+                        "--show requires a coordinated Workspace without --node",
+                    ));
+                }
                 let combined = client.combined_node_snapshot(None)?;
                 let selected_node = resolve_workspace_open_node(&combined.nodes, &node_selector)?;
                 if selected_node.local {
                     let snapshot = client.snapshot()?;
                     let workspace = resolve_workspace_target(&snapshot.workspaces, &target)?;
                     let terminal = effective_terminal(terminal_override)?;
-                    open_workspace(workspace, terminal.as_deref())?;
+                    open_workspace(workspace, terminal.as_deref(), None, true)?;
                     println!(
                         "Opened {} launcher(s) and {} shell(s) for {} on Node {}",
                         workspace.launchers.len(),
@@ -7421,11 +8012,15 @@ fn workspace_command(
                 if let Some(workspace) =
                     resolve_global_workspace_target(&combined.workspaces, &target).cloned()
                 {
+                    if show {
+                        show_desktop_workspace(&workspace)?;
+                    }
                     let (launchers, shells) = open_coordinated_workspace(
                         &client,
                         &combined,
                         &workspace,
                         terminal_override,
+                        true,
                     )?;
                     println!(
                         "Opened {launchers} launcher(s) and {shells} shell(s) for {}",
@@ -7437,7 +8032,7 @@ fn workspace_command(
             let snapshot = client.snapshot()?;
             let workspace = resolve_workspace_target(&snapshot.workspaces, &target)?;
             let terminal = effective_terminal(terminal_override)?;
-            open_workspace(workspace, terminal.as_deref())?;
+            open_workspace(workspace, terminal.as_deref(), None, true)?;
             println!(
                 "Opened {} launcher(s) and {} shell(s) for {}",
                 workspace.launchers.len(),
@@ -7899,16 +8494,27 @@ fn shell_command(
                         selection.node.alias, selection.workspace.name
                     )
                 };
-                let gate = open
-                    .then(|| {
-                        terminal::open_waiting(
+                let gate = if open {
+                    if hyprland_special_workspaces_enabled()? {
+                        Some(terminal::open_waiting_placed(
+                            terminal_override,
+                            (!selection.node.local).then_some(selection.node.node_id.as_str()),
+                            &selection.node.node_id,
+                            &selection.workspace.id,
+                            &shell_id,
+                            &title,
+                        )?)
+                    } else {
+                        Some(terminal::open_waiting(
                             terminal_override,
                             (!selection.node.local).then_some(selection.node.node_id.as_str()),
                             &shell_id,
                             &title,
-                        )
-                    })
-                    .transpose()?;
+                        )?)
+                    }
+                } else {
+                    None
+                };
                 let owner_default_cwd = selection.default_cwd.clone().or_else(|| Some(cwd.clone()));
                 let (_, shell) = client.create_global_workspace_shell(
                     Uuid::new_v4().to_string(),
@@ -11291,18 +11897,29 @@ fn close_focused_shell_with_client(client: &client::Client) -> Result<String, St
     let combined = client
         .combined_node_snapshot(None)
         .map_err(|error| error.to_string())?;
+    let identity = combined
+        .focused_terminal
+        .as_ref()
+        .ok_or_else(|| "no Boomux terminal has reported focus; focus one and retry".to_owned())?
+        .shell
+        .clone();
+    close_qualified_shell_with_client(client, &combined, &identity, None)
+}
+
+fn close_qualified_shell_with_client(
+    client: &client::Client,
+    combined: &protocol::CombinedNodeSnapshot,
+    identity: &protocol::QualifiedIdentity,
+    desktop_context: Option<(&str, &hyprland::ActiveShellIdentity)>,
+) -> Result<String, String> {
     let local_node_id = combined
         .nodes
         .iter()
         .find(|node| node.local)
         .map(|node| node.node_id.clone())
         .ok_or_else(|| "local Node identity is unavailable".to_owned())?;
-    let identity = combined
-        .focused_terminal
-        .ok_or_else(|| "no Boomux terminal has reported focus; focus one and retry".to_owned())?
-        .shell;
     let local = identity.node_id == local_node_id;
-    let shell = routed_dashboard_shell(client, &identity, &local_node_id)?;
+    let shell = routed_dashboard_shell(client, identity, &local_node_id)?;
     if local && env::var("BOOMUX_SHELL_ID").ok().as_deref() == Some(shell.id.as_str()) {
         return Err(
             "cannot close the current shell from inside it; use the dashboard or another shell"
@@ -11314,6 +11931,19 @@ fn close_focused_shell_with_client(client: &client::Client) -> Result<String, St
         &protocol::QualifiedIdentity::new(&identity.node_id, &shell.workspace_id),
         &local_node_id,
     )?;
+    if let Some((global_workspace_id, active_window)) = desktop_context {
+        let global = find_global_workspace_by_id(&combined.workspaces, global_workspace_id)
+            .ok_or_else(|| "visible Boomux Workspace is unavailable".to_owned())?;
+        if !global.placements.iter().any(|placement| {
+            placement.node_id == identity.node_id
+                && placement.workspace_id == shell.workspace_id
+                && placement.state == protocol::WorkspacePlacementState::Active
+        }) {
+            return Err("active terminal does not belong to the visible Boomux Workspace".into());
+        }
+        hyprland::revalidate_boomux_shell_window(active_window, global_workspace_id)
+            .map_err(|error| error.to_string())?;
+    }
     if local {
         client
             .close_shell(&shell.id)
@@ -11321,7 +11951,7 @@ fn close_focused_shell_with_client(client: &client::Client) -> Result<String, St
     } else {
         match routed_dashboard_operation(
             client,
-            &identity,
+            identity,
             &local_node_id,
             protocol::RoutedOperation::CloseShell {
                 shell_id: shell.id.clone(),
@@ -11513,12 +12143,37 @@ fn open_dashboard_shell(
         .into());
     }
     let workspace = client.get_workspace(&shell.workspace_id)?;
-    open_terminal(
-        shell_id,
-        &format!("{} - {}", workspace.name, shell.name),
-        true,
-        terminal,
-    )?;
+    let title = format!("{} - {}", workspace.name, shell.name);
+    let placement = if hyprland_special_workspaces_enabled()? {
+        let combined = client.combined_node_snapshot(None)?;
+        let local_node_id = combined
+            .nodes
+            .iter()
+            .find(|node| node.local)
+            .map(|node| node.node_id.as_str())
+            .ok_or_else(|| cli_output::failure("internal", "local Node is unavailable"))?;
+        coordinated_workspace_for_owner(&combined.workspaces, local_node_id, &shell.workspace_id)?
+            .cloned()
+            .map(|global| (global, local_node_id.to_owned()))
+    } else {
+        None
+    };
+    if let Some((global, local_node_id)) = placement {
+        show_desktop_workspace(&global)?;
+        terminal::open_placed(
+            terminal,
+            shell_id,
+            &title,
+            true,
+            terminal::HyprlandPlacement {
+                workspace_id: &global.id,
+                node_id: &local_node_id,
+                shell_id,
+            },
+        )?;
+    } else {
+        open_terminal(shell_id, &title, true, terminal)?;
+    }
     Ok(format!("Opened {} from {}", shell.name, workspace.name))
 }
 
@@ -11547,33 +12202,118 @@ fn open_dashboard_remote_shell(
         protocol::RoutedOperationResult::Workspace { workspace } => workspace,
         _ => return Err("remote Node returned an unexpected workspace response".into()),
     };
-    terminal::open_remote(
-        terminal,
-        &identity.node_id,
-        &identity.inner_id,
-        &format!(
-            "[{}] {} - {}",
-            registration.alias, workspace.name, shell.name
-        ),
-        true,
-    )?;
+    let title = format!(
+        "[{}] {} - {}",
+        registration.alias, workspace.name, shell.name
+    );
+    let placement = if hyprland_special_workspaces_enabled()? {
+        let combined = client.combined_node_snapshot(None)?;
+        coordinated_workspace_for_owner(
+            &combined.workspaces,
+            &identity.node_id,
+            &shell.workspace_id,
+        )?
+        .cloned()
+    } else {
+        None
+    };
+    if let Some(global) = placement {
+        show_desktop_workspace(&global)?;
+        terminal::open_remote_placed(
+            terminal,
+            &identity.node_id,
+            &identity.inner_id,
+            &title,
+            true,
+            &global.id,
+        )?;
+    } else {
+        terminal::open_remote(
+            terminal,
+            &identity.node_id,
+            &identity.inner_id,
+            &title,
+            true,
+        )?;
+    }
     Ok(format!(
         "Opened {} from {} on Node {}",
         shell.name, workspace.name, registration.alias
     ))
 }
 
+fn coordinated_workspace_for_owner<'a>(
+    workspaces: &'a [protocol::GlobalWorkspaceSnapshot],
+    node_id: &str,
+    owner_workspace_id: &str,
+) -> Result<Option<&'a protocol::GlobalWorkspaceSnapshot>, Box<dyn Error>> {
+    let mut matching = workspaces.iter().filter(|workspace| {
+        !workspace.closing
+            && workspace.placements.iter().any(|placement| {
+                placement.node_id == node_id
+                    && placement.workspace_id == owner_workspace_id
+                    && placement.state == protocol::WorkspacePlacementState::Active
+            })
+    });
+    let workspace = matching.next();
+    if matching.next().is_some() {
+        return Err(cli_output::failure(
+            "internal",
+            "the owner Workspace belongs to more than one coordinated Workspace",
+        ));
+    }
+    Ok(workspace)
+}
+
 fn open_workspace(
     workspace: &WorkspaceSnapshot,
     terminal: Option<&str>,
+    desktop_placement: Option<(&str, &str)>,
+    invoke_launchers: bool,
 ) -> Result<(), Box<dyn Error>> {
-    if workspace_user_shell_count(workspace) == 0 && workspace.launchers.is_empty() {
-        return Err(format!("workspace {} has no shells or launchers", workspace.name).into());
+    let outcome = attempt_open_workspace(workspace, terminal, desktop_placement, invoke_launchers)?;
+    if !outcome.failures.is_empty() {
+        return Err(io::Error::other(format!(
+            "workspace {} opened with failures: {}",
+            workspace.name,
+            outcome.failures.join("; ")
+        ))
+        .into());
     }
+    Ok(())
+}
+
+struct LocalWorkspaceOpenOutcome {
+    opened_launchers: usize,
+    opened_shells: usize,
+    failures: Vec<String>,
+}
+
+fn attempt_open_workspace(
+    workspace: &WorkspaceSnapshot,
+    terminal: Option<&str>,
+    desktop_placement: Option<(&str, &str)>,
+    invoke_launchers: bool,
+) -> Result<LocalWorkspaceOpenOutcome, Box<dyn Error>> {
+    if workspace_user_shell_count(workspace) == 0 {
+        if !invoke_launchers {
+            return Err(
+                format!("workspace {} has no Shell terminal windows", workspace.name).into(),
+            );
+        }
+        if workspace.launchers.is_empty() {
+            return Err(format!("workspace {} has no shells or launchers", workspace.name).into());
+        }
+    }
+    let mut opened_launchers = 0;
+    let mut opened_shells = 0;
     let mut failures = Vec::new();
-    for launcher in &workspace.launchers {
-        if let Err(error) = invoke_workspace_launcher(workspace, launcher) {
-            failures.push(format!("launcher {}: {error}", launcher.name));
+    if invoke_launchers {
+        for launcher in &workspace.launchers {
+            match invoke_workspace_launcher(workspace, launcher) {
+                Ok(()) => opened_launchers += 1,
+                Err(error) => failures.push(format!("launcher {}: {error}", launcher.name)),
+            }
         }
     }
     for shell in workspace
@@ -11581,24 +12321,36 @@ fn open_workspace(
         .iter()
         .filter(|shell| matches!(shell.owner, protocol::ShellOwner::User))
     {
-        if let Err(error) = open_terminal(
-            &shell.id,
-            &format!("{} - {}", workspace.name, shell.name),
-            true,
-            terminal,
-        ) {
-            failures.push(format!("shell {}: {error}", shell.name));
+        let opened = if let Some((global_workspace_id, node_id)) = desktop_placement {
+            terminal::open_placed(
+                terminal,
+                &shell.id,
+                &format!("{} - {}", workspace.name, shell.name),
+                true,
+                terminal::HyprlandPlacement {
+                    workspace_id: global_workspace_id,
+                    node_id,
+                    shell_id: &shell.id,
+                },
+            )
+        } else {
+            open_terminal(
+                &shell.id,
+                &format!("{} - {}", workspace.name, shell.name),
+                true,
+                terminal,
+            )
+        };
+        match opened {
+            Ok(()) => opened_shells += 1,
+            Err(error) => failures.push(format!("shell {}: {error}", shell.name)),
         }
     }
-    if !failures.is_empty() {
-        return Err(io::Error::other(format!(
-            "workspace {} opened with failures: {}",
-            workspace.name,
-            failures.join("; ")
-        ))
-        .into());
-    }
-    Ok(())
+    Ok(LocalWorkspaceOpenOutcome {
+        opened_launchers,
+        opened_shells,
+        failures,
+    })
 }
 
 fn workspace_user_shell_count(workspace: &WorkspaceSnapshot) -> usize {
@@ -11693,6 +12445,7 @@ fn sanitize_inherited_opencode_shim(command: &mut Command) {
 fn open_shell(
     shell_id: &str,
     node: Option<&str>,
+    coordinated_workspace: Option<&str>,
     title: Option<&str>,
     takeover: bool,
     terminal: Option<&str>,
@@ -11726,7 +12479,29 @@ fn open_shell(
                 registration.alias, workspace.name, shell.name
             )
         });
-        return terminal::open_remote(terminal, &registration.node_id, shell_id, &title, takeover);
+        let placement = coordinated_workspace
+            .map(|target| {
+                prepare_shell_desktop_placement(
+                    &client,
+                    target,
+                    &registration.node_id,
+                    &shell.workspace_id,
+                )
+            })
+            .transpose()?
+            .flatten();
+        return if let Some(workspace_id) = placement {
+            terminal::open_remote_placed(
+                terminal,
+                &registration.node_id,
+                shell_id,
+                &title,
+                takeover,
+                &workspace_id,
+            )
+        } else {
+            terminal::open_remote(terminal, &registration.node_id, shell_id, &title, takeover)
+        };
     }
     let shell = client.get_shell(shell_id)?;
     if matches!(shell.owner, protocol::ShellOwner::Schedule { .. })
@@ -11744,7 +12519,99 @@ fn open_shell(
             .map(|workspace| format!("{} - {}", workspace.name, shell.name))
             .unwrap_or_else(|_| format!("Boomux: {}", shell.name))
     });
-    open_terminal(shell_id, &title, takeover, terminal)
+    let (placement, local_node_id) = if let Some(target) = coordinated_workspace {
+        let combined = client.combined_node_snapshot(None)?;
+        let local_node_id = combined
+            .nodes
+            .iter()
+            .find(|node| node.local)
+            .map(|node| node.node_id.clone())
+            .ok_or_else(|| cli_output::failure("internal", "local Node is unavailable"))?;
+        let placement = prepare_shell_desktop_placement_from_snapshot(
+            target,
+            &local_node_id,
+            &shell.workspace_id,
+            &combined.workspaces,
+        )?;
+        (placement, local_node_id)
+    } else {
+        (None, String::new())
+    };
+    if let Some(workspace_id) = placement {
+        terminal::open_placed(
+            terminal,
+            shell_id,
+            &title,
+            takeover,
+            terminal::HyprlandPlacement {
+                workspace_id: &workspace_id,
+                node_id: &local_node_id,
+                shell_id,
+            },
+        )
+    } else {
+        open_terminal(shell_id, &title, takeover, terminal)
+    }
+}
+
+fn prepare_shell_desktop_placement(
+    client: &client::Client,
+    target: &str,
+    node_id: &str,
+    owner_workspace_id: &str,
+) -> Result<Option<String>, Box<dyn Error>> {
+    let combined = client.combined_node_snapshot(None)?;
+    prepare_shell_desktop_placement_from_snapshot(
+        target,
+        node_id,
+        owner_workspace_id,
+        &combined.workspaces,
+    )
+}
+
+fn prepare_shell_desktop_placement_from_snapshot(
+    target: &str,
+    node_id: &str,
+    owner_workspace_id: &str,
+    workspaces: &[protocol::GlobalWorkspaceSnapshot],
+) -> Result<Option<String>, Box<dyn Error>> {
+    let workspace =
+        resolve_shell_desktop_workspace(target, node_id, owner_workspace_id, workspaces)?;
+    if !hyprland_special_workspaces_enabled()? {
+        return Ok(None);
+    }
+    if hyprland::active_boomux_workspace()?.as_deref() != Some(workspace.id.as_str()) {
+        hyprland::toggle_special(&workspace.id)?;
+    }
+    select_desktop_workspace(workspace)?;
+    Ok(Some(workspace.id.clone()))
+}
+
+fn resolve_shell_desktop_workspace<'a>(
+    target: &str,
+    node_id: &str,
+    owner_workspace_id: &str,
+    workspaces: &'a [protocol::GlobalWorkspaceSnapshot],
+) -> Result<&'a protocol::GlobalWorkspaceSnapshot, Box<dyn Error>> {
+    let workspace = resolve_global_workspace_target(workspaces, target).ok_or_else(|| {
+        cli_output::failure(
+            "not_found",
+            format!("coordinated Workspace not found: {target}"),
+        )
+    })?;
+    if workspace.closing
+        || !workspace.placements.iter().any(|placement| {
+            placement.node_id == node_id
+                && placement.workspace_id == owner_workspace_id
+                && placement.state == protocol::WorkspacePlacementState::Active
+        })
+    {
+        return Err(cli_output::failure(
+            "invalid_argument",
+            "the Shell does not belong to an active placement in that coordinated Workspace",
+        ));
+    }
+    Ok(workspace)
 }
 
 fn open_terminal(
@@ -12405,10 +13272,17 @@ fn print_integration_diagnostic(
         );
         true
     } else {
-        eprintln!(
-            "err {} integration: {} foreground process(es) are untracked; restart {} and verify it loads {path}",
-            spec.key, status.runtime.untracked_processes, spec.display_name
-        );
+        if integration == integration_management::IntegrationId::KIRO {
+            eprintln!(
+                "err {} integration: {} foreground process(es) are untracked; reopen the owning managed ShellRun, then launch bare kiro-cli and verify it loads {path}",
+                spec.key, status.runtime.untracked_processes
+            );
+        } else {
+            eprintln!(
+                "err {} integration: {} foreground process(es) are untracked; restart {} and verify it loads {path}",
+                spec.key, status.runtime.untracked_processes, spec.display_name
+            );
+        }
         false
     }
 }
@@ -12539,6 +13413,211 @@ mod tests {
             agents: Vec::new(),
             schedules: Vec::new(),
         }
+    }
+
+    fn coordinated_workspace(
+        id: &str,
+        name: &str,
+        closing: bool,
+    ) -> protocol::GlobalWorkspaceSnapshot {
+        protocol::GlobalWorkspaceSnapshot {
+            id: id.into(),
+            revision: 1,
+            name: name.into(),
+            closing,
+            placements: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn desktop_commands_are_human_only_and_parse_every_action() {
+        for (action, expected) in [
+            ("toggle", DesktopCommands::Toggle),
+            ("next", DesktopCommands::Next),
+            ("previous", DesktopCommands::Previous),
+            ("terminal", DesktopCommands::Terminal),
+            ("close", DesktopCommands::Close),
+            ("pop", DesktopCommands::Pop),
+            ("return", DesktopCommands::Return),
+            ("gather", DesktopCommands::Gather),
+        ] {
+            let cli = Cli::try_parse_from(["boomux", "desktop", action]).unwrap();
+            assert_eq!(cli.command_descriptor().key, "desktop");
+            assert_eq!(cli.command_descriptor().output, OutputMode::HumanOnly);
+            assert!(matches!(
+                cli.command,
+                Some(Commands::Desktop { command }) if std::mem::discriminant(&command) == std::mem::discriminant(&expected)
+            ));
+        }
+        assert!(Cli::try_parse_from(["boomux", "desktop"]).is_err());
+
+        let cli = Cli::try_parse_from(["boomux", "desktop", "show", "workspace-1"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Desktop {
+                command: DesktopCommands::Show { target }
+            }) if target == "workspace-1"
+        ));
+    }
+
+    #[test]
+    fn shell_open_parses_exact_coordinated_workspace_placement() {
+        let cli = Cli::try_parse_from([
+            "boomux",
+            "open",
+            "shell-1",
+            "--node",
+            "node-1",
+            "--workspace",
+            "workspace-1",
+            "--takeover",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Open {
+                shell_id,
+                node: Some(node),
+                workspace: Some(workspace),
+                takeover: true,
+                ..
+            }) if shell_id == "shell-1" && node == "node-1" && workspace == "workspace-1"
+        ));
+    }
+
+    #[test]
+    fn workspace_open_parses_desktop_show_request() {
+        let cli =
+            Cli::try_parse_from(["boomux", "workspace", "open", "workspace-1", "--show"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Workspace {
+                command: WorkspaceCommands::Open {
+                    target,
+                    node: None,
+                    show: true,
+                }
+            }) if target == "workspace-1"
+        ));
+    }
+
+    #[test]
+    fn shell_desktop_placement_requires_exact_active_membership() {
+        let workspace = protocol::GlobalWorkspaceSnapshot {
+            id: Uuid::from_u128(10).to_string(),
+            revision: 1,
+            name: "project".into(),
+            closing: false,
+            placements: vec![protocol::WorkspacePlacementSnapshot {
+                node_id: "node-1".into(),
+                workspace_id: "owner-1".into(),
+                owner_workspace_name: Some("project".into()),
+                owner_revision: 1,
+                default_cwd: None,
+                state: protocol::WorkspacePlacementState::Active,
+            }],
+        };
+
+        assert_eq!(
+            resolve_shell_desktop_workspace(
+                "project",
+                "node-1",
+                "owner-1",
+                std::slice::from_ref(&workspace),
+            )
+            .unwrap()
+            .id,
+            workspace.id
+        );
+        assert!(
+            resolve_shell_desktop_workspace("project", "node-1", "other-owner", &[workspace],)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn tui_workspace_restore_reports_partial_success_as_a_warning() {
+        let partial = CoordinatedWorkspaceOpenOutcome {
+            opened_launchers: 1,
+            opened_shells: 2,
+            failures: vec!["remote unavailable".into()],
+        };
+        let message = tui_workspace_open_message("project", &partial).unwrap();
+        assert!(message.contains("Opened 1 launcher(s) and 2 shell(s) for project"));
+        assert!(message.contains("warning: 1 operation(s) unavailable"));
+
+        let failed = CoordinatedWorkspaceOpenOutcome {
+            opened_launchers: 0,
+            opened_shells: 0,
+            failures: vec!["remote unavailable".into()],
+        };
+        assert!(tui_workspace_open_message("project", &failed).is_err());
+    }
+
+    #[test]
+    fn tui_item_placement_resolves_its_exact_coordinated_workspace() {
+        let workspace = protocol::GlobalWorkspaceSnapshot {
+            id: Uuid::from_u128(10).to_string(),
+            revision: 1,
+            name: "project".into(),
+            closing: false,
+            placements: vec![protocol::WorkspacePlacementSnapshot {
+                node_id: "node-1".into(),
+                workspace_id: "owner-1".into(),
+                owner_workspace_name: Some("project".into()),
+                owner_revision: 1,
+                default_cwd: None,
+                state: protocol::WorkspacePlacementState::Active,
+            }],
+        };
+
+        assert_eq!(
+            coordinated_workspace_for_owner(std::slice::from_ref(&workspace), "node-1", "owner-1",)
+                .unwrap()
+                .unwrap()
+                .id,
+            workspace.id
+        );
+        assert!(
+            coordinated_workspace_for_owner(&[workspace], "node-2", "owner-1")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn desktop_workspace_order_excludes_closing_and_cycles_both_directions() {
+        let workspaces = vec![
+            coordinated_workspace("550e8400-e29b-41d4-a716-446655440003", "zeta", false),
+            coordinated_workspace("550e8400-e29b-41d4-a716-446655440002", "alpha", true),
+            coordinated_workspace("550e8400-e29b-41d4-a716-446655440001", "alpha", false),
+            coordinated_workspace("550e8400-e29b-41d4-a716-446655440000", "alpha", false),
+        ];
+        let ordered = desktop_workspaces(&workspaces);
+        assert_eq!(
+            ordered
+                .iter()
+                .map(|workspace| workspace.id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "550e8400-e29b-41d4-a716-446655440000",
+                "550e8400-e29b-41d4-a716-446655440001",
+                "550e8400-e29b-41d4-a716-446655440003",
+            ]
+        );
+        assert_eq!(
+            cycle_desktop_workspace(&ordered, 0, true).unwrap().id,
+            ordered[1].id
+        );
+        assert_eq!(
+            cycle_desktop_workspace(&ordered, 0, false).unwrap().id,
+            ordered[2].id
+        );
+        assert_eq!(
+            cycle_desktop_workspace(&ordered, 2, true).unwrap().id,
+            ordered[0].id
+        );
+        assert!(cycle_desktop_workspace(&ordered[..1], 0, true).is_none());
     }
 
     fn combined_node(id: &str, alias: &str, eligible: bool) -> protocol::CombinedNode {
@@ -13453,6 +14532,15 @@ mod tests {
             Some(Commands::GuidedNodeUpgrade { selector }) if selector == "node-id"
         ));
         assert_eq!(cli.command_descriptor().key, "node.upgrade");
+        assert!(should_release_node_upgrade_maintenance(
+            ssh_bootstrap::BootstrapRecoveryDisposition::NoRemoteMutation
+        ));
+        assert!(should_release_node_upgrade_maintenance(
+            ssh_bootstrap::BootstrapRecoveryDisposition::RollbackConfirmed
+        ));
+        assert!(!should_release_node_upgrade_maintenance(
+            ssh_bootstrap::BootstrapRecoveryDisposition::OutcomeUnknown
+        ));
     }
 
     #[test]
@@ -15597,7 +16685,8 @@ mod tests {
 
     #[test]
     fn restoring_empty_workspace_returns_actionable_error() {
-        let error = open_workspace(&workspace("w1", "empty", Vec::new()), None).unwrap_err();
+        let error =
+            open_workspace(&workspace("w1", "empty", Vec::new()), None, None, true).unwrap_err();
 
         assert!(error.to_string().contains("workspace empty has no shells"));
     }
@@ -15610,7 +16699,7 @@ mod tests {
         };
         let workspace = workspace("w1", "scheduled-only", vec![scheduled]);
         assert_eq!(workspace_user_shell_count(&workspace), 0);
-        let error = open_workspace(&workspace, None).unwrap_err();
+        let error = open_workspace(&workspace, None, None, true).unwrap_err();
         assert!(error.to_string().contains("has no shells or launchers"));
     }
 
@@ -15717,7 +16806,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_open_continues_after_a_launcher_spawn_failure() {
+    fn local_workspace_open_counts_successful_siblings_when_one_launcher_fails() {
         let marker = env::temp_dir().join(format!("boomux-launcher-{}", Uuid::new_v4()));
         let mut workspace = workspace("w1", "launchers", Vec::new());
         workspace.launchers = vec![
@@ -15745,8 +16834,11 @@ mod tests {
             },
         ];
 
-        let error = open_workspace(&workspace, None).unwrap_err();
-        assert!(error.to_string().contains("launcher missing"));
+        let outcome = attempt_open_workspace(&workspace, None, None, true).unwrap();
+        assert_eq!(outcome.opened_launchers, 1);
+        assert_eq!(outcome.opened_shells, 0);
+        assert_eq!(outcome.failures.len(), 1);
+        assert!(outcome.failures[0].contains("launcher missing"));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         let contents = loop {
             if let Ok(contents) = fs::read_to_string(&marker)
@@ -15763,6 +16855,31 @@ mod tests {
         if marker.is_file() {
             fs::remove_file(marker).unwrap();
         }
+    }
+
+    #[test]
+    fn desktop_workspace_restore_does_not_invoke_launchers() {
+        let marker = env::temp_dir().join(format!("boomux-desktop-launcher-{}", Uuid::new_v4()));
+        let mut workspace = workspace("w1", "launcher-only", Vec::new());
+        workspace.launchers = vec![WorkspaceLauncherSnapshot {
+            id: "l1".into(),
+            revision: 1,
+            workspace_id: "w1".into(),
+            name: "must-not-run".into(),
+            cwd: env::temp_dir(),
+            command: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "printf launched > \"$1\"".into(),
+                "launcher".into(),
+                marker.display().to_string(),
+            ],
+        }];
+
+        let error = open_workspace(&workspace, None, None, false).unwrap_err();
+
+        assert!(error.to_string().contains("has no Shell terminal windows"));
+        assert!(!marker.exists());
     }
 
     #[test]
@@ -16193,6 +17310,13 @@ mod tests {
             output.contains("  Runtime       untracked (3 running, 2 reporting, 1 untracked)\n")
         );
         assert!(output.contains("  Action        restart host\n"));
+        assert_eq!(
+            format_recommended_action(
+                "kiro",
+                integration_management::RecommendedAction::RestartHost
+            ),
+            "reopen managed ShellRun, then launch bare kiro-cli"
+        );
     }
 
     #[test]
@@ -16528,6 +17652,7 @@ mod tests {
             "desktop_notifications",
             "sound_notifications",
             "integration_management",
+            "desktop_workspace_show",
             "protocol_31",
             "node_registration_management",
             "pinned_node_identity",
@@ -16537,6 +17662,14 @@ mod tests {
                     || protocol::protocol_capabilities().any(|current| current == feature)
             );
         }
+        assert_eq!(
+            NON_PROTOCOL_FEATURES
+                .iter()
+                .filter(|feature| **feature == "desktop_workspace_show")
+                .count(),
+            1
+        );
+        assert!(!NON_PROTOCOL_FEATURES.contains(&"workspace_open_desktop_show"));
         assert_eq!(
             integration_management::IntegrationId::Opencode
                 .installation()

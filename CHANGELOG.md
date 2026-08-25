@@ -1,5 +1,55 @@
 # Changelog
 
+## [0.30.4](https://github.com/gardnmi/boomux/compare/v0.30.3...v0.30.4) (2026-08-25)
+
+
+### Bug Fixes
+
+* **node:** recover interrupted upgrades ([#266](https://github.com/gardnmi/boomux/issues/266)) ([06434b3](https://github.com/gardnmi/boomux/commit/06434b35d61c51255aa3da4f9476c3c6fdb36502))
+* **tui:** preserve project workspace cwd ([#268](https://github.com/gardnmi/boomux/issues/268)) ([62845bf](https://github.com/gardnmi/boomux/commit/62845bfd824a62e621b06a49c3c386615d9ec25e))
+
+## [0.30.3](https://github.com/gardnmi/boomux/compare/v0.30.2...v0.30.3) (2026-08-25)
+
+
+### Bug Fixes
+
+* **kiro:** stage shim before host installation ([#264](https://github.com/gardnmi/boomux/issues/264)) ([9227525](https://github.com/gardnmi/boomux/commit/9227525f896136220ff3532bbd2ccfd65e5cbfb9))
+
+## [0.30.2](https://github.com/gardnmi/boomux/compare/v0.30.1...v0.30.2) (2026-08-25)
+
+
+### Bug Fixes
+
+* **web:** follow replacement OpenCode runtime ([#261](https://github.com/gardnmi/boomux/issues/261)) ([2a3d67c](https://github.com/gardnmi/boomux/commit/2a3d67c2c62770e93b42412b07cfd9cf44dfdb2c))
+
+## [0.30.1](https://github.com/gardnmi/boomux/compare/v0.30.0...v0.30.1) (2026-08-25)
+
+
+### Bug Fixes
+
+* preserve interactive node setup and workspace layout ([#259](https://github.com/gardnmi/boomux/issues/259)) ([4471794](https://github.com/gardnmi/boomux/commit/447179459b145b232cd3381aef0512931b81fc58))
+
+## [0.30.0](https://github.com/gardnmi/boomux/compare/v0.29.1...v0.30.0) (2026-08-25)
+
+
+### Features
+
+* **desktop:** add Hyprland workspace presentation ([#257](https://github.com/gardnmi/boomux/issues/257)) ([9e1f7da](https://github.com/gardnmi/boomux/commit/9e1f7daa96ba6fde84cfe6a4f21355db03f103ea))
+
+## [0.29.1](https://github.com/gardnmi/boomux/compare/v0.29.0...v0.29.1) (2026-08-24)
+
+
+### Bug Fixes
+
+* **claude:** preserve mise shim dispatch ([#254](https://github.com/gardnmi/boomux/issues/254)) ([e3a8075](https://github.com/gardnmi/boomux/commit/e3a80756f6852c309d834ca8efe2be60efe34d29))
+
+## [0.29.0](https://github.com/gardnmi/boomux/compare/v0.28.0...v0.29.0) (2026-08-24)
+
+
+### Features
+
+* **cli:** close focused shell ([#251](https://github.com/gardnmi/boomux/issues/251)) ([7abbe38](https://github.com/gardnmi/boomux/commit/7abbe384ba141cedfe974ea395df90a63a3dc900))
+
 ## [0.28.0](https://github.com/gardnmi/boomux/compare/v0.27.1...v0.28.0) (2026-08-23)
 
 

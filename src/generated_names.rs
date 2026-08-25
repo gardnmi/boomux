@@ -28,6 +28,13 @@ pub(crate) fn random_excluding<'a>(
     from_seed(random_seed(), unavailable)
 }
 
+pub(crate) fn stable(value: &str) -> String {
+    let seed = value.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    });
+    from_seed(seed, []).expect("the generated name catalog is nonempty")
+}
+
 fn random_seed() -> u64 {
     let bytes = Uuid::new_v4();
     u64::from_le_bytes(
@@ -77,6 +84,16 @@ mod tests {
             from_seed((ADJECTIVES.len() * NOUNS.len() - 1) as u64, [last.as_str()]),
             Some("agile-badger".into())
         );
+    }
+
+    #[test]
+    fn stable_names_repeat_for_the_same_value() {
+        assert_eq!(stable("edge-datapipe-support"), "noble-koala");
+        assert_eq!(
+            stable("edge-datapipe-support"),
+            stable("edge-datapipe-support")
+        );
+        assert_ne!(stable("edge-datapipe-support"), stable("boomux"));
     }
 
     #[test]

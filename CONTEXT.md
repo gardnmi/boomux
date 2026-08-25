@@ -62,7 +62,22 @@ A durable detached argument-vector command associated with a workspace and invok
 explicit open or restore of that workspace. Dashboard selection alone does not invoke it. Each
 launcher has a durable identity and name, owns its working directory, and belongs to an ordered
 workspace collection. Each invocation is ephemeral, has no PTY, and does not create or appear as a
-shell or shell run.
+shell or shell run. Presentation-only desktop navigation is not a Workspace open or restore and
+does not invoke launchers.
+
+## Desktop Workspace Layer
+
+The core desktop presentation of a coordinated Workspace as one named Hyprland
+special Workspace. The durable Boomux Workspace remains the authority for its
+name, membership, Shells, launchers, and schedules; the Hyprland layer is local
+presentation derived from its immutable coordinator ID and owns no durable
+resource identity.
+
+Boomux desktop development targets Hyprland-based environments such as Omarchy.
+It does not require a generic cross-compositor abstraction or fallback desktop
+semantics. Configuration can still gate rollout of the layer, but supported
+desktop navigation, restoration, and focused terminal placement are defined in
+terms of Hyprland.
 
 ## Shell
 

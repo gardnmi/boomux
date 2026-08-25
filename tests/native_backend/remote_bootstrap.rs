@@ -199,6 +199,20 @@ fn fake_challenge_ssh(directory: &Path) {
     fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
 }
 
+fn fake_terminal_prompt_ssh(directory: &Path) {
+    let ssh = directory.join("ssh");
+    let authentication = directory.join("authentication");
+    fs::write(
+        &ssh,
+        format!(
+            "#!/bin/sh\ncontrol=; previous=; master=false; check=false\nfor arg do\n  case \"$previous\" in -S) control=$arg ;; -O) [ \"$arg\" = check ] && check=true ;; esac\n  case \"$arg\" in ControlPath=*) control=${{arg#ControlPath=}} ;; -N) master=true ;; esac\n  previous=$arg\ndone\nif $master; then\n  printf 'SSH password: ' > /dev/tty\n  IFS= read -r password < /dev/tty || exit 70\n  printf '%s' \"$password\" > '{}'\n  : > \"$control.ready\"\n  trap 'rm -f \"$control.ready\"' EXIT HUP INT TERM\n  while :; do sleep 60; done\nfi\nif $check; then [ -e \"$control.ready\" ]; exit; fi\nexit 64\n",
+            authentication.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
 fn command(directory: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_boomux"));
     command
@@ -1017,6 +1031,33 @@ fn guided_node_add_mirrors_master_challenge_and_waits_after_failure() {
     assert!(child.try_wait().unwrap().is_none());
     master.write_all(b"\n").unwrap();
     assert_eq!(child.wait().unwrap().code(), Some(1));
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn guided_node_add_allows_ssh_to_read_authentication_from_the_terminal() {
+    let directory = test_directory();
+    fs::create_dir_all(directory.join("home/.ssh")).unwrap();
+    fs::create_dir_all(directory.join("runtime")).unwrap();
+    fake_terminal_prompt_ssh(&directory);
+
+    let (status, output) = run_interactive(
+        &directory,
+        &["__guided-node-add"],
+        b"workbox\nwork\nsecret\n\n",
+    );
+    let output = String::from_utf8_lossy(&output);
+    assert_eq!(status.code(), Some(1), "{output}");
+    assert!(
+        output.contains("Complete any SSH authentication prompt or login URL"),
+        "{output}"
+    );
+    assert!(output.contains("SSH password:"), "{output}");
+    assert_eq!(
+        fs::read(directory.join("authentication")).unwrap(),
+        b"secret"
+    );
+    assert!(output.contains("Node setup failed (exit 1)."), "{output}");
     fs::remove_dir_all(directory).unwrap();
 }
 

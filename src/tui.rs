@@ -860,6 +860,10 @@ pub(crate) enum DashboardEffect {
     CreateWorkspace {
         name: String,
     },
+    CreateProjectWorkspace {
+        name: String,
+        default_cwd: PathBuf,
+    },
     CreateShell(QualifiedIdentity),
     CreateGlobalShell {
         workspace_id: String,
@@ -952,6 +956,7 @@ pub(crate) enum DashboardEvent {
     PreviewRequested,
     UpdateCheckCompleted,
     OperationCompleted(Result<String, String>),
+    WorkspaceOpened(Result<String, String>),
     WorkspaceSelectionCompleted {
         workspace_id: String,
         result: Result<String, String>,
@@ -3404,6 +3409,10 @@ impl App {
                 self.message = Some(Message::from_result(result));
                 return vec![DashboardEffect::Refresh];
             }
+            DashboardEvent::WorkspaceOpened(result) => {
+                self.message = Some(Message::from_result(result));
+                return vec![DashboardEffect::Refresh];
+            }
             DashboardEvent::WorkspaceSelectionCompleted {
                 workspace_id,
                 result,
@@ -4437,7 +4446,11 @@ fn handle_mode_key(
             }
             KeyCode::Enter if picker.selected().is_some() => {
                 let project = picker.selected().expect("selected project").clone();
-                app.create_workspace(&project.name)
+                app.mode = Mode::Normal;
+                Some(DashboardEffect::CreateProjectWorkspace {
+                    name: project.name,
+                    default_cwd: project.path,
+                })
             }
             KeyCode::Enter => {
                 app.mode = Mode::PickProject(picker);
@@ -9645,7 +9658,7 @@ mod tests {
     }
 
     #[test]
-    fn project_suggestion_creates_an_empty_workspace_regardless_of_nodes() {
+    fn project_suggestion_preserves_its_local_path_regardless_of_remote_nodes() {
         let mut app = app();
         let mut remote = app.nodes[0].clone();
         remote.id = "remote-node".into();
@@ -9658,8 +9671,9 @@ mod tests {
         }
         assert_eq!(
             handle_mode_key(&mut app, KeyCode::Enter, KeyModifiers::NONE),
-            Some(DashboardEffect::CreateWorkspace {
+            Some(DashboardEffect::CreateProjectWorkspace {
                 name: "alpha".into(),
+                default_cwd: "/tmp/alpha".into(),
             })
         );
         assert!(matches!(app.mode, Mode::Normal));
@@ -10436,6 +10450,42 @@ mod tests {
         let message = app.message.expect("restore message");
         assert_eq!(message.text, "Restored workspace");
         assert!(!message.error);
+    }
+
+    #[test]
+    fn coordinated_workspace_open_keeps_app_active_and_reports_results() {
+        let mut app = app();
+        app.workspaces[0].coordination = WorkspaceCoordinationView::Global {
+            revision: 7,
+            closing: false,
+            placements: Vec::new(),
+        };
+        assert_eq!(
+            app.restore_selected(),
+            Some(DashboardEffect::OpenGlobalWorkspace {
+                workspace_id: "w1".into(),
+                expected_revision: 7,
+            })
+        );
+        assert_eq!(
+            app.update(DashboardEvent::WorkspaceOpened(Ok("opened".into()))),
+            vec![DashboardEffect::Refresh]
+        );
+        assert!(
+            app.message
+                .as_ref()
+                .is_some_and(|message| !message.error && message.text == "opened")
+        );
+
+        assert_eq!(
+            app.update(DashboardEvent::WorkspaceOpened(Err("failed".into()))),
+            vec![DashboardEffect::Refresh]
+        );
+        assert!(
+            app.message
+                .as_ref()
+                .is_some_and(|message| message.error && message.text == "failed")
+        );
     }
 
     #[test]

@@ -47,13 +47,26 @@ macro_rules! remote_runtime_prefix {
 
 macro_rules! remote_install_restore {
     () => {
-        "sync_install_path() { boomux_sync_os=$(/usr/bin/uname -s 2>/dev/null || true); if [ \"$boomux_sync_os\" = Linux ]; then /bin/sync -f \"$1\"; fi; }; restore_install() { prior_daemon=$(/bin/cat \"$transaction/prior_daemon\" 2>/dev/null || true); contacted=false; [ ! -e \"$transaction/daemon_contacted\" ] || contacted=true; if [ -e \"$transaction/missing\" ]; then if [ -e \"$transaction/restore_required\" ]; then /bin/rm -f \"$destination\"; sync_install_path \"$directory\"; fi; elif [ -e \"$transaction/backup_ready\" ] && [ -e \"$transaction/restore_required\" ]; then /bin/mv -f \"$transaction/backup\" \"$destination\"; sync_install_path \"$destination\"; sync_install_path \"$directory\"; fi; case \"$prior_daemon:$contacted\" in [0-9]*:true) boomux_runtime_daemon daemon restart >/dev/null 2>&1 || true ;; esac; }; "
+        "sync_install_path() { boomux_sync_os=$(/usr/bin/uname -s 2>/dev/null || true); if [ \"$boomux_sync_os\" = Linux ]; then /bin/sync -f \"$1\" || return 1; fi; }; install_file_metadata() { case \"$boomux_sync_os\" in Linux) /usr/bin/stat -Lc '%u:%g:%a:%s:%Y' -- \"$1\" ;; Darwin) /usr/bin/stat -f '%u:%g:%Lp:%z:%m' \"$1\" ;; *) return 1 ;; esac; }; preserve_provisional() { [ ! -e \"$transaction/new\" ] || return 0; [ -f \"$destination\" ] && [ -x \"$destination\" ] && [ ! -L \"$destination\" ] || return 1; provisional_metadata=$(install_file_metadata \"$destination\") || return 1; provisional_size=${provisional_metadata%:*}; provisional_size=${provisional_size##*:}; case \"$provisional_size\" in ''|*[!0-9]*) return 1 ;; esac; [ \"$provisional_size\" -gt 0 ] && [ \"$provisional_size\" -le 268435456 ] || return 1; /bin/cp -p \"$destination\" \"$transaction/new\" || return 1; [ -f \"$transaction/new\" ] && [ -x \"$transaction/new\" ] && [ ! -L \"$transaction/new\" ] || return 1; [ \"$(install_file_metadata \"$destination\")\" = \"$provisional_metadata\" ] || return 1; [ \"$(install_file_metadata \"$transaction/new\")\" = \"$provisional_metadata\" ] || return 1; /usr/bin/cmp -s \"$destination\" \"$transaction/new\" || return 1; sync_install_path \"$transaction/new\" || return 1; }; restore_install() { prior_daemon=$(/bin/cat \"$transaction/prior_daemon\" 2>/dev/null || true); contacted=false; [ ! -e \"$transaction/daemon_contacted\" ] || contacted=true; if [ -e \"$transaction/restore_required\" ] && [ ! -e \"$transaction/restored\" ]; then if [ ! -e \"$transaction/new\" ]; then if [ -e \"$transaction/backup_ready\" ] && [ ! -e \"$transaction/backup\" ] && [ -f \"$destination\" ]; then :; else preserve_provisional || return 1; fi; fi; if [ -e \"$transaction/missing\" ]; then /bin/rm -f \"$destination\" || return 1; elif [ -e \"$transaction/backup_ready\" ]; then if [ -e \"$transaction/backup\" ]; then /bin/mv -f \"$transaction/backup\" \"$destination\" || return 1; else [ -e \"$transaction/new\" ] && [ -f \"$destination\" ] || return 1; fi; sync_install_path \"$destination\" || return 1; else return 1; fi; sync_install_path \"$directory\" || return 1; : > \"$transaction/restored\" || return 1; sync_install_path \"$transaction\" || return 1; fi; case \"$prior_daemon:$contacted\" in [0-9]*:true) boomux_runtime_daemon daemon restart >/dev/null 2>&1 || return 1 ;; esac; }; "
+    };
+}
+
+#[allow(unused_macros)]
+macro_rules! remote_claim_functions_legacy {
+    () => {
+        "claim_process_start() { claim_pid=$1; case \"$boomux_os\" in Linux) claim_stat=$(/bin/cat \"/proc/$claim_pid/stat\" 2>/dev/null) || return 1; claim_tail=${claim_stat##*) }; set -- $claim_tail; [ \"$#\" -ge 20 ] || return 1; [ \"$1\" != Z ] || return 1; shift 19; printf '%s' \"$1\" ;; Darwin) /bin/ps -p \"$claim_pid\" -o lstart= 2>/dev/null ;; *) return 1 ;; esac; }; claim_directory_time() { case \"$boomux_os\" in Linux) /usr/bin/stat -Lc '%Y' -- \"$lock/claim\" 2>/dev/null ;; Darwin) /usr/bin/stat -f '%m' \"$lock/claim\" 2>/dev/null ;; *) return 1 ;; esac; }; claim_release() { [ -e \"$lock/claim/ready\" ] || return 0; current_owner=$(/bin/cat \"$lock/claim/owner\" 2>/dev/null || true); [ \"$current_owner\" != \"$claim_owner\" ] || /bin/rm -rf \"$lock/claim\"; }; claim_acquire() { boomux_os=$(/usr/bin/uname -s 2>/dev/null) || return 1; claim_now=$(/bin/date +%s 2>/dev/null) || return 1; claim_pid=${claim_pid_override-$$}; claim_start=$(claim_process_start \"$claim_pid\") || return 1; claim_owner=$txn:$claim_pid:$claim_start; if ! /bin/mkdir \"$lock/claim\" 2>/dev/null; then if [ ! -e \"$lock/claim/ready\" ]; then old_created=$(/bin/cat \"$lock/claim/created\" 2>/dev/null || claim_directory_time) || return 1; case \"$old_created\" in ''|*[!0-9]*) return 1 ;; esac; claim_age=$((claim_now - old_created)); [ \"$claim_age\" -ge 180 ] || return 1; [ ! -e \"$lock/claim/ready\" ] || return 1; current_created=$(/bin/cat \"$lock/claim/created\" 2>/dev/null || claim_directory_time) || return 1; [ \"$current_created\" = \"$old_created\" ] || return 1; else old_owner=$(/bin/cat \"$lock/claim/owner\" 2>/dev/null || true); old_pid=$(/bin/cat \"$lock/claim/pid\" 2>/dev/null || true); old_start=$(/bin/cat \"$lock/claim/start\" 2>/dev/null || true); old_heartbeat=$(/bin/cat \"$lock/claim/heartbeat\" 2>/dev/null || true); case \"$old_pid:$old_heartbeat\" in *[!0-9:]*) return 1 ;; esac; claim_age=$((claim_now - old_heartbeat)); [ \"$claim_age\" -ge 180 ] || return 1; old_current=$(claim_process_start \"$old_pid\" 2>/dev/null || true); if /bin/kill -0 \"$old_pid\" 2>/dev/null && [ \"$old_current\" = \"$old_start\" ]; then return 1; fi; [ -e \"$lock/claim/ready\" ] || return 1; [ \"$(/bin/cat \"$lock/claim/owner\" 2>/dev/null || true)\" = \"$old_owner\" ] || return 1; fi; /bin/rm -rf \"$lock/claim\"; /bin/mkdir \"$lock/claim\" 2>/dev/null || return 1; fi; printf '%s\\n' \"$claim_now\" > \"$lock/claim/created\"; printf '%s\\n' \"$claim_pid\" > \"$lock/claim/pid\"; printf '%s\\n' \"$claim_start\" > \"$lock/claim/start\"; printf '%s\\n' \"$claim_now\" > \"$lock/claim/heartbeat\"; printf '%s\\n' \"$claim_owner\" > \"$lock/claim/owner\"; : > \"$lock/claim/ready\"; }; "
     };
 }
 
 macro_rules! remote_claim_functions {
     () => {
-        "claim_process_start() { claim_pid=$1; case \"$boomux_os\" in Linux) claim_stat=$(/bin/cat \"/proc/$claim_pid/stat\" 2>/dev/null) || return 1; claim_tail=${claim_stat##*) }; set -- $claim_tail; [ \"$#\" -ge 20 ] || return 1; shift 19; printf '%s' \"$1\" ;; Darwin) /bin/ps -p \"$claim_pid\" -o lstart= 2>/dev/null ;; *) return 1 ;; esac; }; claim_release() { /bin/rm -rf \"$lock/claim\"; }; claim_acquire() { boomux_os=$(/usr/bin/uname -s 2>/dev/null) || return 1; claim_now=$(/bin/date +%s 2>/dev/null) || return 1; claim_pid=${claim_pid_override-$$}; claim_start=$(claim_process_start \"$claim_pid\") || return 1; claim_owner=$txn:$claim_pid:$claim_start; if ! /bin/mkdir \"$lock/claim\" 2>/dev/null; then old_pid=$(/bin/cat \"$lock/claim/pid\" 2>/dev/null || true); old_start=$(/bin/cat \"$lock/claim/start\" 2>/dev/null || true); old_heartbeat=$(/bin/cat \"$lock/claim/heartbeat\" 2>/dev/null || true); case \"$old_pid:$old_heartbeat\" in *[!0-9:]*) return 1 ;; esac; claim_age=$((claim_now - old_heartbeat)); [ \"$claim_age\" -ge 180 ] || return 1; old_current=$(claim_process_start \"$old_pid\" 2>/dev/null || true); if /bin/kill -0 \"$old_pid\" 2>/dev/null && [ \"$old_current\" = \"$old_start\" ]; then return 1; fi; /bin/rm -rf \"$lock/claim\"; /bin/mkdir \"$lock/claim\" 2>/dev/null || return 1; fi; printf '%s\\n' \"$claim_owner\" > \"$lock/claim/owner\"; printf '%s\\n' \"$claim_pid\" > \"$lock/claim/pid\"; printf '%s\\n' \"$claim_start\" > \"$lock/claim/start\"; printf '%s\\n' \"$claim_now\" > \"$lock/claim/heartbeat\"; }; "
+        "claim_process_start() { claim_pid=$1; case \"$boomux_os\" in Linux) claim_stat=$(/bin/cat \"/proc/$claim_pid/stat\" 2>/dev/null) || return 1; claim_tail=${claim_stat##*) }; set -- $claim_tail; [ \"$#\" -ge 20 ] || return 1; [ \"$1\" != Z ] || return 1; shift 19; printf '%s' \"$1\" ;; Darwin) /bin/ps -p \"$claim_pid\" -o lstart= 2>/dev/null ;; *) return 1 ;; esac; }; claim_release() { [ -f \"$lock/claim\" ] || return 0; IFS= read -r current_owner < \"$lock/claim\" || return 0; [ \"$current_owner\" != \"$claim_owner\" ] || /bin/rm -f \"$lock/claim\"; }; claim_acquire() { boomux_os=$(/usr/bin/uname -s 2>/dev/null) || return 1; claim_now=$(/bin/date +%s 2>/dev/null) || return 1; claim_pid=${claim_pid_override-$$}; claim_start=$(claim_process_start \"$claim_pid\") || return 1; claim_owner=$txn:$claim_pid:$claim_start; claim_record=$lock/.claim.$txn.$claim_pid; /bin/rm -f \"$claim_record\"; printf '%s\n%s\n%s\n%s\n' \"$claim_owner\" \"$claim_pid\" \"$claim_start\" \"$claim_now\" > \"$claim_record\" || return 1; if /bin/ln \"$claim_record\" \"$lock/claim\" 2>/dev/null; then /bin/rm -f \"$claim_record\"; return 0; fi; /bin/rm -f \"$claim_record\"; [ -f \"$lock/claim\" ] || return 1; { IFS= read -r old_owner; IFS= read -r old_pid; IFS= read -r old_start; IFS= read -r old_heartbeat; } < \"$lock/claim\" || return 1; case \"$old_pid:$old_heartbeat\" in *[!0-9:]*) return 1 ;; esac; claim_age=$((claim_now - old_heartbeat)); [ \"$claim_age\" -ge 180 ] || return 1; old_current=$(claim_process_start \"$old_pid\" 2>/dev/null || true); [ \"$old_current\" != \"$old_start\" ] || return 1; IFS= read -r current_owner < \"$lock/claim\" || return 1; [ \"$current_owner\" = \"$old_owner\" ] || return 1; /bin/rm -f \"$lock/claim\" || return 1; claim_acquire; }; "
+    };
+}
+
+macro_rules! remote_process_identity_function {
+    () => {
+        "claim_process_start() { claim_pid=$1; case \"$boomux_os\" in Linux) claim_stat=$(/bin/cat \"/proc/$claim_pid/stat\" 2>/dev/null) || return 1; claim_tail=${claim_stat##*) }; set -- $claim_tail; [ \"$#\" -ge 20 ] || return 1; [ \"$1\" != Z ] || return 1; shift 19; printf '%s' \"$1\" ;; Darwin) claim_info=$(/bin/ps -p \"$claim_pid\" -o state= -o lstart= 2>/dev/null) || return 1; set -- $claim_info; [ \"$#\" -ge 6 ] || return 1; case \"$1\" in Z*) return 1 ;; esac; shift; printf '%s' \"$*\" ;; *) return 1 ;; esac; }; "
     };
 }
 
@@ -64,8 +77,9 @@ pub const REMOTE_INSTALL_COMMAND: &str = concat!(
     remote_runtime_prefix!(),
     "exec \"$destination\" \"$@\"; ); ",
     "set -u; exec 3>&2; exec 2>/dev/null; umask 077; IFS= read -r txn; ",
-    "stage=home; stage_code=74; transaction=; watchdog=; lock_owned=false; ",
+    "stage=home; stage_code=74; transaction=; watchdog=; lock_owned=false; boomux_sync_os=$(/usr/bin/uname -s 2>/dev/null || true); ",
     remote_install_restore!(),
+    remote_process_identity_function!(),
     "rollback_install() { set +e; if [ -n \"$watchdog\" ]; then kill \"$watchdog\" 2>/dev/null || true; fi; if [ -n \"$transaction\" ]; then restore_install; /bin/rm -rf \"$transaction\"; fi; if [ \"$lock_owned\" = true ]; then /bin/rm -rf \"$lock\"; fi; }; ",
     "fail_install() { trap - EXIT HUP INT TERM; set +e; printf 'boomux-install-stage-v1:%s:%s\\n' \"$stage\" \"$stage_code\" >&3; rollback_install; exit \"$stage_code\"; }; ",
     "trap fail_install EXIT; trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM; set -e; ",
@@ -78,9 +92,10 @@ pub const REMOTE_INSTALL_COMMAND: &str = concat!(
     "stage=mode; stage_code=81; /bin/chmod 755 \"$temporary\"; upload_uid=$(/usr/bin/id -u); upload_size=$(/usr/bin/stat -Lc '%s' -- \"$temporary\" 2>/dev/null || /usr/bin/stat -f '%z' \"$temporary\"); case \"$upload_uid:$upload_size\" in *[!0-9:]*) false ;; esac; if [ \"$upload_size\" -le 0 ] || [ \"$upload_size\" -gt 268435456 ] || [ -L \"$temporary\" ] || [ ! -f \"$temporary\" ] || [ ! -x \"$temporary\" ]; then false; fi; /bin/mv \"$temporary\" \"$transaction/new\"; : > \"$transaction/new_ready\"; sync_install_path \"$transaction/new\"; ",
     "stage=watchdog_spawn; stage_code=84; ( exec 3>&-; trap '' HUP; lease_limit=180; lease_value=$(/bin/cat \"$transaction/lease\"); unchanged=0; committed=false; : > \"$transaction/watchdog_ready\"; ",
     remote_claim_functions!(),
-    "while :; do if claim_pid_override=$(/bin/cat \"$transaction/watchdog_pid\" 2>/dev/null); then break; fi; if claim_pid_override=$(/bin/cat \"$lock/committed/watchdog_pid\" 2>/dev/null); then transaction=$lock/committed; committed=true; break; fi; [ -d \"$lock\" ] || exit; /bin/sleep 1; done; while [ -d \"$lock\" ]; do /bin/sleep 1; current=$(/bin/cat \"$transaction/lease\" 2>/dev/null || true); if [ \"$current\" != \"$lease_value\" ]; then lease_value=$current; unchanged=0; continue; fi; unchanged=$((unchanged + 1)); [ \"$unchanged\" -lt \"$lease_limit\" ] && continue; if claim_acquire; then current=$(/bin/cat \"$lock/id\" 2>/dev/null || true); claimed_lease=$(/bin/cat \"$transaction/lease\" 2>/dev/null || true); if [ \"$current\" != \"$txn\" ]; then claim_release; exit; fi; if [ \"$claimed_lease\" != \"$lease_value\" ]; then claim_release; lease_value=$claimed_lease; unchanged=0; continue; fi; if ! $committed; then restore_install; fi; /bin/rm -rf \"$transaction\" \"$lock\"; exit; fi; unchanged=0; done ) </dev/null >/dev/null 2>&1 & watchdog=$!; ",
+    remote_process_identity_function!(),
+    "while :; do if claim_pid_override=$(/bin/cat \"$transaction/watchdog_pid\" 2>/dev/null); then break; fi; if claim_pid_override=$(/bin/cat \"$lock/committed/watchdog_pid\" 2>/dev/null); then transaction=$lock/committed; committed=true; break; fi; [ -d \"$lock\" ] || exit; /bin/sleep 1; done; while [ -d \"$lock\" ]; do /bin/sleep 1; current=$(/bin/cat \"$transaction/lease\" 2>/dev/null || true); if [ \"$current\" != \"$lease_value\" ]; then lease_value=$current; unchanged=0; continue; fi; unchanged=$((unchanged + 1)); [ \"$unchanged\" -lt \"$lease_limit\" ] && continue; if claim_acquire; then current=$(/bin/cat \"$lock/id\" 2>/dev/null || true); claimed_lease=$(/bin/cat \"$transaction/lease\" 2>/dev/null || true); if [ \"$current\" != \"$txn\" ]; then claim_release; exit; fi; if [ \"$claimed_lease\" != \"$lease_value\" ]; then claim_release; lease_value=$claimed_lease; unchanged=0; continue; fi; if ! $committed && ! restore_install; then claim_release; unchanged=0; continue; fi; /bin/rm -rf \"$transaction\" \"$lock\"; exit; fi; unchanged=0; done ) </dev/null >/dev/null 2>&1 & watchdog=$!; ",
     "stage=watchdog_ready; stage_code=85; attempts=0; while [ ! -e \"$transaction/watchdog_ready\" ]; do kill -0 \"$watchdog\"; attempts=$((attempts + 1)); [ \"$attempts\" -lt 1000 ]; /bin/sleep 0.01; done; ",
-    "stage=watchdog_pid; stage_code=86; printf '%s\\n' \"$watchdog\" > \"$transaction/watchdog_pid\"; rm -f \"$transaction/watchdog_ready\"; ",
+    "stage=watchdog_pid; stage_code=86; boomux_os=$(/usr/bin/uname -s); watchdog_start=$(claim_process_start \"$watchdog\"); printf '%s\\n' \"$watchdog_start\" > \"$transaction/watchdog_start.next\"; /bin/mv -f \"$transaction/watchdog_start.next\" \"$transaction/watchdog_start\"; printf '%s\\n' \"$watchdog\" > \"$transaction/watchdog_pid.next\"; /bin/mv -f \"$transaction/watchdog_pid.next\" \"$transaction/watchdog_pid\"; sync_install_path \"$transaction\"; rm -f \"$transaction/watchdog_ready\"; ",
     "stage=result; stage_code=87; printf 'boomux-install-transaction-v1\\0%s\\0' \"$txn\"; ",
     "trap - EXIT HUP INT TERM; exec 3>&-"
 );
@@ -103,13 +118,13 @@ pub const REMOTE_INSTALL_ACTIVATE_COMMAND: &str = concat!(
     "case \"$HOME\" in /*) ;; *) exit 1 ;; esac; case \"$txn\" in .boomux.bootstrap.[A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9]) ;; *) exit 2 ;; esac; case \"$reason:$prior\" in missing:absent|upgrade:[0-9]*) ;; *) exit 2 ;; esac; ",
     "directory=$HOME/.local/bin; destination=$directory/boomux; lock=$directory/.boomux.bootstrap.lock; transaction=$directory/$txn; backup=$transaction/backup; [ \"$(/bin/cat \"$lock/id\")\" = \"$txn\" ]; ",
     remote_claim_functions!(),
+    remote_process_identity_function!(),
     "claim_acquire || exit 73; trap claim_release EXIT HUP INT TERM; ",
-    "if [ -e \"$transaction/activated\" ]; then trap - EXIT HUP INT TERM; claim_release; printf 'boomux-install-activation-v1\\0activated\\0'; exit; fi; [ -e \"$transaction/new_ready\" ] && [ -f \"$transaction/new\" ] && [ -x \"$transaction/new\" ] && [ ! -L \"$transaction/new\" ]; ",
-    "restore_activation() { if [ -e \"$transaction/restore_required\" ]; then if [ -e \"$transaction/missing\" ]; then /bin/rm -f \"$destination\"; elif [ -e \"$transaction/backup_ready\" ]; then /bin/mv -f \"$backup\" \"$destination\"; fi; fi; }; fail_activation() { code=$?; trap - EXIT HUP INT TERM; set +e; restore_activation; claim_release; exit \"$code\"; }; trap fail_activation EXIT HUP INT TERM; ",
-    "if [ -e \"$destination\" ] || [ -L \"$destination\" ]; then if [ -L \"$destination\" ] || [ ! -f \"$destination\" ] || [ ! -x \"$destination\" ]; then false; fi; /bin/cp -p \"$destination\" \"$backup\"; if [ -L \"$backup\" ] || [ ! -f \"$backup\" ] || [ ! -x \"$backup\" ]; then false; fi; /usr/bin/cmp -s \"$destination\" \"$backup\"; : > \"$transaction/backup_ready\"; else : > \"$transaction/missing\"; fi; printf '%s\\n' \"$prior\" > \"$transaction/prior_daemon\"; : > \"$transaction/restore_required\"; ",
-    "if [ \"$reason\" = missing ]; then ",
+    "sync_install_path() { boomux_sync_os=$(/usr/bin/uname -s 2>/dev/null || true); if [ \"$boomux_sync_os\" = Linux ]; then /bin/sync -f \"$1\" || return 1; fi; }; if [ -e \"$transaction/activated\" ] && [ -e \"$transaction/restore_required\" ] && [ ! -e \"$transaction/new\" ] && [ -f \"$destination\" ] && [ -x \"$destination\" ] && [ ! -L \"$destination\" ] && { { [ -e \"$transaction/missing\" ] && [ ! -e \"$transaction/backup_ready\" ]; } || { [ -e \"$transaction/backup_ready\" ] && [ ! -e \"$transaction/missing\" ] && [ -f \"$backup\" ]; }; }; then sync_install_path \"$destination\"; sync_install_path \"$directory\"; sync_install_path \"$transaction\"; trap - EXIT HUP INT TERM; claim_release; printf 'boomux-install-activation-v1\\0activated\\0'; exit; fi; ",
+    "sync_install_path() { boomux_sync_os=$(/usr/bin/uname -s 2>/dev/null || true); if [ \"$boomux_sync_os\" = Linux ]; then /bin/sync -f \"$1\" || return 1; fi; }; restore_activation() { [ -e \"$transaction/restore_required\" ] || return 0; if [ ! -e \"$transaction/restored\" ]; then if [ ! -e \"$transaction/new\" ]; then if [ -e \"$transaction/backup_ready\" ] && [ ! -e \"$backup\" ] && [ -f \"$destination\" ]; then :; else /bin/mv -f \"$destination\" \"$transaction/new\" || return 1; sync_install_path \"$transaction/new\" || return 1; fi; fi; [ -f \"$transaction/new\" ] && [ -x \"$transaction/new\" ] && [ ! -L \"$transaction/new\" ] || return 1; if [ -e \"$transaction/missing\" ]; then /bin/rm -f \"$destination\" || return 1; elif [ -e \"$transaction/backup_ready\" ]; then if [ -e \"$backup\" ]; then /bin/mv -f \"$backup\" \"$destination\" || return 1; else [ -f \"$destination\" ] || return 1; fi; sync_install_path \"$destination\" || return 1; else return 1; fi; sync_install_path \"$directory\" || return 1; : > \"$transaction/restored\" || return 1; sync_install_path \"$transaction\" || return 1; fi; /bin/rm -f \"$transaction/activated\" \"$transaction/restore_required\" \"$transaction/backup_ready\" \"$transaction/missing\" \"$transaction/restored\" || return 1; sync_install_path \"$transaction\" || return 1; }; fail_activation() { code=$?; trap - EXIT HUP INT TERM; set +e; restore_activation; claim_release; exit \"$code\"; }; trap fail_activation EXIT HUP INT TERM; if [ -e \"$transaction/restore_required\" ]; then restore_activation; fi; [ -e \"$transaction/new_ready\" ] && [ -f \"$transaction/new\" ] && [ -x \"$transaction/new\" ] && [ ! -L \"$transaction/new\" ]; /bin/rm -f \"$backup\" \"$transaction/backup_ready\" \"$transaction/missing\" \"$transaction/restored\"; ",
+    "install_os=$(/usr/bin/uname -s); install_uid=$(/usr/bin/id -u); case \"$install_uid\" in ''|*[!0-9]*) false ;; esac; case \"$install_os\" in Linux) install_metadata() { /usr/bin/stat -Lc '%u:%g:%a:%s:%Y' -- \"$1\"; }; install_size() { /usr/bin/stat -Lc '%s' -- \"$1\"; } ;; Darwin) install_metadata() { /usr/bin/stat -f '%u:%g:%Lp:%z:%m' \"$1\"; }; install_size() { /usr/bin/stat -f '%z' \"$1\"; } ;; *) false ;; esac; if [ -e \"$destination\" ] || [ -L \"$destination\" ]; then if [ -L \"$destination\" ] || [ ! -f \"$destination\" ] || [ ! -x \"$destination\" ]; then false; fi; destination_metadata=$(install_metadata \"$destination\"); destination_owner=${destination_metadata%%:*}; [ \"$destination_owner\" = \"$install_uid\" ]; destination_size=$(install_size \"$destination\"); case \"$destination_size\" in ''|*[!0-9]*) false ;; esac; [ \"$destination_size\" -gt 0 ] && [ \"$destination_size\" -le 268435456 ]; /bin/cp -p \"$destination\" \"$backup\"; [ -f \"$backup\" ] && [ -x \"$backup\" ] && [ ! -L \"$backup\" ]; [ \"$(install_metadata \"$destination\")\" = \"$destination_metadata\" ]; [ \"$(install_metadata \"$backup\")\" = \"$destination_metadata\" ]; /usr/bin/cmp -s \"$destination\" \"$backup\"; sync_install_path \"$backup\"; : > \"$transaction/backup_ready\"; else : > \"$transaction/missing\"; fi; printf '%s\\n' \"$prior\" > \"$transaction/prior_daemon\"; : > \"$transaction/restore_required\"; sync_install_path \"$transaction\"; ",
     remote_runtime_prefix!(),
-    "socket=$XDG_RUNTIME_DIR/boomux/daemon.sock; if [ -S \"$socket\" ] || [ -e \"$socket\" ] || [ -L \"$socket\" ]; then restore_activation; /bin/rm -f \"$transaction/restore_required\"; trap - EXIT HUP INT TERM; claim_release; printf 'boomux-install-activation-v1\\0daemon_present\\0'; exit; fi; /bin/mv -f \"$transaction/new\" \"$destination\"; : > \"$transaction/activated\"; else case \"$proof_pid:$proof_device:$proof_inode\" in *[!0-9:]*) false ;; esac; [ \"$proof_executable\" = \"$destination\" ]; \"$transaction/new\" __bootstrap-activate \"$txn\" \"$proof_pid\" \"$prior\" \"$proof_executable\" \"$proof_device\" \"$proof_inode\"; fi; ",
+    "if [ \"$reason\" = missing ]; then socket=$XDG_RUNTIME_DIR/boomux/daemon.sock; if [ -S \"$socket\" ] || [ -e \"$socket\" ] || [ -L \"$socket\" ]; then restore_activation; trap - EXIT HUP INT TERM; claim_release; printf 'boomux-install-activation-v1\\0daemon_present\\0'; exit; fi; /bin/mv -f \"$transaction/new\" \"$destination\"; : > \"$transaction/activated\"; else case \"$proof_pid:$proof_device:$proof_inode\" in *[!0-9:]*) false ;; esac; [ \"$proof_executable\" = \"$destination\" ]; \"$transaction/new\" __bootstrap-activate \"$txn\" \"$proof_pid\" \"$prior\" \"$proof_executable\" \"$proof_device\" \"$proof_inode\"; fi; ",
     "trap - EXIT HUP INT TERM; claim_release; printf 'boomux-install-activation-v1\\0activated\\0'"
 );
 #[doc(hidden)]
@@ -126,17 +141,19 @@ const REMOTE_INSTALL_ROLLBACK_COMMAND_LEGACY: &str = concat!(
 pub const REMOTE_INSTALL_ROLLBACK_COMMAND: &str = concat!(
     "PATH=/usr/bin:/bin; export PATH; boomux_runtime_daemon() ( ",
     remote_runtime_prefix!(),
-    "exec \"$destination\" \"$@\"; ); set -eu; case \"$HOME\" in /*) ;; *) exit 1 ;; esac; IFS= read -r txn; case \"$txn\" in .boomux.bootstrap.[A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9]) ;; *) exit 2 ;; esac; directory=$HOME/.local/bin; destination=$directory/boomux; lock=$directory/.boomux.bootstrap.lock; transaction=$directory/$txn; [ \"$(/bin/cat \"$lock/id\")\" = \"$txn\" ]; ",
+    "exec \"$destination\" \"$@\"; ); set -eu; case \"$HOME\" in /*) ;; *) exit 1 ;; esac; IFS= read -r txn; case \"$txn\" in .boomux.bootstrap.[A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9]) ;; *) exit 2 ;; esac; directory=$HOME/.local/bin; destination=$directory/boomux; lock=$directory/.boomux.bootstrap.lock; transaction=$directory/$txn; boomux_sync_os=$(/usr/bin/uname -s 2>/dev/null || true); [ \"$(/bin/cat \"$lock/id\")\" = \"$txn\" ]; ",
     remote_claim_functions!(),
-    "claim_acquire || exit 73; trap claim_release EXIT HUP INT TERM; watchdog=$(/bin/cat \"$transaction/watchdog_pid\" 2>/dev/null || true); ",
+    remote_process_identity_function!(),
+    "claim_acquire || exit 73; trap claim_release EXIT HUP INT TERM; watchdog=$(/bin/cat \"$transaction/watchdog_pid\" 2>/dev/null || true); watchdog_start=$(/bin/cat \"$transaction/watchdog_start\" 2>/dev/null || true); ",
     remote_install_restore!(),
-    "case \"$watchdog\" in *[!0-9]*|'') ;; *) /bin/kill \"$watchdog\" 2>/dev/null || true ;; esac; restore_install; trap - EXIT HUP INT TERM; /bin/rm -rf \"$transaction\" \"$lock\""
+    "restore_install; case \"$watchdog\" in *[!0-9]*|'') ;; *) current_watchdog_start=$(claim_process_start \"$watchdog\" 2>/dev/null || true); if [ -n \"$watchdog_start\" ] && [ \"$current_watchdog_start\" = \"$watchdog_start\" ]; then /bin/kill \"$watchdog\" 2>/dev/null || true; fi ;; esac; trap - EXIT HUP INT TERM; /bin/rm -rf \"$transaction\" \"$lock\""
 );
 #[allow(dead_code)]
 const REMOTE_INSTALL_COMMIT_COMMAND_LEGACY: &str = "set -eu; case \"$HOME\" in /*) ;; *) exit 1 ;; esac; IFS= read -r txn; case \"$txn\" in .boomux.bootstrap.[A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9]) ;; *) exit 2 ;; esac; directory=$HOME/.local/bin; lock=$directory/.boomux.bootstrap.lock; transaction=$directory/$txn; committed=$lock/committed; [ \"$(cat \"$lock/id\")\" = \"$txn\" ]; ( trap '' HUP; sleep 180; if [ \"$(cat \"$lock/id\" 2>/dev/null || true)\" = \"$txn\" ]; then rm -rf \"$lock/claim\"; fi ) </dev/null >/dev/null 2>&1 & if [ -d \"$committed\" ]; then printf 'boomux-install-commit-v1\\0committed\\0'; exit; fi; mkdir \"$lock/claim\"; trap 'rmdir \"$lock/claim\" 2>/dev/null || true' EXIT HUP INT TERM; if [ -d \"$committed\" ]; then :; elif [ -d \"$transaction\" ]; then mv \"$transaction\" \"$committed\"; else exit 1; fi; trap - EXIT HUP INT TERM; rmdir \"$lock/claim\"; printf 'boomux-install-commit-v1\\0committed\\0'";
 const REMOTE_INSTALL_COMMIT_COMMAND: &str = concat!(
     "PATH=/usr/bin:/bin; export PATH; set -eu; case \"$HOME\" in /*) ;; *) exit 1 ;; esac; IFS= read -r txn; case \"$txn\" in .boomux.bootstrap.[A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9]) ;; *) exit 2 ;; esac; directory=$HOME/.local/bin; lock=$directory/.boomux.bootstrap.lock; transaction=$directory/$txn; committed=$lock/committed; [ \"$(/bin/cat \"$lock/id\")\" = \"$txn\" ]; ",
     remote_claim_functions!(),
+    remote_process_identity_function!(),
     "if [ -d \"$committed\" ]; then printf 'boomux-install-commit-v1\\0committed\\0'; exit; fi; claim_acquire || exit 73; trap claim_release EXIT HUP INT TERM; if [ -d \"$committed\" ]; then :; elif [ -d \"$transaction\" ]; then /bin/mv \"$transaction\" \"$committed\"; else exit 1; fi; trap - EXIT HUP INT TERM; claim_release; printf 'boomux-install-commit-v1\\0committed\\0'"
 );
 #[doc(hidden)]
@@ -147,12 +164,13 @@ const REMOTE_INSTALL_RENEW_COMMAND_LEGACY: &str = "set -eu; case \"$HOME\" in /*
 const REMOTE_INSTALL_RENEW_COMMAND: &str = concat!(
     "PATH=/usr/bin:/bin; export PATH; set -eu; case \"$HOME\" in /*) ;; *) exit 1 ;; esac; IFS= read -r txn; IFS= read -r renewal; case \"$txn\" in .boomux.bootstrap.[A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9]) ;; *) exit 2 ;; esac; case \"$renewal\" in ''|*[!0-9]*) exit 2 ;; esac; directory=$HOME/.local/bin; lock=$directory/.boomux.bootstrap.lock; transaction=$directory/$txn; temporary=$transaction/lease.next.$$; printf '%s\\n' \"$renewal\" > \"$temporary\"; ",
     remote_claim_functions!(),
-    "if [ -d \"$lock/claim\" ] || ! claim_acquire; then /bin/rm -f \"$temporary\"; exit 3; fi; trap '/bin/rm -f \"$temporary\"; claim_release' EXIT HUP INT TERM; [ \"$(/bin/cat \"$lock/id\")\" = \"$txn\" ]; /bin/mv -f \"$temporary\" \"$transaction/lease\"; trap - EXIT HUP INT TERM; claim_release"
+    remote_process_identity_function!(),
+    "if [ -e \"$lock/claim\" ] || ! claim_acquire; then /bin/rm -f \"$temporary\"; exit 3; fi; trap '/bin/rm -f \"$temporary\"; claim_release' EXIT HUP INT TERM; [ \"$(/bin/cat \"$lock/id\")\" = \"$txn\" ]; /bin/mv -f \"$temporary\" \"$transaction/lease\"; trap - EXIT HUP INT TERM; claim_release"
 );
 
-pub const PLATFORM_PROBE_COMMAND: &str = "os=$(/usr/bin/uname -s) || exit 92; arch=$(/usr/bin/uname -m) || exit 92; case \"$os\" in Linux|Darwin) ;; *) exit 92 ;; esac; for command in /usr/bin/uname /usr/bin/id /usr/bin/stat /usr/bin/cmp /bin/cat /bin/chmod /bin/cp /bin/date /bin/kill /bin/mkdir /bin/mv /bin/ps /bin/rm /bin/rmdir /bin/sleep /bin/sync; do [ -x \"$command\" ] || exit 92; done; printf 'boomux-platform-v1\\0%s\\0%s\\0' \"$os\" \"$arch\"";
+pub const PLATFORM_PROBE_COMMAND: &str = "os=$(/usr/bin/uname -s) || exit 92; arch=$(/usr/bin/uname -m) || exit 92; case \"$os\" in Linux|Darwin) ;; *) exit 92 ;; esac; for command in /usr/bin/uname /usr/bin/id /usr/bin/stat /usr/bin/cmp /bin/cat /bin/chmod /bin/cp /bin/date /bin/kill /bin/ln /bin/mkdir /bin/mv /bin/ps /bin/rm /bin/rmdir /bin/sleep /bin/sync; do [ -x \"$command\" ] || exit 92; done; printf 'boomux-platform-v1\\0%s\\0%s\\0' \"$os\" \"$arch\"";
 pub const EXECUTABLE_PROBE_COMMAND: &str = "printf 'boomux-executables-v1\\0'; path=$(command -v boomux 2>/dev/null || true); for candidate in \"$path\" /usr/local/bin/boomux /usr/bin/boomux /opt/homebrew/bin/boomux /home/linuxbrew/.linuxbrew/bin/boomux \"$HOME/.local/bin/boomux\" \"$HOME/.local/share/mise/shims/boomux\" \"$HOME/.nix-profile/bin/boomux\" /run/current-system/sw/bin/boomux; do case \"$candidate\" in /*) if [ \"$candidate\" = \"$HOME/.local/bin/boomux\" ] && [ -d \"$HOME/.local/bin/.boomux.bootstrap.lock\" ] && [ ! -d \"$HOME/.local/bin/.boomux.bootstrap.lock/committed\" ]; then continue; fi; [ -f \"$candidate\" ] && [ -x \"$candidate\" ] && printf '%s\\0' \"$candidate\" ;; esac; done; true";
-pub const INSTALL_DESTINATION_PROBE_COMMAND: &str = "case \"$HOME\" in /*) printf 'boomux-install-destination-v1\\0%s\\0' \"$HOME/.local/bin/boomux\" ;; *) exit 1 ;; esac";
+pub const INSTALL_DESTINATION_PROBE_COMMAND: &str = "case \"$HOME\" in /*) destination=$HOME/.local/bin/boomux; lock=$HOME/.local/bin/.boomux.bootstrap.lock; state=clear; if [ -d \"$lock\" ] && [ ! -d \"$lock/committed\" ]; then state=stale; txn=$(/bin/cat \"$lock/id\" 2>/dev/null || true); case \"$txn\" in .boomux.bootstrap.[A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9]) transaction=$HOME/.local/bin/$txn; watchdog=$(/bin/cat \"$transaction/watchdog_pid\" 2>/dev/null || true); expected_start=$(/bin/cat \"$transaction/watchdog_start\" 2>/dev/null || true); case \"$watchdog\" in ''|*[!0-9]*) ;; *) probe_os=$(/usr/bin/uname -s 2>/dev/null || true); case \"$probe_os\" in Linux) watchdog_stat=$(/bin/cat \"/proc/$watchdog/stat\" 2>/dev/null || true); watchdog_tail=${watchdog_stat##*) }; set -- $watchdog_tail; if [ \"$#\" -ge 20 ] && [ \"$1\" != Z ]; then shift 19; current_start=$1; else current_start=; fi ;; Darwin) watchdog_info=$(/bin/ps -p \"$watchdog\" -o state= -o lstart= 2>/dev/null || true); set -- $watchdog_info; if [ \"$#\" -ge 6 ]; then case \"$1\" in Z*) current_start= ;; *) shift; current_start=$* ;; esac; else current_start=; fi ;; *) current_start= ;; esac; if [ -n \"$expected_start\" ] && [ \"$current_start\" = \"$expected_start\" ]; then state=recovering; fi ;; esac ;; esac; fi; printf 'boomux-install-destination-v1\\0%s\\0%s\\0' \"$destination\" \"$state\" ;; *) exit 1 ;; esac";
 
 fn remote_daemon_command(executable: &RemoteExecutable, arguments: &str) -> String {
     format!(
@@ -246,6 +264,14 @@ pub struct RemoteDiscovery {
     pub platform: RemotePlatform,
     pub executables: Vec<RemoteExecutable>,
     pub install_destination: RemoteExecutable,
+    recovery: RemoteRecoveryState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteRecoveryState {
+    Clear,
+    Active,
+    Stale,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -352,6 +378,14 @@ pub enum RemoteInstallReason {
 struct ClassifiedBootstrapError {
     code: &'static str,
     message: String,
+    recovery: BootstrapRecoveryDisposition,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootstrapRecoveryDisposition {
+    NoRemoteMutation,
+    RollbackConfirmed,
+    OutcomeUnknown,
 }
 
 impl std::fmt::Display for ClassifiedBootstrapError {
@@ -367,12 +401,36 @@ fn classified_error(
     code: &'static str,
     message: impl Into<String>,
 ) -> io::Error {
+    classified_error_with_recovery(
+        kind,
+        code,
+        message,
+        BootstrapRecoveryDisposition::NoRemoteMutation,
+    )
+}
+
+fn classified_error_with_recovery(
+    kind: io::ErrorKind,
+    code: &'static str,
+    message: impl Into<String>,
+    recovery: BootstrapRecoveryDisposition,
+) -> io::Error {
     io::Error::new(
         kind,
         ClassifiedBootstrapError {
             code,
             message: message.into(),
+            recovery,
         },
+    )
+}
+
+fn with_recovery(error: io::Error, recovery: BootstrapRecoveryDisposition) -> io::Error {
+    classified_error_with_recovery(
+        error.kind(),
+        error_code(&error),
+        error.to_string(),
+        recovery,
     )
 }
 
@@ -381,7 +439,7 @@ fn post_install_failure(stage: &'static str, error: io::Error) -> io::Error {
         error_code(&error),
         "bootstrap_runtime_unavailable" | "node_identity_changed"
     ) {
-        return error;
+        return with_recovery(error, BootstrapRecoveryDisposition::OutcomeUnknown);
     }
     let message = match stage {
         "stream" => "remote provisional executable upload failed",
@@ -403,7 +461,7 @@ fn post_install_failure(stage: &'static str, error: io::Error) -> io::Error {
             | io::ErrorKind::BrokenPipe
             | io::ErrorKind::UnexpectedEof
     );
-    classified_error(
+    classified_error_with_recovery(
         error.kind(),
         if transport {
             "bootstrap_transport_failed"
@@ -411,6 +469,7 @@ fn post_install_failure(stage: &'static str, error: io::Error) -> io::Error {
             "bootstrap_install_failed"
         },
         message,
+        BootstrapRecoveryDisposition::OutcomeUnknown,
     )
 }
 
@@ -420,15 +479,18 @@ fn post_contact_failure(
     reason: RemoteInstallReason,
 ) -> io::Error {
     let error = post_install_failure(stage, error);
-    if reason != RemoteInstallReason::Missing {
-        return error;
-    }
-    classified_error(
-        error.kind(),
-        error_code(&error),
+    let message = if reason == RemoteInstallReason::Missing {
         format!(
             "{error}; filesystem rollback does not stop runtime processes, so a daemon started independently during bootstrap may remain and require manual recovery"
-        ),
+        )
+    } else {
+        error.to_string()
+    };
+    classified_error_with_recovery(
+        error.kind(),
+        error_code(&error),
+        message,
+        BootstrapRecoveryDisposition::RollbackConfirmed,
     )
 }
 
@@ -484,6 +546,14 @@ pub fn error_code(error: &io::Error) -> &'static str {
         io::ErrorKind::Other => "bootstrap_transport_failed",
         _ => "bootstrap_transport_failed",
     }
+}
+
+pub fn recovery_disposition(error: &io::Error) -> BootstrapRecoveryDisposition {
+    error
+        .get_ref()
+        .and_then(|error| error.downcast_ref::<ClassifiedBootstrapError>())
+        .map(|error| error.recovery)
+        .unwrap_or(BootstrapRecoveryDisposition::OutcomeUnknown)
 }
 
 impl RemoteInstallReason {
@@ -615,6 +685,30 @@ fn shadow_upgrade_required(helper: &RemoteExecutable) -> io::Error {
 
 fn install_presence_required(message: &str) -> io::Error {
     classified_error(io::ErrorKind::Unsupported, "install_required", message)
+}
+
+fn upgrade_recovery_active() -> io::Error {
+    classified_error(
+        io::ErrorKind::WouldBlock,
+        "busy",
+        "a remote Boomux upgrade transaction is still recovering; wait for watchdog cleanup or inspect the owning Node before retrying",
+    )
+}
+
+pub(crate) fn stale_upgrade_recovery() -> io::Error {
+    classified_error(
+        io::ErrorKind::WouldBlock,
+        "upgrade_recovery_required",
+        "a stale remote Boomux upgrade transaction is hiding the installed helper; inspect and recover that exact transaction before retrying",
+    )
+}
+
+fn remote_recovery_error(state: RemoteRecoveryState) -> Option<io::Error> {
+    match state {
+        RemoteRecoveryState::Clear => None,
+        RemoteRecoveryState::Active => Some(upgrade_recovery_active()),
+        RemoteRecoveryState::Stale => Some(stale_upgrade_recovery()),
+    }
 }
 
 fn parse_install_commit(output: &[u8]) -> io::Result<()> {
@@ -1030,16 +1124,29 @@ pub fn parse_executable_probe(output: &[u8]) -> io::Result<Vec<RemoteExecutable>
 }
 
 pub fn parse_install_destination_probe(output: &[u8]) -> io::Result<RemoteExecutable> {
+    parse_install_destination_state(output).map(|(destination, _)| destination)
+}
+
+fn parse_install_destination_state(
+    output: &[u8],
+) -> io::Result<(RemoteExecutable, RemoteRecoveryState)> {
     let fields = parse_nul_fields(output, INSTALL_DESTINATION_PROBE_PREFIX)?;
-    if fields.len() != 1 {
-        return Err(invalid_probe(
-            "install destination probe returned an invalid field count",
-        ));
-    }
+    let recovery = match fields.as_slice() {
+        [_] | [_, b"clear"] => RemoteRecoveryState::Clear,
+        [_, b"recovering"] => RemoteRecoveryState::Active,
+        [_, b"stale"] => RemoteRecoveryState::Stale,
+        _ => {
+            return Err(invalid_probe(
+                "install destination probe returned an invalid field count or state",
+            ));
+        }
+    };
     let value = std::str::from_utf8(fields[0])
         .map_err(|_| invalid_probe("install destination probe returned non-UTF-8 data"))?;
-    RemoteExecutable::parse(value.to_owned())
-        .map_err(|_| invalid_probe("install destination probe returned an invalid executable path"))
+    let destination = RemoteExecutable::parse(value.to_owned()).map_err(|_| {
+        invalid_probe("install destination probe returned an invalid executable path")
+    })?;
+    Ok((destination, recovery))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1113,6 +1220,44 @@ pub struct BootstrapSession {
     stderr_reader: Option<MasterStderrReader>,
 }
 
+struct TerminalForegroundGuard {
+    terminal: fs::File,
+    original_group: i32,
+}
+
+impl TerminalForegroundGuard {
+    fn acquire(terminal: fs::File, group: i32) -> io::Result<Self> {
+        let original_group = unsafe { libc::tcgetpgrp(terminal.as_raw_fd()) };
+        if original_group == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        set_terminal_foreground(terminal.as_raw_fd(), group)?;
+        Ok(Self {
+            terminal,
+            original_group,
+        })
+    }
+}
+
+impl Drop for TerminalForegroundGuard {
+    fn drop(&mut self) {
+        let _ = set_terminal_foreground(self.terminal.as_raw_fd(), self.original_group);
+    }
+}
+
+fn set_terminal_foreground(fd: i32, group: i32) -> io::Result<()> {
+    unsafe {
+        let previous = libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+        let result = libc::tcsetpgrp(fd, group);
+        libc::signal(libc::SIGTTOU, previous);
+        if result == -1 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SshProbeOutput {
     pub stdout: Vec<u8>,
@@ -1124,6 +1269,8 @@ type BoundedReader = thread::JoinHandle<io::Result<(Vec<u8>, bool)>>;
 trait StderrMirror: Write + AsRawFd + Send {}
 
 impl<T: Write + AsRawFd + Send> StderrMirror for T {}
+
+type InteractiveTerminal = (Option<Box<dyn StderrMirror>>, Option<fs::File>);
 
 #[derive(Debug, Clone, Copy)]
 enum MasterStderrEvent {
@@ -1161,14 +1308,23 @@ impl BootstrapSession {
             .filter(|home| !home.is_empty())
             .map(PathBuf::from)
             .map(|home| home.join(".ssh/config"));
-        let stderr_mirror = match authentication {
-            SshAuthenticationMode::Interactive => Some(Box::new(
-                OpenOptions::new()
-                    .write(true)
-                    .custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK)
-                    .open("/dev/tty")?,
-            ) as Box<dyn StderrMirror>),
-            SshAuthenticationMode::Batch => None,
+        let (stderr_mirror, foreground_terminal) = match authentication {
+            SshAuthenticationMode::Interactive => (
+                Some(Box::new(
+                    OpenOptions::new()
+                        .write(true)
+                        .custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK)
+                        .open("/dev/tty")?,
+                ) as Box<dyn StderrMirror>),
+                Some(
+                    OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .custom_flags(libc::O_CLOEXEC)
+                        .open("/dev/tty")?,
+                ),
+            ),
+            SshAuthenticationMode::Batch => (None, None),
         };
         Self::open_at_with_mirror(
             runtime_directory,
@@ -1177,7 +1333,7 @@ impl BootstrapSession {
             authentication,
             timeout,
             OsStr::new("ssh"),
-            stderr_mirror,
+            (stderr_mirror, foreground_terminal),
         )
     }
 
@@ -1197,7 +1353,7 @@ impl BootstrapSession {
             authentication,
             timeout,
             program,
-            None,
+            (None, None),
         )
     }
 
@@ -1208,8 +1364,9 @@ impl BootstrapSession {
         authentication: SshAuthenticationMode,
         timeout: Duration,
         program: &OsStr,
-        stderr_mirror: Option<Box<dyn StderrMirror>>,
+        interactive_terminal: InteractiveTerminal,
     ) -> io::Result<Self> {
+        let (stderr_mirror, foreground_terminal) = interactive_terminal;
         if timeout.is_zero() || timeout > MAX_PROBE_TIMEOUT {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -1229,8 +1386,12 @@ impl BootstrapSession {
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
         unsafe {
-            command.pre_exec(|| {
-                if libc::setsid() == -1 {
+            command.pre_exec(move || {
+                let result = match authentication {
+                    SshAuthenticationMode::Interactive => libc::setpgid(0, 0),
+                    SshAuthenticationMode::Batch => libc::setsid(),
+                };
+                if result == -1 {
                     Err(io::Error::last_os_error())
                 } else {
                     Ok(())
@@ -1250,6 +1411,17 @@ impl BootstrapSession {
             let _ = fs::remove_dir_all(&directory);
             io::Error::other(format!("child PID overflow: {error}"))
         })?;
+        let _foreground = match foreground_terminal {
+            Some(terminal) => match TerminalForegroundGuard::acquire(terminal, master_pid) {
+                Ok(foreground) => Some(foreground),
+                Err(error) => {
+                    let _ = kill_process_group(master_pid, &mut master);
+                    let _ = fs::remove_dir_all(&directory);
+                    return Err(error);
+                }
+            },
+            None => None,
+        };
         let stderr = match master.stderr.take() {
             Some(stderr) => stderr,
             None => {
@@ -1365,6 +1537,9 @@ impl BootstrapSession {
         if let Some(helper) = selection.compatible {
             return Ok(RemoteBootstrapPlan::Ready(helper));
         }
+        if let Some(error) = remote_recovery_error(discovery.recovery) {
+            return Err(error);
+        }
         let reason = if discovery.executables.is_empty() {
             RemoteInstallReason::Missing
         } else if selection.incompatible == discovery.executables.len() {
@@ -1397,6 +1572,9 @@ impl BootstrapSession {
         let discovery = discover_remote_in_session(self, timeout)?;
         let selection = inspect_remote_helpers_in_session(self, &discovery.executables, timeout)?;
         let helper = selection.compatible.ok_or_else(|| {
+            if let Some(error) = remote_recovery_error(discovery.recovery) {
+                return error;
+            }
             classified_error(
                 io::ErrorKind::Unsupported,
                 "upgrade_required",
@@ -1447,19 +1625,28 @@ impl BootstrapSession {
         timeout: Duration,
         mut maintenance: impl FnMut() -> io::Result<()>,
     ) -> io::Result<RemoteConnection> {
-        maintenance()?;
+        maintenance().map_err(|error| {
+            with_recovery(error, BootstrapRecoveryDisposition::NoRemoteMutation)
+        })?;
         if plan.bootstrap_id != Some(self.id) || plan.target != self.target {
-            return Err(io::Error::new(
+            return Err(classified_error(
                 io::ErrorKind::PermissionDenied,
+                "bootstrap_authentication_failed",
                 "remote install authorization belongs to a different bootstrap endpoint",
             ));
         }
         let upgrade_helper = if plan.reason == RemoteInstallReason::Upgrade {
             Some(plan.upgrade_helper.as_ref().ok_or_else(|| {
-                invalid_probe("remote upgrade omitted its verified outdated helper")
+                classified_error(
+                    io::ErrorKind::InvalidData,
+                    "bootstrap_malformed_helper",
+                    "remote upgrade omitted its verified outdated helper",
+                )
             })?)
         } else {
-            prove_remote_daemon_absent(&self, timeout)?;
+            prove_remote_daemon_absent(&self, timeout).map_err(|error| {
+                with_recovery(error, BootstrapRecoveryDisposition::NoRemoteMutation)
+            })?;
             None
         };
         let requested_transaction = InstallTransactionId::generate();
@@ -1481,8 +1668,16 @@ impl BootstrapSession {
             }
             Err(first_error) => {
                 if let Err(error) = maintenance() {
-                    let _ = self.rollback_install(&requested_transaction, timeout);
-                    return Err(post_install_failure("stream", error));
+                    let failure = post_install_failure("stream", error);
+                    return Err(
+                        match self.rollback_install(&requested_transaction, timeout) {
+                            Ok(()) => with_recovery(
+                                failure,
+                                BootstrapRecoveryDisposition::RollbackConfirmed,
+                            ),
+                            Err(_) => failure,
+                        },
+                    );
                 }
                 match upload() {
                     Ok(transaction) if transaction == requested_transaction => transaction,
@@ -1511,16 +1706,26 @@ impl BootstrapSession {
             ($stage:literal) => {{
                 renewal += 1;
                 if let Err(error) = maintenance() {
-                    let _ = self.rollback_install(&transaction, timeout);
-                    return Err(post_install_failure($stage, error));
+                    let failure = post_install_failure($stage, error);
+                    return Err(match self.rollback_install(&transaction, timeout) {
+                        Ok(()) => {
+                            with_recovery(failure, BootstrapRecoveryDisposition::RollbackConfirmed)
+                        }
+                        Err(_) => failure,
+                    });
                 }
                 if let Err(error) = run_streaming_command(
                     self.command(REMOTE_INSTALL_RENEW_COMMAND),
                     transaction.renewal_input(renewal),
                     timeout,
                 ) {
-                    let _ = self.rollback_install(&transaction, timeout);
-                    return Err(post_install_failure($stage, error));
+                    let failure = post_install_failure($stage, error);
+                    return Err(match self.rollback_install(&transaction, timeout) {
+                        Ok(()) => {
+                            with_recovery(failure, BootstrapRecoveryDisposition::RollbackConfirmed)
+                        }
+                        Err(_) => failure,
+                    });
                 }
             }};
         }
@@ -1534,7 +1739,15 @@ impl BootstrapSession {
             match status {
                 Ok(status) if status.proves_executable(&plan.destination) => status,
                 _ => {
-                    return Err(shadow_upgrade_required(helper));
+                    let failure = shadow_upgrade_required(helper);
+                    return Err(match self.rollback_install(&transaction, timeout) {
+                        Ok(()) => {
+                            with_recovery(failure, BootstrapRecoveryDisposition::RollbackConfirmed)
+                        }
+                        Err(_) => {
+                            with_recovery(failure, BootstrapRecoveryDisposition::OutcomeUnknown)
+                        }
+                    });
                 }
             }
         } else {
@@ -1567,9 +1780,13 @@ impl BootstrapSession {
             },
         };
         if !activated {
-            return Err(install_presence_required(
+            let failure = install_presence_required(
                 "a remote daemon socket appeared before activation; recover or stop that daemon before retrying installation",
-            ));
+            );
+            return Err(match self.rollback_install(&transaction, timeout) {
+                Ok(()) => with_recovery(failure, BootstrapRecoveryDisposition::RollbackConfirmed),
+                Err(_) => with_recovery(failure, BootstrapRecoveryDisposition::OutcomeUnknown),
+            });
         }
         renew_lease!("helper_verification");
         if let Err(error) = run_streaming_command(
@@ -1708,12 +1925,13 @@ impl BootstrapSession {
         .and_then(|output| parse_install_commit(&output.stdout));
         if let Err(error) = commit {
             drop(connection);
-            return Err(classified_error(
+            return Err(classified_error_with_recovery(
                 io::ErrorKind::Other,
                 "bootstrap_commit_outcome_unknown",
                 format!(
                     "remote install commit outcome is unknown after successful helper verification and protocol ping; retry the exact bootstrap to discover the installed helper: {error}"
                 ),
+                BootstrapRecoveryDisposition::OutcomeUnknown,
             ));
         }
         connection._bootstrap_session = Some(self);
@@ -1730,6 +1948,7 @@ impl BootstrapSession {
             transaction.input(),
             timeout,
         )
+        .map_err(|error| with_recovery(error, BootstrapRecoveryDisposition::OutcomeUnknown))
     }
 }
 
@@ -2096,12 +2315,13 @@ fn discover_remote_in_session(
     let run = |probe: RemoteProbe| run_bounded_command(session.command(probe.command()), timeout);
     let platform = RemotePlatform::parse_probe(&run(RemoteProbe::Platform)?.stdout)?;
     let executables = parse_executable_probe(&run(RemoteProbe::Executables)?.stdout)?;
-    let install_destination =
-        parse_install_destination_probe(&run(RemoteProbe::InstallDestination)?.stdout)?;
+    let (install_destination, recovery) =
+        parse_install_destination_state(&run(RemoteProbe::InstallDestination)?.stdout)?;
     Ok(RemoteDiscovery {
         platform,
         executables,
         install_destination,
+        recovery,
     })
 }
 
@@ -2157,6 +2377,9 @@ fn plan_remote_bootstrap_at(
     )?;
     if let Some(helper) = selection.compatible {
         return Ok(RemoteBootstrapPlan::Ready(helper));
+    }
+    if let Some(error) = remote_recovery_error(discovery.recovery) {
+        return Err(error);
     }
     let reason = if discovery.executables.is_empty() {
         RemoteInstallReason::Missing
@@ -2518,11 +2741,18 @@ struct PublishedRelease {
 
 // Keep this matrix explicit: package versions on development branches do not
 // prove that an asset exists or that its wire protocol matches this source.
-const PUBLISHED_RELEASES: &[PublishedRelease] = &[PublishedRelease {
-    tag: "v0.18.1",
-    target: "x86_64-unknown-linux-gnu",
-    protocol_version: 27,
-}];
+const PUBLISHED_RELEASES: &[PublishedRelease] = &[
+    PublishedRelease {
+        tag: "v0.18.1",
+        target: "x86_64-unknown-linux-gnu",
+        protocol_version: 27,
+    },
+    PublishedRelease {
+        tag: "v0.30.3",
+        target: "x86_64-unknown-linux-gnu",
+        protocol_version: 44,
+    },
+];
 
 const fn federation_protocol_floor() -> u32 {
     protocol::ProtocolFeature::FederationChannel.minimum_version()
@@ -3037,12 +3267,13 @@ fn discover_remote_at(
     };
     let platform = RemotePlatform::parse_probe(&run(RemoteProbe::Platform)?.stdout)?;
     let executables = parse_executable_probe(&run(RemoteProbe::Executables)?.stdout)?;
-    let install_destination =
-        parse_install_destination_probe(&run(RemoteProbe::InstallDestination)?.stdout)?;
+    let (install_destination, recovery) =
+        parse_install_destination_state(&run(RemoteProbe::InstallDestination)?.stdout)?;
     Ok(RemoteDiscovery {
         platform,
         executables,
         install_destination,
+        recovery,
     })
 }
 
@@ -3832,14 +4063,18 @@ mod tests {
     #[cfg(not(target_os = "linux"))]
     fn test_process_start(pid: i32) -> Option<String> {
         let output = Command::new("/bin/ps")
-            .args(["-p", &pid.to_string(), "-o", "lstart="])
+            .args(["-p", &pid.to_string(), "-o", "state=", "-o", "lstart="])
             .output()
             .ok()?;
-        output
-            .status
-            .success()
-            .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
-            .filter(|start| !start.is_empty())
+        let fields = String::from_utf8_lossy(&output.stdout)
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        (output.status.success()
+            && fields.len() >= 6
+            && !fields.first().is_some_and(|state| state.starts_with('Z')))
+        .then(|| fields[1..].join(" "))
+        .filter(|start| !start.is_empty())
     }
 
     fn local_shell_command(shell: &str, home: &Path) -> Command {
@@ -4015,6 +4250,272 @@ mod tests {
             assert_eq!(fs::read(&destination).unwrap(), b"previous");
             fs::remove_dir_all(directory).unwrap();
         }
+    }
+
+    #[test]
+    fn upgrade_activation_derives_runtime_before_provisional_proof() {
+        for shell in ["sh", "bash"] {
+            let directory = runtime_directory();
+            let bin = directory.join(".local/bin");
+            fs::create_dir_all(&bin).unwrap();
+            let destination = bin.join("boomux");
+            fs::write(&destination, b"previous").unwrap();
+            fs::set_permissions(&destination, fs::Permissions::from_mode(0o755)).unwrap();
+            let replacement = String::from(
+                "#!/bin/sh\ntransaction=\"$HOME/.local/bin/$2\"\nprintf '%s' \"$XDG_RUNTIME_DIR\" > \"$HOME/observed-runtime\"\n/bin/mv \"$transaction/new\" \"$HOME/.local/bin/boomux\"\n: > \"$transaction/activated\"\n",
+            );
+            let transaction = run_local_upload_with_command(
+                &directory,
+                replacement.as_bytes(),
+                shell,
+                REMOTE_INSTALL_COMMAND,
+            );
+            let command_text = REMOTE_INSTALL_ACTIVATE_COMMAND.replacen(
+                "boomux_runtime=/run/user/$boomux_uid",
+                "boomux_runtime=$HOME/runtime",
+                1,
+            );
+            assert_ne!(command_text, REMOTE_INSTALL_ACTIVATE_COMMAND);
+            let proof = RemoteDaemonStatus::Present {
+                protocol_version: protocol::PROTOCOL_VERSION,
+                pid: Some(1),
+                executable: Some(
+                    RemoteExecutable::parse(destination.to_string_lossy().into_owned()).unwrap(),
+                ),
+                socket_device: Some(1),
+                socket_inode: Some(1),
+            };
+            let mut activate = local_shell_command(shell, &directory);
+            activate
+                .env_remove("XDG_RUNTIME_DIR")
+                .args(["-c", &command_text]);
+            let output = run_streaming_command_capture(
+                activate,
+                transaction.activation_input(RemoteInstallReason::Upgrade, &proof),
+                Duration::from_secs(1),
+            )
+            .unwrap();
+            assert!(parse_install_activation(&output.stdout).unwrap());
+            assert_eq!(
+                fs::read_to_string(directory.join("observed-runtime")).unwrap(),
+                directory.join("runtime").to_string_lossy()
+            );
+            assert_eq!(fs::read(&destination).unwrap(), replacement.as_bytes());
+            run_local_transaction(&directory, REMOTE_INSTALL_ROLLBACK_COMMAND, &transaction);
+            assert_eq!(fs::read(&destination).unwrap(), b"previous");
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn failed_activation_restores_uploaded_state_for_exact_retry() {
+        for shell in ["sh", "bash"] {
+            let directory = runtime_directory();
+            let bin = directory.join(".local/bin");
+            fs::create_dir_all(&bin).unwrap();
+            let destination = bin.join("boomux");
+            fs::write(&destination, b"previous").unwrap();
+            fs::set_permissions(&destination, fs::Permissions::from_mode(0o755)).unwrap();
+            let replacement = b"#!/bin/sh\ntransaction=\"$HOME/.local/bin/$2\"\n/bin/mv \"$transaction/new\" \"$HOME/.local/bin/boomux\"\n: > \"$transaction/activated\"\nif [ ! -e \"$HOME/failed-once\" ]; then : > \"$HOME/failed-once\"; exit 97; fi\n";
+            let transaction = run_local_upload_with_command(
+                &directory,
+                replacement,
+                shell,
+                REMOTE_INSTALL_COMMAND,
+            );
+            let proof = RemoteDaemonStatus::Present {
+                protocol_version: protocol::PROTOCOL_VERSION,
+                pid: Some(1),
+                executable: Some(
+                    RemoteExecutable::parse(destination.to_string_lossy().into_owned()).unwrap(),
+                ),
+                socket_device: Some(1),
+                socket_inode: Some(1),
+            };
+            let activate_once = || {
+                let mut activate = local_shell_command(shell, &directory);
+                activate.args(["-c", REMOTE_INSTALL_ACTIVATE_COMMAND]);
+                run_streaming_command_capture(
+                    activate,
+                    transaction.activation_input(RemoteInstallReason::Upgrade, &proof),
+                    Duration::from_secs(1),
+                )
+            };
+            assert!(activate_once().is_err());
+            let transaction_dir = bin.join(&transaction.0);
+            assert_eq!(fs::read(&destination).unwrap(), b"previous");
+            assert_eq!(fs::read(transaction_dir.join("new")).unwrap(), replacement);
+            for marker in ["activated", "restore_required", "backup_ready", "missing"] {
+                assert!(!transaction_dir.join(marker).exists(), "stale {marker}");
+            }
+            let output = activate_once().unwrap();
+            assert!(parse_install_activation(&output.stdout).unwrap());
+            assert_eq!(fs::read(&destination).unwrap(), replacement);
+            run_local_transaction(&directory, REMOTE_INSTALL_ROLLBACK_COMMAND, &transaction);
+            assert_eq!(fs::read(&destination).unwrap(), b"previous");
+            assert!(!transaction_dir.exists());
+            assert!(!bin.join(".boomux.bootstrap.lock").exists());
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn activation_retry_finalizes_durable_activation_when_compensation_cannot_move_it() {
+        let directory = runtime_directory();
+        let bin = directory.join(".local/bin");
+        fs::create_dir_all(&bin).unwrap();
+        let destination = bin.join("boomux");
+        fs::write(&destination, b"previous").unwrap();
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o755)).unwrap();
+        let replacement = b"#!/bin/sh\ntransaction=\"$HOME/.local/bin/$2\"\n/bin/mv -f \"$transaction/new\" \"$HOME/.local/bin/boomux\"\n: > \"$transaction/activated\"\nexit 97\n";
+        let transaction =
+            run_local_upload_with_command(&directory, replacement, "sh", REMOTE_INSTALL_COMMAND);
+        let proof = RemoteDaemonStatus::Present {
+            protocol_version: protocol::PROTOCOL_VERSION,
+            pid: Some(1),
+            executable: Some(
+                RemoteExecutable::parse(destination.to_string_lossy().into_owned()).unwrap(),
+            ),
+            socket_device: Some(1),
+            socket_inode: Some(1),
+        };
+        let interrupted = REMOTE_INSTALL_ACTIVATE_COMMAND.replace(
+            "/bin/mv -f \"$destination\" \"$transaction/new\" || return 1;",
+            "false || return 1;",
+        );
+        let mut first = local_shell_command("sh", &directory);
+        first.args(["-c", &interrupted]);
+        assert!(
+            run_streaming_command_capture(
+                first,
+                transaction.activation_input(RemoteInstallReason::Upgrade, &proof),
+                Duration::from_secs(1),
+            )
+            .is_err()
+        );
+        let transaction_dir = bin.join(&transaction.0);
+        assert!(transaction_dir.join("activated").exists());
+        assert!(transaction_dir.join("restore_required").exists());
+        assert!(!transaction_dir.join("new").exists());
+        assert_eq!(fs::read(&destination).unwrap(), replacement);
+
+        let mut retry = local_shell_command("sh", &directory);
+        retry.args(["-c", REMOTE_INSTALL_ACTIVATE_COMMAND]);
+        let output = run_streaming_command_capture(
+            retry,
+            transaction.activation_input(RemoteInstallReason::Upgrade, &proof),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        assert!(parse_install_activation(&output.stdout).unwrap());
+        run_local_transaction(&directory, REMOTE_INSTALL_ROLLBACK_COMMAND, &transaction);
+        assert_eq!(fs::read(&destination).unwrap(), b"previous");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn incomplete_activation_compensation_retains_recovery_markers() {
+        let directory = runtime_directory();
+        let bin = directory.join(".local/bin");
+        fs::create_dir_all(&bin).unwrap();
+        let destination = bin.join("boomux");
+        fs::write(&destination, b"previous").unwrap();
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o755)).unwrap();
+        let replacement = b"#!/bin/sh\ntransaction=\"$HOME/.local/bin/$2\"\n/bin/mv \"$transaction/new\" \"$HOME/.local/bin/boomux\"\n: > \"$transaction/activated\"\n/bin/mkdir \"$transaction/new\"\nexit 97\n";
+        let transaction =
+            run_local_upload_with_command(&directory, replacement, "sh", REMOTE_INSTALL_COMMAND);
+        let proof = RemoteDaemonStatus::Present {
+            protocol_version: protocol::PROTOCOL_VERSION,
+            pid: Some(1),
+            executable: Some(
+                RemoteExecutable::parse(destination.to_string_lossy().into_owned()).unwrap(),
+            ),
+            socket_device: Some(1),
+            socket_inode: Some(1),
+        };
+        let mut activate = local_shell_command("sh", &directory);
+        activate.args(["-c", REMOTE_INSTALL_ACTIVATE_COMMAND]);
+        assert!(
+            run_streaming_command_capture(
+                activate,
+                transaction.activation_input(RemoteInstallReason::Upgrade, &proof),
+                Duration::from_secs(1),
+            )
+            .is_err()
+        );
+        let transaction_dir = bin.join(&transaction.0);
+        for marker in ["activated", "restore_required", "backup_ready"] {
+            assert!(transaction_dir.join(marker).exists(), "missing {marker}");
+        }
+        assert!(transaction_dir.join("backup").exists());
+        assert!(transaction_dir.join("new").is_dir());
+        assert_eq!(fs::read(&destination).unwrap(), replacement);
+
+        let mut retry = local_shell_command("sh", &directory);
+        retry.args(["-c", REMOTE_INSTALL_ACTIVATE_COMMAND]);
+        assert!(
+            run_streaming_command_capture(
+                retry,
+                transaction.activation_input(RemoteInstallReason::Upgrade, &proof),
+                Duration::from_secs(1),
+            )
+            .is_err(),
+            "retry must not accept an activated marker while compensation is incomplete"
+        );
+
+        fs::remove_dir(transaction_dir.join("new")).unwrap();
+        run_local_transaction(&directory, REMOTE_INSTALL_ROLLBACK_COMMAND, &transaction);
+        assert_eq!(fs::read(&destination).unwrap(), b"previous");
+        assert!(!transaction_dir.exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn activation_retry_reconciles_partially_compensated_backup() {
+        let directory = runtime_directory();
+        let bin = directory.join(".local/bin");
+        fs::create_dir_all(&bin).unwrap();
+        let destination = bin.join("boomux");
+        fs::write(&destination, b"previous").unwrap();
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o755)).unwrap();
+        let replacement = b"#!/bin/sh\ntransaction=\"$HOME/.local/bin/$2\"\n/bin/mv -f \"$transaction/new\" \"$HOME/.local/bin/boomux\"\n: > \"$transaction/activated\"\n";
+        let transaction =
+            run_local_upload_with_command(&directory, replacement, "sh", REMOTE_INSTALL_COMMAND);
+        let transaction_dir = bin.join(&transaction.0);
+        fs::copy(&destination, transaction_dir.join("backup")).unwrap();
+        fs::write(transaction_dir.join("backup_ready"), b"").unwrap();
+        fs::write(transaction_dir.join("restore_required"), b"").unwrap();
+        fs::write(
+            transaction_dir.join("prior_daemon"),
+            protocol::PROTOCOL_VERSION.to_string(),
+        )
+        .unwrap();
+        fs::remove_file(&destination).unwrap();
+        assert!(transaction_dir.join("new").exists());
+
+        let proof = RemoteDaemonStatus::Present {
+            protocol_version: protocol::PROTOCOL_VERSION,
+            pid: Some(1),
+            executable: Some(
+                RemoteExecutable::parse(destination.to_string_lossy().into_owned()).unwrap(),
+            ),
+            socket_device: Some(1),
+            socket_inode: Some(1),
+        };
+        let mut activate = local_shell_command("sh", &directory);
+        activate.args(["-c", REMOTE_INSTALL_ACTIVATE_COMMAND]);
+        let output = run_streaming_command_capture(
+            activate,
+            transaction.activation_input(RemoteInstallReason::Upgrade, &proof),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        assert!(parse_install_activation(&output.stdout).unwrap());
+        assert_eq!(fs::read(&destination).unwrap(), replacement);
+        assert!(!transaction_dir.join("missing").exists());
+        run_local_transaction(&directory, REMOTE_INSTALL_ROLLBACK_COMMAND, &transaction);
+        assert_eq!(fs::read(&destination).unwrap(), b"previous");
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -4322,7 +4823,7 @@ mod tests {
         fs::write(
             &ssh,
             format!(
-                "#!/bin/sh\nlast=\nfor arg do last=$arg; done\ncase \"$last\" in *'exec '*) last=${{last##*exec }} ;; esac\ncase \"$last\" in\n  *boomux-platform-v1*) printf 'boomux-platform-v1\\0Linux\\0x86_64\\0' ;;\n  *boomux-executables-v1*) printf 'boomux-executables-v1\\0{candidates}' ;;\n  *boomux-install-destination-v1*) printf 'boomux-install-destination-v1\\0/home/person/.local/bin/boomux\\0' ;;\n{executable_cases}\n  *) exit 64 ;;\nesac\n"
+                "#!/bin/sh\nlast=\nfor arg do last=$arg; done\ncase \"$last\" in *'exec '*) last=${{last##*exec }} ;; esac\ncase \"$last\" in\n  *boomux-platform-v1*) printf 'boomux-platform-v1\\0Linux\\0x86_64\\0' ;;\n  *boomux-executables-v1*) printf 'boomux-executables-v1\\0{candidates}' ;;\n  *boomux-install-destination-v1*) printf 'boomux-install-destination-v1\\0/home/person/.local/bin/boomux\\0clear\\0' ;;\n{executable_cases}\n  *) exit 64 ;;\nesac\n"
             ),
         )
         .unwrap();
@@ -4340,7 +4841,7 @@ mod tests {
         fs::write(
             &ssh,
             format!(
-                "#!/bin/sh\n{CONTROL_MASTER_SCRIPT}\ncase \"$last\" in *'exec '*) last=${{last##*exec }} ;; esac\ncase \"$last\" in\n  *boomux-platform-v1*) printf 'boomux-platform-v1\\0Linux\\0x86_64\\0' ;;\n  *boomux-executables-v1*) printf 'boomux-executables-v1\\0{candidates}' ;;\n  *boomux-install-destination-v1*) printf 'boomux-install-destination-v1\\0/home/person/.local/bin/boomux\\0' ;;\n{executable_cases}\n  *) exit 64 ;;\nesac\n"
+                "#!/bin/sh\n{CONTROL_MASTER_SCRIPT}\ncase \"$last\" in *'exec '*) last=${{last##*exec }} ;; esac\ncase \"$last\" in\n  *boomux-platform-v1*) printf 'boomux-platform-v1\\0Linux\\0x86_64\\0' ;;\n  *boomux-executables-v1*) printf 'boomux-executables-v1\\0{candidates}' ;;\n  *boomux-install-destination-v1*) printf 'boomux-install-destination-v1\\0/home/person/.local/bin/boomux\\0clear\\0' ;;\n{executable_cases}\n  *) exit 64 ;;\nesac\n"
             ),
         )
         .unwrap();
@@ -4714,7 +5215,7 @@ mod tests {
             fs::write(
                 &ssh,
                 format!(
-                    "#!/bin/sh\n{CONTROL_MASTER_SCRIPT}\nlast=\nfor arg do last=$arg; done\nprintf '%s\\n' \"$last\" >> {}\ncase \"$last\" in\n  *'daemon status --json'*) printf '%s' {} ;;\n  *'boomux-install-transaction-v1'*) cat >/dev/null; printf 'boomux-install-transaction-v1\\0.boomux.bootstrap.ABC12345\\0' ;;\n  *'daemon restart'*|*'daemon stop'*) : > {}; exit 99 ;;\n  *) exit 64 ;;\nesac\n",
+                    "#!/bin/sh\n{CONTROL_MASTER_SCRIPT}\nlast=\nfor arg do last=$arg; done\nprintf '%s\\n' \"$last\" >> {}\ncase \"$last\" in\n  *'daemon status --json'*) printf '%s' {} ;;\n  *'boomux-install-transaction-v1'*) cat >/dev/null; printf 'boomux-install-transaction-v1\\0.boomux.bootstrap.ABC12345\\0' ;;\n  *'transaction/watchdog_pid'*'restore_install'*) cat >/dev/null ;;\n  *'daemon restart'*|*'daemon stop'*) : > {}; exit 99 ;;\n  *) exit 64 ;;\nesac\n",
                     quote_posix_shell(log.to_str().unwrap()),
                     quote_posix_shell(&status),
                     quote_posix_shell(mutated.to_str().unwrap()),
@@ -4749,6 +5250,10 @@ mod tests {
                 .err()
                 .expect("shadow upgrade must fail");
             assert_eq!(error_code(&error), "upgrade_required");
+            assert_eq!(
+                recovery_disposition(&error),
+                BootstrapRecoveryDisposition::RollbackConfirmed
+            );
             assert!(error.to_string().contains(helper_path));
             assert!(error.to_string().contains("owner or package mechanism"));
             assert!(error.to_string().contains("explicitly stop the daemon"));
@@ -4896,7 +5401,7 @@ mod tests {
                 authentication,
                 Duration::from_secs(2),
                 ssh.as_os_str(),
-                Some(Box::new(mirror)),
+                (Some(Box::new(mirror)), None),
             )
             .unwrap();
 
@@ -4932,7 +5437,7 @@ mod tests {
             SshAuthenticationMode::Batch,
             Duration::from_secs(2),
             ssh.as_os_str(),
-            Some(Box::new(mirror)),
+            (Some(Box::new(mirror)), None),
         )
         .err()
         .expect("the fake master must fail authentication");
@@ -4962,7 +5467,7 @@ mod tests {
             SshAuthenticationMode::Interactive,
             Duration::from_secs(10),
             ssh.as_os_str(),
-            Some(Box::new(mirror)),
+            (Some(Box::new(mirror)), None),
         )
         .err()
         .expect("oversized master stderr must fail");
@@ -5105,6 +5610,27 @@ mod tests {
                 .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert_eq!(error_code(&error), "bootstrap_malformed_helper");
+        let (destination, recovery) = parse_install_destination_state(
+            b"boomux-install-destination-v1\0/home/person/.local/bin/boomux\0recovering\0",
+        )
+        .unwrap();
+        assert_eq!(destination.as_str(), "/home/person/.local/bin/boomux");
+        assert_eq!(recovery, RemoteRecoveryState::Active);
+        assert_eq!(
+            parse_install_destination_state(
+                b"boomux-install-destination-v1\0/home/person/.local/bin/boomux\0stale\0",
+            )
+            .unwrap()
+            .1,
+            RemoteRecoveryState::Stale
+        );
+        for state in [b"unknown".as_slice(), b"recovering\0extra".as_slice()] {
+            let mut probe =
+                b"boomux-install-destination-v1\0/home/person/.local/bin/boomux\0".to_vec();
+            probe.extend_from_slice(state);
+            probe.push(0);
+            assert!(parse_install_destination_state(&probe).is_err());
+        }
     }
 
     #[test]
@@ -5148,8 +5674,91 @@ mod tests {
                 .iter()
                 .any(|path| path.as_str() == destination.to_str().unwrap())
         );
+        let recovery = || {
+            let mut command = Command::new("sh");
+            command
+                .args(["-c", INSTALL_DESTINATION_PROBE_COMMAND])
+                .env("HOME", &home);
+            let output = run_bounded_command(command, Duration::from_secs(1)).unwrap();
+            parse_install_destination_state(&output.stdout).unwrap().1
+        };
+        assert_eq!(recovery(), RemoteRecoveryState::Stale);
+        let transaction = ".boomux.bootstrap.ABC12345";
+        fs::write(lock.join("id"), format!("{transaction}\n")).unwrap();
+        let transaction_dir = bin.join(transaction);
+        fs::create_dir(&transaction_dir).unwrap();
+        fs::write(
+            transaction_dir.join("watchdog_pid"),
+            format!("{}\n", std::process::id()),
+        )
+        .unwrap();
+        #[cfg(target_os = "linux")]
+        let watchdog_start = {
+            let stat = fs::read_to_string(format!("/proc/{}/stat", std::process::id())).unwrap();
+            stat.rsplit_once(") ")
+                .unwrap()
+                .1
+                .split_whitespace()
+                .nth(19)
+                .unwrap()
+                .to_owned()
+        };
+        #[cfg(target_os = "macos")]
+        let watchdog_start = {
+            let output = Command::new("ps")
+                .args([
+                    "-p",
+                    &std::process::id().to_string(),
+                    "-o",
+                    "state=",
+                    "-o",
+                    "lstart=",
+                ])
+                .output()
+                .unwrap();
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .split_whitespace()
+                .skip(1)
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        fs::write(
+            transaction_dir.join("watchdog_start"),
+            format!("{watchdog_start}\n"),
+        )
+        .unwrap();
+        assert_eq!(recovery(), RemoteRecoveryState::Active);
+        #[cfg(target_os = "linux")]
+        {
+            let mut zombie = Command::new("sh").args(["-c", "exit 0"]).spawn().unwrap();
+            let zombie_pid = zombie.id();
+            let deadline = Instant::now() + Duration::from_secs(1);
+            let zombie_start = loop {
+                let stat = fs::read_to_string(format!("/proc/{zombie_pid}/stat")).unwrap();
+                let mut fields = stat.rsplit_once(") ").unwrap().1.split_whitespace();
+                if fields.next().unwrap() == "Z" {
+                    break fields.nth(18).unwrap().to_owned();
+                }
+                assert!(Instant::now() < deadline, "child did not become a zombie");
+                thread::sleep(Duration::from_millis(10));
+            };
+            fs::write(
+                transaction_dir.join("watchdog_pid"),
+                format!("{zombie_pid}\n"),
+            )
+            .unwrap();
+            fs::write(
+                transaction_dir.join("watchdog_start"),
+                format!("{zombie_start}\n"),
+            )
+            .unwrap();
+            assert_eq!(recovery(), RemoteRecoveryState::Stale);
+            zombie.wait().unwrap();
+        }
 
         fs::create_dir(lock.join("committed")).unwrap();
+        assert_eq!(recovery(), RemoteRecoveryState::Clear);
         assert!(
             run()
                 .iter()
@@ -5514,6 +6123,89 @@ mod tests {
     }
 
     #[test]
+    fn active_bootstrap_recovery_is_busy_unless_an_alternate_helper_is_ready() {
+        let runtime = runtime_directory();
+        let ssh = write_session_bootstrap_ssh(&runtime, "", "");
+        let script = fs::read_to_string(&ssh)
+            .unwrap()
+            .replace("boomux\\0clear\\0", "boomux\\0recovering\\0");
+        fs::write(&ssh, script).unwrap();
+        let mut session = BootstrapSession::open_at(
+            &runtime,
+            None,
+            SshTarget::parse("workbox").unwrap(),
+            SshAuthenticationMode::Batch,
+            Duration::from_secs(1),
+            ssh.as_os_str(),
+        )
+        .unwrap();
+        let error = match session.plan(Duration::from_secs(1)) {
+            Ok(_) => panic!("active recovery without another helper must be busy"),
+            Err(error) => error,
+        };
+        assert_eq!(error_code(&error), "busy");
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(
+            recovery_disposition(&error),
+            BootstrapRecoveryDisposition::NoRemoteMutation
+        );
+        drop(session);
+        fs::remove_dir_all(&runtime).unwrap();
+
+        let runtime = runtime_directory();
+        let ssh = write_session_bootstrap_ssh(&runtime, "", "");
+        let script = fs::read_to_string(&ssh)
+            .unwrap()
+            .replace("boomux\\0clear\\0", "boomux\\0stale\\0");
+        fs::write(&ssh, script).unwrap();
+        let mut session = BootstrapSession::open_at(
+            &runtime,
+            None,
+            SshTarget::parse("workbox").unwrap(),
+            SshAuthenticationMode::Batch,
+            Duration::from_secs(1),
+            ssh.as_os_str(),
+        )
+        .unwrap();
+        let error = match session.plan(Duration::from_secs(1)) {
+            Ok(_) => panic!("stale recovery must not propose another install"),
+            Err(error) => error,
+        };
+        assert_eq!(error_code(&error), "upgrade_recovery_required");
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        drop(session);
+        fs::remove_dir_all(&runtime).unwrap();
+
+        let runtime = runtime_directory();
+        let node_id = Uuid::new_v4().to_string();
+        let helper = compatible_helper_script(&node_id);
+        let ssh = write_session_bootstrap_ssh(
+            &runtime,
+            &format!("  \"'/good/boomux' __federation-stdio\") {helper} ;;"),
+            "/good/boomux\\0",
+        );
+        let script = fs::read_to_string(&ssh)
+            .unwrap()
+            .replace("boomux\\0clear\\0", "boomux\\0recovering\\0");
+        fs::write(&ssh, script).unwrap();
+        let mut session = BootstrapSession::open_at(
+            &runtime,
+            None,
+            SshTarget::parse("workbox").unwrap(),
+            SshAuthenticationMode::Batch,
+            Duration::from_secs(1),
+            ssh.as_os_str(),
+        )
+        .unwrap();
+        assert!(matches!(
+            session.plan(Duration::from_secs(1)).unwrap(),
+            RemoteBootstrapPlan::Ready(_)
+        ));
+        drop(session);
+        fs::remove_dir_all(runtime).unwrap();
+    }
+
+    #[test]
     fn explicit_upgrade_rejects_a_different_node_before_remote_mutation() {
         let runtime = runtime_directory();
         let actual_node_id = Uuid::new_v4().to_string();
@@ -5694,8 +6386,12 @@ mod tests {
     }
 
     #[test]
-    fn unreleased_local_protocol_has_no_compatible_published_release() {
-        let error = select_published_release("x86_64-unknown-linux-gnu").unwrap_err();
+    fn current_published_release_is_selected_without_falling_back_to_stale_assets() {
+        let release = select_published_release("x86_64-unknown-linux-gnu").unwrap();
+        assert_eq!(release.tag, "v0.30.3");
+        assert_eq!(release.protocol_version, protocol::PROTOCOL_VERSION);
+
+        let error = select_published_release("aarch64-unknown-linux-gnu").unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Unsupported);
         assert!(
             error
@@ -5719,7 +6415,7 @@ mod tests {
         fs::write(
             &ssh,
             format!(
-                "#!/bin/sh\n{control}\nlast=\nfor arg do last=$arg; done\ncase \"$last\" in\n  *'boomux-install-transaction-v1'*) mv {destination} {backup}; cat > {destination}; printf 'boomux-install-transaction-v1\\0.boomux.bootstrap.ABC12345\\0' ;;\n  *'transaction/watchdog_pid'*'daemon stop'*) cat >/dev/null; rm -f {destination}; mv {backup} {destination} ;;\n  *'daemon status --json'*) exit 126 ;;\n  *'daemon restart'*) : > {restart} ;;\n  *\"'/home/person/.local/bin/boomux' __federation-stdio\" | \"'/home/person/.local/bin/boomux' --version\") exit 126 ;;\n  *) exit 64 ;;\nesac\n",
+                "#!/bin/sh\n{control}\nlast=\nfor arg do last=$arg; done\ncase \"$last\" in\n  *'boomux-install-transaction-v1'*) mv {destination} {backup}; cat > {destination}; printf 'boomux-install-transaction-v1\\0.boomux.bootstrap.ABC12345\\0' ;;\n  *'transaction/watchdog_pid'*'restore_install'*) cat >/dev/null; rm -f {destination}; mv {backup} {destination} ;;\n  *'daemon status --json'*) exit 126 ;;\n  *'daemon restart'*) : > {restart} ;;\n  *\"'/home/person/.local/bin/boomux' __federation-stdio\" | \"'/home/person/.local/bin/boomux' --version\") exit 126 ;;\n  *) exit 64 ;;\nesac\n",
                 control = CONTROL_MASTER_SCRIPT,
                 destination = quote_posix_shell(destination.to_str().unwrap()),
                 backup = quote_posix_shell(backup.to_str().unwrap()),
@@ -5727,15 +6423,35 @@ mod tests {
             ),
         )
         .unwrap();
-        let script = fs::read_to_string(&ssh).unwrap().replace(
-            &format!(
-                "mv {} {}; cat > {};",
-                quote_posix_shell(destination.to_str().unwrap()),
-                quote_posix_shell(backup.to_str().unwrap()),
-                quote_posix_shell(destination.to_str().unwrap())
-            ),
-            "cat >/dev/null;",
-        );
+        let script = fs::read_to_string(&ssh)
+            .unwrap()
+            .replace(
+                &format!(
+                    "mv {} {}; cat > {};",
+                    quote_posix_shell(destination.to_str().unwrap()),
+                    quote_posix_shell(backup.to_str().unwrap()),
+                    quote_posix_shell(destination.to_str().unwrap())
+                ),
+                "cat >/dev/null;",
+            )
+            .replace(
+                &format!(
+                    "cat >/dev/null; rm -f {}; mv {} {};",
+                    quote_posix_shell(destination.to_str().unwrap()),
+                    quote_posix_shell(backup.to_str().unwrap()),
+                    quote_posix_shell(destination.to_str().unwrap())
+                ),
+                "cat >/dev/null;",
+            )
+            .replace(
+                &format!(
+                    "rm -f {}; mv {} {}",
+                    quote_posix_shell(destination.to_str().unwrap()),
+                    quote_posix_shell(backup.to_str().unwrap()),
+                    quote_posix_shell(destination.to_str().unwrap())
+                ),
+                ":",
+            );
         fs::write(&ssh, script).unwrap();
         fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
         let session = BootstrapSession::open_at(
@@ -5859,6 +6575,10 @@ mod tests {
             .err()
             .expect("post-install ping EOF must fail");
         assert_eq!(error_code(&error), "bootstrap_transport_failed");
+        assert_eq!(
+            recovery_disposition(&error),
+            BootstrapRecoveryDisposition::RollbackConfirmed
+        );
         assert_eq!(fs::read(&destination).unwrap(), b"previous-helper");
         assert!(!backup.exists());
         assert!(!committed.exists());
@@ -6071,7 +6791,7 @@ mod tests {
         fs::write(
             &ssh,
             format!(
-                "#!/bin/sh\n{control}\nlast=\nfor arg do last=$arg; done\ncase \"$last\" in\n  *'boomux-install-transaction-v1'*) mv {destination} {backup}; cat > {destination}; printf 'boomux-install-transaction-v1\\0.boomux.bootstrap.ABC12345\\0' ;;\n  *': > \"$transaction/daemon_absent\"'*) cat >/dev/null ;;\n  *'committed=$lock/committed'*) cat >/dev/null; [ \"$(cat {count})\" -eq 2 ]; : > {committed}; printf 'boomux-install-commit-v1\\0committed\\0' ;;\n  *'daemon status --json'*) if [ -e {started} ]; then printf '%s' '{{\"schema\":\"boomux.cli/v1\",\"command\":\"daemon.status\",\"data\":{{\"protocol_version\":38}}}}'; else printf 'boomux-daemon-status-v1\\0absent\\0'; fi ;;\n  *'daemon restart'*) : > {restarted} ;;\n  *\"'/home/person/.local/bin/boomux' __federation-stdio\") : > {started}; n=0; [ ! -f {count} ] || n=$(cat {count}); n=$((n + 1)); printf '%s' \"$n\" > {count}; {helper} ;;\n  *) exit 64 ;;\nesac\n",
+                "#!/bin/sh\n{control}\nlast=\nfor arg do last=$arg; done\ncase \"$last\" in\n  *'boomux-install-transaction-v1'*) mv {destination} {backup}; cat > {destination}; printf 'boomux-install-transaction-v1\\0.boomux.bootstrap.ABC12345\\0' ;;\n  *'transaction/watchdog_pid'*'restore_install'*) cat >/dev/null; rm -f {destination}; mv {backup} {destination} ;;\n  *': > \"$transaction/daemon_absent\"'*) cat >/dev/null ;;\n  *'committed=$lock/committed'*) cat >/dev/null; [ \"$(cat {count})\" -eq 2 ]; : > {committed}; printf 'boomux-install-commit-v1\\0committed\\0' ;;\n  *'daemon status --json'*) if [ -e {started} ]; then printf '%s' '{{\"schema\":\"boomux.cli/v1\",\"command\":\"daemon.status\",\"data\":{{\"protocol_version\":38}}}}'; else printf 'boomux-daemon-status-v1\\0absent\\0'; fi ;;\n  *'daemon restart'*) : > {restarted} ;;\n  *\"'/home/person/.local/bin/boomux' __federation-stdio\") : > {started}; n=0; [ ! -f {count} ] || n=$(cat {count}); n=$((n + 1)); printf '%s' \"$n\" > {count}; {helper} ;;\n  *) exit 64 ;;\nesac\n",
                 control = CONTROL_MASTER_SCRIPT,
                 destination = quote_posix_shell(destination.to_str().unwrap()),
                 backup = quote_posix_shell(backup.to_str().unwrap()),
@@ -6112,6 +6832,10 @@ mod tests {
             .err()
             .expect("upgrade requires a running daemon identity");
         assert_eq!(error_code(&error), "upgrade_required");
+        assert_eq!(
+            recovery_disposition(&error),
+            BootstrapRecoveryDisposition::RollbackConfirmed
+        );
         assert!(!restarted.exists());
         assert!(!committed.exists());
         fs::remove_dir_all(runtime).unwrap();
@@ -6253,6 +6977,10 @@ mod tests {
             .err()
             .expect("lost commit acknowledgment must be unknown");
         assert_eq!(error_code(&error), "bootstrap_commit_outcome_unknown");
+        assert_eq!(
+            recovery_disposition(&error),
+            BootstrapRecoveryDisposition::OutcomeUnknown
+        );
         assert!(committed.exists());
         assert_eq!(fs::read(&destination).unwrap(), b"replacement");
         assert!(backup.exists());
@@ -6569,6 +7297,105 @@ mod tests {
     }
 
     #[test]
+    fn dead_atomic_claim_is_reclaimed_and_release_is_owner_checked() {
+        let directory = runtime_directory();
+        fs::create_dir_all(directory.join(".local/bin")).unwrap();
+        let destination = directory.join(".local/bin/boomux");
+        fs::write(&destination, b"previous").unwrap();
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o755)).unwrap();
+        let install = gate_watchdog(
+            &REMOTE_INSTALL_COMMAND
+                .replace("lease_limit=180", "lease_limit=1")
+                .replace("[ \"$claim_age\" -ge 180 ]", "[ \"$claim_age\" -ge 1 ]"),
+        );
+        let _transaction =
+            run_local_upload_with_command(&directory, b"replacement", "sh", &install);
+        let claim = directory.join(".local/bin/.boomux.bootstrap.lock/claim");
+        fs::write(&claim, b"dead-owner\n999999999\n1\n0\n").unwrap();
+        fs::write(directory.join("watchdog-tick"), b"").unwrap();
+        let lock = directory.join(".local/bin/.boomux.bootstrap.lock");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while lock.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!lock.exists());
+        assert_eq!(fs::read(&destination).unwrap(), b"previous");
+
+        fs::remove_file(directory.join("watchdog-tick")).unwrap();
+        let install = gate_watchdog(REMOTE_INSTALL_COMMAND);
+        let transaction = run_local_upload_with_command(&directory, b"replacement", "sh", &install);
+        let renew = REMOTE_INSTALL_RENEW_COMMAND.replacen(
+            "trap - EXIT HUP INT TERM; claim_release",
+            "printf 'replacement-owner\\n999999999\\n1\\n0\\n' > \"$lock/claim\"; trap - EXIT HUP INT TERM; claim_release",
+            1,
+        );
+        assert_ne!(renew, REMOTE_INSTALL_RENEW_COMMAND);
+        let mut command = local_shell_command("sh", &directory);
+        command.args(["-c", &renew]);
+        run_streaming_command(
+            command,
+            transaction.renewal_input(1),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(directory.join(".local/bin/.boomux.bootstrap.lock/claim")).unwrap(),
+            "replacement-owner\n999999999\n1\n0\n"
+        );
+        fs::remove_file(directory.join(".local/bin/.boomux.bootstrap.lock/claim")).unwrap();
+        run_local_transaction(&directory, REMOTE_INSTALL_ROLLBACK_COMMAND, &transaction);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn zombie_claim_owner_does_not_block_watchdog_recovery() {
+        let mut zombie = Command::new("sh").args(["-c", "exit 0"]).spawn().unwrap();
+        let zombie_pid = i32::try_from(zombie.id()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let zombie_start = loop {
+            let stat = fs::read_to_string(format!("/proc/{zombie_pid}/stat")).unwrap();
+            let mut fields = stat.rsplit_once(") ").unwrap().1.split_whitespace();
+            if fields.next().unwrap() == "Z" {
+                break fields.nth(18).unwrap().to_owned();
+            }
+            assert!(Instant::now() < deadline, "child did not become a zombie");
+            thread::sleep(Duration::from_millis(10));
+        };
+
+        let directory = runtime_directory();
+        fs::create_dir_all(directory.join(".local/bin")).unwrap();
+        let destination = directory.join(".local/bin/boomux");
+        fs::write(&destination, b"previous").unwrap();
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o755)).unwrap();
+        let install = gate_watchdog(
+            &REMOTE_INSTALL_COMMAND
+                .replace("lease_limit=180", "lease_limit=1")
+                .replace("[ \"$claim_age\" -ge 180 ]", "[ \"$claim_age\" -ge 1 ]"),
+        );
+        let transaction = run_local_upload_with_command(&directory, b"replacement", "sh", &install);
+        let claim = directory.join(".local/bin/.boomux.bootstrap.lock/claim");
+        fs::write(
+            &claim,
+            format!(
+                "{}:{zombie_pid}:{zombie_start}\n{zombie_pid}\n{zombie_start}\n0\n",
+                transaction.0
+            ),
+        )
+        .unwrap();
+        fs::write(directory.join("watchdog-tick"), b"").unwrap();
+        let lock = directory.join(".local/bin/.boomux.bootstrap.lock");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while lock.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!lock.exists());
+        assert_eq!(fs::read(&destination).unwrap(), b"previous");
+        zombie.wait().unwrap();
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn two_bootstrap_sessions_share_atomic_remote_install_exclusion() {
         let runtime = runtime_directory();
         fs::create_dir_all(&runtime).unwrap();
@@ -6848,6 +7675,99 @@ mod tests {
         run_local_transaction(&directory, REMOTE_INSTALL_ROLLBACK_COMMAND, &transaction);
         assert!(destination.exists());
         assert_eq!(fs::read_to_string(&log).unwrap(), "daemon restart\n");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn rollback_remains_retryable_when_restored_daemon_restart_fails() {
+        let directory = runtime_directory();
+        fs::create_dir_all(directory.join(".local/bin")).unwrap();
+        let destination = directory.join(".local/bin/boomux");
+        fs::write(&destination, "#!/bin/sh\n[ ! -e \"$HOME/restart-fail\" ]\n").unwrap();
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o755)).unwrap();
+        let transaction = run_local_install(&directory, b"provisional");
+        let transaction_dir = directory.join(".local/bin").join(&transaction.0);
+        fs::write(
+            transaction_dir.join("prior_daemon"),
+            protocol::PROTOCOL_VERSION.to_string(),
+        )
+        .unwrap();
+        fs::write(transaction_dir.join("daemon_contacted"), b"").unwrap();
+        fs::write(directory.join("restart-fail"), b"").unwrap();
+
+        let mut rollback = local_shell_command("sh", &directory);
+        rollback.args(["-c", REMOTE_INSTALL_ROLLBACK_COMMAND]);
+        run_streaming_command(rollback, transaction.input(), Duration::from_secs(1)).unwrap_err();
+        assert!(transaction_dir.exists());
+        assert!(directory.join(".local/bin/.boomux.bootstrap.lock").exists());
+        assert!(transaction_dir.join("new").exists());
+
+        fs::remove_file(directory.join("restart-fail")).unwrap();
+        run_local_transaction(&directory, REMOTE_INSTALL_ROLLBACK_COMMAND, &transaction);
+        assert!(!transaction_dir.exists());
+        assert!(!directory.join(".local/bin/.boomux.bootstrap.lock").exists());
+        assert!(
+            fs::read_to_string(&destination)
+                .unwrap()
+                .contains("restart-fail")
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn rollback_does_not_signal_reused_watchdog_pid() {
+        let directory = runtime_directory();
+        fs::create_dir_all(directory.join(".local/bin")).unwrap();
+        let destination = directory.join(".local/bin/boomux");
+        fs::write(&destination, b"previous").unwrap();
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o755)).unwrap();
+        let transaction = run_local_install(&directory, b"provisional");
+        let transaction_dir = directory.join(".local/bin").join(&transaction.0);
+        let mut unrelated = Command::new("sleep").arg("60").spawn().unwrap();
+        fs::write(
+            transaction_dir.join("watchdog_pid"),
+            format!("{}\n", unrelated.id()),
+        )
+        .unwrap();
+        fs::write(
+            transaction_dir.join("watchdog_start"),
+            b"not-this-process\n",
+        )
+        .unwrap();
+
+        run_local_transaction(&directory, REMOTE_INSTALL_ROLLBACK_COMMAND, &transaction);
+        assert!(unrelated.try_wait().unwrap().is_none());
+        unrelated.kill().unwrap();
+        unrelated.wait().unwrap();
+        assert_eq!(fs::read(&destination).unwrap(), b"previous");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn watchdog_retains_transaction_when_backup_restore_fails() {
+        let directory = runtime_directory();
+        fs::create_dir_all(directory.join(".local/bin")).unwrap();
+        let destination = directory.join(".local/bin/boomux");
+        fs::write(&destination, b"previous").unwrap();
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o755)).unwrap();
+        let install = gate_watchdog(
+            &REMOTE_INSTALL_COMMAND
+                .replace("lease_limit=180", "lease_limit=1")
+                .replace(
+                    "/bin/mv -f \"$transaction/backup\" \"$destination\" || return 1;",
+                    "false || return 1;",
+                ),
+        );
+        let transaction = run_local_upload_with_command(&directory, b"provisional", "sh", &install);
+        run_local_activation(&directory, "sh", &transaction, RemoteInstallReason::Missing);
+        fs::write(directory.join("watchdog-tick"), b"").unwrap();
+        thread::sleep(Duration::from_secs(2));
+        let transaction_dir = directory.join(".local/bin").join(&transaction.0);
+        assert!(transaction_dir.exists());
+        assert!(directory.join(".local/bin/.boomux.bootstrap.lock").exists());
+
+        run_local_transaction(&directory, REMOTE_INSTALL_ROLLBACK_COMMAND, &transaction);
+        assert_eq!(fs::read(&destination).unwrap(), b"previous");
         fs::remove_dir_all(directory).unwrap();
     }
 

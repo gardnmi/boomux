@@ -51,9 +51,12 @@ dashboard starts without OpenCode links and continues to expose other eligible
 native handoffs such as Claude Remote Control. Port conflicts, installed-runtime
 startup failures, readiness timeouts, and daemon/protocol failures remain fatal.
 The same Node-local generation is used by eligible native OpenCode TUIs and the
-phone. Restarting `boomux web` does not replace that generation. Runtime exit
-withdraws native links until the daemon starts or strictly cold-adopts a
-replacement generation.
+phone. Restarting `boomux web` does not replace that generation. The gateway
+refreshes its presentation identity from the authoritative daemon and follows a
+replacement generation only on its originally requested port. Runtime exit or
+an identity mismatch withdraws native links until the daemon starts or strictly
+cold-adopts a replacement generation; the browser's normal polling presents an
+eligible replacement without a page reload.
 
 Stop the default gateway without stopping the Boomux daemon or any managed
 processes:
