@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.30.4](https://github.com/gardnmi/boomux/compare/v0.30.3...v0.30.4) (2026-08-25)
+
+
+### Bug Fixes
+
+* **node:** recover interrupted upgrades ([#266](https://github.com/gardnmi/boomux/issues/266)) ([06434b3](https://github.com/gardnmi/boomux/commit/06434b35d61c51255aa3da4f9476c3c6fdb36502))
+* **tui:** preserve project workspace cwd ([#268](https://github.com/gardnmi/boomux/issues/268)) ([62845bf](https://github.com/gardnmi/boomux/commit/62845bfd824a62e621b06a49c3c386615d9ec25e))
+
 ## [0.30.3](https://github.com/gardnmi/boomux/compare/v0.30.2...v0.30.3) (2026-08-25)
 
 
