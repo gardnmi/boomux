@@ -3824,6 +3824,17 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
                     create_dashboard_workspace(&client, &name).map_err(|error| error.to_string()),
                 )
             }
+            tui::DashboardEffect::CreateProjectWorkspace { name, default_cwd } => {
+                tui::DashboardEvent::OperationCompleted(
+                    create_dashboard_project_workspace(
+                        &client,
+                        &local_node_id,
+                        &name,
+                        &default_cwd,
+                    )
+                    .map_err(|error| error.to_string()),
+                )
+            }
             tui::DashboardEffect::CreateShell(workspace_id) => {
                 tui::DashboardEvent::ShellCreationCompleted(
                     local_dashboard_inner(&workspace_id, &local_node_id).and_then(|workspace_id| {
@@ -6023,6 +6034,46 @@ fn create_dashboard_workspace(
     }
     client.create_workspace_with_default_cwd(name, None, Vec::new())?;
     Ok(format!("Created empty workspace {name}"))
+}
+
+fn create_dashboard_project_workspace(
+    client: &client::Client,
+    local_node_id: &str,
+    name: &str,
+    project_cwd: &Path,
+) -> Result<String, Box<dyn Error>> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("workspace name cannot be empty".into());
+    }
+    let cwd = resolve_directory(project_cwd)?;
+    if !client.supports(protocol::ProtocolFeature::GlobalWorkspaces)? {
+        client.create_workspace_with_default_cwd(name, Some(cwd), Vec::new())?;
+        return Ok(format!("Created empty workspace {name}"));
+    }
+
+    let combined = client.combined_node_snapshot(Some(local_node_id.to_owned()))?;
+    let local = combined
+        .nodes
+        .iter()
+        .find(|node| node.local && node.node_id == local_node_id)
+        .filter(|node| node.workspace_owner_eligible)
+        .ok_or("local Node is not available for Workspace resources")?;
+    let shell_name = generated_names::stable(name);
+    let (workspace, shell) = client.create_global_workspace_with_shell(
+        Uuid::new_v4().to_string(),
+        Uuid::new_v4().to_string(),
+        name,
+        local.node_id.clone(),
+        Uuid::new_v4().to_string(),
+        cwd.clone(),
+        Uuid::new_v4().to_string(),
+        shell_spec(shell_name, &cwd, &[]),
+    )?;
+    Ok(format!(
+        "Created {} in {} on Node {}",
+        shell.name, workspace.name, local.alias
+    ))
 }
 
 fn create_dashboard_shell(

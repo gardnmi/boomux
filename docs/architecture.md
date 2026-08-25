@@ -577,11 +577,13 @@ refresh and preview reads are single-flight to keep stale work from accumulating
 Rendering remains a function of typed model state. One
 daemon snapshot contains each workspace, its launchers, and its shells, avoiding
 races between separate list operations. Configured project roots provide
-Workspace-name suggestions; when global Workspaces are negotiated, selecting one
-creates empty coordinator metadata without retaining its path. Older peers
-retain empty local Workspace creation. Git information is still collected
-independently from item directories and cached. Paths do not create
-Workspace-level Git identity, and mixed-directory Workspaces remain valid.
+Workspace-name suggestions. Selecting one validates its discovered path on the
+local Node and atomically creates the coordinated Workspace, its local placement,
+and a first pending Shell with that path as both Shell cwd and placement default.
+Arbitrary by-name creation still creates empty coordinator metadata, and older
+peers retain the path as the empty local Workspace default. Git information is
+still collected independently from item directories and cached. Paths do not
+create Workspace-level Git identity, and mixed-directory Workspaces remain valid.
 
 The dashboard establishes an atomic event-stream baseline and treats later
 events as invalidation signals for authoritative snapshot reprojection. It also

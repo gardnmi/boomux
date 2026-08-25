@@ -1,6 +1,6 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Barrier};
 use std::thread;
@@ -727,7 +727,39 @@ fn project_workspace_preflight_failure_does_not_reserve_the_name() {
         )
         .unwrap();
     assert_eq!(recovered.placements.len(), 1);
+    assert_eq!(
+        recovered.placements[0].default_cwd.as_deref(),
+        Some(Path::new("/tmp"))
+    );
+    assert_eq!(recovered_shell.cwd, PathBuf::from("/tmp"));
     assert_eq!(recovered_shell.name, "valid-different-semantics");
+    assert_eq!(
+        daemon
+            .client
+            .get_workspace(&recovered.placements[0].workspace_id)
+            .unwrap()
+            .default_cwd,
+        Some(PathBuf::from("/tmp"))
+    );
+    let (replayed, replayed_shell) = daemon
+        .client
+        .create_global_workspace_with_shell(
+            Uuid::new_v4().to_string(),
+            Uuid::new_v4().to_string(),
+            "missing-owner-project",
+            &local.node_id,
+            Uuid::new_v4().to_string(),
+            "/tmp".into(),
+            Uuid::new_v4().to_string(),
+            ShellSpec {
+                name: "valid-different-semantics".into(),
+                cwd: "/tmp".into(),
+                command: Vec::new(),
+            },
+        )
+        .unwrap();
+    assert_eq!(replayed, recovered);
+    assert_eq!(replayed_shell, recovered_shell);
 }
 
 #[test]
