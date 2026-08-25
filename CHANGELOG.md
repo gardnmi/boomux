@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.31.0](https://github.com/gardnmi/boomux/compare/v0.30.5...v0.31.0) (2026-08-25)
+
+
+### Features
+
+* **node:** add interactive reauthentication ([#271](https://github.com/gardnmi/boomux/issues/271)) ([89fc634](https://github.com/gardnmi/boomux/commit/89fc634853033e6a9d17a26aab0799607d259572))
+
 ## [0.30.5](https://github.com/gardnmi/boomux/compare/v0.30.4...v0.30.5) (2026-08-25)
 
 
