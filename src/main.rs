@@ -2315,6 +2315,13 @@ fn verified_remote_connection(
     } else {
         ssh_bootstrap::SshAuthenticationMode::Batch
     };
+    if interactive {
+        println!(
+            "Connecting to {}. Complete any SSH authentication prompt or login URL shown in this terminal.",
+            target.as_str()
+        );
+        std::io::Write::flush(&mut io::stdout())?;
+    }
     let mut session = ssh_bootstrap::BootstrapSession::open(target, authentication, TIMEOUT)
         .map_err(bootstrap_cli_failure)?;
     // Both branches return a channel verified by exactly one protocol ping. An
@@ -7627,6 +7634,7 @@ fn ensure_desktop_workspace(
     workspace: &protocol::GlobalWorkspaceSnapshot,
     terminal_override: Option<&str>,
 ) -> Result<(), Box<dyn Error>> {
+    hyprland::apply_workspace_layout(&workspace.id)?;
     if hyprland::workspace_has_windows(&workspace.id)? {
         return Ok(());
     }
