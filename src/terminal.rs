@@ -396,12 +396,32 @@ pub fn open_node_upgrade(desktop_entry: Option<&str>, node_id: &str) -> Result<(
     )
 }
 
+pub fn open_node_reauthenticate(
+    desktop_entry: Option<&str>,
+    node_id: &str,
+) -> Result<(), Box<dyn Error>> {
+    let arguments = node_reauthenticate_arguments(node_id);
+    launch(
+        desktop_entry,
+        "Reauthenticate Boomux Node",
+        None,
+        attachment_executable()?.as_os_str(),
+        &arguments,
+        None,
+        false,
+    )
+}
+
 fn node_add_arguments() -> [OsString; 1] {
     ["__guided-node-add".into()]
 }
 
 fn node_upgrade_arguments(node_id: &str) -> [OsString; 2] {
     ["__guided-node-upgrade".into(), node_id.into()]
+}
+
+fn node_reauthenticate_arguments(node_id: &str) -> [OsString; 2] {
+    ["__guided-node-reauthenticate".into(), node_id.into()]
 }
 
 pub(crate) fn open_plain(desktop_entry: Option<&str>) -> Result<(), Box<dyn Error>> {
@@ -848,6 +868,17 @@ mod tests {
             node_upgrade_arguments("node;still-one-argument"),
             [
                 OsString::from("__guided-node-upgrade"),
+                OsString::from("node;still-one-argument"),
+            ]
+        );
+    }
+
+    #[test]
+    fn guided_node_reauthentication_preserves_the_exact_node_id_argument() {
+        assert_eq!(
+            node_reauthenticate_arguments("node;still-one-argument"),
+            [
+                OsString::from("__guided-node-reauthenticate"),
                 OsString::from("node;still-one-argument"),
             ]
         );

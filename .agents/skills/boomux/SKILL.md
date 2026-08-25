@@ -78,6 +78,7 @@ boomux node inspect "<node-alias-or-id>" --json
 boomux node snapshot --json
 boomux node add "<alias>" "<user@host>"
 boomux node upgrade "<node>"
+boomux node reauthenticate "<node>"
 boomux node rename "<node>" "<new-alias>" --revision <revision> --json
 boomux node retarget "<node>" "<user@host>" --revision <revision> --json
 boomux node forget "<node>" --json
@@ -98,6 +99,10 @@ authorized upgrade for the selected remote Node in a native terminal.
 `node upgrade` is human-only and requires an interactive terminal. It verifies
 the registered Node identity before replacing the helper transactionally and
 gracefully restarting its daemon, including when the old helper remains protocol-compatible.
+`node reauthenticate` is human-only and uses the registration's exact stored
+route for interactive SSH authentication. It requires the pinned Node identity
+and an existing compatible helper, performs no install, upgrade, retarget, or
+registration mutation, and wakes the existing background projection observer.
 `node rekey` changes this Node's durable identity and is local, interactive, and
 human-only; use it only after the command's exact confirmation requirements are
 explicitly authorized.
@@ -615,7 +620,8 @@ terminal and refreshes for when focus returns. Enter on an Agent or Shell shows
 that same owning layer and opens only the selected terminal. Unavailable
 placement operations are reported as a warning when at least one item restored.
 
-The Nodes view inspects and refreshes registrations, starts guided setup,
+The Nodes view inspects and refreshes registrations, starts guided setup, opens
+`R` reauthentication for a selected authentication-required Node,
 revision-safely renames or retargets routes, and forgets a registration after
 confirmation. It is not a resource filter. Coordinated Workspace rows aggregate
 persisted placements while every item retains its owner Node; external owner

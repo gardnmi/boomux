@@ -950,6 +950,63 @@ fn upgraded_node_add_registers_after_the_precommit_ping_channel_closes() {
 }
 
 #[test]
+fn registered_node_reauthentication_is_interactive_read_only_and_requests_projection_retry() {
+    let directory = test_directory();
+    fs::create_dir_all(directory.join("home/.ssh")).unwrap();
+    fs::create_dir_all(directory.join("runtime")).unwrap();
+    fake_ssh(&directory, "/remote/boomux\\0", false);
+
+    let add = Command::new(env!("CARGO_BIN_EXE_boomux"))
+        .args(["node", "add", "work", "workbox", "--json"])
+        .env("PATH", format!("{}:/usr/bin:/bin", directory.display()))
+        .env("HOME", directory.join("home"))
+        .env("XDG_RUNTIME_DIR", directory.join("runtime"))
+        .env("XDG_STATE_HOME", directory.join("state"))
+        .output()
+        .unwrap();
+    assert!(
+        add.status.success(),
+        "Node registration failed: {}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+    let registration_path = directory.join("state/boomux/node_registrations.json");
+    let registration_before = fs::read(&registration_path).unwrap();
+
+    let (status, output) = run_interactive(&directory, &["node", "reauthenticate", "work"], b"");
+    assert!(
+        status.success(),
+        "Node reauthentication failed with {status}: {}",
+        String::from_utf8_lossy(&output)
+    );
+    assert!(
+        String::from_utf8_lossy(&output)
+            .contains("Authenticated work and requested a fresh background observation")
+    );
+    assert_eq!(fs::read(&registration_path).unwrap(), registration_before);
+    let ssh_log = fs::read_to_string(directory.join("ssh.log")).unwrap();
+    for forbidden in [
+        "boomux-install-transaction-v1",
+        "boomux-install-activation-v1",
+        "daemon restart",
+    ] {
+        assert!(
+            !ssh_log.contains(forbidden),
+            "unexpected {forbidden} command"
+        );
+    }
+
+    let _ = Command::new(env!("CARGO_BIN_EXE_boomux"))
+        .args(["daemon", "stop"])
+        .env("HOME", directory.join("home"))
+        .env("XDG_RUNTIME_DIR", directory.join("runtime"))
+        .env("XDG_STATE_HOME", directory.join("state"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn guided_node_add_mirrors_master_challenge_and_waits_after_failure() {
     let directory = test_directory();
     fs::create_dir_all(directory.join("home/.ssh")).unwrap();

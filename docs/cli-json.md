@@ -53,9 +53,10 @@ human-only. They orchestrate the default local Hyprland
 presentation and do not appear in `json_commands`, add a wire request, or expose
 compositor window identities through `boomux.cli/v1`.
 The static `hyprland_special_workspaces`, `contextual_desktop_terminal`,
-`coordinated_shell_desktop_placement`, and `desktop_workspace_show`
-features advertise that the installed CLI contains these human-facing paths;
-they do not claim that Hyprland is running or that the adapter is enabled.
+`coordinated_shell_desktop_placement`, `desktop_workspace_show`, and
+`node_reauthentication` features advertise that the installed CLI contains
+these human-facing paths; they do not claim that Hyprland is running, that the
+adapter is enabled, or that a registered Node currently needs authentication.
 
 ### Accepted Remote Node Compatibility
 
@@ -195,6 +196,13 @@ forwarded. Post-install status, restart, helper verification, handshake, and pin
 failures identify that fixed stage without exposing remote stderr.
 An already-active remote bootstrap transaction returns the existing stable
 `busy` code before changing the destination.
+`boomux node reauthenticate NODE` is human-only and absent from `json_commands`.
+It opens the registration's exact stored SSH route for normal interactive
+authentication, requires an already-compatible helper with the pinned Node
+identity, requires a subsequent prompt-free verification, revalidates unchanged
+registration state, and requests a prompt-free projection retry. It requires
+daemon protocol 38 or newer and never installs, upgrades, retargets, or mutates
+the registration.
 `boomux node upgrade NODE` is a human-only operation and rejects `--json` before
 SSH discovery or mutation. It requires a currently compatible helper to verify
 the registration's pinned Node ID, asks once after showing source, destination,

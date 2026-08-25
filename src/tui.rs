@@ -219,6 +219,7 @@ pub(crate) struct DashboardState {
     pub(crate) exact_run_attachment: bool,
     pub(crate) schedule_editing: bool,
     pub(crate) cached_projection_dismissal: bool,
+    pub(crate) node_reauthentication: bool,
     pub(crate) focused_terminal: Option<FocusedTerminalView>,
     pub(crate) reset_focus_revision: bool,
 }
@@ -851,6 +852,7 @@ pub(crate) enum DashboardEffect {
     Quit,
     AddNode,
     UpgradeNode(String),
+    ReauthenticateNode(String),
     SelectWorkspace {
         workspace_id: String,
     },
@@ -1105,6 +1107,7 @@ struct App {
     exact_run_attachment: bool,
     schedule_editing: bool,
     cached_projection_dismissal: bool,
+    node_reauthentication: bool,
     selected_execution_id: Option<String>,
     execution_state: TableState,
     workspace_state: TableState,
@@ -2357,6 +2360,7 @@ impl App {
             exact_run_attachment: false,
             schedule_editing: false,
             cached_projection_dismissal: false,
+            node_reauthentication: false,
             selected_execution_id: None,
             execution_state: TableState::default(),
             workspace_state,
@@ -3625,6 +3629,18 @@ impl App {
                     .filter(|node| !node.local)
                     .map(|node| DashboardEffect::UpgradeNode(node.id.clone()));
             }
+            KeyCode::Char('R') if self.primary_tab == PrimaryTab::Nodes => {
+                return self
+                    .node_state
+                    .selected()
+                    .and_then(|index| self.nodes.get(index))
+                    .filter(|node| {
+                        self.node_reauthentication
+                            && !node.local
+                            && node.health == NodeProjectionHealthCode::AuthenticationRequired
+                    })
+                    .map(|node| DashboardEffect::ReauthenticateNode(node.id.clone()));
+            }
             KeyCode::Char('p') if self.primary_tab == PrimaryTab::Schedules => {
                 return self
                     .selected_schedule()
@@ -3709,6 +3725,7 @@ impl App {
                 self.scheduling = state.scheduling;
                 self.exact_run_attachment = state.exact_run_attachment;
                 self.schedule_editing = state.schedule_editing;
+                self.node_reauthentication = state.node_reauthentication;
                 if state.reset_focus_revision {
                     self.observed_focus_revision = None;
                 }
@@ -4145,6 +4162,7 @@ pub(crate) fn run<B: DashboardBackend + Send + 'static>(
     app.exact_run_attachment = state.exact_run_attachment;
     app.schedule_editing = state.schedule_editing;
     app.cached_projection_dismissal = state.cached_projection_dismissal;
+    app.node_reauthentication = state.node_reauthentication;
     if follow_focused_terminal {
         app.enable_focus_following(state.focused_terminal.as_ref());
     }
@@ -5747,7 +5765,23 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
             }),
         );
     }
-    if app.primary_tab == PrimaryTab::Schedules {
+    if app.primary_tab == PrimaryTab::Nodes {
+        if let Some(node) = app
+            .node_state
+            .selected()
+            .and_then(|index| app.nodes.get(index))
+        {
+            lines.extend([
+                Line::from(format!("  Node: {} ({})", node.alias, short_id(&node.id))),
+                Line::from("  r wakes the prompt-free background observer."),
+                Line::from("  R opens interactive SSH reauthentication when authentication is required."),
+                Line::from("  Reauthentication uses the stored route and pinned identity; it does not retarget, install, upgrade, or change registration state."),
+                Line::from("  U opens the separately authorized helper upgrade workflow."),
+            ]);
+        } else {
+            lines.push(Line::from("  No Node selected."));
+        }
+    } else if app.primary_tab == PrimaryTab::Schedules {
         if let Some(schedule) = app.selected_schedule() {
             lines.extend([
                 Line::from(format!("  schedule: {} / {}", schedule.workspace, schedule.name)),
@@ -7641,6 +7675,21 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
                     Span::styled(" restore dismissed  ", Style::new().fg(SUBTEXT)),
                 ]);
             }
+            let reauthentication_available = app.node_reauthentication
+                && app
+                    .node_state
+                    .selected()
+                    .and_then(|index| app.nodes.get(index))
+                    .is_some_and(|node| {
+                        !node.local
+                            && node.health == NodeProjectionHealthCode::AuthenticationRequired
+                    });
+            if reauthentication_available {
+                spans.extend([
+                    Span::styled("R", Style::new().fg(YELLOW)),
+                    Span::styled(" reauthenticate  ", Style::new().fg(SUBTEXT)),
+                ]);
+            }
             spans.extend([
                 Span::styled("U", Style::new().fg(GREEN)),
                 Span::styled(" upgrade  ", Style::new().fg(SUBTEXT)),
@@ -8526,6 +8575,7 @@ mod tests {
                 "missing {expected}: {rendered}"
             );
         }
+        assert!(!rendered.contains("reauthenticate"));
     }
 
     #[test]
@@ -8622,8 +8672,15 @@ mod tests {
         remote.node.local = false;
         remote.node.route = Some("user@work".into());
         remote.node.registration_revision = Some(7);
+        remote.node.health = NodeProjectionHealthCode::AuthenticationRequired;
         let mut app = App::new(vec![remote], project_context());
         app.select_tab(PrimaryTab::Nodes);
+        assert!(!rendered_text(&mut app, 180, 24).contains("reauthenticate"));
+        app.node_reauthentication = true;
+        assert!(rendered_text(&mut app, 180, 24).contains("reauthenticate"));
+        app.nodes[0].health = NodeProjectionHealthCode::Reconnecting;
+        assert_eq!(app.update_key(KeyCode::Char('R'), KeyModifiers::NONE), None);
+        app.nodes[0].health = NodeProjectionHealthCode::AuthenticationRequired;
         assert_eq!(app.update_key(KeyCode::Char('u'), KeyModifiers::NONE), None);
         assert!(!rendered_text(&mut app, 180, 24).contains("restore dismissed"));
         app.cached_projection_dismissal = true;
@@ -8641,6 +8698,11 @@ mod tests {
         assert!(matches!(
             app.update_key(KeyCode::Char('U'), KeyModifiers::NONE),
             Some(DashboardEffect::UpgradeNode(node_id))
+                if node_id == "00000000-0000-0000-0000-000000000002"
+        ));
+        assert!(matches!(
+            app.update_key(KeyCode::Char('R'), KeyModifiers::NONE),
+            Some(DashboardEffect::ReauthenticateNode(node_id))
                 if node_id == "00000000-0000-0000-0000-000000000002"
         ));
 

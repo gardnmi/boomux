@@ -1597,6 +1597,39 @@ impl BootstrapSession {
         })
     }
 
+    pub fn connect_existing_verified(
+        self,
+        expected_node_id: &str,
+        timeout: Duration,
+    ) -> io::Result<RemoteConnection> {
+        let discovery = discover_remote_in_session(&self, timeout)?;
+        let selection = inspect_remote_helpers_in_session(&self, &discovery.executables, timeout)?;
+        let helper = selection.compatible.ok_or_else(|| {
+            if let Some(error) = remote_recovery_error(discovery.recovery) {
+                return error;
+            }
+            let (code, message) = if discovery.executables.is_empty() {
+                (
+                    "install_required",
+                    "registered Node reauthentication requires an existing compatible remote helper",
+                )
+            } else {
+                (
+                    "upgrade_required",
+                    "registered Node reauthentication found no compatible remote helper",
+                )
+            };
+            classified_error(io::ErrorKind::Unsupported, code, message)
+        })?;
+        RemoteInstallIntent::ExplicitRegisteredUpgrade {
+            expected_node_id: expected_node_id.to_owned(),
+        }
+        .verify_helper_identity(&helper)?;
+        let mut connection = self.connect(helper, timeout)?;
+        connection.ping_with_timeout(timeout)?;
+        Ok(connection)
+    }
+
     pub fn connect(
         self,
         helper: CompatibleRemoteHelper,
@@ -6077,6 +6110,92 @@ mod tests {
         assert_eq!(ready.executable.as_str(), "/good/boomux");
         assert_eq!(ready.handshake.node_id, node_id);
         drop(session);
+        fs::remove_dir_all(runtime).unwrap();
+    }
+
+    #[test]
+    fn registered_reauthentication_connects_only_the_pinned_existing_helper() {
+        let runtime = runtime_directory();
+        let node_id = Uuid::new_v4().to_string();
+        let helper = compatible_helper_script(&node_id);
+        let mutated = runtime.join("mutated");
+        let ssh = write_session_bootstrap_ssh(
+            &runtime,
+            &format!(
+                "  \"'/good/boomux' __federation-stdio\") {helper} ;;\n  *'boomux-install-transaction-v1'*|*'__bootstrap-activate'*|*'daemon restart'*) : > {}; exit 99 ;;",
+                quote_posix_shell(mutated.to_str().unwrap())
+            ),
+            "/good/boomux\\0",
+        );
+        let session = BootstrapSession::open_at(
+            &runtime,
+            None,
+            SshTarget::parse("workbox").unwrap(),
+            SshAuthenticationMode::Batch,
+            Duration::from_secs(1),
+            ssh.as_os_str(),
+        )
+        .unwrap();
+        let connection = session
+            .connect_existing_verified(&node_id, Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(connection.handshake.node_id, node_id);
+        drop(connection);
+        assert!(!mutated.exists());
+        fs::remove_dir_all(runtime).unwrap();
+    }
+
+    #[test]
+    fn registered_reauthentication_rejects_missing_and_changed_helpers_without_mutation() {
+        let runtime = runtime_directory();
+        let ssh = write_session_bootstrap_ssh(&runtime, "", "");
+        let session = BootstrapSession::open_at(
+            &runtime,
+            None,
+            SshTarget::parse("workbox").unwrap(),
+            SshAuthenticationMode::Batch,
+            Duration::from_secs(1),
+            ssh.as_os_str(),
+        )
+        .unwrap();
+        let error = match session
+            .connect_existing_verified(&Uuid::new_v4().to_string(), Duration::from_secs(1))
+        {
+            Ok(_) => panic!("missing helper unexpectedly authenticated"),
+            Err(error) => error,
+        };
+        assert_eq!(error_code(&error), "install_required");
+        fs::remove_dir_all(&runtime).unwrap();
+
+        let runtime = runtime_directory();
+        let actual_node_id = Uuid::new_v4().to_string();
+        let helper = compatible_helper_script(&actual_node_id);
+        let mutated = runtime.join("mutated");
+        let ssh = write_session_bootstrap_ssh(
+            &runtime,
+            &format!(
+                "  \"'/good/boomux' __federation-stdio\") {helper} ;;\n  *'boomux-install-transaction-v1'*|*'__bootstrap-activate'*|*'daemon restart'*) : > {}; exit 99 ;;",
+                quote_posix_shell(mutated.to_str().unwrap())
+            ),
+            "/good/boomux\\0",
+        );
+        let session = BootstrapSession::open_at(
+            &runtime,
+            None,
+            SshTarget::parse("workbox").unwrap(),
+            SshAuthenticationMode::Batch,
+            Duration::from_secs(1),
+            ssh.as_os_str(),
+        )
+        .unwrap();
+        let error = match session
+            .connect_existing_verified(&Uuid::new_v4().to_string(), Duration::from_secs(1))
+        {
+            Ok(_) => panic!("changed Node identity unexpectedly authenticated"),
+            Err(error) => error,
+        };
+        assert_eq!(error_code(&error), "node_identity_changed");
+        assert!(!mutated.exists());
         fs::remove_dir_all(runtime).unwrap();
     }
 
