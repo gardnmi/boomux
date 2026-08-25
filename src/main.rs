@@ -298,6 +298,7 @@ const NON_PROTOCOL_FEATURES: &[&str] = &[
     "contextual_desktop_terminal",
     "coordinated_shell_desktop_placement",
     "desktop_workspace_show",
+    "node_reauthentication",
 ];
 const LEGACY_BOOMUX_SHELLS_SKILL: &str = r#"---
 name: boomux-shells
@@ -603,6 +604,8 @@ enum Commands {
     GuidedNodeAdd,
     #[command(name = "__guided-node-upgrade", hide = true)]
     GuidedNodeUpgrade { selector: String },
+    #[command(name = "__guided-node-reauthenticate", hide = true)]
+    GuidedNodeReauthenticate { selector: String },
     #[command(name = "__bootstrap-activate", hide = true)]
     BootstrapActivate {
         transaction: String,
@@ -679,6 +682,8 @@ enum NodeCommands {
     List,
     /// Upgrade a registered remote Node after interactive authorization
     Upgrade { selector: String },
+    /// Reauthenticate the stored route to a registered remote Node
+    Reauthenticate { selector: String },
     /// Inspect a registered remote Node by alias or exact Node ID
     Inspect { selector: String },
     /// Show the combined Node-qualified local and cached remote projection
@@ -1532,6 +1537,7 @@ command_keys! {
     Desktop => ("desktop", HumanOnly),
     NodeAdd => ("node.add", Json),
     NodeUpgrade => ("node.upgrade", HumanOnly),
+    NodeReauthenticate => ("node.reauthenticate", HumanOnly),
     NodeList => ("node.list", Json),
     NodeInspect => ("node.inspect", Json),
     NodeSnapshot => ("node.snapshot", Json),
@@ -1647,6 +1653,9 @@ impl Cli {
             Some(Commands::Node {
                 command: NodeCommands::Upgrade { .. },
             }) => CommandKey::NodeUpgrade,
+            Some(Commands::Node {
+                command: NodeCommands::Reauthenticate { .. },
+            }) => CommandKey::NodeReauthenticate,
             Some(Commands::Node {
                 command: NodeCommands::Inspect { .. },
             }) => CommandKey::NodeInspect,
@@ -1858,6 +1867,7 @@ impl Cli {
             Some(Commands::FederationStdio) => CommandKey::Attach,
             Some(Commands::GuidedNodeAdd) => CommandKey::NodeAdd,
             Some(Commands::GuidedNodeUpgrade { .. }) => CommandKey::NodeUpgrade,
+            Some(Commands::GuidedNodeReauthenticate { .. }) => CommandKey::NodeReauthenticate,
             Some(Commands::BootstrapActivate { .. }) => CommandKey::Daemon,
         }
     }
@@ -2098,6 +2108,9 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
         Some(Commands::GuidedNodeUpgrade { selector }) => {
             return guided_node_upgrade(selector).map(CliExit::Child);
         }
+        Some(Commands::GuidedNodeReauthenticate { selector }) => {
+            return guided_node_reauthenticate(selector).map(CliExit::Child);
+        }
         Some(Commands::BootstrapActivate {
             transaction,
             expected_pid,
@@ -2268,6 +2281,7 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
         Some(Commands::FederationStdio) => unreachable!(),
         Some(Commands::GuidedNodeAdd) => unreachable!(),
         Some(Commands::GuidedNodeUpgrade { .. }) => unreachable!(),
+        Some(Commands::GuidedNodeReauthenticate { .. }) => unreachable!(),
         Some(Commands::BootstrapActivate { .. }) => unreachable!(),
         None => dashboard(cli.terminal.as_deref()),
     };
@@ -2473,6 +2487,77 @@ fn upgrade_node(selector: &str) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn reauthenticate_node(selector: &str) -> Result<(), Box<dyn Error>> {
+    const TIMEOUT: Duration = Duration::from_secs(120);
+
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Node reauthentication requires an interactive terminal",
+        )
+        .into());
+    }
+    let local = client::connect_or_start()?;
+    let registration = local.node_registration(selector)?;
+    if !protocol::ProtocolFeature::GlobalWorkspaces.is_supported_by(local.protocol_version()?) {
+        return Err(cli_output::failure(
+            "unsupported_version",
+            "Node reauthentication requires daemon protocol 38 or newer",
+        ));
+    }
+    println!("Node: {} ({})", registration.alias, registration.node_id);
+    println!("Stored SSH route: {}", registration.target);
+    println!(
+        "Complete any SSH authentication prompt or login URL shown in this terminal. Boomux will not install, upgrade, retarget, or modify the registration."
+    );
+    io::Write::flush(&mut io::stdout())?;
+
+    let target = ssh_bootstrap::SshTarget::parse(&registration.target)?;
+    let session = ssh_bootstrap::BootstrapSession::open(
+        target.clone(),
+        ssh_bootstrap::SshAuthenticationMode::Interactive,
+        TIMEOUT,
+    )
+    .map_err(bootstrap_cli_failure)?;
+    let connection = session
+        .connect_existing_verified(&registration.node_id, TIMEOUT)
+        .map_err(bootstrap_cli_failure)?;
+    drop(connection);
+
+    println!("Verifying that background observation can reconnect without prompts...");
+    io::Write::flush(&mut io::stdout())?;
+    let session = ssh_bootstrap::BootstrapSession::open(
+        target,
+        ssh_bootstrap::SshAuthenticationMode::Batch,
+        TIMEOUT,
+    )
+    .map_err(bootstrap_cli_failure)?;
+    let connection = session
+        .connect_existing_verified(&registration.node_id, TIMEOUT)
+        .map_err(bootstrap_cli_failure)?;
+
+    let current = local.node_registration(&registration.node_id)?;
+    if current != registration {
+        return Err(cli_output::failure(
+            "revision_changed",
+            "Node registration changed during reauthentication; refresh and retry",
+        ));
+    }
+    local.force_node_projection_refresh(&registration.node_id)?;
+    if local.node_registration(&registration.node_id)? != registration {
+        return Err(cli_output::failure(
+            "revision_changed",
+            "Node registration changed while requesting a fresh observation; refresh and retry",
+        ));
+    }
+    drop(connection);
+    println!(
+        "Authenticated {} and requested a fresh background observation",
+        registration.alias
+    );
+    Ok(())
+}
+
 fn node_command(command: NodeCommands, json: bool) -> Result<(), Box<dyn Error>> {
     match command {
         NodeCommands::Add { alias, target } => {
@@ -2529,6 +2614,7 @@ fn node_command(command: NodeCommands, json: bool) -> Result<(), Box<dyn Error>>
             }
         }
         NodeCommands::Upgrade { selector } => upgrade_node(&selector),
+        NodeCommands::Reauthenticate { selector } => reauthenticate_node(&selector),
         NodeCommands::Inspect { selector } => {
             let client = client::connect_or_start()?;
             let registration = client.node_registration(selector)?;
@@ -2724,6 +2810,25 @@ fn guided_node_upgrade(selector: &str) -> Result<process_adapter::ProcessExit, B
         &executable,
         &["node", "upgrade", selector],
         "Node upgrade",
+        &mut input,
+        &mut output,
+        interactive,
+        interactive.then(|| stdin.as_raw_fd()),
+    )
+}
+
+fn guided_node_reauthenticate(
+    selector: &str,
+) -> Result<process_adapter::ProcessExit, Box<dyn Error>> {
+    let executable = env::current_exe()?;
+    let stdin = io::stdin();
+    let interactive = stdin.is_terminal() && io::stdout().is_terminal();
+    let mut input = stdin.lock();
+    let mut output = io::stdout().lock();
+    guided_node_command_with(
+        &executable,
+        &["node", "reauthenticate", selector],
+        "Node reauthentication",
         &mut input,
         &mut output,
         interactive,
@@ -3572,6 +3677,13 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
                     .map(|()| "Opened Node upgrade".into())
                     .map_err(|error| error.to_string()),
             ),
+            tui::DashboardEffect::ReauthenticateNode(node_id) => {
+                tui::DashboardEvent::OperationCompleted(
+                    terminal::open_node_reauthenticate(terminal.as_deref(), &node_id)
+                        .map(|()| "Opened Node reauthentication".into())
+                        .map_err(|error| error.to_string()),
+                )
+            }
             tui::DashboardEffect::CheckForUpdates => {
                 let result = refresh.check(&client).map_err(|error| error.to_string());
                 match result {
@@ -4508,6 +4620,8 @@ fn dashboard_state(
         schedule_editing: protocol::ProtocolFeature::AgentScheduleEditing
             .is_supported_by(refresh.negotiated_protocol),
         cached_projection_dismissal: protocol::ProtocolFeature::CachedProjectionDismissal
+            .is_supported_by(refresh.negotiated_protocol),
+        node_reauthentication: protocol::ProtocolFeature::GlobalWorkspaces
             .is_supported_by(refresh.negotiated_protocol),
         focused_terminal: dashboard_focused_terminal_view(
             refresh.negotiated_protocol,
@@ -14515,7 +14629,7 @@ mod tests {
     }
 
     #[test]
-    fn node_upgrade_and_hidden_wrapper_are_human_only() {
+    fn node_upgrade_and_reauthentication_wrappers_are_human_only() {
         let cli = Cli::try_parse_from(["boomux", "node", "upgrade", "work"]).unwrap();
         assert!(matches!(
             cli.command.as_ref(),
@@ -14524,6 +14638,24 @@ mod tests {
             }) if selector == "work"
         ));
         assert_eq!(cli.command_descriptor().key, "node.upgrade");
+
+        let cli = Cli::try_parse_from(["boomux", "node", "reauthenticate", "work"]).unwrap();
+        assert!(matches!(
+            cli.command.as_ref(),
+            Some(Commands::Node {
+                command: NodeCommands::Reauthenticate { selector }
+            }) if selector == "work"
+        ));
+        assert_eq!(cli.command_descriptor().key, "node.reauthenticate");
+        assert_eq!(cli.command_descriptor().output, OutputMode::HumanOnly);
+
+        let cli =
+            Cli::try_parse_from(["boomux", "__guided-node-reauthenticate", "node-id"]).unwrap();
+        assert!(matches!(
+            cli.command.as_ref(),
+            Some(Commands::GuidedNodeReauthenticate { selector }) if selector == "node-id"
+        ));
+        assert_eq!(cli.command_descriptor().key, "node.reauthenticate");
         assert_eq!(cli.command_descriptor().output, OutputMode::HumanOnly);
 
         let cli = Cli::try_parse_from(["boomux", "__guided-node-upgrade", "node-id"]).unwrap();
@@ -17653,6 +17785,7 @@ mod tests {
             "sound_notifications",
             "integration_management",
             "desktop_workspace_show",
+            "node_reauthentication",
             "protocol_31",
             "node_registration_management",
             "pinned_node_identity",

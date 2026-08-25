@@ -70,11 +70,16 @@ distinct placements atomically enlarge all related pending reservations for the
 additional future placement before either new owner dispatch proceeds.
 
 The dashboard has a dedicated Nodes tab rather than a Node filter. Inspection is
-read-only; alias rename and route retarget use registration revisions, retarget
-verifies the pinned identity before mutation, and forget requires confirmation
-and removes only the local route. Projection refresh wakes the selected Node's
-existing observer without starting an overlapping worker or changing remote
-authority.
+read-only; `R` opens interactive reauthentication for a selected
+`authentication_required` Node, alias rename and route retarget use registration
+revisions, retarget verifies the pinned identity before mutation, and forget
+requires confirmation and removes only the local route. Reauthentication uses
+the exact stored route and pinned Node identity, requires an already-compatible
+helper and a subsequent prompt-free connection, and never installs, upgrades,
+retargets, or changes registration state. Success wakes the selected Node's
+existing batch observer without starting an overlapping worker or changing
+remote authority. Daemon protocol 38 or newer is required for that explicit
+observer wake.
 Prepared operations are isolated and serialized by operation UUID, so concurrent
 identical handlers return one durable result and cancellation cannot consume an
 in-flight or completed success. Distinct first-placement requests retain their
@@ -190,8 +195,12 @@ never scans SSH configuration and automatically connects to every alias.
 The implemented registration CLI is `boomux node add ALIAS TARGET`, or guided
 interactive `boomux node add` from the dashboard command palette or Omarchy
 panel. Registration management continues with `node list`,
-`node inspect`, revision-conditional `node rename` and `node retarget`, and `node
-forget`. Human-only `node upgrade NODE` verifies the pinned identity and, after
+`node inspect`, human-only `node reauthenticate`, revision-conditional `node
+rename` and `node retarget`, and `node forget`. Reauthentication presents normal
+OpenSSH authentication in a terminal, verifies the exact stored route against
+the pinned identity and an existing compatible helper, then requests a fresh
+background observation without mutating either Node. Human-only `node upgrade
+NODE` verifies the pinned identity and, after
 confirmation, transactionally replaces a compatible registered helper without
 changing the registration. Immediately before activation it acquires a bounded
 local maintenance lease, drains admitted operations, and prevents rename,

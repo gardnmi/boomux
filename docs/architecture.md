@@ -1192,8 +1192,12 @@ global Workspace row aggregates qualified resources from all placements while
 each item retains its exact owner Node and owner Workspace ID. Unlinked owner
 Workspaces remain external singleton rows even when names match. External rows
 offer explicit revision-guarded adopt-as-new and link-to-existing actions. The
-Nodes tab is not a filter: it exposes inspection plus revision-pinned alias
-rename and verified retarget, confirmed route forget, and projection refresh.
+Nodes tab is not a filter: it exposes inspection plus interactive pinned-route
+reauthentication, revision-pinned alias rename and verified retarget, confirmed
+route forget, and projection refresh. Reauthentication accepts prompts only in
+its native terminal, requires an existing compatible helper and exact pinned
+identity, mutates no registration or remote installation, and then wakes the
+existing prompt-free projection observer.
 Refresh wakes that Node's existing projection worker; it never starts an
 overlapping observer.
 Resource tables place `NODE` after task identity columns rather than making Node

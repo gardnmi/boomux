@@ -341,6 +341,7 @@ Add or upgrade a Node through the interactive workflow:
 boomux node add
 boomux node list
 boomux node upgrade <node>
+boomux node reauthenticate <node>
 ```
 
 Setup verifies remote identity and requires confirmation before installation or
