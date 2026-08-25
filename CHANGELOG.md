@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.30.5](https://github.com/gardnmi/boomux/compare/v0.30.4...v0.30.5) (2026-08-25)
+
+
+### Bug Fixes
+
+* **kiro:** bind lifecycle to process launches ([ca2fe1a](https://github.com/gardnmi/boomux/commit/ca2fe1ab52fbc6c44bb179102fbe5788d420080e))
+
 ## [0.30.4](https://github.com/gardnmi/boomux/compare/v0.30.3...v0.30.4) (2026-08-25)
 
 
