@@ -1949,7 +1949,14 @@ fn handle_connection_inner(
             },
         );
     }
-    if matches!(request.message, Request::Shutdown) {
+    let shutdown_identity = match &request.message {
+        Request::Shutdown => Some(None),
+        Request::ShutdownIfNodeIdentity { expected_node_id } => {
+            Some(Some(expected_node_id.as_str()))
+        }
+        _ => None,
+    };
+    if let Some(expected_node_id) = shutdown_identity {
         if transition
             .compare_exchange(
                 TRANSITION_IDLE,
@@ -1968,6 +1975,30 @@ fn handle_connection_inner(
                 )
                 .into_response(),
             );
+        }
+        if let Some(expected_node_id) = expected_node_id {
+            match registry
+                .node_identity()
+                .and_then(|identity| identity.id().map_err(DaemonError::from))
+            {
+                Ok(node_id) if node_id == expected_node_id => {}
+                Ok(_) => {
+                    transition.store(TRANSITION_IDLE, Ordering::Release);
+                    return send_response(
+                        &mut stream,
+                        response_version,
+                        DaemonError::lifecycle(
+                            ErrorCode::NodeIdentityChanged,
+                            "daemon Node identity changed from the authorized uninstall target",
+                        )
+                        .into_response(),
+                    );
+                }
+                Err(error) => {
+                    transition.store(TRANSITION_IDLE, Ordering::Release);
+                    return send_response(&mut stream, response_version, error.into_response());
+                }
+            }
         }
         match node_upgrade_maintenance_active(&registry) {
             Ok(true) => {
@@ -10506,6 +10537,16 @@ impl DaemonService {
                 .finish_upgrade_maintenance(&node_id, &token)
                 .map(|()| Response::Ok)
                 .map_err(node_registration_error),
+            Request::FinishNodeUninstallMaintenance { node_id, token } => {
+                let registration = self
+                    .node_registrations()?
+                    .finish_uninstall_maintenance(&node_id, &token)
+                    .map_err(node_registration_error)?;
+                if let Err(error) = self.node_projection_cache()?.remove(&registration.node_id) {
+                    eprintln!("boomux: could not remove disposable Node projection: {error}");
+                }
+                Ok(Response::NodeRegistration { registration })
+            }
             Request::RenewNodeUpgradeMaintenance { node_id, token } => self
                 .node_registrations()?
                 .renew_upgrade_maintenance(&node_id, &token, NODE_UPGRADE_MAINTENANCE_LEASE)
@@ -10872,7 +10913,9 @@ impl DaemonService {
             Request::Restart | Request::RestartWithNotificationConfig { .. } => {
                 unreachable!("restart is handled before dispatch")
             }
-            Request::Shutdown => unreachable!("shutdown is handled before dispatch"),
+            Request::Shutdown | Request::ShutdownIfNodeIdentity { .. } => {
+                unreachable!("shutdown is handled before dispatch")
+            }
             Request::Snapshot => Ok(Response::Snapshot {
                 snapshot: self.snapshot()?,
             }),

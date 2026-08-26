@@ -1,8 +1,9 @@
 use std::cmp::Ordering;
 use std::env;
+use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, IsTerminal, Read, Write};
-use std::os::unix::ffi::OsStringExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -99,6 +100,21 @@ struct Inspection {
     tag: Option<String>,
 }
 
+pub(crate) struct UninstallTarget {
+    path: PathBuf,
+    baseline: FileFingerprint,
+}
+
+impl UninstallTarget {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn authorization_token(&self) -> String {
+        fingerprint_token(&self.baseline)
+    }
+}
+
 pub(crate) fn status() -> UpdateStatus {
     inspect().status
 }
@@ -178,6 +194,159 @@ pub(crate) fn guided_update() -> Result<(), Box<dyn std::error::Error>> {
         let _ = fs::remove_file(&candidate);
     }
     result.map_err(Into::into)
+}
+
+pub(crate) fn uninstall_target() -> io::Result<UninstallTarget> {
+    let path = env::current_exe()?;
+    let home = env::var_os("HOME").map(PathBuf::from);
+    let (kind, baseline) = classify_installation(&path, home.as_deref(), DISTRIBUTION);
+    if kind != InstallKind::GithubRelease {
+        let message = match kind {
+            InstallKind::PackageManaged | InstallKind::RootOwned => {
+                "this Boomux executable is package-managed; uninstall it with the package manager that installed it"
+            }
+            InstallKind::SourceBuild | InstallKind::DevelopmentBuild => {
+                "this Boomux executable is a source or development build; remove it through its build or installation workflow"
+            }
+            InstallKind::Custom | InstallKind::Unknown | InstallKind::GithubRelease => {
+                "this Boomux executable is not an ownership-proven official release installation"
+            }
+        };
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, message));
+    }
+    Ok(UninstallTarget {
+        path,
+        baseline: baseline.expect("eligible uninstall has a baseline"),
+    })
+}
+
+pub(crate) fn stop_daemon_for_uninstall(
+    target: &UninstallTarget,
+) -> io::Result<client::DaemonLockReservation> {
+    match daemon_disposition(&target.path)? {
+        DaemonDisposition::Absent { _reservation, .. } => Ok(_reservation),
+        DaemonDisposition::SameExecutable { client, .. } => {
+            client
+                .shutdown()
+                .map_err(|error| io::Error::other(error.to_string()))?;
+            reserve_daemon_absence(&client::socket_path()?)
+        }
+    }
+}
+
+pub(crate) fn stop_daemon_for_remote_uninstall(
+    target: &UninstallTarget,
+    expected_node_id: &str,
+) -> io::Result<client::DaemonLockReservation> {
+    match daemon_disposition(&target.path)? {
+        DaemonDisposition::Absent { .. } => Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "remote uninstall requires the identity-verified daemon to remain running",
+        )),
+        DaemonDisposition::SameExecutable { client, .. } => {
+            client
+                .shutdown_if_node_identity(expected_node_id)
+                .map_err(|error| io::Error::other(error.to_string()))?;
+            reserve_daemon_absence(&client::socket_path()?)
+        }
+    }
+}
+
+fn fingerprint_token(fingerprint: &FileFingerprint) -> String {
+    let mut digest = String::with_capacity(64);
+    for byte in fingerprint.digest {
+        write!(digest, "{byte:02x}").expect("writing to a string cannot fail");
+    }
+    format!(
+        "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+        fingerprint.device,
+        fingerprint.inode,
+        fingerprint.length,
+        fingerprint.modified_seconds,
+        fingerprint.modified_nanoseconds,
+        fingerprint.changed_seconds,
+        fingerprint.changed_nanoseconds,
+        fingerprint.owner,
+        fingerprint.mode,
+        fingerprint.links,
+        digest
+    )
+}
+
+pub(crate) fn remove_uninstall_target(target: &UninstallTarget) -> io::Result<()> {
+    let parent = target
+        .path
+        .parent()
+        .ok_or_else(|| io::Error::other("install path has no parent directory"))?;
+    let staged = parent.join(format!(".boomux.uninstall.{}", Uuid::new_v4()));
+    rename_noreplace(&target.path, &staged)?;
+    let moved = match fingerprint(&staged) {
+        Ok(moved) => moved,
+        Err(error) => {
+            return match rename_noreplace(&staged, &target.path) {
+                Ok(()) => Err(error),
+                Err(restore) => Err(io::Error::other(format!(
+                    "could not inspect the staged Boomux executable: {error}; restoring it failed: {restore}; preserved at {}",
+                    staged.display()
+                ))),
+            };
+        }
+    };
+    if !same_candidate(&moved, &target.baseline) {
+        return match rename_noreplace(&staged, &target.path) {
+            Ok(()) => Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "installed Boomux executable changed after uninstall authorization",
+            )),
+            Err(restore) => Err(io::Error::other(format!(
+                "installed Boomux executable changed after uninstall authorization; restoring the moved file failed: {restore}; preserved at {}",
+                staged.display()
+            ))),
+        };
+    }
+    fs::remove_file(&staged)?;
+    sync_directory(parent)
+}
+
+#[cfg(target_os = "linux")]
+fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
+    let from = std::ffi::CString::new(from.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))?;
+    let to = std::ffi::CString::new(to.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))?;
+    if unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            from.as_ptr(),
+            libc::AT_FDCWD,
+            to.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    } == 0
+    {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn rename_noreplace(_from: &Path, _to: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "self-uninstall requires Linux atomic rename support",
+    ))
+}
+
+pub(crate) fn revalidate_uninstall_target(target: &UninstallTarget) -> io::Result<()> {
+    let current = fingerprint(&target.path)?;
+    if current != target.baseline {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "installed Boomux executable changed after uninstall authorization",
+        ));
+    }
+    Ok(())
 }
 
 fn inspect() -> Inspection {
@@ -1080,6 +1249,46 @@ mod tests {
             classify_installation(&executable, Some(&home), Some("github-release")).0,
             InstallKind::GithubRelease
         );
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn uninstall_removes_the_unchanged_pinned_executable_and_syncs_parent() {
+        let home = temporary_directory();
+        let bin = home.join(".local/bin");
+        fs::create_dir_all(&bin).unwrap();
+        let path = bin.join("boomux");
+        fs::write(&path, b"binary").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        let target = UninstallTarget {
+            baseline: fingerprint(&path).unwrap(),
+            path: path.clone(),
+        };
+
+        remove_uninstall_target(&target).unwrap();
+        assert!(!path.exists());
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn uninstall_refuses_an_executable_changed_after_authorization() {
+        let home = temporary_directory();
+        let bin = home.join(".local/bin");
+        fs::create_dir_all(&bin).unwrap();
+        let path = bin.join("boomux");
+        fs::write(&path, b"binary").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        let target = UninstallTarget {
+            baseline: fingerprint(&path).unwrap(),
+            path: path.clone(),
+        };
+        fs::write(&path, b"changed").unwrap();
+
+        assert_eq!(
+            remove_uninstall_target(&target).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"changed");
         fs::remove_dir_all(home).unwrap();
     }
 

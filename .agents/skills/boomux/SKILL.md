@@ -77,6 +77,7 @@ boomux node inspect "<node-alias-or-id>" --json
 boomux node snapshot --json
 boomux node add "<alias>" "<user@host>"
 boomux node upgrade "<node>"
+boomux node uninstall "<node>"
 boomux node reauthenticate "<node>"
 boomux node rename "<node>" "<new-alias>" --revision <revision> --json
 boomux node retarget "<node>" "<user@host>" --revision <revision> --json
@@ -98,6 +99,12 @@ authorized upgrade for the selected remote Node in a native terminal.
 `node upgrade` is human-only and requires an interactive terminal. It verifies
 the registered Node identity before replacing the helper transactionally and
 gracefully restarting its daemon, including when the old helper remains protocol-compatible.
+`node uninstall` is human-only and interactive. It verifies the registered Node
+identity and canonical owner-controlled user installation, removes current
+Boomux integration assets while preserving modified assets and durable data,
+stops every remote managed process, removes the remote executable, and forgets
+the local registration only after confirmed removal. It is distinct from
+`node forget`, which never contacts the owner.
 `node reauthenticate` is human-only and uses the registration's exact stored
 route for interactive SSH authentication. It requires the pinned Node identity
 and an existing compatible helper, performs no install, upgrade, retarget, or
@@ -773,6 +780,21 @@ source, development, root-owned, custom, and unknown installations must be
 updated through their owning installation method. It never downgrades, never
 updates remote Nodes, and leaves a stopped daemon stopped. Remote helpers remain
 under `boomux node upgrade`.
+
+Remove an official canonical local release installation with:
+
+```console
+boomux uninstall
+boomux uninstall --purge
+```
+
+Uninstall stops every local Boomux web gateway and managed process and removes
+unchanged Boomux-owned integrations and this Skill. It preserves modified
+assets, configuration, and durable state by default. `--purge` explicitly
+removes the standard Boomux state and configuration directories.
+Package-managed, source, custom, or otherwise unproven executable paths are
+refused. Use only with explicit authorization because process shutdown is
+destructive.
 
 ## Install Or Update This Skill
 

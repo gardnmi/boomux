@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 47;
+pub const PROTOCOL_VERSION: u32 = 48;
 pub const MIN_PROTOCOL_VERSION: u32 = 47;
 pub const MAX_CONTROL_FRAME: usize = 8 * 1024 * 1024;
 pub const MAX_ATTACH_FRAME: usize = 1024 * 1024;
@@ -175,6 +175,10 @@ define_protocol_features! {
         "kiro_stop_idle",
     ]),
     ScheduleFreeProtocol => (47, "schedule-free protocol", ["protocol_47"]),
+    NodeUninstallCoordination => (48, "Node uninstall coordination", [
+        "protocol_48",
+        "node_uninstall_coordination",
+    ]),
 }
 
 pub const MAX_NODE_PROJECTION_TRANSITIONS: u16 = 256;
@@ -1478,6 +1482,10 @@ pub enum Request {
         node_id: String,
         token: String,
     },
+    FinishNodeUninstallMaintenance {
+        node_id: String,
+        token: String,
+    },
     RenewNodeUpgradeMaintenance {
         node_id: String,
         token: String,
@@ -1584,6 +1592,9 @@ pub enum Request {
         environment: Option<UnixEnvironment>,
     },
     Shutdown,
+    ShutdownIfNodeIdentity {
+        expected_node_id: String,
+    },
     Snapshot,
     GetFocusedTerminal,
     GetWorkspace {
@@ -1852,6 +1863,10 @@ impl Request {
             | Self::RenewNodeUpgradeMaintenance { .. } => {
                 Some(ProtocolFeature::NodeUpgradeCoordination)
             }
+            Self::FinishNodeUninstallMaintenance { .. } => {
+                Some(ProtocolFeature::NodeUninstallCoordination)
+            }
+            Self::ShutdownIfNodeIdentity { .. } => Some(ProtocolFeature::NodeUninstallCoordination),
             Self::SyncNodeProjection { .. } | Self::GetNodeProjectionHealth { .. } => {
                 Some(ProtocolFeature::NodeProjectionSync)
             }
@@ -2499,8 +2514,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_forty_seven_only() {
-        assert_eq!(PROTOCOL_VERSION, 47);
+    fn protocol_version_is_forty_eight_with_forty_seven_floor() {
+        assert_eq!(PROTOCOL_VERSION, 48);
         assert_eq!(MIN_PROTOCOL_VERSION, 47);
     }
 
@@ -2661,6 +2676,27 @@ mod tests {
             serde_json::from_value::<Response>(encoded).unwrap(),
             response
         );
+    }
+
+    #[test]
+    fn node_uninstall_completion_requires_protocol_forty_eight() {
+        for request in [
+            Request::FinishNodeUninstallMaintenance {
+                node_id: "550e8400-e29b-41d4-a716-446655440000".into(),
+                token: "token".into(),
+            },
+            Request::ShutdownIfNodeIdentity {
+                expected_node_id: "550e8400-e29b-41d4-a716-446655440000".into(),
+            },
+        ] {
+            let encoded = serde_json::to_value(&request).unwrap();
+            assert_eq!(serde_json::from_value::<Request>(encoded).unwrap(), request);
+            assert_eq!(
+                request.required_feature(),
+                Some(ProtocolFeature::NodeUninstallCoordination)
+            );
+            assert_eq!(request.minimum_protocol_version(), 48);
+        }
     }
 
     #[test]
@@ -3772,6 +3808,7 @@ mod tests {
             (45, &["protocol_45", "kiro_exact_launch_holders"][..]),
             (46, &["protocol_46", "kiro_stop_idle"][..]),
             (47, &["protocol_47"][..]),
+            (48, &["protocol_48", "node_uninstall_coordination"][..]),
         ];
 
         let actual = ProtocolFeature::ALL

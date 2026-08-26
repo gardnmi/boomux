@@ -29,6 +29,12 @@
 > from an authenticated projection connection for Nodes-view presentation.
 > Public `boomux --remote TARGET`
 > remains ad hoc.
+> Protocol 48 adds explicit registered-Node uninstall coordination. The
+> interactive client verifies the pinned owner and canonical user install,
+> removes current owner integration assets, stops the proven daemon, and removes
+> the helper over one authenticated SSH endpoint. Confirmed remote removal
+> atomically consumes local maintenance into registration deletion; uncertain
+> outcomes retain the route.
 
 ## Purpose
 
@@ -210,6 +216,17 @@ Successful remote commit, failure before remote mutation, and a synchronously
 confirmed rollback release it immediately. Only an ambiguous upgrade or a
 rollback whose completion cannot be confirmed leaves it closed until bounded
 expiry so the remote watchdog settles before local routing resumes.
+Human-only `node uninstall NODE` uses the same admission-closing maintenance
+lease after explicit process and data-impact confirmation. It requires an
+existing protocol-48 helper at the canonical user install destination, proves a
+present daemon executes that exact destination, performs Node-ID-conditional
+normal daemon stop, and owner-validates the regular single-link executable
+against its pre-confirmation fingerprint before removal. Remote state, config, modified
+integrations, and the Agent Skill remain. Confirmed removal atomically deletes
+the local registration while admission is still closed, then best-effort removes
+its now-inaccessible disposable projection. Any failure retains the registration
+and releases maintenance; Boomux never interprets `node forget` as remote
+uninstall authority.
 Add and retarget complete verified bootstrap before submitting a registration
 mutation to the local daemon. The selected helper path is
 connection-local and is rediscovered on every later connection; it is not a

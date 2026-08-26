@@ -1045,6 +1045,17 @@ impl Client {
         )
     }
 
+    pub fn finish_node_uninstall_maintenance(
+        &self,
+        node_id: impl Into<String>,
+        token: impl Into<String>,
+    ) -> Result<NodeRegistrationSnapshot> {
+        self.node_registration_response(Request::FinishNodeUninstallMaintenance {
+            node_id: node_id.into(),
+            token: token.into(),
+        })
+    }
+
     pub fn renew_node_upgrade_maintenance(
         &self,
         node_id: impl Into<String>,
@@ -1068,6 +1079,20 @@ impl Client {
 
     pub fn shutdown(&self) -> Result<()> {
         expect_ok(self.request(Request::Shutdown)?, Response::Ok)?;
+        self.wait_for_shutdown()
+    }
+
+    pub fn shutdown_if_node_identity(&self, expected_node_id: impl Into<String>) -> Result<()> {
+        expect_ok(
+            self.request(Request::ShutdownIfNodeIdentity {
+                expected_node_id: expected_node_id.into(),
+            })?,
+            Response::Ok,
+        )?;
+        self.wait_for_shutdown()
+    }
+
+    fn wait_for_shutdown(&self) -> Result<()> {
         for _ in 0..SHUTDOWN_ATTEMPTS {
             if !self.socket_path.exists() && daemon_lock_available(&self.socket_path)? {
                 return Ok(());
@@ -2345,21 +2370,23 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
-            assert_eq!(request.version, 47);
-            assert_eq!(request.message, Request::Ping);
-            protocol::write_message(
-                &mut stream,
-                &Envelope::with_version(
-                    46,
-                    Response::Error {
-                        message: "protocol 47 unsupported".into(),
-                        code: Some(ErrorCode::UnsupportedVersion),
-                    },
-                ),
-            )
-            .unwrap();
+            for expected in [48, 47] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+                assert_eq!(request.version, expected);
+                assert_eq!(request.message, Request::Ping);
+                protocol::write_message(
+                    &mut stream,
+                    &Envelope::with_version(
+                        46,
+                        Response::Error {
+                            message: format!("protocol {expected} unsupported"),
+                            code: Some(ErrorCode::UnsupportedVersion),
+                        },
+                    ),
+                )
+                .unwrap();
+            }
         });
         let client = Client::from_socket_path(socket);
 

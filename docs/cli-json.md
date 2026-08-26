@@ -57,9 +57,10 @@ The static `hyprland_special_workspaces`, `contextual_desktop_terminal`,
 `node_reauthentication` features advertise that the installed CLI contains
 these human-facing paths; they do not claim that Hyprland is running, that the
 adapter is enabled, or that a registered Node currently needs authentication.
-The static `local_update_status` and `guided_local_update` features advertise
-the local update surfaces. They do not claim that the current executable is an
-eligible official release installation or that a newer release exists.
+The static `local_update_status`, `guided_local_update`, and
+`guided_local_uninstall` features advertise the local release-management
+surfaces. They do not claim that the current executable is an eligible official
+release installation or that a newer release exists.
 
 ### Accepted Remote Node Compatibility
 
@@ -212,6 +213,10 @@ successful commit or lease expiry. The CLI renews the lease while active, and
 local daemon restart or stop returns `busy` until release or expiry.
 Successful commit releases it immediately; a failed or ambiguous upgrade keeps
 it closed through bounded expiry so remote watchdog rollback cannot race routing.
+`boomux node uninstall NODE` is likewise human-only and rejects `--json` before
+SSH discovery. Protocol 48 atomically consumes its exact maintenance lease into
+registration removal only after the identity-pinned remote executable has been
+removed. Failures retain the registration.
 Per-Node observed capabilities must distinguish passive combined projection from
 process-starting, destructive, integration-management, and exact-attachment
 support. The full compatibility and privacy rules are defined
@@ -463,6 +468,9 @@ is no longer negotiated.
 Protocol 47 also removes Agent Schedule and Scheduled Execution commands, JSON
 payloads, capabilities, snapshot fields, and event types. Historical schedule
 request shapes are not part of the protocol-47 wire contract.
+Protocol 48 adds `protocol_48` and `node_uninstall_coordination`. The completion
+request is local coordinator state and adds no JSON mutation command, remote
+projection field, or arbitrary routed operation.
 
 Protocol-38 `workspace create` creates empty coordinator metadata without a
 default Node or cwd. First global `shell create` or `launcher create` resolves

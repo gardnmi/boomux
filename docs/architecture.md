@@ -36,6 +36,7 @@
 | `src/host_session_source.rs` and children | Canonical host source paths, normalization, and secure source lookup |
 | `src/integration_management.rs` | Integration inventory, status, setup, verification, install, and uninstall workflows |
 | `src/update.rs` | Local release discovery, installation classification, interactive self-update authorization, atomic executable replacement, and daemon handoff verification |
+| `src/uninstall.rs` | Interactive release uninstall orchestration, owned-asset cleanup, bounded purge validation, and process shutdown ordering |
 | `src/claude_hooks.rs`, `src/codex_hooks.rs`, `src/kiro_hooks.rs` | Bounded Claude Code, Codex, and Kiro hook decoding and lifecycle reduction |
 | `src/process_adapter.rs` | Exact-argv child supervision and fail-open process-bound Agent observation |
 | `src/config.rs` | Layered configuration resolution, bounded validation, and transactional active-layer editing |
@@ -64,6 +65,9 @@
 - **Local update ownership:** [`local-update.md`](local-update.md) defines the
   official-release eligibility, package-manager refusal, no-downgrade rule,
   atomic replacement, and graceful daemon handoff boundary.
+- **Local uninstall ownership:** [`uninstall.md`](uninstall.md) reuses the
+  official-release ownership boundary, preserves modified assets and user data
+  by default, and removes the executable only after process cleanup.
 - **Remote Node authority:** [`remote-nodes.md`](remote-nodes.md) defines the
   accepted federation boundary: one owning Node remains authoritative, SSH is a
   route, and local cached projections never authorize mutation or lifecycle
@@ -209,6 +213,13 @@ incompatible runtime, coordinator, journal, selection, and projection state,
 remove the old scheduling and scheduled-notification config keys, then install
 and start the new binary. [`local-update.md`](local-update.md) defines the exact
 operator sequence.
+Protocol 48 adds `node_uninstall_coordination`. It atomically consumes an exact
+Node maintenance lease into registration removal only after the interactive
+client confirms identity-pinned remote uninstall, then best-effort removes the
+now-inaccessible disposable projection. The remote mutation remains a fixed SSH
+bootstrap operation rather than an arbitrary routed daemon request. Protocol-47
+peers retain every prior Node operation but cannot use this atomic completion
+primitive.
 Remote notification presentation reuses protocol-32 atomic reduced transitions,
 so it does not require a later protocol. Node-cache schema 2 adds bounded local
 at-most-once individual and reconnect-digest claims with an explicit schema-1

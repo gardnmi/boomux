@@ -192,7 +192,7 @@ fn native_daemon_lifecycle() {
     .unwrap();
     let response: protocol::Envelope<protocol::Response> =
         protocol::read_message(&mut protocol_forty_six).unwrap();
-    assert_eq!(response.version, 47);
+    assert_eq!(response.version, 48);
     assert!(matches!(
         response.message,
         protocol::Response::Error {
@@ -200,6 +200,12 @@ fn native_daemon_lifecycle() {
             ..
         }
     ));
+    let error = daemon
+        .client
+        .shutdown_if_node_identity(Uuid::new_v4().to_string())
+        .unwrap_err();
+    assert_remote_code(&error, ErrorCode::NodeIdentityChanged);
+    daemon.client.ping().unwrap();
 
     let missing_id = Uuid::new_v4().to_string();
     let error = daemon.client.get_shell(&missing_id).unwrap_err();
