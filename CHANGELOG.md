@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.0.0](https://github.com/gardnmi/boomux/compare/v0.32.0...v1.0.0) (2026-08-26)
+
+
+### ⚠ BREAKING CHANGES
+
+* removes Schedule and Scheduled Execution APIs, requires protocol 47 and state schema 14, and requires a cold reset when upgrading from earlier releases.
+
+### Features
+
+* remove agent scheduling ([#277](https://github.com/gardnmi/boomux/issues/277)) ([df106d5](https://github.com/gardnmi/boomux/commit/df106d5a9997e85c7f92acff4b2adc72f1700214))
+
 ## [0.32.0](https://github.com/gardnmi/boomux/compare/v0.31.1...v0.32.0) (2026-08-26)
 
 
