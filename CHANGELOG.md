@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.0](https://github.com/gardnmi/boomux/compare/v1.0.2...v1.1.0) (2026-08-26)
+
+
+### Features
+
+* add safe local and remote uninstall ([#284](https://github.com/gardnmi/boomux/issues/284)) ([18d5c5f](https://github.com/gardnmi/boomux/commit/18d5c5f2c55d880dc8b3ab8ed06121cab295b674))
+
 ## [1.0.2](https://github.com/gardnmi/boomux/compare/v1.0.1...v1.0.2) (2026-08-26)
 
 
