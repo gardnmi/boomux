@@ -915,6 +915,43 @@ fn node_upgrade_maintenance_blocks_registration_changes_until_release() {
 }
 
 #[test]
+fn node_upgrade_maintenance_does_not_wait_for_projection_reads() {
+    let daemon = TestDaemon::start_with(|command, runtime_dir| {
+        let marker = runtime_dir.join("projection-started");
+        let ssh = runtime_dir.join("ssh");
+        fs::write(
+            &ssh,
+            format!(
+                "#!/bin/sh\n{CONTROL_MASTER_PREFIX}\n: > '{}'\nsleep 1\nexit 64\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+        command.env("PATH", format!("{}:/usr/bin:/bin", runtime_dir.display()));
+    });
+    let registration = daemon
+        .client
+        .add_node_registration("work", "work.example", node_id(2))
+        .unwrap();
+    let marker = daemon.runtime_dir.join("projection-started");
+    wait_until(
+        || marker.exists(),
+        "projection worker did not begin its SSH read",
+    );
+
+    let (leased, token) = daemon
+        .client
+        .begin_node_upgrade_maintenance(&registration.node_id, registration.revision)
+        .unwrap();
+    assert_eq!(leased, registration);
+    daemon
+        .client
+        .finish_node_upgrade_maintenance(&registration.node_id, token)
+        .unwrap();
+}
+
+#[test]
 fn guarded_resource_revisions_survive_cold_recovery() {
     let mut daemon = TestDaemon::start();
     let workspace = daemon

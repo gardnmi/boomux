@@ -441,14 +441,19 @@ Framed executable candidates and install destinations that are relative,
 oversized, or contain control characters are malformed helper output and return
 `bootstrap_malformed_helper`; they are not transport evidence.
 
-Every registration carries a monotonic local registration revision.
-Synchronization and routed requests reserve admission and copy that revision
-before network I/O, then revalidate it before committing any registration or
-cache change. Setup and a candidate retarget probe copy the revision without
-joining ordinary request admission, perform network work, and revalidate at their
-mutation commit. The registry retains a monotonic tombstone epoch so deleting and
-re-adding a registration cannot make an old reservation current. Duplicate
-checks are repeated at commit while the Node mutation gate is held.
+Every registration carries a monotonic local registration revision. Routed
+requests reserve admission and copy that revision before network I/O, then
+revalidate it before returning or committing a mutation. Background projection
+synchronization is read-only on the owner: it copies the revision without
+reserving mutation admission, and cache commit requires that exact registration
+and admission epoch to remain current and open. Maintenance advances that epoch
+as it closes the commit gate, so it need not wait for an in-flight SSH projection
+read and that stale result is discarded. Setup and a candidate retarget probe
+likewise copy the revision without joining ordinary request admission, perform
+network work, and revalidate at their mutation commit. The registry retains a
+monotonic tombstone epoch so deleting and re-adding a registration cannot make
+an old observation current. Duplicate checks are repeated at commit while the
+Node mutation gate is held.
 
 Forget and retarget use prepare, drain, and commit phases. Prepare closes
 admission without changing the revision, then releases the mutation gate.
