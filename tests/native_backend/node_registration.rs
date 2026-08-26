@@ -11,7 +11,7 @@ use boomux::protocol::{ErrorCode, Request, ShellRunExitReason, ShellSpec, Worksp
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::support::{CONTROL_MASTER_PREFIX, TestDaemon, profile};
+use crate::support::{CONTROL_MASTER_PREFIX, TestDaemon, profile, wait_until};
 
 fn node_id(value: u128) -> String {
     Uuid::from_u128(value).to_string()
@@ -1408,16 +1408,19 @@ fn cli_add_and_retarget_use_once_verified_identity_without_persisting_helper_pat
         .output()
         .unwrap();
     assert!(restart.status.success());
-    let inspect = command(&directory)
-        .args(["node", "inspect", "work", "--json"])
-        .output()
-        .unwrap();
-    assert!(inspect.status.success());
-    let inspect: serde_json::Value = serde_json::from_slice(&inspect.stdout).unwrap();
-    assert!(
-        inspect["data"]["projection"]["cache_generation"]
-            .as_u64()
-            .is_some_and(|generation| generation > 0)
+    wait_until(
+        || {
+            let inspect = command(&directory)
+                .args(["node", "inspect", "work", "--json"])
+                .output()
+                .unwrap();
+            inspect.status.success()
+                && serde_json::from_slice::<serde_json::Value>(&inspect.stdout)
+                    .ok()
+                    .and_then(|inspect| inspect["data"]["projection"]["cache_generation"].as_u64())
+                    .is_some_and(|generation| generation > 0)
+        },
+        "Node projection did not recover after daemon restart",
     );
 
     let stop = command(&directory)
