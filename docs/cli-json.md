@@ -390,8 +390,11 @@ Command payloads are:
   bounded event array.
 - `daemon.status`: `status`, `protocol_version`, `socket_path`, nullable `pid`,
   `executable`, `socket_device`, and `socket_inode`. On Linux, these identity fields
-  are populated only after same-user `SO_PEERCRED` and bounded absolute
-  `/proc/<pid>/exe` validation; the executable has a kernel ` (deleted)` suffix
+  are populated only after the bound listener maps to one unique same-user holder
+  through bounded kernel Unix-socket and `/proc` descriptor views, followed by
+  bounded absolute `/proc/<pid>/exe` validation. This remains current after the
+  listener is transferred between daemon processes; retained `SO_PEERCRED` alone
+  is not process identity. The executable has a kernel ` (deleted)` suffix
   removed. Other platforms or failed proof return null.
 
 ## Project Data

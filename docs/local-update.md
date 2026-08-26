@@ -97,10 +97,14 @@ If no daemon was running before activation, none is started. The installed path
 is revalidated against the candidate and the backup is removed.
 
 If a daemon was running, it must belong to the same user and execute the exact
-install path. The existing graceful handoff transfers PTYs, process identities,
-runtime locks, event state, and reconnecting attachments. Success requires the
-replacement daemon's exact handoff argv and `/proc` executable device, inode,
-length, mode, and SHA-256 to match the pinned candidate.
+install path. On Linux, the updater resolves the unique current holder of the
+bound listener through the kernel Unix-socket table and that user's bounded
+`/proc` descriptor view; it does not treat listener credentials retained from a
+prior handoff process as current process identity. The existing graceful handoff
+transfers PTYs, process identities, runtime locks, event state, and reconnecting
+attachments. Success requires the replacement daemon's exact handoff argv and
+`/proc` executable device, inode, length, mode, and SHA-256 to match the pinned
+candidate.
 
 Before successful verification, any failure restores the backup pathname and
 attempts a reverse graceful handoff to the restored executable. Recovery runs

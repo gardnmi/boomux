@@ -1,7 +1,7 @@
 use std::env;
 use std::error::Error;
-use std::fs::OpenOptions;
-use std::io;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read};
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -12,7 +12,7 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::protocol::{
     self, AgentInstanceSnapshot, AgentRegistrationSpec, AgentReport, AgentState,
@@ -28,6 +28,14 @@ use crate::protocol::{
 const CONNECT_ATTEMPTS: usize = 40;
 const CONNECT_DELAY: Duration = Duration::from_millis(25);
 const SHUTDOWN_ATTEMPTS: usize = 200;
+#[cfg(target_os = "linux")]
+const MAX_PROC_UNIX_BYTES: u64 = 4 * 1024 * 1024;
+#[cfg(target_os = "linux")]
+const MAX_PROC_ENTRIES: usize = 65_536;
+#[cfg(target_os = "linux")]
+const MAX_PROC_FD_ENTRIES: usize = 1_048_576;
+#[cfg(target_os = "linux")]
+const DAEMON_IDENTITY_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub type Result<T> = std::result::Result<T, ClientError>;
 
@@ -608,6 +616,22 @@ impl Client {
             uid: credentials.uid,
             protocol_version,
         })
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn daemon_process_credentials(&self) -> Result<DaemonPeerCredentials> {
+        let socket_before = fs::metadata(&self.socket_path).map_err(ClientError::Transport)?;
+        let peer = self.daemon_peer_credentials()?;
+        let pid =
+            daemon_listener_holder(&self.socket_path, peer.uid).map_err(ClientError::Transport)?;
+        let socket_after = fs::metadata(&self.socket_path).map_err(ClientError::Transport)?;
+        if socket_before.dev() != socket_after.dev() || socket_before.ino() != socket_after.ino() {
+            return Err(ClientError::Transport(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "daemon socket changed during process identification",
+            )));
+        }
+        Ok(DaemonPeerCredentials { pid, ..peer })
     }
 
     pub fn node_identity(&self) -> Result<String> {
@@ -2016,6 +2040,217 @@ fn unexpected<T>(response: Response) -> Result<T> {
     )))
 }
 
+#[cfg(target_os = "linux")]
+fn daemon_listener_holder(socket_path: &Path, uid: u32) -> io::Result<u32> {
+    let inode = daemon_listener_inode(socket_path)?;
+    let expected = format!("socket:[{inode}]");
+    let mut holders = Vec::new();
+    let mut processes = fs::read_dir("/proc")?;
+    let mut descriptor_count = 0usize;
+    let deadline = Instant::now() + DAEMON_IDENTITY_TIMEOUT;
+    for _ in 0..MAX_PROC_ENTRIES {
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "daemon listener holder inspection timed out",
+            ));
+        }
+        let Some(entry) = processes.next() else {
+            return unique_listener_holder(holders);
+        };
+        let entry = entry?;
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|value| value.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let process_path = entry.path();
+        match fs::metadata(&process_path) {
+            Ok(metadata) if metadata.is_dir() && metadata.uid() == uid => {}
+            Ok(_) => continue,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error),
+        }
+        let descriptors = match fs::read_dir(process_path.join("fd")) {
+            Ok(descriptors) => descriptors,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let mut holder = false;
+        for descriptor in descriptors {
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "daemon listener holder inspection timed out",
+                ));
+            }
+            descriptor_count = descriptor_count.checked_add(1).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "process descriptor count overflowed",
+                )
+            })?;
+            if descriptor_count > MAX_PROC_FD_ENTRIES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "process descriptor tables exceed the identification bound",
+                ));
+            }
+            let descriptor = match descriptor {
+                Ok(descriptor) => descriptor,
+                Err(_error)
+                    if fs::metadata(&process_path)
+                        .is_err_and(|current| current.kind() == io::ErrorKind::NotFound) =>
+                {
+                    break;
+                }
+                Err(error) => return Err(error),
+            };
+            match fs::read_link(descriptor.path()) {
+                Ok(target) if target.as_os_str().as_bytes() == expected.as_bytes() => {
+                    holder = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+                    ) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        if holder {
+            holders.push(pid);
+            if holders.len() > 1 {
+                return unique_listener_holder(holders);
+            }
+        }
+    }
+    if processes.next().is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "process table exceeds the identification bound",
+        ));
+    }
+    unique_listener_holder(holders)
+}
+
+#[cfg(target_os = "linux")]
+fn unique_listener_holder(mut holders: Vec<u32>) -> io::Result<u32> {
+    if holders.len() == 1 {
+        Ok(holders.remove(0))
+    } else if holders.is_empty() {
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "daemon listener holder was not found",
+        ))
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "daemon listener has multiple process holders",
+        ))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn daemon_listener_inode(socket_path: &Path) -> io::Result<u64> {
+    let mut bytes = Vec::new();
+    File::open("/proc/net/unix")?
+        .take(MAX_PROC_UNIX_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_PROC_UNIX_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Unix socket table exceeds the identification bound",
+        ));
+    }
+    let expected = socket_path.as_os_str().as_bytes();
+    let mut found = None;
+    for line in bytes.split(|byte| *byte == b'\n') {
+        let Some((inode, path)) = parse_proc_unix_entry(line) else {
+            continue;
+        };
+        if path != expected {
+            continue;
+        }
+        if found.replace(inode).is_some_and(|current| current != inode) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "daemon socket path has multiple kernel identities",
+            ));
+        }
+    }
+    found.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "daemon socket was not found in the Unix socket table",
+        )
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn parse_proc_unix_entry(line: &[u8]) -> Option<(u64, &[u8])> {
+    let mut position = 0;
+    let mut inode = None;
+    let mut flags = None;
+    let mut socket_type = None;
+    let mut state = None;
+    for field in 0..7 {
+        while line.get(position).is_some_and(u8::is_ascii_whitespace) {
+            position += 1;
+        }
+        let start = position;
+        while line
+            .get(position)
+            .is_some_and(|byte| !byte.is_ascii_whitespace())
+        {
+            position += 1;
+        }
+        if start == position {
+            return None;
+        }
+        let value = &line[start..position];
+        match field {
+            3 => flags = parse_proc_hex(value),
+            4 => socket_type = parse_proc_hex(value),
+            5 => state = parse_proc_hex(value),
+            6 => inode = std::str::from_utf8(value).ok()?.parse::<u64>().ok(),
+            _ => {}
+        }
+    }
+    while line.get(position).is_some_and(u8::is_ascii_whitespace) {
+        position += 1;
+    }
+    let inode = inode?;
+    (flags? & 0x0001_0000 != 0
+        && socket_type? == libc::SOCK_STREAM as u64
+        && state? == 1
+        && position < line.len())
+    .then_some((inode, &line[position..]))
+}
+
+#[cfg(target_os = "linux")]
+fn parse_proc_hex(value: &[u8]) -> Option<u64> {
+    u64::from_str_radix(std::str::from_utf8(value).ok()?, 16).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2023,6 +2258,27 @@ mod tests {
     use std::os::unix::net::UnixListener;
 
     use uuid::Uuid;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_unix_entry_preserves_socket_paths_with_spaces() {
+        assert_eq!(
+            parse_proc_unix_entry(
+                b"0000000000000000: 00000002 00000000 00010000 0001 01 12345 /run/user/1000/path with spaces.sock"
+            ),
+            Some((12345, b"/run/user/1000/path with spaces.sock".as_slice()))
+        );
+        assert_eq!(
+            parse_proc_unix_entry(b"Num RefCount Protocol Flags Type St Inode Path"),
+            None
+        );
+        assert_eq!(
+            parse_proc_unix_entry(
+                b"0000000000000000: 00000003 00000000 00000000 0001 03 12346 /run/user/1000/path with spaces.sock"
+            ),
+            None
+        );
+    }
 
     #[test]
     fn optional_runtime_accepts_legacy_typed_absence_without_changing_required_callers() {

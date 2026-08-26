@@ -1,6 +1,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -222,6 +223,22 @@ fn graceful_restart_executes_an_atomically_replaced_installed_inode() {
     );
     let new_pid = wait_for_replacement_pid(&installed, old_pid);
     assert_ne!(new_pid, old_pid);
+    let persistent_connection =
+        UnixStream::connect(root.join("runtime/boomux/daemon.sock")).unwrap();
+    assert_eq!(client.daemon_peer_credentials().unwrap().pid, old_pid);
+    assert_eq!(client.daemon_process_credentials().unwrap().pid, new_pid);
+    let status = command_with_executable(&root, &installed)
+        .args(["daemon", "status", "--json"])
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["data"]["pid"], new_pid);
+    assert_eq!(
+        status["data"]["executable"],
+        installed.to_string_lossy().as_ref()
+    );
+    drop(persistent_connection);
     let installed_metadata = fs::metadata(&installed).unwrap();
     let daemon_metadata = fs::metadata(format!("/proc/{new_pid}/exe")).unwrap();
     assert_eq!(daemon_metadata.dev(), installed_metadata.dev());
