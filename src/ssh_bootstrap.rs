@@ -4269,6 +4269,17 @@ mod tests {
         )
     }
 
+    fn gate_one_watchdog_attempt(command: &str) -> String {
+        let gated = gate_watchdog(command);
+        let one_attempt = gated.replacen(
+            "/bin/sleep 0.01; };",
+            "/bin/rm -f \"$HOME/watchdog-tick\"; };",
+            1,
+        );
+        assert_ne!(one_attempt, gated);
+        one_attempt
+    }
+
     fn delay_watchdog_readiness(command: &str) -> String {
         let delayed = command.replacen(
             ": > \"$transaction/watchdog_ready\";",
@@ -8066,19 +8077,27 @@ mod tests {
         let destination = directory.join(".local/bin/boomux");
         fs::write(&destination, b"previous").unwrap();
         fs::set_permissions(&destination, fs::Permissions::from_mode(0o755)).unwrap();
-        let install = gate_watchdog(
+        let install = gate_one_watchdog_attempt(
             &REMOTE_INSTALL_COMMAND
                 .replace("lease_limit=180", "lease_limit=1")
                 .replace(
                     "/bin/mv -f \"$transaction/backup\" \"$destination\" || return 1;",
-                    "false || return 1;",
+                    ": > \"$HOME/restore-attempted\"; false || return 1;",
                 ),
         );
         let transaction = run_local_upload_with_command(&directory, b"provisional", "sh", &install);
         run_local_activation(&directory, "sh", &transaction, RemoteInstallReason::Missing);
         fs::write(directory.join("watchdog-tick"), b"").unwrap();
-        thread::sleep(Duration::from_secs(2));
         let transaction_dir = directory.join(".local/bin").join(&transaction.0);
+        let claim = directory.join(".local/bin/.boomux.bootstrap.lock/claim");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while (!directory.join("restore-attempted").exists() || claim.exists())
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(directory.join("restore-attempted").exists());
+        assert!(!claim.exists());
         assert!(transaction_dir.exists());
         assert!(directory.join(".local/bin/.boomux.bootstrap.lock").exists());
 
