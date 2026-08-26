@@ -877,6 +877,28 @@ memory, PTYs, and mutated environments do not survive. Confirm before either
 operation when the user did not request it explicitly. They do not restart or
 stop daemons on registered remote Nodes.
 
+## Update Boomux
+
+Inspect the local installation and latest stable release without starting the
+daemon:
+
+```console
+boomux update status
+boomux update status --json
+```
+
+`update.status` reports a closed installation classification, current/latest
+versions, target, release URL, and recommended action. It is passive but performs
+a bounded network request to the fixed Boomux GitHub release endpoint.
+
+Use `boomux update` only after the user explicitly authorizes local executable
+replacement and graceful daemon restart. It is interactive and human-only. It
+can replace only an official release binary at `~/.local/bin/boomux`; AUR/pacman,
+source, development, root-owned, custom, and unknown installations must be
+updated through their owning installation method. It never downgrades, never
+updates remote Nodes, and leaves a stopped daemon stopped. Remote helpers remain
+under `boomux node upgrade`.
+
 ## Install Or Update This Skill
 
 ```console

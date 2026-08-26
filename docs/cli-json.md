@@ -57,6 +57,9 @@ The static `hyprland_special_workspaces`, `contextual_desktop_terminal`,
 `node_reauthentication` features advertise that the installed CLI contains
 these human-facing paths; they do not claim that Hyprland is running, that the
 adapter is enabled, or that a registered Node currently needs authentication.
+The static `local_update_status` and `guided_local_update` features advertise
+the local update surfaces. They do not claim that the current executable is an
+eligible official release installation or that a newer release exists.
 
 ### Accepted Remote Node Compatibility
 
@@ -235,6 +238,7 @@ The following commands support `--json`:
 - `boomux shells`
 - `boomux read`
 - `boomux events`
+- `boomux update status`
 - `boomux project list`
 - `boomux workspace list`
 - `boomux workspace inspect`
@@ -302,6 +306,17 @@ Command payloads are:
 
 - `capabilities`: CLI/protocol versions, integration host compatibility, plus
   arrays of schemas, commands, features, and error codes.
+- `update.status`: `current`, nullable `latest`, `state`, `install_kind`, `path`,
+  nullable `target`, nullable `release_url`, and `recommended_action`. `state`
+  is one of `update_available`, `current`, `newer_than_latest`, `ineligible`,
+  `unsupported_target`, or `check_failed`. `install_kind` is one of
+  `github_release`, `package_managed`, `root_owned`, `source_build`,
+  `development_build`, `custom`, or `unknown`. `recommended_action` is one of
+  `run_update`, `none`, `keep_current`, `use_package_manager`,
+  `install_github_release`, or `retry`. Status performs bounded release discovery
+  but does not start or contact the daemon. Network and malformed-release
+  failures are represented as `check_failed` data so passive integrations can
+  remain fail-open.
 - `list`: a `shells` array.
 - `shells`: workspace identity plus a `shells` array.
 - `project.list`: `roots_configured`, a `projects` array, and a `warnings`

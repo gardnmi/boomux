@@ -32,3 +32,5 @@ mod schedules;
 mod shell_lifecycle;
 #[path = "native_backend/shell_name_suggestion.rs"]
 mod shell_name_suggestion;
+#[path = "native_backend/update.rs"]
+mod update;
