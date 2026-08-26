@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.1](https://github.com/gardnmi/boomux/compare/v1.0.0...v1.0.1) (2026-08-26)
+
+
+### Bug Fixes
+
+* **update:** identify handed-off daemon listener ([#280](https://github.com/gardnmi/boomux/issues/280)) ([307ac52](https://github.com/gardnmi/boomux/commit/307ac524d70b3f34a8bc4df6146cc77885281fb4))
+
 ## [1.0.0](https://github.com/gardnmi/boomux/compare/v0.32.0...v1.0.0) (2026-08-26)
 
 
