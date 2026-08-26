@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.32.0](https://github.com/gardnmi/boomux/compare/v0.31.1...v0.32.0) (2026-08-26)
+
+
+### Features
+
+* **update:** add verified self-updates ([#275](https://github.com/gardnmi/boomux/issues/275)) ([abd3f43](https://github.com/gardnmi/boomux/commit/abd3f43fcb031d807a2ea9e524947a364b3c16d7))
+
 ## [0.31.1](https://github.com/gardnmi/boomux/compare/v0.31.0...v0.31.1) (2026-08-25)
 
 
