@@ -147,7 +147,7 @@ fn update_status_has_stable_json_and_does_not_start_daemon() {
 }
 
 #[test]
-fn capabilities_advertise_update_surfaces() {
+fn capabilities_advertise_release_management_surfaces() {
     let root = fixture();
     let output = command(&root)
         .args(["--json", "capabilities"])
@@ -160,6 +160,11 @@ fn capabilities_advertise_update_surfaces() {
     let features = value["data"]["features"].as_array().unwrap();
     assert!(features.iter().any(|value| value == "local_update_status"));
     assert!(features.iter().any(|value| value == "guided_local_update"));
+    assert!(
+        features
+            .iter()
+            .any(|value| value == "guided_local_uninstall")
+    );
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -170,6 +175,21 @@ fn json_guided_update_is_rejected_before_any_mutation() {
     assert!(!output.status.success());
     let value: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
     assert_eq!(value["command"], "update");
+    assert_eq!(value["error"]["code"], "invalid_argument");
+    assert!(!root.join("runtime").exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn json_guided_uninstall_is_rejected_before_any_mutation() {
+    let root = fixture();
+    let output = command(&root)
+        .args(["--json", "uninstall"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(value["command"], "uninstall");
     assert_eq!(value["error"]["code"], "invalid_argument");
     assert!(!root.join("runtime").exists());
     fs::remove_dir_all(root).unwrap();

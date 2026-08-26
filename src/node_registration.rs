@@ -498,6 +498,48 @@ impl NodeRegistrationManager {
         Ok(())
     }
 
+    pub(crate) fn finish_uninstall_maintenance(
+        &self,
+        node_id: &str,
+        token: &str,
+    ) -> io::Result<NodeRegistrationSnapshot> {
+        let mut state = self.lock_state()?;
+        let current = available_mut(&mut state)?;
+        expire_maintenance(current);
+        let index = current
+            .registrations
+            .iter()
+            .position(|registration| registration.snapshot.node_id == node_id)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "Node registration not found")
+            })?;
+        if current.registrations[index]
+            .maintenance
+            .as_ref()
+            .is_none_or(|maintenance| maintenance.token != token)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Node uninstall maintenance lease is not current",
+            ));
+        }
+        if current.registrations[index].admitted != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::ResourceBusy,
+                "Node uninstall maintenance still has admitted operations",
+            ));
+        }
+        let mut replacement = current.clone();
+        let tombstone_epoch = next(replacement.tombstone_epoch, "registration tombstone epoch")?;
+        replacement.tombstone_epoch = tombstone_epoch;
+        let mut removed = replacement.registrations.remove(index).snapshot;
+        removed.tombstone_epoch = tombstone_epoch;
+        save(&self.path, &replacement)?;
+        *current = replacement;
+        self.changed.notify_all();
+        Ok(removed)
+    }
+
     pub(crate) fn renew_upgrade_maintenance(
         &self,
         node_id: &str,
@@ -1207,6 +1249,35 @@ mod tests {
         thread::sleep(Duration::from_millis(2));
         assert!(manager.admit(&registration).unwrap());
         manager.release(&registration);
+        fs::remove_dir_all(path.parent().unwrap().parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn uninstall_maintenance_atomically_persists_registration_removal() {
+        let path = path();
+        let manager = NodeRegistrationManager::load_at(path.clone());
+        let registration = manager
+            .add("work".into(), "old".into(), node_id(2), &node_id(1))
+            .unwrap();
+        let (_, token) = manager
+            .begin_upgrade_maintenance_if(
+                "work",
+                registration.revision,
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                || true,
+            )
+            .unwrap();
+
+        let removed = manager
+            .finish_uninstall_maintenance(&registration.node_id, &token)
+            .unwrap();
+        assert_eq!(removed.node_id, registration.node_id);
+        assert!(removed.tombstone_epoch > registration.tombstone_epoch);
+        assert!(manager.list().unwrap().is_empty());
+
+        let restored = NodeRegistrationManager::load_at(path.clone());
+        assert!(restored.list().unwrap().is_empty());
         fs::remove_dir_all(path.parent().unwrap().parent().unwrap()).unwrap();
     }
 }

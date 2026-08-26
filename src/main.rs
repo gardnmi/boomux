@@ -53,6 +53,7 @@ mod session_projection;
 mod tailscale_serve;
 mod terminal;
 mod tui;
+mod uninstall;
 mod update;
 mod web_terminal;
 mod workspace_selection;
@@ -152,6 +153,7 @@ const NON_PROTOCOL_FEATURES: &[&str] = &[
     "node_reauthentication",
     "local_update_status",
     "guided_local_update",
+    "guided_local_uninstall",
 ];
 const LEGACY_BOOMUX_SHELLS_SKILL: &str = r#"---
 name: boomux-shells
@@ -308,6 +310,12 @@ enum Commands {
         #[command(subcommand)]
         command: Option<UpdateCommands>,
     },
+    /// Remove this official Boomux release installation
+    Uninstall {
+        /// Also remove standard Boomux durable state and configuration
+        #[arg(long)]
+        purge: bool,
+    },
     /// Discover configured projects
     Project {
         #[command(subcommand)]
@@ -461,6 +469,13 @@ enum Commands {
         expected_socket_device: u64,
         expected_socket_inode: u64,
     },
+    #[command(name = "__uninstall-remote", hide = true)]
+    UninstallRemote {
+        expected_node_id: String,
+        expected_executable: String,
+    },
+    #[command(name = "__uninstall-fingerprint", hide = true)]
+    UninstallFingerprint,
 }
 
 #[derive(Subcommand)]
@@ -534,6 +549,8 @@ enum NodeCommands {
     List,
     /// Upgrade a registered remote Node after interactive authorization
     Upgrade { selector: String },
+    /// Uninstall Boomux from a registered remote Node
+    Uninstall { selector: String },
     /// Reauthenticate the stored route to a registered remote Node
     Reauthenticate { selector: String },
     /// Inspect a registered remote Node by alias or exact Node ID
@@ -1172,6 +1189,7 @@ command_keys! {
     ConfigEdit => ("config.edit", HumanOnly),
     UpdateStatus => ("update.status", Json),
     Update => ("update", HumanOnly),
+    Uninstall => ("uninstall", HumanOnly),
     ProjectList => ("project.list", Json),
     WorkspaceList => ("workspace.list", Json),
     WorkspaceInspect => ("workspace.inspect", Json),
@@ -1179,6 +1197,7 @@ command_keys! {
     Desktop => ("desktop", HumanOnly),
     NodeAdd => ("node.add", Json),
     NodeUpgrade => ("node.upgrade", HumanOnly),
+    NodeUninstall => ("node.uninstall", HumanOnly),
     NodeReauthenticate => ("node.reauthenticate", HumanOnly),
     NodeList => ("node.list", Json),
     NodeInspect => ("node.inspect", Json),
@@ -1229,6 +1248,8 @@ command_keys! {
     Daemon => ("daemon", HumanOnly),
     Attach => ("attach", HumanOnly),
     ResumeSessionInternal => ("resume-session-internal", HumanOnly),
+    UninstallRemote => ("uninstall-remote", HumanOnly),
+    UninstallFingerprint => ("uninstall-fingerprint", HumanOnly),
 }
 
 impl Cli {
@@ -1269,6 +1290,7 @@ impl Cli {
                 command: Some(UpdateCommands::Status),
             }) => CommandKey::UpdateStatus,
             Some(Commands::Update { command: None }) => CommandKey::Update,
+            Some(Commands::Uninstall { .. }) => CommandKey::Uninstall,
             Some(Commands::Project {
                 command: ProjectCommands::List { .. },
             }) => CommandKey::ProjectList,
@@ -1287,6 +1309,9 @@ impl Cli {
             Some(Commands::Node {
                 command: NodeCommands::Upgrade { .. },
             }) => CommandKey::NodeUpgrade,
+            Some(Commands::Node {
+                command: NodeCommands::Uninstall { .. },
+            }) => CommandKey::NodeUninstall,
             Some(Commands::Node {
                 command: NodeCommands::Reauthenticate { .. },
             }) => CommandKey::NodeReauthenticate,
@@ -1465,6 +1490,8 @@ impl Cli {
             Some(Commands::GuidedNodeAdd) => CommandKey::NodeAdd,
             Some(Commands::GuidedNodeUpgrade { .. }) => CommandKey::NodeUpgrade,
             Some(Commands::GuidedNodeReauthenticate { .. }) => CommandKey::NodeReauthenticate,
+            Some(Commands::UninstallRemote { .. }) => CommandKey::UninstallRemote,
+            Some(Commands::UninstallFingerprint) => CommandKey::UninstallFingerprint,
             Some(Commands::BootstrapActivate { .. }) => CommandKey::Daemon,
         }
     }
@@ -1808,6 +1835,7 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
             }
         }
         Some(Commands::Update { command: None }) => update::guided_update(),
+        Some(Commands::Uninstall { purge }) => uninstall::guided_uninstall(purge),
         Some(Commands::Project {
             command: ProjectCommands::List { node },
         }) => list_projects(cli.json, node.as_deref()),
@@ -1900,6 +1928,18 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
         Some(Commands::GuidedNodeAdd) => unreachable!(),
         Some(Commands::GuidedNodeUpgrade { .. }) => unreachable!(),
         Some(Commands::GuidedNodeReauthenticate { .. }) => unreachable!(),
+        Some(Commands::UninstallRemote {
+            expected_node_id,
+            expected_executable,
+        }) => uninstall::remote_uninstall(&expected_node_id, &expected_executable),
+        Some(Commands::UninstallFingerprint) => {
+            let target = update::uninstall_target()?;
+            println!(
+                "boomux-uninstall-fingerprint-v1 {}",
+                target.authorization_token()
+            );
+            Ok(())
+        }
         Some(Commands::BootstrapActivate { .. }) => unreachable!(),
         None => dashboard(cli.terminal.as_deref()),
     };
@@ -2100,6 +2140,97 @@ fn upgrade_node(selector: &str) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn uninstall_node(selector: &str) -> Result<(), Box<dyn Error>> {
+    const TIMEOUT: Duration = Duration::from_secs(120);
+
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Node uninstall requires an interactive terminal",
+        )
+        .into());
+    }
+    let local = client::connect_or_start()?;
+    if !local.supports(protocol::ProtocolFeature::NodeUninstallCoordination)? {
+        return Err(cli_output::failure(
+            "unsupported_version",
+            "Node uninstall requires daemon protocol 48 or newer",
+        ));
+    }
+    let registration = local.node_registration(selector)?;
+    let target = ssh_bootstrap::SshTarget::parse(&registration.target)?;
+    let mut session = ssh_bootstrap::BootstrapSession::open(
+        target,
+        ssh_bootstrap::SshAuthenticationMode::Interactive,
+        TIMEOUT,
+    )
+    .map_err(bootstrap_cli_failure)?;
+    let plan = session
+        .plan_explicit_uninstall(&registration.node_id, TIMEOUT)
+        .map_err(bootstrap_cli_failure)?;
+
+    println!("Node: {} ({})", registration.alias, registration.node_id);
+    println!("Remote target: {}", registration.target);
+    println!("Install path: {}", plan.destination.as_str());
+    println!("Remote helper version: {}", plan.helper_version);
+    println!(
+        "Process impact: every managed Shell process, PTY, projection worker, and shared runtime on this remote Node will be stopped"
+    );
+    println!(
+        "Data impact: durable remote state and configuration are preserved; current Boomux integration assets are removed and modified assets are preserved"
+    );
+    for (display_name, path) in &plan.preserved_integrations {
+        println!(
+            "Preserving modified or uninspectable {display_name} integration asset{}",
+            path.as_deref()
+                .map(|path| format!(" at {path}"))
+                .unwrap_or_default()
+        );
+    }
+    println!(
+        "Registration impact: the local registration is removed atomically only after remote executable removal is confirmed"
+    );
+    if !confirm_setup("Uninstall Boomux from this registered Node?")? {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "remote Boomux uninstall was not authorized",
+        )
+        .into());
+    }
+
+    let current = local.node_registration(&registration.node_id)?;
+    if current != registration {
+        return Err(cli_output::failure(
+            "revision_changed",
+            "Node registration changed during uninstall preparation; refresh and retry",
+        ));
+    }
+    let (current, maintenance_token) =
+        local.begin_node_upgrade_maintenance(&registration.node_id, registration.revision)?;
+    if current != registration {
+        let _ = local.finish_node_upgrade_maintenance(&registration.node_id, &maintenance_token);
+        return Err(cli_output::failure(
+            "revision_changed",
+            "Node registration changed while uninstall authorization was pending; refresh and retry",
+        ));
+    }
+    let uninstall = session.uninstall_registered(&plan, TIMEOUT, || {
+        local
+            .renew_node_upgrade_maintenance(&registration.node_id, &maintenance_token)
+            .map_err(|error| io::Error::other(error.to_string()))
+    });
+    if let Err(error) = uninstall {
+        let _ = local.finish_node_upgrade_maintenance(&registration.node_id, &maintenance_token);
+        return Err(bootstrap_cli_failure(error));
+    }
+    local.finish_node_uninstall_maintenance(&registration.node_id, maintenance_token)?;
+    println!(
+        "Uninstalled Boomux from {} and forgot registration {}",
+        registration.target, registration.alias
+    );
+    Ok(())
+}
+
 fn reauthenticate_node(selector: &str) -> Result<(), Box<dyn Error>> {
     const TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -2227,6 +2358,7 @@ fn node_command(command: NodeCommands, json: bool) -> Result<(), Box<dyn Error>>
             }
         }
         NodeCommands::Upgrade { selector } => upgrade_node(&selector),
+        NodeCommands::Uninstall { selector } => uninstall_node(&selector),
         NodeCommands::Reauthenticate { selector } => reauthenticate_node(&selector),
         NodeCommands::Inspect { selector } => {
             let client = client::connect_or_start()?;
@@ -11072,7 +11204,7 @@ mod tests {
     }
 
     #[test]
-    fn node_upgrade_and_reauthentication_wrappers_are_human_only() {
+    fn node_upgrade_uninstall_and_reauthentication_wrappers_are_human_only() {
         let cli = Cli::try_parse_from(["boomux", "node", "upgrade", "work"]).unwrap();
         assert!(matches!(
             cli.command.as_ref(),
@@ -11081,6 +11213,16 @@ mod tests {
             }) if selector == "work"
         ));
         assert_eq!(cli.command_descriptor().key, "node.upgrade");
+
+        let cli = Cli::try_parse_from(["boomux", "node", "uninstall", "work"]).unwrap();
+        assert!(matches!(
+            cli.command.as_ref(),
+            Some(Commands::Node {
+                command: NodeCommands::Uninstall { selector }
+            }) if selector == "work"
+        ));
+        assert_eq!(cli.command_descriptor().key, "node.uninstall");
+        assert_eq!(cli.command_descriptor().output, OutputMode::HumanOnly);
 
         let cli = Cli::try_parse_from(["boomux", "node", "reauthenticate", "work"]).unwrap();
         assert!(matches!(
@@ -11115,6 +11257,40 @@ mod tests {
         ));
         assert!(!should_release_node_upgrade_maintenance(
             ssh_bootstrap::BootstrapRecoveryDisposition::OutcomeUnknown
+        ));
+    }
+
+    #[test]
+    fn local_uninstall_is_human_only_and_purge_is_explicit() {
+        let cli = Cli::try_parse_from(["boomux", "uninstall"]).unwrap();
+        assert!(matches!(
+            cli.command.as_ref(),
+            Some(Commands::Uninstall { purge: false })
+        ));
+        assert_eq!(cli.command_descriptor().key, "uninstall");
+        assert_eq!(cli.command_descriptor().output, OutputMode::HumanOnly);
+
+        let cli = Cli::try_parse_from(["boomux", "uninstall", "--purge"]).unwrap();
+        assert!(matches!(
+            cli.command.as_ref(),
+            Some(Commands::Uninstall { purge: true })
+        ));
+
+        let node_id = "550e8400-e29b-41d4-a716-446655440000";
+        let cli =
+            Cli::try_parse_from(["boomux", "__uninstall-remote", node_id, "fingerprint"]).unwrap();
+        assert!(matches!(
+            cli.command.as_ref(),
+            Some(Commands::UninstallRemote { expected_node_id, expected_executable })
+                if expected_node_id == node_id && expected_executable == "fingerprint"
+        ));
+        assert_eq!(cli.command_descriptor().key, "uninstall-remote");
+        assert_eq!(cli.command_descriptor().output, OutputMode::HumanOnly);
+
+        let cli = Cli::try_parse_from(["boomux", "__uninstall-fingerprint"]).unwrap();
+        assert!(matches!(
+            cli.command.as_ref(),
+            Some(Commands::UninstallFingerprint)
         ));
     }
 
@@ -13884,7 +14060,7 @@ mod tests {
                 .validated_version,
             "2.1.236"
         );
-        assert_eq!(protocol::PROTOCOL_VERSION, 47);
+        assert_eq!(protocol::PROTOCOL_VERSION, 48);
     }
 
     #[test]

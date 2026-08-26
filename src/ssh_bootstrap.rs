@@ -28,6 +28,7 @@ const MAX_DISCOVERED_EXECUTABLES: usize = 32;
 const MAX_PROBE_STDERR_BYTES: usize = 16 * 1024;
 const MAX_PROBE_TIMEOUT: Duration = Duration::from_secs(120);
 const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(10);
+type RemoteIntegrationCleanupPlan = (Vec<String>, Vec<(String, Option<String>)>);
 const PLATFORM_PROBE_PREFIX: &[u8] = b"boomux-platform-v1";
 const EXECUTABLE_PROBE_PREFIX: &[u8] = b"boomux-executables-v1";
 const INSTALL_DESTINATION_PROBE_PREFIX: &[u8] = b"boomux-install-destination-v1";
@@ -38,6 +39,7 @@ const INSTALL_STAGE_PREFIX: &str = "boomux-install-stage-v1";
 const RUNTIME_STAGE_PREFIX: &str = "boomux-runtime-v1";
 const DAEMON_STATUS_PREFIX: &[u8] = b"boomux-daemon-status-v1";
 const DAEMON_PRESENCE_PREFIX: &[u8] = b"boomux-daemon-presence-v1";
+const UNINSTALL_FINGERPRINT_PREFIX: &str = "boomux-uninstall-fingerprint-v1 ";
 const MAX_RELEASE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_RELEASE_METADATA_BYTES: u64 = 64 * 1024;
 const RELEASE_DOWNLOAD_TIMEOUT_SECONDS: &str = "120";
@@ -223,6 +225,66 @@ fn remote_helper_command(executable: &RemoteExecutable) -> String {
     remote_daemon_command(executable, "__federation-stdio")
 }
 
+fn remote_integration_cleanup_plan(
+    session: &BootstrapSession,
+    executable: &RemoteExecutable,
+    timeout: Duration,
+) -> io::Result<RemoteIntegrationCleanupPlan> {
+    let output = run_bounded_command(
+        session.command(&remote_daemon_command(
+            executable,
+            "integration status --json",
+        )),
+        timeout,
+    )?;
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|_| invalid_probe("remote integration status returned invalid JSON"))?;
+    if value.get("schema").and_then(serde_json::Value::as_str) != Some("boomux.cli/v1")
+        || value.get("command").and_then(serde_json::Value::as_str) != Some("integration.status")
+    {
+        return Err(invalid_probe(
+            "remote integration status returned an invalid envelope",
+        ));
+    }
+    let rows = value
+        .pointer("/data/integrations")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| invalid_probe("remote integration status omitted integrations"))?;
+    let allowed = ["opencode", "pi", "claude", "codex", "kiro"];
+    let mut current = Vec::new();
+    let mut preserved = Vec::new();
+    for row in rows {
+        let name = row
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .filter(|name| allowed.contains(name))
+            .ok_or_else(|| invalid_probe("remote integration status returned an unknown name"))?;
+        let display_name = row
+            .get("display_name")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| invalid_probe("remote integration status omitted a display name"))?;
+        let state = row
+            .pointer("/asset/state")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| invalid_probe("remote integration status omitted an asset state"))?;
+        let path = row
+            .pointer("/asset/path")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        match state {
+            "current" => current.push(name.to_owned()),
+            "modified" | "unavailable" => preserved.push((display_name.to_owned(), path)),
+            "missing" => {}
+            _ => {
+                return Err(invalid_probe(
+                    "remote integration status returned an invalid state",
+                ));
+            }
+        }
+    }
+    Ok((current, preserved))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SshAuthenticationMode {
     Interactive,
@@ -339,6 +401,19 @@ pub struct RemoteInstallPlan {
     bootstrap_id: Option<Uuid>,
     upgrade_helper: Option<RemoteExecutable>,
     intent: RemoteInstallIntent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteUninstallPlan {
+    pub target: SshTarget,
+    pub destination: RemoteExecutable,
+    pub helper_version: String,
+    pub preserved_integrations: Vec<(String, Option<String>)>,
+    helper: RemoteExecutable,
+    bootstrap_id: Uuid,
+    current_integrations: Vec<String>,
+    expected_node_id: String,
+    expected_executable: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1602,6 +1677,133 @@ impl BootstrapSession {
             upgrade_helper: Some(helper.executable),
             intent,
         })
+    }
+
+    pub fn plan_explicit_uninstall(
+        &mut self,
+        expected_node_id: &str,
+        timeout: Duration,
+    ) -> io::Result<RemoteUninstallPlan> {
+        let discovery = discover_remote_in_session(self, timeout)?;
+        if let Some(error) = remote_recovery_error(discovery.recovery) {
+            return Err(error);
+        }
+        let selection = inspect_remote_helpers_in_session(self, &discovery.executables, timeout)?;
+        let helper = selection.compatible.ok_or_else(|| {
+            classified_error(
+                io::ErrorKind::Unsupported,
+                "upgrade_required",
+                "registered Node uninstall requires an existing compatible remote helper",
+            )
+        })?;
+        RemoteInstallIntent::ExplicitRegisteredUpgrade {
+            expected_node_id: expected_node_id.to_owned(),
+        }
+        .verify_helper_identity(&helper)?;
+        if helper.handshake.core_protocol_version < 48 {
+            return Err(classified_error(
+                io::ErrorKind::Unsupported,
+                "upgrade_required",
+                "registered Node uninstall requires a protocol-48 helper; upgrade this Node first",
+            ));
+        }
+        let fingerprint = run_bounded_command(
+            self.command(&remote_daemon_command(
+                &helper.executable,
+                "__uninstall-fingerprint",
+            )),
+            timeout,
+        )?;
+        let expected_executable = std::str::from_utf8(&fingerprint.stdout)
+            .ok()
+            .and_then(|value| value.strip_suffix('\n'))
+            .and_then(|value| value.strip_prefix(UNINSTALL_FINGERPRINT_PREFIX))
+            .filter(|value| {
+                !value.is_empty()
+                    && value.len() <= 512
+                    && value.bytes().all(|byte| byte.is_ascii_graphic())
+            })
+            .ok_or_else(|| invalid_probe("remote uninstall fingerprint is invalid"))?
+            .to_owned();
+        if helper.executable != discovery.install_destination {
+            return Err(classified_error(
+                io::ErrorKind::PermissionDenied,
+                "package_managed",
+                "the registered Node helper is not the canonical user installation; uninstall it with its owning package or installation workflow",
+            ));
+        }
+        let (current_integrations, preserved_integrations) =
+            remote_integration_cleanup_plan(self, &helper.executable, timeout)?;
+        Ok(RemoteUninstallPlan {
+            target: self.target.clone(),
+            destination: discovery.install_destination,
+            helper_version: helper.handshake.helper_version,
+            preserved_integrations,
+            helper: helper.executable,
+            bootstrap_id: self.id,
+            current_integrations,
+            expected_node_id: expected_node_id.to_owned(),
+            expected_executable,
+        })
+    }
+
+    pub fn uninstall_registered(
+        self,
+        plan: &RemoteUninstallPlan,
+        timeout: Duration,
+        mut maintenance: impl FnMut() -> io::Result<()>,
+    ) -> io::Result<()> {
+        if plan.bootstrap_id != self.id
+            || plan.target != self.target
+            || plan.helper != plan.destination
+        {
+            return Err(classified_error(
+                io::ErrorKind::PermissionDenied,
+                "bootstrap_authentication_failed",
+                "remote uninstall authorization belongs to a different bootstrap endpoint",
+            ));
+        }
+        maintenance()?;
+        for integration in &plan.current_integrations {
+            let arguments = match integration.as_str() {
+                "opencode" => "integration uninstall opencode --json",
+                "pi" => "integration uninstall pi --json",
+                "claude" => "integration uninstall claude --json",
+                "codex" => "integration uninstall codex --json",
+                "kiro" => "integration uninstall kiro --json",
+                _ => {
+                    return Err(invalid_probe(
+                        "remote uninstall plan contains an unknown integration",
+                    ));
+                }
+            };
+            let output = run_bounded_command(
+                self.command(&remote_daemon_command(&plan.helper, arguments)),
+                timeout,
+            )?;
+            let value: serde_json::Value = serde_json::from_slice(&output.stdout)
+                .map_err(|_| invalid_probe("remote integration uninstall returned invalid JSON"))?;
+            if value.get("schema").and_then(serde_json::Value::as_str) != Some("boomux.cli/v1")
+                || value.get("command").and_then(serde_json::Value::as_str)
+                    != Some("integration.uninstall")
+            {
+                return Err(invalid_probe(
+                    "remote integration uninstall returned an invalid envelope",
+                ));
+            }
+            maintenance()?;
+        }
+        maintenance()?;
+        let arguments = format!(
+            "__uninstall-remote {} {}",
+            quote_posix_shell(&plan.expected_node_id),
+            quote_posix_shell(&plan.expected_executable)
+        );
+        run_bounded_command(
+            self.command(&remote_daemon_command(&plan.helper, &arguments)),
+            timeout,
+        )?;
+        Ok(())
     }
 
     pub fn connect_existing_verified(
@@ -4953,13 +5155,13 @@ mod tests {
         let mut request_bytes = Vec::new();
         protocol::write_message(
             &mut request_bytes,
-            &Envelope::with_version(protocol::PROTOCOL_VERSION, Request::Ping),
+            &Envelope::with_version(core_protocol_version, Request::Ping),
         )
         .unwrap();
         let mut response_bytes = Vec::new();
         protocol::write_message(
             &mut response_bytes,
-            &Envelope::with_version(protocol::PROTOCOL_VERSION, Response::Pong),
+            &Envelope::with_version(core_protocol_version, Response::Pong),
         )
         .unwrap();
         format!(
@@ -6418,6 +6620,81 @@ mod tests {
             }
         );
         drop(session);
+        fs::remove_dir_all(runtime).unwrap();
+    }
+
+    #[test]
+    fn explicit_uninstall_requires_protocol_forty_eight_helper() {
+        let runtime = runtime_directory();
+        let node_id = Uuid::new_v4().to_string();
+        let helper = helper_script(&node_id, 47);
+        let executable = "/home/person/.local/bin/boomux";
+        let ssh = write_session_bootstrap_ssh(
+            &runtime,
+            &format!(
+                "  \"'{executable}' __federation-stdio\") {helper} ;;\n  \"'{executable}' --version\") printf 'boomux 1.0.0\\n' ;;"
+            ),
+            "/home/person/.local/bin/boomux\\0",
+        );
+        let mut session = BootstrapSession::open_at(
+            &runtime,
+            None,
+            SshTarget::parse("workbox").unwrap(),
+            SshAuthenticationMode::Batch,
+            Duration::from_secs(1),
+            ssh.as_os_str(),
+        )
+        .unwrap();
+
+        let error = session
+            .plan_explicit_uninstall(&node_id, Duration::from_secs(1))
+            .unwrap_err();
+        assert_eq!(error_code(&error), "upgrade_required");
+        fs::remove_dir_all(runtime).unwrap();
+    }
+
+    #[test]
+    fn explicit_uninstall_uses_one_session_and_preserves_modified_integrations() {
+        let runtime = runtime_directory();
+        let marker = runtime.join("uninstalled");
+        let node_id = Uuid::new_v4().to_string();
+        let helper = compatible_helper_script(&node_id);
+        let executable = "/home/person/.local/bin/boomux";
+        let status = r#"{"schema":"boomux.cli/v1","command":"integration.status","data":{"integrations":[{"name":"opencode","display_name":"OpenCode","asset":{"state":"current","path":"/current"}},{"name":"pi","display_name":"Pi","asset":{"state":"modified","path":"/modified"}}]}}"#;
+        let removed = r#"{"schema":"boomux.cli/v1","command":"integration.uninstall","data":{"integrations":[]}}"#;
+        let ssh = write_session_bootstrap_ssh(
+            &runtime,
+            &format!(
+                "  \"'{executable}' __federation-stdio\") {helper} ;;\n  \"'{executable}' --version\") printf 'boomux 1.0.1\\n' ;;\n  *'__uninstall-fingerprint'*) printf 'boomux-uninstall-fingerprint-v1 token\\n' ;;\n  *'integration status --json'*) printf '%s' '{status}' ;;\n  *'integration uninstall opencode --json'*) printf '%s' '{removed}' ;;\n  *'__uninstall-remote'*) : > {} ;;",
+                quote_posix_shell(marker.to_str().unwrap())
+            ),
+            "/home/person/.local/bin/boomux\\0",
+        );
+        let mut session = BootstrapSession::open_at(
+            &runtime,
+            None,
+            SshTarget::parse("workbox").unwrap(),
+            SshAuthenticationMode::Batch,
+            Duration::from_secs(1),
+            ssh.as_os_str(),
+        )
+        .unwrap();
+        let plan = session
+            .plan_explicit_uninstall(&node_id, Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(
+            plan.preserved_integrations,
+            vec![("Pi".into(), Some("/modified".into()))]
+        );
+        let mut renewals = 0;
+        session
+            .uninstall_registered(&plan, Duration::from_secs(1), || {
+                renewals += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert!(renewals >= 3);
+        assert!(marker.exists());
         fs::remove_dir_all(runtime).unwrap();
     }
 
