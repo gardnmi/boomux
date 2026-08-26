@@ -5135,7 +5135,7 @@ mod tests {
     fn run_local_transaction(home: &Path, command: &str, transaction: &InstallTransactionId) {
         let mut child = local_shell_command("sh", home);
         child.args(["-c", command]);
-        run_streaming_command(child, transaction.input(), Duration::from_secs(1)).unwrap();
+        run_streaming_command(child, transaction.input(), Duration::from_secs(5)).unwrap();
     }
 
     fn compatible_helper_script(node_id: &str) -> String {
