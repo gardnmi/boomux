@@ -52,12 +52,19 @@ transferred separately. The replacement cannot inherit Unix parenthood; process
 monitoring and cleanup therefore need an imported-process representation, with
 a Linux pidfd where available.
 
-Bootstrap version 7 starts with the `BOOMUXH7` header, accepts an H6 sender for
-compatibility, and has bounded read/write deadlines. An H6 transfer has no Kiro
-Launch Holder records. The receiver validates the listener path/type,
+Bootstrap version 8 starts with the `BOOMUXH8` header, accepts only an H8 sender,
+and has bounded read/write deadlines. H7 and all earlier manifests are rejected
+before descriptor import. The receiver validates the listener path/type,
 forces nonblocking mode, matches both lock-file inodes, and establishes exclusive
 flock ownership before acknowledging readiness. Explicit abort closes every
 received duplicate without affecting descriptors retained by the old daemon.
+
+The H8-only boundary accompanies the protocol-47 removal of Agent Schedules and
+Scheduled Executions. In particular, v0.32/state schema 13 cannot gracefully
+self-update into this release. The operator must stop the old daemon, accepting
+that every managed process terminates, reset the incompatible state and removed
+configuration keys described in [`local-update.md`](local-update.md), then
+install and cold-start the new binary.
 
 For each running shell, every active primary controller and collaborator first
 acknowledges its reconnect boundary and the old reader pauses before the manifest is captured. The

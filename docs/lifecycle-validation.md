@@ -82,7 +82,7 @@ Kiro CLI `2.18.0` was inspected with its opt-in v3 harness (`kiro-cli --v3`).
 The documented standalone hook schema and installed command help establish the
 five consumed lifecycle events, canonical `session_id`, exact resume command,
 and headless dispatch surface. Repository tests validate bounded hook decoding,
-run-scoped authority, bare v3 launch selection, exact schedule and recovery argv,
+run-scoped authority, bare v3 launch selection, exact managed and recovery argv,
 dedicated hook installation, and safe ambiguity handling. This is fixture and
 interface compatibility evidence only: no live authenticated Kiro turn,
 permission wait, cloud Session, or Kiro Web handoff was exercised. No Blocked,
@@ -94,7 +94,7 @@ ambiguous boundaries to Unknown. The Stop mapping was superseded by the
 
 Codex CLI `0.147.0` was inspected against the documented hooks and experimental
 app-server interfaces. Repository tests validate bounded hook decoding,
-run-scoped authority, lifecycle reduction, exact schedule and recovery argv,
+run-scoped authority, lifecycle reduction, exact managed and recovery argv,
 merged hook installation, and catalog projection. This is fixture and interface
 compatibility evidence only: no live authenticated Codex turn, permission wait,
 hook trust flow, or app-server catalog was exercised. No Codex Remote handoff is
@@ -158,7 +158,7 @@ evidence only.
 ## 2026-08-14
 
 OpenCode `1.18.18` was validated for exact canonical transcript reading from a
-completed scheduled execution. The PATH-resolved wrapper and OpenCode CLI wrote
+completed managed Agent run. The PATH-resolved wrapper and OpenCode CLI wrote
 bounded informational preamble lines before the export JSON. Boomux accepted
 the preamble, revalidated the exported session identity, and returned 13
 structured entries through `session read` without exposing content during the

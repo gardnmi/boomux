@@ -80,6 +80,21 @@ source, development, root-owned, custom-path, and unsafe installations are never
 self-replaced, and Boomux never silently downgrades. Automatic updates are not
 enabled.
 
+> [!CAUTION]
+> v0.32 uses protocol 46, state schema 13, and handoff H7. It cannot gracefully
+> self-update into the schedule-free protocol-47 release. Before installing this
+> release, use the v0.32 binary to run `boomux daemon stop`; this terminates every
+> managed process. Back up and remove
+> `$XDG_STATE_HOME/boomux/state.json`, `global_workspaces.json`,
+> `local_shell_transactions.log`, `node-cache.json`, and
+> `selected-workspace.json` (using `~/.local/state` when `XDG_STATE_HOME` is
+> unset). Remove the `[scheduling]` table and the
+> `scheduled_dispatch_failed` and `scheduled_interrupted` keys from both
+> `[notifications]` and `[notifications.sound]` in every active config layer,
+> including `BOOMUX_CONFIG`. Then install the new binary and start it with an
+> ordinary command such as `boomux`. `node.json` and `node_registrations.json`
+> are not part of this reset.
+
 Prefer `daemon restart` over `daemon stop`: stopping the daemon terminates every
 managed process. Upgrade registered remote Nodes separately with
 `boomux node upgrade NODE`.
@@ -127,10 +142,9 @@ boomux
 | **Command** | A Shell with stored exact arguments instead of an interactive login command. |
 | **Launcher** | A detached exact-argument command invoked by an explicit Workspace open or restore. Desktop navigation alone never invokes it. |
 | **Agent Instance** | Run-scoped lifecycle state reported by an integration; not a permanent process-completion record. |
-| **Agent Schedule** | Durable recurring Agent work owned by one Workspace and Node. New schedules are paused by default. |
 
 Boomux preserves exact argument vectors and does not add shell interpolation to
-launchers, adapters, or scheduled execution.
+launchers or adapters.
 
 ## What Persists
 
@@ -139,7 +153,7 @@ launchers, adapters, or scheduled execution.
 | Close a terminal window | Its managed Shell run keeps running. |
 | Quit the native dashboard | Managed processes keep running. |
 | Close a Shell | Its current run is terminated and the Shell is removed. |
-| Close a Workspace | Its managed Shells terminate; its launchers, schedules, and persisted prompts are removed. Unresolved remote placement removal leaves the Workspace visibly closing for explicit retry. |
+| Close a Workspace | Its managed Shells terminate and its launchers are removed. Unresolved remote placement removal leaves the Workspace visibly closing for explicit retry. |
 | Restart the daemon gracefully | A compatible replacement preserves managed processes through handoff; failure rolls back to the old daemon. |
 | Stop the daemon | Every managed process is terminated. |
 | Crash or reboot | Live processes are lost. Durable definitions remain, and later opens start new runs. |
@@ -147,8 +161,8 @@ launchers, adapters, or scheduled execution.
 ## Hyprland Workspace Layer
 
 In an active Hyprland session, Boomux presents terminal-bearing coordinated
-Workspaces on demand as named special Workspaces. Empty, launcher-only, and
-schedule-only Workspaces have no terminal layer to show.
+Workspaces on demand as named special Workspaces. Empty and launcher-only
+Workspaces have no terminal layer to show.
 
 The adapter defaults on. To opt out while using Hyprland:
 
@@ -233,12 +247,11 @@ Use `boomux --help` and `boomux <command> --help` for the complete current CLI.
 
 ## Native Dashboard
 
-Run `boomux` in a terminal. The dashboard provides five primary views:
+Run `boomux` in a terminal. The dashboard provides four primary views:
 
 - **Workspaces**: coordinated tasks, placement state, attention, and ownership.
 - **Shells**: durable Shell slots, commands, launchers, and exact run state.
 - **Agents**: current Agent lifecycle and canonical Sessions.
-- **Schedules**: definitions, scheduler health, and bounded execution history.
 - **Nodes**: registration, route health, compatibility, and upgrade actions.
 
 Core keys:
@@ -246,15 +259,14 @@ Core keys:
 | Keys | Action |
 | --- | --- |
 | Arrow keys or `h/j/k/l` | Navigate |
-| `Tab`, `Shift-Tab`, `1`-`5` | Change view |
+| `Tab`, `Shift-Tab`, `1`-`4` | Change view |
 | `Enter` | Open or activate the selected item |
 | `a`, `e`, `x` | Add, rename/edit, or close/remove where available |
 | `/` or `:` | Open the command palette |
 | `?` | Help |
 | `q` | Quit after pending mutations finish |
 
-Terminal previews are read-only. Schedule prompts appear only during explicit
-inspection or editing of an exact schedule.
+Terminal previews are read-only.
 
 ## Web Dashboard
 
@@ -320,32 +332,6 @@ Install the vendor-neutral Agent skill separately when desired:
 boomux skill install
 ```
 
-## Scheduled Agent Work
-
-Schedules are durable Workspace-owned recurring Agent prompts. New schedules are
-paused unless `--enabled` explicitly authorizes future unattended host and tool
-activity.
-
-```console
-boomux schedule create review \
-  --workspace my-project \
-  --cwd . \
-  --integration opencode \
-  --prompt-file ./review-prompt.txt \
-  --weekdays 09:00
-
-boomux schedule run review --workspace my-project
-boomux schedule resume review --workspace my-project
-```
-
-Timed work runs only while the owning daemon and user session are active. Overlap
-is skipped rather than queued, and Boomux adds no automatic retry or timeout.
-Routine lists, events, notifications, and execution records omit prompt text;
-exact `schedule inspect` and explicit TUI editing can disclose it.
-
-See [Scheduled Agent Work](docs/scheduled-agent-work.md) for triggers, DST,
-continuation identity, concurrency, retention, and privacy.
-
 ## Remote Nodes
 
 Add or upgrade a Node through the interactive workflow:
@@ -403,22 +389,16 @@ follow_focused_terminal = true
 [recovery]
 resume_agents = true
 persist_terminal_history = false
-
-[scheduling]
-max_concurrent = 4
 ```
 
 Terminal history persistence is disabled by default because output can contain
-secrets. Notifications and schedule notifications are independently configurable
-and default conservatively. Daemon-owned settings require `boomux daemon restart`;
-local desktop presentation settings do not.
+secrets. Notifications default conservatively. Daemon-owned settings require
+`boomux daemon restart`; local desktop presentation settings do not.
 
 ## Security And Privacy
 
 - Daemon sockets and durable stores are restricted to the current user.
 - Attachment startup environments are validated but never persisted or projected.
-- Schedule prompts are private durable content but are passed to the selected
-  external host, which may retain or expose them according to its own behavior.
 - Persistent terminal history is opt-in and stores bounded plain text.
 - Writable web-terminal access is equivalent to shell access.
 - Remote projections never authorize offline writes.
@@ -458,7 +438,6 @@ versions, downgrade behavior, and protocol history.
 - [Architecture](docs/architecture.md)
 - [CLI JSON contract](docs/cli-json.md)
 - [Remote Nodes](docs/remote-nodes.md)
-- [Scheduled Agent Work](docs/scheduled-agent-work.md)
 - [Mobile Web](docs/mobile-web.md)
 - [Event Stream](docs/event-stream.md)
 - [Live PTY Handoff](docs/live-pty-handoff.md)

@@ -14,12 +14,10 @@
 > schema 2 adds local remote-notification and reconnect-digest claims without a
 > remote protocol change. Public
 > Protocol 33 adds the local-daemon combined Node snapshot and federated
-> dashboard. Protocol 34 and state schema 13 implement typed exact-Node private
+> dashboard. Protocol 34 implements typed exact-Node private
 > reads and guarded management operations. Protocol 35 implements Node-qualified
 > native-terminal PTY attachment and owner-environment remote startup. Protocol
 > 36 implements closed typed owner host services and exact Agent Session resume.
-> Protocol 37 implements Node-qualified remote Schedule creation, management,
-> execution observation, and presentation.
 > Protocol 38 implements coordinator-owned Workspace metadata, explicit
 > Node-owned placements, guarded adoption and linking, and resumable close
 > progress. Node-local runtime state remains authoritative on each owner.
@@ -130,14 +128,14 @@ unexpected state installation. Copying both SSH trust and private Node state is
 outside that guarantee and is equivalent to cloning one authority.
 
 Every Workspace belongs to exactly one Node. Its Shells, ShellRuns, launchers,
-Agent Instances, projected Agent Sessions, Agent Schedules, and Scheduled
-Executions remain under that Node. Inner resource IDs are not rewritten during
-projection. Federated identity is the structured pair `(node_id, resource_id)`.
+Agent Instances, and projected Agent Sessions remain under that Node. Inner
+resource IDs are not rewritten during projection. Federated identity is the
+structured pair `(node_id, resource_id)`.
 
 The Node is an additional outer name-resolution scope, not a replacement for
-existing scopes. Workspace names are unique within one Node. Shell, launcher,
-and Agent Schedule names retain their Workspace scopes, and exact-only identities
-remain exact-only. A client resolving a name outside the local Node must supply
+existing scopes. Workspace names are unique within one Node. Shell and launcher
+names retain their Workspace scopes, and exact-only identities remain exact-only.
+A client resolving a name outside the local Node must supply
 explicit Node context. Legacy unqualified resource operations retain local-Node
 meaning; protocol-38 coordinated Workspace commands are the explicit exception
 and route only through persisted placement membership. Federation never changes
@@ -188,8 +186,8 @@ Ad hoc remote access accepts one explicit OpenSSH target and creates no durable
 registration. Persistent federation is a separate explicit operation that
 authorizes identity pinning, background SSH connections, and bounded local
 projection storage. Registration alone is read-only authority: process starts,
-destructive changes, integration installation, Schedule enablement, and remote
-daemon management retain their existing explicit user authorization. Boomux
+destructive changes, integration installation, and remote daemon management
+retain their existing explicit user authorization. Boomux
 never scans SSH configuration and automatically connects to every alias.
 
 The implemented registration CLI is `boomux node add ALIAS TARGET`, or guided
@@ -263,14 +261,16 @@ error terminate and reap the master and remove its private control directory.
 
 Discovery checks every bounded absolute executable candidate. A verified helper
 whose daemon identity and negotiated protocol are federation-compatible is used
-unchanged, even when another candidate is old. No candidates produces an install
-plan; candidates whose strict published version metadata all predates the
-federation protocol floor produce an upgrade plan. An inaccessible candidate,
+unchanged, even when another candidate is old. No candidates produces a
+first-install plan. When every discovered helper has strict published version
+metadata below the protocol-47 floor, planning returns typed `upgrade_required`
+with the owner-side cold-upgrade sequence before source selection, upload, or any
+remote mutation. An inaccessible candidate,
 malformed handshake, unsupported newer protocol, conflicting Node identity, or
 indeterminate transport/authentication failure is not version evidence and fails
 without an install plan. Interactive install or upgrade presents one plan and
 asks once. JSON and other noninteractive invocation returns `install_required`
-or `upgrade_required` and performs no remote mutation. An uncommitted bootstrap
+for a missing helper and performs no remote mutation. An uncommitted bootstrap
 lock suppresses only its provisional destination. If no alternate compatible
 helper is available, discovery returns typed `busy` rather than proposing
 another install; registered projection presents that bounded recovery interval
@@ -412,21 +412,19 @@ not ping that returned handoff-era channel again. The remote may close the chann
 immediately after the successful verification ping without invalidating the
 verified handshake identity or a completed commit. A Ready helper that cannot
 answer its one required ping still fails before any registration mutation.
-An automatic compatibility upgrade may use the existing graceful daemon restart command only when the new
-helper has verified provisionally and a separate runtime-aware status check shows
-that the running daemon protocol is outside the supported federation range. This
-status check runs for every upgrade, including when the provisional helper
-handshake itself looks compatible. The transaction is marked restarted before
-one graceful restart, the helper is inspected again afterward, and the final
-live channel must still pass its protocol ping. An absent daemon is not restarted
-and can start only through ordinary helper behavior. Pre-install presence and
-protocol are recorded durably before helper contact, so rollback and watchdog
-recovery do not depend on later socket, status, or daemon-generation races. An
-already-compatible daemon is never restarted by automatic bootstrap for a
-release-version difference. Explicit `node upgrade`, however, restarts any
-present daemon after activation so a same-protocol replacement actually runs;
-the registered Node ID is checked before activation and again inside the rollback
-boundary before commit. An absent daemon is not restarted.
+Automatic and ad hoc bootstrap never upload or restart when every discovered
+helper is below protocol 47. Because protocol 47 has no migration from protocol
+46, the remote owner must use its existing pre-47 binary to run `boomux daemon
+stop`, reset the incompatible owner state and removed scheduling configuration,
+then install and start protocol 47 as documented in
+[`local-update.md`](local-update.md). Explicit `node upgrade` likewise returns
+typed `upgrade_required` with that guidance when no compatible helper exists.
+When a registered Node already has a compatible helper, explicit `node upgrade`
+may transactionally replace it and restarts any present same-protocol daemon so
+the replacement actually runs; the registered Node ID is checked before
+activation and again inside the rollback boundary before commit. An absent daemon
+is not restarted, and a release-version difference never causes automatic
+bootstrap to replace a compatible helper.
 
 The remote bridge command uses a fixed template. No prompt, resource ID,
 integration command, or user argument is interpolated into it. Its only variable
@@ -478,7 +476,7 @@ handoff retain their existing authority.
 
 A local federation coordinator is separate from the authoritative local durable
 registry. Remote Workspaces and their children never enter the local registry,
-local scheduler, local process manager, or local PTY owner. A successful remote
+local process manager or local PTY owner. A successful remote
 mutation is not rolled back because local projection persistence fails, and the
 local Node does not optimistically mutate its cache from a forwarded response.
 
@@ -492,8 +490,8 @@ than serialization of existing public summary objects:
   `authentication_required`, `identity_changed`, `identity_conflict`, and
   `unsupported`; raw SSH or authentication output is not health data.
 - Workspace IDs, names, and bounded item/attention counts.
-- Shell IDs, Workspace IDs, names, ownership, status, run ID, generation, and
-  lifecycle timestamps, but not cwd, argv, foreground process, or terminal data.
+- Shell IDs, Workspace IDs, names, status, run ID, generation, and lifecycle
+  timestamps, but not ownership, cwd, argv, foreground process, or terminal data.
   Protocol 40 includes a pending Shell's interrupted run and selected Agent ID
   only when the owner has authoritatively selected one resumable Agent; older
   negotiated projections omit both markers.
@@ -501,12 +499,6 @@ than serialization of existing public summary objects:
 - Agent IDs, names, integration, Workspace/Shell/Run links, state, observation
   revision/timestamps, and bounded attention reason/revision, but not evidence,
   external session identity, source cwd, or host catalog data.
-- Schedule IDs, Workspace IDs, names, integration, state, canonical trigger,
-  timezone, revisions, timestamps, and next occurrence, but not cwd, prompt, or
-  continuation identity.
-- Bounded execution IDs, Workspace/Schedule IDs, revisions, state, dispatch kind,
-  typed reason/outcome, timestamps, and Shell/Run/Agent links, but not cwd,
-  session data, prompt, environment, or runner capability.
 
 Live identity-verified reads can return richer fields under their existing
 contracts without making them cacheable. “Prompt-free” alone is not a general
@@ -528,12 +520,11 @@ state from loading or persisting. Node identity, registrations, and cache each
 use owner-only directories, bounded schemas, atomic replacement, and explicit
 validation.
 
-Node-cache schema 4 is `node-cache.json` beside, but independent from,
+Node-cache schema 5 is `node-cache.json` beside, but independent from,
 `state.json`, `node.json`, and `node_registrations.json`. It is owner-only,
 atomically replaced, and capped at 4 MiB and 128 Nodes. Per Node it accepts at
-most 1,024 Workspaces, 4,096 Shells, 4,096 launchers, 4,096 Agents, 1,024
-Schedules, 1,000 executions, 4,096 dismissed Shell IDs, and 96 capability
-identifiers of at most 128 bytes.
+most 1,024 Workspaces, 4,096 Shells, 4,096 launchers, 4,096 Agents, 4,096
+dismissed Shell IDs, and 128 capability identifiers of at most 128 bytes.
 Names and identifiers in reduced collections are capped at 256 bytes. An invalid
 cache is renamed to `node-cache.corrupt-<uuid>.json` when possible and otherwise
 discarded in memory; it never blocks authoritative state startup.
@@ -542,7 +533,7 @@ Schema 2 explicitly migrates schema 1 by retaining every cached Node generation,
 projection, cursor, capability, and health field and initializing empty local
 notification frontiers. Each Node retains at most 512 individual claims and 128
 digest claims. Individual claims contain only stream UUID, entity ID, positive
-observation or execution revision, typed category, and bounded typed reason;
+observation revision, typed category, and bounded typed reason;
 digest claims contain stream UUID, prior and through cursor IDs, and the sorted
 enabled category set. Claims are local presentation state and are removed with
 their registered Node cache.
@@ -559,6 +550,8 @@ Schema 4 explicitly migrates schema 3 by initializing the optional observed
 helper version. Successful authenticated projection commits retain that bounded
 ASCII-graphic version in the same generation as health, capabilities, cursor,
 and snapshot.
+Schema 5 removes Schedule projections and their notification claims. Schemas 3
+and 4 are rejected as disposable caches and rebuilt from authoritative Nodes.
 
 ## Synchronization And Events
 
@@ -569,17 +562,17 @@ event IDs provide an order only within one daemon stream. There is no cross-Node
 event order and timestamps cannot create one.
 
 The owning daemon provides one Node-projection synchronization operation that
-captures the reduced persisted field allowlist, bounded latest execution set,
-stream UUID, cursor, and bounded transition records at one event-transition cut.
+captures the reduced persisted field allowlist, stream UUID, cursor, and bounded
+transition records at one event-transition cut.
 Given a resumable prior cursor, the response contains every transition through
 that cut. If they cannot fit or the cursor expired, it explicitly returns a
 baseline reseed with no notification-eligible history. Ordinary event long
-polling can wake the synchronization writer, but neither event pages nor
-independently paged execution lists update the cache themselves.
+polling can wake the synchronization writer, but event pages do not update the
+cache themselves.
 
 Each cache commit is one complete atomic generation containing the registration
-revision, pinned Node ID, remote stream UUID, cursor, complete projected
-snapshot, bounded execution set, health, and synchronization time. A remote
+revision, pinned Node ID, remote stream UUID, cursor, complete projected snapshot,
+health, and synchronization time. A remote
 synchronization response is applied entirely or not at all. A reseed obtains the
 remote baseline snapshot and cursor from one authoritative cut, then replaces
 the whole Node generation. Registration itself requires only verified Node
@@ -600,8 +593,8 @@ authoritative domain events.
 
 Remote cursor expiry or cold restart reseeds only that Node from a fresh
 prompt-free baseline. Disconnect marks the projection stale. It does not mark an
-Agent done, interrupt an execution, acknowledge attention, run a Schedule,
-advance a remote revision, or dispatch replacement work. Cached rows can remain
+Agent done, acknowledge attention, advance a remote revision, or dispatch
+replacement work. Cached rows can remain
 visible after local restart, but every action is disabled until the owner
 reconnects and revalidates identity.
 
@@ -651,21 +644,18 @@ credential, stderr capture, cache update, or event is created.
 
 | Operation | Owner guard | Automatic retry | Ambiguity read and exact postcondition |
 | --- | --- | --- | --- |
-| Workspace/Shell/launcher/Agent/Schedule/execution inspect | Exact ID on a fresh verified channel | Yes; read-only | Not applicable |
+| Workspace/Shell/launcher/Agent inspect | Exact ID on a fresh verified channel | Yes; read-only | Not applicable |
 | Rename Workspace/Shell/launcher | Durable resource revision | No | Exact inspect proves requested name and a later revision |
-| Close Workspace/Shell; remove launcher/Schedule | Durable resource or Schedule revision | No | Exact inspect returns typed `not_found` |
+| Close Workspace/Shell; remove launcher | Durable resource revision | No | Exact inspect returns typed `not_found` |
 | Restart exited Shell | Durable Shell revision and exact run ID | No | Exact inspect proves pending state, unchanged definition revision, and the confirmed retained run |
-| Pause/resume Schedule | Exact Schedule revision | No | Exact inspect proves requested state and a later revision |
-| Update paused Schedule | Exact Schedule revision | No | Private inspect proves the complete requested name, prompt, trigger, and later revision |
-| Run Schedule now | Durable dispatch key | Yes, with the same key | Dispatch-key record returns the same execution/run IDs |
-| Cancel execution | Exact execution revision and exact active run binding | No | Exact inspect proves a later `cancelled_by_user` revision |
 | Acknowledge attention | Exact raising observation revision; empty is idempotent | Yes, with the same revision | Returned Agent retains lifecycle revision and has no matching outstanding item |
 
 Any unproved ambiguous write returns `outcome_unknown`; conditional revisions
 alone never authorize blind replay. Workspace revisions also act as membership
-generations and advance when owned Shell, launcher, Agent, or Schedule membership
-changes. Schema 13 persists positive Workspace, Shell, and launcher revisions;
-the explicit schema-12 migration initializes each to 1.
+generations and advance when owned Shell, launcher, or Agent membership changes.
+Current state schema 14 persists positive Workspace, Shell, and launcher
+revisions. Historical state schema 13 is rejected at the protocol-47 alpha break
+rather than migrated.
 
 New explicitly Node-aware read-only views can use persisted remote projections
 and must expose their observation time and stale state. Existing commands and
@@ -687,16 +677,14 @@ retains its existing connection-only result.
 
 Boomux never queues an offline mutation. Before forwarding, it resolves explicit
 Node context, verifies the pinned identity, negotiates the remote core protocol,
-and revalidates the exact target where the operation requires it. Exact IDs,
-run IDs, revisions, dispatch keys, capability tokens, and typed remote errors are
-preserved.
+and revalidates the exact target where the operation requires it. Exact IDs, run
+IDs, revisions, capability tokens, and typed remote errors are preserved.
 
 A transport failure after sending a mutation can leave the outcome unknown.
 Automatic retry is allowed only for a request with an explicit wire idempotency
-key, using the exact same key; the initial known case is Schedule run-now. An
-exact conditional revision prevents a second conflicting commit but does not by
-itself prove whether the first response was lost, so it is not an automatic
-retry key.
+key, using the exact same key. An exact conditional revision prevents a second
+conflicting commit but does not by itself prove whether the first response was
+lost, so it is not an automatic retry key.
 
 After ambiguity, Boomux refreshes authoritative state. It can report success only
 when a request-specific durable postcondition, revision, or idempotency record
@@ -706,8 +694,8 @@ tests must classify its key, precondition, ambiguity refresh, and retry behavior
 an unclassified mutation remains unavailable through federation.
 
 Destructive remote UI actions require a fresh authoritative read and an atomic
-owner-side precondition that covers the confirmed scope. Existing exact run and
-Schedule revisions remain valid guards. Workspace, Shell, launcher, rename, and
+owner-side precondition that covers the confirmed scope. Existing exact run
+revisions remain valid guards. Workspace, Shell, launcher, rename, and
 other operations without an ABA-safe revision or membership generation remain
 disabled remotely until their protocol adds one. Name equality or a repeated
 fresh read alone is not a sufficient guard. Confirmation identifies the Node and
@@ -745,8 +733,8 @@ Protocol 35 advertises `remote_pty_attachment` and
 for old peers and is rejected when an arbitrary `UnixEnvironment` is also
 present. Public `open --node SELECTOR` resolves through the local registration
 and launches local presentation with a Node-qualified title. The dashboard opens
-current remote Shell rows and active exact Scheduled Execution runs only when
-the observed owner capabilities include remote attachment.
+current remote Shell rows only when the observed owner capabilities include
+remote attachment.
 
 Protocol 39 advertises `qualified_focused_terminal`. A focus frame relayed by a
 local attachment is still validated and recorded by the owning daemon. After a
@@ -788,37 +776,6 @@ notifications before `FINALIZE`; rollback reopens old-daemon admission and
 workers. No SSH child, control socket, remote cursor in flight, or notification
 queue is transferred as live ownership.
 
-## Schedules And Failover
-
-An Agent Schedule belongs to its Workspace's Node and is evaluated only by that
-Node. Its filesystem, environment, integration, session catalog, scheduler
-health, occurrence frontier, and concurrency lease are Node-local. Losing the
-local presentation connection does not affect remote evaluation or active work.
-
-There is no automatic cross-Node failover in the initial design. A local network
-partition establishes only stale or unreachable presentation; it cannot assert
-that the owning daemon was offline or synthesize a missed decision. If that
-daemon actually stops, it alone applies the documented missed-occurrence policy
-when it recovers and projects the resulting durable decision. Another Node cannot
-substitute its context or continue an external Agent Session implicitly. Future
-failover requires a separate explicit placement and portability contract; the
-initial model neither promises nor emulates it.
-
-Protocol 37 exposes prompt-free projected Schedule and bounded execution state
-only for presentation. Exact inspection, creation, editing, run-now, pause,
-resume, removal, execution list/inspect/wait/cancel, and Open all use a fresh
-identity-verified owner channel. Remote creation validates cwd and an optional
-opaque continuation Session on the owner before committing. Prompt content is
-transient routing input and is never added to the Node cache, projection events,
-notifications, or routing diagnostics. A lost create response is
-`outcome_unknown`; only run-now retries, with its exact durable dispatch key.
-
-Starting and Active Open re-fetches the exact execution, Shell, run, and
-ownership links before launching protocol-35 Node attachment with the
-protocol-26 expected run. Terminal Open freshly resolves the exact linked Agent
-occurrence and uses protocol-36 owner Session resume. Neither path restarts the
-schedule-owned Shell or chooses a later run or Session.
-
 ## Attention And Notifications
 
 The owning Node remains authoritative for durable Agent attention. A local Node
@@ -827,34 +784,31 @@ acknowledging it. Multiple presentation Nodes can notify independently.
 
 Live transition records from a synchronization response can produce individual
 local desktop and sound notifications under the local subscriber's configured
-Agent and Scheduled Execution categories. Reconnection through an unexpired
+Agent categories. Reconnection through an unexpired
 cursor updates every outstanding attention row but emits at most one bounded
 digest per Node. That digest contains fixed counts for blocked/completed Agent
-attention and, when their local categories are enabled, Scheduled Execution
-dispatch failures and interruptions proven by the resumed records. Historical
-notifications and execution failures are not replayed individually.
+attention. Historical notifications are not replayed individually.
 
 A baseline reseed after cursor expiry updates the UI but emits no notification or
 digest because it cannot prove which transitions occurred and remained unseen.
 Before delivery, bounded local deduplication is persisted atomically with the
 Node cache. Individual claims include Node ID, event stream, entity ID,
-observation or execution revision, category, and reason. A resumed digest claim
+observation revision, category, and reason. A resumed digest claim
 also includes its deterministic prior and through cursors plus enabled category
 set. Persisting a claim before enqueue preserves at-most-once delivery across a
 local crash or handoff at the accepted fail-open cost that a claimed notification
 can be lost. Cache pruning and local handoff retain the latest bounded dedup
 frontier without turning it into remote attention authority.
 
-Notification failure is fail-open and cannot change remote lifecycle, attention,
-Schedule, or execution state.
+Notification failure is fail-open and cannot change remote lifecycle or attention
+state.
 
 Classification consumes only protocol-32 reduced transitions and the projection
 from that same owner-side cut. An Agent transition qualifies only when its exact
 observation revision is the current blocked or Done row with matching outstanding
-attention. An execution transition qualifies only when its exact revision is a
-configured dispatch failure or cold-recovery interruption. Stale revisions,
-acknowledgments, disconnects, process or output changes, and unrelated transitions
-do not qualify. Because this evidence already exists in protocol 32, remote
+attention. Stale revisions, acknowledgments, disconnects, process or output
+changes, and unrelated transitions do not qualify. Because this evidence already
+exists in protocol 32, remote
 notification presentation adds no protocol version or capability.
 
 The coordinator first persists the complete projection and cursor. After that
@@ -885,31 +839,35 @@ receive it, but their cursors advance across the filtered event.
 Federation has three independent compatibility boundaries:
 
 - The local CLI and local daemon negotiate the ordinary core protocol. Clients
-  predating federation remain local-only.
+  and daemons must both use protocol 47; protocol 46 is rejected.
 - The local coordinator and remote helper negotiate the federation handshake
   before an inner request. An absent helper triggers explicit bootstrap; an
   unsupported handshake fails with a typed pre-protocol error and sends no inner
   bytes. Unknown additive handshake fields are ignored only within a negotiated
   compatible federation version.
 - The helper and remote daemon negotiate the ordinary core protocol for every
-  channel. The daemon must support Node identity before ad hoc access or
-  registration, and must additionally support the atomic projection operation
-  before synchronization activates. Individual management and attachment
-  operations remain gated by their own ordinary protocol features. A
-  pre-federation daemon cannot be proxied as a Node merely because it supports an
-  unrelated inner operation.
+  channel. Protocol 47 is the current floor, so a protocol-46 helper or daemon is
+  never admitted as a Node.
 
 A compatible running remote daemon is not restarted solely because release
-versions differ. Handshake round trips, old/new helper pairs, current/minimum
-federation-capable remote daemons, old local clients, response filtering, and
-cursor advancement all require mixed-version tests before capability
-advertisement.
+versions differ. Automatic and ad hoc bootstrap reject an all-incompatible
+pre-47 helper set during planning, before upload or mutation.
 
-Protocol-34 owners are the attachment compatibility floor for registered
-running Shells because the coordinator performs a fresh exact Shell preflight
-through guarded routing. Starting a pending Shell or restarting an exited Shell
-requires protocol 35. Release-version differences never authorize restarting a
-compatible remote daemon.
+v0.32/state schema 13 cannot gracefully hand off into the protocol-47 release on
+a remote Node. Upgrade that host with the same cold sequence as a local install:
+stop its v0.32 daemon (terminating all processes managed by that Node), reset the
+incompatible state files while retaining `node.json` and registrations when
+desired, remove `[scheduling]` and the scheduled notification/sound keys from the
+remote Node's active config layers, then install and start protocol 47. See
+[`local-update.md`](local-update.md). Automatic bootstrap cannot migrate
+schema-13 state, replace the helper, restart the daemon, or perform an H7-to-H8
+graceful handoff across this boundary.
+
+Protocol 47 is now the attachment compatibility floor for every registered
+owner. The historical protocol-34 running-Shell and protocol-35 startup
+distinction remains part of the feature history but no older owner is negotiated.
+Release-version differences never authorize restarting a protocol-compatible
+remote daemon.
 
 Node identity, registrations, and projections use explicit independent schemas.
 Introducing them cannot silently reinterpret authoritative `state.json`.
@@ -925,12 +883,13 @@ target, pinned Node ID, registration revision, and tombstone epoch. Atomic
 replacement fsyncs the new file before rename; records, aliases, targets, and
 file size are bounded and list order is deterministic by alias then Node ID.
 
-Every durable federation schema retains its immediately previous representation
-and migrates it explicitly under the appropriate owner lock before advertising
-the new capability. Migration is atomic and covered by valid, invalid,
-cold-recovery, and graceful-handoff tests. An unsupported future schema is
-preserved unchanged and disables federation rather than being reinterpreted or
-downgraded.
+Durable federation schemas either migrate an explicitly supported predecessor
+under the appropriate owner lock or reject it when a breaking alpha boundary
+removes data that cannot be retained. Migration is atomic and covered by valid,
+invalid, cold-recovery, and graceful-handoff tests. Authoritative unsupported
+schemas are preserved unchanged and disable federation rather than being
+reinterpreted or downgraded; disposable projection caches may instead be
+quarantined or discarded and rebuilt.
 
 The first federation-capable startup creates `node.json` once under a dedicated
 creation lock using atomic no-replace installation, file and directory fsync,
@@ -950,17 +909,15 @@ stores under their locks; it does not synthesize or transfer a new Node ID.
 ## Bounds And Non-Goals
 
 Implementations bound registered Nodes, concurrent SSH children, connection
-handlers, stderr, frame sizes, projections, execution pages, retry delays, and
+handlers, stderr, frame sizes, projections, retry delays, and
 shutdown waits. No network wait occurs while core or federation registry,
 persistence, event, lifecycle, runtime, or terminal locks are held.
 
 The initial contract excludes:
 
 - Automatic SSH-host discovery or connection.
-- Automatic cross-Node Schedule failover.
 - Shared resource ownership or distributed consensus.
 - Queued offline writes or ambiguous-write replay.
-- A global cross-Node scheduler concurrency lease.
 - Moving active Shells, Agents, or continuation sessions between Nodes.
 - Remote TCP control listeners or forwarding the local daemon socket.
 - Treating a local daemon stop, restart, or Node removal as remote process

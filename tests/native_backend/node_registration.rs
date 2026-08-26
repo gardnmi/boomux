@@ -7,11 +7,7 @@ use std::thread;
 use std::time::Duration;
 
 use boomux::client::{ClientError, RemoteError};
-use boomux::protocol::{
-    AgentScheduleOverlapPolicy, AgentScheduleSession, AgentScheduleSpec, AgentScheduleState,
-    AgentScheduleTrigger, ErrorCode, Request, Response, ShellRunExitReason, ShellSpec,
-    WorkspaceLauncherSpec,
-};
+use boomux::protocol::{ErrorCode, Request, ShellRunExitReason, ShellSpec, WorkspaceLauncherSpec};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -208,7 +204,7 @@ fn first_resources_atomically_establish_one_exact_owner_placement() {
     );
 
     let launcher_id = Uuid::new_v4().to_string();
-    let (global, launcher) = daemon
+    let (_, launcher) = daemon
         .client
         .create_global_workspace_launcher(
             Uuid::new_v4().to_string(),
@@ -228,75 +224,10 @@ fn first_resources_atomically_establish_one_exact_owner_placement() {
     assert_eq!(launcher.id, launcher_id);
     assert_eq!(launcher.command[2], "a b;$(private)");
 
-    let schedule_id = Uuid::new_v4().to_string();
-    let (_, schedule) = daemon
-        .client
-        .create_global_workspace_agent_schedule(
-            Uuid::new_v4().to_string(),
-            &global.id,
-            global.revision,
-            &owner.node_id,
-            &owner_workspace_id,
-            Some(cwd.clone()),
-            &schedule_id,
-            AgentScheduleSpec {
-                name: "private".into(),
-                cwd: cwd.clone(),
-                integration: "opencode".into(),
-                prompt: "PRIVATE FIRST PLACEMENT PROMPT".into(),
-                session: AgentScheduleSession::Fresh,
-                trigger: AgentScheduleTrigger {
-                    cron: "0 2 * * *".into(),
-                    timezone: "UTC".into(),
-                },
-                state: AgentScheduleState::Paused,
-                overlap_policy: AgentScheduleOverlapPolicy::Skip,
-            },
-        )
-        .unwrap();
-    assert_eq!(schedule.id, schedule_id);
-    let replay = daemon
-        .client
-        .request(Request::CreateWorkspaceAgentSchedule {
-            workspace_id: owner_workspace_id.clone(),
-            workspace_name: "placed".into(),
-            default_cwd: Some(cwd.clone()),
-            schedule_id: schedule_id.clone(),
-            spec: AgentScheduleSpec {
-                name: "private".into(),
-                cwd: cwd.clone(),
-                integration: "opencode".into(),
-                prompt: "PRIVATE FIRST PLACEMENT PROMPT".into(),
-                session: AgentScheduleSession::Fresh,
-                trigger: AgentScheduleTrigger {
-                    cron: "  0\t2  * * *  ".into(),
-                    timezone: "  UTC\n".into(),
-                },
-                state: AgentScheduleState::Paused,
-                overlap_policy: AgentScheduleOverlapPolicy::Skip,
-            },
-        })
-        .unwrap();
-    let Response::AgentSchedule { schedule: replay } = replay else {
-        panic!("expected exact Schedule replay");
-    };
-    assert_eq!(replay, schedule);
     let snapshot = daemon.client.snapshot().unwrap();
     assert_eq!(snapshot.workspaces.len(), 1);
     assert_eq!(snapshot.workspaces[0].shells.len(), 1);
     assert_eq!(snapshot.workspaces[0].launchers.len(), 1);
-    assert_eq!(snapshot.workspaces[0].schedules.len(), 1);
-    assert!(
-        !String::from_utf8_lossy(
-            &fs::read(
-                daemon
-                    .runtime_dir
-                    .join("state/boomux/global_workspaces.json")
-            )
-            .unwrap()
-        )
-        .contains("PRIVATE FIRST PLACEMENT PROMPT")
-    );
 }
 
 #[test]
@@ -798,7 +729,7 @@ fn attempted_project_survives_missing_registration_and_blocks_different_semantic
     fs::write(
         &path,
         serde_json::to_vec_pretty(&serde_json::json!({
-            "version": 6,
+            "version": 7,
             "local_migration_complete": true,
             "workspaces": [{
                 "id": global_workspace_id,
@@ -1162,7 +1093,7 @@ fn write_fake_handshake(directory: &Path, core_protocol_version: u32) {
 fn write_fake_combined_snapshot(directory: &Path, workspace_owner_eligible: bool) {
     use boomux::protocol::{
         self, CombinedNode, CombinedNodeSnapshot, Envelope, NodeProjectionHealthCode, Response,
-        SchedulerHealth, SchedulerState, Snapshot, WorkspaceSnapshot,
+        Snapshot, WorkspaceSnapshot,
     };
 
     let unavailable_reason =
@@ -1171,11 +1102,6 @@ fn write_fake_combined_snapshot(directory: &Path, workspace_owner_eligible: bool
         vec!["protocol_38".into(), "global_workspaces".into()]
     } else {
         vec!["protocol_38".into()]
-    };
-    let scheduler = SchedulerHealth {
-        state: SchedulerState::Active,
-        max_concurrent: 4,
-        active_executions: 0,
     };
     let mut response = Vec::new();
     protocol::write_message(
@@ -1199,7 +1125,6 @@ fn write_fake_combined_snapshot(directory: &Path, workspace_owner_eligible: bool
                         observed_capabilities: capabilities,
                         workspace_owner_eligible,
                         workspace_owner_unavailable_reason: unavailable_reason,
-                        scheduler: scheduler.clone(),
                         local_snapshot: Some(Snapshot {
                             workspaces: vec![WorkspaceSnapshot {
                                 id: "shared-workspace".into(),
@@ -1209,10 +1134,8 @@ fn write_fake_combined_snapshot(directory: &Path, workspace_owner_eligible: bool
                                 shells: Vec::new(),
                                 launchers: Vec::new(),
                                 agents: Vec::new(),
-                                schedules: Vec::new(),
                             }],
                             focused_terminal: None,
-                            scheduler: Some(scheduler),
                         }),
                         remote_projection: None,
                     }],
@@ -1230,8 +1153,7 @@ fn write_fake_combined_snapshot(directory: &Path, workspace_owner_eligible: bool
 fn fake_ssh(directory: &Path) {
     use boomux::protocol::{
         self, Envelope, EventCursor, NodeProjectionShell, NodeProjectionSnapshot,
-        NodeProjectionSync, NodeProjectionSyncMode, NodeProjectionWorkspace, Response,
-        SchedulerHealth, SchedulerState, ShellOwner, ShellStatus,
+        NodeProjectionSync, NodeProjectionSyncMode, NodeProjectionWorkspace, Response, ShellStatus,
     };
 
     write_fake_handshake(directory, protocol::PROTOCOL_VERSION);
@@ -1266,7 +1188,6 @@ fn fake_ssh(directory: &Path) {
                             id: "shared-shell".into(),
                             workspace_id: "shared-workspace".into(),
                             name: "shared".into(),
-                            owner: ShellOwner::User,
                             status: ShellStatus::Running,
                             run_id: Some("shared-run".into()),
                             generation: Some(1),
@@ -1276,14 +1197,6 @@ fn fake_ssh(directory: &Path) {
                         }],
                         launchers: Vec::new(),
                         agents: Vec::new(),
-                        schedules: Vec::new(),
-                        executions: Vec::new(),
-                        executions_truncated: false,
-                        scheduler: SchedulerHealth {
-                            state: SchedulerState::Active,
-                            max_concurrent: 4,
-                            active_executions: 0,
-                        },
                     },
                     transitions: Vec::new(),
                     capabilities: vec!["protocol_38".into(), "global_workspaces".into()],
@@ -1306,7 +1219,6 @@ fn fake_ssh(directory: &Path) {
                     shells: Vec::new(),
                     launchers: Vec::new(),
                     agents: Vec::new(),
-                    schedules: Vec::new(),
                 },
             },
         ),
@@ -1437,25 +1349,8 @@ fn cli_add_and_retarget_use_once_verified_identity_without_persisting_helper_pat
         "shared-workspace"
     );
     assert_eq!(remote["workspace_owner_eligible"], true);
-    write_fake_handshake(&directory, 37);
     let client =
         boomux::client::Client::from_socket_path(directory.join("runtime/boomux/daemon.sock"));
-    let adopt = client
-        .adopt_node_workspace(
-            boomux::protocol::QualifiedIdentity::new(node_id(2), "shared-workspace"),
-            7,
-        )
-        .unwrap_err();
-    assert!(
-        matches!(
-            &adopt,
-            ClientError::Remote(RemoteError {
-                code: Some(ErrorCode::UnsupportedVersion),
-                ..
-            })
-        ),
-        "unexpected adopt error: {adopt:?}"
-    );
     write_fake_handshake(&directory, boomux::protocol::PROTOCOL_VERSION);
     write_fake_combined_snapshot(&directory, false);
     let unavailable = client

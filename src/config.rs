@@ -13,8 +13,6 @@ use serde::Deserialize;
 
 const DEFAULT_PROJECT_SEARCH_DEPTH: usize = 3;
 const MAX_PROJECT_SEARCH_DEPTH: usize = 10;
-const DEFAULT_MAX_SCHEDULED_EXECUTION_CONCURRENCY: u16 = 4;
-const MAX_SCHEDULED_EXECUTION_CONCURRENCY: i64 = 64;
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 const TEMPORARY_CREATE_ATTEMPTS: u8 = 16;
 
@@ -38,22 +36,15 @@ pub(crate) const CONFIG_TEMPLATE: &str = r#"# Boomux configuration
 # enabled = false
 # blocked = true
 # completed = true
-# scheduled_dispatch_failed = false
-# scheduled_interrupted = false
 
 [notifications.sound]
 # enabled = false
 # blocked = "message-new-instant"
 # completed = "complete"
-# scheduled_dispatch_failed = "dialog-warning"
-# scheduled_interrupted = "dialog-warning"
 
 [recovery]
 # resume_agents = true
 # persist_terminal_history = false
-
-[scheduling]
-# max_concurrent = 4
 
 [claude]
 # remote_control = true
@@ -68,7 +59,6 @@ struct RawConfig {
     dashboard: Option<RawDashboardConfig>,
     desktop: Option<RawDesktopConfig>,
     recovery: Option<RawRecoveryConfig>,
-    scheduling: Option<RawSchedulingConfig>,
     claude: Option<RawClaudeConfig>,
 }
 
@@ -85,8 +75,6 @@ struct RawNotificationsConfig {
     enabled: Option<bool>,
     blocked: Option<bool>,
     completed: Option<bool>,
-    scheduled_dispatch_failed: Option<bool>,
-    scheduled_interrupted: Option<bool>,
     sound: Option<RawNotificationSoundConfig>,
 }
 
@@ -96,8 +84,6 @@ struct RawNotificationSoundConfig {
     enabled: Option<bool>,
     blocked: Option<String>,
     completed: Option<String>,
-    scheduled_dispatch_failed: Option<String>,
-    scheduled_interrupted: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -117,12 +103,6 @@ struct RawDesktopConfig {
 struct RawRecoveryConfig {
     resume_agents: Option<bool>,
     persist_terminal_history: Option<bool>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct RawSchedulingConfig {
-    max_concurrent: Option<i64>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -226,7 +206,7 @@ pub(crate) fn load_snapshot() -> Result<ConfigSnapshot, Box<dyn Error>> {
 pub(crate) fn load_notification_settings()
 -> Result<boomux::daemon::NotificationDeliverySettings, Box<dyn Error>> {
     let (raw, _) = load_raw()?;
-    resolve_daemon_settings(raw.notifications, raw.recovery, raw.scheduling, raw.claude)
+    resolve_daemon_settings(raw.notifications, raw.recovery, raw.claude)
 }
 
 fn load_raw() -> Result<(RawConfig, Option<PathBuf>), Box<dyn Error>> {
@@ -723,12 +703,6 @@ fn merge(base: &mut RawConfig, next: RawConfig) {
         if next_notifications.completed.is_some() {
             notifications.completed = next_notifications.completed;
         }
-        if next_notifications.scheduled_dispatch_failed.is_some() {
-            notifications.scheduled_dispatch_failed = next_notifications.scheduled_dispatch_failed;
-        }
-        if next_notifications.scheduled_interrupted.is_some() {
-            notifications.scheduled_interrupted = next_notifications.scheduled_interrupted;
-        }
         if let Some(next_sound) = next_notifications.sound {
             let sound = notifications.sound.get_or_insert_default();
             if next_sound.enabled.is_some() {
@@ -739,12 +713,6 @@ fn merge(base: &mut RawConfig, next: RawConfig) {
             }
             if next_sound.completed.is_some() {
                 sound.completed = next_sound.completed;
-            }
-            if next_sound.scheduled_dispatch_failed.is_some() {
-                sound.scheduled_dispatch_failed = next_sound.scheduled_dispatch_failed;
-            }
-            if next_sound.scheduled_interrupted.is_some() {
-                sound.scheduled_interrupted = next_sound.scheduled_interrupted;
             }
         }
     }
@@ -767,12 +735,6 @@ fn merge(base: &mut RawConfig, next: RawConfig) {
         }
         if next_recovery.persist_terminal_history.is_some() {
             recovery.persist_terminal_history = next_recovery.persist_terminal_history;
-        }
-    }
-    if let Some(next_scheduling) = next.scheduling {
-        let scheduling = base.scheduling.get_or_insert_default();
-        if next_scheduling.max_concurrent.is_some() {
-            scheduling.max_concurrent = next_scheduling.max_concurrent;
         }
     }
     if let Some(next_claude) = next.claude {
@@ -811,12 +773,7 @@ fn resolve(raw: RawConfig, path: Option<PathBuf>) -> Result<Config, Box<dyn Erro
         terminal,
         projects: ProjectsConfig { roots, max_depth },
         path,
-        notifications: resolve_daemon_settings(
-            raw.notifications,
-            raw.recovery,
-            raw.scheduling,
-            raw.claude,
-        )?,
+        notifications: resolve_daemon_settings(raw.notifications, raw.recovery, raw.claude)?,
         dashboard: DashboardConfig {
             follow_focused_terminal: raw
                 .dashboard
@@ -838,34 +795,21 @@ fn resolve(raw: RawConfig, path: Option<PathBuf>) -> Result<Config, Box<dyn Erro
 fn resolve_notifications(
     raw: Option<RawNotificationsConfig>,
 ) -> boomux::daemon::NotificationDeliverySettings {
-    resolve_daemon_settings(raw, None, None, None).expect("default scheduling config is valid")
+    resolve_daemon_settings(raw, None, None).expect("default notification config is valid")
 }
 
 fn resolve_daemon_settings(
     notifications: Option<RawNotificationsConfig>,
     recovery: Option<RawRecoveryConfig>,
-    scheduling: Option<RawSchedulingConfig>,
     claude: Option<RawClaudeConfig>,
 ) -> Result<boomux::daemon::NotificationDeliverySettings, Box<dyn Error>> {
     let raw = notifications.unwrap_or_default();
     let recovery = recovery.unwrap_or_default();
-    let max_concurrent = scheduling
-        .unwrap_or_default()
-        .max_concurrent
-        .unwrap_or(i64::from(DEFAULT_MAX_SCHEDULED_EXECUTION_CONCURRENCY));
-    if !(1..=MAX_SCHEDULED_EXECUTION_CONCURRENCY).contains(&max_concurrent) {
-        return Err(ConfigError(format!(
-            "scheduling.max_concurrent must be between 1 and {MAX_SCHEDULED_EXECUTION_CONCURRENCY}"
-        ))
-        .into());
-    }
     Ok(boomux::daemon::NotificationDeliverySettings {
         desktop: boomux::daemon::NotificationSettings {
             enabled: raw.enabled.unwrap_or(false),
             blocked: raw.blocked.unwrap_or(true),
             completed: raw.completed.unwrap_or(true),
-            scheduled_dispatch_failed: raw.scheduled_dispatch_failed.unwrap_or(false),
-            scheduled_interrupted: raw.scheduled_interrupted.unwrap_or(false),
         },
         sound: raw.sound.map_or_else(Default::default, |sound| {
             boomux::daemon::NotificationSoundSettings {
@@ -874,17 +818,10 @@ fn resolve_daemon_settings(
                     .blocked
                     .unwrap_or_else(|| "message-new-instant".into()),
                 completed: sound.completed.unwrap_or_else(|| "complete".into()),
-                scheduled_dispatch_failed: sound
-                    .scheduled_dispatch_failed
-                    .unwrap_or_else(|| "dialog-warning".into()),
-                scheduled_interrupted: sound
-                    .scheduled_interrupted
-                    .unwrap_or_else(|| "dialog-warning".into()),
             }
         }),
         resume_agents: recovery.resume_agents.unwrap_or(true),
         persist_terminal_history: recovery.persist_terminal_history.unwrap_or(false),
-        max_scheduled_execution_concurrency: max_concurrent as u16,
         claude_remote_control: claude.unwrap_or_default().remote_control.unwrap_or(true),
     })
 }
@@ -1107,13 +1044,11 @@ mod tests {
         assert!(settings.sound.enabled);
         assert_eq!(settings.sound.blocked, "dialog-warning");
         assert_eq!(settings.sound.completed, "complete");
-        assert!(!settings.desktop.scheduled_dispatch_failed);
-        assert!(!settings.desktop.scheduled_interrupted);
     }
 
     #[test]
     fn recovery_settings_default_and_merge_per_field() {
-        let defaults = resolve_daemon_settings(None, None, None, None).unwrap();
+        let defaults = resolve_daemon_settings(None, None, None).unwrap();
         assert!(defaults.resume_agents);
         assert!(!defaults.persist_terminal_history);
 
@@ -1123,13 +1058,8 @@ mod tests {
         let next: RawConfig = toml::from_str("[recovery]\nresume_agents = true").unwrap();
         merge(&mut base, next);
 
-        let settings = resolve_daemon_settings(
-            base.notifications,
-            base.recovery,
-            base.scheduling,
-            base.claude,
-        )
-        .unwrap();
+        let settings =
+            resolve_daemon_settings(base.notifications, base.recovery, base.claude).unwrap();
         assert!(settings.resume_agents);
         assert!(settings.persist_terminal_history);
         assert!(toml::from_str::<RawConfig>("[recovery]\nunknown = true").is_err());
@@ -1137,20 +1067,15 @@ mod tests {
 
     #[test]
     fn claude_remote_control_defaults_on_and_can_be_disabled_per_layer() {
-        let defaults = resolve_daemon_settings(None, None, None, None).unwrap();
+        let defaults = resolve_daemon_settings(None, None, None).unwrap();
         assert!(defaults.claude_remote_control);
 
         let mut base: RawConfig = toml::from_str("[claude]\nremote_control = false").unwrap();
         let next: RawConfig =
             toml::from_str("[dashboard]\nfollow_focused_terminal = false").unwrap();
         merge(&mut base, next);
-        let settings = resolve_daemon_settings(
-            base.notifications,
-            base.recovery,
-            base.scheduling,
-            base.claude,
-        )
-        .unwrap();
+        let settings =
+            resolve_daemon_settings(base.notifications, base.recovery, base.claude).unwrap();
         assert!(!settings.claude_remote_control);
         assert!(toml::from_str::<RawConfig>("[claude]\nunknown = true").is_err());
     }
@@ -1174,34 +1099,17 @@ mod tests {
                     enabled: true,
                     blocked: false,
                     completed: true,
-                    ..Default::default()
                 },
                 sound: boomux::daemon::NotificationSoundSettings {
                     enabled: true,
                     blocked: "message-new-instant".into(),
                     completed: "service-login".into(),
-                    ..Default::default()
                 },
                 resume_agents: true,
                 persist_terminal_history: false,
-                max_scheduled_execution_concurrency: 4,
                 claude_remote_control: true,
             }
         );
-    }
-
-    #[test]
-    fn scheduled_notification_categories_are_independent_and_default_disabled() {
-        let raw: RawConfig = toml::from_str(
-            "[notifications]\nenabled = true\nscheduled_dispatch_failed = true\nscheduled_interrupted = false\n[notifications.sound]\nscheduled_interrupted = \"service-logout\"",
-        )
-        .unwrap();
-        let settings = resolve_notifications(raw.notifications);
-        assert!(settings.desktop.scheduled_dispatch_failed);
-        assert!(!settings.desktop.scheduled_interrupted);
-        assert!(settings.desktop.blocked);
-        assert!(settings.desktop.completed);
-        assert_eq!(settings.sound.scheduled_interrupted, "service-logout");
     }
 
     #[test]
@@ -1221,48 +1129,14 @@ mod tests {
     }
 
     #[test]
-    fn scheduling_concurrency_defaults_layers_and_rejects_invalid_values() {
-        assert_eq!(
-            resolve(RawConfig::default(), None)
-                .unwrap()
-                .notifications
-                .max_scheduled_execution_concurrency,
-            4
-        );
-        let mut base: RawConfig = toml::from_str("[scheduling]\nmax_concurrent = 2").unwrap();
-        let next: RawConfig = toml::from_str("[scheduling]\nmax_concurrent = 9").unwrap();
-        merge(&mut base, next);
-        assert_eq!(
-            resolve(base, None)
-                .unwrap()
-                .notifications
-                .max_scheduled_execution_concurrency,
-            9
-        );
-        for value in [0, -1, 65] {
-            let raw: RawConfig =
-                toml::from_str(&format!("[scheduling]\nmax_concurrent = {value}")).unwrap();
-            assert!(resolve(raw, None).is_err());
-        }
-        assert!(toml::from_str::<RawConfig>("[scheduling]\nunknown = 1").is_err());
-    }
-
-    #[test]
     fn layered_semantics_are_resolved_only_after_field_merge() {
-        let mut base: RawConfig =
-            toml::from_str("[projects]\nmax_depth = 99\n[scheduling]\nmax_concurrent = 100")
-                .unwrap();
-        let override_layer: RawConfig =
-            toml::from_str("[projects]\nmax_depth = 4\n[scheduling]\nmax_concurrent = 8").unwrap();
+        let mut base: RawConfig = toml::from_str("[projects]\nmax_depth = 99").unwrap();
+        let override_layer: RawConfig = toml::from_str("[projects]\nmax_depth = 4").unwrap();
 
         assert!(resolve(base.clone(), None).is_err());
         merge(&mut base, override_layer);
         let resolved = resolve(base, None).unwrap();
         assert_eq!(resolved.projects.max_depth, 4);
-        assert_eq!(
-            resolved.notifications.max_scheduled_execution_concurrency,
-            8
-        );
     }
 
     #[test]

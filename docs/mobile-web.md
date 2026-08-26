@@ -136,7 +136,6 @@ the intended authentication boundary.
 - Local Agents come from the authoritative local snapshot.
 - Remote Agents come from each registered Node's bounded reduced projection.
 - Every Agent card carries both its owning Node ID and Node-local Agent ID.
-- Schedule-owned Agents are excluded.
 - One newest non-inactive and non-done Agent is selected for each exact current
   Node, Shell, and run identity.
 - Historical, inactive, and done Agents are hidden unless they retain durable

@@ -90,13 +90,23 @@ fn fake_ssh(
 }
 
 fn fake_old_ssh(directory: &Path) {
+    let handshake = FederationHandshake {
+        version: FEDERATION_VERSION,
+        node_id: "550e8400-e29b-41d4-a716-446655440000".into(),
+        helper_version: "0.32.0".into(),
+        core_protocol_version: 46,
+        connection_mode: FederationConnectionMode::AdHoc,
+    };
+    let mut handshake_bytes = Vec::new();
+    write_handshake(&mut handshake_bytes, &handshake).unwrap();
     let log = directory.join("ssh.log");
     let ssh = directory.join("ssh");
     fs::write(
         &ssh,
         format!(
-            "#!/bin/sh\n{CONTROL_MASTER_PREFIX}\nlast=\nfor arg do last=$arg; done\nprintf '%s|%s\\n' \"$control\" \"$last\" >> '{}'\ncase \"$last\" in *'exec '*) last=${{last##*exec }} ;; esac\ncase \"$last\" in\n  *boomux-platform-v1*) printf 'boomux-platform-v1\\0Linux\\0x86_64\\0' ;;\n  *boomux-executables-v1*) printf 'boomux-executables-v1\\0/remote/boomux\\0' ;;\n  *boomux-install-destination-v1*) printf 'boomux-install-destination-v1\\0/home/remote/.local/bin/boomux\\0' ;;\n  \"'/remote/boomux' __federation-stdio\") exit 2 ;;\n  \"'/remote/boomux' --version\") printf 'boomux 0.14.2\\n' ;;\n  *) exit 64 ;;\nesac\n",
+            "#!/bin/sh\n{CONTROL_MASTER_PREFIX}\nlast=\nfor arg do last=$arg; done\nprintf '%s|%s\\n' \"$control\" \"$last\" >> '{}'\ncase \"$last\" in *'exec '*) last=${{last##*exec }} ;; esac\ncase \"$last\" in\n  *boomux-platform-v1*) printf 'boomux-platform-v1\\0Linux\\0x86_64\\0' ;;\n  *boomux-executables-v1*) printf 'boomux-executables-v1\\0/remote/boomux\\0' ;;\n  *boomux-install-destination-v1*) printf 'boomux-install-destination-v1\\0/home/remote/.local/bin/boomux\\0' ;;\n  \"'/remote/boomux' __federation-stdio\") {} ;;\n  \"'/remote/boomux' --version\") printf 'boomux 0.32.0\\n' ;;\n  *) exit 64 ;;\nesac\n",
             log.display(),
+            shell_printf(&handshake_bytes),
         ),
     )
     .unwrap();
@@ -129,7 +139,7 @@ fn fake_malformed_helper_ssh(directory: &Path) {
     fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
 }
 
-fn fake_runtime_upgrade_ssh(directory: &Path) {
+fn fake_missing_install_ssh(directory: &Path) {
     let handshake = FederationHandshake {
         version: FEDERATION_VERSION,
         node_id: "550e8400-e29b-41d4-a716-446655440000".into(),
@@ -153,39 +163,21 @@ fn fake_runtime_upgrade_ssh(directory: &Path) {
     .unwrap();
     let installed = directory.join("installed");
     let helper_calls = directory.join("helper-calls");
-    let restarted = directory.join("restarted");
     let committed = directory.join("committed");
-    let socket = directory.join("remote-runtime/boomux/daemon.sock");
-    fs::create_dir_all(socket.parent().unwrap()).unwrap();
-    fs::write(&socket, b"socket").unwrap();
     let ssh = directory.join("ssh");
-    let script = format!(
-        "#!/bin/sh\n{CONTROL_MASTER_PREFIX}\nunset XDG_RUNTIME_DIR\nlast=\nfor arg do last=$arg; done\nrequire_runtime() {{ case \"$last\" in *boomux-runtime-v1*'/run/user/$boomux_uid'*) [ -e {socket} ] ;; *) return 1 ;; esac; }}\ncase \"$last\" in\n  *boomux-platform-v1*) printf 'boomux-platform-v1\\0Linux\\0x86_64\\0' ;;\n  *boomux-executables-v1*) printf 'boomux-executables-v1\\0/remote/boomux\\0' ;;\n  *boomux-install-destination-v1*) printf 'boomux-install-destination-v1\\0/home/remote/.local/bin/boomux\\0' ;;\n  *'boomux-install-transaction-v1'*) cat >/dev/null; : > {installed}; printf 'boomux-install-transaction-v1\\0.boomux.bootstrap.ABC12345\\0' ;;\n  *': > \"$transaction/restarted\"'*) cat >/dev/null; : > {restarted} ;;\n  *'committed=$lock/committed'*) cat >/dev/null; [ -e {restarted} ]; : > {committed}; printf 'boomux-install-commit-v1\\0committed\\0' ;;\n  *'daemon status --json'*) require_runtime || exit 97; printf '%s' '{{\"schema\":\"boomux.cli/v1\",\"command\":\"daemon.status\",\"data\":{{\"protocol_version\":21}}}}' ;;\n  *'daemon restart'*) require_runtime || exit 97; printf 'restart\\n' >> {restarted} ;;\n  *\"'/home/remote/.local/bin/boomux' __federation-stdio\" | *\"'/remote/boomux' __federation-stdio\") n=0; [ ! -e {helper_calls} ] || n=$(cat {helper_calls}); n=$((n + 1)); printf '%s' \"$n\" > {helper_calls}; if [ ! -e {installed} ]; then exit 2; fi; require_runtime || exit 97; {handshake}; limit=1; [ \"$n\" -ge 4 ] && limit=2; i=0; while [ \"$i\" -lt \"$limit\" ]; do dd bs=1 count={request_len} of=/dev/null 2>/dev/null || exit; {pong}; i=$((i + 1)); done ;;\n  \"'/remote/boomux' --version\") printf 'boomux 0.14.2\\n' ;;\n  *) exit 64 ;;\nesac\n",
-        socket = socket.display(),
+    fs::write(
+        &ssh,
+        format!(
+        "#!/bin/sh\n{CONTROL_MASTER_PREFIX}\nlast=\nfor arg do last=$arg; done\ncase \"$last\" in\n  *boomux-platform-v1*) printf 'boomux-platform-v1\\0Linux\\0x86_64\\0' ;;\n  *boomux-executables-v1*) printf 'boomux-executables-v1\\0'; [ ! -e {installed} ] || printf '/home/remote/.local/bin/boomux\\0' ;;\n  *boomux-install-destination-v1*) printf 'boomux-install-destination-v1\\0/home/remote/.local/bin/boomux\\0' ;;\n  *boomux-daemon-presence-v1*) printf 'boomux-daemon-presence-v1\\0absent\\0' ;;\n  *'boomux-install-transaction-v1'*) cat >/dev/null; : > {installed}; printf 'boomux-install-transaction-v1\\0.boomux.bootstrap.ABC12345\\0' ;;\n  *'committed=$lock/committed'*) cat >/dev/null; : > {committed}; printf 'boomux-install-commit-v1\\0committed\\0' ;;\n  *\"'/home/remote/.local/bin/boomux' __federation-stdio\") [ -e {installed} ] || exit 2; n=0; [ ! -e {helper_calls} ] || n=$(cat {helper_calls}); n=$((n + 1)); printf '%s' \"$n\" > {helper_calls}; {handshake}; dd bs=1 count={request_len} of=/dev/null 2>/dev/null && {pong} ;;\n  *'daemon restart'*) exit 99 ;;\n  *) exit 64 ;;\nesac\n",
         installed = installed.display(),
         helper_calls = helper_calls.display(),
-        restarted = restarted.display(),
         committed = committed.display(),
         handshake = shell_printf(&handshake_bytes),
         request_len = request.len(),
         pong = shell_printf(&response),
-    );
-    let script = script.replace("/remote/boomux", "/home/remote/.local/bin/boomux");
-    let script = script.replace(
-        "*'daemon status --json'*) require_runtime || exit 97; printf '%s' '{\"schema\":\"boomux.cli/v1\",\"command\":\"daemon.status\",\"data\":{\"protocol_version\":21}}' ;;",
-        "*'.boomux.bootstrap.'*'daemon status --json'*) require_runtime || exit 97; printf '%s' '{\"schema\":\"boomux.cli/v1\",\"command\":\"daemon.status\",\"data\":{\"protocol_version\":21,\"pid\":123,\"executable\":\"/home/remote/.local/bin/boomux\",\"socket_device\":1,\"socket_inode\":1}}' ;;\n  *'daemon status --json'*) require_runtime || exit 97; printf '%s' '{\"schema\":\"boomux.cli/v1\",\"command\":\"daemon.status\",\"data\":{\"protocol_version\":21}}' ;;",
-    );
-    assert!(script.contains("\"pid\":123"));
-    let script = script.replace("limit=1; [ \"$n\" -ge 4 ] && limit=2;", "limit=1;");
-    let script = script.replace(
-        &format!(": > {}", committed.display()),
-        &format!(
-            "/bin/cat {} > {}",
-            helper_calls.display(),
-            committed.display()
         ),
-    );
-    fs::write(&ssh, script).unwrap();
+    )
+    .unwrap();
     fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
 }
 
@@ -742,10 +734,21 @@ fn json_node_add_reports_upgrade_required_without_remote_mutation() {
     assert!(!output.status.success());
     let error: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
     assert_eq!(error["error"]["code"], "upgrade_required");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("`boomux daemon stop`")
+    );
     let log = fs::read_to_string(directory.join("ssh.log")).unwrap();
     assert_eq!(log.lines().count(), 5);
-    assert!(!log.contains("mktemp"));
-    assert!(!log.contains("daemon restart"));
+    for forbidden in [
+        "boomux-install-transaction-v1",
+        "boomux-install-activation-v1",
+        "daemon restart",
+    ] {
+        assert!(!log.contains(forbidden), "unexpected {forbidden} command");
+    }
     fs::remove_dir_all(directory).unwrap();
 }
 
@@ -822,130 +825,44 @@ fn json_node_add_classifies_invalid_framed_executable_paths_as_malformed_helper(
 }
 
 #[test]
-fn interactive_upgrade_restarts_old_running_daemon_after_compatible_provisional_helper() {
+fn interactive_protocol_46_helper_requires_cold_upgrade_without_remote_mutation() {
     let directory = test_directory();
     fs::create_dir_all(directory.join("home/.ssh")).unwrap();
     fs::create_dir_all(directory.join("runtime")).unwrap();
-    fake_runtime_upgrade_ssh(&directory);
+    fake_old_ssh(&directory);
 
-    let mut master = 0;
-    let mut slave = 0;
-    assert_eq!(
-        unsafe {
-            libc::openpty(
-                &mut master,
-                &mut slave,
-                std::ptr::null_mut(),
-                std::ptr::null(),
-                std::ptr::null(),
-            )
-        },
-        0
-    );
-    let master = unsafe { OwnedFd::from_raw_fd(master) };
-    let slave = unsafe { OwnedFd::from_raw_fd(slave) };
-    let mut command = Command::new(env!("CARGO_BIN_EXE_boomux"));
-    command
-        .args(["--remote", "workbox"])
-        .env("PATH", format!("{}:/usr/bin:/bin", directory.display()))
-        .env("HOME", directory.join("home"))
-        .env("XDG_RUNTIME_DIR", directory.join("runtime"))
-        .env("XDG_STATE_HOME", directory.join("state"))
-        .stdin(Stdio::from(slave.try_clone().unwrap()))
-        .stdout(Stdio::from(slave.try_clone().unwrap()))
-        .stderr(Stdio::from(slave));
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY, 0) == -1 {
-                Err(std::io::Error::last_os_error())
-            } else {
-                Ok(())
-            }
-        });
+    let (status, output) = run_interactive(&directory, &["--remote", "workbox"], b"y\n");
+    assert!(!status.success());
+    let output = String::from_utf8_lossy(&output);
+    assert!(output.contains("`boomux daemon stop`"), "{output}");
+    assert!(output.contains("protocol-47 binary"), "{output}");
+    let log = fs::read_to_string(directory.join("ssh.log")).unwrap();
+    for forbidden in [
+        "boomux-install-transaction-v1",
+        "boomux-install-activation-v1",
+        "daemon restart",
+    ] {
+        assert!(!log.contains(forbidden), "unexpected {forbidden} command");
     }
-    let mut child = command.spawn().unwrap();
-    let mut master = fs::File::from(master);
-    master.write_all(b"y\n").unwrap();
-    let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
-    assert_ne!(flags, -1);
-    assert_ne!(
-        unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
-        -1
-    );
-    let mut output = Vec::new();
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let status = loop {
-        let mut bytes = [0_u8; 4096];
-        match master.read(&mut bytes) {
-            Ok(count) => output.extend_from_slice(&bytes[..count]),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(error) if error.raw_os_error() == Some(libc::EIO) => {}
-            Err(error) => panic!("PTY read failed: {error}"),
-        }
-        if let Some(status) = child.try_wait().unwrap() {
-            break status;
-        }
-        assert!(Instant::now() < deadline, "interactive upgrade timed out");
-        std::thread::sleep(Duration::from_millis(20));
-    };
-    assert!(
-        status.success(),
-        "interactive upgrade failed with {status}: {}",
-        String::from_utf8_lossy(&output)
-    );
-    assert_eq!(
-        fs::read_to_string(directory.join("restarted")).unwrap(),
-        "restart\n"
-    );
-    assert!(directory.join("committed").exists());
-
-    let _ = Command::new(env!("CARGO_BIN_EXE_boomux"))
-        .args(["daemon", "stop"])
-        .env("HOME", directory.join("home"))
-        .env("XDG_RUNTIME_DIR", directory.join("runtime"))
-        .env("XDG_STATE_HOME", directory.join("state"))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
     fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
-fn upgraded_node_add_registers_after_the_precommit_ping_channel_closes() {
+fn interactive_missing_helper_first_install_still_succeeds_without_restart() {
     let directory = test_directory();
     fs::create_dir_all(directory.join("home/.ssh")).unwrap();
     fs::create_dir_all(directory.join("runtime")).unwrap();
-    fake_runtime_upgrade_ssh(&directory);
+    fake_missing_install_ssh(&directory);
 
-    let (status, output) = run_interactive(&directory, &["node", "add", "work", "workbox"], b"y\n");
+    let (status, output) = run_interactive(&directory, &["--remote", "workbox"], b"y\n");
     assert!(
         status.success(),
-        "upgraded node add failed with {status}: {}",
+        "missing-helper install failed with {status}: {}",
         String::from_utf8_lossy(&output)
     );
-    assert_eq!(
-        fs::read_to_string(directory.join("committed")).unwrap(),
-        "4"
-    );
-    let persisted: serde_json::Value = serde_json::from_slice(
-        &fs::read(directory.join("state/boomux/node_registrations.json")).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(persisted["registrations"][0]["alias"], "work");
-    assert_eq!(persisted["registrations"][0]["target"], "workbox");
-    assert_eq!(
-        persisted["registrations"][0]["node_id"],
-        "550e8400-e29b-41d4-a716-446655440000"
-    );
-
-    let stop = Command::new(env!("CARGO_BIN_EXE_boomux"))
-        .args(["daemon", "stop"])
-        .env("HOME", directory.join("home"))
-        .env("XDG_RUNTIME_DIR", directory.join("runtime"))
-        .env("XDG_STATE_HOME", directory.join("state"))
-        .output()
-        .unwrap();
-    assert!(stop.status.success());
+    assert!(directory.join("installed").exists());
+    assert!(directory.join("committed").exists());
+    assert!(!directory.join("restarted").exists());
     fs::remove_dir_all(directory).unwrap();
 }
 

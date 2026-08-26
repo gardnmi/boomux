@@ -169,7 +169,6 @@ fn edit_creates_comprehensive_private_template() {
         "[notifications]",
         "[notifications.sound]",
         "[recovery]",
-        "[scheduling]",
     ] {
         assert!(
             contents.contains(section),

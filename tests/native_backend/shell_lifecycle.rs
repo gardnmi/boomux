@@ -1215,7 +1215,7 @@ fn attach_with_environment(
     protocol::write_message(
         &mut stream,
         &protocol::Envelope::with_version(
-            16,
+            protocol::PROTOCOL_VERSION,
             protocol::Request::Attach {
                 shell_id: shell_id.into(),
                 takeover: false,
@@ -1230,7 +1230,7 @@ fn attach_with_environment(
     .unwrap();
     let response: protocol::Envelope<protocol::Response> =
         protocol::read_message(&mut stream).unwrap();
-    assert_eq!(response.version, 16);
+    assert_eq!(response.version, protocol::PROTOCOL_VERSION);
     match response.message {
         protocol::Response::Attached {
             token,
@@ -1242,7 +1242,7 @@ fn attach_with_environment(
             token,
             reconstruction,
             warning,
-            protocol_version: 16,
+            protocol_version: protocol::PROTOCOL_VERSION,
             profile,
         },
         response => panic!("unexpected attach response: {response:?}"),

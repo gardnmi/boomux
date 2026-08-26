@@ -4,8 +4,8 @@ use std::path::PathBuf;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 46;
-pub const MIN_PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 47;
+pub const MIN_PROTOCOL_VERSION: u32 = 47;
 pub const MAX_CONTROL_FRAME: usize = 8 * 1024 * 1024;
 pub const MAX_ATTACH_FRAME: usize = 1024 * 1024;
 
@@ -82,36 +82,9 @@ define_protocol_features! {
     WorkspaceDefaultCwd => (19, "request", ["protocol_19", "workspace_default_cwd"]),
     StructuredTerminalPreview => (20, "request", ["protocol_20", "structured_terminal_previews"]),
     FocusedTerminalRead => (21, "request", ["protocol_21", "focused_terminal_read"]),
-    AgentSchedules => (22, "agent schedule management", [
-        "protocol_22",
-        "agent_schedule_management",
-        "durable_agent_schedules",
-    ]),
-    ScheduledExecutions => (23, "scheduled execution dispatch", [
-        "protocol_23",
-        "scheduled_execution_dispatch",
-        "scheduled_execution_cancellation",
-        "schedule_owned_shells",
-    ]),
-    TimedScheduling => (24, "timed scheduling", [
-        "protocol_24",
-        "timed_schedule_dispatch",
-        "scheduler_health",
-        "bounded_scheduled_execution_concurrency",
-    ]),
-    ScheduledExecutionObservation => (25, "scheduled execution observation", [
-        "protocol_25",
-        "revision_aware_scheduled_execution_wait",
-        "bounded_scheduled_execution_history",
-        "scheduled_execution_notifications",
-    ]),
     ExactRunAttachment => (26, "exact run attachment", [
         "protocol_26",
         "exact_run_attachment",
-    ]),
-    AgentScheduleEditing => (27, "agent schedule editing", [
-        "protocol_27",
-        "agent_schedule_editing",
     ]),
     NodeIdentity => (28, "Node identity", [
         "protocol_28",
@@ -155,11 +128,6 @@ define_protocol_features! {
         "remote_integration_management",
         "remote_agent_session_catalog",
         "remote_exact_session_resume",
-    ]),
-    RemoteSchedules => (37, "remote Schedule management", [
-        "protocol_37",
-        "remote_agent_schedule_management",
-        "remote_scheduled_execution_observation",
     ]),
     GlobalWorkspaces => (38, "coordinated multi-Node Workspaces", [
         "protocol_38",
@@ -206,12 +174,9 @@ define_protocol_features! {
         "protocol_46",
         "kiro_stop_idle",
     ]),
+    ScheduleFreeProtocol => (47, "schedule-free protocol", ["protocol_47"]),
 }
 
-pub const DEFAULT_SCHEDULED_EXECUTION_LIST_LIMIT: u16 = 100;
-pub const MAX_SCHEDULED_EXECUTION_LIST_LIMIT: u16 = 1_000;
-pub const MAX_SCHEDULED_EXECUTION_SCHEDULE_PROJECTIONS: u16 = 100;
-pub const MAX_NODE_PROJECTION_EXECUTIONS: u16 = 1_000;
 pub const MAX_NODE_PROJECTION_TRANSITIONS: u16 = 256;
 pub const MAX_HOST_SERVICE_PROJECTS: usize = 2_000;
 pub const MAX_HOST_SERVICE_WARNINGS: usize = 64;
@@ -490,22 +455,6 @@ pub struct Snapshot {
     pub workspaces: Vec<WorkspaceSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub focused_terminal: Option<FocusedTerminalSnapshot>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub scheduler: Option<SchedulerHealth>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SchedulerState {
-    Active,
-    Offline,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SchedulerHealth {
-    pub state: SchedulerState,
-    pub max_concurrent: u16,
-    pub active_executions: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -617,7 +566,6 @@ pub struct NodeProjectionShell {
     pub id: String,
     pub workspace_id: String,
     pub name: String,
-    pub owner: ShellOwner,
     pub status: ShellStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
@@ -668,65 +616,12 @@ pub struct NodeProjectionAgent {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct NodeProjectionSchedule {
-    pub id: String,
-    pub workspace_id: String,
-    pub name: String,
-    pub integration: String,
-    pub state: AgentScheduleState,
-    pub trigger: AgentScheduleTrigger,
-    pub revision: u64,
-    pub prompt_revision: u64,
-    pub trigger_revision: u64,
-    pub created_at_ms: u64,
-    pub updated_at_ms: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub next_occurrence: Option<ScheduledOccurrence>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct NodeProjectionExecution {
-    pub id: String,
-    pub workspace_id: String,
-    pub schedule_id: String,
-    pub revision: u64,
-    pub state: ScheduledExecutionState,
-    pub dispatch_kind: ScheduledExecutionDispatchKind,
-    pub schedule_revision: u64,
-    pub prompt_revision: u64,
-    pub trigger_revision: u64,
-    pub requested_at_ms: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub scheduled_at_ms: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub started_at_ms: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ended_at_ms: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reason: Option<ScheduledExecutionReason>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub outcome: Option<ScheduledExecutionOutcome>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub shell_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub run_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agent_id: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct NodeProjectionSnapshot {
     pub node_id: String,
     pub workspaces: Vec<NodeProjectionWorkspace>,
     pub shells: Vec<NodeProjectionShell>,
     pub launchers: Vec<NodeProjectionLauncher>,
     pub agents: Vec<NodeProjectionAgent>,
-    pub schedules: Vec<NodeProjectionSchedule>,
-    pub executions: Vec<NodeProjectionExecution>,
-    pub executions_truncated: bool,
-    pub scheduler: SchedulerHealth,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -746,16 +641,6 @@ pub enum NodeProjectionTransitionKind {
     Agent {
         workspace_id: String,
         agent_id: String,
-        revision: u64,
-    },
-    Schedule {
-        workspace_id: String,
-        schedule_id: String,
-        revision: Option<u64>,
-    },
-    Execution {
-        workspace_id: String,
-        execution_id: String,
         revision: u64,
     },
     HandoffCompleted,
@@ -882,7 +767,6 @@ pub struct CombinedNode {
     pub workspace_owner_eligible: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_owner_unavailable_reason: Option<String>,
-    pub scheduler: SchedulerHealth,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_snapshot: Option<Snapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -902,278 +786,6 @@ pub struct WorkspaceSnapshot {
     pub launchers: Vec<WorkspaceLauncherSnapshot>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub agents: Vec<AgentInstanceSnapshot>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub schedules: Vec<AgentScheduleSnapshot>,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AgentScheduleState {
-    #[default]
-    Paused,
-    Enabled,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
-pub enum AgentScheduleSession {
-    #[default]
-    Fresh,
-    Continue {
-        external_session_id: String,
-    },
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AgentScheduleOverlapPolicy {
-    #[default]
-    Skip,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AgentScheduleTrigger {
-    pub cron: String,
-    pub timezone: String,
-}
-
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AgentScheduleSpec {
-    pub name: String,
-    pub cwd: PathBuf,
-    pub integration: String,
-    pub prompt: String,
-    #[serde(default)]
-    pub session: AgentScheduleSession,
-    pub trigger: AgentScheduleTrigger,
-    #[serde(default)]
-    pub state: AgentScheduleState,
-    #[serde(default)]
-    pub overlap_policy: AgentScheduleOverlapPolicy,
-}
-
-impl std::fmt::Debug for AgentScheduleSpec {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("AgentScheduleSpec")
-            .field("name", &self.name)
-            .field("cwd", &self.cwd)
-            .field("integration", &self.integration)
-            .field("prompt", &"<redacted>")
-            .field("session", &self.session)
-            .field("trigger", &self.trigger)
-            .field("state", &self.state)
-            .field("overlap_policy", &self.overlap_policy)
-            .finish()
-    }
-}
-
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AgentScheduleUpdate {
-    pub name: String,
-    pub prompt: String,
-    pub trigger: AgentScheduleTrigger,
-}
-
-impl std::fmt::Debug for AgentScheduleUpdate {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("AgentScheduleUpdate")
-            .field("name", &self.name)
-            .field("prompt", &"<redacted>")
-            .field("trigger", &self.trigger)
-            .finish()
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AgentScheduleSnapshot {
-    pub id: String,
-    pub workspace_id: String,
-    pub name: String,
-    pub cwd: PathBuf,
-    pub integration: String,
-    #[serde(default)]
-    pub session: AgentScheduleSession,
-    pub trigger: AgentScheduleTrigger,
-    #[serde(default)]
-    pub state: AgentScheduleState,
-    #[serde(default)]
-    pub overlap_policy: AgentScheduleOverlapPolicy,
-    pub revision: u64,
-    pub prompt_revision: u64,
-    pub trigger_revision: u64,
-    pub created_at_ms: u64,
-    pub updated_at_ms: u64,
-    pub evaluation_frontier_ms: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub execution_shell_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub next_occurrence: Option<ScheduledOccurrence>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ScheduledOccurrence {
-    pub trigger_revision: u64,
-    pub scheduled_at_ms: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ScheduledExecutionScheduleProjection {
-    pub schedule_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub next_occurrence: Option<ScheduledOccurrence>,
-}
-
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AgentScheduleInspection {
-    pub schedule: AgentScheduleSnapshot,
-    pub prompt: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ScheduledExecutionState {
-    Skipped,
-    Claimed,
-    Starting,
-    Active,
-    DispatchFailed,
-    Exited,
-    Cancelled,
-    Interrupted,
-}
-
-impl ScheduledExecutionState {
-    pub fn is_terminal(self) -> bool {
-        matches!(
-            self,
-            Self::Skipped
-                | Self::DispatchFailed
-                | Self::Exited
-                | Self::Cancelled
-                | Self::Interrupted
-        )
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ScheduledExecutionDispatchKind {
-    Manual,
-    Timed,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ScheduledExecutionReason {
-    Overlap,
-    ActiveSession,
-    WorkspaceCapacity,
-    GlobalCapacity,
-    Missed,
-    PausedRace,
-    InvalidTarget,
-    RunnerStartFailed,
-    HostSpawnFailed,
-    CancelledByUser,
-    ColdDaemonRecovery,
-    RunnerExitedWithoutReport,
-    DaemonShutdown,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum ScheduledExecutionOutcome {
-    ExitCode { code: i32 },
-    Signal { signal: i32 },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ScheduledExecutionSnapshot {
-    pub id: String,
-    pub workspace_id: String,
-    pub schedule_id: String,
-    #[serde(default)]
-    pub revision: u64,
-    pub state: ScheduledExecutionState,
-    pub dispatch_kind: ScheduledExecutionDispatchKind,
-    pub dispatch_key: String,
-    pub schedule_revision: u64,
-    pub prompt_revision: u64,
-    pub trigger_revision: u64,
-    pub requested_at_ms: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub scheduled_at_ms: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub coalesced_through_ms: Option<u64>,
-    pub started_at_ms: Option<u64>,
-    pub ended_at_ms: Option<u64>,
-    pub cwd: PathBuf,
-    pub integration: String,
-    pub session: AgentScheduleSession,
-    pub reason: Option<ScheduledExecutionReason>,
-    pub outcome: Option<ScheduledExecutionOutcome>,
-    pub shell_id: Option<String>,
-    pub run_id: Option<String>,
-    pub agent_id: Option<String>,
-    pub external_session_id: Option<String>,
-}
-
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ScheduledExecutionClaim {
-    pub execution: ScheduledExecutionSnapshot,
-    pub prompt: String,
-}
-
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct ScheduledRunnerCapability(String);
-
-impl ScheduledRunnerCapability {
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl std::fmt::Debug for ScheduledRunnerCapability {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("<redacted>")
-    }
-}
-
-impl std::fmt::Debug for ScheduledExecutionClaim {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("ScheduledExecutionClaim")
-            .field("execution", &self.execution)
-            .field("prompt", &"<redacted>")
-            .finish()
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "result", rename_all = "snake_case")]
-pub enum ScheduledRunnerResult {
-    Active,
-    SpawnFailed,
-    Exited { outcome: ScheduledExecutionOutcome },
-}
-
-impl std::fmt::Debug for AgentScheduleInspection {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("AgentScheduleInspection")
-            .field("schedule", &self.schedule)
-            .field("prompt", &"<redacted>")
-            .finish()
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1313,8 +925,6 @@ pub struct ShellSnapshot {
     pub cwd: PathBuf,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub command: Vec<String>,
-    #[serde(default)]
-    pub owner: ShellOwner,
     pub status: ShellStatus,
     #[serde(default)]
     pub run: Option<ShellRunSnapshot>,
@@ -1322,16 +932,6 @@ pub struct ShellSnapshot {
     pub recovered_agent_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub foreground_process: Option<String>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum ShellOwner {
-    #[default]
-    User,
-    Schedule {
-        schedule_id: String,
-    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1407,18 +1007,6 @@ pub enum RoutedOperation {
         launcher_id: String,
         spec: WorkspaceLauncherSpec,
     },
-    CreateWorkspaceAgentSchedule {
-        workspace_id: String,
-        workspace_name: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        default_cwd: Option<PathBuf>,
-        schedule_id: String,
-        spec: AgentScheduleSpec,
-    },
-    CreateAgentSchedule {
-        workspace_id: String,
-        spec: AgentScheduleSpec,
-    },
     GetWorkspace {
         workspace_id: String,
     },
@@ -1430,25 +1018,6 @@ pub enum RoutedOperation {
     },
     GetAgent {
         agent_id: String,
-    },
-    GetAgentSchedule {
-        schedule_id: String,
-    },
-    GetScheduledExecution {
-        execution_id: String,
-    },
-    ListScheduledExecutions {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        workspace_id: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        schedule_id: Option<String>,
-        limit: u16,
-    },
-    WaitScheduledExecution {
-        execution_id: String,
-        after_revision: u64,
-        #[serde(default)]
-        wait_ms: u32,
     },
     RenameWorkspace {
         workspace_id: String,
@@ -1482,31 +1051,6 @@ pub enum RoutedOperation {
         launcher_id: String,
         expected_revision: u64,
     },
-    PauseAgentSchedule {
-        schedule_id: String,
-        expected_revision: u64,
-    },
-    ResumeAgentSchedule {
-        schedule_id: String,
-        expected_revision: u64,
-    },
-    UpdateAgentSchedule {
-        schedule_id: String,
-        expected_revision: u64,
-        update: AgentScheduleUpdate,
-    },
-    RemoveAgentSchedule {
-        schedule_id: String,
-        expected_revision: u64,
-    },
-    RunAgentSchedule {
-        schedule_id: String,
-        dispatch_key: String,
-    },
-    CancelScheduledExecution {
-        execution_id: String,
-        expected_revision: u64,
-    },
     AcknowledgeAgentAttention {
         agent_id: String,
         observation_revision: u64,
@@ -1519,9 +1063,6 @@ pub enum RoutedGuard {
     ExactId,
     ResourceRevision,
     ResourceRevisionAndRun,
-    ScheduleRevision,
-    ExecutionRevision,
-    DispatchKey,
     AttentionObservationRevision,
 }
 
@@ -1541,28 +1082,19 @@ impl RoutedOperation {
     pub const fn classification(&self) -> RoutedOperationClass {
         use RoutedAmbiguity::{ReadAndProve, RetrySameRequest};
         use RoutedGuard::{
-            AttentionObservationRevision, DispatchKey, ExactId, ExecutionRevision, None,
-            ResourceRevision, ResourceRevisionAndRun, ScheduleRevision,
+            AttentionObservationRevision, ExactId, ResourceRevision, ResourceRevisionAndRun,
         };
         match self {
-            Self::CreateWorkspaceShell { .. }
-            | Self::CreateWorkspaceLauncher { .. }
-            | Self::CreateWorkspaceAgentSchedule { .. } => RoutedOperationClass {
-                guard: ExactId,
-                ambiguity: RetrySameRequest,
-            },
-            Self::CreateAgentSchedule { .. } => RoutedOperationClass {
-                guard: None,
-                ambiguity: ReadAndProve,
-            },
+            Self::CreateWorkspaceShell { .. } | Self::CreateWorkspaceLauncher { .. } => {
+                RoutedOperationClass {
+                    guard: ExactId,
+                    ambiguity: RetrySameRequest,
+                }
+            }
             Self::GetWorkspace { .. }
             | Self::GetShell { .. }
             | Self::GetLauncher { .. }
-            | Self::GetAgent { .. }
-            | Self::GetAgentSchedule { .. }
-            | Self::GetScheduledExecution { .. }
-            | Self::ListScheduledExecutions { .. }
-            | Self::WaitScheduledExecution { .. } => RoutedOperationClass {
+            | Self::GetAgent { .. } => RoutedOperationClass {
                 guard: ExactId,
                 ambiguity: RetrySameRequest,
             },
@@ -1577,21 +1109,6 @@ impl RoutedOperation {
             },
             Self::RestartShell { .. } => RoutedOperationClass {
                 guard: ResourceRevisionAndRun,
-                ambiguity: ReadAndProve,
-            },
-            Self::PauseAgentSchedule { .. }
-            | Self::ResumeAgentSchedule { .. }
-            | Self::UpdateAgentSchedule { .. }
-            | Self::RemoveAgentSchedule { .. } => RoutedOperationClass {
-                guard: ScheduleRevision,
-                ambiguity: ReadAndProve,
-            },
-            Self::RunAgentSchedule { .. } => RoutedOperationClass {
-                guard: DispatchKey,
-                ambiguity: RetrySameRequest,
-            },
-            Self::CancelScheduledExecution { .. } => RoutedOperationClass {
-                guard: ExecutionRevision,
                 ambiguity: ReadAndProve,
             },
             Self::AcknowledgeAgentAttention { .. } => RoutedOperationClass {
@@ -1610,9 +1127,7 @@ impl RoutedOperation {
 
     pub fn ambiguity_probe(&self) -> Option<Request> {
         match self {
-            Self::CreateWorkspaceShell { .. }
-            | Self::CreateWorkspaceLauncher { .. }
-            | Self::CreateWorkspaceAgentSchedule { .. } => None,
+            Self::CreateWorkspaceShell { .. } | Self::CreateWorkspaceLauncher { .. } => None,
             Self::RenameWorkspace { workspace_id, .. }
             | Self::CloseWorkspace { workspace_id, .. } => Some(Request::GetWorkspace {
                 workspace_id: workspace_id.clone(),
@@ -1625,17 +1140,6 @@ impl RoutedOperation {
             Self::RenameLauncher { launcher_id, .. } | Self::RemoveLauncher { launcher_id, .. } => {
                 Some(Request::GetLauncher {
                     launcher_id: launcher_id.clone(),
-                })
-            }
-            Self::PauseAgentSchedule { schedule_id, .. }
-            | Self::ResumeAgentSchedule { schedule_id, .. }
-            | Self::UpdateAgentSchedule { schedule_id, .. }
-            | Self::RemoveAgentSchedule { schedule_id, .. } => Some(Request::GetAgentSchedule {
-                schedule_id: schedule_id.clone(),
-            }),
-            Self::CancelScheduledExecution { execution_id, .. } => {
-                Some(Request::GetScheduledExecution {
-                    execution_id: execution_id.clone(),
                 })
             }
             _ => None,
@@ -1670,48 +1174,10 @@ impl RoutedOperation {
                 launcher_id,
                 spec,
             },
-            Self::CreateWorkspaceAgentSchedule {
-                workspace_id,
-                workspace_name,
-                default_cwd,
-                schedule_id,
-                spec,
-            } => Request::CreateWorkspaceAgentSchedule {
-                workspace_id,
-                workspace_name,
-                default_cwd,
-                schedule_id,
-                spec,
-            },
-            Self::CreateAgentSchedule { workspace_id, spec } => {
-                Request::CreateAgentSchedule { workspace_id, spec }
-            }
             Self::GetWorkspace { workspace_id } => Request::GetWorkspace { workspace_id },
             Self::GetShell { shell_id } => Request::GetShell { shell_id },
             Self::GetLauncher { launcher_id } => Request::GetLauncher { launcher_id },
             Self::GetAgent { agent_id } => Request::GetAgent { agent_id },
-            Self::GetAgentSchedule { schedule_id } => Request::GetAgentSchedule { schedule_id },
-            Self::GetScheduledExecution { execution_id } => {
-                Request::GetScheduledExecution { execution_id }
-            }
-            Self::ListScheduledExecutions {
-                workspace_id,
-                schedule_id,
-                limit,
-            } => Request::ListScheduledExecutions {
-                workspace_id,
-                schedule_id,
-                limit: Some(limit),
-            },
-            Self::WaitScheduledExecution {
-                execution_id,
-                after_revision,
-                wait_ms,
-            } => Request::WaitScheduledExecution {
-                execution_id,
-                after_revision,
-                wait_ms,
-            },
             Self::RenameWorkspace {
                 workspace_id,
                 name,
@@ -1767,50 +1233,6 @@ impl RoutedOperation {
                 expected_revision,
             } => Request::GuardedRemoveLauncher {
                 launcher_id,
-                expected_revision,
-            },
-            Self::PauseAgentSchedule {
-                schedule_id,
-                expected_revision,
-            } => Request::GuardedPauseAgentSchedule {
-                schedule_id,
-                expected_revision,
-            },
-            Self::ResumeAgentSchedule {
-                schedule_id,
-                expected_revision,
-            } => Request::GuardedResumeAgentSchedule {
-                schedule_id,
-                expected_revision,
-            },
-            Self::UpdateAgentSchedule {
-                schedule_id,
-                expected_revision,
-                update,
-            } => Request::UpdateAgentSchedule {
-                schedule_id,
-                expected_revision,
-                update,
-            },
-            Self::RemoveAgentSchedule {
-                schedule_id,
-                expected_revision,
-            } => Request::GuardedRemoveAgentSchedule {
-                schedule_id,
-                expected_revision,
-            },
-            Self::RunAgentSchedule {
-                schedule_id,
-                dispatch_key,
-            } => Request::RunAgentSchedule {
-                schedule_id,
-                dispatch_key,
-            },
-            Self::CancelScheduledExecution {
-                execution_id,
-                expected_revision,
-            } => Request::GuardedCancelScheduledExecution {
-                execution_id,
                 expected_revision,
             },
             Self::AcknowledgeAgentAttention {
@@ -1916,34 +1338,6 @@ pub enum DaemonEventKind {
         shell_id: String,
         agent: AgentInstanceSnapshot,
     },
-    AgentScheduleCreated {
-        workspace_id: String,
-        schedule: AgentScheduleSnapshot,
-    },
-    AgentSchedulePaused {
-        workspace_id: String,
-        schedule: AgentScheduleSnapshot,
-    },
-    AgentScheduleResumed {
-        workspace_id: String,
-        schedule: AgentScheduleSnapshot,
-    },
-    AgentScheduleUpdated {
-        workspace_id: String,
-        schedule: AgentScheduleSnapshot,
-    },
-    AgentScheduleRemoved {
-        workspace_id: String,
-        schedule_id: String,
-    },
-    ScheduledExecutionCreated {
-        workspace_id: String,
-        execution: ScheduledExecutionSnapshot,
-    },
-    ScheduledExecutionChanged {
-        workspace_id: String,
-        execution: ScheduledExecutionSnapshot,
-    },
     NodeProjectionChanged {
         node_id: String,
         cache_generation: u64,
@@ -1993,22 +1387,12 @@ pub struct NotificationDeliveryConfig {
     pub sound_enabled: bool,
     pub blocked: bool,
     pub completed: bool,
-    #[serde(default)]
-    pub scheduled_dispatch_failed: bool,
-    #[serde(default)]
-    pub scheduled_interrupted: bool,
     pub blocked_sound: String,
     pub completed_sound: String,
-    #[serde(default = "default_scheduled_dispatch_failed_sound")]
-    pub scheduled_dispatch_failed_sound: String,
-    #[serde(default = "default_scheduled_interrupted_sound")]
-    pub scheduled_interrupted_sound: String,
     #[serde(default = "default_true")]
     pub resume_agents: bool,
     #[serde(default)]
     pub persist_terminal_history: bool,
-    #[serde(default = "default_max_scheduled_execution_concurrency")]
-    pub max_scheduled_execution_concurrency: u16,
 }
 
 impl Default for NotificationDeliveryConfig {
@@ -2018,33 +1402,16 @@ impl Default for NotificationDeliveryConfig {
             sound_enabled: false,
             blocked: true,
             completed: true,
-            scheduled_dispatch_failed: false,
-            scheduled_interrupted: false,
             blocked_sound: "message-new-instant".into(),
             completed_sound: "complete".into(),
-            scheduled_dispatch_failed_sound: default_scheduled_dispatch_failed_sound(),
-            scheduled_interrupted_sound: default_scheduled_interrupted_sound(),
             resume_agents: true,
             persist_terminal_history: false,
-            max_scheduled_execution_concurrency: 4,
         }
     }
 }
 
-fn default_max_scheduled_execution_concurrency() -> u16 {
-    4
-}
-
 fn default_true() -> bool {
     true
-}
-
-fn default_scheduled_dispatch_failed_sound() -> String {
-    "dialog-warning".into()
-}
-
-fn default_scheduled_interrupted_sound() -> String {
-    "dialog-warning".into()
 }
 
 impl std::fmt::Debug for UnixEnvironmentVariable {
@@ -2199,17 +1566,6 @@ pub enum Request {
         launcher_id: String,
         spec: WorkspaceLauncherSpec,
     },
-    CreateGlobalWorkspaceAgentSchedule {
-        operation_id: String,
-        global_workspace_id: String,
-        expected_global_revision: u64,
-        node_id: String,
-        owner_workspace_id: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        default_cwd: Option<PathBuf>,
-        schedule_id: String,
-        spec: AgentScheduleSpec,
-    },
     RouteNodeOperation {
         node_id: String,
         operation: RoutedOperation,
@@ -2242,26 +1598,6 @@ pub enum Request {
     GetAgent {
         agent_id: String,
     },
-    GetAgentSchedule {
-        schedule_id: String,
-    },
-    ListScheduledExecutions {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        workspace_id: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        schedule_id: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        limit: Option<u16>,
-    },
-    GetScheduledExecution {
-        execution_id: String,
-    },
-    WaitScheduledExecution {
-        execution_id: String,
-        after_revision: u64,
-        #[serde(default)]
-        wait_ms: u32,
-    },
     WaitAgent {
         agent_id: String,
         after_revision: u64,
@@ -2290,14 +1626,6 @@ pub enum Request {
         launcher_id: String,
         spec: WorkspaceLauncherSpec,
     },
-    CreateWorkspaceAgentSchedule {
-        workspace_id: String,
-        workspace_name: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        default_cwd: Option<PathBuf>,
-        schedule_id: String,
-        spec: AgentScheduleSpec,
-    },
     CreateShell {
         #[serde(default)]
         workspace_id: Option<String>,
@@ -2306,39 +1634,6 @@ pub enum Request {
     CreateLauncher {
         workspace_id: String,
         spec: WorkspaceLauncherSpec,
-    },
-    CreateAgentSchedule {
-        workspace_id: String,
-        spec: AgentScheduleSpec,
-    },
-    UpdateAgentSchedule {
-        schedule_id: String,
-        expected_revision: u64,
-        update: AgentScheduleUpdate,
-    },
-    RunAgentSchedule {
-        schedule_id: String,
-        dispatch_key: String,
-    },
-    CancelScheduledExecution {
-        execution_id: String,
-    },
-    GuardedCancelScheduledExecution {
-        execution_id: String,
-        expected_revision: u64,
-    },
-    ResolveScheduledExecutionClaim {
-        schedule_id: String,
-        shell_id: String,
-        run_id: String,
-        runner_token: ScheduledRunnerCapability,
-    },
-    ReportScheduledRunner {
-        execution_id: String,
-        shell_id: String,
-        run_id: String,
-        runner_token: ScheduledRunnerCapability,
-        result: ScheduledRunnerResult,
     },
     RegisterAgent {
         shell_id: String,
@@ -2495,27 +1790,6 @@ pub enum Request {
         launcher_id: String,
         expected_revision: u64,
     },
-    PauseAgentSchedule {
-        schedule_id: String,
-    },
-    GuardedPauseAgentSchedule {
-        schedule_id: String,
-        expected_revision: u64,
-    },
-    ResumeAgentSchedule {
-        schedule_id: String,
-    },
-    GuardedResumeAgentSchedule {
-        schedule_id: String,
-        expected_revision: u64,
-    },
-    RemoveAgentSchedule {
-        schedule_id: String,
-    },
-    GuardedRemoveAgentSchedule {
-        schedule_id: String,
-        expected_revision: u64,
-    },
     Attach {
         shell_id: String,
         takeover: bool,
@@ -2559,6 +1833,7 @@ impl Request {
         self.required_feature()
             .map(ProtocolFeature::minimum_version)
             .unwrap_or(MIN_PROTOCOL_VERSION)
+            .max(MIN_PROTOCOL_VERSION)
     }
 
     pub fn required_feature(&self) -> Option<ProtocolFeature> {
@@ -2595,39 +1870,23 @@ impl Request {
             | Self::RetryGlobalWorkspaceClose { .. }
             | Self::CreateGlobalWorkspaceShell { .. }
             | Self::CreateGlobalWorkspaceWithShell { .. }
-            | Self::CreateGlobalWorkspaceLauncher { .. }
-            | Self::CreateGlobalWorkspaceAgentSchedule { .. } => {
-                Some(ProtocolFeature::GlobalWorkspaces)
-            }
+            | Self::CreateGlobalWorkspaceLauncher { .. } => Some(ProtocolFeature::GlobalWorkspaces),
             Self::CreateWorkspaceShell { .. }
             | Self::CreateWorkspaceLauncher { .. }
-            | Self::CreateWorkspaceAgentSchedule { .. }
             | Self::RouteNodeOperation {
                 operation:
                     RoutedOperation::CreateWorkspaceShell { .. }
-                    | RoutedOperation::CreateWorkspaceLauncher { .. }
-                    | RoutedOperation::CreateWorkspaceAgentSchedule { .. },
+                    | RoutedOperation::CreateWorkspaceLauncher { .. },
                 ..
             } => Some(ProtocolFeature::GlobalWorkspaces),
-            Self::RouteNodeOperation {
-                operation:
-                    RoutedOperation::CreateAgentSchedule { .. }
-                    | RoutedOperation::ListScheduledExecutions { .. }
-                    | RoutedOperation::WaitScheduledExecution { .. },
-                ..
-            } => Some(ProtocolFeature::RemoteSchedules),
             Self::RouteNodeOperation { .. }
-            | Self::GuardedCancelScheduledExecution { .. }
             | Self::GuardedRenameWorkspace { .. }
             | Self::GuardedRenameShell { .. }
             | Self::GuardedRenameLauncher { .. }
             | Self::GuardedCloseWorkspace { .. }
             | Self::GuardedCloseShell { .. }
             | Self::GuardedRestartShell { .. }
-            | Self::GuardedRemoveLauncher { .. }
-            | Self::GuardedPauseAgentSchedule { .. }
-            | Self::GuardedResumeAgentSchedule { .. }
-            | Self::GuardedRemoveAgentSchedule { .. } => Some(ProtocolFeature::GuardedNodeRouting),
+            | Self::GuardedRemoveLauncher { .. } => Some(ProtocolFeature::GuardedNodeRouting),
             Self::HostService { .. }
             | Self::RouteNodeHostService { .. }
             | Self::ResumeAgentSession { .. }
@@ -2640,21 +1899,6 @@ impl Request {
                 owner_environment: true,
                 ..
             } => Some(ProtocolFeature::RemotePtyAttachment),
-            Self::WaitScheduledExecution { .. } => {
-                Some(ProtocolFeature::ScheduledExecutionObservation)
-            }
-            Self::ListScheduledExecutions { .. }
-            | Self::GetScheduledExecution { .. }
-            | Self::RunAgentSchedule { .. }
-            | Self::CancelScheduledExecution { .. }
-            | Self::ResolveScheduledExecutionClaim { .. }
-            | Self::ReportScheduledRunner { .. } => Some(ProtocolFeature::ScheduledExecutions),
-            Self::UpdateAgentSchedule { .. } => Some(ProtocolFeature::AgentScheduleEditing),
-            Self::CreateAgentSchedule { .. }
-            | Self::GetAgentSchedule { .. }
-            | Self::PauseAgentSchedule { .. }
-            | Self::ResumeAgentSchedule { .. }
-            | Self::RemoveAgentSchedule { .. } => Some(ProtocolFeature::AgentSchedules),
             Self::ReadShellPreview { .. } => Some(ProtocolFeature::StructuredTerminalPreview),
             Self::GetFocusedTerminal => Some(ProtocolFeature::FocusedTerminalRead),
             Self::CreateWorkspace {
@@ -2664,21 +1908,6 @@ impl Request {
             | Self::CreateShell {
                 workspace_id: None, ..
             } => Some(ProtocolFeature::WorkspaceDefaultCwd),
-            Self::RestartWithNotificationConfig { notifications, .. }
-                if notifications.scheduled_dispatch_failed
-                    || notifications.scheduled_interrupted =>
-            {
-                Some(ProtocolFeature::ScheduledExecutionObservation)
-            }
-            Self::RestartWithNotificationConfig { notifications, .. }
-                if notifications.max_scheduled_execution_concurrency != 4 =>
-            {
-                Some(ProtocolFeature::TimedScheduling)
-            }
-            Self::RestartWithNotificationConfig {
-                environment: Some(_),
-                ..
-            } => Some(ProtocolFeature::ScheduledExecutions),
             Self::RestartWithNotificationConfig { .. } => {
                 Some(ProtocolFeature::RestartNotificationConfig)
             }
@@ -2836,37 +2065,6 @@ pub enum Response {
     ClaudeRemoteControlBinding {
         binding: Option<ClaudeRemoteControlBindingSnapshot>,
     },
-    AgentSchedule {
-        schedule: AgentScheduleSnapshot,
-    },
-    AgentScheduleInspection {
-        inspection: AgentScheduleInspection,
-    },
-    ScheduledExecution {
-        execution: ScheduledExecutionSnapshot,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        next_occurrence: Option<ScheduledOccurrence>,
-    },
-    ScheduledExecutions {
-        executions: Vec<ScheduledExecutionSnapshot>,
-        #[serde(default)]
-        limit: u16,
-        #[serde(default)]
-        truncated: bool,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        schedules: Vec<ScheduledExecutionScheduleProjection>,
-        #[serde(default)]
-        schedule_limit: u16,
-        #[serde(default)]
-        schedules_truncated: bool,
-    },
-    ScheduledExecutionWait {
-        execution: ScheduledExecutionSnapshot,
-        changed: bool,
-    },
-    ScheduledExecutionClaim {
-        claim: ScheduledExecutionClaim,
-    },
     AgentWait {
         agent: AgentInstanceSnapshot,
         changed: bool,
@@ -2923,29 +2121,6 @@ pub enum RoutedOperationResult {
     },
     Agent {
         agent: AgentInstanceSnapshot,
-    },
-    AgentSchedule {
-        schedule: AgentScheduleSnapshot,
-    },
-    AgentScheduleInspection {
-        inspection: AgentScheduleInspection,
-    },
-    ScheduledExecution {
-        execution: ScheduledExecutionSnapshot,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        next_occurrence: Option<ScheduledOccurrence>,
-    },
-    ScheduledExecutions {
-        executions: Vec<ScheduledExecutionSnapshot>,
-        limit: u16,
-        truncated: bool,
-        schedules: Vec<ScheduledExecutionScheduleProjection>,
-        schedule_limit: u16,
-        schedules_truncated: bool,
-    },
-    ScheduledExecutionWait {
-        execution: ScheduledExecutionSnapshot,
-        changed: bool,
     },
     AgentAttentionAcknowledged {
         agent: AgentInstanceSnapshot,
@@ -3113,118 +2288,6 @@ mod tests {
         }
     }
 
-    fn test_schedule() -> AgentScheduleSnapshot {
-        AgentScheduleSnapshot {
-            id: "schedule-1".into(),
-            workspace_id: "w1".into(),
-            name: "morning review".into(),
-            cwd: "/tmp/project".into(),
-            integration: "opencode".into(),
-            session: AgentScheduleSession::Continue {
-                external_session_id: "session-1".into(),
-            },
-            trigger: AgentScheduleTrigger {
-                cron: "0 9 * * 1-5".into(),
-                timezone: "America/New_York".into(),
-            },
-            state: AgentScheduleState::Enabled,
-            overlap_policy: AgentScheduleOverlapPolicy::Skip,
-            revision: 3,
-            prompt_revision: 2,
-            trigger_revision: 1,
-            created_at_ms: 10,
-            updated_at_ms: 20,
-            evaluation_frontier_ms: 30,
-            execution_shell_id: Some("shell-1".into()),
-            next_occurrence: Some(ScheduledOccurrence {
-                trigger_revision: 1,
-                scheduled_at_ms: 60,
-            }),
-        }
-    }
-
-    fn test_execution() -> ScheduledExecutionSnapshot {
-        ScheduledExecutionSnapshot {
-            id: "execution-1".into(),
-            workspace_id: "workspace-1".into(),
-            schedule_id: "schedule-1".into(),
-            revision: 4,
-            state: ScheduledExecutionState::Exited,
-            dispatch_kind: ScheduledExecutionDispatchKind::Manual,
-            dispatch_key: "dispatch-1".into(),
-            schedule_revision: 3,
-            prompt_revision: 2,
-            trigger_revision: 1,
-            requested_at_ms: 10,
-            scheduled_at_ms: None,
-            coalesced_through_ms: None,
-            started_at_ms: Some(11),
-            ended_at_ms: Some(12),
-            cwd: "/tmp/project".into(),
-            integration: "opencode".into(),
-            session: AgentScheduleSession::Fresh,
-            reason: None,
-            outcome: Some(ScheduledExecutionOutcome::ExitCode { code: 0 }),
-            shell_id: Some("shell-1".into()),
-            run_id: Some("run-1".into()),
-            agent_id: None,
-            external_session_id: None,
-        }
-    }
-
-    #[test]
-    fn scheduled_execution_observation_messages_round_trip_and_list_defaults_are_bounded() {
-        let legacy: Request = serde_json::from_str(
-            r#"{"request":"list_scheduled_executions","workspace_id":null,"schedule_id":null}"#,
-        )
-        .unwrap();
-        assert!(matches!(
-            legacy,
-            Request::ListScheduledExecutions { limit: None, .. }
-        ));
-
-        let wait = Request::WaitScheduledExecution {
-            execution_id: "execution-1".into(),
-            after_revision: 3,
-            wait_ms: 30_000,
-        };
-        assert_eq!(
-            serde_json::from_value::<Request>(serde_json::to_value(&wait).unwrap()).unwrap(),
-            wait
-        );
-        assert_eq!(
-            wait.required_feature(),
-            Some(ProtocolFeature::ScheduledExecutionObservation)
-        );
-
-        for response in [
-            Response::ScheduledExecutions {
-                executions: vec![test_execution()],
-                limit: 100,
-                truncated: true,
-                schedules: vec![ScheduledExecutionScheduleProjection {
-                    schedule_id: "schedule-1".into(),
-                    next_occurrence: Some(ScheduledOccurrence {
-                        trigger_revision: 1,
-                        scheduled_at_ms: 100,
-                    }),
-                }],
-                schedule_limit: 100,
-                schedules_truncated: false,
-            },
-            Response::ScheduledExecutionWait {
-                execution: test_execution(),
-                changed: true,
-            },
-        ] {
-            assert_eq!(
-                serde_json::from_value::<Response>(serde_json::to_value(&response).unwrap())
-                    .unwrap(),
-                response
-            );
-        }
-    }
-
     #[derive(Deserialize)]
     struct ProtocolSixShellSnapshot {
         id: String,
@@ -3286,9 +2349,6 @@ mod tests {
 
         assert!(config.resume_agents);
         assert!(!config.persist_terminal_history);
-        assert_eq!(config.max_scheduled_execution_concurrency, 4);
-        assert!(!config.scheduled_dispatch_failed);
-        assert!(!config.scheduled_interrupted);
     }
 
     #[test]
@@ -3357,14 +2417,7 @@ mod tests {
 
         assert!(snapshot.launchers.is_empty());
         assert!(snapshot.agents.is_empty());
-        assert!(snapshot.schedules.is_empty());
         assert!(snapshot.default_cwd.is_none());
-        assert!(
-            serde_json::to_value(snapshot)
-                .unwrap()
-                .get("schedules")
-                .is_none()
-        );
     }
 
     #[test]
@@ -3446,9 +2499,9 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_forty_six_with_minimum_six() {
-        assert_eq!(PROTOCOL_VERSION, 46);
-        assert_eq!(MIN_PROTOCOL_VERSION, 6);
+    fn protocol_version_is_forty_seven_only() {
+        assert_eq!(PROTOCOL_VERSION, 47);
+        assert_eq!(MIN_PROTOCOL_VERSION, 47);
     }
 
     #[test]
@@ -3466,7 +2519,7 @@ mod tests {
             request.required_feature(),
             Some(ProtocolFeature::CollaborativeExactRunAttachment)
         );
-        assert_eq!(request.minimum_protocol_version(), 44);
+        assert_eq!(request.minimum_protocol_version(), 47);
         assert_eq!(
             ProtocolFeature::CollaborativeExactRunAttachment.capability_names(),
             &["protocol_44", "collaborative_exact_run_attachment"]
@@ -3670,7 +2723,7 @@ mod tests {
                 request.required_feature(),
                 Some(ProtocolFeature::OpenCodeSharedRuntimeClaims)
             );
-            assert_eq!(request.minimum_protocol_version(), 42);
+            assert_eq!(request.minimum_protocol_version(), 47);
         }
 
         let old_request: Request = serde_json::from_value(serde_json::json!({
@@ -3790,7 +2843,7 @@ mod tests {
                 request.required_feature(),
                 Some(ProtocolFeature::ClaudeRemoteControlBindings)
             );
-            assert_eq!(request.minimum_protocol_version(), 43);
+            assert_eq!(request.minimum_protocol_version(), 47);
         }
 
         for response in [
@@ -3843,7 +2896,7 @@ mod tests {
                 request.required_feature(),
                 Some(ProtocolFeature::KiroLaunchHolders)
             );
-            assert_eq!(request.minimum_protocol_version(), 45);
+            assert_eq!(request.minimum_protocol_version(), 47);
         }
         for response in [
             Response::KiroLaunchHolder {
@@ -3878,7 +2931,7 @@ mod tests {
             request.required_feature(),
             Some(ProtocolFeature::KiroStopIdle)
         );
-        assert_eq!(request.minimum_protocol_version(), 46);
+        assert_eq!(request.minimum_protocol_version(), 47);
         let encoded = serde_json::to_value(&request).unwrap();
         assert_eq!(serde_json::from_value::<Request>(encoded).unwrap(), request);
     }
@@ -3907,14 +2960,6 @@ mod tests {
             shells: Vec::new(),
             launchers: Vec::new(),
             agents: Vec::new(),
-            schedules: Vec::new(),
-            executions: Vec::new(),
-            executions_truncated: false,
-            scheduler: SchedulerHealth {
-                state: SchedulerState::Active,
-                max_concurrent: 4,
-                active_executions: 0,
-            },
         };
         let mut encoded = serde_json::to_value(projection).unwrap();
         let serialized = encoded.to_string();
@@ -4034,12 +3079,7 @@ mod tests {
             "stale": false,
             "observed_at_ms": 1,
             "observed_capabilities": [],
-            "observed_helper_version": "0.41.0",
-            "scheduler": {
-                "state": "active",
-                "max_concurrent": 4,
-                "active_executions": 0
-            }
+            "observed_helper_version": "0.41.0"
         }))
         .unwrap();
         assert_eq!(node.observed_helper_version.as_deref(), Some("0.41.0"));
@@ -4082,63 +3122,6 @@ mod tests {
                 "operation": "shutdown"
             }))
             .is_err()
-        );
-    }
-
-    #[test]
-    fn protocol_thirty_seven_routes_remote_schedule_reads_without_broadening_retries() {
-        let create = RoutedOperation::CreateAgentSchedule {
-            workspace_id: "workspace-1".into(),
-            spec: AgentScheduleSpec {
-                name: "review".into(),
-                cwd: "/owner/work".into(),
-                integration: "opencode".into(),
-                prompt: "PRIVATE ROUTED PROMPT".into(),
-                session: AgentScheduleSession::Fresh,
-                trigger: AgentScheduleTrigger {
-                    cron: "0 2 * * *".into(),
-                    timezone: "UTC".into(),
-                },
-                state: AgentScheduleState::Paused,
-                overlap_policy: AgentScheduleOverlapPolicy::Skip,
-            },
-        };
-        let request = Request::RouteNodeOperation {
-            node_id: "node-1".into(),
-            operation: create.clone(),
-        };
-        assert_eq!(
-            request.required_feature(),
-            Some(ProtocolFeature::RemoteSchedules)
-        );
-        assert!(!create.is_retryable());
-        assert!(format!("{create:?}").contains("<redacted>"));
-        assert!(!format!("{create:?}").contains("PRIVATE ROUTED PROMPT"));
-
-        let list = RoutedOperation::ListScheduledExecutions {
-            workspace_id: None,
-            schedule_id: Some("schedule-1".into()),
-            limit: 100,
-        };
-        assert!(list.is_retryable());
-        assert_eq!(
-            serde_json::from_value::<RoutedOperation>(serde_json::to_value(&list).unwrap())
-                .unwrap(),
-            list
-        );
-        assert!(
-            RoutedOperation::RunAgentSchedule {
-                schedule_id: "schedule-1".into(),
-                dispatch_key: "dispatch-1".into(),
-            }
-            .is_retryable()
-        );
-        assert!(
-            !RoutedOperation::CancelScheduledExecution {
-                execution_id: "execution-1".into(),
-                expected_revision: 4,
-            }
-            .is_retryable()
         );
     }
 
@@ -4218,305 +3201,6 @@ mod tests {
         assert_eq!(
             request.required_feature(),
             Some(ProtocolFeature::GlobalWorkspaces)
-        );
-
-        let schedule = RoutedOperation::CreateWorkspaceAgentSchedule {
-            workspace_id,
-            workspace_name: "work".into(),
-            default_cwd: Some("/owner/work".into()),
-            schedule_id: uuid::Uuid::from_u128(5).to_string(),
-            spec: AgentScheduleSpec {
-                name: "review".into(),
-                cwd: "/owner/work".into(),
-                integration: "opencode".into(),
-                prompt: "PRIVATE WORKSPACE PROMPT".into(),
-                session: AgentScheduleSession::Fresh,
-                trigger: AgentScheduleTrigger {
-                    cron: "0 2 * * *".into(),
-                    timezone: "UTC".into(),
-                },
-                state: AgentScheduleState::Paused,
-                overlap_policy: AgentScheduleOverlapPolicy::Skip,
-            },
-        };
-        assert!(!format!("{schedule:?}").contains("PRIVATE WORKSPACE PROMPT"));
-        assert!(format!("{schedule:?}").contains("<redacted>"));
-
-        let request = Request::CreateGlobalWorkspaceAgentSchedule {
-            operation_id: uuid::Uuid::from_u128(10).to_string(),
-            global_workspace_id: uuid::Uuid::from_u128(6).to_string(),
-            expected_global_revision: 1,
-            node_id: uuid::Uuid::from_u128(7).to_string(),
-            owner_workspace_id: uuid::Uuid::from_u128(8).to_string(),
-            default_cwd: Some("/owner/work".into()),
-            schedule_id: uuid::Uuid::from_u128(9).to_string(),
-            spec: match schedule {
-                RoutedOperation::CreateWorkspaceAgentSchedule { spec, .. } => spec,
-                _ => unreachable!(),
-            },
-        };
-        assert_eq!(
-            request.required_feature(),
-            Some(ProtocolFeature::GlobalWorkspaces)
-        );
-        assert!(!format!("{request:?}").contains("PRIVATE WORKSPACE PROMPT"));
-        assert_eq!(
-            serde_json::from_value::<Request>(serde_json::to_value(&request).unwrap()).unwrap(),
-            request
-        );
-    }
-
-    #[test]
-    fn agent_schedule_defaults_and_snake_case_are_stable() {
-        assert_eq!(AgentScheduleSession::default(), AgentScheduleSession::Fresh);
-        assert_eq!(AgentScheduleState::default(), AgentScheduleState::Paused);
-        assert_eq!(
-            AgentScheduleOverlapPolicy::default(),
-            AgentScheduleOverlapPolicy::Skip
-        );
-
-        let spec: AgentScheduleSpec = serde_json::from_value(serde_json::json!({
-            "name": "review",
-            "cwd": "/tmp/project",
-            "integration": "opencode",
-            "prompt": "review the changes",
-            "trigger": {"cron": "0 9 * * 1-5", "timezone": "UTC"}
-        }))
-        .unwrap();
-        assert_eq!(spec.session, AgentScheduleSession::Fresh);
-        assert_eq!(spec.state, AgentScheduleState::Paused);
-        assert_eq!(spec.overlap_policy, AgentScheduleOverlapPolicy::Skip);
-
-        let continued = serde_json::to_value(AgentScheduleSession::Continue {
-            external_session_id: "session-1".into(),
-        })
-        .unwrap();
-        assert_eq!(
-            continued,
-            serde_json::json!({"continue": {"external_session_id": "session-1"}})
-        );
-        assert_eq!(
-            serde_json::to_value(AgentScheduleState::Enabled).unwrap(),
-            "enabled"
-        );
-        assert_eq!(
-            serde_json::to_value(AgentScheduleOverlapPolicy::Skip).unwrap(),
-            "skip"
-        );
-    }
-
-    #[test]
-    fn agent_schedule_messages_round_trip() {
-        let spec = AgentScheduleSpec {
-            name: "review".into(),
-            cwd: "/tmp/project".into(),
-            integration: "opencode".into(),
-            prompt: "review the changes".into(),
-            session: AgentScheduleSession::Fresh,
-            trigger: AgentScheduleTrigger {
-                cron: "0 9 * * 1-5".into(),
-                timezone: "UTC".into(),
-            },
-            state: AgentScheduleState::Paused,
-            overlap_policy: AgentScheduleOverlapPolicy::Skip,
-        };
-        let update = AgentScheduleUpdate {
-            name: "updated review".into(),
-            prompt: "private updated prompt".into(),
-            trigger: AgentScheduleTrigger {
-                cron: "30 10 * * 1-5".into(),
-                timezone: "America/New_York".into(),
-            },
-        };
-        let requests = [
-            Request::CreateAgentSchedule {
-                workspace_id: "w1".into(),
-                spec,
-            },
-            Request::GetAgentSchedule {
-                schedule_id: "schedule-1".into(),
-            },
-            Request::UpdateAgentSchedule {
-                schedule_id: "schedule-1".into(),
-                expected_revision: 3,
-                update: update.clone(),
-            },
-            Request::PauseAgentSchedule {
-                schedule_id: "schedule-1".into(),
-            },
-            Request::ResumeAgentSchedule {
-                schedule_id: "schedule-1".into(),
-            },
-            Request::RemoveAgentSchedule {
-                schedule_id: "schedule-1".into(),
-            },
-        ];
-        for request in requests {
-            let encoded = serde_json::to_value(&request).unwrap();
-            assert_eq!(serde_json::from_value::<Request>(encoded).unwrap(), request);
-        }
-        assert_eq!(
-            Request::UpdateAgentSchedule {
-                schedule_id: "schedule-1".into(),
-                expected_revision: 3,
-                update: update.clone(),
-            }
-            .required_feature(),
-            Some(ProtocolFeature::AgentScheduleEditing)
-        );
-        assert!(!format!("{update:?}").contains("private updated prompt"));
-
-        let schedule = test_schedule();
-        for response in [
-            Response::AgentSchedule {
-                schedule: schedule.clone(),
-            },
-            Response::AgentScheduleInspection {
-                inspection: AgentScheduleInspection {
-                    schedule,
-                    prompt: "private prompt".into(),
-                },
-            },
-        ] {
-            let encoded = serde_json::to_value(&response).unwrap();
-            assert_eq!(
-                serde_json::from_value::<Response>(encoded).unwrap(),
-                response
-            );
-        }
-    }
-
-    #[test]
-    fn scheduled_execution_wire_and_events_are_prompt_free() {
-        let execution = ScheduledExecutionSnapshot {
-            id: "execution-1".into(),
-            workspace_id: "workspace-1".into(),
-            schedule_id: "schedule-1".into(),
-            revision: 2,
-            state: ScheduledExecutionState::Starting,
-            dispatch_kind: ScheduledExecutionDispatchKind::Manual,
-            dispatch_key: "dispatch-1".into(),
-            schedule_revision: 3,
-            prompt_revision: 2,
-            trigger_revision: 1,
-            requested_at_ms: 10,
-            scheduled_at_ms: None,
-            coalesced_through_ms: None,
-            started_at_ms: None,
-            ended_at_ms: None,
-            cwd: "/tmp/project".into(),
-            integration: "opencode".into(),
-            session: AgentScheduleSession::Fresh,
-            reason: None,
-            outcome: None,
-            shell_id: Some("shell-1".into()),
-            run_id: Some("run-1".into()),
-            agent_id: None,
-            external_session_id: None,
-        };
-        let prompt = "PRIVATE EXECUTION PROMPT";
-        let claim = ScheduledExecutionClaim {
-            execution: execution.clone(),
-            prompt: prompt.into(),
-        };
-        assert!(!format!("{claim:?}").contains(prompt));
-        let event = DaemonEventKind::ScheduledExecutionChanged {
-            workspace_id: execution.workspace_id.clone(),
-            execution: execution.clone(),
-        };
-        assert!(!serde_json::to_string(&event).unwrap().contains(prompt));
-        let request = Request::RunAgentSchedule {
-            schedule_id: execution.schedule_id.clone(),
-            dispatch_key: execution.dispatch_key.clone(),
-        };
-        assert_eq!(
-            serde_json::from_value::<Request>(serde_json::to_value(&request).unwrap()).unwrap(),
-            request
-        );
-        assert_eq!(
-            request.required_feature(),
-            Some(ProtocolFeature::ScheduledExecutions)
-        );
-        let capability = "PRIVATE RUNNER CAPABILITY";
-        let request = Request::ResolveScheduledExecutionClaim {
-            schedule_id: execution.schedule_id,
-            shell_id: execution.shell_id.unwrap(),
-            run_id: execution.run_id.unwrap(),
-            runner_token: ScheduledRunnerCapability::new(capability),
-        };
-        assert!(!format!("{request:?}").contains(capability));
-        assert_eq!(
-            serde_json::from_value::<Request>(serde_json::to_value(&request).unwrap()).unwrap(),
-            request
-        );
-    }
-
-    #[test]
-    fn schedule_summaries_and_events_never_expose_prompts() {
-        let private_prompt = "private prompt contents";
-        let schedule = test_schedule();
-        let request = Request::CreateAgentSchedule {
-            workspace_id: "w1".into(),
-            spec: AgentScheduleSpec {
-                name: "review".into(),
-                cwd: "/tmp/project".into(),
-                integration: "opencode".into(),
-                prompt: private_prompt.into(),
-                session: AgentScheduleSession::Fresh,
-                trigger: schedule.trigger.clone(),
-                state: AgentScheduleState::Paused,
-                overlap_policy: AgentScheduleOverlapPolicy::Skip,
-            },
-        };
-        let request_debug = format!("{request:?}");
-        assert!(!request_debug.contains(private_prompt));
-        assert!(request_debug.contains("redacted"));
-
-        let summary = serde_json::to_value(&schedule).unwrap();
-        assert!(summary.get("prompt").is_none());
-        assert!(!summary.to_string().contains(private_prompt));
-
-        let events = [
-            DaemonEventKind::AgentScheduleCreated {
-                workspace_id: "w1".into(),
-                schedule: schedule.clone(),
-            },
-            DaemonEventKind::AgentSchedulePaused {
-                workspace_id: "w1".into(),
-                schedule: schedule.clone(),
-            },
-            DaemonEventKind::AgentScheduleResumed {
-                workspace_id: "w1".into(),
-                schedule: schedule.clone(),
-            },
-            DaemonEventKind::AgentScheduleUpdated {
-                workspace_id: "w1".into(),
-                schedule: schedule.clone(),
-            },
-            DaemonEventKind::AgentScheduleRemoved {
-                workspace_id: "w1".into(),
-                schedule_id: schedule.id.clone(),
-            },
-        ];
-        for event in events {
-            let encoded = serde_json::to_value(&event).unwrap();
-            assert!(!encoded.to_string().contains(private_prompt));
-            assert_eq!(
-                serde_json::from_value::<DaemonEventKind>(encoded).unwrap(),
-                event
-            );
-        }
-
-        let inspection = AgentScheduleInspection {
-            schedule,
-            prompt: private_prompt.into(),
-        };
-        let debug = format!("{inspection:?}");
-        assert!(!debug.contains(private_prompt));
-        assert!(debug.contains("redacted"));
-        assert_eq!(
-            serde_json::to_value(inspection).unwrap()["prompt"],
-            private_prompt
         );
     }
 
@@ -4628,47 +3312,6 @@ mod tests {
             ),
             (29, vec![Request::OpenFederationChannel]),
             (28, vec![Request::GetNodeIdentity]),
-            (
-                25,
-                vec![Request::WaitScheduledExecution {
-                    execution_id: "execution-1".into(),
-                    after_revision: 1,
-                    wait_ms: 30_000,
-                }],
-            ),
-            (
-                22,
-                vec![
-                    Request::CreateAgentSchedule {
-                        workspace_id: "w1".into(),
-                        spec: AgentScheduleSpec {
-                            name: "review".into(),
-                            cwd: "/tmp".into(),
-                            integration: "opencode".into(),
-                            prompt: "review".into(),
-                            session: AgentScheduleSession::Fresh,
-                            trigger: AgentScheduleTrigger {
-                                cron: "0 9 * * *".into(),
-                                timezone: "UTC".into(),
-                            },
-                            state: AgentScheduleState::Paused,
-                            overlap_policy: AgentScheduleOverlapPolicy::Skip,
-                        },
-                    },
-                    Request::GetAgentSchedule {
-                        schedule_id: "schedule-1".into(),
-                    },
-                    Request::PauseAgentSchedule {
-                        schedule_id: "schedule-1".into(),
-                    },
-                    Request::ResumeAgentSchedule {
-                        schedule_id: "schedule-1".into(),
-                    },
-                    Request::RemoveAgentSchedule {
-                        schedule_id: "schedule-1".into(),
-                    },
-                ],
-            ),
             (21, vec![Request::GetFocusedTerminal]),
             (
                 20,
@@ -4704,8 +3347,6 @@ mod tests {
                         completed_sound: "complete".into(),
                         resume_agents: true,
                         persist_terminal_history: false,
-                        max_scheduled_execution_concurrency: 4,
-                        ..Default::default()
                     },
                     environment: None,
                 }],
@@ -4906,21 +3547,6 @@ mod tests {
                 }],
             ),
             (
-                27,
-                vec![Request::UpdateAgentSchedule {
-                    schedule_id: "schedule-1".into(),
-                    expected_revision: 1,
-                    update: AgentScheduleUpdate {
-                        name: "review".into(),
-                        prompt: "private prompt".into(),
-                        trigger: AgentScheduleTrigger {
-                            cron: "0 9 * * *".into(),
-                            timezone: "UTC".into(),
-                        },
-                    },
-                }],
-            ),
-            (
                 35,
                 vec![
                     Request::Attach {
@@ -4961,17 +3587,6 @@ mod tests {
                         profile: test_profile(),
                     },
                 ],
-            ),
-            (
-                37,
-                vec![Request::RouteNodeOperation {
-                    node_id: "node-1".into(),
-                    operation: RoutedOperation::WaitScheduledExecution {
-                        execution_id: "execution-1".into(),
-                        after_revision: 1,
-                        wait_ms: 10,
-                    },
-                }],
             ),
             (
                 38,
@@ -5023,8 +3638,9 @@ mod tests {
                 assert_eq!(
                     request
                         .required_feature()
-                        .map_or(MIN_PROTOCOL_VERSION, ProtocolFeature::minimum_version),
-                    expected,
+                        .map_or(MIN_PROTOCOL_VERSION, ProtocolFeature::minimum_version)
+                        .max(MIN_PROTOCOL_VERSION),
+                    expected.max(MIN_PROTOCOL_VERSION),
                     "unexpected minimum protocol version for {request:?}"
                 );
             }
@@ -5076,43 +3692,7 @@ mod tests {
             (19, &["protocol_19", "workspace_default_cwd"][..]),
             (20, &["protocol_20", "structured_terminal_previews"][..]),
             (21, &["protocol_21", "focused_terminal_read"][..]),
-            (
-                22,
-                &[
-                    "protocol_22",
-                    "agent_schedule_management",
-                    "durable_agent_schedules",
-                ][..],
-            ),
-            (
-                23,
-                &[
-                    "protocol_23",
-                    "scheduled_execution_dispatch",
-                    "scheduled_execution_cancellation",
-                    "schedule_owned_shells",
-                ][..],
-            ),
-            (
-                24,
-                &[
-                    "protocol_24",
-                    "timed_schedule_dispatch",
-                    "scheduler_health",
-                    "bounded_scheduled_execution_concurrency",
-                ][..],
-            ),
-            (
-                25,
-                &[
-                    "protocol_25",
-                    "revision_aware_scheduled_execution_wait",
-                    "bounded_scheduled_execution_history",
-                    "scheduled_execution_notifications",
-                ][..],
-            ),
             (26, &["protocol_26", "exact_run_attachment"][..]),
-            (27, &["protocol_27", "agent_schedule_editing"][..]),
             (28, &["protocol_28", "stable_node_identity"][..]),
             (29, &["protocol_29", "federation_daemon_channel"][..]),
             (30, &["protocol_30", "node_rekey"][..]),
@@ -5169,14 +3749,6 @@ mod tests {
                 ][..],
             ),
             (
-                37,
-                &[
-                    "protocol_37",
-                    "remote_agent_schedule_management",
-                    "remote_scheduled_execution_observation",
-                ][..],
-            ),
-            (
                 38,
                 &[
                     "protocol_38",
@@ -5199,6 +3771,7 @@ mod tests {
             ),
             (45, &["protocol_45", "kiro_exact_launch_holders"][..]),
             (46, &["protocol_46", "kiro_stop_idle"][..]),
+            (47, &["protocol_47"][..]),
         ];
 
         let actual = ProtocolFeature::ALL
@@ -5207,7 +3780,6 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(actual, expected);
         assert!(ProtocolFeature::StructuredTerminalPreview.is_supported_by(PROTOCOL_VERSION));
-        assert!(ProtocolFeature::AgentSchedules.is_supported_by(PROTOCOL_VERSION));
         assert_eq!(
             protocol_capabilities().collect::<Vec<_>>(),
             expected
@@ -5434,7 +4006,6 @@ mod tests {
             name: "shell".into(),
             cwd: "/tmp".into(),
             command: vec!["sleep".into(), "1".into()],
-            owner: ShellOwner::User,
             status: ShellStatus::Running,
             run: Some(ShellRunSnapshot {
                 id: "r1".into(),

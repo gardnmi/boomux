@@ -27,7 +27,7 @@ use boomux::client::{self, Client};
 use boomux::protocol::{
     AgentAttentionReason, AgentInstanceSnapshot, AgentState, CombinedNodeSnapshot,
     MAX_ATTACH_FRAME, NodeProjectionHealthCode, OpenCodeSessionClaimSnapshot,
-    OpenCodeSharedRuntimeSnapshot, ShellOwner, TerminalProfile,
+    OpenCodeSharedRuntimeSnapshot, TerminalProfile,
 };
 use serde::{Deserialize, Serialize};
 use tokio::net::UnixListener;
@@ -212,8 +212,6 @@ struct AgentCard {
     just_completed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     native_web: Option<NativeWebHandoff>,
-    #[serde(skip)]
-    schedule_owned: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1366,16 +1364,6 @@ fn project_agents(combined: &CombinedNodeSnapshot) -> Vec<AgentCard> {
                             .map(|run| (shell.id.as_str(), run.id.as_str()))
                     })
                     .collect::<HashMap<_, _>>();
-                let schedule_owned = workspace
-                    .shells
-                    .iter()
-                    .map(|shell| {
-                        (
-                            shell.id.as_str(),
-                            matches!(shell.owner, ShellOwner::Schedule { .. }),
-                        )
-                    })
-                    .collect::<HashMap<_, _>>();
                 for agent in &workspace.agents {
                     agents.push(AgentCard {
                         node_id: node.node_id.clone(),
@@ -1410,10 +1398,6 @@ fn project_agents(combined: &CombinedNodeSnapshot) -> Vec<AgentCard> {
                         }),
                         just_completed: false,
                         native_web: None,
-                        schedule_owned: schedule_owned
-                            .get(agent.shell_id.as_str())
-                            .copied()
-                            .unwrap_or(false),
                     });
                 }
             }
@@ -1436,16 +1420,6 @@ fn project_agents(combined: &CombinedNodeSnapshot) -> Vec<AgentCard> {
                         .run_id
                         .as_deref()
                         .map(|run_id| (shell.id.as_str(), run_id))
-                })
-                .collect::<HashMap<_, _>>();
-            let schedule_owned = projection
-                .shells
-                .iter()
-                .map(|shell| {
-                    (
-                        shell.id.as_str(),
-                        matches!(shell.owner, ShellOwner::Schedule { .. }),
-                    )
                 })
                 .collect::<HashMap<_, _>>();
             for agent in &projection.agents {
@@ -1486,10 +1460,6 @@ fn project_agents(combined: &CombinedNodeSnapshot) -> Vec<AgentCard> {
                     }),
                     just_completed: false,
                     native_web: None,
-                    schedule_owned: schedule_owned
-                        .get(agent.shell_id.as_str())
-                        .copied()
-                        .unwrap_or(false),
                 });
             }
         }
@@ -1501,10 +1471,7 @@ fn project_visible_agents(combined: &CombinedNodeSnapshot) -> Vec<AgentCard> {
     let agents = project_agents(combined);
     let mut winners = HashMap::<(String, String, String), (u64, u64, String)>::new();
     for agent in &agents {
-        if agent.schedule_owned
-            || !agent.run_current
-            || matches!(agent.state, AgentState::Inactive | AgentState::Done)
-        {
+        if !agent.run_current || matches!(agent.state, AgentState::Inactive | AgentState::Done) {
             continue;
         }
         let key = (
@@ -1530,9 +1497,6 @@ fn project_visible_agents(combined: &CombinedNodeSnapshot) -> Vec<AgentCard> {
     agents
         .into_iter()
         .filter(|agent| {
-            if agent.schedule_owned {
-                return false;
-            }
             if agent.attention.is_some() {
                 return true;
             }
@@ -1699,18 +1663,10 @@ mod tests {
     use boomux::protocol::{
         AgentAttentionSnapshot, AgentAuthority, AgentInstanceSnapshot, AgentObservationSnapshot,
         CombinedNode, NodeProjectionAgent, NodeProjectionAttention, NodeProjectionShell,
-        NodeProjectionSnapshot, SchedulerHealth, SchedulerState, ShellOwner, ShellRunSnapshot,
-        ShellSnapshot, ShellStatus, Snapshot, WorkspaceSnapshot,
+        NodeProjectionSnapshot, ShellRunSnapshot, ShellSnapshot, ShellStatus, Snapshot,
+        WorkspaceSnapshot,
     };
     use std::path::PathBuf;
-
-    fn scheduler() -> SchedulerHealth {
-        SchedulerHealth {
-            state: SchedulerState::Active,
-            max_concurrent: 4,
-            active_executions: 0,
-        }
-    }
 
     fn combined_snapshot() -> CombinedNodeSnapshot {
         let local_agent = AgentInstanceSnapshot {
@@ -1756,7 +1712,6 @@ mod tests {
             observed_helper_version: Some("0.21.0".into()),
             workspace_owner_eligible: true,
             workspace_owner_unavailable_reason: None,
-            scheduler: scheduler(),
             local_snapshot: Some(Snapshot {
                 workspaces: vec![WorkspaceSnapshot {
                     id: "00000000-0000-0000-0000-000000000002".into(),
@@ -1770,7 +1725,6 @@ mod tests {
                         name: "agent".into(),
                         cwd: PathBuf::from("/work"),
                         command: Vec::new(),
-                        owner: ShellOwner::User,
                         status: ShellStatus::Running,
                         run: Some(ShellRunSnapshot {
                             id: "00000000-0000-0000-0000-000000000005".into(),
@@ -1786,10 +1740,8 @@ mod tests {
                     }],
                     launchers: Vec::new(),
                     agents: vec![local_agent, historical_agent],
-                    schedules: Vec::new(),
                 }],
                 focused_terminal: None,
-                scheduler: Some(scheduler()),
             }),
             remote_projection: None,
         };
@@ -1809,7 +1761,6 @@ mod tests {
             observed_helper_version: Some("0.21.0".into()),
             workspace_owner_eligible: false,
             workspace_owner_unavailable_reason: Some("stale".into()),
-            scheduler: scheduler(),
             local_snapshot: None,
             remote_projection: Some(NodeProjectionSnapshot {
                 node_id: "00000000-0000-0000-0000-000000000008".into(),
@@ -1823,7 +1774,6 @@ mod tests {
                     id: "00000000-0000-0000-0000-000000000010".into(),
                     workspace_id: "00000000-0000-0000-0000-000000000009".into(),
                     name: "remote-agent".into(),
-                    owner: ShellOwner::User,
                     status: ShellStatus::Running,
                     run_id: Some("00000000-0000-0000-0000-000000000011".into()),
                     generation: Some(1),
@@ -1850,10 +1800,6 @@ mod tests {
                         observed_at_ms: 40,
                     }),
                 }],
-                schedules: Vec::new(),
-                executions: Vec::new(),
-                executions_truncated: false,
-                scheduler: scheduler(),
             }),
         };
 
@@ -2412,31 +2358,6 @@ mod tests {
         });
         workspace.agents.push(completed);
 
-        let mut schedule_shell = workspace.shells[0].clone();
-        schedule_shell.id = "00000000-0000-0000-0000-000000000016".into();
-        schedule_shell.owner = ShellOwner::Schedule {
-            schedule_id: "00000000-0000-0000-0000-000000000017".into(),
-        };
-        schedule_shell.run.as_mut().unwrap().id = "00000000-0000-0000-0000-000000000018".into();
-        workspace.shells.push(schedule_shell);
-        let mut scheduled = template;
-        scheduled.id = "00000000-0000-0000-0000-000000000019".into();
-        scheduled.name = "scheduled-attention".into();
-        scheduled.shell_id = "00000000-0000-0000-0000-000000000016".into();
-        scheduled.run_id = "00000000-0000-0000-0000-000000000018".into();
-        scheduled.attention = Some(AgentAttentionSnapshot {
-            reason: AgentAttentionReason::Blocked,
-            observation: AgentObservationSnapshot {
-                revision: 6,
-                state: AgentState::Blocked,
-                authority: AgentAuthority::LifecycleIntegration,
-                evidence: "blocked".into(),
-                confidence: 100,
-                observed_at_ms: 70,
-            },
-        });
-        workspace.agents.push(scheduled);
-
         let snapshot = project_snapshot(combined, None);
         let names = snapshot
             .agents
@@ -2452,7 +2373,6 @@ mod tests {
         assert!(names.contains(&"remote-blocked"));
         assert!(!names.contains(&"local-active"));
         assert!(!names.contains(&"historical-blocked"));
-        assert!(!names.contains(&"scheduled-attention"));
     }
 
     #[test]

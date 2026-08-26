@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs::{self, File, OpenOptions};
@@ -47,28 +49,22 @@ use crate::node_registration::NodeRegistrationManager;
 use crate::protocol::ClaudeRemoteControlBindingSnapshot;
 use crate::protocol::{
     self, AgentAttentionReason, AgentAttentionSnapshot, AgentAuthority, AgentInstanceSnapshot,
-    AgentObservationSnapshot, AgentRegistrationSpec, AgentReport, AgentScheduleInspection,
-    AgentScheduleOverlapPolicy, AgentScheduleSession, AgentScheduleSnapshot, AgentScheduleSpec,
-    AgentScheduleState, AgentScheduleTrigger, AgentScheduleUpdate, AgentState, AttachFrame,
+    AgentObservationSnapshot, AgentRegistrationSpec, AgentReport, AgentState, AttachFrame,
     DaemonEvent, DaemonEventKind, Envelope, ErrorCode, EventCursor, FocusedTerminalSnapshot,
     HostIntegrationMutationPreview, HostServiceOperation, HostServiceResult, NodeProjectionAgent,
-    NodeProjectionAttention, NodeProjectionExecution, NodeProjectionLauncher,
-    NodeProjectionSchedule, NodeProjectionShell, NodeProjectionSnapshot, NodeProjectionSync,
-    NodeProjectionSyncMode, NodeProjectionTransition, NodeProjectionTransitionKind,
-    NodeProjectionWorkspace, NotificationDeliveryConfig, OpenCodeSessionClaimSnapshot,
-    OpenCodeSharedRuntimeSnapshot, QualifiedFocusedTerminalSnapshot, QualifiedIdentity, Request,
-    Response, RoutedOperation, RoutedOperationResult, ScheduledExecutionDispatchKind,
-    ScheduledExecutionOutcome, ScheduledExecutionReason, ScheduledExecutionScheduleProjection,
-    ScheduledExecutionSnapshot, ScheduledExecutionState, ScheduledOccurrence,
-    ScheduledRunnerResult, SchedulerHealth, SchedulerState, ShellOwner, ShellRunExitReason,
-    ShellRunSnapshot, ShellSnapshot, ShellSpec, ShellStatus, Snapshot, TerminalPreview,
-    TerminalProfile, UnixEnvironment, UnixEnvironmentVariable, WorkspaceLauncherSnapshot,
-    WorkspaceLauncherSpec, WorkspaceSnapshot,
+    NodeProjectionAttention, NodeProjectionLauncher, NodeProjectionShell, NodeProjectionSnapshot,
+    NodeProjectionSync, NodeProjectionSyncMode, NodeProjectionTransition,
+    NodeProjectionTransitionKind, NodeProjectionWorkspace, NotificationDeliveryConfig,
+    OpenCodeSessionClaimSnapshot, OpenCodeSharedRuntimeSnapshot, QualifiedFocusedTerminalSnapshot,
+    QualifiedIdentity, Request, Response, RoutedOperation, RoutedOperationResult,
+    ShellRunExitReason, ShellRunSnapshot, ShellSnapshot, ShellSpec, ShellStatus, Snapshot,
+    TerminalPreview, TerminalProfile, UnixEnvironment, UnixEnvironmentVariable,
+    WorkspaceLauncherSnapshot, WorkspaceLauncherSpec, WorkspaceSnapshot,
 };
 use crate::ssh_bootstrap::{self, RemoteBootstrapPlan, SshAuthenticationMode, SshTarget};
 use crate::state_store::{
-    PersistedAgentInstance, PersistedAgentSchedule, PersistedScheduledExecution, PersistedShell,
-    PersistedShellRun, PersistedState, PersistedWorkspace, PersistedWorkspaceLauncher, StateStore,
+    PersistedAgentInstance, PersistedShell, PersistedShellRun, PersistedState, PersistedWorkspace,
+    PersistedWorkspaceLauncher, StateStore,
 };
 use crate::terminal_state::TerminalState;
 
@@ -83,8 +79,6 @@ const RESTART_TIMEOUT: Duration = Duration::from_secs(10);
 const IO_RETRY_DELAY: Duration = Duration::from_millis(2);
 const OUTPUT_PUBLICATION_INTERVAL: Duration = Duration::from_millis(16);
 const PERSIST_RETRY_INTERVAL: Duration = Duration::from_secs(1);
-const SCHEDULER_RETRY_MIN: Duration = Duration::from_millis(50);
-const SCHEDULER_RETRY_MAX: Duration = Duration::from_secs(5);
 const TERMINAL_HISTORY_INTERVAL: Duration = Duration::from_secs(5);
 const FOREGROUND_PROCESS_CACHE_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_TERMINAL_HISTORY_BYTES: usize = 256 * 1024;
@@ -94,7 +88,6 @@ const MAX_AGENT_EVIDENCE_BYTES: usize = 4 * 1024;
 const MAX_HOST_SERVICE_PREVIEWS: usize = 64;
 const HOST_SERVICE_PREVIEW_TTL: Duration = Duration::from_secs(300);
 const MAX_TERMINAL_ROWS: u16 = 1_000;
-pub const MAX_SCHEDULED_EXECUTION_CONCURRENCY: u16 = 64;
 const MAX_TERMINAL_COLS: u16 = 1_000;
 const MAX_TERMINAL_PREVIEW_LINES: usize = 500;
 const MAX_TERMINAL_PREVIEW_SPANS: usize = 20_000;
@@ -102,7 +95,6 @@ const MAX_TERMINAL_CELLS: usize = 1_000_000;
 const MAX_SHELL_READ_BYTES: usize = 1024 * 1024;
 const MAX_FOREGROUND_PROCESS_BYTES: usize = 64;
 const MAX_RETAINED_EVENTS: usize = 8_192;
-const MAX_TERMINAL_EXECUTIONS_PER_SCHEDULE: usize = 100;
 const DISPATCH_KEY_FILTER_BYTES: usize = 2048;
 const MAX_EVENT_BATCH: u16 = 256;
 const MAX_EVENT_WAIT: Duration = Duration::from_secs(30);
@@ -178,8 +170,6 @@ pub struct NotificationSettings {
     pub enabled: bool,
     pub blocked: bool,
     pub completed: bool,
-    pub scheduled_dispatch_failed: bool,
-    pub scheduled_interrupted: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -187,8 +177,6 @@ pub struct NotificationSoundSettings {
     pub enabled: bool,
     pub blocked: String,
     pub completed: String,
-    pub scheduled_dispatch_failed: String,
-    pub scheduled_interrupted: String,
 }
 
 impl Default for NotificationSoundSettings {
@@ -197,8 +185,6 @@ impl Default for NotificationSoundSettings {
             enabled: false,
             blocked: "message-new-instant".into(),
             completed: "complete".into(),
-            scheduled_dispatch_failed: "dialog-warning".into(),
-            scheduled_interrupted: "dialog-warning".into(),
         }
     }
 }
@@ -210,19 +196,14 @@ impl From<NotificationDeliveryConfig> for NotificationDeliverySettings {
                 enabled: config.desktop_enabled,
                 blocked: config.blocked,
                 completed: config.completed,
-                scheduled_dispatch_failed: config.scheduled_dispatch_failed,
-                scheduled_interrupted: config.scheduled_interrupted,
             },
             sound: NotificationSoundSettings {
                 enabled: config.sound_enabled,
                 blocked: config.blocked_sound,
                 completed: config.completed_sound,
-                scheduled_dispatch_failed: config.scheduled_dispatch_failed_sound,
-                scheduled_interrupted: config.scheduled_interrupted_sound,
             },
             resume_agents: config.resume_agents,
             persist_terminal_history: config.persist_terminal_history,
-            max_scheduled_execution_concurrency: config.max_scheduled_execution_concurrency,
             claude_remote_control: true,
         }
     }
@@ -235,15 +216,10 @@ impl From<NotificationDeliverySettings> for NotificationDeliveryConfig {
             sound_enabled: settings.sound.enabled,
             blocked: settings.desktop.blocked,
             completed: settings.desktop.completed,
-            scheduled_dispatch_failed: settings.desktop.scheduled_dispatch_failed,
-            scheduled_interrupted: settings.desktop.scheduled_interrupted,
             blocked_sound: settings.sound.blocked,
             completed_sound: settings.sound.completed,
-            scheduled_dispatch_failed_sound: settings.sound.scheduled_dispatch_failed,
-            scheduled_interrupted_sound: settings.sound.scheduled_interrupted,
             resume_agents: settings.resume_agents,
             persist_terminal_history: settings.persist_terminal_history,
-            max_scheduled_execution_concurrency: settings.max_scheduled_execution_concurrency,
         }
     }
 }
@@ -254,7 +230,6 @@ pub struct NotificationDeliverySettings {
     pub sound: NotificationSoundSettings,
     pub resume_agents: bool,
     pub persist_terminal_history: bool,
-    pub max_scheduled_execution_concurrency: u16,
     pub claude_remote_control: bool,
 }
 
@@ -265,7 +240,6 @@ impl Default for NotificationDeliverySettings {
             sound: NotificationSoundSettings::default(),
             resume_agents: true,
             persist_terminal_history: false,
-            max_scheduled_execution_concurrency: 4,
             claude_remote_control: true,
         }
     }
@@ -296,8 +270,6 @@ impl Default for NotificationSettings {
             enabled: false,
             blocked: true,
             completed: true,
-            scheduled_dispatch_failed: false,
-            scheduled_interrupted: false,
         }
     }
 }
@@ -464,13 +436,11 @@ fn run_daemon(
     }
     registry.startup_environment =
         sanitize_opencode_shim_environment(&capture_current_environment());
-    registry.configure_scheduler_clock()?;
     registry.notification_settings = notification_settings.clone();
     if !registry.notification_settings.persist_terminal_history {
         registry.clear_terminal_histories()?;
     }
     registry.notification_sink = Arc::new(DesktopNotificationSink::new(notification_settings));
-    registry.publish_cold_recovery_notifications();
     let registry = Arc::new(registry);
     let shells = registry.durable.shells()?;
     let (gated_readers, handoff_changed) = registry.runtimes.import_handoff(
@@ -509,7 +479,6 @@ fn run_daemon(
                 for runtime in gated_readers {
                     registry.runtimes.resume_reader(&runtime)?;
                 }
-                registry.resume_claimed_schedule_executions();
                 // FINALIZE is the irreversible ownership boundary. Failure to
                 // report COMMITTED must not make the old daemon resume.
                 let _ = channel.write_all(&[handoff::COMMITTED]);
@@ -529,12 +498,6 @@ fn run_daemon(
     } else if registry.durable.persistence_dirty.load(Ordering::Acquire) {
         registry.persist()?;
     }
-    if !live_handoff {
-        registry
-            .evaluate_schedules(true)
-            .map_err(|error| io::Error::other(error.to_string()))?;
-    }
-    registry.start_scheduler()?;
     registry.start_node_projection_workers()?;
     let shutdown = Arc::new(AtomicBool::new(false));
     let transition = Arc::new(AtomicU8::new(TRANSITION_IDLE));
@@ -566,7 +529,6 @@ fn run_daemon(
         registry.opencode.reap_exited()?;
         match restart_receiver.try_recv() {
             Ok(request) => {
-                registry.stop_scheduler()?;
                 registry.stop_node_projection_workers()?;
                 let result = launch_replacement(
                     &listener,
@@ -580,7 +542,6 @@ fn run_daemon(
                     shutdown.store(true, Ordering::Release);
                 } else {
                     transition.store(TRANSITION_IDLE, Ordering::Release);
-                    registry.start_scheduler()?;
                     registry.start_node_projection_workers()?;
                 }
                 let _ = request.reply.send(result);
@@ -625,7 +586,6 @@ fn run_daemon(
     for handler in handlers {
         let _ = handler.join();
     }
-    registry.stop_scheduler()?;
     registry.stop_node_projection_workers()?;
     let result = if handed_off {
         socket_cleanup.disarm();
@@ -1280,48 +1240,41 @@ fn resolve_executable(
 }
 
 fn opencode_shim_eligible(shell: &Shell, effective_command: &[String]) -> bool {
-    matches!(shell.owner, ShellOwner::User)
-        && shell.command.is_empty()
-        && effective_command.is_empty()
+    shell.command.is_empty() && effective_command.is_empty()
 }
 
-fn codex_launch_eligible(shell: &Shell, effective_command: &[String]) -> bool {
-    matches!(shell.owner, ShellOwner::User)
-        && effective_command.first().is_some_and(|executable| {
-            Path::new(executable)
-                .file_name()
-                .and_then(std::ffi::OsStr::to_str)
-                == Some("codex")
-        })
-        && (effective_command.len() == 1
-            || effective_command
-                .get(1)
-                .is_some_and(|argument| matches!(argument.as_str(), "resume" | "exec")))
+fn codex_launch_eligible(_shell: &Shell, effective_command: &[String]) -> bool {
+    effective_command.first().is_some_and(|executable| {
+        Path::new(executable)
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            == Some("codex")
+    }) && (effective_command.len() == 1
+        || effective_command
+            .get(1)
+            .is_some_and(|argument| matches!(argument.as_str(), "resume" | "exec")))
 }
 
-fn kiro_launch_eligible(shell: &Shell, effective_command: &[String]) -> bool {
-    matches!(shell.owner, ShellOwner::User)
-        && effective_command.first().is_some_and(|executable| {
-            Path::new(executable)
-                .file_name()
-                .and_then(std::ffi::OsStr::to_str)
-                == Some("kiro-cli")
-        })
-        && (effective_command.len() == 1
-            || effective_command
-                .get(1)
-                .is_some_and(|argument| argument == "--v3"))
+fn kiro_launch_eligible(_shell: &Shell, effective_command: &[String]) -> bool {
+    effective_command.first().is_some_and(|executable| {
+        Path::new(executable)
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            == Some("kiro-cli")
+    }) && (effective_command.len() == 1
+        || effective_command
+            .get(1)
+            .is_some_and(|argument| argument == "--v3"))
 }
 
 fn claude_remote_control_command(
-    shell: &Shell,
+    _shell: &Shell,
     effective_command: &[String],
     recovery_override: bool,
     enabled: bool,
 ) -> Option<Vec<String>> {
     (enabled
         && !recovery_override
-        && matches!(shell.owner, ShellOwner::User)
         && effective_command.len() == 1
         && Path::new(&effective_command[0])
             .file_name()
@@ -2035,7 +1988,6 @@ fn handle_connection_inner(
                 return send_response(&mut stream, response_version, error.into_response());
             }
         }
-        registry.stop_scheduler()?;
         registry.stop_node_projection_workers()?;
         return match registry.shutdown() {
             Ok(()) => {
@@ -2044,7 +1996,6 @@ fn handle_connection_inner(
             }
             Err(error) => {
                 transition.store(TRANSITION_IDLE, Ordering::Release);
-                let _ = registry.start_scheduler();
                 let _ = registry.start_node_projection_workers();
                 send_response(
                     &mut stream,
@@ -2064,18 +2015,6 @@ fn handle_connection_inner(
             notifications,
             environment,
         } => {
-            if !(1..=MAX_SCHEDULED_EXECUTION_CONCURRENCY)
-                .contains(&notifications.max_scheduled_execution_concurrency)
-            {
-                return send_response(
-                    &mut stream,
-                    response_version,
-                    DaemonError::validation(format!(
-                        "scheduling max_concurrent must be between 1 and {MAX_SCHEDULED_EXECUTION_CONCURRENCY}"
-                    ))
-                    .into_response(),
-                );
-            }
             if let Some(environment) = environment
                 && let Err(error) = validate_unix_environment(environment)
             {
@@ -2190,35 +2129,14 @@ fn handle_connection_inner(
         return send_response(&mut stream, response_version, response);
     }
 
-    let schedule_semantics_changed = matches!(
-        &request.message,
-        Request::CreateAgentSchedule { .. }
-            | Request::CreateWorkspaceAgentSchedule { .. }
-            | Request::CreateGlobalWorkspaceAgentSchedule { .. }
-            | Request::PauseAgentSchedule { .. }
-            | Request::ResumeAgentSchedule { .. }
-            | Request::RemoveAgentSchedule { .. }
-            | Request::GuardedPauseAgentSchedule { .. }
-            | Request::GuardedResumeAgentSchedule { .. }
-            | Request::GuardedRemoveAgentSchedule { .. }
-    );
     let response = match registry.dispatch_arc(request.message, response_version) {
         Ok(response) => response,
         Err(error) => error.into_response(),
     };
-    if schedule_semantics_changed && !matches!(response, Response::Error { .. }) {
-        registry.wake_scheduler();
-    }
     let result = send_response(
         &mut stream,
         response_version,
-        response_for_version_with_schedule_shells(
-            response,
-            response_version,
-            &registry
-                .schedule_shell_ids_for_downgrade()
-                .unwrap_or_default(),
-        ),
+        response_for_version(response, response_version),
     );
     if result.is_ok()
         && registry
@@ -2239,20 +2157,9 @@ fn handle_connection_inner(
 }
 
 fn validate_notification_delivery_settings(
-    settings: &NotificationDeliverySettings,
+    _settings: &NotificationDeliverySettings,
 ) -> io::Result<()> {
-    if (1..=MAX_SCHEDULED_EXECUTION_CONCURRENCY)
-        .contains(&settings.max_scheduled_execution_concurrency)
-    {
-        Ok(())
-    } else {
-        Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "scheduling max_concurrent must be between 1 and {MAX_SCHEDULED_EXECUTION_CONCURRENCY}"
-            ),
-        ))
-    }
+    Ok(())
 }
 
 fn validate_opencode_uuid(label: &str, value: &str) -> DaemonResult<()> {
@@ -2318,16 +2225,7 @@ fn global_workspace_error(error: io::Error) -> DaemonError {
     }
 }
 
-#[cfg(test)]
 fn response_for_version(response: Response, version: u32) -> Response {
-    response_for_version_with_schedule_shells(response, version, &HashSet::new())
-}
-
-fn response_for_version_with_schedule_shells(
-    response: Response,
-    version: u32,
-    schedule_shell_ids: &HashSet<String>,
-) -> Response {
     let mut response = response;
     if !protocol::ProtocolFeature::QualifiedFocusedTerminal.is_supported_by(version) {
         match &mut response {
@@ -2377,80 +2275,6 @@ fn response_for_version_with_schedule_shells(
         && let Response::Events { events, .. } = &mut response
     {
         events.retain(|event| !matches!(event.kind, DaemonEventKind::NodeProjectionChanged { .. }));
-    }
-    if !protocol::ProtocolFeature::ScheduledExecutionObservation.is_supported_by(version) {
-        match &mut response {
-            Response::ScheduledExecution {
-                next_occurrence, ..
-            } => *next_occurrence = None,
-            Response::ScheduledExecutions {
-                schedules,
-                schedule_limit,
-                schedules_truncated,
-                ..
-            } => {
-                schedules.clear();
-                *schedule_limit = 0;
-                *schedules_truncated = false;
-            }
-            _ => {}
-        }
-    }
-    if !protocol::ProtocolFeature::TimedScheduling.is_supported_by(version) {
-        remove_timed_scheduling(&mut response);
-    }
-    if !protocol::ProtocolFeature::ScheduledExecutions.is_supported_by(version) {
-        if let Response::Events { events, .. } = &mut response {
-            events.retain(|event| {
-                !matches!(
-                    &event.kind,
-                    DaemonEventKind::ScheduledExecutionCreated { .. }
-                        | DaemonEventKind::ScheduledExecutionChanged { .. }
-                ) && !event_shell_id(&event.kind)
-                    .is_some_and(|shell_id| schedule_shell_ids.contains(shell_id))
-            });
-        }
-        let hide_schedule_shells = |workspace: &mut WorkspaceSnapshot| {
-            workspace
-                .shells
-                .retain(|shell| matches!(shell.owner, ShellOwner::User));
-            for schedule in &mut workspace.schedules {
-                schedule.execution_shell_id = None;
-            }
-        };
-        match &mut response {
-            Response::Snapshot { snapshot } => {
-                for workspace in &mut snapshot.workspaces {
-                    hide_schedule_shells(workspace);
-                }
-            }
-            Response::Workspace { workspace } => {
-                hide_schedule_shells(workspace);
-            }
-            Response::Shell { shell } if !matches!(shell.owner, ShellOwner::User) => {
-                response = Response::Error {
-                    code: Some(ErrorCode::NotFound),
-                    message: format!("shell not found: {}", shell.id),
-                };
-            }
-            Response::Events {
-                snapshot: Some(snapshot),
-                ..
-            } => {
-                for workspace in &mut snapshot.workspaces {
-                    hide_schedule_shells(workspace);
-                }
-            }
-            _ => {}
-        }
-    }
-    if !protocol::ProtocolFeature::AgentSchedules.is_supported_by(version) {
-        remove_agent_schedules(&mut response);
-    }
-    if !protocol::ProtocolFeature::AgentScheduleEditing.is_supported_by(version)
-        && let Response::Events { events, .. } = &mut response
-    {
-        events.retain(|event| !matches!(event.kind, DaemonEventKind::AgentScheduleUpdated { .. }));
     }
     if !protocol::ProtocolFeature::WorkspaceDefaultCwd.is_supported_by(version) {
         remove_workspace_default_cwds(&mut response);
@@ -2588,61 +2412,6 @@ fn remove_recovered_agent_presentation(response: &mut Response) {
     }
 }
 
-fn remove_timed_scheduling(response: &mut Response) {
-    let downgrade_schedule = |schedule: &mut AgentScheduleSnapshot| {
-        schedule.next_occurrence = None;
-    };
-    let downgrade_snapshot = |snapshot: &mut Snapshot| {
-        snapshot.scheduler = None;
-        for workspace in &mut snapshot.workspaces {
-            for schedule in &mut workspace.schedules {
-                downgrade_schedule(schedule);
-            }
-        }
-    };
-    match response {
-        Response::Snapshot { snapshot } => downgrade_snapshot(snapshot),
-        Response::Workspace { workspace } => {
-            for schedule in &mut workspace.schedules {
-                downgrade_schedule(schedule);
-            }
-        }
-        Response::AgentSchedule { schedule } => downgrade_schedule(schedule),
-        Response::AgentScheduleInspection { inspection } => {
-            downgrade_schedule(&mut inspection.schedule);
-        }
-        Response::ScheduledExecution { execution, .. }
-            if execution.dispatch_kind == ScheduledExecutionDispatchKind::Timed
-                || execution.state == ScheduledExecutionState::Skipped =>
-        {
-            *response = Response::Error {
-                code: Some(ErrorCode::NotFound),
-                message: format!("scheduled execution not found: {}", execution.id),
-            };
-        }
-        Response::ScheduledExecutions { executions, .. } => executions.retain(|execution| {
-            execution.dispatch_kind == ScheduledExecutionDispatchKind::Manual
-                && execution.state != ScheduledExecutionState::Skipped
-        }),
-        Response::Events {
-            snapshot, events, ..
-        } => {
-            if let Some(snapshot) = snapshot {
-                downgrade_snapshot(snapshot);
-            }
-            events.retain(|event| match &event.kind {
-                DaemonEventKind::ScheduledExecutionCreated { execution, .. }
-                | DaemonEventKind::ScheduledExecutionChanged { execution, .. } => {
-                    execution.dispatch_kind == ScheduledExecutionDispatchKind::Manual
-                        && execution.state != ScheduledExecutionState::Skipped
-                }
-                _ => true,
-            });
-        }
-        _ => {}
-    }
-}
-
 fn event_shell_id(event: &DaemonEventKind) -> Option<&str> {
     match event {
         DaemonEventKind::ShellCreated { shell_id, .. }
@@ -2656,37 +2425,6 @@ fn event_shell_id(event: &DaemonEventKind) -> Option<&str> {
         | DaemonEventKind::AgentCompleted { shell_id, .. }
         | DaemonEventKind::AgentAttentionAcknowledged { shell_id, .. } => Some(shell_id),
         _ => None,
-    }
-}
-
-fn remove_agent_schedules(response: &mut Response) {
-    match response {
-        Response::Snapshot { snapshot } => {
-            for workspace in &mut snapshot.workspaces {
-                workspace.schedules.clear();
-            }
-        }
-        Response::Workspace { workspace } => workspace.schedules.clear(),
-        Response::Events {
-            snapshot, events, ..
-        } => {
-            if let Some(snapshot) = snapshot {
-                for workspace in &mut snapshot.workspaces {
-                    workspace.schedules.clear();
-                }
-            }
-            events.retain(|event| {
-                !matches!(
-                    event.kind,
-                    DaemonEventKind::AgentScheduleCreated { .. }
-                        | DaemonEventKind::AgentSchedulePaused { .. }
-                        | DaemonEventKind::AgentScheduleResumed { .. }
-                        | DaemonEventKind::AgentScheduleUpdated { .. }
-                        | DaemonEventKind::AgentScheduleRemoved { .. }
-                )
-            });
-        }
-        _ => {}
     }
 }
 
@@ -2810,10 +2548,6 @@ fn operation_is_read(operation: &RoutedOperation) -> bool {
             | RoutedOperation::GetShell { .. }
             | RoutedOperation::GetLauncher { .. }
             | RoutedOperation::GetAgent { .. }
-            | RoutedOperation::GetAgentSchedule { .. }
-            | RoutedOperation::GetScheduledExecution { .. }
-            | RoutedOperation::ListScheduledExecutions { .. }
-            | RoutedOperation::WaitScheduledExecution { .. }
     )
 }
 
@@ -2823,37 +2557,6 @@ fn routed_result(response: Response) -> Result<RoutedOperationResult, Box<Respon
         Response::Shell { shell } => Ok(RoutedOperationResult::Shell { shell }),
         Response::Launcher { launcher } => Ok(RoutedOperationResult::Launcher { launcher }),
         Response::Agent { agent } => Ok(RoutedOperationResult::Agent { agent }),
-        Response::AgentSchedule { schedule } => {
-            Ok(RoutedOperationResult::AgentSchedule { schedule })
-        }
-        Response::AgentScheduleInspection { inspection } => {
-            Ok(RoutedOperationResult::AgentScheduleInspection { inspection })
-        }
-        Response::ScheduledExecution {
-            execution,
-            next_occurrence,
-        } => Ok(RoutedOperationResult::ScheduledExecution {
-            execution,
-            next_occurrence,
-        }),
-        Response::ScheduledExecutions {
-            executions,
-            limit,
-            truncated,
-            schedules,
-            schedule_limit,
-            schedules_truncated,
-        } => Ok(RoutedOperationResult::ScheduledExecutions {
-            executions,
-            limit,
-            truncated,
-            schedules,
-            schedule_limit,
-            schedules_truncated,
-        }),
-        Response::ScheduledExecutionWait { execution, changed } => {
-            Ok(RoutedOperationResult::ScheduledExecutionWait { execution, changed })
-        }
         Response::AgentAttentionAcknowledged { agent, changed } => {
             Ok(RoutedOperationResult::AgentAttentionAcknowledged { agent, changed })
         }
@@ -2895,8 +2598,7 @@ fn routed_postcondition(operation: &RoutedOperation, response: &Response) -> boo
         (
             RoutedOperation::CloseWorkspace { .. }
             | RoutedOperation::CloseShell { .. }
-            | RoutedOperation::RemoveLauncher { .. }
-            | RoutedOperation::RemoveAgentSchedule { .. },
+            | RoutedOperation::RemoveLauncher { .. },
             Response::Error {
                 code: Some(ErrorCode::NotFound),
                 ..
@@ -2917,47 +2619,6 @@ fn routed_postcondition(operation: &RoutedOperation, response: &Response) -> boo
                     .as_ref()
                     .is_some_and(|run| run.id == *expected_run_id)
         }
-        (
-            RoutedOperation::PauseAgentSchedule {
-                expected_revision, ..
-            },
-            Response::AgentScheduleInspection { inspection },
-        ) => {
-            inspection.schedule.revision > *expected_revision
-                && inspection.schedule.state == AgentScheduleState::Paused
-        }
-        (
-            RoutedOperation::ResumeAgentSchedule {
-                expected_revision, ..
-            },
-            Response::AgentScheduleInspection { inspection },
-        ) => {
-            inspection.schedule.revision > *expected_revision
-                && inspection.schedule.state == AgentScheduleState::Enabled
-        }
-        (
-            RoutedOperation::UpdateAgentSchedule {
-                expected_revision,
-                update,
-                ..
-            },
-            Response::AgentScheduleInspection { inspection },
-        ) => {
-            inspection.schedule.revision > *expected_revision
-                && inspection.schedule.name == update.name
-                && inspection.schedule.trigger == update.trigger
-                && inspection.prompt == update.prompt
-        }
-        (
-            RoutedOperation::CancelScheduledExecution {
-                expected_revision, ..
-            },
-            Response::ScheduledExecution { execution, .. },
-        ) => {
-            execution.revision > *expected_revision
-                && execution.state == ScheduledExecutionState::Cancelled
-                && execution.reason == Some(ScheduledExecutionReason::CancelledByUser)
-        }
         _ => false,
     }
 }
@@ -2973,18 +2634,9 @@ fn proven_routed_result(
         (
             RoutedOperation::CloseWorkspace { .. }
             | RoutedOperation::CloseShell { .. }
-            | RoutedOperation::RemoveLauncher { .. }
-            | RoutedOperation::RemoveAgentSchedule { .. },
+            | RoutedOperation::RemoveLauncher { .. },
             Response::Error { .. },
         ) => Some(RoutedOperationResult::Ok),
-        (
-            RoutedOperation::PauseAgentSchedule { .. }
-            | RoutedOperation::ResumeAgentSchedule { .. }
-            | RoutedOperation::UpdateAgentSchedule { .. },
-            Response::AgentScheduleInspection { inspection },
-        ) => Some(RoutedOperationResult::AgentSchedule {
-            schedule: inspection.schedule,
-        }),
         (_, response) => routed_result(response).ok(),
     }
 }
@@ -3036,12 +2688,8 @@ fn send_registered_node_request_with_timeout(
 }
 
 fn routed_response_timeout(operation: &RoutedOperation) -> Duration {
-    match operation {
-        RoutedOperation::WaitScheduledExecution { wait_ms, .. } => {
-            Duration::from_millis(u64::from(*wait_ms)).saturating_add(Duration::from_secs(2))
-        }
-        _ => Duration::from_secs(2),
-    }
+    let _ = operation;
+    Duration::from_secs(2)
 }
 
 fn routed_owner_feature(operation: &RoutedOperation) -> Option<protocol::ProtocolFeature> {
@@ -3049,17 +2697,10 @@ fn routed_owner_feature(operation: &RoutedOperation) -> Option<protocol::Protoco
         operation,
         RoutedOperation::CreateWorkspaceShell { .. }
             | RoutedOperation::CreateWorkspaceLauncher { .. }
-            | RoutedOperation::CreateWorkspaceAgentSchedule { .. }
     ) {
         return Some(protocol::ProtocolFeature::GlobalWorkspaces);
     }
-    matches!(
-        operation,
-        RoutedOperation::CreateAgentSchedule { .. }
-            | RoutedOperation::ListScheduledExecutions { .. }
-            | RoutedOperation::WaitScheduledExecution { .. }
-    )
-    .then_some(protocol::ProtocolFeature::RemoteSchedules)
+    None
 }
 
 fn require_guard(actual: u64, expected: u64, resource: &str) -> DaemonResult<()> {
@@ -3095,7 +2736,6 @@ fn workspace_operation_fingerprints(
         Request::CreateGlobalWorkspaceShell { .. }
             | Request::CreateGlobalWorkspaceWithShell { .. }
             | Request::CreateGlobalWorkspaceLauncher { .. }
-            | Request::CreateGlobalWorkspaceAgentSchedule { .. }
     )
     .then(|| {
         let bytes = serde_json::to_vec(request).map_err(|error| {
@@ -3149,24 +2789,6 @@ fn rollback_bump(revision: &Mutex<u64>) -> io::Result<()> {
     Ok(())
 }
 
-fn scheduled_execution_response(
-    execution: ScheduledExecutionSnapshot,
-    response_version: u32,
-) -> DaemonResult<Response> {
-    if execution.state == ScheduledExecutionState::Skipped
-        && !protocol::ProtocolFeature::TimedScheduling.is_supported_by(response_version)
-    {
-        return Err(DaemonError::lifecycle(
-            ErrorCode::Busy,
-            "scheduled execution was skipped by the current concurrency policy",
-        ));
-    }
-    Ok(Response::ScheduledExecution {
-        execution,
-        next_occurrence: None,
-    })
-}
-
 struct DaemonService {
     node_identity: Option<Arc<NodeIdentityManager>>,
     node_registrations: Option<NodeRegistrationManager>,
@@ -3183,14 +2805,10 @@ struct DaemonService {
     host_service_previews: Mutex<HashMap<String, HostServicePreview>>,
     workspace_operation_locks: Mutex<HashMap<String, Weak<Mutex<()>>>>,
     mutation_lock: Mutex<()>,
-    schedule_dispatch_lock: Mutex<()>,
     notification_settings: NotificationDeliverySettings,
     notification_sink: Arc<dyn NotificationSink>,
-    cold_recovery_executions: Vec<ScheduledExecutionSnapshot>,
     startup_environment: UnixEnvironment,
-    scheduler: SchedulerWorker,
     node_projection_workers: NodeProjectionWorkers,
-    clock: Mutex<Arc<dyn SchedulerClock>>,
     #[cfg(test)]
     fail_after_mutation: AtomicBool,
 }
@@ -3743,173 +3361,6 @@ impl RemoteAttachmentManager {
     }
 }
 
-trait SchedulerClock: Send + Sync {
-    fn now_ms(&self) -> u64;
-
-    fn take_tick(&self) -> io::Result<Option<u64>> {
-        Ok(None)
-    }
-
-    fn acknowledge(&self, _generation: u64) -> io::Result<()> {
-        Ok(())
-    }
-
-    fn record_attempt(&self) -> io::Result<()> {
-        Ok(())
-    }
-
-    fn record_failure_diagnostic(&self) -> io::Result<()> {
-        Ok(())
-    }
-
-    fn resample_interval(&self) -> Duration {
-        Duration::from_secs(60)
-    }
-}
-
-struct SystemSchedulerClock;
-
-impl SchedulerClock for SystemSchedulerClock {
-    fn now_ms(&self) -> u64 {
-        unix_time_ms()
-    }
-}
-
-#[cfg(debug_assertions)]
-struct NativeTestSchedulerClock {
-    directory: PathBuf,
-    now_ms: AtomicU64,
-    generation: AtomicU64,
-}
-
-#[cfg(debug_assertions)]
-impl NativeTestSchedulerClock {
-    fn new(directory: PathBuf) -> io::Result<Self> {
-        let (generation, now_ms) = read_native_clock_tick(&directory)?;
-        Ok(Self {
-            directory,
-            now_ms: AtomicU64::new(now_ms),
-            generation: AtomicU64::new(generation.saturating_sub(1)),
-        })
-    }
-}
-
-#[cfg(debug_assertions)]
-impl SchedulerClock for NativeTestSchedulerClock {
-    fn now_ms(&self) -> u64 {
-        self.now_ms.load(Ordering::Acquire)
-    }
-
-    fn take_tick(&self) -> io::Result<Option<u64>> {
-        let (generation, now_ms) = read_native_clock_tick(&self.directory)?;
-        if generation <= self.generation.load(Ordering::Acquire) {
-            return Ok(None);
-        }
-        self.now_ms.store(now_ms, Ordering::Release);
-        self.generation.store(generation, Ordering::Release);
-        write_native_clock_marker(&self.directory.join("seen"), &generation.to_string())?;
-        Ok(Some(generation))
-    }
-
-    fn acknowledge(&self, generation: u64) -> io::Result<()> {
-        write_native_clock_marker(&self.directory.join("ack"), &generation.to_string())
-    }
-
-    fn record_attempt(&self) -> io::Result<()> {
-        let path = self.directory.join("attempts");
-        let attempts = match read_native_clock_marker(&path) {
-            Ok(value) => value.trim().parse::<u64>().unwrap_or(0),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
-            Err(error) => return Err(error),
-        };
-        write_native_clock_marker(&path, &attempts.saturating_add(1).to_string())
-    }
-
-    fn record_failure_diagnostic(&self) -> io::Result<()> {
-        let path = self.directory.join("diagnostics");
-        let diagnostics = match read_native_clock_marker(&path) {
-            Ok(value) => value.trim().parse::<u64>().unwrap_or(0),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
-            Err(error) => return Err(error),
-        };
-        write_native_clock_marker(&path, &diagnostics.saturating_add(1).to_string())
-    }
-
-    fn resample_interval(&self) -> Duration {
-        Duration::from_millis(10)
-    }
-}
-
-#[cfg(debug_assertions)]
-fn read_native_clock_tick(directory: &Path) -> io::Result<(u64, u64)> {
-    let value = read_native_clock_marker(&directory.join("tick"))?;
-    let (generation, now_ms) = value.trim().split_once(' ').ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidData, "native clock tick is malformed")
-    })?;
-    Ok((
-        generation
-            .parse()
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid tick generation"))?,
-        now_ms
-            .parse()
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid tick time"))?,
-    ))
-}
-
-#[cfg(debug_assertions)]
-fn read_native_clock_marker(path: &Path) -> io::Result<String> {
-    let mut file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)?;
-    validate_native_clock_marker(path, &file.metadata()?)?;
-    let mut value = String::new();
-    file.read_to_string(&mut value)?;
-    Ok(value)
-}
-
-#[cfg(debug_assertions)]
-fn write_native_clock_marker(path: &Path, value: &str) -> io::Result<()> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)?;
-    validate_native_clock_marker(path, &file.metadata()?)?;
-    file.write_all(value.as_bytes())
-}
-
-#[cfg(debug_assertions)]
-fn validate_native_clock_marker(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
-    if !metadata.is_file()
-        || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.mode() & 0o077 != 0
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!("native clock marker is unsafe: {}", path.display()),
-        ));
-    }
-    Ok(())
-}
-
-#[derive(Default)]
-struct SchedulerWorker {
-    state: Mutex<SchedulerWorkerState>,
-    changed: Condvar,
-}
-
-#[derive(Default)]
-struct SchedulerWorkerState {
-    stop: bool,
-    wake: bool,
-    running: bool,
-    healthy: bool,
-    handle: Option<thread::JoinHandle<()>>,
-}
-
 #[derive(Default)]
 struct NodeProjectionWorkers {
     stop: Arc<AtomicBool>,
@@ -4003,10 +3454,6 @@ enum DurableUndo {
         workspace: Arc<Workspace>,
         launcher: Arc<WorkspaceLauncher>,
     },
-    CreatedSchedule {
-        workspace: Arc<Workspace>,
-        schedule: Arc<AgentSchedule>,
-    },
     RegisteredAgent {
         workspace: Arc<Workspace>,
         agent: Arc<AgentInstance>,
@@ -4030,24 +3477,9 @@ enum DurableUndo {
         agent: Arc<AgentInstance>,
         previous: AgentInstanceState,
     },
-    ScheduleState {
-        schedule: Arc<AgentSchedule>,
-        previous: AgentScheduleMutableState,
-    },
-    ScheduleExecutions {
-        schedule: Arc<AgentSchedule>,
-        previous: Vec<Arc<ScheduledExecution>>,
-        previous_dispatch_key_filter: Vec<u8>,
-        execution: Option<(Arc<ScheduledExecution>, ScheduledExecutionMutableState)>,
-    },
     RemovedLauncher {
         workspace: Arc<Workspace>,
         launcher: Arc<WorkspaceLauncher>,
-        index: usize,
-    },
-    RemovedSchedule {
-        workspace: Arc<Workspace>,
-        schedule: Arc<AgentSchedule>,
         index: usize,
     },
     RemovedShell {
@@ -4060,7 +3492,6 @@ enum DurableUndo {
         shells: Vec<Arc<Shell>>,
         launchers: Vec<Arc<WorkspaceLauncher>>,
         agents: Vec<Arc<AgentInstance>>,
-        schedules: Vec<Arc<AgentSchedule>>,
     },
 }
 
@@ -4127,7 +3558,6 @@ struct PersistenceWrite {
 struct PersistenceGeneration {
     revision: u64,
     state: PersistedState,
-    executions: Vec<ScheduledExecutionSnapshot>,
 }
 
 impl PersistenceWriter {
@@ -4204,8 +3634,6 @@ struct EventStreamState {
     stream_id: String,
     latest_id: u64,
     events: VecDeque<DaemonEvent>,
-    schedule_shell_ids: HashSet<String>,
-    committed_executions: HashMap<String, ScheduledExecutionSnapshot>,
 }
 
 struct EventTransaction<'a> {
@@ -4293,13 +3721,6 @@ impl EventTransaction<'_> {
         self.transition.lifecycle_event_reservation = event_count;
     }
 
-    fn replace_committed_executions(&mut self, executions: Vec<ScheduledExecutionSnapshot>) {
-        self.events.committed_executions = executions
-            .into_iter()
-            .map(|execution| (execution.id.clone(), execution))
-            .collect();
-    }
-
     fn release_lifecycle_reservation(&mut self) {
         self.transition.lifecycle_event_reservation = 0;
         EventStream::publish_pending_runtime_locked(&mut self.transition, &mut self.events);
@@ -4361,8 +3782,6 @@ impl EventStream {
                 stream_id: Uuid::new_v4().to_string(),
                 latest_id: 0,
                 events: VecDeque::new(),
-                schedule_shell_ids: HashSet::new(),
-                committed_executions: HashMap::new(),
             }),
             transitions: Mutex::new(TransitionState::default()),
             changed: Condvar::new(),
@@ -4376,31 +3795,11 @@ impl EventStream {
                 stream_id: Uuid::new_v4().to_string(),
                 latest_id: 0,
                 events: VecDeque::new(),
-                schedule_shell_ids: HashSet::new(),
-                committed_executions: HashMap::new(),
             },
-            |transfer| {
-                let mut schedule_shell_ids = transfer
-                    .schedule_shell_ids
-                    .into_iter()
-                    .collect::<HashSet<_>>();
-                for event in &transfer.events {
-                    if let DaemonEventKind::ScheduledExecutionCreated { execution, .. }
-                    | DaemonEventKind::ScheduledExecutionChanged { execution, .. } = &event.kind
-                        && let Some(shell_id) = &execution.shell_id
-                    {
-                        schedule_shell_ids.insert(shell_id.clone());
-                    }
-                }
-                let mut state = EventStreamState {
-                    stream_id: transfer.stream_id,
-                    latest_id: transfer.latest_id,
-                    events: transfer.events.into(),
-                    schedule_shell_ids,
-                    committed_executions: HashMap::new(),
-                };
-                Self::retain_referenced_schedule_shell_ids(&mut state);
-                state
+            |transfer| EventStreamState {
+                stream_id: transfer.stream_id,
+                latest_id: transfer.latest_id,
+                events: transfer.events.into(),
             },
         );
         Self {
@@ -4434,72 +3833,7 @@ impl EventStream {
             stream_id: state.stream_id.clone(),
             latest_id: state.latest_id,
             events: state.events.iter().cloned().collect(),
-            schedule_shell_ids: state.schedule_shell_ids.iter().cloned().collect(),
         })
-    }
-
-    fn schedule_shell_ids(&self) -> io::Result<HashSet<String>> {
-        Ok(lock(&self.state)?.schedule_shell_ids.clone())
-    }
-
-    fn initialize_committed_executions(
-        &self,
-        executions: Vec<ScheduledExecutionSnapshot>,
-    ) -> io::Result<()> {
-        let mut transaction = self.transaction()?;
-        transaction.replace_committed_executions(executions);
-        Ok(())
-    }
-
-    fn wait_for_scheduled_execution(
-        &self,
-        execution_id: &str,
-        after_revision: u64,
-        wait_ms: u32,
-        stopping: impl Fn() -> bool,
-    ) -> DaemonResult<Response> {
-        let deadline =
-            Instant::now() + Duration::from_millis(u64::from(wait_ms)).min(MAX_EVENT_WAIT);
-        loop {
-            if stopping() {
-                return Err(DaemonError::lifecycle(
-                    ErrorCode::DaemonStopping,
-                    "Boomux daemon is stopping",
-                ));
-            }
-            let expired = wait_ms == 0 || Instant::now() >= deadline;
-            let transition = lock(&self.transitions)?;
-            let state = lock(&self.state)?;
-            let execution = state
-                .committed_executions
-                .get(execution_id)
-                .cloned()
-                .ok_or_else(|| not_found("scheduled execution", execution_id))?;
-            if after_revision < execution.revision {
-                return Ok(Response::ScheduledExecutionWait {
-                    execution,
-                    changed: true,
-                });
-            }
-            if after_revision > execution.revision {
-                return Err(DaemonError::lifecycle(
-                    ErrorCode::RevisionAhead,
-                    "requested execution revision is ahead of the current revision",
-                ));
-            }
-            if expired {
-                return Ok(Response::ScheduledExecutionWait {
-                    execution,
-                    changed: false,
-                });
-            }
-            drop(transition);
-            let timeout = deadline.saturating_duration_since(Instant::now());
-            let (_state, _) = self
-                .changed
-                .wait_timeout(state, timeout)
-                .map_err(|_| io::Error::other("execution wait lock poisoned"))?;
-        }
     }
 
     fn wait_for<T>(
@@ -4545,12 +3879,6 @@ impl EventStream {
         debug_assert!(Self::ensure_capacity(state, kinds.len()).is_ok());
         let mut appended = Vec::with_capacity(kinds.len());
         for kind in kinds {
-            if let DaemonEventKind::ScheduledExecutionCreated { execution, .. }
-            | DaemonEventKind::ScheduledExecutionChanged { execution, .. } = &kind
-                && let Some(shell_id) = &execution.shell_id
-            {
-                state.schedule_shell_ids.insert(shell_id.clone());
-            }
             state.latest_id += 1;
             let event = DaemonEvent {
                 id: state.latest_id,
@@ -4564,19 +3892,7 @@ impl EventStream {
             let remove = state.events.len() - MAX_RETAINED_EVENTS;
             state.events.drain(..remove);
         }
-        Self::retain_referenced_schedule_shell_ids(state);
         appended
-    }
-
-    fn retain_referenced_schedule_shell_ids(state: &mut EventStreamState) {
-        let referenced_shell_ids = state
-            .events
-            .iter()
-            .filter_map(|event| event_shell_id(&event.kind).map(str::to_owned))
-            .collect::<HashSet<_>>();
-        state
-            .schedule_shell_ids
-            .retain(|shell_id| referenced_shell_ids.contains(shell_id));
     }
 
     #[cfg(test)]
@@ -4811,46 +4127,6 @@ fn reduce_projection_transition(event: &DaemonEvent) -> Option<NodeProjectionTra
             agent_id: agent.id.clone(),
             revision: agent.observation.revision,
         },
-        DaemonEventKind::AgentScheduleCreated {
-            workspace_id,
-            schedule,
-        }
-        | DaemonEventKind::AgentSchedulePaused {
-            workspace_id,
-            schedule,
-        }
-        | DaemonEventKind::AgentScheduleResumed {
-            workspace_id,
-            schedule,
-        }
-        | DaemonEventKind::AgentScheduleUpdated {
-            workspace_id,
-            schedule,
-        } => NodeProjectionTransitionKind::Schedule {
-            workspace_id: workspace_id.clone(),
-            schedule_id: schedule.id.clone(),
-            revision: Some(schedule.revision),
-        },
-        DaemonEventKind::AgentScheduleRemoved {
-            workspace_id,
-            schedule_id,
-        } => NodeProjectionTransitionKind::Schedule {
-            workspace_id: workspace_id.clone(),
-            schedule_id: schedule_id.clone(),
-            revision: None,
-        },
-        DaemonEventKind::ScheduledExecutionCreated {
-            workspace_id,
-            execution,
-        }
-        | DaemonEventKind::ScheduledExecutionChanged {
-            workspace_id,
-            execution,
-        } => NodeProjectionTransitionKind::Execution {
-            workspace_id: workspace_id.clone(),
-            execution_id: execution.id.clone(),
-            revision: execution.revision,
-        },
         DaemonEventKind::HandoffCompleted => NodeProjectionTransitionKind::HandoffCompleted,
         DaemonEventKind::NodeProjectionChanged { .. }
         | DaemonEventKind::FocusedTerminalPresentationChanged => return None,
@@ -4893,382 +4169,6 @@ impl DurableRegistry {
             .get(id)
             .cloned()
             .ok_or_else(|| not_found("agent instance", id))
-    }
-
-    fn schedule(&self, id: &str) -> io::Result<Arc<AgentSchedule>> {
-        lock(&self.state)?
-            .schedules
-            .get(id)
-            .cloned()
-            .ok_or_else(|| not_found("agent schedule", id))
-    }
-
-    fn execution(&self, id: &str) -> io::Result<Arc<ScheduledExecution>> {
-        let schedules = lock(&self.state)?
-            .schedules
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
-        for schedule in schedules {
-            if let Some(execution) = lock(&schedule.executions)?
-                .iter()
-                .find(|execution| execution.id == id)
-            {
-                return Ok(Arc::clone(execution));
-            }
-        }
-        Err(not_found("scheduled execution", id))
-    }
-
-    fn scheduled_executions(
-        &self,
-        workspace_id: Option<&str>,
-        schedule_id: Option<&str>,
-    ) -> io::Result<Vec<ScheduledExecutionSnapshot>> {
-        let schedules = lock(&self.state)?
-            .schedules
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut snapshots = Vec::new();
-        for schedule in schedules {
-            if workspace_id.is_some_and(|id| id != schedule.workspace_id)
-                || schedule_id.is_some_and(|id| id != schedule.id)
-            {
-                continue;
-            }
-            let executions = lock(&schedule.executions)?.clone();
-            for execution in executions {
-                snapshots.push(execution.snapshot()?);
-            }
-        }
-        snapshots.sort_by(|left, right| {
-            right
-                .requested_at_ms
-                .cmp(&left.requested_at_ms)
-                .then_with(|| right.id.cmp(&left.id))
-        });
-        Ok(snapshots)
-    }
-
-    fn scheduled_execution_page(
-        &self,
-        workspace_id: Option<&str>,
-        schedule_id: Option<&str>,
-        limit: u16,
-    ) -> io::Result<(Vec<ScheduledExecutionSnapshot>, u16, bool)> {
-        let limit = limit.clamp(1, protocol::MAX_SCHEDULED_EXECUTION_LIST_LIMIT);
-        let mut executions = self.scheduled_executions(workspace_id, schedule_id)?;
-        let truncated = executions.len() > usize::from(limit);
-        executions.truncate(usize::from(limit));
-        Ok((executions, limit, truncated))
-    }
-
-    fn scheduled_execution_schedule_projections(
-        &self,
-        workspace_id: Option<&str>,
-        schedule_id: Option<&str>,
-    ) -> io::Result<(Vec<ScheduledExecutionScheduleProjection>, u16, bool)> {
-        let mut schedules = lock(&self.state)?
-            .schedules
-            .values()
-            .filter(|schedule| {
-                workspace_id.is_none_or(|id| id == schedule.workspace_id)
-                    && schedule_id.is_none_or(|id| id == schedule.id)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        schedules.sort_by(|left, right| left.id.cmp(&right.id));
-        let limit = protocol::MAX_SCHEDULED_EXECUTION_SCHEDULE_PROJECTIONS;
-        let truncated = schedules.len() > usize::from(limit);
-        schedules.truncate(usize::from(limit));
-        let projections = schedules
-            .into_iter()
-            .map(|schedule| {
-                let snapshot = schedule.snapshot()?;
-                Ok(ScheduledExecutionScheduleProjection {
-                    schedule_id: snapshot.id,
-                    next_occurrence: snapshot.next_occurrence,
-                })
-            })
-            .collect::<io::Result<_>>()?;
-        Ok((projections, limit, truncated))
-    }
-
-    fn active_scheduled_execution_count(&self) -> io::Result<usize> {
-        self.active_scheduled_execution_count_excluding(None)
-    }
-
-    fn active_scheduled_execution_count_excluding(
-        &self,
-        excluding_schedule_id: Option<&str>,
-    ) -> io::Result<usize> {
-        let schedules = lock(&self.state)?
-            .schedules
-            .values()
-            .filter(|schedule| excluding_schedule_id != Some(schedule.id.as_str()))
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut count = 0;
-        for schedule in schedules {
-            for execution in lock(&schedule.executions)?.iter() {
-                count += usize::from(!lock(&execution.state)?.state.is_terminal());
-            }
-        }
-        Ok(count)
-    }
-
-    #[cfg(test)]
-    fn claim_schedule_execution(
-        &self,
-        schedule_id: &str,
-        dispatch_key: &str,
-    ) -> DaemonResult<(ScheduledExecutionSnapshot, Option<DurableUndo>)> {
-        let (execution, undo, _) = self.decide_schedule_execution(
-            schedule_id,
-            ScheduleDecision {
-                dispatch_kind: ScheduledExecutionDispatchKind::Manual,
-                dispatch_key: dispatch_key.to_owned(),
-                scheduled_at_ms: None,
-                coalesced_through_ms: None,
-                requested_at_ms: unix_time_ms(),
-                forced_skip: None,
-            },
-            4,
-        )?;
-        Ok((execution, undo))
-    }
-
-    fn decide_schedule_execution(
-        &self,
-        schedule_id: &str,
-        decision: ScheduleDecision,
-        max_concurrent: u16,
-    ) -> DaemonResult<(ScheduledExecutionSnapshot, Option<DurableUndo>, bool)> {
-        let ScheduleDecision {
-            dispatch_kind,
-            dispatch_key,
-            scheduled_at_ms,
-            coalesced_through_ms,
-            requested_at_ms,
-            forced_skip,
-        } = decision;
-        validate_id("dispatch idempotency key", &dispatch_key)?;
-        let schedule = self.schedule(schedule_id)?;
-        let existing = lock(&schedule.executions)?
-            .iter()
-            .find(|execution| execution.dispatch_key == dispatch_key)
-            .cloned();
-        if let Some(existing) = existing {
-            let snapshot = existing.snapshot()?;
-            let claimed = snapshot.state == ScheduledExecutionState::Claimed;
-            return Ok((snapshot, None, claimed));
-        }
-        let schedule_state = lock(&schedule.state)?.clone();
-        let execution_shell_id = schedule_state.execution_shell_id.clone();
-        let mut skip_reason = forced_skip;
-        if let Some(shell_id) = execution_shell_id {
-            let shell = self.shell(&shell_id)?;
-            if matches!(*lock(&shell.lifecycle)?, ShellLifecycle::Running { .. }) {
-                skip_reason.get_or_insert(ScheduledExecutionReason::Overlap);
-            }
-        }
-        let mut executions = lock(&schedule.executions)?;
-        let mut dispatch_key_filter = lock(&schedule.dispatch_key_filter)?;
-        if dispatch_key_was_seen(&dispatch_key_filter, &dispatch_key) {
-            return Err(DaemonError::lifecycle(
-                ErrorCode::IdempotencyExpired,
-                "dispatch idempotency key was used by a pruned execution",
-            ));
-        }
-        if executions
-            .iter()
-            .any(|execution| lock(&execution.state).is_ok_and(|state| !state.state.is_terminal()))
-        {
-            skip_reason.get_or_insert(ScheduledExecutionReason::Overlap);
-        }
-        if skip_reason.is_none()
-            && (self.continuation_session_is_active(&schedule)?
-                || self.continuation_lease_is_occupied(&schedule)?)
-        {
-            skip_reason = Some(ScheduledExecutionReason::ActiveSession);
-        }
-        if skip_reason.is_none()
-            && self.workspace_has_nonterminal_execution(&schedule.workspace_id, &schedule.id)?
-        {
-            skip_reason = Some(ScheduledExecutionReason::WorkspaceCapacity);
-        }
-        if skip_reason.is_none()
-            && self.active_scheduled_execution_count_excluding(Some(&schedule.id))?
-                >= usize::from(max_concurrent)
-        {
-            skip_reason = Some(ScheduledExecutionReason::GlobalCapacity);
-        }
-        if skip_reason.is_none()
-            && validate_schedule_capability(&schedule.integration, &schedule.session).is_err()
-        {
-            skip_reason = Some(ScheduledExecutionReason::InvalidTarget);
-        }
-        let state = if skip_reason.is_some() {
-            ScheduledExecutionState::Skipped
-        } else {
-            ScheduledExecutionState::Claimed
-        };
-        let id = if let Some(scheduled_at_ms) = scheduled_at_ms {
-            timed_execution_id(
-                &schedule.id,
-                schedule_state.trigger_revision,
-                scheduled_at_ms,
-            )
-        } else {
-            Uuid::new_v4().to_string()
-        };
-        let execution = Arc::new(ScheduledExecution {
-            id,
-            workspace_id: schedule.workspace_id.clone(),
-            schedule_id: schedule.id.clone(),
-            dispatch_kind,
-            dispatch_key: dispatch_key.clone(),
-            schedule_revision: schedule_state.revision,
-            prompt_revision: schedule_state.prompt_revision,
-            trigger_revision: schedule_state.trigger_revision,
-            requested_at_ms,
-            scheduled_at_ms,
-            coalesced_through_ms,
-            cwd: schedule.cwd.clone(),
-            integration: schedule.integration.clone(),
-            session: schedule.session.clone(),
-            prompt: schedule_state.prompt.clone(),
-            runner_token: Uuid::new_v4().to_string(),
-            state: Mutex::new(ScheduledExecutionMutableState {
-                revision: 1,
-                state,
-                started_at_ms: None,
-                ended_at_ms: skip_reason.map(|_| requested_at_ms),
-                reason: skip_reason,
-                outcome: None,
-                shell_id: None,
-                run_id: None,
-                agent_id: None,
-                external_session_id: None,
-            }),
-        });
-        let snapshot = execution.snapshot()?;
-        let previous = executions.clone();
-        let previous_dispatch_key_filter = dispatch_key_filter.clone();
-        remember_dispatch_key(&mut dispatch_key_filter, &dispatch_key);
-        executions.push(execution);
-        if state.is_terminal() {
-            prune_terminal_executions(&mut executions);
-        }
-        drop(dispatch_key_filter);
-        drop(executions);
-        Ok((
-            snapshot,
-            Some(DurableUndo::ScheduleExecutions {
-                schedule,
-                previous,
-                previous_dispatch_key_filter,
-                execution: None,
-            }),
-            state == ScheduledExecutionState::Claimed,
-        ))
-    }
-
-    fn workspace_has_nonterminal_execution(
-        &self,
-        workspace_id: &str,
-        excluding_schedule_id: &str,
-    ) -> io::Result<bool> {
-        let schedules = lock(&self.state)?
-            .schedules
-            .values()
-            .filter(|schedule| {
-                schedule.workspace_id == workspace_id && schedule.id != excluding_schedule_id
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        for schedule in schedules {
-            if lock(&schedule.executions)?.iter().any(|execution| {
-                lock(&execution.state).is_ok_and(|state| !state.state.is_terminal())
-            }) {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
-    fn continuation_lease_is_occupied(&self, schedule: &AgentSchedule) -> io::Result<bool> {
-        let AgentScheduleSession::Continue {
-            external_session_id,
-        } = &schedule.session
-        else {
-            return Ok(false);
-        };
-        let schedules = lock(&self.state)?
-            .schedules
-            .values()
-            .filter(|candidate| candidate.id != schedule.id)
-            .cloned()
-            .collect::<Vec<_>>();
-        for candidate in schedules {
-            if candidate.integration == schedule.integration
-                && matches!(
-                    &candidate.session,
-                    AgentScheduleSession::Continue { external_session_id: candidate_id }
-                        if candidate_id == external_session_id
-                )
-                && lock(&candidate.executions)?.iter().any(|execution| {
-                    lock(&execution.state).is_ok_and(|state| !state.state.is_terminal())
-                })
-            {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
-    fn continuation_session_is_active(&self, schedule: &AgentSchedule) -> io::Result<bool> {
-        let AgentScheduleSession::Continue {
-            external_session_id,
-        } = &schedule.session
-        else {
-            return Ok(false);
-        };
-        let candidates = {
-            let state = lock(&self.state)?;
-            state
-                .agents
-                .values()
-                .filter(|agent| {
-                    agent.integration == schedule.integration
-                        && agent.external_session_id.as_deref()
-                            == Some(external_session_id.as_str())
-                })
-                .filter_map(|agent| {
-                    state
-                        .shells
-                        .get(&agent.shell_id)
-                        .map(|shell| (Arc::clone(agent), Arc::clone(shell)))
-                })
-                .collect::<Vec<_>>()
-        };
-        for (agent, shell) in candidates {
-            let agent_state = lock(&agent.state)?;
-            if agent_state.ended_at_ms.is_none()
-                && !matches!(
-                    agent_state.observation.state,
-                    AgentState::Inactive | AgentState::Done
-                )
-                && matches!(
-                    &*lock(&shell.lifecycle)?,
-                    ShellLifecycle::Running { run, .. } if run.id == agent.run_id
-                )
-            {
-                return Ok(true);
-            }
-        }
-        Ok(false)
     }
 
     fn contains_shell(&self, shell: &Arc<Shell>) -> io::Result<bool> {
@@ -5363,27 +4263,6 @@ impl DurableRegistry {
         (workspace, shell)
     }
 
-    fn schedule_notification_context(
-        &self,
-        workspace_id: &str,
-        schedule_id: &str,
-    ) -> (String, String) {
-        let Ok(state) = self.state.lock() else {
-            return ("unknown".into(), "removed".into());
-        };
-        let workspace = state
-            .workspaces
-            .get(workspace_id)
-            .and_then(|workspace| workspace.name.lock().ok().map(|name| name.clone()))
-            .unwrap_or_else(|| "unknown".into());
-        let schedule = state
-            .schedules
-            .get(schedule_id)
-            .and_then(|schedule| schedule.state.lock().ok().map(|state| state.name.clone()))
-            .unwrap_or_else(|| "removed".into());
-        (workspace, schedule)
-    }
-
     fn create_workspace(
         &self,
         name: String,
@@ -5408,7 +4287,6 @@ impl DurableRegistry {
             shell_ids: Mutex::new(shells.iter().map(|shell| shell.id.clone()).collect()),
             launcher_ids: Mutex::new(Vec::new()),
             agent_ids: Mutex::new(Vec::new()),
-            schedule_ids: Mutex::new(Vec::new()),
         });
         let snapshot = WorkspaceSnapshot {
             id: workspace_id.clone(),
@@ -5421,7 +4299,6 @@ impl DurableRegistry {
                 .collect::<io::Result<_>>()?,
             launchers: Vec::new(),
             agents: Vec::new(),
-            schedules: Vec::new(),
         };
         let mut state = lock(&self.state)?;
         if state
@@ -5475,7 +4352,6 @@ impl DurableRegistry {
             shell_ids: Mutex::new(Vec::new()),
             launcher_ids: Mutex::new(Vec::new()),
             agent_ids: Mutex::new(Vec::new()),
-            schedule_ids: Mutex::new(Vec::new()),
         });
         let snapshot = WorkspaceSnapshot {
             id: workspace_id.to_owned(),
@@ -5485,7 +4361,6 @@ impl DurableRegistry {
             shells: Vec::new(),
             launchers: Vec::new(),
             agents: Vec::new(),
-            schedules: Vec::new(),
         };
         let mut state = lock(&self.state)?;
         if state
@@ -5658,79 +4533,6 @@ impl DurableRegistry {
         Ok(())
     }
 
-    fn create_schedule_shell(
-        &self,
-        schedule: &Arc<AgentSchedule>,
-        command: Vec<String>,
-    ) -> io::Result<(Arc<Shell>, DurableUndo)> {
-        let workspace = self.workspace(&schedule.workspace_id)?;
-        let shell = Arc::new(Shell {
-            id: Uuid::new_v4().to_string(),
-            revision: Mutex::new(1),
-            workspace_id: schedule.workspace_id.clone(),
-            name: Mutex::new(format!("schedule-{}", &schedule.id[..8])),
-            cwd: schedule.cwd.clone(),
-            command,
-            owner: ShellOwner::Schedule {
-                schedule_id: schedule.id.clone(),
-            },
-            last_run: Mutex::new(None),
-            lifecycle: Mutex::new(ShellLifecycle::Pending),
-            foreground_process_cache: Mutex::new(None),
-        });
-        let mut state = lock(&self.state)?;
-        let mut shell_ids = lock(&workspace.shell_ids)?;
-        state.shells.insert(shell.id.clone(), Arc::clone(&shell));
-        shell_ids.push(shell.id.clone());
-        bump_revision(&workspace.revision, "workspace")?;
-        drop(shell_ids);
-        drop(state);
-        Ok((
-            shell.clone(),
-            DurableUndo::CreatedShell { workspace, shell },
-        ))
-    }
-
-    fn mutate_execution(
-        &self,
-        execution: &Arc<ScheduledExecution>,
-        mutate: impl FnOnce(&mut ScheduledExecutionMutableState) -> io::Result<()>,
-    ) -> io::Result<(ScheduledExecutionSnapshot, DurableUndo)> {
-        let schedule = self.schedule(&execution.schedule_id)?;
-        let mut executions = lock(&schedule.executions)?;
-        if !executions
-            .iter()
-            .any(|current| Arc::ptr_eq(current, execution))
-        {
-            return Err(not_found("scheduled execution", &execution.id));
-        }
-        let previous = executions.clone();
-        let previous_dispatch_key_filter = lock(&schedule.dispatch_key_filter)?.clone();
-        let mut state = lock(&execution.state)?;
-        let previous_state = state.clone();
-        mutate(&mut state)?;
-        state.revision = state
-            .revision
-            .checked_add(1)
-            .ok_or_else(|| io::Error::other("scheduled execution revision exhausted"))?;
-        let snapshot = execution.snapshot_from(&state);
-        let became_terminal = state.state.is_terminal();
-        drop(state);
-        if became_terminal {
-            prune_terminal_executions(&mut executions);
-        }
-        drop(executions);
-        Ok((
-            snapshot,
-            DurableUndo::ScheduleExecutions {
-                schedule,
-                previous,
-                previous_dispatch_key_filter,
-                execution: Some((Arc::clone(execution), previous_state)),
-            },
-        ))
-    }
-
     fn create_shell_with_workspace(
         &self,
         spec: ShellSpec,
@@ -5871,297 +4673,6 @@ impl DurableRegistry {
         ))
     }
 
-    #[cfg(test)]
-    fn create_schedule(
-        &self,
-        workspace_id: &str,
-        spec: AgentScheduleSpec,
-    ) -> io::Result<(AgentScheduleSnapshot, DurableUndo)> {
-        self.create_schedule_at(workspace_id, spec, unix_time_ms())
-    }
-
-    fn create_schedule_at(
-        &self,
-        workspace_id: &str,
-        spec: AgentScheduleSpec,
-        now: u64,
-    ) -> io::Result<(AgentScheduleSnapshot, DurableUndo)> {
-        let (snapshot, undo) =
-            self.create_schedule_at_with_id(workspace_id, Uuid::new_v4().to_string(), spec, now)?;
-        Ok((
-            snapshot,
-            undo.expect("new random Schedule ID cannot be idempotent"),
-        ))
-    }
-
-    fn create_schedule_at_with_id(
-        &self,
-        workspace_id: &str,
-        schedule_id: String,
-        mut spec: AgentScheduleSpec,
-        now: u64,
-    ) -> io::Result<(AgentScheduleSnapshot, Option<DurableUndo>)> {
-        validate_uuid(&schedule_id, "Schedule idempotency key")?;
-        spec.trigger.cron = crate::scheduling::canonicalize_cron(&spec.trigger.cron)
-            .map_err(schedule_validation_error)?;
-        spec.trigger.timezone = crate::scheduling::canonicalize_timezone(&spec.trigger.timezone)
-            .map_err(schedule_validation_error)?;
-        if let Some(existing) = lock(&self.state)?.schedules.get(&schedule_id).cloned() {
-            let inspection = existing.inspection()?;
-            if inspection.schedule.workspace_id == workspace_id
-                && inspection.schedule.name == spec.name
-                && inspection.schedule.cwd == spec.cwd
-                && inspection.schedule.integration == spec.integration
-                && inspection.schedule.session == spec.session
-                && inspection.schedule.trigger == spec.trigger
-                && inspection.schedule.state == spec.state
-                && inspection.prompt == spec.prompt
-            {
-                return Ok((inspection.schedule, None));
-            }
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "Schedule idempotency key exists with a different definition",
-            ));
-        }
-        validate_name(&spec.name)?;
-        validate_cwd(&spec.cwd)?;
-        validate_schedule_spec(&spec)?;
-        crate::scheduling::CronSchedule::compile(&spec.trigger.cron, &spec.trigger.timezone)
-            .and_then(|cron| cron.ensure_possible())
-            .map_err(schedule_validation_error)?;
-        validate_schedule_capability(&spec.integration, &spec.session)?;
-        let workspace = self.workspace(workspace_id)?;
-        let schedule = Arc::new(AgentSchedule {
-            id: schedule_id,
-            workspace_id: workspace_id.into(),
-            cwd: spec.cwd,
-            integration: spec.integration,
-            session: spec.session,
-            overlap_policy: spec.overlap_policy,
-            created_at_ms: now,
-            state: Mutex::new(AgentScheduleMutableState {
-                name: spec.name,
-                prompt: spec.prompt,
-                trigger: spec.trigger,
-                prompt_revision: 1,
-                trigger_revision: 1,
-                state: spec.state,
-                revision: 1,
-                updated_at_ms: now,
-                evaluation_frontier_ms: now,
-                evaluation_frontier_trigger_revision: 1,
-                execution_shell_id: None,
-            }),
-            executions: Mutex::new(Vec::new()),
-            dispatch_key_filter: Mutex::new(vec![0; DISPATCH_KEY_FILTER_BYTES]),
-        });
-        let snapshot = schedule.snapshot()?;
-        let mut state = lock(&self.state)?;
-        let Some(current) = state.workspaces.get(workspace_id) else {
-            return Err(not_found("workspace", workspace_id));
-        };
-        if !Arc::ptr_eq(current, &workspace) {
-            return Err(not_found("workspace", workspace_id));
-        }
-        let mut schedule_ids = lock(&workspace.schedule_ids)?;
-        if schedule_ids.len() >= crate::scheduling::MAX_SCHEDULES_PER_WORKSPACE {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "workspace may contain at most {} agent schedules",
-                    crate::scheduling::MAX_SCHEDULES_PER_WORKSPACE
-                ),
-            ));
-        }
-        if schedule_ids.iter().any(|id| {
-            state
-                .schedules
-                .get(id)
-                .and_then(|existing| existing.state.lock().ok())
-                .is_some_and(|existing| existing.name == snapshot.name)
-        }) {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!("agent schedule name already exists: {}", snapshot.name),
-            ));
-        }
-        state
-            .schedules
-            .insert(schedule.id.clone(), Arc::clone(&schedule));
-        schedule_ids.push(schedule.id.clone());
-        bump_revision(&workspace.revision, "workspace")?;
-        drop(schedule_ids);
-        drop(state);
-        Ok((
-            snapshot,
-            Some(DurableUndo::CreatedSchedule {
-                workspace,
-                schedule,
-            }),
-        ))
-    }
-
-    fn set_schedule_state_at(
-        &self,
-        schedule_id: &str,
-        next: AgentScheduleState,
-        expected_revision: Option<u64>,
-        requested_at_ms: u64,
-    ) -> DaemonResult<(AgentScheduleSnapshot, Option<DurableUndo>)> {
-        let schedule = self.schedule(schedule_id)?;
-        let mut state = lock(&schedule.state)?;
-        if let Some(expected) = expected_revision {
-            require_guard(state.revision, expected, "agent schedule")?;
-        }
-        if state.state == next {
-            return Ok((schedule.snapshot_from(&state)?, None));
-        }
-        let mut compiled_trigger = None;
-        if next == AgentScheduleState::Enabled {
-            let cron = crate::scheduling::CronSchedule::compile(
-                &state.trigger.cron,
-                &state.trigger.timezone,
-            )
-            .map_err(schedule_validation_error)?;
-            cron.ensure_possible().map_err(schedule_validation_error)?;
-            compiled_trigger = Some(cron);
-            validate_schedule_capability(&schedule.integration, &schedule.session)?;
-        }
-        let previous = state.clone();
-        let now = requested_at_ms.max(state.updated_at_ms.saturating_add(1));
-        if let Some(cron) = compiled_trigger {
-            cron.next_after_ms(now.max(state.evaluation_frontier_ms))
-                .map_err(schedule_validation_error)?;
-        }
-        state.state = next;
-        state.revision = state
-            .revision
-            .checked_add(1)
-            .ok_or_else(|| io::Error::other("agent schedule revision exhausted"))?;
-        state.updated_at_ms = now;
-        if next == AgentScheduleState::Enabled {
-            state.evaluation_frontier_ms = now.max(state.evaluation_frontier_ms);
-            state.evaluation_frontier_trigger_revision = state.trigger_revision;
-        }
-        let snapshot = schedule.snapshot_from(&state)?;
-        drop(state);
-        Ok((
-            snapshot,
-            Some(DurableUndo::ScheduleState { schedule, previous }),
-        ))
-    }
-
-    fn update_schedule_at(
-        &self,
-        schedule_id: &str,
-        expected_revision: u64,
-        mut update: AgentScheduleUpdate,
-        requested_at_ms: u64,
-    ) -> DaemonResult<(AgentScheduleSnapshot, Option<DurableUndo>)> {
-        validate_name(&update.name)?;
-        crate::scheduling::validate_prompt(&update.prompt).map_err(schedule_validation_error)?;
-        update.trigger.cron = crate::scheduling::canonicalize_cron(&update.trigger.cron)
-            .map_err(schedule_validation_error)?;
-        update.trigger.timezone =
-            crate::scheduling::canonicalize_timezone(&update.trigger.timezone)
-                .map_err(schedule_validation_error)?;
-        crate::scheduling::CronSchedule::compile(&update.trigger.cron, &update.trigger.timezone)
-            .and_then(|cron| cron.ensure_possible())
-            .map_err(schedule_validation_error)?;
-
-        let schedule = self.schedule(schedule_id)?;
-        {
-            let state = lock(&schedule.state)?;
-            if state.revision != expected_revision {
-                return Err(DaemonError::lifecycle(
-                    ErrorCode::RevisionAhead,
-                    format!(
-                        "agent schedule revision is {}; update supplied {}",
-                        state.revision, expected_revision
-                    ),
-                ));
-            }
-            if state.state != AgentScheduleState::Paused {
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "agent schedule must be paused before editing",
-                )
-                .into());
-            }
-            if state.name == update.name
-                && state.prompt == update.prompt
-                && state.trigger == update.trigger
-            {
-                return Ok((schedule.snapshot_from(&state)?, None));
-            }
-        }
-
-        let workspace = self.workspace(&schedule.workspace_id)?;
-        let durable = lock(&self.state)?;
-        let schedule_ids = lock(&workspace.schedule_ids)?;
-        if schedule_ids
-            .iter()
-            .filter(|id| id.as_str() != schedule_id)
-            .any(|id| {
-                durable
-                    .schedules
-                    .get(id)
-                    .and_then(|existing| existing.state.lock().ok())
-                    .is_some_and(|state| state.name == update.name)
-            })
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!("agent schedule name already exists: {}", update.name),
-            )
-            .into());
-        }
-        drop(schedule_ids);
-        drop(durable);
-
-        let mut state = lock(&schedule.state)?;
-        if state.revision != expected_revision {
-            return Err(DaemonError::lifecycle(
-                ErrorCode::RevisionAhead,
-                "agent schedule changed while preparing the update",
-            ));
-        }
-        if state.state != AgentScheduleState::Paused {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "agent schedule must be paused before editing",
-            )
-            .into());
-        }
-        let previous = state.clone();
-        let revision = state
-            .revision
-            .checked_add(1)
-            .ok_or_else(|| io::Error::other("agent schedule revision exhausted"))?;
-        let prompt_changed = state.prompt != update.prompt;
-        let trigger_changed = state.trigger != update.trigger;
-        state.name = update.name;
-        state.prompt = update.prompt;
-        state.trigger = update.trigger;
-        state.revision = revision;
-        state.updated_at_ms = requested_at_ms.max(state.updated_at_ms.saturating_add(1));
-        if prompt_changed {
-            state.prompt_revision = revision;
-        }
-        if trigger_changed {
-            state.trigger_revision = revision;
-            state.evaluation_frontier_ms = state.updated_at_ms;
-            state.evaluation_frontier_trigger_revision = revision;
-        }
-        let snapshot = schedule.snapshot_from(&state)?;
-        drop(state);
-        Ok((
-            snapshot,
-            Some(DurableUndo::ScheduleState { schedule, previous }),
-        ))
-    }
-
     fn next_workspace_name(&self) -> io::Result<String> {
         let state = lock(&self.state)?;
         let mut suffix = 1_u64;
@@ -6183,12 +4694,6 @@ impl DurableRegistry {
     fn rename_shell(&self, shell_id: &str, name: String) -> io::Result<Option<DurableUndo>> {
         validate_name(&name)?;
         let shell = self.shell(shell_id)?;
-        if !matches!(shell.owner, ShellOwner::User) {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "schedule-owned shells cannot be renamed",
-            ));
-        }
         let workspace = self.workspace(&shell.workspace_id)?;
         let state = lock(&self.state)?;
         let shell_ids = lock(&workspace.shell_ids)?;
@@ -6356,8 +4861,6 @@ impl DurableRegistry {
         let lifecycle = lock(&shell.lifecycle)?;
         match &*lifecycle {
             ShellLifecycle::Running { run, .. } if run.id == run_id => {}
-            ShellLifecycle::Exited { run, .. }
-                if run.id == run_id && matches!(shell.owner, ShellOwner::Schedule { .. }) => {}
             ShellLifecycle::Running { .. }
             | ShellLifecycle::Exited { .. }
             | ShellLifecycle::Pending => {
@@ -6536,63 +5039,6 @@ impl DurableRegistry {
         ))
     }
 
-    fn link_agent_execution(
-        &self,
-        agent: &AgentInstanceSnapshot,
-    ) -> io::Result<Option<(ScheduledExecutionSnapshot, DurableUndo)>> {
-        let shell = self.shell(&agent.shell_id)?;
-        let ShellOwner::Schedule { schedule_id } = &shell.owner else {
-            return Ok(None);
-        };
-        let schedule = self.schedule(schedule_id)?;
-        if schedule.integration != agent.integration {
-            return Ok(None);
-        }
-        let execution = lock(&schedule.executions)?
-            .iter()
-            .find(|execution| {
-                lock(&execution.state).is_ok_and(|state| {
-                    state.shell_id.as_deref() == Some(agent.shell_id.as_str())
-                        && state.run_id.as_deref() == Some(agent.run_id.as_str())
-                })
-            })
-            .cloned();
-        let Some(execution) = execution else {
-            return Ok(None);
-        };
-        match &execution.session {
-            AgentScheduleSession::Fresh => {
-                if agent.external_session_id.is_none() {
-                    return Ok(None);
-                }
-            }
-            AgentScheduleSession::Continue {
-                external_session_id,
-            } if agent.external_session_id.as_deref() != Some(external_session_id.as_str()) => {
-                return Ok(None);
-            }
-            AgentScheduleSession::Continue { .. } => {}
-        }
-        let current = execution.snapshot()?;
-        if current.agent_id.as_deref() == Some(agent.id.as_str())
-            && current.external_session_id == agent.external_session_id
-        {
-            return Ok(None);
-        }
-        if current.agent_id.is_some() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "scheduled execution is already linked to a different Agent",
-            ));
-        }
-        let (snapshot, undo) = self.mutate_execution(&execution, |state| {
-            state.agent_id = Some(agent.id.clone());
-            state.external_session_id = agent.external_session_id.clone();
-            Ok(())
-        })?;
-        Ok(Some((snapshot, undo)))
-    }
-
     fn workspace_shells(&self, workspace: &Arc<Workspace>) -> io::Result<Vec<Arc<Shell>>> {
         let state = lock(&self.state)?;
         let Some(current) = state.workspaces.get(&workspace.id) else {
@@ -6655,21 +5101,6 @@ impl DurableRegistry {
                 lock(&workspace.launcher_ids)?.retain(|id| id != &launcher.id);
                 rollback_bump(&workspace.revision)?;
             }
-            DurableUndo::CreatedSchedule {
-                workspace,
-                schedule,
-            } => {
-                let mut state = lock(&self.state)?;
-                if state
-                    .schedules
-                    .get(&schedule.id)
-                    .is_some_and(|current| Arc::ptr_eq(current, &schedule))
-                {
-                    state.schedules.remove(&schedule.id);
-                }
-                lock(&workspace.schedule_ids)?.retain(|id| id != &schedule.id);
-                rollback_bump(&workspace.revision)?;
-            }
             DurableUndo::RegisteredAgent { workspace, agent } => {
                 let mut state = lock(&self.state)?;
                 if state
@@ -6709,21 +5140,6 @@ impl DurableRegistry {
             DurableUndo::AgentState { agent, previous } => {
                 *lock(&agent.state)? = previous;
             }
-            DurableUndo::ScheduleState { schedule, previous } => {
-                *lock(&schedule.state)? = previous;
-            }
-            DurableUndo::ScheduleExecutions {
-                schedule,
-                previous,
-                previous_dispatch_key_filter,
-                execution,
-            } => {
-                if let Some((execution, state)) = execution {
-                    *lock(&execution.state)? = state;
-                }
-                *lock(&schedule.executions)? = previous;
-                *lock(&schedule.dispatch_key_filter)? = previous_dispatch_key_filter;
-            }
             DurableUndo::RemovedLauncher {
                 workspace,
                 launcher,
@@ -6733,17 +5149,6 @@ impl DurableRegistry {
                     .launchers
                     .insert(launcher.id.clone(), Arc::clone(&launcher));
                 lock(&workspace.launcher_ids)?.insert(index, launcher.id.clone());
-                rollback_bump(&workspace.revision)?;
-            }
-            DurableUndo::RemovedSchedule {
-                workspace,
-                schedule,
-                index,
-            } => {
-                lock(&self.state)?
-                    .schedules
-                    .insert(schedule.id.clone(), Arc::clone(&schedule));
-                lock(&workspace.schedule_ids)?.insert(index, schedule.id.clone());
                 rollback_bump(&workspace.revision)?;
             }
             DurableUndo::RemovedShell {
@@ -6762,7 +5167,6 @@ impl DurableRegistry {
                 shells,
                 launchers,
                 agents,
-                schedules,
             } => {
                 let mut state = lock(&self.state)?;
                 for shell in shells {
@@ -6773,9 +5177,6 @@ impl DurableRegistry {
                 }
                 for agent in agents {
                     state.agents.insert(agent.id.clone(), agent);
-                }
-                for schedule in schedules {
-                    state.schedules.insert(schedule.id.clone(), schedule);
                 }
                 state.workspaces.insert(workspace.id.clone(), workspace);
             }
@@ -6804,30 +5205,23 @@ impl DurableRegistry {
                 .map(|workspace| workspace.snapshot(self))
                 .collect::<io::Result<_>>()?,
             focused_terminal,
-            scheduler: None,
         })
     }
 
-    fn node_projection(
-        &self,
-        node_id: String,
-        scheduler: SchedulerHealth,
-    ) -> io::Result<NodeProjectionSnapshot> {
-        let (workspaces, shells, launchers, agents, schedules) = {
+    fn node_projection(&self, node_id: String) -> io::Result<NodeProjectionSnapshot> {
+        let (workspaces, shells, launchers, agents) = {
             let state = lock(&self.state)?;
             (
                 state.workspaces.values().cloned().collect::<Vec<_>>(),
                 state.shells.values().cloned().collect::<Vec<_>>(),
                 state.launchers.values().cloned().collect::<Vec<_>>(),
                 state.agents.values().cloned().collect::<Vec<_>>(),
-                state.schedules.values().cloned().collect::<Vec<_>>(),
             )
         };
         let mut projected_workspaces = Vec::with_capacity(workspaces.len());
         for workspace in workspaces {
-            let item_count = lock(&workspace.shell_ids)?.len()
-                + lock(&workspace.launcher_ids)?.len()
-                + lock(&workspace.schedule_ids)?.len();
+            let item_count =
+                lock(&workspace.shell_ids)?.len() + lock(&workspace.launcher_ids)?.len();
             let agent_ids = lock(&workspace.agent_ids)?.clone();
             let attention_count = agents
                 .iter()
@@ -6854,45 +5248,16 @@ impl DurableRegistry {
             .iter()
             .map(|agent| agent.node_projection())
             .collect::<io::Result<Vec<_>>>()?;
-        let mut projected_schedules = schedules
-            .iter()
-            .map(|schedule| schedule.node_projection())
-            .collect::<io::Result<Vec<_>>>()?;
-        let mut executions = Vec::new();
-        for schedule in schedules {
-            for execution in lock(&schedule.executions)?.iter() {
-                executions.push(execution.node_projection()?);
-            }
-        }
-        executions.sort_by(|left, right| {
-            left.state
-                .is_terminal()
-                .cmp(&right.state.is_terminal())
-                .then_with(|| {
-                    right
-                        .requested_at_ms
-                        .cmp(&left.requested_at_ms)
-                        .then_with(|| left.id.cmp(&right.id))
-                })
-        });
-        let execution_limit = usize::from(protocol::MAX_NODE_PROJECTION_EXECUTIONS);
-        let executions_truncated = executions.len() > execution_limit;
-        executions.truncate(execution_limit);
         projected_workspaces.sort_by(|left, right| left.id.cmp(&right.id));
         projected_shells.sort_by(|left, right| left.id.cmp(&right.id));
         projected_launchers.sort_by(|left, right| left.id.cmp(&right.id));
         projected_agents.sort_by(|left, right| left.id.cmp(&right.id));
-        projected_schedules.sort_by(|left, right| left.id.cmp(&right.id));
         Ok(NodeProjectionSnapshot {
             node_id,
             workspaces: projected_workspaces,
             shells: projected_shells,
             launchers: projected_launchers,
             agents: projected_agents,
-            schedules: projected_schedules,
-            executions,
-            executions_truncated,
-            scheduler,
         })
     }
 
@@ -6900,31 +5265,14 @@ impl DurableRegistry {
         Ok(lock(&self.state)?.shells.values().cloned().collect())
     }
 
-    fn schedule_shell_ids(&self) -> io::Result<HashSet<String>> {
-        let schedules = lock(&self.state)?
-            .schedules
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut ids = HashSet::new();
-        for schedule in schedules {
-            if let Some(shell_id) = lock(&schedule.state)?.execution_shell_id.clone() {
-                ids.insert(shell_id);
-            }
-        }
-        Ok(ids)
-    }
-
     fn capture_persisted_state(&self) -> io::Result<PersistenceGeneration> {
-        let executions = self.scheduled_executions(None, None)?;
-        let (mut workspaces, shells_by_id, launchers_by_id, agents_by_id, schedules_by_id) = {
+        let (mut workspaces, shells_by_id, launchers_by_id, agents_by_id) = {
             let state = lock(&self.state)?;
             (
                 state.workspaces.values().cloned().collect::<Vec<_>>(),
                 state.shells.clone(),
                 state.launchers.clone(),
                 state.agents.clone(),
-                state.schedules.clone(),
             )
         };
         workspaces.sort_by(|left, right| left.id.cmp(&right.id));
@@ -6942,7 +5290,6 @@ impl DurableRegistry {
                     name: lock(&shell.name)?.clone(),
                     cwd: shell.cwd.clone(),
                     command: shell.command.clone(),
-                    owner: shell.owner.clone(),
                     last_run: lock(&shell.last_run)?.clone(),
                 });
             }
@@ -6968,14 +5315,6 @@ impl DurableRegistry {
                 };
                 agents.push(agent.persisted()?);
             }
-            let ids = lock(&workspace.schedule_ids)?.clone();
-            let mut schedules = Vec::with_capacity(ids.len());
-            for id in ids {
-                let Some(schedule) = schedules_by_id.get(&id) else {
-                    continue;
-                };
-                schedules.push(schedule.persisted()?);
-            }
             saved.workspaces.push(PersistedWorkspace {
                 id: workspace.id.clone(),
                 revision: *lock(&workspace.revision)?,
@@ -6984,13 +5323,11 @@ impl DurableRegistry {
                 shells,
                 launchers,
                 agents,
-                schedules,
             });
         }
         Ok(PersistenceGeneration {
             revision: self.persistence_revision.load(Ordering::Acquire),
             state: saved,
-            executions,
         })
     }
 
@@ -7815,7 +6152,6 @@ struct DurableState {
     shells: HashMap<String, Arc<Shell>>,
     launchers: HashMap<String, Arc<WorkspaceLauncher>>,
     agents: HashMap<String, Arc<AgentInstance>>,
-    schedules: HashMap<String, Arc<AgentSchedule>>,
 }
 
 impl Default for DaemonService {
@@ -7846,14 +6182,10 @@ impl Default for DaemonService {
             host_service_previews: Mutex::new(HashMap::new()),
             workspace_operation_locks: Mutex::new(HashMap::new()),
             mutation_lock: Mutex::new(()),
-            schedule_dispatch_lock: Mutex::new(()),
             notification_settings: NotificationDeliverySettings::default(),
             notification_sink: Arc::new(DisabledNotificationSink),
-            cold_recovery_executions: Vec::new(),
             startup_environment: capture_current_environment(),
-            scheduler: SchedulerWorker::default(),
             node_projection_workers: NodeProjectionWorkers::default(),
-            clock: Mutex::new(Arc::new(SystemSchedulerClock)),
             #[cfg(test)]
             fail_after_mutation: AtomicBool::new(false),
         }
@@ -7868,78 +6200,6 @@ struct Workspace {
     shell_ids: Mutex<Vec<String>>,
     launcher_ids: Mutex<Vec<String>>,
     agent_ids: Mutex<Vec<String>>,
-    schedule_ids: Mutex<Vec<String>>,
-}
-
-struct AgentSchedule {
-    id: String,
-    workspace_id: String,
-    cwd: PathBuf,
-    integration: String,
-    session: AgentScheduleSession,
-    overlap_policy: AgentScheduleOverlapPolicy,
-    created_at_ms: u64,
-    state: Mutex<AgentScheduleMutableState>,
-    executions: Mutex<Vec<Arc<ScheduledExecution>>>,
-    dispatch_key_filter: Mutex<Vec<u8>>,
-}
-
-struct ScheduledExecution {
-    id: String,
-    workspace_id: String,
-    schedule_id: String,
-    dispatch_kind: ScheduledExecutionDispatchKind,
-    dispatch_key: String,
-    schedule_revision: u64,
-    prompt_revision: u64,
-    trigger_revision: u64,
-    requested_at_ms: u64,
-    scheduled_at_ms: Option<u64>,
-    coalesced_through_ms: Option<u64>,
-    cwd: PathBuf,
-    integration: String,
-    session: AgentScheduleSession,
-    prompt: String,
-    runner_token: String,
-    state: Mutex<ScheduledExecutionMutableState>,
-}
-
-#[derive(Clone)]
-struct ScheduledExecutionMutableState {
-    revision: u64,
-    state: ScheduledExecutionState,
-    started_at_ms: Option<u64>,
-    ended_at_ms: Option<u64>,
-    reason: Option<ScheduledExecutionReason>,
-    outcome: Option<ScheduledExecutionOutcome>,
-    shell_id: Option<String>,
-    run_id: Option<String>,
-    agent_id: Option<String>,
-    external_session_id: Option<String>,
-}
-
-struct ScheduleDecision {
-    dispatch_kind: ScheduledExecutionDispatchKind,
-    dispatch_key: String,
-    scheduled_at_ms: Option<u64>,
-    coalesced_through_ms: Option<u64>,
-    requested_at_ms: u64,
-    forced_skip: Option<ScheduledExecutionReason>,
-}
-
-#[derive(Clone)]
-struct AgentScheduleMutableState {
-    name: String,
-    prompt: String,
-    trigger: AgentScheduleTrigger,
-    prompt_revision: u64,
-    trigger_revision: u64,
-    state: AgentScheduleState,
-    revision: u64,
-    updated_at_ms: u64,
-    evaluation_frontier_ms: u64,
-    evaluation_frontier_trigger_revision: u64,
-    execution_shell_id: Option<String>,
 }
 
 struct AgentInstance {
@@ -7978,7 +6238,6 @@ struct Shell {
     name: Mutex<String>,
     cwd: PathBuf,
     command: Vec<String>,
-    owner: ShellOwner,
     last_run: Mutex<Option<PersistedShellRun>>,
     lifecycle: Mutex<ShellLifecycle>,
     foreground_process_cache: Mutex<Option<(String, Instant, Option<String>)>>,
@@ -8523,118 +6782,6 @@ fn workspace_created_events(workspace: &WorkspaceSnapshot) -> Vec<DaemonEventKin
     events
 }
 
-fn scheduler_worker(service: Weak<DaemonService>) {
-    let mut unacknowledged_tick = None;
-    let mut consecutive_failures = 0_u32;
-    let mut failure_logged = false;
-    if let Some(service) = service.upgrade()
-        && let Ok(mut state) = service.scheduler.state.lock()
-    {
-        state.running = true;
-    }
-    loop {
-        let Some(service) = service.upgrade() else {
-            return;
-        };
-        let clock = match lock(&service.clock) {
-            Ok(clock) => Arc::clone(&clock),
-            Err(_) => return,
-        };
-        let tick = clock.take_tick().map_err(DaemonError::from);
-        if let Ok(Some(generation)) = &tick {
-            unacknowledged_tick = Some(*generation);
-        }
-        let attempt = if unacknowledged_tick.is_some() {
-            clock.record_attempt().map_err(DaemonError::from)
-        } else {
-            Ok(())
-        };
-        let attempt = tick
-            .map(|_| ())
-            .and(attempt)
-            .and_then(|()| service.evaluate_schedules(false))
-            .and_then(|()| {
-                service
-                    .next_scheduled_occurrence_ms()
-                    .map_err(DaemonError::from)
-            })
-            .and_then(|next| {
-                if let Some(generation) = unacknowledged_tick {
-                    clock.acknowledge(generation).map_err(DaemonError::from)?;
-                }
-                Ok(next)
-            });
-        let (wait, retry_deadline) = match &attempt {
-            Ok(next) => {
-                consecutive_failures = 0;
-                failure_logged = false;
-                unacknowledged_tick = None;
-                let wait = next
-                    .map(|next| Duration::from_millis(next.saturating_sub(clock.now_ms())))
-                    .map_or_else(
-                        || clock.resample_interval(),
-                        |until_next| until_next.min(clock.resample_interval()),
-                    );
-                (wait, None)
-            }
-            Err(error) => {
-                consecutive_failures = consecutive_failures.saturating_add(1);
-                if !failure_logged {
-                    let _ = clock.record_failure_diagnostic();
-                    eprintln!("boomux: scheduler attempt failed: {error}");
-                    failure_logged = true;
-                }
-                let wait = scheduler_retry_delay(consecutive_failures);
-                (wait, Some(Instant::now() + wait))
-            }
-        };
-        let mut state = match lock(&service.scheduler.state) {
-            Ok(state) => state,
-            Err(_) => return,
-        };
-        state.healthy = attempt.is_ok();
-        if state.stop {
-            state.running = false;
-            state.healthy = false;
-            return;
-        }
-        if state.wake && retry_deadline.is_none() {
-            state.wake = false;
-            continue;
-        }
-        state.wake = false;
-        let mut remaining = wait;
-        loop {
-            let Ok((next, _)) = service.scheduler.changed.wait_timeout(state, remaining) else {
-                return;
-            };
-            state = next;
-            if state.stop {
-                state.running = false;
-                state.healthy = false;
-                return;
-            }
-            state.wake = false;
-            let Some(deadline) = retry_deadline else {
-                break;
-            };
-            let now = Instant::now();
-            if now >= deadline {
-                break;
-            }
-            remaining = deadline.saturating_duration_since(now);
-        }
-    }
-}
-
-fn scheduler_retry_delay(consecutive_failures: u32) -> Duration {
-    let shift = consecutive_failures.saturating_sub(1).min(7);
-    SCHEDULER_RETRY_MIN
-        .checked_mul(1_u32 << shift)
-        .unwrap_or(SCHEDULER_RETRY_MAX)
-        .min(SCHEDULER_RETRY_MAX)
-}
-
 fn node_projection_worker(service: Weak<DaemonService>, node_id: String) {
     let mut failures = 0_u32;
     loop {
@@ -8875,12 +7022,6 @@ fn remote_notification_candidates(
         .iter()
         .map(|shell| (shell.id.as_str(), shell.name.as_str()))
         .collect::<HashMap<_, _>>();
-    let schedules = sync
-        .projection
-        .schedules
-        .iter()
-        .map(|schedule| (schedule.id.as_str(), schedule.name.as_str()))
-        .collect::<HashMap<_, _>>();
     let mut seen = HashSet::new();
     let mut candidates = Vec::new();
     for transition in &sync.transitions {
@@ -8935,57 +7076,6 @@ fn remote_notification_candidates(
                         },
                     })
                 }),
-            NodeProjectionTransitionKind::Execution {
-                workspace_id,
-                execution_id,
-                revision,
-            } => sync
-                .projection
-                .executions
-                .iter()
-                .find(|execution| execution.id == *execution_id && execution.revision == *revision)
-                .and_then(|execution| {
-                    let category = match (execution.state, execution.reason) {
-                        (
-                            ScheduledExecutionState::DispatchFailed,
-                            Some(
-                                ScheduledExecutionReason::RunnerStartFailed
-                                | ScheduledExecutionReason::HostSpawnFailed,
-                            ),
-                        ) => RemoteNotificationCategory::ScheduledDispatchFailed,
-                        (
-                            ScheduledExecutionState::Interrupted,
-                            Some(ScheduledExecutionReason::ColdDaemonRecovery),
-                        ) => RemoteNotificationCategory::ScheduledInterrupted,
-                        _ => return None,
-                    };
-                    let reason = remote_notification_reason(category);
-                    category_enabled(settings, reason).then(|| RemoteNotificationCandidate {
-                        claim: RemoteNotificationClaim {
-                            stream_id: sync.cursor.stream_id.clone(),
-                            entity_id: execution.id.clone(),
-                            revision: *revision,
-                            category,
-                            reason: remote_notification_reason_key(category).into(),
-                        },
-                        request: NotificationRequest {
-                            reason,
-                            agent: schedules
-                                .get(execution.schedule_id.as_str())
-                                .copied()
-                                .unwrap_or(&execution.schedule_id)
-                                .into(),
-                            workspace: workspaces
-                                .get(workspace_id.as_str())
-                                .copied()
-                                .unwrap_or(workspace_id)
-                                .into(),
-                            shell: execution.id.clone(),
-                            node: Some(node.clone()),
-                            digest: None,
-                        },
-                    })
-                }),
             _ => None,
         };
         if let Some(candidate) = candidate
@@ -9011,10 +7101,6 @@ fn remote_notification_candidates(
         let count = match candidate.claim.category {
             RemoteNotificationCategory::AgentBlocked => &mut counts.blocked,
             RemoteNotificationCategory::AgentCompleted => &mut counts.completed,
-            RemoteNotificationCategory::ScheduledDispatchFailed => {
-                &mut counts.scheduled_dispatch_failed
-            }
-            RemoteNotificationCategory::ScheduledInterrupted => &mut counts.scheduled_interrupted,
         };
         *count = count.saturating_add(1);
     }
@@ -9044,12 +7130,6 @@ fn remote_notification_reason(category: RemoteNotificationCategory) -> Notificat
     match category {
         RemoteNotificationCategory::AgentBlocked => NotificationReason::Blocked,
         RemoteNotificationCategory::AgentCompleted => NotificationReason::Completed,
-        RemoteNotificationCategory::ScheduledDispatchFailed => {
-            NotificationReason::ScheduledDispatchFailed
-        }
-        RemoteNotificationCategory::ScheduledInterrupted => {
-            NotificationReason::ScheduledInterrupted
-        }
     }
 }
 
@@ -9057,8 +7137,6 @@ fn remote_notification_reason_key(category: RemoteNotificationCategory) -> &'sta
     match category {
         RemoteNotificationCategory::AgentBlocked => "blocked",
         RemoteNotificationCategory::AgentCompleted => "completed",
-        RemoteNotificationCategory::ScheduledDispatchFailed => "runner_or_host_spawn_failed",
-        RemoteNotificationCategory::ScheduledInterrupted => "cold_daemon_recovery",
     }
 }
 
@@ -10724,7 +8802,7 @@ impl DaemonService {
                     ));
                 }
             };
-            let saved = match self.capture_persisted_state() {
+            let _saved = match self.capture_persisted_state() {
                 Ok(saved) => saved,
                 Err(error) => {
                     return Err(Self::mutation_failure(
@@ -10767,7 +8845,6 @@ impl DaemonService {
                 .commit()
                 .map_err(DaemonError::persistence)?;
             let mut transaction = self.events.transaction()?;
-            transaction.replace_committed_executions(saved.executions);
             transaction.append_batch(events);
             transaction.finish_persistence();
             drop(transaction);
@@ -10924,7 +9001,6 @@ impl DaemonService {
         let resource_workspace_id = match &resource {
             RoutedOperationResult::Shell { shell } => &shell.workspace_id,
             RoutedOperationResult::Launcher { launcher } => &launcher.workspace_id,
-            RoutedOperationResult::AgentSchedule { schedule } => &schedule.workspace_id,
             _ => {
                 return Err(DaemonError::lifecycle(
                     ErrorCode::Internal,
@@ -10965,9 +9041,6 @@ impl DaemonService {
             },
             PendingResourceKind::Launcher => RoutedOperation::GetLauncher {
                 launcher_id: pending.resource_id.clone(),
-            },
-            PendingResourceKind::AgentSchedule => RoutedOperation::GetAgentSchedule {
-                schedule_id: pending.resource_id.clone(),
             },
         };
         let local_node_id = self.node_identity()?.id()?;
@@ -11043,11 +9116,6 @@ impl DaemonService {
                 PendingResourceKind::Launcher,
                 &launcher.id,
                 &launcher.workspace_id,
-            ),
-            RoutedOperationResult::AgentSchedule { schedule } => (
-                PendingResourceKind::AgentSchedule,
-                &schedule.id,
-                &schedule.workspace_id,
             ),
             _ => {
                 return Err(DaemonError::lifecycle(
@@ -11227,10 +9295,7 @@ impl DaemonService {
         &self,
         selector: Option<&str>,
     ) -> DaemonResult<crate::protocol::CombinedNodeSnapshot> {
-        use crate::protocol::{
-            CombinedNode, CombinedNodeSnapshot, NodeProjectionHealthCode, SchedulerHealth,
-            SchedulerState,
-        };
+        use crate::protocol::{CombinedNode, CombinedNodeSnapshot, NodeProjectionHealthCode};
 
         let local_node_id = self.node_identity()?.id()?;
         let registrations = self
@@ -11264,11 +9329,6 @@ impl DaemonService {
         let mut nodes = Vec::with_capacity(usize::from(local_selected) + remote_selected.len());
         if local_selected {
             let snapshot = self.snapshot()?;
-            let scheduler = snapshot.scheduler.clone().unwrap_or(SchedulerHealth {
-                state: SchedulerState::Offline,
-                max_concurrent: 0,
-                active_executions: 0,
-            });
             nodes.push(CombinedNode {
                 node_id: local_node_id,
                 alias: "local".into(),
@@ -11287,22 +9347,12 @@ impl DaemonService {
                     .global_workspaces
                     .is_none()
                     .then(|| "coordinated Workspace storage is unavailable".into()),
-                scheduler,
                 local_snapshot: Some(snapshot),
                 remote_projection: None,
             });
         }
         for registration in remote_selected {
             let view = self.node_projection_cache()?.view(registration)?;
-            let scheduler = view
-                .projection
-                .as_ref()
-                .map(|projection| projection.scheduler.clone())
-                .unwrap_or(SchedulerHealth {
-                    state: SchedulerState::Offline,
-                    max_concurrent: 0,
-                    active_executions: 0,
-                });
             let observed_protocol_version = view
                 .health
                 .capabilities
@@ -11338,7 +9388,6 @@ impl DaemonService {
                 observed_helper_version: view.health.observed_helper_version,
                 workspace_owner_eligible,
                 workspace_owner_unavailable_reason,
-                scheduler,
                 local_snapshot: None,
                 remote_projection: view.projection,
             });
@@ -11455,72 +9504,6 @@ impl DaemonService {
         })
     }
 
-    fn clock_now_ms(&self) -> u64 {
-        lock(&self.clock)
-            .map(|clock| clock.now_ms())
-            .unwrap_or_else(|_| unix_time_ms())
-    }
-
-    fn configure_scheduler_clock(&mut self) -> io::Result<()> {
-        #[cfg(debug_assertions)]
-        if self.native_test_hooks_enabled()
-            && let Some(variable) = self
-                .startup_environment
-                .variables
-                .iter()
-                .find(|variable| variable.name == b"BOOMUX_NATIVE_TEST_CLOCK")
-        {
-            let directory = PathBuf::from(std::ffi::OsString::from_vec(variable.value.clone()));
-            let runtime = client::socket_path()?
-                .parent()
-                .ok_or_else(|| io::Error::other("daemon socket has no runtime directory"))?
-                .canonicalize()?;
-            let metadata = fs::symlink_metadata(&directory)?;
-            let canonical = directory.canonicalize()?;
-            if canonical != directory
-                || canonical == runtime
-                || !canonical.starts_with(&runtime)
-                || !metadata.is_dir()
-                || metadata.uid() != unsafe { libc::geteuid() }
-                || metadata.mode() & 0o077 != 0
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "native clock directory must be canonical, owned, private, and beneath the daemon runtime directory",
-                ));
-            }
-            for marker in ["tick", "seen", "ack", "attempts", "diagnostics"] {
-                let path = canonical.join(marker);
-                match fs::symlink_metadata(&path) {
-                    Ok(metadata) => validate_native_clock_marker(&path, &metadata)?,
-                    Err(error) if error.kind() == io::ErrorKind::NotFound && marker != "tick" => {}
-                    Err(error) => return Err(error),
-                }
-            }
-            self.clock = Mutex::new(Arc::new(NativeTestSchedulerClock::new(canonical)?));
-        }
-        Ok(())
-    }
-
-    fn start_scheduler(self: &Arc<Self>) -> io::Result<()> {
-        let mut state = lock(&self.scheduler.state)?;
-        if state.handle.is_some() {
-            return Ok(());
-        }
-        state.stop = false;
-        state.wake = true;
-        state.running = false;
-        state.healthy = false;
-        let service = Arc::downgrade(self);
-        state.handle = Some(
-            thread::Builder::new()
-                .name("boomux-scheduler".into())
-                .spawn(move || scheduler_worker(service))?,
-        );
-        self.scheduler.changed.notify_all();
-        Ok(())
-    }
-
     fn start_node_projection_workers(self: &Arc<Self>) -> io::Result<()> {
         self.node_projection_workers
             .stop
@@ -11595,192 +9578,10 @@ impl DaemonService {
         Ok(())
     }
 
-    fn stop_scheduler(&self) -> io::Result<()> {
-        let handle = {
-            let mut state = lock(&self.scheduler.state)?;
-            state.stop = true;
-            state.wake = true;
-            self.scheduler.changed.notify_all();
-            state.handle.take()
-        };
-        if let Some(handle) = handle {
-            handle
-                .join()
-                .map_err(|_| io::Error::other("scheduler worker panicked"))?;
-        }
-        let mut state = lock(&self.scheduler.state)?;
-        state.running = false;
-        state.healthy = false;
-        Ok(())
-    }
-
-    fn wake_scheduler(&self) {
-        if let Ok(mut state) = self.scheduler.state.lock() {
-            state.wake = true;
-            self.scheduler.changed.notify_all();
-        }
-    }
-
-    fn evaluate_schedules(self: &Arc<Self>, cold_recovery: bool) -> DaemonResult<()> {
-        let schedules = lock(&self.durable.state)?
-            .schedules
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
-        let now = self.clock_now_ms();
-        for schedule in schedules {
-            let state = lock(&schedule.state)?.clone();
-            if state.state != AgentScheduleState::Enabled {
-                continue;
-            }
-            let sampled_trigger_revision = state.trigger_revision;
-            let cron = crate::scheduling::CronSchedule::compile(
-                &state.trigger.cron,
-                &state.trigger.timezone,
-            )
-            .map_err(|error| DaemonError::Internal(io::Error::other(error.to_string())))?;
-            let first_due = cron
-                .next_after_ms(state.evaluation_frontier_ms)
-                .map_err(|error| DaemonError::Internal(io::Error::other(error.to_string())))?;
-            if first_due > now {
-                continue;
-            }
-            let latest_due = cron.latest_at_or_before_ms(now).map_err(|error| {
-                DaemonError::Internal(io::Error::other(format!(
-                    "could not evaluate scheduled occurrence: {error}"
-                )))
-            })?;
-            if latest_due < first_due {
-                continue;
-            }
-            self.wait_for_native_pre_dispatch_barrier();
-            let _dispatch_eligibility = lock(&self.schedule_dispatch_lock)?;
-            let schedule_id = schedule.id.clone();
-            let mut dispatch = Vec::new();
-            let response = self.durable_mutation_outcome(|undo| {
-                let schedule = self.durable.schedule(&schedule_id)?;
-                let current = lock(&schedule.state)?.clone();
-                if current.trigger_revision != sampled_trigger_revision
-                    || current.evaluation_frontier_trigger_revision != sampled_trigger_revision
-                    || current.evaluation_frontier_ms >= latest_due
-                {
-                    return Ok(DurableMutation::Unchanged(Vec::new()));
-                }
-                let paused_race = current.state != AgentScheduleState::Enabled;
-                let mut decisions = Vec::new();
-                if cold_recovery || paused_race {
-                    decisions.push((
-                        first_due,
-                        Some(latest_due).filter(|through| *through > first_due),
-                        if paused_race {
-                            ScheduledExecutionReason::PausedRace
-                        } else {
-                            ScheduledExecutionReason::Missed
-                        },
-                    ));
-                } else {
-                    if first_due < latest_due {
-                        let coalesced_through = latest_due
-                            .checked_sub(1)
-                            .and_then(|ceiling| cron.latest_at_or_before_ms(ceiling).ok())
-                            .filter(|through| *through >= first_due);
-                        decisions.push((
-                            first_due,
-                            coalesced_through,
-                            ScheduledExecutionReason::Missed,
-                        ));
-                    }
-                    decisions.push((latest_due, None, ScheduledExecutionReason::Missed));
-                }
-
-                let mut snapshots = Vec::new();
-                for (scheduled_at_ms, coalesced_through_ms, default_reason) in decisions {
-                    let is_current =
-                        !cold_recovery && !paused_race && scheduled_at_ms == latest_due;
-                    let dispatch_key =
-                        timed_dispatch_key(&schedule.id, current.trigger_revision, scheduled_at_ms);
-                    let (execution, record, claimed) = self.durable.decide_schedule_execution(
-                        &schedule.id,
-                        ScheduleDecision {
-                            dispatch_kind: ScheduledExecutionDispatchKind::Timed,
-                            dispatch_key,
-                            scheduled_at_ms: Some(scheduled_at_ms),
-                            coalesced_through_ms,
-                            requested_at_ms: now,
-                            forced_skip: (!is_current).then_some(default_reason),
-                        },
-                        self.notification_settings
-                            .max_scheduled_execution_concurrency,
-                    )?;
-                    if let Some(record) = record {
-                        undo.record(record);
-                    }
-                    if claimed {
-                        dispatch.push(execution.id.clone());
-                    }
-                    snapshots.push(execution);
-                }
-                let mut schedule_state = lock(&schedule.state)?;
-                let previous = schedule_state.clone();
-                schedule_state.evaluation_frontier_ms = latest_due;
-                schedule_state.evaluation_frontier_trigger_revision =
-                    schedule_state.trigger_revision;
-                drop(schedule_state);
-                undo.record(DurableUndo::ScheduleState { schedule, previous });
-                let events = snapshots
-                    .iter()
-                    .map(|execution| DaemonEventKind::ScheduledExecutionCreated {
-                        workspace_id: execution.workspace_id.clone(),
-                        execution: execution.clone(),
-                    })
-                    .collect();
-                Ok(DurableMutation::Changed(snapshots, events))
-            })?;
-            drop(response);
-            for execution_id in dispatch.drain(..) {
-                self.wait_for_native_claim_barrier();
-                let execution = self.durable.execution(&execution_id)?;
-                if let Err(error) = self.dispatch_schedule_execution(Arc::clone(&execution)) {
-                    let current = execution.snapshot()?;
-                    if current.state == ScheduledExecutionState::Claimed {
-                        self.terminalize_dispatch_failure(&execution)?;
-                    }
-                    eprintln!("boomux: timed scheduled dispatch failed: {error}");
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn next_scheduled_occurrence_ms(&self) -> io::Result<Option<u64>> {
-        let schedules = lock(&self.durable.state)?
-            .schedules
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut next = None;
-        for schedule in schedules {
-            let state = lock(&schedule.state)?.clone();
-            if state.state != AgentScheduleState::Enabled {
-                continue;
-            }
-            let cron = crate::scheduling::CronSchedule::compile(
-                &state.trigger.cron,
-                &state.trigger.timezone,
-            )
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
-            let candidate = cron
-                .next_after_ms(state.evaluation_frontier_ms)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
-            next = Some(next.map_or(candidate, |current: u64| current.min(candidate)));
-        }
-        Ok(next)
-    }
-
     fn dispatch_arc(
         self: &Arc<Self>,
         request: Request,
-        response_version: u32,
+        _response_version: u32,
     ) -> DaemonResult<Response> {
         if matches!(request, Request::AddNodeRegistration { .. }) {
             let response = self.dispatch(request)?;
@@ -11789,129 +9590,7 @@ impl DaemonService {
             }
             return Ok(response);
         }
-        if let Request::ListScheduledExecutions {
-            workspace_id,
-            schedule_id,
-            limit,
-        } = request
-        {
-            return self.list_scheduled_executions(
-                workspace_id.as_deref(),
-                schedule_id.as_deref(),
-                limit,
-                response_version,
-            );
-        }
-        if let Request::RunAgentSchedule {
-            schedule_id,
-            dispatch_key,
-        } = request
-        {
-            self.wait_for_native_pre_dispatch_barrier();
-            let _dispatch_eligibility = lock(&self.schedule_dispatch_lock)?;
-            let response = self.durable_mutation_outcome(|undo| {
-                let (execution, record, _) = self.durable.decide_schedule_execution(
-                    &schedule_id,
-                    ScheduleDecision {
-                        dispatch_kind: ScheduledExecutionDispatchKind::Manual,
-                        dispatch_key: dispatch_key.clone(),
-                        scheduled_at_ms: None,
-                        coalesced_through_ms: None,
-                        requested_at_ms: self.clock_now_ms(),
-                        forced_skip: None,
-                    },
-                    self.notification_settings
-                        .max_scheduled_execution_concurrency,
-                )?;
-                let Some(record) = record else {
-                    return Ok(DurableMutation::Unchanged(Response::ScheduledExecution {
-                        execution,
-                        next_occurrence: None,
-                    }));
-                };
-                undo.record(record);
-                Ok(DurableMutation::Changed(
-                    Response::ScheduledExecution {
-                        execution: execution.clone(),
-                        next_occurrence: None,
-                    },
-                    vec![DaemonEventKind::ScheduledExecutionCreated {
-                        workspace_id: execution.workspace_id.clone(),
-                        execution,
-                    }],
-                ))
-            })?;
-            let Response::ScheduledExecution { execution, .. } = response else {
-                unreachable!("claim returns an execution")
-            };
-            if execution.state == ScheduledExecutionState::Skipped {
-                return scheduled_execution_response(execution, response_version);
-            }
-            self.wait_for_native_claim_barrier();
-            let execution = self.durable.execution(&execution.id)?;
-            return match self.dispatch_schedule_execution(Arc::clone(&execution)) {
-                Ok(execution) => scheduled_execution_response(execution, response_version),
-                Err(error) => {
-                    let current = execution.snapshot()?;
-                    if current.state == ScheduledExecutionState::Claimed {
-                        self.terminalize_dispatch_failure(&execution)
-                        .map_err(|transition| {
-                            DaemonError::Internal(io::Error::other(format!(
-                                "scheduled dispatch failed: {error}; could not record failure: {transition}"
-                            )))
-                        })?;
-                    }
-                    Err(error)
-                }
-            };
-        }
         self.dispatch(request)
-    }
-
-    fn list_scheduled_executions(
-        &self,
-        workspace_id: Option<&str>,
-        schedule_id: Option<&str>,
-        requested_limit: Option<u16>,
-        response_version: u32,
-    ) -> DaemonResult<Response> {
-        let mut executions = self
-            .durable
-            .scheduled_executions(workspace_id, schedule_id)?;
-        if !protocol::ProtocolFeature::TimedScheduling.is_supported_by(response_version) {
-            executions.retain(|execution| {
-                execution.dispatch_kind == ScheduledExecutionDispatchKind::Manual
-                    && execution.state != ScheduledExecutionState::Skipped
-            });
-        }
-        let observation_supported = protocol::ProtocolFeature::ScheduledExecutionObservation
-            .is_supported_by(response_version);
-        let (limit, truncated) = if observation_supported {
-            let limit = requested_limit
-                .unwrap_or(protocol::DEFAULT_SCHEDULED_EXECUTION_LIST_LIMIT)
-                .clamp(1, protocol::MAX_SCHEDULED_EXECUTION_LIST_LIMIT);
-            let truncated = executions.len() > usize::from(limit);
-            executions.truncate(usize::from(limit));
-            (limit, truncated)
-        } else {
-            (0, false)
-        };
-        let mut schedules = Vec::new();
-        let mut schedule_limit = 0;
-        let mut schedules_truncated = false;
-        if observation_supported {
-            (schedules, schedule_limit, schedules_truncated) = self
-                .durable
-                .scheduled_execution_schedule_projections(workspace_id, schedule_id)?;
-        }
-        Ok(Response::ScheduledExecutions {
-            executions,
-            limit,
-            truncated,
-            schedules,
-            schedule_limit,
-            schedules_truncated,
-        })
     }
 
     fn clear_terminal_histories(&self) -> io::Result<()> {
@@ -11921,6 +9600,22 @@ impl DaemonService {
         Ok(())
     }
 
+    fn clock_now_ms(&self) -> u64 {
+        unix_time_ms()
+    }
+
+    #[cfg(debug_assertions)]
+    fn wait_for_native_start_barrier(&self) {}
+
+    #[cfg(not(debug_assertions))]
+    fn wait_for_native_start_barrier(&self) {}
+
+    #[cfg(debug_assertions)]
+    fn wait_for_native_outcome_barrier(&self) {}
+
+    #[cfg(not(debug_assertions))]
+    fn wait_for_native_outcome_barrier(&self) {}
+
     #[cfg(debug_assertions)]
     fn native_test_hooks_enabled(&self) -> bool {
         self.startup_environment
@@ -11928,98 +9623,6 @@ impl DaemonService {
             .iter()
             .any(|variable| variable.name == b"BOOMUX_NATIVE_TEST_HOOKS" && variable.value == b"1")
     }
-
-    #[cfg(debug_assertions)]
-    fn wait_for_native_claim_barrier(&self) {
-        if !self.native_test_hooks_enabled() {
-            return;
-        }
-        let Some(variable) = self
-            .startup_environment
-            .variables
-            .iter()
-            .find(|variable| variable.name == b"BOOMUX_NATIVE_TEST_CLAIM_BARRIER")
-        else {
-            return;
-        };
-        let directory = PathBuf::from(std::ffi::OsString::from_vec(variable.value.clone()));
-        let _ = fs::write(directory.join("claimed"), b"claimed");
-        while !directory.join("release").exists() && !self.runtimes.is_stopping() {
-            thread::sleep(IO_RETRY_DELAY);
-        }
-    }
-
-    #[cfg(not(debug_assertions))]
-    fn wait_for_native_claim_barrier(&self) {}
-
-    #[cfg(debug_assertions)]
-    fn wait_for_native_pre_dispatch_barrier(&self) {
-        if !self.native_test_hooks_enabled() {
-            return;
-        }
-        let Some(variable) = self
-            .startup_environment
-            .variables
-            .iter()
-            .find(|variable| variable.name == b"BOOMUX_NATIVE_TEST_PRE_DISPATCH_BARRIER")
-        else {
-            return;
-        };
-        let directory = PathBuf::from(std::ffi::OsString::from_vec(variable.value.clone()));
-        let _ = fs::write(directory.join("waiting"), b"waiting");
-        while !directory.join("release").exists() && !self.runtimes.is_stopping() {
-            thread::sleep(IO_RETRY_DELAY);
-        }
-    }
-
-    #[cfg(not(debug_assertions))]
-    fn wait_for_native_pre_dispatch_barrier(&self) {}
-
-    #[cfg(debug_assertions)]
-    fn wait_for_native_start_barrier(&self) {
-        if !self.native_test_hooks_enabled() {
-            return;
-        }
-        let Some(variable) = self
-            .startup_environment
-            .variables
-            .iter()
-            .find(|variable| variable.name == b"BOOMUX_NATIVE_TEST_START_BARRIER")
-        else {
-            return;
-        };
-        let directory = PathBuf::from(std::ffi::OsString::from_vec(variable.value.clone()));
-        let _ = fs::write(directory.join("started"), b"started");
-        while !directory.join("release").exists() && !self.runtimes.is_stopping() {
-            thread::sleep(IO_RETRY_DELAY);
-        }
-    }
-
-    #[cfg(not(debug_assertions))]
-    fn wait_for_native_start_barrier(&self) {}
-
-    #[cfg(debug_assertions)]
-    fn wait_for_native_outcome_barrier(&self) {
-        if !self.native_test_hooks_enabled() {
-            return;
-        }
-        let Some(variable) = self
-            .startup_environment
-            .variables
-            .iter()
-            .find(|variable| variable.name == b"BOOMUX_NATIVE_TEST_OUTCOME_BARRIER")
-        else {
-            return;
-        };
-        let directory = PathBuf::from(std::ffi::OsString::from_vec(variable.value.clone()));
-        let _ = fs::write(directory.join("outcome"), b"outcome");
-        while !directory.join("release").exists() && !self.runtimes.is_stopping() {
-            thread::sleep(IO_RETRY_DELAY);
-        }
-    }
-
-    #[cfg(not(debug_assertions))]
-    fn wait_for_native_outcome_barrier(&self) {}
 
     fn resumable_agent(
         &self,
@@ -12035,737 +9638,6 @@ impl DaemonService {
             return Ok(None);
         };
         self.durable.resumable_agent(shell, previous_run)
-    }
-
-    fn change_execution(
-        &self,
-        execution: &Arc<ScheduledExecution>,
-        mutate: impl FnOnce(&mut ScheduledExecutionMutableState) -> io::Result<()>,
-    ) -> DaemonResult<ScheduledExecutionSnapshot> {
-        self.durable_mutation(|undo| {
-            let (snapshot, record) = self.durable.mutate_execution(execution, mutate)?;
-            undo.record(record);
-            Ok((
-                Response::ScheduledExecution {
-                    execution: snapshot.clone(),
-                    next_occurrence: None,
-                },
-                vec![DaemonEventKind::ScheduledExecutionChanged {
-                    workspace_id: snapshot.workspace_id.clone(),
-                    execution: snapshot.clone(),
-                }],
-            ))
-        })
-        .and_then(|response| match response {
-            Response::ScheduledExecution { execution, .. } => Ok(execution),
-            _ => Err(DaemonError::Internal(io::Error::other(
-                "execution mutation returned an unexpected response",
-            ))),
-        })
-    }
-
-    fn terminalize_dispatch_failure(
-        &self,
-        execution: &Arc<ScheduledExecution>,
-    ) -> DaemonResult<ScheduledExecutionSnapshot> {
-        let _mutation = lock(&self.mutation_lock)?;
-        self.ensure_running()?;
-        let current = execution.snapshot()?;
-        if current.state.is_terminal() {
-            return Ok(current);
-        }
-        let _persistence = lock(&self.durable.persist_lock)?;
-        let mut transaction = self.events.transaction()?;
-        transaction.reserve_with_pending(1)?;
-        let (failed, _) = self.durable.mutate_execution(execution, |state| {
-            if !state.state.is_terminal() {
-                state.state = ScheduledExecutionState::DispatchFailed;
-                state.ended_at_ms = Some(unix_time_ms().max(execution.requested_at_ms));
-                state.reason = Some(ScheduledExecutionReason::RunnerStartFailed);
-                state.outcome = None;
-            }
-            Ok(())
-        })?;
-        let events = vec![DaemonEventKind::ScheduledExecutionChanged {
-            workspace_id: failed.workspace_id.clone(),
-            execution: failed.clone(),
-        }];
-        let notifications =
-            self.execution_notification_requests(&events, &transaction.events.committed_executions);
-        let saved = self.capture_persisted_state()?;
-        transaction.begin_persistence(events.len());
-        drop(transaction);
-        let committed = match self.write_persisted_state(saved) {
-            Ok(committed) => committed,
-            Err(error) => {
-                let mut transaction = self.events.transaction()?;
-                transaction.finish_persistence();
-                self.queue_durable_batch_locked(events, &mut transaction);
-                drop(transaction);
-                self.events.notify();
-                return Err(DaemonError::persistence(error));
-            }
-        };
-        let mut transaction = self.events.transaction()?;
-        transaction.replace_committed_executions(committed);
-        transaction.append_batch(events);
-        transaction.finish_persistence();
-        drop(transaction);
-        drop(_persistence);
-        drop(_mutation);
-        self.events.notify();
-        for notification in notifications {
-            self.notification_sink.notify(notification);
-        }
-        Ok(failed)
-    }
-
-    fn prepare_schedule_shell(
-        &self,
-        execution: &Arc<ScheduledExecution>,
-    ) -> DaemonResult<Option<Arc<Shell>>> {
-        let response = self.durable_mutation(|undo| {
-            let schedule = self.schedule(&execution.schedule_id)?;
-            let (execution_status, execution_shell_id) = {
-                let execution_state = lock(&execution.state)?;
-                (execution_state.state, execution_state.shell_id.clone())
-            };
-            if execution_status != ScheduledExecutionState::Claimed {
-                return Ok((
-                    Response::ScheduledExecution {
-                        execution: execution.snapshot()?,
-                        next_occurrence: None,
-                    },
-                    Vec::new(),
-                ));
-            }
-            if execution_shell_id.is_none()
-                && (self.durable.continuation_session_is_active(&schedule)?
-                    || self.durable.continuation_lease_is_occupied(&schedule)?)
-            {
-                let (skipped, record) = self.durable.mutate_execution(execution, |state| {
-                    if state.state == ScheduledExecutionState::Claimed && state.shell_id.is_none() {
-                        state.state = ScheduledExecutionState::Skipped;
-                        state.ended_at_ms =
-                            Some(self.clock_now_ms().max(execution.requested_at_ms));
-                        state.reason = Some(ScheduledExecutionReason::ActiveSession);
-                    }
-                    Ok(())
-                })?;
-                undo.record(record);
-                return Ok((
-                    Response::ScheduledExecution {
-                        execution: skipped.clone(),
-                        next_occurrence: None,
-                    },
-                    vec![DaemonEventKind::ScheduledExecutionChanged {
-                        workspace_id: skipped.workspace_id.clone(),
-                        execution: skipped,
-                    }],
-                ));
-            }
-            if let Some(shell_id) = &execution_shell_id {
-                return Ok((
-                    Response::Shell {
-                        shell: self.shell(shell_id)?.snapshot()?,
-                    },
-                    Vec::new(),
-                ));
-            }
-            let existing_shell_id = lock(&schedule.state)?.execution_shell_id.clone();
-            let (shell, shell_created) = if let Some(shell_id) = &existing_shell_id {
-                (self.shell(shell_id)?, false)
-            } else {
-                let executable = replacement_executable()?;
-                let command = vec![
-                    executable.to_string_lossy().into_owned(),
-                    "__scheduled-runner".into(),
-                    schedule.id.clone(),
-                ];
-                let (shell, record) = self.durable.create_schedule_shell(&schedule, command)?;
-                undo.record(record);
-                let mut schedule_state = lock(&schedule.state)?;
-                if schedule_state.execution_shell_id.is_some() {
-                    return Err(DaemonError::lifecycle(
-                        ErrorCode::RunChanged,
-                        "schedule execution shell changed during preparation",
-                    ));
-                }
-                let previous = schedule_state.clone();
-                schedule_state.execution_shell_id = Some(shell.id.clone());
-                undo.record(DurableUndo::ScheduleState {
-                    schedule: Arc::clone(&schedule),
-                    previous,
-                });
-                (shell, true)
-            };
-            if shell.workspace_id != execution.workspace_id
-                || shell.owner
-                    != (ShellOwner::Schedule {
-                        schedule_id: schedule.id.clone(),
-                    })
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "schedule-owned shell does not match its schedule",
-                )
-                .into());
-            }
-            let (snapshot, record) = self.durable.mutate_execution(execution, |state| {
-                if state.state != ScheduledExecutionState::Claimed || state.shell_id.is_some() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::ConnectionAborted,
-                        "scheduled execution claim changed during shell preparation",
-                    ));
-                }
-                state.shell_id = Some(shell.id.clone());
-                Ok(())
-            })?;
-            undo.record(record);
-            let mut events = Vec::new();
-            if shell_created {
-                events.push(DaemonEventKind::ShellCreated {
-                    workspace_id: shell.workspace_id.clone(),
-                    shell_id: shell.id.clone(),
-                    name: lock(&shell.name)?.clone(),
-                });
-            }
-            events.push(DaemonEventKind::ScheduledExecutionChanged {
-                workspace_id: snapshot.workspace_id.clone(),
-                execution: snapshot,
-            });
-            Ok((
-                Response::Shell {
-                    shell: shell.snapshot()?,
-                },
-                events,
-            ))
-        })?;
-        match response {
-            Response::Shell { shell } => self.shell(&shell.id).map(Some).map_err(Into::into),
-            Response::ScheduledExecution { .. } => Ok(None),
-            _ => Err(DaemonError::Internal(io::Error::other(
-                "schedule shell preparation returned an unexpected response",
-            ))),
-        }
-    }
-
-    fn dispatch_schedule_execution(
-        self: &Arc<Self>,
-        execution: Arc<ScheduledExecution>,
-    ) -> DaemonResult<ScheduledExecutionSnapshot> {
-        if execution.snapshot()?.state != ScheduledExecutionState::Claimed {
-            return Ok(execution.snapshot()?);
-        }
-        let Some(shell) = self.prepare_schedule_shell(&execution)? else {
-            return execution.snapshot().map_err(Into::into);
-        };
-        let _mutation = lock(&self.mutation_lock)?;
-        self.ensure_running()?;
-        {
-            let state = lock(&execution.state)?;
-            if state.state != ScheduledExecutionState::Claimed
-                || state.shell_id.as_deref() != Some(shell.id.as_str())
-            {
-                return Ok(execution.snapshot_from(&state));
-            }
-        }
-        let old_runtime = match &*lock(&shell.lifecycle)? {
-            ShellLifecycle::Exited { runtime, .. } => runtime.clone(),
-            ShellLifecycle::Pending => None,
-            ShellLifecycle::Running { .. } => {
-                return Err(DaemonError::lifecycle(
-                    ErrorCode::Busy,
-                    "schedule-owned shell is already running",
-                ));
-            }
-            ShellLifecycle::Closed => return Err(not_found("shell", &shell.id).into()),
-        };
-        if let Some(runtime) = old_runtime {
-            self.runtimes.stop_reader(&runtime)?;
-            *lock(&shell.lifecycle)? = ShellLifecycle::Pending;
-        }
-        self.flush_pending()?;
-        let _persistence = lock(&self.durable.persist_lock)?;
-        let mut transaction = self.events.transaction()?;
-        transaction.reserve(2)?;
-        let workspace = self.workspace(&shell.workspace_id)?;
-        let workspace_name = lock(&workspace.name)?.clone();
-        let shell_name = lock(&shell.name)?.clone();
-        let profile = TerminalProfile {
-            term: Some("xterm-256color".into()),
-            colorterm: None,
-            term_program: Some("boomux-scheduled".into()),
-            term_program_version: None,
-            rows: 24,
-            cols: 80,
-            pixel_width: 0,
-            pixel_height: 0,
-        };
-        let previous_run = lock(&shell.last_run)?.clone();
-        let generation = previous_run.as_ref().map_or(Ok(1), |run| {
-            run.generation
-                .checked_add(1)
-                .ok_or_else(|| io::Error::other("shell run generation exhausted"))
-        })?;
-        let run = Arc::new(ShellRun::new(generation));
-        let mut runner_environment = self.startup_environment.clone();
-        runner_environment
-            .variables
-            .retain(|variable| !variable.name.starts_with(b"BOOMUX_NATIVE_TEST_"));
-        runner_environment.variables.push(UnixEnvironmentVariable {
-            name: b"BOOMUX_SCHEDULE_RUNNER_TOKEN".to_vec(),
-            value: execution.runner_token.as_bytes().to_vec(),
-        });
-        let (runtime, reader) = match self.runtimes.spawn_runtime(
-            &shell,
-            &run,
-            RuntimeStart {
-                workspace_name: &workspace_name,
-                shell_name: &shell_name,
-                profile: &profile,
-                environment: Some(&runner_environment),
-                recovery: RuntimeRecovery::default(),
-                claude_remote_control: false,
-            },
-        ) {
-            Ok(runtime) => runtime,
-            Err(error) => {
-                drop(transaction);
-                drop(_persistence);
-                drop(_mutation);
-                return self.terminalize_dispatch_failure(&execution).map_err(|transition| DaemonError::Internal(io::Error::other(format!(
-                    "could not start scheduled runner: {error}; could not record failure: {transition}"
-                ))));
-            }
-        };
-        *lock(&shell.lifecycle)? = ShellLifecycle::Running {
-            profile: profile.clone(),
-            run: Arc::clone(&run),
-            runtime: Arc::clone(&runtime),
-        };
-        *lock(&shell.last_run)? = Some(run.persisted(profile)?);
-        if let Err(error) = self.runtimes.start_pty_reader(
-            Arc::downgrade(self),
-            Arc::clone(&shell),
-            Arc::clone(&run),
-            Arc::clone(&runtime),
-            reader,
-            true,
-        ) {
-            let cleanup = self.runtimes.kill(&shell);
-            let _ = self.runtimes.reset_pending(&shell);
-            drop(transaction);
-            drop(_persistence);
-            drop(_mutation);
-            return self
-                .terminalize_dispatch_failure(&execution)
-                .map_err(|transition| {
-                    DaemonError::Internal(io::Error::other(format!(
-                        "could not start scheduled runner reader: {error}; cleanup: {}; could not record failure: {transition}",
-                        cleanup
-                            .err()
-                            .map_or_else(|| "ok".into(), |error| error.to_string())
-                    )))
-                });
-        }
-        let binding = self.durable.mutate_execution(&execution, |state| {
-            if state.state != ScheduledExecutionState::Claimed
-                || state.shell_id.as_deref() != Some(shell.id.as_str())
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::ConnectionAborted,
-                    "scheduled execution claim was revoked before runner binding",
-                ));
-            }
-            state.state = ScheduledExecutionState::Starting;
-            state.run_id = Some(run.id.clone());
-            Ok(())
-        });
-        let (starting, _undo) = match binding {
-            Ok(binding) => binding,
-            Err(error) => {
-                let run_event = self.runtimes.kill_with_event(&shell);
-                let _ = self.runtimes.reset_pending(&shell);
-                let failed = self
-                    .durable
-                    .mutate_execution(&execution, |state| {
-                        if !state.state.is_terminal() {
-                            state.state = ScheduledExecutionState::DispatchFailed;
-                            state.run_id.get_or_insert_with(|| run.id.clone());
-                            state.ended_at_ms = Some(unix_time_ms().max(execution.requested_at_ms));
-                            state.reason = Some(ScheduledExecutionReason::RunnerStartFailed);
-                            state.outcome = None;
-                        }
-                        Ok(())
-                    })
-                    .map(|(snapshot, _)| snapshot);
-                let mut events = Vec::new();
-                if let Ok(Some(event)) = run_event {
-                    events.push(event);
-                }
-                if let Ok(snapshot) = failed {
-                    events.push(DaemonEventKind::ScheduledExecutionChanged {
-                        workspace_id: snapshot.workspace_id.clone(),
-                        execution: snapshot,
-                    });
-                }
-                self.queue_durable_batch_locked(events, &mut transaction);
-                drop(transaction);
-                drop(_persistence);
-                drop(_mutation);
-                self.events.notify();
-                return Err(error.into());
-            }
-        };
-        self.wait_for_native_start_barrier();
-        let saved = match self.capture_persisted_state() {
-            Ok(saved) => saved,
-            Err(error) => {
-                let run_event = self.runtimes.kill_with_event(&shell);
-                let _ = self.runtimes.reset_pending(&shell);
-                let failed = self
-                    .durable
-                    .mutate_execution(&execution, |state| {
-                        state.state = ScheduledExecutionState::DispatchFailed;
-                        state.ended_at_ms = Some(unix_time_ms().max(execution.requested_at_ms));
-                        state.reason = Some(ScheduledExecutionReason::RunnerStartFailed);
-                        state.outcome = None;
-                        Ok(())
-                    })
-                    .map(|(snapshot, _)| snapshot);
-                let mut events = Vec::new();
-                if let Ok(Some(event)) = run_event {
-                    events.push(event);
-                }
-                if let Ok(snapshot) = failed {
-                    events.push(DaemonEventKind::ScheduledExecutionChanged {
-                        workspace_id: snapshot.workspace_id.clone(),
-                        execution: snapshot,
-                    });
-                }
-                self.queue_durable_batch_locked(events, &mut transaction);
-                drop(transaction);
-                drop(_persistence);
-                drop(_mutation);
-                self.events.notify();
-                return Err(error.into());
-            }
-        };
-        transaction.begin_persistence(2);
-        drop(transaction);
-        let committed = match self.write_persisted_state(saved) {
-            Ok(committed) => committed,
-            Err(error) => {
-                let run_event = self.runtimes.kill_with_event(&shell);
-                let _ = self.runtimes.reset_pending(&shell);
-                let failed = self
-                    .durable
-                    .mutate_execution(&execution, |state| {
-                        state.state = ScheduledExecutionState::DispatchFailed;
-                        state.ended_at_ms = Some(unix_time_ms().max(execution.requested_at_ms));
-                        state.reason = Some(ScheduledExecutionReason::RunnerStartFailed);
-                        state.outcome = None;
-                        Ok(())
-                    })
-                    .map(|(snapshot, _)| snapshot);
-                let mut transaction = self.events.transaction()?;
-                transaction.finish_persistence();
-                let mut events = Vec::new();
-                if let Ok(Some(event)) = &run_event {
-                    events.push(event.clone());
-                }
-                if let Ok(snapshot) = &failed {
-                    events.push(DaemonEventKind::ScheduledExecutionChanged {
-                        workspace_id: snapshot.workspace_id.clone(),
-                        execution: snapshot.clone(),
-                    });
-                }
-                self.queue_durable_batch_locked(events, &mut transaction);
-                drop(transaction);
-                drop(_persistence);
-                drop(_mutation);
-                self.events.notify();
-                return Err(DaemonError::persistence_context(
-                error,
-                run_event.map_or_else(
-                    |cleanup| {
-                        format!(
-                            "could not persist scheduled runner start; cleanup failed: {cleanup}"
-                        )
-                    },
-                    |_| {
-                        failed.map_or_else(
-                            |failure| {
-                                format!(
-                                    "could not persist scheduled runner start; could not record dispatch failure: {failure}"
-                                )
-                            },
-                            |_| "could not persist scheduled runner start".into(),
-                        )
-                    },
-                ),
-            ));
-            }
-        };
-        let mut transaction = self.events.transaction()?;
-        transaction.replace_committed_executions(committed);
-        transaction.append_batch(vec![
-            DaemonEventKind::RunStarted {
-                workspace_id: shell.workspace_id.clone(),
-                shell_id: shell.id.clone(),
-                run: run.snapshot()?,
-            },
-            DaemonEventKind::ScheduledExecutionChanged {
-                workspace_id: starting.workspace_id.clone(),
-                execution: starting,
-            },
-        ]);
-        transaction.finish_persistence();
-        drop(transaction);
-        drop(_persistence);
-        drop(_mutation);
-        self.events.notify();
-        self.runtimes.resume_reader(&runtime)?;
-        Ok(execution.snapshot()?)
-    }
-
-    fn cancel_scheduled_execution(
-        &self,
-        execution_id: &str,
-        expected_revision: Option<u64>,
-    ) -> DaemonResult<Response> {
-        let _mutation = lock(&self.mutation_lock)?;
-        self.ensure_running()?;
-        self.flush_pending()?;
-        let execution = self.durable.execution(execution_id)?;
-        let current = execution.snapshot()?;
-        if let Some(expected) = expected_revision {
-            require_guard(current.revision, expected, "scheduled execution")?;
-        }
-        if current.state.is_terminal() {
-            return Ok(Response::ScheduledExecution {
-                execution: current,
-                next_occurrence: None,
-            });
-        }
-
-        let bound_shell = match current.state {
-            ScheduledExecutionState::Claimed => {
-                if current.run_id.is_some() {
-                    return Err(DaemonError::Internal(io::Error::other(
-                        "claimed scheduled execution has a run binding",
-                    )));
-                }
-                None
-            }
-            ScheduledExecutionState::Starting | ScheduledExecutionState::Active => {
-                let shell_id = current.shell_id.as_deref().ok_or_else(|| {
-                    DaemonError::Internal(io::Error::other(
-                        "started scheduled execution has no shell binding",
-                    ))
-                })?;
-                let run_id = current.run_id.as_deref().ok_or_else(|| {
-                    DaemonError::Internal(io::Error::other(
-                        "started scheduled execution has no run binding",
-                    ))
-                })?;
-                let shell = self.shell(shell_id)?;
-                if !matches!(
-                    &*lock(&shell.lifecycle)?,
-                    ShellLifecycle::Running { run, .. } if run.id == run_id
-                ) {
-                    return Err(DaemonError::lifecycle(
-                        ErrorCode::RunChanged,
-                        "scheduled execution no longer owns the exact shell run",
-                    ));
-                }
-                Some(shell)
-            }
-            _ => unreachable!("terminal execution returned above"),
-        };
-
-        let event_capacity = 1 + usize::from(bound_shell.is_some());
-        let mut transaction = self.events.transaction()?;
-        transaction.reserve_with_pending(event_capacity)?;
-        transaction.begin_lifecycle_reservation(event_capacity);
-        drop(transaction);
-        let _lifecycle_activity = LifecycleActivity::begin(&self.events.lifecycle_active);
-
-        let mut stop_failure = None;
-        let mut run_event = None;
-        if let Some(shell) = &bound_shell {
-            #[cfg(debug_assertions)]
-            if self.native_test_hooks_enabled()
-                && self.startup_environment.variables.iter().any(|variable| {
-                    variable.name == b"BOOMUX_NATIVE_TEST_CANCEL_STOP_FAILURE"
-                        && variable.value == b"1"
-                })
-            {
-                if let Some(variable) =
-                    self.startup_environment.variables.iter().find(|variable| {
-                        variable.name == b"BOOMUX_NATIVE_TEST_CANCEL_FAILURE_BARRIER"
-                    })
-                {
-                    let barrier =
-                        PathBuf::from(std::ffi::OsString::from_vec(variable.value.clone()));
-                    fs::write(barrier.join("reserved"), b"reserved")?;
-                    while !barrier.join("release").exists() {
-                        thread::sleep(IO_RETRY_DELAY);
-                    }
-                }
-                let mut transaction = self.events.transaction()?;
-                transaction.release_lifecycle_reservation();
-                return Err(DaemonError::Internal(io::Error::other(
-                    "injected scheduled cancellation stop failure",
-                )));
-            }
-            if let Err(error) = self.runtimes.stop_runtime(shell) {
-                if !error.stopped {
-                    let mut transaction = self.events.transaction()?;
-                    transaction.release_lifecycle_reservation();
-                    return Err(error.source.into());
-                }
-                stop_failure = Some(error.source);
-            }
-            match self.runtimes.finalize_stop(shell) {
-                Ok(rollback) => run_event = rollback.event,
-                Err(error) => {
-                    stop_failure.get_or_insert(error);
-                }
-            }
-            if let Err(error) = self.runtimes.reset_pending(shell) {
-                stop_failure.get_or_insert(error);
-            }
-        }
-
-        let terminal_state = if stop_failure.is_some() {
-            ScheduledExecutionState::Interrupted
-        } else {
-            ScheduledExecutionState::Cancelled
-        };
-        let terminal_reason = if stop_failure.is_some() {
-            ScheduledExecutionReason::RunnerExitedWithoutReport
-        } else {
-            ScheduledExecutionReason::CancelledByUser
-        };
-        let (cancelled, undo) = self.durable.mutate_execution(&execution, |state| {
-            state.state = terminal_state;
-            state.ended_at_ms = Some(unix_time_ms().max(execution.requested_at_ms));
-            state.reason = Some(terminal_reason);
-            state.outcome = None;
-            Ok(())
-        })?;
-        let mut events = Vec::with_capacity(event_capacity);
-        if let Some(event) = run_event {
-            events.push(event);
-        }
-        events.push(DaemonEventKind::ScheduledExecutionChanged {
-            workspace_id: cancelled.workspace_id.clone(),
-            execution: cancelled.clone(),
-        });
-
-        let persistence = lock(&self.durable.persist_lock)?;
-        let saved = match self.capture_persisted_state() {
-            Ok(saved) => saved,
-            Err(error) => {
-                let mut transaction = self.events.transaction()?;
-                if bound_shell.is_none() {
-                    let rollback = self.durable.rollback(undo);
-                    transaction.release_lifecycle_reservation();
-                    return Err(Self::lifecycle_failure(error.into(), rollback));
-                }
-                self.queue_durable_batch_locked(events, &mut transaction);
-                transaction.release_lifecycle_reservation();
-                return Err(error.into());
-            }
-        };
-        let mut transaction = self.events.transaction()?;
-        transaction.transfer_lifecycle_reservation_to_persistence(events.len(), 0);
-        drop(transaction);
-        let committed = match self.write_persisted_state(saved) {
-            Ok(committed) => committed,
-            Err(error) => {
-                let mut transaction = self.events.transaction()?;
-                transaction.finish_persistence();
-                if bound_shell.is_none() {
-                    let rollback = self.durable.rollback(undo);
-                    return Err(Self::lifecycle_failure(
-                        DaemonError::persistence(error),
-                        rollback,
-                    ));
-                }
-                self.queue_durable_batch_locked(events, &mut transaction);
-                drop(transaction);
-                drop(persistence);
-                self.events.notify();
-                return Err(DaemonError::persistence(error));
-            }
-        };
-        let mut transaction = self.events.transaction()?;
-        transaction.replace_committed_executions(committed);
-        transaction.append_batch(events);
-        transaction.finish_persistence();
-        drop(transaction);
-        drop(persistence);
-        self.events.notify();
-        if let Some(error) = stop_failure {
-            return Err(DaemonError::Internal(error));
-        }
-        Ok(Response::ScheduledExecution {
-            execution: cancelled,
-            next_occurrence: None,
-        })
-    }
-
-    fn resume_claimed_schedule_executions(self: &Arc<Self>) {
-        let schedules = match lock(&self.durable.state) {
-            Ok(state) => state.schedules.values().cloned().collect::<Vec<_>>(),
-            Err(error) => {
-                eprintln!("boomux: could not inspect claimed scheduled executions: {error}");
-                return;
-            }
-        };
-        let mut claimed = Vec::new();
-        for schedule in schedules {
-            let executions = match lock(&schedule.executions) {
-                Ok(executions) => executions.clone(),
-                Err(error) => {
-                    eprintln!(
-                        "boomux: could not inspect schedule {}: {error}",
-                        schedule.id
-                    );
-                    continue;
-                }
-            };
-            claimed.extend(executions.into_iter().filter(|execution| {
-                lock(&execution.state)
-                    .is_ok_and(|state| state.state == ScheduledExecutionState::Claimed)
-            }));
-        }
-        for execution in claimed {
-            let _dispatch_eligibility = match lock(&self.schedule_dispatch_lock) {
-                Ok(guard) => guard,
-                Err(error) => {
-                    eprintln!("boomux: could not acquire schedule dispatch lease: {error}");
-                    return;
-                }
-            };
-            if let Err(error) = self.dispatch_schedule_execution(Arc::clone(&execution)) {
-                eprintln!(
-                    "boomux: could not resume scheduled execution {} after handoff: {error}",
-                    execution.id
-                );
-                let _ = self.change_execution(&execution, |state| {
-                    if state.state == ScheduledExecutionState::Claimed {
-                        state.state = ScheduledExecutionState::DispatchFailed;
-                        state.ended_at_ms = Some(unix_time_ms().max(execution.requested_at_ms));
-                        state.reason = Some(ScheduledExecutionReason::RunnerStartFailed);
-                    }
-                    Ok(())
-                });
-            }
-        }
     }
 
     fn acquire_kiro_launch_holder(
@@ -12829,7 +9701,7 @@ impl DaemonService {
         report: AgentReport,
     ) -> DaemonResult<Response> {
         validate_uuid(holder_id, "Kiro launch holder ID")?;
-        crate::scheduling::validate_external_session_id(&session_id)
+        crate::integrations::validate_external_session_id(&session_id)
             .map_err(|error| DaemonError::validation(error.to_string()))?;
         validate_agent_report(&report)?;
         if report.authority != AgentAuthority::LifecycleIntegration
@@ -13069,13 +9941,6 @@ impl DaemonService {
                     workspace_id: agent.workspace_id.clone(),
                     shell_id: agent.shell_id.clone(),
                     agent: agent.clone(),
-                });
-            }
-            if let Some((execution, record)) = self.durable.link_agent_execution(&agent)? {
-                undo.record(record);
-                events.push(DaemonEventKind::ScheduledExecutionChanged {
-                    workspace_id: execution.workspace_id.clone(),
-                    execution,
                 });
             }
             for claim in claims.state.claims.values_mut() {
@@ -13557,19 +10422,6 @@ impl DaemonService {
         }
         let (workspace_request_fingerprint, workspace_semantic_fingerprint) =
             workspace_operation_fingerprints(&request)?;
-        let _dispatch_eligibility = matches!(
-            &request,
-            Request::RegisterAgent { .. }
-                | Request::EnsureAgent { .. }
-                | Request::AcquireKiroLaunchHolder { .. }
-                | Request::ReportKiroHook { .. }
-                | Request::ReleaseKiroLaunchHolder { .. }
-                | Request::EnsureOpenCodeSessionClaim { .. }
-                | Request::ReportClaimedOpenCodeAgent { .. }
-                | Request::ReportAgent { .. }
-        )
-        .then(|| lock(&self.schedule_dispatch_lock))
-        .transpose()?;
         match request {
             Request::Ping => Ok(Response::Pong),
             Request::GetNodeIdentity => self
@@ -14011,43 +10863,6 @@ impl DaemonService {
                     resource,
                 })
             }
-            Request::CreateGlobalWorkspaceAgentSchedule {
-                operation_id,
-                global_workspace_id,
-                expected_global_revision,
-                node_id,
-                owner_workspace_id,
-                default_cwd,
-                schedule_id,
-                spec,
-            } => {
-                let request = workspace_request_fingerprint
-                    .as_ref()
-                    .expect("Workspace resource request has a fingerprint");
-                let (workspace, resource) = self.create_global_workspace_resource(
-                    &operation_id,
-                    &request.digest,
-                    request.bytes,
-                    &global_workspace_id,
-                    expected_global_revision,
-                    &node_id,
-                    &owner_workspace_id,
-                    default_cwd,
-                    &schedule_id,
-                    PendingResourceKind::AgentSchedule,
-                    move |pending| RoutedOperation::CreateWorkspaceAgentSchedule {
-                        workspace_id: pending.owner_workspace_id.clone(),
-                        workspace_name: pending.owner_workspace_name.clone(),
-                        default_cwd: pending.default_cwd.clone(),
-                        schedule_id: pending.resource_id.clone(),
-                        spec,
-                    },
-                )?;
-                Ok(Response::GlobalWorkspaceResource {
-                    workspace,
-                    resource,
-                })
-            }
             Request::RouteNodeOperation { node_id, operation } => {
                 Ok(self.route_node_operation(&node_id, operation))
             }
@@ -14085,47 +10900,6 @@ impl DaemonService {
             Request::GetAgent { agent_id } => Ok(Response::Agent {
                 agent: self.agent(&agent_id)?.snapshot()?,
             }),
-            Request::GetAgentSchedule { schedule_id } => {
-                let schedule = self.schedule(&schedule_id)?;
-                Ok(Response::AgentScheduleInspection {
-                    inspection: schedule.inspection()?,
-                })
-            }
-            Request::ListScheduledExecutions {
-                workspace_id,
-                schedule_id,
-                limit,
-            } => {
-                let (executions, limit, truncated) = self.durable.scheduled_execution_page(
-                    workspace_id.as_deref(),
-                    schedule_id.as_deref(),
-                    limit.unwrap_or(protocol::DEFAULT_SCHEDULED_EXECUTION_LIST_LIMIT),
-                )?;
-                Ok(Response::ScheduledExecutions {
-                    executions,
-                    limit,
-                    truncated,
-                    schedules: Vec::new(),
-                    schedule_limit: 0,
-                    schedules_truncated: false,
-                })
-            }
-            Request::GetScheduledExecution { execution_id } => {
-                let execution = self.durable.execution(&execution_id)?.snapshot()?;
-                let next_occurrence = self
-                    .schedule(&execution.schedule_id)?
-                    .snapshot()?
-                    .next_occurrence;
-                Ok(Response::ScheduledExecution {
-                    execution,
-                    next_occurrence,
-                })
-            }
-            Request::WaitScheduledExecution {
-                execution_id,
-                after_revision,
-                wait_ms,
-            } => self.wait_scheduled_execution(&execution_id, after_revision, wait_ms),
             Request::WaitAgent {
                 agent_id,
                 after_revision,
@@ -14251,55 +11025,6 @@ impl DaemonService {
                     events,
                 ))
             }),
-            Request::CreateWorkspaceAgentSchedule {
-                workspace_id,
-                workspace_name,
-                default_cwd,
-                schedule_id,
-                spec,
-            } => self.durable_mutation_outcome(|undo| {
-                let (workspace, workspace_undo) = self.durable.create_workspace_exact(
-                    &workspace_id,
-                    workspace_name,
-                    default_cwd,
-                )?;
-                let workspace_created = workspace_undo.is_some();
-                if let Some(record) = workspace_undo {
-                    undo.record(record);
-                }
-                let (schedule, schedule_undo) = self.durable.create_schedule_at_with_id(
-                    &workspace_id,
-                    schedule_id,
-                    spec,
-                    self.clock_now_ms(),
-                )?;
-                let schedule_created = schedule_undo.is_some();
-                if let Some(record) = schedule_undo {
-                    undo.record(record);
-                }
-                if !workspace_created && !schedule_created {
-                    return Ok(DurableMutation::Unchanged(Response::AgentSchedule {
-                        schedule,
-                    }));
-                }
-                let mut events = Vec::new();
-                if workspace_created {
-                    events.push(DaemonEventKind::WorkspaceCreated {
-                        workspace_id: workspace.id,
-                        name: workspace.name,
-                    });
-                }
-                if schedule_created {
-                    events.push(DaemonEventKind::AgentScheduleCreated {
-                        workspace_id,
-                        schedule: schedule.clone(),
-                    });
-                }
-                Ok(DurableMutation::Changed(
-                    Response::AgentSchedule { schedule },
-                    events,
-                ))
-            }),
             Request::CreateShell {
                 workspace_id,
                 shell,
@@ -14330,163 +11055,6 @@ impl DaemonService {
                 };
                 Ok((Response::Launcher { launcher }, vec![event]))
             }),
-            Request::CreateAgentSchedule { workspace_id, spec } => self.durable_mutation(|undo| {
-                let schedule = self.create_schedule_mutation(undo, &workspace_id, spec)?;
-                let event = DaemonEventKind::AgentScheduleCreated {
-                    workspace_id,
-                    schedule: schedule.clone(),
-                };
-                Ok((Response::AgentSchedule { schedule }, vec![event]))
-            }),
-            Request::UpdateAgentSchedule {
-                schedule_id,
-                expected_revision,
-                update,
-            } => self.durable_mutation_outcome(|undo| {
-                let (schedule, record) = self.durable.update_schedule_at(
-                    &schedule_id,
-                    expected_revision,
-                    update,
-                    self.clock_now_ms(),
-                )?;
-                let Some(record) = record else {
-                    return Ok(DurableMutation::Unchanged(Response::AgentSchedule {
-                        schedule,
-                    }));
-                };
-                undo.record(record);
-                Ok(DurableMutation::Changed(
-                    Response::AgentSchedule {
-                        schedule: schedule.clone(),
-                    },
-                    vec![DaemonEventKind::AgentScheduleUpdated {
-                        workspace_id: schedule.workspace_id.clone(),
-                        schedule,
-                    }],
-                ))
-            }),
-            Request::RunAgentSchedule { .. } => {
-                unreachable!("schedule run is handled with the service Arc")
-            }
-            Request::CancelScheduledExecution { execution_id } => {
-                self.cancel_scheduled_execution(&execution_id, None)
-            }
-            Request::GuardedCancelScheduledExecution {
-                execution_id,
-                expected_revision,
-            } => self.cancel_scheduled_execution(&execution_id, Some(expected_revision)),
-            Request::ResolveScheduledExecutionClaim {
-                schedule_id,
-                shell_id,
-                run_id,
-                runner_token,
-            } => {
-                let schedule = self.schedule(&schedule_id)?;
-                let execution = lock(&schedule.executions)?
-                    .iter()
-                    .find(|execution| {
-                        lock(&execution.state).is_ok_and(|state| {
-                            matches!(
-                                state.state,
-                                ScheduledExecutionState::Starting | ScheduledExecutionState::Active
-                            ) && state.shell_id.as_deref() == Some(shell_id.as_str())
-                                && state.run_id.as_deref() == Some(run_id.as_str())
-                                && execution.runner_token == runner_token.as_str()
-                        })
-                    })
-                    .cloned()
-                    .ok_or_else(|| {
-                        DaemonError::lifecycle(
-                            ErrorCode::RunChanged,
-                            "no scheduled execution matches the exact runner claim",
-                        )
-                    })?;
-                Ok(Response::ScheduledExecutionClaim {
-                    claim: protocol::ScheduledExecutionClaim {
-                        execution: execution.snapshot()?,
-                        prompt: execution.prompt.clone(),
-                    },
-                })
-            }
-            Request::ReportScheduledRunner {
-                execution_id,
-                shell_id,
-                run_id,
-                runner_token,
-                result,
-            } => {
-                let staged_outcome = matches!(result, ScheduledRunnerResult::Exited { .. });
-                let response = self.durable_mutation_outcome(|undo| {
-                    let execution = self.durable.execution(&execution_id)?;
-                    let current = execution.snapshot()?;
-                    if current.shell_id.as_deref() != Some(shell_id.as_str())
-                        || current.run_id.as_deref() != Some(run_id.as_str())
-                        || execution.runner_token != runner_token.as_str()
-                    {
-                        return Err(DaemonError::lifecycle(
-                            ErrorCode::RunChanged,
-                            "scheduled runner report does not match the exact execution run",
-                        ));
-                    }
-                    if current.state.is_terminal() {
-                        return Ok(DurableMutation::Unchanged(Response::ScheduledExecution {
-                            execution: current,
-                            next_occurrence: None,
-                        }));
-                    }
-                    let unchanged = match &result {
-                        ScheduledRunnerResult::Active => {
-                            current.state == ScheduledExecutionState::Active
-                                && current.started_at_ms.is_some()
-                        }
-                        ScheduledRunnerResult::SpawnFailed => {
-                            current.reason == Some(ScheduledExecutionReason::HostSpawnFailed)
-                        }
-                        ScheduledRunnerResult::Exited { outcome } => {
-                            current.outcome.as_ref() == Some(outcome)
-                        }
-                    };
-                    if unchanged {
-                        return Ok(DurableMutation::Unchanged(Response::ScheduledExecution {
-                            execution: current,
-                            next_occurrence: None,
-                        }));
-                    }
-                    let now = unix_time_ms().max(execution.requested_at_ms);
-                    let (snapshot, record) =
-                        self.durable.mutate_execution(&execution, |state| {
-                            match result {
-                                ScheduledRunnerResult::Active => {
-                                    state.state = ScheduledExecutionState::Active;
-                                    state.started_at_ms.get_or_insert(now);
-                                }
-                                ScheduledRunnerResult::SpawnFailed => {
-                                    state.reason = Some(ScheduledExecutionReason::HostSpawnFailed);
-                                }
-                                ScheduledRunnerResult::Exited { ref outcome } => {
-                                    state.started_at_ms.get_or_insert(now);
-                                    state.outcome = Some(outcome.clone());
-                                }
-                            }
-                            Ok(())
-                        })?;
-                    undo.record(record);
-                    Ok(DurableMutation::Changed(
-                        Response::ScheduledExecution {
-                            execution: snapshot.clone(),
-                            next_occurrence: None,
-                        },
-                        vec![DaemonEventKind::ScheduledExecutionChanged {
-                            workspace_id: snapshot.workspace_id.clone(),
-                            execution: snapshot,
-                        }],
-                    ))
-                })?;
-                if staged_outcome {
-                    self.wait_for_native_outcome_barrier();
-                }
-                Ok(response)
-            }
             Request::RegisterAgent {
                 shell_id,
                 run_id,
@@ -14503,13 +11071,6 @@ impl DaemonService {
                         workspace_id: agent.workspace_id.clone(),
                         shell_id: agent.shell_id.clone(),
                         agent: agent.clone(),
-                    });
-                }
-                if let Some((execution, record)) = self.durable.link_agent_execution(&agent)? {
-                    undo.record(record);
-                    events.push(DaemonEventKind::ScheduledExecutionChanged {
-                        workspace_id: execution.workspace_id.clone(),
-                        execution,
                     });
                 }
                 Ok((Response::Agent { agent }, events))
@@ -14538,13 +11099,6 @@ impl DaemonService {
                             agent: agent.clone(),
                         });
                     }
-                }
-                if let Some((execution, record)) = self.durable.link_agent_execution(&agent)? {
-                    undo.record(record);
-                    events.push(DaemonEventKind::ScheduledExecutionChanged {
-                        workspace_id: execution.workspace_id.clone(),
-                        execution,
-                    });
                 }
                 if events.is_empty() {
                     Ok(DurableMutation::Unchanged(Response::Agent { agent }))
@@ -14800,57 +11354,6 @@ impl DaemonService {
                     }],
                 ))
             }),
-            Request::PauseAgentSchedule { schedule_id } => {
-                self.change_schedule_state(&schedule_id, AgentScheduleState::Paused)
-            }
-            Request::ResumeAgentSchedule { schedule_id } => {
-                self.change_schedule_state(&schedule_id, AgentScheduleState::Enabled)
-            }
-            Request::GuardedPauseAgentSchedule {
-                schedule_id,
-                expected_revision,
-            } => self.change_schedule_state_guarded(
-                &schedule_id,
-                AgentScheduleState::Paused,
-                Some(expected_revision),
-            ),
-            Request::GuardedResumeAgentSchedule {
-                schedule_id,
-                expected_revision,
-            } => self.change_schedule_state_guarded(
-                &schedule_id,
-                AgentScheduleState::Enabled,
-                Some(expected_revision),
-            ),
-            Request::RemoveAgentSchedule { schedule_id } => self.durable_mutation(|undo| {
-                let schedule = self.remove_schedule_mutation(undo, &schedule_id)?;
-                Ok((
-                    Response::Ok,
-                    vec![DaemonEventKind::AgentScheduleRemoved {
-                        workspace_id: schedule.workspace_id.clone(),
-                        schedule_id,
-                    }],
-                ))
-            }),
-            Request::GuardedRemoveAgentSchedule {
-                schedule_id,
-                expected_revision,
-            } => self.durable_mutation(|undo| {
-                let schedule = self.schedule(&schedule_id)?;
-                require_guard(
-                    schedule.snapshot()?.revision,
-                    expected_revision,
-                    "agent schedule",
-                )?;
-                let schedule = self.remove_schedule_mutation(undo, &schedule_id)?;
-                Ok((
-                    Response::Ok,
-                    vec![DaemonEventKind::AgentScheduleRemoved {
-                        workspace_id: schedule.workspace_id.clone(),
-                        schedule_id,
-                    }],
-                ))
-            }),
             Request::Attach { .. }
             | Request::AttachCollaborative { .. }
             | Request::AttachNode { .. }
@@ -14902,12 +11405,7 @@ impl DaemonService {
         let mut workspace_names = HashSet::new();
         let mut run_ids = HashSet::new();
         let mut agent_ids = HashSet::new();
-        let mut schedule_ids = HashSet::new();
-        let mut execution_ids = HashSet::new();
-        let mut linked_agent_ids = HashSet::new();
         let mut recovered_interrupted_run = false;
-        let mut cold_recovery_executions = Vec::new();
-        let mut cold_recovered_execution_ids = HashSet::new();
         for saved_workspace in persisted.workspaces {
             validate_id("workspace", &saved_workspace.id)?;
             validate_persisted_name(&saved_workspace.name)?;
@@ -14964,7 +11462,6 @@ impl DaemonService {
                     name: Mutex::new(saved_shell.name),
                     cwd: saved_shell.cwd,
                     command: saved_shell.command,
-                    owner: saved_shell.owner,
                     last_run: Mutex::new(saved_shell.last_run),
                     lifecycle: Mutex::new(ShellLifecycle::Pending),
                     foreground_process_cache: Mutex::new(None),
@@ -15022,157 +11519,6 @@ impl DaemonService {
                 workspace_agent_ids.push(agent.id.clone());
                 state.agents.insert(agent.id.clone(), agent);
             }
-            if saved_workspace.schedules.len() > crate::scheduling::MAX_SCHEDULES_PER_WORKSPACE {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Boomux state contains too many agent schedules in a workspace",
-                ));
-            }
-            let mut schedule_names = HashSet::new();
-            let mut workspace_schedule_ids = Vec::with_capacity(saved_workspace.schedules.len());
-            for saved_schedule in saved_workspace.schedules {
-                validate_id("agent schedule", &saved_schedule.id)?;
-                validate_persisted_schedule(&saved_schedule)?;
-                if !schedule_ids.insert(saved_schedule.id.clone())
-                    || !schedule_names.insert(saved_schedule.name.clone())
-                {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "Boomux state contains a duplicate agent schedule",
-                    ));
-                }
-                let schedule = Arc::new(AgentSchedule::from_persisted(
-                    &saved_workspace.id,
-                    saved_schedule,
-                ));
-                if !live_handoff {
-                    for execution in lock(&schedule.executions)?.iter() {
-                        let mut execution_state = lock(&execution.state)?;
-                        if !execution_state.state.is_terminal() {
-                            execution_state.state = ScheduledExecutionState::Interrupted;
-                            execution_state.revision =
-                                execution_state.revision.checked_add(1).ok_or_else(|| {
-                                    io::Error::other("scheduled execution revision exhausted")
-                                })?;
-                            execution_state.ended_at_ms =
-                                Some(unix_time_ms().max(execution.requested_at_ms));
-                            execution_state.reason =
-                                Some(ScheduledExecutionReason::ColdDaemonRecovery);
-                            execution_state.outcome = None;
-                            recovered_interrupted_run = true;
-                            cold_recovered_execution_ids.insert(execution.id.clone());
-                        }
-                    }
-                    let mut executions = lock(&schedule.executions)?;
-                    prune_terminal_executions(&mut executions);
-                    for execution in executions
-                        .iter()
-                        .filter(|execution| cold_recovered_execution_ids.contains(&execution.id))
-                    {
-                        cold_recovery_executions.push(execution.snapshot()?);
-                    }
-                }
-                workspace_schedule_ids.push(schedule.id.clone());
-                state.schedules.insert(schedule.id.clone(), schedule);
-            }
-            for shell_id in &shell_ids {
-                let shell = state
-                    .shells
-                    .get(shell_id)
-                    .expect("workspace shell was inserted");
-                if let ShellOwner::Schedule { schedule_id } = &shell.owner {
-                    let schedule = state.schedules.get(schedule_id).ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "schedule-owned shell references a missing schedule",
-                        )
-                    })?;
-                    if schedule.workspace_id != saved_workspace.id
-                        || lock(&schedule.state)?.execution_shell_id.as_deref()
-                            != Some(shell.id.as_str())
-                    {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "schedule-owned shell does not match its persisted schedule",
-                        ));
-                    }
-                }
-            }
-            for schedule_id in &workspace_schedule_ids {
-                let schedule = state
-                    .schedules
-                    .get(schedule_id)
-                    .expect("workspace schedule was inserted");
-                if let Some(shell_id) = &lock(&schedule.state)?.execution_shell_id {
-                    let shell = state.shells.get(shell_id).ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "agent schedule references a missing execution shell",
-                        )
-                    })?;
-                    if shell.owner
-                        != (ShellOwner::Schedule {
-                            schedule_id: schedule.id.clone(),
-                        })
-                    {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "agent schedule references a shell with the wrong owner",
-                        ));
-                    }
-                }
-                let schedule_shell_id = lock(&schedule.state)?.execution_shell_id.clone();
-                let executions = lock(&schedule.executions)?.clone();
-                for execution in executions {
-                    if !execution_ids.insert(execution.id.clone()) {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "Boomux state contains a duplicate scheduled execution",
-                        ));
-                    }
-                    let execution_state = lock(&execution.state)?;
-                    if let Some(shell_id) = &execution_state.shell_id
-                        && schedule_shell_id.as_deref() != Some(shell_id.as_str())
-                    {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "scheduled execution references a shell outside its schedule",
-                        ));
-                    }
-                    if let Some(agent_id) = &execution_state.agent_id {
-                        let agent = state.agents.get(agent_id).ok_or_else(|| {
-                            io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "scheduled execution references a missing Agent",
-                            )
-                        })?;
-                        if !linked_agent_ids.insert(agent_id.clone())
-                            || execution_state.shell_id.as_deref() != Some(agent.shell_id.as_str())
-                            || execution_state.run_id.as_deref() != Some(agent.run_id.as_str())
-                            || execution.integration != agent.integration
-                            || execution_state.external_session_id != agent.external_session_id
-                            || matches!(
-                                &execution.session,
-                                AgentScheduleSession::Continue { external_session_id }
-                                    if execution_state.external_session_id.as_deref()
-                                        != Some(external_session_id.as_str())
-                                        || agent.external_session_id.as_deref()
-                                            != Some(external_session_id.as_str())
-                            )
-                        {
-                            return Err(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "scheduled execution has an invalid Agent link",
-                            ));
-                        }
-                    } else if execution_state.external_session_id.is_some() {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "scheduled execution has a session link without an Agent",
-                        ));
-                    }
-                }
-            }
             let workspace = Arc::new(Workspace {
                 id: saved_workspace.id.clone(),
                 revision: Mutex::new(saved_workspace.revision),
@@ -15181,7 +11527,6 @@ impl DaemonService {
                 shell_ids: Mutex::new(shell_ids),
                 launcher_ids: Mutex::new(launcher_ids),
                 agent_ids: Mutex::new(workspace_agent_ids),
-                schedule_ids: Mutex::new(workspace_schedule_ids),
             });
             state.workspaces.insert(saved_workspace.id, workspace);
         }
@@ -15213,23 +11558,15 @@ impl DaemonService {
             host_service_previews: Mutex::new(HashMap::new()),
             workspace_operation_locks: Mutex::new(HashMap::new()),
             mutation_lock: Mutex::new(()),
-            schedule_dispatch_lock: Mutex::new(()),
             notification_settings: NotificationDeliverySettings::default(),
             notification_sink: Arc::new(DisabledNotificationSink),
-            cold_recovery_executions,
             startup_environment: capture_current_environment(),
-            scheduler: SchedulerWorker::default(),
             node_projection_workers: NodeProjectionWorkers::default(),
-            clock: Mutex::new(Arc::new(SystemSchedulerClock)),
             #[cfg(test)]
             fail_after_mutation: AtomicBool::new(false),
         };
         if recovered_interrupted_run {
             registry.persist()?;
-        } else {
-            registry.events.initialize_committed_executions(
-                registry.durable.scheduled_executions(None, None)?,
-            )?;
         }
         Ok(registry)
     }
@@ -15460,11 +11797,7 @@ impl DaemonService {
                         undo.rollback(&self.durable),
                     ));
                 }
-                let notifications = self.notification_requests(
-                    &kinds,
-                    &undo,
-                    &transaction.events.committed_executions,
-                );
+                let notifications = self.notification_requests(&kinds, &undo);
                 let saved = match self.capture_persisted_state() {
                     Ok(saved) => saved,
                     Err(error) => {
@@ -15480,9 +11813,8 @@ impl DaemonService {
                     .write_persisted_state(saved)
                     .map_err(DaemonError::persistence)
                 {
-                    Ok(committed) => {
+                    Ok(()) => {
                         let mut transaction = self.events.transaction()?;
-                        transaction.replace_committed_executions(committed);
                         transaction.append_batch(kinds);
                         transaction.finish_persistence();
                         drop(transaction);
@@ -15550,7 +11882,6 @@ impl DaemonService {
         &self,
         kinds: &[DaemonEventKind],
         undo: &DurableUndoLog,
-        committed_executions: &HashMap<String, ScheduledExecutionSnapshot>,
     ) -> Vec<NotificationRequest> {
         let mut seen = HashSet::new();
         let mut requests = Vec::new();
@@ -15616,104 +11947,8 @@ impl DaemonService {
                 digest: None,
             });
         }
-        requests.extend(self.execution_notification_requests(kinds, committed_executions));
         requests
     }
-
-    fn execution_notification_requests(
-        &self,
-        kinds: &[DaemonEventKind],
-        committed_executions: &HashMap<String, ScheduledExecutionSnapshot>,
-    ) -> Vec<NotificationRequest> {
-        let mut seen = HashSet::new();
-        let mut published = HashMap::new();
-        let mut requests = Vec::new();
-        for kind in kinds {
-            let DaemonEventKind::ScheduledExecutionChanged {
-                workspace_id,
-                execution,
-            } = kind
-            else {
-                continue;
-            };
-            let previous = published
-                .get(&execution.id)
-                .or_else(|| committed_executions.get(&execution.id));
-            let reason = Self::execution_notification_reason(execution);
-            let transitioned = reason.is_some()
-                && previous
-                    .and_then(Self::execution_notification_reason)
-                    .is_none();
-            published.insert(execution.id.clone(), execution.clone());
-            let Some(reason) = reason.filter(|_| transitioned) else {
-                continue;
-            };
-            if !category_enabled(&self.notification_settings, reason)
-                || !seen.insert((execution.id.clone(), execution.revision, reason))
-            {
-                continue;
-            }
-            let (workspace, schedule) = self
-                .durable
-                .schedule_notification_context(workspace_id, &execution.schedule_id);
-            requests.push(NotificationRequest {
-                reason,
-                agent: schedule,
-                workspace,
-                shell: execution.id.clone(),
-                node: None,
-                digest: None,
-            });
-        }
-        requests
-    }
-
-    fn execution_notification_reason(
-        execution: &ScheduledExecutionSnapshot,
-    ) -> Option<NotificationReason> {
-        match (execution.state, execution.reason) {
-            (
-                ScheduledExecutionState::DispatchFailed,
-                Some(
-                    ScheduledExecutionReason::RunnerStartFailed
-                    | ScheduledExecutionReason::HostSpawnFailed,
-                ),
-            ) => Some(NotificationReason::ScheduledDispatchFailed),
-            (
-                ScheduledExecutionState::Interrupted,
-                Some(ScheduledExecutionReason::ColdDaemonRecovery),
-            ) => Some(NotificationReason::ScheduledInterrupted),
-            _ => None,
-        }
-    }
-
-    fn publish_cold_recovery_notifications(&mut self) {
-        if !category_enabled(
-            &self.notification_settings,
-            NotificationReason::ScheduledInterrupted,
-        ) {
-            self.cold_recovery_executions.clear();
-            return;
-        }
-        let mut seen = HashSet::new();
-        for execution in self.cold_recovery_executions.drain(..) {
-            if !seen.insert((execution.id.clone(), execution.revision)) {
-                continue;
-            }
-            let (workspace, schedule) = self
-                .durable
-                .schedule_notification_context(&execution.workspace_id, &execution.schedule_id);
-            self.notification_sink.notify(NotificationRequest {
-                reason: NotificationReason::ScheduledInterrupted,
-                agent: schedule,
-                workspace,
-                shell: execution.id,
-                node: None,
-                digest: None,
-            });
-        }
-    }
-
     fn notification_context(&self, workspace_id: &str, shell_id: &str) -> (String, String) {
         self.durable.notification_context(workspace_id, shell_id)
     }
@@ -15730,37 +11965,29 @@ impl DaemonService {
         let count = transaction.pending_durable_event_count(pending_count);
         transaction.reserve_with_pending(0)?;
         let saved = self.capture_persisted_state()?;
-        let committed_before = transaction.events.committed_executions.clone();
         let pending = transaction.take_pending_durable(pending_count);
         transaction.begin_persistence(count);
         drop(transaction);
-        let committed = match self
+        match self
             .write_persisted_state(saved)
             .map_err(DaemonError::persistence)
         {
-            Ok(committed) => committed,
+            Ok(()) => {}
             Err(error) => {
                 let mut transaction = self.events.transaction()?;
                 transaction.restore_pending_durable(pending);
                 transaction.finish_persistence();
                 return Err(error);
             }
-        };
-        let notification_events = pending.iter().flatten().cloned().collect::<Vec<_>>();
-        let notifications =
-            self.execution_notification_requests(&notification_events, &committed_before);
+        }
         let mut transaction = self.events.transaction()?;
         transaction.reserve_with_pending(0)?;
-        transaction.replace_committed_executions(committed);
         for batch in pending {
             transaction.append_batch(batch);
         }
         transaction.finish_persistence();
         drop(transaction);
         self.events.notify();
-        for notification in notifications {
-            self.notification_sink.notify(notification);
-        }
         Ok(count != 0)
     }
 
@@ -15777,9 +12004,6 @@ impl DaemonService {
                 Ok(None) => {}
                 Err(error) if failure.is_none() => failure = Some(error),
                 Err(_) => {}
-            }
-            if let Ok(Some(event)) = self.reconcile_irreversibly_stopped_execution(shell) {
-                batch.push(event);
             }
         }
         self.queue_durable_batch_locked(batch, transition);
@@ -15802,51 +12026,9 @@ impl DaemonService {
             {
                 failure = Some(error);
             }
-            if let Ok(Some(event)) = self.reconcile_irreversibly_stopped_execution(&shell) {
-                batch.push(event);
-            }
         }
         self.queue_durable_batch_locked(batch, transition);
         failure.map_or(Ok(()), Err)
-    }
-
-    fn reconcile_irreversibly_stopped_execution(
-        &self,
-        shell: &Arc<Shell>,
-    ) -> io::Result<Option<DaemonEventKind>> {
-        let ShellOwner::Schedule { schedule_id } = &shell.owner else {
-            return Ok(None);
-        };
-        let run_id = lock(&shell.last_run)?.as_ref().map(|run| run.id.clone());
-        let Some(run_id) = run_id else {
-            return Ok(None);
-        };
-        let schedule = self.schedule(schedule_id)?;
-        let executions = lock(&schedule.executions)?.clone();
-        let execution = executions.into_iter().find(|execution| {
-            lock(&execution.state).is_ok_and(|state| {
-                matches!(
-                    state.state,
-                    ScheduledExecutionState::Starting | ScheduledExecutionState::Active
-                ) && state.shell_id.as_deref() == Some(shell.id.as_str())
-                    && state.run_id.as_deref() == Some(run_id.as_str())
-            })
-        });
-        let Some(execution) = execution else {
-            return Ok(None);
-        };
-        let now = unix_time_ms().max(execution.requested_at_ms);
-        let (snapshot, _) = self.durable.mutate_execution(&execution, |state| {
-            state.state = ScheduledExecutionState::Interrupted;
-            state.ended_at_ms = Some(now);
-            state.reason = Some(ScheduledExecutionReason::RunnerExitedWithoutReport);
-            state.outcome = None;
-            Ok(())
-        })?;
-        Ok(Some(DaemonEventKind::ScheduledExecutionChanged {
-            workspace_id: snapshot.workspace_id.clone(),
-            execution: snapshot,
-        }))
     }
 
     fn lifecycle_failure(primary: DaemonError, compensation: io::Result<()>) -> DaemonError {
@@ -15893,21 +12075,15 @@ impl DaemonService {
     fn persist(&self) -> io::Result<()> {
         let _persist = lock(&self.durable.persist_lock)?;
         let saved = self.durable.capture_persisted_state()?;
-        let executions = self.write_persisted_state(saved)?;
-        self.events.initialize_committed_executions(executions)
+        self.write_persisted_state(saved)
     }
 
     fn capture_persisted_state(&self) -> io::Result<PersistenceGeneration> {
         self.durable.capture_persisted_state()
     }
 
-    fn write_persisted_state(
-        &self,
-        generation: PersistenceGeneration,
-    ) -> io::Result<Vec<ScheduledExecutionSnapshot>> {
-        let executions = generation.executions.clone();
-        self.durable.write_persisted_state(generation)?;
-        Ok(executions)
+    fn write_persisted_state(&self, generation: PersistenceGeneration) -> io::Result<()> {
+        self.durable.write_persisted_state(generation)
     }
 
     #[cfg(test)]
@@ -15957,22 +12133,7 @@ impl DaemonService {
                 return Err(io::Error::other("daemon state lock poisoned"));
             }
         };
-        let execution = if let ShellOwner::Schedule { schedule_id } = &shell.owner {
-            let schedule = self.schedule(schedule_id)?;
-            let executions = lock(&schedule.executions)?.clone();
-            executions.into_iter().find(|execution| {
-                lock(&execution.state).is_ok_and(|state| {
-                    matches!(
-                        state.state,
-                        ScheduledExecutionState::Starting | ScheduledExecutionState::Active
-                    ) && state.shell_id.as_deref() == Some(shell.id.as_str())
-                        && state.run_id.as_deref() == Some(run.id.as_str())
-                })
-            })
-        } else {
-            None
-        };
-        let reserve = 1 + usize::from(execution.is_some());
+        let reserve = 1;
         let mut transaction = self.events.transaction()?;
         if let Err(error) = transaction.reserve_with_pending(reserve) {
             if transaction.capacity_is_blocked_only_by_lifecycle_reservation(reserve) {
@@ -15985,58 +12146,22 @@ impl DaemonService {
         };
         let mut batch = transaction.drain_runtime_events();
         batch.push(exit_event);
-        if let Some(execution) = execution {
-            let now = unix_time_ms().max(execution.requested_at_ms);
-            let (snapshot, _) = self.durable.mutate_execution(&execution, |state| {
-                if matches!(
-                    state.state,
-                    ScheduledExecutionState::Starting | ScheduledExecutionState::Active
-                ) {
-                    state.ended_at_ms = Some(now);
-                    if state.outcome.is_some() {
-                        state.state = ScheduledExecutionState::Exited;
-                        state.reason = None;
-                    } else if state.reason == Some(ScheduledExecutionReason::HostSpawnFailed) {
-                        state.state = ScheduledExecutionState::DispatchFailed;
-                    } else {
-                        state.state = ScheduledExecutionState::Interrupted;
-                        state.reason = Some(ScheduledExecutionReason::RunnerExitedWithoutReport);
-                    }
-                }
-                Ok(())
-            })?;
-            batch.push(DaemonEventKind::ScheduledExecutionChanged {
-                workspace_id: snapshot.workspace_id.clone(),
-                execution: snapshot,
-            });
-        }
         let pending_count =
             transaction.pending_durable_event_count(transaction.pending_durable_batch_count());
         let event_count = pending_count.saturating_add(batch.len());
-        let mut notification_events = transaction.pending_durable_events();
-        notification_events.extend(batch.iter().cloned());
-        let notifications = self.execution_notification_requests(
-            &notification_events,
-            &transaction.events.committed_executions,
-        );
         let saved = self.capture_persisted_state()?;
         transaction.begin_persistence(event_count);
         drop(transaction);
         match self.write_persisted_state(saved) {
-            Ok(committed) => {
+            Ok(()) => {
                 let mut transaction = self.events.transaction()?;
-                transaction.replace_committed_executions(committed);
                 transaction.append_pending_durable();
                 transaction.append_batch(batch);
                 transaction.finish_persistence();
                 drop(transaction);
                 self.events.notify();
-                self.wake_scheduler();
                 drop(_persistence);
                 drop(_mutation);
-                for notification in notifications {
-                    self.notification_sink.notify(notification);
-                }
                 Ok(RunExitRecord::Recorded)
             }
             Err(error) => {
@@ -16045,7 +12170,6 @@ impl DaemonService {
                 transaction.finish_persistence();
                 drop(transaction);
                 self.events.notify();
-                self.wake_scheduler();
                 Err(error)
             }
         }
@@ -16089,26 +12213,6 @@ impl DaemonService {
                 self.add_recovery_presentation(shell)?;
             }
         }
-        let active = self.scheduler.state.lock().ok().is_some_and(|scheduler| {
-            scheduler.running
-                && scheduler.healthy
-                && scheduler
-                    .handle
-                    .as_ref()
-                    .is_some_and(|handle| !handle.is_finished())
-        });
-        snapshot.scheduler = Some(SchedulerHealth {
-            state: if active {
-                SchedulerState::Active
-            } else {
-                SchedulerState::Offline
-            },
-            max_concurrent: self
-                .notification_settings
-                .max_scheduled_execution_concurrency,
-            active_executions: u16::try_from(self.durable.active_scheduled_execution_count()?)
-                .unwrap_or(u16::MAX),
-        });
         Ok(snapshot)
     }
 
@@ -16192,8 +12296,7 @@ impl DaemonService {
         let (mode, transitions) =
             projection_transitions(&transaction.events, after.as_ref(), &cursor);
         let node_id = self.node_identity()?.id()?;
-        let scheduler = self.scheduler_health()?;
-        let mut projection = self.durable.node_projection(node_id, scheduler)?;
+        let mut projection = self.durable.node_projection(node_id)?;
         for shell in &mut projection.shells {
             self.add_recovery_projection(shell)?;
         }
@@ -16218,35 +12321,6 @@ impl DaemonService {
             .copied()
             .map(str::to_owned)
             .collect()
-    }
-
-    fn scheduler_health(&self) -> io::Result<SchedulerHealth> {
-        let active = self.scheduler.state.lock().ok().is_some_and(|scheduler| {
-            scheduler.running
-                && scheduler.healthy
-                && scheduler
-                    .handle
-                    .as_ref()
-                    .is_some_and(|handle| !handle.is_finished())
-        });
-        Ok(SchedulerHealth {
-            state: if active {
-                SchedulerState::Active
-            } else {
-                SchedulerState::Offline
-            },
-            max_concurrent: self
-                .notification_settings
-                .max_scheduled_execution_concurrency,
-            active_executions: u16::try_from(self.durable.active_scheduled_execution_count()?)
-                .unwrap_or(u16::MAX),
-        })
-    }
-
-    fn schedule_shell_ids_for_downgrade(&self) -> io::Result<HashSet<String>> {
-        let mut ids = self.events.schedule_shell_ids()?;
-        ids.extend(self.durable.schedule_shell_ids()?);
-        Ok(ids)
     }
 
     fn focused_terminal(&self) -> io::Result<Option<FocusedTerminalSnapshot>> {
@@ -16520,11 +12594,11 @@ impl DaemonService {
             lifecycle_event_capacity.saturating_sub(committed_events.len()),
         );
         drop(transaction);
-        let committed = match self
+        match self
             .write_persisted_state(saved)
             .map_err(DaemonError::persistence)
         {
-            Ok(committed) => committed,
+            Ok(()) => {}
             Err(error) => {
                 let mut transaction = self.events.transaction()?;
                 let durable = undo.rollback(&self.durable);
@@ -16539,9 +12613,8 @@ impl DaemonService {
                     runtime,
                 ));
             }
-        };
+        }
         let mut transaction = self.events.transaction()?;
-        transaction.replace_committed_executions(committed);
         transaction.append_batch(committed_events);
         transaction.release_lifecycle_reservation();
         transaction.finish_persistence();
@@ -16554,24 +12627,7 @@ impl DaemonService {
         self.lifecycle_transaction(
             true,
             || Ok(self.durable.shells()?),
-            |undo| {
-                let executions = self.durable.scheduled_executions(None, None)?;
-                for snapshot in executions {
-                    if snapshot.state.is_terminal() {
-                        continue;
-                    }
-                    let execution = self.durable.execution(&snapshot.id)?;
-                    let (_, record) = self.durable.mutate_execution(&execution, |state| {
-                        state.state = ScheduledExecutionState::Cancelled;
-                        state.ended_at_ms = Some(unix_time_ms().max(execution.requested_at_ms));
-                        state.reason = Some(ScheduledExecutionReason::DaemonShutdown);
-                        state.outcome = None;
-                        Ok(())
-                    })?;
-                    undo.record(record);
-                }
-                Ok(())
-            },
+            |_| Ok(()),
             |_| Vec::new(),
         )?;
         self.opencode.shutdown()?;
@@ -16592,10 +12648,6 @@ impl DaemonService {
 
     fn agent(&self, id: &str) -> io::Result<Arc<AgentInstance>> {
         self.durable.agent(id)
-    }
-
-    fn schedule(&self, id: &str) -> io::Result<Arc<AgentSchedule>> {
-        self.durable.schedule(id)
     }
 
     fn contains_shell(&self, shell: &Arc<Shell>) -> io::Result<bool> {
@@ -16672,63 +12724,6 @@ impl DaemonService {
         let (snapshot, record) = self.durable.create_launcher(workspace_id, spec)?;
         undo.record(record);
         Ok(snapshot)
-    }
-
-    fn create_schedule_mutation(
-        &self,
-        undo: &mut DurableUndoLog,
-        workspace_id: &str,
-        spec: AgentScheduleSpec,
-    ) -> io::Result<AgentScheduleSnapshot> {
-        let (snapshot, record) =
-            self.durable
-                .create_schedule_at(workspace_id, spec, self.clock_now_ms())?;
-        undo.record(record);
-        Ok(snapshot)
-    }
-
-    fn change_schedule_state(
-        &self,
-        schedule_id: &str,
-        next: AgentScheduleState,
-    ) -> DaemonResult<Response> {
-        self.change_schedule_state_guarded(schedule_id, next, None)
-    }
-
-    fn change_schedule_state_guarded(
-        &self,
-        schedule_id: &str,
-        next: AgentScheduleState,
-        expected_revision: Option<u64>,
-    ) -> DaemonResult<Response> {
-        self.durable_mutation_outcome(|undo| {
-            let (schedule, record) = self.durable.set_schedule_state_at(
-                schedule_id,
-                next,
-                expected_revision,
-                self.clock_now_ms(),
-            )?;
-            let Some(record) = record else {
-                return Ok(DurableMutation::Unchanged(Response::AgentSchedule {
-                    schedule,
-                }));
-            };
-            undo.record(record);
-            let event = match next {
-                AgentScheduleState::Paused => DaemonEventKind::AgentSchedulePaused {
-                    workspace_id: schedule.workspace_id.clone(),
-                    schedule: schedule.clone(),
-                },
-                AgentScheduleState::Enabled => DaemonEventKind::AgentScheduleResumed {
-                    workspace_id: schedule.workspace_id.clone(),
-                    schedule: schedule.clone(),
-                },
-            };
-            Ok(DurableMutation::Changed(
-                Response::AgentSchedule { schedule },
-                vec![event],
-            ))
-        })
     }
 
     #[cfg(test)]
@@ -16925,61 +12920,6 @@ impl DaemonService {
         Ok(result)
     }
 
-    fn remove_schedule_mutation(
-        &self,
-        undo: &mut DurableUndoLog,
-        schedule_id: &str,
-    ) -> io::Result<Arc<AgentSchedule>> {
-        let schedule = self.schedule(schedule_id)?;
-        if lock(&schedule.executions)?
-            .iter()
-            .any(|execution| lock(&execution.state).is_ok_and(|state| !state.state.is_terminal()))
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "agent schedule has a nonterminal execution",
-            ));
-        }
-        if let Some(shell_id) = lock(&schedule.state)?.execution_shell_id.clone() {
-            let shell = self.shell(&shell_id)?;
-            if matches!(*lock(&shell.lifecycle)?, ShellLifecycle::Running { .. }) {
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "agent schedule runner shell is still active",
-                ));
-            }
-            undo.record(self.remove_shell_mutation(&shell_id)?);
-        }
-        let mut state = lock(&self.durable.state)?;
-        let schedule = state
-            .schedules
-            .get(schedule_id)
-            .cloned()
-            .ok_or_else(|| not_found("agent schedule", schedule_id))?;
-        let workspace = state
-            .workspaces
-            .get(&schedule.workspace_id)
-            .cloned()
-            .ok_or_else(|| not_found("workspace", &schedule.workspace_id))?;
-        let mut schedule_ids = lock(&workspace.schedule_ids)?;
-        let index = schedule_ids
-            .iter()
-            .position(|id| id == schedule_id)
-            .ok_or_else(|| not_found("agent schedule", schedule_id))?;
-        state.schedules.remove(schedule_id);
-        schedule_ids.remove(index);
-        bump_revision(&workspace.revision, "workspace")?;
-        drop(schedule_ids);
-        drop(state);
-        let result = Arc::clone(&schedule);
-        undo.record(DurableUndo::RemovedSchedule {
-            workspace,
-            schedule,
-            index,
-        });
-        Ok(result)
-    }
-
     fn read_shell(&self, shell_id: &str, max_bytes: usize) -> io::Result<Vec<u8>> {
         let shell = self.shell(shell_id)?;
         self.runtimes.read_shell(&shell, max_bytes)
@@ -17029,18 +12969,6 @@ impl DaemonService {
                 Ok(None)
             },
         )
-    }
-
-    fn wait_scheduled_execution(
-        &self,
-        execution_id: &str,
-        after_revision: u64,
-        wait_ms: u32,
-    ) -> DaemonResult<Response> {
-        self.events
-            .wait_for_scheduled_execution(execution_id, after_revision, wait_ms, || {
-                self.runtimes.is_stopping()
-            })
     }
 
     fn read_shell_at(
@@ -17100,7 +13028,6 @@ impl DaemonService {
         let shell_ids = lock(&workspace.shell_ids)?.clone();
         let launcher_ids = lock(&workspace.launcher_ids)?.clone();
         let agent_ids = lock(&workspace.agent_ids)?.clone();
-        let schedule_ids = lock(&workspace.schedule_ids)?.clone();
         let shells = shell_ids
             .iter()
             .filter_map(|id| state.shells.get(id).cloned())
@@ -17113,10 +13040,6 @@ impl DaemonService {
             .iter()
             .filter_map(|id| state.agents.get(id).cloned())
             .collect();
-        let schedules = schedule_ids
-            .iter()
-            .filter_map(|id| state.schedules.get(id).cloned())
-            .collect();
         state.workspaces.remove(workspace_id);
         for id in shell_ids {
             state.shells.remove(&id);
@@ -17127,16 +13050,12 @@ impl DaemonService {
         for id in agent_ids {
             state.agents.remove(&id);
         }
-        for id in schedule_ids {
-            state.schedules.remove(&id);
-        }
         drop(state);
         Ok(DurableUndo::RemovedWorkspace {
             workspace,
             shells,
             launchers,
             agents,
-            schedules,
         })
     }
 
@@ -17149,12 +13068,6 @@ impl DaemonService {
         shell_id: &str,
         expected_revision: Option<u64>,
     ) -> DaemonResult<()> {
-        if !matches!(self.shell(shell_id)?.owner, ShellOwner::User) {
-            return Err(DaemonError::lifecycle(
-                ErrorCode::Busy,
-                "schedule-owned shells cannot be closed directly",
-            ));
-        }
         self.lifecycle_transaction(
             false,
             || {
@@ -17229,12 +13142,6 @@ impl DaemonService {
                 ));
             }
         }
-        if !matches!(shell.owner, ShellOwner::User) {
-            return Err(DaemonError::lifecycle(
-                ErrorCode::Busy,
-                "schedule-owned shells cannot be restarted directly",
-            ));
-        }
         let old_runtime = {
             let mut lifecycle = lock(&shell.lifecycle)?;
             let old_runtime = match &*lifecycle {
@@ -17263,7 +13170,7 @@ impl DaemonService {
 
 impl Workspace {
     fn snapshot(&self, registry: &DurableRegistry) -> io::Result<WorkspaceSnapshot> {
-        let (shells, launchers, agents, schedules) = {
+        let (shells, launchers, agents) = {
             let state = lock(&registry.state)?;
             let shell_ids = lock(&self.shell_ids)?;
             let shells = shell_ids
@@ -17280,12 +13187,7 @@ impl Workspace {
                 .iter()
                 .filter_map(|id| state.agents.get(id).cloned())
                 .collect::<Vec<_>>();
-            let schedule_ids = lock(&self.schedule_ids)?;
-            let schedules = schedule_ids
-                .iter()
-                .filter_map(|id| state.schedules.get(id).cloned())
-                .collect::<Vec<_>>();
-            (shells, launchers, agents, schedules)
+            (shells, launchers, agents)
         };
         let shells = shells
             .iter()
@@ -17299,10 +13201,6 @@ impl Workspace {
             .iter()
             .map(|agent| agent.snapshot())
             .collect::<io::Result<_>>()?;
-        let schedules = schedules
-            .iter()
-            .map(|schedule| schedule.snapshot())
-            .collect::<io::Result<_>>()?;
         Ok(WorkspaceSnapshot {
             id: self.id.clone(),
             revision: *lock(&self.revision)?,
@@ -17311,293 +13209,6 @@ impl Workspace {
             shells,
             launchers,
             agents,
-            schedules,
-        })
-    }
-}
-
-impl AgentSchedule {
-    fn node_projection(&self) -> io::Result<NodeProjectionSchedule> {
-        let state = lock(&self.state)?;
-        let next_occurrence = if state.state == AgentScheduleState::Enabled {
-            Some(ScheduledOccurrence {
-                trigger_revision: state.trigger_revision,
-                scheduled_at_ms: crate::scheduling::CronSchedule::compile(
-                    &state.trigger.cron,
-                    &state.trigger.timezone,
-                )
-                .and_then(|cron| cron.next_after_ms(state.evaluation_frontier_ms))
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?,
-            })
-        } else {
-            None
-        };
-        Ok(NodeProjectionSchedule {
-            id: self.id.clone(),
-            workspace_id: self.workspace_id.clone(),
-            name: state.name.clone(),
-            integration: self.integration.clone(),
-            state: state.state,
-            trigger: state.trigger.clone(),
-            revision: state.revision,
-            prompt_revision: state.prompt_revision,
-            trigger_revision: state.trigger_revision,
-            created_at_ms: self.created_at_ms,
-            updated_at_ms: state.updated_at_ms,
-            next_occurrence,
-        })
-    }
-
-    fn from_persisted(workspace_id: &str, saved: PersistedAgentSchedule) -> Self {
-        let schedule_id = saved.id.clone();
-        Self {
-            id: saved.id,
-            workspace_id: workspace_id.into(),
-            cwd: saved.cwd,
-            integration: saved.integration,
-            session: saved.session,
-            overlap_policy: saved.overlap_policy,
-            created_at_ms: saved.created_at_ms,
-            state: Mutex::new(AgentScheduleMutableState {
-                name: saved.name,
-                prompt: saved.prompt,
-                trigger: saved.trigger,
-                prompt_revision: saved.prompt_revision,
-                trigger_revision: saved.trigger_revision,
-                state: saved.state,
-                revision: saved.revision,
-                updated_at_ms: saved.updated_at_ms,
-                evaluation_frontier_ms: saved.evaluation_frontier_ms,
-                evaluation_frontier_trigger_revision: saved.evaluation_frontier_trigger_revision,
-                execution_shell_id: saved.execution_shell_id,
-            }),
-            executions: Mutex::new(
-                saved
-                    .executions
-                    .into_iter()
-                    .map(|execution| {
-                        Arc::new(ScheduledExecution::from_persisted(
-                            workspace_id,
-                            &schedule_id,
-                            execution,
-                        ))
-                    })
-                    .collect(),
-            ),
-            dispatch_key_filter: Mutex::new(saved.dispatch_key_filter),
-        }
-    }
-
-    fn snapshot(&self) -> io::Result<AgentScheduleSnapshot> {
-        let state = lock(&self.state)?;
-        self.snapshot_from(&state)
-    }
-
-    fn snapshot_from(
-        &self,
-        state: &AgentScheduleMutableState,
-    ) -> io::Result<AgentScheduleSnapshot> {
-        let next_occurrence = if state.state == AgentScheduleState::Enabled {
-            let scheduled_at_ms = crate::scheduling::CronSchedule::compile(
-                &state.trigger.cron,
-                &state.trigger.timezone,
-            )
-            .and_then(|cron| cron.next_after_ms(state.evaluation_frontier_ms))
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
-            Some(ScheduledOccurrence {
-                trigger_revision: state.trigger_revision,
-                scheduled_at_ms,
-            })
-        } else {
-            None
-        };
-        Ok(AgentScheduleSnapshot {
-            id: self.id.clone(),
-            workspace_id: self.workspace_id.clone(),
-            name: state.name.clone(),
-            cwd: self.cwd.clone(),
-            integration: self.integration.clone(),
-            session: self.session.clone(),
-            trigger: state.trigger.clone(),
-            state: state.state,
-            overlap_policy: self.overlap_policy,
-            revision: state.revision,
-            prompt_revision: state.prompt_revision,
-            trigger_revision: state.trigger_revision,
-            created_at_ms: self.created_at_ms,
-            updated_at_ms: state.updated_at_ms,
-            evaluation_frontier_ms: state.evaluation_frontier_ms,
-            execution_shell_id: state.execution_shell_id.clone(),
-            next_occurrence,
-        })
-    }
-
-    fn inspection(&self) -> io::Result<AgentScheduleInspection> {
-        let state = lock(&self.state)?;
-        Ok(AgentScheduleInspection {
-            schedule: self.snapshot_from(&state)?,
-            prompt: state.prompt.clone(),
-        })
-    }
-
-    fn persisted(&self) -> io::Result<PersistedAgentSchedule> {
-        let state = lock(&self.state)?;
-        let snapshot = self.snapshot_from(&state)?;
-        let prompt = state.prompt.clone();
-        let evaluation_frontier_trigger_revision = state.evaluation_frontier_trigger_revision;
-        drop(state);
-        let executions = lock(&self.executions)?
-            .iter()
-            .map(|execution| execution.persisted())
-            .collect::<io::Result<_>>()?;
-        let dispatch_key_filter = lock(&self.dispatch_key_filter)?.clone();
-        Ok(PersistedAgentSchedule {
-            id: snapshot.id,
-            name: snapshot.name,
-            cwd: snapshot.cwd,
-            integration: snapshot.integration,
-            prompt,
-            session: snapshot.session,
-            trigger: snapshot.trigger,
-            state: snapshot.state,
-            overlap_policy: snapshot.overlap_policy,
-            revision: snapshot.revision,
-            prompt_revision: snapshot.prompt_revision,
-            trigger_revision: snapshot.trigger_revision,
-            created_at_ms: snapshot.created_at_ms,
-            updated_at_ms: snapshot.updated_at_ms,
-            evaluation_frontier_ms: snapshot.evaluation_frontier_ms,
-            evaluation_frontier_trigger_revision,
-            execution_shell_id: snapshot.execution_shell_id,
-            dispatch_key_filter,
-            executions,
-        })
-    }
-}
-
-impl ScheduledExecution {
-    fn node_projection(&self) -> io::Result<NodeProjectionExecution> {
-        let state = lock(&self.state)?;
-        Ok(NodeProjectionExecution {
-            id: self.id.clone(),
-            workspace_id: self.workspace_id.clone(),
-            schedule_id: self.schedule_id.clone(),
-            revision: state.revision,
-            state: state.state,
-            dispatch_kind: self.dispatch_kind,
-            schedule_revision: self.schedule_revision,
-            prompt_revision: self.prompt_revision,
-            trigger_revision: self.trigger_revision,
-            requested_at_ms: self.requested_at_ms,
-            scheduled_at_ms: self.scheduled_at_ms,
-            started_at_ms: state.started_at_ms,
-            ended_at_ms: state.ended_at_ms,
-            reason: state.reason,
-            outcome: state.outcome.clone(),
-            shell_id: state.shell_id.clone(),
-            run_id: state.run_id.clone(),
-            agent_id: state.agent_id.clone(),
-        })
-    }
-
-    fn from_persisted(
-        workspace_id: &str,
-        schedule_id: &str,
-        saved: PersistedScheduledExecution,
-    ) -> Self {
-        Self {
-            id: saved.id,
-            workspace_id: workspace_id.into(),
-            schedule_id: schedule_id.into(),
-            dispatch_kind: saved.dispatch_kind,
-            dispatch_key: saved.dispatch_key,
-            schedule_revision: saved.schedule_revision,
-            prompt_revision: saved.prompt_revision,
-            trigger_revision: saved.trigger_revision,
-            requested_at_ms: saved.requested_at_ms,
-            scheduled_at_ms: saved.scheduled_at_ms,
-            coalesced_through_ms: saved.coalesced_through_ms,
-            cwd: saved.cwd,
-            integration: saved.integration,
-            session: saved.session,
-            prompt: saved.prompt,
-            runner_token: saved.runner_token,
-            state: Mutex::new(ScheduledExecutionMutableState {
-                revision: saved.revision,
-                state: saved.state,
-                started_at_ms: saved.started_at_ms,
-                ended_at_ms: saved.ended_at_ms,
-                reason: saved.reason,
-                outcome: saved.outcome,
-                shell_id: saved.shell_id,
-                run_id: saved.run_id,
-                agent_id: saved.agent_id,
-                external_session_id: saved.external_session_id,
-            }),
-        }
-    }
-
-    fn snapshot(&self) -> io::Result<ScheduledExecutionSnapshot> {
-        let state = lock(&self.state)?;
-        Ok(self.snapshot_from(&state))
-    }
-
-    fn snapshot_from(&self, state: &ScheduledExecutionMutableState) -> ScheduledExecutionSnapshot {
-        ScheduledExecutionSnapshot {
-            id: self.id.clone(),
-            workspace_id: self.workspace_id.clone(),
-            schedule_id: self.schedule_id.clone(),
-            revision: state.revision,
-            state: state.state,
-            dispatch_kind: self.dispatch_kind,
-            dispatch_key: self.dispatch_key.clone(),
-            schedule_revision: self.schedule_revision,
-            prompt_revision: self.prompt_revision,
-            trigger_revision: self.trigger_revision,
-            requested_at_ms: self.requested_at_ms,
-            scheduled_at_ms: self.scheduled_at_ms,
-            coalesced_through_ms: self.coalesced_through_ms,
-            started_at_ms: state.started_at_ms,
-            ended_at_ms: state.ended_at_ms,
-            cwd: self.cwd.clone(),
-            integration: self.integration.clone(),
-            session: self.session.clone(),
-            reason: state.reason,
-            outcome: state.outcome.clone(),
-            shell_id: state.shell_id.clone(),
-            run_id: state.run_id.clone(),
-            agent_id: state.agent_id.clone(),
-            external_session_id: state.external_session_id.clone(),
-        }
-    }
-
-    fn persisted(&self) -> io::Result<PersistedScheduledExecution> {
-        let state = lock(&self.state)?;
-        Ok(PersistedScheduledExecution {
-            id: self.id.clone(),
-            revision: state.revision,
-            state: state.state,
-            dispatch_kind: self.dispatch_kind,
-            dispatch_key: self.dispatch_key.clone(),
-            schedule_revision: self.schedule_revision,
-            prompt_revision: self.prompt_revision,
-            trigger_revision: self.trigger_revision,
-            requested_at_ms: self.requested_at_ms,
-            scheduled_at_ms: self.scheduled_at_ms,
-            coalesced_through_ms: self.coalesced_through_ms,
-            started_at_ms: state.started_at_ms,
-            ended_at_ms: state.ended_at_ms,
-            cwd: self.cwd.clone(),
-            integration: self.integration.clone(),
-            session: self.session.clone(),
-            prompt: self.prompt.clone(),
-            runner_token: self.runner_token.clone(),
-            reason: state.reason,
-            outcome: state.outcome.clone(),
-            shell_id: state.shell_id.clone(),
-            run_id: state.run_id.clone(),
-            agent_id: state.agent_id.clone(),
-            external_session_id: state.external_session_id.clone(),
         })
     }
 }
@@ -17733,7 +13344,6 @@ impl Shell {
             id: self.id.clone(),
             workspace_id: self.workspace_id.clone(),
             name: lock(&self.name)?.clone(),
-            owner: self.owner.clone(),
             status,
             run_id,
             generation,
@@ -17771,7 +13381,6 @@ impl Shell {
             name: lock(&self.name)?.clone(),
             cwd: self.cwd.clone(),
             command: self.command.clone(),
-            owner: self.owner.clone(),
             status,
             run,
             recovered_agent_id: None,
@@ -17798,7 +13407,6 @@ fn create_pending_shell_with_id(
         name: Mutex::new(spec.name),
         cwd: spec.cwd,
         command: spec.command,
-        owner: ShellOwner::User,
         last_run: Mutex::new(None),
         lifecycle: Mutex::new(ShellLifecycle::Pending),
         foreground_process_cache: Mutex::new(None),
@@ -18437,19 +14045,6 @@ impl ShellRuntimeManager {
                 return send_daemon_error(&mut stream, response_version, error.into());
             }
         };
-        if !matches!(shell.owner, ShellOwner::User)
-            && (restart_exited || matches!(*lock(&shell.lifecycle)?, ShellLifecycle::Pending))
-        {
-            return send_response(
-                &mut stream,
-                response_version,
-                DaemonError::lifecycle(
-                    ErrorCode::Busy,
-                    "schedule-owned shells start only through schedule dispatch",
-                )
-                .into_response(),
-            );
-        }
         let mutation = lock(&registry.mutation_lock)?;
         if registry.runtimes.is_stopping() {
             return send_response(
@@ -18492,7 +14087,7 @@ impl ShellRuntimeManager {
                     response_version,
                     DaemonError::lifecycle(
                         ErrorCode::RunChanged,
-                        "shell is no longer running the expected scheduled execution run",
+                        "shell is no longer running the expected run",
                     )
                     .into_response(),
                 );
@@ -18672,7 +14267,6 @@ impl ShellRuntimeManager {
                 }
             }
         };
-        let mut committed_executions = None;
         if started {
             event_transaction
                 .as_mut()
@@ -18697,7 +14291,7 @@ impl ShellRuntimeManager {
                     Ok(()) => Ok(()),
                     Err(journal_error) => (|| {
                         let saved = registry.capture_persisted_state()?;
-                        let committed = registry.write_persisted_state(saved)?;
+                        registry.write_persisted_state(saved)?;
                         registry
                             .global_workspaces
                             .as_ref()
@@ -18708,11 +14302,8 @@ impl ShellRuntimeManager {
                             .as_ref()
                             .ok_or_else(|| io::Error::other("local Shell journal is unavailable"))?
                             .reset_after_full_checkpoint()?;
-                        Ok(committed)
+                        Ok(())
                     })()
-                        .map(|committed| {
-                            committed_executions = Some(committed);
-                        })
                         .map_err(|state_error: io::Error| {
                             io::Error::new(
                                 state_error.kind(),
@@ -18724,9 +14315,7 @@ impl ShellRuntimeManager {
                 }
             } else {
                 let saved = registry.capture_persisted_state()?;
-                registry.write_persisted_state(saved).map(|committed| {
-                    committed_executions = Some(committed);
-                })
+                registry.write_persisted_state(saved)
             };
             if let Err(error) = persistence_result {
                 let cleanup = self.kill(&shell);
@@ -18757,9 +14346,6 @@ impl ShellRuntimeManager {
             let transaction = event_transaction
                 .as_mut()
                 .expect("start event transaction is locked");
-            if let Some(committed_executions) = committed_executions {
-                transaction.replace_committed_executions(committed_executions);
-            }
             transaction.append_batch(vec![DaemonEventKind::RunStarted {
                 workspace_id: shell.workspace_id.clone(),
                 shell_id: shell.id.clone(),
@@ -19425,339 +15011,6 @@ fn validate_persisted_cwd(cwd: &Path) -> io::Result<()> {
     }
 }
 
-fn schedule_validation_error(error: crate::scheduling::SchedulingError) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidInput, error.to_string())
-}
-
-fn validate_schedule_spec(spec: &AgentScheduleSpec) -> io::Result<()> {
-    crate::scheduling::validate_prompt(&spec.prompt).map_err(schedule_validation_error)?;
-    crate::scheduling::validate_integration_key(&spec.integration)
-        .map_err(schedule_validation_error)?;
-    if let AgentScheduleSession::Continue {
-        external_session_id,
-    } = &spec.session
-    {
-        crate::scheduling::validate_external_session_id(external_session_id)
-            .map_err(schedule_validation_error)?;
-    }
-    if spec.overlap_policy != AgentScheduleOverlapPolicy::Skip {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "agent schedule overlap policy must be skip",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_schedule_capability(
-    integration: &str,
-    session: &AgentScheduleSession,
-) -> io::Result<()> {
-    let capability = crate::integrations::by_key(integration)
-        .and_then(|descriptor| descriptor.schedule_dispatch)
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "integration does not support scheduled dispatch",
-            )
-        })?;
-    let supported = match session {
-        AgentScheduleSession::Fresh => capability.fresh.is_some(),
-        AgentScheduleSession::Continue { .. } => capability.continuation.is_some(),
-    };
-    if !supported {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "integration does not support the requested scheduled session mode",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_persisted_schedule(schedule: &PersistedAgentSchedule) -> io::Result<()> {
-    validate_name(&schedule.name)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
-    validate_persisted_cwd(&schedule.cwd)?;
-    crate::scheduling::validate_prompt(&schedule.prompt)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
-    crate::scheduling::validate_integration_key(&schedule.integration)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
-    if let AgentScheduleSession::Continue {
-        external_session_id,
-    } = &schedule.session
-    {
-        crate::scheduling::validate_external_session_id(external_session_id)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
-    }
-    for timestamp in [
-        schedule.created_at_ms,
-        schedule.updated_at_ms,
-        schedule.evaluation_frontier_ms,
-    ] {
-        crate::scheduling::validate_timestamp_ms(timestamp)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
-    }
-    let cron = crate::scheduling::canonicalize_cron(&schedule.trigger.cron)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
-    let timezone = crate::scheduling::canonicalize_timezone(&schedule.trigger.timezone)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
-    crate::scheduling::CronSchedule::compile(&cron, &timezone)
-        .and_then(|compiled| {
-            compiled.ensure_possible()?;
-            if schedule.state == AgentScheduleState::Enabled {
-                compiled.next_after_ms(schedule.evaluation_frontier_ms)?;
-            }
-            Ok(())
-        })
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
-    if cron != schedule.trigger.cron
-        || timezone != schedule.trigger.timezone
-        || schedule.overlap_policy != AgentScheduleOverlapPolicy::Skip
-        || schedule.revision == 0
-        || schedule.prompt_revision == 0
-        || schedule.trigger_revision == 0
-        || schedule.prompt_revision > schedule.revision
-        || schedule.trigger_revision > schedule.revision
-        || schedule.updated_at_ms < schedule.created_at_ms
-        || schedule.evaluation_frontier_ms < schedule.created_at_ms
-        || schedule.evaluation_frontier_trigger_revision != schedule.trigger_revision
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Boomux state contains an invalid agent schedule",
-        ));
-    }
-    if schedule.dispatch_key_filter.len() != DISPATCH_KEY_FILTER_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Boomux state contains an invalid dispatch idempotency filter",
-        ));
-    }
-    if let Some(shell_id) = &schedule.execution_shell_id {
-        validate_id("schedule execution shell", shell_id)?;
-    }
-    let mut execution_ids = HashSet::new();
-    let mut dispatch_keys = HashSet::new();
-    let mut nonterminal_count = 0;
-    for execution in &schedule.executions {
-        validate_id("scheduled execution", &execution.id)?;
-        validate_id("scheduled execution dispatch key", &execution.dispatch_key)?;
-        validate_id("scheduled execution runner token", &execution.runner_token)?;
-        validate_persisted_cwd(&execution.cwd)?;
-        crate::scheduling::validate_prompt(&execution.prompt)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
-        for timestamp in [
-            Some(execution.requested_at_ms),
-            execution.scheduled_at_ms,
-            execution.coalesced_through_ms,
-            execution.started_at_ms,
-            execution.ended_at_ms,
-        ]
-        .into_iter()
-        .flatten()
-        {
-            crate::scheduling::validate_timestamp_ms(timestamp)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
-        }
-        if !execution_ids.insert(&execution.id)
-            || !dispatch_keys.insert(&execution.dispatch_key)
-            || !dispatch_key_was_seen(&schedule.dispatch_key_filter, &execution.dispatch_key)
-            || execution.schedule_revision == 0
-            || execution.prompt_revision == 0
-            || execution.trigger_revision == 0
-            || execution.prompt_revision > execution.schedule_revision
-            || execution.trigger_revision > execution.schedule_revision
-            || execution.revision == 0
-            || execution.schedule_revision > schedule.revision
-            || execution.prompt_revision > schedule.prompt_revision
-            || execution.trigger_revision > schedule.trigger_revision
-            || execution.cwd != schedule.cwd
-            || execution.integration != schedule.integration
-            || execution.session != schedule.session
-            || match execution.dispatch_kind {
-                ScheduledExecutionDispatchKind::Manual => {
-                    execution.scheduled_at_ms.is_some() || execution.coalesced_through_ms.is_some()
-                }
-                ScheduledExecutionDispatchKind::Timed => {
-                    execution.scheduled_at_ms.is_none()
-                        || execution
-                            .scheduled_at_ms
-                            .is_some_and(|scheduled| scheduled > execution.requested_at_ms)
-                        || execution
-                            .scheduled_at_ms
-                            .is_some_and(|scheduled| scheduled > schedule.evaluation_frontier_ms)
-                        || execution.coalesced_through_ms.is_some_and(|through| {
-                            through < execution.scheduled_at_ms.unwrap_or(through)
-                                || through > schedule.evaluation_frontier_ms
-                        })
-                        || execution.scheduled_at_ms.is_some_and(|scheduled_at_ms| {
-                            execution.id
-                                != timed_execution_id(
-                                    &schedule.id,
-                                    execution.trigger_revision,
-                                    scheduled_at_ms,
-                                )
-                                || execution.dispatch_key
-                                    != timed_dispatch_key(
-                                        &schedule.id,
-                                        execution.trigger_revision,
-                                        scheduled_at_ms,
-                                    )
-                        })
-                }
-            }
-            || execution
-                .started_at_ms
-                .is_some_and(|time| time < execution.requested_at_ms)
-            || execution
-                .ended_at_ms
-                .is_some_and(|time| time < execution.requested_at_ms)
-            || execution
-                .started_at_ms
-                .zip(execution.ended_at_ms)
-                .is_some_and(|(started, ended)| ended < started)
-            || execution.shell_id.is_some() != execution.run_id.is_some()
-                && execution.run_id.is_some()
-            || execution.agent_id.is_some() != execution.external_session_id.is_some()
-            || execution.coalesced_through_ms.is_some()
-                && !(execution.dispatch_kind == ScheduledExecutionDispatchKind::Timed
-                    && execution.state == ScheduledExecutionState::Skipped
-                    && matches!(
-                        execution.reason,
-                        Some(
-                            ScheduledExecutionReason::Missed | ScheduledExecutionReason::PausedRace
-                        )
-                    ))
-            || matches!(
-                execution.reason,
-                Some(ScheduledExecutionReason::Missed | ScheduledExecutionReason::PausedRace)
-            ) && !(execution.dispatch_kind == ScheduledExecutionDispatchKind::Timed
-                && execution.state == ScheduledExecutionState::Skipped)
-            || matches!(
-                &execution.session,
-                AgentScheduleSession::Continue { external_session_id }
-                    if execution
-                        .external_session_id
-                        .as_deref()
-                        .is_some_and(|linked| linked != external_session_id)
-            )
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Boomux state contains an invalid scheduled execution",
-            ));
-        }
-        if let Some(shell_id) = &execution.shell_id {
-            validate_id("scheduled execution shell", shell_id)?;
-        }
-        if let Some(run_id) = &execution.run_id {
-            validate_id("scheduled execution run", run_id)?;
-        }
-        if let Some(agent_id) = &execution.agent_id {
-            validate_id("scheduled execution agent", agent_id)?;
-        }
-        let valid_state = match execution.state {
-            ScheduledExecutionState::Skipped => {
-                execution.started_at_ms.is_none()
-                    && execution.ended_at_ms.is_some()
-                    && execution.outcome.is_none()
-                    && execution.shell_id.is_none()
-                    && execution.run_id.is_none()
-                    && execution.agent_id.is_none()
-                    && matches!(
-                        execution.reason,
-                        Some(
-                            ScheduledExecutionReason::Overlap
-                                | ScheduledExecutionReason::ActiveSession
-                                | ScheduledExecutionReason::WorkspaceCapacity
-                                | ScheduledExecutionReason::GlobalCapacity
-                                | ScheduledExecutionReason::Missed
-                                | ScheduledExecutionReason::PausedRace
-                                | ScheduledExecutionReason::InvalidTarget
-                        )
-                    )
-            }
-            ScheduledExecutionState::Claimed => {
-                execution.started_at_ms.is_none()
-                    && execution.ended_at_ms.is_none()
-                    && execution.run_id.is_none()
-                    && execution.reason.is_none()
-                    && execution.outcome.is_none()
-                    && execution.agent_id.is_none()
-            }
-            ScheduledExecutionState::Starting => {
-                execution.run_id.is_some()
-                    && execution.started_at_ms.is_none()
-                    && execution.ended_at_ms.is_none()
-                    && execution.outcome.is_none()
-                    && matches!(
-                        execution.reason,
-                        None | Some(ScheduledExecutionReason::HostSpawnFailed)
-                    )
-            }
-            ScheduledExecutionState::Active => {
-                execution.run_id.is_some()
-                    && execution.started_at_ms.is_some()
-                    && execution.ended_at_ms.is_none()
-                    && execution.reason.is_none()
-            }
-            ScheduledExecutionState::DispatchFailed => {
-                execution.ended_at_ms.is_some()
-                    && execution.outcome.is_none()
-                    && matches!(
-                        execution.reason,
-                        Some(
-                            ScheduledExecutionReason::RunnerStartFailed
-                                | ScheduledExecutionReason::HostSpawnFailed
-                        )
-                    )
-            }
-            ScheduledExecutionState::Exited => {
-                execution.started_at_ms.is_some()
-                    && execution.ended_at_ms.is_some()
-                    && execution.outcome.is_some()
-                    && execution.reason.is_none()
-            }
-            ScheduledExecutionState::Cancelled => {
-                execution.ended_at_ms.is_some()
-                    && execution.outcome.is_none()
-                    && matches!(
-                        execution.reason,
-                        Some(
-                            ScheduledExecutionReason::CancelledByUser
-                                | ScheduledExecutionReason::DaemonShutdown
-                        )
-                    )
-            }
-            ScheduledExecutionState::Interrupted => {
-                execution.ended_at_ms.is_some()
-                    && execution.outcome.is_none()
-                    && matches!(
-                        execution.reason,
-                        Some(
-                            ScheduledExecutionReason::ColdDaemonRecovery
-                                | ScheduledExecutionReason::RunnerExitedWithoutReport
-                        )
-                    )
-            }
-        };
-        if !valid_state {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Boomux state contains an invalid scheduled execution state",
-            ));
-        }
-        nonterminal_count += usize::from(!execution.state.is_terminal());
-    }
-    if nonterminal_count > 1 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Boomux state contains overlapping scheduled executions",
-        ));
-    }
-    Ok(())
-}
-
 fn validate_id(kind: &str, id: &str) -> io::Result<()> {
     Uuid::parse_str(id).map(|_| ()).map_err(|_| {
         io::Error::new(
@@ -19792,56 +15045,6 @@ fn remember_dispatch_key(filter: &mut [u8], key: &str) {
     let bit_count = filter.len().saturating_mul(8);
     for position in dispatch_key_positions(key, bit_count) {
         filter[position / 8] |= 1 << (position % 8);
-    }
-}
-
-fn timed_execution_id(schedule_id: &str, trigger_revision: u64, scheduled_at_ms: u64) -> String {
-    Uuid::new_v5(
-        &Uuid::NAMESPACE_OID,
-        format!("boomux:timed-execution:{schedule_id}:{trigger_revision}:{scheduled_at_ms}")
-            .as_bytes(),
-    )
-    .to_string()
-}
-
-fn timed_dispatch_key(schedule_id: &str, trigger_revision: u64, scheduled_at_ms: u64) -> String {
-    Uuid::new_v5(
-        &Uuid::NAMESPACE_OID,
-        format!("boomux:timed-dispatch:{schedule_id}:{trigger_revision}:{scheduled_at_ms}")
-            .as_bytes(),
-    )
-    .to_string()
-}
-
-fn prune_terminal_executions(executions: &mut Vec<Arc<ScheduledExecution>>) {
-    let mut terminal = executions
-        .iter()
-        .enumerate()
-        .filter_map(|(index, candidate)| {
-            lock(&candidate.state)
-                .ok()
-                .filter(|state| state.state.is_terminal())
-                .map(|_| (index, candidate.requested_at_ms, candidate.id.as_str()))
-        })
-        .collect::<Vec<_>>();
-    terminal.sort_by(
-        |(_, left_requested, left_id), (_, right_requested, right_id)| {
-            left_requested
-                .cmp(right_requested)
-                .then_with(|| left_id.cmp(right_id))
-        },
-    );
-    let remove = terminal
-        .len()
-        .saturating_sub(MAX_TERMINAL_EXECUTIONS_PER_SCHEDULE);
-    let mut remove = terminal
-        .into_iter()
-        .take(remove)
-        .map(|(index, _, _)| index)
-        .collect::<Vec<_>>();
-    remove.sort_unstable_by(|left, right| right.cmp(left));
-    for index in remove {
-        executions.remove(index);
     }
 }
 
@@ -20149,17 +15352,6 @@ mod tests {
         );
     }
 
-    struct FixedSchedulerClock(AtomicU64);
-
-    impl SchedulerClock for FixedSchedulerClock {
-        fn now_ms(&self) -> u64 {
-            self.0.load(Ordering::Acquire)
-        }
-    }
-
-    fn set_scheduler_time(registry: &DaemonService, now_ms: u64) {
-        *lock(&registry.clock).unwrap() = Arc::new(FixedSchedulerClock(AtomicU64::new(now_ms)));
-    }
     use std::sync::Barrier;
 
     use crate::protocol::{AgentAuthority, AgentState};
@@ -20298,7 +15490,7 @@ mod tests {
     }
 
     #[test]
-    fn opencode_shim_eligibility_is_limited_to_user_login_shells() {
+    fn opencode_shim_eligibility_is_limited_to_login_shells() {
         let login =
             create_pending_shell("workspace", ShellSpec::login("login", env::temp_dir())).unwrap();
         assert!(opencode_shim_eligible(&login, &[]));
@@ -20317,18 +15509,10 @@ mod tests {
         )
         .unwrap();
         assert!(!opencode_shim_eligible(&command, &command.command));
-
-        let mut scheduled =
-            create_pending_shell("workspace", ShellSpec::login("scheduled", env::temp_dir()))
-                .unwrap();
-        Arc::get_mut(&mut scheduled).unwrap().owner = ShellOwner::Schedule {
-            schedule_id: "schedule-1".into(),
-        };
-        assert!(!opencode_shim_eligible(&scheduled, &[]));
     }
 
     #[test]
-    fn claude_remote_control_rewrites_only_bare_user_commands() {
+    fn claude_remote_control_rewrites_only_bare_commands() {
         let command = create_pending_shell(
             "workspace",
             ShellSpec {
@@ -20360,22 +15544,6 @@ mod tests {
                 "rewrote {argv:?}"
             );
         }
-
-        let mut scheduled = create_pending_shell(
-            "workspace",
-            ShellSpec {
-                name: "scheduled".into(),
-                cwd: env::temp_dir(),
-                command: vec!["claude".into()],
-            },
-        )
-        .unwrap();
-        Arc::get_mut(&mut scheduled).unwrap().owner = ShellOwner::Schedule {
-            schedule_id: "schedule-1".into(),
-        };
-        assert!(
-            claude_remote_control_command(&scheduled, &scheduled.command, false, true).is_none()
-        );
     }
 
     #[test]
@@ -21933,47 +17101,6 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_health_tracks_running_stopped_and_panicked_workers() {
-        let registry = Arc::new(DaemonService::default());
-        assert_eq!(
-            registry.snapshot().unwrap().scheduler.unwrap().state,
-            SchedulerState::Offline
-        );
-        registry.start_scheduler().unwrap();
-        for _ in 0..100 {
-            if registry.snapshot().unwrap().scheduler.unwrap().state == SchedulerState::Active {
-                break;
-            }
-            thread::sleep(Duration::from_millis(1));
-        }
-        assert_eq!(
-            registry.snapshot().unwrap().scheduler.unwrap().state,
-            SchedulerState::Active
-        );
-        registry.stop_scheduler().unwrap();
-        assert_eq!(
-            registry.snapshot().unwrap().scheduler.unwrap().state,
-            SchedulerState::Offline
-        );
-
-        let panicked = thread::spawn(|| panic!("scheduler test panic"));
-        while !panicked.is_finished() {
-            thread::yield_now();
-        }
-        {
-            let mut state = lock(&registry.scheduler.state).unwrap();
-            state.running = true;
-            state.healthy = true;
-            state.handle = Some(panicked);
-        }
-        assert_eq!(
-            registry.snapshot().unwrap().scheduler.unwrap().state,
-            SchedulerState::Offline
-        );
-        assert!(registry.stop_scheduler().is_err());
-    }
-
-    #[test]
     fn focus_reports_require_protocol_eighteen_and_increment_revision() {
         let registry = DaemonService::default();
         let (_workspace, shell, runtime) = running_shell(&registry);
@@ -22222,86 +17349,6 @@ mod tests {
     }
 
     #[test]
-    fn schedule_shell_filter_ownership_tracks_retained_event_lifetime() {
-        let stream = EventStream::new();
-        let workspace_id = Uuid::new_v4().to_string();
-        let mut batch = Vec::with_capacity((MAX_RETAINED_EVENTS + 1) * 2);
-        for index in 0..=MAX_RETAINED_EVENTS {
-            let shell_id = Uuid::from_u128(index as u128 + 1).to_string();
-            batch.push(DaemonEventKind::ScheduledExecutionChanged {
-                workspace_id: workspace_id.clone(),
-                execution: ScheduledExecutionSnapshot {
-                    id: Uuid::new_v4().to_string(),
-                    workspace_id: workspace_id.clone(),
-                    schedule_id: Uuid::new_v4().to_string(),
-                    revision: 1,
-                    state: ScheduledExecutionState::Starting,
-                    dispatch_kind: ScheduledExecutionDispatchKind::Manual,
-                    dispatch_key: Uuid::new_v4().to_string(),
-                    schedule_revision: 1,
-                    prompt_revision: 1,
-                    trigger_revision: 1,
-                    requested_at_ms: 1,
-                    scheduled_at_ms: Some(index as u64 + 1),
-                    coalesced_through_ms: None,
-                    started_at_ms: None,
-                    ended_at_ms: None,
-                    cwd: env::temp_dir(),
-                    integration: "opencode".into(),
-                    session: AgentScheduleSession::Fresh,
-                    reason: None,
-                    outcome: None,
-                    shell_id: Some(shell_id.clone()),
-                    run_id: Some(Uuid::new_v4().to_string()),
-                    agent_id: None,
-                    external_session_id: None,
-                },
-            });
-            batch.push(DaemonEventKind::ShellCreated {
-                workspace_id: workspace_id.clone(),
-                shell_id,
-                name: format!("schedule-shell-{index}"),
-            });
-        }
-
-        let (events, cursor, schedule_shell_ids) = {
-            let mut state = lock(&stream.state).unwrap();
-            EventStream::append_batch_locked(&mut state, batch);
-            let retained_generic_ids = state
-                .events
-                .iter()
-                .filter_map(|event| event_shell_id(&event.kind).map(str::to_owned))
-                .collect::<HashSet<_>>();
-            assert_eq!(state.events.len(), MAX_RETAINED_EVENTS);
-            assert_eq!(state.schedule_shell_ids, retained_generic_ids);
-            assert!(state.schedule_shell_ids.len() < MAX_RETAINED_EVENTS);
-            (
-                state.events.iter().cloned().collect::<Vec<_>>(),
-                EventCursor {
-                    stream_id: state.stream_id.clone(),
-                    event_id: state.latest_id,
-                },
-                state.schedule_shell_ids.clone(),
-            )
-        };
-        let latest_id = cursor.event_id;
-        let Response::Events { cursor, events, .. } = response_for_version_with_schedule_shells(
-            Response::Events {
-                stream_id: cursor.stream_id.clone(),
-                cursor,
-                snapshot: None,
-                events,
-            },
-            22,
-            &schedule_shell_ids,
-        ) else {
-            panic!("expected downgraded events");
-        };
-        assert_eq!(cursor.event_id, latest_id);
-        assert!(events.is_empty());
-    }
-
-    #[test]
     fn blocked_publication_coalesces_output_by_shell_run() {
         let mut transition = TransitionState {
             persistence_in_flight: true,
@@ -22475,1940 +17522,6 @@ mod tests {
         assert!(validate_persisted_name("real\nlegacy row").is_ok());
     }
 
-    fn schedule_spec(prompt: &str) -> AgentScheduleSpec {
-        AgentScheduleSpec {
-            name: "nightly".into(),
-            cwd: env::temp_dir(),
-            integration: "opencode".into(),
-            prompt: prompt.into(),
-            session: AgentScheduleSession::Fresh,
-            trigger: AgentScheduleTrigger {
-                cron: " 0  2 * * * ".into(),
-                timezone: "UTC".into(),
-            },
-            state: AgentScheduleState::Paused,
-            overlap_policy: AgentScheduleOverlapPolicy::Skip,
-        }
-    }
-
-    fn schedule_update(name: &str, prompt: &str, cron: &str) -> AgentScheduleUpdate {
-        AgentScheduleUpdate {
-            name: name.into(),
-            prompt: prompt.into(),
-            trigger: AgentScheduleTrigger {
-                cron: cron.into(),
-                timezone: "UTC".into(),
-            },
-        }
-    }
-
-    #[test]
-    fn restored_enabled_schedule_records_a_removed_dispatch_capability_as_invalid_target() {
-        let schedule = PersistedAgentSchedule {
-            id: Uuid::new_v4().to_string(),
-            name: "nightly".into(),
-            cwd: env::temp_dir(),
-            integration: "unsupported".into(),
-            prompt: "review changes".into(),
-            session: AgentScheduleSession::Fresh,
-            trigger: AgentScheduleTrigger {
-                cron: "0 2 * * *".into(),
-                timezone: "UTC".into(),
-            },
-            state: AgentScheduleState::Enabled,
-            overlap_policy: AgentScheduleOverlapPolicy::Skip,
-            revision: 1,
-            prompt_revision: 1,
-            trigger_revision: 1,
-            created_at_ms: 1,
-            updated_at_ms: 1,
-            evaluation_frontier_ms: 1,
-            evaluation_frontier_trigger_revision: 1,
-            execution_shell_id: None,
-            dispatch_key_filter: vec![0; DISPATCH_KEY_FILTER_BYTES],
-            executions: Vec::new(),
-        };
-
-        assert!(validate_persisted_schedule(&schedule).is_ok());
-
-        let registry = DaemonService::default();
-        let workspace = registry
-            .create_workspace("restored-invalid-target".into(), Vec::new())
-            .unwrap();
-        let restored = Arc::new(AgentSchedule::from_persisted(&workspace.id, schedule));
-        lock(&registry.durable.state)
-            .unwrap()
-            .schedules
-            .insert(restored.id.clone(), Arc::clone(&restored));
-        lock(
-            &registry
-                .durable
-                .workspace(&workspace.id)
-                .unwrap()
-                .schedule_ids,
-        )
-        .unwrap()
-        .push(restored.id.clone());
-
-        let execution = registry
-            .durable
-            .decide_schedule_execution(
-                &restored.id,
-                ScheduleDecision {
-                    dispatch_kind: ScheduledExecutionDispatchKind::Timed,
-                    dispatch_key: timed_dispatch_key(&restored.id, 1, 60_000),
-                    scheduled_at_ms: Some(60_000),
-                    coalesced_through_ms: None,
-                    requested_at_ms: 60_000,
-                    forced_skip: None,
-                },
-                4,
-            )
-            .unwrap()
-            .0;
-        assert_eq!(execution.state, ScheduledExecutionState::Skipped);
-        assert_eq!(
-            execution.reason,
-            Some(ScheduledExecutionReason::InvalidTarget)
-        );
-    }
-
-    #[test]
-    fn state_twelve_execution_validation_enforces_exact_state_shapes_and_revisions() {
-        let dispatch_key = Uuid::new_v4().to_string();
-        let mut filter = vec![0; DISPATCH_KEY_FILTER_BYTES];
-        remember_dispatch_key(&mut filter, &dispatch_key);
-        let execution = PersistedScheduledExecution {
-            id: Uuid::new_v4().to_string(),
-            revision: 1,
-            state: ScheduledExecutionState::Claimed,
-            dispatch_kind: ScheduledExecutionDispatchKind::Manual,
-            dispatch_key,
-            schedule_revision: 2,
-            prompt_revision: 1,
-            trigger_revision: 1,
-            requested_at_ms: 10,
-            scheduled_at_ms: None,
-            coalesced_through_ms: None,
-            started_at_ms: None,
-            ended_at_ms: None,
-            cwd: env::temp_dir(),
-            integration: "opencode".into(),
-            session: AgentScheduleSession::Fresh,
-            prompt: "private".into(),
-            runner_token: Uuid::new_v4().to_string(),
-            reason: None,
-            outcome: None,
-            shell_id: None,
-            run_id: None,
-            agent_id: None,
-            external_session_id: None,
-        };
-        let mut schedule = PersistedAgentSchedule {
-            id: Uuid::new_v4().to_string(),
-            name: "valid".into(),
-            cwd: env::temp_dir(),
-            integration: "opencode".into(),
-            prompt: "private".into(),
-            session: AgentScheduleSession::Fresh,
-            trigger: AgentScheduleTrigger {
-                cron: "0 2 * * *".into(),
-                timezone: "UTC".into(),
-            },
-            state: AgentScheduleState::Paused,
-            overlap_policy: AgentScheduleOverlapPolicy::Skip,
-            revision: 2,
-            prompt_revision: 1,
-            trigger_revision: 1,
-            created_at_ms: 1,
-            updated_at_ms: 2,
-            evaluation_frontier_ms: 1,
-            evaluation_frontier_trigger_revision: 1,
-            execution_shell_id: None,
-            dispatch_key_filter: filter,
-            executions: vec![execution],
-        };
-        assert!(validate_persisted_schedule(&schedule).is_ok());
-
-        schedule.executions[0].revision = 0;
-        assert!(validate_persisted_schedule(&schedule).is_err());
-        schedule.executions[0].revision = 1;
-
-        schedule.executions[0].started_at_ms = Some(10);
-        assert!(validate_persisted_schedule(&schedule).is_err());
-        schedule.executions[0].started_at_ms = None;
-        schedule.executions[0].schedule_revision = 3;
-        assert!(validate_persisted_schedule(&schedule).is_err());
-        schedule.executions[0].schedule_revision = 2;
-        schedule.executions[0].state = ScheduledExecutionState::Active;
-        schedule.executions[0].shell_id = Some(Uuid::new_v4().to_string());
-        schedule.executions[0].run_id = Some(Uuid::new_v4().to_string());
-        schedule.executions[0].started_at_ms = Some(10);
-        schedule.executions[0].reason = Some(ScheduledExecutionReason::HostSpawnFailed);
-        assert!(validate_persisted_schedule(&schedule).is_err());
-    }
-
-    #[test]
-    fn state_twelve_validates_timed_matrix_frontier_and_chrono_bounds() {
-        let scheduled_at_ms = 60_000;
-        let dispatch_key =
-            timed_dispatch_key("00000000-0000-0000-0000-000000000001", 1, scheduled_at_ms);
-        let mut filter = vec![0; DISPATCH_KEY_FILTER_BYTES];
-        remember_dispatch_key(&mut filter, &dispatch_key);
-        let execution = PersistedScheduledExecution {
-            id: timed_execution_id("00000000-0000-0000-0000-000000000001", 1, scheduled_at_ms),
-            revision: 1,
-            state: ScheduledExecutionState::Skipped,
-            dispatch_kind: ScheduledExecutionDispatchKind::Timed,
-            dispatch_key,
-            schedule_revision: 1,
-            prompt_revision: 1,
-            trigger_revision: 1,
-            requested_at_ms: 120_000,
-            scheduled_at_ms: Some(scheduled_at_ms),
-            coalesced_through_ms: Some(120_000),
-            started_at_ms: None,
-            ended_at_ms: Some(120_000),
-            cwd: env::temp_dir(),
-            integration: "opencode".into(),
-            session: AgentScheduleSession::Fresh,
-            prompt: "private".into(),
-            runner_token: Uuid::new_v4().to_string(),
-            reason: Some(ScheduledExecutionReason::Missed),
-            outcome: None,
-            shell_id: None,
-            run_id: None,
-            agent_id: None,
-            external_session_id: None,
-        };
-        let mut schedule = PersistedAgentSchedule {
-            id: "00000000-0000-0000-0000-000000000001".into(),
-            name: "timed-valid".into(),
-            cwd: env::temp_dir(),
-            integration: "opencode".into(),
-            prompt: "private".into(),
-            session: AgentScheduleSession::Fresh,
-            trigger: AgentScheduleTrigger {
-                cron: "0 2 * * *".into(),
-                timezone: "UTC".into(),
-            },
-            state: AgentScheduleState::Paused,
-            overlap_policy: AgentScheduleOverlapPolicy::Skip,
-            revision: 1,
-            prompt_revision: 1,
-            trigger_revision: 1,
-            created_at_ms: 1,
-            updated_at_ms: 120_000,
-            evaluation_frontier_ms: 120_000,
-            evaluation_frontier_trigger_revision: 1,
-            execution_shell_id: None,
-            dispatch_key_filter: filter,
-            executions: vec![execution],
-        };
-        assert!(validate_persisted_schedule(&schedule).is_ok());
-
-        let clone_schedule = |schedule: &PersistedAgentSchedule| {
-            serde_json::from_value(serde_json::to_value(schedule).unwrap()).unwrap()
-        };
-        let valid = clone_schedule(&schedule);
-        schedule.executions[0].scheduled_at_ms = Some(120_001);
-        assert!(validate_persisted_schedule(&schedule).is_err());
-        schedule = clone_schedule(&valid);
-        schedule.executions[0].coalesced_through_ms = Some(120_001);
-        assert!(validate_persisted_schedule(&schedule).is_err());
-        schedule = clone_schedule(&valid);
-        schedule.executions[0].coalesced_through_ms = Some(60_000);
-        schedule.executions[0].reason = Some(ScheduledExecutionReason::Overlap);
-        assert!(validate_persisted_schedule(&schedule).is_err());
-        schedule = clone_schedule(&valid);
-        schedule.executions[0].dispatch_kind = ScheduledExecutionDispatchKind::Manual;
-        schedule.executions[0].scheduled_at_ms = None;
-        schedule.executions[0].coalesced_through_ms = None;
-        assert!(validate_persisted_schedule(&schedule).is_err());
-        schedule = clone_schedule(&valid);
-        schedule.executions[0].id = Uuid::new_v4().to_string();
-        assert!(validate_persisted_schedule(&schedule).is_err());
-        schedule = clone_schedule(&valid);
-        schedule.evaluation_frontier_ms = scheduled_at_ms - 1;
-        assert!(validate_persisted_schedule(&schedule).is_err());
-
-        let max =
-            u64::try_from(chrono::DateTime::<chrono::Utc>::MAX_UTC.timestamp_millis()).unwrap();
-        schedule = clone_schedule(&valid);
-        schedule.executions[0].scheduled_at_ms = Some(max + 1);
-        assert!(validate_persisted_schedule(&schedule).is_err());
-        schedule = clone_schedule(&valid);
-        schedule.executions[0].coalesced_through_ms = Some(max + 1);
-        assert!(validate_persisted_schedule(&schedule).is_err());
-        schedule = valid;
-        schedule.executions.clear();
-        schedule.dispatch_key_filter = vec![0; DISPATCH_KEY_FILTER_BYTES];
-        schedule.created_at_ms = max;
-        schedule.updated_at_ms = max;
-        schedule.evaluation_frontier_ms = max;
-        assert!(validate_persisted_schedule(&schedule).is_ok());
-        schedule.evaluation_frontier_ms = max + 1;
-        assert!(validate_persisted_schedule(&schedule).is_err());
-        schedule.evaluation_frontier_ms = max;
-        schedule.updated_at_ms = max + 1;
-        assert!(validate_persisted_schedule(&schedule).is_err());
-        schedule.updated_at_ms = max;
-        schedule.created_at_ms = max + 1;
-        assert!(validate_persisted_schedule(&schedule).is_err());
-    }
-
-    #[test]
-    fn malformed_current_state_rejects_linked_continuation_identity_mismatch() {
-        let directory = env::temp_dir().join(format!(
-            "boomux-invalid-continuation-link-{}",
-            Uuid::new_v4()
-        ));
-        let store = StateStore::at(directory.join("state/state.json"));
-        let workspace_id = Uuid::new_v4().to_string();
-        let schedule_id = Uuid::new_v4().to_string();
-        let shell_id = Uuid::new_v4().to_string();
-        let run_id = Uuid::new_v4().to_string();
-        let agent_id = Uuid::new_v4().to_string();
-        let dispatch_key = Uuid::new_v4().to_string();
-        let mut filter = vec![0; DISPATCH_KEY_FILTER_BYTES];
-        remember_dispatch_key(&mut filter, &dispatch_key);
-        let expected_session_id = "exact-continuation".to_owned();
-        let mismatched_session_id = "different-session".to_owned();
-        let session = AgentScheduleSession::Continue {
-            external_session_id: expected_session_id,
-        };
-        let schedule = PersistedAgentSchedule {
-            id: schedule_id.clone(),
-            name: "continued".into(),
-            cwd: env::temp_dir(),
-            integration: "opencode".into(),
-            prompt: "private".into(),
-            session: session.clone(),
-            trigger: AgentScheduleTrigger {
-                cron: "0 2 * * *".into(),
-                timezone: "UTC".into(),
-            },
-            state: AgentScheduleState::Paused,
-            overlap_policy: AgentScheduleOverlapPolicy::Skip,
-            revision: 1,
-            prompt_revision: 1,
-            trigger_revision: 1,
-            created_at_ms: 1,
-            updated_at_ms: 1,
-            evaluation_frontier_ms: 1,
-            evaluation_frontier_trigger_revision: 1,
-            execution_shell_id: Some(shell_id.clone()),
-            dispatch_key_filter: filter,
-            executions: vec![PersistedScheduledExecution {
-                id: Uuid::new_v4().to_string(),
-                revision: 1,
-                state: ScheduledExecutionState::Active,
-                dispatch_kind: ScheduledExecutionDispatchKind::Manual,
-                dispatch_key,
-                schedule_revision: 1,
-                prompt_revision: 1,
-                trigger_revision: 1,
-                requested_at_ms: 1,
-                scheduled_at_ms: None,
-                coalesced_through_ms: None,
-                started_at_ms: Some(1),
-                ended_at_ms: None,
-                cwd: env::temp_dir(),
-                integration: "opencode".into(),
-                session,
-                prompt: "private".into(),
-                runner_token: Uuid::new_v4().to_string(),
-                reason: None,
-                outcome: None,
-                shell_id: Some(shell_id.clone()),
-                run_id: Some(run_id.clone()),
-                agent_id: Some(agent_id.clone()),
-                external_session_id: Some(mismatched_session_id.clone()),
-            }],
-        };
-        let mut persisted = PersistedState::default();
-        persisted.workspaces = vec![PersistedWorkspace {
-            id: workspace_id,
-            revision: 1,
-            name: "continued".into(),
-            default_cwd: None,
-            shells: vec![PersistedShell {
-                id: shell_id.clone(),
-                revision: 1,
-                name: "scheduled".into(),
-                cwd: env::temp_dir(),
-                command: vec!["boomux".into()],
-                owner: ShellOwner::Schedule { schedule_id },
-                last_run: Some(PersistedShellRun {
-                    id: run_id.clone(),
-                    generation: 1,
-                    started_at_ms: 1,
-                    ended_at_ms: None,
-                    exit_reason: None,
-                    output_revision: 0,
-                    environment_has_run_id: true,
-                    profile: profile(),
-                    terminal_history: None,
-                }),
-            }],
-            launchers: Vec::new(),
-            agents: vec![PersistedAgentInstance {
-                id: agent_id,
-                shell_id,
-                run_id,
-                name: "continued".into(),
-                integration: "opencode".into(),
-                external_session_id: Some(mismatched_session_id),
-                cwd: Some(env::temp_dir()),
-                started_at_ms: 1,
-                ended_at_ms: None,
-                observation: AgentObservationSnapshot {
-                    revision: 1,
-                    state: AgentState::Idle,
-                    authority: AgentAuthority::LifecycleIntegration,
-                    evidence: "registered".into(),
-                    confidence: 100,
-                    observed_at_ms: 1,
-                },
-                attention: None,
-            }],
-            schedules: vec![schedule],
-        }];
-        store.save(&persisted).unwrap();
-        assert_eq!(
-            DaemonService::restore(store, true, None)
-                .err()
-                .expect("malformed continuation state was accepted")
-                .kind(),
-            io::ErrorKind::InvalidData
-        );
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn schedule_update_changes_all_fields_and_preserves_execution_snapshots() {
-        let registry = DaemonService::default();
-        set_scheduler_time(&registry, 100);
-        let workspace = registry
-            .create_workspace("schedule-update".into(), Vec::new())
-            .unwrap();
-        let Response::AgentSchedule { schedule } = registry
-            .dispatch(Request::CreateAgentSchedule {
-                workspace_id: workspace.id,
-                spec: schedule_spec("original private prompt"),
-            })
-            .unwrap()
-        else {
-            panic!("expected schedule");
-        };
-        let (execution, _) = registry
-            .durable
-            .claim_schedule_execution(&schedule.id, &Uuid::new_v4().to_string())
-            .unwrap();
-        set_scheduler_time(&registry, 200);
-
-        let Response::AgentSchedule { schedule: updated } = registry
-            .dispatch(Request::UpdateAgentSchedule {
-                schedule_id: schedule.id.clone(),
-                expected_revision: schedule.revision,
-                update: schedule_update(
-                    "morning review",
-                    "updated private prompt",
-                    " 30  9 * * 1-5 ",
-                ),
-            })
-            .unwrap()
-        else {
-            panic!("expected updated schedule");
-        };
-
-        assert_eq!(updated.name, "morning review");
-        assert_eq!(updated.trigger.cron, "30 9 * * 1-5");
-        assert_eq!(updated.revision, 2);
-        assert_eq!(updated.prompt_revision, 2);
-        assert_eq!(updated.trigger_revision, 2);
-        assert_eq!(updated.updated_at_ms, 200);
-        assert_eq!(updated.evaluation_frontier_ms, 200);
-        let inspection = registry
-            .schedule(&schedule.id)
-            .unwrap()
-            .inspection()
-            .unwrap();
-        assert_eq!(inspection.prompt, "updated private prompt");
-        let retained = registry.durable.execution(&execution.id).unwrap();
-        assert_eq!(retained.prompt, "original private prompt");
-        assert_eq!(retained.schedule_revision, 1);
-        assert_eq!(retained.prompt_revision, 1);
-        assert_eq!(retained.trigger_revision, 1);
-    }
-
-    #[test]
-    fn schedule_update_tracks_component_revisions_and_exact_noops() {
-        let directory = env::temp_dir().join(format!("boomux-update-noop-{}", Uuid::new_v4()));
-        let registry = DaemonService::restore(
-            StateStore::at(directory.join("state/state.json")),
-            false,
-            None,
-        )
-        .unwrap();
-        set_scheduler_time(&registry, 100);
-        let workspace = registry
-            .create_workspace("schedule-components".into(), Vec::new())
-            .unwrap();
-        let Response::AgentSchedule { schedule } = registry
-            .dispatch(Request::CreateAgentSchedule {
-                workspace_id: workspace.id,
-                spec: schedule_spec("first prompt"),
-            })
-            .unwrap()
-        else {
-            panic!("expected schedule");
-        };
-        let original_frontier = schedule.evaluation_frontier_ms;
-
-        set_scheduler_time(&registry, 200);
-        let Response::AgentSchedule { schedule: renamed } = registry
-            .dispatch(Request::UpdateAgentSchedule {
-                schedule_id: schedule.id.clone(),
-                expected_revision: 1,
-                update: schedule_update("renamed", "first prompt", "0 2 * * *"),
-            })
-            .unwrap()
-        else {
-            panic!("expected renamed schedule");
-        };
-        assert_eq!(
-            (
-                renamed.revision,
-                renamed.prompt_revision,
-                renamed.trigger_revision
-            ),
-            (2, 1, 1)
-        );
-        assert_eq!(renamed.evaluation_frontier_ms, original_frontier);
-        let event_id = lock(&registry.events.state).unwrap().latest_id;
-        registry.fail_next_persistence();
-        let Response::AgentSchedule {
-            schedule: unchanged,
-        } = registry
-            .dispatch(Request::UpdateAgentSchedule {
-                schedule_id: schedule.id.clone(),
-                expected_revision: 2,
-                update: schedule_update("renamed", "first prompt", " 0  2 * * * "),
-            })
-            .unwrap()
-        else {
-            panic!("expected unchanged schedule");
-        };
-        assert_eq!(unchanged, renamed);
-        assert_eq!(lock(&registry.events.state).unwrap().latest_id, event_id);
-
-        set_scheduler_time(&registry, 300);
-        assert!(
-            registry
-                .dispatch(Request::UpdateAgentSchedule {
-                    schedule_id: schedule.id.clone(),
-                    expected_revision: 2,
-                    update: schedule_update("renamed", "second prompt", "0 2 * * *"),
-                })
-                .is_err(),
-            "the no-op must not consume the injected persistence failure"
-        );
-        registry.flush_pending().unwrap();
-        let Response::AgentSchedule { schedule: prompted } = registry
-            .dispatch(Request::UpdateAgentSchedule {
-                schedule_id: schedule.id.clone(),
-                expected_revision: 2,
-                update: schedule_update("renamed", "second prompt", "0 2 * * *"),
-            })
-            .unwrap()
-        else {
-            panic!("expected prompt update");
-        };
-        assert_eq!(
-            (
-                prompted.revision,
-                prompted.prompt_revision,
-                prompted.trigger_revision
-            ),
-            (3, 3, 1)
-        );
-        assert_eq!(prompted.evaluation_frontier_ms, original_frontier);
-
-        set_scheduler_time(&registry, 400);
-        let Response::AgentSchedule {
-            schedule: triggered,
-        } = registry
-            .dispatch(Request::UpdateAgentSchedule {
-                schedule_id: schedule.id,
-                expected_revision: 3,
-                update: schedule_update("renamed", "second prompt", "15 3 * * *"),
-            })
-            .unwrap()
-        else {
-            panic!("expected trigger update");
-        };
-        assert_eq!(
-            (
-                triggered.revision,
-                triggered.prompt_revision,
-                triggered.trigger_revision
-            ),
-            (4, 3, 4)
-        );
-        assert_eq!(triggered.evaluation_frontier_ms, 400);
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn schedule_update_requires_paused_exact_revision_and_valid_unique_definition() {
-        let registry = DaemonService::default();
-        let workspace = registry
-            .create_workspace("schedule-validation".into(), Vec::new())
-            .unwrap();
-        let Response::AgentSchedule { schedule } = registry
-            .dispatch(Request::CreateAgentSchedule {
-                workspace_id: workspace.id.clone(),
-                spec: schedule_spec("private"),
-            })
-            .unwrap()
-        else {
-            panic!("expected schedule");
-        };
-        let mut second = schedule_spec("other private");
-        second.name = "other".into();
-        registry
-            .dispatch(Request::CreateAgentSchedule {
-                workspace_id: workspace.id,
-                spec: second,
-            })
-            .unwrap();
-        let Response::AgentSchedule { schedule: enabled } = registry
-            .dispatch(Request::ResumeAgentSchedule {
-                schedule_id: schedule.id.clone(),
-            })
-            .unwrap()
-        else {
-            panic!("expected enabled schedule");
-        };
-        let busy = registry
-            .dispatch(Request::UpdateAgentSchedule {
-                schedule_id: schedule.id.clone(),
-                expected_revision: enabled.revision,
-                update: schedule_update("changed", "changed", "0 3 * * *"),
-            })
-            .unwrap_err();
-        assert_eq!(busy.wire_code(), ErrorCode::Busy);
-        let Response::AgentSchedule { schedule: paused } = registry
-            .dispatch(Request::PauseAgentSchedule {
-                schedule_id: schedule.id.clone(),
-            })
-            .unwrap()
-        else {
-            panic!("expected paused schedule");
-        };
-        let stale = registry
-            .dispatch(Request::UpdateAgentSchedule {
-                schedule_id: schedule.id.clone(),
-                expected_revision: enabled.revision,
-                update: schedule_update("changed", "changed", "0 3 * * *"),
-            })
-            .unwrap_err();
-        assert_eq!(stale.wire_code(), ErrorCode::RevisionAhead);
-        let duplicate = registry
-            .dispatch(Request::UpdateAgentSchedule {
-                schedule_id: schedule.id.clone(),
-                expected_revision: paused.revision,
-                update: schedule_update("other", "changed", "0 3 * * *"),
-            })
-            .unwrap_err();
-        assert_eq!(duplicate.wire_code(), ErrorCode::AlreadyExists);
-        let invalid = registry
-            .dispatch(Request::UpdateAgentSchedule {
-                schedule_id: schedule.id,
-                expected_revision: paused.revision,
-                update: schedule_update("changed", "changed", "not a cron"),
-            })
-            .unwrap_err();
-        assert_eq!(invalid.wire_code(), ErrorCode::InvalidArgument);
-    }
-
-    #[test]
-    fn schedule_update_rolls_back_persistence_and_publishes_prompt_free_event() {
-        let directory = env::temp_dir().join(format!("boomux-update-rollback-{}", Uuid::new_v4()));
-        let registry = DaemonService::restore(
-            StateStore::at(directory.join("state/state.json")),
-            false,
-            None,
-        )
-        .unwrap();
-        let workspace = registry
-            .create_workspace("schedule-rollback".into(), Vec::new())
-            .unwrap();
-        let Response::AgentSchedule { schedule } = registry
-            .dispatch(Request::CreateAgentSchedule {
-                workspace_id: workspace.id,
-                spec: schedule_spec("original private"),
-            })
-            .unwrap()
-        else {
-            panic!("expected schedule");
-        };
-        let event_id = lock(&registry.events.state).unwrap().latest_id;
-        registry.fail_next_persistence();
-        assert!(
-            registry
-                .dispatch(Request::UpdateAgentSchedule {
-                    schedule_id: schedule.id.clone(),
-                    expected_revision: 1,
-                    update: schedule_update("updated", "NEW PRIVATE PROMPT", "0 3 * * *"),
-                })
-                .is_err()
-        );
-        assert_eq!(
-            registry.schedule(&schedule.id).unwrap().snapshot().unwrap(),
-            schedule
-        );
-        assert_eq!(lock(&registry.events.state).unwrap().latest_id, event_id);
-        registry.flush_pending().unwrap();
-
-        registry
-            .dispatch(Request::UpdateAgentSchedule {
-                schedule_id: schedule.id,
-                expected_revision: 1,
-                update: schedule_update("updated", "NEW PRIVATE PROMPT", "0 3 * * *"),
-            })
-            .unwrap();
-        let events = lock(&registry.events.state).unwrap().events.clone();
-        let event = events.back().unwrap();
-        assert!(matches!(
-            event.kind,
-            DaemonEventKind::AgentScheduleUpdated { .. }
-        ));
-        assert!(
-            !serde_json::to_string(event)
-                .unwrap()
-                .contains("NEW PRIVATE PROMPT")
-        );
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn schedule_management_is_prompt_private_and_idempotent() {
-        let registry = DaemonService::default();
-        let workspace = registry
-            .create_workspace("scheduled".into(), Vec::new())
-            .unwrap();
-        let prompt = "private schedule instructions";
-        let Response::AgentSchedule { schedule } = registry
-            .dispatch(Request::CreateAgentSchedule {
-                workspace_id: workspace.id.clone(),
-                spec: schedule_spec(prompt),
-            })
-            .unwrap()
-        else {
-            panic!("expected schedule response");
-        };
-        assert_eq!(schedule.trigger.cron, "0 2 * * *");
-        assert_eq!(schedule.revision, 1);
-        assert!(schedule.execution_shell_id.is_none());
-        assert_eq!(
-            registry.snapshot().unwrap().workspaces[0].schedules,
-            std::slice::from_ref(&schedule)
-        );
-        assert!(
-            !serde_json::to_string(&registry.snapshot().unwrap())
-                .unwrap()
-                .contains(prompt)
-        );
-
-        let Response::AgentScheduleInspection { inspection } = registry
-            .dispatch(Request::GetAgentSchedule {
-                schedule_id: schedule.id.clone(),
-            })
-            .unwrap()
-        else {
-            panic!("expected schedule inspection");
-        };
-        assert_eq!(inspection.prompt, prompt);
-
-        let Response::AgentSchedule { schedule: paused } = registry
-            .dispatch(Request::PauseAgentSchedule {
-                schedule_id: schedule.id.clone(),
-            })
-            .unwrap()
-        else {
-            panic!("expected paused schedule");
-        };
-        assert_eq!(paused.revision, 1);
-        let Response::AgentSchedule { schedule: resumed } = registry
-            .dispatch(Request::ResumeAgentSchedule {
-                schedule_id: schedule.id.clone(),
-            })
-            .unwrap()
-        else {
-            panic!("expected resumed schedule");
-        };
-        assert_eq!(resumed.revision, 2);
-        assert!(resumed.evaluation_frontier_ms >= schedule.evaluation_frontier_ms);
-        let Response::AgentSchedule { schedule: repeated } = registry
-            .dispatch(Request::ResumeAgentSchedule {
-                schedule_id: schedule.id.clone(),
-            })
-            .unwrap()
-        else {
-            panic!("expected resumed schedule");
-        };
-        assert_eq!(repeated, resumed);
-
-        let events = lock(&registry.events.state).unwrap().events.clone();
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| matches!(
-                    event.kind,
-                    DaemonEventKind::AgentScheduleCreated { .. }
-                        | DaemonEventKind::AgentSchedulePaused { .. }
-                        | DaemonEventKind::AgentScheduleResumed { .. }
-                ))
-                .count(),
-            2
-        );
-        assert!(!serde_json::to_string(&events).unwrap().contains(prompt));
-    }
-
-    #[test]
-    fn timed_evaluation_is_idempotent_rollback_safe_and_frontier_authoritative() {
-        let registry = Arc::new(DaemonService::default());
-        set_scheduler_time(&registry, 0);
-        let workspace = registry
-            .create_workspace("timed".into(), Vec::new())
-            .unwrap();
-        let mut spec = schedule_spec("private");
-        spec.trigger.cron = "* * * * *".into();
-        spec.state = AgentScheduleState::Enabled;
-        let Response::AgentSchedule { schedule } = registry
-            .dispatch(Request::CreateAgentSchedule {
-                workspace_id: workspace.id.clone(),
-                spec,
-            })
-            .unwrap()
-        else {
-            panic!("expected schedule");
-        };
-
-        set_scheduler_time(&registry, 180_000);
-        registry.evaluate_schedules(true).unwrap();
-        let executions = registry
-            .durable
-            .scheduled_executions(None, Some(&schedule.id))
-            .unwrap();
-        assert_eq!(executions.len(), 1);
-        assert_eq!(executions[0].state, ScheduledExecutionState::Skipped);
-        assert_eq!(executions[0].reason, Some(ScheduledExecutionReason::Missed));
-        assert_eq!(executions[0].scheduled_at_ms, Some(60_000));
-        assert_eq!(executions[0].coalesced_through_ms, Some(180_000));
-        let event_count = lock(&registry.events.state).unwrap().events.len();
-        registry.evaluate_schedules(true).unwrap();
-        assert_eq!(
-            registry
-                .durable
-                .scheduled_executions(None, Some(&schedule.id))
-                .unwrap()
-                .len(),
-            1
-        );
-        assert_eq!(
-            lock(&registry.events.state).unwrap().events.len(),
-            event_count
-        );
-
-        set_scheduler_time(&registry, 240_000);
-        registry.fail_after_next_mutation();
-        assert!(registry.evaluate_schedules(true).is_err());
-        assert_eq!(
-            registry
-                .durable
-                .schedule(&schedule.id)
-                .unwrap()
-                .snapshot()
-                .unwrap()
-                .evaluation_frontier_ms,
-            180_000
-        );
-        assert_eq!(
-            lock(&registry.events.state).unwrap().events.len(),
-            event_count
-        );
-        assert_eq!(
-            registry
-                .durable
-                .schedule(&schedule.id)
-                .unwrap()
-                .snapshot()
-                .unwrap()
-                .next_occurrence
-                .unwrap()
-                .scheduled_at_ms,
-            240_000
-        );
-        registry.evaluate_schedules(true).unwrap();
-        let after_retry = registry
-            .durable
-            .scheduled_executions(None, Some(&schedule.id))
-            .unwrap();
-        assert_eq!(after_retry.len(), 2);
-        assert_eq!(after_retry[0].scheduled_at_ms, Some(240_000));
-        assert_eq!(
-            registry
-                .durable
-                .schedule(&schedule.id)
-                .unwrap()
-                .snapshot()
-                .unwrap()
-                .next_occurrence
-                .unwrap()
-                .scheduled_at_ms,
-            300_000
-        );
-
-        set_scheduler_time(&registry, 120_000);
-        registry.evaluate_schedules(true).unwrap();
-        assert_eq!(
-            registry
-                .durable
-                .scheduled_executions(None, Some(&schedule.id))
-                .unwrap()
-                .len(),
-            2
-        );
-    }
-
-    #[test]
-    fn pause_resume_and_history_pruning_do_not_reenable_old_occurrences() {
-        let registry = Arc::new(DaemonService::default());
-        set_scheduler_time(&registry, 0);
-        let workspace = registry
-            .create_workspace("timed-pruning".into(), Vec::new())
-            .unwrap();
-        let mut spec = schedule_spec("private");
-        spec.trigger.cron = "* * * * *".into();
-        spec.state = AgentScheduleState::Enabled;
-        let Response::AgentSchedule { schedule } = registry
-            .dispatch(Request::CreateAgentSchedule {
-                workspace_id: workspace.id.clone(),
-                spec,
-            })
-            .unwrap()
-        else {
-            panic!("expected schedule");
-        };
-        set_scheduler_time(&registry, 60_000);
-        registry
-            .change_schedule_state(&schedule.id, AgentScheduleState::Paused)
-            .unwrap();
-        set_scheduler_time(&registry, 600_000);
-        registry.evaluate_schedules(true).unwrap();
-        assert!(
-            registry
-                .durable
-                .scheduled_executions(None, Some(&schedule.id))
-                .unwrap()
-                .is_empty()
-        );
-        registry
-            .change_schedule_state(&schedule.id, AgentScheduleState::Enabled)
-            .unwrap();
-        for minute in 11..=(11 + MAX_TERMINAL_EXECUTIONS_PER_SCHEDULE as u64) {
-            set_scheduler_time(&registry, minute * 60_000);
-            registry.evaluate_schedules(true).unwrap();
-        }
-        let executions = registry
-            .durable
-            .scheduled_executions(None, Some(&schedule.id))
-            .unwrap();
-        assert_eq!(executions.len(), MAX_TERMINAL_EXECUTIONS_PER_SCHEDULE);
-        let frontier = registry
-            .durable
-            .schedule(&schedule.id)
-            .unwrap()
-            .snapshot()
-            .unwrap()
-            .evaluation_frontier_ms;
-        set_scheduler_time(&registry, frontier.saturating_sub(60_000));
-        registry.evaluate_schedules(true).unwrap();
-        assert_eq!(
-            registry
-                .durable
-                .scheduled_executions(None, Some(&schedule.id))
-                .unwrap()
-                .len(),
-            MAX_TERMINAL_EXECUTIONS_PER_SCHEDULE
-        );
-    }
-
-    #[test]
-    fn manual_and_timed_decisions_share_atomic_capacity_and_continuation_leases() {
-        let registry = DaemonService::default();
-        let first_workspace = registry
-            .create_workspace("capacity-one".into(), Vec::new())
-            .unwrap();
-        let second_workspace = registry
-            .create_workspace("capacity-two".into(), Vec::new())
-            .unwrap();
-        let (first, _) = registry
-            .durable
-            .create_schedule(&first_workspace.id, schedule_spec("first"))
-            .unwrap();
-        let mut second_spec = schedule_spec("second");
-        second_spec.name = "second".into();
-        let (second, _) = registry
-            .durable
-            .create_schedule(&first_workspace.id, second_spec)
-            .unwrap();
-        let mut third_spec = schedule_spec("third");
-        third_spec.name = "third".into();
-        let (third, _) = registry
-            .durable
-            .create_schedule(&second_workspace.id, third_spec)
-            .unwrap();
-
-        let decide = |schedule_id: &str, max_concurrent| {
-            registry
-                .durable
-                .decide_schedule_execution(
-                    schedule_id,
-                    ScheduleDecision {
-                        dispatch_kind: ScheduledExecutionDispatchKind::Manual,
-                        dispatch_key: Uuid::new_v4().to_string(),
-                        scheduled_at_ms: None,
-                        coalesced_through_ms: None,
-                        requested_at_ms: 1,
-                        forced_skip: None,
-                    },
-                    max_concurrent,
-                )
-                .unwrap()
-                .0
-        };
-        assert_eq!(decide(&first.id, 4).state, ScheduledExecutionState::Claimed);
-        assert_eq!(
-            decide(&first.id, 4).reason,
-            Some(ScheduledExecutionReason::Overlap)
-        );
-        assert_eq!(
-            decide(&second.id, 4).reason,
-            Some(ScheduledExecutionReason::WorkspaceCapacity)
-        );
-        assert_eq!(
-            decide(&third.id, 1).reason,
-            Some(ScheduledExecutionReason::GlobalCapacity)
-        );
-
-        let continuation_registry = DaemonService::default();
-        let first_workspace = continuation_registry
-            .create_workspace("continuation-one".into(), Vec::new())
-            .unwrap();
-        let second_workspace = continuation_registry
-            .create_workspace("continuation-two".into(), Vec::new())
-            .unwrap();
-        let mut continuation = schedule_spec("continued");
-        continuation.session = AgentScheduleSession::Continue {
-            external_session_id: "exact-session".into(),
-        };
-        let (first, _) = continuation_registry
-            .durable
-            .create_schedule(&first_workspace.id, continuation.clone())
-            .unwrap();
-        continuation.name = "continued-two".into();
-        let (second, _) = continuation_registry
-            .durable
-            .create_schedule(&second_workspace.id, continuation)
-            .unwrap();
-        let decision = |schedule_id: &str| {
-            continuation_registry
-                .durable
-                .decide_schedule_execution(
-                    schedule_id,
-                    ScheduleDecision {
-                        dispatch_kind: ScheduledExecutionDispatchKind::Timed,
-                        dispatch_key: timed_dispatch_key(schedule_id, 1, 60_000),
-                        scheduled_at_ms: Some(60_000),
-                        coalesced_through_ms: None,
-                        requested_at_ms: 60_000,
-                        forced_skip: None,
-                    },
-                    4,
-                )
-                .unwrap()
-                .0
-        };
-        assert_eq!(decision(&first.id).state, ScheduledExecutionState::Claimed);
-        let blocked = decision(&second.id);
-        assert_eq!(blocked.state, ScheduledExecutionState::Skipped);
-        assert_eq!(
-            blocked.reason,
-            Some(ScheduledExecutionReason::ActiveSession)
-        );
-        assert!(blocked.shell_id.is_none());
-    }
-
-    #[test]
-    fn pruned_dispatch_keys_remain_explicitly_rejected() {
-        let registry = DaemonService::default();
-        let workspace = registry
-            .create_workspace("scheduled".into(), Vec::new())
-            .unwrap();
-        let (schedule, _) = registry
-            .durable
-            .create_schedule(&workspace.id, schedule_spec("private"))
-            .unwrap();
-        let first_key = Uuid::from_u128(1).to_string();
-        let mut keys = Vec::new();
-
-        for value in 1..=MAX_TERMINAL_EXECUTIONS_PER_SCHEDULE + 1 {
-            let key = Uuid::from_u128(value as u128).to_string();
-            let (snapshot, _) = registry
-                .durable
-                .claim_schedule_execution(&schedule.id, &key)
-                .unwrap();
-            let execution = registry.durable.execution(&snapshot.id).unwrap();
-            keys.push((key, snapshot.id));
-            registry
-                .durable
-                .mutate_execution(&execution, |state| {
-                    state.state = ScheduledExecutionState::DispatchFailed;
-                    state.ended_at_ms = Some(unix_time_ms().max(execution.requested_at_ms));
-                    state.reason = Some(ScheduledExecutionReason::RunnerStartFailed);
-                    Ok(())
-                })
-                .unwrap();
-        }
-
-        let pruned_key = keys
-            .iter()
-            .find(|(_, execution_id)| registry.durable.execution(execution_id).is_err())
-            .map(|(key, _)| key)
-            .unwrap_or(&first_key);
-        let error = match registry
-            .durable
-            .claim_schedule_execution(&schedule.id, pruned_key)
-        {
-            Err(error) => error,
-            Ok(_) => panic!("pruned dispatch key was accepted"),
-        };
-        assert_eq!(error.wire_code(), ErrorCode::IdempotencyExpired);
-    }
-
-    #[test]
-    fn execution_wait_and_bounded_list_are_revision_exact() {
-        let registry = DaemonService::default();
-        let workspace = registry
-            .create_workspace("observed".into(), Vec::new())
-            .unwrap();
-        let (schedule, _) = registry
-            .durable
-            .create_schedule(&workspace.id, schedule_spec("private"))
-            .unwrap();
-        let (claimed, _) = registry
-            .durable
-            .claim_schedule_execution(&schedule.id, &Uuid::new_v4().to_string())
-            .unwrap();
-        registry
-            .events
-            .initialize_committed_executions(
-                registry.durable.scheduled_executions(None, None).unwrap(),
-            )
-            .unwrap();
-        assert_eq!(claimed.revision, 1);
-
-        let Response::ScheduledExecutionWait { changed, execution } = registry
-            .wait_scheduled_execution(&claimed.id, 0, 0)
-            .unwrap()
-        else {
-            panic!("expected execution wait response");
-        };
-        assert!(changed);
-        assert_eq!(execution.revision, 1);
-        let Response::ScheduledExecutionWait { changed, .. } = registry
-            .wait_scheduled_execution(&claimed.id, 1, 0)
-            .unwrap()
-        else {
-            panic!("expected execution wait timeout");
-        };
-        assert!(!changed);
-        assert_eq!(
-            registry
-                .wait_scheduled_execution(&claimed.id, 2, 0)
-                .unwrap_err()
-                .wire_code(),
-            ErrorCode::RevisionAhead
-        );
-
-        let execution = registry.durable.execution(&claimed.id).unwrap();
-        registry
-            .durable
-            .mutate_execution(&execution, |state| {
-                state.state = ScheduledExecutionState::DispatchFailed;
-                state.ended_at_ms = Some(execution.requested_at_ms);
-                state.reason = Some(ScheduledExecutionReason::RunnerStartFailed);
-                Ok(())
-            })
-            .unwrap();
-        let (second, _) = registry
-            .durable
-            .claim_schedule_execution(&schedule.id, &Uuid::new_v4().to_string())
-            .unwrap();
-        let second_execution = registry.durable.execution(&second.id).unwrap();
-        registry
-            .durable
-            .mutate_execution(&second_execution, |state| {
-                state.state = ScheduledExecutionState::DispatchFailed;
-                state.ended_at_ms = Some(second_execution.requested_at_ms);
-                state.reason = Some(ScheduledExecutionReason::RunnerStartFailed);
-                Ok(())
-            })
-            .unwrap();
-        let (page, limit, truncated) = registry
-            .durable
-            .scheduled_execution_page(None, None, 1)
-            .unwrap();
-        assert_eq!(limit, 1);
-        assert!(truncated);
-        assert_eq!(page[0].revision, 2);
-        let expected_newest = if (second.requested_at_ms, second.id.as_str())
-            > (claimed.requested_at_ms, claimed.id.as_str())
-        {
-            second.id
-        } else {
-            claimed.id
-        };
-        assert_eq!(page[0].id, expected_newest);
-    }
-
-    #[test]
-    fn execution_wait_never_observes_in_flight_or_rolled_back_revision() {
-        let directory = env::temp_dir().join(format!("boomux-execution-wait-{}", Uuid::new_v4()));
-        let gate = Arc::new((Mutex::new((false, false, false)), Condvar::new()));
-        let hook_gate = Arc::clone(&gate);
-        let store = StateStore::at_with_save_hook(
-            directory.join("state/state.json"),
-            Arc::new(move || {
-                let (state, changed) = &*hook_gate;
-                let mut state = state.lock().unwrap();
-                if !state.0 {
-                    return;
-                }
-                state.1 = true;
-                changed.notify_all();
-                while !state.2 {
-                    state = changed.wait(state).unwrap();
-                }
-            }),
-        );
-        let registry = Arc::new(DaemonService::restore(store, false, None).unwrap());
-        let workspace = registry
-            .create_workspace("wait-commit".into(), Vec::new())
-            .unwrap();
-        let (schedule, _) = registry
-            .durable
-            .create_schedule(&workspace.id, schedule_spec("private"))
-            .unwrap();
-        let (claimed, _) = registry
-            .durable
-            .claim_schedule_execution(&schedule.id, &Uuid::new_v4().to_string())
-            .unwrap();
-        registry
-            .events
-            .initialize_committed_executions(
-                registry.durable.scheduled_executions(None, None).unwrap(),
-            )
-            .unwrap();
-        let execution = registry.durable.execution(&claimed.id).unwrap();
-        {
-            let (state, _) = &*gate;
-            state.lock().unwrap().0 = true;
-        }
-        let changing_registry = Arc::clone(&registry);
-        let changing_execution = Arc::clone(&execution);
-        let mutation = thread::spawn(move || {
-            changing_registry.change_execution(&changing_execution, |state| {
-                state.state = ScheduledExecutionState::DispatchFailed;
-                state.ended_at_ms = Some(changing_execution.requested_at_ms);
-                state.reason = Some(ScheduledExecutionReason::RunnerStartFailed);
-                Ok(())
-            })
-        });
-        {
-            let (state, changed) = &*gate;
-            let mut state = state.lock().unwrap();
-            while !state.1 {
-                state = changed.wait(state).unwrap();
-            }
-        }
-        let (waited_tx, waited_rx) = mpsc::sync_channel(1);
-        let waiting_registry = Arc::clone(&registry);
-        let execution_id = claimed.id.clone();
-        let waiter = thread::spawn(move || {
-            let result = waiting_registry.wait_scheduled_execution(&execution_id, 1, 25);
-            waited_tx.send(result).unwrap();
-        });
-        let Response::ScheduledExecutionWait { execution, changed } = waited_rx
-            .recv_timeout(Duration::from_secs(1))
-            .unwrap()
-            .unwrap()
-        else {
-            panic!("expected in-flight execution wait deadline");
-        };
-        assert!(!changed);
-        assert_eq!(execution.revision, 1);
-        waiter.join().unwrap();
-        {
-            let (state, changed) = &*gate;
-            let mut state = state.lock().unwrap();
-            state.2 = true;
-            changed.notify_all();
-        }
-        mutation.join().unwrap().unwrap();
-        let Response::ScheduledExecutionWait { execution, changed } = registry
-            .wait_scheduled_execution(&claimed.id, 1, 1_000)
-            .unwrap()
-        else {
-            panic!("expected committed execution wait");
-        };
-        assert!(changed);
-        assert_eq!(execution.revision, 2);
-
-        let (second, _) = registry
-            .durable
-            .claim_schedule_execution(&schedule.id, &Uuid::new_v4().to_string())
-            .unwrap();
-        let second_execution = registry.durable.execution(&second.id).unwrap();
-        registry
-            .events
-            .initialize_committed_executions(
-                registry.durable.scheduled_executions(None, None).unwrap(),
-            )
-            .unwrap();
-        registry.fail_next_persistence();
-        assert!(
-            registry
-                .change_execution(&second_execution, |state| {
-                    state.state = ScheduledExecutionState::DispatchFailed;
-                    state.ended_at_ms = Some(second_execution.requested_at_ms);
-                    state.reason = Some(ScheduledExecutionReason::RunnerStartFailed);
-                    Ok(())
-                })
-                .is_err()
-        );
-        let Response::ScheduledExecutionWait { execution, changed } =
-            registry.wait_scheduled_execution(&second.id, 1, 0).unwrap()
-        else {
-            panic!("expected rolled-back execution wait");
-        };
-        assert!(!changed);
-        assert_eq!(execution.revision, 1);
-
-        registry.fail_next_persistence();
-        assert!(
-            registry
-                .terminalize_dispatch_failure(&second_execution)
-                .is_err()
-        );
-        let Response::ScheduledExecutionWait { execution, changed } = registry
-            .wait_scheduled_execution(&second.id, 1, 25)
-            .unwrap()
-        else {
-            panic!("expected pending-storage execution wait deadline");
-        };
-        assert!(!changed);
-        assert_eq!(execution.revision, 1);
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn lifecycle_reservation_hides_cancellation_revision_until_commit_or_rollback() {
-        let registry = DaemonService::default();
-        let workspace = registry
-            .create_workspace("cancel-frontier".into(), Vec::new())
-            .unwrap();
-        let (schedule, _) = registry
-            .durable
-            .create_schedule(&workspace.id, schedule_spec("private"))
-            .unwrap();
-        let (claimed, _) = registry
-            .durable
-            .claim_schedule_execution(&schedule.id, &Uuid::new_v4().to_string())
-            .unwrap();
-        registry
-            .events
-            .initialize_committed_executions(
-                registry.durable.scheduled_executions(None, None).unwrap(),
-            )
-            .unwrap();
-        let mut transaction = registry.events.transaction().unwrap();
-        transaction.begin_lifecycle_reservation(1);
-        drop(transaction);
-        let execution = registry.durable.execution(&claimed.id).unwrap();
-        let (_, undo) = registry
-            .durable
-            .mutate_execution(&execution, |state| {
-                state.state = ScheduledExecutionState::Cancelled;
-                state.ended_at_ms = Some(execution.requested_at_ms);
-                state.reason = Some(ScheduledExecutionReason::CancelledByUser);
-                Ok(())
-            })
-            .unwrap();
-        let Response::ScheduledExecutionWait { execution, changed } = registry
-            .wait_scheduled_execution(&claimed.id, 1, 0)
-            .unwrap()
-        else {
-            panic!("expected committed cancellation frontier");
-        };
-        assert!(!changed);
-        assert_eq!(execution.state, ScheduledExecutionState::Claimed);
-        registry.durable.rollback(undo).unwrap();
-        let mut transaction = registry.events.transaction().unwrap();
-        transaction.release_lifecycle_reservation();
-        drop(transaction);
-        let restored = registry
-            .durable
-            .execution(&claimed.id)
-            .unwrap()
-            .snapshot()
-            .unwrap();
-        assert_eq!(restored.revision, 1);
-        assert_eq!(restored.state, ScheduledExecutionState::Claimed);
-    }
-
-    #[test]
-    fn protocol_twenty_three_and_twenty_four_lists_remain_uncapped_before_filtering() {
-        let registry = Arc::new(DaemonService::default());
-        let workspace = registry
-            .create_workspace("mixed-list".into(), Vec::new())
-            .unwrap();
-        for schedule_index in 0..2 {
-            let mut spec = schedule_spec("private");
-            spec.name = format!("schedule-{schedule_index}");
-            let (schedule, _) = registry
-                .durable
-                .create_schedule(&workspace.id, spec)
-                .unwrap();
-            for index in 0..60 {
-                let (claimed, _) = registry
-                    .durable
-                    .claim_schedule_execution(&schedule.id, &Uuid::new_v4().to_string())
-                    .unwrap();
-                let execution = registry.durable.execution(&claimed.id).unwrap();
-                registry
-                    .durable
-                    .mutate_execution(&execution, |state| {
-                        state.state = ScheduledExecutionState::DispatchFailed;
-                        state.ended_at_ms = Some(execution.requested_at_ms);
-                        state.reason = Some(ScheduledExecutionReason::RunnerStartFailed);
-                        Ok(())
-                    })
-                    .unwrap();
-                if index < 10 {
-                    registry
-                        .durable
-                        .decide_schedule_execution(
-                            &schedule.id,
-                            ScheduleDecision {
-                                dispatch_kind: ScheduledExecutionDispatchKind::Timed,
-                                dispatch_key: Uuid::new_v4().to_string(),
-                                scheduled_at_ms: Some(index + 1),
-                                coalesced_through_ms: Some(index + 1),
-                                requested_at_ms: index + 1,
-                                forced_skip: Some(ScheduledExecutionReason::Missed),
-                            },
-                            4,
-                        )
-                        .unwrap();
-                }
-            }
-        }
-        let mut empty_spec = schedule_spec("private");
-        empty_spec.name = "schedule-without-history".into();
-        registry
-            .durable
-            .create_schedule(&workspace.id, empty_spec)
-            .unwrap();
-        for (version, supplied_limit, expected) in
-            [(23, None, 120), (23, Some(1), 120), (24, None, 140)]
-        {
-            let Response::ScheduledExecutions {
-                executions,
-                limit,
-                truncated,
-                schedules,
-                ..
-            } = registry
-                .dispatch_arc(
-                    Request::ListScheduledExecutions {
-                        workspace_id: None,
-                        schedule_id: None,
-                        limit: supplied_limit,
-                    },
-                    version,
-                )
-                .unwrap()
-            else {
-                panic!("expected execution list");
-            };
-            assert_eq!(executions.len(), expected);
-            assert_eq!(limit, 0);
-            assert!(!truncated);
-            assert!(schedules.is_empty());
-        }
-        let Response::ScheduledExecutions {
-            executions,
-            limit,
-            truncated,
-            schedules,
-            schedule_limit,
-            schedules_truncated,
-        } = registry
-            .dispatch_arc(
-                Request::ListScheduledExecutions {
-                    workspace_id: None,
-                    schedule_id: None,
-                    limit: Some(1),
-                },
-                25,
-            )
-            .unwrap()
-        else {
-            panic!("expected bounded execution list");
-        };
-        assert_eq!(executions.len(), 1);
-        assert_eq!(limit, 1);
-        assert!(truncated);
-        assert_eq!(schedules.len(), 3);
-        assert!(
-            schedules
-                .iter()
-                .any(|projection| projection.schedule_id != executions[0].schedule_id)
-        );
-        assert_eq!(schedule_limit, 100);
-        assert!(!schedules_truncated);
-    }
-
-    #[test]
-    fn execution_list_bounds_complete_selected_schedule_projection_scope() {
-        let registry = Arc::new(DaemonService::default());
-        let workspace = registry
-            .create_workspace("projection-bound".into(), Vec::new())
-            .unwrap();
-        let second_workspace = registry
-            .create_workspace("projection-bound-second".into(), Vec::new())
-            .unwrap();
-        for index in 0..=protocol::MAX_SCHEDULED_EXECUTION_SCHEDULE_PROJECTIONS {
-            let mut spec = schedule_spec("private");
-            spec.name = format!("schedule-{index:03}");
-            let workspace_id = if index < 64 {
-                &workspace.id
-            } else {
-                &second_workspace.id
-            };
-            registry
-                .durable
-                .create_schedule(workspace_id, spec)
-                .unwrap();
-        }
-        let Response::ScheduledExecutions {
-            executions,
-            schedules,
-            schedule_limit,
-            schedules_truncated,
-            ..
-        } = registry
-            .dispatch_arc(
-                Request::ListScheduledExecutions {
-                    workspace_id: None,
-                    schedule_id: None,
-                    limit: Some(1),
-                },
-                protocol::PROTOCOL_VERSION,
-            )
-            .unwrap()
-        else {
-            panic!("expected bounded schedule projections");
-        };
-        assert!(executions.is_empty());
-        assert_eq!(schedule_limit, 100);
-        assert_eq!(schedules.len(), 100);
-        assert!(schedules_truncated);
-        assert!(
-            schedules
-                .windows(2)
-                .all(|pair| pair[0].schedule_id < pair[1].schedule_id)
-        );
-    }
-
-    #[test]
-    fn pending_runner_start_failure_notifies_once_after_recovery_commit() {
-        let directory = env::temp_dir().join(format!("boomux-pending-notify-{}", Uuid::new_v4()));
-        let sink = Arc::new(RecordingNotificationSink::default());
-        let mut registry = DaemonService::restore(
-            StateStore::at(directory.join("state/state.json")),
-            false,
-            None,
-        )
-        .unwrap();
-        registry.notification_settings.desktop = NotificationSettings {
-            enabled: true,
-            scheduled_dispatch_failed: true,
-            ..Default::default()
-        };
-        registry.notification_sink = sink.clone();
-        let workspace = registry
-            .create_workspace("runner-failure".into(), Vec::new())
-            .unwrap();
-        let (schedule, _) = registry
-            .durable
-            .create_schedule(&workspace.id, schedule_spec("PRIVATE RUNNER PROMPT"))
-            .unwrap();
-        let (claimed, _) = registry
-            .durable
-            .claim_schedule_execution(&schedule.id, &Uuid::new_v4().to_string())
-            .unwrap();
-        let execution = registry.durable.execution(&claimed.id).unwrap();
-        registry.fail_next_persistence();
-        assert!(registry.terminalize_dispatch_failure(&execution).is_err());
-        assert!(sink.requests.lock().unwrap().is_empty());
-        assert!(registry.flush_pending().unwrap());
-        let failed = execution.snapshot().unwrap();
-        assert_eq!(
-            failed.reason,
-            Some(ScheduledExecutionReason::RunnerStartFailed)
-        );
-        assert_eq!(failed.revision, 2);
-        assert_eq!(
-            registry.terminalize_dispatch_failure(&execution).unwrap(),
-            failed
-        );
-        let linked = registry
-            .change_execution(&execution, |state| {
-                state.agent_id = Some("late-exact-agent".into());
-                state.external_session_id = Some("late-exact-session".into());
-                Ok(())
-            })
-            .unwrap();
-        assert_eq!(linked.revision, 3);
-        assert_eq!(linked.agent_id.as_deref(), Some("late-exact-agent"));
-        let requests = sink.requests.lock().unwrap();
-        assert_eq!(requests.len(), 1);
-        assert_eq!(
-            requests[0].reason,
-            NotificationReason::ScheduledDispatchFailed
-        );
-        assert_eq!(requests[0].shell, failed.id);
-        assert!(!format!("{:?}", requests[0]).contains("PRIVATE RUNNER PROMPT"));
-        drop(requests);
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn cold_interruption_notification_does_not_repeat_for_late_agent_link() {
-        let (registry, sink) = notification_registry(NotificationSettings {
-            enabled: true,
-            scheduled_interrupted: true,
-            ..Default::default()
-        });
-        let workspace = registry
-            .create_workspace("late-cold-link".into(), Vec::new())
-            .unwrap();
-        let (schedule, _) = registry
-            .durable
-            .create_schedule(&workspace.id, schedule_spec("private"))
-            .unwrap();
-        let (claimed, _) = registry
-            .durable
-            .claim_schedule_execution(&schedule.id, &Uuid::new_v4().to_string())
-            .unwrap();
-        registry
-            .events
-            .initialize_committed_executions(
-                registry.durable.scheduled_executions(None, None).unwrap(),
-            )
-            .unwrap();
-        let execution = registry.durable.execution(&claimed.id).unwrap();
-        let interrupted = registry
-            .change_execution(&execution, |state| {
-                state.state = ScheduledExecutionState::Interrupted;
-                state.ended_at_ms = Some(execution.requested_at_ms);
-                state.reason = Some(ScheduledExecutionReason::ColdDaemonRecovery);
-                Ok(())
-            })
-            .unwrap();
-        assert_eq!(interrupted.revision, 2);
-        assert_eq!(sink.requests.lock().unwrap().len(), 1);
-
-        let linked = registry
-            .change_execution(&execution, |state| {
-                state.agent_id = Some("late-cold-agent".into());
-                state.external_session_id = Some("late-cold-session".into());
-                Ok(())
-            })
-            .unwrap();
-        assert_eq!(linked.revision, 3);
-        let requests = sink.requests.lock().unwrap();
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].reason, NotificationReason::ScheduledInterrupted);
-    }
-
-    #[test]
-    fn schedules_restore_remove_with_workspace_and_rollback_on_failure() {
-        let directory = env::temp_dir().join(format!("boomux-schedules-{}", Uuid::new_v4()));
-        let path = directory.join("state/state.json");
-        let registry = DaemonService::restore(StateStore::at(path.clone()), false, None).unwrap();
-        let Response::Workspace { workspace } = registry
-            .dispatch(Request::CreateWorkspace {
-                name: "scheduled".into(),
-                default_cwd: None,
-                shells: Vec::new(),
-            })
-            .unwrap()
-        else {
-            panic!("expected workspace");
-        };
-        registry.fail_after_next_mutation();
-        assert!(
-            registry
-                .dispatch(Request::CreateAgentSchedule {
-                    workspace_id: workspace.id.clone(),
-                    spec: schedule_spec("rolled back prompt"),
-                })
-                .is_err()
-        );
-        assert!(
-            registry.snapshot().unwrap().workspaces[0]
-                .schedules
-                .is_empty()
-        );
-        let Response::AgentSchedule { schedule } = registry
-            .dispatch(Request::CreateAgentSchedule {
-                workspace_id: workspace.id.clone(),
-                spec: schedule_spec("persisted private prompt"),
-            })
-            .unwrap()
-        else {
-            panic!("expected schedule");
-        };
-        drop(registry);
-
-        let registry = DaemonService::restore(StateStore::at(path), false, None).unwrap();
-        let restored = registry
-            .dispatch(Request::GetAgentSchedule {
-                schedule_id: schedule.id.clone(),
-            })
-            .unwrap();
-        let Response::AgentScheduleInspection { inspection } = restored else {
-            panic!("expected inspection");
-        };
-        assert_eq!(inspection.prompt, "persisted private prompt");
-
-        registry.fail_after_next_mutation();
-        assert!(
-            registry
-                .dispatch(Request::ResumeAgentSchedule {
-                    schedule_id: schedule.id.clone(),
-                })
-                .is_err()
-        );
-        assert_eq!(
-            registry.schedule(&schedule.id).unwrap().snapshot().unwrap(),
-            schedule
-        );
-
-        registry.fail_after_next_mutation();
-        assert!(
-            registry
-                .dispatch(Request::RemoveAgentSchedule {
-                    schedule_id: schedule.id.clone(),
-                })
-                .is_err()
-        );
-        assert!(registry.schedule(&schedule.id).is_ok());
-
-        registry.close_workspace(&workspace.id).unwrap();
-        assert!(registry.schedule(&schedule.id).is_err());
-        let events = lock(&registry.events.state).unwrap();
-        assert_eq!(
-            events
-                .events
-                .iter()
-                .filter(|event| matches!(event.kind, DaemonEventKind::WorkspaceClosed { .. }))
-                .count(),
-            1
-        );
-        assert!(
-            !events
-                .events
-                .iter()
-                .any(|event| matches!(event.kind, DaemonEventKind::AgentScheduleRemoved { .. }))
-        );
-        drop(events);
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn invalid_schedule_input_does_not_mutate_or_disclose_prompt() {
-        let registry = DaemonService::default();
-        let workspace = registry
-            .create_workspace("scheduled".into(), Vec::new())
-            .unwrap();
-        let prompt = "private invalid prompt";
-        let mut spec = schedule_spec(prompt);
-        spec.trigger.cron = "not a cron expression".into();
-        let error = registry
-            .dispatch(Request::CreateAgentSchedule {
-                workspace_id: workspace.id.clone(),
-                spec,
-            })
-            .unwrap_err();
-        assert!(!error.to_string().contains(prompt));
-        assert!(
-            registry.snapshot().unwrap().workspaces[0]
-                .schedules
-                .is_empty()
-        );
-        assert!(lock(&registry.events.state).unwrap().events.is_empty());
-
-        let mut impossible = schedule_spec(prompt);
-        impossible.trigger.cron = "0 0 30 2 *".into();
-        let error = registry
-            .dispatch(Request::CreateAgentSchedule {
-                workspace_id: workspace.id,
-                spec: impossible,
-            })
-            .unwrap_err();
-        assert_eq!(error.wire_code(), ErrorCode::InvalidArgument);
-        assert!(
-            registry.snapshot().unwrap().workspaces[0]
-                .schedules
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn protocol_twenty_one_filters_schedules_without_rewinding_cursor() {
-        let registry = DaemonService::default();
-        let workspace = registry
-            .create_workspace("scheduled".into(), Vec::new())
-            .unwrap();
-        registry
-            .dispatch(Request::CreateAgentSchedule {
-                workspace_id: workspace.id,
-                spec: schedule_spec("private prompt"),
-            })
-            .unwrap();
-        let Response::Events {
-            stream_id,
-            cursor,
-            snapshot,
-            events,
-        } = registry.read_events(None, 256, 0).unwrap()
-        else {
-            panic!("expected event baseline");
-        };
-        let response = response_for_version(
-            Response::Events {
-                stream_id,
-                cursor: cursor.clone(),
-                snapshot,
-                events,
-            },
-            21,
-        );
-        let Response::Events {
-            cursor: filtered_cursor,
-            snapshot: Some(snapshot),
-            events,
-            ..
-        } = response
-        else {
-            panic!("expected filtered baseline");
-        };
-        assert_eq!(filtered_cursor, cursor);
-        assert!(snapshot.workspaces[0].schedules.is_empty());
-        assert!(events.is_empty());
-
-        let retained = lock(&registry.events.state).unwrap().events.clone();
-        let response = response_for_version(
-            Response::Events {
-                stream_id: cursor.stream_id.clone(),
-                cursor: cursor.clone(),
-                snapshot: None,
-                events: retained.into(),
-            },
-            21,
-        );
-        let Response::Events {
-            cursor: filtered_cursor,
-            events,
-            ..
-        } = response
-        else {
-            panic!("expected filtered events");
-        };
-        assert_eq!(filtered_cursor, cursor);
-        assert!(events.is_empty());
-    }
-
-    #[test]
-    fn protocol_twenty_six_filters_schedule_updates_without_rewinding_cursor() {
-        let registry = DaemonService::default();
-        let workspace = registry
-            .create_workspace("schedule-edit-filter".into(), Vec::new())
-            .unwrap();
-        let Response::AgentSchedule { schedule } = registry
-            .dispatch(Request::CreateAgentSchedule {
-                workspace_id: workspace.id,
-                spec: schedule_spec("private prompt"),
-            })
-            .unwrap()
-        else {
-            panic!("expected schedule");
-        };
-        let Response::Events {
-            cursor: baseline, ..
-        } = registry.read_events(None, 256, 0).unwrap()
-        else {
-            panic!("expected event baseline");
-        };
-        registry
-            .dispatch(Request::UpdateAgentSchedule {
-                schedule_id: schedule.id,
-                expected_revision: 1,
-                update: schedule_update("updated", "new private prompt", "0 3 * * *"),
-            })
-            .unwrap();
-        let current = registry.read_events(Some(&baseline), 256, 0).unwrap();
-        let Response::Events {
-            cursor: current_cursor,
-            events: current_events,
-            ..
-        } = current.clone()
-        else {
-            panic!("expected current events");
-        };
-        assert!(matches!(
-            current_events.as_slice(),
-            [DaemonEvent {
-                kind: DaemonEventKind::AgentScheduleUpdated { .. },
-                ..
-            }]
-        ));
-
-        let Response::Events { cursor, events, .. } = response_for_version(current, 26) else {
-            panic!("expected filtered events");
-        };
-        assert_eq!(cursor, current_cursor);
-        assert!(events.is_empty());
-    }
-
     #[test]
     fn protocol_thirty_one_filters_projection_invalidation_without_rewinding_cursor() {
         let cursor = EventCursor {
@@ -24527,8 +17640,6 @@ mod tests {
                 enabled: true,
                 blocked: true,
                 completed: true,
-                scheduled_dispatch_failed: true,
-                scheduled_interrupted: true,
             },
             ..Default::default()
         }
@@ -24547,7 +17658,6 @@ mod tests {
                 id: "shell-1".into(),
                 workspace_id: "workspace-1".into(),
                 name: "agent-shell".into(),
-                owner: ShellOwner::User,
                 status: ShellStatus::Running,
                 run_id: Some("run-1".into()),
                 generation: Some(1),
@@ -24594,49 +17704,6 @@ mod tests {
                     }),
                 },
             ],
-            schedules: vec![NodeProjectionSchedule {
-                id: "schedule-1".into(),
-                workspace_id: "workspace-1".into(),
-                name: "nightly".into(),
-                integration: "test".into(),
-                state: AgentScheduleState::Paused,
-                trigger: AgentScheduleTrigger {
-                    cron: "0 2 * * *".into(),
-                    timezone: "UTC".into(),
-                },
-                revision: 1,
-                prompt_revision: 1,
-                trigger_revision: 1,
-                created_at_ms: 1,
-                updated_at_ms: 1,
-                next_occurrence: None,
-            }],
-            executions: vec![NodeProjectionExecution {
-                id: "execution-1".into(),
-                workspace_id: "workspace-1".into(),
-                schedule_id: "schedule-1".into(),
-                revision: 3,
-                state: ScheduledExecutionState::DispatchFailed,
-                dispatch_kind: ScheduledExecutionDispatchKind::Manual,
-                schedule_revision: 1,
-                prompt_revision: 1,
-                trigger_revision: 1,
-                requested_at_ms: 1,
-                scheduled_at_ms: None,
-                started_at_ms: None,
-                ended_at_ms: Some(3),
-                reason: Some(ScheduledExecutionReason::HostSpawnFailed),
-                outcome: None,
-                shell_id: None,
-                run_id: None,
-                agent_id: None,
-            }],
-            executions_truncated: false,
-            scheduler: SchedulerHealth {
-                state: SchedulerState::Active,
-                max_concurrent: 4,
-                active_executions: 0,
-            },
         }
     }
 
@@ -24677,15 +17744,6 @@ mod tests {
                         revision: 4,
                     },
                 },
-                NodeProjectionTransition {
-                    event_id: 13,
-                    at_ms: 13,
-                    kind: NodeProjectionTransitionKind::Execution {
-                        workspace_id: "workspace-1".into(),
-                        execution_id: "execution-1".into(),
-                        revision: 3,
-                    },
-                },
             ],
             capabilities: Vec::new(),
         };
@@ -24703,14 +17761,10 @@ mod tests {
             &live,
             &remote_notification_test_settings(),
         );
-        assert_eq!(requests.len(), 3);
+        assert_eq!(requests.len(), 2);
         assert!(digest.is_none());
         assert_eq!(requests[0].request.reason, NotificationReason::Blocked);
         assert_eq!(requests[1].request.reason, NotificationReason::Completed);
-        assert_eq!(
-            requests[2].request.reason,
-            NotificationReason::ScheduledDispatchFailed
-        );
         assert_eq!(requests[0].request.node.as_ref().unwrap().alias, "work");
 
         let reconnect = ProjectionCommit {
@@ -24729,15 +17783,6 @@ mod tests {
         assert_eq!(digest.claim.through_cursor, 13);
         assert_eq!(digest.request.digest.as_ref().unwrap().blocked, 1);
         assert_eq!(digest.request.digest.as_ref().unwrap().completed, 1);
-        assert_eq!(
-            digest
-                .request
-                .digest
-                .as_ref()
-                .unwrap()
-                .scheduled_dispatch_failed,
-            1
-        );
     }
 
     #[test]
@@ -24794,72 +17839,6 @@ mod tests {
             &remote_notification_test_settings(),
         );
         assert!(result.0.is_empty() && result.1.is_none());
-    }
-
-    #[test]
-    fn protocol_twenty_three_filters_paginated_timed_events_without_stalling_cursor() {
-        let registry = DaemonService::default();
-        let workspace = registry
-            .create_workspace("timed-pagination".into(), Vec::new())
-            .unwrap();
-        let (schedule, _) = registry
-            .durable
-            .create_schedule(&workspace.id, schedule_spec("private"))
-            .unwrap();
-        let Response::Events {
-            cursor: baseline, ..
-        } = registry.read_events(None, 256, 0).unwrap()
-        else {
-            panic!("expected baseline");
-        };
-        for occurrence in 1..=300_u64 {
-            let scheduled_at_ms = occurrence * 60_000;
-            let execution = registry
-                .durable
-                .decide_schedule_execution(
-                    &schedule.id,
-                    ScheduleDecision {
-                        dispatch_kind: ScheduledExecutionDispatchKind::Timed,
-                        dispatch_key: timed_dispatch_key(&schedule.id, 1, scheduled_at_ms),
-                        scheduled_at_ms: Some(scheduled_at_ms),
-                        coalesced_through_ms: None,
-                        requested_at_ms: scheduled_at_ms,
-                        forced_skip: Some(ScheduledExecutionReason::Missed),
-                    },
-                    4,
-                )
-                .unwrap()
-                .0;
-            registry
-                .events
-                .publish_runtime_batch(vec![DaemonEventKind::ScheduledExecutionCreated {
-                    workspace_id: workspace.id.clone(),
-                    execution,
-                }])
-                .unwrap();
-        }
-
-        let first =
-            response_for_version(registry.read_events(Some(&baseline), 256, 0).unwrap(), 23);
-        let first_json = serde_json::to_value(&first).unwrap();
-        assert_eq!(first_json["events"], serde_json::json!([]));
-        assert_eq!(first_json["cursor"]["event_id"], baseline.event_id + 256);
-        assert!(!first_json.to_string().contains("timed"));
-        assert!(!first_json.to_string().contains("skipped"));
-        let Response::Events {
-            cursor: first_cursor,
-            ..
-        } = first
-        else {
-            panic!("expected first filtered page");
-        };
-        let second = response_for_version(
-            registry.read_events(Some(&first_cursor), 256, 0).unwrap(),
-            23,
-        );
-        let second_json = serde_json::to_value(second).unwrap();
-        assert_eq!(second_json["events"], serde_json::json!([]));
-        assert_eq!(second_json["cursor"]["event_id"], baseline.event_id + 300);
     }
 
     #[test]
@@ -25187,82 +18166,6 @@ mod tests {
 
         shell.kill().unwrap();
         registry.close_workspace(&workspace.id).unwrap();
-    }
-
-    #[test]
-    fn failed_shutdown_persistence_compensates_and_cancels_stopping() {
-        let directory = env::temp_dir().join(format!("boomux-shutdown-{}", Uuid::new_v4()));
-        let registry = DaemonService::restore(
-            StateStore::at(directory.join("state/state.json")),
-            false,
-            None,
-        )
-        .unwrap();
-        let (workspace, shell, _runtime) = running_shell(&registry);
-        let (schedule, _) = registry
-            .durable
-            .create_schedule(&workspace.id, schedule_spec("private"))
-            .unwrap();
-        for _ in 0..MAX_TERMINAL_EXECUTIONS_PER_SCHEDULE {
-            let (snapshot, _) = registry
-                .durable
-                .claim_schedule_execution(&schedule.id, &Uuid::new_v4().to_string())
-                .unwrap();
-            let execution = registry.durable.execution(&snapshot.id).unwrap();
-            registry
-                .durable
-                .mutate_execution(&execution, |state| {
-                    state.state = ScheduledExecutionState::DispatchFailed;
-                    state.ended_at_ms = Some(execution.requested_at_ms);
-                    state.reason = Some(ScheduledExecutionReason::RunnerStartFailed);
-                    Ok(())
-                })
-                .unwrap();
-        }
-        let (active, _) = registry
-            .durable
-            .claim_schedule_execution(&schedule.id, &Uuid::new_v4().to_string())
-            .unwrap();
-        let executions_before = registry
-            .durable
-            .scheduled_executions(None, Some(&schedule.id))
-            .unwrap();
-        assert_eq!(executions_before.len(), 101);
-        registry.fail_next_persistence();
-
-        assert!(registry.shutdown().is_err());
-
-        assert!(!registry.runtimes.is_stopping());
-        assert!(registry.workspace(&workspace.id).is_ok());
-        assert_eq!(shell.snapshot().unwrap().status, ShellStatus::Pending);
-        assert_eq!(
-            registry
-                .durable
-                .scheduled_executions(None, Some(&schedule.id))
-                .unwrap(),
-            executions_before
-        );
-        let restored_active = registry
-            .durable
-            .execution(&active.id)
-            .unwrap()
-            .snapshot()
-            .unwrap();
-        assert_eq!(restored_active.revision, 1);
-        assert_eq!(restored_active.state, ScheduledExecutionState::Claimed);
-        assert_eq!(restored_active.reason, None);
-        assert_eq!(restored_active.outcome, None);
-        let transitions = lock(&registry.events.transitions).unwrap();
-        assert_eq!(transitions.lifecycle_event_reservation, 0);
-        assert_eq!(transitions.pending_durable_events.len(), 1);
-        assert!(matches!(
-            transitions.pending_durable_events[0].as_slice(),
-            [DaemonEventKind::RunExited { .. }]
-        ));
-        drop(transitions);
-
-        registry.close_workspace(&workspace.id).unwrap();
-        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -26351,7 +19254,6 @@ mod tests {
             enabled: true,
             blocked: true,
             completed: true,
-            ..Default::default()
         });
         let (workspace, shell, _runtime) = running_shell(&registry);
         let run_id = shell.snapshot().unwrap().run.unwrap().id;
@@ -26468,7 +19370,6 @@ mod tests {
             enabled: true,
             blocked: true,
             completed: true,
-            ..Default::default()
         });
         let (workspace, shell, _runtime) = running_shell(&registry);
         let run_id = shell.snapshot().unwrap().run.unwrap().id;
@@ -26526,7 +19427,6 @@ mod tests {
             enabled: true,
             blocked: true,
             completed: true,
-            ..Default::default()
         });
         let (workspace, shell, _runtime) = running_shell(&registry);
         let run_id = shell.snapshot().unwrap().run.unwrap().id;
@@ -26577,7 +19477,6 @@ mod tests {
                 enabled: true,
                 blocked: true,
                 completed: true,
-                ..Default::default()
             },
             ..Default::default()
         };
@@ -26958,7 +19857,6 @@ mod tests {
             shells: Vec::new(),
             launchers: Vec::new(),
             agents: vec![agent.clone()],
-            schedules: Vec::new(),
         };
         let response = Response::Events {
             stream_id: "stream".into(),
@@ -26969,7 +19867,6 @@ mod tests {
             snapshot: Some(Snapshot {
                 workspaces: vec![workspace],
                 focused_terminal: None,
-                scheduler: None,
             }),
             events: vec![
                 DaemonEvent {
@@ -27032,11 +19929,6 @@ mod tests {
             observed_helper_version: Some("0.41.0".into()),
             workspace_owner_eligible: true,
             workspace_owner_unavailable_reason: Some("new field".into()),
-            scheduler: SchedulerHealth {
-                state: SchedulerState::Active,
-                max_concurrent: 1,
-                active_executions: 0,
-            },
             local_snapshot: None,
             remote_projection: None,
         };
@@ -27099,7 +19991,6 @@ mod tests {
             observed_at_ms: u64,
             observed_protocol_version: Option<u32>,
             observed_capabilities: Vec<String>,
-            scheduler: SchedulerHealth,
             local_snapshot: Option<Snapshot>,
             remote_projection: Option<NodeProjectionSnapshot>,
         }
@@ -27128,7 +20019,6 @@ mod tests {
             assert_eq!(old.observed_at_ms, 10);
             assert_eq!(old.observed_protocol_version, Some(37));
             assert_eq!(old.observed_capabilities, ["protocol_37"]);
-            assert_eq!(old.scheduler.state, SchedulerState::Active);
             assert!(old.local_snapshot.is_none());
             assert!(old.remote_projection.is_none());
         }
@@ -27151,11 +20041,6 @@ mod tests {
             observed_helper_version: Some("0.41.0".into()),
             workspace_owner_eligible: false,
             workspace_owner_unavailable_reason: None,
-            scheduler: SchedulerHealth {
-                state: SchedulerState::Active,
-                max_concurrent: 1,
-                active_executions: 0,
-            },
             local_snapshot: None,
             remote_projection: None,
         };
@@ -27216,7 +20101,6 @@ mod tests {
             name: "agent".into(),
             cwd: "/tmp/project".into(),
             command: Vec::new(),
-            owner: ShellOwner::User,
             status: ShellStatus::Pending,
             run: Some(ShellRunSnapshot {
                 id: "run-1".into(),
@@ -27238,13 +20122,11 @@ mod tests {
             shells: vec![shell.clone()],
             launchers: Vec::new(),
             agents: Vec::new(),
-            schedules: Vec::new(),
         };
         let response = Response::Snapshot {
             snapshot: Snapshot {
                 workspaces: vec![workspace.clone()],
                 focused_terminal: None,
-                scheduler: None,
             },
         };
         let Response::Snapshot { snapshot } = response_for_version(response.clone(), 39) else {
@@ -27348,7 +20230,6 @@ mod tests {
                     shell_id: "s1".into(),
                     run_id: "r1".into(),
                 }),
-                scheduler: None,
             },
         };
 
@@ -27422,7 +20303,6 @@ mod tests {
             shells: Vec::new(),
             launchers: Vec::new(),
             agents: vec![agent.clone()],
-            schedules: Vec::new(),
         };
         let Response::Workspace {
             workspace: downgraded_workspace,
@@ -27454,7 +20334,6 @@ mod tests {
                 snapshot: Some(Snapshot {
                     workspaces: vec![workspace],
                     focused_terminal: None,
-                    scheduler: None,
                 }),
                 events: vec![DaemonEvent {
                     id: 1,
@@ -27524,10 +20403,8 @@ mod tests {
                     shells: Vec::new(),
                     launchers: Vec::new(),
                     agents: vec![agent.clone()],
-                    schedules: Vec::new(),
                 }],
                 focused_terminal: None,
-                scheduler: None,
             }),
             events: vec![DaemonEvent {
                 id: 2,
@@ -27882,7 +20759,6 @@ mod tests {
             shells: Vec::new(),
             launchers: Vec::new(),
             agents: Vec::new(),
-            schedules: Vec::new(),
         };
 
         let Response::Workspace { workspace } = response_for_version(
@@ -27901,7 +20777,6 @@ mod tests {
                 snapshot: Snapshot {
                     workspaces: vec![source_workspace.clone()],
                     focused_terminal: None,
-                    scheduler: None,
                 },
             },
             18,
@@ -27923,7 +20798,6 @@ mod tests {
                 snapshot: Some(Snapshot {
                     workspaces: vec![source_workspace],
                     focused_terminal: None,
-                    scheduler: None,
                 }),
                 events: Vec::new(),
             },

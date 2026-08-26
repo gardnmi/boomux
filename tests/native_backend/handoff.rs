@@ -95,7 +95,7 @@ fn replacement_bootstrap_receives_listener_and_lock_ownership() {
 
     parent_channel.set_read_timeout(Some(TIMEOUT)).unwrap();
     parent_channel.set_write_timeout(Some(TIMEOUT)).unwrap();
-    parent_channel.write_all(b"BOOMUXH6").unwrap();
+    parent_channel.write_all(b"BOOMUXH8").unwrap();
     protocol::write_message(
         &mut parent_channel,
         &serde_json::json!({
@@ -116,7 +116,7 @@ fn replacement_bootstrap_receives_listener_and_lock_ownership() {
     if let Err(error) = parent_channel.read_exact(&mut ready) {
         let output = replacement.wait_with_output().unwrap();
         panic!(
-            "H6 replacement closed before READY: {error}; status {}; stderr: {}",
+            "H8 replacement closed before READY: {error}; status {}; stderr: {}",
             output.status,
             String::from_utf8_lossy(&output.stderr)
         );

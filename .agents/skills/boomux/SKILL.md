@@ -1,7 +1,7 @@
 ---
 name: boomux
-description: Inspect and manage Boomux Nodes, coordinated persistent terminal Workspaces, launchers, shells, run-scoped agent instances, attention, projected sessions, recurring Agent schedules, local configuration, notifications, the OpenCode Shared Harness Runtime, process supervision, and integrations. Use when asked to discover Nodes, shells, agents, sessions, or schedules, read terminal output, inspect, validate, or edit local Boomux configuration, manage explicitly authorized recurring Agent prompts, supervise an explicitly identified external session, report agent lifecycle state, configure or test notifications, install or remove an OpenCode, Pi, Claude Code, Codex, or Kiro integration, create or open Workspaces and shells, inspect status, rename or close targets, or manage the local Boomux daemon.
-compatibility: Requires boomux on PATH. Federated resource identity is the pair of owning Node ID and Node-local inner ID. Some name operations require Workspace context or an explicit --workspace/--node; agent mutation and supervision require exact shell-run context, and continuation schedules or supervision require caller-supplied exact canonical session identity.
+description: Inspect and manage Boomux Nodes, coordinated persistent terminal Workspaces, launchers, shells, run-scoped agent instances, attention, projected sessions, local configuration, notifications, the OpenCode Shared Harness Runtime, process supervision, and integrations. Use when asked to discover Nodes, shells, agents, or sessions, read terminal output, inspect, validate, or edit local Boomux configuration, supervise an explicitly identified external session, report agent lifecycle state, configure or test notifications, install or remove an OpenCode, Pi, Claude Code, Codex, or Kiro integration, create or open Workspaces and shells, inspect status, rename or close targets, or manage the local Boomux daemon.
+compatibility: Requires boomux on PATH. Federated resource identity is the pair of owning Node ID and Node-local inner ID. Some name operations require Workspace context or an explicit --workspace/--node; agent mutation and supervision require exact shell-run context, and supervision requires caller-supplied exact canonical session identity.
 metadata:
   author: boomux
   version: "17"
@@ -57,13 +57,12 @@ boomux capabilities --json
 
 Parse `data` on success and `error.code` on a nonzero exit; do not parse human
 tables or `error.message`. JSON mutation support includes Node registration
-management, Agent lifecycle reporting, attention acknowledgment, Schedule
-management, execution open/cancellation, and integration management. Treat this
+management, Agent lifecycle reporting, attention acknowledgment, and integration management. Treat this
 as illustrative; `capabilities.data.json_commands` is authoritative.
 
 Most daemon-backed inspection commands automatically start Boomux when it is
 not running. This includes `list`, `shells`, `read`, `events`, workspace, shell,
-and launcher inspection, Agent, attention, session, and schedule inspection, and
+and launcher inspection, Agent, attention, and session inspection, and
 `doctor`. Use `boomux daemon status` first when starting the daemon would be an
 unwanted side effect. `capabilities`, `project list`, `integration list`, and
 `integration status` do not start it.
@@ -112,8 +111,7 @@ temporary verified connection and does not persist registration. Registered and
 ad hoc routes do not make hostnames or addresses resource identities.
 
 Node-qualified host operations include `project list`, launcher invocation,
-integration management, Session catalogs/resume, Schedule and execution
-management, and `open`. Preserve the same explicit `--node` on every follow-up
+integration management, Session catalogs/resume, and `open`. Preserve the same explicit `--node` on every follow-up
 operation. Remote paths, commands, catalogs, and integration assets are resolved
 only by their owning Node. Daemon status, restart, and stop remain local and are
 not routed through registration.
@@ -309,92 +307,6 @@ canonical session can be resumed in its original context. Resume launches a
 native host process and requires authorization. A remote Session ID is exact
 only within its owning Node; keep the same `--node` used for discovery.
 
-## Manage Agent Schedules
-
-Schedule prompts are durable private content. Require authorization before
-creating one or using `schedule inspect`, because inspect is the only management
-surface that discloses the prompt. Enabling a schedule authorizes future
-unattended Agent process and tool activity; never pass `--enabled` or run
-`schedule resume` without explicit authorization for that continuing effect.
-
-```console
-boomux schedule create "<name>" --workspace "<workspace-name-or-id>" --node "<node>" --cwd "/absolute/owner/path" --integration opencode --prompt-file "/path/to/prompt.txt" --weekdays 09:00 --json
-boomux schedule list --json
-boomux schedule list --workspace "<workspace-name-or-id>" --json
-boomux schedule inspect "<exact-id-or-contextual-name>" --workspace "<workspace-name-or-id>" --json
-boomux schedule pause "<exact-id-or-contextual-name>" --workspace "<workspace-name-or-id>" --json
-boomux schedule resume "<exact-id-or-contextual-name>" --workspace "<workspace-name-or-id>" --json
-boomux schedule run "<exact-id-or-contextual-name>" --workspace "<workspace-name-or-id>" --json
-boomux execution list --workspace "<workspace-name-or-id>" --schedule "<schedule-name-or-id>" --limit 100 --json
-boomux execution inspect "<exact-execution-id>" --json
-boomux execution wait "<exact-execution-id>" --after-revision "<revision>" --wait-ms 30000 --json
-boomux execution open "<exact-execution-id>" --json
-boomux execution cancel "<exact-execution-id>" --json
-boomux schedule remove "<exact-id-or-contextual-name>" --workspace "<workspace-name-or-id>" --json
-```
-
-Create requires explicit Workspace, owner-local cwd, integration, exactly one prompt source,
-and exactly one trigger source. `--prompt` preserves the accepted bytes;
-`--prompt-file` snapshots exact UTF-8, including a final newline, and does not
-track later file changes. Use `--cron '<five fields>'`, `--every Nm|Nh`, `--daily
-HH:MM`, `--weekdays HH:MM`, or `--weekly DAY@HH:MM`. Omitted `--timezone`
-snapshots the system IANA timezone. New schedules default to fresh, paused, and
-skip-overlap policy. `--fresh` conflicts with `--continue`; `--paused` conflicts
-with `--enabled`.
-
-For continuation, first obtain the exact opaque projected session ID from
-`session list --workspace ... --json`, then pass it as `--continue`. It must
-resolve in that workspace, expose a canonical external session ID, and match the
-selected integration. Never substitute a description, external ID, latest
-session, Agent ID, or shell ID.
-
-List, create, pause, resume, remove, run, and all execution responses are
-prompt-free. Inspect
-returns the private prompt under `data.schedule.prompt`; do not log or repeat it
-unless needed for the authorized request. Exact Schedule and execution IDs are
-global only within one Node. Names resolve only with explicit `--workspace` or
-`BOOMUX_WORKSPACE_ID`; preserve `--node` for remote discovery and every exact
-follow-up operation.
-Removing a schedule removes its persisted prompt. Workspace close removes every
-owned schedule and persisted prompt and must be confirmed with that full scope.
-
-`schedule run` is an explicit process-starting action and requires authorization
-for that one execution. It remains available while paused. Use
-`--idempotency-key <uuid>` for request retry; otherwise the CLI creates a UUID
-before sending. Never retry with a new key when the intent is the same dispatch.
-Inspect the returned exact execution ID, and cancel only when process-tree
-termination is authorized. Execution exit or cancellation never means Agent
-`done`.
-
-`execution open` is also process-starting/presentation behavior. It opens only
-the exact active run or exact linked canonical Agent Session; it must not restart
-the reusable Schedule shell or substitute a later run or Session.
-
-Execution list responses are newest-first and contain `limit`, `truncated`, and
-prompt-free records. Limits are 1-1,000 and default to 100. Each execution has a
-positive durable `revision`. Wait with the exact last revision instead of polling
-lists: newer state or Agent linkage returns `changed: true`, timeout returns the
-same record with `changed: false`, and a future revision fails with
-`revision_ahead`. On `daemon_stopping`, reconnect and repeat the same revision.
-Do not stop waiting merely because process state is terminal; the canonical Agent
-link can arrive later, and its blocked attention remains under `agent inspect` or
-`attention list` with the exact Agent ID and observation revision.
-
-Enabled schedules are evaluated by the daemon in their stored timezone. Timed
-work runs only while the daemon and user session are active. Offline periods are
-recorded as one coalesced missed decision, paused periods are not caught up, and
-policy contention is skipped rather than queued. Manual and timed decisions share
-one active execution per schedule and workspace, exact continuation exclusion,
-and `[scheduling] max_concurrent` (default 4, range 1-64). Use `daemon status`
-and `doctor` to inspect scheduler health and whether a config change needs
-`daemon restart`.
-
-Cron day-field semantics preserve syntax: `*` and `*/n` are wildcard-origin;
-numeric lists/ranges are restricted even when they cover the full field, and two
-restricted day fields use OR. Boomux rejects schedules with no occurrence in a
-Gregorian 400-year cycle. Treat scheduler `offline` health as not evaluating
-timed work even when the daemon still answers other requests.
-
 Exact shell IDs are global only within one Node. Shell names resolve in the current workspace,
 or through `--workspace` for `shell inspect`, `shell rename`, and `shell close`.
 `boomux read` and targeted top-level `boomux close` require an exact shell ID
@@ -575,8 +487,7 @@ on graceful exit or `boomux web stop`; it never resets unrelated Serve state or
 defines tailnet grants and ACLs. Without the flag, remote publication remains
 external.
 It uses the Omarchy presentation model: one current user-Shell
-Agent per exact run plus historical Agents with durable attention, excluding
-schedule-owned Agents. It also presents local working-to-idle transitions as
+Agent per exact run plus historical Agents with durable attention. It also presents local working-to-idle transitions as
 gateway-owned ephemeral finished alerts, refreshed even without a connected
 browser. Its home page is the complete dashboard and cannot send terminal input
 or acknowledge attention. It attempts to ensure the Node's loopback Shared
@@ -602,7 +513,7 @@ stop support `--json` as `web.start`, `web.status`, and `web.stop`.
 first-start runtime environment, are never persisted by Boomux, and must remain
 consistent for attached clients.
 
-The dashboard has Workspaces, Agents, Shells, Schedules, and Nodes views. `/` or
+The dashboard has Workspaces, Agents, Shells, and Nodes views. `/` or
 `:` opens its action and search palette, `?` shows contextual help, `Enter`
 restores the selected workspace or opens the selected entry, and `x` followed
 by `y` confirms close or removal. On an active coordinated Workspace row, `s`
@@ -627,37 +538,6 @@ confirmation. It is not a resource filter. Coordinated Workspace rows aggregate
 persisted placements while every item retains its owner Node; external owner
 Workspaces remain distinct and offer explicit adopt/link actions.
 
-Each Agent Schedule appears once in its owning workspace with `KIND schedule`.
-That row is the durable definition, not a process; Enter navigates to its exact
-Schedules view. Schedule-owned execution shells remain absent from ordinary
-workspace rows and process counts.
-
-In Schedules, Left/Right changes between the schedule and history panes, `j`/`k`
-navigates the focused pane, and `[`/`]` also selects retained executions by exact
-execution ID. `Enter` attaches an exact Starting or Active run. For a completed
-execution with a canonical session, it resumes that exact OpenCode, Pi, Claude,
-or Codex session in an unmanaged native terminal without adding a workspace row. `u` runs now with a fresh dispatch key, `p`
-pauses or resumes future timed work, `c` then
-`y` confirms cancellation of the selected exact active execution. Selecting a
-schedule automatically loads bounded exact-schedule history. `x` then `y`
-confirms removal. `a` shows `boomux
-schedule create --help`. Prompt text is shown only after explicit exact editing
-or inspection. Schedule-owned shells are excluded from ordinary rows and
-workspace restore; their exact Agents remain selectable without ordinary shell
-actions. Opening does not acknowledge durable attention. Protocol 25
-has no skip-next operation; never emulate one with pause and resume.
-Active Open uses a protocol-26 exact-run attachment that cannot restart into a
-later run. Protocol-25 dashboards retain schedule controls and history but
-disable exact active-run attachment with upgrade-and-restart guidance.
-
-Press `e` to fetch and edit the exact private definition of a paused schedule.
-The built-in editor changes name, prompt, trigger preset or custom cron, and IANA
-timezone. Its timezone control filters the bundled IANA names as the user types;
-arrows select only valid matches. `Ctrl-S` saves with the loaded revision and
-`Esc` discards the private buffer. A stale save must be cancelled and reloaded rather than blindly retried.
-Trigger edits start future evaluation at commit time, while active executions
-retain their captured definition.
-
 ## Configuration
 
 Boomux reads `$XDG_CONFIG_HOME/boomux/config.toml`, falling back to
@@ -665,12 +545,7 @@ Boomux reads `$XDG_CONFIG_HOME/boomux/config.toml`, falling back to
 field-level override loaded last. The override is the active writable layer when
 set; otherwise the global file is writable. Omitted active-layer fields inherit
 from the global file or defaults. Configuration controls Terminal, Projects,
-Dashboard, Recovery, Scheduling, Notifications, and Sound groups. Unknown fields
-are rejected.
-Scheduled dispatch-failure and cold-interruption notification categories are
-configured independently as `[notifications] scheduled_dispatch_failed` and
-`scheduled_interrupted`; both default to false and never disclose schedule
-prompts or acknowledge Agent attention.
+Dashboard, Recovery, Notifications, and Sound groups. Unknown fields are rejected.
 Selecting a discovered project in the dashboard uses its name only and creates
 empty coordinator metadata. Set
 `[dashboard] follow_focused_terminal = false` to disable the default
@@ -730,7 +605,7 @@ boomux workspace retry "<closing-global-workspace-name-or-id>"
 
 On protocol 38 or newer, `workspace create` creates empty coordinator metadata.
 It does not select a Node or store a path; choose those when creating the first
-Shell, launcher, or schedule. Older daemons retain empty local Workspace
+Shell or launcher. Older daemons retain empty local Workspace
 creation. Exactly one eligible Node may be selected implicitly; multiple eligible
 Nodes require explicit `--node`, while zero means creation is unavailable.
 Filesystem paths are interpreted only
@@ -740,10 +615,10 @@ explicit `--node` never falls back to local Shell or launcher creation.
 On protocol 38 or newer, `workspace select` persists the exact coordinator
 Workspace ID as local owner-only CLI preference state; Node-local owner
 Workspace IDs are not selectable. For commands that require workspace context, explicit input
-wins, then the current managed Workspace, then the selection. Shell, launcher,
-and Schedule creation may omit their workspace while selected, but Node
+wins, then the current managed Workspace, then the selection. Shell and launcher
+creation may omit their workspace while selected, but Node
 selection remains independent. Exact resource IDs need no workspace, and an
-omitted filter on Agent, attention, Session, Schedule, or execution lists still
+omitted filter on Agent, attention, or Session lists still
 means all Workspaces. Agent registration still requires an exact ShellRun.
 Selection survives rename, fails visibly after close, and is removed only by
 `workspace clear` or replacement with another selection.
@@ -754,7 +629,7 @@ current eligible owner and fresh identity-pinned revision. Equal names never
 establish membership.
 
 `workspace close` terminates every running Shell process and removes launchers,
-Schedules and persisted prompts, retained terminal state, and Agent/attention
+retained terminal state, and Agent/attention
 records after each owner confirms removal. A coordinated close can remain
 `closing`; unresolved membership is retained until `workspace retry` or repeated
 close succeeds. Canonical OpenCode, Pi, or Codex host data is not deleted. A Workspace

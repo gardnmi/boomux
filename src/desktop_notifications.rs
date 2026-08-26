@@ -16,8 +16,6 @@ const NOTIFICATION_QUEUE_CAPACITY: usize = 32;
 pub(crate) enum NotificationReason {
     Blocked,
     Completed,
-    ScheduledDispatchFailed,
-    ScheduledInterrupted,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -40,8 +38,6 @@ pub(crate) struct NotificationNodeContext {
 pub(crate) struct NotificationDigest {
     pub(crate) blocked: u16,
     pub(crate) completed: u16,
-    pub(crate) scheduled_dispatch_failed: u16,
-    pub(crate) scheduled_interrupted: u16,
 }
 
 pub(crate) trait NotificationSink: Send + Sync {
@@ -205,10 +201,6 @@ pub(crate) fn category_enabled(
         && match reason {
             NotificationReason::Blocked => settings.desktop.blocked,
             NotificationReason::Completed => settings.desktop.completed,
-            NotificationReason::ScheduledDispatchFailed => {
-                settings.desktop.scheduled_dispatch_failed
-            }
-            NotificationReason::ScheduledInterrupted => settings.desktop.scheduled_interrupted,
         }
 }
 
@@ -216,8 +208,6 @@ fn sound_argv(settings: &NotificationDeliverySettings, reason: NotificationReaso
     let event = match reason {
         NotificationReason::Blocked => &settings.sound.blocked,
         NotificationReason::Completed => &settings.sound.completed,
-        NotificationReason::ScheduledDispatchFailed => &settings.sound.scheduled_dispatch_failed,
-        NotificationReason::ScheduledInterrupted => &settings.sound.scheduled_interrupted,
     };
     vec![
         "canberra-gtk-play".into(),
@@ -237,13 +227,11 @@ fn notify_send_argv(request: &NotificationRequest) -> Vec<String> {
         (
             "Boomux remote activity".into(),
             format!(
-                "Node {} ({}) reconnected: {} blocked, {} completed, {} dispatch failed, {} interrupted. Open Boomux to inspect.",
+                "Node {} ({}) reconnected: {} blocked, {} completed. Open Boomux to inspect.",
                 sanitize(&node.alias),
                 sanitize(&node.node_id),
                 digest.blocked,
                 digest.completed,
-                digest.scheduled_dispatch_failed,
-                digest.scheduled_interrupted,
             ),
         )
     } else {
@@ -263,26 +251,6 @@ fn notify_send_argv(request: &NotificationRequest) -> Vec<String> {
                     "{} in workspace {}, shell {}. Open Boomux or run `boomux attention list`.",
                     sanitize(&request.agent),
                     sanitize(&request.workspace),
-                    sanitize(&request.shell)
-                ),
-            ),
-            NotificationReason::ScheduledDispatchFailed => (
-                "Boomux scheduled dispatch failed".into(),
-                format!(
-                    "Schedule {} in workspace {} failed for execution {}. Run `boomux execution inspect {}`.",
-                    sanitize(&request.agent),
-                    sanitize(&request.workspace),
-                    sanitize(&request.shell),
-                    sanitize(&request.shell)
-                ),
-            ),
-            NotificationReason::ScheduledInterrupted => (
-                "Boomux scheduled execution interrupted".into(),
-                format!(
-                    "Schedule {} in workspace {} was interrupted for execution {}. Run `boomux execution inspect {}`.",
-                    sanitize(&request.agent),
-                    sanitize(&request.workspace),
-                    sanitize(&request.shell),
                     sanitize(&request.shell)
                 ),
             ),
@@ -415,13 +383,11 @@ mod tests {
             digest: Some(NotificationDigest {
                 blocked: 2,
                 completed: 3,
-                scheduled_dispatch_failed: 4,
-                scheduled_interrupted: 5,
             }),
         };
         let arguments = notify_send_argv(&digest);
         assert_eq!(arguments[3], "Boomux remote activity");
-        assert!(arguments[4].contains("2 blocked, 3 completed, 4 dispatch failed, 5 interrupted"));
+        assert!(arguments[4].contains("2 blocked, 3 completed"));
         assert!(!arguments[4].contains("prompt"));
     }
 
@@ -432,7 +398,6 @@ mod tests {
                 enabled: true,
                 blocked: true,
                 completed: false,
-                ..Default::default()
             },
             ..Default::default()
         };
@@ -460,7 +425,6 @@ mod tests {
                 enabled: true,
                 blocked: "dialog-warning".into(),
                 completed: "complete".into(),
-                ..Default::default()
             },
             ..Default::default()
         };

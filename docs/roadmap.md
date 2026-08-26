@@ -53,11 +53,11 @@
 - [x] Share one daemon-supervised Node-local OpenCode runtime across eligible
   native TUIs and OpenCode Web, with exact ShellRun claims for lifecycle and
   native Session links.
-- [x] Add first-class Codex hooks, run-scoped managed launches, exact resume and
-  scheduling, bounded thread catalogs, foreground hints, and safe merged
+- [x] Add first-class Codex hooks, run-scoped managed launches, exact resume,
+  bounded thread catalogs, foreground hints, and safe merged
   installation without fabricating a Codex Remote handoff.
-- [x] Add first-class Kiro v3 hooks, run-scoped managed launches, exact resume
-  and scheduling, and dedicated hook installation without fabricating
+- [x] Add first-class Kiro v3 hooks, run-scoped managed launches, exact resume,
+  and dedicated hook installation without fabricating
   local-to-cloud lifecycle or web handoff authority.
 
 ## Workspace Control
@@ -187,21 +187,6 @@ eternal process.
   user-controller precedence, idempotency, and audit events are defined.
 - Defer hooks, tests, focus actions, and other automatic reactions until waits,
   notification deduplication, and durable transition semantics are proven.
-
-### Scheduled Agent Work
-
-The accepted pre-implementation contract is documented in
-[`scheduled-agent-work.md`](scheduled-agent-work.md) and tracked by
-[#146](https://github.com/gardnmi/boomux/issues/146). Delivery is intentionally
-stacked: terminology and safety policy, durable management, manual dispatch,
-timed dispatch, observation, dashboard UX, companion-plugin UX, then an
-evidence-based decision about optional user-service activation.
-
-The first version uses workspace-owned paused-by-default schedules, snapshotted
-prompt revisions, fresh or exact-session continuation, canonical five-field cron
-with friendly creation conveniences, skipped overlap and missed work, no retry,
-no automatic timeout, one active execution per workspace, and a configurable
-daemon-wide concurrency limit that defaults to four.
 
 ## Distribution And Polish
 

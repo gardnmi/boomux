@@ -24,10 +24,6 @@ mod remote_attachment;
 mod remote_bootstrap;
 #[path = "native_backend/remote_host_services.rs"]
 mod remote_host_services;
-#[path = "native_backend/remote_schedules.rs"]
-mod remote_schedules;
-#[path = "native_backend/schedules.rs"]
-mod schedules;
 #[path = "native_backend/shell_lifecycle.rs"]
 mod shell_lifecycle;
 #[path = "native_backend/shell_name_suggestion.rs"]

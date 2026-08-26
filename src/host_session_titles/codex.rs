@@ -176,7 +176,7 @@ fn parse_catalog(output: &[u8], directory: &Path) -> Option<Inspection> {
         if thread.id.is_empty() || thread.ephemeral {
             continue;
         }
-        if boomux::scheduling::validate_external_session_id(&thread.id).is_err() {
+        if boomux::integrations::validate_external_session_id(&thread.id).is_err() {
             continue;
         }
         let Some(title) = thread

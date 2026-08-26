@@ -1034,7 +1034,7 @@ fn recovered_opencode_fallback_preserves_user_environment_and_exact_session() {
 }
 
 #[test]
-fn agent_runtime_is_revisioned_durable_and_version_compatible() {
+fn agent_runtime_is_revisioned_and_durable() {
     let mut daemon = TestDaemon::start();
     let workspace = daemon
         .client
@@ -1487,7 +1487,7 @@ fn agent_runtime_is_revisioned_durable_and_version_compatible() {
         },
     ] {
         assert!(matches!(
-            versioned_request(&daemon.client, 10, request),
+            versioned_request(&daemon.client, protocol::PROTOCOL_VERSION, request),
             protocol::Response::Error {
                 code: Some(ErrorCode::InvalidArgument),
                 ..
@@ -1608,111 +1608,6 @@ fn agent_runtime_is_revisioned_durable_and_version_compatible() {
     assert_eq!(inspect["command"], "agent.inspect");
     assert_eq!(inspect["data"]["agent"]["id"], adapter_id);
     assert_eq!(inspect["data"]["agent"]["observation"]["state"], "done");
-
-    assert!(matches!(
-        versioned_request(
-            &daemon.client,
-            9,
-            protocol::Request::EnsureAgent {
-                shell_id: shell_id.clone(),
-                run_id: run_id.clone(),
-                spec: registration.clone(),
-            },
-        ),
-        protocol::Response::Error {
-            code: Some(ErrorCode::UnsupportedVersion),
-            ..
-        }
-    ));
-    assert!(matches!(
-        versioned_request(
-            &daemon.client,
-            13,
-            protocol::Request::WaitAgent {
-                agent_id: agent_id.clone(),
-                after_revision: 1,
-                wait_ms: 0,
-            },
-        ),
-        protocol::Response::Error {
-            code: Some(ErrorCode::UnsupportedVersion),
-            ..
-        }
-    ));
-    assert!(matches!(
-        versioned_request(
-            &daemon.client,
-            9,
-            protocol::Request::GetAgent {
-                agent_id: agent_id.clone(),
-            },
-        ),
-        protocol::Response::Agent { agent } if agent.id == agent_id
-    ));
-    assert!(matches!(
-        versioned_request(
-            &daemon.client,
-            9,
-            protocol::Request::ReportAgent {
-                agent_id: agent_id.clone(),
-                run_id: run_id.clone(),
-                report: registration.report.clone(),
-            },
-        ),
-        protocol::Response::Agent { agent }
-            if agent.id == agent_id && agent.observation.revision == 1
-    ));
-
-    let legacy_baseline = daemon.client.events(None, 256, 0).unwrap().cursor;
-    let protocol_eight_snapshot = versioned_request(&daemon.client, 8, protocol::Request::Snapshot);
-    let protocol::Response::Snapshot { snapshot } = protocol_eight_snapshot else {
-        panic!("expected protocol-8 snapshot response");
-    };
-    assert!(
-        snapshot
-            .workspaces
-            .iter()
-            .all(|workspace| workspace.agents.is_empty())
-    );
-    let protocol_eight_events = versioned_request(
-        &daemon.client,
-        8,
-        protocol::Request::Events {
-            after: Some(legacy_baseline),
-            limit: 256,
-            wait_ms: 0,
-        },
-    );
-    let protocol::Response::Events {
-        cursor: filtered_cursor,
-        events,
-        ..
-    } = protocol_eight_events
-    else {
-        panic!("expected protocol-8 events response");
-    };
-    assert!(events.is_empty());
-    daemon
-        .client
-        .rename_shell(&shell_id, "runtime-renamed")
-        .unwrap();
-    let protocol_eight_events = versioned_request(
-        &daemon.client,
-        8,
-        protocol::Request::Events {
-            after: Some(filtered_cursor.clone()),
-            limit: 256,
-            wait_ms: 0,
-        },
-    );
-    let protocol::Response::Events { cursor, events, .. } = protocol_eight_events else {
-        panic!("expected protocol-8 events response after rename");
-    };
-    assert!(events.iter().any(|event| matches!(
-        &event.kind,
-        protocol::DaemonEventKind::ShellRenamed { shell_id: id, .. } if id == &shell_id
-    )));
-    assert!(cursor.event_id > filtered_cursor.event_id);
 
     daemon.stop_with_cli();
 }
@@ -2016,7 +1911,7 @@ fn explicit_process_supervisor_preserves_child_io_exit_and_agent_authority() {
 }
 
 #[test]
-fn cold_recovery_presents_resumable_agent_only_to_protocol_forty() {
+fn cold_recovery_presents_resumable_agent() {
     let mut daemon = TestDaemon::start();
     let workspace = daemon
         .client
@@ -2025,7 +1920,6 @@ fn cold_recovery_presents_resumable_agent_only_to_protocol_forty() {
             vec![ShellSpec::login("agent", std::env::temp_dir())],
         )
         .unwrap();
-    let workspace_id = workspace.id.clone();
     let shell_id = workspace.shells[0].id.clone();
     let attachment = daemon.client.attach(&shell_id, false, profile()).unwrap();
     let first_run = daemon.client.get_shell(&shell_id).unwrap().run.unwrap();
@@ -2066,20 +1960,6 @@ fn cold_recovery_presents_resumable_agent_only_to_protocol_forty() {
     );
     assert!(recovered_run.ended_at_ms.is_some());
     assert_eq!(daemon.client.get_agent(&agent.id).unwrap(), agent);
-
-    let protocol::Response::Snapshot { snapshot } =
-        versioned_request(&daemon.client, 39, protocol::Request::Snapshot)
-    else {
-        panic!("expected protocol-39 snapshot");
-    };
-    let old_shell = snapshot
-        .workspaces
-        .iter()
-        .find(|workspace| workspace.id == workspace_id)
-        .and_then(|workspace| workspace.shells.iter().find(|shell| shell.id == shell_id))
-        .expect("protocol-39 snapshot omitted recovered shell");
-    assert!(old_shell.run.is_none());
-    assert!(old_shell.recovered_agent_id.is_none());
 
     daemon.stop_with_cli();
 }

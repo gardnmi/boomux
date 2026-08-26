@@ -18,8 +18,7 @@ use crate::state_store;
 
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 pub(crate) const CHANNEL_FD: RawFd = 198;
-pub(crate) const HEADER: &[u8; 8] = b"BOOMUXH7";
-pub(crate) const OLD_HEADER: &[u8; 8] = b"BOOMUXH6";
+pub(crate) const HEADER: &[u8; 8] = b"BOOMUXH8";
 pub(crate) const LISTENER_MARKER: u8 = 1;
 pub(crate) const RUNTIME_LOCK_MARKER: u8 = 2;
 pub(crate) const STATE_LOCK_MARKER: u8 = 3;
@@ -53,12 +52,11 @@ pub(crate) struct Manifest {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct EventStreamManifest {
     pub(crate) stream_id: String,
     pub(crate) latest_id: u64,
     pub(crate) events: Vec<DaemonEvent>,
-    #[serde(default)]
-    pub(crate) schedule_shell_ids: Vec<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -248,7 +246,7 @@ pub(crate) fn receive_bootstrap(channel: RawFd) -> io::Result<Bootstrap> {
 }
 
 fn supported_header(header: &[u8; 8]) -> bool {
-    header == HEADER || header == OLD_HEADER
+    header == HEADER
 }
 
 fn validate_pty(descriptor: &OwnedFd, expected_session: u32) -> io::Result<()> {
@@ -315,15 +313,6 @@ fn validate_manifest(manifest: &Manifest) -> io::Result<()> {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "handoff manifest contains invalid presented terminal focus",
-        ));
-    }
-    if manifest.notifications.as_ref().is_some_and(|settings| {
-        !(1..=crate::daemon::MAX_SCHEDULED_EXECUTION_CONCURRENCY)
-            .contains(&settings.max_scheduled_execution_concurrency)
-    }) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "handoff manifest contains an invalid scheduling concurrency limit",
         ));
     }
     if manifest
@@ -411,15 +400,8 @@ fn validate_manifest(manifest: &Manifest) -> io::Result<()> {
             ));
         }
     }
-    let mut schedule_shell_ids = std::collections::HashSet::new();
     if uuid::Uuid::parse_str(&manifest.event_stream.stream_id).is_err()
         || manifest.event_stream.events.len() > 8_192
-        || manifest.event_stream.schedule_shell_ids.len() > manifest.event_stream.events.len()
-        || manifest
-            .event_stream
-            .schedule_shell_ids
-            .iter()
-            .any(|id| uuid::Uuid::parse_str(id).is_err() || !schedule_shell_ids.insert(id))
         || manifest
             .event_stream
             .events
@@ -549,13 +531,13 @@ fn validate_lock(descriptor: &OwnedFd, path: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::fd::IntoRawFd;
 
     fn event_stream() -> EventStreamManifest {
         EventStreamManifest {
             stream_id: uuid::Uuid::new_v4().to_string(),
             latest_id: 0,
             events: Vec::new(),
-            schedule_shell_ids: Vec::new(),
         }
     }
 
@@ -577,10 +559,25 @@ mod tests {
     }
 
     #[test]
-    fn h6_and_h7_bootstrap_headers_remain_accepted() {
-        assert!(supported_header(OLD_HEADER));
+    fn only_h8_bootstrap_header_is_accepted() {
         assert!(supported_header(HEADER));
-        assert!(!supported_header(b"BOOMUXH5"));
+        assert!(!supported_header(b"BOOMUXH7"));
+    }
+
+    #[test]
+    fn receive_bootstrap_rejects_h7_before_reading_a_manifest() {
+        let (mut sender, receiver) = UnixStream::pair().unwrap();
+        sender.write_all(b"BOOMUXH7").unwrap();
+
+        let error = match receive_bootstrap(receiver.into_raw_fd()) {
+            Ok(_) => panic!("H7 bootstrap must be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "replacement bootstrap version is unsupported"
+        );
     }
 
     #[test]
@@ -749,37 +746,5 @@ mod tests {
         validate_manifest(&manifest).unwrap();
         let encoded = serde_json::to_vec(&manifest).unwrap();
         assert!(encoded.len() + std::mem::size_of::<u32>() <= protocol::MAX_CONTROL_FRAME);
-    }
-
-    #[test]
-    fn manifest_rejects_invalid_scheduler_concurrency() {
-        for max_scheduled_execution_concurrency in [0, 65, u16::MAX] {
-            let manifest = Manifest {
-                runtimes: Vec::new(),
-                exited: Vec::new(),
-                event_stream: event_stream(),
-                notifications: Some(NotificationDeliveryConfig {
-                    desktop_enabled: false,
-                    sound_enabled: false,
-                    blocked: true,
-                    completed: true,
-                    blocked_sound: "blocked".into(),
-                    completed_sound: "completed".into(),
-                    resume_agents: true,
-                    persist_terminal_history: false,
-                    max_scheduled_execution_concurrency,
-                    ..Default::default()
-                }),
-                focused_terminal: None,
-                presented_focused_terminal: None,
-                opencode_runtime: None,
-                claude_remote_control_bindings: Vec::new(),
-                kiro_launch_holders: Vec::new(),
-            };
-            assert_eq!(
-                validate_manifest(&manifest).unwrap_err().kind(),
-                io::ErrorKind::InvalidData
-            );
-        }
     }
 }

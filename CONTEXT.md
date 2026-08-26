@@ -25,7 +25,7 @@ that Shell.
 ## Workspace
 
 A durable coordinator-owned place where a user organizes Shells, Agent
-Instances, launchers, and Agent Schedules that may execute on multiple Nodes.
+Instances, and launchers that may execute on multiple Nodes.
 The Workspace coordinator owns its identity, name, and membership, but is not an
 execution placement and does not imply a default Node. Each Node-hosted resource
 in a Workspace retains its own Node authority and exact qualified identity.
@@ -69,7 +69,7 @@ does not invoke launchers.
 
 The core desktop presentation of a coordinated Workspace as one named Hyprland
 special Workspace. The durable Boomux Workspace remains the authority for its
-name, membership, Shells, launchers, and schedules; the Hyprland layer is local
+name, membership, Shells, and launchers; the Hyprland layer is local
 presentation derived from its immutable coordinator ID and owns no durable
 resource identity.
 
@@ -181,25 +181,6 @@ Session claim, lifecycle authority, credential, durable resource, or remote Node
 projection. Consumption or expiry removes the grant. The daemon independently
 revalidates the exact ShellRun when the browser joins as a collaborative terminal
 participant. The primary native controller remains resize authority.
-
-## Agent Schedule
-
-A durable workspace-owned definition for recurring prompt-driven Agent work with fixed execution
-context, session policy, and trigger policy. Creating a schedule does not create a shell, shell run,
-Agent Instance, or Agent Session. Its first dispatch creates one reusable schedule-owned shell for
-later execution runs, and a new schedule is paused until explicitly enabled. Definition edits are
-allowed only while paused, require the exact current definition revision, and affect only later
-Scheduled Executions; an already-active execution does not prevent editing, and active and
-historical executions retain the definition revisions they captured. Editing a trigger starts its future
-evaluation at the edit time, so neither the old trigger nor paused time is caught up after resume.
-
-## Scheduled Execution
-
-A durable record of one manual or timed Agent Schedule decision, bound to the exact schedule and
-prompt revisions evaluated for that decision. A skipped or pre-shell failed dispatch has no shell
-run; an execution whose internal runner started retains that run even if the external host failed
-to launch. It may acquire an Agent Instance, whose lifecycle remains authoritative independently
-of the execution's process outcome.
 
 ## Process Adapter
 

@@ -6,9 +6,7 @@ use serde::Serialize;
 use boomux::client::{ClientError, LifecycleError, ProtocolError};
 use boomux::protocol::{
     AgentAttentionReason, AgentAuthority, AgentInstanceSnapshot, AgentObservationSnapshot,
-    AgentScheduleOverlapPolicy, AgentScheduleSession, AgentScheduleSnapshot, AgentScheduleState,
-    AgentState, ErrorCode, ScheduledExecutionOutcome, ScheduledExecutionReason,
-    ScheduledExecutionSnapshot, ShellRunExitReason, ShellSnapshot, ShellStatus,
+    AgentState, ErrorCode, ShellRunExitReason, ShellSnapshot, ShellStatus,
     WorkspaceLauncherSnapshot,
 };
 
@@ -61,8 +59,6 @@ pub(crate) struct ShellData {
     pub(crate) cwd: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) command: Vec<String>,
-    pub(crate) owner: &'static str,
-    pub(crate) owner_schedule_id: Option<String>,
     pub(crate) status: &'static str,
     pub(crate) exit_code: Option<u32>,
     pub(crate) foreground_process: Option<String>,
@@ -87,7 +83,6 @@ pub(crate) struct WorkspaceSummary {
     pub(crate) name: String,
     pub(crate) shell_count: usize,
     pub(crate) launcher_count: usize,
-    pub(crate) schedule_count: usize,
     pub(crate) agent_count: usize,
     pub(crate) agent_state_counts: AgentStateCounts,
     pub(crate) attention_count: usize,
@@ -109,78 +104,6 @@ pub(crate) struct LauncherData {
     pub(crate) name: String,
     pub(crate) cwd: String,
     pub(crate) command: Vec<String>,
-}
-
-#[derive(Serialize)]
-pub(crate) struct ScheduleData {
-    pub(crate) id: String,
-    pub(crate) workspace_id: String,
-    pub(crate) workspace_name: Option<String>,
-    pub(crate) name: String,
-    pub(crate) cwd: String,
-    pub(crate) integration: String,
-    pub(crate) session_mode: &'static str,
-    pub(crate) external_session_id: Option<String>,
-    pub(crate) cron: String,
-    pub(crate) timezone: String,
-    pub(crate) state: &'static str,
-    pub(crate) overlap_policy: &'static str,
-    pub(crate) revision: u64,
-    pub(crate) prompt_revision: u64,
-    pub(crate) trigger_revision: u64,
-    pub(crate) created_at_ms: u64,
-    pub(crate) updated_at_ms: u64,
-    pub(crate) evaluation_frontier_ms: u64,
-    pub(crate) execution_shell_id: Option<String>,
-    pub(crate) next_occurrence: Option<ScheduledOccurrenceData>,
-}
-
-#[derive(Serialize)]
-pub(crate) struct ScheduledOccurrenceData {
-    pub(crate) trigger_revision: u64,
-    pub(crate) scheduled_at_ms: u64,
-}
-
-#[derive(Serialize)]
-pub(crate) struct ScheduleInspectionData {
-    #[serde(flatten)]
-    pub(crate) schedule: ScheduleData,
-    pub(crate) prompt: String,
-}
-
-#[derive(Serialize)]
-pub(crate) struct ExecutionData {
-    pub(crate) id: String,
-    pub(crate) workspace_id: String,
-    pub(crate) schedule_id: String,
-    pub(crate) revision: u64,
-    pub(crate) state: &'static str,
-    pub(crate) dispatch_kind: &'static str,
-    pub(crate) dispatch_key: String,
-    pub(crate) schedule_revision: u64,
-    pub(crate) prompt_revision: u64,
-    pub(crate) trigger_revision: u64,
-    pub(crate) requested_at_ms: u64,
-    pub(crate) scheduled_at_ms: Option<u64>,
-    pub(crate) coalesced_through_ms: Option<u64>,
-    pub(crate) started_at_ms: Option<u64>,
-    pub(crate) ended_at_ms: Option<u64>,
-    pub(crate) cwd: String,
-    pub(crate) integration: String,
-    pub(crate) session: AgentScheduleSession,
-    pub(crate) reason: Option<&'static str>,
-    pub(crate) outcome: Option<ExecutionOutcomeData>,
-    pub(crate) shell_id: Option<String>,
-    pub(crate) run_id: Option<String>,
-    pub(crate) agent_id: Option<String>,
-    pub(crate) external_session_id: Option<String>,
-}
-
-#[derive(Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub(crate) enum ExecutionOutcomeData {
-    ExitCode { code: i32 },
-    Signal { signal: i32 },
 }
 
 #[derive(Serialize)]
@@ -305,14 +228,6 @@ pub(crate) fn shell(shell: &ShellSnapshot, workspace_name: Option<&str>) -> Shel
         name: shell.name.clone(),
         cwd: shell.cwd.display().to_string(),
         command: shell.command.clone(),
-        owner: match &shell.owner {
-            boomux::protocol::ShellOwner::User => "user",
-            boomux::protocol::ShellOwner::Schedule { .. } => "schedule",
-        },
-        owner_schedule_id: match &shell.owner {
-            boomux::protocol::ShellOwner::User => None,
-            boomux::protocol::ShellOwner::Schedule { schedule_id } => Some(schedule_id.clone()),
-        },
         status,
         exit_code,
         foreground_process: shell.foreground_process.clone(),
@@ -357,131 +272,6 @@ pub(crate) fn launcher(
         name: launcher.name.clone(),
         cwd: launcher.cwd.display().to_string(),
         command: launcher.command.clone(),
-    }
-}
-
-pub(crate) fn execution(execution: &ScheduledExecutionSnapshot) -> ExecutionData {
-    ExecutionData {
-        id: execution.id.clone(),
-        workspace_id: execution.workspace_id.clone(),
-        schedule_id: execution.schedule_id.clone(),
-        revision: execution.revision,
-        state: match execution.state {
-            boomux::protocol::ScheduledExecutionState::Skipped => "skipped",
-            boomux::protocol::ScheduledExecutionState::Claimed => "claimed",
-            boomux::protocol::ScheduledExecutionState::Starting => "starting",
-            boomux::protocol::ScheduledExecutionState::Active => "active",
-            boomux::protocol::ScheduledExecutionState::DispatchFailed => "dispatch_failed",
-            boomux::protocol::ScheduledExecutionState::Exited => "exited",
-            boomux::protocol::ScheduledExecutionState::Cancelled => "cancelled",
-            boomux::protocol::ScheduledExecutionState::Interrupted => "interrupted",
-        },
-        dispatch_kind: match execution.dispatch_kind {
-            boomux::protocol::ScheduledExecutionDispatchKind::Manual => "manual",
-            boomux::protocol::ScheduledExecutionDispatchKind::Timed => "timed",
-        },
-        dispatch_key: execution.dispatch_key.clone(),
-        schedule_revision: execution.schedule_revision,
-        prompt_revision: execution.prompt_revision,
-        trigger_revision: execution.trigger_revision,
-        requested_at_ms: execution.requested_at_ms,
-        scheduled_at_ms: execution.scheduled_at_ms,
-        coalesced_through_ms: execution.coalesced_through_ms,
-        started_at_ms: execution.started_at_ms,
-        ended_at_ms: execution.ended_at_ms,
-        cwd: execution.cwd.display().to_string(),
-        integration: execution.integration.clone(),
-        session: execution.session.clone(),
-        reason: execution.reason.map(execution_reason),
-        outcome: execution.outcome.as_ref().map(|outcome| match outcome {
-            ScheduledExecutionOutcome::ExitCode { code } => {
-                ExecutionOutcomeData::ExitCode { code: *code }
-            }
-            ScheduledExecutionOutcome::Signal { signal } => {
-                ExecutionOutcomeData::Signal { signal: *signal }
-            }
-        }),
-        shell_id: execution.shell_id.clone(),
-        run_id: execution.run_id.clone(),
-        agent_id: execution.agent_id.clone(),
-        external_session_id: execution.external_session_id.clone(),
-    }
-}
-
-pub(crate) fn execution_reason(reason: ScheduledExecutionReason) -> &'static str {
-    match reason {
-        ScheduledExecutionReason::Overlap => "overlap",
-        ScheduledExecutionReason::ActiveSession => "active_session",
-        ScheduledExecutionReason::WorkspaceCapacity => "workspace_capacity",
-        ScheduledExecutionReason::GlobalCapacity => "global_capacity",
-        ScheduledExecutionReason::Missed => "missed",
-        ScheduledExecutionReason::PausedRace => "paused_race",
-        ScheduledExecutionReason::InvalidTarget => "invalid_target",
-        ScheduledExecutionReason::RunnerStartFailed => "runner_start_failed",
-        ScheduledExecutionReason::HostSpawnFailed => "host_spawn_failed",
-        ScheduledExecutionReason::CancelledByUser => "cancelled_by_user",
-        ScheduledExecutionReason::ColdDaemonRecovery => "cold_daemon_recovery",
-        ScheduledExecutionReason::RunnerExitedWithoutReport => "runner_exited_without_report",
-        ScheduledExecutionReason::DaemonShutdown => "daemon_shutdown",
-    }
-}
-
-pub(crate) fn schedule(
-    schedule: &AgentScheduleSnapshot,
-    workspace_name: Option<&str>,
-) -> ScheduleData {
-    let (session_mode, external_session_id) = match &schedule.session {
-        AgentScheduleSession::Fresh => ("fresh", None),
-        AgentScheduleSession::Continue {
-            external_session_id,
-        } => ("continue", Some(external_session_id.clone())),
-    };
-    ScheduleData {
-        id: schedule.id.clone(),
-        workspace_id: schedule.workspace_id.clone(),
-        workspace_name: workspace_name.map(str::to_owned),
-        name: schedule.name.clone(),
-        cwd: schedule.cwd.display().to_string(),
-        integration: schedule.integration.clone(),
-        session_mode,
-        external_session_id,
-        cron: schedule.trigger.cron.clone(),
-        timezone: schedule.trigger.timezone.clone(),
-        state: schedule_state(schedule.state),
-        overlap_policy: match schedule.overlap_policy {
-            AgentScheduleOverlapPolicy::Skip => "skip",
-        },
-        revision: schedule.revision,
-        prompt_revision: schedule.prompt_revision,
-        trigger_revision: schedule.trigger_revision,
-        created_at_ms: schedule.created_at_ms,
-        updated_at_ms: schedule.updated_at_ms,
-        evaluation_frontier_ms: schedule.evaluation_frontier_ms,
-        execution_shell_id: schedule.execution_shell_id.clone(),
-        next_occurrence: schedule.next_occurrence.as_ref().map(|occurrence| {
-            ScheduledOccurrenceData {
-                trigger_revision: occurrence.trigger_revision,
-                scheduled_at_ms: occurrence.scheduled_at_ms,
-            }
-        }),
-    }
-}
-
-pub(crate) fn schedule_inspection(
-    schedule: &AgentScheduleSnapshot,
-    workspace_name: Option<&str>,
-    prompt: &str,
-) -> ScheduleInspectionData {
-    ScheduleInspectionData {
-        schedule: self::schedule(schedule, workspace_name),
-        prompt: prompt.to_owned(),
-    }
-}
-
-pub(crate) fn schedule_state(state: AgentScheduleState) -> &'static str {
-    match state {
-        AgentScheduleState::Paused => "paused",
-        AgentScheduleState::Enabled => "enabled",
     }
 }
 
@@ -602,12 +392,6 @@ fn classify_error(command: &str, error: &(dyn Error + 'static)) -> &'static str 
         }
         if let Some(client) = candidate.downcast_ref::<ClientError>() {
             return classify_client_error(command, client);
-        }
-        if candidate
-            .downcast_ref::<boomux::scheduling::SchedulingError>()
-            .is_some()
-        {
-            return "invalid_argument";
         }
         if let Some(io_error) = candidate.downcast_ref::<io::Error>() {
             return classify_io_error(command, io_error);
@@ -809,45 +593,6 @@ mod tests {
     }
 
     #[test]
-    fn schedule_summary_is_prompt_free_and_inspection_discloses_prompt() {
-        let snapshot = AgentScheduleSnapshot {
-            id: "schedule-1".into(),
-            workspace_id: "w1".into(),
-            name: "review".into(),
-            cwd: "/tmp/project".into(),
-            integration: "opencode".into(),
-            session: AgentScheduleSession::Fresh,
-            trigger: boomux::protocol::AgentScheduleTrigger {
-                cron: "0 9 * * 1-5".into(),
-                timezone: "UTC".into(),
-            },
-            state: AgentScheduleState::Paused,
-            overlap_policy: AgentScheduleOverlapPolicy::Skip,
-            revision: 1,
-            prompt_revision: 2,
-            trigger_revision: 1,
-            created_at_ms: 10,
-            updated_at_ms: 11,
-            evaluation_frontier_ms: 11,
-            execution_shell_id: None,
-            next_occurrence: None,
-        };
-        let private = "private prompt contents\n";
-
-        let summary = serde_json::to_value(schedule(&snapshot, Some("project"))).unwrap();
-        assert!(summary.get("prompt").is_none());
-        assert!(!summary.to_string().contains(private));
-        assert!(summary["external_session_id"].is_null());
-        assert!(summary["execution_shell_id"].is_null());
-        assert_eq!(summary["session_mode"], "fresh");
-        assert_eq!(summary["state"], "paused");
-
-        let inspection =
-            serde_json::to_value(schedule_inspection(&snapshot, Some("project"), private)).unwrap();
-        assert_eq!(inspection["prompt"], private);
-    }
-
-    #[test]
     fn client_errors_convert_to_stable_cli_codes() {
         let remote = ClientError::Remote(RemoteError {
             code: Some(ErrorCode::ShellStartFailed),
@@ -861,7 +606,6 @@ mod tests {
             "connection refused",
         ));
         let timeout = ClientError::Lifecycle(LifecycleError::ShutdownTimeout);
-        let schedule = boomux::scheduling::canonicalize_cron("not a cron").unwrap_err();
 
         assert_eq!(classify_error("shell.open", &remote), "shell_start_failed");
         assert_eq!(
@@ -873,9 +617,5 @@ mod tests {
             "daemon_unavailable"
         );
         assert_eq!(classify_error("daemon.stop", &timeout), "timeout");
-        assert_eq!(
-            classify_error("schedule.create", &schedule),
-            "invalid_argument"
-        );
     }
 }

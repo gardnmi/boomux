@@ -47,7 +47,7 @@ pub(crate) fn read_update(reader: impl Read) -> Result<HookUpdate, Box<dyn std::
             format!("invalid Kiro hook input: {error}"),
         )
     })?;
-    boomux::scheduling::validate_external_session_id(&input.session_id).map_err(|error| {
+    boomux::integrations::validate_external_session_id(&input.session_id).map_err(|error| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!("invalid Kiro session identity: {error}"),

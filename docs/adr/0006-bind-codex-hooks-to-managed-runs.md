@@ -16,8 +16,8 @@ run-scoped marker. Option-led invocations including explicit `--remote`, other
 subcommands, use outside a managed ShellRun, and absent or modified hook
 installation run stock Codex without lifecycle authority. A configured primary
 Codex command retains its exact executable through `BOOMUX_REAL_CODEX` while the
-launcher adds hooks. Scheduled dispatch and cold recovery use the same launcher
-while retaining their exact descriptor argument vectors and stdin.
+launcher adds hooks. Cold recovery uses the same launcher while retaining its
+exact descriptor argument vectors and stdin.
 
 The integration merges only exact `boomux codex hook` handlers into Codex's
 shared `hooks.json`. It preserves unrelated fields and handlers, requires force
@@ -38,5 +38,5 @@ Rejected alternatives were:
 
 The bounded experimental app-server catalog remains presentation-only. It may
 project historical threads with Unknown state, but cannot grant lifecycle
-authority. This design reuses existing Agent, Session, Schedule, and recovery
+authority. This design reuses existing Agent, Session, and recovery
 contracts and adds no protocol or durable-state representation.

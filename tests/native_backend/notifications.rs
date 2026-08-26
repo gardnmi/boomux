@@ -674,7 +674,7 @@ fn start_remote_subscriber(owner: &TestDaemon) -> RemoteSubscriber {
         let configuration = runtime_dir.join("remote-notifications.toml");
         fs::write(
             &configuration,
-            "[notifications]\nenabled = true\nblocked = true\ncompleted = true\nscheduled_dispatch_failed = true\nscheduled_interrupted = true\n[notifications.sound]\nenabled = true\n",
+            "[notifications]\nenabled = true\nblocked = true\ncompleted = true\n[notifications.sound]\nenabled = true\n",
         )
         .unwrap();
         let paths = std::env::join_paths([

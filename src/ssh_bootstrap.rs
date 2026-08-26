@@ -688,6 +688,14 @@ fn shadow_upgrade_required(helper: &RemoteExecutable) -> io::Error {
     )
 }
 
+fn incompatible_helper_cold_upgrade_required() -> io::Error {
+    classified_error(
+        io::ErrorKind::Unsupported,
+        "upgrade_required",
+        "the remote owner has only pre-protocol-47 Boomux helpers and cannot be upgraded automatically; on that owner, use its existing binary to run `boomux daemon stop` (terminating every managed process), reset the incompatible Boomux state and removed scheduling configuration documented in `docs/local-update.md`, then install and start the protocol-47 binary",
+    )
+}
+
 fn install_presence_required(message: &str) -> io::Error {
     classified_error(io::ErrorKind::Unsupported, "install_required", message)
 }
@@ -1545,26 +1553,24 @@ impl BootstrapSession {
         if let Some(error) = remote_recovery_error(discovery.recovery) {
             return Err(error);
         }
-        let reason = if discovery.executables.is_empty() {
-            RemoteInstallReason::Missing
-        } else if selection.incompatible == discovery.executables.len() {
-            RemoteInstallReason::Upgrade
-        } else {
+        if !discovery.executables.is_empty()
+            && selection.incompatible == discovery.executables.len()
+        {
+            return Err(incompatible_helper_cold_upgrade_required());
+        }
+        if !discovery.executables.is_empty() {
             return Err(io::Error::other(
                 "remote Boomux candidates could not be verified; refusing remote modification",
             ));
-        };
+        }
         let source = select_install_source(discovery.platform)?;
-        let upgrade_helper = (reason == RemoteInstallReason::Upgrade)
-            .then(|| selection.incompatible_executables.first().cloned())
-            .flatten();
         Ok(RemoteBootstrapPlan::Install(RemoteInstallPlan {
             target: self.target.clone(),
             destination: discovery.install_destination,
             source,
-            reason,
+            reason: RemoteInstallReason::Missing,
             bootstrap_id: Some(self.id),
-            upgrade_helper,
+            upgrade_helper: None,
             intent: RemoteInstallIntent::AutomaticCompatibility,
         }))
     }
@@ -1580,11 +1586,7 @@ impl BootstrapSession {
             if let Some(error) = remote_recovery_error(discovery.recovery) {
                 return error;
             }
-            classified_error(
-                io::ErrorKind::Unsupported,
-                "upgrade_required",
-                "explicit registered Node upgrade requires a currently compatible remote helper",
-            )
+            incompatible_helper_cold_upgrade_required()
         })?;
         let intent = RemoteInstallIntent::ExplicitRegisteredUpgrade {
             expected_node_id: expected_node_id.to_owned(),
@@ -2419,26 +2421,22 @@ fn plan_remote_bootstrap_at(
     if let Some(error) = remote_recovery_error(discovery.recovery) {
         return Err(error);
     }
-    let reason = if discovery.executables.is_empty() {
-        RemoteInstallReason::Missing
-    } else if selection.incompatible == discovery.executables.len() {
-        RemoteInstallReason::Upgrade
-    } else {
+    if !discovery.executables.is_empty() && selection.incompatible == discovery.executables.len() {
+        return Err(incompatible_helper_cold_upgrade_required());
+    }
+    if !discovery.executables.is_empty() {
         return Err(io::Error::other(
             "remote Boomux candidates could not be verified; check remote executable access and SSH transport before retrying",
         ));
-    };
+    }
     let source = select_install_source(discovery.platform)?;
-    let upgrade_helper = (reason == RemoteInstallReason::Upgrade)
-        .then(|| selection.incompatible_executables.first().cloned())
-        .flatten();
     Ok(RemoteBootstrapPlan::Install(RemoteInstallPlan {
         target,
         destination: discovery.install_destination,
         source,
-        reason,
+        reason: RemoteInstallReason::Missing,
         bootstrap_id: None,
-        upgrade_helper,
+        upgrade_helper: None,
         intent: RemoteInstallIntent::AutomaticCompatibility,
     }))
 }
@@ -2793,7 +2791,7 @@ const PUBLISHED_RELEASES: &[PublishedRelease] = &[
 ];
 
 const fn federation_protocol_floor() -> u32 {
-    protocol::ProtocolFeature::FederationChannel.minimum_version()
+    protocol::MIN_PROTOCOL_VERSION
 }
 
 fn read_bounded_file(path: &Path) -> io::Result<Vec<u8>> {
@@ -3057,7 +3055,6 @@ pub fn find_compatible_remote_helper(
 struct RemoteHelperInspection {
     compatible: Option<CompatibleRemoteHelper>,
     incompatible: usize,
-    incompatible_executables: Vec<RemoteExecutable>,
 }
 
 fn inspect_remote_helpers_in_session(
@@ -3074,7 +3071,6 @@ fn inspect_remote_helpers_in_session(
     let deadline = Instant::now() + timeout;
     let mut compatible: Option<CompatibleRemoteHelper> = None;
     let mut incompatible = 0;
-    let mut incompatible_executables = Vec::new();
     let mut indeterminate = 0;
     let mut first_indeterminate_error = None;
     for (index, executable) in executables.iter().enumerate() {
@@ -3131,14 +3127,16 @@ fn inspect_remote_helpers_in_session(
                     .as_ref()
                     .ok()
                     .and_then(|output| published_protocol_from_version_output(&output.stdout));
-                if matches!(
-                    helper_error.kind(),
-                    io::ErrorKind::UnexpectedEof | io::ErrorKind::Unsupported
-                ) && published_version
-                    .is_some_and(|version| version < federation_protocol_floor())
+                let reported_older_protocol = helper_error.kind() == io::ErrorKind::Unsupported
+                    && helper_error
+                        .to_string()
+                        .contains("older incompatible core protocol");
+                if reported_older_protocol
+                    || (helper_error.kind() == io::ErrorKind::UnexpectedEof
+                        && published_version
+                            .is_some_and(|version| version < federation_protocol_floor()))
                 {
                     incompatible += 1;
-                    incompatible_executables.push(executable.clone());
                 } else {
                     indeterminate += 1;
                     let error = if matches!(
@@ -3164,7 +3162,6 @@ fn inspect_remote_helpers_in_session(
     Ok(RemoteHelperInspection {
         compatible,
         incompatible,
-        incompatible_executables,
     })
 }
 
@@ -3246,7 +3243,6 @@ fn inspect_remote_helpers_at(
     })?;
     let mut compatible: Option<CompatibleRemoteHelper> = None;
     let mut incompatible = 0;
-    let mut incompatible_executables = Vec::new();
     let mut indeterminate = 0;
     let mut first_indeterminate_error = None;
     for (index, executable) in executables.iter().enumerate() {
@@ -3312,14 +3308,16 @@ fn inspect_remote_helpers_at(
                     .as_ref()
                     .ok()
                     .and_then(|output| published_protocol_from_version_output(&output.stdout));
-                if matches!(
-                    helper_error.kind(),
-                    io::ErrorKind::UnexpectedEof | io::ErrorKind::Unsupported
-                ) && published_version
-                    .is_some_and(|version| version < federation_protocol_floor())
+                let reported_older_protocol = helper_error.kind() == io::ErrorKind::Unsupported
+                    && helper_error
+                        .to_string()
+                        .contains("older incompatible core protocol");
+                if reported_older_protocol
+                    || (helper_error.kind() == io::ErrorKind::UnexpectedEof
+                        && published_version
+                            .is_some_and(|version| version < federation_protocol_floor()))
                 {
                     incompatible += 1;
-                    incompatible_executables.push(executable.clone());
                 } else {
                     indeterminate += 1;
                     let error = if matches!(
@@ -3345,7 +3343,6 @@ fn inspect_remote_helpers_at(
     Ok(RemoteHelperInspection {
         compatible,
         incompatible,
-        incompatible_executables,
     })
 }
 
@@ -3374,6 +3371,7 @@ fn published_protocol_from_version_output(output: &[u8]) -> Option<u32> {
         | "0.12.0" | "0.13.0" => Some(20),
         "0.14.0" | "0.14.1" | "0.14.2" | "0.15.0" => Some(21),
         "0.16.0" | "0.17.0" | "0.18.0" | "0.18.1" => Some(27),
+        "0.32.0" => Some(46),
         _ => None,
     }
 }
@@ -4090,6 +4088,13 @@ mod tests {
                     "\"protocol_version\":38,\"pid\":123,\"executable\":{},\"socket_device\":1,\"socket_inode\":1}}",
                     serde_json::to_string(executable).unwrap()
                 ),
+            )
+            .replace(
+                "\"protocol_version\":47}",
+                &format!(
+                    "\"protocol_version\":47,\"pid\":123,\"executable\":{},\"socket_device\":1,\"socket_inode\":1}}",
+                    serde_json::to_string(executable).unwrap()
+                ),
             );
         fs::write(script, contents).unwrap();
     }
@@ -4262,6 +4267,17 @@ mod tests {
         format!(
             "test_watchdog_tick() {{ while [ ! -e \"$HOME/watchdog-tick\" ]; do /bin/sleep 0.01; done; /bin/sleep 0.01; }}; {gated}"
         )
+    }
+
+    fn gate_one_watchdog_attempt(command: &str) -> String {
+        let gated = gate_watchdog(command);
+        let one_attempt = gated.replacen(
+            "/bin/sleep 0.01; };",
+            "/bin/rm -f \"$HOME/watchdog-tick\"; };",
+            1,
+        );
+        assert_ne!(one_attempt, gated);
+        one_attempt
     }
 
     fn delay_watchdog_readiness(command: &str) -> String {
@@ -4921,11 +4937,15 @@ mod tests {
     }
 
     fn compatible_helper_script(node_id: &str) -> String {
+        helper_script(node_id, protocol::PROTOCOL_VERSION)
+    }
+
+    fn helper_script(node_id: &str, core_protocol_version: u32) -> String {
         let handshake = FederationHandshake {
             version: FEDERATION_VERSION,
             node_id: node_id.into(),
             helper_version: env!("CARGO_PKG_VERSION").into(),
-            core_protocol_version: protocol::PROTOCOL_VERSION,
+            core_protocol_version,
             connection_mode: FederationConnectionMode::AdHoc,
         };
         let mut handshake_bytes = Vec::new();
@@ -5274,6 +5294,26 @@ mod tests {
                 expected
             );
         }
+        assert!(
+            RemoteDaemonStatus::Present {
+                protocol_version: 46,
+                pid: None,
+                executable: None,
+                socket_device: None,
+                socket_inode: None,
+            }
+            .restart_required()
+        );
+        assert!(
+            !RemoteDaemonStatus::Present {
+                protocol_version: protocol::PROTOCOL_VERSION,
+                pid: None,
+                executable: None,
+                socket_device: None,
+                socket_inode: None,
+            }
+            .restart_required()
+        );
         let status = br#"{"schema":"boomux.cli/v1","command":"daemon.status","data":{"protocol_version":38,"pid":42,"executable":"/custom/path with spaces/boomux","socket_device":7,"socket_inode":8}}"#;
         let parsed = parse_remote_daemon_status(status).unwrap();
         assert!(parsed.proves_executable(
@@ -6128,14 +6168,45 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_plans_upgrade_for_a_known_old_protocol_helper() {
+    fn test_planner_requires_owner_cold_upgrade_for_a_protocol_46_helper() {
         let runtime = runtime_directory();
+        let helper = helper_script(&Uuid::new_v4().to_string(), 46);
         let ssh = write_bootstrap_ssh(
             &runtime,
-            "  \"'/old/boomux' __federation-stdio\") exit 2 ;;\n  \"'/old/boomux' --version\") printf 'boomux 0.14.2\\n' ;;",
+            &format!(
+                "  \"'/old/boomux' __federation-stdio\") {helper} ;;\n  \"'/old/boomux' --version\") printf 'boomux 0.32.0\\n' ;;"
+            ),
             "/old/boomux\\0",
         );
-        let plan = plan_remote_bootstrap_at(
+        let error = match plan_remote_bootstrap_at(
+            &runtime,
+            None,
+            SshTarget::parse("workbox").unwrap(),
+            SshAuthenticationMode::Batch,
+            Duration::from_secs(1),
+            ssh.as_os_str(),
+        ) {
+            Ok(_) => panic!("protocol-46 helper unexpectedly produced a bootstrap plan"),
+            Err(error) => error,
+        };
+        assert_eq!(error_code(&error), "upgrade_required");
+        assert!(error.to_string().contains("`boomux daemon stop`"));
+        assert!(error.to_string().contains("protocol-47 binary"));
+        fs::remove_dir_all(runtime).unwrap();
+    }
+
+    #[test]
+    fn session_planner_requires_owner_cold_upgrade_for_a_protocol_46_helper() {
+        let runtime = runtime_directory();
+        let helper = helper_script(&Uuid::new_v4().to_string(), 46);
+        let ssh = write_session_bootstrap_ssh(
+            &runtime,
+            &format!(
+                "  \"'/old/boomux' __federation-stdio\") {helper} ;;\n  \"'/old/boomux' --version\") printf 'boomux 0.32.0\\n' ;;"
+            ),
+            "/old/boomux\\0",
+        );
+        let mut session = BootstrapSession::open_at(
             &runtime,
             None,
             SshTarget::parse("workbox").unwrap(),
@@ -6144,13 +6215,22 @@ mod tests {
             ssh.as_os_str(),
         )
         .unwrap();
-        assert!(matches!(
-            plan,
-            RemoteBootstrapPlan::Install(RemoteInstallPlan {
-                reason: RemoteInstallReason::Upgrade,
-                ..
-            })
-        ));
+
+        let error = match session.plan(Duration::from_secs(1)) {
+            Ok(_) => panic!("protocol-46 helper unexpectedly produced a session plan"),
+            Err(error) => error,
+        };
+        assert_eq!(error_code(&error), "upgrade_required");
+        assert_eq!(
+            recovery_disposition(&error),
+            BootstrapRecoveryDisposition::NoRemoteMutation
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("reset the incompatible Boomux state")
+        );
+        drop(session);
         fs::remove_dir_all(runtime).unwrap();
     }
 
@@ -6337,6 +6417,36 @@ mod tests {
                 expected_node_id: node_id
             }
         );
+        drop(session);
+        fs::remove_dir_all(runtime).unwrap();
+    }
+
+    #[test]
+    fn explicit_upgrade_requires_owner_cold_upgrade_for_a_protocol_46_helper() {
+        let runtime = runtime_directory();
+        let helper = helper_script(&Uuid::new_v4().to_string(), 46);
+        let ssh = write_session_bootstrap_ssh(
+            &runtime,
+            &format!(
+                "  \"'/old/boomux' __federation-stdio\") {helper} ;;\n  \"'/old/boomux' --version\") printf 'boomux 0.32.0\\n' ;;"
+            ),
+            "/old/boomux\\0",
+        );
+        let mut session = BootstrapSession::open_at(
+            &runtime,
+            None,
+            SshTarget::parse("workbox").unwrap(),
+            SshAuthenticationMode::Batch,
+            Duration::from_secs(1),
+            ssh.as_os_str(),
+        )
+        .unwrap();
+
+        let error = session
+            .plan_explicit_upgrade(&Uuid::new_v4().to_string(), Duration::from_secs(1))
+            .unwrap_err();
+        assert_eq!(error_code(&error), "upgrade_required");
+        assert!(error.to_string().contains("`boomux daemon stop`"));
         drop(session);
         fs::remove_dir_all(runtime).unwrap();
     }
@@ -6605,20 +6715,17 @@ mod tests {
     }
 
     #[test]
-    fn current_published_release_is_selected_without_falling_back_to_stale_assets() {
-        let release = select_published_release("x86_64-unknown-linux-gnu").unwrap();
-        assert_eq!(release.tag, "v0.30.3");
-        assert_eq!(release.protocol_version, 44);
-        assert!(release.protocol_version <= protocol::PROTOCOL_VERSION);
-
-        let error = select_published_release("aarch64-unknown-linux-gnu").unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
-        assert!(
-            error
-                .to_string()
-                .contains(&format!("local protocol {}", protocol::PROTOCOL_VERSION))
-        );
-        assert!(error.to_string().contains("manually stream"));
+    fn stale_published_releases_are_not_selected_for_protocol_forty_seven() {
+        for target in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] {
+            let error = select_published_release(target).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("local protocol {}", protocol::PROTOCOL_VERSION))
+            );
+            assert!(error.to_string().contains("manually stream"));
+        }
     }
 
     #[test]
@@ -6752,7 +6859,7 @@ mod tests {
         fs::write(
             &ssh,
             format!(
-                "#!/bin/sh\n{control}\nlast=\nfor arg do last=$arg; done\ncase \"$last\" in\n  *'boomux-install-transaction-v1'*) mv {destination} {backup}; cat > {destination}; printf 'boomux-install-transaction-v1\\0.boomux.bootstrap.ABC12345\\0' ;;\n  *'transaction/watchdog_pid'*'restore_install'*) cat >/dev/null; rm -f {destination}; mv {backup} {destination} ;;\n  *'daemon status --json'*) printf '%s' '{{\"schema\":\"boomux.cli/v1\",\"command\":\"daemon.status\",\"data\":{{\"protocol_version\":38}}}}' ;;\n  *'daemon restart'*) exit 99 ;;\n  *'rm -f \"$transaction/backup\"'*) cat >/dev/null; : > {committed} ;;\n  *\"'/home/person/.local/bin/boomux' __federation-stdio\") n=0; [ ! -f {count} ] || n=$(cat {count}); n=$((n + 1)); printf '%s' \"$n\" > {count}; {handshake}; dd bs=1 count={request_len} of=/dev/null 2>/dev/null; [ \"$n\" -eq 1 ] && {pong} ;;\n  *) exit 64 ;;\nesac\n",
+                "#!/bin/sh\n{control}\nlast=\nfor arg do last=$arg; done\ncase \"$last\" in\n  *'boomux-install-transaction-v1'*) mv {destination} {backup}; cat > {destination}; printf 'boomux-install-transaction-v1\\0.boomux.bootstrap.ABC12345\\0' ;;\n  *'transaction/watchdog_pid'*'restore_install'*) cat >/dev/null; rm -f {destination}; mv {backup} {destination} ;;\n  *'daemon status --json'*) printf '%s' '{{\"schema\":\"boomux.cli/v1\",\"command\":\"daemon.status\",\"data\":{{\"protocol_version\":47}}}}' ;;\n  *'daemon restart'*) exit 99 ;;\n  *'rm -f \"$transaction/backup\"'*) cat >/dev/null; : > {committed} ;;\n  *\"'/home/person/.local/bin/boomux' __federation-stdio\") n=0; [ ! -f {count} ] || n=$(cat {count}); n=$((n + 1)); printf '%s' \"$n\" > {count}; {handshake}; dd bs=1 count={request_len} of=/dev/null 2>/dev/null; [ \"$n\" -eq 1 ] && {pong} ;;\n  *) exit 64 ;;\nesac\n",
                 control = CONTROL_MASTER_SCRIPT,
                 destination = quote_posix_shell(destination.to_str().unwrap()),
                 backup = quote_posix_shell(backup.to_str().unwrap()),
@@ -6820,7 +6927,7 @@ mod tests {
         fs::write(
             &ssh,
             format!(
-                "#!/bin/sh\n{control}\nlast=\nfor arg do last=$arg; done\ncase \"$last\" in\n  *'boomux-install-transaction-v1'*) mv {destination} {backup}; cat > {destination}; printf 'boomux-install-transaction-v1\\0.boomux.bootstrap.ABC12345\\0' ;;\n  *'committed=$lock/committed'*) cat >/dev/null; [ \"$(cat {count})\" -eq 2 ]; : > {committed}; printf 'boomux-install-commit-v1\\0committed\\0' ;;\n  *'transaction/watchdog_pid'*'daemon stop'*) exit 70 ;;\n  *'daemon status --json'*) : > {status_checked}; printf '%s' '{{\"schema\":\"boomux.cli/v1\",\"command\":\"daemon.status\",\"data\":{{\"protocol_version\":38}}}}' ;;\n  *'daemon restart'*) exit 99 ;;\n  *\"'/home/person/.local/bin/boomux' __federation-stdio\") n=0; [ ! -f {count} ] || n=$(cat {count}); n=$((n + 1)); printf '%s' \"$n\" > {count}; {helper} ;;\n  *) exit 64 ;;\nesac\n",
+                "#!/bin/sh\n{control}\nlast=\nfor arg do last=$arg; done\ncase \"$last\" in\n  *'boomux-install-transaction-v1'*) mv {destination} {backup}; cat > {destination}; printf 'boomux-install-transaction-v1\\0.boomux.bootstrap.ABC12345\\0' ;;\n  *'committed=$lock/committed'*) cat >/dev/null; [ \"$(cat {count})\" -eq 2 ]; : > {committed}; printf 'boomux-install-commit-v1\\0committed\\0' ;;\n  *'transaction/watchdog_pid'*'daemon stop'*) exit 70 ;;\n  *'daemon status --json'*) : > {status_checked}; printf '%s' '{{\"schema\":\"boomux.cli/v1\",\"command\":\"daemon.status\",\"data\":{{\"protocol_version\":47}}}}' ;;\n  *'daemon restart'*) exit 99 ;;\n  *\"'/home/person/.local/bin/boomux' __federation-stdio\") n=0; [ ! -f {count} ] || n=$(cat {count}); n=$((n + 1)); printf '%s' \"$n\" > {count}; {helper} ;;\n  *) exit 64 ;;\nesac\n",
                 control = CONTROL_MASTER_SCRIPT,
                 destination = quote_posix_shell(destination.to_str().unwrap()),
                 backup = quote_posix_shell(backup.to_str().unwrap()),
@@ -7156,7 +7263,7 @@ mod tests {
         fs::write(
             &ssh,
             format!(
-                "#!/bin/sh\n{control}\nlast=\nfor arg do last=$arg; done\ncase \"$last\" in\n  *boomux-platform-v1*) printf 'boomux-platform-v1\\0Linux\\0x86_64\\0' ;;\n  *boomux-executables-v1*) printf 'boomux-executables-v1\\0'; [ -e {installed} ] && printf '/home/person/.local/bin/boomux\\0' ;;\n  *boomux-install-destination-v1*) printf 'boomux-install-destination-v1\\0/home/person/.local/bin/boomux\\0' ;;\n  *'boomux-install-transaction-v1'*) mv {destination} {backup}; cat > {destination}; : > {installed}; printf 'boomux-install-transaction-v1\\0.boomux.bootstrap.ABC12345\\0' ;;\n  *'committed=$lock/committed'*) cat >/dev/null; : > {committed}; printf 'boomux-install-commit-v1\\0committed'; exit 255 ;;\n  *'daemon status --json'*) printf '%s' '{{\"schema\":\"boomux.cli/v1\",\"command\":\"daemon.status\",\"data\":{{\"protocol_version\":38}}}}' ;;\n  *'daemon restart'*) exit 99 ;;\n  *\"'/home/person/.local/bin/boomux' __federation-stdio\") {helper} ;;\n  *) exit 64 ;;\nesac\n",
+                "#!/bin/sh\n{control}\nlast=\nfor arg do last=$arg; done\ncase \"$last\" in\n  *boomux-platform-v1*) printf 'boomux-platform-v1\\0Linux\\0x86_64\\0' ;;\n  *boomux-executables-v1*) printf 'boomux-executables-v1\\0'; [ -e {installed} ] && printf '/home/person/.local/bin/boomux\\0' ;;\n  *boomux-install-destination-v1*) printf 'boomux-install-destination-v1\\0/home/person/.local/bin/boomux\\0' ;;\n  *'boomux-install-transaction-v1'*) mv {destination} {backup}; cat > {destination}; : > {installed}; printf 'boomux-install-transaction-v1\\0.boomux.bootstrap.ABC12345\\0' ;;\n  *'committed=$lock/committed'*) cat >/dev/null; : > {committed}; printf 'boomux-install-commit-v1\\0committed'; exit 255 ;;\n  *'daemon status --json'*) printf '%s' '{{\"schema\":\"boomux.cli/v1\",\"command\":\"daemon.status\",\"data\":{{\"protocol_version\":47}}}}' ;;\n  *'daemon restart'*) exit 99 ;;\n  *\"'/home/person/.local/bin/boomux' __federation-stdio\") {helper} ;;\n  *) exit 64 ;;\nesac\n",
                 control = CONTROL_MASTER_SCRIPT,
                 destination = quote_posix_shell(destination.to_str().unwrap()),
                 backup = quote_posix_shell(backup.to_str().unwrap()),
@@ -7970,19 +8077,27 @@ mod tests {
         let destination = directory.join(".local/bin/boomux");
         fs::write(&destination, b"previous").unwrap();
         fs::set_permissions(&destination, fs::Permissions::from_mode(0o755)).unwrap();
-        let install = gate_watchdog(
+        let install = gate_one_watchdog_attempt(
             &REMOTE_INSTALL_COMMAND
                 .replace("lease_limit=180", "lease_limit=1")
                 .replace(
                     "/bin/mv -f \"$transaction/backup\" \"$destination\" || return 1;",
-                    "false || return 1;",
+                    ": > \"$HOME/restore-attempted\"; false || return 1;",
                 ),
         );
         let transaction = run_local_upload_with_command(&directory, b"provisional", "sh", &install);
         run_local_activation(&directory, "sh", &transaction, RemoteInstallReason::Missing);
         fs::write(directory.join("watchdog-tick"), b"").unwrap();
-        thread::sleep(Duration::from_secs(2));
         let transaction_dir = directory.join(".local/bin").join(&transaction.0);
+        let claim = directory.join(".local/bin/.boomux.bootstrap.lock/claim");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while (!directory.join("restore-attempted").exists() || claim.exists())
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(directory.join("restore-attempted").exists());
+        assert!(!claim.exists());
         assert!(transaction_dir.exists());
         assert!(directory.join(".local/bin/.boomux.bootstrap.lock").exists());
 
